@@ -402,7 +402,13 @@ class WebWindow:
         if name == "me":
             return W.build_me(m, pending=self.pending, people=self._people())
         if name == "playbook":
-            return W.build_playbook(m)
+            data = W.build_playbook(m)
+            if self.client is not None and "workflows" in self.ops:   # Phase C's procedures, once the tray has them
+                reply = self.request("workflows", wait_s=4.0) or {}
+                if reply.get("ok") and reply.get("available"):
+                    data["procedures"] = list(reply.get("workflows") or [])
+                    data["workflows_available"] = True
+            return data
         if name == "activity":
             return W.build_activity(m, requests_csv=self.requests_csv())
         if name == "settings":
@@ -411,8 +417,14 @@ class WebWindow:
         raise ValueError(name)
 
     def _people(self) -> tuple[str, list[dict[str, Any]]]:
+        """The people: the tray's ``people`` op (memory's people index) when the tray serves it, else the same index
+        through this window's own memory client, else the portrait's person facts."""
         from yuki.ui import web_data as W
 
+        if self.client is not None and "people" in self.ops:
+            reply = self.request("people", wait_s=6.0, limit=60) or {}
+            if reply.get("ok") and reply.get("available") and isinstance(reply.get("people"), list):
+                return "index", [W.person_from_index(p) for p in reply["people"] if isinstance(p, dict) and p.get("name")]
         return W.people_now(self.memory)
 
     def _devices(self) -> dict[str, Any] | None:
@@ -764,12 +776,20 @@ class WebWindow:
         return {}
 
     def a_person(self, m: dict[str, Any]) -> dict[str, Any]:
+        """One person's card for Me's dossier: the tray's ``people`` op (``contact``) or this window's memory."""
         from yuki.ui.web_data import contact_card
 
-        contact = getattr(self._memory(), "contact", None)
-        if not callable(contact):
-            return {"ok": False, "error": "not available"}
-        card = contact(str(m.get("ref") or "")) or {}
+        ref = str(m.get("ref") or "")
+        card = None
+        if self.client is not None and "people" in self.ops:
+            reply = self.request("people", wait_s=6.0, person=ref) or {}
+            if reply.get("ok") and reply.get("available") and isinstance(reply.get("person"), dict):
+                card = reply["person"]
+        if card is None:
+            contact = getattr(self._memory(), "contact", None)
+            if not callable(contact):
+                return {"ok": False, "error": "not available"}
+            card = contact(ref) or {}
         if not card.get("found", True):
             return {"ok": False, "error": "nobody by that name"}
         return {"person": contact_card(card)}

@@ -300,6 +300,47 @@ def test_the_trays_events_become_chat_diffs_runs_and_live_state(tmp_path, monkey
     assert host.kinds("permissions")
 
 
+def test_the_window_talks_to_the_tray_over_the_authenticated_pipe(tmp_path, monkeypatch):
+    """The real pipe (HMAC both ways, the key from memory's own key file): hello, the tray's snapshot as the page's
+    chat, an op and its reply, the people op as Me's source."""
+    from yuki.ui import window_ipc
+    from yuki.ui.chat_model import ChatModel
+
+    cipher = _cipher(tmp_path / "mem")
+    address = window_ipc.pipe_name(tmp_path / "mem" / "memory.db")
+    tray = ChatModel()
+    tray.apply({"type": "user", "job": 5, "text": "Open the forum", "at": 1000.0})
+    seen: list[dict] = []
+
+    def handle(req):
+        seen.append(req)
+        if req["op"] == "hello":
+            server.send_to(req["_peer"], {"ev": "snapshot", "snapshot": tray.snapshot(), "state": {"voice_state": "off"}})
+            return {"version": window_ipc.VERSION, "ops": list(window_ipc.OPS)}
+        if req["op"] == "people":
+            return {"available": True, "people": [{"ref": "person:2", "name": "Riya", "routes": []}]}
+        if req["op"] == "steer":
+            return {"job": req["job"], "delivered": True}
+        return {"ok": False, "error": "not in this test"}
+
+    server = window_ipc.WindowServer(window_ipc.auth_key(cipher), address, handle).start()
+    try:
+        win, host = _window(tmp_path, monkeypatch)
+        win.cipher, win.want_connect, win.booted = cipher, True, True
+        win._connect()
+        assert win.client is not None and win.shell["connected"] is True and "offer" in win.ops
+        assert _wait(lambda: host.kinds("chat") and host.kinds("chat")[-1].get("reset"))
+        assert host.kinds("chat")[-1]["items"][0]["text"] == "Open the forum"
+        r = _act(win, host, "steer", job=5, text="also the other one")
+        assert r["ok"] and r["delivered"] is True
+        assert win._people() == ("index", [web_data.person_from_index({"ref": "person:2", "name": "Riya", "routes": []})])
+        assert [q["op"] for q in seen][:1] == ["hello"] and any(q["op"] == "people" for q in seen)
+    finally:
+        if win.client is not None:
+            win.client.close()
+        server.stop()
+
+
 # -- settings ops (each writes the file the tray and memory read; here in a temp folder) ----------------------------
 
 

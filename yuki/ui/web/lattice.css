@@ -118,10 +118,10 @@ button { cursor: pointer; }
 .askkey { white-space: nowrap; display: flex; align-items: center; gap: 10px; width: 100%; height: 40px; padding: 0 10px 0 12px; border-radius: 12px; border: 1px solid var(--hair-2); background: var(--raise); color: var(--text-2); text-align: left; font-size: 13.5px; }
 .askkey:hover { color: var(--text); border-color: #3A3E43; }
 .askkey .kbd { margin-left: auto; }
-.me-row { display: flex; align-items: center; gap: 10px; padding: 8px 6px 2px; border-top: 1px solid var(--hair); min-width: 0; }
+.me-row { display: flex; align-items: center; gap: 8px; padding: 8px 4px 2px 6px; border-top: 1px solid var(--hair); min-width: 0; }
 .me-row .av { width: 28px; height: 28px; flex: none; border-radius: 50%; border: 1px solid var(--hair-2); display: grid; place-items: center; font: 800 13px/1 var(--f-display); font-variation-settings: 'ROND' 100; }
 .me-row .who { font-size: 13px; font-weight: 600; line-height: 1.2; min-width: 0; }
-.me-row .who span { white-space: nowrap; display: block; font: 400 11px/1.3 var(--f-mono); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; }
+.me-row .who span { white-space: nowrap; display: block; font: 400 10.5px/1.3 var(--f-mono); color: var(--text-3); overflow: hidden; text-overflow: ellipsis; }
 .me-row .chip.rec { margin-left: auto; height: 22px; padding: 0 7px; }
 .offline { margin: 0 4px; padding: 8px 10px; border: 1px dashed var(--hair-2); border-radius: 10px; font-size: 12px; color: var(--text-2); }
 

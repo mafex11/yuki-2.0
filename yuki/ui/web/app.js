@@ -152,6 +152,7 @@
     const pg = Y.pages[S.page];
     if (pg && pg.mount) { try { pg.mount(main, S, D); } catch (e) { console.error(e); } }
     if (nav) main.querySelectorAll('[data-reveal]').forEach((el, i) => setTimeout(() => L.reveal(el), i * 60));
+    if (nav && Q.get('scroll')) setTimeout(() => { main.scrollTop = Number(Q.get('scroll')); field.remeasure(); }, 50);   // preview knob
     setTimeout(() => field.measure(), 0);
     tickSoon();
   }

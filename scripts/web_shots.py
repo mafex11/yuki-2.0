@@ -39,6 +39,11 @@ SHOTS: dict[str, str] = {
     "activity-calls": "page=activity/calls",
     "activity-failed": "page=activity/failed",
     "settings": "page=settings",
+    "home-scrolled": "page=home&scroll=620",
+    "me-scrolled": "page=me&scroll=560",
+    "settings-scrolled": "page=settings&scroll=600",
+    "day-scrolled": "page=work/day&scroll=640&scrub=1185",
+    "playbook-empty-memory": "page=playbook&empty=1",
 }
 
 
