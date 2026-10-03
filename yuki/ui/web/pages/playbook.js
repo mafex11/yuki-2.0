@@ -1,7 +1,8 @@
 /* Playbook: how you do things, from practice memory (E13). NEW proposals (a way seen once, or a question Yuki would
    like to ask) with Save / Edit / No - Edit is your own words, which memory re-distills into the next version;
    procedures and habits ("How you do things": steps, the app, uses and last use, how sure, where it came from);
-   lessons (what went wrong and what to do instead); standing rules. Every choice goes to memory's own workflow_edit
+   lessons (how you want things, in your own words; a mistake of Yuki's is never shown here as something learned,
+   appLearn: only what worked is); standing rules. Every choice goes to memory's own workflow_edit
    through Python; nothing here edits memory. Without practice memory: the know-how Yuki keeps today. */
 (function () {
   'use strict';
@@ -65,7 +66,7 @@
       h('div', { class: 'grid2', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } }, Y.k(left, 'how')),
         h('div', { class: 'col', data: { k: 'right' } },
-          Y.k(Y.sec('Lessons', les.length, les.length ? les.map(lesson) : Y.empty('No lessons yet. When I get something wrong and you correct me, the fix lands here, and I show it when I use it.')), 'lessons'),
+          Y.k(Y.sec('Lessons', les.length, les.length ? les.map(lesson) : Y.empty('No lessons yet. When you tell me how you want something done, it lands here, and I show it when I use it.')), 'lessons'),
           Y.k(Y.sec('Standing rules', rules.length, rules.length ? rules.map(ruleRow) : Y.empty('No rules yet. Say “always…” or “never…” and it lands here.')), 'rules')))];
   }
 

@@ -189,7 +189,8 @@ def test_the_agent_loop_records_targets_by_role_and_name_and_the_playbooks_it_ci
     client._embedder = Words()
     pid = P.add_playbook(client.store, {"kind": "procedure", "intent": "pause the video in chrome",
                                         "apps": ["chrome"], "body": {"steps": ["press k"]}},
-                         events=[{"type": "observed", "run_key": "r0"}], vector=vec("pause the video in chrome"))
+                         events=[{"type": "observed", "run_key": "r0"}, {"type": "succeeded", "run_key": "r0"}],
+                         vector=vec("pause the video in chrome"))
     memory = MemoryAccess(open_client=lambda: client)
 
     def resp(*blocks: Any) -> Any:
@@ -396,7 +397,8 @@ def _seed(store: Store) -> dict[str, int]:
     ids = {}
     ids["tag"] = P.add_playbook(store, {"kind": "procedure", "intent": "tag someone in a Discord channel",
                                         "apps": ["discord"], "body": {"steps": ["Ctrl+K", "@ by keys"]}},
-                                events=[{"type": "observed", "run_key": "r1"}],
+                                # appLearn: a way from a run is one only when that run was a verified success
+                                events=[{"type": "observed", "run_key": "r1"}, {"type": "succeeded", "run_key": "r1"}],
                                 vector=vec("tag someone in a Discord channel"))
     ids["paste"] = P.add_playbook(store, {"kind": "pitfall", "intent": "mention someone in Discord",
                                           "apps": ["discord"], "body": {"text": "a pasted @name stays text",
@@ -411,7 +413,7 @@ def _seed(store: Store) -> dict[str, int]:
                                    vector=vec("lower or raise a volume any volume change"))
     ids["warp"] = P.add_playbook(store, {"kind": "procedure", "intent": "switch to a Warp tab by its name",
                                          "apps": ["warp"], "body": {"steps": ["ctrl+shift+] until the title"]}},
-                                 events=[{"type": "observed", "run_key": "r3"}],
+                                 events=[{"type": "observed", "run_key": "r3"}, {"type": "succeeded", "run_key": "r3"}],
                                  vector=vec("switch to a Warp tab by its name"))
     return ids
 
@@ -775,9 +777,11 @@ def test_workflows_lists_procedures_lessons_and_proposals_with_uses_and_confiden
     page = P.workflows(store)
     assert page["available"] is True
     by = {c["id"]: c for c in page["workflows"]}
-    assert set(by) == {f"pb:{i}" for i in ids.values()}
-    assert [c["id"] for c in page["lessons"]] == [f"pb:{ids['volume']}"]            # taught: active
-    assert {c["id"] for c in page["proposals"]} == {f"pb:{ids['tag']}", f"pb:{ids['paste']}", f"pb:{ids['warp']}"}
+    assert set(by) == {f"pb:{i}" for i in ids.values()}       # every object, for the run card's chip titles
+    # appLearn: pitfalls are quiet notes for the brain, never a lesson row or a proposal on the page
+    assert page["lessons"] == []
+    assert {c["id"] for c in page["proposals"]} == {f"pb:{ids['tag']}", f"pb:{ids['warp']}"}
+    assert {c["id"] for c in page["learned"]} == {f"pb:{ids['tag']}", f"pb:{ids['warp']}"}
     card = by[f"pb:{ids['tag']}"]
     assert card["uses"] == 0 and card["confidence"] == 0.67 and card["state"] == "candidate" and card["steps"]
 

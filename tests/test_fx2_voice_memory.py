@@ -105,7 +105,9 @@ def _restore_way(store: Store, run: list[dict[str, Any]] | None = None) -> int:
     return P.add_playbook(store, {"kind": "procedure", "intent": "restore the browser pages after a crash",
                                   "apps": ["chrome.exe"], "body": body},
                           events=[{"type": "observed", "run_key": "r1", "at": NOW - 86400},
-                                  {"type": "observed", "run_key": "r2", "at": NOW - 2 * 86400}],
+                                  {"type": "observed", "run_key": "r2", "at": NOW - 2 * 86400},
+                                  # appLearn: a way from a run is offered once that run was a verified success
+                                  {"type": "succeeded", "run_key": "r1", "at": NOW - 86400}],
                           vector=vec("restore the browser pages after a crash"), now=NOW)
 
 

@@ -33,6 +33,13 @@ durable object; retrieval followed the window in front. This module is the store
 * **The Playbook page** (:func:`workflows`, :func:`workflow_edit`): procedures, lessons and proposals with uses, last use
   and confidence; save / edit (the user's words, re-distilled by the pipeline) / disable / forget, every one through
   the ledger.
+* **Only a success is learning** (appLearn, 4 Oct; the user: "the things it should learn should be the ones that it
+  successfully executed ... Why do you want to learn failures?"). A way (procedure or habit) learned from a run is shown
+  and announced only once it rests on a verified success (:func:`learned_way`): a run that ended done with its last
+  action verified and nobody correcting it (a ``succeeded`` event, :func:`verified_run`, :func:`stamp_successes`), a
+  later run that worked with it, or the user's own word. A pitfall is a quiet internal "avoid this" note: shown to the
+  brain so a mistake is not repeated, never on the Playbook page, never announced; what failed becomes visible only as
+  part of a later success (the way's "what didn't work"). :func:`workflows` ``learned`` lists the announced ones.
 
 No model is called here; no regex, keyword list or per-app branch decides anything: numbers are counts, cosines and
 times; strings are only compared with stored strings (whole-word spans, as :mod:`yuki.memory.contacts` does).
@@ -53,6 +60,8 @@ Public API::
     apps_named(store, words, known=()) -> [app_key]
     relevant(store, *, query_vec, apps_in_play, now=None, detail=False) -> dict
     workflows(store, *, now=None) -> dict;  workflow_edit(store, ref, action, words="", *, now=None) -> dict
+    learned_way(kind, events) -> bool;  verified_run(store, key) -> bool;  judged_ok(store, key) -> bool | None;  corrected_by_quote(store, key) -> bool
+    stamp_successes(store, *, run_keys=None, ok=None, dry_run=False) -> [(id, run_key)]
 """
 
 from __future__ import annotations
@@ -96,9 +105,32 @@ MIGRATION_RUN_PREFIX = "knowhow:"
 #: the user corrected the result; ``contradicted``: newer evidence says it is wrong.
 WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0, "taught": 3.0,
                              "ran_trouble": -2.0, "user_corrected": -3.0, "contradicted": -3.0}
+#: ``succeeded`` (appLearn): the run a way was learned from (its ``observed`` run) ended done with its last action
+#: verified and nobody corrected it - what lets a way learned from a run be shown and announced (:func:`learned_way`).
+#: It weighs nothing: the run's own ``observed`` event is already its evidence.
 NEUTRAL_EVENTS: tuple[str, ...] = ("injected", "cited", "superseded", "retired_by", "user_saved", "user_edit",
-                                   "edit_applied", "user_disabled", "user_enabled", "user_forgot")
+                                   "edit_applied", "user_disabled", "user_enabled", "user_forgot", "succeeded")
 EVENT_TYPES: tuple[str, ...] = (*WEIGHTS, *NEUTRAL_EVENTS)
+#: The events that show a way worked (appLearn): the run it came from was a verified success, a later run that followed
+#: it worked, or the user's own word. A way learned from a run without one of them is never shown or announced.
+SUCCESS_EVENTS: tuple[str, ...] = ("succeeded", "ran_ok", "taught")
+#: How the practice learner judged a run (``runs.learn_note`` is ``"<mode>: <outcome>"``, written by it): the
+#: post-mortem outcomes that count as the job having worked in the end.
+WORKED_OUTCOMES: tuple[str, ...] = ("worked", "worked_after_trouble")
+#: The outcomes that mean it did not (a correction, a failure, a stop).
+WRONG_OUTCOMES: tuple[str, ...] = ("corrected", "failed", "cancelled")
+#: The Learned announcements :func:`workflows` returns at most (newest first).
+LEARNED_SHOWN = 5
+#: The named auto-reset event the learner sets when a run it read taught a way or marked one a success (appLearn review):
+#: the tray waits on it, only while a done run's Learned box is still to come (``yuki.ui.learned_wait``, its own copy).
+LEARNED_EVENT_NAME = "Local\\YukiLearnedReady"
+
+
+def signal_learned() -> bool:
+    """Wake the tray's wait for a run's learning (:data:`LEARNED_EVENT_NAME`); ``False`` when nobody waits."""
+    from yuki.memory.store import signal_event
+
+    return signal_event(LEARNED_EVENT_NAME)
 #: Half-life of an object's evidence, days: app mechanics change with app updates, personal defaults drift slowly.
 HALF_LIFE_DAYS: dict[str, float] = {"procedure": 60.0, "pitfall": 60.0, "habit": 180.0, "style": 180.0}
 #: Clean uses (cited, then ran_ok with no negative evidence after them) before an active object is trusted.
@@ -1031,6 +1063,192 @@ def refresh(store: Store, *, now: float | None = None) -> int:
     return len(recompute(store, ids, now=now))
 
 
+# ---------------------------------------------------------------------------
+# What is learned: only a success (appLearn, 4 Oct)
+# ---------------------------------------------------------------------------
+
+
+def _run_evidence(key: Any) -> bool:
+    """A real run's key (not the know-how migration's own)."""
+    return bool(key) and not str(key).startswith(MIGRATION_RUN_PREFIX)
+
+
+def learned_way(kind: str, events: Sequence[Any]) -> bool:
+    """Whether an object counts as something Yuki learned to do - shown on the Playbook page and to the brain as a way:
+    a procedure or habit that either rests on a success (:data:`SUCCESS_EVENTS`) or was not learned from a run at all
+    (the miner's habits from what the user does, know-how carried over, the user's own words). A way learned from a run
+    (an ``observed`` event with a run's key) without a success is not one: a failed or stopped run never makes a way.
+    Pitfalls and style notes are never ways."""
+    if kind not in WAY_KINDS:
+        return False
+    if any(e.type in SUCCESS_EVENTS for e in events):
+        return True
+    return not any(e.type == "observed" and _run_evidence(e.run_key) for e in events)
+
+
+def verified_run(store: Store, key: str) -> bool:
+    """Whether a run is a verified success by its own trace (measured, no model): it ended done (``final``) and its
+    last action ran and its own report showed the effect, or could not by the control's nature (expected-
+    unverifiable). A run that only read or asked did nothing to learn from. ``False`` once the trace is gone."""
+    if not _run_evidence(key):
+        return False
+    head = store._query("SELECT outcome FROM runs WHERE run_key=? AND step=0", (key,))
+    if not head or head[0]["outcome"] != "final":
+        return False
+    last = store._query("SELECT ok, verdict, playbooks FROM runs WHERE run_key=? AND step>0 AND kind='action'"
+                        " ORDER BY step DESC LIMIT 1", (key,))
+    if not last:
+        return False
+    try:
+        meta = json.loads(last[0]["playbooks"] or "{}")
+    except (TypeError, ValueError):
+        meta = {}
+    step = {"ok": bool(last[0]["ok"]), "verdict": None if last[0]["verdict"] is None else bool(last[0]["verdict"]),
+            "expected": bool(meta.get("expected")) if isinstance(meta, dict) else False}
+    return not _bad(step)
+
+
+def judged_ok(store: Store, key: str) -> bool | None:
+    """How the practice learner judged a run (``runs.learn`` and its ``"<mode>: <outcome>"`` note, both its own):
+    ``True`` - nothing to learn from trouble (``skipped``: no measured trouble, nobody corrected it), a distill nobody
+    corrected, or a post-mortem that found it worked in the end; ``False`` - it was corrected, failed or stopped;
+    ``None`` - not judged yet (waiting, held for budget, or the pass failed)."""
+    rows = store._query("SELECT learn, learn_note FROM runs WHERE run_key=? AND step=0", (key,))
+    if not rows:
+        return None
+    learn, note = rows[0]["learn"], str(rows[0]["learn_note"] or "")
+    if learn == "skipped":
+        return True
+    if learn != "done":
+        return None
+    mode, _sep, outcome = note.partition(": ")
+    ok = outcome in WORKED_OUTCOMES if mode == "postmortem" else outcome not in WRONG_OUTCOMES
+    # a run judged before the learner noted its full verdict (a post-mortem the model labelled worked, whose lesson
+    # quotes the user's correction) is still a corrected run: it never makes a way
+    return ok and not corrected_by_quote(store, key)
+
+
+def corrected_by_quote(store: Store, key: str) -> bool:
+    """Whether a lesson written from this run quotes the user's correction of it (their next words after it, or words
+    they added while it ran): the measured half of the learner's correction test
+    (:func:`yuki.memory.practice_learn.corrected_run`), read back from the ledger (a lesson's ``taught`` event keeps
+    its quote). One indexed read; the follow-ups only when such a quote exists."""
+    rows = store._query("SELECT e.refs_ciphertext FROM playbook_events e JOIN playbooks p ON p.id = e.playbook_id"
+                        " WHERE e.run_key=? AND e.type='taught' AND p.kind IN (%s)" % ",".join("?" * len(LESSON_KINDS)),
+                        (key, *LESSON_KINDS))
+    quotes = []
+    for r in rows:
+        try:
+            refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
+        except Exception:
+            continue
+        if isinstance(refs, dict) and str(refs.get("quote") or "").strip():
+            quotes.append(str(refs["quote"]))
+    if not quotes:
+        return False
+    h = run_header(store, key)
+    if h is None:
+        return False
+    from yuki.memory import practice_learn as PL
+
+    words = [f["words"] for f in PL.followups(store, h)] + [t for t in (h.note.get("steers") or []) if t]
+    return any(PL.quote_ok(q, words) for q in quotes)
+
+
+def _success_sets(store: Store, ids: Sequence[int]) -> tuple[set[int], set[int], dict[int, float]]:
+    """For these objects: ``(ids learned from a run, ids resting on a success, {id: when it was last marked a verified
+    success})`` - one read over their ledgers (the ``playbook_events_pb`` index), never each object's ledger apart."""
+    ids = sorted({int(i) for i in ids})
+    from_run: set[int] = set()
+    proven: set[int] = set()
+    succeeded: dict[int, float] = {}
+    types = ("observed", *SUCCESS_EVENTS)
+    for start in range(0, len(ids), 400):
+        part = ids[start:start + 400]
+        rows = store._query(
+            "SELECT playbook_id, type, max(at), sum(CASE WHEN run_key IS NOT NULL AND substr(run_key, 1, ?) != ?"
+            " THEN 1 ELSE 0 END) FROM playbook_events WHERE playbook_id IN (%s) AND type IN (%s)"
+            " GROUP BY playbook_id, type" % (",".join("?" * len(part)), ",".join("?" * len(types))),
+            (len(MIGRATION_RUN_PREFIX), MIGRATION_RUN_PREFIX, *part, *types))
+        for r in rows:
+            pid, type_ = int(r[0]), r[1]
+            if type_ == "observed":
+                if int(r[3] or 0):
+                    from_run.add(pid)
+                continue
+            proven.add(pid)
+            if type_ == "succeeded":
+                succeeded[pid] = float(r[2] or 0.0)
+    return from_run, proven, succeeded
+
+
+def _proven_by_trace(store: Store, pid: int) -> bool:
+    """A way learned from a run and not marked yet: one of its runs is a verified success by its trace and the learner
+    has not judged it wrong (it may not have read it yet: code-learned ways are written as the run ends)."""
+    keys = [r[0] for r in store._query("SELECT DISTINCT run_key FROM playbook_events WHERE playbook_id=? AND"
+                                       " type='observed' AND run_key IS NOT NULL", (int(pid),))]
+    return any(verified_run(store, k) and judged_ok(store, k) is not False for k in keys if _run_evidence(k))
+
+
+def _is_way(store: Store, o: Playbook, from_run: set[int], proven: set[int]) -> bool:
+    """:func:`learned_way` from the sets of :func:`_success_sets`, with a way not marked yet proven by its run's trace
+    (read only for such a way, lazily)."""
+    if o.kind not in WAY_KINDS:
+        return False
+    if o.id in proven or o.id not in from_run:
+        return True
+    return _proven_by_trace(store, o.id)
+
+
+def stamp_successes(store: Store, *, run_keys: Sequence[str] | None = None, ok: bool | None = None,
+                    dry_run: bool = False, now: float | None = None) -> list[tuple[int, str]]:
+    """Mark the live ways learned from a run that turned out a verified success (:func:`verified_run`, judged so) with
+    a ``succeeded`` event, so they are shown and announced, and stay so after the run's trace is pruned. ``run_keys``:
+    only those runs (the learner, after reading one: ``ok`` is its own judgement of it); ``None``: every way not marked
+    yet (the daily refresh, and the backfill: ``--stamp-successes``), judged from each run's learn state. Ways already
+    resting on a success are left alone. ``dry_run``: say what would be marked, write nothing. Returns ``[(id, run)]``."""
+    now = _now(now)
+    if run_keys is not None:
+        keys = [k for k in dict.fromkeys(run_keys) if _run_evidence(k)]
+        if not keys:
+            return []
+        rows = store._query("SELECT DISTINCT playbook_id, run_key FROM playbook_events WHERE type='observed' AND"
+                            " run_key IN (%s)" % ",".join("?" * len(keys)), keys)
+        pairs = [(int(r[0]), str(r[1])) for r in rows]
+    else:
+        rows = store._query("SELECT DISTINCT playbook_id, run_key FROM playbook_events WHERE type='observed' AND"
+                            " run_key IS NOT NULL")
+        pairs = [(int(r[0]), str(r[1])) for r in rows if _run_evidence(r[1])]
+    if not pairs:
+        return []
+    ways = {o.id for o in live(store, WAY_KINDS, include_disabled=True)}
+    _from_run, done, _succeeded = _success_sets(store, [pid for pid, _key in pairs if pid in ways])
+    out: list[tuple[int, str]] = []
+    judged: dict[str, bool] = {}
+    for pid, key in pairs:
+        if pid not in ways or pid in done:
+            continue
+        if key not in judged:
+            j = ok if ok is not None else judged_ok(store, key)
+            judged[key] = bool(j) and verified_run(store, key)
+        if judged[key]:
+            out.append((pid, key))
+            done.add(pid)
+    if out and not dry_run:
+        def when(key: str) -> float:
+            # the learner's mark is now (it just read the run); the backfill's is the run's own end, so an old way
+            # marked today is never taken for something a run in progress just taught (the return card's Learned box)
+            if run_keys is not None:
+                return now
+            head = store._query("SELECT at, ended_at FROM runs WHERE run_key=? AND step=0", (key,))
+            return float(head[0]["ended_at"] or head[0]["at"]) if head else now
+
+        add_events(store, [{"playbook_id": pid, "type": "succeeded", "run_key": key, "at": when(key),
+                            "refs": {"via": "the run ended done and its last action verified"}}
+                           for pid, key in out], now=now)
+    return out
+
+
 def live(store: Store, kinds: Sequence[str] | None = None, *, include_disabled: bool = False) -> list[Playbook]:
     """The current objects (``valid_to`` unset), newest first; disabled ones only when asked."""
     sql = "SELECT * FROM playbooks WHERE valid_to IS NULL"
@@ -1201,11 +1419,13 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     :data:`WAY_APP_MIN_COSINE` when scoped to an app in play, else :data:`WAY_MIN_COSINE`; without the words' vector
     none come (no unranked filler). *Pitfalls* of an app in play always come (nearest the words first, then the most
     confident); others clear :data:`PITFALL_MIN_COSINE`. Ranked by cosine scaled by confidence. Disabled, retired and
-    superseded objects never come."""
+    superseded objects never come, nor a way learned from a run that did not succeed (:func:`learned_way`: a failed
+    method is never offered as the way to do it; what failed comes as a pitfall)."""
     started = time.perf_counter()
     now = _now(now)
     in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
     objs = live(store)
+    from_run, proven, _succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
     q = None
     if query_vec is not None:
         q = np.asarray(query_vec, dtype=np.float32).ravel()
@@ -1240,6 +1460,8 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
         floor = WAY_APP_MIN_COSINE if hit else WAY_MIN_COSINE
         if c < floor:
             continue
+        if o.kind in WAY_KINDS and not _is_way(store, o, from_run, proven):
+            continue
         why = f"cosine {c:.2f}" + (f", its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"
                                    if hit else "")
         (way_hits if o.kind == "procedure" else habit_hits).append((rank(c, o), o, c, why))
@@ -1272,10 +1494,16 @@ def _card(o: Playbook) -> dict[str, Any]:
 
 def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> dict[str, Any]:
     """The window's Playbook page: ``{"available": True, "procedures": [...], "lessons": [...], "proposals": [...],
-    "workflows": [...every object...], "learning": {...}}``. Procedures are procedures and habits, lessons are pitfalls
-    and style notes (active, trusted, stale or disabled); proposals are what Yuki is not sure of yet - objects seen once
-    (tentative) and the teach-back questions waiting for the user. Each card: id (``pb:N``), kind, title, text, steps,
-    apps, uses, last use, confidence, state and its evidence counts. Never raises."""
+    "learned": [...], "workflows": [...every object...], "learning": {...}}``. Procedures are the ways Yuki learned
+    (procedures and habits, :func:`learned_way`: a way from a run only once it rests on a success), lessons are the
+    user's style notes (active, trusted, stale or disabled); proposals are what Yuki is not sure of yet - ways seen once
+    (tentative) and the teach-back questions waiting for the user. A pitfall is never on the page: it is a quiet
+    internal note for the brain, seen only as a way's "what didn't work" (appLearn). ``learned``: the ways a verified
+    success taught, newest first (each card with ``learned_at``, when that success marked it, ``run_at``, when the
+    run that succeeded started - ``None`` once its trace is pruned - and ``why``, what did not work on the way there),
+    the only thing the return card may announce. Each card: id (``pb:N``), kind, title,
+    text, steps, apps, uses, last use, confidence, state and its evidence counts. ``workflows`` keeps every object
+    (titles for the run card's chips). Never raises."""
     try:
         now = _now(now)
         objs = live(store, include_disabled=True)[:limit]
@@ -1284,10 +1512,24 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
             o.confidence = ev["confidence"]
             o.state = "disabled" if o.disabled_at is not None else ev["state"]
         cards = [_card(o) for o in objs]
+        from_run, proven, succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
+        ways = {o.id for o in objs if _is_way(store, o, from_run, proven)}
         unsure = ("candidate", "probation")
-        procedures = [c for c, o in zip(cards, objs) if o.kind in WAY_KINDS and o.state not in unsure]
-        lessons = [c for c, o in zip(cards, objs) if o.kind in LESSON_KINDS and o.state not in unsure]
-        proposals = [c for c, o in zip(cards, objs) if o.state in unsure]
+        procedures = [c for c, o in zip(cards, objs) if o.id in ways and o.state not in unsure]
+        lessons = [c for c, o in zip(cards, objs) if o.kind == "style" and o.state not in unsure]
+        proposals = [c for c, o in zip(cards, objs) if o.state in unsure and (o.id in ways or o.kind == "style")]
+        learned = sorted(({**c, "learned_at": succeeded[o.id], "why": o.avoid or ""}
+                          for c, o in zip(cards, objs)
+                          if o.id in ways and o.id in succeeded and o.disabled_at is None
+                          and o.state not in ("retired", "stale")),
+                         key=lambda c: -float(c["learned_at"]))[:LEARNED_SHOWN]
+        for c in learned:   # the run whose success taught it, so a run's card names only its own learning
+            pid = parse_ref(c["id"])
+            last = store._query("SELECT run_key FROM playbook_events WHERE playbook_id=? AND type='succeeded'"
+                                " ORDER BY at DESC, id DESC LIMIT 1", (pid,))
+            key = last[0]["run_key"] if last else None
+            head = store._query("SELECT at FROM runs WHERE run_key=? AND step=0", (key,)) if key else []
+            c["run_at"] = float(head[0]["at"]) if head else None
         try:
             for q in store.questions(("open", "asked"), limit=20):
                 if q.origin == "practice":
@@ -1300,7 +1542,7 @@ def workflows(store: Store, *, now: float | None = None, limit: int = 100) -> di
                              " 'practice%' AND at >= ?", (day,))[0]
         runs = store._query("SELECT count(*) FROM runs WHERE step=0 AND at >= ?", (now - 86400.0,))[0][0]
         return {"available": True, "procedures": procedures, "lessons": lessons, "proposals": proposals,
-                "workflows": cards, "learning": {"runs_24h": int(runs), "cost_today_usd": round(float(spent[0]), 4),
+                "learned": learned, "workflows": cards, "learning": {"runs_24h": int(runs), "cost_today_usd": round(float(spent[0]), 4),
                                                  "passes_today": int(spent[1])}}
     except Exception as exc:
         return {"available": False, "workflows": [], "error": f"{type(exc).__name__}: {exc}"}
@@ -1395,5 +1637,7 @@ __all__ = [
     "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
     "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
     "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
-    "executable_step", "clean_run", "SKILL_DOS",
+    "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
+    "LEARNED_EVENT_NAME", "signal_learned",
+    "stamp_successes",
 ]

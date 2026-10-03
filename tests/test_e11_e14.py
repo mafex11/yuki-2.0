@@ -294,29 +294,35 @@ def test_home_has_todays_goals_open_first_on_the_now_strip():
 def test_the_playbook_page_is_practice_memorys_workflows(store):
     proc = P.add_playbook(store, {"kind": "procedure", "intent": "Restore the browser after a restart", "apps": ["firefox"],
                                   "body": {"steps": ["Open it", "Click Restore"]}, "origin": "distill"},
-                          events=[{"type": "observed", "run_key": "a"}, {"type": "observed", "run_key": "b"}])
+                          events=[{"type": "observed", "run_key": "a"}, {"type": "observed", "run_key": "b"},
+                                  {"type": "succeeded", "run_key": "b"}])   # appLearn: a way rests on a success
     P.add_playbook(store, {"kind": "pitfall", "intent": "Pause the music", "apps": ["music"], "origin": "postmortem",
                            "body": {"text": "a click behind another window went nowhere", "instead": "bring it forward first"},
                            "avoid": "clicking a background window"},
                    events=[{"type": "taught", "run_key": "c", "refs": {"words": "bring it forward"}}])
+    P.add_playbook(store, {"kind": "style", "intent": "Write emails to the team", "origin": "postmortem",
+                           "body": {"text": "In English, short."}},
+                   events=[{"type": "observed", "run_key": "e"},
+                           {"type": "taught", "run_key": "e", "refs": {"quote": "in English please"}}])
     cand = P.add_playbook(store, {"kind": "habit", "intent": "Videos in Firefox", "apps": ["firefox"],
                                   "body": {"text": "You watch videos in Firefox."}, "origin": "miner"},
-                          events=[{"type": "observed", "run_key": "d"}])
+                          events=[{"type": "observed_day", "run_key": "miner:site"}])
     d = W.build_playbook(MemoryClient(store))
     assert d["workflows_available"] and d["know_how"] == []
     p = next(x for x in d["procedures"] if x["ref"] == f"pb:{proc}")
     assert p["title"] == "Restore the browser after a restart" and p["steps"] == ["Open it", "Click Restore"]
     assert p["app"] == "Firefox" and p["uses"] == 0 and p["conf"] is not None and p["conf_word"]
     assert p["learned"].startswith("From a run that worked")
-    lesson = d["lessons"][0]
-    assert lesson["dont"] == "Pause the music" and lesson["because"] == "a click behind another window went nowhere"
-    assert lesson["do"] == "bring it forward first" and lesson["from"].startswith("From a time I got it wrong")
+    # appLearn: the pitfall is a quiet note for Yuki, never on the page; lessons are the user's style notes
+    assert [x["dont"] for x in d["lessons"]] == ["Write emails to the team"]
+    assert d["lessons"][0]["because"] == "In English, short." and d["lessons"][0]["from"].startswith("In your words")
+    assert "Pause the music" not in json.dumps(d)
     prop = next(x for x in d["proposals"] if x["ref"] == f"pb:{cand}")
     assert prop["title"] == "Videos in Firefox" and "Seen" in prop["basis"] and prop["app"] == "Firefox"
     # more things seen once than NEW blocks: the rest stay visible in their own lists, marked tentative
     for n in range(2):
         P.add_playbook(store, {"kind": "procedure", "intent": f"Open the planner {n}", "body": {"steps": ["a", "b"]}},
-                       events=[{"type": "observed", "run_key": f"x{n}"}])
+                       events=[{"type": "observed", "run_key": f"x{n}"}, {"type": "succeeded", "run_key": f"x{n}"}])
     d = W.build_playbook(MemoryClient(store))
     assert len(d["proposals"]) == W.PROPOSALS_SHOWN == 2
     tentative = [p for p in d["procedures"] if p.get("tentative")]
@@ -419,7 +425,8 @@ def test_the_ledger_says_why_in_the_users_words_with_lessons_procedures_and_rule
     # plain words only: no timing, no raw failure text, no "can't undo" (appC1 review F5)
     assert launch["result"] == "done, checked on screen" and "cant_undo" not in launch
     assert click["f"] == "failed" and click["status"] == "failed" and click["result"] == "didn’t work"
-    assert click["chips"] == [{"kind": "lesson", "text": "Pause the music"}] and "keeping a lesson in mind" in click["why"]
+    # appLearn: a pitfall is Yuki's own quiet note, never shown as something learned (no chip, no "lesson" words)
+    assert click["chips"] == [] and "lesson" not in click["why"]
     # the to-do's own words, from memory's record of it (appC1 review F9), never from the step's input; no Undo on
     # the Activity tab (the 3 Oct ask A)
     assert todo["what"] == "Added to your list “Water the basil”" and "undo" not in todo
