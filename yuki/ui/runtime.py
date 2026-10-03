@@ -164,6 +164,8 @@ class Job:
     #: What the user actually said or typed, for the authorization judge (``Agent.run(user_words=)``; voice: the heard
     #: turns, never the talker's own reading of them); ``None``: the agent takes the request's own words.
     user_words: tuple[str, ...] | None = None
+    #: The thinker's request pack built while the user spoke (``Agent.run(pack=)``, revamp D S5; voice only, worker only).
+    pack: Any = None
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -402,6 +404,7 @@ class Lane(QThread):
             **({"memory_query": job.memory_query} if job.memory_query else {}),
             **({"previous_query": job.previous_query} if job.previous_query else {}),
             **({"user_words": list(job.user_words)} if job.user_words else {}),
+            **({"pack": job.pack} if job.pack is not None else {}),
         )
         while True:
             try:
@@ -697,7 +700,7 @@ class AgentRuntime(QObject):
     def submit(
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
-        user_words: "Iterable[str] | str | None" = None,
+        user_words: "Iterable[str] | str | None" = None, pack: Any = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -720,12 +723,15 @@ class AgentRuntime(QObject):
             previous_query: The previous request's words, for a follow-up.
             user_words: What the user actually said (voice: the heard turns) for the authorization judge; the
                 talker's own reading of them never counts as the user's words.
+            pack: A request pack the voice built while the user spoke (``Agent.build_pack``); used only when the
+                worker takes the request now (a pack read for an idle worker is stale on a queue).
 
         Returns:
             ``(lane name, request id)``.
         """
         request_id = next(self._ids)
-        lane = self.worker if (lane == WORKER or not self.worker_busy) else self.front_desk
+        worker_idle = not self.worker_busy   # before this request counts: a pack is fresh only for an idle worker
+        lane = self.worker if (lane == WORKER or worker_idle) else self.front_desk
         if lane is self.worker:
             self._worker_outstanding.append(request_id)
         else:
@@ -735,8 +741,9 @@ class AgentRuntime(QObject):
         words = _words_tuple(user_words)
         if words and lane is not self.worker:
             self._user_words[request_id] = words
+        fresh = pack if (lane is self.worker and worker_idle) else None
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words))
+                                   previous_query, words, fresh))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
