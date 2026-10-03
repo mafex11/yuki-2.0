@@ -2434,7 +2434,7 @@ class MemoryClient:
     # -- calls: both sides, each track labelled (yuki.memory.calls) ----------
 
     def call_status(self) -> dict:
-        """The call going on now, for the UI's consent card and "remembering your side" indicator.
+        """The call going on now, for the UI's consent card and recording indicator (what is kept: ``mic``, ``tracks``).
 
         ``{"call": {...} | None, "recording": bool}``; the call is
         ``{"id", "app", "status", "asking", "consent", "headphones",
