@@ -9409,7 +9409,8 @@ class Store:
         tid = int(snap["item_id"])
         if self._touched_since(conn, tid, float(snap["at"])):
             return True
-        if conn.execute("SELECT 1 FROM undo_images WHERE surface IN ('thread', 'thread_card') AND item_id=? AND id > ?"
+        if conn.execute("SELECT 1 FROM undo_images WHERE surface IN ('thread', 'thread_card', 'thread_title')"
+                        " AND item_id=? AND id > ?"
                         " AND undone_at IS NULL LIMIT 1", (tid, int(snap["id"]))).fetchone() is not None:
             return True
         if snap["after_ciphertext"]:
@@ -9445,6 +9446,9 @@ class Store:
         "episode": ("episodes", "id", ("title_ciphertext", "summary_ciphertext")),
         "journal": ("journal", "id", ("source_ciphertext",)),
         "thread_card": ("work_threads", "id", ("shown_ciphertext", "next_ciphertext")),
+        "thread_title": ("work_threads", "id", ("title_ciphertext",)),
+        "fact_label": ("portrait_facts", "id", ("summary_ciphertext",)),
+        "todo_title": ("conversation_facts", "id", ("title_ciphertext",)),
     }
 
     def write_with_images(self, surface: str, rows: dict[int, dict[str, Any]], *, run_id: int | None, action: str,

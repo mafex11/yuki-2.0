@@ -3,8 +3,8 @@
 Why (the user's feedback round 3, W5): "no Hindi or other languages shown anywhere in the app". Every writer of what
 the app shows now writes it in English at the source (:data:`yuki.memory.titles.ENGLISH_RULE` inside the shared shown
 rules; the episode, thread and misheard writers; the journal's call side). This pass fixes what was stored before:
-every current shown form - a portrait fact's (people's summaries among them), a thread's card and next step, a call's
-gist, a work session's title and summary - is shown to Haiku in batches, and the model returns an English version only
+every current shown form - a portrait fact's (people's summaries among them) and its short label, a thread's title,
+card and next step, a to-do's title, a call's gist, a work session's title and summary - is shown to Haiku in batches, and the model returns an English version only
 of the ones that contain words in another language (Hindi or Hinglish in any script, Devanagari, another script),
 changing nothing else. Model judgement, no script or word matching. Each rewrite keeps its before-image
 (:meth:`yuki.memory.store.Store.write_with_images`): ``--undo RUN_ID`` puts the old words back while the new ones stand.
@@ -41,7 +41,22 @@ KINDS: dict[str, tuple[str, str, str]] = {
     "N": ("thread_card", "next_ciphertext", "the next step of a thread of their work"),
     "T": ("episode", "title_ciphertext", "a work session's title, a few words"),
     "U": ("episode", "summary_ciphertext", "a work session's summary"),
+    # (review: the short labels the app shows too)
+    "W": ("thread_title", "title_ciphertext", "a thread of their work's title, a few words"),
+    "L": ("fact_label", "summary_ciphertext", "a fact's short label in their app, a few words"),
+    "D": ("todo_title", "title_ciphertext", "a to-do's short title, a few words"),
 }
+#: Characters a thread title may have (as the nightly pass keeps them).
+THREAD_TITLE_MAX_CHARS = 80
+
+
+def _label(text: Any, cap: int) -> str | None:
+    """A short label kept as written (whitespace and wrapping quotes tidied), or None when empty, cut or over ``cap``."""
+    t = " ".join(str(text or "").split())
+    while len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    return t if t and len(t) <= cap and not t.endswith("…") else None
+
 
 SYSTEM_PROMPT = """\
 You check that what Yuki's app shows the user is in English. Yuki is the user's personal assistant on \
@@ -79,7 +94,7 @@ TOOL: dict[str, Any] = {
 @dataclass
 class Line:
     ref: str            # "P12"
-    kind: str           # P | G | S | N | T | U
+    kind: str           # one of KINDS
     item_id: int
     text: str
 
@@ -106,7 +121,12 @@ def lines_of(store: Any) -> list[Line]:
     for f in store.portrait_facts(include_corrections=False):
         if f.shown:
             out.append(Line(f"P{f.id}", "P", f.id, f.shown))
+    for f in store.portrait_facts(include_corrections=False):
+        if f.summary:
+            out.append(Line(f"L{f.id}", "L", f.id, f.summary))
     for t in store.work_threads(("active", "paused", "done")):
+        if t.title:
+            out.append(Line(f"W{t.id}", "W", t.id, t.title))
         if t.shown:
             out.append(Line(f"S{t.id}", "S", t.id, t.shown))
         if t.next:
@@ -116,6 +136,12 @@ def lines_of(store: Any) -> list[Line]:
         for cid, d in store.call_digests(ids).items():
             if d.get("gist_shown"):
                 out.append(Line(f"G{cid}", "G", int(cid), d["gist_shown"]))
+    except Exception:
+        pass
+    try:
+        for c in store.conversation_facts(("commitment",)):
+            if c.title:
+                out.append(Line(f"D{c.id}", "D", c.id, c.title))
     except Exception:
         pass
     for e in store.episodes_between(None, None):
@@ -129,7 +155,7 @@ def lines_of(store: Any) -> list[Line]:
 def validate(raw: Any, batch: Sequence[Line]) -> tuple[list[dict[str, Any]], list[str]]:
     """``(rewrites, rejected)``: a listed line once, a changed English text within that kind's bounds (plumbing)."""
     from yuki.memory.episodes import session_summary, session_title
-    from yuki.memory.titles import clean_shown
+    from yuki.memory.titles import clean, clean_shown
     from yuki.memory.workthreads import card_next, card_shown
 
     by_ref = {ln.ref: ln for ln in batch}
@@ -140,7 +166,8 @@ def validate(raw: Any, batch: Sequence[Line]) -> tuple[list[dict[str, Any]], lis
         except ValueError:
             items = None
     keep = {"P": clean_shown, "G": clean_shown, "S": card_shown, "N": card_next, "T": session_title,
-            "U": session_summary}
+            "U": session_summary, "W": lambda v: _label(v, THREAD_TITLE_MAX_CHARS),
+            "L": lambda v: clean(v, "summary"), "D": lambda v: clean(v, "title")}
     out, rejected, seen = [], [], set()
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):

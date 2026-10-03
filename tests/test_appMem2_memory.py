@@ -506,6 +506,39 @@ def test_w5_the_english_pass_rewrites_only_what_holds_another_language_and_undoe
     assert store.work_thread(tid).next == "Ship it."                                  # a later change is never undone
 
 
+def test_w5_the_english_pass_also_covers_thread_titles_and_short_labels(store):
+    """Review: thread titles, a fact's short label and a to-do's title are shown too."""
+    from yuki.memory.english import EnglishPass, lines_of
+
+    fid = store.commit_portrait_changes(None, [FactChange("ADD", None, "interest", "Cricket", "The user plays cricket.",
+                                                          0.7, [], NOW, summary="Khelna cricket weekends")])[0][1]
+    tid = _thread(store, "Naya seed-swap app", "The user is building it.")
+    cid = store.add_conversation_fact("commitment", "The user will call Kiran.", owner="user",
+                                      title="Kiran ko call karna")
+    refs = {ln.ref for ln in lines_of(store)}
+    assert {f"L{fid}", f"W{tid}", f"D{cid}"} <= refs
+    answer = {"lines": [{"id": f"L{fid}", "english": "Cricket on weekends"},
+                        {"id": f"W{tid}", "english": "New seed-swap app"},
+                        {"id": f"D{cid}", "english": "Call Kiran"}]}
+    r = EnglishPass(_Worker(store, [answer])).run(now=NOW)
+    assert r.ok and r.written == 3
+    assert store.work_thread(tid).title == "New seed-swap app" and store.portrait_fact(fid).summary == "Cricket on weekends"
+    assert next(c for c in store.conversation_facts(("commitment",)) if c.id == cid).title == "Call Kiran"
+    assert EnglishPass(_Worker(store)).undo(r.run_id) == {"restored": 3, "diverged": 0}
+    assert store.work_thread(tid).title == "Naya seed-swap app"
+
+
+def test_w6_a_call_side_mishearing_carries_its_english_line(store):
+    """Review: a misheard entry written by the call side has the line the list shows (second person, English)."""
+    from yuki.memory.misheard import MISHEARD_PROPS, source_fields
+
+    assert "meant_shown" in MISHEARD_PROPS
+    got = source_fields({"heard": "sea ra", "meant": "Ciara", "meant_why": "on the call", "meant_is_name": True,
+                         "meant_shown": "You asked to message Ciara on Discord."}, "uncertain")
+    assert got["shown"] == "You asked to message Ciara on Discord."
+    assert "shown" not in source_fields({"heard": "sea ra", "meant": "Ciara", "meant_shown": ""}, "uncertain")
+
+
 def test_w5_the_talker_speaks_english_only():
     from yuki.voice.mouth import MOUTH_PROMPT
 

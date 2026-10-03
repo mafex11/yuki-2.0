@@ -7,15 +7,16 @@ real mishearings: the words as heard AND Yuki's best guess of what was meant, wi
 
 * **At the source.** The journal's call side (``record_call_side``) gives each uncertain fact that rests on a word or
   name recognition probably got wrong ``heard`` (the words as recognised, in Latin letters), ``meant`` (the guess, in
-  English or the name), ``meant_why`` and ``meant_is_name`` (:data:`MISHEARD_PROPS`, :data:`MISHEARD_GUIDANCE`); they
+  English or the name), ``meant_why``, ``meant_is_name`` and ``meant_shown`` (the English line the list shows, kept
+  as ``shown``; :data:`MISHEARD_PROPS`, :data:`MISHEARD_GUIDANCE`); they
   are kept in the entry's provenance (:func:`source_fields`). An entry uncertain for another reason (cannot tell if
   it was meant seriously, a noisy line it could still follow) gets none and is never listed.
 * **The list** (:meth:`yuki.memory.api.MemoryClient.misheard`) shows only unanswered uncertain entries with a heard
   form and a guess.
-* **The answer** (:meth:`yuki.memory.api.MemoryClient.resolve_heard`): Right (the guess is right) settles the entry and
-  queues the correction pass with the user's words "It was 'Ciara', not 'sea ra'" and the entry as its target, so
+* **The answer** (:meth:`yuki.memory.api.MemoryClient.resolve_heard`): ``guess_right`` (the guess is right) answers
+  the entry (still uncertain until it is rewritten) and queues the correction pass with the user's words "It was 'Ciara', not 'sea ra'" and the entry as its target, so
   the entry is reworded and the name alias learned through the existing pipeline (an alias only lands when a rewrite
-  carried it out); Wrong retires it; "as heard" keeps it as said; anything else goes through ``correct_item``.
+  carried it out); Wrong retires it; Right keeps it as heard; anything else goes through ``correct_item``.
 * **Backfill** (:class:`MisheardPass`): the unanswered uncertain entries of the last week judged once by Haiku - a
   real mishearing gets its heard words, guess, why and an English line said to the user (``shown``); the rest stay
   uncertain (never used as facts) and drop off the list. Reversible (``--undo RUN_ID``: the provenance put back).
@@ -63,6 +64,9 @@ MISHEARD_PROPS: dict[str, Any] = {
         "With heard: why that guess fits, a few words in English (who is on the call, a name memory knows, what the "
         "sentence is about); else \"\".")},
     "meant_is_name": {"type": "boolean", "description": "With heard: true when the guess is a person's name."},
+    "meant_shown": {"type": "string", "description": (
+        "With heard: the fact said to the user in one short English sentence, second person, your guess in place of "
+        "the heard words (\"You asked to message Ciara on Discord.\"); else \"\".")},
 }
 
 MISHEARD_GUIDANCE = """\
@@ -71,9 +75,11 @@ probably got wrong, give heard (those words as recognised, in Latin letters) and
 of what was really said), with meant_why: who or what makes the guess fit - a name in WHAT MEMORY \
 ALREADY KNOWS or on the call screen, what the sentence is about. Example: "message sea ra on \
 Discord" with a friend Ciara on the call -> heard "sea ra", meant "Ciara", meant_why "Ciara is \
-on this call and you were about to message someone", meant_is_name true. Only a real mishearing gets \
-them: a fact uncertain for another reason (you cannot tell whether it was meant seriously, a noisy line \
-whose sense you still follow) leaves all four empty, and so does every fact that is not uncertain.
+on this call and you were about to message someone", meant_is_name true, meant_shown "You asked to \
+message Ciara on Discord." (what the app shows the user: second person, English). Only a real \
+mishearing gets them: a fact uncertain for another reason (you cannot tell whether it was meant \
+seriously, a noisy line whose sense you still follow) leaves all five empty, and so does every fact \
+that is not uncertain.
 
 IN ENGLISH. Every fact you write is in English whatever language the user spoke: translate Hindi and \
 Hinglish, and when the exact words matter quote them translated; never Devanagari or another script in \
@@ -104,8 +110,12 @@ def source_fields(item: dict[str, Any], nature: str) -> dict[str, Any]:
     heard, meant = _clean(item.get("heard"), HEARD_MAX_CHARS), _clean(item.get("meant"), HEARD_MAX_CHARS)
     if heard is None or meant is None or heard.casefold() == meant.casefold():
         return {}
-    return {"heard": heard, "meant": meant, "meant_why": _clean(item.get("meant_why"), WHY_MAX_CHARS) or "",
-            "meant_name": item.get("meant_is_name") is True}
+    out = {"heard": heard, "meant": meant, "meant_why": _clean(item.get("meant_why"), WHY_MAX_CHARS) or "",
+           "meant_name": item.get("meant_is_name") is True}
+    shown = _clean(item.get("meant_shown"), SHOWN_MAX_CHARS)
+    if shown is not None:   # the line the list shows (else it falls back to memory's own sentence)
+        out["shown"] = shown
+    return out
 
 
 def is_listed(source: Any) -> bool:
