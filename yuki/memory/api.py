@@ -2691,6 +2691,29 @@ class MemoryClient:
         except Exception:
             return None
 
+    def people_list(self, *, limit: int = 40) -> list[dict]:
+        """The people the user talks to, as structured rows for the Yuki window's Me page (no message is
+        decrypted): ``[{"ref", "name", "relation", "aliases", "tone", "routes": [{"ref", "label", "app", "kind",
+        "mine", "theirs", "last_mine", "last_theirs", "share", "preferred"}...], "usual", "margin", "close",
+        "last_contact"}]``, most recently in touch first. ``[]`` when memory has no people index yet. Never raises."""
+        from yuki.memory import contacts as _c
+
+        try:
+            rows = []
+            for person in _c.people(self.store):
+                c = _c.card(self.store, person, with_samples=0)
+                routes = [{k: r.get(k) for k in ("ref", "label", "app", "kind", "mine", "theirs", "last_mine",
+                                                 "last_theirs", "share", "preferred")} for r in c["routes"]]
+                last = max((t for r in c["routes"] for t in (r.get("last_mine"), r.get("last_theirs")) if t),
+                           default=None)
+                rows.append({"ref": c["ref"], "name": c["name"], "relation": c["relation"], "aliases": c["aliases"],
+                             "tone": c["tone"], "routes": routes, "usual": c["usual"], "margin": c["margin"],
+                             "close": c["close"], "last_contact": last})
+            rows.sort(key=lambda r: r["last_contact"] or 0, reverse=True)
+            return rows[:limit]
+        except Exception:
+            return []
+
     def people_directory(self) -> str:
         """The compact people block (<= ~900 characters, ``yuki.memory.contacts.directory``): each person the user
         talks to with their relation, aliases (names speech recognition misheard too), where the user talks with them
