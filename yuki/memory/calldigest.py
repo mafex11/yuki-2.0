@@ -87,6 +87,7 @@ from yuki.memory.journal import CALL_TRANSCRIPT_GUIDANCE, HAIKU_MODEL, cached_sy
 from yuki.memory.callcontext import MAX_CHARS as CONTEXT_MAX_CHARS
 from yuki.memory.personality import NATURES, normalize_nature
 from yuki.memory.store import CALL_OPEN_STATUSES, Store
+from yuki.memory.titles import GIST_SHOWN_FIELD
 
 #: Characters of utterance text (plus a line's frame) per model request: ~25 minutes of talk, ~5-7k tokens
 #: of mixed Hindi/English (Devanagari costs several tokens a word), so a part's lines stay detailed.
@@ -124,6 +125,9 @@ STRETCH_MAX_S = 90 * 60.0
 #: about on 3 of 4 calls.
 PEOPLE_HOW: tuple[str, ...] = ("on_call_screen", "call_chat", "likely")
 MAX_PEOPLE = 12
+#: What kind of place a call was in (the structured ``place``, migration 33): a voice channel, a text channel's
+#: call, a meeting, a direct call; "" when the screen does not say.
+PLACE_KINDS: tuple[str, ...] = ("voice", "text", "meeting", "direct", "")
 
 SYSTEM_PROMPT = """\
 You write the timeline of the user's calls for Yuki, a personal assistant on the user's Windows PC, \
@@ -168,8 +172,11 @@ seen in this stretch), story (an anecdote they told), humor (a joke, tease, boas
 bit - write it as one: "Joked that..."), uncertain (possibly misheard or unclear what it refers \
 to - the sentence carries the doubt: "Said what sounded like...").
 - calls: for every call in the request, one gist line of at most 25 words: what the call was \
-mostly about from the user's side. When EARLIER GIST is given, write the gist of the whole call \
-so far, not only this part.
+mostly about from the user's side, about "the user" like the lines (never they, he or she for the \
+user), and the others on the call by name or as "their friends" - never "they" for people no word \
+names. When EARLIER GIST is given, write the gist of the whole call so far, not only this part. \
+gist_shown is the same gist as the user's app shows it, said to them: "you", "your friends", "Ana \
+and Sam" ("A heated game where your friends chose killing people for fun, which shocked you.").
 
 THE OTHER SIDE IS NOT IN THE TRANSCRIPT. Never invent what anyone else said, asked, felt or did, \
 who they are, or what the call was about beyond the user's words and what the CONTEXT (below) shows \
@@ -205,7 +212,9 @@ the user themselves (their names and handles are given above; their own tile or 
 them), never a bot, an AI assistant or a program, never someone only listed as online elsewhere or \
 named in a server's name. Empty when nothing shows who.
 - where, for each call: the app and, when the call screen shows it, the server and voice channel or \
-the meeting's title ("Discord, voice channel Minecraft in the server Friends"); "" when not shown.
+the meeting's title ("Discord, voice channel Minecraft in the server Friends"); "" when not shown. \
+place says the same in parts: app, kind (voice, text, meeting, direct), the channel's name exactly \
+as shown and the server (or the meeting's title); "" for each part the screen does not show.
 - The gist may say who the call was with and what it was about when the context makes that plain.
 
 {guidance}
@@ -252,10 +261,30 @@ WRITE_TIMELINE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["call", "gist", "people", "where"],
+                    "required": ["call", "gist", "gist_shown", "people", "where", "place"],
                     "properties": {
                         "call": {"type": "integer", "description": "The call's number from its header."},
-                        "gist": {"type": "string", "description": "At most 25 words."},
+                        "gist": {"type": "string", "description": "At most 25 words, about the user (\"the user\", "
+                                                                  "never they/he/she for them); the others on the "
+                                                                  "call by name, or \"their friends\"."},
+                        "gist_shown": {"type": "string", "description": GIST_SHOWN_FIELD},
+                        "place": {
+                            "type": "object", "additionalProperties": False,
+                            "required": ["app", "kind", "channel", "server"],
+                            "description": "Where the call was, as the call screen shows it; empty strings for "
+                                           "what it does not show.",
+                            "properties": {
+                                "app": {"type": "string", "description": "The call app (\"Discord\")."},
+                                "kind": {"type": "string", "enum": list(PLACE_KINDS),
+                                         "description": "voice (a voice channel), text (a text channel's call), "
+                                                        "meeting, direct (a call with one person or a DM group), "
+                                                        "or \"\"."},
+                                "channel": {"type": "string",
+                                            "description": "The voice channel's name exactly as shown, or \"\"."},
+                                "server": {"type": "string", "description": "The server or workspace, or the "
+                                                                            "meeting's title; \"\" if not shown."},
+                            },
+                        },
                         "people": {
                             "type": "array",
                             "description": "Who was on the call with the user (see CONTEXT AROUND THE CALL); "
@@ -660,6 +689,49 @@ def parse_people(tool_input: Any, numbered: dict[int, tuple[int, Utterance]], co
         people = sorted(best.values(), key=lambda p: PEOPLE_HOW.index(p["how"]))[:MAX_PEOPLE]
         where = " ".join(str(g.get("where") or "").split())[:160] if context else ""
         out[cid] = {"people": people, "where": where}
+        place = parse_place(g.get("place"), context) if context else None
+        if place:
+            out[cid]["place"] = place
+    return out
+
+
+def parse_place(raw: Any, context: str) -> dict[str, str] | None:
+    """The structured place of a call (migration 33's digests: ``{"app", "kind", "channel", "server"}``), each name
+    kept only when the context the model read shows it (the same check as a person's name); ``None`` when nothing
+    is left."""
+    from yuki.memory.callcontext import grounded
+
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, str] = {}
+    for key, cap in (("app", 40), ("channel", 80), ("server", 80)):
+        value = " ".join(str(raw.get(key) or "").split())[:cap]
+        if value and grounded(value.lstrip("#"), context):
+            out[key] = value
+    kind = str(raw.get("kind") or "")
+    if kind in PLACE_KINDS and out:
+        out["kind"] = kind
+    return out or None
+
+
+def parse_shown(tool_input: Any, call_ids: Sequence[int]) -> dict[int, str]:
+    """``{call_id: gist said to the user}`` from the model's ``calls`` items (migration 33; kept when whole and not
+    overlong, :func:`yuki.memory.titles.clean_shown`)."""
+    from yuki.memory.titles import clean_shown
+
+    data = tool_input if isinstance(tool_input, dict) else {}
+    wanted = {int(i) for i in call_ids}
+    out: dict[int, str] = {}
+    for g in data.get("calls") or []:
+        if not isinstance(g, dict):
+            continue
+        try:
+            cid = int(g.get("call"))
+        except (TypeError, ValueError):
+            continue
+        text = clean_shown(g.get("gist_shown"))
+        if cid in wanted and text:
+            out[cid] = text
     return out
 
 
@@ -751,6 +823,9 @@ class _CallRun:
     #: Who was on the call and where (the model's reading of the context around it; migration 25).
     people: list[dict[str, str]] = field(default_factory=list)
     where: str = ""
+    #: The gist said to the user and the structured place (migration 33).
+    gist_shown: str | None = None
+    place: dict[str, str] | None = None
 
 
 class CallDigestWorker:
@@ -982,6 +1057,7 @@ class CallDigestWorker:
         for p in pieces:
             contexts[p.call_id] = (contexts.get(p.call_id, "") + "\n" + p.context).strip()
         seen = parse_people(getattr(block, "input", None), numbered, contexts, self.user_names())
+        shown = parse_shown(getattr(block, "input", None), call_ids)
         share = 1.0 / len(call_ids)
         for cid in call_ids:
             run = runs[cid]
@@ -993,9 +1069,11 @@ class CallDigestWorker:
             run.blocks += [b for b in blocks if b["call_id"] == cid]
             if cid in gists:
                 run.gist = gists[cid]
+                run.gist_shown = shown.get(cid)   # the shown form follows its gist (a stale one is not kept)
             if cid in seen:
                 run.people = merge_people(run.people, seen[cid]["people"])
                 run.where = seen[cid]["where"] or run.where
+                run.place = seen[cid].get("place") or run.place
         summary["requests"] += 1
         summary["input_tokens"] += int(tokens.get("input_tokens") or 0) + int(tokens.get("cache_read_tokens") or 0) \
             + int(tokens.get("cache_write_tokens") or 0)
@@ -1023,7 +1101,9 @@ class CallDigestWorker:
                 speech_s=speech_seconds(utts), utterances=len(utts), kept=len(run.kept), model=self.model,
                 usage=run.usage, requests=run.requests, cost_usd=run.cost, latency_ms=run.latency_ms,
                 context={"people": run.people, "where": run.where,
-                         "context_chars": sum(len(p.context) for p in run.pieces)} if self.context else None)
+                         **({"place": run.place} if run.place else {}),
+                         "context_chars": sum(len(p.context) for p in run.pieces)} if self.context else None,
+                gist_shown=run.gist_shown)
         except Exception as exc:
             run.failed = f"{type(exc).__name__}: {exc}"
             return

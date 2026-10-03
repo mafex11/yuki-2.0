@@ -61,6 +61,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 
 from yuki.memory.store import WorkOp, WorkThread, capture_attention
+from yuki.memory.titles import THREAD_SHOWN_FIELD, clean_shown
 
 #: At most this many threads are offered to one journal batch.
 CANDIDATES = 8
@@ -564,6 +565,8 @@ days or more is set aside unless its states show it still going or waiting on a 
 as paused. A thread touched in the last two days stays as it is unless its state says it finished.
 - rename: a title that no longer says what the thread became.
 - update: rewrite the state and open items when the latest states contradict each other or pile up.
+A merge or update also gives shown: the same state as the user's app shows it, said to them ("you", \
+natural dates such as "on 2 October", others by name).
 - dismiss: a thread that is no piece of work at all - watching videos or streams, listening to music, scrolling or browsing for fun or for adult content, playing or watching games, chatting with friends, one look at a page, one meeting on its own - it stops being a thread (its facts stay in the journal).
 - ask: when two threads may be the same work but the evidence cannot tell, do not merge - put one \
 short neutral question for the user in questions ("Is 'X' the same work as 'Y'?"), with the thread \
@@ -585,7 +588,8 @@ CONSOLIDATE_TOOL: dict[str, Any] = {
         "properties": {
             "decisions": {"type": "array", "items": {
                 "type": "object", "additionalProperties": False,
-                "required": ["action", "thread_ids", "keep_id", "title", "state", "open_items", "status", "reason"],
+                "required": ["action", "thread_ids", "keep_id", "title", "state", "shown", "open_items", "status",
+                             "reason"],
                 "properties": {
                     "action": {"type": "string", "enum": ["merge", "close", "rename", "update", "dismiss"]},
                     "thread_ids": {"type": "array", "items": {"type": "integer"},
@@ -594,6 +598,8 @@ CONSOLIDATE_TOOL: dict[str, Any] = {
                                 "description": "merge: n of the thread that carries on; else null."},
                     "title": {"type": "string", "description": "merge, rename: the title; else \"\"."},
                     "state": {"type": "string", "description": "merge, update: where it stands; else \"\"."},
+                    "shown": {"type": "string", "description": "merge, update: " + THREAD_SHOWN_FIELD + " For example "
+                              "\"You merged the replies fix; the demo video for Priya is still to send.\" Else \"\"."},
                     "open_items": {"type": "array", "items": {"type": "string"},
                                    "description": "merge, update: at most three open items; else []."},
                     "status": {"type": "string", "enum": ["", "paused", "done"],
@@ -729,6 +735,7 @@ class Consolidator:
                 changes.append({"action": "merge", "ids": sorted(set(ids)), "keep": int(keep),
                                 "title": _clean(item.get("title"), 80) or current[int(keep)].title,
                                 "state": _clean(item.get("state"), 400) or None, "open": open_items or None,
+                                "shown": clean_shown(item.get("shown")) if item.get("state") else None,
                                 "reason": reason})
             elif len(ids) != 1:
                 no(f"{action} takes one thread")
@@ -750,7 +757,8 @@ class Consolidator:
                 if not state:
                     no("update needs a state")
                     continue
-                changes.append({"action": "update", "id": ids[0], "state": state, "open": open_items, "reason": reason})
+                changes.append({"action": "update", "id": ids[0], "state": state, "open": open_items,
+                                "shown": clean_shown(item.get("shown")), "reason": reason})
             elif action == "dismiss":
                 changes.append({"action": "dismiss", "id": ids[0], "reason": reason})
             else:

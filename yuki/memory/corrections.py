@@ -59,7 +59,7 @@ import numpy as np
 from yuki.config import MODEL_ALIASES
 from yuki.memory.journal import sanitize_untrusted
 from yuki.memory.store import CORRECTION_KIND, FactChange, ModelCall, PortraitRunStats
-from yuki.memory.titles import SUMMARY_FIELD, TITLE_FIELD, clean as clean_label
+from yuki.memory.titles import SHOWN_RULES, SUMMARY_FIELD, TITLE_FIELD, clean as clean_label, clean_shown
 
 #: Candidates close in meaning to the correction: this many journal facts and episodes per query vector,
 #: and this many of the small surfaces (portrait facts, conversation items, to-dos, questions, persona).
@@ -146,7 +146,8 @@ such candidate return an edit:
 - rewrite: the complete corrected text with the contradicted part changed to what the user said and \
 every other word, date, number and detail kept as it was, in the item's own style and person (third \
 person, "the user"). For P and Q also give the corrected subject; else "". For a P, a commitment C \
-or a T also give its label: the few words the user's app shows for the corrected item (see the field).
+or a T also give its label: the few words the user's app shows for the corrected item (see the field). \
+For a P also give shown: the corrected fact as the user's app shows it, said to them (see the field).
 - retire: only when the user's words say the item itself is wrong or to forget it, and no corrected \
 version of it would be true. Never retire an E.
 Leave every other candidate out. Being about the same person or topic does not make an item wrong. \
@@ -169,7 +170,7 @@ JUDGE_TOOL: dict[str, Any] = {
         "required": ["edits"],
         "properties": {"edits": {"type": "array", "items": {
             "type": "object", "additionalProperties": False,
-            "required": ["id", "op", "wrong", "text", "subject", "label", "reason"],
+            "required": ["id", "op", "wrong", "text", "subject", "label", "shown", "reason"],
             "properties": {
                 "id": {"type": "string", "description": "The candidate's id as shown (J123, P45, C7, T2, E9, Q5, Y1)."},
                 "wrong": {"type": "string", "description": "The words of the candidate the user's words contradict, "
@@ -181,6 +182,9 @@ JUDGE_TOOL: dict[str, Any] = {
                     "A rewrite of a P, a commitment C or a T: the corrected item's short label for the user's app, "
                     "from its corrected text. P: " + SUMMARY_FIELD + " A commitment C or a T: " + TITLE_FIELD
                     + " Else \"\".")},
+                "shown": {"type": "string", "description": (
+                    "A rewrite of a P: the corrected fact as the user's app shows it to them, from its corrected "
+                    "text. " + SHOWN_RULES + " Else \"\".")},
                 "reason": {"type": "string", "description": "A few words: what was wrong in it."},
             }}}},
     },
@@ -428,7 +432,8 @@ class CorrectionApplier:
                 seen.add(ref)
                 out.append({"cand": c, "op": op, "text": text if op == "rewrite" else None,
                             "subject": subject or c.subject, "reason": reason,
-                            "label": " ".join(str(e.get("label") or "").split()) if op == "rewrite" else ""})
+                            "label": " ".join(str(e.get("label") or "").split()) if op == "rewrite" else "",
+                            "shown": clean_shown(e.get("shown")) if op == "rewrite" else None})
         return out, rejected
 
     def _aliases(self, raw: Any, correction: Any, cands: Sequence[Candidate]) -> list[dict[str, str]]:
@@ -497,7 +502,8 @@ class CorrectionApplier:
                     fcs.append(FactChange("UPDATE", f.id, f.kind, e["subject"] or f.subject, e["text"], f.confidence,
                                           list(f.source_ids), now, f.origin, [], list(f.episode_ids), f.aspect, None,
                                           summary=clean_label(e.get("label"),
-                                                              "title" if f.kind == "open_loop" else "summary")))
+                                                              "title" if f.kind == "open_loop" else "summary"),
+                                          shown=e.get("shown")))
             for e, (ok, new_id) in zip(portrait, store.commit_portrait_changes(run_id, fcs)):
                 record(e, new_id, ok)
                 stats.ops_update += bool(ok) and e["op"] == "rewrite"
