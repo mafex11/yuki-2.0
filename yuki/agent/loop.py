@@ -1648,6 +1648,38 @@ class Agent:
 
         threading.Thread(target=run, name="yuki-session-pitfalls", daemon=True).start()
 
+    #: N9: how long the people-lately block is reused (s), and how long a request waits for it the first time (s; a
+    #: slower answer is kept for the next request when it lands).
+    LATELY_TTL_S = 300.0
+    LATELY_WAIT_S = 0.6
+
+    def _people_lately(self) -> list[str]:
+        """N9 (report 47, review): who the user deals with lately, for resolving a misheard name in a spoken request
+        (:func:`task_frame.people_lately`: closeness, recency, the usual chat, recent calls), from memory's
+        ``people_list`` and ``calls_in``. Reused for :data:`LATELY_TTL_S`; waits at most :data:`LATELY_WAIT_S` (a late
+        answer is kept for the next request). Never raises (``[]``)."""
+        cached = getattr(self, "_lately_cache", None)
+        if cached is not None and time.monotonic() - cached[0] <= self.LATELY_TTL_S:
+            return list(cached[1])
+        call = getattr(self.memory, "call", None)
+        if not getattr(self.memory, "installed", False) or not callable(call):
+            return []
+
+        def read(client: Any) -> list[str]:
+            listing = getattr(client, "people_list", None)
+            rows = listing(limit=task_frame.MAX_LATELY) if callable(listing) else []
+            calls_in = getattr(client, "calls_in", None)
+            calls = calls_in(since=time.time() - task_frame.LATELY_CALL_HOURS * 3600) if callable(calls_in) else []
+            lines = task_frame.people_lately(rows, calls)
+            self._lately_cache = (time.monotonic(), lines)   # also when this request stopped waiting
+            return lines
+
+        try:
+            return list(call("people_lately", read, timeout_s=self.LATELY_WAIT_S) or [])
+        except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+            self.logger.log("people_lately", ok=False, error=f"{type(exc).__name__}: {exc}"[:160])
+            return []
+
     def _lessons_for(self, overview: Any) -> list[str]:
         """N8: the session lessons of the apps in play (an open window's app, or the app the user named), newest
         first."""
@@ -3073,7 +3105,8 @@ class Agent:
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
                                      overview=self._overview_payload, practice=getattr(fetched, "practice", None),
                                      named_app=getattr(self, "_request_app_named", None),
-                                     lessons=self._lessons_for(self._overview_payload))
+                                     lessons=self._lessons_for(self._overview_payload),
+                                     lately=self._people_lately() if self._request_voice else ())
             self._frame = frame
             self._practice_shown = list(frame.playbooks)
             rest, personality = _split_personality(fetched.portrait)

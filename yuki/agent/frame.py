@@ -328,7 +328,7 @@ def named_app_line(app: str | None) -> str:
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
           chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
-          named_app: str | None = None, lessons: Sequence[str] = ()) -> TaskFrame:
+          named_app: str | None = None, lessons: Sequence[str] = (), lately: Sequence[str] = ()) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
     metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
     words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
@@ -337,7 +337,7 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
 
     ``lessons`` (N8, report 47): what went wrong in this session's troubled runs on the apps in play, written by code
     from their traces (:func:`session_lessons`) until practice memory's post-mortem learns it; kept whole with the
-    pitfalls."""
+    pitfalls. ``lately`` (N9): :func:`people_lately`'s lines, for a spoken request (who a misheard name may be)."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
@@ -367,6 +367,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
                                   "samples": r.get("samples") or []})
         lines = _referent_lines(frame, routes, {p["id"] for p in frame.persons})
         lines += _person_lines(frame, overview)
+        near = [str(x) for x in lately or () if str(x).strip()][:MAX_LATELY]
+        if near:   # N9: who a misheard name may be (gives way first when the frame is over its size)
+            lines += [LATELY_HEAD, *(f"- {_one(x, 200)}" for x in near)]
         named = named_app_line(named_app)
         if named:
             lines.insert(0, named)   # first, so the size limit never cuts it and it reads before any usual route
@@ -671,3 +674,76 @@ def session_pitfalls(trace: Sequence[dict[str, Any]], *, outcome: str,
         if rest:
             out[app] = {"text": "; ".join(rest)[:500], "instead": worked[0][:200] if worked else ""}
     return out
+
+
+#: N9: the people block of a spoken request: at most this many people, the calls of this many hours.
+MAX_LATELY = 8
+LATELY_CALL_HOURS = 48.0
+LATELY_HEAD = ("Who they deal with lately (for a name speech recognition may have misheard: first how the heard words "
+               "sound, then this and what the request is about):")
+
+
+def people_lately(people: Sequence[dict[str, Any]] | None, calls: Sequence[dict[str, Any]] | None = None, *,
+                  now: float | None = None, limit: int = MAX_LATELY) -> list[str]:
+    """N9 (report 47, review): one line per person the user deals with lately, for resolving a misheard name: their
+    relation, how long since they were last in touch, the chat they use most with them, their messages a day over the
+    last two weeks (closeness, measured) and the calls of the last :data:`LATELY_CALL_HOURS` they were on (the call
+    digest's reading of the screen around it). From memory's ``people_list`` (most recently in touch first) and
+    ``calls_in``; people only on a call come too. Deterministic formatting; never raises (``[]``)."""
+    from datetime import datetime as _dt
+
+    now = time.time() if now is None else float(now)
+    try:
+        on_calls: dict[str, list[str]] = {}
+        shown: dict[str, str] = {}
+        for c in calls or ():
+            if not isinstance(c, dict):
+                continue
+            try:
+                start = _dt.fromisoformat(str(c.get("start"))).timestamp()
+            except (TypeError, ValueError):
+                continue
+            day = "today" if _dt.fromtimestamp(start).date() == _dt.fromtimestamp(now).date() else \
+                _dt.fromtimestamp(start).strftime("%a %d %b").replace(" 0", " ")
+            when_ = f"{day}, {_dt.fromtimestamp(start).strftime('%I:%M %p').lstrip('0')}"
+            app = str(c.get("service") or c.get("app") or "a").strip()
+            for p in c.get("people") or []:
+                name = " ".join(str((p or {}).get("name") or "").split())[:60] if isinstance(p, dict) else ""
+                if name:
+                    shown.setdefault(name.casefold(), name)
+                    on_calls.setdefault(name.casefold(), []).append(f"on a {app} call with them {when_}")
+        out: list[str] = []
+        named: set[str] = set()
+        for row in people or ():
+            if not isinstance(row, dict) or not row.get("name"):
+                continue
+            name = " ".join(str(row["name"]).split())[:60]
+            bits = [name + (f" ({row['relation']})" if row.get("relation") else "")]
+            if row.get("aliases"):
+                bits.append("also heard as " + ", ".join(f"\"{a}\"" for a in list(row["aliases"])[:3]))
+            last = row.get("last_contact")
+            if isinstance(last, (int, float)) and last > 0:
+                age = now - float(last)
+                bits.append(f"last in touch {_ago(age) if age < 86400 else f'{int(age // 86400)} days ago'}")
+            usual = row.get("usual_route") if isinstance(row.get("usual_route"), dict) else None
+            label = (usual or {}).get("label") or next((r.get("label") for r in row.get("routes") or []
+                                                        if isinstance(r, dict) and r.get("label")), None)
+            if label:
+                bits.append(f"mostly {label}")
+            rhythm = row.get("rhythm") if isinstance(row.get("rhythm"), dict) else {}
+            total, days = rhythm.get("total"), rhythm.get("known_days") or len(rhythm.get("days") or []) or 14
+            if isinstance(total, (int, float)) and total > 0:
+                per_day = float(total) / max(1, int(days))
+                bits.append(f"{per_day:.0f} messages a day both ways" if per_day >= 1 else "a few messages a week"
+                            if per_day * 7 >= 1 else "rarely writes")
+            bits += on_calls.get(name.casefold(), [])[:1]
+            named.add(name.casefold())
+            out.append("; ".join(bits))
+            if len(out) >= limit:
+                break
+        for key, seen in on_calls.items():   # on a recent call, not among the people listed
+            if key not in named and len(out) < limit + 2:
+                out.append(f"{shown.get(key, key)}: {seen[0]}")
+        return out
+    except Exception:  # noqa: BLE001 - a missing block never breaks a request
+        return []

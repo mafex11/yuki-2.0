@@ -1054,3 +1054,48 @@ def test_n8_a_stopped_runs_pitfall_is_kept_in_practice_memory_and_shown_for_that
                                   "ok": False, "why": "x"}], outcome="final") == {}
     finally:
         client.store.close()
+
+
+def test_n9_the_resolver_gets_closeness_recency_the_usual_chat_and_recent_calls() -> None:
+    """Review (N9 not done): a spoken request's frame lists who the user deals with lately, measured, so the thinker
+    can weigh a misheard name ("hey meant") against closeness, recency, the usual app and who was on a recent call."""
+    from datetime import datetime
+
+    from yuki.agent.frame import LATELY_HEAD, build, people_lately
+
+    now = NOW
+    people = [
+        {"name": "Hemanth", "relation": "best friend", "aliases": [], "last_contact": now - 1800,
+         "usual_route": {"label": "Discord DM hemanth_x"}, "routes": [],
+         "rhythm": {"total": 420, "known_days": 14, "days": [30] * 14}},
+        {"name": "Nichol", "relation": None, "aliases": ["nicole"], "last_contact": now - 9 * 86400,
+         "usual_route": None, "routes": [{"label": "Slack DM nichol"}], "rhythm": {"total": 3, "known_days": 14}},
+    ]
+    calls = [{"app": "Discord.exe", "service": "Discord", "start": datetime.fromtimestamp(now - 3600).isoformat(),
+              "people": [{"name": "Hemanth", "how": "in the call window"}, {"name": "Priya", "how": "in the list"}]}]
+    lines = people_lately(people, calls, now=now)
+    assert lines[0].startswith("Hemanth (best friend); last in touch 30 min ago; mostly Discord DM hemanth_x; "
+                               "30 messages a day both ways; on a Discord call with them today")
+    assert lines[1] == "Nichol; also heard as \"nicole\"; last in touch 9 days ago; mostly Slack DM nichol; a few " \
+                       "messages a week"
+    assert lines[2].startswith("Priya: on a Discord call with them today")
+    frame = build({}, lately=lines)
+    assert LATELY_HEAD in frame.text and "- Hemanth (best friend)" in frame.text
+    assert people_lately([{"bad": 1}, None], [{"start": "not a time"}]) == []
+
+
+def test_n9_a_spoken_request_reads_the_people_lately_once_and_reuses_it(tmp_path: Path) -> None:
+    class Client(FakeMemoryClient):
+        reads = 0
+
+        def people_list(self, *, limit: int = 40) -> list[dict]:
+            Client.reads += 1
+            return [{"name": "Hemanth", "relation": "best friend", "last_contact": time.time() - 60}]
+
+        def calls_in(self, since: Any = None, until: Any = None, limit: int = 30) -> list[dict]:
+            return []
+
+    agent = _agent(Brain([]), tmp_path, ChatPlayerDesk(), memory=_memory(Client()))
+    first = agent._people_lately()
+    assert first and first[0].startswith("Hemanth (best friend); last in touch")
+    assert agent._people_lately() == first and Client.reads == 1
