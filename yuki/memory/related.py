@@ -744,10 +744,15 @@ def item_for(client: Any, hit: dict[str, Any], *, now: float | None = None) -> d
         people = [p["name"] for p in (d.get("context") or {}).get("people") or [] if p.get("name")]
         if people:   # as the screen around the call showed (yuki.memory.callcontext)
             text += f" With {', '.join(people)}."
+        # whose words the digest rests on: its lines say (report 61 contract: ``who`` on each line since 3 Oct 2026)
+        others = any(isinstance(ln, dict) and ln.get("who") == "others"
+                     for b in d.get("blocks") or [] for ln in b.get("lines") or [])
+        noun = "game voice chat" if getattr(c, "kind", "call") == "game" else "call"
         return {**base, "kind": "call", "at": _iso(start), "until": _iso(end), "call": f"call:{item_id}",
                 "text": f"{text} (open call:{item_id} with call_timeline for what was said when)",
-                "source": f"{d.get('app') or c.app} call {_day(start)}-{datetime.fromtimestamp(end):%H:%M}, "
-                          f"the user's own side only"}
+                "source": f"{d.get('app') or c.app} {noun} {_day(start)}-{datetime.fromtimestamp(end):%H:%M}, "
+                          + ("both sides: the user's words and, marked, what others on it said" if others
+                             else "the user's own words")}
     if kind == "thread":
         from yuki.memory.workthreads import thread_line
 

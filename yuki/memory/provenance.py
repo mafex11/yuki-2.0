@@ -20,7 +20,9 @@ extracted from one utterance of that call. It just never kept which one.
   matched to the exchange at their time.
 * **When read**, :func:`describe` writes the one line every recall result, fast-memory item
   and portrait citation carries: ``Discord call, Fri 25 Sep 04:26, the user's own words:
-  "..."``.
+  "..."``. Since 3 Oct 2026 a call also records the other side: a fact citing a line of the call
+  app's own sound (or a game's voice chat) is ``who`` "others" and reads ``someone on the call said,
+  not the user: "..."``.
 
 Run the backfill: ``python -m yuki.memory.provenance [--db PATH] [--dry-run]``.
 """
@@ -83,14 +85,25 @@ def source_of(src: Any, thread: Any, sources: Sequence[Any] = (), index: int | N
     utterance = getattr(src, "utterance", None)
     if utterance is not None:
         words = str(utterance.get("text") or "")
+        mine = utterance.get("who", "user") != "others"   # a line from before 3 Oct 2026 is the user's
         if len(words) < SHORT_UTTERANCE_CHARS and index is not None and index > 0:
             prev = sources[index - 1]
-            if getattr(prev, "utterance", None) is not None and getattr(prev, "capture", None) is getattr(src, "capture", None):
+            same = (getattr(prev, "utterance", None) is not None and getattr(prev, "capture", None) is getattr(src, "capture", None)
+                    and (prev.utterance.get("who", "user") != "others") == mine)
+            if same:   # context from the same speaker's line before; never another speaker's words in this quote
                 words = f"{prev.utterance.get('text') or ''} … {words}"
         app = getattr(src, "call_app", None) or getattr(thread, "app", "")
         call = str(getattr(thread, "scope", "") or "")
-        out.update(kind="call", by="the user", quote=_clip(words), where=f"{app} call" if app else "a call",
-                   unclear=bool(utterance.get("unclear")))
+        where = f"{app} call" if app else "a call"
+        if mine:
+            out.update(kind="call", by="the user", quote=_clip(words), where=where,
+                       unclear=bool(utterance.get("unclear")))
+        else:   # the call app's own sound (everyone else on the call), or a game's voice chat
+            game = utterance.get("track_kind") == "game"
+            track = str(utterance.get("app") or app or "")
+            out.update(kind="call", who="others", by="a teammate or the game" if game else "someone on the call",
+                       quote=_clip(words), where=f"{track} game voice chat" if game else where,
+                       unclear=bool(utterance.get("unclear")))
         if call.startswith("call:"):
             out["call"] = call
         return out
@@ -144,7 +157,8 @@ def describe(source: dict[str, Any] | None, *, app: str | None = None, at: float
     quote = src.get("quote")
     head = ", ".join(p for p in (place, when) if p)
     if kind == "call":
-        who = "the user's own words" + (" (unclear in the transcript)" if src.get("unclear") else "")
+        who = ("the user's own words" if src.get("who") != "others" else f"{by or 'someone else'} said, not the user"
+               ) + (" (unclear in the transcript)" if src.get("unclear") else "")
     elif kind == "chat":
         who = "the user told Yuki"
     elif kind == "message":

@@ -401,7 +401,8 @@ def test_prompt_and_mouth_route_call_questions_to_the_timeline():
     from yuki.agent.prompt import SYSTEM_PROMPT
     from yuki.voice.mouth import __dict__ as mouth
 
-    assert "call_timeline" in SYSTEM_PROMPT and "their side alone" in SYSTEM_PROMPT
+    # the routing only: whose words a call's lines are is worded by the agent's own pass (report 61, both sides)
+    assert "call_timeline" in SYSTEM_PROMPT
     assert any("what they said on a call or in a meeting" in v for v in mouth.values() if isinstance(v, str))
 
 

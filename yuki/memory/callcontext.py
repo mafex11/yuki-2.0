@@ -1,12 +1,16 @@
-"""What was around a call: the context pack the call's digest and journal read the user's own words by.
+"""What was around a call: the context pack the call's digest and journal read the call's lines by.
 
-Contract: ``docs/MEMORY.md`` -> "Calls: just my side" (context from what's around the call).
+Contract: ``docs/MEMORY.md`` -> "Calls: both sides" (context from what's around the call).
 
-Only the user's microphone is ever recorded on a call (never the call's audio, never anyone else), so their
-side alone is thin: "yeah do it", "send him that link", "the thing on screen". The user chose (2026-10-01) "use
-what's around the call": what Yuki ALREADY read from the screen and keeps in memory, assembled in code for a
-call's span, so the model can tell who the user was talking to and what "that" was. No new capture source: no
-audio, no pixels - only stored screen text (captures), links seen and threads of work.
+Built when only the user's microphone was recorded (24 Sept-3 Oct 2026), whose side alone was thin: "yeah do
+it", "send him that link", "the thing on screen". The user chose (2026-10-01) "use what's around the call": what
+Yuki ALREADY read from the screen and keeps in memory, assembled in code for a call's span, so the model can tell
+who was talking to whom and what "that" was. Since 3 Oct a call also records the call app's own sound (one track
+for everyone else on it) and a game's voice chat; the pack still matters: it is the only evidence of WHO was on
+the call (the call app's voice panel, participants, tiles), so a line of the others' track is given a name only
+when this screen shows exactly one other person, and "that link" is still resolved from the screen. The pack
+itself adds no capture source and never reads the call's transcript: no audio, no pixels - only stored screen
+text (captures), links seen and threads of work.
 
 The pack (:func:`build`), each item time-stamped (local ``HH:MM``) so it can be lined up with the utterances:
 

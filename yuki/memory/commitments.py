@@ -154,7 +154,8 @@ def close_mirrors(store: Store, *, now: float | None = None) -> list[dict[str, A
 
 def close_joke_commitments(store: Store, *, now: float | None = None) -> list[dict[str, Any]]:
     """End as a wrong capture every open call commitment whose words the call's own digest marks as a joke: the
-    digest line of the very utterance it was taken from (the same moment, within a second) has the nature
+    digest line of the very utterance it was taken from (the same moment, within a second, and resting on the
+    user's own line - a line resting on someone else's words is never the commitment's) has the nature
     ``humor``. Carries the digest's nature flag (the model's label), no words read. Returns what it ended."""
     now = time.time() if now is None else float(now)
     try:
@@ -182,7 +183,8 @@ def close_joke_commitments(store: Store, *, now: float | None = None) -> list[di
                         same = abs(float(line.get("at")) - at) < 1.0
                     except (TypeError, ValueError):
                         continue
-                    if same and normalize_nature(line.get("nature")) == "humor":
+                    mine = line.get("who", "user") != "others"   # digests before 3 Oct carry no who: the user's
+                    if same and mine and normalize_nature(line.get("nature")) == "humor":
                         hit = (c.id, at)
                         break
                 if hit:

@@ -1,7 +1,7 @@
 """Who holds the microphone and the camera, and which of them also plays sound: measured, content-free.
 
 What a call or a meeting *is* comes from these signals, never from a list of
-app names or meeting sites (docs/MEMORY.md, "Calls: just my side" and
+app names or meeting sites (docs/MEMORY.md, "Calls: both sides" and
 "Timeline: full screen and meetings"; docs/research/no-pattern-audit.md C):
 
 * **Device holders**: the CapabilityAccessManager ConsentStore
