@@ -48,6 +48,9 @@ from yuki.voice.progress import JobLog, step_of
 QUEUED, RUNNING, WAITING, DONE, FAILED, CANCELLED = (
     "queued", "running", "waiting_for_answer", "done", "failed", "cancelled")
 OPEN_STATES = (QUEUED, RUNNING, WAITING)
+#: A request pack built when the user's turn ended goes with that turn's hand-off only this soon after (s); the agent
+#: itself reads the screen again when a pack is older than its own ``pack_max_age_s`` (20 s).
+PACK_MAX_AGE_S = 15.0
 
 #: Finished jobs kept in the table ("it finished a minute ago", "want the rest?").
 KEEP_FINISHED = 6
@@ -344,10 +347,12 @@ class VoiceBridge(QObject):
         self.more_held: Callable[[], tuple[str, bool] | None] | None = None
         #: When the thinker last closed a tab or window (monotonic), for the talker's guidance (v3.17).
         self.closed_at: float | None = None
-        #: ``() -> dict | None``: the thinker's request pack, from what the conversation read while the user talked
-        #: (v3.18, 07 §6 E2); passed with a hand-off only when the runtime and the agent take one (probed once).
-        self.pack_source: Callable[[], dict[str, Any] | None] | None = None
+        #: The thinker's request pack built when the user's turn ended (``Agent.build_pack``, v3.18, 07 §6 E2):
+        #: ``(pack, built at, words)``; passed with this turn's hand-off only when the runtime and the agent take one.
+        self._pack: tuple[Any, float, str] | None = None
         self._pack_ok: bool | None = None
+        self._pack_building = False
+        self._pack_lean = not bool(getattr(settings, "voice_brain_portrait", True))
         #: When a call of the mouth's was held until the user answers (doubtful words; monotonic), set by the
         #: conversation: the run that report starts owes them words (a question, or the call again), never silence.
         self.held_at: float | None = None
@@ -423,7 +428,7 @@ class VoiceBridge(QObject):
             self.held_at = None
             self.held_call = None
             self.ledger = None
-            self.pack_source = None
+            self._pack = None
             self.busy_tools = 0
             with self._lock:
                 for job in list(self._jobs.values()) + list(self._unsubmitted.values()):
@@ -1439,15 +1444,11 @@ class VoiceBridge(QObject):
             # 22 §4 (v3.17): memory is searched with the user's own words (``memory_words``), passed explicitly, so it
             # never depends on the hand-off's format.
             extra["memory_query"] = memory_query
-        if self.pack_source is not None and self._pack_supported():
-            # v3.18 (07 §6 E2): what the thinker's first call needs, read while the user talked, handed over with the
-            # request so it is not read again (only when the runtime and the agent take a pack)
-            try:
-                pack = self.pack_source()
-            except Exception:  # noqa: BLE001 - the agent reads what it needs itself
-                pack = None
-            if pack:
-                extra["pack"] = pack
+        pack = self._take_pack()
+        if pack is not None:
+            # v3.18 (07 §6 E2): what the thinker's first call needs (Agent.build_pack), built while the user's turn
+            # ended, handed over with the request so it is not read again (only when the runtime and the agent take it)
+            extra["pack"] = pack
         try:
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
         except TypeError:
@@ -1456,9 +1457,9 @@ class VoiceBridge(QObject):
             extra.pop("memory_query")   # a stand-in runtime without the argument: the agent takes them from the text
             lane, job_id = self.runtime.submit(text, origin_hwnd=origin, source="voice", **extra)
         if "pack" in extra:
-            self._log("bridge", op="pack", token=job.token, keys=len(extra["pack"]),
-                      practice=bool(extra["pack"].get("practice")), age_s=(extra["pack"].get("overview") or {}).get(
-                          "age_s"))
+            age = getattr(extra["pack"], "age_s", None)
+            self._log("bridge", op="pack", token=job.token, age_s=round(age, 2) if isinstance(age, float) else None,
+                      build_ms=getattr(extra["pack"], "build_ms", None))
         with self._lock:
             self._unsubmitted.pop(job.token, None)
             job.job_id, job.lane = job_id, lane
@@ -1470,16 +1471,59 @@ class VoiceBridge(QObject):
         self._changed()
         self._job_event(job, "submitted", job.request)
 
-    def _pack_supported(self) -> bool:
-        """Whether the thinker takes a request pack (v3.18): ``runtime.submit`` names a ``pack`` parameter and the
-        worker's ``Agent.run`` does too (builder 1c-1 adds it; probed once, never assumed)."""
+    def _pack_agent(self) -> Any:
+        """The worker's agent when the thinker takes a request pack (v3.18, revamp D S5): ``runtime.submit`` names a
+        ``pack`` parameter, and the agent has ``build_pack`` and its ``run`` names ``pack`` (probed once, never
+        assumed); else ``None``."""
         if self._pack_ok is None:
-            self._pack_ok = _takes(getattr(self.runtime, "submit", None), "pack")
             agent = getattr(getattr(self.runtime, "worker", None), "agent", None)
-            if self._pack_ok and agent is not None:
-                self._pack_ok = _takes(getattr(agent, "run", None), "pack")
+            self._pack_ok = bool(_takes(getattr(self.runtime, "submit", None), "pack") and agent is not None
+                                 and callable(getattr(agent, "build_pack", None))
+                                 and _takes(getattr(agent, "run", None), "pack"))
             self._log("bridge", op="pack_probe", supported=self._pack_ok)
-        return bool(self._pack_ok)
+        return getattr(getattr(self.runtime, "worker", None), "agent", None) if self._pack_ok else None
+
+    def prefetch_pack(self, words: str) -> None:
+        """The user's turn just ended with ``words``: build the thinker's request pack now, off every loop, so a
+        hand-off of this turn starts its first model call with the screen, the origin and memory's part already read
+        (``Agent.build_pack``; 07 §6 E2: ~0.4 s of the thinker's start). Only when the thinker takes a pack and its
+        worker is idle (a pack is built by the thread-safe reads of an idle agent); one at a time; returns at once."""
+        agent = self._pack_agent()
+        text = " ".join(str(words or "").split())
+        if agent is None or not text or self._pack_building:
+            return
+        busy = getattr(self.runtime, "worker_busy", None)
+        if callable(busy) and busy():
+            return
+        if self.call_mode is not None and self.call_mode():
+            return   # in a call most words are for the others: no reads for a hand-off that rarely comes
+        self._pack_building = True
+        origin = self._foreground()
+        lean = self._pack_lean
+
+        def build() -> None:
+            try:
+                pack = agent.build_pack(text, origin_hwnd=origin, memory_query=text, voice=True, lean=lean)
+                with self._lock:
+                    self._pack = (pack, time.monotonic(), text)
+            except Exception as exc:  # noqa: BLE001 - the agent reads what it needs itself
+                self._log("bridge", op="pack_build", error=type(exc).__name__)
+            finally:
+                self._pack_building = False
+
+        from yuki.voice.workers import shared
+
+        shared().submit(build)
+
+    def _take_pack(self) -> Any:
+        """The pack built for this turn, once (``None`` when there is none, it is older than :data:`PACK_MAX_AGE_S`,
+        or the thinker takes none)."""
+        with self._lock:
+            got, self._pack = self._pack, None
+        if got is None or self._pack_agent() is None:
+            return None
+        pack, at, _words = got
+        return pack if time.monotonic() - at <= PACK_MAX_AGE_S else None
 
     def _steer(self, job: Job, job_id: int, text: str) -> None:
         if not self.runtime.steer(job_id, text):

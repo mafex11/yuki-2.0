@@ -62,6 +62,7 @@ import asyncio
 import threading
 import time
 from collections import deque
+from types import SimpleNamespace
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -97,6 +98,12 @@ INSTANT_HANDS = ("media_key", "app_volume", "scroll", "window", "tab", "click", 
 AUDIO_HANDS = ("media_key", "app_volume")
 #: How long a reopened tab may take to show its title (the browser restores it at once, the page after).
 _REOPEN_WAIT_S = 3.0
+#: What the talker reads when Yuki's own authorization check held a hand back (v3.18, revamp D S1): nothing was done;
+#: the check's one plain question is asked, and the hand runs only after a yes.
+_JUDGE_HELD_NOTE = (
+    "Not done: Yuki's own check held it back, because their words did not plainly ask for this. Nothing was done. Ask "
+    "them in a few words, the question alone with no call: {question} If they say yes, call it again."
+)
 
 _WINDOW = {"type": "integer", "description": "The window's [hwnd] from the desktop block."}
 _SAID_NOTE = "It worked, verified, and your done line was said. Do not say it again."
@@ -655,10 +662,96 @@ class Hands:
         #: Traces kept (one per hand, and one per skill run), for the tests and the log.
         self.traces_queued = 0
         self._trace_n = 0
+        #: The authorization check for the talker's hands (``yuki.agent.judge.Authorizer``, revamp D S1): made on first
+        #: use from the thinker's agent (its client, settings and policy), ``False`` when there is none (no judge in
+        #: this build, no agent, or the judge turned off); a user turn is one request for it.
+        self._authorizer: Any = None
 
     def new_user_turn(self) -> None:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
         self.halted = None
+        judge = self._authorizer
+        if judge:
+            try:
+                judge.begin_request()   # a user turn is one request: its memo, window grants and denial counts
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- v3.18: the authorization check (revamp D S1) -----------------------------------------------------------
+
+    def _judge(self) -> Any:
+        """The talker's hands' own :class:`yuki.agent.judge.Authorizer` (probed, never assumed: the judge landed with
+        revamp D), built from the thinker's agent: its client, its settings, its policy reader. ``None`` when there
+        is no judge, no agent behind the voice, or the agent's judge is turned off (``Settings.judge``)."""
+        if self._authorizer is None:
+            self._authorizer = False
+            try:
+                from yuki.agent.judge import Authorizer
+            except Exception:  # noqa: BLE001 - an older brain: no judge
+                return None
+            runtime = getattr(self.bridge, "runtime", None)
+            agent = getattr(getattr(runtime, "worker", None), "agent", None)
+            if agent is None or getattr(agent, "authorizer", None) is None:
+                return None
+            log = self.log
+
+            def judge_log(kind: str, **fields: Any) -> None:
+                if log is not None:   # the voice log is content-free: the check's why and question stay out
+                    log.event(kind, who="voice_hand", **{k: v for k, v in fields.items() if k not in ("why", "question")})
+
+            try:
+                self._authorizer = Authorizer(lambda: agent.client, agent.settings, log=judge_log,
+                                              policy=getattr(agent.authorizer, "policy", None))
+            except Exception:  # noqa: BLE001
+                self._authorizer = False
+        return self._authorizer or None
+
+    def authorize(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None = None,
+                  earlier: list[str] | None = None) -> Any:
+        """The check's verdict for one call as the thinker's tool it is (``None``: not judged - its metadata and the
+        user's policy do not send it there, or there is no judge). It reads only the user's words in this
+        conversation and the proposed call (the target window's app and title, the element). Blocking (~1 s when it
+        asks the model); off every loop. A check that raises holds the call (fails closed)."""
+        judge = self._judge()
+        if judge is None:
+            return None
+        words = [{"how": "voice", "text": w} for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
+        import json
+
+        signature = json.dumps(tool_input, sort_keys=True, default=str)
+        try:
+            return judge.check(tool, tool_input, words=words, target=target, signature=signature,
+                               earlier=list(earlier or []))
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error",
+                                   why=f"the check could not run ({type(exc).__name__})")
+
+    def _check_hand(self, name: str, args: dict[str, Any]) -> None:
+        """Hold a hand the check holds (raises :class:`_Refused` with ``held``): a window close, a tab close, or a kind
+        the user's autonomy policy holds back (the hand's fixed name and operation map to the thinker's tool, whose
+        metadata decides; the media keys are a fixed set of sound keys that can close or send nothing)."""
+        hwnd = args.get("window")
+        names: list[str] = []
+        if name == "tab":
+            with self._lock:
+                shown = list(self.last.tabs.get(int(hwnd), []) if str(hwnd).lstrip("-").isdigit() else [])
+            wanted = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
+            for n in wanted:
+                try:
+                    names.append(shown[int(n) - 1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+        call = judged_call(name, args, tab_names=names)
+        if call is None:
+            return
+        tool, tool_input = call
+        target: dict[str, Any] = {"hwnd": hwnd, "app": self._app_at(hwnd), "title": self._title_shown(hwnd)}
+        if name == "tab" and str(args.get("action") or "") == "close":
+            target["element"] = "tabs " + ", ".join(f'"{n}"' for n in tool_input.get("tabs") or [])
+        verdict = self.authorize(tool, tool_input, target)
+        if verdict is not None and not getattr(verdict, "allowed", False):
+            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
+                           held=str(getattr(verdict, "question", "") or ""))
 
     # -- the desktop summary ------------------------------------------------------
 
@@ -991,7 +1084,7 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
-        if not confirmed and not facts.get("settled"):
+        if not confirmed and not facts.get("settled") and not facts.get("held"):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
         if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
             self.closed_at = time.monotonic()
@@ -1018,7 +1111,8 @@ class Hands:
         if self.log is not None:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            done_line=speak, **{k: v for k, v in facts.items()
-                                               if isinstance(v, (int, float, bool)) or v is None})
+                                               if (isinstance(v, (int, float, bool)) or v is None)
+                                               and k not in ("question",)})
         # v3.18: every hand that acted is kept as a run trace for practice memory (off the loop, in order)
         if name == SKILL_HAND:
             self._trace_skill(args, ok=ok, report=report, facts=facts, ms=ms, call=params.tool_call_id)
@@ -1037,6 +1131,12 @@ class Hands:
             await params.llm.push_frame(TTSSpeakFrame(text=line))
             await params.result_callback({"done": report[:700], "said": line, "how_to_handle_it": _SAID_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
+            return
+        if facts.get("held"):
+            # v3.18: Yuki's own check held it (revamp D S1): nothing more is done; the talker asks its question
+            question = str(facts.get("question") or "").strip() or "Ask whether they want exactly this."
+            await params.result_callback({"held": report[:700],
+                                          "how_to_handle_it": _JUDGE_HELD_NOTE.format(question=question)})
             return
         if name == "press_keys" and ok:
             note, key = _KEYS_NOTE, "report"
@@ -1165,7 +1265,7 @@ class Hands:
         request_id, words, shown = self._trace_ids(call)
         steps = trace_steps(results, pid)
         started = min((float(s.get("at") or time.time()) for s in steps), default=time.time())
-        outcome = ("final" if ok and facts.get("verified") is True else
+        outcome = ("final" if ok and facts.get("verified") is True else "held" if facts.get("held") else
                    "handed_over" if facts.get("deviated_at") is not None else "unverified")
         run = {"source": "hand", "session_id": getattr(memory, "session_id", None), "request_id": request_id,
                "lane": "voice", "at": started, "ended_at": started + float(ms or 0) / 1000.0,
@@ -1266,12 +1366,17 @@ class Hands:
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         try:
             self._guard_desk(name)
+            if name != SKILL_HAND:
+                self._check_hand(name, args)   # v3.18: a close, a tab close, a held kind: Yuki's own check first
             ok, report, facts = self._act(name, args, facts)
             if not (ok and facts.get("verified") is True) and not facts.get("settled"):
                 self.halted = f"{name}: {report[:160]}"
             return ok, report, facts
         except _Refused as exc:
             facts["refused"] = True  # nothing was done: the talker says why ...
+            if exc.held is not None:
+                facts["held"] = True   # ... or asks the check's question (v3.18)
+                facts["question"] = exc.held
             if exc.stale:
                 # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
                 # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
@@ -2008,6 +2113,40 @@ def _what(name: str, args: dict[str, Any]) -> str:
     return " ".join(str(p) for p in parts)
 
 
+def judged_call(name: str, args: dict[str, Any], *, tab_names: list[str] | None = None
+                ) -> tuple[str, dict[str, Any]] | None:
+    """A talker hand as the thinker's tool for the authorization check (revamp D S1): ``(tool, input)``, whose fixed
+    metadata (``yuki.agent.tools.tool_traits``) and the user's stored policy decide whether it is judged at all; the
+    hand's words for the user (``say_*``, ``named``) are left out. ``None``: never judged - the media keys (a fixed set
+    of sound keys: none can close or send anything) and Yuki's own window."""
+    w = args.get("window")
+    if name == "window":
+        return "window_action", {"hwnd": w, "action": str(args.get("action") or "")}
+    if name == "tab":
+        action = str(args.get("action") or "show")
+        out: dict[str, Any] = {"hwnd": w, "action": action}
+        if action == "close":
+            out["tabs"] = list(tab_names or [])
+        elif action == "reopen":
+            out["expect"] = str(args.get("expect") or "")
+        elif tab_names:
+            out["tab"] = tab_names[0]
+        return "tab", out
+    if name == "click":
+        return "click", {"hwnd": w, "item": args.get("item")}
+    if name == "type":
+        return "type_text", {"hwnd": w, "text": str(args.get("text") or "")}
+    if name == "scroll":
+        return "scroll", {"hwnd": w, "direction": args.get("direction"), "amount": args.get("amount")}
+    if name == "open_url":
+        return "open_url", {"url": args.get("url"), **({"app": args["app"]} if args.get("app") else {})}
+    if name == "open_app":
+        return "launch_app", {"query": args.get("name")}
+    if name == "app_volume":
+        return "app_volume", {k: args[k] for k in ("app", "change", "level", "mute") if args.get(k) is not None}
+    return None
+
+
 def hand_run(trace: dict[str, Any], *, session_id: Any, injected: list[int]) -> dict[str, Any]:
     """One hand's trace (the arguments of ``record_hand_trace``) as the run ``record_run`` keeps, with the playbooks shown
     to the talker for it (``injected``): the same run ``yuki.memory.practice.record_hand_trace`` builds, one step."""
@@ -2032,9 +2171,11 @@ class _Refused(Exception):
     said): the thinker gets the request by code instead of a talker run narrating the refusal.
     """
 
-    def __init__(self, message: str, *, stale: bool = False) -> None:
+    def __init__(self, message: str, *, stale: bool = False, held: str | None = None) -> None:
         super().__init__(message)
         self.stale = stale
+        #: Held by the authorization check (v3.18): its question for the user (``""`` without one); ``None``: not held.
+        self.held = held
 
 
 def _step_key(name: str, args: dict[str, Any]) -> str:

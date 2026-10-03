@@ -411,6 +411,11 @@ def plan(which: str) -> list[dict]:
         for name, text in V314_CLIPS:
             items.append({"set": "v314", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": False})
+    if which in ("v318",):
+        provider, voice = V318_USER
+        for name, text in V318_CLIPS:
+            items.append({"set": "v318", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": False})
     if which in ("names",):
         for provider, voice in NAMES_VOICES:
             tag = voice.replace("aura-2-", "").replace("-en", "")[:6]
@@ -437,10 +442,23 @@ V314_CLIPS = [
 ]
 
 
+#: v3.18 (docs/research/revamp-2026-10-02/29-build-voice-procedures.md): the user's side of 2 Oct 21:24-21:27 (the
+#: volume mistake and its correction, the restore bubble, YouTube) for the practice-memory replays. A voice other than
+#: arcas: Flux heard arcas's "Open Chrome." as "Hook and crumb." in v3.17's replays.
+V318_USER = ("deepgram", "aura-2-apollo-en")
+V318_CLIPS = [
+    ("p_volume", "Lower your volume."), ("p_more", "Lower more."),
+    ("p_correction", "No. No. No. Not my system's audio. I want you to turn your volume down."),
+    ("p_restore", "Restore the pages."), ("p_youtube", "Open YouTube."),
+    ("p_chrome_restore", "Open Chrome and restore the pages."), ("p_thanks", "Thanks."),
+]
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "v314", "all"))
+    ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "v314",
+                                                     "v318", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

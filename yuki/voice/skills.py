@@ -217,8 +217,9 @@ class StepResult:
     hwnd: int | None = None
     ms: float = 0.0
     at: float = 0.0
-    deviation: str | None = None  # not_found | no_focus | window | failed | no_effect | blind | expect
+    deviation: str | None = None  # not_found | no_focus | window | failed | no_effect | blind | expect | held
     started: float = 0.0          # monotonic: when the step began
+    question: str = ""            # held: the authorization check's question for the user
 
 
 class SkillRunner:
@@ -226,6 +227,8 @@ class SkillRunner:
 
     def __init__(self, hands: Any) -> None:
         self.hands = hands
+        #: This run's earlier steps as calls (what the authorization check reads beside the user's words).
+        self._earlier: list[str] = []
 
     # -- the screen ---------------------------------------------------------------
 
@@ -337,6 +340,18 @@ class SkillRunner:
 
     # -- one step ------------------------------------------------------------------
 
+    def _held(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any]) -> Any:
+        """Yuki's own authorization check on a step, as the thinker's tool it is (revamp D S1: keys can close or send
+        anything, so every key step is judged; clicks and typing only when the user's policy holds them back): the
+        verdict when it holds the step, else ``None``. Reads only their words and the calls."""
+        authorize = getattr(self.hands, "authorize", None)
+        if not callable(authorize):
+            return None
+        verdict = authorize(tool, tool_input, target, list(self._earlier))
+        if verdict is not None and not getattr(verdict, "allowed", False):
+            return verdict
+        return None
+
     def _step(self, step: SkillStep, *, apps: list[str], first: bool, after_open: bool,
               start_front: int, opened: set[int]) -> StepResult:
         from yuki.agent.loop import action_verdict
@@ -348,6 +363,12 @@ class SkillRunner:
             kw.setdefault("at", at)
             return StepResult(step=step, started=started, **kw)
 
+        def held(verdict: Any, target: str) -> StepResult:
+            return done(ok=False, verdict=False, kind="control", tool="authorize", target=target,
+                        why=f"Yuki's own check held it back ({getattr(verdict, 'why', '') or 'not plainly asked'})",
+                        report="held by Yuki's own check; nothing was done", deviation="held",
+                        question=str(getattr(verdict, "question", "") or ""))
+
         if step.do == "click":
             wait = AFTER_OPEN_WAIT_S if after_open else (FIRST_FIND_WAIT_S if first else FIND_WAIT_S)
             found = self._find(step, apps, wait)
@@ -357,6 +378,11 @@ class SkillRunner:
                             why="the control the way names is not on the screen",
                             report=f"no {target} on the screen (looked for {wait:g} s)", deviation="not_found")
             hwnd, read, element, title, app = found
+            role_name = f'{element.get("role") or step.role or "control"} "{_words(element.get("name"))[:80]}"'
+            verdict = self._held("click", {"hwnd": hwnd, "element": role_name},
+                                 {"hwnd": hwnd, "app": app, "title": title, "element": role_name})
+            if verdict is not None:
+                return held(verdict, target)
             try:
                 lead = self.hands._front(hwnd)
             except Exception as exc:  # noqa: BLE001 - the hands' refusal: could not bring it up
@@ -377,11 +403,17 @@ class SkillRunner:
                             why="no text field has the keyboard", report="no text field has the keyboard",
                             deviation="no_focus")
             hwnd = int(getattr(snap, "window", 0) or 0) or None
-            app = self._app_of(self._windows(self._overview()).get(hwnd or 0))
+            window = self._windows(self._overview()).get(hwnd or 0)
+            app = self._app_of(window)
+            field_name = f'{getattr(snap, "role", "") or "field"} "{str(getattr(snap, "name", "") or "")[:60]}"'
+            check = self._held("type_text", {"hwnd": hwnd, "text": step.text},
+                               {"hwnd": hwnd, "app": app, "title": str((window or {}).get("title") or ""),
+                                "element": field_name})
+            if check is not None:
+                return held(check, field_name)
             outcome = self.hands._dispatcher.dispatch("type_text", {"text": step.text,
                                                                     **({"expect_hwnd": hwnd} if hwnd else {})})
             verdict, why = action_verdict("type_text", outcome)
-            field_name = f'{getattr(snap, "role", "") or "field"} "{str(getattr(snap, "name", "") or "")[:60]}"'
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="type_text",
                         target=field_name, app=app, hwnd=hwnd, report=f"typed into {field_name}: {outcome.summary}")
         if step.do == "keys":
@@ -394,6 +426,11 @@ class SkillRunner:
                 return done(ok=False, verdict=False, kind="read", tool="hotkey", target=f"window {app or front}",
                             why="the window in front is not the way's app", deviation="window",
                             report=f"the window in front is {app or 'unknown'}, not one the way acts in; no key sent")
+            title = str((window or {}).get("title") or "")
+            check = self._held("hotkey", {"hwnd": front, "keys": list(step.keys)},
+                               {"hwnd": front, "app": app, "title": title})
+            if check is not None:
+                return held(check, f'keys in "{title[:60]}"')
             outcome = self.hands._dispatcher.dispatch("hotkey", {"keys": list(step.keys), "expect_hwnd": front})
             verdict, why = action_verdict("hotkey", outcome)
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="hotkey",
@@ -402,6 +439,13 @@ class SkillRunner:
         # the talker's own hands of the same names (scroll, open_app, open_url), as they verify themselves
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         hands = self.hands
+        tool, tool_input = {"scroll": ("scroll", {"direction": step.direction, "amount": step.amount}),
+                            "open_app": ("launch_app", {"query": step.name or step.app}),
+                            "open_url": ("open_url", {"url": step.url, **({"app": step.app} if step.app else {})})
+                            }[step.do]
+        check = self._held(tool, tool_input, {})
+        if check is not None:
+            return held(check, step.what())
         try:
             if step.do == "scroll":
                 hands.snapshot()   # the window may be new since the talker's summary
@@ -443,9 +487,14 @@ class SkillRunner:
         results: list[StepResult] = []
         deviation: StepResult | None = None
         after_open = False
+        self._earlier = []
         for n, step in enumerate(steps):
             result = self._step(step, apps=apps, first=n == 0, after_open=after_open, start_front=start_front,
                                 opened=opened)
+            if result.kind == "action" and result.ok:
+                import json
+
+                self._earlier.append(f"{result.tool} {json.dumps(trace_steps([result], None)[0]['input'])}")
             if step.do in ("open_app", "open_url"):
                 opened |= set(self._windows(self._overview())) - before
                 after_open = True
@@ -497,6 +546,14 @@ class SkillRunner:
                 report += " The last step's effect could not be seen."
             return True, report, facts
         done_lines = [ln for r, ln in zip(results, lines) if r is not deviation]
+        if deviation.deviation == "held":
+            # Yuki's own check held a step (revamp D S1): nothing more runs; the user is asked, never the thinker
+            facts["held"] = True
+            facts["question"] = deviation.question
+            report = (f"stopped the learned way {ref} (\"{intent}\") before step {deviation.step.i} "
+                      f"({deviation.step.what()}): {deviation.why}. "
+                      + (("Done before it: " + " ".join(done_lines)) if done_lines else "Nothing was done."))
+            return False, report, facts
         ran = deviation.kind == "action"   # the deviating step itself ran (its report showed no effect, or it failed)
         at = (f"step {deviation.step.i} ({deviation.step.what()}) " + ("ran, but " if ran else "was not done: ")
               + deviation.why)

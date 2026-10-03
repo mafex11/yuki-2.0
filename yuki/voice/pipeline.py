@@ -1453,9 +1453,12 @@ class TurnObserver:
         self._said_turn: str | None = None
         #: The user's latest final words (for the spoken-line check's context; content, never logged).
         self.last_user_text = ""
-        #: The user's last few final utterances, oldest first (v3.18: what a hand's trace says they asked, and the words
-        #: a learned way may type or send: content, RAM only).
-        self.recent_words: deque[str] = deque(maxlen=3)
+        #: The user's last final utterances in this conversation, oldest first (v3.18: what a hand's trace says they
+        #: asked, the words a learned way may type or send, and what the authorization check of a hand reads; content,
+        #: RAM only).
+        self.recent_words: deque[str] = deque(maxlen=8)
+        #: ``(words)``: the user's turn ended with these words (the thinker's request pack is built then, v3.18).
+        self.on_final_words: Callable[[str], None] | None = None
         #: The conversation's spoken-line check (yuki.voice.speechguard), or ``None``.
         self.guard: Any = None
         #: Names on the screen in front (yuki.voice.screennames, v3.10): a heard word close to one is named too.
@@ -1921,6 +1924,11 @@ class TurnObserver:
                 self.grounder.final(turn.user_text)  # before the aggregator hands the context over
             if self.practice is not None:
                 self.practice.final(turn.user_text)
+            if self.on_final_words is not None and turn.user_text.strip():
+                try:
+                    self.on_final_words(turn.user_text)   # only puts work on a pre-started thread
+                except Exception:  # noqa: BLE001 - a head start only
+                    pass
             if self.hands is not None:
                 self.hands.new_user_turn()  # a hand halted by a wrong effect may act again
             pending, self._pending_call = self._pending_call, None
@@ -2582,8 +2590,9 @@ class Conversation:
         bridge.more_held = self.more_held   # H2: the talker's own held words, for more_of_result
         bridge.in_exchange = lambda: bool(self.observer.bot_speaking or (
             self.observer.last_bot_stop and time.monotonic() - self.observer.last_bot_stop < self.EXCHANGE_LIVE_S))
-        # v3.18: the thinker's request pack, built from what was read while they talked (when the agent takes one)
-        bridge.pack_source = self._request_pack
+        # v3.18: the thinker's request pack (Agent.build_pack) built when the user's turn ends, when the agent takes one
+        prefetch = getattr(bridge, "prefetch_pack", None)
+        self.observer.on_final_words = prefetch if callable(prefetch) else None
         hands = getattr(bridge, "hands", None)
         if hands is not None:
             hands.on_action = self.observer.hand_acted
@@ -3734,28 +3743,6 @@ class Conversation:
         front = getattr(snap, "foreground", None)
         ordered = ([apps.pop(front)] if front in apps else []) + list(apps.values())
         return list(dict.fromkeys(a for a in ordered if a))
-
-    def _request_pack(self) -> dict[str, Any] | None:
-        """What the thinker's first call needs, from what was read while the user talked (07 §6 E2; ``Agent.run(pack=)``
-        when the agent takes one): the desktop overview and memory's Now picture of the talker's latest summary, the
-        window in front, practice memory's answer for the final words, and the words. RAM only, no read here."""
-        hands = getattr(self.bridge, "hands", None)
-        snap = getattr(hands, "last", None)
-        if snap is None or not getattr(snap, "overview_text", ""):
-            return None
-        lookup = getattr(self.practice, "final_lookup", None) if self.practice is not None else None
-        found = getattr(lookup, "found", None) if lookup is not None else None
-        return {
-            "version": 1, "source": "voice", "built_at": time.time(),
-            "words": self.observer.last_user_text or None,
-            "foreground": getattr(snap, "foreground", None),
-            "overview": {"text": snap.overview_text, "payload": snap.overview, "read_at": snap.wall,
-                         "age_s": round(time.monotonic() - snap.at, 2)},
-            "now": snap.board,
-            "practice": ({"words": lookup.words, "ways": found.get("ways") or [], "pitfalls": found.get("pitfalls")
-                          or [], "apps": found.get("apps") or [], "measured": bool(found.get("measured"))}
-                         if isinstance(found, dict) else None),
-        }
 
     def more_held(self, max_sentences: int = 2, max_chars: int = 280) -> tuple[str, bool] | None:
         """H2: the next part of the talker's held words (``(part, more left)``), taken; ``None`` when nothing is held."""

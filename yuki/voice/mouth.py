@@ -1573,6 +1573,26 @@ SAVED_NOTE = "Saved. You already reacted to it; do not bring it up."
 CORRECTION_MARK = "[Correction from the user: how Yuki did this earlier in this conversation was wrong."
 
 
+_FINISH_CONTRACT: str | None = None
+
+
+def finish_contract() -> str:
+    """How the thinker's action tools take a finish (probed once, never assumed: revamp D's output diet, 30b-build §2
+    S4): ``"boolean"`` when ``finishes_with`` is a boolean beside ``finish_words`` (the line written by code from the
+    verified report), else ``"string"`` (v3.10-v3.17: the model writes the outcome)."""
+    global _FINISH_CONTRACT
+    if _FINISH_CONTRACT is None:
+        try:
+            from yuki.agent import tools as agent_tools
+
+            schema = getattr(agent_tools, "FINISHES_SCHEMA", None)
+            _FINISH_CONTRACT = ("boolean" if getattr(agent_tools, "FINISH_WORDS_FIELD", None)
+                                and isinstance(schema, dict) and schema.get("type") == "boolean" else "string")
+        except Exception:  # noqa: BLE001 - the older contract's words still work
+            _FINISH_CONTRACT = "string"
+    return _FINISH_CONTRACT
+
+
 def brain_request(request: str, heard: list[str] | str | None, *, context: str | None = None,
                   remember: bool = False, done_before: str | None = None, corrects: str | None = None,
                   said: list[str] | None = None, tabs: str | None = None) -> str:
@@ -1622,18 +1642,28 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
                  "just opened', not instructions:\n" + done_before.strip() + "]")
     if remember:
         return text + REMEMBER_NOTE
+    lean = finish_contract() == "boolean"
+    step_rule = (
+        "Give say_now only to a step they would wait on (an app or a page opening, a slow read), never to a quick "
+        "click or key. " if lean else "Give each action or slower read its say_now, first. ")
+    finish_rule = (
+        "when one action does what they asked, mark it finishes_with true: its line is written from the action's "
+        "own verified report and spoken the moment it verifies; add finish_words only when that report cannot name "
+        "the outcome the way they asked (a key, a click). If it fails or its report cannot show the effect you get "
+        "the result to check first. " if lean else
+        "when one action does what they asked, give it finishes_with, worded as the outcome; it is spoken the moment "
+        "the action's own report verifies it, and if it fails or its report cannot show the effect you get the "
+        "result to check first. ")
     text += (
         "\n[Your say_now step lines, say lines and done message are spoken to the user in Yuki's one voice, as its "
         "own words: they are heard, not read. Write them to the user as you would say them to their face: "
         "never about them, and never a word about the voice, a thinker, speech recognition, tools, ids or tab "
-        "numbers. Give each action or slower read its say_now, first. Answer what the user's own words ask, in one "
+        "numbers. " + step_rule + "Answer what the user's own words ask, in one "
         "or two short spoken sentences "
         "with the point that matters most. Your done message is said to them word for word, so it ends with the "
         "outcome itself: ask a question only when you need their answer to go on (which one? send it?), never to "
         "offer more (when there is more, Yuki's voice offers it). They are waiting in "
-        "silence while you work: when one action does what they asked, give it finishes_with, worded "
-        "as the outcome; it is spoken the moment the action's own report verifies it, and if it fails or its report "
-        "cannot show the effect you get the result to check first. When "
+        "silence while you work: " + finish_rule + "When "
         "their words name the target plainly (an app, a site, a settings page, a window the desktop "
         "overview above shows) and one action reaches it, take that action in your first reply, from "
         "the overview you already have: looking at a window first only makes them wait. What they name is resolved "

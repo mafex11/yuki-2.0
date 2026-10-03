@@ -645,53 +645,183 @@ class PackRuntime(FakeRuntime):
         return super().submit(text, origin_hwnd=origin_hwnd, source=source, lane=lane, view_hwnd=view_hwnd,
                               memory_query=memory_query, pack=pack)
 
+    def worker_busy(self) -> bool:
+        return False
 
-def test_the_request_pack_goes_with_a_hand_off_only_when_the_runtime_and_the_agent_take_one() -> None:
+
+class PackAgent:
+    """Revamp D's agent surface: ``build_pack`` and ``run(pack=)`` (what the bridge probes)."""
+
+    def __init__(self) -> None:
+        self.built: list[dict[str, Any]] = []
+
+    def build_pack(self, request: str = "", **kw: Any) -> Any:
+        self.built.append({"request": request, **kw})
+        return SimpleNamespace(age_s=0.2, build_ms=380.0, request=request)
+
+    def run(self, request: str, *, pack: Any = None) -> None: ...
+
+
+def test_the_pack_is_built_when_the_turn_ends_and_goes_with_its_hand_off_only_when_the_thinker_takes_one() -> None:
     from test_voice_v39 import Params as TellParams
 
-    async def main(rt: Any, agent_run: Any = None) -> list:
-        if agent_run is not None:
-            rt.worker = SimpleNamespace(agent=SimpleNamespace(run=agent_run))
+    async def main(rt: Any, agent: Any = None) -> tuple[list, Any]:
+        if agent is not None:
+            rt.worker = SimpleNamespace(agent=agent)
         _rt, bridge = _bridge(rt)
-        bridge.pack_source = lambda: {"version": 1, "overview": {"age_s": 0.4}, "practice": None}
+        bridge.prefetch_pack("restore the pages please")
+        for _ in range(50):
+            if bridge._pack is not None or agent is None or getattr(rt, "submit", None) is FakeRuntime.submit:
+                break
+            await asyncio.sleep(0.02)
         task = asyncio.create_task(bridge.tell_yuki(TellParams("Restore the pages")))
         await _settle()
         task.cancel()
-        return rt.submitted
+        return rt.submitted, bridge
 
-    def run_with_pack(request: str, *, pack: Any = None) -> None: ...
-
-    def run_without(request: str) -> None: ...
-
-    got = asyncio.run(main(PackRuntime(), run_with_pack))
-    assert got[-1][2]["pack"] == {"version": 1, "overview": {"age_s": 0.4}, "practice": None}
-    got = asyncio.run(main(PackRuntime(), run_without))
-    assert got[-1][2].get("pack") is None
-    got = asyncio.run(main(FakeRuntime()))                # **kw only: never assumed to take it
+    agent = PackAgent()
+    got, bridge = asyncio.run(main(PackRuntime(), agent))
+    assert got[-1][2]["pack"].request == "restore the pages please"
+    assert agent.built[0]["voice"] is True and agent.built[0]["memory_query"] == "restore the pages please"
+    assert agent.built[0]["origin_hwnd"] == 42 and bridge._pack is None   # used once
+    # an agent without run(pack=), a runtime that does not name it, or a call: nothing is built or passed
+    old = PackAgent()
+    old.run = lambda request: None
+    got, _b = asyncio.run(main(PackRuntime(), old))
+    assert old.built == [] and got[-1][2].get("pack") is None
+    got, _b = asyncio.run(main(FakeRuntime(), PackAgent()))     # **kw only: never assumed to take it
     assert "pack" not in got[-1][2]
 
 
-def test_the_pack_is_built_from_what_was_read_while_they_talked(tmp_path: Path) -> None:
+def test_the_apps_in_play_come_from_the_talkers_latest_desktop_summary(tmp_path: Path) -> None:
     from yuki.voice.hands import Snapshot
     from yuki.voice.mouth import MouthMemory
     from yuki.voice.pipeline import Conversation
-    from yuki.voice.practice import TalkerPractice
 
-    snap = Snapshot(text="desk", at=time.monotonic() - 0.5, foreground=42, overview_text="[42] chrome.exe",
-                    overview={"windows": [{"hwnd": 42}]}, board={"popups": []}, wall=time.time() - 0.5)
+    snap = Snapshot(text="desk", at=time.monotonic(), foreground=42)
     bridge = SimpleNamespace(hands=SimpleNamespace(last=snap), has_open_voice_job=lambda: False, not_heard=None,
                              open_voice_jobs=lambda: 0, closing=False, busy_tools=0)
     conv = Conversation(settings=Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv",
                                           voice_priority_boost=False), bridge=bridge, transport=None, memory=None,
                         mouth_memory=MouthMemory(), log=Log(), speech_end=lambda: None, on_state=lambda *a: None,
                         session="t")
-    conv.observer.last_user_text = "Restore the pages."
-    lookup = TalkerPractice(words="Restore the pages.", turn=1, started=0.0, found=FOUND)
-    conv.practice = SimpleNamespace(final_lookup=lookup)
-    pack = conv._request_pack()
-    assert pack["foreground"] == 42 and pack["overview"]["text"] == "[42] chrome.exe" and pack["now"] == {"popups": []}
-    assert pack["practice"]["ways"][0]["id"] == 9 and pack["words"] == "Restore the pages."
-    assert 0.3 < pack["overview"]["age_s"] < 5
     assert conv._apps_in_play() == []
     snap.apps = {7: "Warp.exe", 42: "chrome.exe"}
     assert conv._apps_in_play() == ["chrome.exe", "Warp.exe"]   # the one in front first
+
+
+# -- 6. Yuki's own authorization check on the talker's hands (revamp D S1) -----------------------------------------
+
+class FakeJudge:
+    """``Authorizer.check`` as the hands call it: gated by the thinker's tool metadata (here: closes and keys)."""
+
+    def __init__(self, allow: bool = True, question: str = "Close Chrome? You asked me to open it.") -> None:
+        self.allow, self.question = allow, question
+        self.calls: list[tuple[str, dict, list, dict, list]] = []
+        self.requests = 0
+
+    def begin_request(self) -> None:
+        self.requests += 1
+
+    def check(self, name: str, tool_input: dict, *, words: list, target: dict | None = None, signature: str = "",
+              earlier: list | None = None) -> Any:
+        gated = (name in ("hotkey", "press") or (name, tool_input.get("action")) in (("window_action", "close"),
+                                                                                       ("tab", "close")))
+        if not gated:
+            return None
+        self.calls.append((name, dict(tool_input), list(words), dict(target or {}), list(earlier or [])))
+        return SimpleNamespace(allowed=self.allow, decision="allow" if self.allow else "ask_user",
+                               question="" if self.allow else self.question, why="their words did not ask for it")
+
+
+def test_closing_a_window_by_voice_goes_through_the_check_with_their_words_and_the_call() -> None:
+    from practice_eval import CHROME, DISCORD
+
+    desk = _desk(front=CHROME)
+    judge = FakeJudge(allow=False)
+    hands = _hands(desk, words=["open chrome", "restore the pages"], bridge=EscalateBridge())
+    hands._authorizer = judge
+    p = _run(hands, "window", {"window": CHROME, "action": "close", "named": "restore the pages",
+                               "say_when_done": "Closed."})
+    assert CHROME in desk.open and "window_action" not in [c[0] for c in desk.calls]   # nothing was closed
+    name, tool_input, words, target, _e = judge.calls[0]
+    assert name == "window_action" and tool_input == {"hwnd": CHROME, "action": "close"}
+    assert [w["text"] for w in words] == ["open chrome", "restore the pages"] and target["app"] == "chrome.exe"
+    assert p.results[0]["held"] and "Close Chrome? You asked me to open it." in p.results[0]["how_to_handle_it"]
+    assert hands.bridge.escalated == []   # the user is asked; nothing goes to the thinker
+    _drain()
+    assert hands.memory.hand_traces == []   # nothing was done
+    # allowed: it runs; and a minimize (no lasting effect) is never sent to the check
+    judge.allow = True
+    _run(hands, "window", {"window": DISCORD, "action": "close", "named": "close discord", "say_when_done": ""})
+    assert DISCORD not in desk.open
+    before = len(judge.calls)
+    _run(hands, "window", {"window": CHROME, "action": "minimize", "say_when_done": ""})
+    _run(hands, "media_key", {"key": "volumedown", "say_when_done": ""})
+    assert len(judge.calls) == before
+
+
+def test_closing_tabs_is_checked_with_the_tab_names_and_a_new_user_turn_is_a_new_request() -> None:
+    from yuki.voice.hands import judged_call
+
+    assert judged_call("tab", {"window": 5, "action": "close", "tabs": [2]}, tab_names=["Inbox"]) == (
+        "tab", {"hwnd": 5, "action": "close", "tabs": ["Inbox"]})
+    assert judged_call("media_key", {"key": "volumedown"}) is None
+    assert judged_call("open_yuki", {"page": "Today"}) is None
+    assert judged_call("open_app", {"name": "Chrome"}) == ("launch_app", {"query": "Chrome"})
+    hands = _hands(_desk())
+    judge = FakeJudge()
+    hands._authorizer = judge
+    hands.new_user_turn()
+    hands.new_user_turn()
+    assert judge.requests == 2
+
+
+def test_a_learned_ways_keys_are_checked_and_a_held_step_stops_it_and_asks_the_user() -> None:
+    from practice_eval import DISCORD
+
+    desk = _desk("discord_tag", front=DISCORD)
+    bridge = EscalateBridge()
+    hands = _hands(desk, words=["go to the general channel"], offered={"pb:10": CHANNEL}, bridge=bridge)
+    judge = FakeJudge(allow=True)
+    hands._authorizer = judge
+    steps = [{"do": "keys", "keys": ["ctrl", "k"]}, {"do": "type", "text": "general"},
+             {"do": "keys", "keys": ["enter"], "expect": "general"}]
+    p = _run(hands, "run_skill", {"say_first": "", "skill": "pb:10", "steps": steps, "sends": False,
+                                  "say_when_done": "There."})
+    assert p.spoken == ["There."] and [c[0] for c in judge.calls] == ["hotkey", "hotkey"]   # typing is not judged
+    assert judge.calls[1][4] == ['hotkey {"do": "keys", "keys": ["ctrl", "k"]}',
+                                 'type_text {"do": "type", "text": "general"}']   # the run's earlier calls
+    # held at its first key: nothing is pressed, the user is asked, the thinker is not handed it
+    desk2 = _desk("discord_tag", front=DISCORD)
+    hands2 = _hands(desk2, words=["go to the general channel"], offered={"pb:10": CHANNEL}, bridge=EscalateBridge())
+    hands2._authorizer = FakeJudge(allow=False, question="Open the quick switcher?")
+    p2 = _run(hands2, "run_skill", {"say_first": "", "skill": "pb:10", "steps": steps, "sends": False,
+                                    "say_when_done": "There."})
+    assert desk2.calls == [] and "Open the quick switcher?" in p2.results[0]["how_to_handle_it"]
+    assert hands2.bridge.escalated == []
+    _drain()
+    assert hands2.memory.runs[-1]["outcome"] == "held"
+
+
+def test_without_a_judge_in_this_build_or_an_agent_behind_the_voice_the_hands_run_as_before() -> None:
+    from practice_eval import CHROME
+
+    hands = _hands(_desk(front=CHROME), bridge=None)
+    assert hands._judge() is None and hands.authorize("window_action", {"action": "close"}) is None
+    agentless = _hands(_desk(front=CHROME), bridge=SimpleNamespace(runtime=SimpleNamespace(worker=None)))
+    assert agentless._judge() is None
+
+
+def test_the_hand_off_note_follows_the_thinkers_finish_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.voice.mouth as mouth
+
+    monkeypatch.setattr(mouth, "_FINISH_CONTRACT", "boolean")
+    lean = mouth.brain_request("Minimize Discord", ["minimize discord"])
+    assert "finishes_with true" in lean and "finish_words only when" in lean and "never to a quick click" in lean
+    assert "Give each action or slower read its say_now" not in lean
+    monkeypatch.setattr(mouth, "_FINISH_CONTRACT", "string")
+    old = mouth.brain_request("Minimize Discord", ["minimize discord"])
+    assert "worded as the outcome" in old and "Give each action or slower read its say_now" in old
+    monkeypatch.setattr(mouth, "_FINISH_CONTRACT", None)
+    assert mouth.finish_contract() in ("boolean", "string")   # probed from the agent's own schema
