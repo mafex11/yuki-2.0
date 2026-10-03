@@ -177,8 +177,18 @@ def appearance() -> dict[str, Any]:
         return {"accent": "green", "reduce_motion": False}
 
 
-def app_version() -> str:
-    """Yuki's version, for Settings -> About."""
+def app_version(ui_dir: Path | None = None) -> str:
+    """Yuki's version, for Settings -> About.
+
+    An installed build carries ``build_version.txt`` (written by packaging/yuki.spec from build.ps1 -Version), so About
+    says what the installer and the exe's properties say; from source it is ``yuki.__version__``.
+    """
+    try:
+        built = ((ui_dir or UI_DIR) / "build_version.txt").read_text(encoding="utf-8").strip()
+        if built:
+            return built
+    except OSError:
+        pass
     try:
         from yuki import __version__
 

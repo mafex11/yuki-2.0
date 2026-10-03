@@ -217,3 +217,22 @@ def test_the_splash_plays_fades_skips_and_about_replays_in_headless_chrome():
     r = subprocess.run(["node", str(ROOT / "scripts" / "check_splash.js"), "--chrome", str(exe)],
                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
+
+
+def test_about_says_the_version_the_build_was_made_as(tmp_path):
+    """build.ps1 -Version reaches the installer and the exe; the bundle's build_version.txt brings it to About."""
+    from yuki import __version__
+    from yuki.ui import web_window
+
+    assert web_window.app_version(tmp_path) == __version__          # from source: no file, the package's version
+    (tmp_path / "build_version.txt").write_text("", encoding="utf-8")
+    assert web_window.app_version(tmp_path) == __version__          # an empty file never blanks About
+    (tmp_path / "build_version.txt").write_text("0.2.0\n", encoding="utf-8")
+    assert web_window.app_version(tmp_path) == "0.2.0"
+
+
+def test_the_spec_bundles_the_build_version_next_to_the_window_code():
+    spec = (ROOT / "packaging" / "yuki.spec").read_text(encoding="utf-8")
+    assert '"build_version.txt"' in spec and "write_text(VERSION" in spec
+    assert "datas += [(str(_version_file), \"yuki/ui\")]" in spec
+    assert not (ROOT / "yuki" / "ui" / "build_version.txt").exists()   # never in the source tree
