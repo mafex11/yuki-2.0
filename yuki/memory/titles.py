@@ -107,8 +107,10 @@ SHOWN_RULES = (
     "says); never \"they\" for someone whose name is not in the same sentence. Who someone is to the user only as "
     "the item states it (\"your father\", \"your friend Kiran\"). Dates as people say them: \"on 25 September\", "
     "\"on Thursday 1 October\", with the year only when it is not the current year - never 2026-09-25, never "
-    "\"yesterday\" or \"last week\" (the text is kept and read on later days). Times as people say them, 12-hour: "
-    "\"from about 2 AM to 3:22 AM\", \"around 9 PM\" - never 02:00 or 21:00. Something said on a call says who was "
+    "\"yesterday\" or \"last week\" (the text is kept and read on later days). Times as people say them, 12-hour, "
+    "every one with AM or PM: \"from about 2 AM to 3:22 AM\", \"around 10:30 AM\" - never 02:00, 21:00 or a bare "
+    "10:30. People who did something are named or called \"your friends\", never only \"they\" (\"your friends chose "
+    "...\", not \"they chose ...\"). Something said on a call says who was "
     "on it (\"on a Discord call with Ana and Sam\", \"in #general voice\") and, when the person the item is about was "
     "not on that call, \"on a call with other friends\" - it must never read as if the call was with them. Keep every "
     "name, number and specific the item states and add nothing it does not state; a joke stays a joke and a story a "
@@ -136,7 +138,8 @@ SHOWN_MAX_CHARS = 900
 SHOWN_FIELD = ("The fact as the user's app shows it to them, from the text you wrote: " + SHOWN_RULES
                + " For example \"On 25 September, from about 2 AM to 3:22 AM, you prepared a maths chapter to go "
                "over with your friend Kiran.\"")
-GIST_SHOWN_FIELD = ("The gist as the user's app shows it to them, at most 25 words: " + SHOWN_RULES
+GIST_SHOWN_FIELD = ("The gist as the user's app shows it to them, at most 25 words, beside the call's date, time and "
+                    "place (so it leaves those out): " + SHOWN_RULES
                     + " For example \"A heated game where your friends chose killing people for fun, which shocked "
                     "you.\"")
 THREAD_SHOWN_FIELD = ("Where it stands, as the user's app shows it to them: " + SHOWN_RULES)
@@ -527,8 +530,9 @@ class Titler:
             context = (f"WHO WAS ON IT: {', '.join(people) if people else 'not recorded'}; WHERE: {where}; WHEN: "
                        f"{natural_day(d.get('started_at'), now)}, {natural_time(d.get('started_at'))}"
                        + (f"; TOPICS: {'; '.join(topics)}" if topics else ""))
-            add(ShownPending(f"G{cid}", "gist", cid, "the gist of one of their calls (at most 25 words)", d["gist"],
-                             "", context, d["gist"]))
+            add(ShownPending(f"G{cid}", "gist", cid, "the gist of one of their calls, at most 25 words; the app shows "
+                             "it on the call's row beside its date, time and place, so it leaves those out",
+                             d["gist"], "", context, d["gist"]))
         return out
 
     def _shown_message(self, batch: Sequence[ShownPending], now: float) -> str:
