@@ -919,11 +919,12 @@ STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 NOW_FIELD = "now"
 NOW_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "description": "Optional, shown on their screen while this runs: what you are checking or doing and why, one "
-                   "short line in plain words, to them, at most 12 words (\"Checking the chat first so it isn't sent "
-                   "twice\", \"Sam's DM is the one you use most\"). Never a tool name, command, id or number.",
+    "description": "Optional, shown to them as it runs: what you check or do and why, plain words, at most 12, no "
+                   "tool names",
 }
-NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(STEP_TOOLS + ("check_situation",)))
+#: The actions, the situation check and the reads a step usually waits on (the rarer reads go without it).
+NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(ACTION_TOOL_NAMES + (
+    "check_situation", "look_at_window", "read_page", "memory")))
 for _name in NOW_TOOLS:
     if _name in TOOLS_BY_NAME:
         TOOLS_BY_NAME[_name]["input_schema"]["properties"][NOW_FIELD] = NOW_SCHEMA
