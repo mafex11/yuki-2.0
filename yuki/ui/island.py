@@ -124,6 +124,16 @@ NOT_LISTENING_WORDS = {"off": "Yuki isn't listening: switched off", "quiet": "Yu
 #: full screen (:func:`fullscreen_kind`).
 FULLSCREEN_STATES = frozenset({1, 3, 4})
 QUNS_BUSY = 2
+#: The window in front changed its size or place (going full screen inside one window: a browser video's F, F11, a
+#: game's Alt+Enter): the full screen is checked again this long after the last such change (a drag is one check).
+RESHAPE_SETTLE_MS = 200
+#: WinEvent ids: the window in front changed, an object moved or resized (``EVENT_OBJECT_LOCATIONCHANGE``).
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+OBJID_WINDOW = 0
+WINEVENT_SKIPOWNPROCESS = 0x0002
+#: More location events a second than this from the window in front's thread is logged (the reshape watch's cost).
+LOC_EVENTS_BUSY = 50
 
 
 # -- what the island knows ---------------------------------------------------------------------------------
@@ -583,17 +593,44 @@ def active_screen() -> Any:
     return pick_screen(device, list(QGuiApplication.screens()), QGuiApplication.primaryScreen())
 
 
+def reshape_matters(hwnd: int, obj: int, child: int, watched: int) -> bool:
+    """Whether a location-change event is the window in front itself changing size or place (not its caret, cursor
+    or one of its parts)."""
+    return bool(watched) and int(hwnd or 0) == int(watched) and int(obj) == OBJID_WINDOW and int(child) == 0
+
+
 class ForegroundWatch(QObject):
     """Windows says when the window in front changes (``SetWinEventHook(EVENT_SYSTEM_FOREGROUND)``, out of context:
     delivered on this thread's message loop): no polling. Each change re-reads the monitor in use and whether a full
-    screen covers it (``SHQueryUserNotificationState``)."""
+    screen covers it (``SHQueryUserNotificationState``).
+
+    Going full screen inside the same window (a browser video's F, F11, a game's Alt+Enter) is no foreground change,
+    so the window in front is also watched for changing its size or place: ``EVENT_OBJECT_LOCATIONCHANGE``, hooked
+    only for that window's own thread (re-hooked on each foreground change) and filtered to the window itself;
+    :attr:`reshaped` says so once, :data:`RESHAPE_SETTLE_MS` after the last change (a drag is one check)."""
 
     changed = Signal(int)
+    reshaped = Signal(int)
 
     def __init__(self) -> None:
         super().__init__()
         self._hook = None
         self._proc = None
+        self._loc_hook = None
+        self._loc_proc = None
+        #: The window in front whose own size changes are watched (0: none).
+        self.watched = 0
+        #: Location events delivered for the watched window's thread since it was hooked (a cost check in the log).
+        self.loc_events = 0
+        self.loc_since = time.monotonic()
+        self._rehook = QTimer(self)
+        self._rehook.setSingleShot(True)
+        self._rehook.setInterval(0)
+        self._rehook.timeout.connect(self._hook_location)
+        self._settle = QTimer(self)
+        self._settle.setSingleShot(True)
+        self._settle.setInterval(RESHAPE_SETTLE_MS)
+        self._settle.timeout.connect(lambda: self.reshaped.emit(int(self.watched)))
 
     def start(self) -> bool:
         if self._hook or not _is_windows():
@@ -607,19 +644,79 @@ class ForegroundWatch(QObject):
 
             def on_event(_hook: Any, _event: int, hwnd: Any, _obj: int, _child: int, _thread: int, _t: int) -> None:
                 try:
+                    self.follow(int(hwnd or 0))
                     self.changed.emit(int(hwnd or 0))
                 except Exception:
                     pass
 
+            def on_location(_hook: Any, _event: int, hwnd: Any, obj: int, child: int, _thread: int, _t: int) -> None:
+                self.loc_events += 1
+                if reshape_matters(int(hwnd or 0), obj, child, self.watched):
+                    self._settle.start()          # restarted by each change: one check after the last
+
             self._proc = proto(on_event)
+            self._loc_proc = proto(on_location)
             user32.SetWinEventHook.restype = wintypes.HANDLE
-            self._hook = user32.SetWinEventHook(3, 3, None, self._proc, 0, 0, 0)   # EVENT_SYSTEM_FOREGROUND, OUTOFCONTEXT
+            self._hook = user32.SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, self._proc,
+                                                0, 0, 0)                                   # out of context
             return bool(self._hook)
         except Exception:
             self._hook = None
             return False
 
+    def follow(self, hwnd: int) -> None:
+        """Watch ``hwnd`` (the new window in front) for changing its own size; hooked on the next loop turn, not inside
+        the WinEvent callback."""
+        self.watched = int(hwnd or 0)
+        self._settle.stop()
+        self._rehook.start()
+
+    def _thread_of(self, hwnd: int) -> tuple[int, int]:
+        """``(process id, thread id)`` of ``hwnd``; zeros when unknown."""
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32")
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            pid = wintypes.DWORD(0)
+            tid = int(user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid)))
+            return int(pid.value), tid
+        except Exception:
+            return 0, 0
+
+    def _unhook_location(self) -> None:
+        if self._loc_hook:
+            try:
+                ctypes.WinDLL("user32").UnhookWinEvent(self._loc_hook)
+            except Exception:
+                pass
+            self._loc_hook = None
+
+    def _hook_location(self) -> None:
+        self._unhook_location()
+        self.loc_events = 0
+        self.loc_since = time.monotonic()
+        if not self._hook or not self.watched or self._loc_proc is None:
+            return
+        pid, tid = self._thread_of(self.watched)
+        if not tid:
+            return
+        try:
+            from ctypes import wintypes
+
+            user32 = ctypes.WinDLL("user32")
+            user32.SetWinEventHook.restype = wintypes.HANDLE
+            self._loc_hook = user32.SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None,
+                                                    self._loc_proc, pid, tid, WINEVENT_SKIPOWNPROCESS)
+        except Exception:
+            self._loc_hook = None
+
     def stop(self) -> None:
+        self._rehook.stop()
+        self._settle.stop()
+        self._unhook_location()
+        self.watched = 0
         if self._hook:
             try:
                 ctypes.WinDLL("user32").UnhookWinEvent(self._hook)
@@ -1401,7 +1498,11 @@ class IslandWindow(QWidget):
             self.setFixedHeight(h)
         if not was_visible:
             self.enter(animate=not reduced)
-        self._place_halo(spec, reduced)
+        halo_new = self._place_halo(spec, reduced)
+        if not was_visible or halo_new:
+            # Qt shows these no-activate tool windows with SW_SHOWNOACTIVATE, which keeps their old place in the
+            # z-order: an always-on-top window that came forward while they were hidden would stay above them
+            self.island.reassert_topmost()
 
     def _set_rect(self, r: QRect) -> None:
         self._rect = QRect(r)
@@ -1426,7 +1527,8 @@ class IslandWindow(QWidget):
 
     # -- the halo --------------------------------------------------------------------------------------------
 
-    def _place_halo(self, spec: Spec, reduced: bool) -> None:
+    def _place_halo(self, spec: Spec, reduced: bool) -> bool:
+        """Show, move or hide the halo for ``spec``; True when it has just been shown."""
         hw = self.halo_win
         if spec.halo and not spec.mini:
             first = not self._halo_on or not hw.isVisible()
@@ -1435,12 +1537,13 @@ class IslandWindow(QWidget):
             self._move_halo()
             if first:
                 hw.fade_in(animate=not reduced)
-        else:
-            if self._halo_on:
-                hw.halo.model.set_state("idle", L.now())   # blends away the next time it is shown, as the design
-                hw._fade.stop()
-                hw.hide()
-            self._halo_on = False
+            return first
+        if self._halo_on:
+            hw.halo.model.set_state("idle", L.now())   # blends away the next time it is shown, as the design
+            hw._fade.stop()
+            hw.hide()
+        self._halo_on = False
+        return False
 
     def _move_halo(self) -> None:
         pos = self.pos()
@@ -1731,6 +1834,7 @@ class Island(QObject):
         self._notice_timer.timeout.connect(lambda: self.update(notice=""))
         self.watch = ForegroundWatch()
         self.watch.changed.connect(self.on_foreground)
+        self.watch.reshaped.connect(self.on_reshaped)
         self.strip = IslandStrip(self)
         self.voice_pill = IslandVoice(self)
         self.call_indicator = IslandCallIndicator(self)
@@ -1745,7 +1849,9 @@ class Island(QObject):
     def start(self) -> None:
         """Watch the window in front (the monitor in use, full screen) and show the island's first state."""
         self.watch.start()
-        self.on_foreground(foreground_hwnd())
+        hwnd = foreground_hwnd()
+        self.watch.follow(hwnd)
+        self.on_foreground(hwnd)
         self.refresh()
 
     def stop(self) -> None:
@@ -1822,9 +1928,14 @@ class Island(QObject):
 
     def _covered_by(self) -> str:
         """The window class at the middle of the island's panel when another window sits over it (``""`` when the
-        island itself is on top there, or unknown). A class name is not content (``Chrome_WidgetWin_1``)."""
+        island itself is on top there, or unknown). A class name is not content (``Chrome_WidgetWin_1``).
+
+        ``"n/a"`` while the island lets clicks through (the resting pill): hit-testing skips a WS_EX_TRANSPARENT
+        window, so it would name the app beneath although nothing covers the pill."""
         if not _is_windows() or not self.window.isVisible():
             return ""
+        if self.window._click_through:
+            return "n/a"
         try:
             from ctypes import wintypes
 
@@ -1914,6 +2025,14 @@ class Island(QObject):
 
     def _render(self, *, animate: bool = True) -> None:
         spec = self.current_spec()
+        if (self.hovered or self._hover_in.isActive() or self._hover_out.isActive()) and (spec.hidden or spec.resting):
+            # the resting pill never opens and lets the pointer through (and a hidden island has nothing under the
+            # pointer), so Qt may never send the leave that clears the hover: clear it here, or the next state would
+            # open as the full bar though nothing opened it
+            self.hovered = False
+            self._hover_in.stop()
+            self._hover_out.stop()
+            spec = self.current_spec()
         if spec.body == "caption":
             text, spans = caption_spans(self.inputs.caption, unsure_threshold())
             self.window.caption.set_text(text, spans)
@@ -1992,6 +2111,22 @@ class Island(QObject):
 
     # the monitor in use, a full screen, always on top
     def on_foreground(self, hwnd: int) -> None:
+        """The window in front changed: the monitor in use, the full screen, and the island back on top."""
+        w = self.watch
+        took = time.monotonic() - float(getattr(w, "loc_since", time.monotonic()))
+        if took > 5 and w.loc_events / took > LOC_EVENTS_BUSY:   # the reshape watch's cost on the last window
+            self._log("island_reshape_watch", events=int(w.loc_events), seconds=round(took), busy=True)
+        self.check_screen(hwnd)
+        self.reassert_topmost()
+
+    def on_reshaped(self, hwnd: int) -> None:
+        """The window in front changed its size or place (F11, a video's full screen, Alt+Enter): check again."""
+        if hwnd and hwnd == self.watch.watched:
+            self.check_screen(hwnd)
+
+    def check_screen(self, hwnd: int) -> None:
+        """Measure the window in front against its monitor and Windows' notification state: hide only for a real
+        full screen (:func:`fullscreen_kind`), and follow the monitor in use."""
         facts = window_facts(hwnd)
         device = facts.device or monitor_device(hwnd)
         if device:
@@ -2011,11 +2146,12 @@ class Island(QObject):
             self.update(fullscreen=full, fullscreen_title=title, fullscreen_kind=kind)
         else:
             self.window.reposition()
-        self.reassert_topmost()
 
     def reassert_topmost(self) -> None:
         """Put the island and its halo back on top of every other always-on-top window (``HWND_TOPMOST``, no move, no
-        size, no activation). Called on every foreground change: an event, never a poll. A loss is logged."""
+        size, no activation). Called on every foreground change and whenever the island or its halo comes on screen
+        (a hidden window is skipped on a foreground change, and Qt shows it again at its old place in the z-order):
+        events, never a poll. A loss is logged."""
         if not _is_windows():
             return
         try:

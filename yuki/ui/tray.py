@@ -25,7 +25,7 @@ game           shut eyes, no mouth; the rec dot only while a call records
 **The hover card** grows out of the icon in every state when the pointer rests on it: Windows says so
 (``NOTIFYICON_VERSION_4``: ``NIN_POPUPOPEN`` / ``NIN_POPUPCLOSE``; the standard tooltip is suppressed), so nothing
 looks at the pointer. It folds back 300 ms after the pointer has left the icon and the card. **Left-click** opens the
-Yuki window; **right-click** the menu (Open Yuki, Listen for "Yuki", Pause listening for this call, Settings, More,
+Yuki window; **right-click** the menu (Open Yuki, Listen for "Yuki", Pause listening for this call, Settings,
 Quit). On Windows the icon is Yuki's own ``Shell_NotifyIcon`` (:class:`NativeTray`); elsewhere a
 :class:`QSystemTrayIcon` stands in (no hover card).
 """
@@ -706,9 +706,9 @@ class TrayWatch(QObject):
         elif state == "call":
             info.line, info.sub = f"On {app} · {timer} · recording only your mic", ""
         elif state == "off":
-            info.line = "Voice is off"
-            info.sub = {"quiet": "Quiet for a while", "call_off": "Paused for this call"}.get(
-                i.listening, "I’m not listening or speaking")
+            info.line = "Not listening for “Yuki”"      # the mock (item 21)
+            paused = bool(getattr(self.voice, "call_off", False)) or i.listening == "call_off"
+            info.sub = "Paused for this call" if paused else "Quiet for a while" if i.listening == "quiet" else ""
             if timer:                    # call notes still record your mic: the card keeps the call's time
                 info.sub = f"Call notes · {app} · {timer}"
         elif state == "game":
@@ -787,9 +787,27 @@ class TrayWatch(QObject):
 # -- the menu ---------------------------------------------------------------------------------------------------
 
 
+def _call_recording(ui: Any) -> bool:
+    """Whether call notes are recording the user's mic now (the call controller knows)."""
+    return bool(getattr(getattr(ui, "calls", None), "recording", False))
+
+
+def pause_for_call(ui: Any) -> None:
+    """The menu's "Pause listening for this call": the wake word stops until the call ends, and the call's notes stop
+    too (the mock: Pause skips that call's notes; with listening off it is the only way to skip them). Picked again
+    ("Listen again in this call") the wake word comes back; the notes stay stopped (a stopped call is not resumed)."""
+    paused = bool(getattr(ui.voice, "call_off", False))
+    ui.voice.set_call_off(not paused)
+    calls = getattr(ui, "calls", None)
+    if not paused and calls is not None and _call_recording(ui):
+        calls.stop_call()
+
+
 def build_menu(ui: Any, app: Any, *, more: Any = None) -> Any:
     """The right-click menu (the mock's ``.traymenu``): Open Yuki, Listen for “Yuki” on / off, Pause listening for
-    this call (only during a call), Settings, More (everything the old menu had), Quit Yuki."""
+    this call (live only during a call; greyed out "only during a call" while listening is off, so the off card's
+    words always point at something real; hidden otherwise), Settings, Quit Yuki. ``more``: an extra submenu (not
+    used by the app: the brief's menu has none; everything the old menu had is in the window)."""
     from yuki.ui.lattice_cards import TrayMenu
 
     menu = TrayMenu()
@@ -798,8 +816,7 @@ def build_menu(ui: Any, app: Any, *, more: Any = None) -> Any:
     listen_item = menu.item("Listen for “Yuki”", icon="mic", right="on")
     listen_item.triggered.connect(lambda _c=False: ui.voice.set_wake(not bool(ui.voice.wake_enabled)))
     pause_item = menu.item("Pause listening for this call", icon="pause")
-    pause_item.triggered.connect(
-        lambda _c=False: ui.voice.set_call_off(getattr(ui.voice, "listening_state", "on") != "call_off"))
+    pause_item.triggered.connect(lambda _c=False: pause_for_call(ui))
     menu.addSeparator()
     settings_item = menu.item("Settings", icon="settings")
     settings_item.triggered.connect(lambda _c=False: ui.window_host.open_window("settings"))
@@ -812,10 +829,13 @@ def build_menu(ui: Any, app: Any, *, more: Any = None) -> Any:
     def follow() -> None:
         on = bool(getattr(ui.voice, "wake_enabled", True))
         menu.set_right(listen_item, "on" if on else "off", live=on)
-        state = getattr(ui.voice, "listening_state", "on")
-        in_call = bool(getattr(ui.voice, "call_active", False)) or state == "call_off"
-        pause_item.setVisible(in_call)
-        pause_item.setText("Listen again in this call" if state == "call_off" else "Pause listening for this call")
+        paused = bool(getattr(ui.voice, "call_off", False))     # its own flag: listening_state says "off" first
+        in_call = bool(getattr(ui.voice, "call_active", False)) or paused or _call_recording(ui)
+        words = "Listen again in this call" if paused else "Pause listening for this call"
+        menu._words[id(pause_item)] = words
+        menu.set_right(pause_item, "" if in_call else "only during a call")
+        pause_item.setEnabled(in_call)
+        pause_item.setVisible(in_call or not on)
 
     menu.aboutToShow.connect(follow)
     follow()

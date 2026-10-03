@@ -517,10 +517,12 @@ def main(argv: list[str] | None = None) -> int:
         from PySide6.QtCore import Qt as _Qt
 
         from yuki.ui.lattice_cards import TrayHoverCard
+        from yuki.ui.tray import TrayCardInfo
 
         hc = TrayHoverCard()
         hc.setAttribute(_Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-        hc.set_card(what="Quiet while you play Hollow Peak", call="Discord call, your side", timer="47:31")
+        hc.set_info(TrayCardInfo(state="game", line="Quiet while you play", sub="On Discord · 47:31 · your mic only",
+                                 last="Nothing yet", game=True, timer="47:31"))
         hc.show()
         img = composite(args.mock / "backdrop-game.png", "card",
                         [(_grab(hc), VIEW_W - 116 - hc.width(), VIEW_H - 58 - hc.height(), 1.0)])

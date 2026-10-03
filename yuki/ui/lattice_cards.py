@@ -916,42 +916,36 @@ class TrayHoverCard(QWidget):
         return y
 
     def _fit_window(self) -> None:
-        """The window holds the card plus, on the icon's side, room for the icon's square the card grows out of."""
+        """The window is the card alone: it never reaches over the tray icon (a layered window hit-tests by alpha, so
+        a box painted over the icon would take the pointer from it and the card could fold and reopen under a still
+        pointer)."""
         w, h = self.width_now(), self._card_h
-        extra = max(0, self._icon_side() + 10)
-        self.setFixedSize(w, h + extra)
-        top = extra if self._below else 0
-        self.content.setGeometry(0, top, w, h)
-
-    def _icon_side(self) -> int:
-        return max(16, self._icon_rect_global.height()) if hasattr(self, "_icon_rect_global") else 24
+        self.setFixedSize(w, h)
+        self.content.setGeometry(0, 0, w, h)
 
     def card_rect(self) -> QRectF:
         """The card's box in window coordinates."""
-        top = (self.height() - self._card_h) if self._below else 0
-        return QRectF(0, top, self.width(), self._card_h)
+        return QRectF(0, 0, self.width(), self._card_h)
 
     # -- placing, growing and folding -------------------------------------------------------------------------
 
     def open_from(self, icon_rect: QRect) -> None:
-        """Grow out of ``icon_rect`` (the tray icon's square, logical px): above it like Windows, below when the
-        taskbar is at the top; the card's right edge 14 px past the icon's."""
+        """Grow out of ``icon_rect`` (the tray icon's square, logical px): above it like Windows (10 px clear of it),
+        below when the taskbar is at the top; the card's right edge 14 px past the icon's. The clip morph starts from
+        the icon's square at the card's edge next to the icon (in line with it), never over the icon itself."""
         from PySide6.QtGui import QGuiApplication
 
-        self._icon_rect_global = QRect(icon_rect)
         screen = QGuiApplication.screenAt(icon_rect.center()) or QGuiApplication.primaryScreen()
         area = screen.geometry() if screen is not None else QRect(0, 0, 1920, 1080)
         self._below = icon_rect.top() - 10 - self._card_h < area.top() + 8
         self._layout()
-        w = self.width()
+        w, h = self.width(), self.height()
         x = max(area.left() + 8, min(icon_rect.right() + 1 + 14 - w, area.right() + 1 - 8 - w))
-        if self._below:
-            y = icon_rect.top()
-        else:
-            y = icon_rect.bottom() + 1 - self.height()
+        y = icon_rect.bottom() + 1 + 10 if self._below else icon_rect.top() - 10 - h
         self.move(x, y)
-        s = icon_rect.height()
-        self._icon = QRect(icon_rect.left() - x, icon_rect.top() - y, s, s)
+        s = max(16, icon_rect.height())
+        sx = max(0, min(icon_rect.left() - x, w - s))
+        self._icon = QRect(sx, 0 if self._below else h - s, s, s)
         self.closing = False
         self._anim.stop()
         if L.reduced():
@@ -973,6 +967,12 @@ class TrayHoverCard(QWidget):
             from yuki.ui.focus import set_no_activate
 
             set_no_activate(int(self.winId()), True)
+            try:
+                from yuki.ui.focus import assert_topmost
+
+                assert_topmost(int(self.winId()))   # shown again at its old z-order place otherwise (as the island)
+            except Exception:
+                pass
         self.update()
 
     def fold(self) -> None:
@@ -1031,18 +1031,14 @@ class TrayHoverCard(QWidget):
             eff.setOpacity(a)
 
     def _clip(self) -> tuple[QRectF, float]:
-        """The card's box now: from the icon's square (raised 10 px + its side, i.e. over the icon) to the card."""
+        """The card's box now: from the icon's square at the card's edge next to the icon (it grows and folds there)
+        to the whole card."""
         full = self.card_rect()
         k = max(0.0, min(1.0, self._k))
         if k >= 0.999:
             return full, 13.5
         s = float(self._icon.height() or 24)
-        sx = float(self._icon.left())
-        if self._mode == "fold":       # folds in place: the square at the card's own edge
-            sy = full.top() if self._below else full.bottom() - s
-        else:                          # grows out of the icon itself
-            sy = float(self._icon.top())
-        start = QRectF(sx, sy, s, s)
+        start = QRectF(float(self._icon.left()), float(self._icon.top()), s, s)
         r = QRectF(start.left() + (full.left() - start.left()) * k, start.top() + (full.top() - start.top()) * k,
                    start.width() + (full.width() - start.width()) * k,
                    start.height() + (full.height() - start.height()) * k)

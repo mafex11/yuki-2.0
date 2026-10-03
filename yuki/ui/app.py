@@ -1221,7 +1221,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     """
     from yuki.ui.tray import build_menu, make_tray
 
-    # Yuki's own tray icon on Windows (the face, the hover card in every state); the menu below becomes "More"
+    # Yuki's own tray icon on Windows (the face, the hover card in every state). The old menu below is no longer shown
+    # (the brief's menu has no "More"; its items live in the window) but is still built: its follow-ups drive the icon
     tray = make_tray(app, icon or tray_icon())
     nudge_queue = getattr(ui.nudges, "queue_changed", None)
     from yuki.ui.surface import current_theme
@@ -1549,7 +1550,8 @@ def build_tray(ui: YukiUi, app: QApplication, icon: QIcon | None = None) -> QSys
     quit_action.triggered.connect(app.quit)
     menu.addAction(quit_action)
 
-    tray.setContextMenu(build_menu(ui, app, more=menu))   # Open Yuki, Listen, Pause for this call, Settings, More, Quit
+    tray.setContextMenu(build_menu(ui, app))   # Open Yuki, Listen, Pause for this call, Settings, Quit
+    tray._old_menu = menu                       # kept alive: its actions' follow-ups still run
     refresh_ticks()
     show_listening()   # v3.16: a listener that is off shows in the icon from the start (04 F6)
     tray.activated.connect(   # a left click opens the Yuki window (its own process)
