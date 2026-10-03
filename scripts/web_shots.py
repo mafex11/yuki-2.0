@@ -47,6 +47,11 @@ SHOTS: dict[str, str] = {
     # nothing live (no run): the state the design's window shots are in, for side-by-sides (E11-E14)
     "home-idle": "page=home&runs=0", "work-idle": "page=work&runs=0", "me-idle": "page=me&runs=0",
     "playbook-idle": "page=playbook&runs=0", "activity-idle": "page=activity&runs=0",
+    # the 3 Oct design (report 45): folds opened, the lower half of Me, the day's sessions, a request's steps
+    "me-lower": "page=me&runs=0&scroll=760&open=f:g:work,f:fact:12,f:fact:31",
+    "day-sessions": "page=work/day&runs=0&scroll=1080&open=f:s:09:40:VS Code,f:c:19:00:Mumble",
+    "activity-open": "page=activity&runs=0&open=f:g:run:e",
+    "calls-open": "page=activity/calls&runs=0&open=f:call:1790954400.0:Mumble",
 }
 
 

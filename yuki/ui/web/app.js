@@ -27,6 +27,7 @@
   const marks = { ready: 0, boot: 0, element: 0, frame: 0 };
   const epoch = () => performance.timeOrigin + performance.now();
   Object.assign(Y, { S, D, field, B });
+  if (Q.get('open')) Q.get('open').split(',').forEach((k) => S.open.add(k));   // preview knob: folds open for screenshots
   Y.remeasure = () => field.remeasure();
   // the moment of your last action: a build that started before it is not drawn over what the action just showed
   // (actions that only read or open something leave the page's data alone)

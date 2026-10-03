@@ -309,9 +309,9 @@ def build() -> dict:
                       {"ref": "G6", "text": "order the seed trays", "status": "done", "done": True, "thread": None}],
         },
         "needs": [
-            {"kind": "question", "ref": "q:7", "at_label": "2 Oct 12:19", "title": "Is the Friday planning call still at 10?",
+            {"kind": "question", "ref": "q:7", "at_label": "2 Oct, 12:19 PM", "title": "Is the Friday planning call still at 10?",
              "why": "You moved it once last week. The weekly review should have the right time."},
-            {"kind": "question", "ref": "q:9", "at_label": "today 09:41", "title": "The “beds v2” sketch from Thursday: keep it, or was it a test?",
+            {"kind": "question", "ref": "q:9", "at_label": "today, 9:41 AM", "title": "The “beds v2” sketch from Thursday: keep it, or was it a test?",
              "why": "It was saved twice with the same name. It may be a scratch copy."},
         ],
         "running": [
@@ -581,7 +581,7 @@ def build() -> dict:
         "card_feedback": {"ok": True}, "answer": {"ok": True, "saved": True}, "skip_question": {"ok": True},
         "continue": {"ok": True}, "askbar": {"ok": True}, "stop": {"ok": True}, "steer": {"ok": True, "delivered": True},
         "submit": {"ok": True}, "copy": {"ok": True}, "correct": {"ok": True}, "forget": {"ok": True}, "rule_edit": {"ok": True},
-        "workflow_edit": {"ok": True, "state": "active"}, "todo_undo": {"ok": True},
+        "workflow_edit": {"ok": True, "state": "active"},
         "person": {"ok": True, "person": {"found": True, "facts": []}},
         "permissions_set": {"ok": True}, "app_look": {"ok": True}, "app_act": {"ok": True}, "voice": {"ok": True}, "offers": {"ok": True},
         "coach": {"ok": True}, "questions": {"ok": True}, "pause": {"ok": True}, "accent": {"ok": True}, "motion": {"ok": True},

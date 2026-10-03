@@ -391,7 +391,7 @@ def _route(r: dict[str, Any]) -> dict[str, Any]:
     if chat or handle:
         place = "DM" if kind == "dm" else chat or handle
         sub = (("@" + (handle or chat).lstrip("@")) if kind == "dm" else
-               (handle if handle and handle != chat else {"group": "group", "channel": "channel"}.get(kind, "")))
+               (handle if handle and handle != place else {"group": "group", "channel": "channel"}.get(kind, "")))
     else:   # an older index without the chat's own fields: the route's label as it was
         place, sub = r.get("label") or "", ""
     return {"label": place, "sub": sub, "app": r.get("app") or "", "kind": kind,
@@ -562,8 +562,6 @@ UNSURE_BELOW = 0.4
 REVIEW_FLAG = {"unsure": "not sure", "new": "new"}
 #: How far back the window looks for the call an entry was said on (its place and who was on it).
 CALLS_DAYS = 21
-#: Who was on a call, by how the digest saw them: on the call screen or in its chat (named), or likely ("maybe").
-SEEN_ON_CALL = ("on_call_screen", "call_chat")
 
 
 def name_lookup(people: list[dict[str, Any]] | None) -> dict[str, str]:
@@ -591,7 +589,7 @@ def call_people(people: list[Any], lookup: dict[str, str]) -> list[str]:
             continue
         name = lookup.get(raw.lstrip("@").casefold(), raw)
         key = name.casefold()
-        rank = 0 if how in SEEN_ON_CALL else 1
+        rank = 1 if how == "likely" else 0
         if key not in best:
             order.append(key)
         if key not in best or rank < best[key][0]:

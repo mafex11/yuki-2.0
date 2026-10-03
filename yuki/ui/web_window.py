@@ -1222,7 +1222,7 @@ class WebWindow:
         "skip_question": "a_skip_question", "stop": "a_stop", "stop_call": "a_stop_call", "steer": "a_steer",
         "submit": "a_submit", "askbar": "a_askbar", "continue": "a_continue", "copy": "a_copy", "correct": "a_correct",
         "forget": "a_forget", "rule_edit": "a_rule_edit", "person": "a_person", "workflow_edit": "a_workflow_edit",
-        "todo_undo": "a_todo_undo", "pin": "a_pin", "resolve_heard": "a_resolve_heard", "review_mark": "a_review_mark",
+        "pin": "a_pin", "resolve_heard": "a_resolve_heard", "review_mark": "a_review_mark",
         "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
@@ -1414,19 +1414,6 @@ class WebWindow:
         self.refresh("home")
         return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "state": result.get("state"),
                 "queued": bool(result.get("queued"))}
-
-    def a_todo_undo(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Activity's Undo on a to-do Yuki added: only one the ledger offered, inside its window; memory ends it as
-        not needed (``end_todo``)."""
-        ref = str(m.get("todo") or "")
-        rows = (self.pages.get("activity") or {}).get("rows") or []
-        row = next((r for r in rows if (r.get("undo") or {}).get("todo") == ref), None)
-        if row is None or float(row["undo"].get("until") or 0) < time.time():
-            return {"ok": False, "error": "Too late to undo (10 minutes)."}
-        done = self._memory().end_todo(ref, "not_needed")
-        self.refresh("activity")
-        self.refresh("home")
-        return {"ok": bool(done)} if done else {"ok": False, "error": "It was already off your list."}
 
     #: Memory's "too late" answer to an Undo after its correction pass started, said by Yuki itself.
     TOO_LATE = "Too late to undo: I’m already updating my memory from your answer."

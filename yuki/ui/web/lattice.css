@@ -584,6 +584,10 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .dayfold[open] .dsum .ic { transform: rotate(90deg); }
 .dayfold summary:hover .dsum { color: var(--text-2); }
 .dayfold .turn:last-child { border-bottom: 0; }
+.turn .who.two { line-height: 15px; padding-top: 2px; white-space: normal; }
+.dayrow .fx-h .tt { flex-wrap: wrap; row-gap: 4px; }
+.dayrow .fx-h .tt .tx { white-space: normal; }
+.dayrow .kind { white-space: nowrap; }
 
 /* ---------- Playbook ---------- */
 .proposal { padding: 22px 24px; display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: end; margin-bottom: 28px; }

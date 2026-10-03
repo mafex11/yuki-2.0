@@ -46,11 +46,11 @@
       s.running && s.started ? h('span', { class: 'ms', data: { since: s.started }, text: fmt.secs(Date.now() / 1000 - s.started) })
         : h('span', { class: 'ms', text: fmt.took(s.seconds) }));
   }
+  /* who spoke and when, on two short lines ("said" over "9:06 PM"), so a 12-hour time never runs into the words */
   function who(it) {
     const t = it.at ? fmt.natTime(it.at) : '';
-    if (it.kind === 'user') return (it.source === 'voice' ? 'said' : it.source === 'card' ? 'on a card' : 'typed') + (t ? ' · ' + t : '');
-    if (it.kind === 'nudge') return 'card' + (t ? ' · ' + t : '');
-    return 'yuki';
+    const kind = it.kind === 'user' ? (it.source === 'voice' ? 'said' : it.source === 'card' ? 'on a card' : 'typed') : it.kind === 'nudge' ? 'card' : 'yuki';
+    return h('span', { class: 'who two' }, kind, t ? [h('br'), t] : null);
   }
   function assistant(it, S) {
     const steps = it.steps || [];
@@ -71,15 +71,15 @@
     items.forEach((it) => {
       if (it.kind === 'notice') { out.push(h('div', { class: 'turn', data: { k: it.id } }, h('div', { class: 'label', text: it.text }))); cur = null; return; }
       if (it.kind === 'user' || !cur) { cur = h('div', { class: 'turn', data: { k: it.id } }); out.push(cur); }
-      if (it.kind === 'user') cur.append(h('div', { class: 'u', data: { k: it.id } }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx', text: cleanWords(it.text) })));
-      else if (it.kind === 'nudge') cur.append(h('div', { class: 'n', data: { k: it.id } }, h('span', { class: 'who', text: who(it) }), h('span', { class: 'tx dim', text: it.text || '' })));
+      if (it.kind === 'user') cur.append(h('div', { class: 'u', data: { k: it.id } }, who(it), h('span', { class: 'tx', text: cleanWords(it.text) })));
+      else if (it.kind === 'nudge') cur.append(h('div', { class: 'n', data: { k: it.id } }, who(it), h('span', { class: 'tx dim', text: it.text || '' })));
       else cur.append(assistant(it, S));
     });
     return out;
   }
   /* an earlier day's exchanges, read from memory when its fold opens: what you said, what I answered */
   const memoryTurns = (list) => list.map((t) => h('div', { class: 'turn', data: { k: t.id } },
-    h('div', { class: 'u' }, h('span', { class: 'who', text: t.at ? fmt.natTime(t.at) : 'you' }), h('span', { class: 'tx', text: t.user || '' })),
+    h('div', { class: 'u' }, h('span', { class: 'who two' }, 'you', t.at ? [h('br'), fmt.natTime(t.at)] : null), h('span', { class: 'tx', text: t.user || '' })),
     t.reply ? h('div', { class: 'y' }, h('span', { class: 'who', text: 'yuki' }), h('span', { class: 'tx', text: t.reply })) : null));
 
   /* the line I remember about your last day, with its answer kept for the day */

@@ -697,7 +697,7 @@ def test_me_uses_the_people_index_and_falls_back_to_the_portrait():
     assert source == "index" and people[0]["name"] == "Riya" and people[0]["count"] == 136
     assert people[0]["route"] == "Signal" and people[0]["prov"] == "Seen in Signal and Telegram" and "rhythm" not in people[0]
     card = web_data.contact_card(_Memory().contact("person:2"))
-    assert card["facts"] == ["Climbs on Tuesdays.", "Tests the app."] and "samples" not in card["routes"][0]
+    assert [f["h"] for f in card["facts"]] == ["Climbs on Tuesdays.", "Tests the app."] and "samples" not in card["routes"][0]
     assert "private message" not in json.dumps(card)                            # the user's messages never reach the page
     source, people = web_data.people_now(_Memory(index=False))
     assert source == "portrait" and people[0]["name"] == "Dev" and people[0]["routes"] == []
@@ -710,9 +710,12 @@ def test_activity_is_the_ledger_with_why_result_undo_and_calls(tmp_path):
     d = web_data.build_activity(_Memory(), requests_csv=_csv(tmp_path))
     by = {r["what"]: r for r in d["rows"]}
     assert by["“pause it”"]["status"] == "failed" and by["“open my budget”"]["result"] == "done"
-    assert by["“open my budget”"]["because"] == "because" and by["“open my budget”"]["cant_undo"] is True
+    assert by["“open my budget”"]["because"] == "because"
     card = by["Order seed trays."]
-    assert card["undo"]["card"] == "39" and card["result"] == "done" and card["where"] == "Card · Your work"
+    assert card["result"] == "done" and card["where"] == "Card · Your work"
+    # no Undo anywhere on the Activity tab (the 3 Oct ask A), and every row belongs to a group
+    assert not any("undo" in r or "cant_undo" in r for r in d["rows"])
+    assert {r["group"] for r in d["rows"]} == {g["id"] for g in d["groups"]}
     assert d["seen"] == [{"app": "VS Code", "min": 40.0, "visits": 9}]               # under 30 s: left out
     assert d["calls"][0]["gists"] == ["Planned the meetup."] and d["calls"][0]["people"] == ["Noor"]
     assert d["counts"]["did_today"] >= 1
