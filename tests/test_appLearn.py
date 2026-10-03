@@ -242,11 +242,36 @@ def test_a_done_run_learned_later_gets_its_learned_box_from_one_late_read(qapp, 
     late()                                                                      # the one late read
     assert not ui.return_card.learn.isHidden() and ui.return_card.learn.ref == "pb:9"
     assert ui.island.lesson_available is True and ui._return_learned["id"] == "pb:9"
-    # a later run's card is never given another run's learning
-    ui._return_card_id = 7
+    # once a later run has ended, an earlier run's late learning never lands on a card
+    ui._return_last_id = 7
     ui._on_return_ready({"late": True, "id": 6, "learned": {"id": "pb:10", "text": "x"}, "view": {}, "took": ""})
     assert ui.return_card.learn.ref == "pb:9"
     ui.return_card.close()
+
+
+CLICK_ONLY = [{"name": "click", "ok": True, "input": {"_about": {"element": "Close lyrics"}}}]
+
+
+def test_a_done_run_with_nothing_else_to_tell_gets_a_card_only_for_what_it_learned(qapp, monkeypatch, store):
+    """One click that worked is not worth a return card by itself (the strip said it); a way its success taught is."""
+    pages = [{"available": True, "learned": []}]
+    ui = _ui(qapp, monkeypatch, lambda: pages[-1])
+    monkeypatch.setattr("time.time", lambda: NOW + 10)
+    ui._queue_return_card(8, "Closed it.", "done", {"started": __import__("time").monotonic() - 10,
+                                                   "calls": CLICK_ONLY})
+    assert ui.return_card is None and len(ui.timers.kept) == 1                  # no card yet, one late read armed
+    pages.append({"available": True, "learned": [{"id": "pb:11", "kind": "procedure", "run_at": NOW,
+                  "title": "close the lyrics view in Spotify", "learned_at": NOW + 150,
+                  "why": "clicking the Lyrics toggle again and again"}]})
+    ui.timers.kept[0][1]()
+    card = ui.return_card
+    assert card is not None and not card.learn.isHidden() and card.learn.ref == "pb:11"
+    assert card.learn.why.text() == "What didn’t work: clicking the Lyrics toggle again and again"
+    card.close()
+    # a stopped run with nothing to tell: no card, no read, nothing armed
+    ui2 = _ui(qapp, monkeypatch, lambda: pages[-1])
+    ui2._queue_return_card(9, "Stopped.", "stopped", {"started": 0.0, "calls": CLICK_ONLY})
+    assert ui2.return_card is None and ui2.reads == [] and ui2.timers.kept == []
 
 
 # -- a failure, then the same request succeeded ------------------------------------------------------------------------

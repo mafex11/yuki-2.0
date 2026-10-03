@@ -1269,14 +1269,17 @@ class YukiUi(QObject):
         ended done, and only a way a verified success taught (:func:`learned_for_card`, appLearn): a failed, stopped or
         handed-back run announces nothing (no memory read either). The learner writes a run's way after its follow-up
         window, so a done run asks once more :data:`LATE_LEARNED_MS` later. Nothing to tell beyond the strip's final
-        word, no card."""
+        word, no card - unless the run ended done and its success taught a way: then the card comes for the Learned box
+        (``quiet``: shown only with it)."""
         view = return_view(outcome, text, list((run or {}).get("calls") or []))
-        if not view["worth"]:
+        if not view["worth"] and outcome != "done":
             return
         took = time.monotonic() - run["started"] if run else 0.0
         started_wall = time.time() - took
         self._return_pending = {"id": request_id, "view": view, "outcome": outcome, "by": by,
-                                "took": took_words(took) if run else "", "since": started_wall}
+                                "took": took_words(took) if run else "", "since": started_wall,
+                                "quiet": not view["worth"]}
+        self._return_last_id = request_id   # the newest run that acted: only its learning may come late
         if outcome != "done":   # the card comes at the same moment, with no Learned box and no memory read
             QTimer.singleShot(1500, lambda: self._returns.done.emit({"id": request_id, "learned": None}))
             return
@@ -1315,6 +1318,8 @@ class YukiUi(QObject):
         self._return_learned = learned
         if learned is None and callable(pending.get("late")):
             QTimer.singleShot(LATE_LEARNED_MS, pending["late"])
+        if pending.get("quiet") and not learned:
+            return   # nothing to tell beyond the strip's final word (yet)
         self._show_return_card(pending["id"], pending["view"], pending["outcome"], str(pending["took"]), learned,
                                by=pending.get("by"))
 
@@ -1344,12 +1349,11 @@ class YukiUi(QObject):
         if not isinstance(learned, dict) or not learned.get("id"):
             return
         rid = payload.get("id")
+        last = getattr(self, "_return_last_id", None)
+        if (last is not None and last != rid) or getattr(self, "_return_pending", None) is not None:
+            return   # a later run ended since: this learning stays on the Playbook page, never on its card
         card = self.return_card
         showing = card is not None and card.isVisible() and not card.closing
-        if showing and getattr(self, "_return_card_id", None) != rid:
-            return
-        if getattr(self, "_return_pending", None) is not None:
-            return   # another run's card is about to show
         self._return_learned = learned
         self.island.lesson_available = True
         if showing:
