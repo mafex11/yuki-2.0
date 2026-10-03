@@ -1238,14 +1238,15 @@ class DrainBar(QWidget):
         self._t0 = 0.0
         self._secs = 0.0
         self.on_tick: Any = None   # ``fn(seconds_left)``: the label beside it follows the same clock
+        self._frame_fn = self._frame   # one bound method, so the shared loop can remove what it added
 
     def start(self, seconds: float) -> None:
         self._t0, self._secs, self.left = L.now(), max(0.1, float(seconds)), 1.0
-        L.Loop.shared().add(self._frame)
+        L.Loop.shared().add(self._frame_fn)
         self.update()
 
     def stop(self) -> None:
-        L.Loop.shared().remove(self._frame)
+        L.Loop.shared().remove(self._frame_fn)
 
     def hideEvent(self, e: Any) -> None:  # noqa: D102 - nothing runs while hidden
         self.stop()
@@ -1255,12 +1256,15 @@ class DrainBar(QWidget):
         if L.reduced():
             self.left = 1.0
             self.update()
+            self.stop()
             return False
         gone = max(0.0, t - self._t0)
         self.left = max(0.0, 1.0 - gone / self._secs)
         if callable(self.on_tick):
             self.on_tick(max(0.0, self._secs - gone))
         self.update()
+        if self.left <= 0.0:
+            self.stop()   # drained: off the shared loop (the agent's own end closes the card)
         return self.left > 0.0
 
     def paintEvent(self, _e: Any) -> None:  # noqa: D102

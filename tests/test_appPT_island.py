@@ -338,3 +338,18 @@ def test_a_send_stopped_in_its_countdown_ends_saying_nothing_was_sent(qapp) -> N
         YukiUi._settle(ui, "worker", 5, "Cancelled by the user.", tone="error")
         assert finals[-1][0] == line and finals[-1][1]["outcome"] == "stopped"
         assert ui._send_stopped == {}
+
+
+def test_the_drain_leaves_the_shared_loop_when_it_stops(qapp) -> None:
+    from yuki.ui import lattice as L
+    from yuki.ui.lattice_cards import DrainBar
+
+    bar = DrainBar()
+    loop = L.Loop.shared()
+    bar.start(0.2)
+    assert id(bar._frame_fn) in loop.subs
+    bar.stop()
+    assert id(bar._frame_fn) not in loop.subs                          # nothing left ticking after the countdown
+    bar.start(0.05)
+    _pump(qapp, 0.3)
+    assert id(bar._frame_fn) not in loop.subs and bar.left == 0.0      # drained: it took itself off

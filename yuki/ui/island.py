@@ -2116,7 +2116,8 @@ class Island(QObject):
     def _timers(self, spec: Spec) -> None:
         # one clock, only for the full bar's run time ("step 2 · 0:46"); the pill's words don't change by the second,
         # and the call's timer lives in the tray's hover card (its own clock, only while the card is open)
-        need = self.window.isVisible() and not spec.hidden and not spec.compact and self.inputs.run is not None
+        need = (self.window.isVisible() and not spec.hidden and not spec.compact and self.inputs.run is not None
+                and spec.state in ("working", "thinking"))
         if need and not self._clock.isActive():
             self._clock.start()
             self._tick()
