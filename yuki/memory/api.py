@@ -1785,13 +1785,18 @@ class MemoryClient:
         """Episodes overlapping ``[since, until)`` (default today), oldest first.
 
         Each: ``{"start": ISO, "end": ISO, "text": str, "final": bool (False while
-        its window is still open and may be rewritten), "totals": dict}``.
+        its window is still open and may be rewritten), "totals": dict}``, and since migration 35 (the feedback
+        round 3, W2) ``"id"``, ``"ref"`` (``episode:N``, what :meth:`correct_item` takes), ``"title"`` (a few words,
+        distinct; None until written) and ``"summary"`` (one or two short sentences said to the user; None until
+        written). ``text`` is memory's own narrative (third person, with times): the app shows title and summary,
+        and the time per app as data from the timeline.
         """
         s, u = self._window(since, until)
         rows = self.store.episodes_between(s, u)[-max(1, int(limit)):]
         return [
             {"start": _iso(e.started_at), "end": _iso(e.ended_at), "text": e.text, "final": e.final,
-             "totals": (e.aggregates or {}).get("totals") or {}}
+             "totals": (e.aggregates or {}).get("totals") or {}, "id": e.id, "ref": f"episode:{e.id}",
+             "title": getattr(e, "title", None), "summary": getattr(e, "summary", None)}
             for e in rows
         ]
 
