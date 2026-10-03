@@ -123,9 +123,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "look_at_window",
         "label": "Reading a window",
         "description": (
-            "Read one window's UI Automation tree: roles, names, values, states, click points, how elements act. An "
-            "id holds across reads while its element exists. Status ok, busy (read again shortly) or empty. After "
-            "actions that worked, the window is read for you."
+            "Read one window's UI Automation tree: roles, names, values, states, click points, how elements act. Ids "
+            "hold while their element exists. Status ok, busy (read again shortly) or empty. After actions that "
+            "worked, the window is read for you."
         ),
         "input_schema": _obj({"hwnd": {"type": "integer"},
                               "within": {"type": "integer", "description": "An element id: only its part, in full."}},
