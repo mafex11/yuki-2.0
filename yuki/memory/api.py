@@ -1559,8 +1559,12 @@ class MemoryClient:
 
         # a typed offer only (yuki.memory.offers): what the card shows and its button runs, by code; a free-text
         # offer from before 2026-10-03 gets no button (a sentence is not something code can run)
+        inputs = getattr(n, "inputs", None)
+        # a check-in card's moment (day_start, followup, ...), as Yuki wrote it: the card's title comes from it
+        moment = inputs.get("moment") if isinstance(inputs, dict) and n.trigger == "checkin" else None
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
-                "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None)}
+                "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None),
+                "moment": moment}
 
     def _nudges_config(self) -> Any:
         """The user's ``[nudges]`` table (read only; the service applies the same), defaults when unreadable."""
