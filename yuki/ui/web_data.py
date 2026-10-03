@@ -861,6 +861,8 @@ def thread_involves(t: dict[str, Any]) -> tuple[list[str], list[str]]:
 def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, Any]:
     """Threads of work (memory's ``threads``), most recently touched first, with their checklists, the people and
     the apps they involve, their open goal; and the week figure."""
+    from yuki.ui.window.data import natural
+
     rows = _safe(lambda: memory.threads(statuses=("active", "paused", "done"), limit=24), []) or []
     goals = thread_goals(memory)
     threads = []
@@ -868,7 +870,10 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, 
         people, things = thread_involves(t)
         goal = goals.get(f"W{t.get('id')}") if t.get("id") is not None else None
         threads.append({"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
-                        "state": " ".join(str(t.get("state") or "").split()), "open": [str(x) for x in t.get("open") or []],
+                        # where it stands, said to you (memory's shown form, migration 33); until it is written, the
+                        # state with only its date and time formats changed
+                        "state": " ".join(str(t.get("shown") or "").split()) or natural(" ".join(str(t.get("state") or "").split())),
+                        "open": [str(x) for x in t.get("open") or []],
                         "involves": [str(x) for x in t.get("involves") or []], "people": people, "apps": things,
                         "last_at": epoch_of(t.get("last_seen")), "checks": thread_checks(t),
                         "goal": goal["text"] if goal else None})

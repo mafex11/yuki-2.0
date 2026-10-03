@@ -125,7 +125,7 @@
       h('span', { class: 'nm', text: p.name }), h('span', { class: 'rl', text: [p.route, p.last_at ? fmt.rel(p.last_at) : ''].filter(Boolean).join(' · ') }),
       p.rhythm ? Y.rhythm(p.rhythm) : h('span', { class: 'rl', text: p.count != null ? fmt.plural(p.count, 'message') : '' })));
     const anyRhythm = people.some((p) => p.rhythm);
-    if (anyRhythm) latelyB.push(h('div', { class: 'lately-note', text: 'Only chats Yuki saw on this PC.' }));
+    if (anyRhythm) latelyB.push(h('div', { class: 'lately-note', text: 'Only chats I saw on this PC.' }));
     // data-k: the blocks' keys for the live patch (app.js patchInto)
     return [Y.k(head, 'head'), nowStrip(d.now), goalsLine((d.now || {}).goals),
       h('div', { class: 'grid2', data: { k: 'grid' } },

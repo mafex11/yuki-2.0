@@ -82,7 +82,7 @@
     const meta = [h('span', null, h('b', { text: active }), ' active, ', h('b', { text: T.length }), T.length === 1 ? ' thread' : ' threads'),
       tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
     const body = T.length ? h('div', { class: 'grid3', data: { k: 'threads' } }, T.map(threadCard))
-      : Y.k(Y.clearing('section', 'sec', Y.empty('Threads appear as Yuki follows your work across days: what it is, where it stands, what’s open.', 'No threads yet.')), 'none');
+      : Y.k(Y.clearing('section', 'sec', Y.empty('Threads appear as I follow your work across days: what it is, where it stands, what’s open.', 'No threads yet.')), 'none');
     return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'), body];
   }
 

@@ -398,6 +398,7 @@
       return r;
     });
     row.classList.add('resolved');
+    setTimeout(() => Y.renderMain(), 0);   // its flag elsewhere (a person's key facts) updates at once
     row.replaceChildren(h('div', { class: 'confirm res' }, ic('check'), h('span', { text: WORDS[op][verdict] || 'Got it.' }),
       key('Undo', { cls: 'xs ghost', data: { do: 'res-undo' } }), h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
     Y.pop(row.firstElementChild);
@@ -415,6 +416,7 @@
         row.__res = null; resolved.delete(ref);
         row.classList.remove('resolved'); row.replaceChildren(...res.kids); countIn(row, 1);
         if (!window.Lattice.Motion.reduced) row.animate([{ opacity: 0.4 }, { opacity: 1 }], { duration: 220 });
+        Y.renderMain();
         return;
       }
       // too late (memory already started on the answer) or gone: it stays answered and leaves
