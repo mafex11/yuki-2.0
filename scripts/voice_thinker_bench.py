@@ -78,6 +78,8 @@ def one(task: str, spec: dict, kwargs: dict) -> dict:
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv")
     memory = MemoryAccess(path=vs._empty_db(tmp))
     desk = vs._warp_desk(vs.Timeline(), warp_open=True, launch_s=0)
+    if hasattr(vs, "_stand_in_now"):
+        vs._stand_in_now(desk)   # v3.17: the thinker's Now picture is the stub desk's, never the live service's
     agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None, session_id="bench-worker"),
                   backend=desk, lane="worker", memory=memory, prewarm=False)
     text = brain_request(spec["request"], spec["heard"], said=spec["said"],

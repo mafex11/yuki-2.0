@@ -927,12 +927,15 @@ def test_check_progress_is_refused_when_nobody_asked() -> None:
 def test_progress_waits_for_a_real_pause_and_a_result_replaces_it() -> None:
     import time as _t
 
+    from yuki.core.attention import Attention
     from yuki.voice.narrator import Item, NarratorGate
 
     async def main() -> None:
         state, got = _State(), []
+        # Its own anti-spam gates: the process-wide one keeps the progress lines earlier tests spoke, and with them
+        # in its budget "step2" was refused whenever those tests ran just before (v3.17).
         gate = NarratorGate(state, settle_s=0.05, settle_max_s=0.5, cooldown_s=0.05, final_gap_s=0.05,
-                            progress_pause_s=0.5)
+                            progress_pause_s=0.5, attention=Attention())
         gate.start()
         state.s["last_bot_stop"] = _t.monotonic()  # the acknowledgement just ended
 

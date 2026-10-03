@@ -359,6 +359,22 @@ class Settings:
             and do the one-off checks in the background after start-up, so the first "Yuki" is
             heard at once (docs/VOICE.md §26, v3.5). Costs RAM while idle.
         voice_prewarm_delay_s: How long after start-up the prewarm begins.
+        voice_results_by_code: A verified finish, or a thinker result short enough to say whole (2 sentences /
+            280 characters, ``voice_result_*``), is said by code word for word in Yuki's one voice, with no talker run
+            (v3.17, C1); longer ones, questions, failures and late ones still go to the talker.
+        voice_prefetch_results: The sentences of the thinker's done message are fetched by the voice as each one is
+            written (v3.17, C2; Gemini only), so a result said by code plays the moment it is accepted.
+        voice_router: A small model call decides, from the user's words alone, whether the turn needs the thinker,
+            and starts it ~1 s after they stop instead of when the talker begins its hand-off (v3.17, E3a). Off by
+            default (docs/research/revamp-2026-10-02/26-build-voice-speed.md).
+        voice_router_model: The router's model (empty: the talker's model).
+        voice_router_adopt_s: A thinker the router started is withdrawn, unseen, if the talker has not handed the
+            turn over within this many seconds of its start (or chose another way).
+        voice_reply_words_cap: The talker's spoken reply ends at its next sentence end once it has said this many
+            words; the rest is held for "want the rest?" (v3.17, H2). 0 = off.
+        voice_qos: While a conversation is live, the process is opted out of Windows' power throttling and the voice
+            loop, the speaker's writer and the microphone's callback threads too (v3.17, D7).
+        voice_mmcss: Those threads also join the MMCSS "Audio" task (Windows' scheduler for audio threads).
     """
 
     model: str = DEFAULT_MODEL
@@ -486,6 +502,15 @@ class Settings:
     voice_end_tone: bool = True
     voice_prewarm: bool = True
     voice_prewarm_delay_s: float = 20.0
+    # v3.17 voice speed (docs/research/revamp-2026-10-02/26-build-voice-speed.md)
+    voice_results_by_code: bool = True
+    voice_prefetch_results: bool = True
+    voice_router: bool = False
+    voice_router_model: str = ""
+    voice_router_adopt_s: float = 2.5
+    voice_reply_words_cap: int = 45
+    voice_qos: bool = True
+    voice_mmcss: bool = True
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --
     #: Model failover (yuki.agent.failover): per model id, the targets tried after it keeps failing
     #: (throttled, 5xx, overloaded, timed out, unreachable, model or profile not found), in order:

@@ -1096,6 +1096,10 @@ class VoiceSession(QObject):
         with self._mic_lock:
             if self._mic is None:
                 self._mic = (self.mic_factory or SharedMic)(None)
+                # D7 (v3.17): its callback thread on time (yuki.voice.qos), unless turned off.
+                if hasattr(self._mic, "qos"):
+                    self._mic.qos = bool(getattr(self.settings, "voice_qos", True))
+                    self._mic.mmcss = bool(getattr(self.settings, "voice_mmcss", True))
             if not self._mic.is_open:
                 self._mic.device = self._resolve("capture")
                 facts = self._mic.open()
@@ -1335,7 +1339,8 @@ class VoiceSession(QObject):
             params = TransportParams(audio_in_enabled=True, audio_in_sample_rate=16_000,
                                      audio_out_enabled=True, audio_out_sample_rate=24_000)
             mic_input = MicInput(mic, params, dormant=True)
-            output = SpeakerOutput(None, params)
+            output = SpeakerOutput(None, params, qos=bool(getattr(settings, "voice_qos", True)),
+                                   mmcss=bool(getattr(settings, "voice_mmcss", True)))
             box: dict[str, Any] = {}
 
             def closing(why: str) -> None:
@@ -1604,7 +1609,8 @@ class VoiceSession(QObject):
             params = TransportParams(audio_in_enabled=True, audio_in_sample_rate=16_000,
                                      audio_out_enabled=True, audio_out_sample_rate=24_000)
             mic_input = MicInput(mic, params, backlog_since=listen_from)
-            output = SpeakerOutput(speaker, params)
+            output = SpeakerOutput(speaker, params, qos=bool(getattr(settings, "voice_qos", True)),
+                                   mmcss=bool(getattr(settings, "voice_mmcss", True)))
             transport = PairTransport(mic_input, output)
             conversation = Conversation(
                 settings=settings, bridge=self.bridge, transport=transport, memory=self.memory,
@@ -1725,10 +1731,34 @@ def _import_pipeline() -> None:
     import yuki.voice.pipeline  # noqa: F401
     from yuki.voice.pipeline import shared_ssl_context, use_shared_tls
 
+    # D7 (v3.17): what the audit of an offline session found imported on the voice loop (each a read of .pyc files,
+    # once a .pyc written): the narrator's shared gates, the voice's own late imports, and the talker's client's HTTP
+    # stack (httpx, httpcore, h11, the SDK's base client, read lazily when a client is first made).
+    import yuki.core.attention  # noqa: F401
+    import yuki.voice.gcwatch  # noqa: F401
+    import yuki.voice.priority  # noqa: F401
+    import yuki.voice.qos  # noqa: F401
+    import yuki.voice.router  # noqa: F401
+    import yuki.voice.speechguard  # noqa: F401
+    import yuki.voice.stallwatch  # noqa: F401
+    import yuki.voice.steplines  # noqa: F401
+    import yuki.voice.ttscache  # noqa: F401
+    from yuki.voice.gemini_tts import service_class
+
+    service_class()
+
     # The TLS context every service connection uses, built here off the voice loop (v3.6: built per
     # connection on the loop it stalled the loop 2.8 s live, reading the Windows certificate store).
     shared_ssl_context()
     use_shared_tls()
+    try:
+        from yuki.config import Settings
+        from yuki.voice.pipeline import bedrock_client
+
+        settings = Settings()
+        bedrock_client(settings.aws_region, getattr(settings, "model_backend", None))   # thrown away: its imports
+    except Exception:  # noqa: BLE001 - only a head start
+        pass
 
 
 def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:

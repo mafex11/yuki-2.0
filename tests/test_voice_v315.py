@@ -143,7 +143,9 @@ def test_a_heavy_window_is_read_from_the_now_picture_and_a_click_reads_it_itself
     hands._read_ms[desk.CHROME] = hands_module.HEAVY_READ_MS + 200   # measured heavy
     board = {"windows": [{"hwnd": desk.CHROME, "read_at": 1.0, "stale": False, "controls": own[:5],
                           "messages": []}]}
-    monkeypatch.setattr(now, "shared_client", lambda *a, **k: type("C", (), {"now": lambda self, wait_s=0: board})())
+    # v3.17: the hands take memory's Now picture from their own source (a stand-in desk never reaches the real one)
+    hands.now_source = lambda: board
+    del now
     reads: list[str] = []
     real = hands._dispatcher.dispatch
     monkeypatch.setattr(hands._dispatcher, "dispatch",

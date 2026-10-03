@@ -63,10 +63,21 @@ def load(root: Path, name: str) -> tuple[Any, Any]:
     return mods[0], mods[1]
 
 
-def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str = "", history: int = 1) -> dict[str, Any]:
+def _supported(fn: Any, **kwargs: Any) -> dict[str, Any]:
+    """The keyword arguments ``fn`` takes (an older tree's mouth lacks the newer ones)."""
+    import inspect
+
+    params = inspect.signature(fn).parameters
+    return {k: v for k, v in kwargs.items() if k in params and v is not None}
+
+
+def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str = "", history: int = 1, *,
+            channel: str = "marker", call: str | None = None, state: dict[str, Any] | None = None) -> dict[str, Any]:
     from yuki.voice.pipeline import async_tool_instructions
 
-    system = mouth.mouth_system_blocks(memory, tail=[async_tool_instructions()])
+    system = mouth.mouth_system_blocks(memory, tail=[async_tool_instructions()],
+                                       **_supported(mouth.mouth_system_blocks, channel=channel, call=call,
+                                                    state=state))
     tools = []
     for t in (mouth.TELL_YUKI, mouth.CHECK_PROGRESS, mouth.MORE_OF_RESULT, mouth.STAY_QUIET, mouth.END_CONVERSATION,
               mouth.GO_QUIET, *hands.HAND_TOOLS):
@@ -84,8 +95,12 @@ def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str =
     # Pipecat's breakpoints on the last two user messages (the moving conversation cache)
     for m in [m for m in messages if m["role"] == "user"][-1:]:
         m["content"][-1]["cache_control"] = {"type": "ephemeral"}
+    if channel == "marker" and hasattr(mouth, "with_markers"):
+        messages = mouth.with_markers(messages)   # its earlier replies as the marker channel writes them (v3.16)
     messages.append({"role": "user", "content": [{"type": "text", "text": WORDS},
-                                                 mouth.volatile_block(desk=desk, lookup=lookup)]})
+                                                 mouth.volatile_block(**_supported(
+                                                     mouth.volatile_block, desk=desk, lookup=lookup, call=call,
+                                                     channel=channel, state=state))]})
     return {"system": system, "tools": tools, "messages": messages}
 
 
@@ -113,6 +128,10 @@ async def main(argv: list[str]) -> int:
     ap.add_argument("--desk", choices=("items", "plain"), default="items")
     ap.add_argument("--dump", type=Path, default=None, help="every call as a JSON line (variant, ttft, tokens)")
     ap.add_argument("--history", type=int, default=1, help="the six-message conversation repeated this many times")
+    ap.add_argument("--channel", choices=("marker", "guard"), default="marker", help="the speech channel (v3.16)")
+    ap.add_argument("--call", default="", help="an app name: the request is built in call mode")
+    ap.add_argument("--tokens-only", dest="tokens_only", action="store_true",
+                    help="one call per variant (max_tokens 1): the prompt's size only")
     args = ap.parse_args(argv)
 
     from yuki.agent.memory import MemoryAccess
@@ -128,7 +147,18 @@ async def main(argv: list[str]) -> int:
         lookup = Path(lookup_file).read_text(encoding="utf-8") if lookup_file else ""
         mouth, hands = load(Path(root).resolve(), name)
         memory = mouth.fetch_memory(MemoryAccess(path=args.db))
-        variants.append((name, request(mouth, hands, memory, args.desk == "items", lookup, args.history)))
+        variants.append((name, request(mouth, hands, memory, args.desk == "items", lookup, args.history,
+                                       channel=args.channel, call=args.call or None)))
+    if args.tokens_only:
+        for name, req in variants:
+            response = await client.messages.create(model=s.voice_mouth_model, max_tokens=1, **req)
+            u = response.usage
+            total = u.input_tokens + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
+            print(json.dumps({"variant": name, "total_input": total, "cache_read": u.cache_read_input_tokens,
+                              "cache_write": u.cache_creation_input_tokens, "uncached": u.input_tokens,
+                              "system_chars": sum(len(b.get("text", "")) for b in req["system"]),
+                              "tools_chars": len(json.dumps(req["tools"]))}))
+        return 0
     for name, req in variants:   # write each variant's cache first (a conversation's warm-up does the same)
         await one(client, s.voice_mouth_model, req)
     rows: dict[str, list[dict[str, Any]]] = {name: [] for name, _ in variants}

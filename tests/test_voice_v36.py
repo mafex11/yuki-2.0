@@ -449,9 +449,10 @@ def test_the_same_step_again_keeps_its_waiting_line() -> None:
     asyncio.run(main())
 
 
-def test_the_thinkers_finishing_line_goes_to_the_talker_marked_verified_never_said_by_code() -> None:
-    """v3.10 (the user's design call, 2026-09-28): only the talker speaks. The thinker's verified finish is an
-    event the talker says at once and once; nothing is said by code for it."""
+def test_the_thinkers_finishing_line_is_said_by_code_word_for_word_and_the_talker_is_not_run() -> None:
+    """v3.17 (C1, 07 §6 C; was v3.10's "only the talker speaks"): one voice that knows what it said (the user's v3.14
+    decision). The thinker's verified finish is said by code, word for word, in Yuki's voice, the moment the user may
+    be spoken to; the talker is not run (its first token alone is ~1.6 s) and gets the line as its own words."""
     from pipecat.frames.frames import TTSSpeakFrame
 
     async def main() -> None:
@@ -469,16 +470,20 @@ def test_the_thinkers_finishing_line_goes_to_the_talker_marked_verified_never_sa
         await _settle()
         await asyncio.wait_for(task, 1)
         spoken = [f.text for f in params.pushed if isinstance(f, TTSSpeakFrame)]
-        assert spoken == []  # never by code
+        assert spoken == ["Bluetooth settings are open."]   # by code, once, word for word
         result, props = params.results[-1]
         assert result["result"] == "Bluetooth settings are open." and result["verified"] is True
-        assert "said" not in result and props.run_llm is True  # the talker's turn, started at once
+        assert result["said"] is True and props.run_llm is False   # no talker run for it
 
     asyncio.run(main())
 
 
-def test_a_final_that_is_not_the_actions_line_still_goes_to_the_mouth() -> None:
-    async def main() -> None:
+def test_a_short_final_that_is_not_the_actions_line_is_said_by_code_but_a_question_goes_to_the_talker() -> None:
+    """C1: a done that fits the condense rule whole is the thinker's own spoken line, verified or not; one that asks
+    them something (its closing question mark) still goes to the talker, which handles the answer."""
+    from pipecat.frames.frames import TTSSpeakFrame
+
+    async def run(message: str) -> Params:
         rt, bridge = _bridge()
         params = Params()
         task = asyncio.create_task(bridge.tell_yuki(params))
@@ -486,14 +491,20 @@ def test_a_final_that_is_not_the_actions_line_still_goes_to_the_mouth() -> None:
         job = rt.submitted[0][0]
         rt.tool_called.emit("worker", job, "open_url", {"url": "x", "finishes_with": "It's open."})
         rt.tool_finished.emit("worker", job, "open_url", False, "could not open it")  # failed: no finish
-        rt.finished.emit("worker", job, "I couldn't open it.")
+        rt.finished.emit("worker", job, message)
         rt.lane_done.emit("worker", job, "x", False, [])
         await _settle()
         await asyncio.wait_for(task, 1)
-        result, props = params.results[-1]
-        assert result["result"] == "I couldn't open it." and "said" not in result and props.run_llm is True
+        return params
 
-    asyncio.run(main())
+    params = asyncio.run(run("I couldn't open it."))
+    result, props = params.results[-1]
+    assert [f.text for f in params.pushed if isinstance(f, TTSSpeakFrame)] == ["I couldn't open it."]
+    assert result["said"] is True and "verified" not in result and props.run_llm is False
+    params = asyncio.run(run("I couldn't open it. Want me to try another way?"))
+    result, props = params.results[-1]
+    assert not [f for f in params.pushed if isinstance(f, TTSSpeakFrame)]
+    assert "said" not in result and props.run_llm is True
 
 
 def test_gate_runs_the_mouth_for_the_last_item_that_does_not_speak_itself() -> None:

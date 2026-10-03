@@ -122,6 +122,17 @@ class VoiceLog:
         self._writer: threading.Thread | None = None
         self._queued = 0
         self._drained = threading.Condition()
+        # v3.17 (D7): the writer thread starts here, where the log is made (never on the voice loop: a thread started
+        # from the loop waits for the interpreter lock there, v3.14), so the loop's first write only queues.
+        with self._drained:
+            self._ensure_writer()
+
+    def _ensure_writer(self) -> None:
+        """Start the writer thread unless it runs (call with ``_drained`` held)."""
+        if self._writer is None or not self._writer.is_alive():
+            self._writer = threading.Thread(target=self._write_loop, name="yuki-voice-log", daemon=True)
+            self._writer.start()
+            atexit.register(self.flush)
 
     def _jsonl_path(self) -> Path:
         return self.log_dir / f"voice-{datetime.now():%Y%m%d}.jsonl"
@@ -140,10 +151,7 @@ class VoiceLog:
     def _later(self, write: Any) -> None:
         with self._drained:
             self._queued += 1
-            if self._writer is None or not self._writer.is_alive():
-                self._writer = threading.Thread(target=self._write_loop, name="yuki-voice-log", daemon=True)
-                self._writer.start()
-                atexit.register(self.flush)
+            self._ensure_writer()
         self._queue.put(write)
 
     def _write_loop(self) -> None:

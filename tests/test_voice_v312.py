@@ -206,7 +206,9 @@ def test_an_older_outcome_is_folded_in_unsaid_once_a_newer_request_exists() -> N
         await _settle(20)
         await asyncio.wait_for(t2, 1)
         result, props = new.results[-1]
-        assert result.get("result") == "Opening the add account page now." and props.run_llm is True
+        # the newest request's own outcome is said (v3.17 C1: a short result by code, word for word, no talker run)
+        assert result.get("result") == "Opening the add account page now." and result.get("said") is True
+        assert props.run_llm is False
 
     asyncio.run(main())
 

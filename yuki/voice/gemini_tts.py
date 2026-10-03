@@ -191,6 +191,30 @@ class _Piece:
     dropped: bool = False
     #: Its audio came whole from Gemini with no error on the way (only then is it kept in the voice cache).
     clean: bool = False
+    #: Played from the voice fetched ahead for its words (C2, v3.17).
+    prefetched: bool = False
+
+
+#: C2 (v3.17): a piece fetched ahead is kept this long for its words to be said, then let go (s) ...
+PREFETCH_KEEP_S = 30.0
+#: ... and at most this many are kept at once (the oldest let go first).
+PREFETCH_MAX = 6
+
+
+@dataclass
+class _Prefetch:
+    """The voice of exact words fetched ahead (C2): what came so far, and whether it is complete."""
+
+    key: tuple[str | None, str]
+    chunks: list[bytes] = field(default_factory=list)
+    done: bool = False
+    via: str = "gemini"
+    clean: bool = False
+    first_audio_ms: float | None = None
+    at: float = field(default_factory=time.monotonic)
+    grew: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task | None = None
+    used: bool = False
 
 
 @dataclass
@@ -269,7 +293,11 @@ def service_class() -> type:
             self._used_at = 0.0              # when a request last went out (monotonic)
             self._limit = asyncio.Semaphore(PARALLEL)
             self.stats = {"pieces": 0, "fallback_pieces": 0, "errors": 0, "guarded": 0, "hedged": 0,
-                          "hedge_won_by_aura": 0, "aura_retries": 0, "breaker_opened": 0, "silent_replies": 0}
+                          "hedge_won_by_aura": 0, "aura_retries": 0, "breaker_opened": 0, "silent_replies": 0,
+                          "prefetched": 0, "prefetch_used": 0, "prefetch_wasted": 0}
+            #: C2 (v3.17): the voice of exact words fetched ahead (a result's sentences, as the thinker writes them),
+            #: by (style, words): a piece with those words plays from here at once.
+            self._prefetched: dict[tuple[str | None, str], _Prefetch] = {}
             #: The spoken-line check (yuki.voice.speechguard): a piece's audio is held until its verdict, which runs
             #: alongside the speech request, and a dropped piece is never played nor its words kept (v3.10). In
             #: shadow mode (v3.16) the verdict is only logged: nothing waits for it, nothing is dropped.
@@ -383,17 +411,145 @@ def service_class() -> type:
                 reply.wake.set()
             await super().stop(frame)
             await self._cancel_all()
+            self._drop_prefetches()
             await self._close_http()
 
         async def cancel(self, frame: Any) -> None:
             await self._cancel_all()
+            self._drop_prefetches()
             await super().cancel(frame)
             await self._close_http()
 
         async def cleanup(self) -> None:
             await self._cancel_all()
+            self._drop_prefetches()
             await super().cleanup()
             await self._close_http()
+
+        # -- C2: the voice of a result fetched ahead (v3.17) ---------------------------------------------------
+
+        def piece_key(self, text: str) -> tuple[str | None, str]:
+            """``(style, words)`` a frame's text is fetched as: the same steps as Pipecat's preparation and run_tts."""
+            prepared = self._prepare_text_for_tts(text)
+            style, rest = split_style(prepared)
+            rest, _dropped = keep_known_tags(rest)
+            return (style or self._style), rest.strip()
+
+        def prefetch(self, text: str) -> bool:
+            """Fetch the voice of these exact words now, to be played the moment they are said (C2, 07 §6 C).
+
+            For a result's sentence the thinker has just written: nothing is played here, only fetched (Gemini, hedged
+            with Aura as a piece is); a ``TTSSpeakFrame`` with the same words later plays from it with no request.
+            Unused after :data:`PREFETCH_KEEP_S` it is let go. Returns whether a fetch started.
+            """
+            try:
+                key = self.piece_key(text)
+            except Exception:  # noqa: BLE001 - only a head start
+                return False
+            if not speakable(key[1]):
+                return False
+            now = time.monotonic()
+            self._prune_prefetch(now)
+            if key in self._prefetched:
+                return False
+            entry = _Prefetch(key=key, at=now)
+            self._prefetched[key] = entry
+            while len(self._prefetched) > PREFETCH_MAX:
+                oldest = min(self._prefetched.values(), key=lambda e: e.at)
+                self._let_go(oldest)
+            try:
+                entry.task = self.create_task(self._prefetch_run(entry), name="gemini-prefetch")
+            except Exception:  # noqa: BLE001 - the service is not running: nothing ahead
+                self._prefetched.pop(key, None)
+                return False
+            self.stats["prefetched"] += 1
+            self._log("tts_prefetch", op="started", chars=len(key[1]))
+            return True
+
+        async def _prefetch_run(self, entry: _Prefetch) -> None:
+            piece = _Piece(text=entry.key[1])
+            reply = _Reply(context_id="prefetch", style=entry.key[0], styled=True)
+            piece.sent_at = time.monotonic()
+
+            async def pump() -> None:
+                while True:
+                    chunk = await piece.queue.get()
+                    if chunk is None:
+                        return
+                    entry.chunks.append(chunk)
+                    entry.grew.set()
+
+            pumping = asyncio.ensure_future(pump())
+            try:
+                async with self._limit:
+                    await self._race(reply, piece, None)
+            except asyncio.CancelledError:
+                pumping.cancel()
+                entry.done = True
+                entry.grew.set()
+                raise
+            except Exception as exc:  # noqa: BLE001 - then the piece is fetched again when said
+                self._log("tts_error", provider=piece.via, error=type(exc).__name__, prefetch=True)
+            piece.queue.put_nowait(None)
+            await pumping
+            entry.via, entry.clean, entry.first_audio_ms = piece.via, piece.clean, piece.first_audio_ms
+            entry.done = True
+            entry.grew.set()
+
+        def _take_prefetch(self, style: str | None, text: str) -> _Prefetch | None:
+            now = time.monotonic()
+            self._prune_prefetch(now)
+            entry = self._prefetched.pop((style, text), None)
+            if entry is None:
+                return None
+            entry.used = True
+            self.stats["prefetch_used"] += 1
+            return entry
+
+        async def _from_prefetch(self, reply: _Reply, piece: _Piece, entry: _Prefetch) -> None:
+            """A piece played from the voice fetched ahead for its words (as it comes, if it is still coming)."""
+            piece.sent_at = time.monotonic()
+            piece.prefetched = True
+            self.stats["pieces"] += 1
+            index = 0
+            try:
+                while True:
+                    entry.grew.clear()
+                    while index < len(entry.chunks):
+                        if piece.first_audio_ms is None:
+                            piece.first_audio_ms = round((time.monotonic() - piece.sent_at) * 1000)
+                        piece.queue.put_nowait(entry.chunks[index])
+                        index += 1
+                    if entry.done:
+                        break
+                    await entry.grew.wait()
+                piece.via, piece.clean = entry.via, entry.clean
+                self._log("tts_prefetch", op="used", chunks=index, via=entry.via,
+                          ahead_ms=round((piece.sent_at - entry.at) * 1000), first_audio_ms=piece.first_audio_ms)
+            except asyncio.CancelledError:
+                piece.queue.put_nowait(None)
+                raise
+            if index == 0:
+                # Fetched ahead and nothing came (it failed): the piece is fetched now, as any other.
+                piece.prefetched = False
+                await self._fetch(reply, piece)
+                return
+            piece.queue.put_nowait(None)
+
+        def _prune_prefetch(self, now: float) -> None:
+            for entry in [e for e in self._prefetched.values() if now - e.at > PREFETCH_KEEP_S]:
+                self._let_go(entry)
+
+        def _let_go(self, entry: _Prefetch) -> None:
+            self._prefetched.pop(entry.key, None)
+            if not entry.used:
+                self.stats["prefetch_wasted"] += 1
+            if entry.task is not None and not entry.task.done():
+                entry.task.cancel()
+
+        def _drop_prefetches(self) -> None:
+            for entry in list(self._prefetched.values()):
+                self._let_go(entry)
 
         async def process_frame(self, frame: Any, direction: Any) -> None:
             if isinstance(frame, (UserStartedSpeakingFrame, UserStoppedSpeakingFrame, LLMFullResponseStartFrame)):
@@ -436,7 +592,12 @@ def service_class() -> type:
                             piece.verdict = self._yuki_guard.start(strip_tags(piece.text), first=piece.first)
                     except Exception:  # noqa: BLE001 - the check fails open
                         piece.verdict = None
-                piece.task = self.create_task(self._fetch(reply, piece), name="gemini-piece")
+                ahead = self._take_prefetch(reply.style, piece.text) if self._prefetched else None
+                if ahead is not None:
+                    # C2 (v3.17): these exact words were fetched while the thinker was still writing them.
+                    piece.task = self.create_task(self._from_prefetch(reply, piece, ahead), name="gemini-piece")
+                else:
+                    piece.task = self.create_task(self._fetch(reply, piece), name="gemini-piece")
             else:
                 piece.queue.put_nowait(None)  # a style mark alone: nothing to say
             reply.pieces.append(piece)
@@ -576,6 +737,7 @@ def service_class() -> type:
                       tags=reply.tags, dropped_tags=reply.dropped,
                       fallback_pieces=sum(1 for p in pieces if p.via not in ("gemini", "cache")),
                       cached_pieces=sum(1 for p in pieces if p.via == "cache"),
+                      prefetched_pieces=sum(1 for p in pieces if p.prefetched),
                       first_audio_ms=[p.first_audio_ms for p in pieces if p.first_audio_ms is not None],
                       trimmed_lead_ms=round(reply.lead_ms), trimmed_tail_ms=round(reply.tail_ms),
                       heard=reply.heard, **({"lost_pieces": lost} if not reply.heard else {}))

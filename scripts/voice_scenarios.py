@@ -535,7 +535,7 @@ def _youtube_desk(timeline: Timeline) -> Any:
     return YouTubeDesk()
 
 
-def _zen_desk(timeline: Timeline) -> Any:
+def _zen_desk(timeline: Timeline, *, popup: bool = False) -> Any:
     """The live session of 2026-09-28 09:06-09:11 (v3.10), test code only: Chrome closed at first, with a "Restore"
     button once opened (the last session's tabs come back when it is clicked); YouTube's home page with the Sonnet 5.5
     video among others; WhatsApp in the background with its chat list (Bro, Res, Mother, Elina...). A chat row
@@ -549,6 +549,11 @@ def _zen_desk(timeline: Timeline) -> Any:
 
     class ZenDesk(base):  # type: ignore[misc, valid-type]
         WHATSAPP = 0x4004
+        #: v3.17 (``popup``): Chrome's "Restore pages?" bubble as live, a window of its own (2 Oct: hwnd 395462),
+        #: never in Chrome's tree; it has the keyboard while it shows. Served to the hands and the thinker the way
+        #: memory's Now picture serves popups (``now_board``).
+        POPUP = 0x5005
+        popup_mode = popup
 
         def __init__(self) -> None:
             super().__init__()
@@ -574,7 +579,35 @@ def _zen_desk(timeline: Timeline) -> Any:
                 return "WhatsApp"
             return super().title(hwnd)
 
+        def bubble(self) -> bool:
+            """The restore bubble shows (popup mode): Chrome open, its last session not restored yet."""
+            return bool(self.popup_mode and self.state.get(self.CHROME) not in ("closed", "hidden")
+                        and not self.restored)
+
+        def now_board(self) -> dict[str, Any]:
+            """What memory's Now picture would serve for this desk: the bubble as a popup while it shows."""
+            popups = []
+            if self.bubble():
+                popups.append({"hwnd": self.POPUP, "app": "Google Chrome", "title": "", "age_s": 1.0, "at": time.time(),
+                               "kind": "", "text": "Restore pages? Chrome didn't shut down correctly.",
+                               "controls": ["Restore pages?", "Restore", "Close"]})
+            return {"at": time.time(), "foreground": self.POPUP if self.bubble() else self.front, "windows": [],
+                    "popups": popups}
+
+        def _guard(self, expect: Any) -> str | None:
+            if expect is not None and int(expect) == self.POPUP and self.bubble():
+                return None   # the bubble has the keyboard
+            return super()._guard(expect)
+
         def get_desktop_overview(self) -> dict[str, Any]:
+            overview = self._overview()
+            if self.bubble():
+                overview["foreground_hwnd"] = self.POPUP   # the bubble is in front, no window of the list
+                for window in overview.get("windows") or []:
+                    window["is_foreground"] = False
+            return overview
+
+        def _overview(self) -> dict[str, Any]:
             order = [self.front] + [h for h in (self.CHROME, self.WHATSAPP, self.SPOTIFY) if h != self.front]
             names = {self.CHROME: "chrome.exe", self.WHATSAPP: "WhatsApp.Root.exe", self.SPOTIFY: "Spotify.exe"}
             windows = []
@@ -645,8 +678,26 @@ def _zen_desk(timeline: Timeline) -> Any:
                 return {"hwnd": hwnd, "title": "WhatsApp", "process_name": "WhatsApp.Root.exe", "elements": elements,
                         "truncated": False, "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 5.0,
                         "passes": 1, "child_windows": 0, "first_pass_elements": len(elements)}
+            if int(hwnd) == self.POPUP:
+                self._perceive("get_window_tree")
+                if not self.bubble():
+                    return {"hwnd": hwnd, "elements": [], "status": "error", "note": "not a window", "title": "",
+                            "process_name": "", "truncated": False, "captured_at": time.time(), "elapsed_ms": 1.0}
+                x, y = 1700, 160
+                self._links = [link for link in getattr(self, "_links", []) if link[1] != "restore"]
+                self._links.append(((x, y), "restore", ""))
+                elements = [{"id": 0, "role": "Pane", "name": "Restore pages?", "depth": 0,
+                             "bounds": (1500, 100, 1900, 200), "center": (1700, 150)},
+                            {"id": 1, "role": "Text", "name": "Chrome didn't shut down correctly.", "depth": 1,
+                             "parent": 0, "bounds": (1510, 110, 1890, 130), "center": (1700, 120),
+                             "is_interactive": False},
+                            {"id": 2, "role": "Button", "name": "Restore", "depth": 1, "parent": 0,
+                             "bounds": (x - 60, y - 15, x + 60, y + 15), "center": (x, y), "is_interactive": True}]
+                return {"hwnd": hwnd, "title": "", "process_name": "chrome.exe", "elements": elements,
+                        "truncated": False, "status": "ok", "note": "", "captured_at": time.time(), "elapsed_ms": 4.0,
+                        "passes": 1, "child_windows": 0, "first_pass_elements": len(elements)}
             tree = super().get_window_tree(hwnd, **kw)
-            if int(hwnd) == self.CHROME and not self.restored:
+            if int(hwnd) == self.CHROME and not self.restored and not self.popup_mode:
                 x, y = 1860, 262
                 tree["elements"].append({"id": len(tree["elements"]), "role": "Button", "name": "Restore", "depth": 5,
                                          "bounds": (x - 60, y - 20, x + 60, y + 20), "center": (x, y),
@@ -679,7 +730,7 @@ def _zen_desk(timeline: Timeline) -> Any:
                 self.opened_chats.append(hit[2])
                 result.summary = f'clicked DataItem "{hit[2]}" at ({x},{y}); the chat with {hit[2]} is open'
                 return result
-            if hit is not None and hit[1] == "restore" and self.front == self.CHROME:
+            if hit is not None and hit[1] == "restore" and (self.front == self.CHROME or self.bubble()):
                 title_before = self.title(self.CHROME)
                 result = self._act("click", "", x, y, **kwargs)
                 self.restored = True
@@ -1059,6 +1110,68 @@ def _settled(conv_box: dict[str, Any], quiet_s: float = 1.5) -> Any:
     return check
 
 
+def _stand_in_now(desk: Any) -> None:
+    """Point memory's Now picture, for everything in this process, at the stand-in desk (v3.17).
+
+    Since the thinker's per-turn situation carries memory's Now picture (``now_in_situation``), an offline run's real
+    brain read the LIVE memory service's picture of the user's real screen through ``yuki.memory.now.shared_client``.
+    Here that client answers with the stand-in desk's own ``now_board`` (or nothing), so a replay sees only its desk.
+    """
+    import yuki.memory.now as now
+
+    board = getattr(desk, "now_board", None)
+
+    class Client:
+        def now(self, wait_s: float = 0.05) -> Any:
+            return board() if callable(board) else None
+
+        def refresh(self, hwnd: Any = None, wait_s: float = 0.05) -> bool:
+            return False
+
+    client = Client()
+    now.shared_client = lambda *a, **k: client
+    if desk is not None and callable(board):
+        from yuki.voice import hands
+
+        hands.real_now_board = lambda wait_s=0.05: board()
+
+
+def speed_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    """v3.17: per scripted line, end of speech -> first audio, the thinker's submit -> its first action, and the job's
+    end -> its outcome's first audio (the next audible stretch); and their p50s over the run."""
+    ev = report["timeline"]
+    ends = report.get("speech_ends") or {}
+    starts = [(e["t"], e["label"]) for e in ev if e["kind"] == "line"]
+    segments = [a for a, _d in report.get("audio_segments") or []]
+    rows = []
+    for i, (t0, label) in enumerate(starts):
+        t1 = starts[i + 1][0] if i + 1 < len(starts) else float("inf")
+        eos = ends.get(label, t0)
+        window = [e for e in ev if eos <= e["t"] < t1]
+        first = [a for a in segments if eos <= a < t1]
+        row: dict[str, Any] = {"line": label, "first_audio_ms": round((first[0] - eos) * 1000) if first else None}
+        subs = [e for e in window if e["kind"] == "brain" and e.get("event") == "submitted"]
+        if subs:
+            sub_t, job = subs[0]["t"], subs[0].get("job")
+            row["handoff_ms"] = round((sub_t - eos) * 1000)
+            acts = [e["t"] for e in window if e["kind"] == "action" and e["t"] >= sub_t]
+            row["handoff_to_action_ms"] = round((acts[0] - sub_t) * 1000) if acts else None
+            done = [e["t"] for e in ev if e["kind"] == "brain" and e.get("event") in ("finished", "failed")
+                    and e.get("job") == job and e["t"] >= sub_t]
+            if done:
+                heard = [a for a in segments if a >= done[0] - 0.05]
+                row["result_heard_ms"] = round((heard[0] - done[0]) * 1000) if heard else None
+                row["eos_to_result_heard_ms"] = round((heard[0] - eos) * 1000) if heard else None
+        rows.append(row)
+
+    def p50(key: str) -> Any:
+        values = sorted(r[key] for r in rows if r.get(key) is not None)
+        return values[len(values) // 2] if values else None
+
+    return {"rows": rows, "p50": {k: p50(k) for k in ("first_audio_ms", "handoff_ms", "handoff_to_action_ms",
+                                                       "result_heard_ms", "eos_to_result_heard_ms")}}
+
+
 def hands_metrics(report: dict[str, Any], labels: list[str]) -> list[dict[str, Any]]:
     """Per scripted line: end of speech -> first audio, -> action executed, action -> next audio, spoken turns."""
     ev = report["timeline"]
@@ -1212,6 +1325,8 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         over["voice_hold_max_s"] = 8.0
     if args.grounding is not None:
         over["voice_grounding"] = args.grounding == "on"
+    if getattr(args, "router", False) and "voice_router" in Settings.__dataclass_fields__:
+        over["voice_router"] = True
     if getattr(args, "grounding_source", None):
         over["voice_grounding_source"] = args.grounding_source
     # v3.14: the voice cache of a replay is its own (never the user's voice folder); --tts-cache-dir shares one
@@ -1408,14 +1523,37 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             ScriptLine(clip("y_thanks"), "h_thanks", after_s=1.0, wait_for=settled()),
         ]
     elif scenario == "zen928":
+        zen_popup = bool(getattr(args, "popup", False))
         # v3.10, the user's session of 2026-09-28 09:06-09:11 ("it felt like talking with 2 people at the same
         # time"): open Chrome, restore, YouTube, the second YouTube tab, close it, scroll x2, the Sonnet 5.5 video,
         # pause, WhatsApp, the Bro chat, scroll up, the res chat. The call detector runs first on the live case (the
         # Zen browser holding the microphone while it plays YouTube).
-        runtime, desk = _real_brain(settings, memory, timeline, desk=_zen_desk(timeline))
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_zen_desk(timeline, popup=zen_popup))
         settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
         names = ["z_chrome", "z_restore", "z_youtube", "z_tab2", "z_close2", "z_scroll", "z_again", "z_sonnet",
                  "z_pause", "z_whatsapp", "z_bro", "z_scrollup", "z_res"]
+        lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
+    elif scenario == "speed1003":
+        # v3.17: thinker jobs that only read (the results said by code, their voice fetched ahead), on the YouTube stub
+        # desk and a COPY of memory (--db): "what did I do today?", a question for the talker, "who's my accountant?",
+        # "is Spotify playing anything?" (the media line: the talker's or the thinker's).
+        runtime, desk = _real_brain(settings, memory, timeline, desk=_youtube_desk(timeline))
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        names = ["r_today", "r_time", "r_who", "r_spotify"]
+        lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
+            ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
+    elif scenario == "popup1003":
+        # v3.17 (F1): live 2 Oct 21:24:33, "Restore the pages." with Chrome open and its "Restore pages?" bubble a window
+        # of its own (memory's Now picture serves it as a popup; the bubble has the keyboard). Then YouTube, the Sonnet
+        # video (a thinker job on the restored page) and a pause.
+        desk = _zen_desk(timeline, popup=True)
+        desk.state[desk.CHROME] = "normal"
+        desk.front = desk.CHROME
+        runtime, desk = _real_brain(settings, memory, timeline, desk=desk)
+        box["front"] = lambda: desk.POPUP if desk.bubble() else desk.front   # live: the bubble had the keyboard
+        settled = lambda: _settled(box, quiet_s=2.0)  # noqa: E731
+        names = ["p_restore", "p_youtube", "p_sonnet", "p_pause"]
         lines = [ScriptLine(clip(names[0]), names[0], after_s=1.0)] + [
             ScriptLine(clip(n), n, after_s=1.0, wait_for=settled()) for n in names[1:]]
     elif scenario == "call928":
@@ -1564,9 +1702,11 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"unknown scenario {scenario}")
 
     z928 = scenario in ("zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead", "cut_stop",
-                        "warp929")
-    front = ((lambda: getattr(desk, "front", None)) if scenario in ("sync927", "screen927", "hands314") or z928
-             else (lambda: None))
+                        "warp929", "popup1003")
+    _stand_in_now(desk)   # v3.17: memory's Now picture is the stand-in desk's (never the live service's)
+    front = box.get("front") or ((lambda: getattr(desk, "front", None))
+                                 if scenario in ("sync927", "screen927", "hands314", "speed1003") or z928
+                                 else (lambda: None))
     bridge = VoiceBridge(runtime, vlog, foreground=front, settings=settings,
                          **({"hands_backend": desk} if scenario in ("latency926", "tabs926", "clarify") else {}))
     call_app = call_evidence = None
@@ -1723,12 +1863,13 @@ def run(app: Any, scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # Audible stretches (split at 0.12 s of silence), for when each spoken line really started.
         report["audio_segments"] = [(round(at - timeline.t0, 2), round(len(samples) / 24_000, 2))
                                     for at, samples in box["output"].replies(gap_s=0.12)]
+    report["speed"] = speed_metrics(report)   # v3.17
     if z928:
         report["call_detector"] = box.get("call_detector")
         report["quiet_asked"] = quiet_asked
         report["z928"] = z928_metrics(report, box)
     if scenario in ("latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927", "zen928", "call928",
-                    "stale928", "hands314", "warp929"):
+                    "stale928", "hands314", "warp929", "speed1003", "popup1003"):
         if "desk" in box:
             timeline.add("desk", **box["desk"].desk_state(timeline.t0))
             report["timeline"] = timeline.events
@@ -1825,6 +1966,8 @@ def summary(report: dict[str, Any]) -> str:
             lines.append(f"{e['t']:7.1f}   ACTION {e['name']} {e.get('args')} {e.get('kwargs')}")
     if report.get("error"):
         lines.append("ERROR " + report["error"])
+    if report.get("speed"):
+        lines.append("speed p50: " + json.dumps(report["speed"]["p50"]))
     return "\n".join(lines)
 
 
@@ -1833,7 +1976,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("scenario", choices=("talk", "steer", "gate", "pauses", "wake2", "live925", "hands", "hands3",
                                          "latency926", "tabs926", "clarify", "parallel927", "sync927", "screen927",
                                          "zen928", "call928", "stale928", "live1326", "cut_side", "cut_instead",
-                                         "cut_stop", "warp929", "hands314", "all"))
+                                         "cut_stop", "warp929", "hands314", "speed1003", "popup1003", "all"))
     ap.add_argument("--era", default="after", choices=("before", "after"),
                     help="hands3: which scroll the stub desktop behaves like (v3.2 or v3.3)")
     ap.add_argument("--grounding", choices=("on", "off"), default=None)
@@ -1859,6 +2002,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--eot", type=float, default=None)
     ap.add_argument("--call", default="", help="zen928/call928/stale928: force the call mode (an app name, or none)")
     ap.add_argument("--evidence", default="", help="with --call: fresh or stale")
+    ap.add_argument("--popup", action="store_true",
+                    help="zen928 (v3.17): Chrome's restore bubble is a window of its own, as live (memory's Now popup)")
+    ap.add_argument("--router", action="store_true", help="v3.17: the hand-off router on (voice_router)")
     ap.add_argument("--dump-mouth", dest="dump_mouth", action="store_true",
                     help="put the tail of every mouth request on the timeline (the JSON report only)")
     args = ap.parse_args(argv)
