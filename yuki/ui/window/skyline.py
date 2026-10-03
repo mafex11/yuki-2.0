@@ -228,12 +228,12 @@ def moment_at(day: Any, at: float) -> Moment:
     noticed = []
     story: list[tuple[str, str]] = []
     if sess is not None:
-        from yuki.ui.window.data import episode_span, episode_text, plain, second_person
+        from yuki.ui.window.data import episode_span, episode_text, plain, natural
 
         facts = [f for f in sess.facts if f.get("importance", 0) >= 4 and not f.get("by_yuki")]
         facts.sort(key=lambda f: (-f.get("importance", 0), f.get("at", 0)))
         for f in facts[:2]:
-            words = plain(second_person(f["text"]))           # in full: the panel wraps, never cuts
+            words = plain(natural(f["text"]))           # in full: the panel wraps, never cuts
             noticed.append(f"Said as a joke: {words}" if f.get("nature") == "humor" else words)
         several = len(sess.episodes) > 1
         story = [(episode_span(text) if several else "", episode_text(text)) for text in sess.episodes]

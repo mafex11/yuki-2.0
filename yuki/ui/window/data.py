@@ -118,8 +118,8 @@ def episode_gist(text: str, limit: int = 90) -> str:
 
 def episode_text(text: str) -> str:
     """An episode in full, as the window shows it: without its ``HH:MM-HH:MM:`` prefix, plain, capitalised,
-    never shortened (2026-09-28, the user: the hovered moment "cuts off with '...'")."""
-    s = plain(second_person(_EPISODE_TIME.sub("", text or "").strip()))   # "the user was" -> "you were"
+    natural dates and times, never shortened (2026-09-28, the user: the hovered moment "cuts off with '...'")."""
+    s = plain(natural(_EPISODE_TIME.sub("", text or "").strip()))
     return s[:1].upper() + s[1:] if s else s
 
 
@@ -132,47 +132,63 @@ def episode_span(text: str) -> str:
     return f"{m.group(1)} to {m.group(2)}" if m else ""
 
 
-# Portrait and journal text is written about "the user" (third person). The
-# window speaks to the user: a sentence that starts with the user becomes a note
-# ("The user works at X" -> "Works at X"), a possessive becomes "your", and the user
-# further in becomes "you" (with the verb turned: "the user was" -> "you were").
-# A fixed grammar pass, presentation only. Phase 2: the portrait render returns a
-# second-person line itself.
-_ADVERBS = r"(?:also |often |sometimes |currently |usually |still |now |then |recently |regularly |frequently |mostly |has |had |is |was )?"
-_LEAD = re.compile(r"(^|(?<=[.!?;]\s))The user (" + _ADVERBS + r")([a-z]+)\b")
-_MID = re.compile(r"\bthe user (" + _ADVERBS.replace("has |had |is |was ", "") + r")([a-z]+)\b")
+# Memory writes its facts about "the user" and keeps a second form said to the user (``shown``: second person,
+# natural dates; migration 33, revamp 38 §2d), written by the same model call. The window shows that form; the old
+# word-matching pass that turned "the user" into "you" is gone (it could not know who "they" was). What stays at
+# render is a FORMAT conversion only, for text that has no shown form yet: ISO dates and 24-hour clock times become
+# the natural forms people say ("2026-09-25" -> "25 September", "21:52" -> "9:52 PM"). No word is matched.
+
+_ISO_DATE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?)?\b")
+_CLOCK = re.compile(r"(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?![\d:])(?!\s?[AaPp]\.?[Mm]\b)")
 
 
-def _base_verb(word: str) -> str | None:
-    irregular = {"is": "are", "was": "were", "has": "have", "does": "do", "says": "say"}
-    if word in irregular:
-        return irregular[word]
-    if word.endswith("ies") and len(word) > 4:
-        return word[:-3] + "y"
-    if re.search(r"(ss|sh|ch|x|z|o)es$", word):
-        return word[:-2]
-    if word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return None
+def nat_time(at: float | None = None, *, hour: int | None = None, minute: int = 0) -> str:
+    """``9:06 PM`` / ``2 AM``: a 12-hour clock time as people say it (from an epoch, or an hour and minute)."""
+    if hour is None:
+        if not at:
+            return ""
+        d = datetime.fromtimestamp(float(at))
+        hour, minute = d.hour, d.minute
+    h12 = hour % 12 or 12
+    return f"{h12}{'' if minute == 0 else f':{minute:02d}'} {'AM' if hour < 12 else 'PM'}"
 
 
-def second_person(text: str) -> str:
-    """"The user works at X" -> "Works at X"; "the user's brother" -> "your brother"; "owes the user" -> "owes you"."""
-    t = text or ""
-    t = re.sub(r"\bThe user's\b", "Your", t)
-    t = re.sub(r"\bthe user's\b", "your", t)
-    t = _LEAD.sub(lambda m: m.group(1) + (m.group(2) + m.group(3))[:1].upper() + (m.group(2) + m.group(3))[1:], t)
+def nat_day(at: float | None, *, today: date | None = None, words: bool = True) -> str:
+    """``today`` / ``yesterday`` / ``25 September`` (the year only when it is not this year)."""
+    if not at:
+        return ""
+    d = datetime.fromtimestamp(float(at)).date()
+    today = today or date.today()
+    if words and d == today:
+        return "today"
+    if words and d == today - timedelta(days=1):
+        return "yesterday"
+    return f"{d.day} {d:%B}" + (f" {d.year}" if d.year != today.year else "")
 
-    def mid(m: re.Match) -> str:
-        verb = _base_verb(m.group(2)) if not m.group(1) else None
-        if m.group(2) in ("is", "was", "has", "does", "says"):
-            verb = _base_verb(m.group(2))
-        return "you " + m.group(1) + (verb or m.group(2))
 
-    t = _MID.sub(mid, t)
-    t = re.sub(r"\bthe user\b", "you", t)
-    t = re.sub(r"\bThe user\b", "You", t)
-    return t
+def nat_when(at: float | None, *, today: date | None = None) -> str:
+    """``yesterday, 2:29 AM`` / ``25 September, 2 AM`` / ``today, 9:06 PM``: a day and a 12-hour time."""
+    return f"{nat_day(at, today=today)}, {nat_time(at)}" if at else ""
+
+
+def natural(text: str, *, today: date | None = None) -> str:
+    """``text`` with its ISO dates and 24-hour clock times in natural form: a deterministic format conversion,
+    nothing else changes ("On 2026-09-25 from about 02:00 to 03:22" -> "On 25 September from about 2 AM to 3:22
+    AM"). For text memory has no shown form for yet."""
+    today = today or date.today()
+
+    def iso(m: re.Match) -> str:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return m.group(0)
+        out = f"{d.day} {d:%B}" + (f" {d.year}" if d.year != today.year else "")
+        if m.group(4) is not None:
+            out += f", {nat_time(hour=int(m.group(4)), minute=int(m.group(5)))}"
+        return out
+
+    t = _ISO_DATE.sub(iso, text or "")
+    return _CLOCK.sub(lambda m: nat_time(hour=int(m.group(1)), minute=int(m.group(2))), t)
 
 
 # -- config files (read only) ------------------------------------------------------
@@ -259,6 +275,7 @@ class Session:
     episodes: list[str]
     facts: list[dict[str, Any]]
     longest: float = 0.0       # the longest episode inside (its gist is the title)
+    title_full: str = ""       # that episode's whole first sentence (the title is cut at a word for the row)
 
 
 @dataclass
@@ -441,7 +458,7 @@ def dashboard_counts(memory: Any) -> dict[str, Any]:
         qs = memory.questions(statuses=("open",), limit=50)
         out["questions"] = len(qs)
         if qs:
-            out["question"] = plain(second_person(str(qs[0].get("question") or "")))
+            out["question"] = plain(natural(str(qs[0].get("question") or "")))
     except Exception:
         pass
     try:
@@ -495,9 +512,10 @@ def _sessions(memory: Any, since: float, until: float, segments: list[Segment], 
             last.episodes.append(text)
             _, last.present_s, last.apps = lead(last.start, e)
             if e - s > last.longest:
-                last.title, last.longest = episode_gist(text), e - s
+                last.title, last.longest, last.title_full = episode_gist(text), e - s, episode_gist(text, 100_000)
             continue
-        out.append(Session(s, e, lane, episode_gist(text), present, apps, [text], [], e - s))
+        out.append(Session(s, e, lane, episode_gist(text), present, apps, [text], [], e - s,
+                           episode_gist(text, 100_000)))
     for sess in out:
         sess.facts = [f for f in facts if sess.start <= f["at"] < sess.end and f["nature"] != "uncertain"]
     return out
@@ -589,8 +607,10 @@ def portrait_item(f: dict[str, Any], today: date | None = None) -> Item:
         tags.append("you")
     elif f["confidence"] is not None and f["confidence"] < UNSURE_BELOW:
         tags.append("unsure")
-    text = plain(second_person(f["text"]))
-    summary = second_person(short_field(f, "summary"))
+    # memory's shown form (said to the user, natural dates); until it is written, the fact's own text with its dates
+    # and times in natural form
+    text = plain(" ".join(str(f.get("shown") or "").split()) or natural(f["text"]))
+    summary = natural(short_field(f, "summary"))
     title = short_field(f, "title") or f["subject"]
     return Item(f["ref"], title, text, summary or first_sentence(text, 180), f["kind"], f["aspect"], f["origin"],
                 f["since"], f["confidence"], _source_line(f["origin"], f["since"], ev, today), tags, ev, summary)
@@ -611,7 +631,7 @@ def build_me(memory: Any, *, today: date | None = None) -> MeView:
     unsure = []
     for j in memory.journal_entries(week, None):
         if j["nature"] == "uncertain":
-            text = plain(second_person(j["text"]))
+            text = plain(natural(j["text"]))
             app = j["app"] or ""
             where = "a call" if app.startswith("call") else app
             unsure.append(Item(f"journal:{j['id']}", app, text, first_sentence(text, 180), "journal", None, "model",
@@ -691,12 +711,12 @@ def read_todos(memory: Any) -> tuple[list["Todo"], list["Todo"]]:
     todos, promises = [], []
     for t in memory.todos(include_done=False):
         source, quote = _todo_source(t)
-        text = plain(second_person(str(t.get("text") or "")))
+        text = plain(natural(str(t.get("text") or "")))
         # memory says whose it is ("owner", 2026-09-27); an older memory without it: Yuki's own promises
         # were its "commitment" source
         owner = str(t.get("owner") or ("yuki" if t.get("source") == "commitment" else "user"))
         item = Todo(str(t.get("id")), first_sentence(text, 200), source, plain(quote), _due_label(t.get("due")), t,
-                    owner, second_person(short_field(t, "title")))
+                    owner, natural(short_field(t, "title")))
         (promises if owner == "yuki" else todos).append(item)
     return todos, promises
 
@@ -747,7 +767,7 @@ def _todo_source(t: dict[str, Any]) -> tuple[str, str]:
         return f"Yuki promised in a chat, {when}", quote
     if src == "user":
         return f"You added it, {when}", ""
-    ev = plain(second_person(ev))
+    ev = plain(natural(ev))
     return (ev[:1].upper() + ev[1:] if ev else f"Seen in your day, {when}"), ""
 
 
@@ -763,7 +783,7 @@ def _due_label(value: Any) -> str:
 
 def build_yuki(memory: Any, *, today: date | None = None) -> YukiView:
     portrait = memory.portrait_text()
-    talk = [plain(second_person(s)) for s in sentences(portrait_section(portrait, "Relationship"))]
+    talk = [plain(natural(s)) for s in sentences(portrait_section(portrait, "Relationship"))]
     persona_block = memory.yuki_persona() or ""
     persona = [plain(ln.strip().lstrip("-").strip()) for ln in persona_block.split("\n")
                if ln.strip().lstrip("-").strip()]

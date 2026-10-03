@@ -632,13 +632,13 @@ class WebWindow:
         if name == "work":
             return W.build_work(m)
         if name == "day":
-            return W.build_day(m)
+            return W.build_day(m, people=self._people_ids())
         if name == "me":
             return W.build_me(m, pending=self.pending, people=self._people())
         if name == "playbook":   # practice memory's workflows(), read by this window's own memory client
             return W.build_playbook(m)
-        if name == "activity":
-            return W.build_activity(m, requests_csv=self.requests_csv())
+        if name == "activity":   # the people index names a call's friends once (two handles, one friend)
+            return W.build_activity(m, requests_csv=self.requests_csv(), people=self._people_ids())
         if name == "settings":
             live = {k: self.tray_state.get(k) for k in ("wake", "mic", "speaker") if k in self.tray_state}
             data = W.build_settings(m, live=live, devices=self._devices(), policy_path=self.policy_path)
@@ -662,6 +662,16 @@ class WebWindow:
                     return "index", people
                 return W.people_now(self.memory, use_index=False)
         return W.people_now(self.memory)
+
+    def _people_ids(self) -> list[dict[str, Any]]:
+        """Who's who for a call's people (each person's names and handles), kept a minute: Day and Activity name a
+        call's friends once on every build without reading the people index each time."""
+        now = time.time()
+        cache = getattr(self, "_ids_cache", None)
+        if cache is None or now - cache[0] > 60.0:
+            cache = (now, [{"name": p.get("name"), "ids": p.get("ids") or []} for p in self._people()[1]])
+            self._ids_cache = cache
+        return cache[1]
 
     def _devices(self) -> dict[str, Any] | None:
         reply = self.request("devices", wait_s=3.0) if self.client is not None else None
@@ -1206,7 +1216,8 @@ class WebWindow:
         "skip_question": "a_skip_question", "stop": "a_stop", "stop_call": "a_stop_call", "steer": "a_steer",
         "submit": "a_submit", "askbar": "a_askbar", "continue": "a_continue", "copy": "a_copy", "correct": "a_correct",
         "forget": "a_forget", "rule_edit": "a_rule_edit", "person": "a_person", "workflow_edit": "a_workflow_edit",
-        "todo_undo": "a_todo_undo",
+        "todo_undo": "a_todo_undo", "pin": "a_pin", "resolve_heard": "a_resolve_heard", "review_mark": "a_review_mark",
+        "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
         "motion": "a_motion", "call_pref": "a_call_pref",
@@ -1410,6 +1421,100 @@ class WebWindow:
         self.refresh("activity")
         self.refresh("home")
         return {"ok": bool(done)} if done else {"ok": False, "error": "It was already off your list."}
+
+    #: Memory's "too late" answer to an Undo after its correction pass started, said by Yuki itself.
+    TOO_LATE = "Too late to undo: I’m already updating my memory from your answer."
+
+    def _memory_op(self, name: str) -> Any:
+        fn = getattr(self._memory(), name, None)
+        if not callable(fn):
+            raise RuntimeError(f"memory has no {name}")
+        return fn
+
+    def a_pin(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Pin and Unpin on a fact, a routine or a person's summary: its own flag in memory (``pin_fact``; one write,
+        no model), so the button toggles and the next build shows the same."""
+        ref, on = str(m.get("ref") or ""), bool(m.get("on", True))
+        if not ref:
+            return {"ok": False, "error": "Nothing to pin."}
+        r = self._memory_op("pin_fact")(ref, on) or {}
+        self.refresh("me")
+        if not r.get("ok"):
+            return {"ok": False, "error": "That changed since you opened it. I’ll show it again."}
+        return {"pinned": bool(r.get("pinned"))}
+
+    def _answer(self, op: str, m: dict[str, Any], verdicts: tuple[str, ...]) -> dict[str, Any]:
+        ref, verdict = str(m.get("ref") or ""), str(m.get("verdict") or "")
+        if not ref or verdict not in verdicts:
+            return {"ok": False, "error": "Unknown answer."}
+        cid = m.get("correction_id")
+        r = self._memory_op(op)(ref, verdict, correction_id=int(cid) if isinstance(cid, int) else None) or {}
+        self.refresh("me")
+        if r.get("ok"):
+            return {"correction_id": r.get("correction_id"), "verdict": verdict}
+        too_late = verdict == "undo" and str(r.get("error") or "").startswith("Too late")
+        return {"ok": False, "too_late": too_late,
+                "error": self.TOO_LATE if too_late else "That changed since you opened it. I’ll show it again."}
+
+    def a_resolve_heard(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Maybe misheard: Right / Wrong at once (``resolve_heard``, no model on the click), Undo inside the row's 5 s;
+        an Undo after the correction pass started is too late and the item stays resolved."""
+        return self._answer("resolve_heard", m, ("right", "wrong", "undo"))
+
+    def a_review_mark(self, m: dict[str, Any]) -> dict[str, Any]:
+        """To review: Right / Wrong / Not mine at once (``review_mark``), Undo inside the row's 5 s."""
+        return self._answer("review_mark", m, ("right", "wrong", "notmine", "undo"))
+
+    def a_thread_days(self, m: dict[str, Any]) -> dict[str, Any]:
+        """The thread's days (a new chat every day, the 3 Oct item 15): the connector line about your last day
+        (memory's day digest said to you, with what was left open) and the earlier days with exchanges, for the
+        drawer's separators and one-line folds. Reads only."""
+        mem = self._memory()
+        conn = getattr(mem, "day_connector", None)
+        days_fn = getattr(mem, "chat_days", None)
+        c = (conn() if callable(conn) else None) or None
+        connector = None
+        if isinstance(c, dict) and str(c.get("text") or "").strip():
+            connector = {"day": c.get("day"), "label": c.get("label") or "", "text": " ".join(str(c["text"]).split()),
+                         "open": [" ".join(str(o.get("text") or "").split()) for o in c.get("open") or []
+                                  if isinstance(o, dict) and str(o.get("text") or "").strip()][:3]}
+        days = []
+        for d in (days_fn(days=14) if callable(days_fn) else []) or []:
+            if isinstance(d, dict) and d.get("day"):
+                days.append({"day": str(d["day"]), "count": int(d.get("count") or 0), "first_at": d.get("first"),
+                             "last_at": d.get("last")})
+        return {"connector": connector, "days": days}
+
+    def a_chat_day(self, m: dict[str, Any]) -> dict[str, Any]:
+        """One earlier day's exchanges, when you open its fold in the drawer (``turns_on``): what you said (Yuki's
+        own context blocks taken off) and what Yuki answered."""
+        from yuki.ui.chat_model import clean_request
+
+        fn = getattr(self._memory(), "turns_on", None)
+        if not callable(fn):
+            return {"ok": False, "error": "This memory keeps no earlier days yet."}
+        turns = []
+        for t in fn(str(m.get("day") or "")) or []:
+            if isinstance(t, dict):
+                turns.append({"id": f"t{t.get('id')}", "at": t.get("at"), "user": clean_request(str(t.get("user") or "")),
+                              "reply": " ".join(str(t.get("reply") or "").split()), "outcome": t.get("outcome") or ""})
+        return {"turns": turns}
+
+    def a_day_answer(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Your answer to the connector line ("Yesterday you were fixing X. Still on it?"). "Still on it" keeps it
+        open: nothing in memory is wrong, so nothing is sent. "Done" reaches memory the way your words about what it
+        knows always do, as a correction its fold applies (memory has no direct "done" for a day's open item yet);
+        sent after the line's Undo window, like Forget."""
+        verdict, item = str(m.get("verdict") or ""), " ".join(str(m.get("item") or "").split())
+        if verdict == "still":
+            return {"sent": False}
+        if verdict != "done" or not item:
+            return {"ok": False, "error": "Nothing to mark."}
+        from yuki.ui.window.actions import correction_text
+
+        fid = self._memory().correct_portrait(correction_text("what was still open yesterday", item, "That's done now."))
+        self.refresh("me")
+        return {"sent": True, "correction_id": fid}
 
     def a_permissions_set(self, m: dict[str, Any]) -> dict[str, Any]:
         kind, level = str(m.get("kind") or ""), str(m.get("level") or "")
