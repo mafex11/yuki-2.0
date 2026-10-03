@@ -343,4 +343,4 @@ def test_stop_listening_alone_ends_the_conversation_and_is_never_quiet_time() ->
     from yuki.voice.mouth import GO_QUIET, MOUTH_PROMPT
 
     assert "you wait for your name again" in MOUTH_PROMPT   # vfix V1 wording
-    assert "are end_conversation, never this" in GO_QUIET["description"]
+    assert "end_conversation, never this" in GO_QUIET["description"]

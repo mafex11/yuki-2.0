@@ -351,7 +351,7 @@ def test_v1_v3_the_talker_prompt_ends_on_shut_up_go_away_and_bye_and_go_quiet_is
 
     assert "shut up for a couple of hours" not in MOUTH_PROMPT and "shut up for" not in GO_QUIET["description"]
     assert '"ugh, shut up" or "go away" -> end_conversation(say_first="") alone' in MOUTH_PROMPT
-    assert 'Bad: "shut up" -> go_quiet or stay_quiet' in MOUTH_PROMPT
+    assert 'Bad: "shut up" or "leave me alone for a bit" -> go_quiet or stay_quiet' in MOUTH_PROMPT
     assert "a mistaken wake is a sign-off" in MOUTH_PROMPT
     assert "go back to sleep" in END_CONVERSATION["description"]
     assert '""' in END_CONVERSATION["properties"]["say_first"]["description"]
@@ -513,6 +513,8 @@ def fast_scroll(monkeypatch: pytest.MonkeyPatch) -> Any:
 
     monkeypatch.setattr(scrolling, "TICK_S", 0.005)
     monkeypatch.setattr(scrolling, "PACES", {"slow": (0.04, 3), "normal": (0.02, 4), "fast": (0.01, 6)})
+    # never the real keyboard or mouse in a test (someone using the PC would stop the scroll)
+    monkeypatch.setattr(scrolling, "input_watch", lambda: (lambda: False))
     yield scrolling
     scrolling.stop_continuous("ended", wait_s=1.0)
     scrolling.set_voice_hold(None)

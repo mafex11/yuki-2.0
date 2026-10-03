@@ -101,6 +101,13 @@ def cases() -> list[dict[str, Any]]:
         dict(id="call_banter", issue="V2 control", check="quiet", call="Discord", messages=[u("bro did you see that clutch")]),
         dict(id="call_shut_up", issue="V1", check="end_quiet", call="Discord", messages=[u("Yuki, shut up.")]),
         dict(id="stop_listening_2h", issue="V1 control", check="go_quiet_120", messages=[*chat, u("stop listening for two hours")]),
+        # V2: with the named refusal gone from code, words right after the name are never left in silence
+        dict(id="named_pause", issue="V2 named", check="not_quiet", named=True, messages=[u("Pause the music.")]),
+        dict(id="named_call_open", issue="V2 named", check="not_quiet", named=True, call="Discord",
+             messages=[u("Open Slack.")]),
+        dict(id="named_call_time", issue="V2 named", check="not_quiet", named=True, call="Discord",
+             messages=[u("What time is it?")]),
+        dict(id="leave_alone_for_now", issue="V1", check="end_any", messages=[*chat, u("Leave me alone for now.")]),
         dict(id="thanks", issue="V2 control", check="not_quiet", messages=[
             u("pause the music"), call("media_key", {"key": "playpause", "want": "paused", "say_when_done": "Paused."},
                                        "m1"), result("m1", {"done": "media: Chrome now paused", "said": "Paused."}),

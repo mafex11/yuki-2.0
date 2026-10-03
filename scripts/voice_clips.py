@@ -465,7 +465,7 @@ V318_CLIPS = [
 VFIX_USER = ("deepgram", "aura-2-apollo-en")
 VFIX_CLIPS = [
     ("k_name", "Yuki."), ("e_whatsup", "What's up?"), ("e_shutup", "Shut up."),
-    ("e_goaway", "Go away for now, man."), ("e_bye", "Okay, bye."),
+    ("e_goaway", "Go away for now, man."), ("e_bye", "Okay, that's all for now. Bye."),
     ("e_mistake", "Oh, never mind, wrong moment, sorry. You can go back to sleep."),
 ]
 
