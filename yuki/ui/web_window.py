@@ -71,11 +71,57 @@ FOCUS_EVENT = "Local\\YukiWindowFocus"
 #: The pages, and the Qt window's page names (yuki.ui.own_window.PAGES: the agent's open_yuki tool) mapped to them.
 PAGES = ("home", "work", "me", "playbook", "activity", "settings")
 PAGE_ALIASES = {"today": "home", "status": "activity", "yuki": "playbook", "chat": "home", "day": "work"}
-#: Home is read again this often while the window is open (the rest when shown, if older than STALE_S).
-HOME_REFRESH_S = 60.0
+#: A page asked for (navigation) is checked against memory's change stamps if older than this.
 STALE_S = 45.0
-#: A want for the open page again (the same tab clicked, the window shown again): rebuilt if older than this.
+#: A want for the open page again (the same tab clicked, the window shown again): checked if older than this.
 AGAIN_S = 5.0
+
+# -- live refresh (42-window-live-refresh.md §6): event-driven, the open page only, coalesced, never while hidden --
+#: Topic (a closed machine name: what changed in memory or the tray) -> the pages that show it. ``shell`` is the
+#: rail (always on screen).
+TOPIC_PAGES: dict[str, tuple[str, ...]] = {
+    "cards": ("shell", "home", "activity"),          # a card or question arrived, or memory has a reaction to one
+    "call": ("home", "day", "activity"),             # the tray's forwarded call status (the rail is patched from it)
+    "request_end": ("home", "activity"),             # a request finished, failed or was replaced (the request log)
+    "rules": ("me", "playbook"),
+    "todos": ("home", "activity"),
+    "standing": ("playbook",),
+    "portrait": ("me", "home"),
+    "people": ("me", "home"),
+    "voice": ("settings",),                          # the tray's voice, devices or hotkeys changed
+    "settings": ("settings",),                       # one of Settings' own controls was used
+    "media": ("home",),
+    "memory_state": ("shell", "settings"),           # memory paused or resumed
+}
+#: After these, the pages may have changed (a run can move a thread or teach a procedure): their change stamps are
+#: read, and the page is built only if one moved.
+CHECK_TOPICS: dict[str, tuple[str, ...]] = {"request_end": ("work", "playbook"), "practice": ("playbook",)}
+#: The agent's memory tools (``tool_finished`` carries the name) -> topic. Every memory write the agent can make is
+#: here (a test checks it against :data:`yuki.agent.tools.MEMORY_TOOLS`); ``about`` changes routes only with
+#: ``prefer_route``, so it is a stamp check.
+TOOL_TOPICS: dict[str, str] = {"remember_rule": "rules", "forget_rule": "rules", "todo": "todos",
+                               "watch_for": "standing", "remember_how": "practice", "correct_memory": "portrait",
+                               "answer_question": "portrait", "about": "people_check"}
+CHECK_TOPICS["people_check"] = ("me", "home")
+#: A burst of events builds once: the build waits this long after the last event (trailing), at most MAX_WAIT_S
+#: after the first, and a page is built at most once per MIN_GAP_S by events (your own actions go at once).
+DEBOUNCE_S = 1.5
+MAX_WAIT_S = 4.0
+MIN_GAP_S: dict[str, float] = {"home": 10.0, "shell": 5.0}
+DEFAULT_GAP_S = 2.0
+#: Data with no event (threads, the day's timeline, people, the playbook, portrait facts, a tray that is down): the
+#: open page's change stamps are read this often while it can be seen and no call records (a few indexed reads).
+FALLBACK_S: dict[str, float] = {"home": 300.0, "work": 300.0, "day": 120.0, "activity": 300.0, "me": 600.0,
+                                "playbook": 600.0}
+#: Fields that change on every build without anything to show (wrong 4 of the verification): left out of the
+#: "did it change" hash. The page's ticker draws the clock-driven ones itself.
+VOLATILE: dict[str, tuple[str, ...]] = {"home": ("since",), "day": ("now_min",), "settings": ("usage",)}
+#: Messages held while the window can't be seen (minimised, hidden, covered by a full-screen app); one catch-up on show.
+HOLD_KINDS = frozenset({"data", "live", "chat"})
+#: The tray's state fields the Settings page shows (a change in any of them rebuilds Settings if it is open).
+SETTINGS_STATE = ("wake", "mic", "speaker", "hotkeys", "devices", "tts_voice")
+#: What is playing (the Now strip) is read again at most this often, after a Home build.
+MEDIA_S = 60.0
 #: While yuki-ui is not answering, look for it again this often.
 RECONNECT_S = 10.0
 #: While a correction waits to be applied by memory, look this often (a read, no model).
@@ -118,6 +164,46 @@ def page_name(page: str | None) -> tuple[str, bool]:
     """(the window's page for a requested name, whether to open the thread drawer): Qt names map to the new pages."""
     p = str(page or "").strip().casefold()
     return (p if p in PAGES else PAGE_ALIASES.get(p, "home")), p == "chat"
+
+
+def page_hash(name: str, data: Any) -> str:
+    """What a page's data says, as a short digest: equal digests need no post (the page's :data:`VOLATILE` fields,
+    which change on every build with nothing new to show, left out)."""
+    import hashlib
+
+    if isinstance(data, dict) and VOLATILE.get(name):
+        data = {k: v for k, v in data.items() if k not in VOLATILE[name]}
+    text = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=12).hexdigest()
+
+
+#: Keys whose number is a moment the page changes by the clock alone (an Undo window closing, an offer running out,
+#: Home's away window moving on): machine field names of the page data, never content.
+CLOCK_KEYS = frozenset({"until", "undo_until", "expires_at", "next_at"})
+
+
+def next_boundary(data: Any, now: float) -> float:
+    """The next moment ``data`` changes with time alone: the earliest future value under :data:`CLOCK_KEYS`, or
+    the next local midnight ("today", the date, the day's timeline), whichever comes first."""
+    from datetime import datetime, timedelta
+
+    best = (datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+            + timedelta(days=1, seconds=1)).timestamp()
+
+    def walk(v: Any) -> None:
+        nonlocal best
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if k in CLOCK_KEYS and isinstance(x, (int, float)) and not isinstance(x, bool):
+                    if now < x < best:
+                        best = float(x)
+                else:
+                    walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(data)
+    return best
 
 
 def default_db_path() -> Path:
@@ -206,6 +292,25 @@ class WebWindow:
         self._runs_sig = ""
         self._live_t: threading.Timer | None = None
         self.call_status: dict[str, Any] | None = None   # the tray's last forwarded call_status()
+        # live refresh (42 §6): pages marked for a build (dirty) or a stamp check (maybe), with the topics that marked
+        # them; when each is due (debounced); what was last posted (a hash) and the stamps it was built at
+        self._cv = threading.Condition()
+        self.dirty: dict[str, set[str]] = {}
+        self.maybe: dict[str, set[str]] = {}
+        self._due: dict[str, float] = {}
+        self._first: dict[str, float] = {}
+        self._last_build: dict[str, float] = {}
+        self.posted: dict[str, str] = {}
+        self.seen_stamps: dict[str, Any] = {}
+        self._clock_at: dict[str, float] = {}
+        self._fallback_at = float("inf")
+        self.covered = False                  # a full-screen app is in front (from _watch_cover)
+        self._held: set[str] = set()          # kinds of messages held while the window can't be seen
+        self._held_pages: set[str] = set()
+        self._settings_sig = ""
+        self.playing: dict[str, Any] | None = None
+        self._media_at = 0.0
+        self._log_path: Path | None = None
         self.pending: dict[str, dict[str, Any]] = {}
         self.metrics: dict[str, Any] = {"t0": t0, "pid": os.getpid(), "frozen": bool(getattr(sys, "frozen", False)),
                                         "python": sys.version.split()[0], "fixture": fixture is not None}
@@ -218,8 +323,22 @@ class WebWindow:
     # -- the page ------------------------------------------------------------------------------------------
 
     def post(self, message: dict[str, Any]) -> None:
-        if self.host is not None:
-            self.host.post(message)
+        """To the page. Page data, live state and the thread wait while the window can't be seen (minimised,
+        hidden, covered by a full-screen app): nothing wakes the page's JS then; :meth:`catch_up` sends one of each."""
+        if self.host is None:
+            return
+        kind = message.get("kind")
+        if kind in HOLD_KINDS and self.booted and not self.may_refresh():
+            with self._lock:
+                first = not self._held and not self._held_pages
+                if kind == "data":
+                    self._held_pages.add(str(message.get("page")))
+                else:
+                    self._held.add(str(kind))
+            if first:
+                self.log("web_hold", page=self.open_page, reason="hidden" if not self.window_shown() else "covered")
+            return
+        self.host.post(message)
 
     def on_message(self, message: Any) -> None:
         """A message from the page (UI thread): never waits on memory or the pipe."""
@@ -235,9 +354,7 @@ class WebWindow:
         elif op == "want":
             page = str(message.get("page") or "")
             if page in PAGES or page == "day":
-                self.open_page = page   # the host knows which page is open only from here (42 verification, missing 6)
-                again = bool(message.get("again") or message.get("shown"))
-                self.refresh(page, stale_s=AGAIN_S if again else STALE_S)
+                self.want(page, again=bool(message.get("again")), shown=bool(message.get("shown")))
         elif op == "act":
             threading.Thread(target=self._act, args=(message,), name="yuki-web-act", daemon=True).start()
         elif op == "caption" and self.host is not None:   # where the page drew its title bar (Windows' hit test)
@@ -266,6 +383,8 @@ class WebWindow:
         with self._lock:
             pages = dict(self.pages)
             self.booted = True
+            for k, v in pages.items():   # what the page has: fresh data equal to it is not sent again
+                self.posted.setdefault(k, page_hash(k, v))
         chat = self.chat_payload() if self.model is not None else None
         self.post({"kind": "boot", "source": "snapshot", "shell": self.shell, "pages": pages, "chat": chat,
                    "appearance": appearance(), "page": self.page})
@@ -273,15 +392,26 @@ class WebWindow:
             self.post({"kind": "focus", "page": self.page, "thread": True})
         self.marks["boot_sent"] = time.time()
 
-    def send_page(self, name: str, data: Any, source: str = "memory") -> None:
+    def send_page(self, name: str, data: Any, source: str = "memory", built_at: float | None = None) -> bool:
+        """Keep ``data`` as the page's and send it, unless the page already has exactly this (the hash of the data,
+        less its :data:`VOLATILE` fields). Returns whether it was sent."""
+        digest = page_hash(name, data)
         with self._lock:
             self.pages[name] = data
             self.stamps[name] = time.time()
             if source == "memory":
                 self.fresh.add(name)
+            if name == "home" and isinstance(data, dict):
+                self.shell["needs"] = len(data.get("needs") or [])
             booted = self.booted
+            if self.posted.get(name) == digest:
+                return False
+            if booted:
+                self.posted[name] = digest
         if booted:
-            self.post({"kind": "data", "page": name, "data": data, "source": source})
+            self.post({"kind": "data", "page": name, "data": data, "source": source,
+                       **({"built_at": round(built_at, 3)} if built_at else {})})
+        return booted
 
     def post_live(self) -> None:
         if self.booted:
@@ -342,52 +472,108 @@ class WebWindow:
             if self.want_connect and self.cipher is not None and self.client is None:
                 threading.Thread(target=self._connect, daemon=True).start()
         self._load_pending()
+        # the one pass at open: every page from memory once (navigation then shows fresh data at once); after it,
+        # only the open page is built, and only when something changed
         for name in ("shell", "home", self.page if self.page != "home" else "work", "me", "work", "activity",
                      "settings", "playbook", "day"):
-            self.refresh(name)
-        threading.Thread(target=self._timers, name="yuki-web-timers", daemon=True).start()
+            self._enqueue(name, "open")
+        self._arm_fallback()
+        threading.Thread(target=self._scheduler, name="yuki-web-refresh", daemon=True).start()
 
     # -- page data (one worker, one read at a time) -------------------------------------------------------------
 
-    def refresh(self, name: str, stale_s: float | None = None) -> None:
+    def refresh(self, name: str, stale_s: float | None = None, reason: str = "action") -> None:
+        """``name`` changed by something the user just did (a button here, a correction applied): built at once
+        if it is open (or the rail), else marked to be built when it is next opened."""
         if self.memory is None and self.fixture is None:
             return
         if stale_s is not None and time.time() - self.stamps.get(name, 0.0) < stale_s and name in self.fresh:
             return
+        self.mark(name, reason, urgent=True)
+
+    def _enqueue(self, name: str, reason: str, topics: tuple[str, ...] = (), check: bool = False) -> None:
         with self._lock:
-            if name in self._queued:
+            key = ("check:" if check else "") + name
+            if key in self._queued:
                 return
-            self._queued.add(name)
-        self._jobs.put(("page", name))
+            self._queued.add(key)
+        self._jobs.put(("check" if check else "page", name, reason, topics))
 
     def _worker(self) -> None:
         while True:
             job = self._jobs.get()
             if job is None:
                 return
-            _kind, name = job
+            kind, name = job[0], job[1]
+            reason, topics = (job[2], job[3]) if len(job) > 3 else ("refresh", ())
+            if kind == "media":   # what is playing, put on the Home it was read for, in turn with the builds
+                self._apply_media(job[2])
+                continue
             with self._lock:
-                self._queued.discard(name)
+                self._queued.discard(("check:" if kind == "check" else "") + name)
             if self.memory is None or self._closing.is_set():
                 continue
-            t = time.time()
-            try:
-                data = self.build(name)
-            except Exception as exc:  # noqa: BLE001 - one page failing never stops the others
-                self.event("web_page_failed", page=name, error=f"{type(exc).__name__}: {exc}")
-                continue
-            self.event("web_page", page=name, ms=round((time.time() - t) * 1000))
-            if name == "shell":
-                self.shell.update(data)
+            if kind == "check":
+                self._check(name, reason, topics)
+            else:
+                self._build_and_send(name, reason, topics)
+
+    def _check(self, name: str, reason: str, topics: tuple[str, ...]) -> None:
+        """Read the page's change stamps (a few indexed reads); build it only if one moved since its last build."""
+        t = time.time()
+        stamps = self._stamps(name)
+        if stamps is not None and stamps == self.seen_stamps.get(name) and name in self.fresh:
+            if name == self.open_page:
+                self._arm_fallback()
+            self.log("web_page", page=name, reason=reason, topic=",".join(topics), ms=round((time.time() - t) * 1000),
+                     result="unchanged_stamps")
+            return
+        self._build_and_send(name, reason + "+stamps" if stamps is not None else reason, topics, stamps=stamps)
+
+    def _build_and_send(self, name: str, reason: str, topics: tuple[str, ...], stamps: Any = None) -> None:
+        t = time.time()
+        if stamps is None:
+            stamps = self._stamps(name)   # read before the build: a write during it moves them for the next check
+        try:
+            data = self.build(name)
+        except Exception as exc:  # noqa: BLE001 - one page failing never stops the others
+            self.event("web_page_failed", page=name, error=f"{type(exc).__name__}: {exc}")
+            self.log("web_page_failed", page=name, reason=reason, error=type(exc).__name__)
+            return
+        ms = round((time.time() - t) * 1000)
+        self.event("web_page", page=name, ms=ms)
+        self._last_build[name] = time.time()
+        self.seen_stamps[name] = stamps
+        if name == "shell":
+            changed = {k: v for k, v in data.items() if self.shell.get(k) != v}
+            self.shell.update(data)
+            if changed:
                 self.post_live()
-                with self._lock:
-                    self.pages["shell"] = {k: data.get(k) for k in ("user", "memory_line")}
-                    self.fresh.add("shell")
-                continue
-            self.send_page(name, data)
-            if name == "home" and "media" not in self.marks:
-                self.marks["media"] = time.time()
-                threading.Thread(target=self._media, name="yuki-web-media", daemon=True).start()
+            with self._lock:
+                self.pages["shell"] = {k: data.get(k) for k in ("user", "memory_line")}
+                self.fresh.add("shell")
+            self.log("web_page", page=name, reason=reason, topic=",".join(topics), ms=ms,
+                     result="posted" if changed else "unchanged")
+            return
+        posted = self.send_page(name, data, built_at=t)
+        self._clock_at[name] = next_boundary(data, time.time())
+        if name == self.open_page:
+            self._arm_fallback()
+        self.log("web_page", page=name, reason=reason, topic=",".join(topics), ms=ms,
+                 result="posted" if posted else "unchanged")
+        if name == "home" and time.time() - self._media_at >= MEDIA_S:
+            self._media_at = time.time()
+            threading.Thread(target=self._media, name="yuki-web-media", daemon=True).start()
+
+    def _stamps(self, name: str) -> Any:
+        if self.memory is None:
+            return None
+        from yuki.ui.web_data import page_stamps
+
+        try:
+            return page_stamps(self.memory, name, requests_csv=self.requests_csv())
+        except Exception:  # noqa: BLE001 - no stamps: the page is built
+            return None
 
     def requests_csv(self) -> Path | None:
         """The agent's request log; a test memory (its own ``ui_path``) reads the one beside it, never the user's."""
@@ -405,16 +591,15 @@ class WebWindow:
 
         m = self.memory
         if name == "shell":
-            return W.build_shell(m)
+            return W.build_shell(m, call_status=self.call_status)
         if name == "home":
             source, people = self._people()
             lately = [{"ref": p["ref"], "name": p["name"], "route": p.get("route") or "", "last_at": p.get("last_at"),
                        "count": p.get("count"), **({"rhythm": p["rhythm"]} if p.get("rhythm") else {})}
                       for p in people if source == "index" and p.get("last_at")]
-            data = W.build_home(m, requests_csv=self.requests_csv(), people=lately)
-            playing = (self.pages.get("home") or {}).get("now", {}).get("playing")
-            if playing:
-                data["now"]["playing"] = playing
+            data = W.build_home(m, requests_csv=self.requests_csv(), people=lately, call_status=self.call_status)
+            if self.playing:
+                data["now"]["playing"] = self.playing
             return data
         if name == "work":
             return W.build_work(m)
@@ -457,22 +642,191 @@ class WebWindow:
         return None
 
     def _media(self) -> None:
+        """What is playing (WinRT, ~0.1 s), read off the worker; put on Home by the worker itself, so it never lands
+        on an older Home than the latest build (42 verification, missing 8)."""
         from yuki.ui.web_data import media_now
 
-        playing = media_now()
+        self._jobs.put(("media", "home", media_now(), ()))
+
+    def _apply_media(self, playing: Any) -> None:
+        if playing == self.playing:
+            return
+        self.playing = playing
         with self._lock:
             home = self.pages.get("home")
-        if home is not None and playing != (home.get("now") or {}).get("playing"):
+        if isinstance(home, dict) and playing != (home.get("now") or {}).get("playing"):
             home = dict(home)
             home["now"] = {**(home.get("now") or {}), "playing": playing}
-            self.send_page("home", home)
+            posted = self.send_page("home", home, built_at=time.time())
+            self.log("web_page", page="home", reason="media", topic="media", ms=0,
+                     result="posted" if posted else "unchanged")
+
+    # -- what changed, and when the open page is built (42 §6.2) ---------------------------------------------------
+
+    def mark(self, name: str, reason: str, *, urgent: bool = False, check: bool = False,
+             topics: tuple[str, ...] = ()) -> None:
+        """Mark ``name`` for a build (or, ``check``, a stamp check). The open page and the rail are scheduled:
+        at once when ``urgent`` (the user's own action), else after a quiet DEBOUNCE_S (a burst builds once) and no
+        sooner than the page's MIN_GAP_S after its last build. Other pages wait until they are opened."""
+        topics = topics or (reason,)
+        now = time.time()
+        with self._cv:
+            if check and name not in self.dirty:
+                self.maybe.setdefault(name, set()).update(topics)
+            else:
+                self.dirty.setdefault(name, set()).update(topics)
+            if name == self.open_page or name == "shell":
+                self._schedule(name, now, urgent)
+                self._cv.notify()
+
+    def _schedule(self, name: str, now: float, urgent: bool) -> None:
+        """(``self._cv`` held) when ``name`` is built: a trailing debounce, capped, and the page's least gap."""
+        current = self._due.get(name)
+        if urgent:
+            self._due[name] = now if current is None else min(current, now)
+            return
+        if current is not None and current <= now:
+            return
+        first = self._first.setdefault(name, now)
+        due = min(now + DEBOUNCE_S, first + MAX_WAIT_S)
+        due = max(due, self._last_build.get(name, 0.0) + MIN_GAP_S.get(name, DEFAULT_GAP_S))
+        self._due[name] = due
+
+    def topic(self, topic: str, why: str = "") -> None:
+        """Something changed that pages show (a closed topic name): its pages marked, the open one scheduled."""
+        for name in TOPIC_PAGES.get(topic, ()):
+            self.mark(name, why or topic, topics=(topic,))
+        for name in CHECK_TOPICS.get(topic, ()):
+            self.mark(name, why or topic, check=True, topics=(topic,))
+
+    def want(self, page: str, again: bool = False, shown: bool = False) -> None:
+        """The page asked for its data (opened, the same tab clicked again, the window shown again)."""
+        moved = page != self.open_page
+        self.open_page = page   # the host knows which page is open only from here (42 verification, missing 6)
+        if moved:
+            self._arm_fallback()
+        if self.memory is None and self.fixture is None:
+            return
+        if self._clock_at.get(page, float("inf")) <= time.time():
+            self.mark(page, "clock", urgent=True)
+        with self._cv:
+            dirty, maybe = page in self.dirty, page in self.maybe
+        if dirty or page not in self.fresh:
+            self.mark(page, "want", urgent=True)
+        elif maybe or time.time() - self.stamps.get(page, 0.0) >= (AGAIN_S if again or shown else STALE_S):
+            self.mark(page, "want", urgent=True, check=True)
+        if shown:
+            self.catch_up("shown")
+
+    def may_refresh(self) -> bool:
+        """The one gate: the window can be seen (not minimised, not hidden, not covered by a full-screen app)."""
+        return not self.covered and self.window_shown()
+
+    def catch_up(self, reason: str) -> None:
+        """The window can be seen again (restored, brought to the front, a full-screen app gone): one of each held
+        message, and the open page if anything marked it meanwhile (or its fallback came due)."""
+        if not self.booted or not self.may_refresh():
+            return
+        with self._lock:
+            held, self._held = self._held, set()
+            pages, self._held_pages = self._held_pages, set()
+        if "live" in held:
+            self.post_live()
+        if "chat" in held and self.model is not None:
+            self.post({"kind": "chat", "reset": True, **self.chat_payload()})
+        for name in sorted(pages):
+            with self._lock:
+                data = self.pages.get(name)
+            if data is not None:
+                self.post({"kind": "data", "page": name, "data": data, "source": "memory"})
+        now = time.time()
+        with self._cv:
+            for name in (self.open_page, "shell"):
+                if name in self.dirty or name in self.maybe:
+                    self._schedule(name, now, True)
+            if self._fallback_at <= now:
+                self.maybe.setdefault(self.open_page, set()).add("fallback")
+                self._schedule(self.open_page, now, True)
+            self._cv.notify()
+        if self.want_connect and self.client is None and self.cipher is not None:
+            threading.Thread(target=self._connect, name="yuki-web-connect", daemon=True).start()
+        self.log("web_restore", page=self.open_page, reason=reason, held=sorted(held), pages=sorted(pages))
+
+    def _arm_fallback(self) -> None:
+        every = FALLBACK_S.get(self.open_page)
+        with self._cv:
+            self._fallback_at = time.time() + every if every else float("inf")
+            self._cv.notify()
+
+    def _recording(self) -> bool:
+        call = self.shell.get("call")
+        return bool(isinstance(call, dict) and call.get("recording"))
+
+    def _scheduler(self) -> None:
+        """The refresh clock: due builds (debounced), the open page's fallback stamp check, its next time boundary,
+        the pending corrections and the pipe while it is down. Sleeps until the next of them; with nothing due it
+        sleeps until an event wakes it. Nothing is built or read while the window can't be seen."""
+        last_pending = last_connect = 0.0
+        while not self._closing.is_set():
+            now = time.time()
+            visible = self.may_refresh()
+            run: list[tuple[str, str, tuple[str, ...], bool]] = []
+            with self._cv:
+                if visible:
+                    for name, due in list(self._due.items()):
+                        if due > now:
+                            continue
+                        del self._due[name]
+                        self._first.pop(name, None)
+                        if name in self.dirty:
+                            topics = tuple(sorted(self.dirty.pop(name) | self.maybe.pop(name, set())))
+                            run.append((name, topics[0] if len(topics) == 1 else "events", topics, False))
+                        elif name in self.maybe:
+                            topics = tuple(sorted(self.maybe.pop(name)))
+                            run.append((name, topics[0] if len(topics) == 1 else "events", topics, True))
+                    clock = self._clock_at.get(self.open_page, float("inf"))
+                    if clock <= now:
+                        self._clock_at[self.open_page] = float("inf")
+                        self.dirty.setdefault(self.open_page, set()).add("clock")
+                        self._schedule(self.open_page, now, True)   # picked up on the next turn, at once
+                    if self._fallback_at <= now:
+                        self._fallback_at = float("inf")   # re-armed by the check (or by catch_up after a call)
+                        if not self._recording():
+                            run.append((self.open_page, "fallback", ("fallback",), self.open_page not in self.dirty))
+                else:
+                    # held: marks stay, catch_up schedules them on show; the fallback waits for it too
+                    if self._fallback_at <= now:
+                        self._fallback_at = float("inf")
+                        self.maybe.setdefault(self.open_page, set()).add("fallback")
+            for name, reason, topics, check in run:
+                self._enqueue(name, reason, topics, check=check)
+            if visible and self.pending and now - last_pending >= PENDING_POLL_S:
+                last_pending = now
+                self._check_pending()
+            if visible and self.want_connect and self.client is None and self.cipher is not None \
+                    and now - last_connect >= RECONNECT_S:
+                last_connect = now
+                self._connect()
+            with self._cv:
+                waits = [self._fallback_at]
+                if visible:
+                    waits += list(self._due.values()) + [self._clock_at.get(self.open_page, float("inf"))]
+                    if self.pending:
+                        waits.append(last_pending + PENDING_POLL_S)
+                    if self.want_connect and self.client is None and self.cipher is not None:
+                        waits.append(last_connect + RECONNECT_S)
+                wait = min(waits) - time.time()
+                if self._closing.is_set():
+                    return
+                # not visible: due builds wait for catch_up's notify (no wake while hidden but the fallback mark)
+                self._cv.wait(None if wait == float("inf") else max(0.05, min(wait, 3600.0)))
 
     def _watch_cover(self) -> None:
         """While a full-screen app (a game, a presentation, a full-screen video) is in front and this window is not,
-        the window can't be seen: the page draws one still frame (``quiet``) until that ends. Minimised or hidden,
-        WebView2 marks the page hidden and its loop stops by itself. Windows' own answer, checked every 2 s."""
+        the window can't be seen: the page draws one still frame (``quiet``), and nothing is built or posted until
+        that ends (:meth:`may_refresh`; then :meth:`catch_up`). Minimised or hidden, WebView2 marks the page hidden
+        and its loop stops by itself. Windows' own answer, checked every 2 s."""
         shell32, user32 = ctypes.windll.shell32, ctypes.windll.user32
-        quiet = False
         while not self._closing.wait(2.0):
             host = self.host
             if host is None or not host.hwnd or not self.booted:
@@ -482,11 +836,27 @@ class WebWindow:
                 busy = shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in (2, 3, 4)
             except Exception:  # noqa: BLE001
                 busy = False
-            now_quiet = busy and int(user32.GetForegroundWindow() or 0) != host.hwnd
-            if now_quiet != quiet:
-                quiet = now_quiet
-                self.post({"kind": "quiet", "on": quiet})
-                self.event("web_quiet", on=quiet)
+            self.set_covered(busy and int(user32.GetForegroundWindow() or 0) != host.hwnd)
+
+    def set_covered(self, covered: bool) -> None:
+        if covered == self.covered:
+            return
+        self.covered = covered
+        if self.host is not None:
+            self.host.post({"kind": "quiet", "on": covered})   # never held: it is what stills the page
+        self.event("web_quiet", on=covered)
+        self.log("web_quiet", on=covered, page=self.open_page)
+        if covered:
+            return
+        self.catch_up("uncovered")
+        with self._cv:
+            self._cv.notify()
+
+    def on_shown(self, reason: str = "restore") -> None:
+        """The host's restore / activate hook (UI thread): hand on, never wait."""
+        threading.Thread(target=self.catch_up, args=(reason,), name="yuki-web-shown", daemon=True).start()
+        with self._cv:
+            self._cv.notify()
 
     def window_shown(self) -> bool:
         """Whether the window can be seen: not minimised and not hidden (Windows' own answer for its hwnd). ``True``
@@ -501,23 +871,26 @@ class WebWindow:
         except Exception:  # noqa: BLE001
             return True
 
-    def _timers(self) -> None:
-        """Home every minute while the window can be seen (minimised or hidden it waits, and refreshes on the first
-        tick after it is shown again: review 34 M11, the People list costs a pass over memory); the pending
-        corrections every 15 s while there are some; the pipe again while down."""
-        last_home, last_pending, last_connect = time.time(), 0.0, time.time()
-        while not self._closing.wait(5.0):
-            now = time.time()
-            if now - last_home >= HOME_REFRESH_S and self.window_shown():
-                last_home = now
-                self.refresh("home")
-                self._jobs.put(("page", "shell"))
-            if self.pending and now - last_pending >= PENDING_POLL_S:
-                last_pending = now
-                self._check_pending()
-            if self.want_connect and self.client is None and self.cipher is not None and now - last_connect >= RECONNECT_S:
-                last_connect = now
-                self._connect()
+    def log(self, kind: str, **fields: Any) -> None:
+        """One content-free line in the window's own small log (page names, topics, reasons, times; never data):
+        every refresh, skip, hold and catch-up, so a refresh can be proven from disk (42 R8). Beside a test memory's
+        ``ui.json``, else ``<logs>/sessions/<date>-window.jsonl``."""
+        self.event(kind, **fields)
+        try:
+            if self._log_path is None:
+                if self.ui_path is not None:
+                    self._log_path = Path(self.ui_path).parent / "window-refresh.jsonl"
+                else:
+                    from yuki.core.paths import logs_dir
+
+                    self._log_path = logs_dir() / "sessions" / f"{time.strftime('%Y%m%d')}-window.jsonl"
+                self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({"ts": round(time.time(), 3), "type": "ui", "event": kind, "pid": os.getpid(), **fields},
+                              default=str)
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     # -- the pipe to the tray -------------------------------------------------------------------------------------
 
@@ -544,6 +917,7 @@ class WebWindow:
 
     def _on_tray_closed(self) -> None:
         self.client = None
+        self.call_status = None   # no more forwards: pages read the call from memory again
         self.shell.update(connected=False, runs=[])
         self.post_live()
 
@@ -562,6 +936,7 @@ class WebWindow:
             else:
                 self._history()
             self.tray_state.update(msg.get("state") or {})
+            self._settings_sig = self._settings_state()
             self._voice_from_state()
             self._runs_changed(force=True)
             if self.booted:
@@ -570,12 +945,15 @@ class WebWindow:
             ev = msg.get("event")
             if isinstance(ev, dict):
                 self.model.apply(ev)
-                if ev.get("type") in ("nudge", "nudge_state"):
-                    self.refresh("home")
+                self._chat_topic(ev)
         elif kind == "state":
             self.tray_state.update({k: v for k, v in msg.items() if k != "ev"})
             self._voice_from_state()
             self.post_live()
+            sig = self._settings_state()
+            if sig != self._settings_sig:   # only what Settings shows: voice state changes many times a minute
+                self._settings_sig = sig
+                self.topic("voice")
         elif kind == "focus":
             page, thread = page_name(msg.get("page")) if msg.get("page") else (None, False)
             self.come_forward(page, thread)
@@ -597,19 +975,39 @@ class WebWindow:
         self.refresh(self.open_page, stale_s=10.0)
 
     def on_call_status(self, status: dict[str, Any]) -> None:
+        """The tray's call status: the rail's chip patched from it at once (no memory read); Home, Day and Activity
+        marked (Home is built from this status, without reading the call)."""
         from yuki.ui.web_data import call_view
 
         self.call_status = status
-        self.shell["call"] = call_view(status)
-        self.post_live()
-        if self.open_page in ("home", "day", "activity"):
-            self.refresh(self.open_page)
+        call = call_view(status)
+        if call != self.shell.get("call"):
+            self.shell["call"] = call
+            self.post_live()
+        self.topic("call")
 
     def on_memory_topic(self, topic: str) -> None:
-        if topic == "cards":
-            self.refresh("home")
-            if self.open_page == "activity":
-                self.refresh("activity")
+        if topic in TOPIC_PAGES or topic in CHECK_TOPICS:
+            self.topic(topic)
+
+    #: Chat events that mean a request is over (its row is in the request log a moment later).
+    REQUEST_ENDS = frozenset({"finished", "failed", "withdrawn"})
+
+    def _chat_topic(self, ev: dict[str, Any]) -> None:
+        """The thread's events that change pages: a card in the thread or its state, a request's end, and the
+        agent's memory tools by their fixed names (never what they said)."""
+        kind = ev.get("type")
+        if kind in ("nudge", "nudge_state"):
+            self.topic("cards")
+        elif kind in self.REQUEST_ENDS:
+            self.topic("request_end")
+        elif kind == "tool_finished" and ev.get("ok", True):
+            name = TOOL_TOPICS.get(str(ev.get("name") or ""))
+            if name:
+                self.topic(name)
+
+    def _settings_state(self) -> str:
+        return json.dumps({k: self.tray_state.get(k) for k in SETTINGS_STATE}, sort_keys=True, default=str)
 
     def _voice_from_state(self) -> None:
         from yuki.ui.web_data import hotkey_words
@@ -704,6 +1102,10 @@ class WebWindow:
             reply = {"ok": False, "error": f"That didn't work: {type(exc).__name__}"}
             self.event("web_act_failed", action=action, error=f"{type(exc).__name__}: {exc}")
         self.event("web_act", action=action, ok=bool(reply.get("ok")))
+        if action in self.SETTINGS_ACTIONS and self.fixture is None:
+            # Settings' controls flip the page's own switch; its data is read again so a later patch shows the
+            # same (42 verification, missing 3: files and the tray's state, which no memory stamp sees)
+            self.refresh("settings")
         if rid is not None:
             self.post({"kind": "reply", "id": rid, **reply})
 
@@ -718,6 +1120,9 @@ class WebWindow:
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
         "motion": "a_motion", "call_pref": "a_call_pref",
     }
+    #: Settings' own controls (each changes what the Settings page shows).
+    SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
+                                  "pause", "accent", "motion", "call_pref"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -783,7 +1188,7 @@ class WebWindow:
     def a_stop_call(self, m: dict[str, Any]) -> dict[str, Any]:
         self._memory().stop_call()
         self.refresh("home")
-        self._jobs.put(("page", "shell"))
+        self.refresh("shell")
         return {}
 
     def a_steer(self, m: dict[str, Any]) -> dict[str, Any]:
@@ -984,7 +1389,7 @@ class WebWindow:
 
     def a_pause(self, m: dict[str, Any]) -> dict[str, Any]:
         self._memory().set_paused(bool(m.get("paused")))
-        self._jobs.put(("page", "shell"))
+        self.refresh("shell")
         return {}
 
     def _ui(self, **changes: Any) -> dict[str, Any]:
@@ -1164,6 +1569,8 @@ class WebWindow:
     def close(self) -> None:
         """The window is gone: stop the threads, save the pages for the next opening, let memory go."""
         self._closing.set()
+        with self._cv:
+            self._cv.notify_all()
         self._jobs.put(None)
         client = self.client
         if client is not None:
@@ -1358,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
         folders={APP_HOST: WEB_DIR, FONT_HOST: FONTS_DIR}, start_url=url,
         user_data_dir=args.profile or default_profile(), placement="offscreen" if args.offscreen else "normal",
         browser_args=args.browser_args, dev_tools=args.dev_tools, on_message=win.on_message,
-        on_event=win.on_host_event, marks={"main": t_main},
+        on_event=win.on_host_event, on_shown=win.on_shown, marks={"main": t_main},
         rect=tuple(ui.web_window) if ui.web_window and not args.offscreen else None,
         maximized=bool(ui.web_maximized) and not args.offscreen)
     host = WebView2Host(options)

@@ -127,7 +127,9 @@ def hotkey_words(combo: str) -> str:
     return " ".join(p[:1].upper() + p[1:] for p in parts)
 
 
-def build_shell(memory: Any) -> dict[str, Any]:
+def build_shell(memory: Any, call_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The rail: who, the memory line, the call (from the tray's forwarded status when there is one) and how many
+    questions wait (Home's badge, kept fresh while another page is open)."""
     st = _safe(memory.status, {}) or {}
     if st.get("paused"):
         line = "memory paused"
@@ -135,7 +137,9 @@ def build_shell(memory: Any) -> dict[str, Any]:
         line = "memory is off"
     else:
         line = "memory on"
-    return {"user": user_name(), "memory_line": line, "call": call_now(memory)}
+    needs = len(_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])
+    call = call_view(call_status) if call_status is not None else call_now(memory)
+    return {"user": user_name(), "memory_line": line, "call": call, "needs": needs}
 
 
 def call_now(memory: Any) -> dict[str, Any] | None:
@@ -315,8 +319,13 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
                      "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}], "cost": cost})
     away.sort(key=lambda x: x.get("at") or 0, reverse=True)
     now_strip["goals"] = goals_today(memory)
+    # when Home next changes with the clock alone: an open offer running out, the oldest "since you were away" row
+    # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
+    moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
+    moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away[:INBOX_MAX] if a.get("at")]
+    next_at = min((m for m in moments if m and m > now), default=None)
     return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away[:INBOX_MAX],
-            "people": (people or [])[:6], "since": since}
+            "people": (people or [])[:6], "since": since, "next_at": next_at}
 
 
 #: Goals the Now strip shows at most (today's, open first).
@@ -1254,7 +1263,46 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
     return out
 
 
-__all__ = ["SCHEMA", "build_shell", "build_home", "build_me", "build_work", "build_day", "build_playbook",
+# -- change stamps (the window's live refresh: 42-window-live-refresh.md §6.2) -------------------------------------
+
+#: Each page's memory tables (the ones its builder reads). The Work page leaves the timeline out: the week figure
+#: moves every minute at the PC and is read again on the next visit; Day is where the timeline is live.
+PAGE_TABLES: dict[str, tuple[str, ...]] = {
+    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls"),
+    "work": ("work_threads", "goals"),
+    "day": ("timeline", "calls"),
+    "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
+    "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
+    "activity": ("runs", "nudges", "todos", "calls"),
+    "shell": ("questions",),
+}
+
+
+def page_stamps(memory: Any, page: str, *, requests_csv: Path | None = None) -> Any:
+    """A page's change stamps: memory's per-table stamps (:func:`yuki.memory.api.change_stamps`) and, for Home and
+    Activity, the request log's size and time. Equal stamps: nothing the page shows from memory moved, so it is not
+    built. ``None`` (build it) for a page without stamps (Settings: files and the tray's state) or an older memory."""
+    tables = PAGE_TABLES.get(page)
+    if not tables:
+        return None
+    try:
+        from yuki.memory.api import change_stamps
+    except ImportError:
+        return None
+    stamps = change_stamps(memory, tables)
+    if not stamps or any(v is None for v in stamps.values()):
+        return None
+    out: list[Any] = [[t, stamps.get(t)] for t in tables]
+    if page in ("home", "activity") and requests_csv is not None:
+        try:
+            st = Path(requests_csv).stat()
+            out.append(["requests", st.st_size, st.st_mtime_ns])
+        except OSError:
+            out.append(["requests", None])
+    return json.dumps(out, default=str)
+
+
+__all__ = ["SCHEMA", "build_shell", "page_stamps", "build_home", "build_me", "build_work", "build_day", "build_playbook",
            "build_activity", "build_settings", "people_now", "person_from_index", "contact_card", "chat_item",
            "rhythm_view", "goals_today", "thread_goals", "run_rows", "call_rows", "step_what", "step_result",
            "runs_of", "offer_card", "shift_times", "media_now", "read_pending", "week_days", "week_figure"]
