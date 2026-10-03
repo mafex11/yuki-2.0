@@ -16,6 +16,12 @@ The Yuki window is moving to HTML (the Lattice design) rendered by the WebView2 
   browser instead), new windows and downloads are refused, every permission request (microphone, camera,
   clipboard, location...) is denied, no dev tools, context menu, zoom, browser shortcuts, autofill or host
   objects. The page adds its own strict Content-Security-Policy.
+* **frameless** (the Lattice design draws its own caption buttons): no Windows title bar (``WM_NCCALCSIZE``), the
+  system's invisible resize borders (left, right, below) and shadow kept; ``WM_NCHITTEST`` answers the page's title
+  bar from where the page says it drew it (:func:`caption_hit`: top edge resize, caption buttons as HTMINBUTTON /
+  HTMAXBUTTON - snap layouts - / HTCLOSE, the rest of the bar HTCAPTION). WebView2 covers the client area and gets
+  the pointer there first, so the page's own buttons and title bar also act through :meth:`WebView2Host.window_op`
+  (the system's own move and size loops), and its ``app-region: drag`` is honoured where the runtime supports it.
 
 Why not pywebview: its EdgeChromium backend loads the .NET runtime and WinForms into the process, routes every
 resource request through a Python callback, shows its window with ``Form.Show()`` (which activates it) and keeps a
@@ -73,6 +79,97 @@ WM_YUKI_POST = WM_APP + 1
 WM_YUKI_CLOSE = WM_APP + 2
 WM_YUKI_CALL = WM_APP + 3
 
+# -- the frameless window (revamp E3 difference 2, 32-build-E11-E14.md §6): the page draws the Lattice title bar ------
+WM_NCCALCSIZE, WM_NCHITTEST, WM_NCMOUSEMOVE = 0x0083, 0x0084, 0x00A0
+WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCLBUTTONDBLCLK, WM_NCMOUSELEAVE = 0x00A1, 0x00A2, 0x00A3, 0x02A2
+WM_SYSCOMMAND = 0x0112
+SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE = 0xF020, 0xF030, 0xF120
+HTCLIENT, HTCAPTION, HTMINBUTTON, HTMAXBUTTON, HTCLOSE = 1, 2, 8, 9, 20
+HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 10, 11, 12, 13, 14, 15, 16, 17
+#: The border codes the system's own frame answers (left, right, bottom: the invisible resize borders kept outside
+#: the client area); the frameless window lets them through untouched.
+FRAME_HITS = frozenset({HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT})
+#: The page's caption parts and the codes Windows knows them by (HTMAXBUTTON is what lets snap layouts appear).
+CAPTION_PARTS = {"min": HTMINBUTTON, "max": HTMAXBUTTON, "close": HTCLOSE}
+#: The design's title bar (``.titlebar``: 34 px high, 44 px buttons) until the page reports where it drew it.
+CAPTION_CSS_PX = 34
+#: The top edge the page leaves for resizing (CSS px), and how far in from each side a top corner reaches.
+TOP_RESIZE_CSS_PX = 5
+CORNER_CSS_PX = 12
+SM_CXFRAME, SM_CYFRAME, SM_CXPADDEDBORDER = 32, 33, 92
+
+
+class NCCALCSIZE_PARAMS(ctypes.Structure):
+    _fields_ = [("rgrc", wintypes.RECT * 3), ("lppos", c_void_p)]
+
+
+class TRACKMOUSEEVENT(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("hwndTrack", wintypes.HWND),
+                ("dwHoverTime", wintypes.DWORD)]
+
+
+@dataclass
+class CaptionLayout:
+    """Where the page drew its title bar, in client pixels (physical): its height, the caption buttons (``min`` /
+    ``max`` / ``close`` -> x, y, w, h) and the rectangles inside the bar that are page controls, not the drag area."""
+
+    height: int = 0
+    buttons: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+    no_drag: list[tuple[int, int, int, int]] = field(default_factory=list)
+    top: int = 0           # the top resize edge's height
+    corner: int = 0        # how far in from each side a top corner reaches
+
+    @classmethod
+    def from_page(cls, msg: dict[str, Any], scale: float) -> "CaptionLayout":
+        """The page's ``caption`` message (CSS px, ``dpr``) as client pixels; bad values are dropped."""
+        k = float(msg.get("dpr") or scale or 1.0)
+
+        def rect(v: Any) -> tuple[int, int, int, int] | None:
+            if not isinstance(v, (list, tuple)) or len(v) != 4:
+                return None
+            try:
+                x, y, w, h = (float(n) for n in v)
+            except (TypeError, ValueError):
+                return None
+            return (round(x * k), round(y * k), round(w * k), round(h * k)) if w > 0 and h > 0 else None
+
+        buttons = {}
+        for part in CAPTION_PARTS:
+            r = rect((msg.get("buttons") or {}).get(part)) if isinstance(msg.get("buttons"), dict) else None
+            if r is not None:
+                buttons[part] = r
+        try:
+            height = max(0, round(float(msg.get("h") or CAPTION_CSS_PX) * k))
+        except (TypeError, ValueError):
+            height = round(CAPTION_CSS_PX * k)
+        return cls(height=height, buttons=buttons,
+                   no_drag=[r for r in (rect(v) for v in msg.get("no_drag") or []) if r is not None],
+                   top=round(TOP_RESIZE_CSS_PX * k), corner=round(CORNER_CSS_PX * k))
+
+
+def _inside(x: int, y: int, r: tuple[int, int, int, int]) -> bool:
+    return r[0] <= x < r[0] + r[2] and r[1] <= y < r[1] + r[3]
+
+
+def caption_hit(x: int, y: int, width: int, layout: CaptionLayout, *, maximized: bool) -> int:
+    """What a point of the client area is to Windows (``WM_NCHITTEST``) in the frameless window: the top edge resizes
+    (corners too) unless maximized; the page's caption buttons are Windows' own minimize / maximize (snap layouts) /
+    close; the rest of the title bar drags the window (double-click maximizes, right-click opens the system menu);
+    everything else is the page. Pure: the window procedure feeds it client coordinates."""
+    if not maximized and layout.top and 0 <= y < layout.top:
+        if x < layout.corner:
+            return HTTOPLEFT
+        if x >= width - layout.corner:
+            return HTTOPRIGHT
+        return HTTOP
+    for part, code in CAPTION_PARTS.items():
+        r = layout.buttons.get(part)
+        if r is not None and _inside(x, y, r):
+            return code
+    if 0 <= y < layout.height and not any(_inside(x, y, r) for r in layout.no_drag):
+        return HTCAPTION
+    return HTCLIENT
+
 
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [("cbSize", c_uint), ("style", c_uint), ("lpfnWndProc", WNDPROC), ("cbClsExtra", c_int),
@@ -128,6 +225,7 @@ IID_SETTINGS3 = _iid("fdb5ab74-af33-4854-84f0-0a631deb5eba")
 IID_SETTINGS4 = _iid("cb56846c-4168-4d53-b04f-03b6d6796ff2")
 IID_SETTINGS5 = _iid("183e7052-1d03-43a0-ab99-98e043b66b39")
 IID_SETTINGS6 = _iid("11cb3acd-9bc8-43b8-83bf-f40753714f87")
+IID_SETTINGS9 = _iid("0528a73b-e92d-49f4-927a-e547dddaa37d")
 
 #: Handler interfaces we implement: name -> (IID, Invoke's argument types after ``this``).
 HANDLERS: dict[str, tuple[bytes, tuple[Any, ...]]] = {
@@ -159,6 +257,8 @@ SET_PUT_SCRIPT, SET_PUT_WEB_MESSAGE, SET_PUT_SCRIPT_DIALOGS, SET_PUT_STATUS_BAR 
 SET_PUT_DEV_TOOLS, SET_PUT_CONTEXT_MENUS, SET_PUT_HOST_OBJECTS, SET_PUT_ZOOM = 12, 14, 16, 18
 SET3_PUT_ACCELERATOR_KEYS, SET4_PUT_PASSWORD_AUTOSAVE, SET4_PUT_AUTOFILL = 24, 26, 28
 SET5_PUT_PINCH_ZOOM, SET6_PUT_SWIPE = 30, 32
+#: ``put_IsNonClientRegionSupportEnabled`` (ICoreWebView2Settings9): the page's ``app-region: drag`` moves the window.
+SET9_PUT_NON_CLIENT_REGION = 38
 NAV_GET_URI, NAV_IS_USER_INITIATED, NAV_PUT_CANCEL = 3, 4, 8
 NAVDONE_IS_SUCCESS, NAVDONE_ERROR_STATUS = 3, 4
 MSG_GET_SOURCE, MSG_GET_JSON = 3, 4
@@ -347,6 +447,9 @@ class HostOptions:
     #: ``offscreen``: a frameless tool window beyond the left edge of every monitor, shown without activation and
     #: refusing activation (measurements and tests: it never takes focus and is never seen).
     placement: str = "normal"
+    #: The Lattice frame: no Windows title bar (the page draws its own caption buttons), the system's resize borders
+    #: and shadow kept, the page's title bar answered to Windows as caption / buttons (:func:`caption_hit`).
+    frameless: bool = True
     background: tuple[int, int, int] = (0x0B, 0x0B, 0x0C)
     browser_args: str | None = None          # extra Chromium switches (``WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS``)
     dev_tools: bool = False
@@ -383,6 +486,15 @@ class WebView2Host:
         self._low = False   # the memory target is Low (set while minimised)
         #: Called on the UI thread when the window starts to close, before it is destroyed (read its placement).
         self.on_closing: Callable[[], Any] | None = None
+        # the frameless frame: where the page drew its title bar (until it says: the design's height, no buttons)
+        scale = self._scale()
+        self.caption = CaptionLayout(height=round(CAPTION_CSS_PX * scale), top=round(TOP_RESIZE_CSS_PX * scale),
+                                     corner=round(CORNER_CSS_PX * scale))
+        self._hover: str | None = None      # the caption button under the pointer (Windows' own hit test)
+        self._pressed: str | None = None
+        self._maximized: bool | None = None
+        #: Whether WebView2 took ``IsNonClientRegionSupportEnabled`` (the page's ``app-region: drag``); None: not asked.
+        self.non_client_regions: bool | None = None
 
     # -- thread-safe API ------------------------------------------------------------------------------
 
@@ -425,6 +537,123 @@ class WebView2Host:
             return None, False
         r = wp.rcNormalPosition
         return (r.left, r.top, r.right - r.left, r.bottom - r.top), wp.showCmd == SW_SHOWMAXIMIZED
+
+    # -- the frameless frame (UI thread) ----------------------------------------------------------------------
+
+    @staticmethod
+    def _scale() -> float:
+        try:
+            return ctypes.windll.user32.GetDpiForSystem() / 96.0
+        except (AttributeError, OSError):
+            return 1.0
+
+    def set_caption(self, msg: dict[str, Any]) -> None:
+        """The page says where it drew its title bar (CSS px; on load and on every resize): Windows' hit test answers
+        from it. UI thread."""
+        self.caption = CaptionLayout.from_page(msg, self._scale())
+        self._event("caption_layout", h=self.caption.height, buttons=sorted(self.caption.buttons))
+        if self.hwnd:   # the page is up now: it learns whether the window is maximized (its restore glyph)
+            self._maximized = bool(ctypes.windll.user32.IsZoomed(wintypes.HWND(self.hwnd)))
+            self.post({"kind": "window", "maximized": self._maximized, "frameless": self.o.frameless,
+                       "native_drag": bool(self.non_client_regions)})
+
+    def window_op(self, op: str) -> bool:
+        """The page's caption buttons and title bar, when the page itself got the pointer (WebView2 covers the client
+        area): ``minimize``, ``maximize`` (toggles restore), ``close``, ``drag`` (the system's own move loop from
+        where the pointer is: Aero snap, double-click and the system menu as a title bar has them), ``resize-top`` /
+        ``resize-topleft`` / ``resize-topright`` (the system's own sizing loop). Never for the off-screen window.
+        UI thread; returns whether it ran."""
+        if not self.hwnd or self.o.placement == "offscreen":
+            return False
+        user32 = ctypes.windll.user32
+        hwnd = wintypes.HWND(self.hwnd)
+        if op == "minimize":
+            user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
+        elif op == "maximize":
+            user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_RESTORE if user32.IsZoomed(hwnd) else SC_MAXIMIZE, 0)
+        elif op == "close":
+            self._begin_close()
+        elif op in ("drag", "resize-top", "resize-topleft", "resize-topright"):
+            code = {"drag": HTCAPTION, "resize-top": HTTOP, "resize-topleft": HTTOPLEFT,
+                    "resize-topright": HTTOPRIGHT}[op]
+            if code != HTCAPTION and user32.IsZoomed(hwnd):
+                return False
+            pt = wintypes.POINT()
+            user32.GetCursorPos(byref(pt))
+            # the system's move / size loop starts as if the press were on our own frame (the pointer is still down;
+            # the page's own capture ends with the loop's): the pattern frameless WebView2 hosts use
+            user32.ReleaseCapture()
+            user32.PostMessageW(hwnd, WM_NCLBUTTONDOWN, code, (pt.y & 0xFFFF) << 16 | (pt.x & 0xFFFF))
+        else:
+            return False
+        return True
+
+    def _caption_state(self, hover: str | None, pressed: str | None) -> None:
+        if (hover, pressed) != (self._hover, self._pressed):
+            self._hover, self._pressed = hover, pressed
+            self.post({"kind": "caption", "hover": hover, "pressed": pressed})
+
+    def _nc_calcsize(self, hwnd: int, wparam: int, lparam: int) -> int:
+        """No title bar: the client area starts at the window's top (the system keeps its invisible resize borders
+        left, right and below, and the shadow); maximized, the top is pulled in by the frame that hangs off the
+        monitor."""
+        params = ctypes.cast(c_void_p(lparam), POINTER(NCCALCSIZE_PARAMS)).contents
+        top = params.rgrc[0].top
+        _DEF_WINDOW_PROC(hwnd, WM_NCCALCSIZE, wparam, lparam)
+        params.rgrc[0].top = top
+        if ctypes.windll.user32.IsZoomed(wintypes.HWND(hwnd)):
+            try:
+                dpi = ctypes.windll.user32.GetDpiForWindow(wintypes.HWND(hwnd)) or 96
+                frame = (ctypes.windll.user32.GetSystemMetricsForDpi(SM_CYFRAME, dpi)
+                         + ctypes.windll.user32.GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi))
+            except (AttributeError, OSError):
+                frame = 8
+            params.rgrc[0].top += frame
+        return 0
+
+    def _nc_hittest(self, hwnd: int, lparam: int) -> int:
+        """Windows asks what the pointer is over (``WM_NCHITTEST``): the system's own resize borders first, then the
+        page's title bar (:func:`caption_hit`)."""
+        hit = int(_DEF_WINDOW_PROC(hwnd, WM_NCHITTEST, 0, lparam))
+        if hit in FRAME_HITS:
+            return hit
+        pt = wintypes.POINT(ctypes.c_short(lparam & 0xFFFF).value, ctypes.c_short((lparam >> 16) & 0xFFFF).value)
+        ctypes.windll.user32.ScreenToClient(wintypes.HWND(hwnd), byref(pt))
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetClientRect(wintypes.HWND(hwnd), byref(rect))
+        if not (0 <= pt.x < rect.right and 0 <= pt.y < rect.bottom):
+            return hit
+        return caption_hit(pt.x, pt.y, rect.right, self.caption,
+                           maximized=bool(ctypes.windll.user32.IsZoomed(wintypes.HWND(hwnd))))
+
+    def _nc_button(self, msg: int, wparam: int) -> bool:
+        """A press or release on one of the caption buttons as Windows hit-tested them: handled here (the system would
+        draw its old buttons), acting on release over the same button. Returns whether it was one."""
+        part = next((p for p, c in CAPTION_PARTS.items() if c == wparam), None)
+        if msg == WM_NCMOUSEMOVE:
+            if part is not None or self._hover is not None:
+                if part is not None:
+                    tme = TRACKMOUSEEVENT(ctypes.sizeof(TRACKMOUSEEVENT), 0x00000002 | 0x00000010,   # LEAVE|NONCLIENT
+                                          wintypes.HWND(self.hwnd), 0)
+                    ctypes.windll.user32.TrackMouseEvent(byref(tme))
+                self._caption_state(part, self._pressed if part == self._pressed else None)
+            return False   # the system also sees the move (the snap layouts flyout over HTMAXBUTTON)
+        if part is None:
+            return False
+        if msg == WM_NCLBUTTONDOWN:
+            self._caption_state(part, part)
+        elif msg == WM_NCLBUTTONUP:
+            pressed = self._pressed
+            self._caption_state(part, None)
+            if pressed == part:
+                self.window_op({"min": "minimize", "max": "maximize", "close": "close"}[part])
+        return True
+
+    def _maximized_changed(self) -> None:
+        zoomed = bool(ctypes.windll.user32.IsZoomed(wintypes.HWND(self.hwnd)))
+        if zoomed != self._maximized:
+            self._maximized = zoomed
+            self.post({"kind": "window", "maximized": zoomed})
 
     def set_memory_low(self, low: bool) -> bool:
         """``MemoryUsageTargetLevel`` Low or Normal (WebView2 trims caches and lets the OS page memory out)."""
@@ -523,7 +752,9 @@ class WebView2Host:
         w, h = self._scaled(self.o.size)
         if self.o.placement == "offscreen":
             vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)   # SM_X/YVIRTUALSCREEN
-            ex, style, x, y = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WS_POPUP, vx - w - 400, vy
+            # the off-screen window has the real frame when frameless (so measurements and checks run its code)
+            ex, style, x, y = (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, WS_OVERLAPPEDWINDOW if self.o.frameless
+                               else WS_POPUP, vx - w - 400, vy)
         else:
             sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
             ex, style, x, y = 0, WS_OVERLAPPEDWINDOW, max(0, (sw - w) // 2), max(0, (sh - h) // 2)
@@ -533,9 +764,12 @@ class WebView2Host:
         if not hwnd:
             raise ctypes.WinError()
         self.hwnd = int(hwnd)
-        if self.o.placement != "offscreen":
-            dark = c_int(1)   # a dark title bar (DWMWA_USE_IMMERSIVE_DARK_MODE)
+        if self.o.placement != "offscreen" or self.o.frameless:
+            dark = c_int(1)   # a dark frame (DWMWA_USE_IMMERSIVE_DARK_MODE): the border and the system menu
             ctypes.windll.dwmapi.DwmSetWindowAttribute(wintypes.HWND(self.hwnd), 20, byref(dark), 4)
+        if self.o.frameless:   # the frame is recalculated with no title bar (WM_NCCALCSIZE)
+            user32.SetWindowPos(wintypes.HWND(self.hwnd), None, 0, 0, 0, 0,
+                                0x0020 | 0x0001 | 0x0002 | 0x0004 | 0x0010)   # FRAMECHANGED|NOSIZE|NOMOVE|NOZORDER|NOACTIVATE
         user32.ShowWindow(wintypes.HWND(self.hwnd), SW_SHOWNOACTIVATE if self.o.placement == "offscreen"
                           else SW_SHOWMAXIMIZED if self.o.maximized else SW_SHOWNORMAL)
         if self.o.placement != "offscreen":
@@ -570,8 +804,20 @@ class WebView2Host:
             if msg in (WM_YUKI_CLOSE, WM_CLOSE):
                 self._begin_close()
                 return 0
+            if self.o.frameless:
+                if msg == WM_NCCALCSIZE and wparam:
+                    return self._nc_calcsize(hwnd, wparam, lparam)
+                if msg == WM_NCHITTEST:
+                    return self._nc_hittest(hwnd, lparam)
+                if msg in (WM_NCMOUSEMOVE, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCLBUTTONDBLCLK) and \
+                        self._nc_button(msg, wparam):
+                    return 0
+                if msg == WM_NCMOUSELEAVE:
+                    self._caption_state(None, None)
             if msg == WM_SIZE:
                 self._fit(minimized=wparam == SIZE_MINIMIZED)
+                if self.o.frameless and wparam != SIZE_MINIMIZED:
+                    self._maximized_changed()
             elif msg == WM_MOVE and self._controller:
                 self._controller.call(CTL_NOTIFY_MOVED)
             elif msg == WM_MOUSEACTIVATE and self.o.placement == "offscreen":
@@ -741,6 +987,17 @@ class WebView2Host:
                     for slot in slots:
                         newer.put_bool(slot, False)
                     newer.release()
+            if self.o.frameless:
+                # the page's title bar (``app-region: drag``) moves the window natively where the runtime supports it
+                # (WebView2 1.0.2420+); elsewhere the page asks the host to start the move (``window_op("drag")``)
+                s9 = s.query(IID_SETTINGS9)
+                self.non_client_regions = False
+                if s9:
+                    try:
+                        self.non_client_regions = s9.call(SET9_PUT_NON_CLIENT_REGION, (c_int,), 1) >= 0
+                    finally:
+                        s9.release()
+                self._event("webview_non_client_regions", on=self.non_client_regions)
         finally:
             s.release()
 
@@ -827,4 +1084,4 @@ class WebView2Host:
 
 
 __all__ = ["APP_HOST", "FONT_HOST", "HostOptions", "WebView2Host", "loader_path", "runtime_version",
-           "is_allowed_navigation", "is_external_link"]
+           "is_allowed_navigation", "is_external_link", "CaptionLayout", "caption_hit", "CAPTION_PARTS"]

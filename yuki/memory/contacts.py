@@ -48,6 +48,8 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
     recent_chat_contacts(store, now=None, minutes=10) -> list[dict]
     call_contacts(store, now=None) -> list[dict]
     prefer_route(store, contact, route, words, source="agent") -> dict
+    rhythm(store, contacts, now=None, days=RHYTHM_DAYS) -> {contact id: dict}   # messages a day, both ways
+    identify(store, names) -> {name: Contact}           # which of these strings are a person (whole name or alias)
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -1666,6 +1668,132 @@ def prefer_route(store: Store, contact: Contact, route: Route, words: str, *, so
     pid = store._write(op)
     _invalidate(store)
     return {"ok": True, "id": pid}
+
+
+# ---------------------------------------------------------------------------
+# Contact rhythm (the Yuki window's Me and Home, revamp E11): messages a day with each person
+# ---------------------------------------------------------------------------
+
+#: Days the rhythm covers, today last.
+RHYTHM_DAYS = 14
+#: Per group thread, the other senders' messages by local day as of its newest message id (decrypted once each).
+_SENDER_DAYS: dict[tuple[str, int], tuple[int, dict[str, dict[str, int]]]] = {}
+
+
+def watch_started(store: Store) -> float | None:
+    """When memory first read a chat message on this PC (the earliest ``first_seen``): before it, nothing is known
+    about anyone's messages, so those days are left empty rather than counted as zero. ``None`` with no message."""
+    rows = store._query("SELECT min(first_seen) FROM messages")
+    return float(rows[0][0]) if rows and rows[0][0] is not None else None
+
+
+def _sender_days(store: Store, thread_id: int) -> dict[str, dict[str, int]]:
+    """The other senders of one thread by local day, ``{sender words: {"YYYY-MM-DD": messages}}``: each message's
+    sender is decrypted once, then only the new ones (a per-process cache keyed by the newest id, as
+    :func:`_sender_counts`)."""
+    key = (_db_key(store), int(thread_id))
+    cached = _SENDER_DAYS.get(key)
+    after, days = (cached[0], {k: dict(v) for k, v in cached[1].items()}) if cached else (0, {})
+    rows = store._query(f"SELECT id, sender_ciphertext, date({MSG_TIME_SQL}, 'unixepoch', 'localtime') AS d"
+                        " FROM messages WHERE thread_id=? AND is_me=0 AND id > ? ORDER BY id", (int(thread_id), after))
+    for r in rows:
+        after = max(after, int(r["id"]))
+        try:
+            sender = " ".join(tokens(store._dec(r["sender_ciphertext"]) or ""))
+        except Exception:
+            sender = ""
+        if sender and r["d"]:
+            per = days.setdefault(sender, {})
+            per[r["d"]] = per.get(r["d"], 0) + 1
+    _SENDER_DAYS[key] = (after, days)
+    return {k: dict(v) for k, v in days.items()}
+
+
+def rhythm(store: Store, contacts: Sequence[Contact], *, now: float | None = None,
+           days: int = RHYTHM_DAYS) -> dict[int, dict[str, Any]]:
+    """Each person's messages a day over the last ``days`` local days (today last), counted from the messages memory
+    read on this PC with SQL aggregates over their routes: a DM counts every message both ways; a group chat counts
+    only what they wrote there (the sender is one of their names or the route's handle, the identity
+    :func:`measure_route` uses), never the user's own messages to the whole group. Days before memory first read a chat
+    (:func:`watch_started`) are ``None``, not zero. Per contact id::
+
+        {"days": [14 counts or None], "dates": ["YYYY-MM-DD"...], "total", "mine", "theirs", "known_days",
+         "active_days", "peak", "peak_date", "watch_started", "since_watch"}
+
+    ``since_watch``: memory began reading chats inside the window (the page says "since I started watching"). No text
+    is decrypted for DMs; a group's senders are decrypted once per message and cached."""
+    now = time.time() if now is None else float(now)
+    today = datetime.fromtimestamp(now).date()
+    dates = [(today - timedelta(days=days - 1 - i)).isoformat() for i in range(days)]
+    index = {d: i for i, d in enumerate(dates)}
+    start = datetime.combine(today - timedelta(days=days - 1), datetime.min.time()).timestamp()
+    watch = watch_started(store)
+    watch_day = datetime.fromtimestamp(watch).date().isoformat() if watch is not None else None
+    known = [watch_day is not None and d >= watch_day for d in dates]
+    dm_of = {c.id: sorted({t for r in c.routes if r.kind == "dm" for t in r.thread_ids}) for c in contacts}
+    all_dm = sorted({t for ts in dm_of.values() for t in ts})
+    per_thread: dict[int, dict[str, list[int]]] = {}   # thread -> day -> [mine, theirs]
+    if all_dm:
+        marks = ",".join("?" * len(all_dm))
+        for r in store._query(f"SELECT thread_id, is_me, date(t, 'unixepoch', 'localtime') AS d, count(*) AS n FROM"
+                              f" (SELECT thread_id, is_me, {MSG_TIME_SQL} AS t FROM messages WHERE thread_id IN"
+                              f" ({marks})) WHERE t >= ? GROUP BY thread_id, is_me, d", (*all_dm, start)):
+            cell = per_thread.setdefault(int(r["thread_id"]), {}).setdefault(r["d"], [0, 0])
+            cell[0 if r["is_me"] else 1] += int(r["n"])
+    out: dict[int, dict[str, Any]] = {}
+    for c in contacts:
+        mine, theirs = [0] * days, [0] * days
+        for t in dm_of[c.id]:
+            for d, (m, th) in per_thread.get(t, {}).items():
+                i = index.get(d)
+                if i is not None:
+                    mine[i] += m
+                    theirs[i] += th
+        seen_groups: set[int] = set()
+        for route in c.routes:
+            if route.kind == "dm":
+                continue
+            names = {" ".join(tokens(n)) for n in c.names + ([route.handle] if route.handle else []) if tokens(n)}
+            for t in route.thread_ids:
+                if t in seen_groups or t in dm_of[c.id]:
+                    continue
+                seen_groups.add(t)
+                for sender, per in _sender_days(store, t).items():
+                    if sender in names:
+                        for d, n in per.items():
+                            i = index.get(d)
+                            if i is not None:
+                                theirs[i] += n
+        vals = [(mine[i] + theirs[i]) if known[i] else None for i in range(days)]
+        counted = [v for v in vals if v is not None]
+        peak = max(counted) if counted else 0
+        out[c.id] = {
+            "days": vals, "dates": dates, "total": sum(counted),
+            "mine": sum(mine[i] for i in range(days) if known[i]),
+            "theirs": sum(theirs[i] for i in range(days) if known[i]),
+            "known_days": len(counted), "active_days": sum(1 for v in counted if v),
+            "peak": peak, "peak_date": dates[vals.index(peak)] if peak else None,
+            "watch_started": watch, "since_watch": bool(watch_day and watch_day > dates[0]),
+        }
+    return out
+
+
+def identify(store: Store, names: Sequence[str]) -> dict[str, Contact]:
+    """Which of ``names`` stand for a person in the index: the whole string is one of their names or aliases (heard
+    forms included) or the handle an app shows them by, case and punctuation aside - the identity :func:`resolve`'s
+    exact match uses, never a word inside a longer string. ``{name as given: Contact}`` for those that are someone."""
+    by_key: dict[str, Contact] = {}
+    for c in people(store):
+        for n in c.names + [r.handle for r in c.routes if r.handle]:
+            k = " ".join(tokens(n))
+            if k:
+                by_key.setdefault(k, c)
+    out: dict[str, Contact] = {}
+    for name in names:
+        hit = by_key.get(" ".join(tokens(name)))
+        if hit is not None:
+            out[name] = hit
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,8 @@ Public API::
     dedupe_starts(ops, store) -> list[str]                     # measured: a "start" close to a thread continues it
     thread_text(title, state, entities) -> str                 # what a thread is embedded as
     thread_line(t, now=None) -> str;  describe_thread(store, t, ...) -> dict
+    checklists(store, threads) -> {id: {"done", "open", "total", "next"}}   # milestones landed / open items
+    typed_entities(store, threads) -> {id: [{"name", "type": person | app | thing}]}
     Consolidator(worker).run(now=None, reason="", dry_run=False) -> ConsolidateResult
     Backfiller(store, ...).run(since=None, until=None, dry_run=False) -> dict
 """
@@ -454,6 +456,71 @@ def describe_thread(store: Any, t: WorkThread, *, facts: int = 12, events: int =
         out["links"] = [link for link in store.links(limit=400) if link.work_thread_id == t.id][:10]
     except Exception:
         pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The Yuki window's Work page (revamp E12): checklists and what a thread involves, read only
+# ---------------------------------------------------------------------------
+
+#: Capture threads seen this recently name the apps memory knows (for typing what a thread involves).
+KNOWN_APP_DAYS = 60.0
+
+
+def checklists(store: Any, threads: Sequence[WorkThread]) -> dict[int, dict[str, Any]]:
+    """Each thread's checklist as counts: ``done`` = the milestones memory saw land on it (journal facts the
+    journal's model marked finished, shipped, merged, fixed or sent, linked to the thread in the same batch that wrote
+    its event; not Yuki's own, not superseded), ``open`` = its open items now. ``{id: {"done", "open", "total",
+    "next" (the first open item or None), "last_done_at"}}``. One SQL count, nothing decrypted."""
+    ids = [int(t.id) for t in threads]
+    done: dict[int, tuple[int, float | None]] = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        for r in store._query(f"SELECT work_thread_id, count(*), max(at) FROM journal WHERE milestone=1 AND by_yuki=0"
+                              f" AND superseded_at IS NULL AND work_thread_id IN ({marks}) GROUP BY work_thread_id", ids):
+            done[int(r[0])] = (int(r[1]), float(r[2]) if r[2] is not None else None)
+    out: dict[int, dict[str, Any]] = {}
+    for t in threads:
+        n_done, last = done.get(int(t.id), (0, None))
+        items = [x for x in t.open_items if str(x).strip()]
+        out[int(t.id)] = {"done": n_done, "open": len(items), "total": n_done + len(items),
+                          "next": items[0] if items else None, "last_done_at": last}
+    return out
+
+
+def typed_entities(store: Any, threads: Sequence[WorkThread], *, now: float | None = None) -> dict[int, list[dict]]:
+    """What each thread involves (its model's list of apps, sites, repos, files and people), each typed by identity:
+    ``person`` when the whole string is a name or alias of someone in memory's people index
+    (:func:`yuki.memory.contacts.identify`), ``app`` when it is the name or process memory knows an app by (capture
+    threads of the last :data:`KNOWN_APP_DAYS`), else ``thing``. ``{id: [{"name", "type", "ref"?}]}``. No word lists."""
+    from yuki.core.appnames import app_key
+    from yuki.memory import contacts as _c
+
+    names = list(dict.fromkeys(e for t in threads for e in t.entities if str(e).strip()))
+    who = _c.identify(store, names) if names else {}
+    apps: set[str] = set()
+    if names:
+        cutoff = (time.time() if now is None else float(now)) - KNOWN_APP_DAYS * 86400.0
+        try:
+            for r in store._query("SELECT DISTINCT app, process FROM threads WHERE last_seen >= ?", (cutoff,)):
+                for v in (r[0], app_key(r[1]) if r[1] else None):
+                    k = " ".join(_c.tokens(v))
+                    if k:
+                        apps.add(k)
+        except Exception:
+            pass
+    out: dict[int, list[dict]] = {}
+    for t in threads:
+        row = []
+        for e in t.entities:
+            if not str(e).strip():
+                continue
+            c = who.get(e)
+            if c is not None:
+                row.append({"name": e, "type": "person", "ref": c.ref, "person": c.name})
+            else:
+                row.append({"name": e, "type": "app" if " ".join(_c.tokens(e)) in apps else "thing"})
+        out[int(t.id)] = row
     return out
 
 

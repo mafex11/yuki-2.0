@@ -623,11 +623,36 @@ class WindowHost(QObject):
             return {"ok": False, "error": f"memory: {exc}"}
 
     def _op_workflows(self, req: dict[str, Any]) -> dict[str, Any]:
-        """``workflows``: learned procedures. Empty until Phase C writes them."""
-        return {"available": False, "workflows": []}
+        """``workflows``: the Playbook page from practice memory (``MemoryClient.workflows``: procedures, lessons,
+        proposals with uses, last use and confidence), probed: ``{"available": false}`` on a memory without it."""
+        def fn(client: Any) -> dict[str, Any]:
+            workflows = getattr(client, "workflows", None)
+            return dict(workflows() or {}) if callable(workflows) else {"available": False, "workflows": []}
+        try:
+            return self._memory().call("workflows", fn, timeout_s=MEMORY_WAIT_S)
+        except Exception as exc:
+            return {"ok": False, "error": f"memory: {exc}"}
 
     def _op_workflow_edit(self, req: dict[str, Any]) -> dict[str, Any]:
-        return {"ok": False, "error": "workflows are not available yet (Phase C)"}
+        """``workflow_edit(ref, verb, words)``: the page's Save / Edit / No on a Playbook item, as practice memory's
+        ``workflow_edit`` action (:func:`yuki.ui.web_window.workflow_action`; an edit carries the user's words and is
+        re-distilled by the practice worker)."""
+        from yuki.ui.web_window import workflow_action
+
+        ref, words = str(req.get("ref") or ""), " ".join(str(req.get("words") or "").split())
+        action = workflow_action(ref, str(req.get("verb") or req.get("action") or ""), words)
+        if action is None:
+            return {"ok": False, "error": "verb must be save, edit (with words) or no"}
+
+        def fn(client: Any) -> dict[str, Any]:
+            edit = getattr(client, "workflow_edit", None)
+            return dict(edit(ref, action, words) or {}) if callable(edit) else {"ok": False, "error": "no playbook"}
+        try:
+            out = self._memory().call("workflow_edit", fn, timeout_s=MEMORY_WAIT_S)
+        except Exception as exc:
+            return {"ok": False, "error": f"memory: {exc}"}
+        self._log("window_op", op="workflow_edit", action=action, ok=bool(out.get("ok")))
+        return out
 
     def _op_permissions_get(self, req: dict[str, Any]) -> dict[str, Any]:
         """``permissions_get``: the autonomy policy (:mod:`yuki.ui.policy`)."""

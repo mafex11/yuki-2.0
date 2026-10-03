@@ -29,6 +29,12 @@
     if (!tiles.length) return null;
     return h('div', { class: 'now' + (tiles.length === 2 ? ' two' : tiles.length === 1 ? ' one' : '') }, tiles);
   }
+  /* today's goals (check-ins' goals, in your words): a quiet line under the Now strip, open ones first */
+  function goalsLine(goals) {
+    if (!(goals || []).length) return null;
+    return h('div', { class: 'now-goals', data: { clear: '' } }, Y.label('Today you’re after', null, 'lesson'),
+      goals.map((g) => h('span', { class: 'g' + (g.done ? ' done' : ''), title: g.done ? 'Done' : '' }, g.done ? ic('check') : null, h('span', { text: g.text }))));
+  }
 
   function question(n) {
     return h('div', { class: 'item', data: { item: '', ref: n.ref } },
@@ -118,7 +124,8 @@
       h('span', { class: 'nm', text: p.name }), h('span', { class: 'rl', text: [p.route, p.last_at ? fmt.rel(p.last_at) : ''].filter(Boolean).join(' · ') }),
       p.rhythm ? Y.rhythm(p.rhythm) : h('span', { class: 'rl', text: p.count != null ? fmt.plural(p.count, 'message') : '' })));
     const anyRhythm = people.some((p) => p.rhythm);
-    return [head, nowStrip(d.now),
+    if (anyRhythm) latelyB.push(h('div', { class: 'lately-note', text: 'Only chats Yuki saw on this PC.' }));
+    return [head, nowStrip(d.now), goalsLine((d.now || {}).goals),
       h('div', { class: 'grid2' },
         h('div', { class: 'col' },
           Y.sec('Needs you', needs.length, needsB),
@@ -191,18 +198,28 @@
   A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
-  /* Learned proposals (Phase C writes them; the workflow ops say so until then) */
+  /* Learned proposals (practice memory, E13): Save keeps it, Edit is your words (memory re-distills the next
+     version from them), No drops it; a question is answered in your words or skipped. Python maps the choice onto
+     memory's workflow_edit. Shared with the Playbook page. */
   function learnedAct(t, verb, words) {
     const box = t.closest('[data-learned]');
-    Y.act('workflow_edit', { ref: box.dataset.ref, verb, words }).then((r) =>
-      Y.morph(box, h('div', null, Y.confirmRow(r.ok ? ({ save: 'Saved to your playbook. I’ll show it when I use it.', no: 'Dropped. I won’t keep that.', edit: `Saved your version: “${words}”` }[verb]) : (r.error || 'Not available yet.'), { icon: r.ok ? 'lesson' : 'x' }))));
+    const question = box.dataset.kind === 'question';
+    Y.act('workflow_edit', { ref: box.dataset.ref, verb, words }).then((r) => {
+      const ok = question
+        ? { no: 'Skipped. I won’t ask that again soon.', edit: `Saved your answer: “${words}”` }[verb]
+        : { save: 'Saved to your playbook. I’ll show it when I use it.', no: 'Dropped. I won’t use that.',
+          edit: `Saved your version: “${words}”. I’ll rewrite it in your words.` }[verb];
+      Y.morph(box, h('div', null, Y.confirmRow(r.ok ? ok : (r.error || 'Memory didn’t take that.'), { icon: r.ok ? 'lesson' : 'x' })));
+    });
   }
   A['learn-save'] = (t) => learnedAct(t, 'save');
   A['learn-no'] = (t) => learnedAct(t, 'no');
   A['learn-edit'] = (t) => {
     const box = t.closest('[data-learned]'), tx = box.querySelector('.ltx');
-    Y.morph(box, h('div', null, h('div', { class: 'label' }, ic('edit'), 'Say it your way'),
-      h('textarea', { class: 'learn-in', attrs: { rows: 2, 'aria-label': 'Edit what I learned' }, text: tx ? tx.textContent : '' }),
+    const question = box.dataset.kind === 'question';
+    Y.morph(box, h('div', null, h('div', { class: 'label' }, ic('edit'), question ? (tx ? tx.textContent : 'Your answer') : 'Say it your way'),
+      h('textarea', { class: 'learn-in', attrs: { rows: 2, 'aria-label': question ? 'Your answer' : 'Edit what I learned', placeholder: question ? 'In your words' : '' },
+        text: question || !tx ? '' : tx.textContent }),
       h('div', { class: 'row' }, key('Save', { cls: 'pri sm', data: { do: 'learn-save2' } }), key('Cancel', { cls: 'ghost sm', data: { do: 'undo' } }))));
     const ta = box.querySelector('textarea'); if (ta) ta.focus();
   };

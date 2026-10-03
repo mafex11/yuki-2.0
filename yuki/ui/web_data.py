@@ -8,7 +8,10 @@ client: nothing here writes, calls a model, or reads what a message says to deci
 Every builder runs on a worker thread and is safe to call again; a failing part leaves its section empty.
 
 Times are epoch seconds (the page formats them); words the page shows are plain and honest about what memory does
-not have yet (no per-day message counts, no procedure steps, no thread checklists).
+not have (a memory without the people index, practice memory or goals gets the older views, probed with getattr).
+E11-E14 (32-build-E11-E14.md): contact rhythm (``rhythm_view``), thread checklists, typed "involves" and goals
+(``build_work``), the Playbook from ``workflows()`` (``build_playbook``), the ledger from the run traces with why,
+result and Undo (``build_activity``), today's goals on Home's Now strip (``goals_today``).
 """
 
 from __future__ import annotations
@@ -304,23 +307,103 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
         away.append({"kind": "request", "title": request_title(r.get("what") or ""), "at": r["at"], "state": r["state"],
                      "changed": [{"text": words, "state": "failed" if r["state"] == "failed" else "done"}], "cost": cost})
     away.sort(key=lambda x: x.get("at") or 0, reverse=True)
+    now_strip["goals"] = goals_today(memory)
     return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away[:INBOX_MAX],
             "people": (people or [])[:6], "since": since}
+
+
+#: Goals the Now strip shows at most (today's, open first).
+GOALS_SHOWN = 4
+
+
+def goal_view(g: dict[str, Any]) -> dict[str, Any]:
+    """One of memory's goals (``MemoryClient.goals``) as the page shows it: what it is (the user's own words when
+    memory kept them), done or not, its thread."""
+    text = " ".join(str(g.get("text") or g.get("words") or "").split())
+    return {"ref": g.get("id"), "text": text, "status": g.get("status") or "open", "done": g.get("status") == "done",
+            "thread": g.get("thread")}
+
+
+def goals_today(memory: Any) -> list[dict[str, Any]]:
+    """Today's goals for Home's Now strip (check-ins' goals, migration 30): open and unconfirmed ones first, then the
+    ones done today. Probed: ``[]`` on a memory without goals."""
+    goals = getattr(memory, "goals", None)
+    if not callable(goals):
+        return []
+    rows = _safe(lambda: goals(today=True, statuses=("open", "unknown", "done")), []) or []
+    out = [goal_view(g) for g in rows if isinstance(g, dict)]
+    out = [g for g in out if g["text"]]
+    out.sort(key=lambda g: g["done"])
+    return out[:GOALS_SHOWN]
+
+
+def thread_goals(memory: Any) -> dict[str, dict[str, Any]]:
+    """The open goal of each thread of work (``W12`` -> the most recently updated open or unconfirmed goal of any
+    scope that names the thread), for the quiet goal line on Work's thread cards. Probed: ``{}`` without goals."""
+    goals = getattr(memory, "goals", None)
+    if not callable(goals):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for g in _safe(lambda: goals(statuses=("open", "unknown"), limit=60), []) or []:
+        if isinstance(g, dict) and g.get("thread") and g["thread"] not in out:
+            view = goal_view(g)
+            if view["text"]:
+                out[str(g["thread"])] = view
+    return out
 
 
 # -- People (Me, and Home's "people lately") -----------------------------------------------------------------------
 
 
 def _route(r: dict[str, Any]) -> dict[str, Any]:
+    """One route as the routes table shows it: the app; the place (``DM`` for a direct chat, else the chat's name) and
+    the handle the app shows them by (or the chat's kind) small beside it; the counts both ways and the last time."""
     last = max(epoch_of(r.get("last_mine")) or 0, epoch_of(r.get("last_theirs")) or 0) or None
-    return {"label": r.get("label") or "", "app": r.get("app") or "", "kind": r.get("kind") or "",
+    kind = str(r.get("kind") or "")
+    chat, handle = " ".join(str(r.get("chat") or "").split()), " ".join(str(r.get("handle") or "").split())
+    if chat or handle:
+        place = "DM" if kind == "dm" else chat or handle
+        sub = (("@" + (handle or chat).lstrip("@")) if kind == "dm" else
+               (handle if handle and handle != chat else {"group": "group", "channel": "channel"}.get(kind, "")))
+    else:   # an older index without the chat's own fields: the route's label as it was
+        place, sub = r.get("label") or "", ""
+    return {"label": place, "sub": sub, "app": r.get("app") or "", "kind": kind,
             "mine": r.get("mine"), "theirs": r.get("theirs"), "last_at": last, "preferred": bool(r.get("preferred")),
             "share": r.get("share")}
 
 
+def _day_label(iso: str | None) -> str:
+    """``2026-09-24`` -> ``24 Sep``."""
+    try:
+        d = date.fromisoformat(str(iso))
+    except (TypeError, ValueError):
+        return ""
+    return f"{d.day} {d:%b}"
+
+
+def rhythm_view(r: Any) -> tuple[list[Any] | None, dict[str, Any] | None]:
+    """Memory's contact rhythm (``yuki.memory.contacts.rhythm``) as the page draws it: the 14 daily counts (``None``:
+    before Yuki read any chat on this PC, a hollow dot) and the words around the figure - the axis (first day, the day
+    Yuki started watching when it falls inside, today), the sum over the days known, the peak and its day, on how many
+    days there were messages. ``(None, None)`` without per-day counts."""
+    if isinstance(r, list):
+        return r, None
+    if not isinstance(r, dict) or not isinstance(r.get("days"), list):
+        return None, None
+    days, dates = list(r["days"]), list(r.get("dates") or [])
+    watch = next((i for i, v in enumerate(days) if v is not None), None) if r.get("since_watch") else None
+    info = {"total": int(r.get("total") or 0), "known": int(r.get("known_days") or 0),
+            "active": int(r.get("active_days") or 0), "peak": int(r.get("peak") or 0),
+            "peak_day": _day_label(r.get("peak_date")) if r.get("peak") else "",
+            "start_label": _day_label(dates[0]) if dates else "", "watch_index": watch,
+            "watch_label": _day_label(dates[watch]) if watch is not None and watch < len(dates) else "",
+            "mine": r.get("mine"), "theirs": r.get("theirs")}
+    return days, info
+
+
 def person_from_index(p: dict[str, Any]) -> dict[str, Any]:
     """One row of memory's people index (``people_list()``) as Me's list and dossier show it. Message counts and the
-    last contact come from the index; the contact rhythm only when the index has per-day counts (``rhythm``)."""
+    last contact come from the index; the contact rhythm (messages a day both ways, 14 days) from its ``rhythm``."""
     routes = [_route(r) for r in p.get("routes") or [] if isinstance(r, dict)]
     count = sum(int(r["mine"] or 0) + int(r["theirs"] or 0) for r in routes if isinstance(r.get("mine"), int))
     preferred = next((r for r in routes if r["preferred"]), routes[0] if routes else None)
@@ -332,8 +415,11 @@ def person_from_index(p: dict[str, Any]) -> dict[str, Any]:
            "aliases": [str(a) for a in p.get("aliases") or [] if str(a).strip()][:4], "usual": p.get("usual") or "",
            "last_at": epoch_of(p.get("last_contact")), "count": count if routes else None, "routes": routes,
            "route": preferred["app"] if preferred else "", "prov": ("Seen in " + " and ".join(apps[:2])) if apps else ""}
-    if isinstance(p.get("rhythm"), list):
-        out["rhythm"] = p["rhythm"]
+    days, info = rhythm_view(p.get("rhythm"))
+    if days is not None:
+        out["rhythm"] = days
+        if info is not None:
+            out["rhythm_info"] = info
     return out
 
 
@@ -348,8 +434,11 @@ def contact_card(card: dict[str, Any]) -> dict[str, Any]:
     out = {"found": bool(card.get("found", True)), "relation": card.get("relation") or "",
            "aliases": [str(a) for a in card.get("aliases") or []][:4], "usual": card.get("usual") or "",
            "routes": [_route(r) for r in card.get("routes") or [] if isinstance(r, dict)], "facts": facts[:4]}
-    if isinstance(card.get("rhythm"), list):
-        out["rhythm"] = card["rhythm"]
+    days, info = rhythm_view(card.get("rhythm"))
+    if days is not None:
+        out["rhythm"] = days
+        if info is not None:
+            out["rhythm_info"] = info
     return out
 
 
@@ -438,16 +527,50 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
 # -- Work and the Day ----------------------------------------------------------------------------------------------
 
 
+def thread_checks(t: dict[str, Any]) -> dict[str, Any] | None:
+    """A thread's checklist as Work's dot progress draws it: ``{"done", "total", "next"}`` from memory's ``checks``
+    (milestones that landed on it / its open items, E12); ``None`` when there is nothing to count."""
+    c = t.get("checks")
+    if not isinstance(c, dict) or not int(c.get("total") or 0):
+        return None
+    return {"done": int(c.get("done") or 0), "total": int(c.get("total") or 0), "next": c.get("next") or None}
+
+
+def thread_involves(t: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(people, apps and things) a thread involves, typed by memory (``involves_typed``: a person is a name in the
+    people index, matched by identity) - people as their index name, once each; without the typing every name goes
+    to the second list (the page shows those as the mono apps line, never as people)."""
+    typed = t.get("involves_typed")
+    if not isinstance(typed, list):
+        return [], [str(x) for x in t.get("involves") or [] if str(x).strip()]
+    people: list[str] = []
+    things: list[str] = []
+    for e in typed:
+        if not isinstance(e, dict) or not str(e.get("name") or "").strip():
+            continue
+        if e.get("type") == "person":
+            name = str(e.get("person") or e["name"])
+            if name not in people:
+                people.append(name)
+        elif e["name"] not in things:
+            things.append(str(e["name"]))
+    return people, things
+
+
 def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Threads of work (memory's ``threads``), most recently touched first, and the week figure."""
+    """Threads of work (memory's ``threads``), most recently touched first, with their checklists, the people and
+    the apps they involve, their open goal; and the week figure."""
     rows = _safe(lambda: memory.threads(statuses=("active", "paused", "done"), limit=24), []) or []
+    goals = thread_goals(memory)
     threads = []
     for t in rows:
-        checks = t.get("checks") if isinstance(t.get("checks"), dict) else None   # E12 (thread checklists), later
+        people, things = thread_involves(t)
+        goal = goals.get(f"W{t.get('id')}") if t.get("id") is not None else None
         threads.append({"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
                         "state": " ".join(str(t.get("state") or "").split()), "open": [str(x) for x in t.get("open") or []],
-                        "involves": [str(x) for x in t.get("involves") or []], "last_at": epoch_of(t.get("last_seen")),
-                        "checks": checks})
+                        "involves": [str(x) for x in t.get("involves") or []], "people": people, "apps": things,
+                        "last_at": epoch_of(t.get("last_seen")), "checks": thread_checks(t),
+                        "goal": goal["text"] if goal else None})
     order = {"active": 0, "blocked": 0, "paused": 1, "done": 2}
     threads.sort(key=lambda t: (order.get(t["status"], 1), -(t["last_at"] or 0)))
     return {"threads": threads, "week": week if week is not None else week_figure(memory)}
@@ -637,43 +760,299 @@ def _top_full(v: Any) -> str:
 # -- Playbook ------------------------------------------------------------------------------------------------------
 
 
+#: How each practice object came to be (``playbooks.origin``), in the words the Playbook page's side line uses.
+ORIGIN_WORDS = {"distill": "From a run that worked", "run": "From a run that worked",
+                "postmortem": "From a time I got it wrong", "user": "In your words", "taught": "You taught me",
+                "miner": "Seen in what you do", "knowhow": "From what I learned before"}
+
+
+def app_words(apps: list[Any]) -> str:
+    """The apps a playbook is for, as the page names them (``chrome`` -> ``Chrome``; none: ``Any app``)."""
+    from yuki.core.appnames import prettify
+
+    names = [prettify(str(a)) or str(a) for a in apps or [] if str(a).strip()]
+    return " · ".join(dict.fromkeys(names)) if names else "Any app"
+
+
+def _learned_line(c: dict[str, Any]) -> str:
+    """Where a playbook came from and how much evidence it has, e.g. ``From a run that worked, 29 Sep · seen on 3
+    days``."""
+    head = ORIGIN_WORDS.get(str(c.get("origin") or ""), "Learned")
+    since = short_day(epoch_of(c.get("since")))
+    ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
+    bits = []
+    if int(ev.get("days") or 0) > 1:
+        bits.append(f"seen on {ev['days']} days")
+    if int(ev.get("corrected") or 0):
+        bits.append(f"corrected {ev['corrected']}×")
+    return f"{head}{', ' + since if since else ''}" + (" · " + ", ".join(bits) if bits else "")
+
+
+def procedure_view(c: dict[str, Any]) -> dict[str, Any]:
+    """A procedure or habit from ``workflows()`` as the Playbook page's "How you do things" row: title, the line under
+    it (a habit's rule, or what it avoids), its steps, the app, uses and last use, confidence (meter and word) and where
+    it came from. Disabled ones say so."""
+    steps = [str(s) for s in c.get("steps") or [] if str(s).strip()]
+    when = ""
+    if c.get("kind") == "habit":
+        when = " ".join(str(c.get("text") or "").split())
+    elif c.get("avoid"):
+        when = f"Not: {' '.join(str(c['avoid']).split())}"
+    uses = int(c.get("uses") or 0)
+    return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "", "when": when, "steps": steps,
+            "app": app_words(c.get("apps") or []), "uses": uses, "last": short_day(epoch_of(c.get("last_used"))),
+            "conf": c.get("confidence"), "conf_word": conf_word(c.get("confidence")) or str(c.get("label") or ""),
+            "state": c.get("state"), "disabled": bool(c.get("disabled")), "learned": _learned_line(c)}
+
+
+def lesson_view(c: dict[str, Any]) -> dict[str, Any]:
+    """A pitfall or style note as a Lessons row: what it is about (bold), what went wrong, what to do instead, how
+    often it was used and where it came from."""
+    # practice memory's own text() appends " Instead: ..." and " Not: ..." to what happened; those two parts have
+    # their own fields here (``instead``, ``avoid``), so the "because" line is the part before them
+    text = str(c.get("text") or "").split(" Instead: ")[0].split(" Not: ")[0]
+    return {"ref": c.get("id"), "kind": c.get("kind"), "dont": c.get("title") or "",
+            "because": " ".join(text.split()),
+            "do": " ".join(str(c.get("instead") or "").split()), "used": int(c.get("uses") or 0),
+            "from": _learned_line(c), "conf": c.get("confidence"), "disabled": bool(c.get("disabled"))}
+
+
+def proposal_view(c: dict[str, Any]) -> dict[str, Any]:
+    """What Yuki is not sure of yet - a playbook seen once, or a question it would like to ask - as the NEW proposal
+    block: title, the basis line, its steps; ``question`` ones are answered in the user's words."""
+    if c.get("kind") == "question":
+        return {"ref": c.get("id"), "kind": "question", "title": " ".join(str(c.get("text") or c.get("title") or "").split()),
+                "basis": "I’d like to know, so I stop guessing.", "steps": []}
+    steps = [str(s) for s in c.get("steps") or [] if str(s).strip()]
+    ev = c.get("evidence") if isinstance(c.get("evidence"), dict) else {}
+    seen = int(ev.get("seen") or 0)
+    basis = " ".join(str(c.get("text") or "").split()) if not steps else ""
+    when = short_day(epoch_of(c.get("since")))
+    tail = f"Seen {seen} time{'s' if seen != 1 else ''}" if seen else "Seen once"
+    return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "",
+            "basis": (basis + (" " if basis else "") + f"{tail}{', ' + when if when else ''}; I’ll use it once you say so.").strip(),
+            "steps": steps, "app": app_words(c.get("apps") or [])}
+
+
 def build_playbook(memory: Any) -> dict[str, Any]:
-    """Procedures (Phase C writes them: probed), today's know-how, lessons (none yet), the standing rules."""
+    """The Playbook page from practice memory (``workflows()``, Phase C): NEW proposals (seen once, or a question),
+    procedures and habits ("How you do things"), lessons (pitfalls and style notes), with uses, last use and
+    confidence; then the standing rules and requests. Without practice memory, today's know-how instead (probed)."""
     from yuki.ui.window.data import learned_items
 
     workflows = getattr(memory, "workflows", None)
-    procs = _safe(lambda: list(workflows() or []), []) if callable(workflows) else []
-    know = [{"title": k.title, "line": k.line, "app": k.app} for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
+    wf = _safe(workflows, {}) if callable(workflows) else {}
+    wf = wf if isinstance(wf, dict) else {}
+    available = bool(wf.get("available"))
+    procs = [procedure_view(c) for c in wf.get("procedures") or [] if isinstance(c, dict)] if available else []
+    lessons = [lesson_view(c) for c in wf.get("lessons") or [] if isinstance(c, dict)] if available else []
+    props = [proposal_view(c) for c in wf.get("proposals") or [] if isinstance(c, dict)] if available else []
+    know = [] if procs else [{"title": k.title, "line": k.line, "app": k.app}
+                             for k in (_safe(lambda: learned_items(memory, limit=24), []) or [])]
     rules = [rule_json(r) for r in (_safe(memory.rules, []) or [])]
     standing = []
     for r in _safe(memory.standing_requests, []) or []:
         text = " ".join(str(r.get("quote") or r.get("condition") or "").split())
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
-    return {"proposals": [], "procedures": procs, "know_how": know, "lessons": [], "rules": rules,
-            "standing": standing, "workflows_available": callable(workflows)}
+    return {"proposals": props[:3], "procedures": procs, "know_how": know, "lessons": lessons, "rules": rules,
+            "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None}
 
 
 # -- Activity ------------------------------------------------------------------------------------------------------
 
 
+#: What an acting step did, by its tool (the agent's closed set of tool names), in the past tense.
+TOOL_DONE = {"click": "Clicked", "type_text": "Typed", "launch_app": "Opened", "open_url": "Opened",
+             "focus_window": "Brought a window forward", "window_action": "Arranged a window", "hotkey": "Pressed",
+             "press": "Pressed", "scroll": "Scrolled", "hover": "Pointed at", "tab": "Switched tabs",
+             "app_volume": "Changed an app’s volume", "run_powershell": "Ran a command",
+             "write_clipboard": "Put text on the clipboard", "todo": "Changed your list", "remember_rule": "Kept a rule",
+             "forget_rule": "Dropped a rule", "correct_memory": "Corrected what I know",
+             "watch_for": "Started keeping an eye out", "remember_how": "Kept how it’s done",
+             "answer_question": "Kept your answer"}
+#: The argument that names what the tool acted on (the agent's own argument names); the rest show their target.
+TOOL_DETAIL = {"type_text": "text", "launch_app": "query", "open_url": "url", "hotkey": "keys", "press": "key",
+               "app_volume": "app", "window_action": "action", "tab": "tab", "run_powershell": "command",
+               "write_clipboard": "text", "todo": "text", "remember_rule": "text", "forget_rule": "text",
+               "correct_memory": "text", "watch_for": "condition", "remember_how": "text", "answer_question": "answer"}
+#: Practice memory's kinds: ways of doing (shown as "using …") and lessons (shown as "lesson …").
+WAY_KINDS = ("procedure", "habit")
+#: Memory's Undo window for something Yuki added (offers: yuki.memory.offers.UNDO_WITHIN_S; to-dos alike).
+LEDGER_UNDO_S = UNDO_WITHIN_S
+#: A request log row and a run trace are the same request when they started this close (the log keeps seconds).
+SAME_REQUEST_S = 2.5
+
+
+def _clip(text: Any, n: int) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= n else t[: n - 1].rstrip() + "…"
+
+
+#: The to-do tool's own ``action`` values, in the past tense.
+TODO_DONE = {"add": "Added to your list", "done": "Marked done on your list", "not_needed": "Took off your list",
+             "wrong": "Took off your list"}
+
+
+def step_what(step: dict[str, Any]) -> str:
+    """One acting step in plain past-tense words: the tool's verb and what it acted on (its own argument when the tool
+    has one that says so, else the control and window the trace recorded)."""
+    verb = TOOL_DONE.get(str(step.get("tool") or ""), "Did a step")
+    detail = ""
+    key = TOOL_DETAIL.get(str(step.get("tool") or ""))
+    if key:
+        try:
+            args = json.loads(step.get("input") or "{}")
+        except (TypeError, ValueError):
+            args = {}
+        if step.get("tool") == "todo" and isinstance(args, dict):
+            verb = TODO_DONE.get(str(args.get("action") or ""), verb)
+        value = args.get(key) if isinstance(args, dict) else None
+        if isinstance(value, str) and value.strip():
+            detail = f"“{_clip(value, 70)}”" if key in ("text", "condition", "answer", "command") else _clip(value, 70)
+    if not detail and step.get("target"):
+        detail = _clip(step["target"], 80)
+    return f"{verb} {detail}".strip()
+
+
+def step_result(step: dict[str, Any]) -> tuple[str, str]:
+    """(the result in words, its status for the glyph): checked on screen, done, ran but not shown, failed."""
+    ms = step.get("ms")
+    took = ""
+    if isinstance(ms, (int, float)) and ms > 0:
+        took = f" in {round(ms)} ms" if ms < 1000 else f" in {ms / 1000:.1f} s"
+    if step.get("ok") is False:
+        return f"failed: {_clip(step.get('result'), 90)}" if step.get("result") else "failed", "failed"
+    if step.get("verdict") is True:
+        return f"done{took}, checked on screen", "verified"
+    if step.get("verdict") is False:
+        return "ran, but the screen didn’t show it", "unverified"
+    if step.get("expected") or step.get("kind") == "memory":
+        return f"done{took}", "done"
+    return f"done{took}; I couldn’t check it", "unverified"
+
+
+def _todo_for(step: dict[str, Any], todos: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The to-do a ``todo`` step added (its own words, added within two minutes of the step), still open."""
+    try:
+        args = json.loads(step.get("input") or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(args, dict) or args.get("action") != "add" or not str(args.get("text") or "").strip():
+        return None
+    words = " ".join(str(args["text"]).split())
+    at = float(step.get("at") or 0)
+    for t in todos:
+        since = epoch_of(t.get("since"))
+        if t.get("source") == "user" and t.get("status") == "open" and " ".join(str(t.get("text") or "").split()) == words \
+                and since is not None and abs(since - at) <= 120:
+            return t
+    return None
+
+
+def run_rows(run: dict[str, Any], todos: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """One request's rows for the ledger: each acting step (time, what, where, why: the user's words and any
+    procedure or lesson it used, result, Undo where memory can take it back), or one "Answered" row when nothing
+    acted."""
+    voice = run.get("lane") == "voice" or run.get("source") == "hand"
+    words = _clip(run.get("words"), 120)
+    why = (f"you said “{words}”" if voice else f"you typed “{words}”") if words else (
+        "you asked by voice" if voice else "you asked")
+    cost_bits = []
+    if run.get("ms"):
+        cost_bits.append(f"{run['ms'] / 1000:.0f} s" if run["ms"] >= 10000 else f"{run['ms'] / 1000:.1f} s")
+    if run.get("cost_usd"):
+        cost_bits.append(money(run["cost_usd"]))
+    cost = ", ".join(cost_bits)
+    wrong = f"That wasn’t right: “{words}”. " if words else ""
+    steps = run.get("steps") or []
+    if not steps:
+        result = {"final": "answered", "error": "failed", "cancelled": "stopped", "withdrawn": "replaced by a newer request",
+                  "abandoned": "abandoned"}.get(str(run.get("outcome") or ""), str(run.get("outcome") or "answered"))
+        status = "failed" if run.get("outcome") == "error" else "stopped" if run.get("outcome") in (
+            "cancelled", "withdrawn", "abandoned") else "done"
+        return [{"id": f"run:{run.get('key')}", "kind": "request", "f": "failed" if status == "failed" else "did",
+                 "at": float(run.get("at") or now), "what": f"Answered “{words}”" if words else "Answered you",
+                 "where": "Yuki", "cost": cost, "because": "because", "why": why, "chips": [], "result": result,
+                 "status": status, "wrong_text": wrong}]
+    rows = []
+    for i, s in enumerate(steps):
+        result, status = step_result(s)
+        chips = [{"kind": "memory" if c.get("kind") in WAY_KINDS else "lesson", "text": c.get("title") or ""}
+                 for c in s.get("cited") or [] if c.get("title")]
+        row = {"id": f"run:{run.get('key')}:{s.get('step')}", "kind": "action", "f": "failed" if status == "failed" else "did",
+               "at": float(s.get("at") or run.get("at") or now), "what": step_what(s),
+               "where": s.get("app_name") or ("Yuki" if s.get("kind") == "memory" else "Windows"),
+               "cost": cost if i == len(steps) - 1 else "", "because": "because",
+               "why": why + (", using how you do it" if any(c["kind"] == "memory" for c in chips) else "")
+               + (", keeping a lesson in mind" if any(c["kind"] == "lesson" for c in chips) else ""),
+               "chips": chips, "result": result, "status": status, "wrong_text": wrong}
+        todo = _todo_for(s, todos) if s.get("tool") == "todo" else None
+        if todo is not None and row["at"] + LEDGER_UNDO_S > now:
+            row["undo"] = {"todo": todo.get("id"), "until": row["at"] + LEDGER_UNDO_S, "label": "Undo"}
+        elif s.get("kind") == "action" and status != "failed":
+            row["cant_undo"] = True
+        rows.append(row)
+    return rows
+
+
+def call_rows(calls: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+    """The calls whose side Yuki kept, as ledger rows: what (recording or recorded), where, why (the user's standing
+    rule for that app, or their yes on the call's card), and what came of it."""
+    out = []
+    for c in calls:
+        if not c.get("recorded"):
+            continue
+        app = c.get("app") or "a"
+        consent = c.get("consent")
+        why = (f"rule: {app} calls, your mic only" if consent == "always" else
+               "you said yes on the call’s card" if consent == "yes" else "you said yes to keeping your side")
+        live = bool(c.get("live"))
+        mins = int(c.get("min") or 0)
+        result = ("live" if live else "turned into text" if c.get("gists") else
+                  c.get("status") or "waiting to be turned into text")
+        out.append({"id": f"call:{c.get('start_at')}", "kind": "call", "f": "calls", "at": c.get("start_at") or now,
+                    "what": f"Recording your side of a {app} call" if live else
+                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": app, "cost": "", "because": "because",
+                    "why": why, "chips": [], "result": result, "status": "live" if live else "verified"})
+    return out
+
+
 def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float | None = None,
                    days: int = 7) -> dict[str, Any]:
-    """The ledger (finished requests and the cards Yuki showed, newest first), what it saw today (time by app,
-    counts only) and the calls of the week."""
+    """The ledger (E14), newest first: every acting step of Yuki's requests from the run traces (practice memory) with
+    why - the user's words, a procedure or lesson it used - its result and an Undo window where memory can take it
+    back (a to-do it added; an offer that ran); requests the traces don't have, from the request log; the cards Yuki
+    showed (why: the card's reason, or the user's standing request); the calls it kept (why: the user's call rule).
+    Filters by ``f``: did / failed / calls. Plus what it saw today (time by app, counts only) and the week's calls."""
     from yuki.ui.ledger import read_request_log
 
     now = time.time() if now is None else now
     since = now - days * 86400
     rows: list[dict[str, Any]] = []
+    ledger = getattr(memory, "run_ledger", None)
+    runs = (_safe(lambda: ledger(since=since, until=now, limit=150), []) or []) if callable(ledger) else []
+    todos = (_safe(lambda: memory.todos(include_done=False), []) or []) if any(
+        s.get("tool") == "todo" for r in runs for s in r.get("steps") or []) else []
+    for run in runs:
+        rows.extend(run_rows(run, todos, now))
+    run_starts = sorted(float(r.get("at") or 0) for r in runs)
     lanes = {"worker": "Typed request", "front_desk": "Quick answer", "voice": "Voice"}
     for i, r in enumerate(read_request_log(requests_csv, since, limit=120) if requests_csv else []):
+        if any(abs(r["at"] - a) <= SAME_REQUEST_S for a in run_starts):
+            continue   # the run trace above has this request, step by step
         words, cost = request_row_words(r)
         status = {"done": "done", "failed": "failed", "stopped": "stopped"}.get(r["state"], "done")
-        rows.append({"id": f"r{i}", "kind": "request", "at": r["at"], "what": request_title(r.get("what") or ""),
+        voice = r.get("where") == "voice"
+        rows.append({"id": f"r{i}", "kind": "request", "f": "failed" if status == "failed" else "did", "at": r["at"],
+                     "what": request_title(r.get("what") or ""),
                      "where": lanes.get(r.get("where") or "", (r.get("where") or "").replace("_", " ").capitalize()),
-                     "cost": cost, "because": "because", "why": "you asked", "result": words, "status": status,
-                     "cant_undo": status == "done"})
+                     "cost": cost, "because": "because", "why": "you asked by voice" if voice else "you asked",
+                     "chips": [], "result": words, "status": status, "cant_undo": status == "done"})
+    standing = {}
+    for s in _safe(lambda: memory.standing_requests(include_ended=True), []) or []:
+        if isinstance(s, dict) and s.get("ref"):
+            standing[str(s["ref"])] = " ".join(str(s.get("quote") or s.get("condition") or "").split())
     for n in _safe(lambda: memory.recent_nudges(hours=24 * days), []) or []:
         at = epoch_of(n.get("shown_at")) or epoch_of(n.get("at"))
         if not at:
@@ -687,17 +1066,17 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
             "accepted": "you pressed it", "missed": "missed while you were away", "snoozed": "you snoozed cards",
             "shown": "shown"}.get(reaction, reaction)
         c = offer_card(n, now) if offer else None
-        row = {"id": f"c{n.get('id')}", "kind": "card", "card": str(n.get("id")), "at": at,
-               "what": " ".join(str(n.get("text") or "").split())[:160], "where": f"Card · {card_title(n)}",
-               "because": "because" if n.get("reason") else "", "why": " ".join(str(n.get("reason") or "").split())[:200],
+        rule = standing.get(str(n.get("ref") or "")) if str(n.get("ref") or "").startswith("request:") else None
+        why = ((f"rule: “{_clip(rule, 140)}”" if rule else "rule: something you asked me to watch for")
+               if rule is not None else " ".join(str(n.get("reason") or "").split())[:200])
+        row = {"id": f"c{n.get('id')}", "kind": "card", "f": "failed" if outcome in ("expired", "gone") else "did",
+               "card": str(n.get("id")), "at": at, "what": " ".join(str(n.get("text") or "").split())[:160],
+               "where": f"Card · {card_title(n)}", "because": "because" if why else "", "why": why, "chips": [],
                "result": result, "status": "failed" if outcome in ("expired", "gone") else "done"}
         if c and c["undo_until"] and c["undo_until"] > now:
             row["undo"] = {"card": c["card"], "until": c["undo_until"], "label": "Undo"}
         rows.append(row)
-    rows.sort(key=lambda r: r["at"], reverse=True)
     midnight = datetime.combine(datetime.fromtimestamp(now).date(), datetime.min.time()).timestamp()
-    did_today = sum(1 for r in rows if r["at"] >= midnight and r["kind"] == "request")
-    no_reason = sum(1 for r in rows if r["at"] >= midnight and r["kind"] == "card" and not r["why"])
     act = _safe(lambda: memory.activity(since=midnight, until=now, group_by="app", limit=20), {}) or {}
     seen = [{"app": it.get("label") or it.get("app") or "", "min": round(float(it.get("present_s") or 0) / 60, 1),
              "visits": int(it.get("visits") or 0)} for it in act.get("items") or [] if float(it.get("present_s") or 0) >= 30]
@@ -715,7 +1094,11 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
                       "live": bool(c.get("ongoing")), "min": round(float(c.get("seconds") or 0) / 60),
                       "spoke_min": round(float(c.get("speech_s") or 0) / 60) if c.get("recorded") else None,
                       "app": c.get("app") or "", "people": people, "gists": gists[:4], "recorded": bool(c.get("recorded")),
-                      "status": status})
+                      "status": status, "consent": c.get("consent")})
+    rows.extend(call_rows(calls, now))
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    did_today = sum(1 for r in rows if r["at"] >= midnight and r["kind"] in ("action", "request"))
+    no_reason = sum(1 for r in rows if r["at"] >= midnight and not r.get("why"))
     return {"rows": rows[:150], "counts": {"did_today": did_today, "no_reason": no_reason}, "seen": seen,
             "calls": calls}
 
@@ -851,4 +1234,5 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 
 __all__ = ["SCHEMA", "build_shell", "build_home", "build_me", "build_work", "build_day", "build_playbook",
            "build_activity", "build_settings", "people_now", "person_from_index", "contact_card", "chat_item",
+           "rhythm_view", "goals_today", "thread_goals", "run_rows", "call_rows", "step_what", "step_result",
            "runs_of", "offer_card", "shift_times", "media_now", "read_pending", "week_days", "week_figure"]

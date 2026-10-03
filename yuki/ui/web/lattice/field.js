@@ -5,7 +5,9 @@
    - the live colour follows the accent setting (--live; Lattice.refreshColors);
    - Motion.quiet: while a full-screen app covers the window (the host tells the page), one still frame, as reduced
      motion draws; minimised or hidden, the loop stops as before (document.hidden);
-   - a face can be told not to blink while idle (face.idleBlink = false): nothing live, nothing redraws.
+   - a face can be told not to blink while idle (face.idleBlink = false): nothing live, nothing redraws;
+   - the window's idle face blinks cheaply instead (face.tickBlink(), 32-build-E11-E14.md §7): one shared 1 Hz timer,
+     and every 4-7 ticks the eyes dim to the design's blink depth for 140 ms - two still draws, no 30 fps loop.
    Lattice: the living dot field, the halo under the island, Yuki's dot-matrix face, and dot icons.
    Budget:
    - one shared loop on a 33 ms timer (<= 30 fps by construction); it stops when every subscriber
@@ -62,6 +64,28 @@
     }
   };
   document.addEventListener('visibilitychange', () => { if (!document.hidden) Loop.kick(); });
+
+  /* ---------------- the idle blink tick (Yuki, E11-E14 §7) ----------------
+     The design's idle face blinks every 3.8-7 s through the 30 fps loop (about 15 frames a blink). The window's idle
+     face does it on one shared 1 Hz timer instead: each face counts down 4-7 ticks, then is drawn once with its
+     upper eye row at the depth the design's blink reaches (release 0.17 a frame for 140 ms: 0.47) and once open
+     again 140 ms later. Nothing runs while hidden, in reduced motion or under a full-screen app; the timer stops when
+     no ticking face is left on the page. */
+  const BLINK_DEPTH = 0.47, BLINK_HOLD_MS = 140, TICK_MS = 1000;
+  const blinkTicks = () => 4 + Math.floor(Math.random() * 4);   // 4-7 s, the design's 3.8-7 s rounded to ticks
+  const Tick = {
+    faces: new Set(), timer: 0, ticks: 0,
+    add(face) { face.blinkIn = blinkTicks(); this.faces.add(face); if (!this.timer) this.timer = setTimeout(Tick.tick, TICK_MS); },
+    tick() {
+      Tick.timer = 0; Tick.ticks++;
+      Tick.faces.forEach((f) => {
+        if (!f.c.isConnected) { Tick.faces.delete(f); return; }
+        if (document.hidden || Motion.reduced || f.state !== 'idle') return;
+        if (--f.blinkIn <= 0) { f.blinkIn = blinkTicks(); f.stillBlink(); }
+      });
+      if (Tick.faces.size) Tick.timer = setTimeout(Tick.tick, TICK_MS);
+    }
+  };
 
   /* ---------------- dot sprites (pre-rendered, blitted per cell) ---------------- */
   function makeSprites(size, maxR, minR, crisp) {
@@ -504,6 +528,15 @@
       }, 3800 + Math.random() * 3200);
     }
     blinks() { return (this.state === 'idle' && this.idleBlink !== false) || this.state === 'listening' || this.state === 'speaking' || this.state === 'hearing'; }
+    /* Yuki: the idle blink on the shared 1 Hz tick (no loop): see Tick above */
+    tickBlink() { this.idleBlink = false; Tick.add(this); }
+    stillBlink() {
+      this.lid = 1 - BLINK_DEPTH; this.paintStill();
+      clearTimeout(this.lt);
+      this.lt = setTimeout(() => { this.lid = 0; if (this.c.isConnected) this.paintStill(); }, BLINK_HOLD_MS);
+    }
+    /* one frame straight to the target, drawn once (no easing, no loop) */
+    paintStill() { this.snap = true; this.dirty = true; this.frame(performance.now() / 1000); this.snap = false; }
     set(s, step) {
       if (step) this.step = step;
       if (!this.bt) this.scheduleBlink();
@@ -606,7 +639,8 @@
           L(5, 3, 0.5, 0); L(11, 3, 0.5, 0);
           break;
         default:
-          eyes(blink ? [3] : [2, 3], 1);
+          if (this.lid) { eyes([3], 1); eyes([2], 1 - this.lid); }   // Yuki: the tick's still blink
+          else eyes(blink ? [3] : [2, 3], 1);
           for (const c of [7, 8, 9]) L(c, 5, 0.2, 0);
       }
     }
@@ -614,7 +648,7 @@
       if (!this.c.isConnected) { Loop.remove(this.frame); clearTimeout(this.bt); this.bt = 0; SURFACES.delete(this); return false; }
       this.target(Motion.reduced ? 1.3 : t);
       const W = FACE_W, H = FACE_H, x = this.x, dp = this.dp, g = this.g, tn = this.tn, cur = this.cur;
-      const ka = Motion.reduced ? 1 : 0.6, kr = Motion.reduced ? 1 : 0.17;
+      const ka = Motion.reduced || this.snap ? 1 : 0.6, kr = Motion.reduced || this.snap ? 1 : 0.17;
       let maxD = 0;
       for (let n = 0; n < W * H; n++) {
         const d = g[n] - cur[n];
@@ -702,5 +736,5 @@
     readLive();
     SURFACES.forEach((s) => { if (!s.c.isConnected) { SURFACES.delete(s); return; } if (s instanceof Face) s.setPitch(s.p); else s.recolor(); });
   }
-  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, icon, reveal, refreshColors, DPR, FACE_W, FACE_H };
+  window.Lattice = { Field, Face, Core: Face, Loop, Motion, Perf, Tick, icon, reveal, refreshColors, DPR, FACE_W, FACE_H };
 })();
