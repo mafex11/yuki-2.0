@@ -108,8 +108,12 @@ WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0
 #: ``succeeded`` (appLearn): the run a way was learned from (its ``observed`` run) ended done with its last action
 #: verified and nobody corrected it - what lets a way learned from a run be shown and announced (:func:`learned_way`).
 #: It weighs nothing: the run's own ``observed`` event is already its evidence.
+#: ``cleaned`` (appClean): what the practice clean-up pass (:mod:`yuki.memory.practice_clean`) or the daily pitfall
+#: cap did to an object (retired, merged into another, rewritten as title and steps), under the run key
+#: ``clean:<run id>`` (:data:`CLEAN_RUN_PREFIX`), so a whole pass can be taken back.
 NEUTRAL_EVENTS: tuple[str, ...] = ("injected", "cited", "superseded", "retired_by", "user_saved", "user_edit",
-                                   "edit_applied", "user_disabled", "user_enabled", "user_forgot", "succeeded")
+                                   "edit_applied", "user_disabled", "user_enabled", "user_forgot", "succeeded",
+                                   "cleaned")
 EVENT_TYPES: tuple[str, ...] = (*WEIGHTS, *NEUTRAL_EVENTS)
 #: The events that show a way worked (appLearn): the run it came from was a verified success, a later run that followed
 #: it worked, or the user's own word. A way learned from a run without one of them is never shown or announced.
@@ -121,6 +125,17 @@ WORKED_OUTCOMES: tuple[str, ...] = ("worked", "worked_after_trouble")
 WRONG_OUTCOMES: tuple[str, ...] = ("corrected", "failed", "cancelled")
 #: The Learned announcements :func:`workflows` returns at most (newest first).
 LEARNED_SHOWN = 5
+#: The run key prefix of the clean-up pass's ledger events (appClean): ``clean:<portrait run id>``, or
+#: ``clean:daily-<day>`` for the daily pitfall cap. Never a run's evidence (:func:`_run_evidence`).
+CLEAN_RUN_PREFIX = "clean:"
+#: Most live pitfalls kept per app (appClean, 4 Oct; the user: "theres too many spotify lessons"): a request is shown
+#: at most :data:`MAX_PITFALLS` of an app in play, so more than one spare per app only crowds the ranking. The
+#: weakest (no words of the user's, lowest confidence, least evidence, oldest evidence) are retired past it.
+PITFALLS_PER_APP = 4
+#: Where a practice object came from, as the clean-up pass judges it (:func:`provenance`, code only). A way stays
+#: only with the first three; the next two retire it (appClean: "a way stays only if it came from a verified success").
+PROVENANCES: tuple[str, ...] = ("user", "success", "observed", "failed", "unconfirmed", "lesson")
+KEEP_PROVENANCES: tuple[str, ...] = ("user", "success", "observed")
 #: The named auto-reset event the learner sets when a run it read taught a way or marked one a success (appLearn review):
 #: the tray waits on it, only while a done run's Learned box is still to come (``yuki.ui.learned_wait``, its own copy).
 LEARNED_EVENT_NAME = "Local\\YukiLearnedReady"
@@ -1069,8 +1084,8 @@ def refresh(store: Store, *, now: float | None = None) -> int:
 
 
 def _run_evidence(key: Any) -> bool:
-    """A real run's key (not the know-how migration's own)."""
-    return bool(key) and not str(key).startswith(MIGRATION_RUN_PREFIX)
+    """A real run's key (not the know-how migration's own, nor the clean-up pass's)."""
+    return bool(key) and not str(key).startswith((MIGRATION_RUN_PREFIX, CLEAN_RUN_PREFIX))
 
 
 def learned_way(kind: str, events: Sequence[Any]) -> bool:
@@ -1247,6 +1262,112 @@ def stamp_successes(store: Store, *, run_keys: Sequence[str] | None = None, ok: 
                             "refs": {"via": "the run ended done and its last action verified"}}
                            for pid, key in out], now=now)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Cleaning what is saved (appClean, 4 Oct): provenance, the pitfall cap, retiring with a record
+# ---------------------------------------------------------------------------
+
+
+def provenance(store: Store, o: Playbook, events: Sequence[Any] | None = None) -> tuple[str, str]:
+    """Where an object came from, measured from its ledger and its runs' traces (no model): ``(verdict, why)``, the
+    verdict one of :data:`PROVENANCES`.
+
+    A pitfall or style note is a ``lesson`` (judged on its own words, never by this). A way (procedure or habit) is:
+    ``user`` - the user's own word (Save on the Playbook page, a teach-back answer, a quote of theirs it rests on);
+    ``success`` - a run that worked marked it (``succeeded``, ``ran_ok``) or the run it came from is a verified success
+    by its trace that the learner did not judge wrong (:func:`_proven_by_trace`); ``observed`` - not learned from Yuki's
+    runs at all but from what the user does (the nightly miner's days); ``failed`` - learned from runs whose traces are
+    there and none of which was a verified success (failed, stopped, corrected, or done with its last step unverified);
+    ``unconfirmed`` - learned from runs whose traces are gone without ever being marked a success, or carried over from
+    the old know-how notes and never confirmed by a run since (on probation)."""
+    if o.kind not in WAY_KINDS:
+        return "lesson", "a lesson, judged on its own words"
+    events = list(events) if events is not None else ledger(store, o.id)
+    if any(e.type == "user_saved" or (e.type == "taught" and not str(e.run_key or "").startswith(MIGRATION_RUN_PREFIX))
+           for e in events):
+        return "user", "the user's own word (saved, taught or quoted)"
+    if any(e.type in ("succeeded", "ran_ok") for e in events):
+        return "success", "a run that worked marked it"
+    keys = list(dict.fromkeys(str(e.run_key) for e in events if e.type == "observed" and _run_evidence(e.run_key)))
+    if keys:
+        if any(verified_run(store, k) and judged_ok(store, k) is not False for k in keys):
+            return "success", "the run it came from is a verified success by its trace"
+        traced = [k for k in keys if store._query("SELECT 1 FROM runs WHERE run_key=? AND step=0", (k,))]
+        if traced:
+            return "failed", f"learned from {len(traced)} run(s) whose traces show no verified success"
+        return "unconfirmed", "learned from a run that was never marked a success (its trace is gone)"
+    if o.origin in PROBATION_ORIGINS and not confirmed(events):
+        return "unconfirmed", "carried over from the old notes, never confirmed by a run"
+    return "observed", "seen in what the user does, not learned from Yuki's runs"
+
+
+def provenance_rank(verdict: str) -> int:
+    """How strongly a kept way stands (merge survivors): the user's word, then a success, then what the user does."""
+    return {"user": 3, "success": 2, "observed": 1}.get(verdict, 0)
+
+
+def pitfall_rank(store: Store, o: Playbook, events: Sequence[Any] | None = None) -> tuple:
+    """A pitfall's standing for the per-app cap (measured): the user's own words in it first, then confidence, then
+    evidence, then the newest evidence."""
+    events = list(events) if events is not None else ledger(store, o.id)
+    taught = any(e.type == "taught" and not str(e.run_key or "").startswith(MIGRATION_RUN_PREFIX) for e in events)
+    return (1 if taught else 0, float(o.confidence or 0.0), int(o.n_observed or 0), float(o.last_evidence_at or 0.0),
+            int(o.id))
+
+
+def pitfall_overflow(store: Store, pitfalls: Sequence[Playbook], *, cap: int = PITFALLS_PER_APP) -> list[int]:
+    """The pitfalls past the cap of their apps (code): strongest first (:func:`pitfall_rank`), each kept while every app
+    it names (or "no app") still has room. Returns the ids to retire, weakest last."""
+    ranked = sorted(pitfalls, key=lambda o: pitfall_rank(store, o), reverse=True)
+    room: Counter = Counter()
+    out = []
+    for o in ranked:
+        apps = list(o.apps) or [""]
+        if all(room[a] < cap for a in apps):
+            for a in apps:
+                room[a] += 1
+        else:
+            out.append(o.id)
+    return out
+
+
+def retire_cleaned(store: Store, items: Sequence[dict[str, Any]], *, run_key: str,
+                   now: float | None = None) -> list[int]:
+    """Retire live objects bi-temporally (``valid_to``, state retired; a merged one ``superseded_by`` the object it
+    went into), each with a ``cleaned`` ledger event under ``run_key`` (``{"id", "action", "category", "why",
+    "into"}``). Nothing is deleted; :func:`yuki.memory.practice_clean.undo` takes it back. Returns the ids retired."""
+    now = _now(now)
+
+    def op(conn: Any) -> list[int]:
+        done = []
+        for it in items:
+            pid = int(it["id"])
+            into = int(it["into"]) if it.get("into") is not None else None
+            n = conn.execute("UPDATE playbooks SET valid_to=?, state='retired', superseded_by=?, updated_at=?"
+                             " WHERE id=? AND valid_to IS NULL", (now, into, now, pid)).rowcount
+            if n:
+                _insert_event(conn, store, pid, "cleaned", now, run_key,
+                              {"action": it.get("action") or "retire", "category": it.get("category"),
+                               "why": it.get("why"), "into": into})
+                done.append(pid)
+        return done
+
+    return store._write(op)
+
+
+def cap_pitfalls(store: Store, *, cap: int = PITFALLS_PER_APP, dry_run: bool = False,
+                 now: float | None = None) -> list[int]:
+    """The daily pitfall cap (the practice worker's refresh, appClean): live pitfalls past :data:`PITFALLS_PER_APP` per
+    app are retired (code; the weakest first), under the run key ``clean:daily-<day>``. Disabled ones are left alone.
+    Returns the ids retired (or that would be, ``dry_run``)."""
+    now = _now(now)
+    over = pitfall_overflow(store, live(store, ["pitfall"]), cap=cap)
+    if over and not dry_run:
+        retire_cleaned(store, [{"id": i, "action": "retire", "category": "over_cap",
+                                "why": f"more than {cap} pitfalls for its app"} for i in over],
+                       run_key=f"{CLEAN_RUN_PREFIX}daily-{_day(now)}", now=now)
+    return over
 
 
 def live(store: Store, kinds: Sequence[str] | None = None, *, include_disabled: bool = False) -> list[Playbook]:
