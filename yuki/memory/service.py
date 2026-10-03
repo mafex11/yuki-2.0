@@ -585,9 +585,12 @@ def run(args: argparse.Namespace) -> int:
 
                 # the observation cards read the screen recall's cache in-process (no pipe, no new embedding)
                 recall_cache = screen_recall.latest if screen_recall is not None else None
+                from yuki.memory.embed import get_embedder as _nudge_embedder   # shared; loads on first use
+
                 nudges = NudgeWorker(store, db_path=db_path, privacy=privacy, locked_fn=session_locked,
                                      attention=shared_attention(),
-                                     live_fn=live_state, log=log, screen_fn=recall_cache)
+                                     live_fn=live_state, log=log, screen_fn=recall_cache,
+                                     embedder=_nudge_embedder())
                 nudges_thread = threading.Thread(
                     target=_guarded(nudges.run, log, "nudges"), args=(stop, pause_path),
                     name="yuki-memory-nudges", daemon=True,

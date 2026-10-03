@@ -91,8 +91,9 @@ WEIGHTS: dict[str, float] = {"less": -1.0, "not_now": -0.5, "stopped": -1.0, "un
 OFF_AT = -3.0
 #: A request sent from an ``ask`` suggestion and stopped within this long counts as not wanted.
 STOP_WITHIN_S = 60.0
-#: Kinds of cards with offers: the observation cards (their channel is the trigger) and the welcome back.
-OFFER_CARD_KINDS: tuple[str, ...] = ("notice", "resume")
+#: Kinds of cards with offers: the observation cards (their channel is the trigger), the welcome back, and a
+#: check-in (a question card of trigger "checkin", yuki.memory.checkins: at most a todo_add).
+OFFER_CARD_KINDS: tuple[str, ...] = ("notice", "resume", "question")
 
 #: nudge_state key: what Undo needs per card (``{nudge id: {"todo": id}}``), kept for the last cards only.
 UNDO_STATE = "offers_undo"
@@ -139,22 +140,22 @@ JUDGE_OFFER_PROPERTIES: dict[str, Any] = {
 #: The prompt paragraph both writers and the judge share: what an offer may be (model judgement on top of the
 #: closed list; the list itself is the backstop).
 OFFER_RULES = """\
-Offers. A card may carry one offer, and only for Yuki's own small job, from this closed list (its button runs \
+Offers. A card may carry one offer, and only for your own small job, from this closed list (its button runs \
 exactly that, by code, nothing else):
 - todo_add: put one open item of the user's on their Yuki list, with its day or time when the data gives one - \
 the natural offer when something they mean to do (a plan they said, a deadline, a thread's open item) is not on \
 TO-DOS yet ("want it on your list for Monday?");
-- show_memory: show something Yuki already holds - a thread of work, a call's notes, a link, a know-how - named \
+- show_memory: show something you already hold - a thread of work, a call's notes, a link, a know-how - named \
 by its id in refs;
 - bring_back: open again one web page the user already had (an L link, or a W thread's latest page), named in refs;
 - draft: when someone is waiting on a reply from the user (a question on their PR, an ask in a chat), a \
 ready-written reply shown inside the card, in their register, for them to copy and send themselves;
 - ask: a suggested request put in the ask bar, unsent, for the user to change and send themselves (when the only \
-useful help is something Yuki would have to go and look into).
+useful help is something you would have to go and look into).
 The user's own work - their code, repos, files, documents, designs, reviews, tests, their apps' sessions - is \
 theirs: never offer to do, open, read, check, run or finish any of it, and never to send, post or follow up a \
 message ("that's my work, I'll do it"). Putting one of its open items on their list (todo_add), showing what \
-Yuki already holds about it (show_memory) or drafting a reply someone is waiting on (draft) does not touch the \
+you already hold about it (show_memory) or drafting a reply someone is waiting on (draft) does not touch the \
 work and is fine. No offer when another tool (an AI agent, a CI run, a colleague's message) already gave the \
 user the next step and they are acting on it, and never an offer that repeats or carries out another tool's \
 advice. Never offer to add what TO-DOS already has. A card without an offer is complete.
@@ -499,7 +500,10 @@ def record_outcome(store: Any, nudge_id: int, outcome: str, *, now: float | None
 
 
 def channel_of(n: Any) -> str:
-    """The card's channel for learning: an observation card's trigger, else its kind (``resume``)."""
+    """The card's channel for learning: an observation card's trigger, a check-in's ``checkin``, else its kind
+    (``resume``)."""
+    if n.kind == "question" and getattr(n, "trigger", None) == "checkin":
+        return "checkin"
     return str((getattr(n, "trigger", None) if n.kind == "notice" else None) or n.kind)
 
 

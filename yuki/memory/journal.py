@@ -81,6 +81,7 @@ from yuki.memory.questions import (
     embed_questions,
     known_text,
     question_from_item,
+    SCREEN_QUESTION_KINDS,
     question_item_schema,
     vet_new,
 )
@@ -597,7 +598,7 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                     "What you would otherwise have to guess and that matters for knowing the user, as questions "
                     "for them (see ASK, DON'T GUESS). Usually empty; at most two."
                 ),
-                "items": question_item_schema("source"),
+                "items": question_item_schema("source", SCREEN_QUESTION_KINDS),
             },
             "work": _work.work_property(),
         },
@@ -692,7 +693,7 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
             "questions": {
                 "type": "array",
                 "description": "Names the user said that memory cannot place (see ASK ABOUT NAMES); usually empty.",
-                "items": question_item_schema("source"),
+                "items": question_item_schema("source", SCREEN_QUESTION_KINDS),
             },
             "work": _work.work_property(call_side=True),
         },
