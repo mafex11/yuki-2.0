@@ -293,6 +293,32 @@ def test_the_lattice_cards_keys_run_offers_by_code_and_answer_questions(qapp):
     card.close()
 
 
+def test_a_check_in_is_titled_by_its_moment_and_shows_its_offer(qapp):
+    from yuki.ui.cards import card_title
+    from yuki.ui.nudges import NudgeCard
+
+    todo = {"do": "todo_add", "label": "Add to list", "steps": ["add “Ship the export cleanup” to your list"],
+            "wont": "Changes only your list.", "undo": True, "expires_at": _soon()}
+    base = {"id": 11, "kind": "question", "trigger": "checkin", "ref": "question:9", "at": None,
+            "text": "Did the export cleanup go out? You said you'd ship it today."}
+    # the moment is what Yuki itself wrote on the card (its row, or the card's inputs) - never read from the words
+    assert card_title({**base, "moment": "day_start"}) == "Today"
+    assert card_title({**base, "inputs": {"moment": "followup"}}) == "Following up"
+    assert card_title({**base, "moment": "evening"}) == "Tonight"
+    assert card_title(base) == "Checking in"                       # a check-in whose moment is not on its row
+    assert card_title({**base, "trigger": None}) == "Getting to know you"   # a plain question is unchanged
+    card = NudgeCard(linger_ms=5000)
+    card.set_nudge({**base, "moment": "followup", "offer": todo})
+    assert card.head.text().startswith("Following up") and card.title.text() == "Following up"
+    assert not card.do_button.isHidden() and card.do_button.text() == "Add to list"   # its typed key
+    assert card.detail.text() == "Will: add “Ship the export cleanup” to your list\nWon't: Changes only your list."
+    assert card.rest.text() == "You said you'd ship it today." and not card.answer_input.isHidden()
+    assert not card.reply_button.isHidden() and not card.never_button.isHidden()      # still a question
+    card.set_nudge({"id": 12, "kind": "question", "at": None, "text": "Side project or work?", "offer": todo})
+    assert card.do_button.isHidden() and card.head.text().startswith("Question")      # not a check-in: no key
+    card.close()
+
+
 def test_the_consent_card_answers_always_when_the_check_is_on(qapp):
     from yuki.ui.calls import CallConsentCard
 

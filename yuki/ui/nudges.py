@@ -60,8 +60,8 @@ from yuki.ui.status import STRIP_MARGIN, STRIP_WIDTH
 from yuki.ui.uilog import UiLog
 # What a card says and offers, as plain data (no Qt): shared with the HTML window's process (re-exported here).
 from yuki.ui.cards import (  # noqa: F401 - re-exported: chatview, window_host and tests import them from here
-    KIND_TITLES, NOTICE_TITLES, OFFER_DOS, OFFER_FAILED, card_offer, card_title, kind_title, offer_expired,
-    offer_label, offer_lines, offer_open, offer_steps,
+    CHECKIN_ICONS, CHECKIN_TITLES, KIND_TITLES, NOTICE_TITLES, OFFER_DOS, OFFER_FAILED, card_offer, card_title,
+    checkin_moment, kind_title, offer_expired, offer_label, offer_lines, offer_open, offer_steps,
 )
 
 #: The named event the memory service sets when it writes a nudge.
@@ -510,6 +510,12 @@ class NudgeCard(LatticeCard):
         self.when.hide()
         self.body = L.Para("", font=L.ui_font(15), line_height=1.45, parent=self)
         self.content.addWidget(self.body)
+        #: What a check-in that carries an offer rests on (its Will / Won't take the detail's place).
+        self.rest_gap = QWidget(self)
+        self.rest_gap.setFixedHeight(6)
+        self.content.addWidget(self.rest_gap)
+        self.rest = L.Para("", font=L.ui_font(12.5), color=L.TEXT2, line_height=1.45, parent=self)
+        self.content.addWidget(self.rest)
         #: An offer's Will / Won't, or what a question rests on.
         self.detail = Detail(self)
         self._detail_gap = QWidget(self)
@@ -616,19 +622,33 @@ class NudgeCard(LatticeCard):
         title = "" if kind == "nudge" else card_title(nudge)   # a plain check-in has no kind heading
         self.title.setText(title)
         question = kind == "question"
-        offer = offer_open(nudge) and not question
+        moment = checkin_moment(nudge)   # a check-in (Yuki's own moment on the card), else None
+        # a check-in that carries a typed offer shows its key and Will / Won't, as an offer card does
+        offer = offer_open(nudge) and (not question or moment is not None)
         brk = kind == "nudge"
         self._acted, self._draft = False, ""
         when = when_label(nudge.get("at"))
         self.when.setText(when)
         # the design's headers: "Offer · from what I saw", "Question", "Break"; other kinds their own heading
-        head = ["Offer · from what I saw" if offer else "Question" if question else BREAK_TITLE if brk else title,
-                when]
-        self.set_head("eye" if offer else KIND_ICONS.get(kind, "dot"), " · ".join(x for x in head if x))
+        # a check-in: its moment's heading ("Today", "Following up", "Tonight"), from the moment Yuki wrote on it
+        head = [title if moment is not None else "Offer · from what I saw" if offer else "Question" if question
+                else BREAK_TITLE if brk else title, when]
+        icon = (CHECKIN_ICONS.get(moment, "lesson") if moment is not None else "eye" if offer
+                else KIND_ICONS.get(kind, "dot"))
+        self.set_head(icon, " · ".join(x for x in head if x))
         text = _squash(nudge.get("text"))
         self.body._lh = 1.4 if brk else 1.45
         self.body.set_font(L.ui_font(17 if brk else 15, 400))
-        if question:   # the question leads; what it rests on sits under it, small and dim
+        self.rest.set_text("")
+        if question and offer:   # a check-in with an offer: the question, what it rests on, then Will / Won't
+            asked, rest = split_question(text)
+            self.body.set_text(asked)
+            self.rest.set_text(rest)
+            o = card_offer(nudge) or {}
+            self.detail.set_lines("; ".join(offer_steps(nudge)), " ".join(str(o.get("wont") or "").split()))
+            self.detail.setVisible(True)
+            self._detail_gap.setFixedHeight(12)
+        elif question:   # the question leads; what it rests on sits under it, small and dim
             asked, rest = split_question(text)
             self.body.set_text(asked)
             self.detail.set_plain(rest)
@@ -644,13 +664,16 @@ class NudgeCard(LatticeCard):
             self.detail.setVisible(offer)
             self._detail_gap.setFixedHeight(12)
         self._detail_gap.setVisible(not self.detail.isHidden())
+        self.rest.setVisible(bool(self.rest.text()))
+        self.rest_gap.setVisible(bool(self.rest.text()))
         do = str((card_offer(nudge) or {}).get("do") or "")
         self.do_button.set_parts(offer_label(nudge) if offer else BREAK_BUTTONS[0] if brk else "",
                                  icon=OFFER_ICONS.get(do) if offer else None)
         self.do_button.setEnabled(True)
         self.do_button.setVisible(offer or brk)
-        self.reply_button.set_parts(QUESTION_BUTTONS[0] if question else "Reply", variant="pri" if question else "")
-        self.reply_button.setVisible(not offer and not brk)
+        self.reply_button.set_parts(QUESTION_BUTTONS[0] if question else "Reply",
+                                    variant="pri" if question and not offer else "")
+        self.reply_button.setVisible((question or not offer) and not brk)
         self.later_button.setVisible(brk)
         self.answer_input.setVisible(question)
         self.acts.setStretch(self._stretch_at, 0 if question else 1)   # the answer field takes the row
@@ -662,7 +685,7 @@ class NudgeCard(LatticeCard):
         self.result.set_text("")
         self.result_gap.setVisible(False)
         self.draft.setVisible(False)
-        if offer:
+        if offer and not question:
             self.dismiss_button.set_parts(OFFER_BUTTONS[0])
             self._foot([self.dismiss_button, self.less_button], "cards never start a run")
         elif question:

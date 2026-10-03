@@ -482,10 +482,11 @@ class _ItemWidget(QWidget):
             head = QHBoxLayout()
             head.setSpacing(8)
             head.addWidget(Wave("checkin", theme=lambda: t, size=(34, 10)), 0, Qt.AlignmentFlag.AlignVCenter)
-            from yuki.ui.nudges import card_offer, card_title
+            from yuki.ui.nudges import card_offer, card_title, checkin_moment
 
             joiner = " at " if overlay else ", "
-            title = card_title(nudge) if kind == "notice" else KIND_TITLES.get(kind, "Yuki")
+            checkin = checkin_moment(nudge) is not None
+            title = card_title(nudge) if kind == "notice" or checkin else KIND_TITLES.get(kind, "Yuki")
             missed = ", missed while you were away" if nudge.get("missed") else ""
             when = _label(t, f"{title}{joiner}{_stamp(item.at)}{missed}", "micro", t.text_3,
                           wrap=False, select=False)
@@ -512,7 +513,7 @@ class _ItemWidget(QWidget):
             self.offer_result: QLabel | None = None
             #: The offer's state as this thread last heard it (``nudge_state`` ``offer:<state>``), else its outcome.
             self.offer_state: str | None = str(nudge.get("_offer_state") or nudge.get("outcome") or "") or None
-            offer = card_offer(nudge) if kind != "question" else None
+            offer = card_offer(nudge) if kind != "question" or checkin else None   # a check-in may carry one
             if offer is not None:   # what the button will and won't do, in sight before the press
                 from yuki.ui.nudges import offer_label, offer_lines
 
