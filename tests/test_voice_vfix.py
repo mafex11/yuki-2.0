@@ -932,7 +932,7 @@ def test_f9_an_app_named_between_the_job_starting_and_its_run_beginning_is_kept(
                               partial=signal, thought=signal, said=signal, _apps_named={})
     job = Job(3, "Text Meera", None, "voice")
     lane = SimpleNamespace(blocked=None, allowed_tools=None, runtime=runtime, name="worker",
-                           _state=threading.Lock(), _named_late={}, _current=job)
+                           _state=threading.Lock(), _named_late={}, _current=job, _early_steers={})
 
     class _Agent:
         cancelled = False
