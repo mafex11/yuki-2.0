@@ -1375,7 +1375,7 @@ def call_rows(calls: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
                   c.get("status") or "waiting to be turned into text")
         out.append({"id": f"call:{c.get('start_at')}", "kind": "call", "f": "calls", "at": c.get("start_at") or now,
                     "what": f"Recording your side of a {app} call" if live else
-                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": app, "cost": "", "because": "because",
+                    f"Recorded a {dur_words(mins * 60)} {app} call", "where": c.get("where") or app, "cost": "", "because": "because",
                     "why": why, "chips": [], "result": result, "status": "live" if live else "verified"})
     return out
 
