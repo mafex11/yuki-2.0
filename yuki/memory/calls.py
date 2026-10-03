@@ -1,10 +1,21 @@
-"""Calls, "just my side": remember what the user said in a call, from their own microphone only.
+"""Calls, both sides: remember what was said in a call - the user's microphone and the call app's own audio.
 
-Decided with the owner (docs/MEMORY.md, "Calls: just my side"): during a call
-Yuki may transcribe ONLY the user's microphone - never the call's audio, never
-the other participants - on this PC, and only when the user said yes for this
-call (or "always" for the app). Nothing is ever inferred about what anyone
-else said.
+Decided with the owner (docs/MEMORY.md, "Calls: both sides"; handbook rule 9). From
+24 Sept to 3 Oct 2026 only the user's own microphone was recorded. Since 3 Oct a call
+is recorded on both sides, on this PC, only when the user said yes for this call (or
+"always" for the app): the user's microphone (headphones only, as before) plus the
+call app's own audio output through Windows process loopback
+(:mod:`yuki.memory.loopback`: only the call app's process tree - never the whole
+output, so games, music and Yuki's own voice stay out). A game's own voice chat
+(the measured :func:`yuki.memory.avsignals.gaming_with_voice`, never an app list)
+is a voice session of its own (``calls.kind`` "game"), with its own track and the
+same per-app consent, asked only when a card can be seen. The microphone is recorded
+once per voice session, whatever number of app tracks run beside it. Every
+transcribed line says who spoke (``who`` user | others), on which app (``app``,
+``track_kind`` call | game), and a user line which apps were taking the microphone
+then (``heard_by``, from Core Audio's capture-session states: a game that opens its
+microphone only while push-to-talk is held tells a reply to teammates from talk to
+the friends on the call). Knobs: ``[calls] record_others`` and ``game_voice``.
 
 One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
 
@@ -18,7 +29,10 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
    "screen_stale" after it (probably still in the call, not certain). An app the user listed in
    ``[calls] apps`` holding the microphone is a call too (``via`` "mic"). Sound out, the camera and the
    timeline's meeting row are hints only. A full-screen game in front using its own voice chat is not a
-   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`). A call on a site inside a browser (an
+   call (measured: :func:`yuki.memory.avsignals.gaming_with_voice`): it is a **game voice session** of its
+   own (``kind`` "game", ``via`` "game"), living like a call (:class:`CallLife`: the game's microphone
+   hold, its release grace, and the game seen in front drawing like a game as its "screen"). A call on a
+   site inside a browser (an
    app the timeline saw showing ``browser_sites``+ sites) is that site's: its standing answer is kept for
    the site's service, never for the whole browser.
    **Once started, the microphone hold is the session** (:class:`CallLife`, 2026-10-03): the screen decided
@@ -36,14 +50,22 @@ One thread in ``yuki-memory`` (:class:`CallWorker`, ``yuki-memory-calls``):
    per app (``call_prefs``) and answer later calls without a card. No answer
    (card timed out, UI not running, call over) = nothing recorded. While
    nudges are snoozed no card is shown (``not_asked``); memory's pause stops
-   everything.
+   everything. A game's card cannot be seen over the full-screen game: its row
+   waits as ``ask_later`` and the card goes up at the first moment nothing is
+   full screen (the game not in front, or right after its session); recording
+   starts from the answer on.
 3. **Headphones only.** Before and during recording the default output
    devices' form factor is read (Core Audio, :mod:`yuki.perception.audio`);
    unless it is headphones/headset (or a device the user listed as
    headphones), the microphone is not opened (``waiting_headphones``) and the
-   card says why.
+   card says why. The app tracks need no headphones: their sound comes from the
+   app, not the room.
 4. **Keep, do not transcribe.** Shared-mode WASAPI capture of the input
-   device the call app records from, into memory; a speech gate (energy
+   device the call app records from, and process loopback of each consented
+   app (``record_others``), into memory, one :class:`RecordingSession` per
+   track. The microphone belongs to the call's row while a call may record,
+   else to the game's; a game's track goes into the call's row too while both
+   may record (one transcript, both conversations in time order). A speech gate (energy
    floor, then Silero VAD on what is louder) drops everything that is not
    speech; speech is cut into rolling chunks at pauses, compressed (Opus),
    encrypted with the store's key (AES-256-GCM, DPAPI-protected) and written
@@ -59,7 +81,10 @@ speech seconds, bytes spooled, encode ms, VAD CPU), ``call_regrab`` (a new
 microphone hold inside a call), ``call_alive_by`` (what keeps it alive changed),
 ``call_resumed`` (adopted after a restart), ``call_ended`` (with the hold, the
 screen's last in-call frame, the negatives after it and their frame sizes, what
-was in front), never words or audio.
+was in front), ``game_voice_detected`` / ``game_voice_ask``, ``call_track_start`` /
+``call_track_stop`` / ``call_track_unavailable`` (an app's own audio: opened,
+closed, or why it could not be), ``call_micwatch`` (the capture-session watch),
+never words or audio.
 """
 
 from __future__ import annotations
@@ -122,6 +147,19 @@ def _packaged_calls_table() -> dict:
 @dataclass(frozen=True)
 class CallConfig:
     enabled: bool = True
+    #: Also record the other side: the call app's (and a game's) own audio through process loopback, as its own
+    #: track (owner's decision 3 Oct 2026). False: only the user's microphone, as from 24 Sept to 3 Oct.
+    record_others: bool = True
+    #: A full-screen game's own voice chat is a voice session of its own (its own track, asked like a call).
+    #: False: a game's voice chat is not recorded at all (and never a call).
+    game_voice: bool = True
+    #: A user line was heard by an app whose capture session was active over at least this share of the line.
+    heard_by_overlap: float = 0.3
+    #: An app track that could not be opened is tried again after this long (s).
+    track_retry_s: float = 300.0
+    #: A game's own capture session (Core Audio) active this recently still counts as the game being used for voice
+    #: (push-to-talk released a moment ago) - only while its process runs (s).
+    game_mic_grace_s: float = 3.0
     #: The user's own additions (empty by default): apps that are a call whenever they hold the
     #: microphone, sound out or not. Every other call is measured (see the module docstring).
     apps: frozenset[str] = frozenset()
@@ -252,6 +290,11 @@ class CallConfig:
                         if str(v).strip())
         return cls(
             enabled=bool(t.get("enabled", d.enabled)), apps=apps, names=names,
+            record_others=bool(t.get("record_others", d.record_others)),
+            game_voice=bool(t.get("game_voice", d.game_voice)),
+            heard_by_overlap=min(1.0, max(0.0, num("heard_by_overlap", d.heard_by_overlap))),
+            track_retry_s=max(10.0, num("track_retry_s", d.track_retry_s)),
+            game_mic_grace_s=min(30.0, max(0.0, num("game_mic_grace_s", d.game_mic_grace_s))),
             evidence_fresh_s=max(30.0, num("evidence_fresh_s", d.evidence_fresh_s)),
             release_grace_s=min(600.0, max(30.0, num("release_grace_s", d.release_grace_s))),
             neg_frames=max(2, int(num("neg_frames", d.neg_frames))),
@@ -335,10 +378,10 @@ def capture_device_for(cfg: CallConfig, app: str | None) -> str | None:
 
     try:
         if app:
-            import psutil
+            from yuki.memory.loopback import process_table
 
-            pids = {p.pid for p in psutil.process_iter(["name"])
-                    if app_key(p.info.get("name")) == app_key(app)}
+            # image names from one Toolhelp snapshot: no process is opened (a game's anti-cheat is never touched)
+            pids = {pid for pid, _parent, image in process_table() if app_key(image) == app_key(app)}
             for s in audio.capture_sessions():
                 if s["state"] == "active" and s["pid"] in pids:
                     return s["device"]
@@ -628,11 +671,24 @@ class Chunker:
     pause of ``4 * pause_s`` whatever its length (a short "yes"), or at
     ``chunk_max_s``. A chunk with less than ``min_speech_s`` of voiced frames
     is counted and dropped, never transcribed.
+
+    With ``breaks`` (an app track, whose blocks carry the time Windows stamped
+    on the audio: :class:`yuki.memory.loopback.Restamper`), a block that starts
+    more than :data:`BREAK_S` after the previous one ended is a break in the
+    audio (nothing was delivered while the app was silent): the chunk in
+    progress is cut there, so a chunk's samples are always one stretch of time
+    and its ``start_at`` stays true. A microphone's blocks are stamped when they
+    arrive (late under load, while the audio itself is unbroken), so it never
+    breaks on them.
     """
 
-    def __init__(self, cfg: CallConfig, vad: SileroVad | None = None) -> None:
+    #: A jump in an app track's block times larger than this is a break.
+    BREAK_S = 0.25
+
+    def __init__(self, cfg: CallConfig, vad: SileroVad | None = None, *, breaks: bool = False) -> None:
         self.cfg = cfg
         self.vad = vad
+        self.detect_breaks = breaks
         self._in_speech = False
         self.frame = FRAME
         self._buf: list[np.ndarray] = []
@@ -640,8 +696,25 @@ class Chunker:
         self._start_at: float | None = None
         self._rest = np.zeros(0, np.float32)
         self._rest_at: float | None = None
+        self._next_at: float | None = None
         self.silent_dropped = 0
         self.silence_s = 0.0
+        self.breaks = 0
+
+    def _break(self) -> list[Chunk]:
+        """The audio jumped: cut what is voiced, drop the silence and the partial frame before the jump."""
+        self.breaks += 1
+        out: list[Chunk] = []
+        if self._buf and any(self._voiced):
+            chunk = self._cut(keep_tail=0)
+            if chunk is not None:
+                out.append(chunk)
+        else:
+            self.silence_s += len(self._buf) * FRAME_S
+            self._buf, self._voiced, self._start_at = [], [], None
+        self._rest, self._rest_at = np.zeros(0, np.float32), None
+        self._in_speech = False
+        return out
 
     def _frames(self, at: float, samples: np.ndarray) -> list[tuple[float, np.ndarray]]:
         if self._rest.size:
@@ -656,6 +729,9 @@ class Chunker:
     def feed(self, at: float, samples: np.ndarray) -> list[Chunk]:
         out: list[Chunk] = []
         preroll = max(1, int(0.3 / FRAME_S))
+        if self.detect_breaks and self._next_at is not None and at - self._next_at > self.BREAK_S:
+            out += self._break()
+        self._next_at = at + len(samples) / RATE
         frames = self._frames(at, samples)
         for t, frame, voiced in zip((t for t, _ in frames), (f for _, f in frames), self._voicing(frames)):
             if not self._buf:
@@ -792,6 +868,41 @@ def screen_segments(segments: Sequence[Segment], cfg: CallConfig,
         if phrase:
             last = phrase
     return kept, dropped, last
+
+
+def heard_by(spans: Sequence[dict[str, Any]], at: float, end: float, *, overlap: float = 0.3) -> list[str] | None:
+    """The apps that were taking the microphone while the user said a line ``[at, end]`` (display names, sorted).
+
+    ``spans``: :meth:`Store.mic_spans_between` rows - ``capture`` spans (an app's capture session was active)
+    and ``watch`` spans (the watch ran). An app heard the line when its capture spans cover at least
+    ``overlap`` of it (at least 0.1 s). ``None`` when no watch covered the line (not measured: unknown, never
+    "nobody"); ``[]`` when it was watched and no app took the microphone (the user spoke to the room or to Yuki).
+    A game that opens its microphone only while push-to-talk is held is in the list only for what was said
+    with the key down (measured from Windows' session state; not checked live yet).
+    """
+    end = max(float(end), float(at))
+    length = max(end - float(at), 0.05)
+
+    def covered(rows: Iterable[dict[str, Any]]) -> float:
+        """Seconds of the line inside the union of these spans (an app with two processes counts once)."""
+        parts = sorted((max(float(s["start"]), float(at)), min(s["end"] if s.get("end") is not None else end, end))
+                       for s in rows)
+        total, reach = 0.0, float(at)
+        for lo, hi in parts:
+            lo = max(lo, reach)
+            if hi > lo:
+                total += hi - lo
+                reach = hi
+        return total
+
+    if covered(s for s in spans if s.get("kind") == "watch") < 0.5 * length:
+        return None
+    by_app: dict[str, list[dict[str, Any]]] = {}
+    for s in spans:
+        if s.get("kind") == "capture":
+            by_app.setdefault(str(s.get("app") or s.get("process") or "?"), []).append(s)
+    need = max(0.1, overlap * length)
+    return sorted(app for app, rows in by_app.items() if covered(rows) >= need)
 
 
 def vocabulary_hint(subjects: Iterable[str], count_tokens: Callable[[str], int], budget_tokens: int,
@@ -1088,24 +1199,49 @@ class RecordingStats:
     errors: int = 0
 
 
-class RecordingSession:
-    """Records one call's user side on its own thread: gate, compress, encrypt, spool. No speech-to-text here.
+@dataclass(frozen=True)
+class Track:
+    """Where a recording's audio comes from, as its chunks are labelled (``call_chunks.side`` / ``track_*``).
 
-    :meth:`pause` closes the microphone (output left headphones), :meth:`stop`
-    ends it. Chunks the gate passes are Opus-compressed in memory, encrypted
-    with the store's key and written to the spool (:meth:`Store.write_spool`);
-    the deferred transcriber (:mod:`yuki.memory.transcribe`) turns them into
-    text later, when the PC is free, and deletes them.
+    ``side`` "user": the microphone (``app``/``kind``/``call_id``: the voice session's row it is recorded for);
+    "others": an app's own audio (``app``/``process``/``kind``/``call_id``: that app and its own row).
+    """
+
+    side: str = "user"
+    app: str | None = None
+    process: str | None = None
+    kind: str = "call"
+    call_id: int | None = None
+
+    @property
+    def label(self) -> str:
+        return "mic" if self.side != "others" else f"{self.kind}:{self.process or self.app or '?'}"
+
+
+class RecordingSession:
+    """Records one track of a voice session on its own thread: gate, compress, encrypt, spool. No speech-to-text.
+
+    The track is the user's microphone (``track.side`` "user", the default) or an app's own audio ("others",
+    process loopback). :meth:`pause` closes the source (output left headphones; the app let go), :meth:`stop`
+    ends it. Chunks the gate passes are Opus-compressed in memory, encrypted with the store's key and written to
+    the spool under row ``call_id`` (:meth:`Store.write_spool`); the deferred transcriber
+    (:mod:`yuki.memory.transcribe`) turns them into text later, when the PC is free, and deletes them. Several
+    sessions may write into one row at once (the microphone and the call app's audio): ``seq_fn`` hands out the
+    row's chunk numbers. Only the microphone's session keeps the row's counters (``chunks``, ``speech_s``: the
+    user's own speech).
     """
 
     def __init__(self, store: Store, *, call_id: int, app: str, process: str | None, cfg: CallConfig,
                  source_factory: Callable[[], Any], log: Callable[..., Any], start_seq: int = 0,
-                 base: RecordingStats | None = None) -> None:
+                 base: RecordingStats | None = None, track: Track | None = None,
+                 seq_fn: Callable[[], int] | None = None) -> None:
         self.store = store
         self.call_id = call_id
         self.app = app
         self.process = process
         self.cfg = cfg
+        self.track = track or Track(side="user", app=app, process=process, call_id=call_id)
+        self._seq_fn = seq_fn
         self._source_factory = source_factory
         self.log = log
         vad = None
@@ -1113,8 +1249,8 @@ class RecordingSession:
             try:
                 vad = SileroVad()
             except Exception as exc:   # the energy gate alone still keeps silence out
-                log("call_vad_unavailable", call_id=call_id, error=f"{type(exc).__name__}: {exc}")
-        self.chunker = Chunker(cfg, vad)
+                log("call_vad_unavailable", call_id=call_id, track=self.track.label, error=f"{type(exc).__name__}: {exc}")
+        self.chunker = Chunker(cfg, vad, breaks=self.track.side == "others")
         #: A call adopted after a restart goes on from its row: its counts (``base``) and its last spool chunk
         #: number (``start_seq``), so the row's totals and the spool's file names carry on.
         base = base or RecordingStats()
@@ -1123,6 +1259,7 @@ class RecordingSession:
         self._silent_base = base.chunks_silent
         self._seq = int(start_seq)
         self._source: Any = None
+        self.last_source: Any = None
         self._source_lock = threading.Lock()
         self._stop = threading.Event()
         self._drain = threading.Event()
@@ -1137,7 +1274,8 @@ class RecordingSession:
 
     def start(self) -> None:
         self.resume()
-        self._thread = threading.Thread(target=self._run, name="yuki-memory-call-rec", daemon=True)
+        name = "yuki-memory-call-rec" if self.track.side != "others" else "yuki-memory-call-track"
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
     @property
@@ -1154,11 +1292,12 @@ class RecordingSession:
                 self._source = source
 
     def pause(self) -> None:
-        """Close the microphone now; what was heard so far is still spooled."""
+        """Close the source (the microphone, or the app's audio) now; what was heard so far is still spooled."""
         with self._source_lock:
             source, self._source = self._source, None
         if source is not None:
             source.stop()
+            self.last_source = source   # its counters (an app track's packets and gaps) for the stop log
 
     def stop(self, reason: str, *, timeout_s: float = 30.0) -> RecordingStats:
         """Close the microphone, spool what is left; returns the stats."""
@@ -1172,6 +1311,12 @@ class RecordingSession:
     def wait_drained(self, timeout_s: float) -> bool:
         """Offline checks: wait until an :class:`ArraySource` was read to its end."""
         return self._drain.wait(timeout_s)
+
+    @property
+    def source(self) -> Any:
+        """The open source (None while paused): an app track's :class:`~yuki.memory.loopback.LoopbackSource` says
+        whether it is ``ready`` and ``alive``."""
+        return self._source
 
     # -- thread --------------------------------------------------------------
 
@@ -1206,14 +1351,17 @@ class RecordingSession:
 
     def _spool(self, chunk: Chunk) -> None:
         t0 = time.perf_counter()
+        tr = self.track
         try:
             payload, codec = encode_speech(chunk.audio)
-            self._seq += 1
+            self._seq = self._seq_fn() if self._seq_fn is not None else self._seq + 1
             self.store.write_spool(self.call_id, self._seq, start_at=chunk.start_at, audio_s=chunk.seconds,
-                                   speech_s=chunk.speech_s, payload=payload, codec=codec)
+                                   speech_s=chunk.speech_s, payload=payload, codec=codec, side=tr.side,
+                                   track_app=tr.app, track_process=tr.process, track_kind=tr.kind,
+                                   track_call_id=tr.call_id)
         except Exception as exc:
             self.stats.errors += 1
-            self.log("error", where="calls.spool", error=f"{type(exc).__name__}: {exc}")
+            self.log("error", where="calls.spool", track=tr.label, error=f"{type(exc).__name__}: {exc}")
             return
         ms = (time.perf_counter() - t0) * 1000.0
         st = self.stats
@@ -1224,13 +1372,15 @@ class RecordingSession:
         st.encode_ms.append(ms)
         st.chunks_silent = self._silent_base + self.chunker.silent_dropped
         vad = self.chunker.vad
-        self.log("call_chunk", call_id=self.call_id, audio_s=round(chunk.seconds, 2), speech_s=round(chunk.speech_s, 2),
-                 bytes=len(payload), codec=codec, ms=round(ms, 1), silent_dropped=st.chunks_silent,
-                 vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None)
+        self.log("call_chunk", call_id=self.call_id, track=tr.label, side=tr.side, audio_s=round(chunk.seconds, 2),
+                 speech_s=round(chunk.speech_s, 2), bytes=len(payload), codec=codec, ms=round(ms, 1),
+                 silent_dropped=st.chunks_silent, vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None)
         self._update_row()
         del chunk   # the audio goes with it; only the encrypted file is left
 
     def _update_row(self) -> None:
+        if self.track.side == "others":   # the row's counters are the user's own speech
+            return
         st = self.stats
         try:
             self.store.update_call(self.call_id, chunks=st.chunks, chunks_silent=st.chunks_silent,
@@ -1470,6 +1620,8 @@ def lingering_call(store: Store, now: float | None = None, *, within_s: float = 
 
 @dataclass
 class _Active:
+    """One open voice-session row the worker drives: a call (``kind`` "call") or a game's voice chat ("game")."""
+
     call_id: int
     key: str
     app: str
@@ -1477,12 +1629,13 @@ class _Active:
     service: str | None
     detected_at: float
     last_seen: float
+    #: The microphone's recording while this row owns it (one row at a time: the call's, else the game's).
     session: RecordingSession | None = None
     status: str = "asking"
     headphones: bool | None = None
     #: Other people in the call as its screen last showed (0: the user is alone in it), None: not shown (v3.15).
     others: int | None = None
-    #: The call's microphone holder as last seen (an ``avsignals.Holder``; kept while it has let go).
+    #: The row's microphone holder as last seen (an ``avsignals.Holder``; kept while it has let go).
     holder: Any = None
     #: Its lifetime rules (:class:`CallLife`), and whether the app holds the microphone this poll.
     life: CallLife | None = None
@@ -1490,16 +1643,128 @@ class _Active:
     #: What kept it alive at the last poll (:attr:`LifeStep.by`) and when ``last_alive_at`` was last written.
     alive_by: str = "hold"
     alive_written: float = 0.0
-    #: An adopted call's stored chunks and counts: its new recording goes on from them.
+    #: An adopted call's stored chunks and counts (kept for older callers; a recording now always goes on from
+    #: the row's own counts and chunk numbers).
     seq_base: int = 0
     base: RecordingStats | None = None
+    #: ``call`` | ``game`` (``calls.kind``).
+    kind: str = "call"
+    #: A game: the process of its full-screen window (the app track's target; Yuki never opens it) and the last
+    #: poll it was seen in front drawing like a game (its "screen" for :class:`CallLife`).
+    pid: int | None = None
+    gaming_at: float | None = None
+    #: A game's card: when it went up (None while it is down) and how long it was up before.
+    asking_since: float | None = None
+    asked_s: float = 0.0
+    #: The app's own audio (process loopback): its recording, the row its chunks go to, the process tree
+    #: captured, its state for the UI (recording | paused | off | unavailable | asking) and why, and when an
+    #: unavailable track is tried again.
+    track: RecordingSession | None = None
+    track_target: int | None = None
+    track_pid: int | None = None
+    track_state: str = "off"
+    track_reason: str | None = None
+    track_retry_at: float = 0.0
+
+
+#: Row statuses in which a voice session may record (said yes or always; not stopped).
+RECORDING_STATUSES: tuple[str, ...] = ("recording", "waiting_headphones")
+#: The ``nudge_state`` row with every track's state (``call_status()`` reads it for the UI).
+TRACKS_STATE = "call_tracks"
+
+
+@dataclass(frozen=True)
+class TrackSpec:
+    """What :attr:`CallWorker.track_factory` opens: the own audio of ``pid``'s process tree, for row ``call_id``."""
+
+    call_id: int
+    app: str
+    process: str
+    kind: str
+    pid: int
+
+
+def loopback_source(cfg: CallConfig, spec: TrackSpec) -> Any:
+    """The real app track: process loopback of ``spec.pid``'s tree (:class:`yuki.memory.loopback.LoopbackSource`).
+    It opens on its own thread (``wait=False``): the worker's poll never waits on Windows; the next polls see it
+    ``ready``, or dead with its ``error``."""
+    from yuki.memory.loopback import LoopbackSource
+
+    return LoopbackSource(spec.pid, include_tree=True, label=spec.process, wait=False)
+
+
+def app_pid(holder: Holder, *, avoid: Iterable[int] = ()) -> int | None:
+    """The root process of a call app's tree (the loopback target), from one Toolhelp snapshot: the processes that
+    run the holder's image, walked up while the parent runs the same image; of several, the one playing sound
+    (Core Audio render sessions: state only). No process handle is opened. A Store app (package family, no
+    image) is found through its playing processes' package identity, never through ``avoid`` (the full-screen
+    window's process: a game is not opened). For a browser the tree is the whole browser: every tab's sound."""
+    from yuki.memory.loopback import app_root_pid, process_table
+    from yuki.perception import audio
+
+    table = process_table()
+    playing: list[int] = []
+    try:
+        playing = [int(s.get("pid") or 0) for s in audio.render_sessions() if s.get("state") == "active"]
+    except Exception:
+        playing = []
+    if not holder.packaged:
+        image = Path(holder.path).name if holder.path else holder.app
+        return app_root_pid(image, table, playing)
+    from yuki.memory.avsignals import _pid_identity
+
+    skip = {int(p) for p in avoid}
+    names = {pid: image for pid, _parent, image in table}
+    for pid in playing:
+        if pid in skip or pid not in names:
+            continue
+        exe, family = _pid_identity(pid)
+        if holder.matches(exe=exe, family=family):
+            return app_root_pid(names[pid], table, playing)
+    return None
+
+
+class _SeqBook:
+    """Chunk numbers per row, shared by every recording writing into it (the microphone and app tracks)."""
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+        self._last: dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    def _get(self, call_id: int) -> int:
+        if call_id not in self._last:
+            self._last[call_id] = self._store.call_max_seq(call_id)
+        return self._last[call_id]
+
+    def last(self, call_id: int) -> int:
+        with self._lock:
+            return self._get(int(call_id))
+
+    def next(self, call_id: int) -> int:
+        with self._lock:
+            value = self._get(int(call_id)) + 1
+            self._last[int(call_id)] = value
+            return value
+
+
+_DEFAULT: Any = object()
+
+
+def _screen_busy() -> bool:
+    from yuki.memory.transcribe import screen_busy
+
+    return screen_busy()
 
 
 class CallWorker:
-    """Detects calls, asks, and records the user's side (see the module docstring). One thread.
+    """Detects calls and game voice chats, asks, and records every track (see the module docstring). One thread.
 
     Every outside fact comes through a replaceable function, so the whole
-    flow runs offline on a temp database with synthetic audio.
+    flow runs offline on a temp database with synthetic audio. With a stub
+    microphone (``source_factory``) and no ``track_factory`` / ``watch_factory``
+    no app audio is opened and no capture session is watched: an offline worker
+    never touches a live stream.
     """
 
     def __init__(
@@ -1514,6 +1779,11 @@ class CallWorker:
         gpu_fn: Callable[..., float | None] = gpu_share,
         evidence: Any = None,
         sites_fn: Callable[[str], int] | None = None,
+        track_factory: Any = _DEFAULT,
+        pid_fn: Callable[[Holder], int | None] | None = None,
+        busy_fn: Callable[[], bool] | None = None,
+        watch_factory: Any = _DEFAULT,
+        table_fn: Callable[[], list[tuple[int, int, str]]] | None = None,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
 
@@ -1524,7 +1794,8 @@ class CallWorker:
         self._log_fn = log
         self.meeting_fn = meeting_fn
         #: The full-screen window in front (``{"hwnd", "pid", "exe"}`` or None) and the GPU share reader:
-        #: a full-screen game with voice chat is not a call (yuki.memory.avsignals.gaming_with_voice).
+        #: a full-screen game with voice chat is a game voice session, never a call
+        #: (yuki.memory.avsignals.gaming_with_voice).
         self.foreground_fn = foreground_fn
         self.gpu_fn = gpu_fn
         self._gaming_logged: set[str] = set()
@@ -1548,9 +1819,39 @@ class CallWorker:
         #: The microphone holders of the last read, by app key; the keys last written to HOLDERS_STATE.
         self._holders: dict[str, Holder] = {}
         self._holders_written: list[str] | None = None
+        self._camera: tuple[Holder, ...] = ()
         self.headphones_fn = headphones_fn
+        live = source_factory is None
         self.source_factory = source_factory or (lambda cfg, app: MicSource(capture_device_for(cfg, app)))
+        #: The app's own audio: ``(cfg, TrackSpec) -> source`` (process loopback by default; None: app tracks are
+        #: never opened, e.g. offline checks with a stub microphone).
+        self.track_factory = (loopback_source if live else None) if track_factory is _DEFAULT else track_factory
+        self.pid_fn = pid_fn or (lambda holder: app_pid(holder, avoid=self._front_pids()))
+        #: Windows says a full-screen app, a game or a presentation is up (a card cannot be seen then).
+        self.busy_fn = busy_fn or _screen_busy
+        #: ``(on_change) -> watch`` with ``start()``/``stop()``/``mode``: which apps take the microphone, moment by
+        #: moment (:class:`yuki.memory.loopback.CaptureWatch`; None: not measured, lines get no ``heard_by``).
+        self.watch_factory = (self._capture_watch if live else None) if watch_factory is _DEFAULT else watch_factory
+        self.table_fn = table_fn
+        #: The open call row and the open game row (a game's voice chat), at most one of each; a game row whose
+        #: card goes up right after its session (``after``).
         self.active: _Active | None = None
+        self.game: _Active | None = None
+        self.after: _Active | None = None
+        self._gaming: tuple[Holder, dict, dict] | None = None
+        self._poll: dict[str, Any] = {}
+        self._seqs = _SeqBook(store)
+        self._watch: Any = None
+        self._watch_span: int | None = None
+        self._spans_open: dict[int, int] = {}
+        self._span_lock = threading.Lock()
+        self._pid_apps: dict[int, tuple[str | None, str | None]] = {}
+        #: Per app key: the processes whose capture session is active now, and when its last one went inactive.
+        self._capture_live: dict[str, set[int]] = {}
+        self._capture_last: dict[str, float] = {}
+        self._capture_keys: dict[int, str] = {}
+        self._mic_state: dict[str, Any] = {"state": "off", "call_id": None, "reason": None}
+        self._tracks_written: str | None = None
         self.paused = False
         self._event: _NamedEvent | None = None
         self._stop = threading.Event()
@@ -1579,6 +1880,38 @@ class CallWorker:
             until = 0.0
         return until > now
 
+    def _rows(self) -> list[_Active]:
+        return [r for r in (self.active, self.game) if r is not None]
+
+    def _front_now(self) -> dict | None:
+        """The full-screen window in front, read once per poll."""
+        if "front" not in self._poll:
+            try:
+                self._poll["front"] = self.foreground_fn()
+            except Exception:
+                self._poll["front"] = None
+        return self._poll["front"]
+
+    def _front_pids(self) -> list[int]:
+        front = self._poll.get("front")
+        return [int(front.get("pid") or 0)] if front else []
+
+    def _hp(self, cfg: CallConfig) -> tuple[bool, dict[str, Any]]:
+        """Headphones, read once per poll."""
+        if "hp" not in self._poll:
+            self._poll["hp"] = self._headphones(cfg)
+        return self._poll["hp"]
+
+    def _card_visible(self) -> bool:
+        """Whether a card can be seen now: nothing full screen in front, and Windows not saying a game or
+        presentation is up."""
+        if self._front_now() is not None:
+            return False
+        try:
+            return not bool(self.busy_fn())
+        except Exception:
+            return True
+
     # -- lifecycle -----------------------------------------------------------
 
     def recover(self, now: float | None = None) -> int:
@@ -1590,8 +1923,10 @@ class CallWorker:
         microphone with the same ConsentStore ``since`` (within :data:`HOLD_MATCH_S`) and the row was alive at
         most ``adopt_within_s`` ago - or, by the same rules as a live call, when it was alive less than
         ``release_grace_s`` ago (a re-grab or a short release around the restart). A row from before migration
-        26 (no ``hold_since``) is adopted when the hold it would be in began before the row did. Every other
-        open row ends at its ``last_alive_at`` (an older row: now, as before). Returns how many were ended.
+        26 (no ``hold_since``) is adopted when the hold it would be in began before the row did. One call row
+        and one game row can be adopted. Every other open row ends at its ``last_alive_at`` (an older row: now,
+        as before); a game row whose card was waiting after its session ends unanswered. Returns how many were
+        ended.
         """
         now = time.time() if now is None else float(now)
         cfg = self.cfg
@@ -1603,15 +1938,30 @@ class CallWorker:
         n = 0
         for c in self.store.calls(statuses=CALL_OPEN_STATUSES):   # newest first
             h = holders.get(c.process or "")
-            if self.active is None and cfg.enabled and self._adoptable(cfg, c, h, now):
+            if c.ended_at is not None:   # a game's card was waiting after its session: no answer now
+                if c.consent is None:
+                    self.store.update_call(c.id, consent="none", consent_by="call_ended", consent_at=now)
+                self.store.update_call(c.id, status="ended")
+                self._log("call_consent", call_id=c.id, app=c.app, call_kind=c.kind, answer="none", by="service_restart")
+                n += 1
+                continue
+            game = c.kind == "game"
+            free = self.game is None if game else self.active is None
+            if free and cfg.enabled and (cfg.game_voice or not game) and self._adoptable(cfg, c, h, now):
                 self._adopt(cfg, c, h, now)
                 continue
             end_at = min(max(c.last_alive_at, c.detected_at), now) if c.last_alive_at is not None else now
+            if c.kind == "game" and c.consent is None and c.status in ("asking", "ask_later"):
+                self.store.update_call(c.id, consent="none", consent_by="call_ended", consent_at=end_at)
             self.store.update_call(c.id, status="ended", ended_at=end_at, stop_reason="service_restart")
-            self._log("call_ended", call_id=c.id, app=c.app, reason="service_restart",
+            self._log("call_ended", call_id=c.id, app=c.app, call_kind=c.kind, reason="service_restart",
                       seconds=round(end_at - c.detected_at, 1), held=h is not None, hold_since=c.hold_since,
                       down_s=round(now - c.last_alive_at, 1) if c.last_alive_at is not None else None)
             n += 1
+        try:   # who-took-the-microphone spans the previous run left open
+            self.store.close_open_mic_spans(now)
+        except Exception as exc:
+            self._log("error", where="calls.recover_spans", error=f"{type(exc).__name__}: {exc}")
         try:
             self.rekey_prefs()
         except Exception as exc:
@@ -1635,7 +1985,7 @@ class CallWorker:
         held = h is not None
         hold_since = c.hold_since if c.hold_since is not None else (h.since if h is not None else None)
         act = _Active(c.id, c.process or (h.key if h is not None else ""), c.app, c.via, c.service, c.detected_at,
-                      now, status=c.status, headphones=c.headphones, holder=h, held=held)
+                      now, status=c.status, headphones=c.headphones, holder=h, held=held, kind=c.kind)
         # The previous run's hold epoch: a new ``since`` now is a re-grab inside the call (logged on the next poll).
         act.life = CallLife(cfg, now=now, hold_since=hold_since, held=held,
                             last_held_at=None if held else (c.last_alive_at or now))
@@ -1643,9 +1993,14 @@ class CallWorker:
         act.base = RecordingStats(chunks=c.chunks, chunks_silent=c.chunks_silent, audio_s=c.audio_s,
                                   speech_s=c.speech_s)
         act.alive_written = now
+        if c.kind == "game":
+            act.gaming_at = now   # it was a game in front when it began; the next polls measure it again
         self.store.update_call(c.id, last_alive_at=now)
-        self.active = act
-        self._log("call_resumed", call_id=c.id, app=c.app, process=act.key, status=c.status, held=held,
+        if c.kind == "game":
+            self.game = act
+        else:
+            self.active = act
+        self._log("call_resumed", call_id=c.id, app=c.app, call_kind=c.kind, process=act.key, status=c.status, held=held,
                   hold_since=hold_since, now_since=h.since if h is not None else None,
                   down_s=round(now - (c.last_alive_at if c.last_alive_at is not None else c.updated_at), 1),
                   seq=act.seq_base, legacy=c.hold_since is None)
@@ -1689,7 +2044,8 @@ class CallWorker:
         watch = _ConsentStoreWatch() if self._watch_registry else None
         recovered = self.recover()
         self._log("calls_start", recovered=recovered, adopted=self.active.call_id if self.active else None,
-                  poll_s=self.cfg.poll_s, enabled=self.cfg.enabled)
+                  adopted_game=self.game.call_id if self.game else None, poll_s=self.cfg.poll_s,
+                  enabled=self.cfg.enabled, record_others=self.cfg.record_others, game_voice=self.cfg.game_voice)
         try:
             while not stop.is_set():
                 self.paused = bool(pause_path is not None and pause_path.exists())
@@ -1706,13 +2062,24 @@ class CallWorker:
                 else:
                     self._event.wait(timeout)
         finally:
-            if self.active is not None:
-                self._end(self.active, "service_stop", time.time())
-                self.active = None
+            self.close("service_stop")
             if watch is not None:
                 watch.close()
             self._event.close()
             self._log("calls_stop")
+
+    def close(self, reason: str = "service_stop") -> None:
+        """End every open row (each track's last chunk is spooled), the waiting card and the capture watch."""
+        now = time.time()
+        for r in self._rows():
+            try:
+                self._end(r, reason, now, ask=False)
+            except Exception as exc:
+                self._log("error", where="calls.close", error=f"{type(exc).__name__}: {exc}")
+        self.active = self.game = None
+        if self.after is not None:
+            self._close_after(now, reason)
+        self._sync_watch(False, now)
 
     def stop(self) -> None:
         self._stop.set()
@@ -1749,7 +2116,9 @@ class CallWorker:
         "screen_stale" after ``evidence_fresh_s``), or when it is one of the user's own ``[calls] apps``
         ("mic"). Sound out, the camera and the timeline's meeting row are hints only (the meeting row may name
         the service). ``service`` is set only for a call on a site inside a browser (its standing answer is the
-        site's). Also sets :attr:`_held` (every microphone holder now).
+        site's). A holder that is the full-screen app in front drawing like a game (``gaming_with_voice``) is
+        never a call: with ``game_voice`` it is kept in :attr:`_gaming` (a game voice session begins from it).
+        The open game row's app is never a call either. Also sets :attr:`_held` (every microphone holder now).
         """
         now = time.time() if now is None else float(now)
         meeting = None
@@ -1760,13 +2129,17 @@ class CallWorker:
         meeting_key = app_key((meeting or {}).get("process")) if meeting else None
         snap = self.signals.read()
         mic: tuple[Holder, ...] = snap.mic
+        self._camera = tuple(snap.camera)
         self._held = {h.key for h in mic if h.key}
         self._holders = {h.key: h for h in mic if h.key}
+        self._gaming = None
+        game_key = self.game.key if self.game is not None else None
         evidence = self.evidence
         if evidence is not None:
             evidence.fresh_s = cfg.evidence_fresh_s
-        # the holders' screens, and the open call's even while its app has let go (a "you left" screen ends it)
-        judge_for: list[Any] = [h for h in mic if h.key]
+        # the holders' screens, and the open call's even while its app has let go (a "you left" screen ends it);
+        # never the open game's (its screens are not a call's, and judging them costs a model call each)
+        judge_for: list[Any] = [h for h in mic if h.key and h.key != game_key]
         act = self.active
         if act is not None and act.key not in self._held:
             judge_for.append(act.holder or act.key)
@@ -1776,12 +2149,25 @@ class CallWorker:
             except Exception as exc:
                 self._log("error", where="calls.evidence", error=f"{type(exc).__name__}: {exc}")
         out: list[tuple[str, str, str | None, str]] = []
-        front: dict | None = None
-        front_read = False
         for h in mic:
             key = h.key
             if not key:
                 continue
+            if key not in cfg.apps:
+                front = self._front_now()
+                if front and h.matches(exe=str(front.get("exe") or "")):
+                    gaming, facts = gaming_with_voice(h, fullscreen=True, shows_page=False, camera=snap.camera,
+                                                      pids=[int(front.get("pid") or 0)], gpu_fn=self.gpu_fn)
+                    if gaming:
+                        if cfg.game_voice:
+                            if self._gaming is None:
+                                self._gaming = (h, front, facts)
+                        elif key not in self._gaming_logged:
+                            self._gaming_logged.add(key)
+                            self._log("call_skipped_gaming", app=key, **facts)
+                        continue   # a full-screen game's own voice chat: never a call
+            if key == game_key:
+                continue   # the open game voice session's app (it may hold the microphone out of full screen)
             state, service = None, ""
             if evidence is not None:
                 try:
@@ -1790,21 +2176,6 @@ class CallWorker:
                     state, service = None, ""
             if key not in cfg.apps and state is None:
                 continue
-            if key not in cfg.apps:
-                if not front_read:
-                    front_read = True
-                    try:
-                        front = self.foreground_fn()
-                    except Exception:
-                        front = None
-                if front and h.matches(exe=str(front.get("exe") or "")):
-                    gaming, facts = gaming_with_voice(h, fullscreen=True, shows_page=False, camera=snap.camera,
-                                                      pids=[int(front.get("pid") or 0)], gpu_fn=self.gpu_fn)
-                    if gaming:
-                        if key not in self._gaming_logged:
-                            self._gaming_logged.add(key)
-                            self._log("call_skipped_gaming", app=key, **facts)
-                        continue   # a full-screen game's own voice chat: gaming, not a call
             if state is None:
                 via = "mic"
             else:
@@ -1820,10 +2191,16 @@ class CallWorker:
     def step(self, now: float | None = None) -> None:
         now = time.time() if now is None else float(now)
         cfg = self.cfg
+        self._poll = {}
         if self.paused or not cfg.enabled:
-            if self.active is not None:
-                self._end(self.active, "paused" if self.paused else "disabled", now)
-                self.active = None
+            reason = "paused" if self.paused else "disabled"
+            for r in self._rows():
+                self._end(r, reason, now, ask=False)
+            self.active = self.game = None
+            if self.after is not None:
+                self._close_after(now, reason)
+            self._sync_audio(cfg, now)
+            self._note_tracks()
             return
         cands = self._candidates(cfg, now)
         self._note_holders(now)
@@ -1834,10 +2211,30 @@ class CallWorker:
             key, via, service, name = cands[0]
             act = self._begin(cfg, key, via, service, name, now)
             self.active = act
+        g = self.game
+        if g is not None and not cfg.game_voice:
+            self._end(g, "disabled", now, ask=False)
+            self.game = g = None
+        if (g is not None and self._gaming is not None and self._gaming[0].key != g.key
+                and g.key not in self._held):
+            self._end(g, "other_game", now)   # straight into another game: the old one is over
+            self.game = g = None
+        if g is not None and not self._game_goes_on(cfg, g, now):
+            self.game = g = None
+        if g is None and self._gaming is not None and cfg.game_voice:
+            g = self._begin_game(cfg, now)
+            self.game = g
         if act is not None:
             self._note_people(act)
             self._drive(cfg, act, now)
             self._heartbeat(cfg, act, now)
+        if g is not None:
+            self._drive(cfg, g, now)
+            self._heartbeat(cfg, g, now)
+        if self.after is not None:
+            self._drive_after(cfg, now)
+        self._sync_audio(cfg, now)
+        self._note_tracks()
 
     def _goes_on(self, cfg: CallConfig, act: _Active, now: float) -> bool:
         """One poll of the open call's life (:class:`CallLife`); ends it (and returns False) when it is over."""
@@ -1871,6 +2268,63 @@ class CallWorker:
             act.via = via
             self.store.update_call(act.call_id, via=via)
             self._tell_ui()
+        return True
+
+    def _front_is(self, g: _Active, front: dict | None) -> Holder | None:
+        """The game's holder when the full-screen window in front is the game's (by its executable; a row adopted
+        while the game had let go of the microphone matches by its app key)."""
+        if not front:
+            return None
+        exe = str(front.get("exe") or "")
+        if g.holder is not None:
+            return g.holder if g.holder.matches(exe=exe) else None
+        if exe and app_key(Path(exe).name) == g.key:
+            return Holder(app=Path(exe).name, packaged=False, path=exe, since=0.0)
+        return None
+
+    def _game_goes_on(self, cfg: CallConfig, g: _Active, now: float) -> bool:
+        """One poll of a game voice session's life (:class:`CallLife`): alive while the game holds the microphone,
+        for ``release_grace_s`` after it lets go, and while the game is seen in front drawing like a game (its
+        "screen": a push-to-talk game may hold the microphone only while the key is down). Ends it otherwise."""
+        h = self._holders.get(g.key)
+        if h is not None:
+            g.holder = h
+        g.held = h is not None
+        pid = 0
+        if self._gaming is not None and self._gaming[0].key == g.key:
+            g.gaming_at = now
+            pid = int(self._gaming[1].get("pid") or 0)
+        else:
+            front = self._front_now()
+            holder = self._front_is(g, front)
+            if holder is not None:
+                gaming, _facts = gaming_with_voice(holder, fullscreen=True, shows_page=False, camera=self._camera,
+                                                   pids=[int(front.get("pid") or 0)], gpu_fn=self.gpu_fn)
+                if gaming:
+                    g.gaming_at = now
+                    pid = int(front.get("pid") or 0)
+        if pid and pid != g.pid:
+            if g.pid is not None:
+                self._log("game_voice_pid", call_id=g.call_id, app=g.app, was=g.pid, now=pid)
+            g.pid = pid
+        if g.life is None:
+            g.life = CallLife(cfg, now=g.detected_at, hold_since=h.since if h is not None else None)
+        step = g.life.observe(now, held=g.held, hold_since=h.since if h is not None else None,
+                              positive_at=g.gaming_at, negatives=())
+        if step.regrab is not None:
+            self._log("call_regrab", call_id=g.call_id, app=g.app, call_kind="game", regrabs=g.life.regrabs, **step.regrab)
+            try:
+                self.store.update_call(g.call_id, hold_since=step.regrab["new_since"])
+            except Exception as exc:
+                self._log("error", where="calls.regrab", error=f"{type(exc).__name__}: {exc}")
+        if not step.alive:
+            self._end(g, step.end or "game_ended", now)
+            return False
+        if step.by != g.alive_by:
+            self._log("call_alive_by", call_id=g.call_id, app=g.app, call_kind="game", by=step.by, was=g.alive_by,
+                      held=g.held, gaming_age_s=None if g.gaming_at is None else round(now - g.gaming_at, 1))
+            g.alive_by = step.by
+        g.last_seen = now
         return True
 
     def _life(self, act: _Active) -> Any:
@@ -1948,7 +2402,7 @@ class CallWorker:
     def _begin(self, cfg: CallConfig, key: str, via: str, service: str | None, name: str, now: float) -> _Active:
         # a site's call inside a browser has its own standing answer, never the browser's (see Store.answer_call)
         pref = self.store.call_pref(service) if service else self.store.call_pref(key)
-        ok, facts = self._headphones(cfg)
+        ok, facts = self._hp(cfg)
         if pref == "never":
             status, consent, by = "declined", "never", "pref"
         elif pref == "always":
@@ -1973,6 +2427,38 @@ class CallWorker:
         self._tell_ui()
         return act
 
+    def _begin_game(self, cfg: CallConfig, now: float) -> _Active:
+        """A full-screen game's own voice chat began (:attr:`_gaming`): its own row (``kind`` "game"), with the same
+        per-app consent as a call. No card can be seen over the game: without a standing answer the row waits as
+        ``ask_later`` until one can (:meth:`_ask`)."""
+        h, front, facts = self._gaming   # type: ignore[misc]
+        key = h.key
+        name = cfg.name_of(key, display_name(h))
+        if self.after is not None:   # a card still waiting for the last session: this one asks afresh
+            self._close_after(now, "new_session")
+        pref = self.store.call_pref(key)
+        ok, hp = self._hp(cfg)
+        if pref == "never":
+            status, consent, by = "declined", "never", "pref"
+        elif pref == "always":
+            status, consent, by = "asking", "always", "pref"
+        elif self._quiet(now):
+            status, consent, by = "not_asked", None, "quiet"
+        else:
+            status, consent, by = "ask_later", None, None   # the game is full screen in front: nothing can be seen
+        call_id = self.store.start_call(app=name, process=key, via="game", at=now, status=status, consent=consent,
+                                        consent_by=by, output_form_factor=hp.get("form_factor"),
+                                        output_device=hp.get("device"), headphones=ok, hold_since=h.since, kind="game")
+        g = _Active(call_id, key, name, "game", None, now, now, status=status, headphones=ok, holder=h, held=True,
+                    alive_written=now, kind="game", pid=int(front.get("pid") or 0) or None, gaming_at=now)
+        g.life = CallLife(cfg, now=now, hold_since=h.since, held=True)
+        self._log("game_voice_detected", call_id=call_id, app=name, process=key, status=status, headphones=ok,
+                  hold_since=h.since, **facts)
+        if consent is not None or by == "quiet":
+            self._log("call_consent", call_id=call_id, app=name, call_kind="game", answer=consent or "none", by=by)
+        self._tell_ui()
+        return g
+
     def _headphones(self, cfg: CallConfig) -> tuple[bool, dict[str, Any]]:
         try:
             return self.headphones_fn(cfg)
@@ -1986,22 +2472,24 @@ class CallWorker:
             self._tell_ui()
 
     def _drive(self, cfg: CallConfig, act: _Active, now: float) -> None:
+        """One row's consent and status (its audio is driven with every row's together: :meth:`_sync_audio`)."""
         row = self.store.call_record(act.call_id)
         if row is None:
             return
-        if row.consent is not None and act.status == "asking" and row.consent_by == "card":
-            self._log("call_consent", call_id=act.call_id, app=act.app, answer=row.consent, by="card",
+        if row.consent is not None and act.status in ("asking", "ask_later") and row.consent_by == "card":
+            self._log("call_consent", call_id=act.call_id, app=act.app, call_kind=act.kind, answer=row.consent, by="card",
                       headphones=act.headphones, after_s=round((row.consent_at or now) - act.detected_at, 1))
         if row.status in ("declined", "unanswered") or row.status == "stopped":
             act.status = row.status
             return
         if row.stop_requested:
-            if act.session is not None:
-                self._stop_recording(act, "user")
+            self._stop_row_audio(act, "user")
             self._set_status(act, "stopped", stop_reason="user")
             return
         if row.consent is None:
-            if row.status == "asking" and now - act.detected_at >= cfg.ask_timeout_s:
+            if act.kind == "game":
+                self._ask(cfg, act, row, now)
+            elif row.status == "asking" and now - act.detected_at >= cfg.ask_timeout_s:
                 if self.store.answer_call(act.call_id, "none", by="ui_timeout"):
                     act.status = "unanswered"
                     self._log("call_consent", call_id=act.call_id, app=act.app, answer="none", by="ui_timeout")
@@ -2012,72 +2500,365 @@ class CallWorker:
         if row.consent not in ("yes", "always"):
             act.status = row.status
             return
-        ok, facts = self._headphones(cfg)
+        ok, facts = self._hp(cfg)
         if ok != act.headphones:
             self._log("call_headphones", call_id=act.call_id, ok=ok, form_factor=facts.get("form_factor"))
             act.headphones = ok
             self.store.update_call(act.call_id, headphones=ok, output_form_factor=facts.get("form_factor"),
                                    output_device=facts.get("device"))
-        if not ok:
-            if act.session is not None and act.session.listening:
-                act.session.pause()
-                self._log("call_recording_paused", call_id=act.call_id, reason="not_headphones",
-                          form_factor=facts.get("form_factor"))
-            self._set_status(act, "waiting_headphones")
+        self._set_status(act, "recording" if ok else "waiting_headphones")
+
+    def _ask(self, cfg: CallConfig, r: _Active, row: Any, now: float) -> None:
+        """A game row without an answer: its card goes up only when it can be seen (nothing full screen in front),
+        comes down again if the game comes back in front (the answer then waits), and counts as unanswered after
+        ``ask_timeout_s`` of being up. The status moves only while the row has no answer (never over one)."""
+        visible = self._card_visible()
+        if row.status == "ask_later":
+            if visible and self.store.set_call_status_if(r.call_id, "asking", when_status="ask_later"):
+                r.status, r.asking_since = "asking", now
+                self._log("game_voice_ask", call_id=r.call_id, app=r.app, after=r is self.after,
+                          waited_s=round(now - r.detected_at, 1), up_before_s=round(r.asked_s, 1))
+                self._tell_ui()
+            else:
+                r.status = "ask_later"
             return
-        if not act.held:
-            # The call's app let go of the microphone (Meet's mute, a re-grab under way): nothing the user says
-            # reaches the call now, so nothing is recorded; the call itself (row, pill) goes on.
-            if act.session is not None and act.session.listening:
-                act.session.pause()
-                self._log("call_recording_paused", call_id=act.call_id, reason="mic_released")
+        if row.status == "asking":
+            if r.asking_since is None:   # adopted while it was up
+                r.asking_since = now
+            if not visible:
+                if self.store.set_call_status_if(r.call_id, "ask_later", when_status="asking"):
+                    r.asked_s += now - r.asking_since
+                    r.status, r.asking_since = "ask_later", None
+                    self._log("game_voice_ask_withdrawn", call_id=r.call_id, app=r.app, up_s=round(r.asked_s, 1))
+                    self._tell_ui()
+                return
+            if r.asked_s + (now - r.asking_since) >= cfg.ask_timeout_s:
+                if self.store.answer_call(r.call_id, "none", by="ui_timeout"):
+                    r.status = "unanswered"
+                    self._log("call_consent", call_id=r.call_id, app=r.app, call_kind=r.kind, answer="none",
+                              by="ui_timeout")
+                    self._tell_ui()
             return
-        if act.session is None:
-            self._start_recording(cfg, act)
-        elif not act.session.listening:
-            act.session.resume()
-            self._log("call_recording_resumed", call_id=act.call_id)
-        self._set_status(act, "recording")
+        r.status = row.status
+
+    def _drive_after(self, cfg: CallConfig, now: float) -> None:
+        """The card of a game session that ended before it could be seen: up at the first moment it can be, its
+        answer kept (Always / Never hold for the next session; nothing is recorded for the one that ended), then
+        the row is ended. Given up after ``5 x ask_timeout_s`` without a moment to show it."""
+        a = self.after
+        if a is None:
+            return
+        row = self.store.call_record(a.call_id)
+        if row is None:
+            self.after = None
+            return
+        if row.consent is not None:
+            if row.consent_by == "card":
+                self._log("call_consent", call_id=a.call_id, app=a.app, call_kind=a.kind, answer=row.consent, by="card",
+                          after_session=True)
+            self.store.update_call(a.call_id, status="ended")
+            self.after = None
+            self._tell_ui()
+            return
+        if row.status == "ask_later" and now - (row.ended_at or now) > 5 * cfg.ask_timeout_s:
+            self._close_after(now, "never_visible")
+            return
+        self._ask(cfg, a, row, now)
+
+    def _close_after(self, now: float, reason: str) -> None:
+        a, self.after = self.after, None
+        if a is None:
+            return
+        row = self.store.call_record(a.call_id)
+        if row is not None and row.consent is None:
+            self.store.update_call(a.call_id, consent="none", consent_by="call_ended", consent_at=now)
+            self._log("call_consent", call_id=a.call_id, app=a.app, call_kind=a.kind, answer="none", by=reason)
+        self.store.update_call(a.call_id, status="ended")
+        self._tell_ui()
+
+    # -- audio: one microphone, one track per app ---------------------------------
+
+    def _game_alive(self, g: _Active) -> bool:
+        """Whether the game's process still runs (an image of its app in the Toolhelp snapshot, read at most once
+        per poll; no process is opened). True when the snapshot cannot be read."""
+        if "table" not in self._poll:
+            table_fn = self.table_fn
+            if table_fn is None:
+                from yuki.memory.loopback import process_table as table_fn
+            try:
+                self._poll["table"] = {app_key(image) for _pid, _parent, image in table_fn()}
+            except Exception:
+                self._poll["table"] = None
+        names = self._poll["table"]
+        return names is None or g.key in names
+
+    def _game_in_use(self, cfg: CallConfig, g: _Active, now: float) -> tuple[bool, str]:
+        """Whether the user may be talking through the game now, measured at this poll: its full-screen window is in
+        front drawing like a game; or, while its process runs, it holds the microphone (ConsentStore) or its own
+        capture session was active within ``game_mic_grace_s`` (push-to-talk just released). A closed game is never
+        in use, whatever its row's lifetime grace says: the microphone must not outlive the game."""
+        if g.gaming_at is not None and g.gaming_at >= now:
+            return True, "in_front"
+        if not self._game_alive(g):
+            return False, "game_closed"
+        if g.held:
+            return True, "hold"
+        seen = self._capture_seen(g.key, now)
+        if seen is not None and now - seen <= cfg.game_mic_grace_s:
+            return True, "capture_session"
+        return False, "game_not_in_use"
+
+    def _sync_audio(self, cfg: CallConfig, now: float) -> None:
+        """Every recording follows the rows. The microphone is recorded once: it belongs to the call's row while
+        the call may record, else to the game's. It listens on headphones only, and only while what it is recorded
+        for is going on: the call's app holds the microphone, or the game is in use (:meth:`_game_in_use`). A game
+        never records the microphone while a call the user did not say yes to (asking, declined, unanswered, not
+        asked, stopped) holds it: what the user says there is the call's, and the call was not consented. Each
+        consented row records its app's own audio (``record_others``, no headphones needed); a game's goes into the
+        call's row while the call may record. The capture-session watch runs while any row may record."""
+        act, g = self.active, self.game
+        call_may = act is not None and act.status in RECORDING_STATUSES
+        game_may = g is not None and g.status in RECORDING_STATUSES
+        owner = act if call_may else (g if game_may else None)
+        for r in (act, g):
+            if r is not None and r.session is not None and r is not owner:
+                self._stop_recording(r, "moved" if owner is not None else "not_recording", final=owner is None)
+        mic = {"state": "off", "call_id": None, "reason": None}
+        if owner is not None:
+            ok, facts = self._hp(cfg)
+            game_use, game_why = self._game_in_use(cfg, g, now) if game_may else (False, "")   # type: ignore[arg-type]
+            call_blocks = act is not None and not call_may and act.held
+            if owner is act:
+                held = act.held or game_use   # type: ignore[union-attr]
+                why = "mic_released"
+            else:
+                held = game_use and not call_blocks
+                why = "call_not_consented" if call_blocks else game_why
+            session = owner.session
+            if not ok or not held:
+                reason = "not_headphones" if not ok else why
+                if session is not None and session.listening:
+                    session.pause()
+                    self._log("call_recording_paused", call_id=owner.call_id, reason=reason,
+                              **({"form_factor": facts.get("form_factor")} if not ok else {}))
+                mic = {"state": "paused", "call_id": owner.call_id, "reason": reason}
+            else:
+                try:
+                    if session is None:
+                        self._start_recording(cfg, owner)
+                    elif not session.listening:
+                        session.resume()
+                        self._log("call_recording_resumed", call_id=owner.call_id)
+                    mic = {"state": "recording", "call_id": owner.call_id, "reason": None}
+                except Exception as exc:   # tried again next poll; the app tracks go on meanwhile
+                    self._log("error", where="calls.microphone", error=f"{type(exc).__name__}: {exc}")
+                    mic = {"state": "paused", "call_id": owner.call_id, "reason": "mic_error"}
+        elif any(r.status in ("asking", "ask_later") for r in self._rows()):
+            mic = {"state": "asking", "call_id": None, "reason": None}
+        self._mic_state = mic
+        target = act if call_may else None
+        for r in (act, g):
+            if r is not None:
+                self._sync_track(cfg, r, target, now)
+        self._sync_watch(owner is not None, now)
+
+    def _sync_track(self, cfg: CallConfig, r: _Active, call_target: _Active | None, now: float) -> None:
+        """Start, pause, move or stop one row's app track (see :meth:`_sync_audio`)."""
+        target = call_target if (r.kind == "game" and call_target is not None) else r
+        if not cfg.record_others:
+            state, reason = "off", "record_others_off"
+        elif r.status in ("asking", "ask_later"):
+            state, reason = "asking", None
+        elif r.status not in RECORDING_STATUSES:
+            state, reason = "off", r.status
+        elif self.track_factory is None:
+            state, reason = "unavailable", "no_track_source"
+        elif r.kind == "call" and not (r.held or r.alive_by == "screen"):
+            state, reason = "paused", "mic_released"   # the call may be over: its app's sound is not the call's
+        elif r.kind == "game" and not r.pid:
+            state, reason = "paused", "no_window"
+        elif r.kind == "game" and not self._game_alive(r):
+            state, reason = "paused", "game_closed"   # its pid may be reused: never capture a stranger's tree
+        else:
+            state, reason = "recording", None
+        if r.track is not None and (state not in ("recording", "paused") or r.track_target != target.call_id
+                                    or (r.kind == "game" and r.pid and r.pid != r.track_pid)):
+            self._stop_track(r, reason or ("moved" if r.track_target != target.call_id else "process_changed"))
+        if state != "recording":
+            if state == "paused" and r.track is not None and r.track.listening:
+                r.track.pause()
+                self._log("call_track_paused", call_id=r.call_id, app=r.app, call_kind=r.kind, reason=reason)
+            if not (state == "paused" and r.track_state == "unavailable"):
+                self._track_state(r, state, reason)
+            return
+        if r.track is not None:
+            if not r.track.listening:
+                try:
+                    r.track.resume()
+                    self._log("call_track_resumed", call_id=r.call_id, app=r.app, call_kind=r.kind)
+                except Exception as exc:
+                    self._track_failed(cfg, r, exc, now)
+                    return
+            self._track_running(cfg, r, now)
+            return
+        if r.track_state == "unavailable" and now < r.track_retry_at:
+            return
+        try:
+            pid = r.pid if r.kind == "game" else (self.pid_fn(r.holder) if r.holder is not None else None)
+        except Exception as exc:
+            self._track_failed(cfg, r, exc, now)
+            return
+        if not pid:
+            self._track_failed(cfg, r, "no_process", now)
+            return
+        try:
+            self._start_track(cfg, r, target, int(pid))
+        except Exception as exc:
+            self._track_failed(cfg, r, exc, now)
+            return
+        self._track_running(cfg, r, now)
+
+    def _track_running(self, cfg: CallConfig, r: _Active, now: float) -> None:
+        """An open app track's real state: its source opens on its own thread (``starting`` until it runs), and a
+        source whose capture thread ended (it could not open; a GetBuffer error; an exception) is a failed track -
+        logged with its error, tried again after ``track_retry_s`` - never one that shows "recording" while it
+        captures nothing."""
+        src = r.track.source if r.track is not None else None
+        if src is not None and getattr(src, "alive", True) is False:
+            self._track_failed(cfg, r, getattr(src, "error", None) or "capture_stopped", now)
+            return
+        if src is not None and not getattr(src, "ready", True):
+            self._track_state(r, "starting", None)
+            return
+        if r.track_state != "recording" and src is not None:
+            r.track.device = getattr(src, "device_used", None) or r.track.device
+            r.track.opened_as = getattr(src, "opened_as", None) or r.track.opened_as
+            self._log("call_track_ready", call_id=r.call_id, app=r.app, call_kind=r.kind,
+                      opened_as=r.track.opened_as, tried=list(getattr(src, "tried", []) or [])[:4])
+        self._track_state(r, "recording", None)
+
+    def _track_state(self, r: _Active, state: str, reason: str | None) -> None:
+        if (state, reason) != (r.track_state, r.track_reason):
+            r.track_state, r.track_reason = state, reason
+
+    def _track_failed(self, cfg: CallConfig, r: _Active, why: Any, now: float) -> None:
+        """The app's own audio could not be opened: the track is ``unavailable`` (the microphone goes on as
+        always), tried again after ``track_retry_s``."""
+        if r.track is not None:
+            self._stop_track(r, "unavailable")
+        reason = why if isinstance(why, str) else f"{type(why).__name__}: {why}"
+        r.track_retry_at = now + cfg.track_retry_s
+        self._track_state(r, "unavailable", reason[:200])
+        self._log("call_track_unavailable", call_id=r.call_id, app=r.app, call_kind=r.kind, reason=reason[:300],
+                  retry_s=cfg.track_retry_s)
+
+    def _start_track(self, cfg: CallConfig, r: _Active, target: _Active, pid: int) -> None:
+        spec = TrackSpec(call_id=r.call_id, app=r.app, process=r.key, kind=r.kind, pid=pid)
+        factory = self.track_factory
+        session = RecordingSession(
+            self.store, call_id=target.call_id, app=r.app, process=r.key, cfg=cfg,
+            source_factory=lambda: factory(cfg, spec), log=self._log, start_seq=self._seqs.last(target.call_id),
+            track=Track(side="others", app=r.app, process=r.key, kind=r.kind, call_id=r.call_id),
+            seq_fn=lambda cid=target.call_id: self._seqs.next(cid),
+        )
+        session.start()   # a source that opens in the background returns at once (see _track_running)
+        r.track, r.track_target, r.track_pid = session, target.call_id, pid
+        self._log("call_track_start", call_id=r.call_id, into=target.call_id, app=r.app, call_kind=r.kind, pid=pid,
+                  opened_as=session.opened_as, device=session.device, vad=session.chunker.vad is not None)
+
+    def _stop_track(self, r: _Active, reason: str) -> None:
+        session, r.track = r.track, None
+        into, r.track_target, r.track_pid = r.track_target, None, None
+        if session is None:
+            return
+        stats = session.stop(reason)
+        src = session.last_source
+        loop = getattr(src, "stats", None)
+        restamp = getattr(src, "_restamper", None)
+        vad = session.chunker.vad
+        self._log("call_track_stop", call_id=r.call_id, into=into, app=r.app, call_kind=r.kind, reason=reason,
+                  silence_dropped_s=round(session.chunker.silence_s, 1), breaks=session.chunker.breaks,
+                  vad_windows=vad.windows if vad is not None else None,
+                  vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None,
+                  packets=getattr(loop, "packets", None), discontinuities=getattr(loop, "discontinuities", None),
+                  capture_cpu_s=round(loop.cpu_s, 2) if loop is not None else None,
+                  gaps=getattr(restamp, "gaps", None), **summarize(stats))
+
+    def _stop_row_audio(self, r: _Active, reason: str) -> None:
+        """Every recording of row ``r``: its microphone (when it owns it), its app track, and any other row's track
+        writing into it."""
+        if r.session is not None:
+            self._stop_recording(r, reason)
+        self._stop_track(r, reason)
+        for other in self._rows():
+            if other is not r and other.track is not None and other.track_target == r.call_id:
+                self._stop_track(other, "moved")
 
     def _start_recording(self, cfg: CallConfig, act: _Active) -> None:
+        """The microphone, for row ``act``: its counts and chunk numbers go on from the row's own."""
+        row = self.store.call_record(act.call_id)
+        base = (RecordingStats(chunks=row.chunks, chunks_silent=row.chunks_silent, audio_s=row.audio_s,
+                               speech_s=row.speech_s) if row is not None else None)
+        start_seq = self._seqs.last(act.call_id)
         session = RecordingSession(
             self.store, call_id=act.call_id, app=act.app, process=act.key, cfg=cfg,
             source_factory=lambda: self.source_factory(cfg, act.key), log=self._log,
-            start_seq=act.seq_base, base=act.base,
+            start_seq=start_seq, base=base,
+            track=Track(side="user", app=act.app, process=act.key, kind=act.kind, call_id=act.call_id),
+            seq_fn=lambda cid=act.call_id: self._seqs.next(cid),
         )
         session.start()
         act.session = session
-        row = self.store.call_record(act.call_id)
         if row is None or row.recording_started_at is None:   # an adopted call keeps its first start
             self.store.update_call(act.call_id, recording_started_at=time.time())
-        self._log("call_recording_start", call_id=act.call_id, app=act.app, device=session.device,
+        self._log("call_recording_start", call_id=act.call_id, app=act.app, call_kind=act.kind, device=session.device,
                   opened_as=session.opened_as, vad=session.chunker.vad is not None, spool="encrypted, deferred",
-                  **({"continues_seq": act.seq_base} if act.seq_base else {}))
+                  **({"continues_seq": start_seq} if start_seq else {}))
 
-    def _stop_recording(self, act: _Active, reason: str) -> None:
+    def _stop_recording(self, act: _Active, reason: str, *, final: bool = True) -> None:
+        """Close the microphone's recording of row ``act`` (its last chunk is spooled). ``final`` False: the
+        microphone moves to another row (the row's own stop reason is left for its end)."""
         session, act.session = act.session, None
         if session is None:
             return
         stats = session.stop(reason)
         info = summarize(stats)
-        self.store.update_call(act.call_id, recording_stopped_at=time.time(), stop_reason=reason)
+        self.store.update_call(act.call_id, recording_stopped_at=time.time(), **({"stop_reason": reason} if final else {}))
         vad = session.chunker.vad
-        self._log("call_recording_stop", call_id=act.call_id, app=act.app, reason=reason,
+        self._log("call_recording_stop", call_id=act.call_id, app=act.app, call_kind=act.kind, reason=reason,
                   silence_dropped_s=round(session.chunker.silence_s, 1),
                   vad_windows=vad.windows if vad is not None else None,
                   vad_cpu_s=round(vad.cpu_s, 2) if vad is not None else None, **info)
 
-    def _end(self, act: _Active, reason: str, now: float | None = None, *, life: Any = None) -> None:
+    def _end(self, act: _Active, reason: str, now: float | None = None, *, life: Any = None, ask: bool = True) -> None:
+        """End row ``act``: every recording of it stops (each spools its last chunk), its row is ended. A game row
+        whose card could not be seen during the session keeps it for right after (``ask``; never on a pause, a
+        disable or the service stopping): the row's time ends now, its card goes up when it can be seen."""
         now = time.time() if now is None else float(now)
-        if act.session is not None:
-            self._stop_recording(act, reason)
+        self._stop_row_audio(act, reason)
         row = self.store.call_record(act.call_id)
-        if row is not None and row.status == "asking" and row.consent is None:
-            self.store.answer_call(act.call_id, "none", by="call_ended")
-            self._log("call_consent", call_id=act.call_id, app=act.app, answer="none", by="call_ended")
+        if (ask and act.kind == "game" and row is not None and row.consent is None
+                and row.status in ("ask_later", "asking")):
+            self.store.update_call(act.call_id, ended_at=now, stop_reason=reason)
+            self._log("call_ended", call_id=act.call_id, app=act.app, call_kind=act.kind, reason=reason,
+                      seconds=round(now - act.detected_at, 1), card="after", **self._end_facts(act, now, life))
+            if self.after is not None:
+                self._close_after(now, "new_session")
+            if row.status == "asking" and act.asking_since is not None:   # the card stays up: its time goes on
+                act.asked_s += now - act.asking_since
+            act.asking_since = None if row.status == "ask_later" else now
+            self.after = act
+            self._tell_ui()
+            return
+        if row is not None and row.consent is None and row.status in ("asking", "ask_later"):
+            if row.status == "asking":
+                self.store.answer_call(act.call_id, "none", by="call_ended")
+            else:   # a game's card that was never shown (a pause, a disable, the service stopping)
+                self.store.update_call(act.call_id, consent="none", consent_by="call_ended", consent_at=now)
+            self._log("call_consent", call_id=act.call_id, app=act.app, call_kind=act.kind, answer="none", by="call_ended")
         self.store.update_call(act.call_id, status="ended", ended_at=now,
                                **({} if row is not None and row.stop_reason else {"stop_reason": reason}))
-        self._log("call_ended", call_id=act.call_id, app=act.app, reason=reason,
+        self._log("call_ended", call_id=act.call_id, app=act.app, call_kind=act.kind, reason=reason,
                   seconds=round(now - act.detected_at, 1), **self._end_facts(act, now, life))
         self._tell_ui()
 
@@ -2110,10 +2891,155 @@ class CallWorker:
         except Exception as exc:   # the log line itself must never stop a call from ending
             return {"facts_error": f"{type(exc).__name__}: {exc}"}
 
+    # -- who takes the microphone: spans for heard_by -------------------------------
+
+    def _capture_watch(self, on_change: Callable[[float, int, bool], None]) -> Any:
+        from yuki.memory.loopback import CaptureWatch
+
+        return CaptureWatch(on_change, log=self._log, exclude_pids={os.getpid()})
+
+    def _sync_watch(self, on: bool, now: float) -> None:
+        """The capture-session watch runs while a voice session may record: its spans tell which apps were taking
+        the microphone at each moment (``heard_by``); a ``watch`` span marks the time it was measured at all."""
+        if on and self._watch is None and self.watch_factory is not None:
+            try:
+                self._watch_span = self.store.open_mic_span(kind="watch", at=now)
+                watch = self.watch_factory(self._on_capture)
+                watch.start()
+                self._watch = watch
+                self._log("call_micwatch", state="on", mode=getattr(watch, "mode", None))
+            except Exception as exc:
+                self._log("error", where="calls.micwatch_start", error=f"{type(exc).__name__}: {exc}")
+                if self._watch_span is not None:
+                    self.store.close_mic_span(self._watch_span, now)
+                    self._watch_span = None
+        elif not on and self._watch is not None:
+            watch, self._watch = self._watch, None
+            mode = getattr(watch, "mode", None)
+            try:
+                watch.stop()   # reports every process still taking the microphone as stopped now
+            except Exception as exc:
+                self._log("error", where="calls.micwatch_stop", error=f"{type(exc).__name__}: {exc}")
+            with self._span_lock:
+                left, self._spans_open = self._spans_open, {}
+                self._capture_live, self._capture_last, self._capture_keys = {}, {}, {}   # unknown from now on
+            for span_id in left.values():
+                self.store.close_mic_span(span_id, now)
+            if self._watch_span is not None:
+                self.store.close_mic_span(self._watch_span, now)
+                self._watch_span = None
+            self._log("call_micwatch", state="off", mode=mode, **dict(getattr(watch, "counters", {}) or {}))
+
+    def _on_capture(self, at: float, pid: int, active: bool) -> None:
+        """A process started or stopped taking the microphone (called on the watch's thread): a ``capture`` span,
+        and the app's capture state for :meth:`_game_in_use`. A change of an open row's app wakes the worker at once
+        (a game that closes stops the microphone now, not at the next poll)."""
+        key = None
+        try:
+            with self._span_lock:
+                if active:
+                    key, name = self._pid_app(pid)
+                    if key is None or pid in self._spans_open:
+                        return
+                    self._capture_live.setdefault(key, set()).add(pid)
+                    self._capture_keys[pid] = key
+                    self._spans_open[pid] = self.store.open_mic_span(kind="capture", at=at, process=key, app=name,
+                                                                     pid=pid)
+                else:
+                    key = self._capture_keys.pop(pid, None)
+                    if key is not None:
+                        self._capture_live.get(key, set()).discard(pid)
+                        self._capture_last[key] = max(self._capture_last.get(key, 0.0), float(at))
+                    span_id = self._spans_open.pop(pid, None)
+                    if span_id is not None:
+                        self.store.close_mic_span(span_id, at)
+        except Exception as exc:
+            self._log("error", where="calls.micwatch_span", error=f"{type(exc).__name__}: {exc}")
+        if key is not None and key in {r.key for r in self._rows()} and self._event is not None:
+            self._event.set()
+
+    def _capture_seen(self, key: str, now: float) -> float | None:
+        """When the app ``key`` last had a capture session active: ``now`` while it has one, else the moment its
+        last one went inactive; None when the watch never saw one (or is not running)."""
+        with self._span_lock:
+            if self._capture_live.get(key):
+                return now
+            return self._capture_last.get(key)
+
+    def _pid_app(self, pid: int) -> tuple[str | None, str | None]:
+        """``(app key, display name)`` of a process taking the microphone, from the Toolhelp snapshot's image name
+        (no process opened); ``(None, None)`` for Yuki's own processes."""
+        hit = self._pid_apps.get(pid)
+        if hit is not None:
+            return hit
+        table_fn = self.table_fn
+        if table_fn is None:
+            from yuki.memory.loopback import process_table as table_fn
+        image = next((img for p, _parent, img in table_fn() if p == pid), "")
+        key = app_key(image)
+        out: tuple[str | None, str | None]
+        if pid == os.getpid() or not key or self._own(pid, image):
+            out = (None, None)
+        else:
+            row = next((r for r in self._rows() if r.key == key), None)
+            name = row.app if row is not None else None
+            if not name:
+                try:
+                    from yuki.core import appnames
+
+                    name = appnames.name_for_key(key) or key
+                except Exception:
+                    name = key
+            out = (key, name)
+        if len(self._pid_apps) > 256:
+            self._pid_apps.clear()
+        self._pid_apps[pid] = out
+        return out
+
+    def _own(self, pid: int, image: str) -> bool:
+        """Whether ``pid`` is one of Yuki's own processes (its interpreters; only a process running the image of
+        one of them is looked at more closely)."""
+        exclude = getattr(self.signals, "exclude", frozenset()) or frozenset()
+        if not exclude or image.casefold() not in {Path(p).name.casefold() for p in exclude}:
+            return False
+        try:
+            import psutil
+
+            return str(Path(psutil.Process(pid).exe())).casefold() in exclude
+        except Exception:
+            return False
+
+    # -- what the UI reads: every track's state ---------------------------------------
+
+    def track_states(self) -> dict[str, Any]:
+        """The microphone's and every app track's state now (content-free; :data:`TRACKS_STATE`)."""
+        rows = self._rows()
+        return {
+            "rows": [r.call_id for r in rows],
+            "mic": dict(self._mic_state),
+            "tracks": [{"call_id": r.call_id, "app": r.app, "process": r.key, "track_kind": r.kind,
+                        "state": r.track_state if r.track_state else "off", "reason": r.track_reason,
+                        "into": r.track_target} for r in rows],
+            "watch": getattr(self._watch, "mode", None) if self._watch is not None else "off",
+        }
+
+    def _note_tracks(self) -> None:
+        """Keep :meth:`track_states` in :data:`TRACKS_STATE` when it changes (``call_status()`` reads it)."""
+        text = json.dumps(self.track_states(), sort_keys=True)
+        if text == self._tracks_written:
+            return
+        try:
+            self.store.set_nudge_state(TRACKS_STATE, text)
+            self._tracks_written = text
+            self._tell_ui()
+        except Exception as exc:
+            self._log("error", where="calls.tracks_state", error=f"{type(exc).__name__}: {exc}")
+
 
 __all__ = [
     "CallConfig", "CallWorker", "CallLife", "LifeStep", "lingering_call", "HOLDERS_STATE", "LINGER_S",
-    "Chunker", "Chunk", "MicSource", "ArraySource", "RecordingSession",
+    "TRACKS_STATE", "RECORDING_STATUSES", "Chunker", "Chunk", "MicSource", "ArraySource", "RecordingSession",
+    "Track", "TrackSpec", "loopback_source", "app_pid", "heard_by",
     "FasterWhisperBackend", "make_backend", "load_backend", "mic_holders", "headphones_now",
     "capture_device_for", "own_executables", "summarize", "Gpu", "RATE", "Segment", "screen_segments",
     "vocabulary_hint", "ChunkTimeout",

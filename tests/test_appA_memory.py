@@ -96,7 +96,7 @@ def test_migration_33_is_additive_from_32():
         conn.close()
         s = Store.open(db2)
         try:
-            assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS) == 33
+            assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS) >= 33   # later migrations run too
             cols = {t: {r[1] for r in s._query(f"PRAGMA table_info({t})")} for t in
                     ("portrait_facts", "work_threads", "call_digests", "journal", "contact_routes", "day_digests")}
             assert {"shown_ciphertext", "pinned", "reviewed_at"} <= cols["portrait_facts"]
@@ -130,11 +130,17 @@ def test_migration_33_runs_on_a_v32_file_with_rows_and_pins_user_facts_only(tmp_
                           ("contact_routes", "use_ciphertext")):
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute("DROP TABLE day_digests")
+    # migration 34 (calls both sides) is taken back too, so the file is really at v32
+    for table, column in (("calls", "kind"), ("call_chunks", "side"), ("call_chunks", "track_app"),
+                          ("call_chunks", "track_process"), ("call_chunks", "track_kind"),
+                          ("call_chunks", "track_call_id")):
+        conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    conn.execute("DROP TABLE mic_spans")
     conn.execute("PRAGMA user_version=32")
     conn.close()
     s = Store.open(db)
     try:
-        assert s._query("PRAGMA user_version")[0][0] == 33
+        assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS) >= 33
         assert s.portrait_fact(told).pinned is True and s.portrait_fact(seen).pinned is False
         assert s.portrait_fact(told).text == "The user works at Acme." and s.portrait_fact(seen).shown is None
         assert s.shown_missing()["fact"] and op.result_id in s.shown_missing()["thread"]

@@ -90,7 +90,7 @@ def _worker(store, stubs: Stubs, **cfg) -> CallWorker:
     worker = CallWorker(store, signals=stubs.signals(frozenset({PYTHON.casefold()})), config=config,
                         headphones_fn=lambda c: (False, {"form_factor": "speakers", "device": "Speakers"}),
                         source_factory=lambda c, app: pytest.fail("the microphone must not be opened"),
-                        evidence=evidence())
+                        evidence=evidence(), foreground_fn=lambda: None, busy_fn=lambda: False)
     worker._tell_ui = lambda: None   # never wake the real UI's card watcher
     return worker
 

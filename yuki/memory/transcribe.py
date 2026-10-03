@@ -1,8 +1,10 @@
-"""Deferred transcription of the user's side of calls: only when the PC is genuinely free.
+"""Deferred transcription of calls (every track): only when the PC is genuinely free.
 
 During a call nothing but capture, a cheap speech gate and encryption run
-(:mod:`yuki.memory.calls`): the user's own speech waits in the spool as
-encrypted Opus chunks. This module turns it into text later.
+(:mod:`yuki.memory.calls`): the speech of every track - the user's microphone and,
+since 3 Oct 2026, the call app's or game's own audio - waits in the spool as
+encrypted Opus chunks. This module turns it into text later, each line saying
+who spoke (``who`` user | others) and on which app.
 
 Two halves:
 
@@ -515,6 +517,17 @@ def memory_texts(store: Store, days: float) -> list[str]:
     return texts
 
 
+def chunk_line_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Who spoke in a chunk and on which app, for each of its lines: ``{"who", "app", "track_kind"}``.
+
+    ``who`` is ``user`` (the microphone) or ``others`` (an app's own audio); ``app`` the track's app (for the
+    user's chunks, the voice session's row they were recorded for); ``track_kind`` ``call`` | ``game``. A chunk
+    from before migration 34 has no side or track: the user's, on its call's app."""
+    who = "others" if row.get("side") == "others" else "user"
+    return {"who": who, "app": str(row.get("track_app") or row.get("app") or ""),
+            "track_kind": str(row.get("track_kind") or row.get("call_kind") or "call")}
+
+
 def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log: Callable[..., Any],
                        backend: Any = None, max_attempts: int = 3) -> dict[str, Any]:
     """Transcribe every waiting chunk of an ended call, oldest first, until done or ``stop()``.
@@ -522,11 +535,15 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
     Per chunk: decrypt, decode (in memory), transcribe (with memory's names and
     terms as a hint, built once per batch: :func:`yuki.memory.calls.vocabulary_hint`),
     keep what Whisper's own signals support (:func:`yuki.memory.calls.screen_segments`,
-    repeats followed across the chunks of a call), store the words (encrypted) and
-    delete the audio. A call with no chunk left waiting goes to the journal.
-    Returns content-free totals.
+    repeats followed across the chunks of each track of a call), store the words
+    (encrypted) and delete the audio. Every track (the user's microphone, each app's
+    own audio) goes through the same backend and guards. Each line says who spoke and
+    on which app (:func:`chunk_line_fields`); a user line also says which apps were
+    taking the microphone then (``heard_by``, :func:`yuki.memory.calls.heard_by`, from
+    the measured capture-session spans; left out when they were not measured). A call
+    with no chunk left waiting goes to the journal. Returns content-free totals.
     """
-    from yuki.memory.calls import Gpu, decode_speech, load_backend, screen_segments, vocabulary_hint
+    from yuki.memory.calls import Gpu, decode_speech, heard_by, load_backend, screen_segments, vocabulary_hint
 
     done = failed = timed_out = unclear = 0
     audio_s = 0.0
@@ -550,8 +567,11 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
             log("error", where="transcribe.hint", error=f"{type(exc).__name__}: {exc}")
         log("transcribe_hint", terms=len([w for w in hint.split(",") if w.strip()]),
             tokens=backend.count_tokens(" " + hint) if hint else 0, ms=round((time.perf_counter() - t0) * 1000))
-    last_phrase: dict[int, str | None] = {}
-    last_said: dict[int, str] = {}
+    # Whisper's loop on noise is followed per track (a phrase repeated on the microphone is not a repeat of what
+    # the call app played) and so is the secret filter's context
+    last_phrase: dict[tuple[int, str, str], str | None] = {}
+    last_said: dict[tuple[int, str, str], str] = {}
+    overlap = float(getattr(cfg, "heard_by_overlap", 0.3))
     try:
         for r in rows:
             if stop():
@@ -562,16 +582,25 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
                 t0 = time.perf_counter()
                 segments, info = backend.transcribe(audio, hint=hint) if hint else backend.transcribe(audio)
                 ms = (time.perf_counter() - t0) * 1000.0
-                kept, dropped, last_phrase[r["call_id"]] = screen_segments(segments, cfg, last_phrase.get(r["call_id"]))
+                fields = chunk_line_fields(r)
+                track = (int(r["call_id"]), fields["who"], str(r.get("track_process") or ""))
+                kept, dropped, last_phrase[track] = screen_segments(segments, cfg, last_phrase.get(track))
                 utterances = [{"at": round(r["start_at"] + s.start, 2), "end": round(r["start_at"] + s.end, 2),
                                "text": s.text, "lang": s.lang, "lp": round(s.avg_logprob, 2),
-                               "nsp": round(s.no_speech_prob, 2), **({"unclear": True} if s.unclear else {})}
+                               "nsp": round(s.no_speech_prob, 2), **({"unclear": True} if s.unclear else {}),
+                               **fields}
                               for s in kept]
+                if fields["who"] == "user" and utterances:
+                    spans = store.mic_spans_between(float(r["start_at"]), float(r["start_at"]) + float(r["audio_s"]) + 1.0)
+                    for u in utterances:
+                        heard = heard_by(spans, u["at"], u["end"], overlap=overlap)
+                        if heard is not None:
+                            u["heard_by"] = heard
                 # a password or code said aloud is hidden before the words are stored (docs/MEMORY.md,
                 # "Secret filter"); each utterance is read with the one before it as context
-                secrets = redact_utterances(utterances, last_said.get(r["call_id"], ""))
+                secrets = redact_utterances(utterances, last_said.get(track, ""))
                 if utterances:
-                    last_said[r["call_id"]] = utterances[-1]["text"]
+                    last_said[track] = utterances[-1]["text"]
                 store.finish_call_chunk(r["id"], utterances, lang=info.get("lang"), ms=ms, model=backend.name,
                                         device=backend.device)
                 done += 1
@@ -581,7 +610,8 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
                 unclear += sum(1 for s in kept if s.unclear)
                 for k, v in dropped.items():
                     dropped_all[k] = dropped_all.get(k, 0) + v
-                log("transcribe_chunk", chunk_id=r["id"], call_id=r["call_id"], audio_s=r["audio_s"], ms=round(ms),
+                log("transcribe_chunk", chunk_id=r["id"], call_id=r["call_id"], who=fields["who"],
+                    track_kind=fields["track_kind"], audio_s=r["audio_s"], ms=round(ms),
                     segments=len(utterances), dropped=dropped, unclear=sum(1 for s in kept if s.unclear),
                     lang=info.get("lang"), lang_prob=info.get("lang_prob"), decodes=info.get("decodes"),
                     tokens=info.get("tokens"), max_new_tokens=info.get("max_new_tokens"),

@@ -303,13 +303,45 @@ deliver_within_h = 72
 retry_min = 30
 
 [calls]
-# "Just my side" of calls (yuki.memory.calls): during a call Yuki may, if you
-# say yes on the card, transcribe ONLY your own microphone - never the call's
-# sound, never the other people - on this PC (no audio leaves it, no audio is
-# ever written to disk), and remember what you said: facts, decisions and
-# what you said you would do.  It asks every call unless you chose "Always"
-# or "Never" for that app; no answer means nothing is recorded.
+# Calls, both sides (yuki.memory.calls; your decision of 3 Oct 2026 - from
+# 24 Sept to 3 Oct only your own microphone was recorded).  If you say yes on
+# the card, Yuki records during a call, on this PC only: your microphone
+# (headphones only) AND the call app's own sound - the other people - through
+# Windows "process loopback", which takes the sound of that one app and
+# nothing else (never your game, your music or Yuki's own voice).  For a
+# browser call that is every tab of that browser.  The audio is kept
+# encrypted, turned into text later when the PC is free, then deleted; no
+# audio leaves this PC and none is ever written unencrypted.  Every line of
+# text says who spoke (you, or the others) and in which app, and each of your
+# lines which apps were taking your microphone at that moment.  It remembers
+# what was said: facts, decisions and what you said you would do.  It asks
+# every call unless you chose "Always" or "Never" for that app; your earlier
+# "Always" answers still stand; no answer means nothing is recorded.
 enabled = true
+# Also record the other side: the call app's own sound (process loopback, one
+# track per app).  false = only your own microphone, as before 3 Oct.
+record_others = true
+# A full-screen game's own voice chat (VALORANT and the like, measured: the
+# full-screen app in front holding the microphone and drawing like a game) is
+# recorded as its own track, labelled with the game, so a reply to your
+# teammates is never taken for talk to the people on a Discord call.  It is
+# asked like a call ("Always/Never for <game>"); the card cannot show over a
+# full-screen game, so it comes up the first moment it can be seen (the game
+# not in front, or right after the session), and recording starts from your
+# answer.  false = a game's voice chat is never recorded (and never a call).
+game_voice = true
+# One of your lines counts as heard by an app when that app was taking the
+# microphone over at least this share of it (Windows' audio sessions say when;
+# a push-to-talk game may take it only while the key is down).
+heard_by_overlap = 0.3
+# An app's sound that could not be opened is tried again after this many seconds.
+track_retry_s = 300
+# During a game's voice chat your microphone is kept only while the game is in
+# use: its window in front, or (while it runs) it holding the microphone, or
+# its own microphone stream open within this many seconds (push-to-talk just
+# released).  A closed game stops it at once; a call you did not say yes to
+# that holds the microphone stops it too.
+game_mic_grace_s = 3
 # What a call is, is measured, not listed: an app (any app, a browser too) that
 # holds the microphone while a screen of it, read during that hold, shows a
 # joined call (judged by a small model from the window's control names; a
@@ -337,8 +369,9 @@ poll_s = 5
 end_grace_s = 30
 # The card goes away unanswered after this long (= no recording for this call).
 ask_timeout_s = 120
-# Headphones only, so the other people's voices coming out of speakers are
-# never picked up.  The default output device's form factor must be one of
+# Your microphone is recorded with headphones only, so the other people's
+# voices coming out of speakers never land on your track (their own track,
+# taken from the call app, needs no headphones).  The default output device's form factor must be one of
 # these (Windows' own values: headphones, headset, handset, speakers,
 # line_level, digital_display, spdif, network, unknown).
 headphone_form_factors = ["headphones", "headset", "handset"]
@@ -355,8 +388,8 @@ capture_device = ""
 # How often the microphone's users are read again without a change notice
 # from Windows (the ConsentStore key is watched; this is only a backstop).
 holders_backstop_s = 60
-# Speech to text, on this PC only, and never during a call: the user's own
-# speech is kept encrypted in the spool (next to the database) until the PC
+# Speech to text, on this PC only, and never during a call: the speech of
+# every track is kept encrypted in the spool (next to the database) until the PC
 # is free, then transcribed in a below-normal process that exits after the
 # batch (model, RAM and VRAM freed at once).  "faster-whisper:<model>": a Whisper model
 # (tried on the GPU with CUDA, int8), with call_stt_fallback on the CPU when

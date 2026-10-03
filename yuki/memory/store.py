@@ -1304,12 +1304,37 @@ class EpisodeRunStats:
     error: str | None = None
 
 
-#: Capture / thread kind of the user's own side of a call (yuki.memory.calls):
-#: only the user's microphone, transcribed on this PC; never the call audio.
+#: Capture / thread kind of a call's transcript (yuki.memory.calls), transcribed on this PC. The name is from the
+#: time only the user's microphone was recorded (24 Sept-3 Oct 2026) and stays, because stored captures and
+#: threads carry it. Since 3 Oct a capture holds both sides: ``utterances`` the user's own lines (what every older
+#: reader takes as "the user said"), ``lines`` every line of every track in time order, each with ``who``
+#: (user | others), ``app`` and ``track_kind`` (call | game) - see :meth:`Store.call_lines`.
 CALL_SIDE_KIND = "my_call_side"
-#: ``calls.status`` values of a call that is still going on.
+#: The same kind under a name that says what it is now.
+CALL_TRANSCRIPT_KIND = CALL_SIDE_KIND
+#: ``calls.status`` values of a call that is still going on. ``ask_later``: a game's voice chat whose consent card
+#: waits for a moment it can be seen (not over a full-screen game).
 CALL_OPEN_STATUSES: tuple[str, ...] = ("asking", "recording", "waiting_headphones", "declined", "unanswered",
-                                       "not_asked", "stopped")
+                                       "not_asked", "stopped", "ask_later")
+#: ``calls.kind``: a call (an app's voice call) or a game (a game's own voice chat).
+CALL_KINDS: tuple[str, ...] = ("call", "game")
+
+
+def user_side_text(kind: str | None, text: str | None) -> str | None:
+    """A capture's text as the generic readers may show it: a call transcript (:data:`CALL_SIDE_KIND`) without its
+    ``lines`` - only the user's own ``utterances``, as every capture read before 3 Oct 2026 - so the other people's
+    words reach no prompt until the call readers are taught who spoke (report 53). Other kinds unchanged."""
+    if kind != CALL_SIDE_KIND or not text:
+        return text
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(data, dict) or "lines" not in data:
+        return text
+    return json.dumps({k: v for k, v in data.items() if k != "lines"}, ensure_ascii=False)
+#: ``call_chunks.side`` / an utterance's ``who``: the user's microphone, or the app's own audio (the other people).
+CALL_SIDES: tuple[str, ...] = ("user", "others")
 #: Answers the user can give on the consent card (``always``/``never`` are also kept per app).
 CALL_ANSWERS: tuple[str, ...] = ("yes", "no", "always", "never", "none")
 #: ``calls`` columns :meth:`Store.update_call` may set (plumbing whitelist).
@@ -1329,10 +1354,10 @@ class CallRecord:
     app: str                          # display name ("Zoom", "Discord")
     process: str | None               # app_key of the process holding the microphone
     service: str | None               # meeting service when a timeline meeting row named it
-    via: str                          # mic | meeting (older rows) | screen | screen_stale (the evidence)
+    via: str                          # mic | meeting (older rows) | screen | screen_stale (the evidence) | game
     detected_at: float
     ended_at: float | None
-    status: str                       # asking | recording | waiting_headphones | declined | unanswered | not_asked | stopped | ended
+    status: str                       # asking | ask_later | recording | waiting_headphones | declined | unanswered | not_asked | stopped | ended
     consent: str | None               # yes | no | always | never | none
     consent_by: str | None            # card | pref | quiet | ui_timeout | call_ended
     consent_at: float | None
@@ -1359,6 +1384,8 @@ class CallRecord:
     hold_since: float | None = None
     #: The last moment the call worker saw the call alive (at most 15 s stale while it runs), migration 26.
     last_alive_at: float | None = None
+    #: ``call`` | ``game`` (a game's own voice chat), migration 34; older rows are calls.
+    kind: str = "call"
 
 
 #: ``questions.kind``: what memory does not know - who a person is to the user,
@@ -2826,6 +2853,37 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at          REAL NOT NULL
     );
     """,
+    # 34 (2026-10-03, calls record both sides, docs/research/revamp-2026-10-02/52-build-call-others-capture.md;
+    # the owner's decision, handbook rule 9): the user's microphone plus the call app's own audio (process
+    # loopback), and a game's own voice chat as a voice session of its own.
+    # - calls.kind: call | game (a game's voice chat, started by the measured gaming_with_voice signal, asked with
+    #   the same per-app consent). Old rows read as calls.
+    # - call_chunks.side: user (the microphone) | others (an app's own audio); old rows read as the user's.
+    #   track_app / track_process / track_kind: the app the chunk's audio came from (for the user's chunks, the
+    #   voice session's row it was recorded for); track_call_id: the row of that app (a game's chunks are kept in
+    #   the call's row while a call is recorded, so one transcript holds both conversations in time order).
+    # - mic_spans: when each app was actually taking the microphone (its capture session active), and when that
+    #   was being watched (kind "watch"): the transcriber marks each of the user's lines with the apps that heard
+    #   it (heard_by). Content-free; pruned with the spool.
+    # Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    ALTER TABLE calls ADD COLUMN kind TEXT NOT NULL DEFAULT 'call';
+    ALTER TABLE call_chunks ADD COLUMN side TEXT NOT NULL DEFAULT 'user';
+    ALTER TABLE call_chunks ADD COLUMN track_app TEXT;
+    ALTER TABLE call_chunks ADD COLUMN track_process TEXT;
+    ALTER TABLE call_chunks ADD COLUMN track_kind TEXT;
+    ALTER TABLE call_chunks ADD COLUMN track_call_id INTEGER;
+    CREATE TABLE mic_spans (
+        id          INTEGER PRIMARY KEY,
+        kind        TEXT NOT NULL,
+        process     TEXT,
+        app         TEXT,
+        pid         INTEGER,
+        started_at  REAL NOT NULL,
+        ended_at    REAL
+    );
+    CREATE INDEX mic_spans_time ON mic_spans(started_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -4255,18 +4313,20 @@ class Store:
             items = out.setdefault(int(r["journal_batch_id"]), [])
             if len(items) < per_batch:
                 items.append({"id": int(r["id"]), "at": float(r["at"]), "kind": r["kind"],
-                              "thread_id": r["thread_id"], "text": self._dec(r["delta_ciphertext"]) or ""})
+                              "thread_id": r["thread_id"],
+                              "text": user_side_text(r["kind"], self._dec(r["delta_ciphertext"])) or ""})
         return out
 
     def first_capture_text(self, thread_id: int, before: float | None = None) -> tuple[float, str] | None:
         """``(at, text)`` of the oldest capture still stored for a thread (before ``before``), or ``None``:
         the top of a page, where it shows its title, author and date, when later captures are deltas."""
-        sql, params = "SELECT at, delta_ciphertext FROM captures WHERE thread_id=?", [int(thread_id)]
+        sql, params = "SELECT at, kind, delta_ciphertext FROM captures WHERE thread_id=?", [int(thread_id)]
         if before is not None:
             sql += " AND at < ?"
             params.append(float(before))
         rows = self._query(sql + " ORDER BY at, id LIMIT 1", params)
-        return (float(rows[0]["at"]), self._dec(rows[0]["delta_ciphertext"]) or "") if rows else None
+        return ((float(rows[0]["at"]), user_side_text(rows[0]["kind"], self._dec(rows[0]["delta_ciphertext"])) or "")
+                if rows else None)
 
     def journal_superseded_since(self, journal_ids: Iterable[int], since: float) -> set[int]:
         """Those of ``journal_ids`` a re-journal replaced after ``since``."""
@@ -4758,9 +4818,11 @@ class Store:
             lo = min(r.started_at for r in meet) - self.MEETING_CALL_SLACK_S
             hi = max(r.ended_at for r in meet) + self.MEETING_CALL_SLACK_S
             now = time.time()
+            # a game's voice chat (calls.kind "game", migration 34) is never a meeting's proof
             calls = self._query(
                 "SELECT process, detected_at, coalesce(ended_at, last_alive_at, ?), app FROM calls"
-                " WHERE detected_at < ? AND coalesce(ended_at, last_alive_at, ?) > ?", (now, hi, now, lo))
+                " WHERE detected_at < ? AND coalesce(ended_at, last_alive_at, ?) > ? AND kind = 'call'",
+                (now, hi, now, lo))
         except sqlite3.OperationalError:   # a database before migration 26 (no last_alive_at)
             try:
                 first = self._query("SELECT min(detected_at) FROM calls")[0][0]
@@ -6573,9 +6635,10 @@ class Store:
     def captures_between(self, since: TimeArg, until: TimeArg = None, *, limit: int = 4) -> list[dict[str, Any]]:
         """The newest ``limit`` captures in ``[since, until)`` that were the user's own screen (not ``by_yuki``;
         the window in front - not one beside it or a popup, migration 24's attention), oldest first: ``{"at",
-        "app", "host", "kind", "text"}`` (text decrypted)."""
+        "app", "host", "kind", "text"}`` (text decrypted). Never a call's transcript (not a screen; since 3 Oct it
+        holds other people's words too)."""
         clauses, params = ["c.by_yuki = 0", "coalesce(c.trigger, '') != 'popup'",
-                           "coalesce(c.trigger, '') NOT LIKE 'visible:%'"], []
+                           "coalesce(c.trigger, '') NOT LIKE 'visible:%'", "coalesce(c.kind, '') != ?"], [CALL_SIDE_KIND]
         if (s := _ts(since)) is not None:
             clauses.append("c.at >= ?")
             params.append(s)
@@ -7284,27 +7347,41 @@ class Store:
             stt_device=r["stt_device"], captures=r["captures"], updated_at=r["updated_at"],
             hold_since=r["hold_since"] if "hold_since" in r.keys() else None,
             last_alive_at=r["last_alive_at"] if "last_alive_at" in r.keys() else None,
+            kind=(r["kind"] if "kind" in r.keys() else None) or "call",
         )
 
     def start_call(
         self, *, app: str, process: str | None, via: str, service: str | None = None, at: float | None = None,
         status: str = "asking", consent: str | None = None, consent_by: str | None = None,
         output_form_factor: str | None = None, output_device: str | None = None, headphones: bool | None = None,
-        hold_since: float | None = None,
+        hold_since: float | None = None, kind: str = "call",
     ) -> int:
-        """A call was detected: one content-free ``calls`` row; returns its id. ``hold_since``: the start of the
-        microphone hold it is in (the ConsentStore's record); the row is alive as of ``at``."""
+        """A call (or, ``kind`` "game", a game's voice chat) was detected: one content-free ``calls`` row; returns
+        its id. ``hold_since``: the start of the microphone hold it is in (the ConsentStore's record); the row is
+        alive as of ``at``."""
+        if kind not in CALL_KINDS:
+            raise ValueError(f"unknown call kind {kind!r}")
         now = time.time()
         when = float(at) if at is not None else now
         return self._write(lambda conn: int(conn.execute(
             "INSERT INTO calls(app, process, service, via, detected_at, status, consent, consent_by, consent_at,"
-            " output_form_factor, output_device, headphones, updated_at, hold_since, last_alive_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " output_form_factor, output_device, headphones, updated_at, hold_since, last_alive_at, kind)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (app or "", app_key(process), service, via, when, status, consent, consent_by,
              when if consent else None, output_form_factor, output_device,
              None if headphones is None else int(bool(headphones)), now,
-             None if hold_since is None else float(hold_since), when),
+             None if hold_since is None else float(hold_since), when, kind),
         ).lastrowid))
+
+    def set_call_status_if(self, call_id: int, status: str, *, when_status: str) -> bool:
+        """Move a call from ``when_status`` to ``status`` only while it has no answer (a game's card going up or
+        coming down must never undo an answer that arrived meanwhile); False when it did not move."""
+        def op(conn: sqlite3.Connection) -> bool:
+            cur = conn.execute("UPDATE calls SET status=?, updated_at=? WHERE id=? AND status=? AND consent IS NULL",
+                               (status, time.time(), int(call_id), when_status))
+            return cur.rowcount > 0
+
+        return bool(self._write(op))
 
     def call_max_seq(self, call_id: int) -> int:
         """The highest spool chunk number written for a call (0 when none): a call adopted after a restart goes on
@@ -7389,19 +7466,21 @@ class Store:
         return self._write(op)
 
     def request_call_stop(self, call_id: int | None = None) -> int | None:
-        """Ask the worker to stop remembering a call (the open one when ``call_id`` is None); its id or None."""
+        """Ask the worker to stop remembering (``call_id`` None: every voice session recording now - a call and a
+        game's voice chat at once stop together, every track of each); the newest such id, or None."""
         def op(conn: sqlite3.Connection) -> int | None:
             if call_id is None:
-                row = conn.execute(
-                    "SELECT id FROM calls WHERE status IN ('recording','waiting_headphones')"
-                    " OR (status='asking' AND consent IN ('yes','always')) ORDER BY detected_at DESC LIMIT 1"
-                ).fetchone()
+                rows = conn.execute(
+                    "SELECT id FROM calls WHERE ended_at IS NULL AND (status IN ('recording','waiting_headphones')"
+                    " OR (status='asking' AND consent IN ('yes','always'))) ORDER BY detected_at DESC, id DESC"
+                ).fetchall()
             else:
-                row = conn.execute("SELECT id FROM calls WHERE id=?", (int(call_id),)).fetchone()
-            if row is None:
+                rows = conn.execute("SELECT id FROM calls WHERE id=?", (int(call_id),)).fetchall()
+            if not rows:
                 return None
-            conn.execute("UPDATE calls SET stop_requested=1, updated_at=? WHERE id=?", (time.time(), row["id"]))
-            return int(row["id"])
+            conn.executemany("UPDATE calls SET stop_requested=1, updated_at=? WHERE id=?",
+                             [(time.time(), r["id"]) for r in rows])
+            return int(rows[0]["id"])
 
         return self._write(op)
 
@@ -7453,30 +7532,68 @@ class Store:
 
     def add_call_side(
         self, call_id: int, *, app: str, process: str | None, started_at: float, ended_at: float,
-        utterances: Sequence[dict[str, Any]], final: bool = False,
+        utterances: Sequence[dict[str, Any]], final: bool = False, lines: Sequence[dict[str, Any]] | None = None,
+        kind: str = "call",
     ) -> int | None:
-        """Store a stretch of what the user said in a call, for the journal; the capture id (None if empty).
+        """Store a stretch of a call's transcript, for the journal; the capture id (None if empty).
 
         One thread per call (``kind`` :data:`CALL_SIDE_KIND`, scope ``call:<id>``);
-        each capture's delta is ``{"call_id", "app", "start", "end", "final",
-        "utterances": [{"at", "end", "text", "lang"}]}`` as JSON, encrypted like
-        every capture (capture TTL). The call row's counters move in the same
-        transaction. Text only (the audio stays in the spool until it is transcribed, then is deleted).
+        each capture's delta is ``{"call_id", "app", "kind", "start", "end", "final",
+        "utterances": [the user's lines], "lines": [every line, time-ordered]}`` as JSON,
+        encrypted like every capture (capture TTL). A line is ``{"at", "end", "text", "lang", "who", "app",
+        "track_kind", ...}`` (:meth:`call_lines`). ``utterances`` keeps only the user's own lines, so every reader
+        written when only the user's microphone was recorded stays true; ``lines`` (None: the utterances) carries
+        the other people too. The call row's counters move in the same transaction. Text only (the audio stays
+        in the spool until it is transcribed, then is deleted).
         """
-        items = [dict(u) for u in utterances if str(u.get("text") or "").strip()]
-        if not items:
+        every = [dict(u) for u in (lines if lines is not None else utterances) if str(u.get("text") or "").strip()]
+        if not every:
             return None
         capture_id = self._write(lambda conn: self._add_call_side(conn, call_id, app, process, started_at, ended_at,
-                                                                  items, final))
+                                                                  every, final, kind=kind))
         self._captured([capture_id])
         return capture_id
 
+    @staticmethod
+    def call_lines(data: dict[str, Any] | None) -> list[dict[str, Any]]:
+        """Every line of a call capture's JSON (``call_side_captures``' ``data``), time-ordered, each with ``who``
+        (``user`` | ``others``), ``app`` and ``track_kind`` (``call`` | ``game``): its ``lines`` when it has them,
+        else its ``utterances`` - a capture written before 3 Oct 2026 holds only the user's own words, read as
+        ``who`` "user" on the capture's app."""
+        data = data if isinstance(data, dict) else {}
+        raw = data.get("lines")
+        if not isinstance(raw, list):
+            raw = data.get("utterances") or []
+        app = str(data.get("app") or "")
+        kind = str(data.get("kind") or "call")
+        out = []
+        for u in raw:
+            if not isinstance(u, dict) or not str(u.get("text") or "").strip():
+                continue
+            line = dict(u)
+            line["who"] = "others" if line.get("who") == "others" else "user"
+            line["app"] = str(line.get("app") or app)
+            line["track_kind"] = str(line.get("track_kind") or kind)
+            out.append(line)
+        out.sort(key=lambda u: (float(u.get("at") or 0.0), float(u.get("end") or 0.0)))
+        return out
+
     def _add_call_side(self, conn: sqlite3.Connection, call_id: int, app: str, process: str | None,
-                       started_at: float, ended_at: float, items: list[dict[str, Any]], final: bool) -> int:
+                       started_at: float, ended_at: float, items: list[dict[str, Any]], final: bool,
+                       kind: str = "call") -> int:
+        """``items``: every line (the user's and the others'); the user's alone also go in as ``utterances``."""
         redact_utterances(items)   # the transcriber already did; a second pass costs microseconds and holds for any writer
-        delta = json.dumps({"call_id": int(call_id), "app": app, "start": float(started_at), "end": float(ended_at),
-                            "final": bool(final), "utterances": items}, ensure_ascii=False)
-        thread_id = self._upsert_thread(conn, app or "", f"{app} call", None, process=process,
+        for u in items:
+            u["who"] = "others" if u.get("who") == "others" else "user"
+            u.setdefault("app", app)
+            u.setdefault("track_kind", kind)
+        items.sort(key=lambda u: (float(u.get("at") or started_at), float(u.get("end") or 0.0)))
+        mine = [u for u in items if u["who"] == "user"]
+        delta = json.dumps({"call_id": int(call_id), "app": app, "kind": kind, "start": float(started_at),
+                            "end": float(ended_at), "final": bool(final), "utterances": mine, "lines": items},
+                           ensure_ascii=False)
+        title = f"{app} game voice" if kind == "game" else f"{app} call"
+        thread_id = self._upsert_thread(conn, app or "", title, None, process=process,
                                         scope=f"call:{int(call_id)}", kind=CALL_SIDE_KIND)
         first = min(float(u.get("at") or started_at) for u in items)
         cur = conn.execute(
@@ -7495,30 +7612,48 @@ class Store:
 
     @property
     def spool_dir(self) -> Path:
-        """``<database folder>\\spool``: encrypted audio of the user's side of calls, waiting for transcription."""
+        """``<database folder>\\spool``: encrypted call audio (every track), waiting for transcription."""
         return self.path.parent / "spool"
 
+    @staticmethod
+    def spool_track_label(side: str, process: str | None) -> str:
+        """The track part of a spool file's name: ``mic`` for the user's microphone, ``app-<process>`` for an
+        app's own audio (letters, digits and ``_`` only)."""
+        if side != "others":
+            return "mic"
+        safe = "".join(ch if ch.isascii() and (ch.isalnum() or ch == "_") else "_" for ch in (process or "app"))
+        return f"app-{safe[:40] or 'app'}"
+
     def write_spool(self, call_id: int, seq: int, *, start_at: float, audio_s: float, speech_s: float,
-                    payload: bytes, codec: str) -> int:
+                    payload: bytes, codec: str, side: str = "user", track_app: str | None = None,
+                    track_process: str | None = None, track_kind: str | None = None,
+                    track_call_id: int | None = None) -> int:
         """Encrypt ``payload`` (compressed audio) into a spool file and record it; the chunk id.
 
+        ``side``: ``user`` (the microphone) or ``others`` (an app's own audio, ``track_*`` naming the app); the
+        file's name carries the track (``call12-mic-00003-....yspool``, ``call12-app-discord-00004-...``).
         The file holds only ciphertext (AES-256-GCM with the store's
         DPAPI-protected key): it is written to a temporary name and renamed,
         and the row is written after it, so a crash leaves at most an orphan
         file (removed by :meth:`sweep_spool`), never a row without its audio.
         """
+        if side not in CALL_SIDES:
+            raise ValueError(f"unknown side {side!r}")
         folder = self.spool_dir
         folder.mkdir(parents=True, exist_ok=True)
-        name = f"call{int(call_id)}-{int(seq):05d}-{os.urandom(4).hex()}.yspool"
+        track = self.spool_track_label(side, app_key(track_process))
+        name = f"call{int(call_id)}-{track}-{int(seq):05d}-{os.urandom(4).hex()}.yspool"
         blob = b"YSP1" + self.cipher.encrypt_bytes(payload)
         tmp = folder / (name + ".part")
         tmp.write_bytes(blob)
         os.replace(tmp, folder / name)
         return self._write(lambda conn: int(conn.execute(
-            "INSERT INTO call_chunks(call_id, seq, start_at, audio_s, speech_s, file, bytes, codec, status, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?, 'spooled', ?)",
+            "INSERT INTO call_chunks(call_id, seq, start_at, audio_s, speech_s, file, bytes, codec, status, created_at,"
+            " side, track_app, track_process, track_kind, track_call_id)"
+            " VALUES (?,?,?,?,?,?,?,?, 'spooled', ?,?,?,?,?,?)",
             (int(call_id), int(seq), float(start_at), float(audio_s), float(speech_s), name, len(blob), codec,
-             time.time()),
+             time.time(), side, track_app, app_key(track_process), track_kind,
+             None if track_call_id is None else int(track_call_id)),
         ).lastrowid))
 
     def read_spool(self, name: str) -> bytes:
@@ -7538,8 +7673,10 @@ class Store:
 
     def call_chunks(self, *, statuses: Sequence[str] = ("spooled",), call_id: int | None = None,
                     limit: int | None = None) -> list[dict[str, Any]]:
-        """Chunk rows (cleartext metadata), oldest first, with their call's status and app."""
-        sql = ("SELECT k.*, c.status AS call_status, c.app AS app, c.process AS process FROM call_chunks k"
+        """Chunk rows (cleartext metadata), oldest first, with their call's status, app and kind (``call_kind``).
+        ``side`` is ``user`` (the microphone; every row before migration 34) or ``others``."""
+        sql = ("SELECT k.*, c.status AS call_status, c.app AS app, c.process AS process, c.kind AS call_kind"
+               " FROM call_chunks k"
                " LEFT JOIN calls c ON c.id = k.call_id"
                f" WHERE k.status IN ({','.join('?' * len(statuses))})")
         params: list[Any] = list(statuses)
@@ -7627,7 +7764,53 @@ class Store:
             total -= int(r["bytes"] or 0)
         if drop:
             out.append(("capped", *self.remove_call_chunks(drop, "capped")))
+        # who took the microphone when: only needed until the audio it describes is transcribed (or gone)
+        cut = now - max_age_s - 86400.0
+        gone = self._write(lambda conn: conn.execute(
+            "DELETE FROM mic_spans WHERE coalesce(ended_at, started_at) < ?", (cut,)).rowcount)
+        if gone:
+            out.append(("mic_spans", int(gone), 0))
         return out
+
+    # -- who took the microphone when (migration 34): content-free spans -----------------------
+
+    def open_mic_span(self, *, kind: str, at: float, process: str | None = None, app: str | None = None,
+                      pid: int | None = None) -> int:
+        """A span begins: ``kind`` "capture" (an app's capture session went active: it is taking the microphone)
+        or "watch" (the watcher is running, so absence of a capture span means nobody took it). Its id."""
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO mic_spans(kind, process, app, pid, started_at) VALUES (?,?,?,?,?)",
+            (kind, app_key(process), app, None if pid is None else int(pid), float(at))).lastrowid))
+
+    def close_mic_span(self, span_id: int, at: float) -> None:
+        self._write(lambda conn: conn.execute("UPDATE mic_spans SET ended_at=? WHERE id=? AND ended_at IS NULL",
+                                              (float(at), int(span_id))))
+
+    def close_open_mic_spans(self, at: float) -> int:
+        """Spans a previous run left open end now (nothing was recorded while it was down)."""
+        return int(self._write(lambda conn: conn.execute(
+            "UPDATE mic_spans SET ended_at=max(started_at, ?) WHERE ended_at IS NULL", (float(at),)).rowcount))
+
+    def mic_spans_between(self, since: float, until: float) -> list[dict[str, Any]]:
+        """Spans overlapping ``[since, until)``, oldest first: ``{"kind", "process", "app", "pid", "start",
+        "end"}`` (``end`` None: still open)."""
+        rows = self._query("SELECT kind, process, app, pid, started_at, ended_at FROM mic_spans"
+                           " WHERE started_at < ? AND (ended_at IS NULL OR ended_at > ?) ORDER BY started_at, id",
+                           (float(until), float(since)))
+        return [{"kind": r["kind"], "process": r["process"], "app": r["app"], "pid": r["pid"],
+                 "start": float(r["started_at"]), "end": None if r["ended_at"] is None else float(r["ended_at"])}
+                for r in rows]
+
+    def track_speech(self, call_ids: Iterable[int]) -> dict[tuple[str, str], float]:
+        """Seconds of speech kept per track of these calls (every chunk, transcribed or not):
+        ``{(side, track process or ""): speech_s}``. Content-free."""
+        ids = sorted({int(i) for i in call_ids})
+        if not ids:
+            return {}
+        rows = self._query(
+            f"SELECT side, coalesce(track_process, '') AS process, coalesce(sum(speech_s), 0) AS s FROM call_chunks"
+            f" WHERE call_id IN ({','.join('?' * len(ids))}) GROUP BY side, coalesce(track_process, '')", ids)
+        return {(r["side"] or "user", r["process"] or ""): float(r["s"] or 0.0) for r in rows}
 
     def spool_summary(self) -> dict[str, Any]:
         """``{"calls", "chunks", "audio_s", "speech_s", "bytes", "oldest_at"}`` of the audio waiting."""
@@ -7638,29 +7821,41 @@ class Store:
 
     def journal_call_chunks(self, call_id: int) -> int | None:
         """A call whose chunks are all transcribed: its words become one ``my_call_side`` capture for the
-        journal, and the chunk rows drop their text (one transaction). The capture id, or None (nothing said,
-        or chunks still waiting)."""
+        journal, and the chunk rows drop their text (one transaction). Every track of the call goes into the one
+        capture, merged in time order (:meth:`call_lines`); the user's own lines are also its ``utterances``. A
+        line stored before migration 34 carries no ``who``: it is the user's (its chunk's ``side``). The capture
+        id, or None (nothing said, or chunks still waiting)."""
         def op(conn: sqlite3.Connection) -> int | None:
             if conn.execute("SELECT 1 FROM call_chunks WHERE call_id=? AND status='spooled' LIMIT 1",
                             (int(call_id),)).fetchone():
                 return None
-            call = conn.execute("SELECT app, process FROM calls WHERE id=?", (int(call_id),)).fetchone()
-            rows = conn.execute("SELECT id, text_ciphertext FROM call_chunks WHERE call_id=? AND status='done'"
-                                " ORDER BY start_at, id", (int(call_id),)).fetchall()
+            call = conn.execute("SELECT app, process, kind FROM calls WHERE id=?", (int(call_id),)).fetchone()
+            rows = conn.execute("SELECT id, text_ciphertext, side, track_app, track_kind FROM call_chunks"
+                                " WHERE call_id=? AND status='done' ORDER BY start_at, id", (int(call_id),)).fetchall()
             if not rows:
                 return None
+            app = (call["app"] if call is not None else "") or ""
+            kind = (call["kind"] if call is not None else None) or "call"
             items: list[dict[str, Any]] = []
             for r in rows:
-                items += json.loads(self.cipher.decrypt(r["text_ciphertext"]) or "[]")
-            items = [u for u in items if str(u.get("text") or "").strip()]
+                side = "others" if r["side"] == "others" else "user"
+                for u in json.loads(self.cipher.decrypt(r["text_ciphertext"]) or "[]"):
+                    if not isinstance(u, dict) or not str(u.get("text") or "").strip():
+                        continue
+                    u.setdefault("who", side)
+                    u.setdefault("app", r["track_app"] or app)
+                    u.setdefault("track_kind", r["track_kind"] or kind)
+                    items.append(u)
+            items.sort(key=lambda u: (float(u.get("at") or 0.0), float(u.get("end") or 0.0)))
             capture_id = None
             if items and call is not None:
-                capture_id = self._add_call_side(conn, call_id, call["app"], call["process"], items[0]["at"],
-                                                 items[-1]["end"], items, True)
+                capture_id = self._add_call_side(conn, call_id, app, call["process"], items[0]["at"],
+                                                 max(float(u.get("end") or u["at"]) for u in items), items, True,
+                                                 kind=kind)
             conn.executemany("UPDATE call_chunks SET status='journaled', text_ciphertext=NULL WHERE id=?",
                              [(r["id"],) for r in rows])
             conn.execute("UPDATE calls SET utterances=utterances+?, updated_at=? WHERE id=?",
-                         (len(items), time.time(), int(call_id)))
+                         (sum(1 for u in items if u.get("who") != "others"), time.time(), int(call_id)))
             return capture_id
 
         capture_id = self._write(op)
@@ -9311,7 +9506,8 @@ class Store:
             "SELECT c.id, c.at, c.kind, c.delta_ciphertext, c.thread_id, c.by_yuki, c.trigger, t.app, t.process, t.host,"
             " t.title_ciphertext, t.scope_ciphertext, t.url_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
             + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY c.at DESC, c.id DESC LIMIT ?", params)
-        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "text": self.cipher.decrypt(r["delta_ciphertext"]),
+        return [{"id": r["id"], "at": r["at"], "kind": r["kind"],
+                 "text": user_side_text(r["kind"], self.cipher.decrypt(r["delta_ciphertext"])),
                  "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]), "process": r["process"],
                  "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
                  "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
@@ -9345,7 +9541,8 @@ class Store:
             "SELECT c.id, c.at, c.kind, c.delta_ciphertext, c.thread_id, c.by_yuki, c.trigger, t.app, t.process, t.host,"
             " t.title_ciphertext, t.scope_ciphertext, t.url_ciphertext FROM captures c JOIN threads t ON t.id = c.thread_id"
             " WHERE c.id IN (%s) ORDER BY c.at, c.id" % ",".join("?" * len(wanted)), wanted)
-        return [{"id": r["id"], "at": r["at"], "kind": r["kind"], "text": self.cipher.decrypt(r["delta_ciphertext"]),
+        return [{"id": r["id"], "at": r["at"], "kind": r["kind"],
+                 "text": user_side_text(r["kind"], self.cipher.decrypt(r["delta_ciphertext"])),
                  "thread_id": r["thread_id"], "app": _shown(r["app"], r["process"]), "process": r["process"],
                  "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
                  "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
