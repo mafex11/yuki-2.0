@@ -364,6 +364,9 @@
     }, 1000);
   }
 
+  /* measurement knob (scripts/web_window_perf.py): the redraw counters to the host every 5 s */
+  if (Q.get('perfreport') === '1') setInterval(() => B.send('perf', L.Perf.snap()), 5000);
+
   parse();
   if (!location.hash && Q.get('page')) location.hash = Q.get('page');
   parse();

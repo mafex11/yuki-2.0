@@ -234,6 +234,11 @@ class WebWindow:
                 self.refresh(page, stale_s=STALE_S)
         elif op == "act":
             threading.Thread(target=self._act, args=(message,), name="yuki-web-act", daemon=True).start()
+        elif op == "perf":   # the page's redraw counters (a measurement knob)
+            self.metrics.setdefault("perf", []).append({"at": time.time(), "draws": message.get("draws"),
+                                                        "ticks": message.get("ticks"), "ms": message.get("ms")})
+            self.metrics["perf"] = self.metrics["perf"][-40:]
+            self.write()
 
     def _boot_when_ready(self) -> None:
         """The page is up: send it the snapshot (or the fixture), the live state and the thread."""
@@ -413,7 +418,11 @@ class WebWindow:
             return W.build_activity(m, requests_csv=self.requests_csv())
         if name == "settings":
             live = {k: self.tray_state.get(k) for k in ("wake", "mic", "speaker") if k in self.tray_state}
-            return W.build_settings(m, live=live, devices=self._devices(), policy_path=self.policy_path)
+            data = W.build_settings(m, live=live, devices=self._devices(), policy_path=self.policy_path)
+            keys = self.tray_state.get("hotkeys") if isinstance(self.tray_state.get("hotkeys"), dict) else {}
+            if keys.get("voice"):
+                data["voice"]["hotkey"] = W.hotkey_words(str(keys["voice"]))
+            return data
         raise ValueError(name)
 
     def _people(self) -> tuple[str, list[dict[str, Any]]]:
@@ -527,9 +536,14 @@ class WebWindow:
             self.post({"kind": "permissions", "permissions": msg.get("permissions")})
 
     def _voice_from_state(self) -> None:
+        from yuki.ui.web_data import hotkey_words
+
         st = self.tray_state
         self.shell["voice"] = {"state": st.get("voice_state") or "off", "wake": bool(st.get("wake")),
                                "conversation": bool(st.get("conversation")), "quiet_until": st.get("quiet_until") or 0}
+        keys = st.get("hotkeys") if isinstance(st.get("hotkeys"), dict) else {}
+        if keys.get("toggle"):
+            self.shell["hotkey_words"] = hotkey_words(str(keys["toggle"]))
 
     def _on_chat_change(self, what: str, item: Any) -> None:
         if not self.booted:

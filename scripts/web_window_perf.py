@@ -59,6 +59,25 @@ def temp_memory(base: Path) -> Path:
     return db
 
 
+def redraws(result: dict[str, Any], out: Path) -> None:
+    """Canvas redraws per second over the CPU window, from the page's own counters (``perfreport=1``)."""
+    files = sorted(out.glob(f"*-{result['name']}.json"))
+    try:
+        perf = json.loads(files[-1].read_text(encoding="utf-8")).get("perf") or []
+    except (IndexError, OSError, ValueError):
+        return
+    s = result.get("samples") or {}
+    if len(perf) < 2 or "a" not in s or "b" not in s:
+        return
+    a, b = s["a"]["at"], s["b"]["at"]
+    inside = [p for p in perf if a - 3 <= p["at"] <= b + 3]
+    if len(inside) >= 2:
+        first, last = inside[0], inside[-1]
+        span = max(1e-6, last["at"] - first["at"])
+        result["redraws_per_s"] = round((last["draws"] - first["draws"]) / span, 2)
+        result["loop_ticks_per_s"] = round((last["ticks"] - first["ticks"]) / span, 2)
+
+
 def summarize(results: list[dict[str, Any]]) -> str:
     lines = []
     for r in results:
@@ -69,7 +88,8 @@ def summarize(results: list[dict[str, Any]]) -> str:
         tot = (last or {}).get("total") or {}
         lines.append(f"{r['name']:<28} paint {d.get('first_paint')} s  private {tot.get('private_mb')} MB  uss "
                      f"{tot.get('uss_mb')} MB  wset {tot.get('wset_mb')} MB  procs {(last or {}).get('count')}  cpu "
-                     f"{r.get('idle_cpu_pct_one_core')}%  focus {m.get('took_focus')}  exit {r.get('exit_code')}")
+                     f"{r.get('idle_cpu_pct_one_core')}%  redraws/s {r.get('redraws_per_s')}  focus {m.get('took_focus')}  "
+                     f"exit {r.get('exit_code')}")
     return "\n".join(lines)
 
 
@@ -97,7 +117,9 @@ def main() -> int:
                 name, _, query = case.partition("=")
                 behind = name.endswith("-behind")
                 results.append(runner.launch(name, profile, None, 10 + win, at=(("a", 8.0), ("b", 8.0 + win)),
-                                             cpu=("a", "b"), extra=["--fixture", "--query", query] + ([] if behind else ["--assume-focus"])))
+                                             cpu=("a", "b"), extra=["--fixture", "--query", query + "&perfreport=1"]
+                                             + ([] if behind else ["--assume-focus"])))
+                redraws(results[-1], out)
         elif args.try_db:
             db = temp_memory(out)
             results.append(runner.launch("try-empty-memory", profile, None, 7.0, at=(("6s", 6.0),),
