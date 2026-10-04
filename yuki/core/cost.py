@@ -17,8 +17,9 @@ Read from the logs Yuki already writes (estimates at list prices, ``Settings.pri
   TTS per turn) are listed apart: they are not model spend.
 
 :func:`today_spend` reads it all; :class:`CostLedger` does the same incrementally (each file read
-from where it stopped) for a check every few minutes; :class:`CostAlert` fires once per day past
-``Settings.daily_cost_alert_usd`` and remembers that in ``%LOCALAPPDATA%\\Yuki\\cost_alert.json``.
+from where it stopped) for a check every few minutes; :class:`CostAlert` fires once per day past a measured line
+(1.5 times a usual day of the last week, never under ``Settings.daily_cost_alert_usd``) and remembers that, and the
+finished days' spend, in ``%LOCALAPPDATA%\\Yuki\\cost_alert.json``.
 
 CLI: ``yuki cost today``.
 """
@@ -236,20 +237,45 @@ def today_spend(settings: Any = None, *, day: date | None = None) -> Spend:
     return CostLedger(logs_dir(settings), day=day).refresh()
 
 
+#: The alert is about a day well above the usual (report 76: a fixed $3 line fired 7 of 7 days, so it told nobody
+#: anything): it fires past ``SPIKE_FACTOR`` times the median of the last ``BASELINE_DAYS`` finished days that spent
+#: anything, once ``BASELINE_MIN_DAYS`` of them are known, and never under ``Settings.daily_cost_alert_usd``.
+SPIKE_FACTOR = 1.5
+BASELINE_DAYS = 7
+BASELINE_MIN_DAYS = 3
+
+
+def past_day_spend(logs: Path, day: date) -> float:
+    """A finished day's model spend from the request ledger and memory's and the voice's daily files. The agent's
+    start-up warm-ups are left out (they sit in every session log since that day: a costly read for a few cents)."""
+    ledger = CostLedger(logs, day=day)
+    for step in (ledger._requests, ledger._memory, ledger._voice_logs):
+        try:
+            step()
+        except Exception:
+            continue
+    return ledger.spend.model_total
+
+
 def _state_path() -> Path:
     base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
     return Path(base) / "Yuki" / "cost_alert.json"
 
 
 class CostAlert:
-    """Once a day, when the day's model spend passes the threshold: log it and call ``notify``.
+    """Once a day, when the day's model spend is well above the usual: log it and call ``notify``.
+
+    The line is measured (:meth:`line`): ``SPIKE_FACTOR`` times the median spend of the last ``BASELINE_DAYS``
+    finished days, never under ``threshold_usd``; until ``BASELINE_MIN_DAYS`` days are known it is ``threshold_usd``
+    itself. A finished day's spend is read from the logs once (:func:`past_day_spend`), at most one day per check, and
+    kept in the state file.
 
     Args:
-        threshold_usd: ``Settings.daily_cost_alert_usd`` (0 or less: never).
+        threshold_usd: ``Settings.daily_cost_alert_usd``, the floor of the line (0 or less: never).
         ledger: Where the spend comes from.
         notify: ``notify(text, spend)`` - the tray notice (the runtime's ``notice`` signal).
         log: ``log(event, **fields)``.
-        state_path: Remembers the day already alerted (survives restarts).
+        state_path: Remembers the day already alerted and the finished days' spend (survives restarts).
     """
 
     def __init__(self, threshold_usd: float, ledger: CostLedger, *, notify: Callable[[str, Spend], Any] | None = None,
@@ -261,38 +287,77 @@ class CostAlert:
         self.state_path = state_path or _state_path()
         self._lock = threading.Lock()
 
-    def _alerted_day(self) -> str | None:
+    def _state(self) -> dict[str, Any]:
         try:
-            return json.loads(self.state_path.read_text(encoding="utf-8")).get("day")
-        except (OSError, ValueError, AttributeError):
-            return None
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
-    def _remember(self, day: str, total: float) -> None:
+    def _write(self, state: dict[str, Any]) -> None:
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.state_path.write_text(json.dumps({"day": day, "total_usd": round(total, 4),
-                                                   "at": datetime.now().isoformat(timespec="seconds")}),
-                                       encoding="utf-8")
+            self.state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         except OSError:
             pass
 
+    def _alerted_day(self) -> str | None:
+        return self._state().get("day")
+
+    def _remember(self, day: str, total: float) -> None:
+        state = self._state()
+        state.update({"day": day, "total_usd": round(total, 4), "at": datetime.now().isoformat(timespec="seconds")})
+        self._write(state)
+
+    def baseline(self, today: date) -> tuple[float | None, int]:
+        """``(median spend of the known finished days, how many)`` over the last ``BASELINE_DAYS`` before ``today``;
+        the median is None under ``BASELINE_MIN_DAYS`` days. Reads at most one missing day from the logs."""
+        from datetime import timedelta
+        from statistics import median
+
+        state = self._state()
+        history = state.get("history") if isinstance(state.get("history"), dict) else {}
+        days = [(today - timedelta(days=k)).isoformat() for k in range(1, BASELINE_DAYS + 1)]
+        missing = [d for d in days if d not in history]
+        if missing:
+            day = missing[0]
+            try:
+                history[day] = round(past_day_spend(self.ledger.logs, date.fromisoformat(day)), 4)
+            except Exception:
+                history[day] = 0.0
+            state["history"] = {d: v for d, v in history.items() if d in days}
+            self._write(state)
+        values = [float(history[d]) for d in days if _num(history.get(d)) > 0]
+        if len(values) < BASELINE_MIN_DAYS:
+            return None, len(values)
+        return float(median(values)), len(values)
+
+    def line(self, today: date) -> tuple[float, float | None]:
+        """``(the alert line today, the usual day's spend or None)``: see the class."""
+        usual, _n = self.baseline(today)
+        if usual is None:
+            return self.threshold, None
+        return max(self.threshold, SPIKE_FACTOR * usual), usual
+
     def check(self) -> bool:
-        """Read the spend; alert (once a day) past the threshold. True when it alerted now. Never raises."""
+        """Read the spend; alert (once a day) past the line. True when it alerted now. Never raises."""
         if self.threshold <= 0:
             return False
         with self._lock:
             try:
                 spend = self.ledger.refresh()
+                line, usual = self.line(date.fromisoformat(spend.day))
             except Exception:
                 return False
             total = spend.model_total
-            if total < self.threshold or self._alerted_day() == spend.day:
+            if total < line or self._alerted_day() == spend.day:
                 return False
             self._remember(spend.day, total)
-            text = alert_text(spend, self.threshold)
+            text = alert_text(spend, line, usual=usual)
             if self.log is not None:
                 try:
-                    self.log("cost_alert", threshold_usd=self.threshold, **spend.as_dict())
+                    self.log("cost_alert", threshold_usd=round(line, 4), floor_usd=self.threshold,
+                             usual_usd=None if usual is None else round(usual, 4), **spend.as_dict())
                 except Exception:
                     pass
             if self.notify is not None:
@@ -303,11 +368,14 @@ class CostAlert:
             return True
 
 
-def alert_text(spend: Spend, threshold: float) -> str:
-    """The notice, in plain words."""
+def alert_text(spend: Spend, threshold: float, *, usual: float | None = None) -> str:
+    """The notice, in plain words (``usual``: a usual day's spend, when the line was measured from it)."""
     parts = [f"memory ${spend.memory_total:.2f}", f"chat and tasks ${spend.agent + spend.agent_startup:.2f}"]
     if spend.voice_mouth:
         parts.append(f"voice ${spend.voice_mouth:.2f}")
+    if usual is not None:
+        return (f"Heads up: Yuki has used about ${spend.model_total:.2f} of AI today, more than a usual day (about "
+                f"${usual:.2f}) - {', '.join(parts)}. Nothing is slowed down; this is just so you know.")
     return (f"Heads up: Yuki has used about ${spend.model_total:.2f} of AI today (over your ${threshold:.2f} "
             f"line) - {', '.join(parts)}. Nothing is slowed down; this is just so you know.")
 

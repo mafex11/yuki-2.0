@@ -556,7 +556,9 @@ class Settings:
     loop_breaker_repeats: int = 3
     loop_breaker_failed_steps: int = 4
     loop_breaker_max_trips: int = 2
-    #: Daily model spend (agent + voice + memory) above which one notice is shown and logged.
+    #: Daily model spend (agent + voice + memory) above which one notice is shown and logged: the floor of the line.
+    #: Once a few days are known the line is measured instead (yuki.core.cost.CostAlert: 1.5 times a usual day of the
+    #: last week, never under this), so it speaks only on an unusual day (report 76: the fixed line fired 7 of 7 days).
     daily_cost_alert_usd: float = 3.0
     #: Read-only helpers (yuki.agent.subagents): model, effort ("" = none sent), output cap per call,
     #: model calls per helper, wall seconds per helper, input tokens per helper, most at once.

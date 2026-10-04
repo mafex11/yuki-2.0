@@ -1510,6 +1510,25 @@ class PortraitWorker:
 
     # -- model call --------------------------------------------------------
 
+    def _system_param(self, system: str) -> Any:
+        """The request's ``system``: one text block marked for the prompt cache when the client's calls go where
+        Claude's explicit cache works (the default path; ``FailoverClient.prompt_caching``), else the plain text.
+
+        Tools render before the system prompt, so the mark caches both: the same instructions and tool schema go
+        out on every call of a pass (the audit's ~7 parts, the nightly operations' ~3, the admission bar's ~7 per
+        run), each 3-8k tokens; 0% of portrait input hit the cache before (report 76, 28 Sep-5 Oct). The user
+        message stays out of the cached prefix: it changes on every call (a fresh fence and the facts as they are
+        after the previous part). A prompt under the model's cacheable minimum is sent as it is and simply not cached.
+        """
+        caching = getattr(self.client, "prompt_caching", None)
+        try:
+            explicit = callable(caching) and caching() == "explicit"
+        except Exception:
+            explicit = False
+        if not explicit or not system:
+            return system
+        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+
     def _call(
         self, *, purpose: str, run_id: int | None, system: str, user: str, tool: dict[str, Any],
         effort: str, max_tokens: int, stats: PortraitRunStats, model: str | None = None,
@@ -1526,7 +1545,7 @@ class PortraitWorker:
         request: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": self._system_param(system),
             "tools": [tool],
             "messages": [{"role": "user", "content": user}],
         }
