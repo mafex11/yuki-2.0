@@ -338,8 +338,10 @@ def test_the_situation_checks_plain_line_and_the_now_note_reach_the_island(tmp_p
     agent = _agent(brain, tmp_path, desk, countdown=0.0, memory=MemoryAccess(open_client=lambda: mem))
     events = list(agent.run("tell sam omw"))
     nows = [e.text for e in events if isinstance(e, Partial) and e.what == "now"]
-    stamp = time.strftime("%I:%M %p", time.localtime(NOW - 1800)).lstrip("0").replace(":00 ", " ")
-    assert nows[0] == f"Checked Discord first: you sent something close to this at {stamp}"
+    from yuki.agent.situation import said_when
+
+    # "at 11:44 PM" today, "yesterday at 11:44 PM" when the half hour back crosses midnight (the test ran at 00:14)
+    assert nows[0] == f"Checked Discord first: you sent something close to this {said_when(NOW - 1800, NOW)}"
     assert nows[1] == note
     assert TEXT not in nows[0]                                     # what was looked at, never the content
     call = next(i for i, e in enumerate(events) if isinstance(e, ToolCall) and e.name == "type_text")
