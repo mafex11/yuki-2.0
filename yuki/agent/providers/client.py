@@ -358,6 +358,11 @@ class AsyncRoleClient:
         if not route.primary.model:
             raise missing_model(self.role)
         requested = str(params.get("model") or "")
+        if self.role == "talker" and params.get("tools"):
+            # Pipecat's Anthropic service runs one tool call per reply (the last): a service that may answer with
+            # several at once is asked for one
+            choice = params.get("tool_choice") if isinstance(params.get("tool_choice"), dict) else {"type": "auto"}
+            params = {**params, "tool_choice": {**choice, "disable_parallel_tool_use": True}}
         chain = [route.primary]
         if route.backup is not None:
             from yuki.agent.providers.config import Target

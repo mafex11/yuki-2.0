@@ -44,7 +44,10 @@ _EFFORT = {"low": "low", "medium": "medium", "high": "high", "xhigh": "high", "m
 _FINISH = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use", "function_call": "tool_use",
            "content_filter": "refusal"}
 
-IMAGE_LEFT_OUT = "[An image was here, but this model can't see images.]"
+#: Services documented to take ``parallel_tool_calls`` (others may refuse an unknown field, so it isn't sent there).
+PARALLEL_FLAG = frozenset({"openai", "openrouter"})
+
+IMAGE_LEFT_OUT ="[An image was here, but this model can't see images.]"
 DOCUMENT_LEFT_OUT = "[A document was attached here, but this model can't read attachments.]"
 
 
@@ -213,7 +216,7 @@ def to_openai_request(params: dict[str, Any], provider: Provider, model_info: Mo
                 body["tool_choice"] = {"type": "function", "function": {"name": choice["name"]}}
             elif kind == "none":
                 body["tool_choice"] = "none"
-            if choice.get("disable_parallel_tool_use"):
+            if choice.get("disable_parallel_tool_use") and provider.id in PARALLEL_FLAG:
                 body["parallel_tool_calls"] = False
     if model_info is not None and model_info.reasoning:
         thinking = params.get("thinking") or {}

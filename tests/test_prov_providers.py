@@ -539,6 +539,21 @@ def test_talker_routed_stream_with_retry(ai_dir: Path) -> None:
     assert talker_price_model(Settings(), client) == "custom:voice-fast"
 
 
+def test_talker_asks_for_one_tool_call_per_reply(ai_dir: Path) -> None:
+    """Pipecat's Anthropic service runs only a reply's last tool call: a routed talker asks for one at a time."""
+    with FakeOpenAI([Reply(body=completion("ok"))]) as server:
+        _route(ai_dir, "talker", "openai", "gpt-5-mini")
+        client = AsyncRoleClient("talker", _AsyncDefault(), settings=Settings(), factory=lambda pid:
+                                 AsyncOpenAICompatClient(PROVIDERS[pid], base_url=server.url + "/v1", api_key=KEY,
+                                                         model_info=lambda m: known_model(pid, m)))
+        tools = [{"name": "tell_yuki", "description": "hand over", "input_schema": {"type": "object", "properties": {}}}]
+        asyncio.run(client.messages.create(model="haiku", max_tokens=20, tools=tools,
+                                           messages=[{"role": "user", "content": "hi"}]))
+    body = server.posts()[0]["json"]
+    assert body["parallel_tool_calls"] is False and body["model"] == "gpt-5-mini"
+    assert body["reasoning_effort"] in ("low", "medium", "minimal")
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # 5. keys: DPAPI encrypt/decrypt, environment, never in plain files or logs
 # ---------------------------------------------------------------------------------------------------------------------
