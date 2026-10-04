@@ -1299,10 +1299,14 @@ class WebWindow:
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
         "todo_end": "a_todo_end", "todo_reopen": "a_todo_reopen", "todo_add": "a_todo_add",
+        # Settings → AI (report 67): each job's service and model, a key, the other service's address, a model list,
+        # a one-call test. Written here (ai.json, the DPAPI key file): no tray needed, every process follows
+        "ai_role": "a_ai_role", "ai_key": "a_ai_key", "ai_custom": "a_ai_custom", "ai_models": "a_ai_models",
+        "ai_test": "a_ai_test",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
-                                  "pause", "accent", "motion", "call_pref", "quiet"})
+                                  "pause", "accent", "motion", "call_pref", "quiet", "ai_role", "ai_key", "ai_custom"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -1816,6 +1820,61 @@ class WebWindow:
 
     def a_motion(self, m: dict[str, Any]) -> dict[str, Any]:
         return self._ui(reduce_motion=bool(m.get("reduce")))
+
+    # -- Settings → AI (report 67) ---------------------------------------------------------------------------------
+
+    def a_ai_role(self, m: dict[str, Any]) -> dict[str, Any]:
+        from yuki.agent.providers import summary
+
+        provider, model = str(m.get("provider") or "default"), str(m.get("model") or "")
+        backup = m.get("backup_provider")
+        try:
+            line = summary.set_role(str(m.get("role") or ""), provider, model,
+                                    None if backup is None else str(backup), str(m.get("backup_model") or ""),
+                                    price=summary.openrouter_price(model) if provider == "openrouter" else None)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)[:1].upper() + str(exc)[1:]}
+        return {"role": line, "ai": summary.page()}
+
+    def a_ai_key(self, m: dict[str, Any]) -> dict[str, Any]:
+        from yuki.agent.providers import summary
+
+        try:   # the key itself is never logged or echoed: the reply carries only where it now comes from
+            status = summary.set_key(str(m.get("provider") or ""), str(m.get("key") or ""))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:  # noqa: BLE001 - DPAPI refused (another account's file): plain words
+            return {"ok": False, "error": "The key couldn't be saved on this PC."}
+        return {**status, "ai": summary.page()}
+
+    def a_ai_custom(self, m: dict[str, Any]) -> dict[str, Any]:
+        from yuki.agent.providers import summary
+
+        try:
+            summary.set_custom(str(m.get("base_url") or ""), str(m.get("label") or ""))
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ai": summary.page()}
+
+    def a_ai_models(self, m: dict[str, Any]) -> dict[str, Any]:
+        """A service's models (network or the local Ollama, on this action's own thread)."""
+        from yuki.agent.providers import discover
+
+        provider = str(m.get("provider") or "")
+        models = discover.list_models(provider, refresh=bool(m.get("refresh")))
+        out: dict[str, Any] = {"models": discover.describe_list(provider, models) or []}
+        if provider == "ollama":
+            out["running"] = models is not None
+            out["status"] = ("Ollama isn't running" if models is None else
+                             f"{len(models)} model{'s' if len(models) != 1 else ''} on this PC" if models
+                             else "Ollama is running but has no models yet")
+        return out
+
+    def a_ai_test(self, m: dict[str, Any]) -> dict[str, Any]:
+        from yuki.agent.providers import discover
+
+        works, words = discover.test(str(m.get("provider") or ""), str(m.get("model") or ""))
+        return {"works": works, "words": words}
 
     def a_call_pref(self, m: dict[str, Any]) -> dict[str, Any]:
         decision = str(m.get("decision") or "ask")

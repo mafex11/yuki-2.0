@@ -1995,7 +1995,16 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                        "accents": [{"key": k, "label": str((v or {}).get("label") or k.capitalize())}
                                    for k, v in T.ACCENTS.items()]},
         "usage": yuki_usage(),
+        # Settings → AI (report 67): each job's service and model, each service's key status (never a key); no
+        # network here (the page asks for model lists with the ai_models action, off the UI thread)
+        "ai": _safe(_ai_page, None),
     }
+
+
+def _ai_page() -> dict[str, Any]:
+    from yuki.agent.providers.summary import page
+
+    return page(ask=False)
 
 
 def call_knobs(privacy: dict[str, Any] | None) -> dict[str, bool]:

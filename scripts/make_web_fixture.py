@@ -642,6 +642,7 @@ def build() -> dict:
         "call_knobs": W.call_knobs({}),
         "appearance": {"accent": "green", "reduce_motion": False, "accents": [{"key": "green", "label": "Mint"}, {"key": "orange", "label": "Orange"}]},
         "usage": {"mb": 312, "cpu": 0.4},
+        "ai": ai_settings(),
     }
     chat_items = [
         {"id": "u0", "kind": "user", "at": ago(1 * D + 2 * H), "text": "how far is the community hall from the station?", "source": "text"},
@@ -683,6 +684,16 @@ def build() -> dict:
         "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"}, "cancel_correction": {"ok": True},
         "todo_end": {"ok": True, "ref": "todo:31", "how": "done", "undo": True, "until": ago(-10 * M)},
         "todo_reopen": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40"},
+        # Settings → AI (report 67): canned answers (the page keeps what it shows when a reply carries no "ai")
+        "ai_role": {"ok": True}, "ai_key": {"ok": True, "key": "saved", "key_words": "Saved on this PC, encrypted"},
+        "ai_custom": {"ok": True},
+        "ai_models": {"ok": True, "models": [
+            {"id": "vendor/quick-chat:free", "label": "Quick Chat (free)", "tools": True, "small": False, "images": False,
+             "free": True, "price": "Free"},
+            {"id": "vendor/careful-pro", "label": "Careful Pro", "tools": True, "small": False, "images": True,
+             "free": False, "price": "$1.00 in, $4.00 out (per million tokens)"}], "status": "2 models on this PC",
+            "running": True},
+        "ai_test": {"ok": True, "works": True, "words": "Works. OpenRouter answered with vendor/quick-chat:free."},
         "thread_days": {"ok": True, "connector": {
             "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
             "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",
@@ -710,6 +721,42 @@ def build() -> dict:
             "now": NOW, "shell": shell,
             "pages": {"home": home, "work": work, "day": day, "me": me, "playbook": playbook, "activity": activity, "settings": settings},
             "chat": {"items": chat_items, "connected": True}, "replies": replies}
+
+
+def ai_settings() -> dict:
+    """Settings → AI as :func:`yuki.agent.providers.summary.page` sends it (invented: memory upkeep on a local
+    model, an OpenRouter key saved, the rest as it was)."""
+    from yuki.agent.providers.catalog import MODELS, PROVIDERS, ROLE_HINTS, ROLE_WORDS
+    from yuki.agent.providers.summary import APPLY_WORDS, SAVED_WORDS
+
+    def role(name: str, provider: str = "default", model: str = "", warning: str = "") -> dict:
+        return {"role": name, "words": ROLE_WORDS[name], "hint": ROLE_HINTS[name], "provider": provider,
+                "provider_words": PROVIDERS[provider].label, "model": model, "backup_provider": "",
+                "backup_model": "", "warning": warning, "key": "not_needed"}
+
+    local = [{"id": "llama3.2:3b", "label": "llama3.2:3b", "tools": True, "small": True, "images": False, "free": True,
+              "price": "Free", "size": "3.2B"},
+             {"id": "qwen3:14b", "label": "qwen3:14b", "tools": True, "small": False, "images": False, "free": True,
+              "price": "Free", "size": "14.8B"}]
+    words = {"saved": SAVED_WORDS, "missing": "No key yet", "not_needed": "No key needed"}
+    providers = []
+    for pid, info in PROVIDERS.items():
+        if pid == "default":
+            continue
+        key = "saved" if pid == "openrouter" else ("not_needed" if not info.needs_key else "missing")
+        entry = {"id": pid, "label": info.label, "note": info.note, "needs_key": info.needs_key, "key": key,
+                 "key_words": words[key], "env": list(info.key_env),
+                 "models": local if pid == "ollama" else [
+                     {"id": m.id, "label": m.label, "tools": m.tools, "small": m.small, "images": m.images,
+                      "free": m.free, "price": "Price not known"} for m in MODELS.get(pid, ())]}
+        if pid == "ollama":
+            entry["status"] = "2 models on this PC"
+        if pid == "custom":
+            entry["base_url"] = ""
+        providers.append(entry)
+    return {"roles": [role("talker"), role("thinker"), role("memory", "ollama", "llama3.2:3b")],
+            "providers": providers, "apply": APPLY_WORDS,
+            "choices": [{"id": pid, "label": info.label} for pid, info in PROVIDERS.items()]}
 
 
 PREFIX = "window.YUKI_FIXTURE = "

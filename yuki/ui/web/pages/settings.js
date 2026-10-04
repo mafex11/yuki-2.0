@@ -60,6 +60,91 @@
       (A.fixed_rules || []).length ? h('ul', { class: 'fixed-rules' }, A.fixed_rules.map((t) => h('li', { text: '· ' + t }))) : null];
   }
 
+  /* ---------- AI: which AI does each job (Bring your own AI, report 67) ----------
+     The three jobs, each with a service and a model; an optional backup; then each service's key (masked, saved on
+     this PC encrypted) and a Test. A service picked without a model yet waits here (AI.pend) and nothing changes
+     until a model is picked, so a job never points at nothing. Model lists come from Python (ai_models: Ollama's
+     local models, OpenRouter's list with the free ones marked) and are kept here for the page's life. */
+  const AI = { pend: {}, pendB: {}, models: {}, status: {}, test: {}, other: {}, asked: {} };
+  const ORDER = ['openai', 'gemini', 'openrouter', 'ollama', 'anthropic', 'deepseek', 'custom'];
+  const aiData = () => settings().ai || null;
+  const provOf = (ai, id) => (ai.providers || []).find((p) => p.id === id) || null;
+  function modelsFor(ai, id) {
+    if (AI.models[id]) return AI.models[id];
+    const p = provOf(ai, id);
+    return (p && p.models) || [];
+  }
+  function mLabel(m) {
+    const marks = [m.free ? 'free' : '', m.small ? 'small' : '', m.tools === false ? 'no tools' : ''].filter(Boolean);
+    return (m.label || m.id) + (m.size ? ` (${m.size})` : '') + (marks.length ? ' · ' + marks.join(', ') : '');
+  }
+  function modelPick(ai, provider, current, data, label) {
+    const list = modelsFor(ai, provider);
+    const waiting = provider === 'ollama' && AI.status.ollama ? AI.status.ollama : 'Loading models…';
+    const opts = [['', list.length ? 'Pick a model' : (AI.asked[provider] === 'done' ? 'No models found' : waiting)]]
+      .concat(list.map((m) => [m.id, mLabel(m)]));
+    if (current && !list.some((m) => m.id === current)) opts.push([current, current]);
+    opts.push(['__other', 'Other model…']);
+    return pick(opts, current || '', data, label);
+  }
+  function aiRole(ai, r) {
+    const prov = AI.pend[r.role] || r.provider;
+    let model = null;
+    if (prov !== 'default') {
+      model = AI.other[r.role]
+        ? [h('input', { class: 'ai-txt', data: { other: r.role }, attrs: { type: 'text', spellcheck: 'false', autocomplete: 'off', placeholder: 'The model’s exact name', 'aria-label': `${r.words}: model name` } }),
+          key('Use', { cls: 'xs', data: { do: 'ai-other-use', role: r.role } })]
+        : modelPick(ai, prov, AI.pend[r.role] ? '' : r.model, { change: 'ai-model', role: r.role }, `${r.words}: model`);
+    }
+    const warn = AI.pend[r.role] ? 'Pick a model to switch. Until then this job stays as it was.' : r.warning;
+    return h('div', { class: 'srow ai-role', data: { k: 'ai-role-' + r.role } },
+      h('span', null, r.words, h('small', { text: r.hint }), warn ? h('small', { class: 'ai-warn', text: warn }) : null),
+      h('span', { class: 'ctl' }, pick((ai.choices || []).map((c) => [c.id, c.label]), prov, { change: 'ai-provider', role: r.role }, `${r.words}: service`), model));
+  }
+  function aiBackup(ai, r) {
+    if (r.provider === 'default' || AI.pend[r.role]) return null;
+    const bp = AI.pendB[r.role] != null ? AI.pendB[r.role] : (r.backup_provider || '');
+    const choices = [['', 'No backup']].concat((ai.choices || []).filter((c) => c.id !== r.provider).map((c) => [c.id, c.label]));
+    const model = bp && bp !== 'default'
+      ? modelPick(ai, bp, AI.pendB[r.role] != null ? '' : r.backup_model, { change: 'ai-bmodel', role: r.role }, `${r.words}: backup model`) : null;
+    return h('div', { class: 'srow ai-backup', data: { k: 'ai-backup-' + r.role } },
+      h('span', null, h('small', { text: bp ? 'If it fails, I try this instead' : 'If it fails, I tell you. Add a backup to try another AI instead.' })),
+      h('span', { class: 'ctl' }, pick(choices, bp, { change: 'ai-bprovider', role: r.role }, `${r.words}: backup service`), model));
+  }
+  function aiProv(p) {
+    const t = AI.test[p.id];
+    const said = p.id === 'ollama' ? (AI.status.ollama || p.status || 'Press Test to look for Ollama on this PC') : p.key_words;
+    const ctl = [];
+    if (p.needs_key || p.id === 'custom') {
+      ctl.push(h('input', { class: 'ai-key', data: { key: p.id }, attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false',
+        placeholder: p.key === 'saved' ? 'Saved on this PC, encrypted' : 'Paste your key', 'aria-label': `${p.label} key` } }));
+      ctl.push(key('Save', { cls: 'xs', data: { do: 'ai-key-save', p: p.id } }));
+      if (p.key === 'saved') ctl.push(key('Forget', { cls: 'xs', data: { do: 'ai-key-forget', p: p.id } }));
+    }
+    ctl.push(key('Test', { cls: 'xs', data: { do: 'ai-test', p: p.id } }));
+    const rows = [h('div', { class: 'srow ai-prov', data: { k: 'ai-prov-' + p.id } },
+      h('span', null, p.label, h('small', { text: p.note }), h('small', { class: 'ai-said', text: said }),
+        t ? h('small', { class: t.works ? 'ai-ok' : 'ai-warn', text: t.words }) : null),
+      h('span', { class: 'ctl' }, ctl))];
+    if (p.id === 'custom') {
+      rows.push(h('div', { class: 'srow ai-addr', data: { k: 'ai-addr' } },
+        h('span', null, h('small', { text: 'Its address, for example https://api.example.com/v1' })),
+        h('span', { class: 'ctl' },
+          h('input', { class: 'ai-txt', data: { addr: '' }, attrs: { type: 'text', spellcheck: 'false', autocomplete: 'off', value: p.base_url || '', placeholder: 'https://…', 'aria-label': 'Its address' } }),
+          key('Save', { cls: 'xs', data: { do: 'ai-addr-save' } }))));
+    }
+    return rows;
+  }
+  function aiSection(ai) {
+    const provs = ORDER.map((id) => provOf(ai, id)).filter(Boolean);
+    return [
+      h('div', { class: 'ai-say', text: 'Pick which AI does each job. Claude stays as it is unless you change it. Keys you add are saved on this PC, encrypted.' }),
+      (ai.roles || []).map((r) => [aiRole(ai, r), aiBackup(ai, r)]),
+      h('div', { class: 'ai-sub', data: { k: 'ai-sub' }, text: 'Services and keys' }),
+      provs.map(aiProv),
+      h('div', { class: 'ai-say', data: { k: 'ai-apply' }, text: ai.apply || '' })];
+  }
+
   function build(d, S, D) {
     const A = d.autonomy || { levels: [], kinds: [] }, v = d.voice || {}, pr = d.privacy || {}, ap = d.appearance || {}, co = d.coach || {};
     const live = D.shell.connected;
@@ -123,7 +208,8 @@
       h('div', { class: 'set-grid', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
-          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps')),
+          Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps'),
+          d.ai ? Y.k(Y.sec('AI', null, aiSection(d.ai), Y.rightLabel('keys stay on this PC'), 'ai'), 'ai') : null),
         h('div', { class: 'col', data: { k: 'right' } },
           Y.k(Y.sec('Voice', null, voice, live ? null : Y.rightLabel('saved for my next start')), 'voice'),
           Y.k(Y.sec('Offers and check-ins', null, offers), 'offers'),
@@ -190,6 +276,114 @@
   A.pause = (t) => { const on = t.dataset.on === '1'; save(t, 'pause', { paused: on }, on ? 'Memory paused.' : 'Remembering again.').then((r) => { if (r.ok) { settings().privacy.paused = on; Y.renderMain(); } }); };
   A.accent = (t) => { const name = t.dataset.accent; save(t, 'accent', { accent: name }).then((r) => { if (r.ok) { settings().appearance.accent = name; Y.applyAppearance(Object.assign({}, Y.D.appearance, { accent: name })); Y.render(false); } }); };
   A.motion = (t) => { const on = t.dataset.on === '1'; save(t, 'motion', { reduce: on }).then((r) => { if (r.ok) { settings().appearance.reduce_motion = on; Y.applyAppearance(Object.assign({}, Y.D.appearance, { reduce_motion: on })); Y.render(false); } }); };
+  /* ---------- AI actions ---------- */
+  const roleOf = (role) => ((aiData() || {}).roles || []).find((r) => r.role === role) || null;
+  function aiTake(r) {   // Python's fresh AI data (a reply without it, e.g. the preview's canned one, keeps what is shown)
+    if (r && r.ai) settings().ai = r.ai;
+    Y.renderMain();
+  }
+  function aiModels(provider, refresh) {
+    if (!provider || provider === 'default' || (AI.asked[provider] && !refresh)) return;
+    AI.asked[provider] = 'asking';
+    Y.act('ai_models', { provider, refresh: !!refresh }).then((r) => {
+      AI.asked[provider] = 'done';
+      if (r.ok && Array.isArray(r.models)) AI.models[provider] = r.models;
+      if (provider === 'ollama' && r.status) AI.status.ollama = r.status;
+      Y.renderMain();
+    });
+  }
+  function aiSaveRole(t, fields, done) {
+    const r0 = roleOf(fields.role);
+    save(t, 'ai_role', fields, null, () => Y.renderMain()).then((r) => {
+      if (!r.ok) return;
+      delete AI.pend[fields.role]; delete AI.pendB[fields.role]; AI.other[fields.role] = false;
+      if (!r.ai && r0) Object.assign(r0, r.role || { provider: fields.provider, model: fields.model || '' });
+      const line = (r.role || {});
+      Y.toast(line.warning ? `${done} ${line.warning}` : done, !!line.warning);
+      aiTake(r);
+    });
+  }
+  function aiChange(t) {
+    const role = t.dataset.role, r = roleOf(role), v = t.value || '';
+    const words = r ? r.words : 'This job';
+    if (t.dataset.change === 'ai-provider') {
+      if (v === 'default') { delete AI.pend[role]; aiSaveRole(t, { role, provider: 'default' }, `${words}: Claude, as before.`); return; }
+      AI.pend[role] = v; AI.other[role] = false; aiModels(v); Y.renderMain(); return;
+    }
+    if (t.dataset.change === 'ai-model') {
+      if (v === '__other') { AI.other[role] = true; Y.renderMain(); return; }
+      if (!v) return;
+      const provider = AI.pend[role] || (r && r.provider);
+      aiSaveRole(t, { role, provider, model: v }, `${words}: ${v}.`);
+      return;
+    }
+    if (t.dataset.change === 'ai-bprovider') {
+      if (!v || v === 'default') {
+        delete AI.pendB[role];
+        aiSaveRole(t, { role, provider: r.provider, model: r.model, backup_provider: v, backup_model: '' }, v ? 'Backup: Claude, as before.' : 'No backup.');
+        return;
+      }
+      AI.pendB[role] = v; aiModels(v); Y.renderMain(); return;
+    }
+    if (t.dataset.change === 'ai-bmodel' && v && v !== '__other') {
+      aiSaveRole(t, { role, provider: r.provider, model: r.model, backup_provider: AI.pendB[role] || r.backup_provider, backup_model: v }, `Backup: ${v}.`);
+    }
+  }
+  A['ai-other-use'] = (t) => {
+    const role = t.dataset.role, r = roleOf(role);
+    const box = t.parentElement.querySelector('input[data-other]'), v = box ? box.value.trim() : '';
+    if (!v) { Y.toast('Type the model’s name first.', true); return; }
+    aiSaveRole(t, { role, provider: AI.pend[role] || (r && r.provider), model: v }, `${r ? r.words : 'This job'}: ${v}.`);
+  };
+  A['ai-key-save'] = (t) => {
+    const p = t.dataset.p, box = t.parentElement.querySelector('input[data-key]'), v = box ? box.value.trim() : '';
+    if (!v) { Y.toast('Paste the key first.', true); return; }
+    save(t, 'ai_key', { provider: p, key: v }).then((r) => {
+      if (!r.ok) return;
+      box.value = ''; box.defaultValue = '';
+      Y.toast('Saved on this PC, encrypted.');
+      delete AI.asked[p]; delete AI.models[p];
+      const prov = provOf(aiData() || {}, p); if (prov && !r.ai) { prov.key = r.key || 'saved'; prov.key_words = r.key_words || 'Saved on this PC, encrypted'; }
+      aiTake(r);
+    });
+  };
+  A['ai-key-forget'] = (t) => {
+    const p = t.dataset.p;
+    save(t, 'ai_key', { provider: p, key: '' }).then((r) => {
+      if (!r.ok) return;
+      Y.toast('Key removed from this PC.');
+      const prov = provOf(aiData() || {}, p); if (prov && !r.ai) { prov.key = r.key || 'missing'; prov.key_words = r.key_words || 'No key yet'; }
+      aiTake(r);
+    });
+  };
+  A['ai-test'] = (t) => {
+    const p = t.dataset.p;
+    const using = ((aiData() || {}).roles || []).find((r) => r.provider === p && r.model);
+    AI.test[p] = { works: true, words: 'Testing…' }; Y.renderMain();
+    Y.act('ai_test', { provider: p, model: using ? using.model : '' }).then((r) => {
+      AI.test[p] = r.ok ? { works: !!r.works, words: r.words || (r.works ? 'Works.' : 'That didn’t work.') } : { works: false, words: r.error || 'That didn’t work.' };
+      if (p === 'ollama') aiModels('ollama', true);
+      Y.renderMain();
+    });
+  };
+  A['ai-addr-save'] = (t) => {
+    const box = t.parentElement.querySelector('input[data-addr]'), v = box ? box.value.trim() : '';
+    save(t, 'ai_custom', { base_url: v }, v ? 'Address saved.' : 'Address removed.').then((r) => {
+      if (!r.ok) return;
+      box.defaultValue = box.value;
+      delete AI.asked.custom; delete AI.models.custom;
+      const prov = provOf(aiData() || {}, 'custom'); if (prov && !r.ai) prov.base_url = v;
+      aiTake(r);
+    });
+  };
+  /* once per opening of Settings: the lists of the services the jobs use, and whether Ollama runs (off the UI thread
+     in Python; a local look with a 2 s limit) */
+  function aiMount() {
+    const ai = aiData(); if (!ai) return;
+    aiModels('ollama');
+    (ai.roles || []).forEach((r) => { aiModels(r.provider); if (r.backup_provider) aiModels(r.backup_provider); });
+  }
+
   document.addEventListener('click', (e) => {
     const b = e.target.closest('.seg button[data-callpref]'); if (!b) return;
     const seg = b.parentElement, app = seg.dataset.app, decision = b.dataset.callpref;
@@ -198,6 +392,7 @@
   });
   document.addEventListener('change', (e) => {
     const t = e.target; if (!t.dataset || !t.dataset.change) return;
+    if (t.dataset.change.startsWith('ai-')) { aiChange(t); return; }
     const v = t.value || null;
     if (t.dataset.change === 'voice-mic') save(t, 'voice', { mic: v }, `Microphone: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-speaker') save(t, 'voice', { speaker: v }, `Speaker: ${v || 'System default'}.`);
@@ -216,6 +411,7 @@
     el.__splash = window.PlanetSplash.mount(el, { colorSet: 'mint', background: null, reduced: () => window.Lattice.Motion.reduced });
   }
   function mount(main) {
+    aiMount();
     const el = main.querySelector('.about-splash');
     if (!el || el.__splash || el.__seen || !window.PlanetSplash) return;
     if (window.Lattice.Motion.reduced || !window.IntersectionObserver) { start(el); return; }

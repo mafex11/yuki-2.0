@@ -274,7 +274,7 @@ def test(provider_id: str, model: str = "", *, transport: Any = None, settings: 
     if not model:
         return False, "Pick a model first, then test."
     try:
-        client = sync_provider_client(provider_id, settings, transport=transport, timeout=20.0)
+        client = sync_provider_client(provider_id, settings, transport=transport, timeout=12.0)
         client.messages.create(model=model, max_tokens=8, messages=[{"role": "user", "content": "Say ok."}])
     except Exception as exc:  # noqa: BLE001 - said in plain words
         return False, plain_error(exc)

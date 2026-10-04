@@ -168,6 +168,33 @@ def check_models(settings: Any) -> Check:
 #: The old name (the check covers either backend now).
 check_bedrock = check_models
 
+AI_ROLES_CHECK = "AI for each job"
+
+
+def check_ai_roles(offline: bool = False) -> Check:
+    """Settings → AI: which provider and model each job runs on and whether its key is there (never the key);
+    with a job on Ollama and the network allowed, whether Ollama is running with that model."""
+    from yuki.agent.providers.summary import doctor_lines
+
+    status, lines, fixes = doctor_lines()
+    detail = "; ".join(lines)
+    if not offline:
+        from yuki.agent.providers import config
+        from yuki.agent.providers.discover import ollama_models
+
+        wanted = [r.primary.model for r in (config.route(role) for role in ("talker", "thinker", "memory"))
+                  if r is not None and r.primary.provider == "ollama" and r.primary.model]
+        if wanted:
+            local = ollama_models(with_capabilities=False)
+            names = {m.id for m in local or []}
+            if local is None:
+                status, fixes = FAIL, [*fixes, "Ollama isn't running. Start it, or pick another AI in Settings."]
+            elif any(w not in names for w in wanted):
+                status = FAIL
+                fixes.append("Ollama doesn't have " + ", ".join(w for w in wanted if w not in names)
+                             + ". Download it in Ollama, or pick another model in Settings.")
+    return Check(AI_ROLES_CHECK, {"ok": OK, "warn": WARN, "fail": FAIL}.get(status, status), detail, " ".join(fixes))
+
 
 def _user_env(name: str) -> str | None:
     try:
@@ -480,6 +507,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Memory service", check_memory_service),
         ("Memory search (embedder)", check_embed_pipe),
         (MODELS_CHECK, lambda: check_models(settings)),
+        (AI_ROLES_CHECK, lambda: check_ai_roles(offline)),
         ("Speech to text (Deepgram)", check_deepgram),
         (GEMINI_CHECK, lambda: check_gemini_voice(settings)),
         ("Yuki's voice (ElevenLabs)", lambda: check_elevenlabs(settings)),
