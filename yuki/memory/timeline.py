@@ -1566,6 +1566,15 @@ class TimelineRecorder:
                       seen_host=seen_host, signal_meeting=signal)
         self._mark_acting(st)
         self._current = st
+        if app and not facts.is_own:   # never for an app the user's privacy rules keep out (its app is "")
+            # appOpen F3: which program started this one (content-free, in memory only, once per process), so the
+            # practice learner can read what the user did right after one of Yuki's openings
+            try:
+                from yuki.memory import lineage
+
+                lineage.note(pid, now, by_yuki=st.by_yuki)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         if hidden:
             self._unhook_names()
         else:

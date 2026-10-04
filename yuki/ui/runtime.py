@@ -714,6 +714,15 @@ class AgentRuntime(QObject):
         self.settings = settings
         self.ui_log = ui_log
         self.memory = memory if memory is not None else default_memory()
+        if memory is None:
+            # appOpen F3: launch_app reads back what practice memory learned a Start entry's app runs as (the desktop's
+            # own memory only; a caller's stand-in memory is never wired into the real launcher)
+            try:
+                from yuki.actions import launch as _launch
+
+                _launch.set_learned_images(self.memory.learned_launch_images)
+            except Exception:  # noqa: BLE001 - then nothing learned is read; launches work as before
+                pass
         self._ids = itertools.count(1)
         self._worker_outstanding: list[int] = []
         #: Where each front-desk request came from, for a hand-off to the worker.
