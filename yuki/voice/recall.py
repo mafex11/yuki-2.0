@@ -46,7 +46,9 @@ RECENT_TIMEOUT_S = 1.5
 #: Where the to-do list lives in Yuki's window (the 4 Oct appTodo build: Home's "Your list"; all of them on Work too).
 LIST_PLACE = "on Home under Your list in your window"
 RECENT_LABEL = ("[Earlier with them, the last hour (voice and typed chat, across conversations, oldest first). You were "
-                "there: it is what you and they said. For when they refer back to it; never news to bring up.]")
+                "there: it is what you and they said. Use it only when they refer back to it. Never bring any of it up "
+                "yourself, not even in passing: \"what's up?\" gets \"Not much, you?\", never a word about their "
+                "list or what they said.]")
 RECENT_END = "[End of earlier]"
 
 #: The quick memory tool's reads: today's talk is cut to this, a search to this many items.
@@ -85,8 +87,8 @@ QUICK_MEMORY: dict[str, Any] = {
 TODOS_NOTE = ("Their list, read now. Tell them in a few words: how many, then the items briefly, in plain words (a "
               "long list: the first few and offer the rest on a more line). Never ids, never read it like a list.")
 EMPTY_LIST_NOTE = "Their list has nothing open, read now. Say so plainly: you looked at their list and it is empty."
-ADDED_NOTE = ("Saved. Tell them in a few words how many you added and where they are, e.g. \"Added {n}, they're on "
-              "Home under Your list.\" Never read them back unless they ask.")
+ADDED_NOTE = ("Saved and checked: nothing more to do. Tell them in a few words how many you added and where they are, "
+              "e.g. \"Added {n}, they're on Home under Your list.\" Never read them back unless they ask.")
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
                   "on their list.")
 FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few words. When it does not hold what "
@@ -148,11 +150,25 @@ def _exchange(turn: dict[str, Any], user_chars: int, reply_chars: int) -> str | 
     return f"{clock}They: {user}\n  You: {reply}"
 
 
+def _same_exchange(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """Whether two logged turns are one exchange recorded twice: the same words (whitespace and case aside) and one
+    reply carrying the other's opening (record bookkeeping, never a judgement of what was said)."""
+    def norm(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    words_a, words_b = norm(a.get("user")), norm(b.get("user"))
+    reply_a, reply_b = norm(a.get("reply")), norm(b.get("reply"))
+    if not words_a or words_a != words_b or not reply_a or not reply_b:
+        return False
+    short, long_ = sorted((reply_a, reply_b), key=len)
+    return short[:60] in long_
+
+
 def _exchanges(turns: list[dict[str, Any]], since: float, until: float, budget: int, *, user_chars: int,
                reply_chars: int) -> list[str]:
     """The exchanges between ``since`` and ``until``, oldest first, the oldest dropped whole past ``budget``."""
     seen: set[Any] = set()
-    rows: list[tuple[float, str]] = []
+    rows: list[tuple[float, dict[str, Any]]] = []
     for turn in turns or []:
         if not isinstance(turn, dict):
             continue
@@ -161,33 +177,51 @@ def _exchanges(turns: list[dict[str, Any]], since: float, until: float, budget: 
         if at is None or at < since or at > until or key in seen:
             continue
         seen.add(key)
-        line = _exchange(turn, user_chars, reply_chars)
-        if line:
-            rows.append((at, line))
+        rows.append((at, turn))
     rows.sort(key=lambda r: r[0])
-    lines = [line for _at, line in rows]
+    kept: list[dict[str, Any]] = []
+    for _at, turn in rows:
+        if kept and _same_exchange(kept[-1], turn):
+            # One exchange logged twice: the voice turn that handed it over (whose reply already said the outcome)
+            # and the thinker's own turn with the same words. Kept once: the fuller record.
+            if len(str(turn.get("reply") or "")) > len(str(kept[-1].get("reply") or "")):
+                kept[-1] = turn
+            continue
+        kept.append(turn)
+    lines = [line for line in (_exchange(t, user_chars, reply_chars) for t in kept) if line]
     while lines and sum(len(x) + 1 for x in lines) > budget:
         lines.pop(0)
     return lines
 
 
-def _kept(todos: list[dict[str, Any]], rules: list[dict[str, Any]], since: float) -> str:
-    """What the user asked Yuki to keep since ``since``: to-dos put on their list (not memory's own open loops) and
+def _kept(todos: list[dict[str, Any]], rules: list[dict[str, Any]], since: float, until: float) -> str:
+    """What the user asked Yuki to keep between ``since`` and ``until``: to-dos put on their list (not memory's own open loops) and
     rules they set, cut to :data:`KEPT_CHARS`."""
-    added = [_clip(t.get("text"), KEPT_ITEM_CHARS) for t in todos or []
-             if isinstance(t, dict) and t.get("source") != "loop" and str(t.get("status") or "open") == "open"
-             and (_stamp(t.get("since")) or 0.0) >= since and str(t.get("text") or "").strip()]
+    fresh = [t for t in todos or [] if isinstance(t, dict) and str(t.get("status") or "open") == "open"
+             and since <= (_stamp(t.get("since")) or 0.0) <= until and str(t.get("text") or t.get("title") or "").strip()]
+    # their own to-dos (added, or told to Yuki), then Yuki's promises; memory's own open loops are not something
+    # they asked Yuki to keep
+    added = [_clip(t.get("text") or t.get("title"), KEPT_ITEM_CHARS) for t in fresh
+             if t.get("source") not in ("loop", "commitment")]
+    promised = [_clip(t.get("title") or t.get("text"), KEPT_ITEM_CHARS) for t in fresh
+                if t.get("source") == "commitment"]
     set_rules = [_clip(r.get("text") or r.get("quote"), KEPT_ITEM_CHARS) for r in rules or []
-                 if isinstance(r, dict) and (_stamp(r.get("at")) or 0.0) >= since
+                 if isinstance(r, dict) and since <= (_stamp(r.get("at")) or 0.0) <= until
                  and str(r.get("text") or r.get("quote") or "").strip()]
     parts = []
     if added:
-        parts.append(f"to-dos put on their list ({len(added)}, {LIST_PLACE}): " + "; ".join(added))
+        parts.append(f"to-dos put on their list ({len(added)}, {LIST_PLACE}): " + "; ".join(added) + ".")
     if set_rules:
-        parts.append("rules they set: " + "; ".join(set_rules))
+        parts.append("Rules they set: " + "; ".join(set_rules) + ".")
+    if promised:
+        parts.append("Your promises to them: " + "; ".join(promised) + ".")
     if not parts:
         return ""
-    return _clip("Kept in that hour: " + ". ".join(parts) + ".", KEPT_CHARS)
+    text = _clip("Kept in that hour: " + parts[0], KEPT_CHARS)
+    for part in parts[1:]:   # the rest only whole, while it fits
+        if len(text) + 1 + len(part) <= KEPT_CHARS:
+            text += " " + part
+    return text
 
 
 def recent_view(turns: list[dict[str, Any]], todos: list[dict[str, Any]] | None = None,
@@ -196,7 +230,7 @@ def recent_view(turns: list[dict[str, Any]], todos: list[dict[str, Any]] | None 
     first, and what was kept, at most :data:`RECENT_CHARS`; ``None`` when the hour holds nothing."""
     now = time.time() if now is None else float(now)
     since = now - RECENT_S
-    kept = _kept(list(todos or []), list(rules or []), since)
+    kept = _kept(list(todos or []), list(rules or []), since, now + 60.0)
     budget = RECENT_CHARS - len(RECENT_LABEL) - len(RECENT_END) - len(kept) - 4
     lines = _exchanges(list(turns or []), since, now + 60.0, budget, user_chars=USER_CHARS, reply_chars=REPLY_CHARS)
     if not lines and not kept:

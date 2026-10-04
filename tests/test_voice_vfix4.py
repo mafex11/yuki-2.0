@@ -60,7 +60,7 @@ def test_the_view_holds_the_last_hours_exchanges_oldest_first_and_what_was_kept(
     assert view.count("make a to do list") == 1
     assert "09:41 They: okay so today I need" in view and "\n  You: On it." in view and "09:42 You: Added" in view
     assert f"to-dos put on their list (7, {LIST_PLACE})" in view and all(item in view for item in ITEMS)
-    assert "rules they set: Keep replies short." in view
+    assert "Rules they set: Keep replies short." in view
     assert len(view) <= recall.RECENT_CHARS
 
 
@@ -73,6 +73,22 @@ def test_the_view_is_capped_dropping_the_oldest_exchanges_whole_and_none_when_th
     assert " …" in view   # long messages cut after whole words
     assert recent_view([_turn(1, now - 7200, "hi", "hey")], [], [], now=now) is None
     assert recent_view([], None, None, now=now) is None
+
+
+def test_one_exchange_logged_by_the_voice_and_the_thinker_is_shown_once_and_promises_come_after_rules() -> None:
+    now = time.time()
+    turns = [_turn(1, now - 120, "Where is it?", "Let me check. It's on Home, under Your list, all seven of them."),
+             _turn(2, now - 118, "where is it?", "It's on Home, under Your list, all seven of them.", session="w"),
+             _turn(3, now - 60, "Where is it?", "Something else entirely.")]   # the same words, another answer
+    todos = [{"text": "Email Tara the slides", "source": "user", "since": now - 100},
+             {"text": "Yuki will stay quiet for an hour", "title": "Quiet for an hour", "source": "commitment",
+              "since": now - 90},
+             {"text": "Added after now", "source": "user", "since": now + 3600}]
+    view = recent_view(turns, todos, [{"text": "No praise.", "at": now - 80}], now=now) or ""
+    assert view.count("Where is it?") == 2 and "Let me check. It's on Home" in view
+    assert "Something else entirely" in view and "Added after now" not in view
+    assert view.index("Email Tara") < view.index("Rules they set: No praise.") < view.index(
+        "Your promises to them: Quiet for an hour.")
 
 
 def test_due_dates_are_said_naturally() -> None:
