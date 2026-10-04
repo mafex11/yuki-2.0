@@ -220,67 +220,166 @@ def test_several_items_are_counted_in_the_line(n: int) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# the answer to a look is written while its lead plays (Pipecat would wait for the bot to stop speaking)
+# the answer to a look is written while its lead plays (Pipecat kept the report behind the lead's audio)
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-class _Aggregator:
-    """Pipecat 1.11's assistant aggregator, the parts answer_while_speaking wraps."""
+def _tts() -> Any:
+    """ClauseTTS over a stand-in Pipecat TTS: records whether a reply's end paused the voice's frames."""
+    from yuki.voice.pipeline import _clause_tts
 
-    def __init__(self, speaking: bool, queued: bool = False) -> None:
-        self._bot_speaking = speaking
-        self._queued = queued
-        self.pushed: list[Any] = []
-        self.deferred = False
+    class Base:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            from pipecat.utils.text.base_text_aggregator import AggregationType
 
-    def has_queued_frame(self, frame_type: Any) -> bool:
-        return self._queued
+            self._text_aggregation_mode = AggregationType.SENTENCE
+            self.paused = 0
 
-    async def push_context_frame(self, direction: Any = None) -> None:
-        self.pushed.append(direction)
+        async def _maybe_pause_frame_processing(self) -> None:
+            self.paused += 1
 
-    async def _maybe_push_context_after_function_result(self) -> None:   # Pipecat's own rule
-        if self._queued:
-            return
-        if self._bot_speaking:
-            self.deferred = True
-            return
-        await self.push_context_frame("UPSTREAM")
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            from pipecat.frames.frames import LLMFullResponseEndFrame
 
-    async def _handle_function_call_result(self, frame: Any) -> None:
-        await self._maybe_push_context_after_function_result()
+            if isinstance(frame, LLMFullResponseEndFrame):
+                await self._maybe_pause_frame_processing()   # Pipecat: "to avoid audio overlapping"
+
+    return _clause_tts(Base)()
 
 
-@pytest.mark.parametrize("name,speaking,queued,runs_now,deferred", [
-    ("quick_memory", True, False, True, False),    # the look's report while "Let me look." plays: answered at once
-    ("quick_memory", False, False, True, False),   # nothing playing: as before
-    ("quick_memory", True, True, False, False),    # more results queued: bundled, as Pipecat does
-    ("check_progress", True, False, False, True),  # any other tool: Pipecat's wait for the bot to stop
+def _started(*names: str) -> Any:
+    from pipecat.frames.frames import FunctionCallsStartedFrame
+
+    return FunctionCallsStartedFrame(function_calls=[SimpleNamespace(function_name=n) for n in names])
+
+
+@pytest.mark.parametrize("names,paused", [
+    (("quick_memory",), 0),            # a reply ending on a look: its report goes on at once, behind nothing
+    (("tell_yuki",), 1),               # any other call: Pipecat's pause, as before
+    (("quick_memory", "media_key"), 1),
+    ((), 1),                           # a reply with no call
 ])
-def test_a_looks_answer_runs_while_its_lead_plays(name: str, speaking: bool, queued: bool, runs_now: bool,
-                                                 deferred: bool) -> None:
-    from pipecat.processors.frame_processor import FrameDirection
+def test_a_reply_ending_on_a_look_does_not_pause_the_voice(names: tuple[str, ...], paused: int) -> None:
+    from pipecat.frames.frames import LLMFullResponseEndFrame
 
-    from yuki.voice.pipeline import answer_while_speaking
+    tts = _tts()
 
-    agg = _Aggregator(speaking, queued)
-    answer_while_speaking(agg)
-    asyncio.run(agg._handle_function_call_result(SimpleNamespace(function_name=name)))
-    assert bool(agg.pushed) is runs_now and agg.deferred is deferred
-    if runs_now and speaking:
-        assert agg.pushed == [FrameDirection.UPSTREAM]
-    # the wrap is per result: a later call outside a result handler keeps Pipecat's rule
-    agg2 = _Aggregator(True)
-    answer_while_speaking(agg2)
-    asyncio.run(agg2._maybe_push_context_after_function_result())
-    assert agg2.deferred and not agg2.pushed
+    async def run() -> None:
+        if names:
+            await tts.process_frame(_started(*names), None)
+        await tts.process_frame(LLMFullResponseEndFrame(), None)
+        await tts.process_frame(LLMFullResponseEndFrame(), None)   # the next reply's end pauses again
+
+    asyncio.run(run())
+    assert tts.paused == paused + 1
 
 
-def test_the_conversation_wraps_its_assistant_aggregator() -> None:
+def test_a_cut_reply_forgets_its_look() -> None:
+    from pipecat.frames.frames import InterruptionFrame, LLMFullResponseEndFrame
+
+    tts = _tts()
+
+    async def run() -> None:
+        await tts.process_frame(_started("quick_memory"), None)
+        await tts.process_frame(InterruptionFrame(), None)
+        await tts.process_frame(LLMFullResponseEndFrame(), None)
+
+    asyncio.run(run())
+    assert tts.paused == 1
+
+
+class _Context:
+    def __init__(self, messages: list[Any]) -> None:
+        from pipecat.utils.types import NOT_GIVEN
+
+        self._messages = messages
+        self.tools = NOT_GIVEN
+        self.tool_choice = NOT_GIVEN
+
+    def get_messages(self) -> list[Any]:
+        return list(self._messages)
+
+
+def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = False) -> Any:
+    from yuki.voice.pipeline import Conversation
+
+    queued: list[Any] = []
+
+    async def queue_frame(frame: Any, direction: Any = None) -> None:
+        queued.append(frame)
+
+    class Tool:
+        async def handle(self, params: Any) -> None:
+            if by_code:
+                from pipecat.frames.frames import FunctionCallResultProperties
+
+                await params.result_callback(report, properties=FunctionCallResultProperties(run_llm=False))
+            else:
+                await params.result_callback(report)
+
+    conv = SimpleNamespace(_llm=SimpleNamespace(_yuki_spoke=spoke, queue_frame=queue_frame), quick_memory=Tool(),
+                           log=_Log(), session="s1", observer=SimpleNamespace(bot_speaking=True), queued=queued)
+    conv._answer_look_now = lambda params, result: Conversation._answer_look_now(conv, params, result)
+    return conv
+
+
+def _look_params(settled: list[Any], context: Any) -> Any:
+    async def result_callback(result: Any, *, properties: Any = None) -> None:
+        settled.append((result, properties))
+
+    return SimpleNamespace(tool_call_id="toolu_7", function_name="quick_memory", arguments={"action": "todos"},
+                           context=context, result_callback=result_callback)
+
+
+def test_a_look_after_a_lead_is_answered_at_once_on_a_copy_that_holds_its_report() -> None:
+    from pipecat.frames.frames import LLMContextFrame
+
+    from yuki.voice.pipeline import Conversation
+
+    report = {"list": "2 open: - Buy printer ink - Call the plumber", "how_to_handle_it": "Tell them."}
+    history = [{"role": "user", "content": "What's on my list?"},
+               # a placeholder the conversation may already hold for this call is replaced in the copy
+               {"role": "assistant", "tool_calls": [{"id": "toolu_7", "type": "function",
+                                                     "function": {"name": "quick_memory", "arguments": "{}"}}]},
+               {"role": "tool", "tool_call_id": "toolu_7", "content": "IN_PROGRESS"}]
+    conv = _conversation({"toolu_7"}, report)
+    settled: list[Any] = []
+    context = _Context(history)
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, context)))
+    result, properties = settled[0]
+    assert result == report and properties.run_llm is False     # in the conversation, with no run of its own
+    (frame,) = conv.queued
+    assert isinstance(frame, LLMContextFrame)                    # the answer's run, now
+    messages = frame.context.get_messages()
+    assert messages[0] == history[0] and len(messages) == 3
+    assert messages[1]["tool_calls"][0]["id"] == "toolu_7"
+    assert json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]) == {"action": "todos"}
+    assert messages[2] == {"role": "tool", "tool_call_id": "toolu_7", "content": json.dumps(report)}
+    assert context.get_messages() == history   # the shared one is untouched
+    kind, facts = conv.log.events[-1]
+    assert kind == "quick_memory" and facts["op"] == "answer_now" and "plumber" not in repr(facts)
+
+
+def test_a_look_with_no_lead_and_a_clean_add_settle_as_before() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    # no words before the call: nothing holds its report back, Pipecat runs the answer as usual
+    conv = _conversation(set(), {"list": "Nothing open."})
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context([]))))
+    assert settled[0][1] is None and not conv.queued
+    # a clean add said by code after a lead: no run at all
+    conv = _conversation({"toolu_7"}, {"added": 1, "said": "Added it."}, by_code=True)
+    settled = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context([]))))
+    assert settled[0][1].run_llm is False and not conv.queued
+
+
+def test_the_conversation_registers_the_look_with_its_answer_now_handler() -> None:
     import inspect
 
     from yuki.voice import pipeline
 
     source = inspect.getsource(pipeline.Conversation)
-    assert "settle_only_when_newest(assistant_agg)" in source and "answer_while_speaking(assistant_agg)" in source
+    assert 'register_function(QUICK_MEMORY["name"], self._quick_memory_call' in source
     assert pipeline.ANSWER_WHILE_SPEAKING == frozenset({"quick_memory"})

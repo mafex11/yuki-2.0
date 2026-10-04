@@ -726,44 +726,8 @@ def settle_only_when_newest(aggregator: Any) -> None:
 
 
 #: Tools whose result is answered at once even while the voice is still saying the words the talker wrote before the
-#: call (leftVoice: quick_memory's "Let me look.").
+#: call (leftVoice: quick_memory's "Let me look."): see ``Conversation._answer_look_now`` and ``ClauseTTS``.
 ANSWER_WHILE_SPEAKING = frozenset({"quick_memory"})
-
-
-def answer_while_speaking(aggregator: Any, names: frozenset[str] = ANSWER_WHILE_SPEAKING) -> None:
-    """A result of one of ``names`` runs the talker at once, even while the voice is speaking (leftVoice).
-
-    Pipecat 1.11's assistant aggregator defers the run that answers a tool's result until the bot stops speaking (so
-    results landing mid-speech are bundled into one run). Measured offline 4 Oct (``voice_session_offline.py lists``):
-    with the talker's few words before its quick_memory call, the read's report came back while "Let me look." was
-    playing, and the answer's run waited the whole line out (+1.0-1.2 s before the answer, on top of its own first
-    token). The words before the call are the talker's own lead, so the answer may be written while they play: its
-    speech queues behind them in the voice. Results still queued behind this one are bundled as Pipecat does.
-    Plumbing: when a run starts, never what anyone said. ``aggregator`` is Pipecat 1.11's ``LLMAssistantAggregator``.
-    """
-    from pipecat.frames.frames import FunctionCallResultFrame
-    from pipecat.processors.frame_processor import FrameDirection
-
-    handle = aggregator._handle_function_call_result
-    maybe_push = aggregator._maybe_push_context_after_function_result
-    current: dict[str, Any] = {"name": None}
-
-    async def _handle_function_call_result(frame: Any) -> None:
-        current["name"] = getattr(frame, "function_name", None)
-        try:
-            await handle(frame)
-        finally:
-            current["name"] = None
-
-    async def _maybe_push_context_after_function_result() -> None:
-        if (current["name"] in names and getattr(aggregator, "_bot_speaking", False)
-                and not aggregator.has_queued_frame(FunctionCallResultFrame)):
-            await aggregator.push_context_frame(FrameDirection.UPSTREAM)
-            return
-        await maybe_push()
-
-    aggregator._handle_function_call_result = _handle_function_call_result
-    aggregator._maybe_push_context_after_function_result = _maybe_push_context_after_function_result
 
 
 def bedrock_client(region: str, backend: str | None = None) -> Any:
@@ -1316,7 +1280,33 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
                     return
             await super()._push_tts_frames(src_frame, *args, **kwargs)
 
+        async def _maybe_pause_frame_processing(self) -> None:
+            if getattr(self, "_yuki_no_pause", False):
+                return   # a lead before a look: the look's result goes on at once (process_frame below)
+            await super()._maybe_pause_frame_processing()
+
         async def process_frame(self, frame: Any, direction: Any) -> None:
+            from pipecat.frames.frames import FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame
+
+            if isinstance(frame, FunctionCallsStartedFrame):
+                # leftVoice: Pipecat pauses this service's frames after a reply that had words until they have played
+                # ("to avoid audio overlapping"), and the tool's result waits in that queue: with "Let me look."
+                # before a quick_memory call the answer's run started only when the line ended (+1.0-1.2 s,
+                # measured offline). A reply that ends on such a call is not paused: its result reaches the
+                # conversation at once and the answer is written while the lead plays; its audio still plays after
+                # the lead's, in order (the audio contexts are played one after another).
+                names = {getattr(fc, "function_name", "") for fc in getattr(frame, "function_calls", None) or ()}
+                self._yuki_answer_next = bool(names) and names <= ANSWER_WHILE_SPEAKING
+            elif isinstance(frame, InterruptionFrame):
+                self._yuki_answer_next = False
+            elif isinstance(frame, LLMFullResponseEndFrame) and getattr(self, "_yuki_answer_next", False):
+                self._yuki_answer_next = False
+                self._yuki_no_pause = True
+                try:
+                    await super().process_frame(frame, direction)
+                finally:
+                    self._yuki_no_pause = False
+                return
             if _WORDS_DONE is not None and isinstance(frame, _WORDS_DONE):
                 from pipecat.frames.frames import AggregatedTextFrame
 
@@ -2981,7 +2971,7 @@ class Conversation:
             from yuki.voice.recall import QuickMemory
 
             self.quick_memory = QuickMemory(self.memory, log=self.log, session=self.session)
-            llm.register_function(QUICK_MEMORY["name"], self.quick_memory.handle, cancel_on_interruption=False,
+            llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
                                   timeout_secs=20)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
@@ -3105,7 +3095,6 @@ class Conversation:
                     max_context_tokens=8000, max_unsummarized_messages=None)),
         )
         settle_only_when_newest(assistant_agg)
-        answer_while_speaking(assistant_agg)   # leftVoice: a look's answer is written while its lead plays
         self._summarizer = getattr(assistant_agg, "_summarizer", None)
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._stt_connected)
@@ -3779,6 +3768,76 @@ class Conversation:
             except Exception:  # noqa: BLE001
                 pass
         return max(0.0, now - max(marks))
+
+    async def _quick_memory_call(self, params: Any) -> None:
+        """The talker's quick memory tool (vfix4's :class:`yuki.voice.recall.QuickMemory`), its answer written while the
+        words before the call are still being said (leftVoice).
+
+        The talker says a few words before a look ("Let me look."). Pipecat keeps every frame after a reply's words in
+        order behind their audio (the voice's queue pauses until they have played, the speaker plays frames in order),
+        so the look's report reached the conversation, and the run that answers it started, only once "Let me look."
+        had played: measured offline 4 Oct, the answer's run began 1.0-1.2 s after the report was ready. When the reply
+        that made the call spoke, the report is settled without a run (``run_llm`` false: it still goes into the
+        conversation in its place) and the answer's run starts at once on a copy of the conversation that already
+        holds the call and its report (:meth:`_answer_look_now`); its words queue behind the lead in the voice. A reply
+        that called it with no words first waits behind nothing, so it settles as before; so does a clean add, said by
+        code with no run at all. Plumbing: when the run starts, never what anyone said.
+        """
+        llm = getattr(self, "_llm", None)
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        spoke = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_spoke", ())
+        if spoke:
+            original = params.result_callback
+
+            async def settle(result: Any, *, properties: Any = None) -> None:
+                if properties is not None and getattr(properties, "run_llm", None) is False:
+                    await original(result, properties=properties)   # said by code (a clean add): no run at all
+                    return
+                from pipecat.frames.frames import FunctionCallResultProperties
+
+                await original(result, properties=FunctionCallResultProperties(run_llm=False))
+                await self._answer_look_now(params, result)
+
+            params.result_callback = settle
+        await self.quick_memory.handle(params)
+
+    async def _answer_look_now(self, params: Any, result: Any) -> None:
+        """Run the talker now on the conversation as it will be once the look's call and report are in it (leftVoice).
+
+        The shared conversation gets them only when their frames have passed the lead's audio; the copy has them now:
+        the conversation so far without this call's own messages (a placeholder already there is replaced), then the
+        call and its report. The run's words reach the conversation in order, after the report, as any answer's do."""
+        import json
+
+        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
+
+        llm = getattr(self, "_llm", None)
+        context = getattr(params, "context", None)
+        if llm is None or context is None:
+            return
+        call_id = str(params.tool_call_id)
+
+        def mine(message: Any) -> bool:
+            if not isinstance(message, dict):
+                return False
+            if message.get("tool_call_id") == call_id:
+                return True
+            calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+            return bool(calls) and any(isinstance(c, dict) and c.get("id") == call_id for c in calls)
+
+        messages = [m for m in context.get_messages() if not mine(m)]
+        args = params.arguments if isinstance(params.arguments, dict) else {}
+        messages.append({"role": "assistant", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": params.function_name, "arguments": json.dumps(args, ensure_ascii=False)}}]})
+        messages.append({"role": "tool", "tool_call_id": call_id,
+                         "content": json.dumps(result, ensure_ascii=False) if result else "COMPLETED"})
+        copy = LLMContext(messages=messages, tools=context.tools, tool_choice=context.tool_choice)
+        if self.log is not None:
+            self.log.event("quick_memory", session=self.session, op="answer_now", call=call_id,
+                           bot_speaking=bool(self.observer.bot_speaking))
+        await llm.queue_frame(LLMContextFrame(context=copy))
 
     async def _speak(self, text: str) -> None:
         """Say ``text`` now by code (no mouth run): a job's own finishing line with no tell_yuki call to carry it."""
