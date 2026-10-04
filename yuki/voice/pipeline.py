@@ -2470,6 +2470,42 @@ def _said_count(context: Any) -> int | None:
     return sum(1 for m in messages or [] if isinstance(m, dict) and m.get("role") in ("user", "developer"))
 
 
+def _reply_words(observer: Any) -> str:
+    """The current reply's words so far (the observer's turn, from where the newest run began), tags stripped."""
+    turn = getattr(observer, "turn", None)
+    if turn is None:
+        return ""
+    return " ".join(strip_tags("".join(turn.reply[getattr(turn, "reply_from", 0):])).split())
+
+
+async def _add_asked_more(conv: Any, context: Any, result: Any, call_id: str) -> bool:
+    """Whether the words a code-said add came from asked for more that is not answered yet (third check LVV-1).
+
+    :func:`yuki.voice.recall.rest_asked`: one short isolated check by the fast model, run while the add's line plays,
+    with their words and Yuki's words so far (its lead, then the line). ``conv`` is the :class:`Conversation`. No
+    client (a bare conversation), no verdict in time or an error: more, so the talker runs and decides (never
+    silent)."""
+    from yuki.voice.recall import rest_asked
+
+    observer = getattr(conv, "observer", None)
+    said = " ".join(str(result.get("said") or "").split())
+    words = _reply_words(observer)
+    if said and said not in words:
+        words = f"{words} {said}".strip()
+    user = _last_user_text(context) or str(getattr(observer, "last_user_text", "") or "")
+    client = getattr(conv, "_client", None)
+    settings = getattr(conv, "settings", None)
+    started = time.monotonic()
+    if client is None or settings is None:
+        more, how = True, "no_client"
+    else:
+        more, how = await rest_asked(client, settings.voice_mouth_model, user=user, said=words)
+    if conv.log is not None:
+        conv.log.event("quick_memory", session=conv.session, op="add_rest", call=call_id, more=more, how=how,
+                       ms=round((time.monotonic() - started) * 1000))
+    return more
+
+
 def _last_user_text(context: Any) -> str:
     """The newest user message's words in the talker's context (``""`` when the newest message is not the user's)."""
     try:
@@ -3014,7 +3050,9 @@ class Conversation:
             from yuki.voice.recall import QuickMemory
 
             self.quick_memory = QuickMemory(self.memory, log=self.log, session=self.session,
-                                            alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ()))
+                                            alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ()),
+                                            mark_spoken=lambda call_id: getattr(self._llm, "_yuki_spoke", set()).add(
+                                                str(call_id)))
             llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
                                   timeout_secs=20)
         provider = self.tts_provider
@@ -3824,8 +3862,11 @@ class Conversation:
         that made the call spoke, the report is settled without a run (``run_llm`` false: it still goes into the
         conversation in its place) and the answer's run starts at once on a copy of the conversation that already
         holds the call and its report (:meth:`_answer_look_now`); its words queue behind the lead in the voice. A reply
-        that called it with no words first waits behind nothing, so it settles as before; so does a clean add, said by
-        code with no run at all. Plumbing: when the run starts, never what anyone said.
+        that called it with no words first waits behind nothing, so it settles as before. A clean add said by code
+        (:class:`~yuki.voice.recall.QuickMemory`) waits behind its own line, lead or not (third check LVV-1): when the
+        same words asked for more (:func:`_add_asked_more`, checked while the line plays) the run that does the rest
+        starts at once the same way; when the add was all of it, the turn ends with the line, with no run.
+        Plumbing: when the run starts, never what anyone said.
 
         Review fixes (LV-1, LV-2): only a look that was the only call of its reply is answered this way (Pipecat answers
         a reply's several calls once, after the last, with every report), and only when, as the report comes back, the
@@ -3835,7 +3876,7 @@ class Conversation:
         llm = getattr(self, "_llm", None)
         call_id = str(getattr(params, "tool_call_id", "") or "")
         spoke = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_spoke", ())
-        solo = spoke and call_id in getattr(llm, "_yuki_solo", ())
+        solo = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_solo", ())
         if solo:
             original = params.result_callback
             # Second review (LVC-1): what the user says is watched in the live conversation. The run's own context
@@ -3850,7 +3891,18 @@ class Conversation:
 
             async def settle(result: Any, *, properties: Any = None) -> None:
                 if properties is not None and getattr(properties, "run_llm", None) is False:
-                    await original(result, properties=properties)   # said by code (a clean add): no run at all
+                    await original(result, properties=properties)   # settled with no run: nothing to answer
+                    return
+                said_by_code = isinstance(result, dict) and bool(result.get("said"))
+                if not spoke and not said_by_code:
+                    await original(result, properties=properties)   # no words before it to wait behind
+                    return
+                if said_by_code and not await _add_asked_more(self, ran_on, result, call_id):
+                    # Third check LVV-1: a clean add that was all they asked ends the turn with its line, no run
+                    # (a run there wandered: "What's up?", an offer about the screen, once a pause).
+                    from pipecat.frames.frames import FunctionCallResultProperties
+
+                    await original(result, properties=FunctionCallResultProperties(run_llm=False))
                     return
                 user_speaking = bool(getattr(self.observer, "user_speaking", False))
                 now_said = _said_count(live)
@@ -3906,9 +3958,12 @@ class Conversation:
         # Second review: the reply's own words before the call ("It's ten to eleven. Adding it now.") go in too, as
         # ``chronological`` orders them, so the answer knows what was already said (offline 4 Oct: without them the
         # add-and-ask answer gave the time a second time). Words the conversation already holds are not repeated.
-        words = ""
-        if turn is not None:
-            words = " ".join(strip_tags("".join(turn.reply[getattr(turn, "reply_from", 0):])).split())
+        words = _reply_words(observer)
+        said = result.get("said") if isinstance(result, dict) else None
+        if isinstance(said, str) and said.strip() and " ".join(said.split()) not in words:
+            # third check LVV-1: a clean add's line, said by code, is words of this reply before the answer too (text
+            # replays 4 Oct: only in the report, the answer said the add again or chatted; before the call, it did not)
+            words = f"{words} {' '.join(said.split())}".strip()
         if words and not _holds_words_since_user(messages, words):
             messages.append({"role": "assistant", "content": words})
         args = params.arguments if isinstance(params.arguments, dict) else {}

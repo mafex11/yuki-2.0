@@ -53,12 +53,20 @@ TODAY_REPORT = {"found": "Today with you, oldest first:\n- (07:10) they: The plu
 ADD_ASK = "Add call mom to my list, and what time is it?"
 
 
-def _add_then_report() -> dict[str, Any]:
-    """The add's report as QuickMemory gives it when its then holds the rest (second review LVV-1)."""
+def _line() -> str:
+    """A clean add's line, said by code: in the conversation as words before the call (``chronological``)."""
     from yuki.voice import recall
 
-    return {"added": 1, "where": recall.LIST_PLACE, "items": [{"text": "Call mom"}], "then": "what time is it",
-            "how_to_handle_it": recall.ADDED_NOTE.format(n=1) + recall.ADDED_THEN_NOTE.format(then="what time is it")}
+    return recall.ADDED_ONE_LINE
+
+
+def _added_said_report(item: str) -> dict[str, Any]:
+    """A clean add's report as QuickMemory settles it: its line already said by code, and a run after it (third check
+    LVV-1: that run answers the rest of the same words, or stays quiet)."""
+    from yuki.voice import recall
+
+    return {"added": 1, "where": recall.LIST_PLACE, "items": [item], "said": recall.ADDED_ONE_LINE,
+            "how_to_handle_it": recall.ADDED_SAID_NOTE}
 
 
 def _lead_call(args: dict[str, Any], cid: str, lead: str) -> list[dict[str, Any]]:
@@ -84,12 +92,16 @@ def cases() -> list[dict[str, Any]]:
         dict(id="plumber_reply", issue="today", check="plumber", messages=[
             u(PLUMBER), *_lead_call({"action": "today"}, "q4", "Let me check."), result("q4", TODAY_REPORT)]),
         dict(id="add_look", issue="add", check="adds_one", messages=[u("Put renew the car insurance on my list.")]),
-        # second review LVV-1: an add with more asked in the same breath; the rest goes in the call's then (or is
-        # answered in the reply's own words), and the reply to the add's report does that rest
+        # an add with more asked in the same breath; the run after the code-said add gives the time (third check
+        # LVV-1), and after a plain add it stays quiet
         dict(id="add_ask", issue="add", check="add_and_ask", messages=[u(ADD_ASK)]),
-        dict(id="add_ask_reply", issue="add", check="says_added_and_time", messages=[
-            u(ADD_ASK), call("quick_memory", {"action": "add_todos", "items": [{"text": "Call mom"}],
-                                              "then": "what time is it"}, "q9"), result("q9", _add_then_report())]),
+        dict(id="add_ask_reply", issue="add", check="says_time_only", messages=[
+            u(ADD_ASK), a(_line()), call("quick_memory", {"action": "add_todos", "items": [{"text": "Call mom"}]}, "q9"),
+            result("q9", _added_said_report("Call mom"))]),
+        dict(id="add_plain_reply", issue="add", check="quiet_after_add", messages=[
+            u("Add the car insurance renewal to my to-do list."), a(_line()),
+            call("quick_memory", {"action": "add_todos", "items": [{"text": "Car insurance renewal"}]}, "q8"),
+            result("q8", _added_said_report("Car insurance renewal"))]),
         # controls: a plain answer (the floor every reply has), and no lead where no tool is needed
         dict(id="time_plain", issue="control", check="plain", messages=[u("What time is it?")]),
         dict(id="whats_up", issue="control", check="plain", messages=[u("What's up?")]),
@@ -115,14 +127,14 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
         return "thursday" in spoken and not names
     if kind == "adds_one":
         adds = [c["input"] for c in row["calls"] if c["name"] == "quick_memory" and c["input"].get("action") == "add_todos"]
-        return bool(adds) and any("insurance" in str(i).casefold() for i in adds[0].get("items") or []) and not str(
-            adds[0].get("then") or "").strip()
-    if kind == "add_and_ask":   # the add, and the time either asked for in then or said in the reply's words
+        return bool(adds) and any("insurance" in str(i).casefold() for i in adds[0].get("items") or [])
+    if kind == "add_and_ask":   # the add (the time may be said before it, or by the run after the add's line)
         adds = [c["input"] for c in row["calls"] if c["name"] == "quick_memory" and c["input"].get("action") == "add_todos"]
-        return bool(adds) and any("mom" in str(i).casefold() for i in adds[0].get("items") or []) and (
-            bool(str(adds[0].get("then") or "").strip()) or _says_time(spoken))
-    if kind == "says_added_and_time":
-        return "add" in spoken and _says_time(spoken) and not names
+        return bool(adds) and any("mom" in str(i).casefold() for i in adds[0].get("items") or [])
+    if kind == "says_time_only":   # the time, and the add (already said by code) not again
+        return _says_time(spoken) and "added" not in spoken and "list" not in spoken and not names
+    if kind == "quiet_after_add":  # nothing more asked: stay_quiet alone, no words
+        return not spoken and names in ([], ["stay_quiet"])
     if kind == "plain":
         return not names and bool(spoken)
     if kind.startswith("alone:"):   # the call they want, and nothing spoken before it

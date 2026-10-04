@@ -81,8 +81,6 @@ QUICK_MEMORY: dict[str, Any] = {
             "due": {"type": "string", "description": "If given: YYYY-MM-DD[ HH:MM]"}},
             "required": ["text"]}},
         "query": {"type": "string"},
-        # second review LVV-1: the rest of a request an add is part of (a clean add alone ends the turn by code)
-        "then": {"type": "string", "description": "With add_todos: the rest of what they asked, else \"\""},
     },
     "required": ["action"],
 }
@@ -96,17 +94,77 @@ ADDED_NOTE = ("Saved and checked: nothing more to do. Say: \"Added {n}, they're 
               "short in your words, always with how many and where: Home, Your list). Never read them back unless "
               "they ask.")
 #: leftVoice: a clean add (every item saved, with its due when it had one) is confirmed by code, in these words, the
-#: moment memory has it: no second talker run (its first token alone is ~1.2-1.5 s). Formatting: a count and the place.
-#: Only when the add is the whole request: alone in its reply, with nothing left in its ``then`` (second review LVV-1).
+#: moment memory has it, without waiting for the talker (its first token alone is ~1.2-1.5 s). Formatting: a count and
+#: the place.
+#: Only for an add alone in its reply (second review LVV-1: a reply's calls are answered once, after the last).
 ADDED_ONE_LINE = "Added it, it's on Home under Your list."
 ADDED_LINE = "Added {n}, they're on Home under Your list."
-ADDED_SAID_NOTE = ("Said aloud just now in your voice, word for word: your own words to them, already heard. Saved and "
-                   "checked: nothing more to do. Never say it again; if they ask, answer from it.")
-#: Second review LVV-1: the same words asked for more than the add ("add call mom, and what time is it?"; a clean add
-#: said by code used to end the turn, and the rest was never answered). The talker says the add and does the rest, as
-#: fx2's open hands do with their own ``then``.
-ADDED_THEN_NOTE = (" Then, in the same reply, do what else they asked unless your words before the call already did: "
-                   "{then} (this report holds only what was just added; anything more needs its own look).")
+#: Third check LVV-1: the code line no longer ends the turn on its own. When the same words asked for more ("add call
+#: mom, and what time is it?", judged by :func:`rest_asked`), the talker runs once more behind it (its words queue
+#: after the line's audio; the line is in its context as words said before the call) and does the rest, or stays
+#: quiet. Ending the turn used to rest on the talker writing the
+#: rest into a ``then`` field, and live it left that field empty about one add-and-ask in three (the time never given).
+#: Text replays 4 Oct: with the line before the call and this note, 25 of 25 replies to an add-and-ask gave only the
+#: rest, and 20 of 20 with nothing more asked were stay_quiet; with the line only in the report, 0 of 10 and 1 of 10
+#: (it said the add again, or chatted about the screen).
+ADDED_SAID_NOTE = ("Done, and already said aloud: your words before this call, word for word. Nothing about the add is "
+                   "left to say. Reread their last words: if they also asked something besides the add (a question, "
+                   "another request) that you have not answered yet, answer only that, in a few words. If the add was "
+                   "all they asked, your whole reply is the stay_quiet call alone: no words, no offer, no remark on "
+                   "anything else.")
+#: Third check LVV-1, live: a talker run after every code-said add wandered when nothing more was asked (offline
+#: 4 Oct, 6 of 11 plain adds: "What's up?", "The walkthrough's still playing, want me to pause it?", and once it
+#: paused the video), whatever its report said. So one cheap, isolated check by the fast model (no desk, no tools, as
+#: the speech guard's) decides whether the same words asked for anything the reply has not answered yet; only then
+#: does the talker run. A model's judgement from worked examples, never a list of words.
+ADD_REST_PROMPT = """\
+You check one moment in a voice conversation. The user spoke to Yuki, their voice assistant. Yuki has just put \
+what they asked on their to-do list and said so aloud. Decide whether their words ALSO asked for something else \
+that Yuki has not answered or done yet in the words it already said: a question, another request, anything \
+beyond putting things on the list. Answer one word: MORE (something else still waits for Yuki) or DONE (the list \
+was all of it, or the rest was already answered in Yuki's words).
+Their words: "Add call mom to my list, and what time is it?" Yuki said: "Added it, it's on Home under Your list." \
+-> MORE
+Their words: "Add call mom to my list, and what time is it?" Yuki said: "It's 11:35 PM. Adding it now. Added it, \
+it's on Home under Your list." -> DONE
+Their words: "Put milk and eggs on my list." Yuki said: "On it. Added 2, they're on Home under Your list." -> DONE
+Their words: "Add renew the gym pass to my to-do list, then pause the music." Yuki said: "Added it, it's on Home \
+under Your list." -> MORE
+Their words: "Remind me to call the bank tomorrow, thanks." Yuki said: "Added it, it's on Home under Your list." \
+-> DONE
+Their words: "Add the plumber to my list. Also what did I tell you about the gym?" Yuki said: "Sure. Added it, \
+it's on Home under Your list." -> MORE"""
+#: How long the check may take; no verdict in time (or an error) runs the talker: never silent on a question.
+ADD_REST_TIMEOUT_S = 2.5
+
+
+def parse_rest(answer: str) -> bool:
+    """Whether the check's answer says something more waits (anything but a plain DONE does: never silent)."""
+    words = " ".join(str(answer or "").split()).upper()
+    return not (words.startswith("DONE") and "MORE" not in words)
+
+
+async def rest_asked(client: Any, model: str, *, user: str, said: str,
+                     timeout_s: float = ADD_REST_TIMEOUT_S) -> tuple[bool, str]:
+    """``(more, how)``: whether ``user``'s words asked for more than a clean add that ``said`` has not answered yet.
+
+    ``how`` is ``model``, ``timeout`` or ``error`` (both of those count as more: the talker runs and decides), or
+    ``no_words`` when there are no words of theirs to read (more). One short call to the fast model, no tools."""
+    if not str(user or "").strip():
+        return True, "no_words"
+    content = f'Their words: "{" ".join(str(user).split())}" Yuki said: "{" ".join(str(said or "").split())}" ->'
+    try:
+        response = await asyncio.wait_for(client.messages.create(
+            model=model, max_tokens=4, system=ADD_REST_PROMPT, messages=[{"role": "user", "content": content}]),
+            timeout_s)
+    except asyncio.TimeoutError:
+        return True, "timeout"
+    except Exception:  # noqa: BLE001 - a failed check runs the talker
+        return True, "error"
+    answer = "".join(getattr(b, "text", "") for b in getattr(response, "content", []) or [])
+    return parse_rest(answer), "model"
+
+
 #: An item kept without the due it was given (memory could not read the due): the talker says so, not code.
 NO_TIME_MARK = " (saved without its time: it could not be read)"
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
@@ -396,13 +454,16 @@ class QuickMemory:
     use: the action, whether it worked, how long it took and how many items."""
 
     def __init__(self, memory: Any, *, log: Any = None, session: str | None = None,
-                 alone: Any = None) -> None:
+                 alone: Any = None, mark_spoken: Any = None) -> None:
         self.memory = memory
         self.log = log
         self.session = session
         #: ``alone(tool_call_id)``: the call was the only one of its reply (the talker service's ``_yuki_solo``);
         #: ``None`` takes every call as alone.
         self.alone = alone
+        #: ``mark_spoken(tool_call_id)``: words were said for this call (a clean add's line, said by code), as the
+        #: bridge's ``mark_spoken``: the talker service then keeps them before the call in the conversation.
+        self.mark_spoken = mark_spoken
 
     async def handle(self, params: Any) -> None:
         args = params.arguments if isinstance(params.arguments, dict) else {}
@@ -414,32 +475,30 @@ class QuickMemory:
                        "how_to_handle_it": NOTHING_NOTE.format(where="memory")}
             facts = {"ok": False}
         adding = str(args.get("action") or "").strip() == "add_todos"
-        rest = " ".join(str(args.get("then") or "").split())[:200] if adding else ""
         line = added_line(payload) if adding else None
         push = getattr(getattr(params, "llm", None), "push_frame", None)
-        # Second review LVV-1: said by code only when the add is the whole request. A reply with another call beside it
-        # is answered once, after its last report, by Pipecat; settling this one with no run starved that answer when
-        # the other call came back first. And what else the same words asked (``then``) is the talker's to do.
-        alone = self.alone is None or self.alone(str(getattr(params, "tool_call_id", "") or ""))
-        said = bool(line and callable(push) and alone and not rest)
+        # Second review LVV-1: said by code only for an add alone in its reply. A reply with another call beside it is
+        # answered once, after its last report, by Pipecat; the talker says the add in that answer.
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        alone = self.alone is None or self.alone(call_id)
+        said = bool(line and callable(push) and alone)
         if self.log is not None:
             self.log.event("quick_memory", session=self.session, op=str(args.get("action") or ""),
                            ms=round((time.monotonic() - started) * 1000), call=getattr(params, "tool_call_id", None),
-                           **facts, **({"said_by": "code"} if said else {}),
-                           **({"then": True} if rest else {}), **({} if alone else {"alone": False}))
+                           **facts, **({"said_by": "code"} if said else {}), **({} if alone else {"alone": False}))
         if said:
-            # leftVoice: a clean add is confirmed by code in Yuki's voice, as a hand's done line is: the talker is not
-            # run again for it (that second run was ~1.5 s of silence before "Added ..."); its words go into the
-            # conversation as Yuki's own, and the call settles with them as said.
-            from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+            # leftVoice: a clean add is confirmed by code in Yuki's voice the moment memory has it, as a hand's done
+            # line is (waiting for the talker's words was ~1.5 s of silence before "Added ..."); its words go into the
+            # conversation as Yuki's own. Third check LVV-1: the call settles as any report does, so what else the
+            # same words asked is answered; the conversation (``_quick_memory_call``) first asks :func:`rest_asked`
+            # whether there is more, and runs the talker on its own copy only then (its words queue behind the line).
+            from pipecat.frames.frames import TTSSpeakFrame
 
             await push(TTSSpeakFrame(text=line))
-            await params.result_callback({**payload, "said": line, "how_to_handle_it": ADDED_SAID_NOTE},
-                                         properties=FunctionCallResultProperties(run_llm=False))
+            if self.mark_spoken is not None:
+                self.mark_spoken(call_id)   # the line goes before the call in the conversation (``chronological``)
+            await params.result_callback({**payload, "said": line, "how_to_handle_it": ADDED_SAID_NOTE})
             return
-        if rest and isinstance(payload.get("how_to_handle_it"), str):
-            payload = {**payload, "then": rest, "how_to_handle_it": payload["how_to_handle_it"]
-                       + ADDED_THEN_NOTE.format(then=rest)}
         await params.result_callback(payload)
 
     def run(self, args: dict[str, Any], *, now: float | None = None) -> tuple[dict[str, Any], dict[str, Any]]:

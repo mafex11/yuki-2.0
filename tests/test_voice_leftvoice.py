@@ -44,9 +44,9 @@ def test_the_look_comes_after_a_few_words_and_every_other_call_stays_alone() -> 
     assert '"Yep, pausing it." + media_key' in MOUTH_PROMPT
     # what the Earlier block holds is answered from it, with no look
     assert "answer from the Earlier block when it holds it" in " ".join(MOUTH_PROMPT.split())
-    # no say_first field (its tokens were the reason vfix4 left this open); one short optional field, then, for the
-    # rest of a request an add is part of (second review LVV-1), paid for by shorter wording: still vfix4's 700
-    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query", "then"]
+    # no say_first field (its tokens were the reason vfix4 left this open), and no then field either (third check
+    # LVV-1: the turn's end no longer rests on the talker filling it): still vfix4's 700
+    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query"]
     assert QUICK_MEMORY["required"] == ["action"]
     assert len(json.dumps(QUICK_MEMORY)) <= 700
 
@@ -182,7 +182,7 @@ def _params(args: dict[str, Any], *, llm: bool = True) -> tuple[Any, list[Any], 
     return params, pushed, settled
 
 
-def test_a_clean_voice_add_is_said_by_code_with_no_second_talker_run() -> None:
+def test_a_clean_voice_add_is_said_by_code_and_the_talker_still_answers_the_rest() -> None:
     from pipecat.frames.frames import TTSSpeakFrame
 
     log = _Log()
@@ -191,8 +191,10 @@ def test_a_clean_voice_add_is_said_by_code_with_no_second_talker_run() -> None:
     asyncio.run(tool.handle(params))
     assert [type(f) for f in pushed] == [TTSSpeakFrame] and pushed[0].text == "Added it, it's on Home under Your list."
     result, properties = settled[0]
-    assert properties is not None and properties.run_llm is False          # the talker is not run again
+    # third check LVV-1: settled with a run, as any report (the rest of the same words, or stay_quiet); never no run
+    assert properties is None or properties.run_llm is not False
     assert result["said"] == pushed[0].text and result["how_to_handle_it"] == ADDED_SAID_NOTE
+    assert "stay_quiet" in ADDED_SAID_NOTE and "something besides the add" in ADDED_SAID_NOTE
     assert result["added"] == 1 and result["where"] == recall.LIST_PLACE   # the report itself is kept for the record
     kind, facts = log.events[-1]
     assert kind == "quick_memory" and facts["said_by"] == "code" and facts["ok"] is True
@@ -218,7 +220,7 @@ def test_an_add_that_needs_words_and_every_read_still_go_to_the_talker() -> None
 def test_several_items_are_counted_in_the_line(n: int) -> None:
     params, pushed, settled = _params({"action": "add_todos", "items": [{"text": f"Thing {i}"} for i in range(n)]})
     asyncio.run(QuickMemory(_Memory()).handle(params))
-    assert pushed[0].text == f"Added {n}, they're on Home under Your list." and settled[0][1].run_llm is False
+    assert pushed[0].text == f"Added {n}, they're on Home under Your list." and settled[0][1] is None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -617,29 +619,138 @@ def test_the_answer_now_run_stays_in_the_users_turn_until_its_lead_is_heard(tmp_
     assert obs.turn is not user_turn and obs.turn.trigger == "result"
 
 
-def test_an_add_with_more_asked_in_the_same_words_goes_to_the_talker() -> None:
-    from yuki.voice.recall import ADDED_THEN_NOTE
+@pytest.mark.parametrize("then", [None, "", "what time is it", "Done, added to your list."])
+def test_a_clean_add_never_ends_the_turn_whatever_the_talker_wrote(then: Any) -> None:
+    # third check LVV-1: offline 4 Oct "Add coal mom to my list. And what time is it?" -> the add alone, then "" and no
+    # words before it: the code line settled with run_llm=False ended the turn, and the time was never given. And a
+    # then holding only a confirmation turned the code line off (the talker's slower "Added it."). Now nothing the
+    # talker writes into the call decides it: a clean add alone is always said by code, and always settled with a run
+    from pipecat.frames.frames import TTSSpeakFrame
 
-    # LVV-1 (a): "Add call mom to my list, and what time is it?" -> one add whose then holds the rest: no code line
-    # (it ended the turn, and the time was never given); the talker says the add and does the rest
     log = _Log()
-    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}],
-                                       "then": "  what time is it "})
-    asyncio.run(QuickMemory(_Memory(), log=log).handle(params))
-    assert not pushed and settled[0][1] is None
-    report = settled[0][0]
-    assert report["then"] == "what time is it" and "said" not in report
-    assert report["how_to_handle_it"].endswith(ADDED_THEN_NOTE.format(then="what time is it"))
-    assert log.events[-1][1]["then"] is True and "said_by" not in log.events[-1][1]
-    assert "mom" not in repr(log.events) and "time is it" not in repr(log.events)   # content-free
-    # an empty then is a whole request: said by code as before
-    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}], "then": ""})
-    asyncio.run(QuickMemory(_Memory()).handle(params))
-    assert pushed and settled[0][1].run_llm is False
-    # a read's then is ignored (it is for adds)
-    params, pushed, settled = _params({"action": "todos", "then": "what time is it"})
-    asyncio.run(QuickMemory(_Memory()).handle(params))
-    assert "then" not in settled[0][0]
+    args: dict[str, Any] = {"action": "add_todos", "items": [{"text": "Call mom"}]}
+    if then is not None:
+        args["then"] = then   # an old talker habit, or a field it invents: ignored
+    params, pushed, settled = _params(args)
+    asyncio.run(QuickMemory(_Memory(), log=log, alone=lambda cid: True).handle(params))
+    assert [type(f) for f in pushed] == [TTSSpeakFrame] and pushed[0].text == recall.ADDED_ONE_LINE
+    result, properties = settled[0]
+    assert properties is None and result["said"] == recall.ADDED_ONE_LINE and "then" not in result
+    assert log.events[-1][1]["said_by"] == "code" and "then" not in log.events[-1][1]
+    assert not hasattr(recall, "ADDED_THEN_NOTE") and "then" not in QUICK_MEMORY["properties"]
+
+
+class _Client:
+    """A stand-in Anthropic client for the add-rest check: answers ``answer``, or raises / hangs."""
+
+    def __init__(self, answer: str = "DONE", *, fail: bool = False, hang: bool = False) -> None:
+        self.answer, self.fail, self.hang, self.asked = answer, fail, hang, []
+        self.messages = self
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.asked.append(kwargs)
+        if self.fail:
+            raise RuntimeError("down")
+        if self.hang:
+            await asyncio.sleep(5)
+        return SimpleNamespace(content=[SimpleNamespace(text=self.answer)])
+
+
+def test_the_add_rest_check_asks_the_fast_model_and_fails_toward_answering() -> None:
+    # third check LVV-1: whether the words asked more than the add is one isolated check by the fast model
+    client = _Client("MORE")
+    more, how = asyncio.run(recall.rest_asked(client, "m", user="Add call mom, and what time is it?",
+                                              said=recall.ADDED_ONE_LINE))
+    assert (more, how) == (True, "model")
+    (kw,) = client.asked
+    assert kw["model"] == "m" and kw["system"] == recall.ADD_REST_PROMPT and kw["max_tokens"] <= 8
+    assert "what time is it" in kw["messages"][0]["content"] and recall.ADDED_ONE_LINE in kw["messages"][0]["content"]
+    assert "tools" not in kw                                                  # no tools, no desk: isolated
+    assert asyncio.run(recall.rest_asked(_Client("DONE"), "m", user="Add milk.", said="x")) == (False, "model")
+    # never silent on a question: an error, no verdict in time, or no words of theirs to read all run the talker
+    assert asyncio.run(recall.rest_asked(_Client(fail=True), "m", user="Add milk.", said="x")) == (True, "error")
+    assert asyncio.run(recall.rest_asked(_Client(hang=True), "m", user="Add milk.", said="x",
+                                         timeout_s=0.05)) == (True, "timeout")
+    assert asyncio.run(recall.rest_asked(_Client("DONE"), "m", user=" ", said="x")) == (True, "no_words")
+    assert [recall.parse_rest(a) for a in ("DONE", "done.", "MORE", "", "DONE or MORE", "Hmm")] == [
+        False, False, True, True, True, True]
+
+
+@pytest.mark.parametrize("answer", ["DONE", "MORE"])
+def test_a_code_said_add_runs_the_talker_only_when_more_was_asked(answer: str) -> None:
+    # third check LVV-1, live 4 Oct: a talker run after every code-said add wandered on 6 of 11 plain adds ("What's
+    # up?", an offer about the video playing, once a pause); the check decides first, while the line plays
+    from yuki.voice.pipeline import Conversation
+
+    report = {"added": 1, "where": recall.LIST_PLACE, "items": ["Call mom"], "said": recall.ADDED_ONE_LINE,
+              "how_to_handle_it": ADDED_SAID_NOTE}
+    history = [{"role": "user", "content": "Add call mom to my list. And what time is it?"}]
+    conv = _conversation(set(), report, solo={"toolu_7"})
+    conv._client = _Client(answer)
+    conv.settings = SimpleNamespace(voice_mouth_model="fast")
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(history)))))
+    assert settled[0][1].run_llm is False and settled[0][0] == report     # in the conversation either way
+    (asked,) = conv._client.asked
+    assert history[0]["content"] in asked["messages"][0]["content"]       # their words, and the line said
+    assert recall.ADDED_ONE_LINE in asked["messages"][0]["content"]
+    rest = [f for k, f in conv.log.events if k == "quick_memory" and f.get("op") == "add_rest"]
+    assert rest and rest[0]["more"] is (answer == "MORE") and rest[0]["how"] == "model"
+    if answer == "DONE":
+        assert not conv.queued                                            # the line was all: no talker run
+    else:
+        assert len(conv.queued) == 1 and conv.log.events[-1][1]["op"] == "answer_now"
+
+
+def test_a_code_said_line_is_marked_as_words_before_its_call() -> None:
+    # third check LVV-1: text replays 4 Oct, the run after the line with the line only in the report said the add
+    # again or chatted (1 of 20 right); with it as words before the call, 20 of 20. The line is marked spoken for the
+    # call, so the talker service keeps it before the call in the conversation (``chronological``)
+    marked: list[str] = []
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}]})
+    asyncio.run(QuickMemory(_Memory(), alone=lambda cid: True, mark_spoken=marked.append).handle(params))
+    assert marked == ["toolu_9"] and pushed
+    # nothing said by code (an unclean add): nothing marked
+    marked.clear()
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Pay rent", "due": "bad"}]})
+    asyncio.run(QuickMemory(_Memory(), alone=lambda cid: True, mark_spoken=marked.append).handle(params))
+    assert not marked and not pushed
+    for cue in ("already said aloud", "your words before this call", "stay_quiet call alone", "answer only that"):
+        assert cue in ADDED_SAID_NOTE
+
+
+def test_a_code_said_add_with_no_lead_is_answered_at_once_behind_its_line() -> None:
+    from pipecat.frames.frames import LLMContextFrame
+
+    from yuki.voice.pipeline import Conversation
+
+    # third check LVV-1: the add was the reply's only call and nothing was said before it (offline run 5); the code
+    # line is queued in the voice, so the run that answers the rest ("what time is it?") or stays quiet starts now on
+    # its copy, its words behind the line, rather than once the report has passed the line's audio
+    report = {"added": 1, "where": recall.LIST_PLACE, "items": ["Call mom"], "said": recall.ADDED_ONE_LINE,
+              "how_to_handle_it": ADDED_SAID_NOTE}
+    history = [{"role": "user", "content": "Add call mom to my list. And what time is it?"}]
+    conv = _conversation(set(), report, solo={"toolu_7"})
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(history)))))
+    assert settled[0][1].run_llm is False   # in the conversation; its run is the one queued here
+    (frame,) = conv.queued
+    assert isinstance(frame, LLMContextFrame)
+    messages = frame.context.get_messages()
+    assert messages[0] == history[0] and json.loads(messages[-1]["content"])["said"] == recall.ADDED_ONE_LINE
+    # the line is in the copy as the reply's words before the call (no lead: the line alone)
+    assert messages[1] == {"role": "assistant", "content": recall.ADDED_ONE_LINE} and messages[2]["tool_calls"]
+    assert conv.log.events[-1][1]["op"] == "answer_now"
+    # the user went on while it was saved: as on main, the report just goes in with its run (their turn answers)
+    conv = _conversation(set(), report, solo={"toolu_7"}, user_speaking=True)
+    settled = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(history)))))
+    assert settled[0][1] is None and not conv.queued
+    # a report the talker says itself (an unclean add, a read) with no lead: settled as before, Pipecat runs it
+    conv = _conversation(set(), {"added": 0, "not_saved": "x"}, solo={"toolu_7"})
+    settled = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(history)))))
+    assert settled[0][1] is None and not conv.queued
 
 
 def test_an_add_beside_another_call_in_its_reply_goes_to_the_talker() -> None:
@@ -652,7 +763,7 @@ def test_an_add_beside_another_call_in_its_reply_goes_to_the_talker() -> None:
     tool = QuickMemory(_Memory(), alone=lambda cid: True)
     params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}]})
     asyncio.run(tool.handle(params))
-    assert pushed and settled[0][1].run_llm is False
+    assert pushed and settled[0][1] is None
 
 
 def test_the_conversation_tells_the_tool_which_calls_were_alone_in_their_reply() -> None:
@@ -662,7 +773,7 @@ def test_the_conversation_tells_the_tool_which_calls_were_alone_in_their_reply()
 
     source = inspect.getsource(pipeline.Conversation)
     assert 'alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ())' in source
-    assert "then" in QUICK_MEMORY["properties"] and QUICK_MEMORY["required"] == ["action"]
+    assert QUICK_MEMORY["required"] == ["action"]
 
 
 @pytest.mark.parametrize("add_first", [False, True])
