@@ -924,7 +924,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             channel = hook("channel", default="guard")
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call,
                                                    call_evidence=hook("call_evidence", default=None),
-                                                   channel=channel, hands=bool(hook("hands", default=True)))
+                                                   channel=channel, hands=bool(hook("hands", default=True)),
+                                                   marks=bool(hook("marks", default=True)))
             messages = params.get("messages")
             if channel == "marker":
                 messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
@@ -2290,6 +2291,11 @@ class _Hooks:
     def hands(self) -> bool:
         """Whether the talker has hands this conversation (its hands block is in the prompt only then)."""
         return bool(self.c.settings.voice_hands and getattr(self.c.bridge, "hands", None) is not None)
+
+    def marks(self) -> bool:
+        """vfix4: whether this conversation's voice performs the talker's marks (Gemini); Deepgram Aura and ElevenLabs
+        strip them (``_clause_tts(strip_marks=True)``), so their talker's core goes without the marks section."""
+        return str(getattr(self.c, "tts_provider", "") or "").strip().lower() == "gemini"
 
     def reply_cap(self) -> int:
         """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none)."""

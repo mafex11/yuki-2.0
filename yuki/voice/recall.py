@@ -31,12 +31,12 @@ from typing import Any
 #: How far back the start-of-conversation view reaches (s).
 RECENT_S = 3600.0
 #: The whole view's size cap (characters; the oldest exchanges go first). ~550 tokens at most, once per conversation.
-RECENT_CHARS = 2_400
+RECENT_CHARS = 2_200
 #: The kept part (to-dos added, rules set) is cut to this.
 KEPT_CHARS = 800
 #: One message's longest text in the view (whole words).
-USER_CHARS = 220
-REPLY_CHARS = 280
+USER_CHARS = 200
+REPLY_CHARS = 200
 #: One kept item's longest text.
 KEPT_ITEM_CHARS = 110
 #: At most this many of a day's exchanges are read for the view.
@@ -46,9 +46,10 @@ RECENT_TIMEOUT_S = 1.5
 #: Where the to-do list lives in Yuki's window (the 4 Oct appTodo build: Home's "Your list"; all of them on Work too).
 LIST_PLACE = "on Home under Your list in your window"
 RECENT_LABEL = ("[Earlier with them, the last hour (voice and typed chat, across conversations, oldest first). You were "
-                "there: it is what you and they said. Use it only when they refer back to it. Never bring any of it up "
-                "yourself, not even in passing: \"what's up?\" gets \"Not much, you?\", never a word about their "
-                "list or what they said.]")
+                "there: it is what you and they said. When they refer back to anything here, even half-heard (\"the "
+                "total list\" for the to-do list), answer from it or look with quick_memory; never \"I don't have "
+                "that\" without a look. Never bring any of it up yourself, not even in passing: \"what's up?\" gets "
+                "\"Not much, you?\", never a word about their list or what they said.]")
 RECENT_END = "[End of earlier]"
 
 #: The quick memory tool's reads: today's talk is cut to this, a search to this many items.
@@ -67,19 +68,17 @@ SEARCH_EMBED_WAIT_S = 0.4
 QUICK_MEMORY: dict[str, Any] = {
     "name": "quick_memory",
     "description": (
-        "Your quick look into memory: a moment, alone, no words before it; its report says what to tell them. todos: "
-        "their open to-do list. add_todos: put items on it when they ask you to (\"make a to-do list of this\", \"add "
-        "milk to my list\"), one item each, in their words. today: today's talk with you, voice and typed, beyond the "
-        "Earlier block. search: memory's nearest items for query (what they told you, did or saw)."
+        "Your quick look into memory, alone, no words before it; its report says what to say. todos: their to-do "
+        "list. add_todos: put items on it when they ask, one each, their words. today: today's talk with you. "
+        "search: memory for query."
     ),
     "properties": {
         "action": {"type": "string", "enum": ["todos", "add_todos", "today", "search"]},
-        "items": {"type": "array", "description": "add_todos: the to-dos.", "items": {
-            "type": "object", "properties": {
-                "text": {"type": "string"},
-                "due": {"type": "string", "description": "Only a day or time they gave: YYYY-MM-DD or YYYY-MM-DD HH:MM."}},
+        "items": {"type": "array", "items": {"type": "object", "properties": {
+            "text": {"type": "string"},
+            "due": {"type": "string", "description": "Only if they gave one: YYYY-MM-DD or YYYY-MM-DD HH:MM"}},
             "required": ["text"]}},
-        "query": {"type": "string", "description": "search: what to look for, in their words."},
+        "query": {"type": "string"},
     },
     "required": ["action"],
 }

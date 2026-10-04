@@ -79,8 +79,13 @@ def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str =
                                        **_supported(mouth.mouth_system_blocks, channel=channel, call=call,
                                                     state=state))
     tools = []
+    extra = []
+    if hasattr(mouth, "fetch_recent"):   # vfix4: that tree's talker has its quick memory tool (and the Earlier block)
+        from yuki.voice.recall import QUICK_MEMORY
+
+        extra.append(QUICK_MEMORY)
     for t in (mouth.TELL_YUKI, mouth.CHECK_PROGRESS, mouth.MORE_OF_RESULT, mouth.STAY_QUIET, mouth.END_CONVERSATION,
-              mouth.GO_QUIET, *hands.HAND_TOOLS):
+              mouth.GO_QUIET, *extra, *hands.HAND_TOOLS):
         tools.append({"name": t["name"], "description": t["description"],
                       "input_schema": {"type": "object", "properties": t["properties"], "required": t["required"]}})
     desk = DESK

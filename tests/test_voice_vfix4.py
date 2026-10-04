@@ -254,10 +254,15 @@ def test_the_handler_reports_to_the_talker_and_logs_no_content() -> None:
 
 
 def test_the_tool_schema_is_lean_and_the_prompt_stays_in_its_budget() -> None:
-    from yuki.voice.mouth import HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT
+    import json
 
-    assert QUICK_MEMORY["required"] == ["action"] and len(QUICK_MEMORY["description"]) <= 520
-    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 41_800
+    from yuki.voice.mouth import HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT
+
+    # measured 4 Oct: the talker's prompt sat just under a step near 18k tokens (+0.3-0.4 s per reply past it); the
+    # tool is kept small and the marks section (useless with a voice that strips marks) is sent only with Gemini
+    assert QUICK_MEMORY["required"] == ["action"] and len(json.dumps(QUICK_MEMORY)) <= 700
+    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) + len(VOICE_MARKS_PROMPT) <= 41_800
+    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 39_900
     # the judgement is the talker's, with a worked example of the live case; no word list decides it
     assert 'quick_memory(action="todos") alone' in MOUTH_PROMPT and "(no look)" in MOUTH_PROMPT
     assert "the Earlier block" in MOUTH_PROMPT
@@ -272,6 +277,24 @@ def test_the_view_rides_after_the_cached_layers_which_stay_byte_identical() -> N
     plain, viewed = mouth_system_blocks(base), mouth_system_blocks(with_view)
     assert viewed[:-1] == plain and viewed[-1]["text"].startswith(recall.RECENT_LABEL)
     assert "cache_control" not in viewed[-1] and "cache_control" in viewed[-2]
+
+
+def test_the_marks_section_rides_only_with_a_voice_that_performs_marks() -> None:
+    from yuki.voice.mouth import VOICE_MARKS_PROMPT, MouthMemory, mouth_system_blocks
+    from yuki.voice.pipeline import _Hooks
+
+    memory = MouthMemory(source="memory", names=["Dev"])
+    assert VOICE_MARKS_PROMPT in mouth_system_blocks(memory, channel="marker")[0]["text"]   # the default: as before
+    plain = mouth_system_blocks(memory, channel="marker", marks=False)[0]["text"]
+    assert VOICE_MARKS_PROMPT not in plain and "[laugh]" not in plain and "# Your voice" in plain
+
+    class Conv:
+        tts_provider = "gemini"
+
+    conv = Conv()
+    assert _Hooks(conv).marks() is True
+    conv.tts_provider = "deepgram"
+    assert _Hooks(conv).marks() is False
 
 
 def test_a_woken_conversation_reads_the_hour_again_and_its_first_call_waits_for_it() -> None:

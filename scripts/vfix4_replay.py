@@ -59,6 +59,12 @@ LIST_REPORT = todo_report([{"id": f"todo:{i}", "text": t, "source": "user", "sta
 EMPTY_REPORT = todo_report([])
 ADDED_REPORT = {"added": 7, "where": LIST_PLACE, "items": ITEMS, "how_to_handle_it": ADDED_NOTE.format(n=7)}
 ASK = "What were the to-dos I told you?"
+#: Conversation B as it went live (words invented where they were personal; the talker's denials paraphrased).
+LIVE_B = [u("a nucleus arc."), a("Yo, what's up? You testing the new build?"), u("I asked you to, like, close arc."),
+          a("Arc is closed."), u("I told you about the total list. Right? What were the totals from it?"),
+          a("I don't have that on record. What list are you talking about?"),
+          u("No. I just gave you a list of things that I have to do around the app. Right? So what were they?"),
+          a("I'm drawing a blank on that one. Can you run me through it again?")]
 DENIALS = ("don't have", "do not have", "no record", "drawing a blank", "not on record", "didn't tell", "did not tell",
            "haven't told", "not saved", "nothing saved", "don't remember", "can't recall", "no idea")
 
@@ -70,6 +76,14 @@ def cases() -> list[dict[str, Any]]:
         dict(id="b_ask_with_view", issue="recall", check="answers_or_looks", recent=view, messages=[u(ASK)]),
         dict(id="b_what_did_i_tell_you", issue="recall", check="answers_or_looks", recent=view,
              messages=[u("What did I tell you a few minutes ago?")]),
+        # the live shape of conversation B: a misheard opener, a window closed, then the question as recognition heard
+        # it ("total list", "totals"); and the same after the live run's denials, when they say it plainly
+        dict(id="live_b3", issue="live", check="answers_or_looks", recent=view, messages=LIVE_B[:4] + [
+            u("I told you about the total list. Right? What were the totals from it?")]),
+        dict(id="live_b3_other_words", issue="live", check="answers_or_looks", recent=view, messages=LIVE_B[:4] + [
+            u("Wait, didn't I give you a bunch of stuff earlier? What was it?")]),
+        dict(id="live_b6", issue="live", check="answers_or_looks", recent=view, messages=LIVE_B + [
+            u("Not that, bro. The to do list that I told you to, um, keep. Right? Um, what was it?")]),
         # hours later (nothing in the last hour): the talker must look, never deny
         dict(id="b_ask_no_view", issue="look", check="looks", messages=[u(ASK)]),
         dict(id="b_plumber_no_view", issue="look", check="looks",
@@ -110,8 +124,8 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
     denied = any(d in spoken for d in DENIALS)
     looked = "quick_memory" in names or "tell_yuki" in names
     kind = case["check"]
-    if kind == "answers_or_looks":
-        return not denied and (looked or _items_said(spoken) >= 2)
+    if kind == "answers_or_looks":   # looked, said the items, or named the list it means (misheard words)
+        return not denied and (looked or _items_said(spoken) >= 2 or "to-do" in spoken)
     if kind == "looks":
         return looked and not denied
     if kind == "looks_list":

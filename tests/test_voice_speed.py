@@ -547,9 +547,11 @@ def test_the_cached_prompt_stays_under_its_measured_size() -> None:
     call) against main's 16.6k / 17.2k, and the time to first token was the same as main's in a call (p50 1,035 vs
     1,034 ms, 8 interleaved rounds, scripts/voice_ttft.py). A first draft at 18.4k in a call cost +300 ms: the step is
     between the two, so this guard stays tight."""
-    from yuki.voice.mouth import CALL_LAYER, HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT
+    from yuki.voice.mouth import CALL_LAYER, HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT
 
-    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 41_800
+    # vfix4: the voice marks are their own section (sent only with a voice that performs them): still counted here,
+    # so the guard holds for the largest core a conversation can send
+    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) + len(VOICE_MARKS_PROMPT) <= 41_800
     assert len(CALL_LAYER) <= 2_300
 
 
