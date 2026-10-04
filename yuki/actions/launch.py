@@ -2087,9 +2087,10 @@ class _LauncherApp:
         """What is there now: ``{"app": [windows], "launcher": [windows], "candidates": [windows], "foreground"}``
         (and ``"app_procs"`` with ``scan``), each window ``{"hwnd", "title", "process_name", "pid", "fullscreen",
         "in_front", "how"}``."""
+        windows = _user_windows()
         foreground = _foreground()
         app, launcher, candidates = [], [], []
-        for w in _user_windows():
+        for w in windows:
             p = _proc(w.pid, str(w.process_name or ""))
             entry = {"hwnd": int(w.hwnd), "title": w.title, "process_name": w.process_name, "pid": int(w.pid),
                      "fullscreen": bool(getattr(w, "is_fullscreen", False)), "in_front": int(w.hwnd) == foreground}
@@ -2150,7 +2151,8 @@ def _starting_summary(name: str, carrier: str, state: dict, waited_s: float, *, 
     for w in (state.get("candidates") or [])[:3]:
         parts.append(f"a new window under {carrier} appeared: {_window_line(w)} - not confirmed as {name} (its "
                      f"program is not named for it)")
-    parts.append(f"after {waited_s:.0f} s it is still starting; a game can take a minute or two to show its window")
+    parts.append(f"after {waited_s:.0f} s it is still starting; a game can take a minute or two to show its window "
+                 f"(not done yet; another launch_app waits for it and never hands it to the launcher twice)")
     return "; ".join(parts)
 
 
