@@ -89,7 +89,11 @@ MUTEX_NAME = "Local\\YukiWindowSingleInstance"
 FOCUS_EVENT = "Local\\YukiWindowFocus"
 #: The pages, and the Qt window's page names (yuki.ui.own_window.PAGES: the agent's open_yuki tool) mapped to them.
 PAGES = ("home", "work", "me", "playbook", "activity", "settings")
-PAGE_ALIASES = {"today": "home", "status": "activity", "yuki": "playbook", "chat": "home", "day": "work"}
+PAGE_ALIASES = {"today": "home", "status": "activity", "yuki": "playbook", "chat": "home", "day": "work",
+                "todos": "home"}
+#: A place on a page an opener can ask for (the agent's open_yuki "todos": Home, scrolled to Your list): the page's
+#: own sub-address (``#home/list``), which the page brings into view.
+PAGE_SUBS = {"todos": "list"}
 #: A page asked for (navigation) is checked against memory's change stamps if older than this.
 STALE_S = 45.0
 #: A want for the open page again (the same tab clicked, the window shown again): checked if older than this.
@@ -103,7 +107,7 @@ TOPIC_PAGES: dict[str, tuple[str, ...]] = {
     "call": ("day", "activity"),                     # the tray's forwarded call status (rail and Home: patched)
     "request_end": ("home", "activity"),             # a request finished, failed or was replaced (the request log)
     "rules": ("me", "playbook"),
-    "todos": ("home", "activity"),
+    "todos": ("home", "work", "activity"),           # Home's Your list, Work's To-dos (appTodo), the ledger
     "standing": ("playbook",),
     "portrait": ("me", "home"),
     "people": ("me", "home"),
@@ -214,6 +218,11 @@ def page_name(page: str | None) -> tuple[str, bool]:
     return (p if p in PAGES else PAGE_ALIASES.get(p, "home")), p == "chat"
 
 
+def page_sub(page: str | None) -> str:
+    """The place on the page a requested name means (:data:`PAGE_SUBS`), ``""`` for the page itself."""
+    return PAGE_SUBS.get(str(page or "").strip().casefold(), "")
+
+
 def page_hash(name: str, data: Any) -> str:
     """What a page's data says, as a short digest: equal digests need no post (the page's :data:`VOLATILE` fields,
     which change on every build with nothing new to show, left out)."""
@@ -311,8 +320,10 @@ class WebWindow:
                  fixture: dict[str, Any] | None = None, connect: bool = True, ui_path: Path | None = None,
                  t0: float | None = None, metrics_path: Path | None = None, shot: Path | None = None,
                  exit_after: float | None = None, memory_low_after: float | None = None,
-                 policy_path: Path | None = None, shot_delay: float = 0.0, splash: bool = False) -> None:
+                 policy_path: Path | None = None, shot_delay: float = 0.0, splash: bool = False,
+                 sub: str = "") -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
+        self.sub = sub                         # the place on the first page asked for (``todos``: Home's Your list)
         self.splash = splash                   # the startup splash was asked for (the tray's first window of a run)
         self.splash_answered = False           # the page's first ready got its answer (play or not): only once
         self.page, self.thread_open = page, thread
@@ -440,7 +451,7 @@ class WebWindow:
             self.booted = True
             self.post({"kind": "boot", "source": "fixture", "shell": shift_times(f["shell"], delta),
                        "pages": shift_times(f["pages"], delta), "chat": shift_times(f.get("chat") or {}, delta),
-                       "appearance": appearance(), "page": self.page, "version": app_version()})
+                       "appearance": appearance(), "page": self.page, "sub": self.sub, "version": app_version()})
             return
         self._snapshot_done.wait(1.5)   # read in parallel with the browser's start; ~0.1 s
         with self._lock:
@@ -451,7 +462,7 @@ class WebWindow:
                 self.posted_full.setdefault(k, page_hash("", v))
         chat = self.chat_payload() if self.model is not None else None
         self.post({"kind": "boot", "source": "snapshot", "shell": self.shell, "pages": pages, "chat": chat,
-                   "appearance": appearance(), "page": self.page, "version": app_version()})
+                   "appearance": appearance(), "page": self.page, "sub": self.sub, "version": app_version()})
         if self.thread_open:
             self.post({"kind": "focus", "page": self.page, "thread": True})
         self.marks["boot_sent"] = time.time()
@@ -673,7 +684,8 @@ class WebWindow:
             lately = [{"ref": p["ref"], "name": p["name"], "route": p.get("route") or "", "last_at": p.get("last_at"),
                        "count": p.get("count"), **({"rhythm": p["rhythm"]} if p.get("rhythm") else {})}
                       for p in people if source == "index" and p.get("last_at")]
-            data = W.build_home(m, requests_csv=self.requests_csv(), people=lately, call_status=self.call_status)
+            data = W.build_home(m, requests_csv=self.requests_csv(), people=lately, call_status=self.call_status,
+                                pending=self.shown_pending())
             if self.playing:
                 data["now"]["playing"] = self.playing
             return data
@@ -1110,7 +1122,7 @@ class WebWindow:
                 self.topic("voice")
         elif kind == "focus":
             page, thread = page_name(msg.get("page")) if msg.get("page") else (None, False)
-            self.come_forward(page, thread)
+            self.come_forward(page, thread, page_sub(msg.get("page")))
         elif kind == "permissions":
             self.post({"kind": "permissions", "permissions": msg.get("permissions")})
         elif kind == "call":   # the tray's call status, forwarded once per change: no memory read for the rail
@@ -1118,12 +1130,14 @@ class WebWindow:
         elif kind == "memory":   # memory's named events, forwarded by the tray (a closed topic name)
             self.on_memory_topic(str(msg.get("topic") or ""))
 
-    def come_forward(self, page: str | None = None, thread: bool = False) -> None:
+    def come_forward(self, page: str | None = None, thread: bool = False, sub: str = "") -> None:
         """A tray click, the agent's open_yuki or a second start: the window comes forward and the page that will
-        be open is refreshed (not Home whatever is open: 42 R5)."""
+        be open is refreshed (not Home whatever is open: 42 R5). ``sub``: a place on that page to bring into view
+        (``list``: Home's Your list, for open_yuki's ``todos``)."""
         if self.host is not None:
             self.host.invoke(self.host.bring_forward)
-        self.post({"kind": "focus", **({"page": page} if page else {}), **({"thread": True} if thread else {})})
+        self.post({"kind": "focus", **({"page": page} if page else {}), **({"thread": True} if thread else {}),
+                   **({"sub": sub} if page and sub else {})})
         if page and page != self.open_page:
             return   # the page goes there and asks for it (want)
         self.refresh(self.open_page, stale_s=10.0)
@@ -1285,6 +1299,8 @@ class WebWindow:
         # Correct from your own words with its Undo
         "close_thread": "a_close_thread", "thread_continue": "a_thread_continue", "open_page": "a_open_page",
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
+        # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
+        "todo_end": "a_todo_end", "todo_undo": "a_todo_undo", "todo_add": "a_todo_add",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
@@ -1312,12 +1328,14 @@ class WebWindow:
         reply = self._tray("offer", card=m.get("card"))
         self.refresh("home")
         self.refresh("activity")
+        self.refresh("work")   # an "Add to list" offer puts a to-do on Work's list too
         return reply
 
     def a_offer_undo(self, m: dict[str, Any]) -> dict[str, Any]:
         reply = self._tray("offer_undo", card=m.get("card"))
         self.refresh("home")
         self.refresh("activity")
+        self.refresh("work")
         return reply
 
     def a_card_feedback(self, m: dict[str, Any]) -> dict[str, Any]:
@@ -1450,7 +1468,8 @@ class WebWindow:
         return {"status": r.get("status"), "how": how}
 
     #: Which page shows the items of a ref kind (its Correct's live refresh).
-    REF_PAGES = {"fact": ("me", "home"), "journal": ("me",), "thread": ("work", "home"), "episode": ("day",)}
+    REF_PAGES = {"fact": ("me", "home"), "journal": ("me",), "thread": ("work", "home"), "episode": ("day",),
+                 "todo": ("home", "work"), "commit": ("home", "work"), "loop": ("home", "work")}
 
     def a_correct_item(self, m: dict[str, Any]) -> dict[str, Any]:
         """Correct (the feedback round 3, W3): the user's few words about what is wrong with one item (``fact:N``, a
@@ -1471,6 +1490,60 @@ class WebWindow:
         for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
             self.refresh(page)
         return {"correction_id": cid, "ref": ref}
+
+    #: How long a to-do you marked done here can be put back (memory's ``reopen_todo`` window).
+    TODO_UNDO_S = 10 * 60.0
+
+    def _todo_refresh(self) -> None:
+        for page in ("home", "work", "activity"):
+            self.refresh(page)
+
+    def a_todo_end(self, m: dict[str, Any]) -> dict[str, Any]:
+        """A to-do's Done or Not needed (the list on Home and Work): memory's ``end_todo`` by the item's id, at once,
+        no model. ``undo``: whether its Undo can put it back (a to-do you added, within :data:`TODO_UNDO_S`)."""
+        ref, how = str(m.get("ref") or ""), str(m.get("how") or "")
+        if how not in ("done", "not_needed") or not ref:
+            return {"ok": False, "error": "Unknown choice."}
+        mem = self._memory()
+        ended = mem.end_todo(ref, how)
+        self._todo_refresh()
+        if not ended:
+            return {"ok": False, "error": "That’s already off your list."}
+        can_undo = ref.startswith("todo:") and callable(getattr(mem, "reopen_todo", None))
+        return {"ref": ended, "how": how, "undo": can_undo, **({"until": time.time() + self.TODO_UNDO_S} if can_undo else {})}
+
+    def a_todo_undo(self, m: dict[str, Any]) -> dict[str, Any]:
+        """The Undo of a Done or Not needed on a to-do you added: memory's ``reopen_todo``; it is open again, as it was."""
+        fn = getattr(self._memory(), "reopen_todo", None)
+        back = fn(str(m.get("ref") or "")) if callable(fn) else None
+        self._todo_refresh()
+        if not back:
+            return {"ok": False, "error": "Too late to put it back (10 minutes)."}
+        return {"ref": back}
+
+    def a_todo_add(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Add from the window: your words as the to-do (memory's ``add_todo``, as the voice adds one), with the due
+        day and time from the page's own date and time fields (machine values ``YYYY-MM-DD`` and ``HH:MM``, checked
+        here; nothing is read out of the words)."""
+        from datetime import datetime
+
+        text = " ".join(str(m.get("text") or "").split())
+        if not text:
+            return {"ok": False, "error": "Say the to-do in a few words."}
+        day, clock = str(m.get("day") or "").strip(), str(m.get("time") or "").strip()
+        due = None
+        try:
+            if day:
+                datetime.strptime(day, "%Y-%m-%d")
+                due = day
+                if clock:
+                    datetime.strptime(clock, "%H:%M")
+                    due = f"{day} {clock}"
+        except ValueError:
+            return {"ok": False, "error": "That date isn’t one I can read. Pick it again."}
+        ref = self._memory().add_todo(text, due)
+        self._todo_refresh()
+        return {"ref": ref}
 
     def a_cancel_correction(self, m: dict[str, Any]) -> dict[str, Any]:
         """The Undo of a Correct while it waits (memory's ``cancel_correction``); once the pass started it is too late
@@ -2241,7 +2314,7 @@ def main(argv: list[str] | None = None) -> int:
                     fixture=load_fixture(Path(args.fixture)) if args.fixture else None,
                     connect=not args.no_connect, t0=args.t0, metrics_path=args.metrics, shot=args.shot,
                     exit_after=args.exit_after, memory_low_after=args.memory_low_after,
-                    shot_delay=args.shot_delay, splash=bool(args.splash))
+                    shot_delay=args.shot_delay, splash=bool(args.splash), sub=page_sub(args.page))
     win.probe_frame = bool(args.probe_frame and args.offscreen)
     win.start()
     query = "&".join(q for q in (args.query, splash_query(bool(args.splash))) if q)

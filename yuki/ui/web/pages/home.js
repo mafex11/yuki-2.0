@@ -123,6 +123,61 @@
       r.note ? h('div', { class: 'why', text: r.note }) : null, r.cost ? h('div', { class: 'cost', text: r.cost }) : null);
   }
 
+  /* ---------- the to-do list (appTodo, 4 Oct): Home's "Your list" and Work's "To-dos" share these rows ----------
+     memory's merged to-do list, the same one Yuki reads when you ask what is on it. A row: the round tick (Done), the
+     words, when it is due in natural words and where it came from, then Not needed and Correct (the shared "What's
+     wrong?" line, ui.js). Done / Not needed go to memory at once; the row says so for 5 s, with Undo while memory can
+     put it back (a to-do you added, within 10 minutes), then leaves. Nothing here decides anything. */
+  const END_WORDS = { done: 'Done. It’s off your list.', not_needed: 'Not needed. It’s off your list.' };
+  function todoMeta(t, full) {
+    const bits = [t.due ? h('span', { class: 'td-due' + (t.over ? ' over' : ''), text: t.due }) : null,
+      t.from ? h('span', { text: t.from }) : null, full && t.added ? h('span', { text: 'added ' + t.added }) : null].filter(Boolean);
+    return bits.length ? h('div', { class: 'td-m' }, bits) : null;
+  }
+  /* one open to-do; `page` is the page data it lives in (its Correct's pending line), `full` on Work (its own words,
+     when it was added, an open loop's evidence) */
+  Y.todoRow = (t, d, page, full) => {
+    const can = (d.todos || {}).can || {}, p = (d.pending || {})[t.ref];
+    const words = full || !t.title ? t.text : t.title;
+    const row = h('div', { class: 'todo' + (t.over ? ' over' : ''),
+      data: { k: 'todo:' + t.ref, cref: t.ref, cpage: page, kind: 'todo', title: t.title || '', text: t.text } },
+    can.end ? h('button', { class: 'td-tick', data: { do: 'todo-end', how: 'done' }, attrs: { type: 'button', 'aria-label': 'Done: ' + t.text }, title: 'Done' }, ic('check'))
+      : h('i', { class: 'td-dot', aria: { hidden: 'true' } }),
+    h('div', { class: 'td-b' },
+      h('div', { class: 'td-t', text: words, title: words !== t.text ? t.text : '' }),
+      todoMeta(t, full),
+      full && t.evidence ? h('div', { class: 'td-ev', text: t.evidence }) : null,
+      p ? h('div', { class: 'td-fix' }, Y.fixLine(p)) : null,
+      h('div', { class: 'fixslot' })),
+    h('div', { class: 'td-acts' },
+      can.end ? key('Not needed', { cls: 'xs ghost', data: { do: 'todo-end', how: 'not_needed' }, title: 'You don’t need it any more: it leaves your list' }) : null,
+      can.correct && !Y.fixing(p) ? Y.correctKey() : null));
+    return row;
+  };
+  /* Home's "Your list": the open to-dos, due first, a few lines; the rest on Work (see all) */
+  function yourList(d) {
+    const T = d.todos; if (!T) return null;   // a snapshot from before the list: drawn once memory's data is in
+    const open = T.open || [], n = T.n != null ? T.n : open.length, more = Math.max(0, n - open.length);
+    const body = open.length ? [h('div', { class: 'todos' }, open.map((t) => Y.todoRow(t, d, 'home', false))),
+      more ? h('a', { class: 'td-more', attrs: { href: '#work/todos' }, text: `${more} more on Work` }) : null]
+      : Y.empty('Nothing on your list. Ask me to keep a to-do, or add one on Work, and it shows here.');
+    const all = h('a', { class: 'label td-all', attrs: { href: '#work/todos' }, title: 'Every to-do, and the ones done lately, on Work' }, 'see all', ic('chev'));
+    return Y.k(Y.sec('Your list', n, body, all, 'todosec'), 'list');
+  }
+  /* a place on the page asked for (open_yuki's "todos" opens #home/list; Home's "see all" opens #work/todos): that
+     block comes into view once per visit (S.navs), as Work's thread tile does */
+  const FOCUSED = {};
+  Y.focusBlock = (main, k, tag) => {
+    if (FOCUSED[tag] === Y.S.navs) return;
+    const el = main.querySelector(`[data-k="${k}"]`);
+    if (!el) return;   // its data isn't here yet: the mount after it arrives
+    FOCUSED[tag] = Y.S.navs;
+    setTimeout(() => {
+      el.scrollIntoView({ block: 'start', behavior: window.Lattice.Motion.reduced ? 'auto' : 'smooth' });
+      el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600);
+    }, 60);
+  };
+
   function build(d, S, D) {
     const runs = D.shell.runs || [];
     const needs = d.needs || [], offers = d.offers || [], away = d.away || [], running = d.running || [];
@@ -148,7 +203,8 @@
       h('div', { class: 'grid2', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Needs you', needs.length, needsB), 'needs'),
-          Y.k(Y.sec('Offers', offers.length, offersB), 'offers')),
+          Y.k(Y.sec('Offers', offers.length, offersB), 'offers'),
+          yourList(d)),
         h('div', { class: 'col', data: { k: 'right' } },
           Y.k(Y.sec('Running', runningN, runB), 'running'),
           Y.k(Y.sec('Since you were away', away.length, awayB), 'away'),

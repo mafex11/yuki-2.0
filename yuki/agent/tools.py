@@ -185,8 +185,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "open_yuki",
         "label": "Opening my window",
-        "description": "Open your own window (Yuki's app, the user's dashboard) on a page: " + PAGE_WORDS
-                       + ". It is not in the window list while closed.",
+        "description": "Your own window. " + PAGE_WORDS,
         "input_schema": _obj({"page": {"type": "string", "enum": list(YUKI_PAGES)}}, ["page"]),
     },
     {

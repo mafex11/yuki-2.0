@@ -37,6 +37,7 @@ To-dos and the coach (the service's nudge worker, yuki.memory.nudges)::
     memory.todos(include_done=False) -> list[dict]      # open loops + commitments + the user's own to-dos
     memory.add_todo(text, due=None) -> "todo:N"
     memory.complete_todo(ref) -> id | None              # an id ("todo:3", "commit:5", "loop:12"), never text
+    memory.reopen_todo(ref) -> id | None                # Undo of end_todo on "todo:N" within 10 min (the window)
     memory.pending_nudges() -> list[dict]               # unshown, oldest first; wait on Local\\YukiNudgeReady
     memory.recent_nudges(hours=12) -> list[dict]        # shown ones of the last N hours, with shown_at + reaction
     memory.ack_nudge(nudge_id, reaction)                # shown | dismissed | replied | snoozed
@@ -682,13 +683,15 @@ class MemoryClient:
 
     #: What :meth:`correct_item` takes: the ref prefixes the lists give -> the correction target's letter.
     _CORRECT_KINDS = {"fact": "P", "f": "P", "p": "P", "thread": "W", "w": "W", "episode": "E", "e": "E",
-                      "session": "E", "journal": "J", "j": "J", "heard": "J"}
+                      "session": "E", "journal": "J", "j": "J", "heard": "J", "todo": "T", "t": "T", "commit": "C",
+                      "c": "C"}
 
     def correct_item(self, ref: Any, words: str) -> dict:
         """Correct one item from the user's own short words about what is wrong (the feedback round 3, W3): a portrait
         fact or a person's summary (``fact:N``), a thread of work (``thread:N``), a work session (``episode:N``) or a
-        journal entry such as a "maybe misheard" one (``journal:N``); ``words`` is what they said ("he's my cousin, not
-        a classmate", "that was last week"). Returns at once: the correction is recorded in the Me page's fixed
+        journal entry such as a "maybe misheard" one (``journal:N``), or one item of the to-do list as :meth:`todos`
+        names it (``todo:N``, ``commit:N``; ``loop:N`` corrects the loop's portrait fact); ``words`` is what they said
+        ("he's my cousin, not a classmate", "that was last week"). Returns at once: the correction is recorded in the Me page's fixed
         format with the item as its target, and the service is woken to run the correction pass, which rewrites the
         item (and anything else carrying the same wrong thing) a moment later - bi-temporally, the old version kept,
         a diary line each; the user never edits text by hand. Poll :meth:`correction_status` with ``correction_id``
@@ -699,6 +702,13 @@ class MemoryClient:
         head, _, tail = raw.partition(":")
         letter = self._CORRECT_KINDS.get(head.lower()) if tail else self._CORRECT_KINDS.get(raw[:1].lower())
         num = tail if tail else raw[1:]
+        if head.lower() == "loop" and tail.strip().isdigit():   # an open loop is its portrait fact's shown form
+            try:
+                loop = next((x for x in self.store.open_loops("open") if x.id == int(tail)), None)
+            except Exception:
+                loop = None
+            if loop is not None and loop.portrait_fact_id is not None:
+                letter, num = "P", str(loop.portrait_fact_id)
         out: dict[str, Any] = {"ok": False, "ref": raw, "correction_id": None, "state": None}
         if letter is None or not num.isdigit():
             out["error"] = "That can't be corrected here."
@@ -723,6 +733,8 @@ class MemoryClient:
             had = " ".join(str(obj.summary or obj.text or "").split())
         elif letter == "P":
             subject, had = obj.subject or obj.kind, " ".join(str(obj.shown or obj.text or "").split())
+        elif letter in ("T", "C"):   # a to-do on the list (the user's own, or Yuki's commitment)
+            subject, had = "an item on the user's to-do list", " ".join(str(obj.text or "").split())
         else:
             src = obj.source if isinstance(getattr(obj, "source", None), dict) else {}
             subject = "what Yuki heard" if src.get("heard") else (obj.app or "a journal entry")
@@ -736,7 +748,7 @@ class MemoryClient:
             out["error"] = f"memory: {type(exc).__name__}"
             return out
         self.rerender_portrait()   # wakes the service: its scheduler runs queued corrections before anything else
-        prefix = {"P": "fact", "W": "thread", "E": "episode", "J": "journal"}[letter]
+        prefix = {"P": "fact", "W": "thread", "E": "episode", "J": "journal", "T": "todo", "C": "commit"}[letter]
         out.update(ok=True, ref=f"{prefix}:{cand.item_id}", correction_id=cid, state="updating")
         return out
 
@@ -3352,6 +3364,25 @@ class MemoryClient:
         except Exception:
             return None
 
+    #: How long after :meth:`end_todo` a to-do the user added can be put back (the window's Undo).
+    REOPEN_WITHIN_S = 10 * 60.0
+
+    def reopen_todo(self, ref: str) -> str | None:
+        """The Undo of :meth:`end_todo` on a to-do the user added (``"todo:N"``) ended as done or not needed within
+        :data:`REOPEN_WITHIN_S`: it is open again, as it was. Returns the id, or ``None`` (another kind of item: a
+        commitment or an open loop ends through history this cannot take back; too late; not ended). Never raises."""
+        prefix, _, number = str(ref or "").strip().strip("[]").partition(":")
+        if prefix != "todo" or not number.strip().isdigit():
+            return None
+        since = time.time() - self.REOPEN_WITHIN_S
+        try:
+            ok = self.store._write(lambda conn: conn.execute(
+                "UPDATE todos SET status='open', done_at=NULL, updated_at=? WHERE id=? AND status IN ('done','dropped')"
+                " AND done_at >= ?", (time.time(), int(number), since)).rowcount == 1)
+        except Exception:
+            return None
+        return f"todo:{int(number)}" if ok else None
+
     def aliases(self) -> list[dict]:
         """Names the user corrected: ``[{"heard": "Barun", "name": "Varun", "why", "since"}]``, oldest first."""
         try:
@@ -4197,6 +4228,7 @@ _STAMP_SQL: dict[str, str] = {
     "timeline": "SELECT id, updated_at FROM timeline ORDER BY id DESC LIMIT 1",
     "goals": "SELECT max(id), max(updated_at) FROM goals",
     "todos": "SELECT max(id), max(updated_at) FROM todos",
+    "open_loops": "SELECT max(id), max(resolved_at), max(updated_at) FROM open_loops",
     "contacts": "SELECT max(id), max(updated_at) FROM contacts",
     "calls": "SELECT max(id), max(updated_at) FROM calls",
     "work_threads": "SELECT max(id), max(updated_at) FROM work_threads",

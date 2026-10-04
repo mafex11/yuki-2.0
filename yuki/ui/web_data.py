@@ -364,12 +364,101 @@ def home_call(call: dict[str, Any] | None, waiting: dict[str, Any] | None) -> tu
     return now_call, running
 
 
+# -- the to-do list (appTodo, 4 Oct): Home's "Your list" and Work's "To-dos" ---------------------------------------
+# The live test of 4 Oct: Yuki added seven to-dos by voice, and the window showed them nowhere. The list is memory's
+# merged to-do list (MemoryClient.todos: the same one the agent's todo tool lists), so what Yuki says is on it is what
+# the window shows.
+
+#: Open to-dos Home's "Your list" shows (the rest under "see all", on Work).
+HOME_TODOS = 5
+#: To-dos done lately in Work's fold, at most (memory keeps the ones done in the last 14 days in the list).
+TODO_DONE_SHOWN = 10
+#: Where an item came from, said to you (memory's source names; your own additions say nothing).
+TODO_FROM = {"chat": "you told me", "call": "said on a call", "commitment": "for me to do", "loop": "open loop"}
+#: The refs whose Correct memory takes (``correct_item``; an open loop corrects its portrait fact).
+TODO_PREFIXES = ("todo:", "commit:", "loop:")
+
+
+def due_epoch(due: Any) -> tuple[float | None, bool]:
+    """memory's ``due`` (``"2026-10-05"``: that day, no time; or a local ISO date and time) as ``(epoch, all_day)``."""
+    s = str(due or "").strip()
+    if not s:
+        return None, False
+    try:
+        if len(s) == 10:
+            return datetime.strptime(s, "%Y-%m-%d").timestamp(), True
+        return datetime.fromisoformat(s).timestamp(), False
+    except ValueError:
+        return None, False
+
+
+def due_words(at: float | None, all_day: bool, now: float) -> tuple[str, bool]:
+    """When a to-do is due, as people say it, and whether that is past: ``due today, 5 PM`` / ``due tomorrow`` /
+    ``due 6 October, 9 AM``; ``was due yesterday``. A deterministic format of memory's due time, nothing else."""
+    from yuki.ui.window.data import nat_day, nat_time
+
+    if at is None:
+        return "", False
+    today = datetime.fromtimestamp(now).date()
+    day_of = datetime.fromtimestamp(at).date()
+    over = day_of < today if all_day else at < now
+    day = "tomorrow" if day_of == today + timedelta(days=1) else nat_day(at, today=today)
+    words = day if all_day else f"{day}, {nat_time(at)}"
+    return (f"was due {words}" if over else f"due {words}"), over
+
+
+def todo_view(t: dict[str, Any], now: float) -> dict[str, Any]:
+    """One item of memory's to-do list as the window shows it: its words, where it came from (``from``; nothing for
+    your own), when it is due in natural words (``due``, ``over`` when that is past), when it was added, an open
+    loop's evidence (dates made natural; a commitment's is memory's note about you, not shown), and whether Undo can
+    put it back after Done (``undo``: a to-do you added)."""
+    from yuki.ui.window.data import nat_day, natural
+
+    due_at, all_day = due_epoch(t.get("due"))
+    due, over = due_words(due_at, all_day, now)
+    ref, source = str(t.get("id") or ""), str(t.get("source") or "")
+    since = epoch_of(t.get("since"))
+    evidence = natural(" ".join(str(t.get("evidence") or "").split())) if source == "loop" else ""
+    return {"ref": ref, "text": " ".join(str(t.get("text") or "").split()),
+            "title": " ".join(str(t.get("title") or "").split()) or None, "from": TODO_FROM.get(source, ""),
+            "due": due, "over": over, "due_at": due_at, "all_day": all_day, "since": since,
+            "added": nat_day(since, today=datetime.fromtimestamp(now).date()) if since else "",
+            "evidence": evidence or None, "undo": ref.startswith("todo:"),
+            "status": "open" if t.get("status") == "open" else "done"}
+
+
+def todo_lists(memory: Any, now: float, *, include_done: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(open, done)``: the open to-dos, the ones due first (soonest, so the overdue lead) then the undated newest
+    first; with ``include_done``, the ones done lately (memory's order: newest first). Empty when memory can't say."""
+    rows = _safe(lambda: memory.todos(include_done=include_done), []) or []
+    views = [todo_view(t, now) for t in rows if isinstance(t, dict) and t.get("id")]
+    opened = sorted((v for v in views if v["status"] == "open"),
+                    key=lambda v: (v["due_at"] is None, v["due_at"] or 0.0, -(v["since"] or 0.0)))
+    done = [v for v in views if v["status"] != "open"][:TODO_DONE_SHOWN]
+    return opened, done
+
+
+def todo_moment(items: list[dict[str, Any]], now: float) -> float | None:
+    """The next moment the list changes with the clock alone: a timed due passing ("due" becomes "was due"; a day's
+    due turns at midnight, which every page already rebuilds at)."""
+    return min((v["due_at"] for v in items if v.get("due_at") and not v.get("all_day") and v["due_at"] > now),
+               default=None)
+
+
+def todo_can(memory: Any) -> dict[str, bool]:
+    """Which of the list's buttons this memory takes: Done / Not needed, Undo of a Done, Correct, Add."""
+    return {"end": callable(getattr(memory, "end_todo", None)), "undo": callable(getattr(memory, "reopen_todo", None)),
+            "correct": callable(getattr(memory, "correct_item", None)), "add": callable(getattr(memory, "add_todo", None))}
+
+
 def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
                now: float | None = None, people: list[dict[str, Any]] | None = None,
-               call_status: dict[str, Any] | None = None) -> dict[str, Any]:
+               call_status: dict[str, Any] | None = None, pending: dict[str, Any] | None = None) -> dict[str, Any]:
     """Home: the Now strip, Needs you (questions), Running (the call, transcripts waiting; live runs come from the
-    tray), Offers, Since you were away (requests that finished, offers that ran) and the people lately.
-    ``call_status``: the tray's forwarded ``call_status()`` (then the call and the transcripts waiting are not read)."""
+    tray), Offers, Your list (the open to-dos, due first, at most :data:`HOME_TODOS`; ``n`` is how many are open), Since
+    you were away (requests that finished, offers that ran) and the people lately.
+    ``call_status``: the tray's forwarded ``call_status()`` (then the call and the transcripts waiting are not read);
+    ``pending``: corrections sent on a to-do and not landed yet."""
     from yuki.ui.ledger import read_request_log
 
     now = time.time() if now is None else now
@@ -412,9 +501,14 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
     # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
     moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
     moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away if a.get("at")]
+    open_todos, _done = todo_lists(memory, now)
+    shown_todos = open_todos[:HOME_TODOS]
+    moments.append(todo_moment(shown_todos, now))
     next_at = min((m for m in moments if m and m > now), default=None)
     return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away,
-            "people": (people or [])[:6], "since": since, "next_at": next_at}
+            "people": (people or [])[:6], "since": since, "next_at": next_at,
+            "todos": {"open": shown_todos, "n": len(open_todos), "can": todo_can(memory)},
+            "pending": pending_view(pending, TODO_PREFIXES, now)}
 
 
 #: Where the day's AI spend went, in plain words (``yuki.core.cost``'s parts: memory's worker log names, the agent,
@@ -1109,8 +1203,9 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict
     most recently touched first), each with its title, where it stands (``state``: memory's card, said to you), the
     next step (``next``; memory's, or None until written), its checklist, the people and the apps it involves and
     its open goal; ``closed``: the ones closed as done or dismissed lately (newest first, for the Reopen fold);
-    ``pending``: corrections sent on a thread and not landed yet; ``can``: which of close / Continue / correct this
-    memory takes; and the week figure."""
+    ``pending``: corrections sent on a thread or a to-do and not landed yet; ``can``: which of close / Continue /
+    correct this memory takes; the week figure; and ``todos``: the whole to-do list (appTodo: ``open``, due first;
+    ``done``, the ones done lately, for the fold; ``can``: its buttons)."""
     from yuki.ui.window.data import natural
 
     now = time.time() if now is None else now
@@ -1143,8 +1238,11 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict
                            "closed_at": at, "by_you": t.get("closed_by") == "user"})
         closed.sort(key=lambda c: -(c["closed_at"] or 0))
         closed = closed[:CLOSED_SHOWN]
+    open_todos, done_todos = todo_lists(memory, now, include_done=True)
     return {"threads": threads, "closed": closed, "week": week if week is not None else week_figure(memory),
-            "pending": pending_view(pending, ("thread:",), now),
+            "pending": pending_view(pending, ("thread:", *TODO_PREFIXES), now),
+            "todos": {"open": open_todos, "done": done_todos, "n": len(open_todos), "can": todo_can(memory)},
+            "next_at": todo_moment(open_todos, now),
             "can": {"close": can_close, "cont": callable(getattr(memory, "thread_continue", None)),
                     "correct": callable(getattr(memory, "correct_item", None))}}
 
@@ -2050,10 +2148,12 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 
 #: Each page's memory tables (the ones its builder reads). Work's week figure and Activity's "Seen today, by app"
 #: read the timeline, so it is in their stamps (review F3): a revisit after STALE_S, or the open page's slow fallback,
-#: rebuilds them while you are at the PC; the hash still skips a build that shows nothing new.
+#: rebuilds them while you are at the PC; the hash still skips a build that shows nothing new. Home and Work show the
+#: to-do list (appTodo): your to-dos, the commitments (conversation facts) and the open loops.
+TODO_TABLES = ("todos", "conversation_facts", "open_loops")
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
-    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", "work_threads"),
-    "work": ("work_threads", "goals", "timeline"),
+    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", "work_threads", *TODO_TABLES),
+    "work": ("work_threads", "goals", "timeline", *TODO_TABLES),
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
     "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
@@ -2089,4 +2189,5 @@ def page_stamps(memory: Any, page: str, *, requests_csv: Path | None = None) -> 
 __all__ = ["SCHEMA", "build_shell", "page_stamps", "build_home", "build_me", "build_work", "build_day", "build_playbook",
            "build_activity", "build_settings", "people_now", "person_from_index", "contact_card", "chat_item",
            "rhythm_view", "goals_today", "thread_goals", "run_rows", "call_rows", "step_what", "step_result",
-           "runs_of", "offer_card", "shift_times", "media_now", "read_pending", "week_days", "week_figure"]
+           "runs_of", "offer_card", "shift_times", "media_now", "read_pending", "week_days", "week_figure",
+           "todo_view", "todo_lists", "due_words", "due_epoch"]

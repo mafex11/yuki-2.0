@@ -874,6 +874,10 @@ class WindowHost(QObject):
 
         Returns whether it was brought forward or started (``False``: the launch failed)."""
         self.start()
+        if page and self.window_engine() == "qt":   # the native window knows only its own page names
+            from yuki.ui.own_window import qt_page
+
+            page = qt_page(page)
         if self.proc is not None and self.proc.poll() is None:
             _allow_foreground(self.proc.pid)
             if self.server is not None:
