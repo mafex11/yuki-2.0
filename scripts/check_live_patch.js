@@ -776,6 +776,23 @@ async function inPage(F) {
   const lastS = F.pages.day.sessions[F.pages.day.sessions.length - 1], openS = main().querySelector('[data-k="sessions"] .fx.open');
   check('N2 a click opens the Day tab at the session holding the tile’s moment (review F2: not the clock), opened', decodeURIComponent(location.hash) === '#work/day/at:' + Math.round(FH.now.session.at) && !!openS
     && openS.querySelector('.fx-h .tx').textContent === lastS.title, `${decodeURIComponent(location.hash)} ${openS && openS.querySelector('.fx-h .tx').textContent}`);
+  // N3 (report 69): the Day tab's data not in yet when the tile is pressed (a window just opened): the Day tab asks
+  // for it, and the session holding the moment opens once it arrives
+  {
+    await go('#home'); await sleep(400);
+    const dayData = clone(Y.D.pages.day);
+    delete Y.D.pages.day; delete Y.D.raw.day;   // as in a window that never had it
+    for (const k of Array.from(Y.S.open)) if (String(k).startsWith('f:')) Y.S.open.delete(k);
+    const asked = wants().length;
+    main().querySelector('.nowsess').click(); await sleep(400);
+    const before3 = !main().querySelector('[data-k="sessions"] .fx.open');
+    const askedDay = wants().slice(asked).some((w) => w.page === 'day' && String(w.sub).startsWith('day/at:'));
+    await push('day', dayData); await sleep(900);
+    const open3 = main().querySelector('[data-k="sessions"] .fx.open');
+    check('N3 pressed before the Day data is in: Day is asked for, and the session opens when it arrives', askedDay && before3 && !!open3
+      && open3.querySelector('.fx-h .tx').textContent === lastS.title && decodeURIComponent(location.hash) === '#work/day/at:' + Math.round(FH.now.session.at),
+    `asked ${askedDay}, none before ${before3}, opened ${open3 && open3.querySelector('.fx-h .tx').textContent}`);
+  }
   // ---- the Work page (report 68): Today, Your list, Waiting on, Needs your reply, You said you'd ----
   await go('#work'); await sleep(900);
   const sec = (k) => main().querySelector(`[data-k="${k}"]`);

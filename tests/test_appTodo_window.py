@@ -128,7 +128,8 @@ def test_a_to_do_added_by_voice_is_on_home_and_work_at_once(store):
     for i in range(7):                                                                  # the live test: seven by voice
         client.add_todo(f"Invented to-do {i}", (datetime.fromtimestamp(time.time()) + timedelta(days=i)).strftime("%Y-%m-%d"))
     home = W.build_home(client, requests_csv=None)
-    assert home["todos"]["n"] == 7 and len(home["todos"]["open"]) == W.HOME_TODOS
+    # Home carries Work's whole Your list; the page shows the first HOME_TODOS (report 69)
+    assert home["todos"]["n"] == 7 and len(home["todos"]["open"]) == 7 and home["todos"]["shown"] == W.HOME_TODOS
     assert home["todos"]["open"][0]["text"] == "Invented to-do 0" and home["todos"]["open"][0]["due"] == "due today"
     assert home["todos"]["can"] == {"end": True, "undo": True, "correct": True, "add": True}
     work = W.build_work(client, week={"days": [], "totals": {}})
