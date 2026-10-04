@@ -2796,7 +2796,13 @@ class Conversation:
         """The wake word heard the name while this conversation runs (``at``: monotonic). Thread-safe."""
         loop = self._loop
         if loop is not None and not loop.is_closed():
-            loop.call_soon_threadsafe(self._names.append, float(at))
+            loop.call_soon_threadsafe(self._note_name, float(at))
+
+    def _note_name(self, at: float) -> None:
+        obs = self.observer
+        if obs.bot_speaking and not obs.user_speaking:
+            return   # Yuki's own voice saying her name (on speakers the mic hears it), not the user calling her
+        self._names.append(at)
 
     def _named_turn(self, *, final: bool = True) -> tuple[bool, str]:
         """Whether the user's words now were said to Yuki by measured evidence, and which: the first words after a wake

@@ -454,6 +454,48 @@ def test_the_name_said_during_a_conversation_is_passed_to_it() -> None:
     assert heard == [2.0] and s.started == [] and s.log.of("wake", state="name_in_conversation")
 
 
+def test_yukis_own_voice_saying_her_name_is_not_the_user_calling_her(tmp_path: Path) -> None:
+    conv, _log, _s, _t, _d = _conversation(tmp_path)
+    conv.observer.bot_speaking = True
+    conv._note_name(1.0)
+    assert not conv._names
+    conv.observer.user_speaking = True   # they talk over her: theirs
+    conv._note_name(2.0)
+    assert list(conv._names) == [2.0]
+
+
+def test_a_games_own_voice_chat_is_focus_mode_for_the_running_conversation() -> None:
+    from yuki.voice.session import VoiceSession
+
+    games: list[Any] = []
+    conv = SimpleNamespace(set_call=lambda *a: None, set_game=games.append)
+    s = SimpleNamespace(settings=Settings(), log=Log(), call_active=False, call_app=None, call_evidence=None,
+                        call_alone=False, call_off=False, wake_enabled=True, game_session=None, _conversation=conv,
+                        _standby_conv=None, _apply_wake=lambda: None, _emit_listening=lambda: None,
+                        fullscreen_probe=lambda: None)
+    s._wake_allowed = lambda: True
+    s._game_now = lambda: VoiceSession._game_now(s)
+    status = {"call": None, "sessions": [{"id": 4, "app": "VALORANT", "kind": "game", "status": "ask_later",
+                                          "ended": False}]}
+    VoiceSession.on_call_status(s, status)
+    assert s.game_session == "VALORANT" and games == ["VALORANT"] and s.log.of("wake", state="game_on")
+    VoiceSession.on_call_status(s, {"call": None, "sessions": []})
+    assert s.game_session is None and games[-1] is None
+    s.fullscreen_probe = lambda: True   # a full-screen window in front, no game voice chat: still a game for the voice
+    assert VoiceSession._game_now(s) == "fullscreen"
+    s.settings = Settings(voice_focus_mode=False)
+    assert VoiceSession._game_now(s) is None
+
+
+def test_the_fullscreen_probe_is_light_and_never_raises() -> None:
+    from yuki.voice.session import fullscreen_front
+
+    started = time.perf_counter()
+    for _ in range(20):
+        assert fullscreen_front() in (True, False)
+    assert (time.perf_counter() - started) / 20 < 0.01
+
+
 def test_in_a_game_or_call_a_rescued_sound_alike_never_wakes() -> None:
     from yuki.voice.session import VoiceSession
 

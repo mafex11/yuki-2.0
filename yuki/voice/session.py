@@ -150,6 +150,51 @@ def save_prefs(prefs: dict[str, Any], path: Path = PREFS_PATH) -> None:
         pass
 
 
+def fullscreen_front() -> bool:
+    """vGame: whether the window in front is full screen (a game, an F11 video), read at a wake.
+
+    The shell's own report of a Direct3D full-screen app, else a window without a caption covering its whole monitor
+    that is not the desktop or the taskbar (the test memory's watcher makes, without its imports: measured 5 Oct its
+    module took ~0.3 s to import and its probe ~0.3 s on a first call, too slow for the wake's path). Win32 reads only,
+    well under a millisecond; never raises."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        state = ctypes.c_int(0)
+        if shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value == 3:
+            return True   # QUNS_RUNNING_D3D_FULL_SCREEN
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(ctypes.c_void_p(hwnd), name, 64)
+        if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return False
+        user32.GetWindowLongW.restype = ctypes.c_long
+        style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), -16) & 0xFFFFFFFF   # GWL_STYLE
+        if style & 0x00C00000 == 0x00C00000:   # WS_CAPTION: a normal window, maximized or not
+            return False
+
+        class _MonitorInfo(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD)]
+
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        monitor = user32.MonitorFromWindow(ctypes.c_void_p(hwnd), 2)   # MONITOR_DEFAULTTONEAREST
+        info = _MonitorInfo(cbSize=ctypes.sizeof(_MonitorInfo))
+        rect = wintypes.RECT()
+        if not monitor or not user32.GetMonitorInfoW(ctypes.c_void_p(monitor), ctypes.byref(info)) \
+                or not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+            return False
+        m = info.rcMonitor
+        return rect.left <= m.left and rect.top <= m.top and rect.right >= m.right and rect.bottom >= m.bottom
+    except Exception:  # noqa: BLE001 - no reading: no game
+        return False
+
+
 def call_facing(call: dict[str, Any] | None) -> tuple[str | None, str | None, bool]:
     """``(app, evidence, alone)`` a conversation is given for memory's ``call_status()["call"]`` (v3.15).
 
@@ -338,12 +383,7 @@ class VoiceSession(QObject):
             return None
         if self.game_session:
             return self.game_session
-        probe = self.fullscreen_probe
-        if probe is None:
-            try:
-                from yuki.memory.avsignals import foreground_fullscreen as probe
-            except Exception:  # noqa: BLE001 - no probe: no game
-                return None
+        probe = self.fullscreen_probe or fullscreen_front
         try:
             return "fullscreen" if probe() else None
         except Exception:  # noqa: BLE001
