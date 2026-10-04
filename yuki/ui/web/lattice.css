@@ -476,8 +476,13 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .fact.mh .acts.inline, .acts.inline { position: static; opacity: 1; background: none; padding: 0; }
 .fact.mh .acts.inline { grid-column: 2; grid-row: 1 / span 2; }
 .confirm.res { position: relative; padding-bottom: 8px; }
-.confirm.res .res-drain { position: absolute; left: 22px; right: 0; bottom: 0; height: 3px; background: radial-gradient(circle, var(--text-3) 1px, transparent 1.3px) 0 0 / 6px 3px repeat-x; transform-origin: left; animation: drain 5s linear forwards; }
-@keyframes drain { to { transform: scaleX(0); } }
+/* the undo countdown's dotted line: whole dots go away one at a time from the right, each the same size and in the
+   same place until it goes (the 4 Oct bug: a scaleX drain squashed the whole line into a thin bar). The line is a
+   whole number of 6 px dots wide; --drain runs 1 to 0 and the clip keeps round(up) whole dots, so the first dot
+   leaves after one share of the time and the last at the end. Paint only: no layout while it runs. */
+@property --drain { syntax: '<number>'; inherits: false; initial-value: 1; }
+.confirm.res .res-drain { position: absolute; left: 22px; bottom: 0; width: round(down, calc(100% - 22px), 6px); height: 3px; background: radial-gradient(circle, var(--text-3) 1px, transparent 1.3px) 0 0 / 6px 3px repeat-x; clip-path: inset(0 calc(100% - round(up, calc(100% * var(--drain)), 6px)) 0 0); animation: drain 5s linear forwards; }
+@keyframes drain { from { --drain: 1; } to { --drain: 0; } }
 .fsearch { display: flex; align-items: center; gap: 10px; height: 38px; border: 1px solid var(--hair-2); border-radius: 12px; padding: 0 12px; margin: 4px 0 10px; color: var(--text-3); cursor: text; }
 .fsearch:focus-within { border-color: rgba(111,235,196,.55); }
 .fsearch .ic { width: 12px; height: 12px; }
