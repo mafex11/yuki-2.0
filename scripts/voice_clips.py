@@ -422,8 +422,9 @@ def plan(which: str) -> list[dict]:
             items.append({"set": "vfix", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": name == "k_name"})
     if which in ("lists",):
-        provider, voice = VFIX_USER
         for name, text in LIST_CLIPS:
+            # the name in v34's voice (the local wake model never caught apollo's "Yuki." offline, not even a near miss)
+            provider, voice = V34_USER if name == "k_name" else VFIX_USER
             items.append({"set": "lists", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": name == "k_name"})
     if which in ("names",):
