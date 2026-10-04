@@ -1740,7 +1740,9 @@ class TurnObserver:
             "output_tokens": turn.tokens.get("completion_tokens", 0),
         }
         usage["input_tokens"] = max(0, usage["input_tokens"])
-        cost = self.settings.estimate_cost(self.settings.voice_mouth_model, usage)
+        from yuki.agent.providers.client import talker_price_model   # Settings → AI may have moved the talker
+
+        cost = self.settings.estimate_cost(talker_price_model(self.settings), usage)
         # What memory and the chat keep is the words: the voice's marks (<sigh>, <style: ...>) are cut out.
         # What was heard: a line the spoken-line check dropped was never said, so it is never "the reply" either.
         spoken = "".join(turn.spoken).strip()
@@ -2182,6 +2184,9 @@ class _Hooks:
     # -- the mouth's model failover (v3.5) ----------------------------------------
 
     def fallbacks(self) -> list[dict[str, Any]]:
+        routed = getattr(getattr(self.c, "_client", None), "routed", None)
+        if callable(routed) and routed():
+            return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
         return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(s.voice_mouth_model, [])
                 if isinstance(t, dict) and t.get("model")]
@@ -2875,7 +2880,12 @@ class Conversation:
         stt.add_event_handler("on_update", on_update)
         stt.add_event_handler("on_eager_end_of_turn", on_eager)
         stt.add_event_handler("on_end_of_turn", on_eot)
-        self._client = bedrock_client(s.aws_region, getattr(s, "model_backend", None))
+        # Settings → AI: the talker's calls go to the client it wraps while "Voice replies" is on Claude (as before),
+        # else to the chosen provider and model (yuki.agent.providers.client.AsyncRoleClient)
+        from yuki.agent.providers.client import role_async_client
+
+        self._client = role_async_client("talker", bedrock_client(s.aws_region, getattr(s, "model_backend", None)), s,
+                                         log=lambda event, **fields: self.log.event(event, **fields))
         llm = _layered_service(AnthropicLLMService, self.mouth_memory, _Hooks(self))(
             api_key="unused",  # the client passed in carries the auth (Bedrock token or API key)
             client=self._client,
@@ -3081,10 +3091,11 @@ class Conversation:
                 "call_mode": bool(self.call_app), "quiet_for": self._quiet_for()}
 
     async def _progress_answer(self, log_text: str, question: str) -> tuple[str | None, dict[str, Any]]:
+        from yuki.agent.providers.client import talker_price_model
         from yuki.voice.progress import answer_progress
 
         text, facts = await answer_progress(self._client, self.settings.voice_mouth_model, log_text, question)
-        cost = self.settings.estimate_cost(self.settings.voice_mouth_model, {
+        cost = self.settings.estimate_cost(talker_price_model(self.settings, self._client), {
             "input_tokens": facts.get("input_tokens") or 0, "output_tokens": facts.get("output_tokens") or 0,
             "cache_read_tokens": 0, "cache_write_tokens": 0})
         self.progress_cost_usd += cost or 0.0
@@ -3180,7 +3191,9 @@ class Conversation:
             if self.guard is not None:
                 self.guard.cancel()
                 summary = self.guard.summary()
-                cost = self.settings.estimate_cost(self.settings.voice_mouth_model, {
+                from yuki.agent.providers.client import talker_price_model
+
+                cost = self.settings.estimate_cost(talker_price_model(self.settings, self._client), {
                     "input_tokens": summary.get("input_tokens") or 0, "output_tokens": summary.get("output_tokens") or 0,
                     "cache_read_tokens": 0, "cache_write_tokens": 0})
                 self.log.event("speech_guard", op="summary", session=self.session, cost_usd=round(cost or 0.0, 6),
@@ -3456,8 +3469,15 @@ class Conversation:
         first-turn time to first token median 1,031 ms vs 1,186 ms, max 1,090 vs
         2,715 ms; the cache write is the one the first turn would have made). Logged
         as ``warm`` with the tokens it wrote.
+
+        Settings → AI: a talker moved to a service with no prompt cache at all gets no warm-up (it would only spend
+        a call, and on a free model a share of its daily limit).
         """
         started = time.monotonic()
+        caching = getattr(self._client, "prompt_caching", None)
+        if callable(caching) and caching() == "none":
+            self.log.event("warm", note="skipped: the chosen voice model's service keeps no prompt cache")
+            return
         request: dict[str, Any] = {"messages": [{"role": "user", "content": "."}]}
         try:
             from pipecat.processors.aggregators.llm_context import LLMContext

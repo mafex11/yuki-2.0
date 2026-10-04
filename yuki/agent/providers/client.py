@@ -322,6 +322,14 @@ class AsyncRoleClient:
         """``provider:model`` of the last routed call (``None`` after a default one)."""
         return self._last
 
+    def prompt_caching(self) -> str:
+        """``explicit`` | ``auto`` | ``none``: the prompt cache of where this role's calls go now."""
+        chosen = self.route()
+        if chosen is None:
+            return "explicit"
+        info = PROVIDERS.get(chosen.primary.provider)
+        return info.caching if info is not None else "none"
+
     def _client(self, provider_id: str) -> Any:
         from yuki.agent.providers import config, keys
 
