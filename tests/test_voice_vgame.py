@@ -186,12 +186,22 @@ def test_go_away_ends_on_the_transcript_with_no_model_call_and_is_never_for_othe
     assert sounds == []   # no acknowledgement on a dismissal
 
 
-def test_an_eager_dismissal_starts_no_talker_call_and_ends_only_on_the_final(tmp_path: Path) -> None:
-    conv, _log, _sounds, _tones, dismissed = _conversation(tmp_path)
-    _open_turn(conv, "Shut up.")
-    assert conv._fast_turn("Shut up.", final=False) is True
-    assert not conv._stop.is_set() and dismissed == []
-    assert conv._fast_turn("Shut up.", final=True) is True and conv._stop.is_set()
+def test_an_eager_dismissal_ends_at_once_and_the_final_words_make_no_second_turn(tmp_path: Path) -> None:
+    """Flux's eager end of turn comes ~0.15 s before the final words: a dismissal ends there (closing when they were
+    going on costs nothing). Its turn is opened then, and the final transcript only updates its words."""
+    from pipecat.frames.frames import TranscriptionFrame
+
+    conv, log, _sounds, _tones, dismissed = _conversation(tmp_path)
+    obs = conv.observer
+    obs._user_started_at = time.monotonic() - 1.0
+    assert conv._fast_turn("Shut up", final=False) is True
+    assert conv._stop.is_set() and conv.reason == "user_asked" and dismissed == [True]
+    turn = obs.turn
+    assert turn.fast == "dismiss" and turn.user_text == "Shut up" and obs.user_turns == 1
+    assert log.of("fast_path", op="dismiss")[0]["eager"] is True
+    obs.on_frame(TranscriptionFrame(text="Shut up.", user_id="u", timestamp="0"))
+    assert obs.turn is turn and turn.user_text == "Shut up." and obs.user_turns == 1
+    assert conv._fast_turn("Shut up.", final=True) is True   # swallowed: nothing reaches the talker after it
 
 
 def test_a_request_said_by_name_is_acknowledged_at_once_and_still_goes_to_the_talker(tmp_path: Path) -> None:

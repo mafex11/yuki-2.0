@@ -505,13 +505,14 @@ def test_the_conversation_starts_the_routed_job_and_withdraws_it_when_the_talker
     assert conv.log.of("router", op="started") and conv.log.of("router", op="withdrawn", why="talker_chose_otherwise")
 
 
-def test_the_router_is_off_by_default_and_never_runs_on_doubtful_words(tmp_path: Path) -> None:
+def test_the_router_is_on_by_default_off_when_set_and_never_runs_on_doubtful_words(tmp_path: Path) -> None:
+    """vGame (5 Oct): on by default, the user asked for the thinker to start at once (it was off since v3.17)."""
     from yuki.voice.mouth import MouthMemory
     from yuki.voice.pipeline import Conversation
 
-    assert Settings().voice_router is False
+    assert Settings().voice_router is True
     rt_bridge = SimpleNamespace(has_open_voice_job=lambda: False, not_heard=None)
-    conv = Conversation(settings=Settings(voice_qos=False), bridge=rt_bridge, transport=None, memory=None,
+    conv = Conversation(settings=Settings(voice_qos=False, voice_router=False), bridge=rt_bridge, transport=None, memory=None,
                         mouth_memory=MouthMemory(), log=Log(), speech_end=lambda: None, on_state=lambda *a: None,
                         session="t")
     conv._route_turn(SimpleNamespace(get_messages=lambda: []), SimpleNamespace(user_turn=True))

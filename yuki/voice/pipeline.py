@@ -2016,6 +2016,9 @@ class TurnObserver:
             self.user_speaking = False
             self._activity()
         elif isinstance(frame, TranscriptionFrame):
+            if self.turn is not None and self.turn.trigger == "user" and self.turn.fast == "dismiss":
+                self.turn.user_text = frame.text or self.turn.user_text   # vGame: ended on its eager words already
+                return
             turn = self._open("user")
             turn.user_text = frame.text or ""
             self.chat({"type": "user_utterance", "text": turn.user_text, "ts": time.time(), "turn_id": self.turn_id()})
@@ -2818,13 +2821,15 @@ class Conversation:
     def _fast_turn(self, text: str, *, final: bool) -> bool:
         """vGame: the fast path on a transcript before the talker (``FastPath``). ``True``: the frame is taken.
 
-        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation on the final words, with no model call
-        (an eager transcript that is one starts no talker call). The name alone, said to Yuki, is answered "Yeah?" at
-        once and the next turn counts as said to her. A turn said to her by name gets the instant "Mm-hm" and goes on
-        to the talker as before."""
+        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation at once with no model call, already on
+        Flux's eager end of turn (~0.15 s before the final words; if they were going on, closing costs nothing: the name
+        opens it again). The name alone, said to Yuki, is answered "Yeah?" at once and the next turn counts as said to
+        her. A turn said to her by name gets the instant "Mm-hm" and goes on to the talker as before."""
         from yuki.voice.fastpath import bare_name, dismissal
 
-        if self.dormant or self._stop.is_set():
+        if self._stop.is_set():
+            return self.reason == "user_asked"   # after a dismissal nothing more reaches the talker
+        if self.dormant:
             return False
         s = self.settings
         phrase = None
@@ -2833,8 +2838,7 @@ class Conversation:
             busy = self._busy_for_dismiss()
             phrase = dismissal(text, busy=busy)
         if phrase is not None:
-            if final:
-                self._fast_dismiss(phrase, busy)
+            self._fast_dismiss(phrase, busy, eager=not final, text=text)
             return True
         if not final:
             return False
@@ -2852,12 +2856,21 @@ class Conversation:
         self._ack("request", how)
         return False
 
-    def _fast_dismiss(self, phrase: str, busy: bool) -> None:
+    def _fast_dismiss(self, phrase: str, busy: bool, eager: bool = False, text: str = "") -> None:
         obs = self.observer
         turn = obs.turn
+        if eager:
+            # the final transcript has not come yet, so its turn is not open: the dismissal opens it now with the eager
+            # words (logged as usual, said to Yuki); a final transcript after it only updates them (TurnObserver)
+            now = time.monotonic()
+            turn = obs._open("user")
+            turn.user_text = text
+            turn.transcript_at = now
+            turn.speech_end, turn.eos_source = obs._end_of_speech(now)
+            obs.user_turns += 1
         obs.fast_handled("dismiss")
         now = time.monotonic()
-        self.log.event("fast_path", op="dismiss", session=self.session, phrase=phrase, busy=busy,
+        self.log.event("fast_path", op="dismiss", session=self.session, phrase=phrase, busy=busy, eager=eager,
                        call_mode=bool(self.call_app), game=bool(self.game_app),
                        eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
                        else None)
