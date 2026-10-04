@@ -213,6 +213,29 @@ def test_a_request_said_by_name_is_acknowledged_at_once_and_still_goes_to_the_ta
     assert log.of("fast_path", op="ack")[0]["by"] == "wake"
 
 
+def test_the_acknowledgement_plays_on_the_eager_end_of_turn_once(tmp_path: Path) -> None:
+    """~0.15 s sooner than the final words; the final transcript neither plays it again nor loses its time."""
+    conv, log, sounds, _tones, _dismissed = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    assert conv._fast_turn("Open Spotify", final=False) is False
+    assert sounds == [("request", 4800)] and log.of("fast_path", op="ack", eager=True)
+    turn = _open_turn(conv, "Open Spotify.")
+    assert conv._fast_turn("Open Spotify.", final=True) is False
+    assert len(sounds) == 1 and turn.ack_at is not None and turn.named
+    # the second utterance of the conversation is not "the first words after the name"
+    conv.observer._user_started_at = time.monotonic()
+    conv._fast_turn("and turn it up", final=False)
+    assert len(sounds) == 1
+
+
+def test_the_name_alone_is_never_acknowledged_on_its_eager_words(tmp_path: Path) -> None:
+    conv, _log, sounds, _tones, _dismissed = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv._fast_turn("Yuki", final=False)
+    assert sounds == []
+
+
 def test_a_turn_without_the_name_gets_no_acknowledgement(tmp_path: Path) -> None:
     conv, _log, sounds, _tones, _dismissed = _conversation(tmp_path)
     _open_turn(conv, "Open Spotify.")   # not woken by the name, no name heard in it

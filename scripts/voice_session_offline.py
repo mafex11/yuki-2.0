@@ -99,7 +99,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     session.play_tone = lambda *a: timeline.add("notice_tone")
     # vGame: the instant acknowledgement is recorded on the timeline (the room hears Yuki's replies, not this clip);
     # no real window is ever looked at: a game is in front only in the "game" scenario
-    session.play_sound = lambda pcm, kind: timeline.add("ack", kind=kind, ms=round(len(pcm) / 48))
+    session.play_sound = lambda pcm, kind: timeline.add("ack", line=kind, ms=round(len(pcm) / 48))
     session.fullscreen_probe = (lambda: {"hwnd": 1, "pid": 1, "exe": "game.exe"}) if scenario == "game" else (lambda: None)
     session.extra_observers = (timeline.observer(),)
     room = Room(echo_db=args.echo_db)
@@ -418,7 +418,7 @@ def game_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[s
         ended = next((t for t, up in convs if not up and said_end - 0.3 < t < nxt), None)
         ack, audio, tool = first("ack"), first("audio_start"), first("mouth_tool")
         rows.append({"line": name, "conversation_on": live, "wake_after": any(said_end - 2 < w < nxt for w in wakes),
-                     "ack_ms": ms(ack["t"]) if ack else None, "ack_kind": ack.get("kind") if ack else None,
+                     "ack_ms": ms(ack["t"]) if ack else None, "ack_kind": ack.get("line") if ack else None,
                      "first_audio_ms": ms(audio["t"]) if audio else None, "tool": tool["name"] if tool else None,
                      "tool_ms": ms(tool["t"]) if tool else None,
                      "said": [e["text"] for e in events if e["kind"] in ("yuki", "yuki_code") and said_end < e["t"] < nxt],

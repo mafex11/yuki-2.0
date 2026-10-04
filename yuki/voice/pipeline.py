@@ -2741,6 +2741,8 @@ class Conversation:
         self._names: deque[float] = deque(maxlen=16)
         #: Until when the next turn counts as said to Yuki: the user said the name alone and was answered "Yeah?".
         self._name_carry_until = 0.0
+        #: When the acknowledgement played on the eager end of turn of the words being finished (monotonic), else None.
+        self._eager_ack_at: float | None = None
         #: The instant acknowledgement lines in this conversation's voice (:class:`yuki.voice.fastpath.AckVoice`).
         self.ack: Any = None
         #: ``(pcm, kind)``: play a short clip of Yuki's voice now (24 kHz int16 mono) on the conversation's output,
@@ -2796,15 +2798,18 @@ class Conversation:
         if loop is not None and not loop.is_closed():
             loop.call_soon_threadsafe(self._names.append, float(at))
 
-    def _named_turn(self) -> tuple[bool, str]:
-        """Whether the open user turn was said to Yuki by measured evidence, and which: the first words after a wake by
-        name, the turn right after the name alone, or the wake word heard the name in it."""
+    def _named_turn(self, *, final: bool = True) -> tuple[bool, str]:
+        """Whether the user's words now were said to Yuki by measured evidence, and which: the first words after a wake
+        by name, the turn right after the name alone, or the wake word heard the name in it. ``final``: the final
+        transcript (its turn is open and counted); else the eager one (not counted yet, and nothing is used up)."""
         obs = self.observer
         now = time.monotonic()
-        if self.woken_by_name and obs.user_turns <= 1:
+        turns = obs.user_turns if final else obs.user_turns + 1
+        if self.woken_by_name and turns <= 1:
             return True, "wake"
         if now < self._name_carry_until:
-            self._name_carry_until = 0.0
+            if final:
+                self._name_carry_until = 0.0
             return True, "after_name"
         start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
         if any(start - self.NAME_BEFORE_S <= t <= now for t in self._names):
@@ -2841,12 +2846,21 @@ class Conversation:
             self._fast_dismiss(phrase, busy, eager=not final, text=text)
             return True
         if not final:
+            # the acknowledgement already on the eager end of turn (~0.15 s sooner); a premature one is a backchannel
+            named, how = self._named_turn(final=False)
+            if named and getattr(s, "voice_fast_ack", True) and not bare_name(text) and text.strip():
+                self._ack("request", how, eager=True)
             return False
         named, how = self._named_turn()
         turn = self.observer.turn
         if turn is not None and turn.trigger == "user" and named:
             turn.named = True
         if not named or not getattr(s, "voice_fast_ack", True):
+            return False
+        eager_ack, self._eager_ack_at = self._eager_ack_at, None
+        if eager_ack is not None and time.monotonic() - eager_ack < self.EAGER_ACK_S and not bare_name(text):
+            if turn is not None and turn.trigger == "user":
+                turn.ack_at = eager_ack   # acknowledged on its eager words already
             return False
         if bare_name(text):
             self.observer.fast_handled("name")
@@ -2882,10 +2896,14 @@ class Conversation:
         self.log.event("session", state="end_asked", session=self.session, waited_ms=0, fast=True)
         self._set_stop("user_asked")
 
-    def _ack(self, kind: str, how: str) -> None:
-        """Play the instant acknowledgement (``"request"``: "Mm-hm.", ``"name"``: "Yeah?") unless Yuki is speaking."""
+    #: An acknowledgement played on the eager end of turn covers the final words that come within this long (s).
+    EAGER_ACK_S = 4.0
+
+    def _ack(self, kind: str, how: str, *, eager: bool = False) -> None:
+        """Play the instant acknowledgement (``"request"``: "Mm-hm.", ``"name"``: "Yeah?") unless Yuki is speaking.
+        ``eager``: on the eager end of turn (the turn is not open yet: its time is kept for the final words)."""
         obs = self.observer
-        turn = obs.turn
+        turn = None if eager else obs.turn
         if obs.bot_speaking or obs.speech_pending or (self.after_goodbye and obs.user_turns <= 1):
             return
         sound = self.on_sound
@@ -2906,11 +2924,13 @@ class Conversation:
             return
         if played == "none":
             return
-        if turn is not None and turn.trigger == "user":
+        if eager:
+            self._eager_ack_at = now
+        elif turn is not None and turn.trigger == "user":
             turn.ack_at = now
-        self.log.event("fast_path", op="ack", session=self.session, kind=kind, by=how, played=played,
-                       focus=self.focus, eos_to_ack_ms=round((now - turn.speech_end) * 1000)
-                       if turn is not None and turn.speech_end else None)
+        end, _how = obs._end_of_speech(now) if eager else ((turn.speech_end if turn is not None else None), "")
+        self.log.event("fast_path", op="ack", session=self.session, kind=kind, by=how, played=played, eager=eager,
+                       focus=self.focus, eos_to_ack_ms=round((now - end) * 1000) if end else None)
 
     def _quiet_turn(self, turn: Any) -> None:
         """vGame: the talker chose silence on the user's words. In a game or a call (focus mode) with nothing owed or
