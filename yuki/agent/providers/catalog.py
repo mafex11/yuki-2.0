@@ -141,9 +141,10 @@ MODELS: dict[str, tuple[ModelInfo, ...]] = {
            price={"input": 0.10, "output": 0.40}),
     ),
     "anthropic": (
-        # priced from the app's own Claude table (yuki.config.DEFAULT_PRICING) by their Bedrock ids
-        _m("claude-sonnet-5", "Claude Sonnet 5", images=True),
-        _m("claude-opus-5", "Claude Opus 5", images=True),
+        # priced from the app's own Claude table (yuki.config.DEFAULT_PRICING) by their Bedrock ids; ``reasoning``:
+        # takes adaptive thinking and an effort (Sonnet 5, Opus 5); Haiku 4.5 takes only a fixed thinking budget
+        _m("claude-sonnet-5", "Claude Sonnet 5", images=True, reasoning=True),
+        _m("claude-opus-5", "Claude Opus 5", images=True, reasoning=True),
         _m("claude-haiku-4-5-20251001", "Claude Haiku 4.5", images=True),
     ),
     "deepseek": (

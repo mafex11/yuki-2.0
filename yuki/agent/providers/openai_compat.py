@@ -47,7 +47,7 @@ _FINISH = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
 #: Services documented to take ``parallel_tool_calls`` (others may refuse an unknown field, so it isn't sent there).
 PARALLEL_FLAG = frozenset({"openai", "openrouter"})
 
-IMAGE_LEFT_OUT ="[An image was here, but this model can't see images.]"
+IMAGE_LEFT_OUT = "[An image was here, but this model can't see images.]"
 DOCUMENT_LEFT_OUT = "[A document was attached here, but this model can't read attachments.]"
 
 
@@ -107,6 +107,14 @@ def _tool_result_text(content: Any) -> tuple[str, list[dict[str, Any]]]:
         elif b.get("type") == "image":
             images.append(b)
     return "\n".join(texts), images
+
+
+def _whole_json(text: str) -> bool:
+    """Whether a tool call's arguments so far are one whole JSON object (its input is complete)."""
+    try:
+        return isinstance(json.loads(text), dict)
+    except ValueError:
+        return False
 
 
 def parse_arguments(raw: Any) -> Any:
@@ -296,6 +304,9 @@ class StreamTranslator:
     ``feed(chunk)`` -> events; ``finish()`` -> the closing events (raises when the stream never said it ended).
     A tool call's block opens once its name is known and closes when the next block (or the end) begins: services
     send parallel calls one after another (OpenAI, OpenRouter) or each call whole in one chunk (Gemini, Ollama).
+    A service that starts the next call before the open one's input is whole has its later calls held and sent,
+    each whole, at the end (the loop runs a call once its block closes, so a block never closes on half an input);
+    a call that still can't be passed on whole fails the answer as a broken stream (retried), never runs in part.
     """
 
     def __init__(self, model: str, *, thinking: bool = False) -> None:
@@ -309,6 +320,8 @@ class StreamTranslator:
         self.finish_reason: str | None = None
         self.usage: dict[str, Any] | None = None
         self.done = False
+        #: Tool calls are held to the end of the answer once one began before the open one's input was whole.
+        self.held = False
         self.message_id = _new_id("msg_")
 
     def _start(self, events: list[Any]) -> None:
@@ -370,7 +383,7 @@ class StreamTranslator:
             for position, call in enumerate(delta.get("tool_calls") or []):
                 key = call.get("index", position)
                 state = self.tools.setdefault(key, {"id": None, "name": None, "args": "", "pending": "",
-                                                    "opened": False, "closed": False})
+                                                    "opened": False, "closed": False, "sent": ""})
                 fn = call.get("function") or {}
                 if call.get("id"):
                     state["id"] = str(call["id"])
@@ -385,6 +398,13 @@ class StreamTranslator:
                     if not state["name"]:
                         state["pending"] += piece   # the name comes first in every service seen; wait for it
                         continue
+                    if self.open_kind == "tool_use" and self.open_tool != key \
+                            and not _whole_json(self.tools[self.open_tool]["args"]):
+                        # the open call's input isn't whole yet: closing it now could let the loop run it with
+                        # half its input, so this call (and any after it) waits for the end of the answer
+                        self.held = True
+                    if self.held:
+                        continue
                     state["opened"] = True
                     state["id"] = state["id"] or _new_id("toolu_")
                     self._open(events, "tool_use", ToolUseBlock(type="tool_use", id=state["id"],
@@ -395,6 +415,7 @@ class StreamTranslator:
                     events.append(RawContentBlockDeltaEvent(
                         type="content_block_delta", index=self.index,
                         delta=InputJSONDelta(type="input_json_delta", partial_json=piece)))
+                    state["sent"] += piece
             if choice.get("finish_reason"):
                 self.finish_reason = str(choice["finish_reason"])
         return events
@@ -404,11 +425,33 @@ class StreamTranslator:
         from anthropic.types import MessageDeltaUsage, RawMessageDeltaEvent, RawMessageStopEvent
         from anthropic.types.raw_message_delta_event import Delta
 
+        from anthropic.types import (
+            InputJSONDelta, RawContentBlockDeltaEvent, RawContentBlockStartEvent, RawContentBlockStopEvent,
+            ToolUseBlock,
+        )
+
         if not ended and self.finish_reason is None:
             raise StreamCutError("the answer stopped halfway (the connection closed before it ended)")
         events: list[Any] = []
         self._start(events)
         self._close(events)
+        for state in self.tools.values():   # the calls held back (see ``feed``), each whole, in the service's order
+            if state["opened"] or not state["name"]:
+                continue
+            state["opened"], state["id"] = True, state["id"] or _new_id("toolu_")
+            self.index += 1
+            events.append(RawContentBlockStartEvent(type="content_block_start", index=self.index, content_block=(
+                ToolUseBlock(type="tool_use", id=state["id"], name=state["name"], input={}))))
+            if state["args"]:
+                events.append(RawContentBlockDeltaEvent(type="content_block_delta", index=self.index, delta=(
+                    InputJSONDelta(type="input_json_delta", partial_json=state["args"]))))
+            state["sent"], state["closed"] = state["args"], True
+            events.append(RawContentBlockStopEvent(type="content_block_stop", index=self.index))
+        for state in self.tools.values():
+            # a tool call whose pieces came after the next call began, or that never said its name, can't be
+            # passed on whole: said (and retried as a broken answer), never run with a part of its input
+            if (state["args"] and not state["opened"]) or (state["opened"] and state["sent"] != state["args"]):
+                raise StreamCutError("the service sent a tool call in a form that couldn't be read whole")
         usage = usage_from(self.usage)
         has_tools = any(s["opened"] for s in self.tools.values())
         events.append(RawMessageDeltaEvent(
@@ -901,7 +944,9 @@ class _AsyncMessages:
             await stream.open()
             return stream
         data = await self._owner.post(self._owner._body(params, False))
-        return from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params))
+        message = from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params))
+        note_cost(message.usage)
+        return message
 
     def stream(self, **params: Any) -> "_AsyncStreamManager":
         params = {k: v for k, v in params.items() if k not in ("betas", "extra_headers", "extra_body", "stream")}
@@ -936,7 +981,9 @@ class _AsyncRawStream:
                         break
                     for event in translator.feed(chunk):
                         yield event
-                for event in translator.finish(ended=ended):
+                closing = translator.finish(ended=ended)
+                note_cost(translator.final_usage)
+                for event in closing:
                     yield event
             except StreamCutError as exc:
                 raise anthropic.APIConnectionError(message=f"{owner.provider.label}: {exc}",

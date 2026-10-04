@@ -799,6 +799,10 @@ class Agent:
         all (no network yet: worth retrying), None on any other failure.
         """
         started = time.perf_counter()
+        caching = getattr(self.client, "prompt_caching", None)   # Settings → AI (report 67)
+        if callable(caching) and caching() == "none":
+            self.logger.log("model_prewarm", skipped="the chosen AI for doing things keeps no prompt cache")
+            return None
         try:
             response = self.client.messages.create(**self._request_params(warmup=True, profile=profile))
         except Exception as exc:

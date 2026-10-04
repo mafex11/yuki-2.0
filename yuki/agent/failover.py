@@ -341,6 +341,21 @@ class FailoverClient:
 
     # -- Settings → AI: a role moved to another provider ------------------------------------------------------------
 
+    def prompt_caching(self) -> str:
+        """``explicit`` | ``auto`` | ``none``: the prompt cache where this client's calls go now (Claude as before:
+        ``explicit``). A warm-up that only writes a cache is pointless on ``none`` (it would spend a call, a share of
+        a free model's daily limit, or load a local model onto the graphics card)."""
+        if self.role is None:
+            return "explicit"
+        from yuki.agent.providers.catalog import PROVIDERS
+        from yuki.agent.providers.config import route
+
+        chosen = route(self.role)
+        if chosen is None:
+            return "explicit"
+        info = PROVIDERS.get(chosen.primary.provider)
+        return info.caching if info is not None else "none"
+
     def _routed_client(self, chosen: Any, requested: str) -> "FailoverClient":
         """The client of ``chosen`` (a ``yuki.agent.providers.config.Route``): its targets are ``"@<provider>"``
         places, built by ``yuki.agent.providers.client.sync_provider_client``; rebuilt when a key or the custom
@@ -380,7 +395,9 @@ class FailoverClient:
         requested = str(params.get("model") or "")
         client = self._routed_client(chosen, requested)
         self.counters["calls"] += 1
-        result = client.run({**params, "model": chosen.primary.model}, call)
+        # built for ``requested``: a Haiku-style fixed thinking budget becomes adaptive on another Claude model (the
+        # Anthropic provider); the OpenAI-protocol adapter reads only whether thinking is on
+        result = client.run(adapt_params(params, chosen.primary.model), call)
         used, target = client.last_model() or chosen.primary.model, client.last_target() or ""
         provider = target.rpartition("@")[2] or chosen.primary.provider
         name = used if provider == "default" else f"{provider}:{used}"

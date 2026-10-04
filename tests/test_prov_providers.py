@@ -706,3 +706,122 @@ def test_live_ollama_smoke_if_running() -> None:
     client = OpenAICompatClient(PROVIDERS["ollama"], timeout=120.0)
     msg = client.messages.create(model=models[0].id, max_tokens=8, messages=[{"role": "user", "content": "Say ok."}])
     assert msg.stop_reason in ("end_turn", "max_tokens")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 8. hardening (the restart of report 67): interleaved tool calls, Claude models' thinking, warm-ups, async cost
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def test_interleaved_tool_calls_are_held_never_closed_half_read() -> None:
+    """A service that starts the second call before the first one's input is whole: no block closes on half an
+    input (the loop runs a call once its block closes); the later call comes whole at the end."""
+    chunks = [
+        chunk({"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "launch_app", "arguments": '{"name": '}}]}),
+        chunk({"tool_calls": [{"index": 1, "id": "c1", "function": {"name": "done", "arguments": '{"message"'}}]}),
+        chunk({"tool_calls": [{"index": 0, "function": {"arguments": '"Notes"}'}}]}),
+        chunk({"tool_calls": [{"index": 1, "function": {"arguments": ': "Opened."}'}}]}),
+        chunk({}, finish="tool_calls"),
+    ]
+    with FakeOpenAI([Reply(chunks=chunks)]) as server:
+        with _client(server).messages.stream(model="m", max_tokens=50, messages=[{"role": "user", "content": "x"}]) as s:
+            events = list(s)
+            final = s.get_final_message()
+    stops = [e for e in events if e.type == "content_block_stop"]
+    assert [s.content_block.input for s in stops] == [{"name": "Notes"}, {"message": "Opened."}]   # whole at each stop
+    assert [b.input for b in final.content] == [{"name": "Notes"}, {"message": "Opened."}]
+    assert final.stop_reason == "tool_use"
+
+
+def test_a_tool_call_that_cannot_be_read_whole_fails_as_a_broken_stream() -> None:
+    from yuki.agent.providers.openai_compat import StreamCutError, StreamTranslator
+
+    t = StreamTranslator("m")
+    t.feed(chunk({"tool_calls": [{"index": 0, "function": {"arguments": '{"a": 1}'}}]}))   # never names itself
+    with pytest.raises(StreamCutError):
+        t.finish(ended=True)
+
+
+def test_claude_models_get_the_thinking_they_take() -> None:
+    from yuki.agent.providers.client import FittedClaudeClient, fit_claude_params
+
+    sonnet_style = {"model": "m", "max_tokens": 5, "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "high"}, "messages": []}
+    haiku = known_model("anthropic", "claude-haiku-4-5-20251001")
+    out = fit_claude_params(sonnet_style, haiku)
+    assert "thinking" not in out and "output_config" not in out and sonnet_style["thinking"] == {"type": "adaptive"}
+    assert fit_claude_params(sonnet_style, known_model("anthropic", "claude-sonnet-5")) is sonnet_style
+    assert fit_claude_params(sonnet_style, None) is sonnet_style            # an unknown id: sent as it is
+    budget = {**sonnet_style, "thinking": {"type": "enabled", "budget_tokens": 2000}, "output_config": {"effort": "low", "x": 1}}
+    assert fit_claude_params(budget, haiku) == {**budget, "output_config": {"x": 1}}   # a fixed budget is kept
+    seen: list = []
+    inner = SimpleNamespace(messages=SimpleNamespace(create=lambda **p: seen.append(p)),
+                            beta=SimpleNamespace(messages=SimpleNamespace(create=lambda **p: seen.append(p))))
+    client = FittedClaudeClient(inner, lambda model: known_model("anthropic", model))
+    client.beta.messages.create(**{**sonnet_style, "model": "claude-haiku-4-5-20251001"})
+    assert "thinking" not in seen[0] and "output_config" not in seen[0]
+
+
+def test_routed_anthropic_gets_params_adapted_from_the_requested_model(ai_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A memory pass built for Haiku (a fixed thinking budget) moved to Claude Sonnet with the user's key: the budget
+    becomes adaptive, the way the Bedrock chain adapts it for a sibling."""
+    import yuki.agent.providers.client as pc
+
+    sent: list = []
+    monkeypatch.setattr(pc, "sync_provider_client", lambda provider_id, settings=None, **kw: SimpleNamespace(
+        messages=SimpleNamespace(create=lambda **p: sent.append((provider_id, p)) or SimpleNamespace(
+            content=[], stop_reason="end_turn", usage=None))))
+    _route(ai_dir, "memory", "anthropic", "claude-sonnet-5")
+    client = make_client(Settings(), role="memory")
+    client.messages.create(model="global.anthropic.claude-haiku-4-5-20251001-v1:0", max_tokens=5, messages=[],
+                           thinking={"type": "enabled", "budget_tokens": 1024})
+    assert sent[0][0] == "anthropic" and sent[0][1]["model"] == "claude-sonnet-5"
+    assert sent[0][1]["thinking"] == {"type": "adaptive"}
+    assert client.last_model() == "anthropic:claude-sonnet-5"
+
+
+def test_warm_up_skipped_where_no_prompt_cache(ai_dir: Path) -> None:
+    client = FailoverClient.from_settings(Settings(), factory=_stub_factory([]))
+    assert client.prompt_caching() == "explicit"                 # Claude as before
+    _route(ai_dir, "thinker", "ollama", "llama3.2")
+    assert client.prompt_caching() == "none"
+    _route(ai_dir, "thinker", "openai", "gpt-5-mini")
+    assert client.prompt_caching() == "auto"
+    assert FailoverClient("r", lambda region: None).prompt_caching() == "explicit"   # no role: never routed
+
+    from yuki.agent.loop import Agent
+
+    class _Log:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def log(self, event: str, **fields: Any) -> None:
+            self.events.append((event, fields))
+
+        def error(self, *a: Any, **k: Any) -> None:
+            self.events.append(("error", a))
+
+    _route(ai_dir, "thinker", "ollama", "llama3.2")
+    fake = SimpleNamespace(prompt_caching=lambda: "none",
+                           messages=SimpleNamespace(create=lambda **p: pytest.fail("no warm-up call expected")))
+    agent = SimpleNamespace(client=fake, logger=_Log())
+    assert Agent._warm_model(agent) is None
+    assert agent.logger.events[0][0] == "model_prewarm" and "skipped" in agent.logger.events[0][1]
+
+
+def test_async_openrouter_cost_is_noted(ai_dir: Path) -> None:
+    from yuki.agent.providers import pricing
+
+    body = completion("hi")
+    body["usage"]["cost"] = 0.0021
+
+    async def go(url: str) -> Any:
+        client = AsyncOpenAICompatClient(PROVIDERS["openrouter"], base_url=url + "/v1", api_key=KEY)
+        msg = await client.messages.create(model="vendor/paid", max_tokens=5, messages=[{"role": "user", "content": "x"}])
+        await client.aclose()
+        return msg
+
+    with FakeOpenAI([Reply(body=body)]) as server:
+        msg = asyncio.run(go(server.url))
+    tokens = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "cache_read_tokens": 0}
+    assert pricing.cost("openrouter:vendor/paid", tokens) == pytest.approx(0.0021)

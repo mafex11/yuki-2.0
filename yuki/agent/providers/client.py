@@ -60,6 +60,69 @@ def _model_info(provider_id: str) -> Callable[[str], Any]:
     return lambda model: model_facts(provider_id, model)
 
 
+def fit_claude_params(params: dict[str, Any], info: Any) -> dict[str, Any]:
+    """``params`` for a Claude model on the Anthropic API, by the catalog's facts: a model known not to take adaptive
+    thinking or an effort (Haiku 4.5: ``reasoning`` false) gets neither (the thinker and the memory passes build
+    their requests for Sonnet 5). An unknown model id is sent as it is (nothing guessed)."""
+    if info is None or info.reasoning:
+        return params
+    out = dict(params)
+    thinking = out.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "adaptive":
+        out.pop("thinking")
+    config = out.get("output_config")
+    if isinstance(config, dict) and "effort" in config:
+        rest = {k: v for k, v in config.items() if k != "effort"}
+        if rest:
+            out["output_config"] = rest
+        else:
+            out.pop("output_config")
+    return out
+
+
+class _FittedMessages:
+    """``messages`` / ``beta.messages`` of an Anthropic API client with :func:`fit_claude_params` applied (whatever
+    the wrapped call returns, coroutines included)."""
+
+    def __init__(self, inner: Any, facts: Callable[[str], Any]) -> None:
+        self._inner = inner
+        self._facts = facts
+
+    def _fit(self, params: dict[str, Any]) -> dict[str, Any]:
+        return fit_claude_params(params, self._facts(str(params.get("model") or "")))
+
+    def create(self, **params: Any) -> Any:
+        return self._inner.create(**self._fit(params))
+
+    def stream(self, **params: Any) -> Any:
+        return self._inner.stream(**self._fit(params))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _FittedBeta:
+    def __init__(self, inner: Any, facts: Callable[[str], Any]) -> None:
+        self._inner = inner
+        self.messages = _FittedMessages(inner.messages, facts)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class FittedClaudeClient:
+    """The Anthropic API client (user's key) with each request fitted to the Claude model it names."""
+
+    def __init__(self, inner: Any, facts: Callable[[str], Any]) -> None:
+        self._inner = inner
+        self.messages = _FittedMessages(inner.messages, facts)
+        self.beta = _FittedBeta(inner.beta, facts)
+        self.model_backend = "anthropic"
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 def sync_provider_client(provider_id: str, settings: Any = None, *, transport: Any = None,
                          timeout: float | None = None) -> Any:
     """The sync client for ``provider_id`` (Anthropic surface). Raises :class:`ProviderSetupError`."""
@@ -80,9 +143,9 @@ def sync_provider_client(provider_id: str, settings: Any = None, *, transport: A
 
         from yuki.core.models import MappedClient
 
-        return MappedClient(anthropic.Anthropic(api_key=key, max_retries=0,
-                                                timeout=anthropic.Timeout(read, connect=connect, write=30.0,
-                                                                          pool=10.0)))
+        return FittedClaudeClient(MappedClient(anthropic.Anthropic(
+            api_key=key, max_retries=0, timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0))),
+            _model_info(provider_id))
     from yuki.agent.providers.openai_compat import OpenAICompatClient
 
     return OpenAICompatClient(info, base_url=_base_url(provider_id), api_key=key, model_info=_model_info(provider_id),
@@ -107,9 +170,9 @@ def async_provider_client(provider_id: str, settings: Any = None, *, transport: 
 
         from yuki.core.models import MappedClient
 
-        return MappedClient(anthropic.AsyncAnthropic(api_key=key, max_retries=0,
-                                                     timeout=anthropic.Timeout(read, connect=connect, write=30.0,
-                                                                               pool=10.0)))
+        return FittedClaudeClient(MappedClient(anthropic.AsyncAnthropic(
+            api_key=key, max_retries=0, timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0))),
+            _model_info(provider_id))
     from yuki.agent.providers.openai_compat import AsyncOpenAICompatClient
 
     return AsyncOpenAICompatClient(info, base_url=_base_url(provider_id), api_key=key,
@@ -430,5 +493,5 @@ def talker_price_model(settings: Any, client: Any = None) -> str:
     return last or r.primary.name
 
 
-__all__ = ["AsyncRoleClient", "ProviderSetupError", "async_provider_client", "missing_model", "role_async_client",
-           "sync_provider_client", "talker_price_model"]
+__all__ = ["AsyncRoleClient", "FittedClaudeClient", "ProviderSetupError", "async_provider_client", "fit_claude_params",
+           "missing_model", "role_async_client", "sync_provider_client", "talker_price_model"]
