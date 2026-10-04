@@ -607,7 +607,7 @@ def test_in_a_game_a_call_or_after_a_goodbye_the_spotter_alone_is_not_enough() -
 ])
 def test_a_strict_wake_keeps_the_name_in_what_recognition_hears(game: Any, call: bool, after_goodbye: bool,
                                                                  kept: bool) -> None:
-    from yuki.voice.session import WAKE_PREROLL_S, VoiceSession
+    from yuki.voice.session import NAME_KEEP_S, VoiceSession
 
     woke: list[tuple[float, bool]] = []
     s = SimpleNamespace(in_conversation=False, log=Log(), _listener=None, closing=False, settings=Settings(),
@@ -619,7 +619,7 @@ def test_a_strict_wake_keeps_the_name_in_what_recognition_hears(game: Any, call:
     s._wake_standby = lambda via, listen_from, started, cut: woke.append((listen_from, cut)) or True
     assert VoiceSession.start_conversation(s, "wake", wake_at=10.0, heard_at=10.1, name_end=9.8) is True
     if kept:
-        assert woke == [(10.0 - WAKE_PREROLL_S, False)] and s._wake_strict and s.log.of("wake", state="name_kept")
+        assert woke == [(9.8 - NAME_KEEP_S, False)] and s._wake_strict and s.log.of("wake", state="name_kept")
     else:
         assert woke == [(9.8, True)] and not s._wake_strict
 

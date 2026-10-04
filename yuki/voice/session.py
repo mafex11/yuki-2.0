@@ -64,6 +64,9 @@ PREFS_PATH = Path.home() / "AppData" / "Local" / "Yuki" / "voice.json"
 #: With the name's end known (v3.6, :attr:`yuki.voice.wake.WakeListener.name_end`), only what was said
 #: after the name is replayed, so the name never reaches speech recognition.
 WAKE_PREROLL_S = 1.2
+#: vGame review: when the name must be heard by speech recognition too (a game, a call, right after a goodbye) and its
+#: end is known, this much before its end is replayed: "Yuki" said takes ~0.3-0.5 s (the v34 clips).
+NAME_KEEP_S = 0.7
 
 #: Environment variable that sets the ElevenLabs voice id (the tray's "Voice id…" wins over it).
 VOICE_ID_ENV = "YUKI_VOICE_ID"
@@ -525,12 +528,19 @@ class VoiceSession(QObject):
         # words said to Yuki (accidental wakes on sound-alikes; the name said in a story): the name is kept in what
         # speech recognition hears, and the first words count as said to Yuki when it wrote the name opening them.
         self._wake_strict = via == "wake" and bool(self._wake_game or self._call_focus() or self._after_goodbye())
+        keep_from = None
         if self._wake_strict and name_end:
+            # the name itself and no more: replaying the whole pre-roll made the first answer ~0.5 s later offline
+            keep_from = name_end - NAME_KEEP_S
+            if wake_at is not None:
+                keep_from = max(keep_from, wake_at - WAKE_PREROLL_S)
             self.log.event("wake", state="name_kept", game=bool(self._wake_game), call=self._call_focus(),
                            after_goodbye=self._after_goodbye())
             name_end = None
         if name_end:
             listen_from = name_end
+        elif keep_from is not None:
+            listen_from = keep_from
         else:
             listen_from = (wake_at - WAKE_PREROLL_S) if wake_at is not None else time.monotonic()
         self.closing = False

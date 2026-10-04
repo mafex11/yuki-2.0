@@ -67,6 +67,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                         voice_tts_voice="aura-2-thalia-en", voice_grounding=False, voice_idle_s=args.idle,
                         voice_idle_max_s=max(args.idle, 12.0), voice_call_idle_s=args.call_idle,
                         voice_echo=echo_pref, voice_tts_cache_dir=str(tmp / "tts-cache"),
+                        **({"voice_eager_eot_threshold": args.eager_eot} if getattr(args, "eager_eot", None) else {}),
                         **({"voice_standby": False} if getattr(args, "no_standby", False)
                                                   and "voice_standby" in Settings.__dataclass_fields__ else {}))
     manifest = {c["name"]: c for c in json.loads((args.clips / "manifest.json").read_text(encoding="utf-8"))}
@@ -574,6 +575,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ack-room", dest="ack_room", action="store_true",
                     help="vGame review F6: the instant acknowledgement plays into the room (on speakers the mic hears it)")
     ap.add_argument("--plain", action="store_true", help="named_end: no game and no call (plain mode)")
+    ap.add_argument("--eager-eot", dest="eager_eot", type=float, default=None,
+                    help="vGame review: Flux's eager end-of-turn threshold for this run (the setting's default else)")
     ap.add_argument("--clips", type=Path, required=True, help="the folder with manifest.json of the v34 clips")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--echo", default="aec", choices=("aec", "half", "none"))
