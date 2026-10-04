@@ -229,13 +229,21 @@ def natural_when(value: Any) -> str:
 
 
 def _exchange(turn: dict[str, Any], user_chars: int, reply_chars: int) -> str | None:
-    """One exchange as the view shows it, or ``None`` when nothing was answered (talk for others, a silence)."""
+    """One exchange as the view shows it, or ``None`` when it was not part of the talk with Yuki: said to others (the
+    talker stayed quiet, or memory's extractor judged so), a call line nobody has judged yet ("unanswered"), a
+    silence. Words said to Yuki that got no spoken reply stay (report 77b): a request Yuki only acted on, and the first
+    part of a request cut off by its own next words, which the next exchange answers."""
     reply = _clip(turn.get("reply"), reply_chars)
-    if not reply:
-        return None
     at = _stamp(turn.get("at"))
     clock = f"{datetime.fromtimestamp(at):%H:%M} " if at is not None else ""
     user = _clip(turn.get("user"), user_chars)
+    if not reply:
+        if not user or turn.get("addressed") != "yuki":
+            return None
+        acts = [" ".join(str(a).split()) for a in turn.get("actions") or [] if str(a).strip()]
+        if acts:
+            return f"{clock}They: {user}\n  You (no words): {_clip('did ' + '; '.join(acts), reply_chars)}"
+        return f"{clock}They: {user}"
     if not user:
         return f"{clock}You: {reply}"   # a result said on its own
     return f"{clock}They: {user}\n  You: {reply}"
@@ -243,13 +251,18 @@ def _exchange(turn: dict[str, Any], user_chars: int, reply_chars: int) -> str | 
 
 def _same_exchange(a: dict[str, Any], b: dict[str, Any]) -> bool:
     """Whether two logged turns are one exchange recorded twice: the same words (whitespace and case aside) and one
-    reply carrying the other's opening (record bookkeeping, never a judgement of what was said)."""
+    reply carrying the other's opening, or only one of them with a reply (record bookkeeping, never a judgement of
+    what was said)."""
     def norm(value: Any) -> str:
         return " ".join(str(value or "").split()).casefold()
 
     words_a, words_b = norm(a.get("user")), norm(b.get("user"))
     reply_a, reply_b = norm(a.get("reply")), norm(b.get("reply"))
-    if not words_a or words_a != words_b or not reply_a or not reply_b:
+    if not words_a or words_a != words_b:
+        return False
+    if bool(reply_a) != bool(reply_b):
+        return True   # the same words twice, once with no reply (a hand-off with no words, then the worker's turn; 77b)
+    if not reply_a:
         return False
     short, long_ = sorted((reply_a, reply_b), key=len)
     return short[:60] in long_

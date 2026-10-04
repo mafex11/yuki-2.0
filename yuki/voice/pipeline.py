@@ -1782,6 +1782,20 @@ class TurnObserver:
         return turn.call and turn.trigger == "user" and not reply and not turn.counted
 
     @staticmethod
+    def addressed(turn: _Turn, reply: str) -> str:
+        """Who a user turn was said to, as memory keeps it: "others" when Yuki chose silence on it (the talker's
+        stay_quiet: its judgement that the words were for someone else), "unanswered" when, in a call, the next
+        words came before Yuki said or did anything - nobody judged those words, so memory's extractor reads them
+        and judges from their content (report 77b: 15 of 23 such turns were followed by a request Yuki answered,
+        and were kept out of memory as talk to the others by this timing alone), else "yuki"."""
+        if not reply and not turn.counted:
+            if turn.quiet:
+                return "others"
+            if turn.call:
+                return "unanswered"
+        return "yuki"
+
+    @staticmethod
     def _ms(a: float | None, b: float | None) -> float | None:
         return round((b - a) * 1000, 1) if a is not None and b is not None else None
 
@@ -1866,8 +1880,7 @@ class TurnObserver:
         others = self.for_others(turn, reply)
         addressed = None
         if turn.trigger == "user":
-            addressed = ("others" if others or (not reply and turn.quiet and not turn.counted)
-                         else "yuki")
+            addressed = self.addressed(turn, reply)
             self.chat({"type": "turn_closed", "turn_id": f"{self.session}-{turn.n}", "addressed": addressed,
                        "replied": bool(reply), "cut_by_user": turn.cut})
         # v3.16: what was really heard, the marker channel, and an unheard turn answered again (content-free)
@@ -1898,7 +1911,7 @@ class TurnObserver:
             # Every turn is logged, marked with who it was addressed to (v3.5, the memory builder's relay):
             # talk the mouth judged was for someone else (the people on a call, dictation to another app)
             # is stored as "others" and never extracted into memory; the thinker is never handed it either
-            # (``quiet_answered``).
+            # (``quiet_answered``). A call turn nobody judged (the next words came first) is "unanswered" (77b).
             memory, log = self.memory, self.log
             # v3.18: the turn is dated when it opened (the user's final words, or the reply a result turn began), not
             # when this row is written (the next turn's opening): practice memory's learners read "what the user said

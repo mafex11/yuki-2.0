@@ -436,12 +436,14 @@ def said_to_yuki_spans(turns: Sequence[dict[str, Any]]) -> list[tuple[float, flo
     ``(start, end, sure)``: before each turn not judged to be for the others on the call (a turn is logged
     when it closes, after the reply, so :data:`YUKI_TURN_LEAD_S` covers the words it answered) - ``sure``
     when voice judged it said to Yuki, not sure when the turn predates that judgement (addressee unknown) -
-    and, not sure, around the start of each voice session (the wake word comes just before). Timings only;
+    and, not sure, around the start of each voice session (the wake word comes just before). A call turn nobody
+    has judged yet ("unanswered", report 77b: the next words came before Yuki answered) gives no span, as when it
+    was stored "others"; once memory's extractor judges it said to Yuki it counts as sure. Timings only;
     no words are looked at."""
     spans: list[tuple[float, float, bool]] = []
     sessions: set[float] = set()
     for t in turns:
-        if t.get("addressed") == "others":
+        if t.get("addressed") in ("others", "unanswered"):
             continue
         at = float(t["at"])
         spans.append((at - YUKI_TURN_LEAD_S, at + YUKI_TURN_TAIL_S, t.get("addressed") == "yuki"))

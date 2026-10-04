@@ -664,8 +664,8 @@ class MemoryAccess:
             actions: One line per thing Yuki did.
             outcome: ``final``, ``error``, ``cancelled`` or ``abandoned``.
             on_done: Result callback; exceptions from it are swallowed.
-            addressed: Who a voice turn was said to ("yuki" | "others", voice's ``turn_closed``); a turn
-                said to others is kept but never extracted into rules, to-dos or facts.
+            addressed: Who a voice turn was said to ("yuki" | "others" | "unanswered", voice's ``turn_closed``);
+                a turn said to others is kept but never extracted into rules, to-dos or facts.
 
         Returns:
             ``False`` when memory is not installed (nothing queued).

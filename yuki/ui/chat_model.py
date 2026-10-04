@@ -80,7 +80,8 @@ class Item:
     at: float
     text: str = ""
     source: str = "text"               # text | voice | window | overlay | history
-    status: str = "done"               # done | pending | streaming | running | interrupted | failed | question | hearing
+    #: done | pending | streaming | running | interrupted | failed | question | hearing | others | unanswered
+    status: str = "done"
     steps: list[Step] = field(default_factory=list)
     jobs: list[int] = field(default_factory=list)
     meta: str = ""                     # "52 s · 10 steps · 8¢"
@@ -747,13 +748,15 @@ class ChatModel:
             self._voice_job_step(job, at, str(ev.get("request") or ""), _turn(ev.get("turn")))
 
     def _on_voice_turn_closed(self, ev: dict[str, Any], at: float) -> None:
-        """The voice side's verdict on a user turn: said to Yuki, or to the people on a call."""
+        """The voice side's verdict on a user turn: said to Yuki, to the people on a call ("others"), or, in a
+        call, cut off by the next words before Yuki answered ("unanswered": nobody judged who it was for)."""
         turn = _turn(ev.get("turn"))
-        if turn is None or ev.get("addressed") != "others":
+        status = ev.get("addressed")
+        if turn is None or status not in ("others", "unanswered"):
             return
         for item in reversed(self.items):
             if item.kind == "user" and item.turn == turn:
-                item.status = "others"
+                item.status = status
                 self._changed(item)
                 return
 

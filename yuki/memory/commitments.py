@@ -391,7 +391,8 @@ class CommitmentChecker:
         from yuki.memory.conversations import own_words
 
         for t in sorted(turns, key=lambda t: -t.at):
-            if t.addressed == "others":
+            # said to others, or a call turn nobody has judged yet (77b): never evidence about the user's to-dos
+            if t.addressed in ("others", "unanswered"):
                 continue
             did = f" | Yuki did: {safe('; '.join(t.actions), 400)}" if t.actions else ""
             line = (f"- T{t.id} {day(t.at)} the user: \"{safe(own_words(t.user_text) or t.user_text, 300)}\" | "
