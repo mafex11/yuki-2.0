@@ -1,5 +1,5 @@
-/* Home: the inbox (13 §5.3, 06 §4.4). Needs you / Offers on the left; Running / Since you were away / Your people
-   lately on the right; the Now strip above; a finite counter; "Nothing needs you." when empty. Offer cards follow
+/* Home: the inbox (13 §5.3, 06 §4.4). Needs you / Offers on the left; Your list (the open to-dos) / Running / Since
+   you were away / Your people lately on the right; the Now strip above (what you are doing now, playing, the call); a finite counter; "Nothing needs you." when empty. Offer cards follow
    06 §4.4: Will / Won't lines, a button named for the action, Undo for todo_add and bring_back, late feedback
    (Not now / Less like this) at any time. Every button goes to Python (Yk.act); nothing here decides anything. */
 (function () {
@@ -16,22 +16,18 @@
   function nowStrip(n) {
     if (!n) return null;
     const tiles = [];
-    // the thread of work you are on (the 4 Oct decision: it replaced "In front"): "On <thread> in <app> · <time>"
-    // and its next step; a click opens it on Work with its Continue
-    if (n.thread) {
-      // while its app is in front the minutes run on the page from since_at (the ticker's data-durfrom, once a
-      // minute); else the stretch's fixed length
-      const t = n.thread, live = !!(t.in_front && t.since_at);
-      const mins = live ? (Date.now() / 1000 - t.since_at) / 60 : (t.min || 0);
-      const dur = live || mins >= 1 ? fmt.dur(mins) : '';
-      const durEl = live ? h('span', { data: { durfrom: t.since_at }, text: dur }) : dur;
-      const head = t.app ? 'In ' + t.app : '';
-      const where = [t.app ? 'in ' + t.app : '', live ? '' : dur].filter(Boolean).join(' · ');   // no figure that goes stale
-      tiles.push(h('button', { class: 'clear nowthread', data: { clear: '', do: 'thread-go', ref: t.ref },
-        attrs: { type: 'button', 'aria-label': `On ${t.title}${where ? ' ' + where : ''}. Open it on Work.` } },
-      Y.label(head && dur ? [head, ' · ', durEl] : head || (dur ? durEl : 'Your work now'), null, 'front'),
-      h('div', { class: 'big' }, h('span', { text: t.title })),
-      h('div', { class: 'sm', text: t.next ? 'Next: ' + t.next : (t.shown || '') })));
+    // Now: what you are doing right now (the 4 Oct decision: threads left the window): the current session's title,
+    // the app in front and how long (the minutes run on the page from since_at: the ticker's data-durfrom, so no
+    // figure goes stale); a click opens Work at that session
+    if (n.session) {
+      const t = n.session, title = t.title || t.app || 'At the PC';
+      const durEl = t.since_at ? h('span', { data: { durfrom: t.since_at }, text: fmt.dur((Date.now() / 1000 - t.since_at) / 60) }) : null;
+      const inApp = t.title && t.app ? t.app : '';
+      tiles.push(h('button', { class: 'clear nowsess', data: { clear: '', do: 'now-go' },
+        attrs: { type: 'button', 'aria-label': `Now: ${title}${inApp ? ' in ' + inApp : ''}. Open today’s sessions on Work.` } },
+      Y.label(['Now', inApp ? ' · in ' + inApp : '', durEl ? [' · ', durEl] : null], null, 'front'),
+      h('div', { class: 'big' }, h('span', { text: title })),
+      t.summary ? h('div', { class: 'sm', text: t.summary }) : null));
     }
     if (n.playing) tiles.push(Y.clearing('div', '', Y.label(`Playing · ${n.playing.status || ''}`, null, 'music'),
       h('div', { class: 'big' }, h('span', { text: n.playing.title || 'Something' })), h('div', { class: 'sm', text: [n.playing.artist, n.playing.app].filter(Boolean).join(' · ') })));
@@ -129,22 +125,30 @@
      wrong?" line, ui.js). Done / Not needed go to memory at once; the row says so for 5 s, with Undo while memory can
      put it back (a to-do you added, within 10 minutes), then leaves. Nothing here decides anything. */
   const END_WORDS = { done: 'Done. It’s off your list.', not_needed: 'Not needed. It’s off your list.' };
+  const ending = new Map();   // ref -> how, ended here and not yet out of the data (or undone)
+  /* the open to-dos still to draw: the ones ended here leave at once, whatever an older patch still says */
+  Y.todosOpen = (T) => {
+    const open = (T && T.open) || [];
+    for (const ref of Array.from(ending.keys())) if (!open.some((t) => t.ref === ref)) ending.delete(ref);   // the data caught up
+    return open.filter((t) => !ending.has(t.ref));
+  };
   function todoMeta(t, full) {
     const bits = [t.due ? h('span', { class: 'td-due' + (t.over ? ' over' : ''), text: t.due }) : null,
       t.from ? h('span', { text: t.from }) : null, full && t.added ? h('span', { text: 'added ' + t.added }) : null].filter(Boolean);
     return bits.length ? h('div', { class: 'td-m' }, bits) : null;
   }
-  /* one open to-do; `page` is the page data it lives in (its Correct's pending line), `full` on Work (its own words,
-     when it was added, an open loop's evidence) */
+  /* one open to-do; `page` is the page data it lives in (its Correct's pending line), `full` on Work (the whole
+     words under the title, when it was added, an open loop's evidence) */
   Y.todoRow = (t, d, page, full) => {
     const can = (d.todos || {}).can || {}, p = (d.pending || {})[t.ref];
-    const words = full || !t.title ? t.text : t.title;
-    const row = h('div', { class: 'todo' + (t.over ? ' over' : ''),
-      data: { k: 'todo:' + t.ref, cref: t.ref, cpage: page, kind: 'todo', title: t.title || '', text: t.text } },
+    const words = t.title || t.text;   // memory's few-word title when it has one (Home and Work); Work adds the whole
+    return h('div', { class: 'todo' + (t.over ? ' over' : ''),
+      data: { k: 'todo:' + t.ref, cref: t.ref, cpage: page, kind: 'todo', title: t.title || '', text: t.text, undo: t.undo ? '1' : null } },
     can.end ? h('button', { class: 'td-tick', data: { do: 'todo-end', how: 'done' }, attrs: { type: 'button', 'aria-label': 'Done: ' + t.text }, title: 'Done' }, ic('check'))
       : h('i', { class: 'td-dot', aria: { hidden: 'true' } }),
     h('div', { class: 'td-b' },
       h('div', { class: 'td-t', text: words, title: words !== t.text ? t.text : '' }),
+      full && words !== t.text ? h('div', { class: 'td-d', text: t.text, title: t.text }) : null,
       todoMeta(t, full),
       full && t.evidence ? h('div', { class: 'td-ev', text: t.evidence }) : null,
       p ? h('div', { class: 'td-fix' }, Y.fixLine(p)) : null,
@@ -152,30 +156,65 @@
     h('div', { class: 'td-acts' },
       can.end ? key('Not needed', { cls: 'xs ghost', data: { do: 'todo-end', how: 'not_needed' }, title: 'You don’t need it any more: it leaves your list' }) : null,
       can.correct && !Y.fixing(p) ? Y.correctKey() : null));
-    return row;
   };
   /* Home's "Your list": the open to-dos, due first, a few lines; the rest on Work (see all) */
   function yourList(d) {
     const T = d.todos; if (!T) return null;   // a snapshot from before the list: drawn once memory's data is in
-    const open = T.open || [], n = T.n != null ? T.n : open.length, more = Math.max(0, n - open.length);
+    const open = Y.todosOpen(T), gone = (T.open || []).length - open.length;
+    const n = Math.max(0, (T.n != null ? T.n : (T.open || []).length) - gone), more = Math.max(0, n - open.length);
     const body = open.length ? [h('div', { class: 'todos' }, open.map((t) => Y.todoRow(t, d, 'home', false))),
       more ? h('a', { class: 'td-more', attrs: { href: '#work/todos' }, text: `${more} more on Work` }) : null]
       : Y.empty('Nothing on your list. Ask me to keep a to-do, or add one on Work, and it shows here.');
     const all = h('a', { class: 'label td-all', attrs: { href: '#work/todos' }, title: 'Every to-do, and the ones done lately, on Work' }, 'see all', ic('chev'));
     return Y.k(Y.sec('Your list', n, body, all, 'todosec'), 'list');
   }
-  /* a place on the page asked for (open_yuki's "todos" opens #home/list; Home's "see all" opens #work/todos): that
-     block comes into view once per visit (S.navs), as Work's thread tile does */
+  /* a place on the page asked for (open_yuki's "todos" opens #home/list; Home's "see all" opens #work/todos; Home's
+     Now tile opens #work/at:<moment>): that block comes into view and flashes once per visit (S.navs: going there
+     again focuses it again; the data's own re-renders within the visit don't) */
   const FOCUSED = {};
-  Y.focusBlock = (main, k, tag) => {
-    if (FOCUSED[tag] === Y.S.navs) return;
-    const el = main.querySelector(`[data-k="${k}"]`);
-    if (!el) return;   // its data isn't here yet: the mount after it arrives
+  Y.focusBlock = (el, tag, block) => {
+    if (!el || FOCUSED[tag] === Y.S.navs) return;
     FOCUSED[tag] = Y.S.navs;
     setTimeout(() => {
-      el.scrollIntoView({ block: 'start', behavior: window.Lattice.Motion.reduced ? 'auto' : 'smooth' });
+      el.scrollIntoView({ block: block || 'start', behavior: window.Lattice.Motion.reduced ? 'auto' : 'smooth' });
       el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1600);
     }, 60);
+  };
+
+  /* Done / Not needed: the row says so with Undo (a to-do you added, while memory can put it back) and a 5 s drain,
+     then leaves (the data drops it too). A choice memory didn't take puts the row back. */
+  function putBack(row) {
+    const res = row.__res; if (!res) return;
+    clearTimeout(res.timer); row.__res = null; ending.delete(row.dataset.cref);
+    row.classList.remove('resolved'); row.replaceChildren(...res.kids);
+  }
+  Y.actions['todo-end'] = (t) => {
+    const row = t.closest('[data-cref]'); if (!row || row.__res) return;
+    const ref = row.dataset.cref, how = t.dataset.how;
+    const res = { kids: Array.from(row.childNodes), how };
+    row.__res = res; ending.set(ref, how);
+    res.p = Y.act('todo_end', { ref, how }).then((r) => {
+      if (!r.ok && row.__res === res) { putBack(row); Y.toast(r.error || 'Couldn’t change it. Memory didn’t answer.', true); }
+      return r;
+    });
+    row.classList.add('resolved');
+    row.replaceChildren(h('div', { class: 'confirm res' }, ic('check'), h('span', { text: END_WORDS[how] || END_WORDS.done }),
+      row.dataset.undo ? key('Undo', { cls: 'xs ghost', data: { do: 'todo-undo' } }) : null, h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
+    Y.pop(row.firstElementChild);
+    res.timer = setTimeout(() => {
+      if (row.__res !== res) return;
+      row.__res = null; row.__leaving = true; Y.leave(row);
+      setTimeout(() => Y.renderMain(), 460);
+    }, 5000);
+  };
+  Y.actions['todo-undo'] = (t) => {
+    const row = t.closest('[data-cref]'), res = row && row.__res; if (!res) return;
+    clearTimeout(res.timer); t.disabled = true;
+    res.p.then((first) => (first && first.ok ? Y.act('todo_undo', { ref: row.dataset.cref }) : { ok: true })).then((r) => {
+      if (r.ok) { putBack(row); Y.renderMain(); return; }
+      Y.toast(r.error || 'Couldn’t put it back.', true);
+      row.__res = null; row.__leaving = true; Y.leave(row);
+    });
   };
 
   function build(d, S, D) {
@@ -203,9 +242,9 @@
       h('div', { class: 'grid2', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Needs you', needs.length, needsB), 'needs'),
-          Y.k(Y.sec('Offers', offers.length, offersB), 'offers'),
-          yourList(d)),
+          Y.k(Y.sec('Offers', offers.length, offersB), 'offers')),
         h('div', { class: 'col', data: { k: 'right' } },
+          yourList(d),   // first on the right: the list is in view when Home opens (and where open_yuki's todos lands)
           Y.k(Y.sec('Running', runningN, runB), 'running'),
           Y.k(Y.sec('Since you were away', away.length, awayB), 'away'),
           people.length ? Y.k(Y.sec('Your people lately', null, latelyB, Y.rightLabel(anyRhythm ? 'messages a day · 14 days' : 'last in touch')), 'people') : null,
@@ -272,7 +311,8 @@
   A['answer-typed'] = (t) => answered(t, t.value.trim());
   A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
-  A['thread-go'] = (t) => Y.go('work', t.dataset.ref || '');
+  /* the Now tile: Work, at the session holding this moment (its row opens and comes into view) */
+  A['now-go'] = () => Y.go('work', 'at:' + Math.round(Date.now() / 1000));
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
   /* Learned proposals (practice memory, E13): Save keeps it, Edit is your words (memory re-distills the next
      version from them), No drops it; a question is answered in your words or skipped. Python maps the choice onto
@@ -301,5 +341,9 @@
   };
   A['learn-save2'] = (t) => { const box = t.closest('[data-learned]'); learnedAct(t, 'edit', box.querySelector('textarea').value.trim()); };
 
-  Y.pages.home = { build };
+  Y.pages.home = {
+    build,
+    /* open_yuki's "todos" (#home/list): Your list comes into view */
+    mount: (main, S) => { if (S.sub === 'list') Y.focusBlock(main.querySelector('[data-k="list"]'), 'home-list'); }
+  };
 })();

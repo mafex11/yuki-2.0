@@ -243,7 +243,7 @@ async function inPage(F) {
 
   // ---- each other page: new data patched in, scroll kept, focus kept ----
   const pages = [
-    ['work', '#work', 'work', (d) => { d.threads[0].title = 'Invented thread, renamed'; return 'Invented thread, renamed'; }],
+    ['work', '#work', 'work', (d) => { Object.assign(d.todos.open[0], { text: 'Invented to-do, renamed', title: null }); return 'Invented to-do, renamed'; }],
     ['day', '#work/day', 'day', (d) => { d.totals[0][1] = '9h 99m'; return '9h 99m'; }],
     ['me', '#me', 'me', (d) => { d.rules[0].text = 'Invented rule, said again.'; return 'Invented rule, said again.'; }],
     ['playbook', '#playbook', 'playbook', (d) => { d.lessons[0].dont = 'Invented lesson, updated'; return 'Invented lesson, updated'; }],
@@ -626,54 +626,11 @@ async function inPage(F) {
   qsel()[0].value = '23:00'; qsel()[0].dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
   check('W10 a new start time is sent and shown in plain clock words', acts('quiet').some((m) => m.start === '23:00') && qrow().textContent.includes('From 11:00 PM to 8:00 AM'), qrow().textContent.slice(0, 80));
 
-  // ---- appWin1 (4 Oct round 3): W1 threads you can close and continue, W2 session titles, Home's current thread,
-  // W6 misheard guesses, W3 Correct in your words, English only ----
+  // ---- appWin1 (4 Oct round 3): W2 session titles, W6 misheard guesses, W3 Correct in your words, English only
+  // (W1's threads and Home's current-thread tile left the window with appTodo, 4 Oct) ----
   { // (its own block: its names never clash with the checks above)
   const enter = (el) => { el.focus(); el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); };
   const last = (action) => acts(action).slice(-1)[0] || {};
-  await go('#work'); await sleep(600);
-  const cardOf = (ref) => main().querySelector(`.thread[data-cref="${ref}"]`);
-  const c15 = cardOf('thread:15');
-  check('W1 a thread card shows its title, where it stands and the next step', !!c15 && c15.querySelector('h3').textContent.length > 0
-    && c15.querySelector('.stands').textContent.length > 0 && /^Next: \S/.test(c15.querySelector('.tnext').textContent), c15 && c15.textContent.slice(0, 160));
-  check('W1 each open thread has Correct, Done and Not a thread', Array.from(main().querySelectorAll('[data-k="threads"] > .thread')).every((c) => c.querySelector('[data-do="correct"]')
-    && c.querySelector('[data-do="thread-close"][data-how="done"]') && c.querySelector('[data-do="thread-close"][data-how="dismiss"]')));
-  check('W1 paused threads fold away; closed ones sit in their own fold, each with Reopen', !!main().querySelector('.tfold[data-fold="paused"]') && !main().querySelector('[data-k="threads"] .st-tag.paused')
-    && main().querySelectorAll('.tfold[data-fold="closed"] [data-do="thread-reopen"]').length === F.pages.work.closed.length);
-  REPLY.close_thread = (m) => ({ ok: true, status: m.how === 'reopen' ? 'active' : m.how === 'dismiss' ? 'dismissed' : 'done' });
-  c15.querySelector('[data-do="thread-close"][data-how="done"]').click(); await sleep(80);
-  check('W1 Done closes it at once, with Undo', c15.textContent.includes('Closed as done') && !!c15.querySelector('[data-do="thread-undo"]') && last('close_thread').how === 'done' && last('close_thread').ref === 'thread:15');
-  await push('work', clone(F.pages.work));
-  check('W1 a patch with the old data keeps it closed', c15.isConnected && c15.textContent.includes('Closed as done'));
-  c15.querySelector('[data-do="thread-undo"]').click(); await sleep(150);
-  check('W1 Undo reopens it (close_thread reopen) and the card is back', last('close_thread').how === 'reopen' && !!cardOf('thread:15') && !!cardOf('thread:15').querySelector('h3'));
-  const c3 = cardOf('thread:3');
-  c3.querySelector('[data-do="thread-close"][data-how="dismiss"]').click(); await sleep(80);
-  check('W1 Not a thread says so, with Undo', c3.textContent.includes('Not a thread') && last('close_thread').how === 'dismiss');
-  const wk2 = clone(F.pages.work);
-  wk2.threads = wk2.threads.filter((t) => t.ref !== 'thread:3');
-  wk2.closed = [{ ref: 'thread:3', title: 'Photo backup', status: 'dismissed', closed_at: Date.now() / 1000, by_you: true }].concat(wk2.closed);
-  await sleep(5600); await push('work', wk2); await sleep(500);
-  check('W1 after its 5 s it has left your threads and sits under Closed lately', !cardOf('thread:3') && main().querySelector('.tfold[data-fold="closed"]').textContent.includes('Photo backup'));
-  F.pages.work = wk2;
-  const reopenKey = main().querySelector('.tfold[data-fold="closed"] [data-do="thread-reopen"]');
-  reopenKey.click(); await sleep(120);
-  check('W1 Reopen sends close_thread reopen for it', last('close_thread').how === 'reopen' && last('close_thread').ref === reopenKey.dataset.ref);
-  REPLY.thread_continue = (m) => ({ ok: true, cont: { ref: m.ref, title: 'Invented thread', shown: 'Half built.', next: 'Write the invented timer', open: [],
-    last_at: Date.now() / 1000 - 300, ask: 'Help me continue Invented thread. Where it stands: Half built. Next: Write the invented timer',
-    places: [{ kind: 'window', app: 'VS Code', title: 'invented.ts', page: false }, { kind: 'page', app: 'Firefox', title: 'An invented guide', page: true }] } });
-  cardOf('thread:12').querySelector('[data-do="continue"]').click(); await sleep(200);
-  const panel = () => cardOf('thread:12').querySelector('.tcont');
-  check('W1 Continue reads the thread (thread_continue) and shows the next-step request', last('thread_continue').ref === 'thread:12' && !!panel()
-    && panel().textContent.includes('Next: Write the invented timer'), panel() && panel().textContent);
-  check('W1 Continue offers the windows and pages to bring back, a page with its own Open', panel().querySelectorAll('.tc-tick').length === 2 && panel().querySelectorAll('[data-do="cont-open"]').length === 1);
-  check('W1 never a generic "pick up where you left off"', !/pick up where/i.test(main().textContent));
-  await push('work', clone(F.pages.work));
-  check('W1 the Continue panel stays open through a patch', !!panel());
-  panel().querySelector('.tc-tick[data-i="0"]').click(); await sleep(30);
-  panel().querySelector('[data-do="cont-ask"][data-how="ask"]').click(); await sleep(200);
-  const ca = last('continue');
-  check('W1 Ask Yuki hands over the request with only the places still ticked', ca.ref === 'thread:12' && ca.how === 'ask' && JSON.stringify(ca.places) === '[1]', JSON.stringify(ca));
   await go('#work/day'); await sleep(600);
   const sx = Array.from(main().querySelectorAll('[data-k="sessions"] .fx'));
   const sTitles = sx.map((r) => r.querySelector('.fx-h .tx').textContent);
@@ -693,26 +650,6 @@ async function inPage(F) {
   REPLY.cancel_correction = { ok: true };
   sRow().querySelector('[data-do="fix-undo"]').click(); await sleep(200);
   check('W3 Undo while it waits cancels the correction', last('cancel_correction').correction_id === 93 && !sRow().textContent.includes('Got it, fixing it'));
-  await go('#home'); await sleep(500);
-  const tile = main().querySelector('.nowthread');
-  check('Home: the current work thread replaces In front: its title, app and time, its next step', !!tile && tile.textContent.includes('Garden planner: watering schedule')
-    && /In VS Code · 4\dm/.test(tile.textContent) && tile.textContent.includes('Next: ') && !/In front/.test(main().textContent), tile && tile.textContent);
-  const durEl = tile.querySelector('[data-durfrom]');
-  if (durEl) { durEl.dataset.durfrom = String(Date.now() / 1000 - 125 * 60); Y.tickSoon(); await sleep(60); }
-  check('Home: while its app is in front the tile’s minutes run on the page (the ticker), never a stale figure', !!durEl && durEl.textContent === '2h 05m', durEl && durEl.textContent);
-  const nowD = Y.D.pages.home.now;   // (the call may have ended in the checks above)
-  check('Home: Playing and Call stay beside it', main().querySelectorAll('.now > *').length === 1 + (nowD.playing ? 1 : 0) + (nowD.call ? 1 : 0) && !!nowD.playing,
-    Array.from(main().querySelectorAll('.now > *')).map((x) => x.textContent.slice(0, 30)).join(' | '));
-  check('Home: no "cards only · never a run" jargon', !main().textContent.includes('never a run'));
-  tile.click(); await sleep(900);
-  check('Home: the tile opens that thread on Work with its Continue', decodeURIComponent(location.hash) === '#work/thread:12' && !!cardOf('thread:12') && !!cardOf('thread:12').querySelector('.tcont'),
-    `${decodeURIComponent(location.hash)} card ${!!cardOf('thread:12')} panel ${!!(cardOf('thread:12') && cardOf('thread:12').querySelector('.tcont'))}`);
-  cardOf('thread:12').querySelector('[data-do="continue"]').click(); await sleep(200);
-  const closedCont = !cardOf('thread:12').querySelector('.tcont');
-  await go('#home'); await sleep(400);
-  main().querySelector('.nowthread').click(); await sleep(900);
-  check('Home: the tile clicked again after Continue was closed opens it again', closedCont && !!cardOf('thread:12') && !!cardOf('thread:12').querySelector('.tcont'),
-    `closed ${closedCont} panel ${!!(cardOf('thread:12') && cardOf('thread:12').querySelector('.tcont'))}`);
   await go('#me'); await sleep(500);
   const mh2 = main().querySelector('.mhsec [data-resolve]');
   const mtx = mh2.querySelector('.tx').textContent;
@@ -746,6 +683,84 @@ async function inPage(F) {
   check('W3 when the pass lands, the live refresh shows the corrected text and "Fixed"', fxN().querySelector('.fx-h .tx').textContent === 'Invented corrected headline' && fxN().textContent.includes('Fixed from what you said'));
   const rIn = () => main().querySelector('.fgroup[data-group="prefs"] .fx[data-kind="rule"]');
   check('W3 a rule is said again in your words (never its text to edit)', !!rIn() && Array.from(rIn().querySelectorAll('.key')).some((k) => k.textContent.trim() === 'Say it again'));
+  // ---- appTodo (4 Oct): the to-do list on Home and Work, open_yuki's place for it, Home's Now tile (the current
+  // session), and no threads anywhere in the window ----
+  const FH = F.pages.home, FW = F.pages.work;
+  await go('#home'); await sleep(500);
+  const list = () => main().querySelector('[data-k="list"]');
+  const rowOf = (root, ref) => root.querySelector(`.todo[data-cref="${ref}"]`);
+  check('T1 Home shows Your list: the open to-dos, due first, and how many in all', !!list() && list().querySelectorAll('.todo').length === FH.todos.open.length
+    && list().querySelector('.sec-h').textContent.includes(String(FH.todos.n)) && rowOf(list(), FH.todos.open[0].ref) === list().querySelector('.todo'), list() && list().textContent.slice(0, 200));
+  check('T1 due dates in natural words, an overdue one marked, never an ISO date', /was due yesterday/.test(list().textContent) && !!list().querySelector('.td-due.over')
+    && /due today, \d/.test(list().textContent) && !/\d{4}-\d{2}-\d{2}/.test(list().textContent), Array.from(list().querySelectorAll('.td-m')).map((m) => m.textContent).join(' | '));
+  check('T1 each row has Done, Not needed and Correct', Array.from(list().querySelectorAll('.todo')).every((r) => r.querySelector('[data-do="todo-end"][data-how="done"]')
+    && r.querySelector('[data-do="todo-end"][data-how="not_needed"]') && r.querySelector('[data-do="correct"]')));
+  check('T1 the rest are a click away on Work', !!list().querySelector('a[href="#work/todos"]') && list().textContent.includes(`${FH.todos.n - FH.todos.open.length} more on Work`));
+  REPLY.todo_end = (m) => ({ ok: true, ref: m.ref, how: m.how, undo: m.ref.startsWith('todo:') });
+  const r0 = rowOf(list(), 'todo:29');
+  r0.querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
+  check('T2 Done ends it at once (todo_end) and says so, with Undo', r0.textContent.includes('Done. It’s off your list.') && !!r0.querySelector('[data-do="todo-undo"]')
+    && last('todo_end').ref === 'todo:29' && last('todo_end').how === 'done');
+  await push('home', clone(FH));
+  check('T2 a patch with the old data keeps it ended', r0.isConnected && r0.textContent.includes('off your list'));
+  REPLY.todo_undo = { ok: true, ref: 'todo:29' };
+  r0.querySelector('[data-do="todo-undo"]').click(); await sleep(150);
+  check('T2 Undo puts it back (todo_undo) and the row is back', last('todo_undo').ref === 'todo:29' && !!rowOf(list(), 'todo:29') && !!rowOf(list(), 'todo:29').querySelector('.td-tick'));
+  const r1 = rowOf(list(), 'commit:44');
+  r1.querySelector('[data-do="todo-end"][data-how="not_needed"]').click(); await sleep(80);
+  check('T2 Not needed says so; a commitment has no Undo', r1.textContent.includes('Not needed. It’s off your list.') && !r1.querySelector('[data-do="todo-undo"]')
+    && last('todo_end').ref === 'commit:44' && last('todo_end').how === 'not_needed');
+  const h2 = clone(FH);
+  h2.todos.open = [{ ref: 'todo:41', text: 'Invented to-do said by voice', title: null, from: '', due: 'due today, 6 PM', over: false, due_at: Date.now() / 1000 + 3600,
+    all_day: false, since: Date.now() / 1000, added: 'today', evidence: null, undo: true, status: 'open' }].concat(h2.todos.open.slice(0, 4));
+  h2.todos.n += 1;
+  await push('home', h2); await sleep(100);
+  check('T3 a to-do added by voice shows on Home at once (the live refresh)', !!rowOf(list(), 'todo:41') && list().textContent.includes('Invented to-do said by voice'));
+  REPLY.correct_item = (m) => ({ ok: true, correction_id: 95, ref: m.ref });
+  rowOf(list(), 'todo:41').querySelector('[data-do="correct"]').click(); await sleep(60);
+  const ci = rowOf(list(), 'todo:41').querySelector('.fixbox input');
+  check('T4 Correct opens the shared "What’s wrong?" line', !!ci && ci.value === '' && rowOf(list(), 'todo:41').querySelector('.fixbox').textContent.includes('What’s wrong?'));
+  ci.value = 'It is due tomorrow'; enter(ci); await sleep(200);
+  check('T4 it sends correct_item for that to-do; the row says "Got it, fixing it"', last('correct_item').ref === 'todo:41' && last('correct_item').words === 'It is due tomorrow'
+    && rowOf(list(), 'todo:41').textContent.includes('Got it, fixing it'));
+  // Home's Now tile: what you are doing now, from the current session
+  const tile = main().querySelector('.nowsess');
+  check('N1 the Now tile shows the current session’s title, the app and how long', !!tile && tile.textContent.includes(FH.now.session.title) && /Now · in VS Code · 4\dm/.test(tile.textContent), tile && tile.textContent);
+  const durEl = tile && tile.querySelector('[data-durfrom]');
+  if (durEl) { durEl.dataset.durfrom = String(Date.now() / 1000 - 125 * 60); Y.tickSoon(); await sleep(60); }
+  check('N1 its minutes run on the page (the ticker), never a stale figure', !!durEl && durEl.textContent === '2h 05m', durEl && durEl.textContent);
+  const nowD = Y.D.pages.home.now;
+  check('N1 Playing and the call stay beside it', main().querySelectorAll('.now > *').length === 1 + (nowD.playing ? 1 : 0) + (nowD.call ? 1 : 0) && !!nowD.playing);
+  check('N1 no thread tile, no "Next:" line, no "In front"', !main().querySelector('.nowthread') && !/Next: |In front/.test(main().querySelector('.now').textContent));
+  tile.click(); await sleep(900);
+  const lastS = FW.sessions[FW.sessions.length - 1], openS = main().querySelector('[data-k="sessions"] .fx.open');
+  check('N2 a click opens Work at the session holding now, opened', decodeURIComponent(location.hash).startsWith('#work/at:') && !!openS
+    && openS.querySelector('.fx-h .tx').textContent === lastS.title, `${decodeURIComponent(location.hash)} ${openS && openS.querySelector('.fx-h .tx').textContent}`);
+  // Work: the full list beside today's sessions; no threads
+  const wt = () => main().querySelector('[data-k="todos"]');
+  check('T5 Work has the full To-dos block: the open ones, Add, the done ones folded', !!wt() && wt().querySelectorAll('.todos > .todo:not(.done)').length >= FW.todos.open.length - 1
+    && !!wt().querySelector('.td-add .td-in') && !!wt().querySelector('.tdfold[data-fold="todos-done"]') && !wt().querySelector('.tdfold[data-fold="todos-done"]').classList.contains('open'),
+  wt() && `${wt().querySelectorAll('.todos > .todo:not(.done)').length} of ${FW.todos.open.length}`);
+  const lr = rowOf(wt(), 'loop:12');
+  check('T5 a row on Work: its title, its whole words, where it came from and why', !!lr && lr.querySelector('.td-t').textContent === 'Climbing photos for Riya' && !!lr.querySelector('.td-d')
+    && !!lr.querySelector('.td-ev') && lr.querySelector('.td-m').textContent.includes('I noticed it') && !/\d{4}-\d{2}-\d{2}/.test(lr.textContent), lr && lr.textContent);
+  check('T5 the commitment ended on Home is gone here too', !rowOf(wt(), 'commit:44'));
+  REPLY.todo_add = { ok: true, ref: 'todo:42' };
+  const ai = wt().querySelector('.td-in');
+  ai.value = 'Invented new to-do'; enter(ai); await sleep(200);
+  check('T6 Add sends your words to memory (todo_add) and clears the line', last('todo_add').text === 'Invented new to-do' && wt().querySelector('.td-in').value === '');
+  const ws = Array.from(main().querySelectorAll('[data-k="sessions"] .fx'));
+  check('T7 today’s sessions sit beside the list, latest first', ws.length === FW.sessions.length && ws[0].querySelector('.fx-h .tx').textContent === lastS.title);
+  const cols = Array.from(main().querySelectorAll('.wk-grid > .col')).map((c) => c.getBoundingClientRect().height);
+  check('T7 the page stays balanced: two columns, neither under a third of the other', cols.length === 2 && Math.min(...cols) >= Math.max(...cols) / 3, cols.map(Math.round).join(' vs '));
+  check('T8 no threads on Work: no thread cards, Continue, Closed lately or Threads tab', !main().querySelector('.thread, [data-do="continue"], [data-do="thread-close"], .tfold')
+    && !/\bThreads?\b|Continue|Closed lately|Not a thread/.test(main().textContent), main().textContent.slice(0, 200));
+  // open_yuki's "todos": the window opens on Home at Your list; "see all" opens Work at the list
+  window.__push({ kind: 'focus', page: 'home', sub: 'list' }); await sleep(400);
+  check('T9 open_yuki todos opens Home at Your list, brought into view', location.hash === '#home/list' && !!list() && list().classList.contains('flash')
+    && list().getBoundingClientRect().top < window.innerHeight, `${location.hash} ${list() && list().className}`);
+  list().querySelector('a.td-all').click(); await sleep(500);
+  check('T9 see all opens Work at the list', location.hash === '#work/todos' && !!wt() && wt().classList.contains('flash'));
   let foreign = '';
   for (const hsh of ['#home', '#work', '#work/day', '#me']) { await go(hsh); await sleep(300); if (/[ऀ-ॿ]/.test(main().textContent)) foreign += hsh + ' '; }
   check('English only on Home, Work, Day and Me', !foreign, foreign);
