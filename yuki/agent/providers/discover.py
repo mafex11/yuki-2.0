@@ -313,6 +313,12 @@ def fit_for(role: str, info: ModelInfo | None, provider_id: str = "") -> str:
     if info.context is not None and info.context < THINKER_CONTEXT_TOKENS:
         return ("This model can't read a request as long as doing things sends, so the start of it (my rules) "
                 "would be cut off. Pick a bigger model.")
+    if provider_id == "ollama" and info.run_context is not None and info.run_context < THINKER_CONTEXT_TOKENS:
+        # the model's own set-up (its Modelfile) fixes a short window, ahead of Ollama's setting: raising that
+        # won't help
+        return (f"This model is set up to read only {info.run_context:,} tokens of each request, so most of what doing "
+                "things sends (my rules and tools) would be cut off without a word. Pick another model, or one made "
+                "with a bigger context.")
     if provider_id == "ollama":
         window = info.run_context or ollama_server_context()
         if window is None or window < THINKER_CONTEXT_TOKENS:

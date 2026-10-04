@@ -212,6 +212,12 @@ class FailoverClient:
         """The model id the last call on this thread actually used (after any failover)."""
         return getattr(self._local, "model", None)
 
+    def last_routed_model(self) -> str | None:
+        """The model that answered the last call on this thread when Settings → AI sent it elsewhere
+        (``provider:model``, or the Claude id of the user's ``default`` backup); ``None`` after a call that went the default way, so the
+        default path keeps pricing the model it asked for (as before)."""
+        return getattr(self._local, "routed_model", None)
+
     def last_target(self) -> str | None:
         """``model@region`` of the last call on this thread."""
         return getattr(self._local, "target", None)
@@ -289,13 +295,21 @@ class FailoverClient:
     def run(self, params: dict[str, Any], call: Callable[[Any, dict[str, Any]], Any]) -> Any:
         """``call(client, params)`` on each target in turn until one works (see the module docstring)."""
         if self.role is not None:
-            from yuki.agent.providers.config import route
+            from yuki.agent.providers.client import strip_unsigned_thinking
+            from yuki.agent.providers.config import route, take_note
             from yuki.agent.providers.pricing import note_routed
 
             chosen = route(self.role)
             if chosen is not None:
                 return self._run_routed(chosen, params, call)
             note_routed(None, None)
+            self._local.routed_model = None
+            if take_note():   # ai.json is there but unreadable: on Claude because of that, said once (content-free)
+                self._event("ai_config_unreadable", role=self.role)
+            # a role moved back to Claude may still carry another service's reasoning (thinking with no signature)
+            # in the conversation: Claude would refuse the request. Claude's own (signed) blocks stay; a request with
+            # none is the same object.
+            params = strip_unsigned_thinking(params)
         model = str(params.get("model") or "")
         chain = self.chain(model)
         start = self._start_index(model, chain)
@@ -402,6 +416,7 @@ class FailoverClient:
         provider = target.rpartition("@")[2] or chosen.primary.provider
         name = used if provider == "default" else f"{provider}:{used}"
         self._local.model, self._local.target = name, f"{used}@{provider}"
+        self._local.routed_model = name
         note_routed(requested, None if provider == "default" else name)
         return result
 
@@ -430,12 +445,22 @@ class _OpenedStream:
         self._first = first
         self._rest = rest
         self._has_first = has_first
+        #: Settings → AI: told when a routed stream fails after it began (the log line ``model_midstream_error``)
+        self.on_error: Callable[[BaseException], None] | None = None
 
     def __iter__(self) -> Iterator[Any]:
         if self._has_first:
             self._has_first = False
             yield self._first
-        yield from self._rest
+        try:
+            yield from self._rest
+        except Exception as exc:
+            if self.on_error is not None:
+                try:
+                    self.on_error(exc)
+                except Exception:
+                    pass
+            raise
 
     def get_final_message(self) -> Any:
         for _ in self:   # drain whatever the caller did not read
@@ -473,7 +498,16 @@ class _FailoverStream:
             self._manager = manager
             return _OpenedStream(stream, first, events, has_first)
 
-        return self._owner.run(self._params, open_one)
+        opened = self._owner.run(self._params, open_one)
+        routed = self._owner.last_routed_model()
+        if routed:
+            # failed after the answer began (OpenRouter's mid-answer error chunk, a cut stream): what was read can't
+            # be taken back, so it isn't retried here; the request fails with the error, and the log says so
+            owner = self._owner
+            opened.on_error = lambda exc: owner._event(
+                "model_midstream_error", role=owner.role, target=routed, status=getattr(exc, "status_code", None),
+                error=type(exc).__name__)
+        return opened
 
     def __exit__(self, *exc: Any) -> Any:
         if self._manager is not None:

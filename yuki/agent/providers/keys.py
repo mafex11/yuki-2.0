@@ -181,13 +181,21 @@ def saved_values() -> list[str]:
         return []
 
 
+#: An environment variable's value is hidden as a key only from this length: every provider's real keys are far
+#: longer (OpenAI, Anthropic, OpenRouter, DeepSeek, Gemini: 35 characters and up), while the stand-ins local AI tools
+#: tell you to put there ("lm-studio", "sk-no-key-required", "not-needed") are shorter and are ordinary words that
+#: must not vanish from memory wherever they appear. A key typed into Settings is hidden from 8 (it was given as one).
+ENV_KEY_MIN_CHARS = 20
+
+
 def secret_values() -> list[str]:
     """Every AI key this PC holds for Yuki: the saved ones and the providers' environment variables (a key in an
-    environment variable is as secret as a saved one, whatever its format). For exact-match hiding only."""
+    environment variable is as secret as a saved one, whatever its format; a value shorter than
+    :data:`ENV_KEY_MIN_CHARS` there is a stand-in, not a key). For exact-match hiding only."""
     out = saved_values()
     for provider in PROVIDERS:
         value = _env(provider)
-        if value and len(value) >= 8 and value not in out:
+        if value and len(value) >= ENV_KEY_MIN_CHARS and value not in out:
             out.append(value)
     return out
 
@@ -206,5 +214,6 @@ def redact(text: str, *extra: str | None) -> str:
     return out
 
 
-__all__ = ["KeyStoreError", "MAX_KEY_CHARS", "env_names", "forget_key", "get_key", "key_path", "key_source", "redact",
+__all__ = ["ENV_KEY_MIN_CHARS", "KeyStoreError", "MAX_KEY_CHARS",
+           "env_names", "forget_key", "get_key", "key_path", "key_source", "redact",
            "saved_key", "saved_values", "secret_values", "set_key", "version"]

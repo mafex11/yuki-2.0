@@ -125,7 +125,14 @@ def page() -> dict[str, Any]:
 
 def doctor_lines() -> tuple[str, list[str], list[str]]:
     """``(status, lines, fixes)`` for the doctor: ``ok`` / ``warn`` / ``fail``, one line per role (never a key)."""
+    from yuki.agent.providers import config
+
     lines, fixes, status = [], [], "ok"
+    if config.problem() == "unreadable":
+        status = "warn"
+        lines.append("Your AI choices file couldn't be read, so every job is on Claude")
+        fixes.append("Your AI choices file couldn't be read, so every job is on Claude. Pick each job's AI again in "
+                     "Settings, AI (that writes the file afresh).")
     for line in roles_state():
         if line["provider"] == "default":
             lines.append(f"{line['words']}: Claude (as now)")
@@ -157,14 +164,30 @@ def set_role(role: str, provider: str, model: str = "", backup_provider: str | N
         raise ValueError("unknown job")
     if provider not in PROVIDERS:
         raise ValueError("unknown service")
-    with _edit:
+    with _edit, _busy_words():
         _write_role(config, role, provider, model, backup_provider, backup_model, price)
     return role_line(role)
 
 
+class _busy_words:
+    """A save that found ai.json locked by another process for every try says so plainly (``ValueError``, which the
+    window shows); nothing was written."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, kind: Any, exc: Any, tb: Any) -> bool:
+        from yuki.agent.providers.config import LockedError
+
+        if isinstance(exc, (LockedError, PermissionError)):
+            busy = "Your AI choices file is busy right now, so nothing changed. Try again in a moment."
+            raise ValueError(busy) from exc
+        return False
+
+
 def _write_role(config: Any, role: str, provider: str, model: str, backup_provider: str | None,
                 backup_model: str | None, price: dict[str, float] | None) -> None:
-    data = config.load()
+    data = config.load_for_edit()   # never the defaults written over choices a locked file hid
     entry = dict(data["roles"].get(role) or {})
     entry["provider"] = provider
     entry["model"] = "" if provider == "default" else " ".join(str(model or "").split())[:200]
@@ -215,8 +238,8 @@ def set_custom(base_url: str, label: str = "") -> dict[str, Any]:
             raise ValueError("That address doesn't look right. It should start with https://")
         if parts.username or parts.password:
             raise ValueError("Leave the key out of the address and paste it in the key box instead.")
-    with _edit:
-        data = config.load()
+    with _edit, _busy_words():
+        data = config.load_for_edit()
         data["custom"] = {"base_url": url, "label": " ".join(str(label or "").split())[:60]}
         config.save(data)
     return {"base_url": url}

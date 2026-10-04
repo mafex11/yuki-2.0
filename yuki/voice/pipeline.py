@@ -986,13 +986,19 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             # Settings → AI moved the talker: its client already retries there and then tries the user's backup, so
             # this layer makes one attempt (two layers would multiply the attempts and the wait before a reply)
             routed = getattr(hooks, "routed", None)
-            tries = 1 if callable(routed) and routed() else 2
+            moved = bool(callable(routed) and routed())
+            tries = 1 if moved else 2
             last: BaseException | None = None
             for index in range(start, len(chain)):
                 target = chain[index]
                 for attempt in range(tries if index == 0 else 1):
                     try:
-                        if target is None:
+                        if target is None and moved:
+                            # not Pipecat's timeout-and-send-again either (``retry_on_timeout``): the role client reads
+                            # the first event inside this call, so that 5 s limit would cut its retries and backup
+                            # short and start the whole chain over (it has its own first-event limit)
+                            response = await api_call(**params)
+                        elif target is None:
                             response = await super()._create_message_stream(api_call, params)
                         else:
                             client = hooks.client_for(target.get("region"))

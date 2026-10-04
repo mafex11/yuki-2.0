@@ -140,9 +140,11 @@ class Advice:
     cost_usd: float | None = None
     summary_chars: int = 0
     error: str | None = None
-    #: The model that actually answered (the client's ``last_model`` on the consult's own thread: after Settings → AI
-    #: moved doing things, ``provider:model``), so the cost is that model's; ``None``: not known (the asked model).
+    #: The model that actually answered when Settings → AI moved doing things (``provider:model``, read on the
+    #: consult's own thread), so the cost is that model's; ``None`` on the default path (the asked model, as before).
     model: str | None = None
+    #: The amount the service returned for this call (OpenRouter), read on the consult's own thread; else ``None``.
+    returned_usd: float | None = None
 
     def note(self) -> str:
         """The labelled note for the actor's next message."""
@@ -170,8 +172,14 @@ def run_consult(client: Any, params: dict[str, Any], *, signal: str, timeout_s: 
         try:
             response = client.messages.create(**params)
             box["response"] = response
-            last_model = getattr(client, "last_model", None)   # per thread: read here, on the thread that called
-            box["model"] = last_model() if callable(last_model) else None
+            from yuki.agent.providers.pricing import answered_by, returned_cost
+
+            box["model"] = answered_by(client)   # per thread: read here, on the thread that called
+            usage = getattr(response, "usage", None)
+            if box["model"] is not None and usage is not None:
+                from yuki.log.requests import usage_tokens
+
+                box["returned"] = returned_cost(usage_tokens(usage))
         except Exception as exc:  # noqa: BLE001
             box["error"] = f"{type(exc).__name__}: {exc}"[:200]
         finally:
@@ -189,6 +197,7 @@ def run_consult(client: Any, params: dict[str, Any], *, signal: str, timeout_s: 
         return advice
     response = box.get("response")
     advice.model = box.get("model") if isinstance(box.get("model"), str) else None
+    advice.returned_usd = box.get("returned") if isinstance(box.get("returned"), float) else None
     texts = []
     for block in getattr(response, "content", []) or []:
         kind = getattr(block, "type", "")

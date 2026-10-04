@@ -376,11 +376,10 @@
       aiTake(r);
     });
   };
-  /* once per opening of Settings: the lists of the services the jobs use, and whether Ollama runs (off the UI thread
-     in Python; a local look with a 2 s limit) */
+  /* once per opening of Settings: the lists of the services the jobs use (off the UI thread in Python). Ollama is
+     asked only when a job or a backup uses it, or when you pick it or press Test: no local look nobody asked for */
   function aiMount() {
     const ai = aiData(); if (!ai) return;
-    aiModels('ollama');
     (ai.roles || []).forEach((r) => { aiModels(r.provider); if (r.backup_provider) aiModels(r.backup_provider); });
   }
 

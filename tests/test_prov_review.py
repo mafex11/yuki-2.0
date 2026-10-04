@@ -249,6 +249,9 @@ class _ThreadClient:
     def last_model(self) -> str | None:
         return getattr(self._local, "model", None)
 
+    def last_routed_model(self) -> str | None:   # a routed call (FailoverClient's): the model that answered it
+        return getattr(self._local, "model", None)
+
     def _stream(self, **params: Any) -> _Stream:
         self._local.model = self._name
         return _Stream([])
@@ -267,12 +270,13 @@ def test_judge_cost_is_the_answering_models(ai_dir: Path) -> None:
     settings = Settings()
     v = decide(_ThreadClient("ollama:llama3.2"), {"model": settings.judge_model}, timeout_s=5.0)
     assert v.model == "ollama:llama3.2" and v.usage            # read on the judge's own thread
-    owner = SimpleNamespace(settings=settings, _lock=threading.Lock(), cost_usd=0.0)
+    owner = SimpleNamespace(settings=settings, _lock=threading.Lock(), cost_usd=0.0, unpriced=set())
     Authorizer._cost(owner, settings.judge_model, v)
     assert v.cost_usd == 0.0                                   # local: free, never Haiku's rate
     v2 = decide(_ThreadClient("custom:some-model"), {"model": settings.judge_model}, timeout_s=5.0)
     Authorizer._cost(owner, settings.judge_model, v2)
     assert v2.cost_usd is None                                 # unknown price: unknown, never invented
+    assert owner.unpriced == {"custom:some-model"}             # second review V4: the request total is unknown too
 
 
 def test_consult_cost_is_the_answering_models(ai_dir: Path) -> None:

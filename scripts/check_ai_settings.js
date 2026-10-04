@@ -103,6 +103,13 @@ async function main() {
     for (let i = 0; i < 50; i++) { if (await evaluate('!!(window.__sent && window.__sent.some((m) => m.op === "ready"))')) break; await sleep(100); }
     const out = await evaluate(`(${inPage.toString()})(${JSON.stringify(fixture())})`);
     results.push(...out);
+    // a second opening with no job on Ollama: Settings must not look for Ollama by itself (second review D4)
+    const plain = fixture();
+    plain.pages.settings.ai.roles.forEach((r) => { if (r.provider === 'ollama') Object.assign(r, { provider: 'default', model: '' });
+      if (r.backup_provider === 'ollama') Object.assign(r, { backup_provider: '', backup_model: '' }); });
+    await send('Page.navigate', { url });
+    for (let i = 0; i < 50; i++) { if (await evaluate('!!(window.__sent && window.__sent.some((m) => m.op === "ready"))')) break; await sleep(100); }
+    results.push(...await evaluate(`(${noOllamaPage.toString()})(${JSON.stringify(plain)})`));
     if (argv('--shot')) {   // a picture of the section as the checks left it (for a person to look at)
       await evaluate(`(() => { const s = document.querySelector('[data-k="ai"]'); if (s) s.scrollIntoView(); return 1; })()`);
       await sleep(300);
@@ -124,6 +131,18 @@ async function main() {
 }
 
 /* ---------------- runs inside the page ---------------- */
+async function noOllamaPage(F) {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  window.__push({ kind: 'boot', source: 'snapshot', shell: Object.assign({ connected: true }, F.shell, { runs: [], call: null }),
+    pages: JSON.parse(JSON.stringify(F.pages)), chat: F.chat, appearance: { accent: 'green', reduce_motion: false }, page: 'settings' });
+  await sleep(400);
+  location.hash = '#settings'; await sleep(800);
+  const asked = window.__sent.filter((m) => m.op === 'act' && m.action === 'ai_models').map((m) => m.provider);
+  const shown = !!document.querySelector('#main [data-k="ai"]');
+  return [{ name: 'with no job on Ollama, opening Settings does not look for it', ok: shown && !asked.includes('ollama'),
+    detail: !shown ? 'no AI section' : asked.includes('ollama') ? JSON.stringify(asked) : '' }];
+}
+
 async function inPage(F) {
   const results = [];
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

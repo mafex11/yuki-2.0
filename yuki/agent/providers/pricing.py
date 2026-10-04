@@ -53,6 +53,22 @@ def _returned_for(tokens: dict[str, int]) -> float | None:
     return cost if all(int(tokens.get(k) or 0) == int(seen.get(k) or 0) for k in keys) else None
 
 
+def returned_cost(tokens: dict[str, int]) -> float | None:
+    """The amount the service returned for the last call on *this* thread (OpenRouter), when ``tokens`` are that
+    call's; else ``None``. Read it on the thread that made the call (the judge's, the second look's) and keep it
+    with the answer: the caller prices on another thread."""
+    return _returned_for(tokens)
+
+
+def answered_by(client: Any) -> str | None:
+    """The model that answered the last call ``client`` made on this thread when Settings → AI sent it elsewhere
+    (``FailoverClient.last_routed_model``); ``None`` on the default path, where the caller prices the model it asked
+    for, as before."""
+    read = getattr(client, "last_routed_model", None)
+    used = read() if callable(read) else None
+    return used if isinstance(used, str) and used else None
+
+
 def is_free(provider_id: str, model: str) -> bool:
     info = PROVIDERS.get(provider_id)
     if info is not None and info.free:
@@ -129,5 +145,6 @@ def usage_cost_fields(usage: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-__all__ = ["ZERO", "cost", "is_free", "note_returned", "note_routed", "price_words", "rates", "routed_name",
+__all__ = ["ZERO", "answered_by", "cost", "is_free", "note_returned", "note_routed", "price_words", "rates",
+           "returned_cost", "routed_name",
            "usage_cost_fields"]

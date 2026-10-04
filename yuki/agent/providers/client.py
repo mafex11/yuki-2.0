@@ -224,12 +224,14 @@ class _Prefetched:
     ``on_end(stream)`` runs once when the stream has been read to its end (the talker's usage record)."""
 
     def __init__(self, stream: Any, first: Any, has_first: bool,
-                 on_end: Callable[[Any], None] | None = None) -> None:
+                 on_end: Callable[[Any], None] | None = None,
+                 on_error: Callable[[BaseException], None] | None = None) -> None:
         self._stream = stream
         self._first = first
         self._has_first = has_first
         self._it = stream.__aiter__()
         self._on_end = on_end
+        self._on_error = on_error
 
     def __aiter__(self) -> "_Prefetched":
         return self
@@ -246,6 +248,17 @@ class _Prefetched:
                 try:
                     on_end(self._stream)
                 except Exception:  # noqa: BLE001 - bookkeeping never breaks a reply
+                    pass
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - said in the log, then raised as it was
+            # failed after the reply began (OpenRouter's mid-answer error chunk, a cut stream): the words already
+            # passed on can't be taken back, so this is not retried; the turn ends with the error
+            if self._on_error is not None:
+                try:
+                    self._on_error(exc)
+                except Exception:  # noqa: BLE001
                     pass
             raise
 
@@ -332,21 +345,40 @@ class _AsyncRoleMessages:
         return base.beta.messages if self._beta else base.messages
 
     async def create(self, **params: Any) -> Any:
-        if self._owner.route() is None:
-            return await self._default().create(**params)
+        if self._owner.route() is None:   # another service's unsigned reasoning, if any, taken out for Claude
+            return await self._default().create(**strip_unsigned_thinking(params))
         if params.get("stream"):
             owner = self._owner
 
             async def open_raw(client: Any, sent: dict[str, Any]) -> Any:
                 name = owner._answering   # set by ``_run`` just before this call (read before the first await)
-                stream = await (client.beta.messages if self._beta else client.messages).create(**sent)
-                it = stream.__aiter__()
-                try:
-                    first, has_first = await it.__anext__(), True
-                except StopAsyncIteration:
-                    first, has_first = None, False
+
+                held: list[Any] = []
+
+                async def opened() -> tuple[Any, Any, Any, bool]:
+                    stream = await (client.beta.messages if self._beta else client.messages).create(**sent)
+                    held.append(stream)
+                    it = stream.__aiter__()
+                    try:
+                        return stream, it, await it.__anext__(), True
+                    except StopAsyncIteration:
+                        return stream, it, None, False
+
+                if owner.first_event_s is None:
+                    stream, it, first, has_first = await opened()
+                else:
+                    try:   # a service that hangs before its first word is given up on (the voice can't wait 90 s)
+                        stream, it, first, has_first = await asyncio.wait_for(opened(), owner.first_event_s)
+                    except asyncio.TimeoutError as exc:
+                        for late in held:   # the opened stream's connection is let go
+                            try:
+                                await _IterHolder(late, None).close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                        raise FirstEventTimeout(f"no first word within {owner.first_event_s:g} s") from exc
                 return _Prefetched(_IterHolder(stream, it), first, has_first,
-                                   on_end=lambda done: owner._note_stream(name, done))
+                                   on_end=lambda done: owner._note_stream(name, done),
+                                   on_error=lambda exc: owner._midstream(name, exc))
 
             return await self._owner._run(params, open_raw)
 
@@ -357,7 +389,7 @@ class _AsyncRoleMessages:
 
     def stream(self, **params: Any) -> Any:
         if self._owner.route() is None:
-            return self._default().stream(**params)
+            return self._default().stream(**strip_unsigned_thinking(params))
         return _OpenedManager(self._owner, params)
 
     def __getattr__(self, name: str) -> Any:
@@ -390,6 +422,16 @@ class _AsyncBeta:
         self.messages = _AsyncRoleMessages(owner, beta=True)
 
 
+class FirstEventTimeout(TimeoutError):
+    """A routed reply stream gave no first event within :attr:`AsyncRoleClient.first_event_s`: retried, or with a
+    backup set, the backup is tried at once (a hung service rarely answers the same request a moment later)."""
+
+
+#: The talker's limit for a routed reply's first event (seconds): above a cold local model's or a queued free model's
+#: usual wait, far below the 90 s read limit a hung service would otherwise run into on each try.
+TALKER_FIRST_EVENT_S = 15.0
+
+
 class AsyncRoleClient:
     """An async Anthropic-surface client for one role (the voice talker): the wrapped client while the role is on
     ``default``, the chosen provider (with retries, then the user's backup) when it is not.
@@ -401,11 +443,14 @@ class AsyncRoleClient:
         log: ``log(event, **fields)`` for each retry and failover (content-free); ``None`` to not log.
         sleep: The async wait between retries (tests).
         factory: ``factory(provider_id) -> async client`` (tests); default :func:`async_provider_client`.
+        first_event_s: The limit for a routed reply stream's first event (``None``: only the read timeout).
     """
 
     def __init__(self, role: str, default: Any, *, settings: Any = None, log: Callable[..., Any] | None = None,
-                 sleep: Callable[[float], Any] | None = None, factory: Callable[[str], Any] | None = None) -> None:
+                 sleep: Callable[[float], Any] | None = None, factory: Callable[[str], Any] | None = None,
+                 first_event_s: float | None = None) -> None:
         self.role = role
+        self.first_event_s = first_event_s
         self._default = default
         self.settings = settings
         self._log = log
@@ -425,9 +470,12 @@ class AsyncRoleClient:
         return getattr(self._default, name)
 
     def route(self) -> Any:
-        from yuki.agent.providers.config import route
+        from yuki.agent.providers.config import route, take_note
 
-        return route(self.role)
+        chosen = route(self.role)
+        if chosen is None and take_note():   # ai.json is there but unreadable: on Claude because of that, said once
+            self._event("ai_config_unreadable", role=self.role)
+        return chosen
 
     def routed(self) -> bool:
         """Whether this role's calls go to another provider right now (the voice then skips its Bedrock chain)."""
@@ -458,6 +506,11 @@ class AsyncRoleClient:
 
             tokens = usage_tokens(usage)
         self._streams = [*self._streams[-49:], (name, tokens, usage_cost_fields(usage) if usage is not None else None)]
+
+    def _midstream(self, name: str | None, exc: BaseException) -> None:
+        """A routed reply stream failed after it began (content-free: who, the status and the error's type)."""
+        self._event("model_midstream_error", role=self.role, target=name, status=getattr(exc, "status_code", None),
+                    error=type(exc).__name__)
 
     def take_stream_usage(self) -> list[tuple[str, dict[str, int] | None, float | None]]:
         """The routed raw streams read since the last call (and forget them): see :meth:`_note_stream`."""
@@ -532,6 +585,8 @@ class AsyncRoleClient:
                 except Exception as exc:  # noqa: BLE001 - classified from the SDK's own types
                     last = exc
                     kind = classify(exc)
+                    if isinstance(exc, FirstEventTimeout) and index + 1 < len(chain):
+                        kind = "failover"   # hung: straight to the user's backup
                     if kind == "fatal":
                         raise
                     if kind == "retry" and attempt < retries:
@@ -559,8 +614,10 @@ class AsyncRoleClient:
 
 
 def role_async_client(role: str, default: Any, settings: Any = None, *, log: Callable[..., Any] | None = None) -> Any:
-    """The client the voice uses for ``role``: :class:`AsyncRoleClient` around its usual client."""
-    return AsyncRoleClient(role, default, settings=settings, log=log)
+    """The client the voice uses for ``role``: :class:`AsyncRoleClient` around its usual client (the talker's routed
+    replies with a first-event limit, :data:`TALKER_FIRST_EVENT_S`)."""
+    return AsyncRoleClient(role, default, settings=settings, log=log,
+                           first_event_s=TALKER_FIRST_EVENT_S if role == "talker" else None)
 
 
 def talker_price_model(settings: Any, client: Any = None) -> str:
@@ -597,5 +654,6 @@ def price_talker_turn(settings: Any, client: Any, usage: dict[str, int]) -> floa
     return total
 
 
-__all__ = ["AsyncRoleClient", "FittedClaudeClient", "ProviderSetupError", "async_provider_client", "fit_claude_params",
-           "missing_model", "price_talker_turn", "role_async_client", "sync_provider_client", "talker_price_model"]
+__all__ = ["TALKER_FIRST_EVENT_S", "AsyncRoleClient", "FirstEventTimeout", "FittedClaudeClient", "ProviderSetupError",
+           "async_provider_client", "fit_claude_params", "missing_model", "price_talker_turn", "role_async_client",
+           "sync_provider_client", "talker_price_model"]

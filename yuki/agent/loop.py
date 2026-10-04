@@ -1479,6 +1479,12 @@ class Agent:
         authorizer = getattr(self, "authorizer", None)
         return float(getattr(authorizer, "cost_usd", 0.0) or 0.0) if authorizer is not None else 0.0
 
+    def _all_unpriced(self) -> set[str]:
+        """The models with no known price this request: the agent's own calls, the second look's and the judge's."""
+        authorizer = getattr(self, "authorizer", None)
+        judged = getattr(authorizer, "unpriced", None) if authorizer is not None else None
+        return set(self._unpriced) | (set(judged) if isinstance(judged, set) else set())
+
     def _account_response(self, model: str, usage: Any) -> float | None:
         """Fold one real (non-warm-up) response into this request's totals; returns its cost (``None``: unpriced).
 
@@ -1515,7 +1521,8 @@ class Agent:
         try:
             wall_s = time.monotonic() - self._request_started
             models = self._models_used or [model]
-            cost = None if self._unpriced else round(self._cost_usd + self._judge_cost(), 6)
+            unpriced = self._all_unpriced()
+            cost = None if unpriced else round(self._cost_usd + self._judge_cost(), 6)
             summary: dict[str, Any] = {
                 "request": request,
                 "lane": self.lane,
@@ -1535,7 +1542,7 @@ class Agent:
                 "tokens": dict(self._tokens),
                 "thinking_tokens": self.logger.usage.thinking_tokens,
                 "cost_usd": cost,
-                "unpriced_models": sorted(self._unpriced),
+                "unpriced_models": sorted(unpriced),
                 "memory": {
                     **self._memory_info,
                     **{
@@ -1841,7 +1848,7 @@ class Agent:
                 "request_id": f"{self.lane}-{self._requests}", "lane": "voice" if self._request_voice else self.lane,
                 "at": at, "ended_at": time.time(), "words": self._this_query or memory_query_of(request),
                 "reply": reply, "outcome": outcome, "steps": steps,
-                "cost_usd": None if self._unpriced else round(self._cost_usd + self._judge_cost(), 6),
+                "cost_usd": None if self._all_unpriced() else round(self._cost_usd + self._judge_cost(), 6),
                 "model_calls": self._model_calls,
                 "wall_s": round(time.monotonic() - self._request_started, 2), "note": learning.get("note"),
                 "steers": list(self._steer_texts), "breaker": len(self._breaker.trips),
@@ -4064,10 +4071,14 @@ class Agent:
             advice = second_look.run_consult(client, params, signal=signal,
                                              timeout_s=float(getattr(self.settings, "consult_timeout_s", 30.0)))
         if advice.usage:
-            cost = self.settings.estimate_cost(advice.model or model, advice.usage)   # the model that answered
+            # the model that answered (its returned amount when it gave one); an unknown price leaves the total unknown
+            cost = advice.returned_usd if advice.returned_usd is not None else \
+                self.settings.estimate_cost(advice.model or model, advice.usage)
             if cost is not None:
                 advice.cost_usd = round(float(cost), 6)
                 self._cost_usd += float(cost)
+            elif advice.model is not None:   # routed, price not known: the request's total is unknown, never smaller
+                self._unpriced.add(advice.model)
             for key in TOKEN_KEYS:
                 self._tokens[key] += int(advice.usage.get(key) or 0)
         info = {**advice.facts(), "detail": detail[:200], "at_call": self._model_calls}

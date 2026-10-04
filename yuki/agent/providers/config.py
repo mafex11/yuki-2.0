@@ -19,7 +19,8 @@ window is the only process that reads those lists): the tray, where the agent ru
 
 No file, an unreadable file, or a role on ``default`` means what Yuki always did (Claude through Bedrock, or the
 Anthropic API per ``Settings.model_backend``): :func:`route` answers ``None`` and the callers take their existing
-path untouched. A role moved to another provider is a :class:`Route`; a backup is used only when the user set one
+path untouched. A file that is there but can't be read is not silent: the model clients log
+``ai_config_unreadable`` once per version (:func:`take_note`) and the doctor warns (:func:`problem`). A role moved to another provider is a :class:`Route`; a backup is used only when the user set one
 (never a silent fall back to Claude).
 
 The tray, the memory service and the window are separate processes: each reads the file again when its
@@ -34,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -97,24 +99,75 @@ def _clean_role(raw: Any) -> dict[str, str]:
     return out
 
 
+#: A read or a replace Windows refused (another process had the file open that instant) is tried this many times.
+_LOCK_TRIES = 6
+_LOCK_WAIT_S = 0.01
+
+
+class LockedError(OSError):
+    """ai.json is there but stayed locked by another process for every try (a save racing a read, a virus scan)."""
+
+
+def _read(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """``(data, state)``: ``state`` is ``ok`` (a JSON object), ``missing`` (no file: Claude as always, nothing to
+    say), ``unreadable`` (the file is there but isn't a readable JSON object) or ``locked`` (refused every try).
+    A UTF-8 byte-order mark (Notepad's) is accepted."""
+    for attempt in range(_LOCK_TRIES):
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            return None, "missing"
+        except PermissionError:
+            if path.is_dir():
+                return None, "unreadable"
+            if attempt + 1 < _LOCK_TRIES:
+                time.sleep(_LOCK_WAIT_S)
+                continue
+            return None, "locked"
+        except (OSError, ValueError):   # not UTF-8 (UTF-16), a device, ...
+            return None, "unreadable"
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None, "unreadable"
+        return (data, "ok") if isinstance(data, dict) else (None, "unreadable")
+    return None, "locked"   # pragma: no cover - the loop always returns
+
+
 def load(path: Path | None = None) -> dict[str, Any]:
-    """The whole file, cleaned (every role present; ``default`` where unset or unknown). Never raises."""
+    """The whole file, cleaned (every role present; ``default`` where unset or unknown). Never raises: a missing,
+    unreadable or locked file reads as every role on ``default`` (an edit uses :func:`load_for_edit`)."""
     path = Path(path) if path is not None else config_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    return load_from(data if isinstance(data, dict) else {})
+    data, _state = _read(path)
+    return load_from(data or {})
+
+
+def load_for_edit(path: Path | None = None) -> dict[str, Any]:
+    """:func:`load` for a load-modify-save: raises :class:`LockedError` when the file is there but stayed locked, so
+    an edit never writes every role back to ``default`` over choices it couldn't read."""
+    path = Path(path) if path is not None else config_path()
+    data, state = _read(path)
+    if state == "locked":
+        raise LockedError("Your AI choices file is busy right now. Try again in a moment.")
+    return load_from(data or {})
 
 
 def save(data: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
-    """Write ``data`` (cleaned) atomically; returns what was written."""
+    """Write ``data`` (cleaned) atomically; returns what was written. A replace Windows refuses because another
+    process is reading the file that instant is tried again a few times (then it raises)."""
     path = Path(path) if path is not None else config_path()
     clean = load_from(data)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(_LOCK_TRIES):
+        try:
+            os.replace(tmp, path)
+            break
+        except PermissionError:
+            if attempt + 1 >= _LOCK_TRIES:
+                raise
+            time.sleep(_LOCK_WAIT_S)
     _cache.clear()
     return clean
 
@@ -137,13 +190,20 @@ def load_from(data: dict[str, Any]) -> dict[str, Any]:
 
 
 class _Cache:
-    """The parsed file per path, re-read when its modification time or size changes."""
+    """The parsed file per path, re-read when its modification time or size changes.
+
+    A read Windows refused (a writer had the file that instant) is never kept: that call uses the last good reading
+    and the next call reads again. A file that is there but can't be read is noted once per version
+    (:func:`take_note`) and told by the doctor (:func:`problem`)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[tuple[int, int] | None, dict[str, Any]]] = {}
+        self._entries: dict[str, tuple[tuple[int, int] | None, dict[str, Any], str]] = {}
+        #: path -> stamp of an unreadable version not yet handed to a logger, and the last one handed
+        self._notes: dict[str, tuple[int, int]] = {}
+        self._noted: dict[str, tuple[int, int]] = {}
 
-    def get(self, path: Path) -> dict[str, Any]:
+    def entry(self, path: Path) -> tuple[dict[str, Any], str]:
         try:
             st = path.stat()
             stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
@@ -153,11 +213,31 @@ class _Cache:
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None and entry[0] == stamp:
-                return entry[1]
-        data = load(path) if stamp is not None else load_from({})
+                return entry[1], entry[2]
+        raw, state = _read(path) if stamp is not None else (None, "missing")
+        if state == "locked":
+            with self._lock:
+                entry = self._entries.get(key)
+            return (entry[1], entry[2]) if entry is not None else (load_from({}), "locked")
+        data = load_from(raw or {})
         with self._lock:
-            self._entries[key] = (stamp, data)
-        return data
+            self._entries[key] = (stamp, data, state)
+            if state == "unreadable" and stamp is not None and self._noted.get(key) != stamp:
+                self._notes[key] = stamp
+        return data, state
+
+    def get(self, path: Path) -> dict[str, Any]:
+        return self.entry(path)[0]
+
+    def take_note(self, path: Path) -> bool:
+        self.entry(path)
+        key = str(path)
+        with self._lock:
+            stamp = self._notes.pop(key, None)
+            if stamp is None:
+                return False
+            self._noted[key] = stamp
+            return True
 
     def clear(self) -> None:
         with self._lock:
@@ -170,6 +250,19 @@ _cache = _Cache()
 def current(path: Path | None = None) -> dict[str, Any]:
     """The file as it is now (cached until it changes)."""
     return _cache.get(Path(path) if path is not None else config_path())
+
+
+def problem(path: Path | None = None) -> str | None:
+    """``unreadable`` when ai.json is there but isn't a readable JSON object (so every job is on Claude), else
+    ``None`` (no file is no problem: Claude as always)."""
+    state = _cache.entry(Path(path) if path is not None else config_path())[1]
+    return "unreadable" if state == "unreadable" else None
+
+
+def take_note(path: Path | None = None) -> bool:
+    """``True`` once per version of an unreadable ai.json in this process: the caller logs a content-free
+    ``ai_config_unreadable``, so falling back to Claude over a broken file is never silent."""
+    return _cache.take_note(Path(path) if path is not None else config_path())
 
 
 def route(role: str, path: Path | None = None) -> Route | None:
@@ -211,5 +304,5 @@ def saved_facts(name: str, path: Path | None = None) -> dict[str, Any] | None:
     return {k: entry[k] for k in FACT_KEYS if k in entry}
 
 
-__all__ = ["DIR_ENV", "FACT_KEYS", "Route", "Target", "ai_dir", "config_path", "current", "custom_base_url", "load",
-           "load_from", "route", "save", "saved_facts", "saved_price"]
+__all__ = ["DIR_ENV", "FACT_KEYS", "LockedError", "Route", "Target", "ai_dir", "config_path", "current",
+           "custom_base_url", "load", "load_for_edit", "load_from", "problem", "route", "save", "saved_facts", "saved_price", "take_note"]

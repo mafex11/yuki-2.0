@@ -851,9 +851,11 @@ class Verdict:
     #: shown with it are always the same stage's).
     first_why: str = ""
     first_question: str = ""
-    #: The model that actually answered (the client's ``last_model``, read on the judge's own thread: after Settings →
-    #: AI moved doing things, ``provider:model``), so the cost is that model's; ``None``: not known (the asked model).
+    #: The model that actually answered when Settings → AI moved doing things (``provider:model``, read on the judge's
+    #: own thread), so the cost is that model's; ``None`` on the default path (priced as the model asked, as before).
     model: str | None = None
+    #: The amount the service returned for this call (OpenRouter), read on the judge's own thread; ``None``: not given.
+    returned_usd: float | None = None
 
     @property
     def allowed(self) -> bool:
@@ -951,9 +953,9 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
         returned = False
         try:
             with client.messages.stream(**params) as stream:
-                last_model = getattr(client, "last_model", None)   # per thread: read on the thread that opened it
-                used = last_model() if callable(last_model) else None
-                verdict.model = used if isinstance(used, str) else None
+                from yuki.agent.providers.pricing import answered_by
+
+                verdict.model = answered_by(client)   # per thread: read on the thread that opened it
                 for event in stream:
                     kind = getattr(event, "type", "")
                     if kind == "message_start":
@@ -994,6 +996,10 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
                             return
                 final = stream.get_final_message()
             parse_final(final, verdict)
+            if verdict.model is not None:   # routed: what the service returned for it, read on this thread
+                from yuki.agent.providers.pricing import returned_cost
+
+                verdict.returned_usd = returned_cost(verdict.usage)
         except Exception as exc:  # noqa: BLE001 - the caller fails closed
             verdict.error = f"{type(exc).__name__}: {exc}"[:200]
         verdict.ms = round((time.perf_counter() - started) * 1000, 1)
@@ -1112,6 +1118,8 @@ class Authorizer:
         self.denials = 0
         self.calls = 0
         self.cost_usd = 0.0
+        #: The models of this request's judge calls with no known price (the request's cost is then unknown).
+        self.unpriced: set[str] = set()
         self.ms: list[float] = []
 
     def warm(self) -> dict[str, Any] | None:
@@ -1274,14 +1282,17 @@ class Authorizer:
         estimate = getattr(self.settings, "estimate_cost", None)
         if not v.usage or not callable(estimate):
             return
-        try:
-            cost = estimate(v.model or model, v.usage)   # the model that answered (Settings → AI may have moved it)
+        try:   # the model that answered when Settings → AI moved it (its returned amount if it gave one)
+            cost = v.returned_usd if v.returned_usd is not None else estimate(v.model or model, v.usage)
         except Exception:  # noqa: BLE001
             cost = None
         if cost is not None:
             v.cost_usd = round(float(cost), 6)
             with self._lock:
                 self.cost_usd += float(cost)
+        elif v.model is not None:
+            with self._lock:   # a routed call with no known price: the request's total is unknown, never smaller
+                self.unpriced.add(v.model)
 
     def _count(self, name: str, v: Verdict) -> Verdict:
         if v.allowed:
