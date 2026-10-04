@@ -30,8 +30,10 @@ from typing import Any
 
 #: How far back the start-of-conversation view reaches (s).
 RECENT_S = 3600.0
-#: The whole view's size cap (characters; the oldest exchanges go first). ~550 tokens at most, once per conversation.
-RECENT_CHARS = 2_200
+#: The whole view's size cap (characters; the oldest exchanges go first): ~500 tokens at most. Measured 4 Oct with
+#: today's profile: the talker's prompt with a full view and the quick memory tool (and no marks section, the Aura
+#: voice) is 17.9k tokens against main's 17.7k, the same time to first token; a step near 18k costs +0.3-0.4 s.
+RECENT_CHARS = 2_000
 #: The kept part (to-dos added, rules set) is cut to this.
 KEPT_CHARS = 800
 #: One message's longest text in the view (whole words).
@@ -45,11 +47,10 @@ RECENT_TURNS = 60
 RECENT_TIMEOUT_S = 1.5
 #: Where the to-do list lives in Yuki's window (the 4 Oct appTodo build: Home's "Your list"; all of them on Work too).
 LIST_PLACE = "on Home under Your list in your window"
-RECENT_LABEL = ("[Earlier with them, the last hour (voice and typed chat, across conversations, oldest first). You were "
-                "there: it is what you and they said. When they refer back to anything here, even half-heard (\"the "
-                "total list\" for the to-do list), answer from it or look with quick_memory; never \"I don't have "
-                "that\" without a look. Never bring any of it up yourself, not even in passing: \"what's up?\" gets "
-                "\"Not much, you?\", never a word about their list or what they said.]")
+RECENT_LABEL = ("[Earlier with them, the last hour (voice and typed chat, oldest first): what you and they said. When "
+                "they refer back to it, even half-heard (\"the total list\" for the to-do list), answer from it or look "
+                "with quick_memory, never \"I don't have that\" without a look. Never bring it up yourself: \"what's "
+                "up?\" gets \"Not much, you?\", not a word about it.]")
 RECENT_END = "[End of earlier]"
 
 #: The quick memory tool's reads: today's talk is cut to this, a search to this many items.
@@ -86,8 +87,9 @@ QUICK_MEMORY: dict[str, Any] = {
 TODOS_NOTE = ("Their list, read now. Tell them in a few words: how many, then the items briefly, in plain words (a "
               "long list: the first few and offer the rest on a more line). Never ids, never read it like a list.")
 EMPTY_LIST_NOTE = "Their list has nothing open, read now. Say so plainly: you looked at their list and it is empty."
-ADDED_NOTE = ("Saved and checked: nothing more to do. Tell them in a few words how many you added and where they are, "
-              "e.g. \"Added {n}, they're on Home under Your list.\" Never read them back unless they ask.")
+ADDED_NOTE = ("Saved and checked: nothing more to do. Tell them in a few words how many you added and where they are: "
+              "in your window, on Home under Your list (\"Added {n}, they're on Home under Your list.\"). Never read "
+              "them back unless they ask.")
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
                   "on their list.")
 FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few words. When it does not hold what "

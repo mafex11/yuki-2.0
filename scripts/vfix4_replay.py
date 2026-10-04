@@ -134,14 +134,14 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
     if kind == "says_items":
         return _items_said(spoken) >= 2 and "todo:" not in spoken and not denied
     if kind == "says_empty":
-        return ("empty" in spoken or "nothing" in spoken) and "list" in spoken
+        return any(w in spoken for w in ("empty", "nothing", "don't have any", "no to-dos")) and "list" in spoken
     if kind == "adds":
         adds = [c["input"] for c in calls if c["name"] == "quick_memory" and c["input"].get("action") == "add_todos"]
         if adds:
             return len(adds[0].get("items") or []) >= 6
         return "tell_yuki" in names
     if kind == "says_added":
-        return ("7" in spoken or "seven" in spoken) and ("home" in spoken or "list" in spoken) and not names
+        return ("7" in spoken or "seven" in spoken) and "home" in spoken and not names   # the count and where
     if kind == "no_news":
         return _items_said(spoken) == 0 and not any(w in spoken for w in ("to-do", "list", "queued", "those"))
     if kind == "hands_over":
