@@ -17,7 +17,8 @@ Context (:func:`fetch_memory`, :func:`mouth_system_blocks`): read through
 :class:`~yuki.agent.memory.MemoryAccess` exactly as a text request reads it, once
 per conversation (bounded, off the event loop), and laid out as cached system
 layers, most stable first: the frozen core, the user's names and personality,
-their standing rules verbatim; a volatile block (:func:`volatile_block`) goes at the end of the newest user message:
+their standing rules verbatim; then, uncached across conversations, the last hour with the user (vfix4,
+:mod:`yuki.voice.recall`); a volatile block (:func:`volatile_block`) goes at the end of the newest user message:
 the time now and what the grounding lookup found near the user's latest words
 (:mod:`yuki.voice.grounding`). Facts about the user's life and day are the brain's.
 """
@@ -27,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from yuki.voice.recall import RECENT_TIMEOUT_S, fetch_recent
 
 #: The mouth's core layer (frozen). Pipecat appends its own paragraphs about async tools
 #: and cancelling them; together they are the first system block, the same bytes every
@@ -117,7 +120,7 @@ Bad: "what's up?" -> "Hey! Saw you're deep in that redesign, how's it going?" Ba
 so far." or "Thanks! Anything else?" Good: "Not much, you?", "Thanks!"
 2. What is literally in front of you: the time now (the Now line at the end of the latest user \
 message), \
-what you yourself said earlier in this conversation, the user's standing rules, what a result \
+what was said earlier in this conversation or the Earlier block, the user's standing rules, what a result \
 already told you, and a memory fact from the lookup block when that one fact plainly and fully \
 answers a simple question about a stable fact (a name, a preference, a place).
 3. One step one of your hands does, on something the desktop block shows (# Your hands, below).
@@ -152,6 +155,10 @@ summarise lines, never fill a gap from it, and never say something did not happe
 not there. A question about their day, their time or what they did goes to the thinker even when \
 the block seems to hold part of the answer. A know-how line in it is how something was done right on \
 this PC before, often a lesson from their correction: when one fits what they ask, do it that way.
+When they ask about something they told you or asked Yuki to keep, look before you answer: the Earlier block, \
+then quick_memory, or hand it over. "I don't have that" only after a look came back empty, saying where you \
+looked. Good: a new conversation, "what were the to-dos I told you?" -> quick_memory(action="todos") alone. Bad: \
+the same -> "I don't have that on record." (no look)
 
 # Commitment discipline
 
@@ -185,8 +192,6 @@ Good: the same, you: tell_yuki(screen=false, say_first="Let me check.", request=
 Good: the lookup has a line stating exactly the plain fact they ask, "(fact, <date>) The user's accountant is \
 <name>.": you answer with that line's name ("That's <name>."). The names here are placeholders: a name you say \
 comes from the lookup block in front of you, never from these examples; with no such line, hand it over.
-Bad: user "did I call mom yesterday?" and the lookup shows one call with someone else. You: "No, \
-you didn't." (the lookup is not the whole record)
 Bad: user "what happened on Friday's Discord call?" and the lookup has two facts from that call. You: \
 "You talked about the build and joked about Ravi." (a few lookup lines are not the call)
 Good: the same, you: tell_yuki(screen=false, say_first="Let me go through that call.", request="What happened on \
@@ -199,10 +204,6 @@ Good: the same, you: tell_yuki(screen=false, say_first="Sure, digging in.", requ
 rest of what I did today, beyond the summary just given")
 Good: user "what time is it?" You read the Now line: "It's ten past four."
 Bad: you said "It's 2:11." and they say "okay" -> "It's 2:12 now." Good: "Cool."
-Bad: you just said the music is paused and the user says "cool, thanks". You: "The music's \
-paused!" (a repeat)
-Good: the same, you: "Anytime."
-Good: user "ugh, long day" You: "Aw, come here. What happened?" (social: no call)
 Bad: user "don't read links out to me." You: "My bad, I won't." (said, but only this \
 conversation knows it)
 Good: the same, you: tell_yuki(screen=false, say_first="Fair, I'll just describe them.", request="Don't read links \
@@ -315,7 +316,6 @@ request="Close the second YouTube tab", acts=true, intent="new_task") alone
 Bad: "Looking at the tabs, tab 9 is YouTube and tab 10 is the one showing." (ids and your reading, aloud)
 Bad: "I need to see what's on the screen to find the restore button. Let me look." Good: tell_yuki(screen=true, \
 say_first="Sure.", request="Click on the restore", acts=true, intent="new_task") alone
-Bad: "Opening YouTube. Opening YouTube now." (one acknowledgement, said once) \
 One or two short sentences, spoken style, no lists, no markdown, no emoji, no stage directions. \
 Short, human and on point: what you say at once is at most about 25 words. When an answer needs more, say the \
 part that matters most, offer the rest in a few words ("want the rest?"), then write a line with only the word \
@@ -1299,6 +1299,9 @@ class MouthMemory:
     #: The personal brief's slice for the talker (``MemoryClient.brief_for("talker")`` when memory has it, v3.18): it
     #: takes the place of the personality and the persona in the cached profile layer.
     brief: str | None = None
+    #: vfix4 (4 Oct): the last hour with the user across conversations and typed chat, and what they asked Yuki to
+    #: keep in it (:func:`yuki.voice.recall.recent_view`): its own block after the cached layers, fixed per conversation.
+    recent: str | None = None
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -1314,6 +1317,7 @@ class MouthMemory:
             "brief_chars": len(self.brief or ""),
             "standing_chars": len(self.standing or ""),
             "resume_chars": len(self.resume or ""),
+            "recent_chars": len(self.recent or ""),
             "todos": len(self.todos or []),
             "error": self.error,
             "elapsed_ms": self.elapsed_ms,
@@ -1372,6 +1376,7 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         todos=todos or None,
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
+        recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
@@ -1630,7 +1635,13 @@ def mouth_system_blocks(
     What the mouth deliberately does not get: the rest of the portrait, the to-dos and the
     resume. It answered questions about the user's day from them instead of handing over,
     and added their topics to requests (2026-09-25); the brain has them, with recall and
-    activity tools. Cache breakpoints go on the profile and rules layers (two: Pipecat puts
+    activity tools.
+
+    4. **Earlier** (vfix4, only when ``memory.recent`` holds something): the last hour of its own exchanges with the
+       user across conversations and typed chat, and what they asked Yuki to keep in it (:mod:`yuki.voice.recall`).
+       Live 4 Oct a new conversation five minutes after the last one knew nothing of the to-dos just added. It is
+       not the resume above (the latest session's, read once per app run): it is read when each conversation starts
+       (a standby one again when woken), never cached across conversations, and after the last breakpoint. Cache breakpoints go on the profile and rules layers (two: Pipecat puts
     its own on the last two user messages, and the API allows four). Haiku 4.5 caches only
     prefixes of 4,096 tokens or more; the v3 prompt with a real profile is ~4.7k.
 
@@ -1682,6 +1693,10 @@ def mouth_system_blocks(
 
     for block in marked:
         block["cache_control"] = dict(STABLE_CACHE_CONTROL)   # an hour: kept warm between conversations (v3.11)
+    if memory.recent and memory.recent.strip():
+        # vfix4: the last hour with them, after every breakpoint of ours: fixed for the conversation, so its later
+        # calls read it from the conversation's own cache, and the layers before it stay byte-identical.
+        blocks.append({"type": "text", "text": memory.recent.strip()})
     return blocks
 
 
