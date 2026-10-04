@@ -223,8 +223,8 @@
      owing you), in Work's order, its first few lines; the rest on Work (see all) */
   function yourList(d) {
     const T = d.todos; if (!T) return null;   // a snapshot from before the list: drawn once memory's data is in
-    const all = Y.todosOpen(T), gone = (T.open || []).length - all.length;
-    const open = Y.todoOrder(all).slice(0, T.shown || 5);
+    const listed = Y.todosOpen(T), gone = (T.open || []).length - listed.length;
+    const open = Y.todoOrder(listed).slice(0, T.shown || 5);
     const n = Math.max(0, (T.n != null ? T.n : (T.open || []).length) - gone), more = Math.max(0, n - open.length);
     const body = open.length ? [h('div', { class: 'todos' }, open.map((t) => Y.todoRow(t, d, 'home', false))),
       more ? h('a', { class: 'td-more', attrs: { href: '#work/todos' }, text: `${more} more on Work` }) : null]

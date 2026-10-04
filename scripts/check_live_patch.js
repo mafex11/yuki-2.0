@@ -638,6 +638,23 @@ async function inPage(F) {
   check('W10 on again brings the hours back', acts('quiet').some((m) => m.on === true) && qrow().textContent.includes('From 12:30 AM to 8:00 AM') && qsel().every((s) => !s.disabled));
   qsel()[0].value = '23:00'; qsel()[0].dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
   check('W10 a new start time is sent and shown in plain clock words', acts('quiet').some((m) => m.start === '23:00') && qrow().textContent.includes('From 11:00 PM to 8:00 AM'), qrow().textContent.slice(0, 80));
+  // ---- report 69: Settings -> While I work: how far the mouse must move for me to pause, in plain words ----
+  {
+    const tk = () => main().querySelector('[data-k="takeover"]');
+    const tsel = () => tk() && tk().querySelector('select[data-change="takeover-move"]');
+    const opts = tsel() ? Array.from(tsel().options).map((o) => o.textContent) : [];
+    check('TK1 While I work: the label, what it does, the choices in plain words with the current one picked', !!tsel() && tk().textContent.includes('Pause when you move the mouse this far')
+      && tk().textContent.includes('take over') && opts.join('|') === 'A nudge|A short move (the usual)|A clear move|A long move|A big sweep' && tsel().value === '40'
+      && !opts.some((o) => /\d|px|pixel/.test(o)), `${opts.join('|')} = ${tsel() && tsel().value}`);
+    REPLY.takeover_move = (m) => ({ ok: true, px: m.px });
+    tsel().value = '160'; tsel().dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
+    const toasts = Array.from(document.querySelectorAll('.toast')).map((t) => t.textContent).join(' | ');
+    check('TK1 a choice is saved through Python (takeover_move with the distance) and says when it counts', acts('takeover_move').some((m) => m.px === 160)
+      && /Saved: a big sweep\. I use it from my next task\./.test(toasts) && tsel().value === '160' && Y.D.pages.settings.takeover.px === 160, toasts);
+    REPLY.takeover_move = { ok: false, error: 'Couldn’t save that.' };
+    tsel().value = '24'; tsel().dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
+    check('TK1 a save that fails puts the choice back', tsel().value === '160', tsel().value);
+  }
 
   // ---- appWin1 (4 Oct round 3): W2 session titles, W6 misheard guesses, W3 Correct in your words, English only
   // (W1's threads and Home's current-thread tile left the window with appTodo, 4 Oct) ----
@@ -699,16 +716,26 @@ async function inPage(F) {
   // ---- appTodo (4 Oct): the to-do list on Home and Work, open_yuki's place for it, Home's Now tile (the current
   // session), and no threads anywhere in the window ----
   const FH = F.pages.home, FW = F.pages.work;
+  // report 69: Home's Your list is Work's Your list (its first rows, in Work's order), read off Work's page first
+  await go('#work'); await sleep(500);
+  const workFirst = Array.from(main().querySelectorAll('[data-k="list"] .wrows > .wrow.wli')).slice(0, FH.todos.shown).map((r) => r.dataset.cref);
   await go('#home'); await sleep(500);
   const list = () => main().querySelector('[data-k="list"]');
   const rowOf = (root, ref) => root.querySelector(`.todo[data-cref="${ref}"]`);
-  check('T1 Home shows Your list: the open to-dos, due first, and how many in all', !!list() && list().querySelectorAll('.todo').length === FH.todos.open.length
-    && list().querySelector('.sec-h').textContent.includes(String(FH.todos.n)) && rowOf(list(), FH.todos.open[0].ref) === list().querySelector('.todo'), list() && list().textContent.slice(0, 200));
+  const homeRefs = () => Array.from(list().querySelectorAll('.todo')).map((r) => r.dataset.cref);
+  const notMine = new Set(FW.waiting.map((x) => x.ref).concat(FW.said.map((x) => x.ref)));
+  check('H1 Home shows Work’s Your list: its first 5 rows in Work’s order (the one you just added first), the same count',
+    FH.todos.shown === 5 && workFirst.length === 5 && homeRefs().join() === workFirst.join() && homeRefs()[0] === 'todo:36' && FH.todos.n === FW.todos.n,
+    `${homeRefs().join()} vs ${workFirst.join()}`);
+  check('H1 never a promise you made or someone owing you as your to-do on Home', notMine.size >= 6 && FH.todos.open.every((t) => !notMine.has(t.ref))
+    && homeRefs().every((r) => !notMine.has(r)), FH.todos.open.map((t) => t.ref).join());
+  check('T1 Home shows Your list: its first rows, due first, and how many in all', !!list() && list().querySelectorAll('.todo').length === FH.todos.shown
+    && list().querySelector('.sec-h').textContent.includes(String(FH.todos.n)), list() && list().textContent.slice(0, 200));
   check('T1 due dates in natural words, an overdue one marked, never an ISO date', /was due yesterday/.test(list().textContent) && !!list().querySelector('.td-due.over')
     && /due today, \d/.test(list().textContent) && !/\d{4}-\d{2}-\d{2}/.test(list().textContent), Array.from(list().querySelectorAll('.td-m')).map((m) => m.textContent).join(' | '));
   check('T1 each row has Done, Not needed and Correct', Array.from(list().querySelectorAll('.todo')).every((r) => r.querySelector('[data-do="todo-end"][data-how="done"]')
     && r.querySelector('[data-do="todo-end"][data-how="not_needed"]') && r.querySelector('[data-do="correct"]')));
-  check('T1 the rest are a click away on Work', !!list().querySelector('a[href="#work/todos"]') && list().textContent.includes(`${FH.todos.n - FH.todos.open.length} more on Work`));
+  check('T1 the rest are a click away on Work', !!list().querySelector('a[href="#work/todos"]') && list().textContent.includes(`${FH.todos.n - FH.todos.shown} more on Work`));
   REPLY.todo_end = (m) => ({ ok: true, ref: m.ref, how: m.how, undo: m.ref.startsWith('todo:') });
   const r0 = rowOf(list(), 'todo:29');
   r0.querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
@@ -719,13 +746,13 @@ async function inPage(F) {
   REPLY.todo_reopen = { ok: true, ref: 'todo:29' };
   r0.querySelector('[data-do="todo-reopen"]').click(); await sleep(150);
   check('T2 Undo puts it back (todo_reopen) and the row is back', last('todo_reopen').ref === 'todo:29' && !!rowOf(list(), 'todo:29') && !!rowOf(list(), 'todo:29').querySelector('.td-tick'));
-  const r1 = rowOf(list(), 'commit:44');
+  const r1 = rowOf(list(), 'commit:45');   // Yuki's own promise is on your list (yours, said to me or on a call, are on Work's You said you'd)
   r1.querySelector('[data-do="todo-end"][data-how="not_needed"]').click(); await sleep(80);
   check('T2 Not needed says so; a commitment has no Undo', r1.textContent.includes('Not needed. It’s off your list.') && !r1.querySelector('[data-do="todo-reopen"]')
-    && last('todo_end').ref === 'commit:44' && last('todo_end').how === 'not_needed');
+    && last('todo_end').ref === 'commit:45' && last('todo_end').how === 'not_needed');
   const h2 = clone(FH);
   h2.todos.open = [{ ref: 'todo:41', text: 'Invented to-do said by voice', title: null, from: '', due: 'due today, 6 PM', over: false, due_at: Date.now() / 1000 + 3600,
-    all_day: false, since: Date.now() / 1000, added: 'today', evidence: null, undo: true, status: 'open' }].concat(h2.todos.open.slice(0, 4));
+    all_day: false, since: Date.now() / 1000, added: 'today', evidence: null, undo: true, status: 'open', source: 'user' }].concat(h2.todos.open.slice(0, 4));
   h2.todos.n += 1;
   await push('home', h2); await sleep(100);
   check('T3 a to-do added by voice shows on Home at once (the live refresh)', !!rowOf(list(), 'todo:41') && list().textContent.includes('Invented to-do said by voice'));
