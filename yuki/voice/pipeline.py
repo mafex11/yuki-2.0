@@ -3095,7 +3095,7 @@ class Conversation:
         from yuki.voice.progress import answer_progress
 
         text, facts = await answer_progress(self._client, self.settings.voice_mouth_model, log_text, question)
-        cost = self.settings.estimate_cost(talker_price_model(self.settings, self._client), {
+        cost = self.settings.estimate_cost(talker_price_model(self.settings, getattr(self, "_client", None)), {
             "input_tokens": facts.get("input_tokens") or 0, "output_tokens": facts.get("output_tokens") or 0,
             "cache_read_tokens": 0, "cache_write_tokens": 0})
         self.progress_cost_usd += cost or 0.0
@@ -3193,7 +3193,7 @@ class Conversation:
                 summary = self.guard.summary()
                 from yuki.agent.providers.client import talker_price_model
 
-                cost = self.settings.estimate_cost(talker_price_model(self.settings, self._client), {
+                cost = self.settings.estimate_cost(talker_price_model(self.settings, getattr(self, "_client", None)), {
                     "input_tokens": summary.get("input_tokens") or 0, "output_tokens": summary.get("output_tokens") or 0,
                     "cache_read_tokens": 0, "cache_write_tokens": 0})
                 self.log.event("speech_guard", op="summary", session=self.session, cost_usd=round(cost or 0.0, 6),
