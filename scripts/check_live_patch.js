@@ -734,7 +734,7 @@ async function inPage(F) {
   check('N1 no thread tile, no "Next:" line, no "In front"', !main().querySelector('.nowthread') && !/Next: |In front/.test(main().querySelector('.now').textContent));
   tile.click(); await sleep(900);
   const lastS = FW.sessions[FW.sessions.length - 1], openS = main().querySelector('[data-k="sessions"] .fx.open');
-  check('N2 a click opens Work at the session holding now, opened', decodeURIComponent(location.hash).startsWith('#work/at:') && !!openS
+  check('N2 a click opens Work at the session holding the tile’s moment (review F2: not the clock), opened', decodeURIComponent(location.hash) === '#work/at:' + Math.round(FH.now.session.at) && !!openS
     && openS.querySelector('.fx-h .tx').textContent === lastS.title, `${decodeURIComponent(location.hash)} ${openS && openS.querySelector('.fx-h .tx').textContent}`);
   // Work: the full list beside today's sessions; no threads
   const wt = () => main().querySelector('[data-k="todos"]');
@@ -761,6 +761,39 @@ async function inPage(F) {
     && list().getBoundingClientRect().top < window.innerHeight, `${location.hash} ${list() && list().className}`);
   list().querySelector('a.td-all').click(); await sleep(500);
   check('T9 see all opens Work at the list', location.hash === '#work/todos' && !!wt() && wt().classList.contains('flash'));
+  // ---- review F3: Undo after the refresh that already dropped the row: the row is back at once, not after the
+  // next build (a stale copy of that refresh doesn't take it away again) ----
+  await go('#home'); await sleep(400);
+  await push('home', clone(FH)); await sleep(100);
+  const dropped = () => { const x = clone(FH); x.todos.open = x.todos.open.filter((t) => t.ref !== 'todo:29'); x.todos.n -= 1; return x; };
+  const r3 = rowOf(list(), 'todo:29'), n3 = list().querySelector('.sec-h').textContent;
+  r3.querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
+  await push('home', dropped()); await sleep(80);
+  check('F3 the ended row is held through the refresh that drops it', r3.isConnected && r3.textContent.includes('off your list'));
+  REPLY.todo_reopen = { ok: true, ref: 'todo:29' };
+  r3.querySelector('[data-do="todo-reopen"]').click(); await sleep(150);
+  const back3 = () => !!rowOf(list(), 'todo:29') && !!rowOf(list(), 'todo:29').querySelector('.td-tick');
+  check('F3 after Undo the row is on Home before the next refresh', back3(), list().textContent.slice(0, 300));
+  check('F3 and the count is as before', list().querySelector('.sec-h').textContent === n3, `${list().querySelector('.sec-h').textContent} vs ${n3}`);
+  await push('home', dropped()); await sleep(80);
+  check('F3 a late copy of the refresh that dropped it keeps it there', back3());
+  await push('home', clone(FH)); await sleep(80);
+  check('F3 the build that has it again takes over: one row of it', list().querySelectorAll('.todo[data-cref="todo:29"]').length === 1);
+  // ---- review F5: after the 5 s drain the Undo isn't gone: Work keeps it on the row for the rest of memory's 10
+  // minutes ----
+  rowOf(list(), 'todo:29').querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
+  const w5 = clone(FW), t29 = w5.todos.open.find((t) => t.ref === 'todo:29');
+  w5.todos.open = w5.todos.open.filter((t) => t.ref !== 'todo:29'); w5.todos.done = [Object.assign({}, t29, { status: 'done' })].concat(w5.todos.done || []);
+  await push('home', dropped()); await push('work', w5);
+  await go('#work'); await sleep(400);
+  const just = () => wt().querySelector('.td-just .todo[data-dref="todo:29"]');
+  check('F5 Work shows the to-do you just ended, in view, with Undo and the minutes left', !!just() && !!just().querySelector('[data-do="todo-reopen-done"]')
+    && /(^|\D)(9|10) min left/.test(just().textContent) && !wt().querySelector('.tdfold[data-fold="todos-done"] [data-k="done:todo:29"]'), just() && just().textContent);
+  check('F5 a done row you didn’t just end has no Undo', !wt().querySelector('[data-k="done:todo:27"] [data-do="todo-reopen-done"]'));
+  const nR = acts('todo_reopen').length;
+  just().querySelector('[data-do="todo-reopen-done"]').click(); await sleep(200);
+  check('F5 its Undo puts it back (todo_reopen): open again at once, the Undo row gone', acts('todo_reopen').length === nR + 1 && last('todo_reopen').ref === 'todo:29'
+    && !!rowOf(wt(), 'todo:29') && !!rowOf(wt(), 'todo:29').querySelector('.td-tick') && !just());
   let foreign = '';
   for (const hsh of ['#home', '#work', '#work/day', '#me']) { await go(hsh); await sleep(300); if (/[ऀ-ॿ]/.test(main().textContent)) foreign += hsh + ' '; }
   check('English only on Home, Work, Day and Me', !foreign, foreign);

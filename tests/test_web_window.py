@@ -684,9 +684,11 @@ def test_home_is_the_inbox_built_from_memory(tmp_path):
                            "why": "It moved once."}]
     assert [o["card"] for o in d["offers"]] == ["41"] and d["offers"][0]["label"] == "Add to list"
     # Now (appTodo, 4 Oct): the app in front since when, titled by the current session; this stand-in has no
-    # episodes, so the window's own title; no thread tile any more
+    # episodes, so no title (the page shows the app; never the raw window title: review F2); Work opens at since_at;
+    # no thread tile any more
     assert "front" not in d["now"] and "thread" not in d["now"] and d["now"]["call"]["recording"] is True
-    assert d["now"]["session"] == {"app": "VS Code", "since_at": m.now - 1500, "title": "beds.ts", "summary": None, "ref": None}
+    assert d["now"]["session"] == {"app": "VS Code", "since_at": m.now - 1500, "at": round(m.now - 1500, 1), "title": None,
+                                   "summary": None, "ref": None}
     assert [r["kind"] for r in d["running"]] == ["call", "waiting"] and "2 calls" in d["running"][1]["title"]
     kinds = {a["kind"]: a for a in d["away"]}
     assert kinds["card"]["changed"][0]["undo"]["card"] == "39"                   # ran 7 min ago: Undo still open

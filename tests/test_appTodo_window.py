@@ -357,6 +357,24 @@ def test_open_yuki_opens_home_at_the_list_and_says_where():
     assert web_window.page_sub("home") == "" and own_window.qt_page("todos") == "today"
 
 
+def test_open_yuki_in_the_qt_window_says_a_place_it_has():
+    """review: the Qt fallback window has no "Your list" (its to-dos are a card on Today, all of them on Me), so the
+    report the model answers from names those."""
+    opened: list[str] = []
+    own_window.register(lambda page: opened.append(page) or True, engine=lambda: "qt")
+    try:
+        ok, report = own_window.open_page("todos")
+        assert ok and "Your list" not in report and "Today" in report and "Me" in report
+        assert own_window.open_page("activity")[1] == "Yuki's window is open on Status, in front"
+    finally:
+        own_window.register(None)
+    own_window.register(lambda page: True, engine=lambda: 1 / 0)                         # can't say: the web window's words
+    try:
+        assert "Your list" in own_window.open_page("todos")[1]
+    finally:
+        own_window.register(None)
+
+
 def test_the_map_is_short_names_the_list_and_never_threads():
     words = own_window.PAGE_WORDS
     assert "Your list" in words and "todos" in words and "todo list" in words and "never guess" in words

@@ -73,7 +73,7 @@ class WindowHost(QObject):
         # Yuki's own window for the thinker's open_yuki tool and the talker's open_yuki hand (v3.15).
         from yuki.ui import own_window
 
-        own_window.register(self.open_from_anywhere)
+        own_window.register(self.open_from_anywhere, engine=self.window_engine)   # the report names that window's places
         self._started = False
         self._hands = 0
         self._call_sig = call_signature({})

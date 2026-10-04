@@ -34,6 +34,10 @@ PLACES = {"home": "Home", "todos": "Home, at the user's to-do list (under Your l
           "chat": "the chat", "settings": "Settings"}
 #: The new names for the Qt window (``yuki.ui.window``, the fallback without WebView2), which knows only its own.
 QT_PAGES = {"home": "today", "todos": "today", "work": "today", "playbook": "yuki", "activity": "status"}
+#: Where the Qt window opened, for the report (review: it has no "Your list"; its to-dos are a card on Today and all
+#: of them on Me).
+QT_PLACES = {"today": "Today", "me": "Me", "yuki": "Yuki", "status": "Status", "chat": "the chat", "settings": "Settings"}
+QT_TODOS = "Today, where the user's to-dos are a card (Your to-dos; every to-do is on Me)"
 
 
 def qt_page(page: str) -> str:
@@ -43,14 +47,23 @@ def qt_page(page: str) -> str:
 
 _lock = threading.Lock()
 _opener: Callable[[str], bool] | None = None
+_engine: Callable[[], str] | None = None
 
 
-def register(opener: Callable[[str], bool] | None) -> None:
+def register(opener: Callable[[str], bool] | None, engine: Callable[[], str] | None = None) -> None:
     """The tray's way to open the window on a page (``None``: unregister). ``opener(page)`` returns whether the
-    window was brought forward or started; it may be called from any thread."""
-    global _opener
+    window was brought forward or started; it may be called from any thread. ``engine()``: which window it opens
+    (``web`` | ``qt``), so the report names a place that window has."""
+    global _opener, _engine
     with _lock:
-        _opener = opener
+        _opener, _engine = opener, engine
+
+
+def place(page: str, engine: str = "web") -> str:
+    """Where ``page`` opened, in the words of the window that opened (``engine``)."""
+    if engine == "qt":
+        return QT_TODOS if page == "todos" else QT_PLACES.get(qt_page(page)) or f"its {page} page"
+    return PLACES.get(page) or f"its {page} page"
 
 
 def open_page(page: str) -> tuple[bool, str]:
@@ -59,7 +72,7 @@ def open_page(page: str) -> tuple[bool, str]:
     if page not in PAGES and page not in LEGACY:
         return False, f"Yuki's window has no page {page!r}; its pages are {', '.join(PAGES)}"
     with _lock:
-        opener = _opener
+        opener, engine = _opener, _engine
     if opener is None:
         return False, "Yuki's window cannot be opened from here (the tray is not running in this process)"
     try:
@@ -68,7 +81,11 @@ def open_page(page: str) -> tuple[bool, str]:
         return False, f"opening Yuki's window failed: {type(exc).__name__}: {exc}"
     if not ok:
         return False, "Yuki's window did not open"
-    return True, f"Yuki's window is open on {PLACES.get(page) or f'its {page} page'}, in front"
+    try:
+        kind = str(engine()) if engine is not None else "web"
+    except Exception:  # noqa: BLE001 - the web window's words then
+        kind = "web"
+    return True, f"Yuki's window is open on {place(page, kind)}, in front"
 
 
-__all__ = ["PAGES", "PAGE_WORDS", "PLACES", "open_page", "qt_page", "register"]
+__all__ = ["PAGES", "PAGE_WORDS", "PLACES", "open_page", "place", "qt_page", "register"]
