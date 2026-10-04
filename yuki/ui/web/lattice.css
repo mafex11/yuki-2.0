@@ -757,7 +757,7 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .srow small.ai-warn { color: var(--text); }
 .srow small.ai-warn::before { content: '· '; color: var(--text-3); }
 .srow small.ai-ok { color: var(--live); }
-.ai-key, .ai-txt { width: 180px; height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--hair-2); background: var(--raise); color: var(--text); font: 500 12px/1 var(--f-mono); }
+.ai-key, .ai-txt { width: 164px; height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--hair-2); background: var(--raise); color: var(--text); font: 500 12px/1 var(--f-mono); }
 .ai-key::placeholder, .ai-txt::placeholder { color: var(--text-3); }
 .ai-key:focus, .ai-txt:focus { outline: 1.5px solid var(--live); outline-offset: 1px; }
 /* About: the splash (planet-splash.js) plays when Settings opens; a press plays it again */

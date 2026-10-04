@@ -117,7 +117,7 @@
     const ctl = [];
     if (p.needs_key || p.id === 'custom') {
       ctl.push(h('input', { class: 'ai-key', data: { key: p.id }, attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false',
-        placeholder: p.key === 'saved' ? 'Saved on this PC, encrypted' : 'Paste your key', 'aria-label': `${p.label} key` } }));
+        placeholder: p.key === 'saved' ? 'Paste to replace' : 'Paste your key', 'aria-label': `${p.label} key` } }));
       ctl.push(key('Save', { cls: 'xs', data: { do: 'ai-key-save', p: p.id } }));
       if (p.key === 'saved') ctl.push(key('Forget', { cls: 'xs', data: { do: 'ai-key-forget', p: p.id } }));
     }
