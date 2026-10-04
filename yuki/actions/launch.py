@@ -635,10 +635,17 @@ def _wait_for_new_window(
                 ),
                 fresh,
             )
+        # final check V3-explorer-title: the program that shows a shell entry is shared (every Explorer window is
+        # explorer.exe's): an already open window of it counts only when its title names the entry
+        shared = getattr(identity, "via_handler", False)
+
+        def named(hwnd: int) -> bool:
+            return not shared or _title_score((titles.get(hwnd) or ("", ""))[0], identity.name) > 0
+
         if before_titles:
             for hwnd, (title, process) in titles.items():
                 old = before_titles.get(hwnd)
-                if old is not None and title != old[0] and owns(hwnd):
+                if old is not None and title != old[0] and owns(hwnd) and named(hwnd):
                     return hwnd, f"its already open {process} window changed its title", fresh
         foreground = _user32.GetForegroundWindow()
         if (
@@ -646,6 +653,7 @@ def _wait_for_new_window(
             and foreground != before_foreground
             and is_user_window(foreground)
             and owns(foreground)
+            and named(foreground)
         ):
             return foreground, "foreground changed to its already open window", fresh
         time.sleep(_POLL_S)
@@ -1642,6 +1650,16 @@ def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: f
     return None, "shell:AppsFolder", error
 
 
+def _spawned_by(pid: int, running: set[int]) -> bool:
+    """Whether ``pid`` was started (at any depth) by one of ``running`` - appOpen final check V1-riot: the running
+    instance brought up its own interface in a new child process (the Riot Client's window, a child of the running
+    ``RiotClientServices.exe``), which is the app's, not a second instance's "already running" prompt."""
+    p = _proc(pid) if pid else None
+    if p is None:
+        return False
+    return any(a.pid in running for a in _ancestors(p))
+
+
 def _restore_background_app(
     chosen: dict[str, str],
     identity: _AppIdentity,
@@ -1721,7 +1739,7 @@ def _restore_background_app(
         )
     info = window_info(hwnd)
     if kept_hidden and _window_pid(hwnd) not in running and any(psutil.pid_exists(p) for p in running) and not any(
-            is_user_window(h) for h in kept_hidden):
+            is_user_window(h) for h in kept_hidden) and not _spawned_by(_window_pid(hwnd), running):
         reason = (f"{reason} (not confirmed as {name!r}'s own window: its running instance kept its own window "
                   f"hidden, and this one came from the new process the launch started)")
     details.update(
@@ -1748,6 +1766,8 @@ _PKEY_LINK_ARGUMENTS = ("{436F2667-14E2-4FEB-B30A-146C53B5B674}", 100)
 _WEB_SCHEMES = ("http", "https")
 #: How often the launch watches a launcher's hand-off within the call (a game's window takes seconds to minutes).
 LAUNCHER_POLL_S = 0.25
+#: Final check V4-wait: how often a command of an already running program has its own process looked for.
+COMMAND_LOOK_S = 1.0
 #: The background watch (:func:`watch_launch`): how often it looks, and for how long at most. Games here took about
 #: 90 s from Play to a full-screen window (5 Oct: VALORANT 00:17:05 -> 00:18:37); light: one window list a second.
 WATCH_POLL_S = 1.0
@@ -2183,10 +2203,21 @@ class _LauncherApp:
         if how or p is None or not title:
             return how
         # second review V2: a game whose program has no names of its own (cs2.exe: no version resource), running under
-        # the launcher, in a window titled for the entry ("Counter-Strike 2") - the same title test as the carrier's
+        # the launcher, in a window titled for the entry ("Counter-Strike 2") - the same title test as the carrier's.
+        # Final check V2-partial-title: titled exactly for it; a title that only contains the name ("Updating
+        # Counter-Strike 2", a launcher helper's dialog) counts only for a process started since this launch that is
+        # not one of the launcher's own programs (installed under the launcher's folder)
         if self.under_carrier(p) and self.titled_for_it(title):
-            return "started under its launcher, its window titled for it"
+            if _title_score(title, self.name) == 2 or (self._started_since(p) and not self._carrier_program(p)):
+                return "started under its launcher, its window titled for it"
         return ""
+
+    def _carrier_program(self, p: _Proc) -> bool:
+        """A program installed under the carrier's own folder (its helpers: ``steamwebhelper.exe`` under Steam's)."""
+        if not self.carrier_exe or not p.exe:
+            return False
+        folder = os.path.dirname(self.carrier_exe).rstrip("\\") + "\\"
+        return os.path.normcase(p.exe).startswith(folder)
 
     def _started_since(self, p: _Proc) -> bool:
         return bool(self.since) and p.created >= self.since
@@ -2305,6 +2336,7 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
     carrier_is_app = bool(plan.get("carrier_exe")) and _names_agree(_exe_names(plan.get("carrier_exe") or ""), name)
     details["launcher"]["carrier_is_app"] = carrier_is_app
     started = time.monotonic()
+    before_carrier: set[int] = set()
     state = app.read(scan=True)
     if state["app"]:
         return _launcher_found(app, state, details, started, already=True, timeout_s=timeout_s)
@@ -2327,6 +2359,11 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
                   else f"{name} was handed to {carrier} {pending:.0f} s ago, not handed again")
     else:
         details["already_running"] = False
+        # final check V4-wait: a command of a program that is already running (VLC's "reset preferences" while VLC is
+        # open) runs in a new process of it and may end with no window: the wait follows that process, as for any
+        # app already running (:class:`_ReactClock`), instead of the whole launch budget
+        if carrier_is_app:
+            before_carrier = {p.pid for p in _process_table().values() if app.is_carrier(p)}
         ok, error = _start_entry(chosen["appid"], max(2.0, min(timeout_s, 15.0)))
         details["launched"] = ok
         if not ok:
@@ -2338,10 +2375,20 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
         args = plan.get("arguments") or plan.get("uri") or ""
         handed = f"started {name!r} the way the Start menu does: {carrier} took it" + (f" ({args})" if args else "")
     deadline = started + max(0.0, timeout_s)
-    while time.monotonic() < deadline:
+    react_until = time.monotonic() + _RUNNING_REACT_S if before_carrier else None
+    ran: set[int] = set()
+    next_look = 0.0
+    while time.monotonic() < (min(deadline, react_until) if react_until is not None else deadline):
         state = app.read()
         if state["app"]:
             return _launcher_found(app, state, details, started, already=False, timeout_s=timeout_s, lead=handed)
+        if react_until is not None and time.monotonic() >= next_look:
+            # the command's own process(es) of the program: the clock slides while one is alive (one table a second)
+            next_look = time.monotonic() + COMMAND_LOOK_S
+            alive = {p.pid for p in _process_table().values() if app.is_carrier(p) and p.pid not in before_carrier}
+            ran |= alive
+            if alive:
+                react_until = time.monotonic() + _RUNNING_REACT_S
         time.sleep(LAUNCHER_POLL_S)
     state = app.read(scan=True)
     if state["app"]:
@@ -2350,6 +2397,13 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
     if carrier_is_app:
         details.update(starting=False, verified=None, hwnd=None, waited_ms=round(waited * 1000.0, 1),
                        candidates=[{k: w[k] for k in ("hwnd", "title", "process_name")} for w in state["candidates"]])
+        if before_carrier:
+            details["command_ran"] = bool(ran)
+            done = ("its command ran in a new process of the program and ended" if ran
+                    else "no new process of the program stayed running")
+            return True, (f"{handed}; {carrier} is the program of {name} itself and was already running; {done}, and "
+                          f"no window titled for {name} came up within {waited:.0f} s (a command of the program can "
+                          f"run without a window of its own) - not confirmed")
         return True, (f"{handed}; {carrier} is the program of {name} itself, and no window titled for {name} came up "
                       f"within {waited:.0f} s (a command of the program can run without a window of its own) - not "
                       f"confirmed")
@@ -2859,6 +2913,10 @@ def _no_window_outcome(
     details["running_pids_after"] = sorted(pids)
     app_hwnd, state = _find_app_window(identity, pids)
     if app_hwnd is None:
+        if getattr(identity, "via_handler", False):
+            # final check V3-wording: the program that shows it always runs for other things (Explorer)
+            program = os.path.basename(sorted(identity.exe_paths or [""])[0]) or "the program that shows it"
+            return f"{lead}; {program}, which shows it, is shared with other windows, and no new window of it came"
         if pids:
             return (
                 f"{lead}; it is running (pid {', '.join(str(p) for p in sorted(pids)[:6])}) "

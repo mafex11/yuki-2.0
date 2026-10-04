@@ -15,6 +15,11 @@ timeline's own rows).
 
 Cost: one parent snapshot (~12 ms) and a few process reads, once per new process brought to the front; nothing on a
 window of a process already seen. No model, no content, no list of apps.
+
+appOpen final check (L-T3/L-T8): the timeline also hands over *when the user gave input* (:func:`note_input`: the last
+input time ``GetLastInputInfo`` reported each time it looked - times only, no keys, no window, no process), so
+the learner can tell a program the user started (it started a few seconds after their click at the shell or the
+launcher) from one Yuki's own slow launch started while the user merely looked at another window.
 """
 
 from __future__ import annotations
@@ -38,6 +43,10 @@ _lock = threading.Lock()
 _records: deque[dict[str, Any]] = deque(maxlen=MAX_RECORDS)
 _seen: dict[int, float] = {}
 _entries: tuple[float, dict[str, list[dict[str, str]]]] | None = None
+#: When the user gave input, as the timeline saw it: the system's last-input time each time it looked (every 15 s at
+#: most while the user is at the PC, and at each foreground change) - certain input instants, newest last, kept
+#: :data:`KEEP_S`. Times only: no keys, no window, no process.
+_inputs: deque[float] = deque(maxlen=4096)
 
 
 def _facts(pid: int, ppids: dict[int, int]) -> dict[str, Any] | None:
@@ -120,10 +129,34 @@ def add(record: dict[str, Any]) -> None:
         _records.append(dict(record))
 
 
+def note_input(last: float) -> None:
+    """The user gave input at ``last`` (wall clock; the timeline's reading of the system's last-input time). Never
+    raises."""
+    try:
+        last = float(last)
+        if last <= 0:
+            return
+        with _lock:
+            if _inputs and abs(_inputs[-1] - last) < 0.05:
+                return
+            _inputs.append(last)
+            while _inputs and last - _inputs[0] > KEEP_S:
+                _inputs.popleft()
+    except Exception:
+        return
+
+
+def input_times(since: float, until: float) -> list[float]:
+    """The user's input instants in ``[since, until]``, oldest first."""
+    with _lock:
+        return [t for t in _inputs if since <= t <= until]
+
+
 def clear() -> None:
     with _lock:
         _records.clear()
         _seen.clear()
+        _inputs.clear()
 
 
 def between(since: float, until: float | None = None) -> list[dict[str, Any]]:
@@ -172,4 +205,4 @@ def set_start_entries(table: dict[str, list[dict[str, str]]]) -> None:
         _entries = (time.monotonic(), {os.path.normcase(os.path.abspath(k)): list(v) for k, v in table.items()})
 
 
-__all__ = ["add", "between", "clear", "note", "set_start_entries", "start_entries"]
+__all__ = ["add", "between", "clear", "input_times", "note", "note_input", "set_start_entries", "start_entries"]

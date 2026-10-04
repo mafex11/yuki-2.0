@@ -318,7 +318,10 @@ def test_review_f1_the_user_taking_over_through_start_is_still_the_users_own_fix
     P.record_run(store, _voice_opening(handed=True, verdict=False))
     worker.answers.append({"outcome": "failed", "cause": "the game never came up", "operations": [PIT], "used": []})
     L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
-    _game_from(store, chain_at=NOW + 327.0, window_at=NOW + 330.0, start_row_at=NOW + 250.0)
+    # the user picks the entry in Start (their click read at +251.5); the launcher starts the game's boot program 3 s
+    # later, its window comes 75 s after that
+    _game_from(store, chain_at=NOW + 254.5, window_at=NOW + 330.0, start_row_at=NOW + 250.0)
+    lineage.note_input(NOW + 251.5)
     worker.answers.append({**DEMO, "from_user": ["u1", "u2"]})
     res = L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
     assert len(res) == 1 and res[0].outcome == "shown"
@@ -426,6 +429,8 @@ def test_second_review_l1_pressing_play_in_the_launchers_window_is_still_the_use
     _rows(store, [(NOW + 200.0, 12.0, 0.0, "fakelauncher ux", "Fake Launcher", "Fake Launcher", False),
                   (NOW + 300.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)])
     _game_chain(window_at=NOW + 300.0, chain_at=NOW + 211.0)      # started as the user pressed Play
+    for t in (NOW + 201.0, NOW + 210.5):                          # their input at the launcher's window
+        lineage.note_input(t)
     items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
     game = [it for it in items if it["process"] == "starfall-win64-shipping"]
     assert game and not game[0]["yuki"] and game[0]["worked"] and game[0]["fresh"]
@@ -435,7 +440,8 @@ def test_second_review_l2_a_way_the_first_post_mortem_learned_is_not_learned_aga
     """A quick user: the first post-mortem already saw what they did and wrote the way. The recheck neither writes it
     again (a second version, a second announcement) nor undoes the user's "No"."""
     worker = Worker(store)
-    _game_from(store, chain_at=NOW + 238.0, window_at=NOW + 240.0, start_row_at=NOW + 190.0)
+    _game_from(store, chain_at=NOW + 193.0, window_at=NOW + 240.0, start_row_at=NOW + 190.0)
+    lineage.note_input(NOW + 191.5)
     P.record_run(store, _voice_opening(handed=True, verdict=False))
     worker.answers.append({"outcome": "failed", "cause": "the game never came up",
                            "operations": [{**SHOWN, "from_user": ["u1", "u2"]}], "used": []})
@@ -518,3 +524,98 @@ def test_second_review_v3_a_plain_opening_that_could_not_be_confirmed_is_not_dou
     assert not L.doubtful_open([step('{"name":"File Explorer"}', None)])
     assert L.doubtful_open([step('{"name":"File Explorer"}', False)])
     assert L.doubtful_open([step('{"name":"Starfall","handed_to":"fakelauncher.exe"}', None)])
+
+
+# -- final check (5 Oct) ----------------------------------------------------------------------------------------------
+
+EXPLORER = r"C:\Windows\explorer.exe"
+
+
+def _failed_handoff_and(store: Any, worker: Worker, rows: list[tuple], *, chain_at: float, window_at: float,
+                        inputs: list[float]) -> tuple[P.RunHeader, list[dict[str, Any]]]:
+    head = _failed_voice_opening(store, worker)
+    _rows(store, rows)
+    _game_chain(window_at=window_at, chain_at=chain_at)
+    lineage.add({"at": NOW + 60.0, "image": "explorer.exe", "exe": EXPLORER, "started": NOW - 86400.0, "parents": [],
+                 "by_yuki": False})
+    for t in inputs:
+        lineage.note_input(t)
+    return head, L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
+
+
+def test_final_check_t8_browsing_a_folder_while_yukis_launch_waits_is_not_the_users_fix(store):
+    """T8: the opening was handed to the launcher; the user browses a folder in File Explorer (+60 s, 25 s of input),
+    the launcher's "Updating" window comes up with no input, and the game Yuki's hand-off asked for starts under the
+    launcher at +413 s. Explorer is the shell, but nothing started from it: the game stays Yuki's - no demonstration
+    pass, nothing written, nothing announced."""
+    worker = Worker(store)
+    _head, items = _failed_handoff_and(
+        store, worker,
+        [(NOW + 60.0, 25.0, 0.0, "explorer", "File Explorer", "Downloads", False),
+         (NOW + 100.0, 0.0, 50.0, "fakelauncher ux", "Fake Launcher", "Updating", False),
+         (NOW + 415.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)],
+        chain_at=NOW + 413.0, window_at=NOW + 415.0, inputs=[NOW + 61.0, NOW + 72.0, NOW + 84.5])
+    calls = len(worker.calls)
+    assert [it["yuki"] for it in items if it["process"] == "explorer"] == [False]
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"]
+    assert game and game[0]["yuki"] and "started by Yuki's own launch" in game[0]["yuki_why"]
+    assert not any(L.demonstration_item(it) for it in items)
+    worker.answers.append({**DEMO, "from_user": ["u3"]})
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls and P.live(store, ["procedure"]) == []
+
+
+def test_final_check_t8_control_a_program_started_right_after_the_users_click_in_explorer_is_theirs(store):
+    worker = Worker(store)
+    _head, items = _failed_handoff_and(
+        store, worker,
+        [(NOW + 300.0, 8.0, 0.0, "explorer", "File Explorer", "Starfall", False),
+         (NOW + 330.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)],
+        chain_at=NOW + 309.0, window_at=NOW + 330.0, inputs=[NOW + 301.0, NOW + 307.5])
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"][0]
+    assert not game["yuki"] and game["worked"] and game["fresh"]
+
+
+def test_final_check_t3_moving_the_mouse_at_the_launchers_patch_window_is_not_pressing_play(store):
+    """T3: the launcher's "Updating 40%" window from +200 s; the user moves the mouse at it for half a minute and then
+    leaves it be; the patch ends and the game the hand-off asked for starts on its own at +505 s, while that window is
+    still in front (the user's next input, +521 s, is after the game came up). Not the user's Play press: Yuki's, no
+    demonstration pass."""
+    worker = Worker(store)
+    _head, items = _failed_handoff_and(
+        store, worker,
+        [(NOW + 200.0, 30.0, 290.0, "fakelauncher ux", "Fake Launcher", "Updating 40%", False),
+         (NOW + 520.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)],
+        chain_at=NOW + 505.0, window_at=NOW + 520.0, inputs=[NOW + 201.0, NOW + 215.0, NOW + 229.0, NOW + 521.0])
+    calls = len(worker.calls)
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"]
+    assert game and game[0]["yuki"] and "started by Yuki's own launch" in game[0]["yuki_why"]
+    worker.answers.append({**DEMO, "from_user": ["u2"]})
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls and P.live(store, ["procedure"]) == []
+
+
+def test_final_check_the_timeline_hands_the_users_input_times_to_lineage() -> None:
+    lineage.clear()
+    lineage.note_input(NOW + 1.0)
+    lineage.note_input(NOW + 1.0)                                       # the same reading again
+    lineage.note_input(NOW + 9.0)
+    assert lineage.input_times(NOW, NOW + 5.0) == [NOW + 1.0] and len(lineage.input_times(NOW, NOW + 10.0)) == 2
+    import inspect
+
+    from yuki.memory import timeline
+
+    assert "lineage.note_input(l1)" in inspect.getsource(timeline.TimelineRecorder._advance)
+
+
+def test_final_check_v3_a_plain_opening_that_showed_no_window_is_doubtful() -> None:
+    """FL Studio slow to start or crashing: no window of it came (the thinker keeps ``no_window``; the voice hand's
+    step names no program). What the user does next is looked at. A window that came but stayed unconfirmed is not."""
+    def step(tool: str, inp: str, app: Any = None) -> P.RunStep:
+        return P.RunStep(step=1, at=NOW, tool=tool, kind="action", app=app, target="", input=inp, ok=True,
+                         verdict=None, why="", result="", ms=1.0, cost_usd=None, cited=[])
+
+    assert L.doubtful_open([step("launch_app", '{"query":"FL Studio","no_window":true}')])
+    assert not L.doubtful_open([step("launch_app", '{"query":"FL Studio"}', app="explorer")])
+    assert L.doubtful_open([step("open_app", '{"name":"FL Studio"}')])
+    assert not L.doubtful_open([step("open_app", '{"name":"File Explorer"}', app="explorer.exe")])

@@ -469,11 +469,27 @@ SEEN_FILE: str | None = None
 SEEN_LEDGER_CAP = 512
 _ledger: dict[int, tuple[int, float]] = {}
 _ledger_read: tuple[str, float] | None = None
+#: appOpen final check (V1-ledger): what this process last wrote to the ledger for a window -
+#: ``{hwnd: (pid, monotonic when written or confirmed, write count then)}`` - so a window that comes to the front again
+#: is written again when its process changed (a reused handle), when it has drifted into the older half of the ledger
+#: (newest last: a long-lived tray app is never the one cut at the cap), or :data:`SEEN_REFRESH_S` after it was last
+#: confirmed (another writer, a restart). Never the in-process "seen" set: that one says nothing about the file.
+_persisted: dict[int, tuple[int, float, int]] = {}
+#: Windows written so far by this process (each one moved to the newest end counts once).
+_ledger_writes = 0
+#: Windows whose last write failed (the file held open by a reader): written with the next one.
+_seen_pending: set[int] = set()
+SEEN_REFRESH_S = 600.0
+#: Tries of the atomic replace when a reader holds the file open, and the pause between them.
+_REPLACE_TRIES = 3
+_REPLACE_PAUSE_S = 0.02
 
 
 def _seen_path() -> str:
     if SEEN_FILE:
         return SEEN_FILE
+    if os.environ.get("YUKI_SEEN_FILE"):   # the test run's guard (tests/conftest.py): never the user's own file
+        return os.environ["YUKI_SEEN_FILE"]
     from yuki.core.paths import data_dir
 
     return str(data_dir() / "seen_windows.json")
@@ -508,23 +524,38 @@ def _load_ledger() -> dict[int, tuple[int, float]]:
     return _ledger
 
 
+def _owner_pid(hwnd: int) -> int:
+    try:
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1] or 0)
+    except Exception:
+        return 0
+
+
 def note_on_screen(hwnds: Iterable[int], *, persist: bool = False) -> None:
     """Remember these windows as seen on screen (cheap: a dict update). ``persist`` (the timeline, one writer): also
-    keep them in the seen ledger, written only when a window is new to it."""
+    keep them in the seen ledger - written when a window is new to this process's writes, its process changed, it is
+    no longer among the newer half of the ledger, its last write is :data:`SEEN_REFRESH_S` old, or an earlier write
+    failed (appOpen final check V1-ledger)."""
     now = time.monotonic()
-    fresh: list[int] = []
+    handles = [int(h) for h in hwnds]
+    due: list[int] = []
     with _seen_lock:
-        for hwnd in hwnds:
-            hwnd = int(hwnd)
-            if hwnd not in _seen_on_screen:
-                fresh.append(hwnd)
+        for hwnd in handles:
             _seen_on_screen.pop(hwnd, None)
             _seen_on_screen[hwnd] = now
         while len(_seen_on_screen) > _SEEN_CAP:
             _seen_on_screen.pop(next(iter(_seen_on_screen)))
-    if persist and fresh:
+        if persist:
+            for hwnd in handles:
+                kept = _persisted.get(hwnd)
+                if (kept is None or hwnd in _seen_pending or now - kept[1] >= SEEN_REFRESH_S
+                        or _ledger_writes - kept[2] >= SEEN_LEDGER_CAP // 2 or kept[0] != _owner_pid(hwnd)):
+                    due.append(hwnd)
+            if due:
+                due += [h for h in _seen_pending if h not in due]
+    if due:
         try:
-            _persist_seen(fresh)
+            _persist_seen(due)
         except Exception:  # noqa: BLE001 - a ledger that cannot be written costs a re-launch, never the caller
             pass
 
@@ -532,36 +563,74 @@ def note_on_screen(hwnds: Iterable[int], *, persist: bool = False) -> None:
 def _persist_seen(hwnds: list[int]) -> None:
     import json
 
+    global _ledger, _ledger_read, _ledger_writes
     with _seen_lock:
         ledger = dict(_load_ledger())
-        changed = False
+        order = list(ledger)
+        newer = set(order[max(0, len(order) - SEEN_LEDGER_CAP // 2):])
+        confirmed: dict[int, int] = {}
+        moved = 0
         for hwnd in hwnds:
-            try:
-                _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            except Exception:
+            pid = _owner_pid(hwnd)
+            if not pid:
+                _seen_pending.discard(hwnd)
                 continue
-            entry = (int(pid), _process_start(pid))
-            if not pid or ledger.get(hwnd) == entry:
-                continue
-            ledger.pop(hwnd, None)
+            entry = (pid, _process_start(pid))
+            confirmed[hwnd] = pid
+            if ledger.get(hwnd) == entry and hwnd in newer and hwnd not in _seen_pending:
+                continue   # already there, among the newer half: nothing to write
+            ledger.pop(hwnd, None)   # a re-seen window moves to the newest end; a changed process overwrites it
             ledger[hwnd] = entry
-            changed = True
-        if not changed:
-            return
-        while len(ledger) > SEEN_LEDGER_CAP:
-            ledger.pop(next(iter(ledger)))
-        path = _seen_path()
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({str(k): list(v) for k, v in ledger.items()}, fh)
-        os.replace(tmp, path)
-        global _ledger, _ledger_read
-        _ledger = ledger
-        try:
-            _ledger_read = (path, os.path.getmtime(path))
-        except OSError:
-            _ledger_read = None
+            moved += 1
+        now = time.monotonic()
+        if moved:
+            if len(ledger) > SEEN_LEDGER_CAP:
+                # windows that no longer exist go first; then the oldest
+                for hwnd in [h for h in ledger if h not in confirmed]:
+                    if len(ledger) <= SEEN_LEDGER_CAP:
+                        break
+                    try:
+                        alive = bool(win32gui.IsWindow(hwnd))
+                    except Exception:
+                        alive = False
+                    if not alive:
+                        ledger.pop(hwnd, None)
+                while len(ledger) > SEEN_LEDGER_CAP:
+                    ledger.pop(next(iter(ledger)))
+            path = _seen_path()
+            tmp = f"{path}.{os.getpid()}.tmp"
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump({str(k): list(v) for k, v in ledger.items()}, fh)
+                for attempt in range(_REPLACE_TRIES):
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except PermissionError:
+                        # a reader has the file open for a moment (Windows refuses the replace meanwhile)
+                        if attempt == _REPLACE_TRIES - 1:
+                            raise
+                        time.sleep(_REPLACE_PAUSE_S)
+            except OSError:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                _seen_pending.update(confirmed)   # written with the next window that comes to the front
+                return
+            _ledger = ledger
+            try:
+                _ledger_read = (path, os.path.getmtime(path))
+            except OSError:
+                _ledger_read = None
+            _ledger_writes += moved
+        for hwnd, pid in confirmed.items():
+            _persisted.pop(hwnd, None)
+            _persisted[hwnd] = (pid, now, _ledger_writes)
+        _seen_pending.difference_update(confirmed)
+        while len(_persisted) > _SEEN_CAP:
+            _persisted.pop(next(iter(_persisted)))
 
 
 def was_on_screen(hwnd: int) -> bool:

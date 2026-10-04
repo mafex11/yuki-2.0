@@ -2013,6 +2013,15 @@ class TimelineRecorder:
             self._open(st.hwnd, now, like=st, state="present" if idle < AWAY_AFTER_S else "away")
             return
         new_input = l1 > l0 + 0.5
+        if new_input:
+            # appOpen final check (L-T3/L-T8): when the user gave input (a time only, in memory), so the practice
+            # learner tells a program the user started from one Yuki's own slow launch started meanwhile
+            try:
+                from yuki.memory import lineage
+
+                lineage.note_input(l1)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         if st.state == "present" and self._watching(st):
             # The app in front is playing media: watching or listening, whatever
             # the idle timer says (see the module docstring).

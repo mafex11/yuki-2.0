@@ -836,3 +836,230 @@ def test_second_review_v3_a_handler_that_hands_the_target_on_still_gets_its_wind
     snapshots = iter([({92002: 51}, {51}, {92002: ("Help", "hh.exe")})] * 3)
     hwnd, reason, _ = L._wait_for_new_window(identity, {}, set(), 0, time.monotonic() + 0.5)
     assert hwnd == 92002 and "not confirmed" not in reason
+
+
+# -- final check (5 Oct) ----------------------------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def ledger(tmp_path, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """The seen ledger in a temp file, window owners and process starts stubbed, this process's write state fresh."""
+    from yuki.perception import windows as W
+
+    world: dict = {"owner": {}, "starts": {}, "dead": set(), "path": tmp_path / "seen_windows.json"}
+    monkeypatch.setattr(W, "SEEN_FILE", str(world["path"]))
+    for name, value in (("_ledger", {}), ("_ledger_read", None), ("_persisted", {}), ("_seen_pending", set()),
+                        ("_ledger_writes", 0), ("_seen_on_screen", {})):
+        monkeypatch.setattr(W, name, value)
+    monkeypatch.setattr(W.win32process, "GetWindowThreadProcessId",
+                        lambda h: (1, world["owner"].get(int(h), 0)))
+    monkeypatch.setattr(W, "_process_start", lambda pid: world["starts"].get(int(pid), 0.0))
+    monkeypatch.setattr(W.win32gui, "IsWindow", lambda h: int(h) not in world["dead"])
+
+    def other_process() -> None:              # another process (the launch), or Yuki restarted: nothing in memory
+        monkeypatch.setattr(W, "_seen_on_screen", {})
+        monkeypatch.setattr(W, "_ledger_read", None)
+
+    world["other_process"] = other_process
+    world["W"] = W
+    return world
+
+
+def _window(world: dict, hwnd: int, pid: int, start: float) -> None:
+    world["owner"][hwnd] = pid
+    world["starts"][pid] = start
+
+
+def test_final_check_v1_a_long_lived_window_kept_in_use_stays_in_the_ledger(ledger: dict) -> None:
+    """Discord seen first, then 600 other windows while the user keeps coming back to it: it is moved to the newest
+    end as it drifts, so it is never the one cut at the cap. Windows that no longer exist go before live ones."""
+    W = ledger["W"]
+    _window(ledger, 1, 10, 100.0)
+    W.note_on_screen([1], persist=True)
+    for i in range(600):
+        _window(ledger, 1000 + i, 2000 + i, 200.0 + i)
+        if i < 100:
+            ledger["dead"].add(1000 + i)                                  # closed since
+        W.note_on_screen([1000 + i], persist=True)
+        if i % 50 == 49:
+            W.note_on_screen([1], persist=True)
+    import json
+
+    saved = json.loads(ledger["path"].read_text())
+    assert "1" in saved and len(saved) <= W.SEEN_LEDGER_CAP
+    assert all(str(1000 + i) in saved for i in range(100, 600))           # dead ones were cut, never a live one
+    ledger["other_process"]()
+    assert W.was_on_screen(1)
+
+
+def test_final_check_v1_a_reused_handle_is_written_again_for_its_new_process(ledger: dict) -> None:
+    W = ledger["W"]
+    _window(ledger, 77, 700, 100.0)
+    W.note_on_screen([77], persist=True)
+    _window(ledger, 77, 701, 300.0)                                       # the handle now belongs to another process
+    W.note_on_screen([77], persist=True)
+    ledger["other_process"]()
+    assert W.was_on_screen(77)
+
+
+def test_final_check_v1_a_failed_write_leaves_no_temp_file_and_is_retried(ledger: dict,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tray holds the file open to read it: Windows refuses the replace. Nothing is left behind and the window is
+    written with the next one that comes to the front."""
+    import os as _os
+
+    W = ledger["W"]
+    real = _os.replace
+
+    def refuse(src: str, dst: str) -> None:
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(W.os, "replace", refuse)
+    _window(ledger, 41, 410, 100.0)
+    W.note_on_screen([41], persist=True)
+    assert not ledger["path"].exists() and list(ledger["path"].parent.glob("*.tmp")) == []
+    monkeypatch.setattr(W.os, "replace", real)
+    _window(ledger, 42, 420, 200.0)
+    W.note_on_screen([42], persist=True)
+    ledger["other_process"]()
+    assert W.was_on_screen(41) and W.was_on_screen(42)
+
+
+def test_final_check_v1_the_running_instance_bringing_up_its_ui_in_a_child_is_the_app(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """"open Riot Client" from the tray: the running RiotClientServices keeps its tray host hidden and brings up the
+    real client window from a new child process of its own - the app's window, not an "already running" prompt."""
+    procs = {901: L._Proc(901, 800, r"c:\apps\ui\app ui.exe", "app ui.exe"),
+             800: L._Proc(800, 4, r"c:\apps\app.exe", "app.exe")}
+    monkeypatch.setattr(L, "_proc", lambda pid, image_hint="", ppids=None: procs.get(int(pid or 0)))
+    out = _restore_world(monkeypatch, new_window_pid=901)
+    assert out["verdict"] is True and "not confirmed" not in out["details"]["window_reason"]
+
+
+def test_final_check_v1_a_second_instance_not_started_by_the_running_one_is_still_unconfirmed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    procs = {901: L._Proc(901, 4, r"c:\apps\app.exe", "app.exe")}               # started by the shell, its prompt
+    monkeypatch.setattr(L, "_proc", lambda pid, image_hint="", ppids=None: procs.get(int(pid or 0)))
+    out = _restore_world(monkeypatch, new_window_pid=901)
+    assert out["verdict"] is None and "not confirmed" in out["details"]["window_reason"]
+
+
+def test_final_check_v2_a_launcher_helpers_dialog_naming_the_game_is_not_the_game(world: World) -> None:
+    """A store-link game (no sibling entries): the store's long-running helper shows "Updating Pixel Racer". Only a
+    window titled exactly for the game, or a process started since the launch outside the launcher's own folder,
+    counts."""
+    helper = r"C:\Games\Fake Store\bin\storehelper.exe"
+    world.proc(320, helper, ppid=300, created=500.0)
+    world.window(9320, 320, "Updating Pixel Racer", front=True)
+    app = L._LauncherApp("Pixel Racer", "fakestore://rungameid/42", STORE)
+    app.since = time.time() - 1.0
+    state = app.read()
+    assert state["app"] == [] and [w["hwnd"] for w in state["launcher"]] == [9320]
+    world.proc(321, helper, ppid=300, created=time.time())                    # a fresh helper, still the store's
+    world.window(9321, 321, "Pixel Racer - update", front=True)
+    assert app.read()["app"] == []
+    world.proc(322, r"D:\Library\pixel racer\bin\racer_dx11.exe", ppid=300, created=time.time())
+    world.window(9322, 322, "Pixel Racer - DirectX 11", front=True, fullscreen=True)
+    assert [w["hwnd"] for w in app.read()["app"]] == [9322]
+    world.window(9323, 320, "Pixel Racer")                                    # titled exactly for it
+    assert 9323 in [w["hwnd"] for w in app.read()["app"]]
+
+
+def test_final_check_v4_a_command_of_a_running_program_does_not_wait_the_whole_budget(
+        clip: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """"Clip Player - reset preferences" while the player is open: the command runs in a new process of the program
+    and ends with no window. The wait follows that process, then says so - not the whole 8 s budget."""
+    monkeypatch.setattr(L, "COMMAND_LOOK_S", 0.01)
+    monkeypatch.setattr(L, "_RUNNING_REACT_S", 0.3)
+    clip.proc(600, CLIP, ppid=4, created=time.time() - 600.0)
+    clip.window(9600, 600, "Clip Player", front=True)
+
+    def command() -> None:
+        clip.proc(602, CLIP, ppid=4, created=time.time())
+        clip.on_poll.append((clip.polls + 40, lambda: clip.procs.pop(602, None)))
+
+    clip.on_start = command
+    began = time.monotonic()
+    result = L.launch_app("Clip Player - reset preferences", timeout_s=8.0)
+    assert time.monotonic() - began < 3.0
+    assert result.ok and result.details["verified"] is None and result.details["command_ran"] is True
+    assert "its command ran in a new process of the program and ended" in result.summary
+
+
+def test_final_check_v3_another_explorer_window_changing_title_is_not_the_entrys(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """"open Run" while the user browses another folder: that Explorer window changing its title, or coming to the
+    front, is not the Run dialog. One whose title names the entry still counts."""
+    identity = L._AppIdentity("Run", aumid="x-run", exe_paths=[r"C:\WINDOWS\explorer.exe"], via_handler=True)
+    monkeypatch.setattr(identity, "owns_window", lambda h: "same program file")
+    before_titles = {4200: ("Downloads - File Explorer", "explorer.exe")}
+    snapshot = ({4200: 40}, {40}, {4200: ("Documents - File Explorer", "explorer.exe")})
+    monkeypatch.setattr(L, "_window_snapshot", lambda: snapshot)
+    monkeypatch.setattr(L, "is_user_window", lambda h: True)
+    monkeypatch.setattr(L._user32, "GetForegroundWindow", lambda: 4200)
+    hwnd, _reason, _ = L._wait_for_new_window(identity, {4200: 40}, {40}, 0, time.monotonic() + 0.2,
+                                              before_titles=before_titles)
+    assert hwnd is None
+    panel = L._AppIdentity("Control Panel", aumid="x-cp", exe_paths=[r"C:\WINDOWS\explorer.exe"], via_handler=True)
+    monkeypatch.setattr(panel, "owns_window", lambda h: "same program file")
+    snapshot = ({4200: 40}, {40}, {4200: ("Control Panel", "explorer.exe")})
+    hwnd, reason, _ = L._wait_for_new_window(panel, {4200: 40}, {40}, 0, time.monotonic() + 0.2,
+                                             before_titles=before_titles)
+    assert hwnd == 4200 and "changed its title" in reason
+
+
+def test_final_check_v3_a_shell_entry_with_no_window_is_not_said_to_have_no_process(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = L._AppIdentity("File Explorer", aumid="x-fe", exe_paths=[r"C:\WINDOWS\explorer.exe"], via_handler=True)
+    monkeypatch.setattr(L, "_find_app_window", lambda identity, pids: (None, ""))
+    summary = L._no_window_outcome({"name": "File Explorer", "appid": "x-fe"}, identity, {}, [], False, 3.0,
+                                   time.monotonic() + 1.0)
+    assert "no process of it is running" not in summary and "explorer.exe, which shows it, is shared" in summary
+
+
+def test_final_check_v3_the_thinker_keeps_that_no_window_came(tmp_path) -> None:
+    """A plain opening that showed no window at all (slow to start, or it crashed): the thinker's kept step says so,
+    so practice memory looks at what the user did next (final check V3-doubtful)."""
+    from test_c_practice import Words
+    from yuki.agent.loop import Agent
+    from yuki.agent.memory import MemoryAccess
+    from yuki.config import Settings
+    from yuki.log.events import SessionLogger
+    from yuki.memory import practice as P
+    from yuki.memory import practice_learn as PL
+    from yuki.memory.api import MemoryClient
+    from yuki.memory.store import Store
+    from yuki.voice.offline import BrowserDesk
+
+    client = MemoryClient(Store.open(tmp_path / "m" / "memory.db"))
+    client._embedder = Words()
+    memory = MemoryAccess(open_client=lambda: client)
+
+    class Desk(BrowserDesk):
+        def launch_app(self, query: str, **_k: Any) -> Any:
+            return L.ActionResult(ok=True, summary="started 'Beat Studio' but no window of it appeared within 8.0s",
+                                  details={"verified": None, "hwnd": None}, elapsed_ms=5.0)
+
+    def resp(*blocks: Any) -> Any:
+        usage = SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_input_tokens=0,
+                                cache_creation_input_tokens=0)
+        return SimpleNamespace(content=list(blocks), stop_reason="tool_use", usage=usage)
+
+    calls = [resp(SimpleNamespace(type="tool_use", id="a1", name="launch_app", input={"query": "Beat Studio"})),
+             resp(SimpleNamespace(type="tool_use", id="d1", name="done", input={"message": "It did not open.",
+                                                                                "about": []}))]
+    fake = SimpleNamespace(messages=SimpleNamespace(create=lambda **p: calls.pop(0)))
+    settings = Settings(log_dir=tmp_path / "sessions", stream=False, requests_csv=tmp_path / "r.csv")
+    agent = Agent(settings, SessionLogger(settings.sessions_dir, console=None), client=fake,
+                  backend=Desk(action_delay_s=0), prewarm=False, record_requests=False, memory=memory)
+    list(agent.run("open beat studio", effort="low", thinking=False))
+    deadline = time.monotonic() + 10.0
+    heads: list = []
+    while time.monotonic() < deadline and not heads:
+        memory.flush_turns(1)
+        heads = P.pending_runs(client.store)
+        time.sleep(0.05)
+    assert heads, "the run trace was never kept"
+    steps = [s for s in P.run_steps(client.store, heads[0].run_key) if s.tool == "launch_app"]
+    assert len(steps) == 1 and '"no_window":true' in steps[0].input and PL.doubtful_open(steps)
+    client.close()

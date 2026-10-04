@@ -1887,6 +1887,10 @@ class Agent:
                 step["input"] = {**acting, **{k: launcher[k] for k in ("handed_to", "handed_at") if launcher.get(k)}}
                 if details.get("starting"):
                     self._watch_launch(launcher, len(trace))
+            if name == "launch_app" and ok and verdict is None and details and not details.get("hwnd"):
+                # appOpen final check (V3-doubtful): no window of it came at all (slow to start, or it crashed) - the
+                # practice learner looks at what the user did next (the step's app is the window in front, not this)
+                step["input"] = {**step["input"], "no_window": True}
             trace.append(step)
         except Exception as exc:  # noqa: BLE001 - the trace never breaks a request
             self.logger.log("trace_step_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
