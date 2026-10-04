@@ -10,6 +10,8 @@ game-quiet          a real full screen on the monitor in use (an exclusive or bo
                     full-screen video, a presentation) or the session locked: hidden; the tray carries the
                     call timer (one clock, never reset). A borderless app that is only maximised is not one.
 needs-you           Yuki asked something and waits (auto-expands: the question and Answer / Stop)
+paused              you took over the keyboard or mouse while a request worked: "You took over · paused" with
+                    Resume and Stop (auto-expands; appTakeover, 4 Oct); Yuki says nothing
 send-countdown      a plain send is about to go (auto-expands): who / where (swap chips), the exact text, "3 s to
                     stop" and Stop / Esc; then the send goes on (appPT, the user's 3 Oct screenshot of the mock)
 voice-stopped       voice failed: the reason and the fix (Retry, Settings), on screen at least 8 s (auto-expands)
@@ -116,14 +118,22 @@ BAR_SHIFT = 8
 #: The window: the widest island, so morphs paint inside it (the rest is transparent and lets clicks through).
 WIN_W = MAX_W
 
-STATES: tuple[str, ...] = ("game-quiet", "needs-you", "send-countdown", "voice-stopped", "speaking", "hearing",
+STATES: tuple[str, ...] = ("game-quiet", "needs-you", "send-countdown", "paused", "voice-stopped", "speaking", "hearing",
                            "listening", "working", "thinking", "done-flash", "call-notice", "quiet-in-call",
                            "not-listening", "hidden-armed")
 #: States with the halo figure of the same name: only while Yuki hears, thinks or works, or speaks (3 Oct, item 20).
 HALO_STATES = frozenset({"hearing", "thinking", "working", "speaking"})
 #: States that show the full bar without a hover: Yuki needs an answer, a send is about to go (3 s to stop), or voice
 #: broke (the mock's Island spec: "On its own").
-AUTO_EXPAND = frozenset({"needs-you", "send-countdown", "voice-stopped"})
+AUTO_EXPAND = frozenset({"needs-you", "send-countdown", "paused", "voice-stopped"})
+#: appTakeover: the paused bar's words (the user took over the keyboard or mouse while a request worked).
+PAUSED_LINE = "You took over · paused"
+PAUSED_SUB = "Resume when you're ready, or Stop · say “go on” or type to Yuki to continue"
+#: The run card's and the thread's line for a paused run, the thread's line when it goes on, and the end line of a
+#: paused run that was stopped or never resumed (the agent's ``PAUSE_STOP_LINE``, the same words).
+PAUSED_NOTE = "Paused (you took over)"
+RESUMED_NOTE = "Going on from what's on screen now"
+PAUSE_STOP_LINE = "Stopped. Nothing else was done."
 #: The send countdown's open width (the mock's Island spec: "send countdown 620").
 SEND_W = 620
 #: The words the island and the tray use for "Yuki isn't listening" (v3.16, the voice session's states).
@@ -178,6 +188,9 @@ class RunInfo:
     #: The brain's own live line of what it checks or does now and why (its ``now`` note, or the situation check's
     #: plain line), for the current step; "" when the step came without one (its own words show instead).
     thought: str = ""
+    #: appTakeover: paused because the user took over the keyboard or mouse (``paused_why``: keys | click | mouse).
+    paused: bool = False
+    paused_why: str = ""
 
 
 @dataclass
@@ -248,6 +261,8 @@ def resolve(i: IslandInputs) -> str:
         return "needs-you"
     if i.send is not None:
         return "send-countdown"
+    if i.run is not None and i.run.paused and not i.run.stopping:
+        return "paused"
     if i.voice_error:
         return "voice-stopped"
     if i.voice == "speaking":
@@ -357,6 +372,8 @@ def compact_word(state: str, i: IslandInputs) -> str:
     if state == "send-countdown":
         s = i.send
         return f"Sending to {s.who}" if s is not None and s.who else "Sending"
+    if state == "paused":
+        return "Paused"
     if state == "done-flash":
         f = i.final
         return " ".join(str(f.text if f is not None else "Done.").split()) or "Done."
@@ -430,6 +447,13 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
                    else "the countdown starts again once it's ready there")
         return Spec(state, face="speaking", exp=True, width=SEND_W, line=line, sub=sub, rec=rec, body="send",
                     title=line)
+    if state == "paused" and run is not None:
+        # appTakeover: the user took over: the request waits, Resume / Stop under the line; the chevron opens its card
+        if expanded:
+            return Spec(state, face="handed", exp=True, width=RUN_W, line=PAUSED_LINE, sub=PAUSED_SUB, rec=rec,
+                        body="run", keys=("chev",), title=PAUSED_NOTE)
+        return Spec(state, face="handed", exp=True, width=600, line=PAUSED_LINE, sub=PAUSED_SUB, rec=rec,
+                    body="paused", keys=("chev",), title=PAUSED_NOTE)
     if state == "voice-stopped":
         return Spec(state, face="voice-stopped", width=720, line="Voice stopped",
                     sub=i.voice_error, keys=("retry", "settings"), title=i.voice_error)
@@ -1072,6 +1096,7 @@ class RunCard(QWidget):
     close = Signal()
     again = Signal()
     save_lesson = Signal()
+    resume = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1092,6 +1117,10 @@ class RunCard(QWidget):
         self.steerbox = SteerBox(self)
         self.steerbox.submitted.connect(self.steer.emit)
         self.k_stop = L.Key("Stop", variant="stop", icon="stop", kbd="Alt Shift X", parent=self)
+        self.k_resume = L.Key("Resume", variant="pri", parent=self)    # appTakeover: shown while paused
+        self.k_resume.hide()
+        self.k_resume.clicked.connect(self.resume.emit)
+        self.paused = False
         self.k_hand = L.Key("I’ll take it from here", parent=self)
         self.k_save = L.Key("Save the lesson", variant="pri", parent=self)
         self.k_again = L.Key("Ask again", variant="pri", parent=self)
@@ -1112,7 +1141,8 @@ class RunCard(QWidget):
 
     def set_card(self, *, mode: str, title: str, touch: str, count: str, cost: str, asked: str,
                  steps: list[dict[str, Any]], steers: list[Steer], summary: tuple[str, str] | None = None,
-                 foot_note: str = "", stop_kbd: str = "Alt Shift X", lesson: bool = False, waiting: str = "") -> None:
+                 foot_note: str = "", stop_kbd: str = "Alt Shift X", lesson: bool = False, waiting: str = "",
+                 paused: bool = False) -> None:
         """``mode``: ``live`` | ``done`` | ``stopped`` | ``handed`` | ``failed``. ``steps``: ``{kind, verb, obj, ms,
         note, chips}`` in order, the steps so far (never the ones to come). ``waiting``: the brain's own line before
         its first step, in place of "Getting ready…"."""
@@ -1150,6 +1180,8 @@ class RunCard(QWidget):
         self.k_stop.set_parts(kbd=stop_kbd)
         for k in (self.k_stop, self.k_hand, self.k_ledger):
             k.setVisible(live)
+        self.paused = live and bool(paused)
+        self.k_resume.setVisible(self.paused)   # appTakeover: the user took over; Resume goes on
         self.k_save.setVisible(mode == "done" and lesson)
         self.k_close.setVisible(not live)
         self.k_again.setVisible(mode in ("stopped", "handed", "failed"))
@@ -1234,7 +1266,7 @@ class RunCard(QWidget):
             y += sh
         y += 14
         x = 18
-        for k in (self.k_stop, self.k_hand, self.k_save, self.k_again):
+        for k in (self.k_resume, self.k_stop, self.k_hand, self.k_save, self.k_again):
             if k.isVisibleTo(self):
                 if apply:
                     k.move(x, y)
@@ -1389,11 +1421,16 @@ class IslandWindow(QWidget):
         self.caption = L.Para("", font=L.ui_font(17), line_height=1.4, parent=P, caret=True)
         self.k_answer = L.Key("Answer", variant="pri", size="sm", parent=P)
         self.k_qstop = L.Key("Stop", variant="ghost", size="sm", parent=P)
+        self.k_resume = L.Key("Resume", variant="pri", size="sm", parent=P)    # appTakeover: the paused bar
+        self.k_pstop = L.Key("Stop", variant="ghost", size="sm", parent=P)
         self.run = RunCard(P)
         self.send = SendCard(P)    # appPT: the send countdown, the island's open view while a send waits
         self.send.hide()
-        for w in (self.k_stop, self.k_chev, self.k_retry, self.k_settings, self.k_answer, self.k_qstop):
+        for w in (self.k_stop, self.k_chev, self.k_retry, self.k_settings, self.k_answer, self.k_qstop, self.k_resume,
+                  self.k_pstop):
             w.hide()
+        self.k_resume.setToolTip("Go on: Yuki reads the screen again first")
+        self.k_pstop.setToolTip("Stop this request: nothing else is done")
         self.k_chev.setToolTip("Open the run card")
         self.k_stop.setToolTip("Stop this request")
         self.halo_win = HaloWindow()
@@ -1463,7 +1500,7 @@ class IslandWindow(QWidget):
     def body_height(self, spec: Spec, w: int) -> int:
         if spec.body == "caption":
             return max(40, self.caption.heightForWidth(max(10, w - 2 - CAPTION_INDENT - 20)) + 16)
-        if spec.body == "choices":
+        if spec.body in ("choices", "paused"):
             return 26 + 16
         if spec.body == "run":
             return self.run.height_for(w - 2)
@@ -1524,6 +1561,9 @@ class IslandWindow(QWidget):
         elif spec.body == "choices":
             self.k_answer.move(1 + CAPTION_INDENT, y)
             self.k_qstop.move(1 + CAPTION_INDENT + self.k_answer.width() + 8, y)
+        elif spec.body == "paused":
+            self.k_resume.move(1 + CAPTION_INDENT, y)
+            self.k_pstop.move(1 + CAPTION_INDENT + self.k_resume.width() + 8, y)
         elif spec.body == "run":
             self.run.setGeometry(1, y, w - 2, max(0, self.run.height_for(w - 2)))
         elif spec.body == "send":
@@ -1561,6 +1601,8 @@ class IslandWindow(QWidget):
         self.caption.setVisible(spec.body == "caption")
         for w in (self.k_answer, self.k_qstop):
             w.setVisible(spec.body == "choices")
+        for w in (self.k_resume, self.k_pstop):
+            w.setVisible(spec.body == "paused")
         self.run.setVisible(spec.body == "run")
         self.send.setVisible(spec.body == "send")
         pitch =3 if spec.mini else COMPACT_PITCH if spec.compact else 8
@@ -1872,6 +1914,8 @@ class Island(QObject):
     save_lesson = Signal()
     send_stop = Signal(int)
     send_swap = Signal(int, str, str)
+    #: appTakeover: Resume on the paused bar or the run card (the user took over; the request goes on).
+    resume_clicked = Signal(int)
 
     def __init__(self, *, bindings: dict[str, str] | None = None, model: Any = None) -> None:
         super().__init__()
@@ -1900,7 +1944,10 @@ class Island(QObject):
         self.window.k_settings.clicked.connect(lambda: self.open_page.emit("settings"))
         self.window.k_answer.clicked.connect(lambda: self.answer_clicked.emit(int(self.inputs.question_id or 0)))
         self.window.k_qstop.clicked.connect(self._on_question_stop)
+        self.window.k_resume.clicked.connect(self._on_resume)
+        self.window.k_pstop.clicked.connect(self._on_stop)
         rc = self.window.run
+        rc.resume.connect(self._on_resume)
         rc.stop.connect(self._on_stop)
         rc.handback.connect(self._on_handback)
         rc.steer.connect(self._on_steer)
@@ -2117,7 +2164,7 @@ class Island(QObject):
         if not self.enabled:
             return
         state = resolve(self.inputs)
-        if state not in ("working", "thinking", "done-flash"):
+        if state not in ("working", "thinking", "done-flash", "paused"):
             self.expanded = False
         elif state == "done-flash" and (self.inputs.final is None or self.inputs.final.run is None):
             self.expanded = False
@@ -2279,7 +2326,7 @@ class Island(QObject):
     # -- the run card ----------------------------------------------------------------------------------------
 
     def toggle_card(self) -> None:
-        if self.state not in ("working", "thinking", "done-flash"):
+        if self.state not in ("working", "thinking", "done-flash", "paused"):
             return
         self.expanded = not self.expanded
         self._card_timer.stop()
@@ -2314,6 +2361,9 @@ class Island(QObject):
         asked = _clean(run.request)
         title = asked
         touch = _touching(run.frame)
+        paused = mode == "live" and run.paused
+        if paused:   # appTakeover: the card says it waits for the user, above everything it touches
+            touch = PAUSED_NOTE
         summary = None
         if mode in ("stopped", "handed"):
             did = [f"{s['verb']} {s['obj']}".strip() for s in steps if s["kind"] == "done"]
@@ -2324,7 +2374,8 @@ class Island(QObject):
                                  asked=asked if self._needs_say(asked) else "", steps=steps, steers=run.steers,
                                  summary=summary, foot_note=note,
                                  stop_kbd=_words(self.bindings.get("cancel")).replace("+", " ") or "Alt Shift X",
-                                 lesson=self.lesson_available, waiting=run.thought if mode == "live" else "")
+                                 lesson=self.lesson_available, waiting=run.thought if mode == "live" else "",
+                                 paused=paused)
 
     def _needs_say(self, asked: str) -> bool:
         """The request in full under the title only when the title had to cut it (no word said twice)."""
@@ -2380,6 +2431,21 @@ class Island(QObject):
         if run is not None:
             self.strip.stopping()
             self.stop_clicked.emit(run.id)
+
+    def _on_resume(self) -> None:
+        """appTakeover: Resume on the paused bar or the run card."""
+        run = self.inputs.run
+        if run is not None and run.paused:
+            self.resume_clicked.emit(run.id)
+
+    def set_paused(self, request_id: int, paused: bool, why: str = "") -> None:
+        """appTakeover: the runtime's ``paused_changed`` for the request shown: paused (the bar opens to "You took over ·
+        paused" with Resume and Stop) or going on again. Content-free log."""
+        run = self.inputs.run
+        if run is None or run.id != int(request_id) or run.paused == bool(paused):
+            return
+        self._log("island_takeover", paused=bool(paused), why=str(why or ""))
+        self.update(run=replace(run, paused=bool(paused), paused_why=str(why or "") if paused else ""))
 
     def _on_question_stop(self) -> None:
         run = self.inputs.run
@@ -2658,6 +2724,7 @@ class IslandStrip(QObject):
                       hint=hint if not line else "", request=request or (keep.request if keep else ""))
         if keep is not None:
             run.steers, run.chips, run.frame, run.thought = keep.steers, keep.chips, keep.frame, keep.thought
+            run.paused, run.paused_why = keep.paused, keep.paused_why
         isl._final_timer.stop()
         isl.update(run=run, final=None, transient="")
 

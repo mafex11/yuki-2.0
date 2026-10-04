@@ -146,7 +146,20 @@ class SendPending:
     kind: Literal["send_pending"] = "send_pending"
 
 
-AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent | Partial | SendPending
+@dataclass(frozen=True)
+class Paused:
+    """appTakeover: the user took over the keyboard or mouse while the request acted, so it is paused (or goes on
+    again). ``state``: ``paused`` (no new action starts; ``why``: ``keys`` | ``click`` | ``mouse``), ``resumed`` (it
+    read the screen again and goes on; ``seconds``: how long it was paused), or ``ended`` (nobody resumed it within the
+    limit: it stops quietly, the stop follows). Yuki never speaks for it; the island and the run card show it."""
+
+    state: str
+    why: str = ""
+    seconds: float = 0.0
+    kind: Literal["paused"] = "paused"
+
+
+AgentEvent = Thinking | ToolCall | ToolResult | AskUser | Say | Final | ErrorEvent | Partial | SendPending | Paused
 
 #: Every event type name that may appear in a session JSONL file. Anything
 #: :meth:`SessionLogger.log` is called with should be in here, so a reader can
@@ -184,6 +197,8 @@ EVENT_TYPES: frozenset[str] = frozenset(
         # voice: a progress line the agent said, and a correction the user added mid-task
         "say",
         "steer",
+        # appTakeover: the user took over while a request acted (paused, resumed, ended)
+        "takeover",
     }
 )
 

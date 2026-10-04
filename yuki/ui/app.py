@@ -62,7 +62,7 @@ from yuki.ui.nudges import (
     overlay_label,
     suggestion_request,
 )
-from yuki.ui.island import Island, on_call_status
+from yuki.ui.island import PAUSED_NOTE, PAUSE_STOP_LINE, RESUMED_NOTE, Island, on_call_status
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import describe_summary, describe_tool
@@ -369,6 +369,21 @@ class YukiUi(QObject):
         send_pending = getattr(runtime_signals, "send_pending", None)
         if send_pending is not None:
             send_pending.connect(self._on_send_pending)
+        # appTakeover: the user took over while a request worked: the island and the thread say it is paused; Resume
+        # (the island, the run card), their words (voice, the steer box, the ask bar) or Stop goes on from there
+        #: Requests paused because the user took over, until they go on or end.
+        self._paused_runs: set[int] = set()
+        paused_changed = getattr(runtime_signals, "paused_changed", None)
+        if paused_changed is not None:
+            paused_changed.connect(self._on_paused_changed)
+        resume_clicked = getattr(self.island, "resume_clicked", None)
+        if resume_clicked is not None:
+            resume_clicked.connect(self._on_island_resume)
+        worker_agent = getattr(getattr(self.runtime, "worker", None), "agent", None)
+        if worker_agent is not None and hasattr(worker_agent, "takeover_ok"):
+            # review F4: no takeover pause while a full screen is in front (the island is hidden there, so a pause
+            # could not be seen); the input gate's short wait before Yuki's own input still yields to them
+            worker_agent.takeover_ok = self._takeover_ok
         partial = getattr(runtime_signals, "partial", None)
         if partial is not None:
             partial.connect(self._on_partial)
@@ -521,6 +536,16 @@ class YukiUi(QObject):
             self.cards[request_id] = card
             self.overlay.expand_input()
             return
+        paused = self.runtime.paused_id() if callable(getattr(self.runtime, "paused_id", None)) else None
+        if paused is not None and self._pending_ask is None and getattr(self, "_nudge_reply", None) is None:
+            # appTakeover: a request is paused because the user took over: what they type to Yuki now goes to it as
+            # their words, and it goes on (reading the screen again first); the brain judges what the words mean
+            if self.runtime.resume(paused, text, by="typed"):
+                self.window_host.user_answer(paused, text)   # their bubble; the work goes on below it
+                self.overlay.add_card(text)
+                self.overlay.expand_input()
+                self.ui_log.event("submit", id=paused, lane=WORKER, text=text, resumed=True)
+                return
         # A card's ``ask`` suggestion the user now sends: its own request (no card as context, no coach note);
         # sent unchanged, its words are marked as Yuki's (memory never stores them as the user's own words).
         asked, self._pending_ask = self._pending_ask, None
@@ -802,8 +827,11 @@ class YukiUi(QObject):
         stopped = stopped_by is not None
         handed = request_id in getattr(self, "_handed", set())
         getattr(self, "_handed", set()).discard(request_id)
+        was_paused = request_id in getattr(self, "_paused_runs", set())
+        getattr(self, "_paused_runs", set()).discard(request_id)
         if stopped and tone == "error":
-            text, tone = ("Handed back. You have the controls." if handed else "Stopped."), "stopped"
+            text, tone = ("Handed back. You have the controls." if handed else
+                          PAUSE_STOP_LINE if was_paused else "Stopped."), "stopped"
         typed = self._send_stopped.pop(request_id, None) if hasattr(self, "_send_stopped") else None
         if typed is not None and tone == "stopped" and not handed:
             # appPT: stopped in the send countdown: say plainly what did not happen
@@ -1259,6 +1287,38 @@ class YukiUi(QObject):
         """"I'll take it from here" on the run card: stop the request; it ends as handed back."""
         self._handed.add(int(request_id))
         self._on_strip_stop(int(request_id))
+
+    def _on_paused_changed(self, _lane: str, request_id: int, state: str, why: str) -> None:
+        """appTakeover: a request paused because the user took over (``paused``), goes on (``resumed``: it read the
+        screen again), or ended unresumed (``ended``: the stop follows). The island opens to "You took over · paused"
+        with Resume and Stop, the thread gets one plain line, and Yuki says nothing."""
+        rid = int(request_id)
+        host = getattr(self, "window_host", None)
+        emit = getattr(host, "emit", None)
+        if state == "paused":
+            self._paused_runs.add(rid)
+            self.island.set_paused(rid, True, why)
+            line = PAUSED_NOTE
+        elif state == "resumed":
+            self._paused_runs.discard(rid)
+            self.island.set_paused(rid, False)
+            line = RESUMED_NOTE
+        else:
+            self.island.set_paused(rid, False)   # kept in _paused_runs: its end line says nothing else was done
+            line = ""
+        if line and callable(emit):
+            emit({"type": "said", "job": rid, "text": line})
+        self.ui_log.event("takeover", id=rid, state=state, why=why or None)
+
+    def _takeover_ok(self) -> bool:
+        """appTakeover: whether the user taking over may pause a request now (the watch's thread asks; a plain read of
+        the island's measured full-screen flag): never while a full screen (a game, a video) is in front."""
+        return not bool(getattr(getattr(self.island, "inputs", None), "fullscreen", False))
+
+    def _on_island_resume(self, request_id: int) -> None:
+        """Resume on the island's paused bar or the run card: the request reads the screen again and goes on."""
+        ok = bool(self.runtime.resume(int(request_id), by="island"))
+        self.ui_log.event("takeover_resume_click", id=int(request_id), delivered=ok)
 
     def _on_island_steer(self, request_id: int, text: str) -> None:
         """The run card's steer box: the words go to the running request (read at its next step)."""

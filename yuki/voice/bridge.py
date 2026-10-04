@@ -60,6 +60,11 @@ RECENT_S = 180.0
 #: What the mouth reads for a result the bridge said itself (the thinker's own finishing line).
 RESULT_SAID_NOTE = ("Said aloud just now, word for word, the moment the action that did it succeeded. Do not "
                     "say it again or add to it; if they ask about it, answer from it.")
+#: appTakeover (review F5): what the talker reads for a request that ended because nobody went on with it after the
+#: user took over the keyboard or mouse (it waited paused, then stopped by itself; nothing else was done).
+PAUSED_OUT_NOTE = ("Stopped by itself: they took over the keyboard or mouse while it worked, it waited paused, and "
+                   "nobody went on with it for a long while, so nothing else was done. Say nothing about it; if they "
+                   "ask, say that plainly.")
 
 
 @dataclass
@@ -104,6 +109,10 @@ class Job:
     #: appPT: who a send of this job goes to while its send countdown runs (the island's "3 s to stop"), else
     #: ``None``: the talker's thinker line says so, so their "stop" in those seconds is taken for that send.
     sending: str | None = None
+    #: appTakeover: paused because the user took over the keyboard or mouse (the talker's thinker line says so, so their
+    #: "go on" or anything they add is for this task); ``paused_out``: it ended unresumed (quietly: nothing is said).
+    paused: bool = False
+    paused_out: bool = False
     #: Handed over with intent ``remember`` (a rule, correction or life fact to keep).
     remember: bool = False
     #: The desktop action it is running now, in a few words (for the shared action log).
@@ -160,6 +169,8 @@ class Job:
             **({"current_step": self.step} if self.step and self.state == RUNNING else {}),
             **({"last_said": self.last_say} if self.last_say else {}),
             **({"asking": self.question} if self.question and self.state == WAITING else {}),
+            **({"paused": "they took over the keyboard or mouse; it waits for them"} if self.paused
+               and self.state == RUNNING else {}),
             **({"outcome": self.outcome} if self.outcome and self.state not in OPEN_STATES else {}),
         }
 
@@ -397,6 +408,7 @@ class VoiceBridge(QObject):
             ("failed", self._on_failed), ("withdrawn", self._on_withdrawn), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
             ("partial", self._on_partial), ("resumed", self._on_resumed), ("send_pending", self._on_send_pending),
+            ("paused_changed", self._on_paused_changed),
         ):
             signal = getattr(runtime, name, None)
             if signal is not None:
@@ -575,6 +587,13 @@ class VoiceBridge(QObject):
             elif j.state == WAITING:
                 parts.append(f'{name} "{j.brief()}" waiting for their answer to: {j.question or "its question"} '
                              f'(asked already, never again: words that are not its answer are a new request)')
+            elif j.paused:
+                # appTakeover: paused because they took over: their wish to go on, or anything they add to it, is for
+                # this task (added to it with tell_yuki, it goes on from what the screen shows); their stop cancels it
+                parts.append(f'{name} "{j.brief()}" paused for {ago} s: they took over the keyboard or mouse, so it '
+                             f'waits for them (their wish to go on, or anything they add to it, is for this task: '
+                             f'tell_yuki adds it and it goes on from what the screen shows now; their stop is '
+                             f'cancel_tell_yuki; say nothing of the pause unless they ask)')
             else:
                 step = (f", now: about to send it to {j.sending}, a few seconds left to stop it (their stop or no now "
                         f"is for this send: cancel_tell_yuki)" if j.sending else
@@ -586,7 +605,9 @@ class VoiceBridge(QObject):
         if done:
             j = done[-1]
             what = {DONE: "finished", FAILED: "failed", CANCELLED: "stopped"}.get(j.state, j.state)
-            if j.superseded:
+            if j.paused_out:
+                what = "stopped after waiting paused (they had taken over and nobody went on with it)"
+            elif j.superseded:
                 left = _tasks_left(j.tasks)
                 what = "withdrawn for a newer request" + (
                     f" (its list still had: {'; '.join(left)}; say so if they did not mean to drop it)" if left else "")
@@ -833,6 +854,15 @@ class VoiceBridge(QObject):
                 self.steps.closed(job.token)
             self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
                       chars=len(str(payload)))
+            if job.paused_out and kind in ("done", "failed", "withdrawn"):
+                # appTakeover (review F5): it ended because nobody went on with it after the user took over: settled
+                # quietly with what really happened (never "replaced by a newer request")
+                self._drop_items(job)
+                self._unowe(job)
+                await params.result_callback({"stopped": job.brief(), "how_to_handle_it": PAUSED_OUT_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                self._log("bridge", op="paused_out_settled", job_id=job.job_id)
+                return
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
                 # Replaced by the user's newer request: nothing of it is ever said. Its call settles quietly, so
                 # the talker knows it stopped, and its waiting lines go with it.
@@ -1706,6 +1736,31 @@ class VoiceBridge(QObject):
         self._log("bridge", op="send_countdown", job_id=job_id, state=send.get("state"))
         self._changed()
 
+    def _on_paused_changed(self, lane: str, job_id: int, state: str, why: str) -> None:
+        """appTakeover: the job paused because the user took over (``paused``), goes on (``resumed``), or ended
+        unresumed (``ended``). Nothing is said for any of them (Yuki never speaks first): a step or "still on it" line
+        still waiting is dropped, none comes while it is paused, and an unresumed end is quiet."""
+        job = self._job(job_id)
+        if job is None:
+            return
+        if state == "paused":
+            job.paused = True
+            self._post(job, "moved", None)        # a "still on it" line still waiting goes unsaid
+            self._post(job, "step_hold", None)    # and so does a step line
+            if job.log is not None:
+                job.log.add("paused", "the user took over the keyboard or mouse; it waits for them")
+        elif state == "resumed":
+            job.paused = False
+            if job.log is not None:
+                job.log.add("resumed", "it read the screen again and goes on")
+        else:
+            job.paused, job.paused_out = False, True
+            job.superseded = True                 # nothing of its end is spoken
+            if job.log is not None:
+                job.log.add("stopped", "nobody went on with it after the user took over")
+        self._log("bridge", op="takeover", job_id=job_id, state=state, why=why or None)
+        self._changed()
+
     def _on_tool_called(self, lane: str, job_id: int, name: str, tool_input: dict) -> None:
         from yuki.agent.tools import ACTION_TOOL_NAMES, FINISHES_FIELD, STEP_FIELD
 
@@ -2162,6 +2217,11 @@ class VoiceBridge(QObject):
         job.wait_handle = None
         if job.state not in (QUEUED, RUNNING) or job.events is None or self._loop is None or job.superseded:
             return
+        if job.paused:
+            # appTakeover: paused because the user took over: no "still on it" line (Yuki never speaks first); checked
+            # again later, so a long silence after it goes on still gets its line
+            self._arm_wait(job, self._wait_again_s)
+            return
         if job.waits >= (1 if job.acked else self._progress_lines):
             # Its lines said: quiet until the outcome. v3.14: an acknowledged job gets one, others up to
             # ``voice_progress_lines``, each only after real silence (the complaint of 2026-09-29 was "On it" then
@@ -2268,6 +2328,11 @@ class VoiceBridge(QObject):
                 self.steps.closed(job.token)
             announce = self.announce
             if announce is None:
+                return
+            if job.paused_out and kind in ("done", "failed", "withdrawn"):
+                self._drop_items(job)   # appTakeover (review F5): what really happened, quietly
+                self._unowe(job)
+                await announce({"stopped": job.brief(), "how_to_handle_it": PAUSED_OUT_NOTE}, False)
                 return
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
                 self._drop_items(job)

@@ -185,13 +185,15 @@ def tray_icon(listening: bool = True, state: str | None = None) -> QIcon:
 
 
 def tray_state(island_state: str, *, listening: str = "on", recording: bool = False, asking: bool = False,
-               fullscreen: bool = False) -> str:
+               fullscreen: bool = False, paused: bool = False) -> str:
     """The tray's face from the island's state (:func:`yuki.ui.island.resolve`) and what the island doesn't show: a
     request running or a question wins, then a broken voice, then your turn and Yuki speaking, then "not listening",
     then a full screen, then a call (recorded, or its consent card waiting), else resting."""
     if island_state in ("working", "thinking", "send-countdown"):   # a send countdown is a request running
         return "working"
-    if island_state == "needs-you":
+    if island_state in ("needs-you", "paused") or paused:
+        # appTakeover: paused because you took over: it waits for you (``paused``: also behind a hidden full-screen
+        # island, review F4: a pause that began before the full screen came up is never invisible)
         return "needs-you"
     if island_state == "voice-stopped":
         return "stopped"
@@ -597,7 +599,8 @@ class TrayWatch(QObject):
     def current(self) -> str:
         i = self.island.inputs
         return tray_state(self.island.state, listening=i.listening, recording=self._recording(),
-                          asking=bool(getattr(i, "call_asking", "")), fullscreen=bool(i.fullscreen))
+                          asking=bool(getattr(i, "call_asking", "")), fullscreen=bool(i.fullscreen),
+                          paused=bool(getattr(i, "run", None) is not None and getattr(i.run, "paused", False)))
 
     def words(self) -> str:
         """The icon's accessible text (Windows' tooltip slot; screen readers read it): the state line, then the
