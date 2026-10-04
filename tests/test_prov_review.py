@@ -144,10 +144,19 @@ def _layered(routed: bool) -> tuple[Any, list]:
 
 
 def test_moved_talker_gets_one_attempt_from_the_voice_layer() -> None:
+    import httpx
+
     llm, events = _layered(routed=True)
+    sent: list = []
+
+    async def api_call(**params: Any) -> Any:          # the role client: it already did its own retries and backup
+        sent.append(params)
+        raise anthropic.APIConnectionError(message="no connection", request=httpx.Request("POST", "http://x"))
+
     with pytest.raises(anthropic.APIConnectionError):
-        asyncio.run(llm._create_message_stream(None, {"model": "m", "stream": True}))
-    assert llm.calls == 1 and events == [("problem", 0, "retry")]   # the role client did its own retries
+        asyncio.run(llm._create_message_stream(api_call, {"model": "m", "stream": True}))
+    # one attempt, straight to the role client (not through Pipecat's timeout layer, V1)
+    assert len(sent) == 1 and llm.calls == 0 and events == [("problem", 0, "retry")]
 
 
 def test_talker_on_claude_keeps_its_retry() -> None:
@@ -326,7 +335,8 @@ def test_ollama_listing_reads_both_contexts(ai_dir: Path) -> None:
     with FakeOpenAI(models={"/api/tags": tags, "/api/show": shown}) as server:
         models = discover.ollama_models(base_url=server.url + "/v1")
     assert models[0].context == 40_960 and models[0].run_context == 16_384
-    assert "context length" in discover.fit_for("thinker", models[0], "ollama")   # 16k is under 32k
+    # 16k is under 32k, and set by the model's own Modelfile: raising Ollama's context length can't help (V6)
+    assert "Pick another model" in discover.fit_for("thinker", models[0], "ollama")
 
 
 # -- F6: a moved talker's turn, priced per reply stream -----------------------------------------------------------------
