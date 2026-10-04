@@ -1,0 +1,111 @@
+{
+  "name": "Yuki app icon · Y",
+  "about": "Dot grids per icon size, in pixels from the top-left of the icon. Draw the tile first: a rounded square with corner radius rx, anti-aliased, in fill; if stroke is set, add a 1 px stroke inset by .5 (rx - .5). Then draw every dot in order: shape \"px\" fills a block of whole pixels 2r wide centred on x, y; any other dot is an anti-aliased circle of radius r. Colours are the Mint set; to draw another set, colour each dot by its role from colourSets[set][role] (ink is the Y, acc its joint).",
+  "sizes": [256,64,48,40,32,24,20,16],
+  "colourSets": {"mint":{"ink":"#F2EFE9","acc":"#6FEBC4","field":"#284A50","base":"#26292C"},"night":{"ink":"#BFC8CC","acc":"#F6F0E4","field":"#3A4044","base":"#26292C"},"bang":{"ink":"#F2EFE9","acc":"#FFB85C","field":"#1F3B47","base":"#26292C"}},
+  "icons": {
+    "256": {
+      "tile": {"fill":"#0B0B0C","rx":56,"stroke":"#2A2D31"},
+      "dots": [
+        {"x":56,"y":44,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":80,"y":68,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":104,"y":92,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":200,"y":44,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":176,"y":68,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":152,"y":92,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":128,"y":148,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":128,"y":180,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":128,"y":212,"r":14,"c":"#F2EFE9","role":"ink"},
+        {"x":128,"y":116,"r":14,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "64": {
+      "tile": {"fill":"#0B0B0C","rx":13,"stroke":"#2A2D31"},
+      "dots": [
+        {"x":13.5,"y":10.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":19.5,"y":16.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":25.5,"y":22.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":49.5,"y":10.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":43.5,"y":16.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":37.5,"y":22.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":31.5,"y":36.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":31.5,"y":44.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":31.5,"y":52.5,"r":3.5,"c":"#F2EFE9","role":"ink"},
+        {"x":31.5,"y":28.5,"r":3.5,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "48": {
+      "tile": {"fill":"#0B0B0C","rx":10,"stroke":"#2A2D31"},
+      "dots": [
+        {"x":8.5,"y":7.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":13.5,"y":12.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":18.5,"y":17.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":38.5,"y":7.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":33.5,"y":12.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":28.5,"y":17.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":23.5,"y":28.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":23.5,"y":34.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":23.5,"y":40.5,"r":2.5,"c":"#F2EFE9","role":"ink"},
+        {"x":23.5,"y":22.5,"r":2.5,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "40": {
+      "tile": {"fill":"#0B0B0C","rx":9,"stroke":"#2A2D31"},
+      "dots": [
+        {"x":8,"y":7,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":14,"y":13,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":32,"y":7,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":26,"y":13,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":20,"y":26,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":20,"y":33,"r":3,"c":"#F2EFE9","role":"ink"},
+        {"x":20,"y":19,"r":3,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "32": {
+      "tile": {"fill":"#0B0B0C","rx":7,"stroke":"#2A2D31"},
+      "dots": [
+        {"x":8,"y":7,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":12,"y":11,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":24,"y":7,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":20,"y":11,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":16,"y":20,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":16,"y":25,"r":2,"c":"#F2EFE9","role":"ink"},
+        {"x":16,"y":15,"r":2,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "24": {
+      "tile": {"fill":"#0B0B0C","rx":5,"stroke":null},
+      "dots": [
+        {"x":5.5,"y":5.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":8.5,"y":8.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":17.5,"y":5.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":14.5,"y":8.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":11.5,"y":15.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":11.5,"y":19.5,"r":1.5,"c":"#F2EFE9","role":"ink"},
+        {"x":11.5,"y":11.5,"r":1.5,"c":"#6FEBC4","role":"acc"}
+      ]
+    },
+    "20": {
+      "tile": {"fill":"#0B0B0C","rx":4,"stroke":null},
+      "dots": [
+        {"x":4,"y":4,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":7,"y":7,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":16,"y":4,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":13,"y":7,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":10,"y":13,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":10,"y":16,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":10,"y":10,"r":1,"c":"#6FEBC4","role":"acc","shape":"px"}
+      ]
+    },
+    "16": {
+      "tile": {"fill":"#0B0B0C","rx":3,"stroke":null},
+      "dots": [
+        {"x":4,"y":3,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":12,"y":3,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":8,"y":9,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":8,"y":12,"r":1,"c":"#F2EFE9","role":"ink","shape":"px"},
+        {"x":8,"y":6,"r":1,"c":"#6FEBC4","role":"acc","shape":"px"}
+      ]
+    }
+  }
+}

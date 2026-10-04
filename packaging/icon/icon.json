@@ -1,5 +1,5 @@
 {
- "mark": "badge",
+ "mark": "y",
  "ramp": "mint",
- "note": "The app icon is one parameter: mark is the picked logo id or number from the logo gallery (badge / 02g: the user's pick of 3 Oct 2026; others e.g. planet or 06a). The badge is drawn from packaging/icon/badge/yuki-icon-grids.json into the committed frames packaging/icon/badge-<ramp>/<size>.png by python packaging/make_icon.py --export (a headless browser); other marks from their SVGs packaging/icon/<mark>-<ramp>/. Every build packs the frames into packaging/yuki.ico and copies it to yuki/ui/yuki.ico. Empty keeps the current yuki.ico."
+ "note": "The app icon is one parameter: mark picks the logo. y: one bold Y in round dots with a mint joint (the user's pick of 4 Oct 2026), hand-tuned per size in packaging/icon/y/y_grids.py, written to packaging/icon/y/yuki-icon-grids.json and drawn into the committed frames packaging/icon/y-<ramp>/<size>.png by python packaging/make_icon.py --export (a headless browser). badge / 02g: YU over Ki (the pick of 3 Oct), from packaging/icon/badge/yuki-icon-grids.json into packaging/icon/badge-<ramp>/; kept, pick it back with mark badge. Other marks (e.g. planet or 06a) come from the logo gallery's SVGs in packaging/icon/<mark>-<ramp>/. Every build packs the frames into packaging/yuki.ico and copies it to yuki/ui/yuki.ico. Empty keeps the current yuki.ico."
 }

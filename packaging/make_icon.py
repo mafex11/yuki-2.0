@@ -22,6 +22,11 @@ own source of truth, ``packaging/icon/badge/yuki-icon-grids.json`` (every dot of
    canvas, the way its ``export/yuki-icon-<size>.png`` were made, so the frames match them byte for byte).
 2. A build packs the committed frames into ``yuki.ico`` unchanged (no browser, no Node, no gallery).
 
+**The Y** (``mark`` ``y``, the user's pick of 4 Oct: one bold Y in round dots, a mint dot at its joint) is a grid mark
+like the badge, with no gallery behind it: its hand-tuned layout per size is ``packaging/icon/y/y_grids.py``, which
+``--export`` writes to ``packaging/icon/y/yuki-icon-grids.json`` before drawing the frames into
+``packaging/icon/y-<ramp>/<size>.png`` the same way. The badge's files stay; ``mark`` picks which one is built.
+
 Every build also copies the icon to ``yuki/ui/yuki.ico``, the copy the app itself loads (the window's title bar and
 taskbar button; :mod:`yuki.ui.webview2`).
 
@@ -54,6 +59,10 @@ SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
 BADGE_IDS = ("badge", "02g")
 GRIDS = ICON_DIR / "badge" / "yuki-icon-grids.json"
 RENDER_JS = ICON_DIR / "render.js"
+#: The marks drawn from dot grids (name -> the ids that pick it): grids in icon/<name>/, frames in icon/<name>-<ramp>/.
+GRID_MARKS = {"badge": BADGE_IDS, "y": ("y",)}
+#: The Y's layout, which writes its grids (no gallery: the hand-tuned dots live in the repo).
+Y_LAYOUT = ICON_DIR / "y" / "y_grids.py"
 #: The copy of the icon the app loads at run time (bundled with yuki/ui by yuki.spec).
 APP_ICON = ROOT / "yuki" / "ui" / "yuki.ico"
 WEB_DIR = ROOT / "yuki" / "ui" / "web"
@@ -75,8 +84,32 @@ def is_badge(mark: str) -> bool:
     return mark.strip().casefold() in BADGE_IDS
 
 
+def grid_mark(mark: str) -> str | None:
+    """The grid mark ``mark`` picks (``badge`` or ``y``), or None for a gallery mark drawn from SVGs."""
+    key = mark.strip().casefold()
+    return next((name for name, ids in GRID_MARKS.items() if key in ids), None)
+
+
+def grids_file(name: str) -> Path:
+    return ICON_DIR / name / "yuki-icon-grids.json"
+
+
+def frames_dir(name: str, ramp: str) -> Path:
+    return ICON_DIR / f"{name}-{ramp}"
+
+
 def badge_dir(ramp: str) -> Path:
-    return ICON_DIR / f"badge-{ramp}"
+    return frames_dir("badge", ramp)
+
+
+def y_layout():
+    """The Y's layout module (packaging/icon/y/y_grids.py; packaging is not a package, so loaded by path)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("y_grids", Y_LAYOUT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def load_config() -> dict:
@@ -230,8 +263,8 @@ def _png(data_url: str) -> bytes:
     return base64.b64decode(data_url.split(",", 1)[1])
 
 
-def render_badge(ramp: str = "mint", grids: Path = GRIDS, browser: str | None = None) -> dict[int, bytes]:
-    """Every size of the badge from its grids, as PNG bytes (``render.js``: the gallery's own drawing)."""
+def render_grids(grids: Path, ramp: str = "mint", browser: str | None = None) -> dict[int, bytes]:
+    """Every size of a grid mark from its grids file, as PNG bytes (``render.js``: the gallery's own drawing)."""
     data = json.loads(grids.read_text(encoding="utf-8"))
     if ramp not in data.get("colourSets", {}):
         raise SystemExit(f"unknown colour set: {ramp} (have {', '.join(data.get('colourSets', {}))})")
@@ -239,23 +272,37 @@ def render_badge(ramp: str = "mint", grids: Path = GRIDS, browser: str | None = 
     return {int(s): _png(u) for s, u in res.items()}
 
 
-def export_badge(ramp: str, gallery: Path = GALLERY, browser: str | None = None) -> Path:
-    """Refresh the grids from the gallery (when it and Node are here), then draw and save every frame."""
-    node = shutil.which("node")
-    if node is not None and (gallery / "marks-badge.js").exists():
-        cmd = [node, str(ICON_DIR / "export_mark.js"), "--logo", str(gallery), "--mark", "badge", "--out", str(GRIDS.parent)]
-        done = subprocess.run(cmd, capture_output=True, text=True)
-        if done.returncode != 0:
-            raise SystemExit((done.stderr or done.stdout or "export failed").strip())
-        print(done.stdout.strip())
-    elif not GRIDS.exists():
-        raise SystemExit(f"No badge grids at {GRIDS} and no gallery to export them from")
-    out = badge_dir(ramp)
+def render_badge(ramp: str = "mint", grids: Path = GRIDS, browser: str | None = None) -> dict[int, bytes]:
+    """Every size of the badge from its grids, as PNG bytes."""
+    return render_grids(grids, ramp, browser)
+
+
+def export_grids(name: str, ramp: str, gallery: Path = GALLERY, browser: str | None = None) -> Path:
+    """Refresh a grid mark's grids (the badge: from the gallery when it and Node are here; the Y: from its layout in
+    the repo), then draw and save every frame."""
+    grids = grids_file(name)
+    if name == "y":
+        print(f"wrote the Y grids to {y_layout().write(grids)}")
+    else:
+        node = shutil.which("node")
+        if node is not None and (gallery / "marks-badge.js").exists():
+            cmd = [node, str(ICON_DIR / "export_mark.js"), "--logo", str(gallery), "--mark", "badge", "--out", str(grids.parent)]
+            done = subprocess.run(cmd, capture_output=True, text=True)
+            if done.returncode != 0:
+                raise SystemExit((done.stderr or done.stdout or "export failed").strip())
+            print(done.stdout.strip())
+        elif not grids.exists():
+            raise SystemExit(f"No {name} grids at {grids} and no gallery to export them from")
+    out = frames_dir(name, ramp)
     out.mkdir(parents=True, exist_ok=True)
-    for s, png in render_badge(ramp, browser=browser).items():
+    for s, png in render_grids(grids, ramp, browser=browser).items():
         (out / f"{s}.png").write_bytes(png)
-    print(f"drew the badge ({ramp}) at {', '.join(str(s) for s in SIZES)} px into {out}")
+    print(f"drew the {name} mark ({ramp}) at {', '.join(str(s) for s in SIZES)} px into {out}")
     return out
+
+
+def export_badge(ramp: str, gallery: Path = GALLERY, browser: str | None = None) -> Path:
+    return export_grids("badge", ramp, gallery, browser)
 
 
 def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) -> list[Path]:
@@ -282,17 +329,22 @@ def installer_images(out_dir: Path = INSTALLER_DIR, browser: str | None = None) 
     return written
 
 
-def badge_frames(ramp: str) -> dict[int, bytes]:
-    src = badge_dir(ramp)
+def grid_frames(name: str, ramp: str) -> dict[int, bytes]:
+    src = frames_dir(name, ramp)
     missing = [s for s in SIZES if not (src / f"{s}.png").exists()]
     if missing:
-        raise SystemExit(f"No badge frames for {ramp} in {src} ({missing}): run make_icon.py --export first")
+        raise SystemExit(f"No {name} frames for {ramp} in {src} ({missing}): run make_icon.py --export first")
     return {s: (src / f"{s}.png").read_bytes() for s in SIZES}
 
 
+def badge_frames(ramp: str) -> dict[int, bytes]:
+    return grid_frames("badge", ramp)
+
+
 def build(mark: str, ramp: str, out: Path, *, allow_export: bool = True) -> Path:
-    if is_badge(mark):
-        write_ico(badge_frames(ramp), out)
+    name = grid_mark(mark)
+    if name:
+        write_ico(grid_frames(name, ramp), out)
         return out
     src = svg_dir(mark, ramp)
     if not all((src / f"{s}.svg").exists() for s in SIZES):
@@ -332,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--mark", help="a mark id or number from the logo gallery (overrides icon.json)")
     ap.add_argument("--ramp", help="the colour set: mint | night | bang (overrides icon.json)")
     ap.add_argument("--export", action="store_true",
-                    help="export the mark from the gallery (SVGs: Node; the badge: its grids, then frames in a headless browser)")
+                    help="export the mark (gallery marks: SVGs, Node; the badge and the Y: their grids, then frames in a headless browser)")
     ap.add_argument("--installer-images", action="store_true",
                     help="draw the installer's wizard images from the splash's still frame (a headless browser)")
     ap.add_argument("--browser", default=None, help="the Chromium to draw with (default: found by find_browser)")
@@ -351,8 +403,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no logo picked yet (packaging/icon/icon.json \"mark\"): keeping {args.out}")
         return 0
     if args.export:
-        if is_badge(mark):
-            export_badge(ramp, browser=args.browser)
+        if grid_mark(mark):
+            export_grids(grid_mark(mark), ramp, browser=args.browser)
         else:
             export(mark, ramp)
     print(build(mark, ramp, args.out))

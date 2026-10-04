@@ -22,7 +22,9 @@
       : `<rect width="${size}" height="${size}" rx="${t.rx}" fill="${t.fill}"/>`;
     for (const p of G.dots) {
       const op = p.o != null && p.o < 1 ? ` opacity="${p.o}"` : '';
-      g += p.shape === 'px' ? `<rect x="${p.x - 0.5}" y="${p.y - 0.5}" width="1" height="1" fill="${col(p)}"${op}/>`
+      // a "px" dot is a block of whole pixels, 2r wide (r .5: one pixel, the badge's micro font; r 1: 2 x 2)
+      const w = p.r ? 2 * p.r : 1;
+      g += p.shape === 'px' ? `<rect x="${p.x - w / 2}" y="${p.y - w / 2}" width="${w}" height="${w}" fill="${col(p)}"${op}/>`
         : `<circle cx="${p.x}" cy="${p.y}" r="${p.r}" fill="${col(p)}"${op}/>`;
     }
     return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" aria-hidden="true">${g}</svg>`;

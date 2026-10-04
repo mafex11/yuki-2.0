@@ -1,6 +1,7 @@
-"""The app icon is the 02g badge (the user's pick, 3 Oct): its grids are the source of truth, its committed frames are
-the gallery's PNGs byte for byte, and packaging/yuki.ico (and the app's copy, yuki/ui/yuki.ico) holds every frame
-pixel for pixel, read back by PIL and by Windows itself. The installer's wizard images are the splash's still frame
+"""The app icon is a grid mark, the Y since 4 Oct (the 02g badge, the pick of 3 Oct, stays in the repo): the badge's
+grids are the source of truth, its committed frames are the gallery's PNGs byte for byte, and packaging/yuki.ico (and
+the app's copy, yuki/ui/yuki.ico) holds every frame of the picked mark pixel for pixel, read back by PIL and by
+Windows itself (the Y's own checks: tests/test_app_icon_y.py). The installer's wizard images are the splash's still frame
 at the sizes Inno Setup picks from. A headless browser redraws the frames only when one is installed (never a
 visible window, a throwaway profile). Offline; everything written goes to a temp folder."""
 
@@ -22,7 +23,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "packaging"
 ICO = PKG / "yuki.ico"
-FRAMES = PKG / "icon" / "badge-mint"
+BADGE_FRAMES = PKG / "icon" / "badge-mint"
 _REL = Path("docs") / "ui-mockups" / "revamp-2026-10" / "logo" / "export"
 # the gallery is gitignored: in an agent worktree (.claude/worktrees/<name>) it is in the main checkout
 GALLERY = next((p for p in (ROOT / _REL, ROOT.parents[2] / _REL) if p.exists()), ROOT / _REL)
@@ -36,6 +37,9 @@ def _make_icon():
 
 
 M = _make_icon()
+_CFG = M.load_config()
+#: the picked mark's committed frames, the ones yuki.ico packs
+FRAMES = M.frames_dir(M.grid_mark(_CFG["mark"]), _CFG["ramp"])
 
 
 def _rgba(data: bytes) -> tuple[tuple[int, int], bytes]:
@@ -57,10 +61,20 @@ def _ico_frames(path: Path) -> dict[int, bytes]:
     return out
 
 
-def test_the_picked_logo_is_the_badge():
+def test_the_picked_logo_is_the_y_and_the_badge_stays_pickable():
     cfg = M.load_config()
-    assert M.is_badge(cfg["mark"]) and cfg["ramp"] == "mint"
-    assert M.is_badge("02g") and M.is_badge("Badge") and not M.is_badge("planet")
+    assert M.grid_mark(cfg["mark"]) == "y" and cfg["ramp"] == "mint"
+    assert M.is_badge("02g") and M.is_badge("Badge") and not M.is_badge("planet") and not M.is_badge("y")
+    assert M.grid_mark("02g") == M.grid_mark("badge") == "badge" and M.grid_mark("planet") is None
+    assert all((BADGE_FRAMES / f"{s}.png").exists() for s in M.SIZES) and M.GRIDS.exists()   # the old badge is kept
+
+
+def test_the_badge_still_builds_from_its_frames(tmp_path):
+    out = tmp_path / "badge.ico"
+    M.build("badge", "mint", out)
+    frames = _ico_frames(out)
+    for s in M.SIZES:
+        assert frames[s] == _rgba((BADGE_FRAMES / f"{s}.png").read_bytes())[1], s
 
 
 def test_the_grids_hold_every_size_with_its_tile_and_round_dots():
@@ -185,7 +199,7 @@ def test_bitmap_frames_keep_soft_alpha_exactly(tmp_path):
 @pytest.mark.skipif(not (GALLERY / "yuki-icon-16.png").exists(), reason="the logo gallery (gitignored) is not on this PC")
 def test_the_frames_are_the_gallerys_pngs_byte_for_byte():
     for s in M.SIZES:
-        assert (FRAMES / f"{s}.png").read_bytes() == (GALLERY / f"yuki-icon-{s}.png").read_bytes(), s
+        assert (BADGE_FRAMES / f"{s}.png").read_bytes() == (GALLERY / f"yuki-icon-{s}.png").read_bytes(), s
     assert json.loads(M.GRIDS.read_text(encoding="utf-8")) == json.loads((GALLERY / "yuki-icon-grids.json").read_text(encoding="utf-8"))
 
 
@@ -193,7 +207,7 @@ def test_the_frames_are_the_gallerys_pngs_byte_for_byte():
 def test_the_frames_redraw_identically_from_the_grids():
     drawn = M.render_badge("mint")
     for s in M.SIZES:
-        assert drawn[s] == (FRAMES / f"{s}.png").read_bytes(), s
+        assert drawn[s] == (BADGE_FRAMES / f"{s}.png").read_bytes(), s
     night = M.render_badge("night")
     g = json.loads(M.GRIDS.read_text(encoding="utf-8"))
     acc = next(d for d in g["icons"]["48"]["dots"] if d["role"] == "acc")
