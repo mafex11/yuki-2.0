@@ -2993,11 +2993,19 @@ def split_envelope(text: str | None) -> tuple[str, str | None]:
     return t[:cut], t[cut:]
 
 
+#: A commitment done within this many days is on the Work page's Recently done (``yuki.memory.nudges.DONE_DAYS``), so
+#: the titles pass gives it a title too (leftMem: never memory's third-person text there).
+COMMIT_DONE_TITLE_DAYS = 14
+
 #: What carries a model-written short label (migration 21, :mod:`yuki.memory.titles`): surface ->
-#: (table, {label: column}, which rows are current). An open loop's title is its portrait fact's summary.
+#: (table, {label: column}, which rows are current). An open loop's title is its portrait fact's summary. A
+#: commitment is current while open and while it is on Recently done (:data:`COMMIT_DONE_TITLE_DAYS`); older done
+#: ones get theirs from the one-off backfill (``python -m yuki.memory.done_titles``).
 LABEL_SURFACES: dict[str, tuple[str, dict[str, str], str]] = {
     "fact": ("portrait_facts", {"summary": "summary_ciphertext"}, f"valid_to IS NULL AND kind != '{CORRECTION_KIND}'"),
-    "commit": ("conversation_facts", {"title": "title_ciphertext"}, "kind = 'commitment' AND status = 'active'"),
+    "commit": ("conversation_facts", {"title": "title_ciphertext"},
+               "kind = 'commitment' AND (status = 'active' OR (status = 'done' AND valid_to >= "
+               f"CAST(strftime('%s', 'now') AS REAL) - {COMMIT_DONE_TITLE_DAYS * 86400}))"),
     "todo": ("todos", {"title": "title_ciphertext"}, "status = 'open'"),
     "knowhow": ("knowhow", {"title": "title_ciphertext", "summary": "summary_ciphertext"}, "valid_to IS NULL"),
 }
