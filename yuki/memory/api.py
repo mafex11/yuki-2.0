@@ -1350,8 +1350,9 @@ class MemoryClient:
         session once it ends (30 minutes without an exchange, or a new
         session id). Fast (well under 20 ms; the write waits at most 8 ms for
         the database, else a background writer finishes it) and never raises.
-        ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others");
-        a turn said to others is kept for the record and never extracted (no rule, to-do or fact).
+        ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others" |
+        "unanswered"); a turn said to others is kept for the record and never extracted (no rule, to-do or fact);
+        an unanswered call turn (the next words came first; nobody judged it) is extracted, the extractor judging.
         ``envelope``: the notes Yuki put after the user's words, when the caller has them apart; ``None``: read
         off ``user_text`` (:func:`yuki.memory.store.split_envelope`). Stored apart from the words (migration 27).
         """
@@ -3199,7 +3200,7 @@ class MemoryClient:
     def recent_turns(self, limit: int = 40, session_id: str | None = None) -> list[dict]:
         """The latest exchanges with Yuki (the given conversation session, else the newest one), oldest first.
 
-        Each: ``{"id", "session_id", "request_id", "at", "user", "reply", "actions", "outcome"}``.
+        Each: ``{"id", "session_id", "request_id", "at", "user", "reply", "actions", "outcome", "addressed"}``.
         """
         if session_id is None:
             latest = self.store.latest_turn()
@@ -3209,7 +3210,7 @@ class MemoryClient:
         turns = self.store.turns_for_session(session_id, limit=max(1, int(limit)))
         return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
                  "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
-                 "outcome": t.outcome} for t in turns]
+                 "outcome": t.outcome, "addressed": t.addressed} for t in turns]
 
     # -- a new chat every day, with memory between days (migration 33; report 38 §9) ---------------------------
 
@@ -3297,7 +3298,7 @@ class MemoryClient:
             return []
         return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
                  "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
-                 "outcome": t.outcome} for t in turns]
+                 "outcome": t.outcome, "addressed": t.addressed} for t in turns]
 
     def app_colors(self, until: Any = None, days: float = 14.0, limit: int = 8) -> dict[str, int]:
         """Each app's rank by time in front over the last ``days`` (0 = most): the window gives an app the

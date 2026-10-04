@@ -115,6 +115,9 @@ ENDED_AS = {"dropped": "the user said it is not needed", "wrong": "the user said
             "real item - do not capture the like again"}
 #: A voice turn said to someone else (voice's turn_closed, migration 18).
 OTHERS = "others"
+#: A call turn the next words cut off before Yuki answered: nobody judged who it was for (report 77b); the
+#: extractor judges it from its content.
+UNANSWERED = "unanswered"
 
 EXTRACT_SYSTEM_PROMPT = """\
 You keep Yuki's memory of its conversations with the user. Yuki is a personal assistant \
@@ -212,9 +215,11 @@ Call record_conversation_memory exactly once, with one operation per decision, e
 in exchanges the numbers [n] of the NEW exchanges it rests on:
 - ADD: a new rule, preference, commitment or resource the NEW exchanges establish.
 - UPDATE: an existing item (item = n of C<n>) the user restated, refined or changed ("call \
-me Kee instead"). Give the complete new text, and for a rule or preference the new quote; the \
-old version is kept as history. A near-duplicate of an existing item is an UPDATE or a NOOP, \
-never a second ADD.
+me Kee instead"). Give the complete new text, and for a rule or preference the new quote: the \
+user's own words in the NEW exchanges that restate or change it, never the item's old quote (the \
+old version is kept as history, with its words). When the user said nothing in the NEW exchanges \
+that restates or changes it (only Yuki spoke of it), it is a NOOP. A near-duplicate of an \
+existing item is an UPDATE or a NOOP, never a second ADD.
 - INVALIDATE: an existing item that ended, with end_as:
   - "revoked": the user withdrew the rule, preference or feedback ("stop calling me babe") or \
 called off the commitment ("never mind the reminder"). To revoke a rule, preference or \
@@ -308,7 +313,12 @@ into a coding agent such as Claude Code, a chat, a document). An exchange marked
 ELSE was judged so by the voice. Judge every other NEW exchange from its content too. \
 {addressee} List those exchange numbers in not_for_yuki. Nothing from them becomes a rule, preference, commitment, \
 feedback, answer, know-how, question or journal fact, even when Yuki replied or acted on them. \
-When you cannot tell, the words were said to Yuki; usually not_for_yuki is empty.
+When you cannot tell, the words were said to Yuki; usually not_for_yuki is empty. The one exception: an \
+exchange marked SAID IN A CALL, NEVER ANSWERED came while the user was on a call and their next words came \
+before Yuki said or did anything, so nobody has judged it yet. It was said to Yuki only when its content shows \
+it (it speaks to Yuki or asks for something only Yuki would do, or it is the first part of a request Yuki \
+answered in the next exchange); when you cannot tell, it was said to the people on the call: list it in \
+not_for_yuki.
 
 Work only from the NEW EXCHANGES. EARLIER IN THIS CONVERSATION is context for \
 understanding them (what "that" or "yes, do it" refers to); never cite it. If nothing \
@@ -653,6 +663,17 @@ def _request_text(t: Any) -> str:
     """A turn's request as Yuki sent it: the user's words and Yuki's notes after them (migration 27 stores them
     apart; ``ConversationTurn.full_text``)."""
     return getattr(t, "full_text", None) or getattr(t, "user_text", None) or ""
+
+
+def _quote_miss(quote: str, cited: Sequence[Any], target: Any = None) -> str:
+    """Why a rule, preference or feedback quote was rejected, from where its words do come from (report 77b:
+    the 4 rejected in 3 days were the item's own old quote sent again with an UPDATE, 3, and Yuki's reply quoted as
+    the user's rule, 1; none was the user's words transcribed differently)."""
+    if target is not None and quote_in(quote, getattr(target, "quote", None)):
+        return "quote is the item's old words, not said in the cited exchanges (an UPDATE quotes the new words)"
+    if any(quote_in(quote, getattr(t, "reply_text", None)) for t in cited):
+        return "quote is Yuki's words, not the user's"
+    return "quote is not the user's own words in the cited exchanges"
 
 
 def quote_in(quote: str | None, text: str | None) -> bool:
@@ -1022,6 +1043,9 @@ class ConversationWorker:
     def _exchange_lines(t: ConversationTurn, safe: Callable[[str | None, int], str], head: str) -> list[str]:
         if getattr(t, "addressed", None) == OTHERS:
             head += " SAID TO SOMEONE ELSE (the voice judged it was not said to Yuki)"
+        elif getattr(t, "addressed", None) == UNANSWERED:
+            head += (" SAID IN A CALL, NEVER ANSWERED (the user's next words came before Yuki said or did anything:"
+                     " judge from its content who it was said to)")
         if yuki_words_request(t.user_text):
             head += (" YUKI'S OWN WORDS (the user pressed a button on Yuki's card, or sent its suggestion unchanged:"
                      " never the user's words, never a reply or feedback to the card)")
@@ -1234,7 +1258,7 @@ class ConversationWorker:
                         reject(f"a {kind} needs the user's own words in quote")
                         continue
                     if not said:
-                        reject("quote is not the user's own words in the cited exchanges")
+                        reject(_quote_miss(rec.quote, cited, target))
                         continue
                     at = said[-1].at
                     if kind == "feedback" and rec.card:
@@ -1525,9 +1549,13 @@ class ConversationWorker:
             call.journal_facts = len(facts)
             call.ops_applied = len(changes)
             question_outcomes: list[tuple[int | None, str]] = []
+            # A call turn nobody had judged (the next words came first) takes the extractor's judgement, so every
+            # reader after this (search, call digests, the to-do check) sees who it was said to (report 77b).
+            judged = {t.id: (OTHERS if t.id in elsewhere else "yuki") for t in turns
+                      if getattr(t, "addressed", None) == UNANSWERED}
             batch_id, written = self.store.commit_conversation_batch(
                 call, turn_ids, changes, facts, turn_vectors=turn_vectors, embed_model=model_name,
-                questions=questions, answers=answers, question_outcomes=question_outcomes,
+                questions=questions, answers=answers, question_outcomes=question_outcomes, addressed=judged,
             )
             if any(o.startswith("answer:") and o != "answer:not_open" for _q, o in question_outcomes):
                 request_render(self.store.path)   # the portrait folds the user's answer in

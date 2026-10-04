@@ -698,11 +698,13 @@ class _ItemWidget(QWidget):
             longest = max((QFontMetrics(self.text.font()).horizontalAdvance(line) for line in
                            (item.text or " ").split("\n")), default=0)
             self.text.setMinimumWidth(min(longest + 4, max(80, self.max_w - 30)))
-            ink = t.text_2 if item.status in ("hearing", "others") else t.text
+            ink = t.text_2 if item.status in ("hearing", "others", "unanswered") else t.text
             self.text.setStyleSheet(f"color: {css(ink)}; background: transparent;")
             how = {"voice": ", said", "window": ", typed", "overlay": ", typed", "history": ""}.get(item.source, "")
             if item.status == "others":
                 how = ", said to others on the call"
+            elif item.status == "unanswered":
+                how = ", said in the call, not answered"
             self.meta.setText(f"You, {_stamp(item.at)}{how}")
         elif item.kind == "nudge" and hasattr(self, "reply"):
             state = item.reply_state or "open"
