@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from yuki.core import doctor   # loaded before the fixture runs: its own "datetime" name is swapped
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -41,8 +43,6 @@ def test_the_pinned_clock_is_noon_of_the_pinned_day_and_ticks(pinned_clock):
 
 @pytest.mark.clock("00:30")
 def test_the_clock_mark_moves_it_after_midnight(pinned_clock):
-    from yuki.core import doctor   # a yuki module's own "datetime" name reads the pinned clock too
-
     assert doctor.datetime.now().strftime("%H:%M") == "00:30"
     assert datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d") == "2026-09-25"
 
