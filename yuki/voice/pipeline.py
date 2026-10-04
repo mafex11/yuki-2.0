@@ -4130,7 +4130,13 @@ class Conversation:
         self._tone("error" if item.kind == "failed" else "note")
 
     async def _speak_owed(self, text: str) -> None:
-        """An owed outcome said by code in the one voice: the thinker's own words, never held by the line check."""
+        """An owed outcome said by code in the one voice: the thinker's own words, never held by the line check (but
+        never with Yuki's internal words in them, report 76: the sentences that carry one are left out)."""
+        from yuki.core.ownwords import strip_internal
+
+        text = strip_internal(text)
+        if not text.strip():
+            return
         tts = getattr(self, "_tts", None)
         unguard = getattr(tts, "unguard", None)
         if callable(unguard):
@@ -4140,14 +4146,16 @@ class Conversation:
     async def _speak_result(self, lines: list[str]) -> None:
         """C1 (v3.17): a result's sentences said by code in the one voice, each its own piece (so each starts the moment
         its audio is ready, and a sentence fetched ahead, C2, is found by its words); the thinker's own words, never
-        held by a blocking line check (as an owed outcome's)."""
+        held by a blocking line check (as an owed outcome's), but never with Yuki's internal words in them (report 76:
+        the sentences that carry one are left out)."""
+        from yuki.core.ownwords import strip_internal
+
+        lines = [kept for kept in (strip_internal(line) for line in lines) if kept.strip()]
         tts = getattr(self, "_tts", None)
         unguard = getattr(tts, "unguard", None)
         if lines and not self.observer.bot_speaking:
             self.observer.speech_pending_since = time.monotonic()   # words on their way: Yuki is about to speak
         for line in lines:
-            if not line.strip():
-                continue
             if callable(unguard):
                 unguard(line)
             await self._speak(line)

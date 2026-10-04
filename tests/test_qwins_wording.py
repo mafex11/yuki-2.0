@@ -94,6 +94,42 @@ def test_blocks_is_only_for_the_vocabulary():
     assert asyncio.run(run()) == (False, True, False)
 
 
+def _conversation(pushed: list[str], unguarded: list[str]):
+    from types import SimpleNamespace
+
+    from yuki.config import Settings
+    from yuki.voice.mouth import MouthMemory
+    from yuki.voice.pipeline import Conversation
+
+    class _Log:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    async def push(frame, direction=None):
+        pushed.append(frame.text)
+
+    conv = Conversation(settings=Settings(voice_qos=False, voice_priority_boost=False), bridge=SimpleNamespace(),
+                        transport=None, memory=None, mouth_memory=MouthMemory(), log=_Log(), speech_end=lambda: None,
+                        on_state=lambda *a: None, session="t")
+    conv._llm = SimpleNamespace(push_frame=push)
+    conv._tts = SimpleNamespace(unguard=unguarded.append)
+    return conv
+
+
+def test_lines_said_by_code_never_carry_an_internal_word():
+    # review F1: a result's sentences and an owed outcome skip the speech guard (unguarded), so the vocabulary check
+    # runs before they are said: "I tried open_url ..." is left out, the rest is said; nothing left -> nothing said
+    pushed: list[str] = []
+    unguarded: list[str] = []
+    conv = _conversation(pushed, unguarded)
+    asyncio.run(conv._speak_result(["I tried open_url but the page didn't load.", "The site is down for now."]))
+    assert pushed == ["The site is down for now."] and unguarded == pushed
+    asyncio.run(conv._speak_result(["The thinker is on it."]))
+    asyncio.run(conv._speak_owed("Your export finished. The thinker logged it."))
+    asyncio.run(conv._speak_owed("check_progress says done"))
+    assert pushed == ["The site is down for now.", "Your export finished."] and unguarded == pushed
+
+
 # -- cards ------------------------------------------------------------------------------------------------------------
 
 
