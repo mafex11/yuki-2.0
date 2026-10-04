@@ -1082,11 +1082,15 @@ def test_n9_the_resolver_gets_closeness_recency_the_usual_chat_and_recent_calls(
     calls = [{"app": "Discord.exe", "service": "Discord", "start": datetime.fromtimestamp(now - 3600).isoformat(),
               "people": [{"name": "Hemanth", "how": "in the call window"}, {"name": "Priya", "how": "in the list"}]}]
     lines = people_lately(people, calls, now=now)
+    # "today", unless the hour back crosses midnight: then the call's own day (the sweep ran at 00:30)
+    started = datetime.fromtimestamp(now - 3600)
+    day = "today" if started.date() == datetime.fromtimestamp(now).date() else \
+        started.strftime("%a %d %b").replace(" 0", " ")
     assert lines[0].startswith("Hemanth (best friend); last in touch 30 min ago; mostly Discord DM hemanth_x; "
-                               "30 messages a day both ways; on a Discord call with them today")
+                               f"30 messages a day both ways; on a Discord call with them {day}")
     assert lines[1] == "Nichol; also heard as \"nicole\"; last in touch 9 days ago; mostly Slack DM nichol; a few " \
                        "messages a week"
-    assert lines[2].startswith("Priya: on a Discord call with them today")
+    assert lines[2].startswith(f"Priya: on a Discord call with them {day}")
     frame = build({}, lately=lines)
     assert LATELY_HEAD in frame.text and "- Hemanth (best friend)" in frame.text
     assert people_lately([{"bad": 1}, None], [{"start": "not a time"}]) == []
