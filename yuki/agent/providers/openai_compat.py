@@ -511,8 +511,8 @@ def connection_error(provider: Provider, base_url: str, request: Any, exc: BaseE
     import anthropic
     import httpx2
 
-    if isinstance(exc, httpx2.TimeoutException):
-        return anthropic.APITimeoutError(request=request)
+    if isinstance(exc, httpx2.TimeoutException) and not isinstance(exc, httpx2.ConnectTimeout):
+        return anthropic.APITimeoutError(request=request)   # it answered too slowly (a closed port is below)
     where = base_url.split("/v1")[0] if base_url else provider.label
     hint = " Is it running?" if provider.id == "ollama" else " Check the internet connection."
     return anthropic.APIConnectionError(message=f"Couldn't reach {provider.label} at {where}.{hint}",

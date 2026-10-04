@@ -82,7 +82,7 @@ _PLACEHOLDER_RE = re.compile(r"\[(?:%s)\]" % "|".join(re.escape(p[1:-1]) for p i
                              re.IGNORECASE)
 
 #: Which finding wins when two overlap (lower wins; then the longer).
-_PRIORITY = {"private_key": 0, "known": 1, "url": 2, "http": 2, "card": 3, "ifsc": 3}
+_PRIORITY = {"private_key": 0, "known": 1, "saved": 1, "url": 2, "http": 2, "card": 3, "ifsc": 3}
 
 _TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
 
@@ -317,12 +317,41 @@ def _ifsc(text: str) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
+#: How often (seconds) the list of keys saved in Settings → AI is looked at again (one ``stat``).
+_SAVED_CHECK_S = 2.0
+_saved_cache: list[Any] = [-1e9, ()]
+
+
+def _saved_keys(text: str) -> list[Finding]:
+    """The AI keys the user saved in Settings → AI, wherever they appear: exact matches of the stored values
+    (``yuki.agent.providers.keys.saved_values``), whatever their format. No guessing: a fixed string."""
+    import time as _time
+
+    now = _time.monotonic()
+    if now - _saved_cache[0] >= _SAVED_CHECK_S:
+        try:
+            from yuki.agent.providers.keys import saved_values
+
+            values = tuple(saved_values())
+        except Exception:  # noqa: BLE001 - no key store here: nothing saved to look for
+            values = ()
+        _saved_cache[0], _saved_cache[1] = now, values
+    out: list[Finding] = []
+    for value in _saved_cache[1]:
+        start = text.find(value)
+        while start >= 0:
+            out.append(Finding("api_key", start, start + len(value), "saved:ai_key"))
+            start = text.find(value, start + len(value))
+    return out
+
+
 def find(text: str, *, context: str = "") -> list[Finding]:
     """The secrets in ``text``, non-overlapping, in order (``context`` is not used: see the module docstring)."""
     if not text or len(text) < 8:
         return []
     low = text.lower()
     found = _known(text, low) + _url_credentials(text) + _http_credentials(text, low) + _cards(text)
+    found += _saved_keys(text)
     if any(c.isupper() for c in text):
         found += _ifsc(text)
     if not found:
