@@ -1730,7 +1730,7 @@ class WebWindow:
         self._save_pending()
         for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
             self.refresh(page)
-        return {"due_back": due_back}
+        return {"due_back": True} if due_back else {}
 
     def a_copy(self, m: dict[str, Any]) -> dict[str, Any]:
         return {"ok": set_clipboard(str(m.get("text") or ""))}
