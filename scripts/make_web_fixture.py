@@ -800,12 +800,13 @@ def ai_settings() -> dict:
     """Settings → AI as :func:`yuki.agent.providers.summary.page` sends it (invented: memory upkeep on a local
     model, an OpenRouter key saved, the rest as it was)."""
     from yuki.agent.providers.catalog import MODELS, PROVIDERS, ROLE_HINTS, ROLE_WORDS
-    from yuki.agent.providers.summary import APPLY_WORDS, SAVED_WORDS
+    from yuki.agent.providers.summary import APPLY_WORDS, SAFETY_WORDS, SAVED_WORDS
 
     def role(name: str, provider: str = "default", model: str = "", warning: str = "") -> dict:
         return {"role": name, "words": ROLE_WORDS[name], "hint": ROLE_HINTS[name], "provider": provider,
                 "provider_words": PROVIDERS[provider].label, "model": model, "backup_provider": "",
-                "backup_model": "", "warning": warning, "key": "not_needed"}
+                "backup_model": "", "warning": warning, "key": "not_needed",
+                "note": SAFETY_WORDS if name == "thinker" else ""}
 
     local = [{"id": "llama3.2:3b", "label": "llama3.2:3b", "tools": True, "small": True, "images": False, "free": True,
               "price": "Free", "size": "3.2B"},

@@ -27,7 +27,8 @@ Settings → AI (report 67): a client built for a role (``from_settings`` -> ``t
 ``default`` nothing below changes. A role moved to another provider (OpenAI, Gemini, OpenRouter, Ollama, DeepSeek,
 another OpenAI-compatible service, or Anthropic with the user's key) is served by a client of this same class whose
 places are ``@<provider>``: the same retries and backoff on that provider, then the user's backup if one is set;
-``last_model`` is then ``provider:model``.
+``last_model`` is then ``provider:model``. :meth:`FailoverClient.claude_only` is the same client never routed (the
+safety check that approves the agent's actions stays on Claude whatever "Doing things" runs on; 4 Oct decision).
 
 Usage::
 
@@ -292,14 +293,18 @@ class FailoverClient:
 
     # -- the call ---------------------------------------------------------------------------
 
-    def run(self, params: dict[str, Any], call: Callable[[Any, dict[str, Any]], Any]) -> Any:
-        """``call(client, params)`` on each target in turn until one works (see the module docstring)."""
+    def run(self, params: dict[str, Any], call: Callable[[Any, dict[str, Any]], Any], *,
+            claude: bool = False) -> Any:
+        """``call(client, params)`` on each target in turn until one works (see the module docstring).
+
+        ``claude``: always the default (Claude) path, whatever Settings → AI chose for this role (the safety check,
+        :meth:`claude_only`): exactly the path a role left on ``default`` takes."""
         if self.role is not None:
             from yuki.agent.providers.client import strip_unsigned_thinking
             from yuki.agent.providers.config import route, take_note
             from yuki.agent.providers.pricing import note_routed
 
-            chosen = route(self.role)
+            chosen = None if claude else route(self.role)
             if chosen is not None:
                 return self._run_routed(chosen, params, call)
             note_routed(None, None)
@@ -354,6 +359,16 @@ class FailoverClient:
         raise last
 
     # -- Settings → AI: a role moved to another provider ------------------------------------------------------------
+
+    def claude_only(self) -> "ClaudePath":
+        """This client pinned to the default (Claude) path: the same regional clients, backup chains, retries,
+        sticky failover and per-thread ``last_model``, never routed by Settings → AI. The safety check that approves
+        the agent's actions uses it (the user's decision, 4 Oct: it stays on Claude whatever "Doing things" runs on);
+        the second look and the helpers keep the routed client. One per client, made on first use."""
+        view = self.__dict__.get("_claude_view")
+        if view is None:
+            view = self.__dict__.setdefault("_claude_view", ClaudePath(self))
+        return view
 
     def prompt_caching(self) -> str:
         """``explicit`` | ``auto`` | ``none``: the prompt cache where this client's calls go now (Claude as before:
@@ -421,17 +436,44 @@ class FailoverClient:
         return result
 
 
-class _Messages:
-    """``client.messages``: ``create`` and ``stream`` with failover."""
+class ClaudePath:
+    """:meth:`FailoverClient.claude_only`: the owner's ``messages`` on the default (Claude) path; everything else
+    (``last_model``, ``last_target``, ``last_routed_model``, ``counters``, ...) is the owner's."""
 
     def __init__(self, owner: FailoverClient) -> None:
         self._owner = owner
+        self.messages = _Messages(owner, claude=True)
+
+    def prompt_caching(self) -> str:
+        return "explicit"   # Claude's own prompt cache, as on the default path
+
+    def claude_only(self) -> "ClaudePath":
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._owner, name)
+
+
+def claude_path(client: Any) -> Any:
+    """``client`` pinned to the default (Claude) path when it is a :class:`FailoverClient` (or already pinned);
+    any other client (a test's stand-in, a replay double) as it is."""
+    return client.claude_only() if isinstance(client, (FailoverClient, ClaudePath)) else client
+
+
+class _Messages:
+    """``client.messages``: ``create`` and ``stream`` with failover (``claude``: always on the default path)."""
+
+    def __init__(self, owner: FailoverClient, *, claude: bool = False) -> None:
+        self._owner = owner
+        self._claude = claude
 
     def create(self, **params: Any) -> Any:
+        if self._claude:
+            return self._owner.run(params, lambda client, p: client.messages.create(**p), claude=True)
         return self._owner.run(params, lambda client, p: client.messages.create(**p))
 
     def stream(self, **params: Any) -> "_FailoverStream":
-        return _FailoverStream(self._owner, params)
+        return _FailoverStream(self._owner, params, claude=self._claude)
 
     def count_tokens(self, **params: Any) -> Any:
         return self._owner.client_for(self._owner.region).messages.count_tokens(**params)
@@ -474,9 +516,10 @@ class _OpenedStream:
 class _FailoverStream:
     """Context manager: opens the stream (first event read) on the first target that works."""
 
-    def __init__(self, owner: FailoverClient, params: dict[str, Any]) -> None:
+    def __init__(self, owner: FailoverClient, params: dict[str, Any], *, claude: bool = False) -> None:
         self._owner = owner
         self._params = params
+        self._claude = claude
         self._manager: Any = None
 
     def __enter__(self) -> _OpenedStream:
@@ -498,7 +541,8 @@ class _FailoverStream:
             self._manager = manager
             return _OpenedStream(stream, first, events, has_first)
 
-        opened = self._owner.run(self._params, open_one)
+        opened = (self._owner.run(self._params, open_one, claude=True) if self._claude
+                  else self._owner.run(self._params, open_one))
         routed = self._owner.last_routed_model()
         if routed:
             # failed after the answer began (OpenRouter's mid-answer error chunk, a cut stream): what was read can't

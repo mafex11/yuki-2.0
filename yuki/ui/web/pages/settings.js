@@ -98,7 +98,7 @@
     }
     const warn = AI.pend[r.role] ? 'Pick a model to switch. Until then this job stays as it was.' : r.warning;
     return h('div', { class: 'srow ai-role', data: { k: 'ai-role-' + r.role } },
-      h('span', null, r.words, h('small', { text: r.hint }), warn ? h('small', { class: 'ai-warn', text: warn }) : null),
+      h('span', null, r.words, h('small', { text: r.hint }), r.note ? h('small', { text: r.note }) : null, warn ? h('small', { class: 'ai-warn', text: warn }) : null),
       h('span', { class: 'ctl' }, pick((ai.choices || []).map((c) => [c.id, c.label]), prov, { change: 'ai-provider', role: r.role }, `${r.words}: service`), model));
   }
   function aiBackup(ai, r) {

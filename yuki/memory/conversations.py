@@ -227,7 +227,9 @@ reply and actions show it), or the user says it is done or handled ("I finished 
 - NOOP: an existing item the NEW exchanges bear on without changing it. Leave items the \
 exchanges do not touch out of the list.
 Items under RECENTLY ENDED are history: never ADD one of them again unless the user asks \
-for it again in a NEW exchange dated after it ended.
+for it again in a NEW exchange dated after it ended. A commitment marked "put back by the \
+user" was ended before and the user said it is not done yet: end or change it only on a NEW \
+exchange dated after the put-back.
 
 For every operation give all fields; use 0 for item on an ADD and for card unless it is \
 feedback on a card, "" for fields that do not apply. owner: for a commitment (ADD, UPDATE) "yuki" or \
@@ -1004,6 +1006,8 @@ class ConversationWorker:
             line += f" value={safe(f.value, 200)!r}"
         if f.due_at is not None:
             line += f" due {_local(f.due_at, '%Y-%m-%d %H:%M (%A)')}"
+        if f.kind == "commitment" and f.reopened_at and not ended:
+            line += f", put back by the user {_local(float(f.reopened_at), '%Y-%m-%d %H:%M')}"
         if ended and f.valid_to is not None:
             how = ENDED_AS.get(f.status, f.status)
             line += f" - {how} {_local(f.valid_to, '%Y-%m-%d %H:%M')}"
@@ -1185,6 +1189,12 @@ class ConversationWorker:
                 continue
             if target is not None and max(t.at for t in cited) < target.valid_from:
                 reject("the cited exchanges are older than the item")
+                continue
+            if (target is not None and target.kind == "commitment" and target.reopened_at
+                    and max(t.at for t in cited) <= float(target.reopened_at)):
+                # put back by the user (migration 37): only exchanges after the put-back change or end it, never
+                # one from before it that was still waiting for extraction (second review R1)
+                reject("the cited exchanges are older than when the user put it back")
                 continue
             # A reply to a card (Reply pressed) is feedback on that card: it never makes, changes or
             # withdraws a rule, a preference said in chat or a commitment. Rules the user states in

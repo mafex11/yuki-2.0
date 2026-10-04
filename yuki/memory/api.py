@@ -3418,10 +3418,12 @@ class MemoryClient:
                 recent = float(rows[0]["expired_at"] or 0.0) >= since
                 if not ((by_user and recent) or (any_age and (not by_user or rows[0]["status"] == "done"))):
                     return None
+                # reopened_at (migration 37): memory closes it again only on evidence after this moment, never on
+                # what closed it before (yuki.memory.commitments)
                 ok = self.store._write(lambda conn: conn.execute(
                     "UPDATE conversation_facts SET status='active', valid_to=NULL, expired_at=NULL, superseded_by=NULL,"
-                    " end_note_ciphertext=NULL WHERE id=? AND kind='commitment' AND status IN ('done','dropped','wrong')",
-                    (n,)).rowcount == 1)
+                    " end_note_ciphertext=NULL, reopened_at=? WHERE id=? AND kind='commitment'"
+                    " AND status IN ('done','dropped','wrong')", (now, n)).rowcount == 1)
             elif prefix == "loop":
                 def op(conn: Any) -> bool:
                     row = conn.execute("SELECT portrait_fact_id, resolved_at FROM open_loops WHERE id=? AND status='done'"

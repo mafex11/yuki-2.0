@@ -9,7 +9,9 @@ show a label a model wrote for the item (migration 21, encrypted like the text i
   (three to six words), which its to-do row shows (``todos()`` item ``title``);
 * ``title`` (:data:`TITLE_MIN_WORDS` to :data:`TITLE_MAX_WORDS` words) for Yuki's commitments and the user's
   own to-dos from chats and calls, the to-dos the user added, and know-how, which also gets a ``summary`` of
-  the way that works.
+  the way that works. A commitment gets one while open and once done while it is on the Work page's Recently
+  done (``COMMIT_DONE_TITLE_DAYS``), said to the user ("Send your landlord the rent receipt", never "the user
+  ..."); done ones older than that get theirs from the one-off backfill :mod:`yuki.memory.done_titles`.
 
 **Written at the source.** The model calls that already write these items write the label in the same call:
 the portrait's operations (nightly, weekly, refresh, fold, audit), the conversation extractor (commitments,
@@ -51,7 +53,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from yuki.memory.store import LABEL_SURFACES, PortraitRunStats
+from yuki.memory.store import COMMIT_DONE_TITLE_DAYS, LABEL_SURFACES, PortraitRunStats
 
 # (yuki.memory.journal is imported where it is used: the journal's own call-side tool imports this module.)
 
@@ -214,7 +216,12 @@ most about them, not a list ("Talks future plans with you", not "Father, fine re
 future plans").
 - a title: {TITLE_MIN_WORDS} TO {TITLE_MAX_WORDS} WORDS. Something to be done: the action first ("Send \
 Varun the demo video", "Remind you to call Mom"). A way Yuki learned: what it does ("Open a YouTube link \
-in Arc").
+in Arc"). A to-do or promise (a C line) is kept in memory about "the user" in the third person; its title \
+speaks to them: "The user will send their landlord the rent receipt by Friday" -> "Send your landlord the \
+rent receipt"; "Yuki will remind the user to call their sister at 6 PM" -> "Remind you to call your \
+sister"; "The user will have Yuki tag Neha in the trip group" -> "Tag Neha in the trip group". One marked \
+already done keeps the title of what was to be done (the app shows it struck through), never a report that \
+it happened: "Send your landlord the rent receipt", not "You sent the rent receipt".
 Count the words before you answer: a label over its limit is thrown away. Leave details out rather than \
 squeeze them in - the full item is one tap away.
 Rules for every label: plain, human words a friend would use; one complete thought that stands alone, \
@@ -447,6 +454,17 @@ class Pending:
     subject: str = ""
 
 
+def commit_pending(f: Any) -> Pending:
+    """A commitment's title line (``f`` a :class:`yuki.memory.store.ConversationFact`): whose it is and, for one
+    already done, that it is done (its title is still what was to be done: Recently done shows it struck through)."""
+    whose = "Yuki's own promise" if f.owner == "yuki" else "the user's own to-do"
+    if f.origin == "call":
+        whose = "the user's own to-do, said on a call"
+    if getattr(f, "status", "active") == "done":
+        whose += ", already done"
+    return Pending(f"C{f.id}", "commit", f.id, "title", "title", whose, f.text, f.subject)
+
+
 @dataclass
 class TitlesResult:
     ok: bool = True
@@ -520,13 +538,12 @@ class Titler:
                 what += ", the user told Yuki"
             add(Pending(f"P{f.id}", "fact", f.id, "title" if f.kind == "open_loop" else "summary", "summary", what,
                         f.text, f.subject))
-        for f in store.conversation_facts(("commitment",)):
-            if not wanted("commit", f.id):
+        done_since = time.time() - COMMIT_DONE_TITLE_DAYS * 86400.0
+        for f in store.conversation_facts(("commitment",), statuses=("active", "done")):
+            # a done one while it is on Recently done (older ones: the one-off backfill, yuki.memory.done_titles)
+            if (f.status == "done" and float(f.valid_to or 0.0) < done_since) or not wanted("commit", f.id):
                 continue
-            whose = "Yuki's own promise" if f.owner == "yuki" else "the user's own to-do"
-            if f.origin == "call":
-                whose = "the user's own to-do, said on a call"
-            add(Pending(f"C{f.id}", "commit", f.id, "title", "title", whose, f.text, f.subject))
+            add(commit_pending(f))
         for t in store.todos(("open",)):
             if wanted("todo", t.id):
                 add(Pending(f"T{t.id}", "todo", t.id, "title", "title", "a to-do the user added", t.text))

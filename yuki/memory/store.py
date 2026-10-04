@@ -1087,6 +1087,9 @@ class ConversationFact:
     value: str | None = None
     #: resource: the words speech recognition must hear right ("janedoe"), model-chosen.
     keyterms: list[str] = field(default_factory=list)
+    #: commitment (migration 37): when the user last put it back after it ended (Not done yet, Put it back, Undo);
+    #: memory closes it again only on evidence dated after this. ``None``: never put back.
+    reopened_at: float | None = None
 
 
 @dataclass
@@ -2958,6 +2961,14 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX work_items_kind ON work_items(kind, updated_at);
     """,
+    # 37 (2026-10-04, leftMem, docs/research/revamp-2026-10-02/70-build-leftMem.md): conversation_facts.reopened_at,
+    # when the user last put an ended commitment back (the Work page's Not done yet, Put it back, Undo): memory closes
+    # it again only on evidence dated after that moment, never on what closed it before (yuki.memory.commitments).
+    # Content-free; carried to a commitment's new version. Additive only; one self-contained entry (renumber freely
+    # at a merge).
+    """
+    ALTER TABLE conversation_facts ADD COLUMN reopened_at REAL;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -2982,11 +2993,19 @@ def split_envelope(text: str | None) -> tuple[str, str | None]:
     return t[:cut], t[cut:]
 
 
+#: A commitment done within this many days is on the Work page's Recently done (``yuki.memory.nudges.DONE_DAYS``), so
+#: the titles pass gives it a title too (leftMem: never memory's third-person text there).
+COMMIT_DONE_TITLE_DAYS = 14
+
 #: What carries a model-written short label (migration 21, :mod:`yuki.memory.titles`): surface ->
-#: (table, {label: column}, which rows are current). An open loop's title is its portrait fact's summary.
+#: (table, {label: column}, which rows are current). An open loop's title is its portrait fact's summary. A
+#: commitment is current while open and while it is on Recently done (:data:`COMMIT_DONE_TITLE_DAYS`); older done
+#: ones get theirs from the one-off backfill (``python -m yuki.memory.done_titles``).
 LABEL_SURFACES: dict[str, tuple[str, dict[str, str], str]] = {
     "fact": ("portrait_facts", {"summary": "summary_ciphertext"}, f"valid_to IS NULL AND kind != '{CORRECTION_KIND}'"),
-    "commit": ("conversation_facts", {"title": "title_ciphertext"}, "kind = 'commitment' AND status = 'active'"),
+    "commit": ("conversation_facts", {"title": "title_ciphertext"},
+               "kind = 'commitment' AND (status = 'active' OR (status = 'done' AND valid_to >= "
+               f"CAST(strftime('%s', 'now') AS REAL) - {COMMIT_DONE_TITLE_DAYS * 86400}))"),
     "todo": ("todos", {"title": "title_ciphertext"}, "status = 'open'"),
     "knowhow": ("knowhow", {"title": "title_ciphertext", "summary": "summary_ciphertext"}, "valid_to IS NULL"),
 }
@@ -5583,6 +5602,7 @@ class Store:
             title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
             value=self._dec(r["value_ciphertext"]) if "value_ciphertext" in r.keys() else None,
             keyterms=self._keyterms(r),
+            reopened_at=r["reopened_at"] if "reopened_at" in r.keys() else None,
         )
 
     def _keyterms(self, r: sqlite3.Row) -> list[str]:
@@ -5692,6 +5712,9 @@ class Store:
                 out.append((True, self._insert_cfact(conn, ch, now, batch_id)))
             elif ch.op == "UPDATE":
                 new_id = self._insert_cfact(conn, ch, now, batch_id)
+                # a commitment the user put back stays put back in its new version (migration 37)
+                conn.execute("UPDATE conversation_facts SET reopened_at=(SELECT reopened_at FROM conversation_facts"
+                             " WHERE id=?) WHERE id=?", (int(ch.fact_id), new_id))
                 self._end_cfact(conn, int(ch.fact_id), "superseded", at, now, superseded_by=new_id, note=ch.end_note)
                 out.append((True, new_id))
             elif ch.op == "INVALIDATE":

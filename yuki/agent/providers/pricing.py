@@ -18,6 +18,8 @@ call, :func:`routed_name` says which provider model actually answered on this th
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from yuki.agent.providers.catalog import PROVIDERS, known_model, split_qualified
@@ -37,6 +39,19 @@ def routed_name(requested: str) -> str | None:
     """The qualified model that answered the last call on this thread, when that call asked for ``requested``."""
     rec = getattr(_local, "routed", None)
     return rec[1] if rec and rec[0] == requested else None
+
+
+@contextmanager
+def unrouted() -> Iterator[None]:
+    """Price as if no call on this thread was routed, then put the note back: for a call known to have gone the
+    default (Claude) way on another thread, like the safety check's, priced on the agent's thread after the agent's
+    own routed call left its note there (review L1)."""
+    rec = getattr(_local, "routed", None)
+    _local.routed = None
+    try:
+        yield
+    finally:
+        _local.routed = rec
 
 
 def note_returned(cost: float | None, tokens: dict[str, int]) -> None:
@@ -146,5 +161,5 @@ def usage_cost_fields(usage: Any) -> float | None:
 
 
 __all__ = ["ZERO", "answered_by", "cost", "is_free", "note_returned", "note_routed", "price_words", "rates",
-           "returned_cost", "routed_name",
+           "returned_cost", "routed_name", "unrouted",
            "usage_cost_fields"]
