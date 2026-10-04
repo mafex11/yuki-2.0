@@ -546,3 +546,222 @@ def test_a_standby_warms_speech_recognition_with_half_a_second_of_silence(tmp_pa
     off._stt = SimpleNamespace(_transport_send_audio=send)
     asyncio.run(off._warm_stt())
     assert sent == [16_000]
+
+
+# -- review fixes (5 Oct, report 79 "Review fixes") ---------------------------------------------------------------
+
+def test_a_late_hit_for_the_name_in_go_away_never_starts_yuki_again() -> None:
+    """F1: "Yuki, stop." The eager end of turn closes it before the spotter reports the name; that hit, stored as the
+    next wake during the teardown, started a new conversation right after the dismissal. A name said after it still
+    wakes it."""
+    from yuki.voice.session import VoiceSession
+
+    now = time.monotonic()
+    s = _fake_session(in_conversation=True, closing=True, _dismissed_at=now)
+    VoiceSession._on_wake_heard(s, now - 1.2, now + 0.3, now - 0.9)    # the name ended before the dismissal
+    assert s._pending_wake is None and s.log.of("wake", state="ignored", why="before_dismissal")
+    VoiceSession._on_wake_heard(s, now - 1.2, now + 0.3, 0.0)           # no name end: the batch's start decides
+    assert s._pending_wake is None
+    VoiceSession._on_wake_heard(s, now + 0.1, now + 0.6, now + 0.3)    # said again after it: the next wake
+    assert s._pending_wake is not None
+    idle = _fake_session(_dismissed_at=now)                             # the teardown is over: not a fresh wake either
+    VoiceSession._on_wake_heard(idle, now - 1.2, now + 1.5, now - 0.9)
+    assert idle.started == []
+    old = _fake_session(_dismissed_at=now - 30.0)                       # long after: as before
+    VoiceSession._on_wake_heard(old, now - 1.2, now, now - 0.9)
+    assert len(old.started) == 1
+
+
+def test_the_dismissal_time_is_the_conversations_own_stop(tmp_path: Path) -> None:
+    from yuki.voice.session import VoiceSession
+
+    conv, *_ = _conversation(tmp_path)
+    assert conv.stopped_at is None
+    conv._set_stop("user_asked")
+    first = conv.stopped_at
+    conv._set_stop("idle")
+    assert first is not None and conv.stopped_at == first
+    s = SimpleNamespace(_conversation=conv, _dismissed_at=None)
+    VoiceSession._note_dismissed(s, "idle")
+    assert s._dismissed_at is None
+    VoiceSession._note_dismissed(s, "user_asked")
+    assert s._dismissed_at == first
+
+
+def test_in_a_game_a_call_or_after_a_goodbye_the_spotter_alone_is_not_enough() -> None:
+    """F2/F5: there the first words are said to Yuki when recognition also hears the name open them."""
+    from yuki.voice.session import VoiceSession
+
+    s = SimpleNamespace(_wake_strict=False)
+    direct, rescued = SimpleNamespace(rescued=False), SimpleNamespace(rescued=True)
+    assert VoiceSession._wake_evidence(s, "wake", direct) == (True, False)
+    assert VoiceSession._wake_evidence(s, "wake", rescued) == (False, True)
+    assert VoiceSession._wake_evidence(s, "hotkey", direct) == (False, False)
+    s._wake_strict = True
+    assert VoiceSession._wake_evidence(s, "wake", direct) == (False, True)
+
+
+@pytest.mark.parametrize("game,call,after_goodbye,kept", [
+    (None, False, False, False), ("VALORANT", False, False, True), (None, True, False, True),
+    (None, False, True, True),
+])
+def test_a_strict_wake_keeps_the_name_in_what_recognition_hears(game: Any, call: bool, after_goodbye: bool,
+                                                                 kept: bool) -> None:
+    from yuki.voice.session import WAKE_PREROLL_S, VoiceSession
+
+    woke: list[tuple[float, bool]] = []
+    s = SimpleNamespace(in_conversation=False, log=Log(), _listener=None, closing=False, settings=Settings(),
+                        call_app="Discord" if call else None, call_evidence="fresh" if call else None)
+    s._game_now = lambda: game
+    s._call_focus = lambda: VoiceSession._call_focus(s)
+    s._after_goodbye = lambda: after_goodbye
+    s._name_while_talking = lambda: True
+    s._wake_standby = lambda via, listen_from, started, cut: woke.append((listen_from, cut)) or True
+    assert VoiceSession.start_conversation(s, "wake", wake_at=10.0, heard_at=10.1, name_end=9.8) is True
+    if kept:
+        assert woke == [(10.0 - WAKE_PREROLL_S, False)] and s._wake_strict and s.log.of("wake", state="name_kept")
+    else:
+        assert woke == [(9.8, True)] and not s._wake_strict
+
+
+def test_with_the_name_check_only_words_the_name_opens_are_said_to_yuki(tmp_path: Path) -> None:
+    """F5: an accidental wake in a call (a sound-alike): the friends' words get no "Mm-hm" and no named note."""
+    conv, _log, sounds, _t, _d = _conversation(tmp_path, call=True)
+    conv.name_check = True
+    turn = _open_turn(conv, "Push B, I'm rotating.")
+    assert conv._fast_turn(turn.user_text, final=True) is False
+    assert sounds == [] and not turn.named and not conv._utterance_named()
+    real, log2, sounds2, _t2, _d2 = _conversation(tmp_path, call=True)
+    real.name_check = True
+    turn2 = _open_turn(real, "Yuki, pause the music.")
+    assert real._fast_turn(turn2.user_text, final=True) is False
+    assert sounds2 == [("request", 4800)] and turn2.named and log2.of("fast_path", op="ack")[0]["by"] == "wake_confirmed"
+    # in focus mode a name the spotter heard mid-conversation needs the same (a sound-alike in team talk)
+    conv._names.append(time.monotonic() - 0.5)
+    other = _open_turn(conv, "nah he's lurking")
+    conv._fast_turn(other.user_text, final=True)
+    assert not other.named and sounds == []
+
+
+def test_after_a_goodbye_the_name_alone_then_a_command_is_never_dropped(tmp_path: Path) -> None:
+    """F2 / item 5: "Yuki, go away" (a goodbye), then "Yuki." (pause) "pause the music" in a game and a call: the name
+    alone is answered and the command after it is said to Yuki, named for the talker."""
+    from yuki.voice.pipeline import _Hooks
+
+    conv, _log, sounds, _t, _d = _conversation(tmp_path, call=True)
+    conv.set_game("VALORANT")
+    conv.after_goodbye, conv.name_check = True, True
+    first = _open_turn(conv, "Yuki.")
+    assert conv._fast_turn("Yuki.", final=True) is True and first.fast == "name" and sounds == [("name", 7200)]
+    conv.observer._user_started_at = time.monotonic()
+    assert conv._fast_turn("Pause the music", final=False) is False and _Hooks(conv).named() is True
+    turn = _open_turn(conv, "Pause the music.", started_ago=0.0)
+    assert conv._fast_turn("Pause the music.", final=True) is False and turn.named
+    assert _Hooks(conv).named() is True and sounds[-1][0] == "request"
+    # a story about her right after the goodbye is still judged
+    story, _l, sounds3, _t3, _d3 = _conversation(tmp_path)
+    story.after_goodbye, story.name_check = True, True
+    _open_turn(story, "I had a long talk with, uh, Yuki.")
+    story._fast_turn("I had a long talk with, uh, Yuki.", final=True)
+    assert sounds3 == [] and not story._utterance_named()
+
+
+@pytest.mark.parametrize("words", ["Yeah, that's it.", "Yes that's it", "So that's it?", "Go away?"])
+def test_confirmations_and_questions_are_never_dismissals(words: str) -> None:
+    """F3: "Yeah, that's it." answers a question; a transcript written as a question is not a command."""
+    from yuki.voice.fastpath import dismissal
+
+    assert dismissal(words) is None and dismissal(words, busy=True) is None
+
+
+def test_thats_it_answering_her_question_goes_to_the_talker(tmp_path: Path) -> None:
+    from yuki.voice.fastpath import dismissal
+
+    assert dismissal("That's it.") == "that's it" and dismissal("That's it.", asked=True) is None
+    assert dismissal("That's it.", busy=True) is None
+    assert dismissal("Okay. That's all for now. Bye.", asked=True) == "bye"   # a goodbye in the same words still ends
+    conv, _log, _s, _t, dismissed = _conversation(tmp_path)
+    conv.observer.last_said = {"written": "The report from yesterday?", "heard": "The report from yesterday?"}
+    _open_turn(conv, "That's it.")
+    assert conv._fast_turn("That's it.", final=True) is False and dismissed == []
+    conv.observer.last_said = {"written": "Paused.", "heard": "Paused."}
+    assert conv._fast_turn("That's it.", final=True) is True and dismissed == [True]
+
+
+def test_named_follows_the_words_a_speculative_call_answers_not_the_last_turn(tmp_path: Path) -> None:
+    """F4: after a named turn, the eager (speculative) talker call for the next words ran while the observer's open
+    turn was still the named one: the friends' talk was told "said to you" and could start the thinker."""
+    from yuki.voice.pipeline import _Hooks
+
+    conv, _log, _s, _t, _d = _conversation(tmp_path, call=True, voice_router=True)
+    named = _open_turn(conv, "Yuki, turn it up.")
+    conv._names.append(time.monotonic() - 0.5)
+    conv._fast_turn(named.user_text, final=True)
+    assert named.named and _Hooks(conv).named() is True
+    conv.observer._user_started_at = time.monotonic()            # new words; the observer's turn is still the named one
+    conv._fast_turn("push B, I'm rotating", final=False)          # the eager end of turn, before the final words
+    assert conv.observer.turn is named and _Hooks(conv).named() is False
+    conv._route_turn(SimpleNamespace(get_messages=lambda: []), SimpleNamespace(user_turn=True))
+    assert getattr(conv, "_router_task", None) is None
+    # the turn-2 case after a wake: the first words were named, the next eager words are not
+    woke, *_ = _conversation(tmp_path)
+    woke.woken_by_name = True
+    first = _open_turn(woke, "Open Spotify.")
+    woke._fast_turn(first.user_text, final=True)
+    assert _Hooks(woke).named() is True
+    woke.observer._user_started_at = time.monotonic()
+    woke._fast_turn("and the other one", final=False)
+    assert _Hooks(woke).named() is False
+
+
+def test_the_eager_acknowledgement_plays_once_per_utterance(tmp_path: Path) -> None:
+    """F7: "Yuki, open... uh... Spotify": eager, resumed, eager again: one "Mm-hm"."""
+    conv, _log, sounds, _t, _d = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    conv._fast_turn("Open", final=False)
+    conv._fast_turn("Open uh Spotify", final=False)
+    assert len(sounds) == 1
+    turn = _open_turn(conv, "Open, uh, Spotify.")
+    conv._fast_turn(turn.user_text, final=True)
+    assert len(sounds) == 1 and turn.ack_at is not None
+
+
+def test_the_acknowledgement_is_written_as_yukis_voice_for_the_echo_guard() -> None:
+    """F6: "Mm-hm" is her voice, not a tone: written with the echo guard's gate on, like her replies."""
+    import threading
+
+    from yuki.voice.session import VoiceSession
+
+    done = threading.Event()
+    writes: list[dict[str, Any]] = []
+
+    class Speaker:
+        def write(self, pcm: bytes, **kw: Any) -> None:
+            writes.append(kw)
+            done.set()
+
+    s = SimpleNamespace(play_sound=None, _speaker=Speaker())
+    VoiceSession._play_sound(s, b"\x00\x00" * 100, "request")
+    assert done.wait(2.0) and writes == [{"gate": True}]
+
+
+def test_shell_surfaces_are_never_a_game() -> None:
+    """F8: Start, Search and the emoji panel are caption-less windows covering the monitor."""
+    from yuki.voice.session import _SHELL_CLASSES
+
+    assert {"Windows.UI.Core.CoreWindow", "Progman", "Shell_TrayWnd", "XamlExplorerHostIslandWindow"} <= _SHELL_CLASSES
+
+
+def test_the_pill_leaves_thinking_when_the_name_alone_is_answered(tmp_path: Path) -> None:
+    """F9: "Yuki?" -> "Yeah?": Yuki waits for the command, she is not thinking."""
+    from pipecat.frames.frames import TranscriptionFrame
+
+    conv, _log, _s, _t, _d = _conversation(tmp_path)
+    conv.woken_by_name = True
+    obs = conv.observer
+    obs._user_started_at = time.monotonic() - 1.0
+    obs.on_frame(TranscriptionFrame(text="Yuki?", user_id="u", timestamp="0"))
+    obs.set_state("thinking")
+    assert conv._fast_turn("Yuki?", final=True) is True
+    assert obs.state != "thinking"
