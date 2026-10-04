@@ -825,3 +825,18 @@ def test_async_openrouter_cost_is_noted(ai_dir: Path) -> None:
         msg = asyncio.run(go(server.url))
     tokens = {"input_tokens": msg.usage.input_tokens, "output_tokens": msg.usage.output_tokens, "cache_read_tokens": 0}
     assert pricing.cost("openrouter:vendor/paid", tokens) == pytest.approx(0.0021)
+
+
+def test_an_env_key_of_any_format_is_hidden_too(ai_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.memory import secret_filter
+
+    odd = "dsk_Hq72Lp0Zx4Mn9Vb3Rt8W"   # invented, in no known vendor format
+    monkeypatch.setenv("DEEPSEEK_API_KEY", odd)
+    import yuki.core.models as core_models
+
+    monkeypatch.setattr(core_models, "get_key", lambda name: __import__("os").environ.get(name))
+    secret_filter._saved_cache[0] = -1e9
+    assert odd in ai_keys.secret_values() and odd not in ai_keys.saved_values()
+    assert odd not in secret_filter.redact_text(f"the key {odd} was pasted")
+    assert ai_keys.redact(f"bad key {odd}") == "bad key [key]"
+    secret_filter._saved_cache[0] = -1e9

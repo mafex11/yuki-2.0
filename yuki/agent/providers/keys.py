@@ -181,6 +181,17 @@ def saved_values() -> list[str]:
         return []
 
 
+def secret_values() -> list[str]:
+    """Every AI key this PC holds for Yuki: the saved ones and the providers' environment variables (a key in an
+    environment variable is as secret as a saved one, whatever its format). For exact-match hiding only."""
+    out = saved_values()
+    for provider in PROVIDERS:
+        value = _env(provider)
+        if value and len(value) >= 8 and value not in out:
+            out.append(value)
+    return out
+
+
 def version() -> tuple[str, int, int] | None:
     """Changes whenever the key file changes (clients rebuild when it does)."""
     return _store.version()
@@ -189,11 +200,11 @@ def version() -> tuple[str, int, int] | None:
 def redact(text: str, *extra: str | None) -> str:
     """``text`` with every saved key (and ``extra`` values) replaced by ``[key]``: for a provider's error message."""
     out = str(text or "")
-    for value in [*saved_values(), *(v for v in extra if v)]:
+    for value in [*secret_values(), *(v for v in extra if v)]:
         if value and len(value) >= 8:
             out = out.replace(value, "[key]")
     return out
 
 
 __all__ = ["KeyStoreError", "MAX_KEY_CHARS", "env_names", "forget_key", "get_key", "key_path", "key_source", "redact",
-           "saved_key", "saved_values", "set_key", "version"]
+           "saved_key", "saved_values", "secret_values", "set_key", "version"]

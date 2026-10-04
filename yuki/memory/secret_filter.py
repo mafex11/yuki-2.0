@@ -323,16 +323,17 @@ _saved_cache: list[Any] = [-1e9, ()]
 
 
 def _saved_keys(text: str) -> list[Finding]:
-    """The AI keys the user saved in Settings → AI, wherever they appear: exact matches of the stored values
-    (``yuki.agent.providers.keys.saved_values``), whatever their format. No guessing: a fixed string."""
+    """The AI keys the user saved in Settings → AI (and the AI services' key environment variables), wherever they
+    appear: exact matches of the values (``yuki.agent.providers.keys.secret_values``), whatever their format. No
+    guessing: a fixed string."""
     import time as _time
 
     now = _time.monotonic()
     if now - _saved_cache[0] >= _SAVED_CHECK_S:
         try:
-            from yuki.agent.providers.keys import saved_values
+            from yuki.agent.providers.keys import secret_values
 
-            values = tuple(saved_values())
+            values = tuple(secret_values())
         except Exception:  # noqa: BLE001 - no key store here: nothing saved to look for
             values = ()
         _saved_cache[0], _saved_cache[1] = now, values
