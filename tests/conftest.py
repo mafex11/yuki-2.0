@@ -69,6 +69,22 @@ def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
             os.environ["YUKI_MEMORY_DIR"] = old
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _temp_seen_ledger(tmp_path_factory: pytest.TempPathFactory):
+    """appOpen final check: the seen-windows ledger (``yuki.perception.windows``, written by the timeline) in a temp
+    folder, so a test that drives the timeline with the real windows module never writes the user's own file."""
+    folder = tmp_path_factory.mktemp("yuki-seen")
+    old = os.environ.get("YUKI_SEEN_FILE")
+    os.environ["YUKI_SEEN_FILE"] = str(folder / "seen_windows.json")
+    try:
+        yield folder
+    finally:
+        if old is None:
+            os.environ.pop("YUKI_SEEN_FILE", None)
+        else:
+            os.environ["YUKI_SEEN_FILE"] = old
+
+
 # -- a pinned clock (report 76: tests that format "today"/"yesterday" failed after midnight) --------------------------
 #
 # ``pinned_clock`` (opt-in) moves the wall clock a test sees to a fixed local time of a fixed day, ticking from there:

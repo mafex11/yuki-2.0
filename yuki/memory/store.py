@@ -1017,6 +1017,11 @@ TODO_END_STATUSES: tuple[str, ...] = ("done", "dropped", "wrong")
 COMMITMENT_OWNERS: tuple[str, ...] = ("yuki", "user")
 
 
+#: The values of ``conversation_turns.addressed`` (migration 18; "unanswered" since report 77b, no schema change:
+#: the column is free text and older rows keep theirs).
+ADDRESSED = ("yuki", "others", "unanswered")
+
+
 @dataclass
 class ConversationTurn:
     """One exchange between the user and Yuki (decrypted), see :meth:`Store.add_turn`.
@@ -1040,7 +1045,8 @@ class ConversationTurn:
     created_at: float
     score: float | None = None       # cosine, set by search_turns
     #: Who a voice turn was said to (migration 18): "yuki", "others" (the people on a call, dictation into
-    #: another app), or None when not known (typed turns are to Yuki).
+    #: another app), "unanswered" (in a call, the next words came before Yuki answered: nobody judged it, report
+    #: 77b), or None when not known (typed turns are to Yuki).
     addressed: str | None = None
     #: Yuki's own notes after the user's words (migration 27), or ``None``.
     envelope: str | None = None
@@ -5405,8 +5411,9 @@ class Store:
         longer, the row goes to a background thread that retries and the id is
         returned at once (ids come from a microsecond clock, so they are known
         before the write lands). Raises only on encryption/argument errors.
-        ``addressed``: who a voice turn was said to ("yuki" | "others", from voice's ``turn_closed``);
-        a turn said to others is stored for the record but never extracted (migration 18).
+        ``addressed``: who a voice turn was said to (:data:`ADDRESSED`, from voice's ``turn_closed``);
+        a turn said to others is stored for the record but never extracted (migration 18); an "unanswered"
+        call turn is extracted with its addressee left to the extractor's judgement (report 77b).
         ``envelope``: the notes Yuki put after the user's words; ``None``: read off ``user_text`` itself
         (:func:`split_envelope`), so the words and the notes are always stored apart (migration 27).
         """
@@ -5418,7 +5425,7 @@ class Store:
             self._next_turn_id(), str(session_id or ""), _request_key(request_id), float(at),
             self.cipher.encrypt(user_text or ""), self._enc(reply_text),
             self.cipher.encrypt(json.dumps(acts, ensure_ascii=False)) if acts else None,
-            outcome or None, now, addressed if addressed in ("yuki", "others") else None,
+            outcome or None, now, addressed if addressed in ADDRESSED else None,
             self._enc(envelope) if envelope else None,
         ]
         with self._deferred_lock:
@@ -5794,12 +5801,15 @@ class Store:
         embed_model: str | None = None, questions: Sequence[NewQuestion] = (),
         answers: Sequence[tuple[int, str, str, float]] = (),
         question_outcomes: list[tuple[int | None, str]] | None = None,
+        addressed: dict[int, str] | None = None,
     ) -> tuple[int, list[tuple[bool, int | None]]]:
         """One transaction: the batch row, the fact changes, the journal facts (filed under
         the Yuki conversation thread), the questions for the user found in the exchanges
         (deduped), the answers the user gave to asked questions (``(question id, outcome,
         the user's words, at)``, see :meth:`answer_question`), the turns marked extracted
-        and their vectors.
+        and their vectors. ``addressed``: ``{turn id: "yuki" | "others"}``, the extractor's
+        judgement of call turns nobody had judged; only a turn still marked "unanswered"
+        takes it (report 77b).
 
         Returns ``(batch_id, [(applied, new fact id) per change])``; a change
         whose target is no longer active is skipped (``(False, None)``).
@@ -5828,6 +5838,10 @@ class Store:
             conn.executemany(
                 "UPDATE conversation_turns SET extracted=1, extract_batch_id=? WHERE id=?", [(batch_id, i) for i in ids]
             )
+            judged = [(v, int(k)) for k, v in (addressed or {}).items() if v in ("yuki", "others")]
+            if judged:
+                conn.executemany("UPDATE conversation_turns SET addressed=? WHERE id=? AND addressed='unanswered'",
+                                 judged)
             for turn_id, vec in turn_vectors:
                 self._put_vec(conn, "conversation_turn_vec", "turn_id", turn_id, vec, embed_model)
             return batch_id, results
@@ -8236,7 +8250,8 @@ class Store:
 
     def voice_turns(self, since: TimeArg, until: TimeArg) -> list[dict[str, Any]]:
         """Spoken exchanges with Yuki in ``[since, until)`` (outcome ``voice``), oldest first, content-free:
-        ``{"at", "request_id", "addressed"}`` (``at`` is when the turn closed; ``addressed`` yuki | others | None)."""
+        ``{"at", "request_id", "addressed"}`` (``at`` is when the turn closed; ``addressed`` yuki | others |
+        unanswered | None)."""
         rows = self._query("SELECT at, request_id, addressed FROM conversation_turns WHERE outcome = 'voice'"
                            " AND at >= ? AND at < ? ORDER BY at", (_ts(since) or 0.0, _ts(until) or time.time()))
         return [{"at": r["at"], "request_id": str(r["request_id"]), "addressed": r["addressed"]} for r in rows]

@@ -148,8 +148,9 @@ class RelevantIndex:
                         usable = True
                         if kind == "journal":
                             usable = (r["nature"] or "fact") != "uncertain" and not r["tainted"]
-                        elif kind == "chat":   # an exchange said to someone else was never Yuki's to learn from
-                            usable = r["addressed"] != "others"
+                        elif kind == "chat":   # an exchange said to someone else was never Yuki's to learn from;
+                            # one nobody has judged yet (a call turn cut off by the next words, 77b) neither, for now
+                            usable = r["addressed"] not in ("others", "unanswered")
                         k.usable.append(usable)
                         weak = "attention" in r.keys() and r["attention"] in ("visible", "popup")
                         k.offset.append(-ATTENTION_DISCOUNT if weak else 0.0)
