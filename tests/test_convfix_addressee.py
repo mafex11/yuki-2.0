@@ -163,8 +163,8 @@ def test_a_batch_of_unanswered_turns_is_read_and_the_extractor_judgement_is_stor
                                                ("bro you're cooked", "others")], start=1)]
     store.flush_turns()
     seen: list[str] = []
-    worker = _worker(store, {"operations": [], "not_for_yuki": [2], "journal_facts": [], "questions": [],
-                             "answers": [], "knowhow": []}, seen)
+    worker = _worker(store, {"operations": [], "not_for_yuki": [], "for_yuki": [1], "journal_facts": [],
+                             "questions": [], "answers": [], "knowhow": []}, seen)
     result = worker.extract("call-1", store.turns_by_ids(ids))
     assert result.ok and seen, "a batch with unanswered turns is read by the model, never skipped"
     assert seen[0].count("SAID IN A CALL, NEVER ANSWERED") == 2 and "SAID TO SOMEONE ELSE" in seen[0]
@@ -185,7 +185,8 @@ def test_the_extract_prompt_explains_the_unanswered_mark():
     from yuki.memory.conversations import EXTRACT_SYSTEM_PROMPT
 
     assert "SAID IN A CALL, NEVER ANSWERED" in EXTRACT_SYSTEM_PROMPT
-    assert "when you cannot tell, it was said to the people on the call" in EXTRACT_SYSTEM_PROMPT
+    text = " ".join(EXTRACT_SYSTEM_PROMPT.split())
+    assert "counts as said to the people on the call" in text and "when you cannot tell, leave it out" in text
 
 
 def test_search_does_not_learn_from_unjudged_call_turns_meanwhile():
@@ -278,19 +279,271 @@ def test_backfill_plans_then_applies_from_the_voice_log_only(store, tmp_path):
                                                encoding="utf-8")
     ids = bf.unanswered_turns(bf.read_voice_logs(logs))
     assert ids == ["voice-20261004-230000-aa-3", "voice-20261004-230000-aa-9"]
-    p = bf.plan(store, ids, requeue=True)
+    p = bf.plan(store, ids)
     assert p.as_dict() | {"relabel_ids": None} == {"logged_unanswered": 2, "in_memory": 1, "relabel": 1,
                                                    "relabel_ids": None, "already": 0, "missing": 1, "requeue": 1}
     # the dry run (main's default) writes nothing
     db = store.path
     assert bf.main(["--db", str(db), "--voice-logs", str(logs)]) == 0
     assert store.turns_by_ids([old_cut])[0].addressed == "others"
-    assert bf.apply(store, p) == 1
+    assert bf.apply(store, p, tmp_path / "undo.json") == [old_cut]
     got = {t.id: (t.addressed, t.extracted) for t in store.turns_by_ids([old_cut, quiet])}
     assert got == {old_cut: ("unanswered", False), quiet: ("others", True)}
     assert [t.id for t in store.turns_pending()] == [old_cut]
     # run again: nothing left to do
     assert bf.plan(store, ids).as_dict()["relabel"] == 0
+
+
+# -- review fixes (77b review F1-F5) ----------------------------------------------------------------------------------
+
+
+def test_f1_the_todo_check_never_reads_an_unjudged_call_turn(store):
+    from yuki.memory.commitments import CommitmentChecker
+
+    judged = store.add_turn("call-f1", "voice-call-f1-1", T0, "invented words to yuki", "Okay.", [], "voice",
+                            addressed="yuki")
+    friends = store.add_turn("call-f1", "voice-call-f1-2", T0 + 5, "nah I already booked the invented dentist", "",
+                             [], "voice", addressed="others")
+    unjudged = store.add_turn("call-f1", "voice-call-f1-3", T0 + 9, "yeah booked it yesterday", "", [], "voice",
+                              addressed="unanswered")
+    store.flush_turns()
+    _text, _j, shown_t, _d = CommitmentChecker(SimpleNamespace(store=store)).message([], T0 - 60, T0 + 60)
+    assert set(shown_t) == {judged}, (friends, unjudged)
+
+
+def test_f1_call_digest_spans_skip_unjudged_turns_and_trust_judged_ones():
+    from yuki.memory.calldigest import said_to_yuki_spans
+
+    rows = [{"at": T0, "request_id": "x", "addressed": "unanswered"},
+            {"at": T0 + 100, "request_id": "y", "addressed": "others"},
+            {"at": T0 + 200, "request_id": "z", "addressed": "yuki"}]
+    spans = said_to_yuki_spans(rows)
+    assert len(spans) == 1 and spans[0][2] is True and spans[0][0] < T0 + 200 < spans[0][1]
+
+
+def test_f3_an_unanswered_turn_left_out_of_for_yuki_counts_as_said_to_the_call(store):
+    from yuki.memory.conversations import ConversationWorker
+
+    ids = [store.add_turn("call-f3", f"voice-call-f3-{n}", T0 + n, words, "", [], "voice", addressed=mark)
+           for n, (words, mark) in enumerate([("open the invented Fieldnotes app", "unanswered"),
+                                               ("I need to buy groceries tomorrow, anyone want anything", "unanswered"),
+                                               ("what time is it", None)], start=1)]
+    store.flush_turns()
+    turns = store.turns_by_ids(ids)
+    assert ConversationWorker.not_for_yuki([], turns, [1]) == {ids[1]}          # named: for Yuki; left out: the call
+    assert ConversationWorker.not_for_yuki([], turns, None) == {ids[0], ids[1]}  # nothing named: neither is Yuki's
+    assert ConversationWorker.not_for_yuki([1], turns, [1]) == {ids[0], ids[1]}  # named in both: not Yuki's
+    assert ConversationWorker.not_for_yuki([3], turns, [1, 3]) == {ids[1], ids[2]}   # for_yuki only for unanswered
+
+
+def test_f3_items_from_a_call_line_said_to_friends_are_dropped_by_default(store):
+    ids = [store.add_turn("call-f3b", "voice-call-f3b-1", T0, "I need to buy groceries tomorrow", "", [], "voice",
+                          addressed="unanswered")]
+    store.flush_turns()
+    op = {"op": "ADD", "item": 0, "kind": "commitment", "subject": "groceries", "text": "Buy groceries tomorrow.",
+          "quote": "I need to buy groceries tomorrow", "due": "", "end_as": "", "card": 0, "exchanges": [1],
+          "reason": "", "owner": "user", "title": "Buy groceries"}
+    seen: list[str] = []
+    worker = _worker(store, {"operations": [op], "not_for_yuki": [], "journal_facts": [], "questions": [],
+                             "answers": [], "knowhow": []}, seen)      # the model named nothing in for_yuki
+    result = worker.extract("call-f3b", store.turns_by_ids(ids))
+    assert result.ok and store.conversation_facts(("commitment",)) == []
+    assert store.turns_by_ids(ids)[0].addressed == "others"
+    # control: the same item from a line the model named in for_yuki is kept
+    ids2 = [store.add_turn("call-f3c", "voice-call-f3c-1", T0 + 60, "I need to buy groceries tomorrow", "", [],
+                           "voice", addressed="unanswered")]
+    store.flush_turns()
+    worker = _worker(store, {"operations": [op], "not_for_yuki": [], "for_yuki": [1], "journal_facts": [],
+                             "questions": [], "answers": [], "knowhow": []}, seen)
+    assert worker.extract("call-f3c", store.turns_by_ids(ids2)).ok
+    assert len(store.conversation_facts(("commitment",))) == 1
+    assert store.turns_by_ids(ids2)[0].addressed == "yuki"
+
+
+def test_f3_the_prompt_judges_call_lines_with_worked_examples_and_an_explicit_list():
+    from yuki.memory.conversations import EXTRACT_SYSTEM_PROMPT, RECORD_CONVERSATION_TOOL
+
+    schema = RECORD_CONVERSATION_TOOL["input_schema"]
+    assert "for_yuki" in schema["properties"] and "for_yuki" in schema["required"]
+    text = " ".join(EXTRACT_SYSTEM_PROMPT.split())
+    assert text.count("(SAID IN A CALL, NEVER ANSWERED)") >= 4, "worked examples, good and bad"
+    assert "leave it out of for_yuki" in text and "put 1 in for_yuki" in text
+    assert "usually not_for_yuki is empty" not in text
+
+
+def test_f2_a_requeued_unanswered_turn_is_read_with_the_exchange_after_it(store):
+    earlier = store.add_turn("call-f2", "voice-call-f2-1", T0, "invented earlier words", "Sure.", [], "voice",
+                             addressed="yuki")
+    cut = store.add_turn("call-f2", "voice-call-f2-2", T0 + 10, "and also remind me at nine to", "", [], "voice",
+                         addressed="unanswered")
+    after = store.add_turn("call-f2", "voice-call-f2-3", T0 + 14, "call the invented garage, Yuki",
+                           "Okay, I'll remind you at nine.", [], "voice", addressed="yuki")
+    store.flush_turns()
+    store._write(lambda c: c.execute("UPDATE conversation_turns SET extracted=1 WHERE id IN (?, ?)", (earlier, after)))
+    seen: list[str] = []
+    worker = _worker(store, {"operations": [], "not_for_yuki": [], "for_yuki": [1], "journal_facts": [],
+                             "questions": [], "answers": [], "knowhow": []}, seen)
+    assert [t.id for t in store.turns_pending()] == [cut]
+    assert worker.extract("call-f2", store.turns_pending()).ok
+    later = seen[0].split("LATER IN THIS CONVERSATION", 1)
+    assert len(later) == 2 and "call the invented garage, Yuki" in later[1]
+    assert "invented earlier words" in later[0] and "NEW EXCHANGES" in later[0]
+    assert store.turns_by_ids([cut])[0].addressed == "yuki"
+
+
+def test_f2_no_later_context_when_the_batch_does_not_end_unanswered(store):
+    ids = [store.add_turn("call-f2b", f"voice-call-f2b-{n}", T0 + n, f"invented line {n}", "Ok.", [], "voice",
+                          addressed="yuki") for n in (1, 2)]
+    store.flush_turns()
+    seen: list[str] = []
+    worker = _worker(store, {"operations": [], "not_for_yuki": [], "journal_facts": [], "questions": [],
+                             "answers": [], "knowhow": []}, seen)
+    assert worker.extract("call-f2b", store.turns_by_ids(ids[:1])).ok
+    assert "LATER IN THIS CONVERSATION" not in seen[0]
+
+
+def test_f2_a_live_batch_ending_unanswered_waits_for_its_next_exchange(store):
+    import time as _time
+
+    seen: list[str] = []
+    worker = _worker(store, {"operations": [], "not_for_yuki": [], "for_yuki": [1], "journal_facts": [],
+                             "questions": [], "answers": [], "knowhow": []}, seen)
+    worker.min_turns = 1
+    worker.ended_segments = lambda now: []
+    worker.sort_owners = worker.check_commitments = worker.check_work_board = lambda *a, **k: None
+    worker.backfill_vectors = lambda *a, **k: None
+    now = _time.time()
+    cut = store.add_turn("call-live", "voice-call-live-1", now, "and put a reminder in for nine to", "", [], "voice",
+                         addressed="unanswered")
+    store.flush_turns()
+    pending = store.turns_pending()
+    hold = worker.held_until(pending, pending)
+    assert hold is not None and now < hold <= _time.time() + worker.max_wait_s
+    assert worker.run_once().extractions == [] and seen == []
+    assert worker.next_wake_in(_time.time()) >= 1.0
+    nxt = store.add_turn("call-live", "voice-call-live-2", now + 3, "call the invented garage, Yuki",
+                         "Okay, I'll remind you at nine.", [], "voice", addressed="yuki")
+    store.flush_turns()
+    result = worker.run_once()
+    assert [r.turn_ids for r in result.extractions] == [[cut, nxt]]
+    # once the wait is over it goes alone
+    late = store.add_turn("call-live", "voice-call-live-3", now + 9, "and the other thing", "", [], "voice",
+                          addressed="unanswered")
+    store.flush_turns()
+    pending = store.turns_pending()
+    assert worker.held_until(pending, pending) is not None
+    assert worker.run_once(now=_time.time() + worker.max_wait_s + 1).extractions == []   # run_once waits on wall time
+    store._write(lambda c: c.execute("UPDATE conversation_turns SET created_at=created_at-? WHERE id=?",
+                                     (worker.max_wait_s + 5, late)))
+    assert [r.turn_ids for r in worker.run_once().extractions] == [[late]]
+
+
+def _backfill_db(tmp_path: Path) -> tuple[Path, Path, list[int]]:
+    """A DB with two old cut-off call turns stored "others" and extracted, and a voice log naming them."""
+    folder = tmp_path / "copy"
+    folder.mkdir()
+    db = folder / "memory.db"
+    s = Store.open(db)
+    try:
+        ids = [s.add_turn("20261004-230000-bb", f"voice-20261004-230000-bb-{n}", T0 + n, f"invented line {n}", "", [],
+                          "voice", addressed="others") for n in (1, 2)]
+        s.flush_turns()
+        s._write(lambda c: c.execute("UPDATE conversation_turns SET extracted=1, extract_attempts=1,"
+                                     " extract_batch_id=7"))
+    finally:
+        s.close()
+    logs = tmp_path / "voice"
+    logs.mkdir()
+    rows = [{"type": "turn", "session": "20261004-230000-bb", "turn": n, "trigger": "user", "call_mode": True,
+             "addressed": "unanswered"} for n in (1, 2)]
+    (logs / "voice-20261004.jsonl").write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    return db, logs, ids
+
+
+def test_f4_the_dry_run_refuses_a_missing_database_and_creates_nothing(tmp_path, capsys):
+    from yuki.memory import addressee_backfill as bf
+
+    logs = tmp_path / "voice"
+    logs.mkdir()
+    typo = tmp_path / "typo" / "memory.db"
+    assert bf.main(["--db", str(typo), "--voice-logs", str(logs), "--dry-run"]) == 2
+    assert bf.main(["--db", str(typo), "--voice-logs", str(logs), "--apply"]) == 2
+    assert not typo.parent.exists()
+
+
+def test_f4_the_dry_run_opens_read_only_no_key_no_change(tmp_path, capsys):
+    import hashlib
+
+    from yuki.memory import addressee_backfill as bf
+
+    db, logs, ids = _backfill_db(tmp_path)
+    (db.parent / "memory.key").unlink()          # a copy without its key: the dry run must not make one
+    digest = hashlib.sha256(db.read_bytes()).hexdigest()
+    before = sorted(p.name for p in db.parent.iterdir())
+    assert bf.main(["--db", str(db), "--voice-logs", str(logs)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["applied"] is False and out["PLAN"]["relabel_ids"] == ids
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == digest
+    assert sorted(p.name for p in db.parent.iterdir()) == before
+
+
+def test_f5_apply_requeues_writes_an_undo_file_and_undo_is_exact(tmp_path, capsys):
+    from yuki.memory import addressee_backfill as bf
+
+    db, logs, ids = _backfill_db(tmp_path)
+    undo_file = tmp_path / "undo.json"
+    assert bf.main(["--db", str(db), "--voice-logs", str(logs), "--apply", "--undo-file", str(undo_file)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["relabelled"] == out["requeued"] == 2 and out["undo_file"] == str(undo_file)
+    record = json.loads(undo_file.read_text(encoding="utf-8"))
+    assert [r["id"] for r in record["rows"]] == ids
+    assert record["rows"][0] | {"id": 0} == {"id": 0, "addressed": "others", "extracted": 1, "extract_attempts": 1,
+                                             "extract_batch_id": 7}
+    s = Store.open(db)
+    try:
+        got = s._query("SELECT id, addressed, extracted, extract_attempts FROM conversation_turns ORDER BY id")
+        assert [tuple(r) for r in got] == [(ids[0], "unanswered", 0, 0), (ids[1], "unanswered", 0, 0)]
+        # the worker judges one of them before the undo: that one is listed and left alone
+        s._write(lambda c: c.execute("UPDATE conversation_turns SET addressed='yuki', extracted=1, extract_batch_id=9"
+                                     " WHERE id=?", (ids[1],)))
+    finally:
+        s.close()
+    assert bf.main(["--db", str(db), "--undo", str(undo_file)]) == 0
+    res = json.loads(capsys.readouterr().out)["undo"]
+    assert res["restored"] == [ids[0]] and [r["id"] for r in res["rejudged"]] == [ids[1]] and res["missing"] == []
+    s = Store.open(db)
+    try:
+        got = s._query("SELECT id, addressed, extracted, extract_attempts, extract_batch_id FROM conversation_turns"
+                       " ORDER BY id")
+        assert [tuple(r) for r in got] == [(ids[0], "others", 1, 1, 7), (ids[1], "yuki", 1, 0, 9)]
+    finally:
+        s.close()
+
+
+def test_f5_apply_leaves_a_row_that_changed_since_the_plan_and_undo_checks_the_database(tmp_path):
+    from yuki.memory import addressee_backfill as bf
+
+    db, logs, ids = _backfill_db(tmp_path)
+    s = Store.open(db)
+    try:
+        p = bf.plan(s, bf.unanswered_turns(bf.read_voice_logs(logs)))
+        s._write(lambda c: c.execute("UPDATE conversation_turns SET extract_attempts=2 WHERE id=?", (ids[0],)))
+        assert bf.apply(s, p, tmp_path / "undo.json") == [ids[1]]
+        assert s.turns_by_ids([ids[0]])[0].addressed == "others"
+        record = json.loads((tmp_path / "undo.json").read_text(encoding="utf-8"))
+        assert [r["id"] for r in record["rows"]] == [ids[1]]
+        # an undo file is refused against another database
+        record["db"] = str(tmp_path / "other.db")
+        (tmp_path / "other.json").write_text(json.dumps(record), encoding="utf-8")
+        with pytest.raises(ValueError):
+            bf.undo(s, tmp_path / "other.json")
+        # an apply whose undo file cannot be written changes nothing
+        p2 = bf.plan(s, ["voice-20261004-230000-bb-1"])
+        with pytest.raises(OSError):
+            bf.apply(s, p2, tmp_path / "no-such-dir" / "undo.json")
+        assert s.turns_by_ids([ids[0]])[0].addressed == "others"
+    finally:
+        s.close()
 
 
 # -- gap 3: why a quote was rejected ---------------------------------------------------------------------------------
