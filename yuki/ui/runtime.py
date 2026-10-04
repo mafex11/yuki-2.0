@@ -63,6 +63,7 @@ from yuki.log.events import (
     Partial,
     ToolCall,
     ToolResult,
+    content_kept,
 )
 from yuki.ui.uilog import UiLog
 
@@ -728,8 +729,8 @@ class AgentRuntime(QObject):
         if worker_agent is None:
             worker_agent = Agent(
                 settings,
-                SessionLogger(
-                    settings.sessions_dir, console=console, session_id=f"{session}-worker"
+                SessionLogger(   # counts, ids and timings only unless YUKI_LOG_CONTENT=1 (report 76)
+                    settings.sessions_dir, console=console, session_id=f"{session}-worker", content=content_kept()
                 ),
                 lane=WORKER,
                 memory=self.memory,
@@ -745,7 +746,7 @@ class AgentRuntime(QObject):
             front_desk_agent = Agent(
                 replace(settings),  # its own copy: the lanes may diverge later
                 SessionLogger(
-                    settings.sessions_dir, console=console, session_id=f"{session}-frontdesk"
+                    settings.sessions_dir, console=console, session_id=f"{session}-frontdesk", content=content_kept()
                 ),
                 dispatcher=Dispatcher(
                     front_desk_blocked,

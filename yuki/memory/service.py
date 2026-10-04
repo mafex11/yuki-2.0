@@ -752,6 +752,12 @@ def run(args: argparse.Namespace) -> int:
                     log("prune", captures_deleted=store.prune(CAPTURE_TTL_DAYS), older_than_days=CAPTURE_TTL_DAYS)
                 except Exception as exc:
                     log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
+                try:   # log files older than 14 days (report 76); counts only
+                    from yuki.log.retention import LOG_RETENTION_DAYS, prune_logs
+
+                    log("prune_logs", older_than_days=LOG_RETENTION_DAYS, **prune_logs(logs_dir()))
+                except Exception as exc:
+                    log("error", where="prune_logs", error=f"{type(exc).__name__}: {exc}")
     except KeyboardInterrupt:
         pass
     except Exception as exc:

@@ -867,6 +867,8 @@ def history_from_session_log(path: Any, *, limit: int = 40, source: str = "histo
             continue
         t = r.get("type")
         ts = _ts(r.get("ts"))
+        if t == "user_message" and "text" not in r:
+            return []   # a content-free log (report 76): no words to show; the caller reads memory's turns instead
         if t == "user_message":
             text = clean_request(str(r.get("text") or ""))
             cur_user = Item(f"h:{stem}:{n}:u", "user", ts, text=text, source=source)
