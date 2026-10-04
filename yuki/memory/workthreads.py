@@ -1210,7 +1210,8 @@ def continue_context(store: Any, t: WorkThread, *, now: float | None = None) -> 
     """What the window shows and offers for a thread's Continue (the feedback round 3, W1d): where it stands and the
     next step, said to the user (the thread's card, written by the nightly pass or the titles pass), its open items,
     and the windows and pages worth bringing back - the capture threads (windows, pages, folders, chats) its own events
-    came from and the pages linked to it, newest first, the user's own (never Yuki's, never only glimpsed). Plus
+    came from and the pages linked to it, newest first, the user's own (never Yuki's, never only glimpsed, never a link
+    someone else shared that the user didn't open). Plus
     ``ask``: the request the window can hand to Yuki to continue it, from those parts. Read only, no model."""
     from yuki.memory.titles import natural_day
 
@@ -1239,7 +1240,10 @@ def continue_context(store: Any, t: WorkThread, *, now: float | None = None) -> 
         if len(places) >= CONTINUE_PLACES:
             break
     try:
-        links = [link for link in store.links(limit=400) if link.work_thread_id == t.id and not link.by_yuki
+        # pages the user viewed only: a link someone shared in a chat (``how`` shared) may never have been opened by
+        # the user, and Continue reopens what they had, never a third party's address (appWork second review S2)
+        links = [link for link in store.links(limit=400, how="viewed") if link.work_thread_id == t.id
+                 and not link.by_yuki and getattr(link, "how", "viewed") == "viewed"
                  and getattr(link, "attention", None) is None]
     except Exception:
         links = []

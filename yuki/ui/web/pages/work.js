@@ -196,14 +196,16 @@
     const items = listItems(d);
     for (const t of items) if (!(w.seen && w.seen.has(t.ref)) && t.since && nowS() - t.since < 120) w.arrived.add(t.ref);   // said to me: slides in once
     w.seen = new Set(items.map((t) => t.ref).concat(w.seen ? Array.from(w.seen) : []));
-    const open = !!w.more.list, extra = Math.max(0, items.length - SHOWN);
+    // an "adding it…" row counts toward the 6 shown, so the list never briefly shows 7 (second review V2)
+    const adding = w.adding.filter((a) => !items.some((t) => t.ref === a.ref)).map(addingRow);
+    const shown = Math.max(0, SHOWN - adding.length);
+    const open = !!w.more.list, extra = Math.max(0, items.length - shown);
     const rows = items.map((t, i) => {
       const r = Y.todoRow(t, d, 'work', true);
-      if (i >= SHOWN) r.classList.add('more');
+      if (i >= shown) r.classList.add('more');
       if (w.arrived.has(t.ref)) r.classList.add('arriving');
       return r;
     });
-    const adding = w.adding.filter((a) => !items.some((t) => t.ref === a.ref)).map(addingRow);
     const done = (T.done || []).filter((t) => !items.some((o) => o.ref === t.ref));
     const body = [addLine(T),
       h('div', { class: 'wrows' + (open ? ' open' : ''), data: { k: 'rows' } }, adding, rows.length || adding.length ? rows : wempty('Nothing on your list. Add one above, or say “Yuki, add … to my list”.')),
@@ -218,14 +220,17 @@
   function waitRow(o) {
     return h('div', { class: 'wrow ww', data: { k: 'wait:' + o.ref, wref: o.ref } }, av(o.who),
       h('div', { class: 'wtx' }, h('div', { class: 'wt' }, h('b', { text: o.who }), ' ', h('span', { class: 't2', text: 'to ' + o.what })),
-        h('div', { class: 'wm' }, o.where ? h('span', { text: o.where }) : null, o.day ? h('span', { text: o.day }) : null)),
+        h('div', { class: 'wm' }, o.basis ? h('span', { text: o.basis === 'offered' ? 'they said they would' : 'you asked' }) : null,
+          o.where ? h('span', { text: o.where }) : null, o.day ? h('span', { text: o.day }) : null)),
       ageDots(o.since),
       acts(o.draft ? key('Draft a nudge', { cls: 'xs', icon: 'edit', data: { do: 'work-nudge' }, title: 'A draft in the ask bar. Nothing is sent until you press Enter.' }) : null,
         key('They did it', { cls: 'xs ghost', data: { do: 'work-gotit' } })));
   }
   function waitBlock(d) {
     const list = d.waiting || [];
-    return Y.k(Y.sec('Waiting on', list.length, h('div', { class: 'wrows', data: { k: 'rows' } }, list.length ? list.map(waitRow) : wempty('Nobody owes you anything right now.')),
+    // until memory has judged your open threads, someone may well owe you: say it's still reading (second review V3)
+    const none = d.ready ? 'Nobody owes you anything right now.' : 'I haven’t read your open threads for this yet. Who owes you shows here.';
+    return Y.k(Y.sec('Waiting on', list.length, h('div', { class: 'wrows', data: { k: 'rows' } }, list.length ? list.map(waitRow) : wempty(none)),
       Y.rightLabel('a nudge is only a draft'), 'wsec wk-wait'), 'wait');
   }
 
@@ -413,7 +418,8 @@
     Y.renderMain();
     Y.act('todo_add', { text, words: true }).then((r) => {
       if (!r.ok) { w.adding = w.adding.filter((x) => x !== a); Y.toast(r.error || 'Couldn’t add it. Memory didn’t answer.', true); Y.renderMain(); return; }
-      a.ref = r.ref; w.arrived.add(r.ref);
+      // already on screen as "adding it…": memory's row takes its place as it is, never sliding in a second time
+      a.ref = r.ref; w.seen = w.seen || new Set(); w.seen.add(r.ref); w.arrived.delete(r.ref);
       setTimeout(() => { w.adding = w.adding.filter((x) => x !== a); Y.renderMain(); }, 15000);   // memory's build has it by then
       Y.toast(r.due ? 'Added to your list, with its due date.' : 'Added to your list.');
     });
@@ -515,17 +521,44 @@
     if (!Y.S.open.has('f:' + k)) { Y.S.open.add('f:' + k); Y.renderMain(); }
     Y.focusBlock(main.querySelector(`[data-k="${CSS.escape('f:' + k)}"]`), 'day-at', 'center');
   }
-  /* an item said to me ("Yuki, add …") slides into Your list once, with a mint flash */
+  /* an item said to me ("Yuki, add …") slides into Your list once, with a mint flash. Until it lands, the row it
+     pushes past the first 6 stands in for it, folding away as it slides in, and "Show N more" keeps its count, so
+     nothing below moves (as the mock does; second review V1) */
+  const ARRIVE_MS = 420;
   function arrive(main) {
-    const w = W();
-    main.querySelectorAll('.wk-list .wrow.arriving').forEach((r) => {
+    const w = W(), list = main.querySelector('.wk-list .wrows');
+    const arriving = Array.from(main.querySelectorAll('.wk-list .wrow.arriving'));
+    const motion = !window.Lattice.Motion.reduced;
+    const moving = [];
+    arriving.forEach((r) => {
       const ref = r.dataset.cref || (r.dataset.k || '').replace(/^todo:/, '');
       w.arrived.delete(ref); w.slid = (w.slid || 0) + 1;
       r.classList.remove('arriving');
-      if (window.Lattice.Motion.reduced || !r.animate) return;
+      if (motion && r.animate && !(r.classList.contains('more') && list && !list.classList.contains('open'))) moving.push(r);
+    });
+    if (!moving.length) return;
+    const folded = list && !list.classList.contains('open') ? Array.from(list.querySelectorAll(':scope > .wrow.more')) : [];
+    const peeks = folded.filter((r) => !moving.includes(r)).slice(0, moving.length);
+    const more = peeks.length && main.querySelector('.wk-list [data-do="work-more"][data-which="list"]');
+    const moreText = more && more.textContent;
+    if (more) { const k = folded.length - peeks.length; if (k > 0) more.textContent = `Show ${k} more`; else more.style.visibility = 'hidden'; }
+    const opts = { duration: ARRIVE_MS, easing: Y.EASE };
+    const flat = { height: '0px', minHeight: '0px', paddingTop: '0px', paddingBottom: '0px', borderTopWidth: '0px', opacity: 0 };
+    peeks.forEach((pk) => pk.classList.add('wkpeek'));
+    const sizes = peeks.map((pk) => pk.offsetHeight);
+    moving.forEach((r) => {
       const hh = r.offsetHeight;
-      r.animate([{ height: '0px', minHeight: '0px', paddingTop: '0px', paddingBottom: '0px', opacity: 0 }, { height: hh + 'px', minHeight: hh + 'px', opacity: 1 }], { duration: 420, easing: Y.EASE });
+      r.style.overflow = 'hidden';
+      r.animate([flat, { height: hh + 'px', minHeight: hh + 'px', opacity: 1 }], opts).onfinish = () => { r.style.overflow = ''; };
       const tt = r.querySelector('.wt'); if (tt) tt.animate([{ background: 'rgba(111,235,196,.18)' }, { background: 'rgba(111,235,196,0)' }], { duration: 1800, delay: 300, easing: Y.EASE });
+    });
+    peeks.forEach((pk, i) => {
+      pk.style.overflow = 'hidden';
+      const an = pk.animate([{ height: sizes[i] + 'px', minHeight: sizes[i] + 'px', opacity: 1 }, flat], { ...opts, fill: 'forwards' });
+      an.onfinish = () => {
+        pk.classList.remove('wkpeek'); pk.style.overflow = ''; an.cancel();
+        if (i === 0 && more && more.isConnected) { more.textContent = moreText; more.style.visibility = ''; }
+      };
     });
   }
 

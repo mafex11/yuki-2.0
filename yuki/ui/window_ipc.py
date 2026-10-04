@@ -43,14 +43,15 @@ VERSION = 2
 #: ``activity(filter)``, ``threads``, ``people``, ``workflows``, ``workflow_edit``, ``permissions_get``,
 #: ``permissions_set(kind, level)``, ``forget(object)``; then the HTML window's (E3/E4): ``offer(card)`` and
 #: ``offer_undo(card)`` (an offer's button and Undo, as the corner card's), ``askbar(text)`` (the ask bar with text
-#: in it, unsent). Unasked events the tray may send: ``snapshot``,
+#: in it, unsent); then the Work page's ``start(text, shown)`` (a click's request, always a new one: never an answer
+#: or a paused request's words). Unasked events the tray may send: ``snapshot``,
 #: ``chat``, ``state``, ``focus`` and (E5) ``permissions`` (the policy changed).
 OPS: tuple[str, ...] = (
     "hello", "state", "submit", "nudge_do", "cancel", "voice_set", "voice_toggle", "devices", "model", "effort",
     "ui_settings", "ensure_memory", "open_logs", "snooze",
     "stop", "steer", "now", "plan", "card_feedback", "activity", "threads", "people", "workflows",
     "workflow_edit", "permissions_get", "permissions_set", "forget",
-    "offer", "offer_undo", "askbar",
+    "offer", "offer_undo", "askbar", "start",
 )
 _BUF = 1 << 16
 #: Largest message either side accepts.

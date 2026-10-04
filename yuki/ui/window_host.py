@@ -468,6 +468,8 @@ class WindowHost(QObject):
         "permissions_get": "_op_permissions_get", "permissions_set": "_op_permissions_set", "forget": "_op_forget",
         # E3/E4 (the HTML window's pages): an offer's button and its Undo, the ask bar
         "offer": "_op_offer", "offer_undo": "_op_offer_undo", "askbar": "_op_askbar",
+        # the Work page's Continue run (report 68, second review S3): always a new request
+        "start": "_op_start",
     }
     #: The autonomy policy file (``None``: :func:`yuki.ui.policy.policy_path`); tests point it at a temp file.
     policy_path: Path | None = None
@@ -867,6 +869,35 @@ class WindowHost(QObject):
         self._on_gui(show)
         self._log("window_op", op="askbar", chars=len(text))
         return {}
+
+    def _op_start(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``start(text, shown)``: a request the window built from a click (Work's Continue run), always as a **new**
+        request. Unlike ``submit`` it never becomes the answer to a question Yuki has open, nor the user's words to a
+        request paused for their takeover, nor a reply to a recent card: while a question or a paused request is open
+        it refuses in plain words and nothing runs (second review S3). ``shown``: the bubble in the chat (the request
+        itself carries fenced data the user doesn't need to read)."""
+        text = str(req.get("text") or "").strip()
+        shown = " ".join(str(req.get("shown") or "").split())[:200] or text
+        if not text:
+            return {"ok": False, "error": "empty"}
+
+        def go() -> dict[str, Any]:
+            ui = self.ui
+            if getattr(ui, "_question", None) is not None:
+                return {"ok": False, "error": "Yuki is waiting on your answer to a question first. Answer it, then "
+                                              "try again."}
+            runtime = ui.runtime
+            paused = runtime.paused_id() if callable(getattr(runtime, "paused_id", None)) else None
+            if paused is not None:
+                return {"ok": False, "error": "A request is paused for you. Let it go on or stop it, then try again."}
+            lane, request_id = runtime.submit(text, origin_hwnd=getattr(ui, "_origin_hwnd", None))
+            self.user_message(request_id, shown)
+            ui.cards[request_id] = ui.overlay.add_card(shown)
+            ui.ui_log.event("submit", id=request_id, lane=lane, text=shown, via="window_start")
+            return {}
+        reply = self._on_gui(go)
+        self._log("window_op", op="start", chars=len(text), ok=not (reply or {}).get("error"))
+        return reply if isinstance(reply, dict) else {"ok": False, "error": "Yuki didn't answer. Try again."}
 
     # -- the window's process ----------------------------------------------------------------------
 

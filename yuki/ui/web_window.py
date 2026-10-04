@@ -358,26 +358,28 @@ def app_windows(process: str | None) -> list[tuple[int, str]]:
 def bring_forward(place: dict[str, Any]) -> tuple[bool, str]:
     """Bring a chat forward. Types, clicks and sends nothing. ``(ok, how)``:
 
-    * ``"chat"``: the app's window whose title holds the chat's name, restored if minimised and focused;
-    * ``"page"``: the chat's own address opened (the browser focuses or opens its tab), for a chat in a browser
-      (``browser``: measured by memory) with no window showing it, or any chat whose app has no window open;
+    * ``"page"``: a chat in a browser (``browser``: measured by memory) opens by its own address (the browser focuses
+      or opens its tab), and so does any chat whose app has no window open. A browser's window titles are never
+      matched: a tab titled "Samsung review" holds "Sam" and is not Sam's chat (second review S4);
+    * ``"chat"``: a desktop app's window whose title holds the chat's name, restored if minimised and focused;
     * ``"app"``: a desktop app's topmost window (one window holds all its chats, so the chat is a click away);
-    * ``(False, "lost")``: a browser chat with no window showing it and no address (another tab on top is not it);
+    * ``(False, "lost")``: a browser chat with no address (another tab on top is not it), nothing focused;
       ``(False, "")``: nothing of the app open and no address."""
-    windows = app_windows(place.get("process"))
-    name = " ".join(str(place.get("name") or "").split()).casefold()
-    pick = next(((h, t) for h, t in windows if name and name in t.casefold()), None)
     url = str(place.get("url") or "")
     web = url.startswith(("https://", "http://"))
-    if pick is None and web and (place.get("browser") or not windows):
+    browser = bool(place.get("browser"))
+    windows = [] if browser and web else app_windows(place.get("process"))
+    if web and (browser or not windows):
         import webbrowser
 
         try:
             return bool(webbrowser.open(url)), "page"
         except Exception:  # noqa: BLE001
             return False, ""
-    if pick is None and windows and place.get("browser"):
-        return False, "lost"
+    if browser:
+        return False, ("lost" if windows else "")
+    name = " ".join(str(place.get("name") or "").split()).casefold()
+    pick = next(((h, t) for h, t in windows if name and name in t.casefold()), None)
     how = "chat" if pick else "app"
     pick = pick or (windows[0] if windows else None)
     if pick is not None:
@@ -388,10 +390,23 @@ def bring_forward(place: dict[str, Any]) -> tuple[bool, str]:
     return False, ""
 
 
-def continue_request(cont: dict[str, Any]) -> str:
-    """The request a "Worked on today" row hands Yuki (the Continue run): bring back the windows and pages the thread
-    had, named as memory has them, and nothing else: no typing, clicking or sending."""
-    title = " ".join(str(cont.get("title") or "that").split())
+#: Where the Continue run's names come from, as its fence says (the same words the agent's memory reads use).
+CONTINUE_SOURCE = "memory (window titles and pages seen)"
+#: The Continue run's own words: fixed, never memory's text (second review S1). Memory's thread title and the window
+#: titles and addresses it saw were written by apps, web pages and other people, so they ride below, fenced as data.
+CONTINUE_WORDS = ("Pick up the work I clicked on my Work page (its name and places are below). Bring back only the "
+                  "windows and pages listed there; don't type, click or send anything.")
+
+
+def continue_request(cont: dict[str, Any]) -> tuple[str, str]:
+    """The Continue run a "Worked on today" row starts: ``(request, shown)``. ``request`` is fixed words of the user's
+    (:data:`CONTINUE_WORDS`: reopen the listed places, type, click and send nothing) followed by memory's thread title
+    and the windows and pages it saw, fenced as untrusted data (:func:`yuki.agent.untrusted.wrap`, the same fence every
+    agent path puts round captured text) in a note after the words, so the agent's judge never reads a window title as
+    the user's own words (second review S1). ``shown``: the bubble the user sees ("Pick up “Garden planner”")."""
+    from yuki.agent.untrusted import new_nonce, wrap
+
+    title = " ".join(str(cont.get("title") or "").split())
     names = []
     for p in cont.get("places") or []:
         if not isinstance(p, dict):
@@ -403,9 +418,11 @@ def continue_request(cont: dict[str, Any]) -> str:
             what += f" ({url})"
         if what and what not in names:
             names.append(what)
-    had = f": {'; '.join(names)}" if names else ""
-    return (f"Pick up {title}. Bring back the windows and pages I had open for it{had}. Only reopen them; "
-            "don't type, click or send anything.")
+    data = "\n".join([f"The work: {title or 'untitled'}", *(f"- {n}" for n in names or ["(no places on record)"])])
+    request = (f"{CONTINUE_WORDS}\n\n[The work and its places, as memory saw them on screen:\n"
+               f"{wrap(data, source=CONTINUE_SOURCE, nonce=new_nonce())}]\n\n"
+               "[Started from the Yuki app's Work page (a Worked on today row): there is room for a complete answer.]")
+    return request, (f"Pick up “{title}”" if title else "Pick up that work")
 
 
 class WebWindow:
@@ -1682,7 +1699,10 @@ class WebWindow:
         cont = self._memory_op("thread_continue")(str(m.get("ref") or ""))
         if not cont:
             return {"ok": False, "error": "I can’t find that work any more."}
-        return {**self._tray("submit", text=continue_request(cont)), "title": cont.get("title") or ""}
+        request, shown = continue_request(cont)
+        # ``start``: always a new request (second review S3). The plain ``submit`` would take it as the answer to a
+        # question Yuki has open, or as your words to a paused request; the tray refuses instead while one is.
+        return {**self._tray("start", text=request, shown=shown), "title": cont.get("title") or ""}
 
     def a_work_nudge(self, m: dict[str, Any]) -> dict[str, Any]:
         """Waiting on's Draft a nudge: memory's draft for that loop (read again here by its id; the page sends no

@@ -363,10 +363,10 @@ def work_board() -> dict:
     """An invented judged board (memory's ``work_board`` shape): who owes what in the open loops, with a nudge draft
     for the ones you wait on."""
     return {"loops": {
-        13: {"kind": "waiting", "who": "Dev", "what": "send the bed measurements", "where": "Signal",
+        13: {"kind": "waiting", "who": "Dev", "what": "send the bed measurements", "where": "Signal", "basis": "asked",
              "draft": "message Dev on Signal: hey, any luck with the bed measurements?"},
         14: {"kind": "waiting", "who": "Ana", "what": "book the community hall", "where": "Allotment Club, #seed-swap",
-             "draft": "message Ana on Mumble: did the hall booking go through?"},
+             "basis": "offered", "draft": "message Ana on Mumble: did the hall booking go through?"},
         15: {"kind": "promised", "who": "Noor", "what": "Send Noor the drum loop", "where": "Signal"},
         16: {"kind": "asked", "who": "Riya", "what": "Add a dark mode to the planner", "where": "Signal"},
         12: {"kind": "asked", "who": "Riya", "what": "Send Riya the climbing photos", "where": "Signal"}},
@@ -535,6 +535,7 @@ def build() -> dict:
         "todos": {"open": cols["list"], "done": cols["done"], "n": len(cols["list"]), "can": can},
         "waiting": cols["waiting"], "said": cols["said"],
         "replies": {"items": work_replies(), "ready": True},
+        "ready": True,
         "today": {"focus": 306, "usual": 340,
                   "longest": {"min": 52, "app": "VS Code", "title": "Bed sizes screen", "at": ago(11 * H + 40 * M),
                               "from": "10:12 AM"},

@@ -1304,6 +1304,51 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
             "coming_seen": f"seen on your screen in {_and(seen)}" if seen else ""}
 
 
+def dates_said(text: str, now: float) -> str:
+    """``text`` with any machine date in it ("2026-10-09", "2026-10-09 17:00") said the page's one way ("Friday",
+    "tomorrow 5 PM", "25 September"): a model's words can carry one though asked not to (second review M2). A format
+    read token by token (a date parses or it doesn't), never a guess about what the words mean."""
+    words = str(text or "").split(" ")
+    out: list[str] = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        core = w.rstrip(".,;:)")
+        tail = w[len(core):]
+        try:
+            day = datetime.strptime(core, "%Y-%m-%d") if len(core) == 10 else None
+        except ValueError:
+            day = None
+        if day is None:
+            out.append(w)
+            i += 1
+            continue
+        at, all_day = day.timestamp(), True
+        if not tail and i + 1 < len(words):   # "2026-10-09 17:00": the time after it
+            nxt = words[i + 1].rstrip(".,;:)")
+            try:
+                hm = datetime.strptime(nxt, "%H:%M") if len(nxt) == 5 else None
+            except ValueError:
+                hm = None
+            if hm is not None:
+                at, all_day = at + hm.hour * 3600 + hm.minute * 60, False
+                tail = words[i + 1][len(nxt):]
+                i += 1
+        today = datetime.fromtimestamp(now).date()
+        said = ahead_words(at, all_day, now) if day.date() >= today else week_words(at, now)
+        out.append(said + tail)
+        i += 1
+    return " ".join(out)
+
+
+def _loop_title(loop: dict[str, Any] | None, now: float) -> str:
+    """An open loop's own words for a row with no memory title: memory's judged ``what`` (said to the user, a verb
+    first) for something asked of or promised by them, its dates said the page's way; ``""`` for anything else."""
+    if not loop or loop.get("kind") not in ("asked", "promised"):
+        return ""
+    return dates_said(" ".join(str(loop.get("what") or "").split()), now)
+
+
 def _from_words(t: dict[str, Any], loop: dict[str, Any] | None, now: float) -> str:
     """Where a row of Your list came from, in the Work page's words (Home keeps ``from``): ``added Wednesday``, ``you
     told me, yesterday``, ``you said it on a call, Tuesday``, ``Mira asked in Slack, Wednesday``."""
@@ -1342,9 +1387,12 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
         loop = loops.get(int(number)) if kind == "loop" and number.isdigit() else None
         moved = ref in listed
         if kind == "loop" and loop and loop.get("kind") == "waiting" and not moved:
-            waiting.append({"ref": ref, "who": loop.get("who") or "", "what": loop.get("what") or t["text"],
+            waiting.append({"ref": ref, "who": loop.get("who") or "",
+                            "what": dates_said(loop.get("what") or "", now) or t["text"],
                             "where": loop.get("where") or "", "since": t.get("since"),
                             "day": week_words(t.get("since"), now), "draft": loop.get("draft") or "",
+                            # what the wait rests on (second review V5): they offered, or you asked
+                            "basis": loop.get("basis") if loop.get("basis") in ("offered", "asked") else "",
                             "text": t["text"]})
             continue
         if not moved and ((kind == "commit" and t.get("source") in ("chat", "call"))
@@ -1354,13 +1402,16 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
                 where = ("on a call" if t.get("source") == "call" else "said to me")
             else:
                 where = loop.get("where") or ""
-            said.append({"ref": ref, "title": (loop or {}).get("what") or t.get("title") or t["text"], "text": t["text"],
+            said.append({"ref": ref, "title": dates_said((loop or {}).get("what") or "", now) or t.get("title") or t["text"],
+                         "text": t["text"],
                          "where": where, "day": week_words(t.get("since"), now), "quote": quote,
                          "who": (loop or {}).get("who") or "", "due": t.get("due") or "", "over": t.get("over"),
                          "due_at": t.get("due_at"), "all_day": t.get("all_day"), "since": t.get("since"),
                          "tomorrow": t.get("tomorrow")})
             continue
-        lst.append({**t, "meta": _from_words(t, loop, now), "moved": moved})
+        # a row memory hasn't titled yet: a loop's judged words, never its raw third-person text (second review V4)
+        lst.append({**t, "title": t.get("title") or _loop_title(loop, now) or None, "meta": _from_words(t, loop, now),
+                    "moved": moved})
     for k in kept:
         said.append({"ref": k["ref"], "title": k.get("title") or k["text"], "text": k["text"],
                      "closed": f"closed itself: I saw it done {week_words(k['closed_at'], now, in_sentence=True)}",
@@ -1373,7 +1424,8 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
 
     # a promise memory saw kept shows once: struck through in You said you'd (Not done yet), not again in Recently
     # done (review F3). Every row there can be put back (memory's reopen_item at any age; review F7).
-    done = [{**t, "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:", "loop:"))}
+    done = [{**t, "title": t.get("title") or _loop_title(loop_of(t["ref"]), now) or None,
+             "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:", "loop:"))}
             for t in done_todos if t["ref"] not in kept_refs]
     return {"list": lst, "done": done, "said": said, "waiting": waiting}
 
@@ -1401,6 +1453,9 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict
     return {"todos": {"open": cols["list"], "done": cols["done"], "n": len(cols["list"]), "can": can},
             "waiting": cols["waiting"], "said": cols["said"],
             "replies": {"items": replies, "ready": bool(board.get("ready"))},
+            # whether memory has judged the chats and open loops at all (second review V3): until then Waiting on
+            # says it is still reading instead of "nobody owes you anything"
+            "ready": bool(board.get("ready")),
             "today": work_today(memory, v, sessions, board, now),
             "week": week if week is not None else week_figure(memory),
             "pending": pending_view(pending, ("episode:", *TODO_PREFIXES), now),

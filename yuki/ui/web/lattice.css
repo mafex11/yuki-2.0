@@ -1011,7 +1011,7 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
 .wadd input { flex: 1; min-width: 0; border: 0; background: transparent; outline: 0; color: var(--text); font: inherit; font-size: 13.5px; }
 .wadd input::placeholder { color: var(--text-3); }
 .wadd .hint { font: 500 11px/1 var(--f-mono); color: var(--text-3); white-space: nowrap; }
-.wrows:not(.open) > .wrow.more { display: none; }
+.wrows:not(.open) > .wrow.more:not(.wkpeek) { display: none; }   /* wkpeek: the stand-in while a row arrives */
 .wfoot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 28px; padding-top: 4px; border-top: 1px solid var(--hair); }
 .wfold-b { display: inline-flex; align-items: center; gap: 8px; height: 22px; padding: 0 4px; border: 0; background: transparent; color: var(--text-3); font: 500 11.5px/1 var(--f-mono); cursor: pointer; }
 .wfold-b:hover { color: var(--text-2); }

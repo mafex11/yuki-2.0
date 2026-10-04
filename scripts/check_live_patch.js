@@ -781,6 +781,9 @@ async function inPage(F) {
   ['Nothing on your list', 'Nobody owes you', 'caught up', 'No promises', 'No usual', 'tie to your work', 'coming up'].filter((s) => !txt.includes(s)).join(', '));
   await push('work', Object.assign(clone(empty), { replies: { items: [], ready: false } })); await sleep(80);
   check('WK14 before memory has read the chats, it says so (never "caught up")', main().textContent.includes('I haven’t read your chats for this yet') && !main().textContent.includes('caught up'));
+  await push('work', Object.assign(clone(empty), { ready: false, replies: { items: [], ready: false } })); await sleep(80);
+  check('WK14 before memory has judged your open threads, Waiting on says so (never "nobody owes you"; second review V3)',
+    sec('wait').textContent.includes('I haven’t read your open threads for this yet') && !sec('wait').textContent.includes('Nobody owes you'), sec('wait').textContent);
   await push('work', clone(FW)); await sleep(150);
   // Your list
   const wl = () => sec('list');
@@ -859,6 +862,10 @@ async function inPage(F) {
   check('WK9 Waiting on: "<who> to <what>", where and when, one dot per day waited and the age in words', wait().querySelectorAll('.wrows > .wrow').length === FW.waiting.length
     && wr0().querySelector('.wt').textContent === `${w0.who} to ${w0.what}` && /\d day|yesterday|hour|min/.test(wr0().querySelector('.wage').textContent) && wr0().querySelectorAll('.adots i').length === 3,
   wr0() && wr0().textContent);
+  const basisOf = (o) => (o.basis === 'offered' ? 'they said they would' : o.basis === 'asked' ? 'you asked' : '');
+  check('WK9 each wait says what it rests on first: they said they would, or you asked (second review V5)', FW.waiting.every((o) => !!o.basis)
+    && FW.waiting.every((o) => { const r = wait().querySelector(`.wrow[data-wref="${o.ref}"] .wm span`); return r && r.textContent === basisOf(o); }),
+  FW.waiting.map((o) => o.basis).join(','));
   REPLY.work_nudge = { ok: true, text: w0.draft };
   wr0().querySelector('[data-do="work-nudge"]').click(); await sleep(120);
   check('WK9 Draft a nudge puts the draft in the ask bar, unsent (work_nudge with the loop only; nothing sent here)', last('work_nudge').ref === w0.ref && !('text' in last('work_nudge'))
@@ -940,6 +947,51 @@ async function inPage(F) {
   await push('work', clone(FW)); await sleep(100);
   check('WK15 no threads on Work and no ISO dates anywhere on it', !main().querySelector('.thread, [data-do="thread-close"], .tfold') && !/\bThreads?\b|Closed lately|Not a thread/.test(main().textContent)
     && !/\d{4}-\d{2}-\d{2}/.test(main().textContent));
+  // second review V1: a to-do said by voice arrives while the page is open: the row it pushes past the first 6
+  // stands in until it lands, so Waiting on and the footer never move and "Show N more" holds its count
+  Y.S.work.adding = []; Y.S.work.more.list = false; Y.renderMain();
+  await push('work', clone(FW)); await sleep(500);
+  const track = (ms, fn) => new Promise((res) => { const out = []; const t0 = performance.now();
+    const step = () => { out.push(fn()); if (performance.now() - t0 < ms) requestAnimationFrame(step); else res(out); }; requestAnimationFrame(step); });
+  const waitTop = () => Math.round(sec('wait').getBoundingClientRect().top * 10) / 10;
+  const moreTxt = () => (wl().querySelector('[data-do="work-more"][data-which="list"]') || {}).textContent;
+  const said1 = clone(FW), v1 = Object.assign(clone(FW.todos.open.find((t) => t.source === 'user') || FW.todos.open[0]),
+    { ref: 'todo:701', text: 'Invented to-do said just now', title: 'Invented to-do said just now', since: Date.now() / 1000 - 5, source: 'user',
+      due: '', over: false, due_at: null, tomorrow: false, meta: 'added at 3 PM', evidence: null });
+  said1.todos.open.unshift(v1); said1.todos.n += 1;
+  const top0 = waitTop(), more0 = moreTxt();
+  push('work', said1);
+  const seen1 = await track(700, () => [waitTop(), moreTxt(), (wl().querySelector('.wrow[data-cref="todo:701"]') || {}).offsetHeight || 0]);
+  const tops1 = seen1.map((x) => x[0]), moves1 = Math.max(...tops1) - Math.min(...tops1);
+  const counts1 = Array.from(new Set(seen1.map((x) => x[1]).filter(Boolean)));
+  check('WK18 a to-do said by voice slides in while nothing below the list moves (second review V1)', moves1 <= 1.5 && Math.abs(tops1[0] - top0) <= 1.5
+    && seen1.some((x) => x[2] > 0 && x[2] < 40), `top ${top0} -> ${Math.min(...tops1)}..${Math.max(...tops1)}, heights ${seen1.map((x) => x[2]).slice(0, 8).join(',')}`);
+  check('WK18 "Show N more" keeps its count until the row lands, then counts it', counts1.length <= 2 && seen1[0][1] === more0 && moreTxt() === `Show ${wl().querySelectorAll('.wrows > .wrow.wli').length - 6} more`,
+    `${more0} -> ${counts1.join(' / ')} -> ${moreTxt()}`);
+  check('WK18 the stand-in is gone once the row has landed: six rows show, the new one among them', !wl().querySelector('.wkpeek')
+    && Array.from(wl().querySelectorAll('.wrows > .wrow.wli')).filter(visible).length === 6 && !!wl().querySelector('.wrow[data-cref="todo:701"]'),
+    `${wl().querySelectorAll('.wkpeek').length} peeks, ${wl().querySelectorAll('.wrows > .wrow.wli').length} rows`);
+  // second review V2: a typed add shows "adding it…" within the 6 and memory's row takes its place without sliding in
+  await push('work', clone(FW)); await sleep(500);
+  Y.S.work.seen.delete('todo:777');
+  REPLY.todo_add = (m) => ({ ok: true, ref: 'todo:777', due: null });
+  const top2 = waitTop(), addIn2 = wl().querySelector('.wl-in');
+  addIn2.value = 'An invented typed to-do'; enter(addIn2); await sleep(30);
+  const vis2 = Array.from(wl().querySelectorAll('.wrows > .wrow')).filter(visible).length;
+  check('WK19 the "adding it…" row counts toward the 6 shown (second review V2)', !!wl().querySelector('.wrow.adding') && vis2 === 6 && Math.abs(waitTop() - top2) <= 1.5,
+    `${vis2} rows, top ${top2} -> ${waitTop()}`);
+  await sleep(150);
+  const typed = clone(FW), v2 = Object.assign(clone(v1), { ref: 'todo:777', text: 'An invented typed to-do', title: 'An invented typed to-do', since: Date.now() / 1000 - 1 });
+  typed.todos.open.unshift(v2); typed.todos.n += 1;
+  const top2b = waitTop();
+  push('work', typed);
+  const seen2 = await track(600, () => [waitTop(), (wl().querySelector('.wrow[data-cref="todo:777"]') || {}).offsetHeight || 0, !!wl().querySelector('.wrow.adding')]);
+  const hs2 = seen2.map((x) => x[1]).filter((x) => x > 0), tops2 = seen2.map((x) => x[0]);
+  check('WK19 memory’s row takes the adding row’s place as it is: no second slide-in, nothing below moves', hs2.length > 0 && Math.min(...hs2) >= Math.max(...hs2) - 2
+    && Math.max(...tops2) - Math.min(...tops2) <= 2.5 && Math.abs(tops2[0] - top2b) <= 2.5 && !wl().querySelector('.wrow.adding'),
+  `heights ${Math.min(...hs2)}..${Math.max(...hs2)}, top ${top2b} -> ${Math.min(...tops2)}..${Math.max(...tops2)}`);
+  Y.S.work.adding = [];
+  await push('work', clone(FW)); await sleep(150);
   // open_yuki's "todos": the window opens on Home at Your list; "see all" opens Work at the list
   await go('#home'); await sleep(400);
     window.__push({ kind: 'focus', page: 'home', sub: 'list' }); await sleep(400);
