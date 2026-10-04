@@ -247,6 +247,34 @@ def test_the_thread_fires_once_then_ends():
     assert got == ["mouse"] and t.fired == "mouse" and not t.running and stub.polls == 3
 
 
+def test_a_takeover_not_taken_now_keeps_the_thread_watching():
+    answers = [False, False, True]
+    got: list[str] = []
+
+    def on(kind: str) -> bool:
+        got.append(kind)
+        return answers.pop(0)
+
+    t = TakeoverThread(on, move_px=40, poll_s=0.01, watch=lambda: _Watch(1, "keys")).start()
+    t._thread.join(2.0)
+    assert got == ["keys"] * 3 and t.refused == 2 and t.fired == "keys"
+
+
+def test_no_pause_while_yuki_asks_or_a_send_counts_down(tmp_path: Path):
+    agent = _agent(Brain([]), tmp_path, _desk(), watches=Watches())
+    agent._acting_token = "acting"
+    agent._awaiting_answer = True                 # the hand goes to Answer on the island
+    assert agent.pause("mouse") is False
+    agent._awaiting_answer = False
+    agent._send_open = {"who": "Sam"}             # the hand goes to Stop or a chip on the send card
+    assert agent.pause("click") is False
+    agent._send_open = None
+    agent._pause_quiet_until = time.monotonic() + 5.0   # and for a moment after, while it moves on
+    assert agent.pause("mouse") is False
+    agent._pause_quiet_until = 0.0
+    assert agent.pause("mouse") is True and agent.paused
+
+
 def test_a_stopped_thread_never_fires_and_the_grace_delays_the_first_look():
     got: list[str] = []
     made: list[float] = []

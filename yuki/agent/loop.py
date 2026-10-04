@@ -571,6 +571,7 @@ class Agent:
         self._paused_s = 0.0
         self._pauses = 0
         self._stopped_paused = False
+        self._pause_quiet_until = 0.0
         self._watch: Any = None
         self._pending_answer: str | None = None
         self._awaiting_answer = False
@@ -1008,6 +1009,10 @@ class Agent:
         with self._pause_lock:
             if self._acting_token is None or self._cancelled.is_set() or self._paused.is_set():
                 return False
+            if self._awaiting_answer or self._send_open is not None or time.monotonic() < self._pause_quiet_until:
+                # Yuki asked something, or a send counts down on the island: the user's hand is on Yuki's card (the
+                # answer, Stop, a chip), not taking over; and for a moment after, while that hand moves on
+                return False
             self._pause_why, self._pause_at = str(why or ""), time.monotonic()
             self._pauses += 1
             self._paused.set()
@@ -1063,9 +1068,10 @@ class Agent:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _on_takeover(self, kind: str) -> None:
-        """The watch saw the user take over (its own thread)."""
-        self.pause(kind)
+    def _on_takeover(self, kind: str) -> bool:
+        """The watch saw the user take over (its own thread). ``False``: not taken as a pause now (Yuki is asking, a
+        send counts down): the watch goes on."""
+        return self.pause(kind)
 
     def _hold_paused(self) -> Iterator[AgentEvent]:
         """When the user took over: say so (:class:`Paused`), wait until they resume, stop, or the limit passes, and
@@ -1244,6 +1250,7 @@ class Agent:
         self._paused.clear()
         self._pause_wake.clear()
         self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
+        self._pause_quiet_until = 0.0
         stale = self.take_steers()
         self._pending_answer = None
         self._awaiting_answer = False
@@ -2717,6 +2724,7 @@ class Agent:
             yield AskUser(question)  # generator pauses here
             self._waited_s += time.monotonic() - asked_at
             self._awaiting_answer = False
+            self._pause_quiet_until = time.monotonic() + RESUME_GRACE_S   # appTakeover: the answering hand moves on
             answer, self._pending_answer = self._pending_answer, None
             if answer is None:
                 text = "Not run: it can't be undone and the user did not answer whether to go ahead."
@@ -2907,6 +2915,7 @@ class Agent:
             yield AskUser(question)  # generator pauses here
             self._waited_s += time.monotonic() - asked_at
             self._awaiting_answer = False
+            self._pause_quiet_until = time.monotonic() + RESUME_GRACE_S   # appTakeover: the answering hand moves on
             answer = self._pending_answer
             self._pending_answer = None
             self._trace_step(name, tool_input, ok=answer is not None, kind="ask",
@@ -4205,6 +4214,7 @@ class Agent:
             self._send_wake.clear()
         with self._send_lock:
             self._send_open = None
+        self._pause_quiet_until = time.monotonic() + RESUME_GRACE_S   # appTakeover: a hand on the card moves on
         self._waited_s += time.monotonic() - started
         if state == "swapped" and choice is not None:
             kind, value = choice

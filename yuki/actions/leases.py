@@ -183,13 +183,15 @@ def input_held_elsewhere() -> bool:
 # ---------------------------------------------------------------------------
 
 
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
 def last_input_age_s() -> float | None:
     """Seconds since the keyboard or mouse was last used, any source (``GetLastInputInfo``), ``None`` unknown."""
     try:
-        class _Info(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-        info = _Info(ctypes.sizeof(_Info), 0)
+        # (the structure is made once: a class made per call cost ~0.15 ms, and the takeover watch asks 10 times a second)
+        info = _LastInputInfo(ctypes.sizeof(_LastInputInfo), 0)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
             return None
         idle_ms = (ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF
@@ -601,10 +603,11 @@ class TakeoverWatch:
 
 
 class TakeoverThread:
-    """Runs a :class:`TakeoverWatch` on its own thread while a request acts; calls ``on_takeover(kind)`` once, the
-    first time the user takes over, then ends. :meth:`stop` ends it at once (the agent stops it when the request ends
-    or is paused). ``grace_s``: how long it waits before its first look (after a resume, the hand that pressed Resume
-    is still moving away)."""
+    """Runs a :class:`TakeoverWatch` on its own thread while a request acts; calls ``on_takeover(kind)`` the first time
+    the user takes over, then ends (unless ``on_takeover`` returns ``False``: not taken now, e.g. Yuki is asking
+    something and the hand is on its card; then it watches on). :meth:`stop` ends it at once (the agent stops it when
+    the request ends or is paused). ``grace_s``: how long it waits before its first look (after a resume, the hand that
+    pressed Resume is still moving away)."""
 
     def __init__(self, on_takeover: Callable[[str], None], *, move_px: int | None = None,
                  poll_s: float = TAKEOVER_POLL_S, grace_s: float = 0.0,
@@ -617,6 +620,7 @@ class TakeoverThread:
         self._thread: threading.Thread | None = None
         self.watch: TakeoverWatch | None = None
         self.fired: str | None = None
+        self.refused = 0
 
     def start(self) -> "TakeoverThread":
         self._thread = threading.Thread(target=self._run, name="yuki-takeover-watch", daemon=True)
@@ -643,12 +647,14 @@ class TakeoverThread:
             except Exception:  # noqa: BLE001 - a broken read never pauses anything
                 kind = None
             if kind is not None and not self._stop.is_set():
-                self.fired = kind
                 try:
-                    self.on_takeover(kind)
+                    taken = self.on_takeover(kind)
                 except Exception:  # noqa: BLE001
-                    pass
-                return
+                    taken = None
+                if taken is not False:
+                    self.fired = kind
+                    return
+                self.refused += 1
             self._stop.wait(self.poll_s)
 
 
