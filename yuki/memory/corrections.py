@@ -267,7 +267,7 @@ def thread_candidate(t: Any) -> "Candidate":
 def target_candidate(store: Any, target: str | None) -> "Candidate | None":
     """The item a correction was made on (``correction_passes.target``, migration 35) as a candidate, when it is still
     current: ``W12`` a thread, ``E40`` an episode (a newer version followed), ``P7`` a portrait fact, ``J300`` a journal
-    fact, ``C5`` a conversation item. ``None`` otherwise."""
+    fact, ``C5`` a conversation item, ``T3`` an open to-do the user added. ``None`` otherwise."""
     ref = str(target or "").strip()
     if len(ref) < 2 or not ref[1:].isdigit():
         return None
@@ -310,6 +310,11 @@ def target_candidate(store: Any, target: str | None) -> "Candidate | None":
                 return None
             whose = {"yuki": ", Yuki's own", "user": ", the user's to-do"}.get(f.owner or "", "")
             return Candidate(f"C{f.id}", "C", f.id, f.text, f.subject, f"{f.kind}{whose}", f)
+        if letter == "T":   # the window's to-do list (appTodo): a to-do the user added, while it is open
+            t = store.todo(n)
+            if t is None or t.status != "open":
+                return None
+            return Candidate(f"T{t.id}", "T", t.id, t.text, label="to-do the user added", obj=t)
     except Exception:
         return None
     return None

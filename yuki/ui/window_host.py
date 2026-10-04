@@ -73,7 +73,7 @@ class WindowHost(QObject):
         # Yuki's own window for the thinker's open_yuki tool and the talker's open_yuki hand (v3.15).
         from yuki.ui import own_window
 
-        own_window.register(self.open_from_anywhere)
+        own_window.register(self.open_from_anywhere, engine=self.window_engine)   # the report names that window's places
         self._started = False
         self._hands = 0
         self._call_sig = call_signature({})
@@ -874,6 +874,10 @@ class WindowHost(QObject):
 
         Returns whether it was brought forward or started (``False``: the launch failed)."""
         self.start()
+        if page and self.window_engine() == "qt":   # the native window knows only its own page names
+            from yuki.ui.own_window import qt_page
+
+            page = qt_page(page)
         if self.proc is not None and self.proc.poll() is None:
             _allow_foreground(self.proc.pid)
             if self.server is not None:

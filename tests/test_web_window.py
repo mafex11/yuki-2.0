@@ -683,8 +683,12 @@ def test_home_is_the_inbox_built_from_memory(tmp_path):
     assert d["needs"] == [{"kind": "question", "ref": "question:4", "at_label": label, "title": "Is the call at 10?",
                            "why": "It moved once."}]
     assert [o["card"] for o in d["offers"]] == ["41"] and d["offers"][0]["label"] == "Add to list"
-    # "In front" became the current work thread (4 Oct); this stand-in has no threads of work, so no tile
-    assert "front" not in d["now"] and d["now"]["thread"] is None and d["now"]["call"]["recording"] is True
+    # Now (appTodo, 4 Oct): the app in front since when, titled by the current session; this stand-in has no
+    # episodes, so no title (the page shows the app; never the raw window title: review F2); Work opens at since_at;
+    # no thread tile any more
+    assert "front" not in d["now"] and "thread" not in d["now"] and d["now"]["call"]["recording"] is True
+    assert d["now"]["session"] == {"app": "VS Code", "since_at": m.now - 1500, "at": round(m.now - 1500, 1), "title": None,
+                                   "summary": None, "ref": None}
     assert [r["kind"] for r in d["running"]] == ["call", "waiting"] and "2 calls" in d["running"][1]["title"]
     kinds = {a["kind"]: a for a in d["away"]}
     assert kinds["card"]["changed"][0]["undo"]["card"] == "39"                   # ran 7 min ago: Undo still open
@@ -738,14 +742,6 @@ def test_the_drawer_gets_every_step_with_its_time_and_the_runs():
                      "started_at": 100.0, "status": "running", "step": 1}]   # appPT: the step, no total
     m.apply({"type": "finished", "job": 3, "text": "The forum's up.", "at": 104.0})
     assert web_data.runs_of(m) == []
-
-
-def test_continue_puts_a_plan_from_memorys_own_fields_in_the_ask_bar():
-    # an older memory (no thread_continue): the same concrete shape memory's ask has, never "where I left off" (W1)
-    text = web_window.plan_text({"title": "Garden planner", "state": "Half built.", "open": ["Write the schedule", "Test"]})
-    assert text == "Help me continue Garden planner. Where it stands: Half built. Next: Write the schedule"
-    assert web_window.plan_text({"title": "X"}) == "Help me continue X."
-    assert "left off" not in text
 
 
 def test_shift_times_moves_only_times():
@@ -1256,7 +1252,10 @@ def test_page_stamps_move_on_each_write_and_stay_cheap(tmp_path):
         conn = m.store._conn
 
         def insert(table: str) -> None:
-            cols = [c for c in m.store._query(f"PRAGMA table_info({table})") if c[3] and c[4] is None and not c[5]]
+            # the required columns, and updated_at where a later migration added it nullable (open_loops): every
+            # real write sets it
+            cols = [c for c in m.store._query(f"PRAGMA table_info({table})")
+                    if (c[3] and c[4] is None and not c[5]) or c[1] == "updated_at"]
             values = [1.0 if str(c[2]).upper() in ("REAL", "INTEGER") else "x" for c in cols]
             m.store._write(lambda c: c.execute(f"INSERT INTO {table} ({', '.join(x[1] for x in cols)}) VALUES "
                                                f"({', '.join('?' for _ in cols)})", values))

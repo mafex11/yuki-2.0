@@ -31,7 +31,7 @@
   Y.remeasure = () => field.remeasure();
   // the moment of your last action: a build that started before it is not drawn over what the action just showed
   // (actions that only read or open something leave the page's data alone)
-  const READS = new Set(['person', 'copy', 'askbar', 'continue', 'thread_days', 'chat_day']);
+  const READS = new Set(['person', 'copy', 'askbar', 'thread_days', 'chat_day']);
   Y.act = (action, fields) => {
     if (!READS.has(action)) S.actedAt = Date.now();
     return B.request('act', Object.assign({ action: action }, fields || {}));
@@ -436,7 +436,7 @@
     // the minute's own changes, with no message from the host (42 §6.3): "x min ago", an Undo's minutes left, the
     // Day's now marker; an Undo whose window closed is patched away
     document.querySelectorAll('[data-rel]').forEach((el) => { const v = fmt.rel(Number(el.dataset.rel)); if (el.textContent !== v) el.textContent = v; });
-    // Home's thread tile: how long you've been on it, "1h 05m", while its app is in front
+    // Home's Now tile: how long the app in front has been in front, "1h 05m"
     document.querySelectorAll('[data-durfrom]').forEach((el) => { const v = fmt.dur((now - Number(el.dataset.durfrom)) / 60); if (el.textContent !== v) el.textContent = v; });
     let closed = false;
     document.querySelectorAll('#main [data-until]').forEach((el) => {
@@ -567,7 +567,7 @@
     for (const [k, v] of Object.entries(m.pages || {})) { D.pages[k] = v; D.raw[k] = JSON.stringify(v); D.source[k] = m.source || 'snapshot'; D.stamp[k] = Date.now(); }
     if (D.pages.home && D.shell.needs == null) D.shell.needs = (D.pages.home.needs || []).length;
     if (m.chat) setChat(m.chat);
-    if (m.page && !location.hash) { location.hash = hashFor(m.page, '', false); }
+    if (m.page && !location.hash) { location.hash = hashFor(m.page, m.sub || '', false); }   // sub: open_yuki's todos (#home/list)
     S.booted = true;
     if (m.version) D.version = m.version;
     render(true);

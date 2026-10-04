@@ -1,76 +1,13 @@
-/* Work: threads of work (where each stands and its next step, people and apps involved, last touched; Continue =
-   the next-step request and the windows and pages to bring back; Done / Not a thread with Undo; paused and closed
-   ones folded below, closed ones with Reopen; Correct in your words) and the Day tab: the day as a dot skyline you
-   can scrub (the readout follows the cursor; arrow keys move it), today's totals, the week by hour, sessions (a short
-   title; opened, the summary and the time per app) and calls. Everything drawn is measured by memory's timeline;
-   nothing here guesses what an app is (full screen is a measured signal, not a game detector). */
+/* Work: your to-do list (open ones due first, with Done / Not needed / Correct, Add, the ones done lately folded) and
+   today's sessions (a short title; opened, the summary and the time per app), under the week's hours; and the Day
+   tab: the day as a dot skyline you can scrub (the readout follows the cursor; arrow keys move it), today's totals,
+   the week by hour, sessions and calls. Threads of work are not shown (the 4 Oct decision: memory keeps them for
+   Yuki's own use). Everything drawn is measured by memory's timeline or is memory's list; nothing here guesses what
+   an app is (full screen is a measured signal, not a game detector). */
 (function () {
   'use strict';
-  const Y = window.Yk, { h, ic, key, fmt } = Y;
-  const tabs = (sub) => Y.seg([['', 'Threads'], ['day', 'Day']], 'sub', sub === 'day' ? 'day' : '');
-
-  /* the thread card (the 4 Oct feedback round 3, W1): state tag and when, the title, where it stands (memory's card,
-     said to you), the next step (memory's; until written, the checklist's next open item) with the checklist as dot
-     progress, a quiet goal line, the people (chips) and apps it involves, then Continue, and Correct / Done / Not a
-     thread. Continue opens below the card: the request I'd get for the next step and the windows and pages to bring
-     back. Done and Not a thread take it out of your threads at once, with Undo. */
-  const CONT = {};       // ref -> what Continue shows (memory's thread_continue), read when it opens
-  const UNPICK = {};     // ref -> the places you unticked
-  const closing = new Map();   // ref -> how, closed here and not yet out of the data (or undone)
-  function threadCard(t, d) {
-    const open = t.open || [], checks = t.checks, can = d.can || {};
-    const p = (d.pending || {})[t.ref];
-    const next = t.next || (checks && checks.next) || open[0] || null;
-    const dots = checks && checks.total ? [Y.dotProgress(checks.done, checks.total), h('span', { class: 'mono', text: `${checks.done}/${checks.total}` })] : null;
-    const prog = next || dots ? h('div', { class: 'tprog' }, dots, next ? h('span', { class: 'tnext' }, h('b', { text: 'Next: ' }), next) : h('span', { class: 'tnext', text: 'all done' })) : null;
-    const people = (t.people || []).slice(0, 3);
-    const apps = (t.apps || (t.people ? [] : t.involves) || []).slice(0, 4);
-    const contOpen = Y.S.open.has('cont:' + t.ref);
-    const el = Y.clearing('article', 'thread' + (contOpen ? ' cont-open' : ''),
-      h('div', { class: 'top' }, h('span', { class: 'st-tag ' + (t.status || '') }, h('i'), t.status || ''), h('span', { class: 'when', data: { rel: t.last_at }, text: fmt.rel(t.last_at) })),
-      h('h3', { text: t.title }),
-      h('div', { class: 'stands' + (t.state ? '' : ' none'), text: t.state || 'Where it stands isn’t written yet.' }),
-      prog,
-      t.goal ? h('div', { class: 'tgoal', title: 'Your goal for it', text: `goal · ${t.goal}` }) : null,
-      p ? h('div', { class: 'tfix' }, Y.fixLine(p)) : null,
-      h('div', { class: 'fixslot' }),
-      contOpen ? contPanel(t) : null,
-      h('div', { class: 'foot' },
-        h('div', null, people.length ? h('div', { class: 'people-dots' }, people.map((x) => h('span', { text: x }))) : null,
-          apps.length ? h('div', { class: 'apps', css: { marginTop: people.length ? '8px' : '0' }, text: apps.join(' · ') }) : null),
-        h('button', { class: 'key sm' + (contOpen ? ' pressed' : ''), data: { do: 'continue', ref: t.ref }, attrs: { type: 'button', 'aria-expanded': String(contOpen) },
-          title: can.cont ? 'The next step, and the windows and pages to bring back' : 'Opens the ask bar with a plan. Nothing runs until you press Enter.' }, 'Continue', ic('chev'))),
-      can.close || can.correct ? h('div', { class: 'tacts' },
-        can.correct && !Y.fixing(p) ? Y.correctKey() : null,
-        can.close ? key('Done', { cls: 'xs ghost', data: { do: 'thread-close', how: 'done' }, title: 'It’s finished: it leaves your threads' }) : null,
-        can.close ? key('Not a thread', { cls: 'xs ghost', data: { do: 'thread-close', how: 'dismiss' }, title: 'It isn’t a piece of work: I stop treating it as one' }) : null) : null);
-    Object.assign(el.dataset, { cref: t.ref || '', cpage: 'work', kind: 'thread', title: t.title || '', text: t.state || '' });
-    return Y.k(el, t.ref || t.title);
-  }
-  /* Continue, under the card: the request I'd get (memory's, from where it stands and the next step), the windows and
-     pages worth bringing back (ticked; a page can be opened on its own), Ask Yuki / Edit first */
-  function contPanel(t) {
-    const c = CONT[t.ref];
-    const box = (...kids) => h('div', { class: 'tcont', data: { k: 'cont' } }, Y.label('Continue'), kids);
-    if (!c) return box(h('div', { class: 't3', text: 'Reading where it stands…' }));
-    if (c.error) return box(h('div', { class: 't2', text: c.error }));
-    const un = UNPICK[t.ref] || new Set(), places = c.places || [];
-    return box(h('div', { class: 'tc-ask' }, h('span', { class: 't3', text: 'I’ll be asked:' }), h('div', { class: 'tc-q', text: c.ask })),
-      places.length ? h('div', { class: 'tc-places' }, h('span', { class: 't3', text: 'Bring back first:' }), places.map((pl, i) => h('div', { class: 'tc-pl', data: { k: 'pl:' + i } },
-        h('button', { class: 'tc-tick', data: { do: 'cont-pick', ref: t.ref, i }, attrs: { type: 'button', role: 'checkbox', 'aria-checked': String(!un.has(i)) } },
-          h('i', { class: 'box' }, ic('check')), h('span', { class: 'tc-t', text: pl.title || pl.app || 'A window' }), pl.title && pl.app ? h('span', { class: 't3', text: pl.app }) : null),
-        pl.page ? key('Open', { cls: 'xs ghost', data: { do: 'cont-open', ref: t.ref, i }, title: 'Opens just this page in your browser' }) : null))) : null,
-      h('div', { class: 'row' }, key('Ask Yuki', { cls: 'sm pri', data: { do: 'cont-ask', ref: t.ref, how: 'ask' }, title: 'Sends this request to me now' }),
-        key('Edit first', { cls: 'sm ghost', data: { do: 'cont-ask', ref: t.ref, how: 'edit' }, title: 'Puts it in the ask bar, not sent' })));
-  }
-  /* the threads you closed or dismissed lately, folded, each with Reopen */
-  function closedFold(C) {
-    if (!C.length) return null;
-    const rows = C.map((c) => h('div', { class: 'crow', data: { k: 'c:' + c.ref } }, h('span', { class: 'tx', text: c.title }),
-      h('span', { class: 't3', text: c.status === 'dismissed' ? 'not a thread' : 'done' }), h('span', { class: 't3 mono', text: fmt.rel(c.closed_at) }),
-      key('Reopen', { cls: 'xs ghost', data: { do: 'thread-reopen', ref: c.ref }, title: 'Back into your threads, as it was' })));
-    return Y.fold('closed', h('span', { class: 'tx', text: 'Closed lately' }), h('span', { text: String(C.length) }), rows, { cls: 'tfold' });
-  }
+  const Y = window.Yk, { h, key, fmt } = Y;
+  const tabs = (sub) => Y.seg([['', 'Work'], ['day', 'Day']], 'sub', sub === 'day' ? 'day' : '');
 
   /* the week bars (the 3 Oct item 16): a bar is your hours at the PC that day, its outlined top the part that was
      full screen, today brightest and labelled; hovering or focusing a day shows its readout and brightens its
@@ -111,22 +48,52 @@
   document.addEventListener('focusin', (e) => { const b = e.target.closest && e.target.closest('[data-wk]'); if (b) wkHover(+b.dataset.wk); });
   document.addEventListener('focusout', (e) => { if (e.target.closest && e.target.closest('[data-wk]')) wkHover(null); });
 
-  function threads(d, S) {
-    const all = d.threads || [];
-    for (const ref of Array.from(closing.keys())) if (!all.some((t) => t.ref === ref)) closing.delete(ref);   // the data caught up
-    const T = all.filter((t) => !closing.has(t.ref));
-    const cur = T.filter((t) => t.status !== 'paused'), paused = T.filter((t) => t.status === 'paused');
+  /* ---------- Work: the to-do list and today's sessions ---------- */
+  const OPEN_SHOWN = 8;   // open to-dos drawn at once; the rest fold under them (the two columns stay about level)
+  function addLine(T) {
+    if (!(T.can || {}).add) return null;
+    return h('div', { class: 'td-add', data: { k: 'add' } },
+      h('input', { class: 'td-in', data: { enter: 'todo-add' }, attrs: { 'aria-label': 'A new to-do', placeholder: 'Add a to-do, then Enter', autocomplete: 'off', maxlength: 300 } }),
+      h('input', { class: 'td-day', attrs: { type: 'date', 'aria-label': 'Due day, if it has one', title: 'Due day, if it has one' } }),
+      key('Add', { cls: 'xs', data: { do: 'todo-add' } }));
+  }
+  /* a to-do done lately (memory keeps 14 days of them): what it was, quietly; one you ended here a moment ago keeps
+     its Undo for the rest of memory's 10 minutes (review F5: the drain's 5 s is not the only chance) */
+  function doneRow(t) {
+    const until = Y.todoUndoUntil(t.ref);
+    const row = h('div', { class: 'todo done', data: { k: 'done:' + t.ref, dref: until ? t.ref : null } }, h('i', { class: 'td-dot on', aria: { hidden: 'true' } }),
+      h('div', { class: 'td-b' }, h('div', { class: 'td-t', text: t.title || t.text, title: t.title ? t.text : '' }), t.from ? h('div', { class: 'td-m' }, h('span', { text: t.from })) : null),
+      until ? h('div', { class: 'td-acts' }, key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen-done' }, title: 'Put it back on your list' }),
+        h('span', { class: 'until', data: { until }, text: `${Math.max(1, Math.round((until * 1000 - Date.now()) / 60000))} min left` })) : null);   // counted down by the ticker
+    row.__t = t;
+    return row;
+  }
+  function todoBlock(d) {
+    const T = d.todos;
+    if (!T) return Y.k(Y.sec('To-dos', null, Y.empty('Reading your list…')), 'todos');   // a snapshot from before the list
+    const open = Y.todosOpen(T), allDone = (T.done || []).filter((t) => !open.some((o) => o.ref === t.ref));
+    const undoNow = allDone.filter((t) => Y.todoUndoUntil(t.ref)), done = allDone.filter((t) => !Y.todoUndoUntil(t.ref));   // ended here: in view, with Undo
+    const row = (t) => Y.todoRow(t, d, 'work', true);
+    const first = open.slice(0, OPEN_SHOWN), rest = open.slice(OPEN_SHOWN);
+    const body = [addLine(T),
+      open.length ? h('div', { class: 'todos' }, first.map(row)) : Y.empty('Nothing on your list. Ask me to keep a to-do, or add one here.'),
+      rest.length ? Y.fold('todos-more', h('span', { class: 'tx', text: `${rest.length} more` }), null, h('div', { class: 'todos' }, rest.map(row)), { cls: 'tdfold' }) : null,
+      undoNow.length ? h('div', { class: 'todos td-just', data: { k: 'just' } }, undoNow.map(doneRow)) : null,
+      done.length ? Y.fold('todos-done', h('span', { class: 'tx', text: 'Done lately' }), h('span', { text: String(done.length) }), h('div', { class: 'todos' }, done.map(doneRow)), { cls: 'tdfold' }) : null];
+    return Y.k(Y.sec('To-dos', open.length, body, Y.rightLabel('due first'), 'todosec'), 'todos');
+  }
+  function work(d, S) {
+    const T = d.todos, open = T ? Y.todosOpen(T) : [];
     const w = d.week || {}, tot = w.totals || {};
-    const meta = [h('span', null, h('b', { text: cur.length }), ' open', paused.length ? [', ', h('b', { text: paused.length }), ' paused'] : null),
+    const sess = (d.sessions || []).slice().reverse();
+    const meta = [T ? h('span', null, h('b', { text: open.length }), open.length === 1 ? ' to-do open' : ' to-dos open') : null,
+      h('span', null, h('b', { text: sess.length }), sess.length === 1 ? ' session today' : ' sessions today'),
       tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
-    const card = (t) => threadCard(t, d);
-    const body = cur.length ? h('div', { class: 'grid3', data: { k: 'threads' } }, cur.map(card))
-      : Y.k(Y.clearing('section', 'sec', Y.empty('Threads appear as I follow your work across days: what it is, where it stands, what’s next.', T.length ? 'Nothing open right now.' : 'No threads yet.')), 'none');
-    const folds = paused.length || (d.closed || []).length ? h('div', { class: 'tfolds', data: { k: 'folds' } },
-      paused.length ? Y.fold('paused', h('span', { class: 'tx', text: 'Paused: you moved on to other things' }), h('span', { text: String(paused.length) }),
-        h('div', { class: 'grid3' }, paused.map(card)), { cls: 'tfold' }) : null,
-      closedFold(d.closed || [])) : null;
-    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'), body, folds];
+    const sessions = Y.k(Y.sec('Sessions today', sess.length, sess.length ? sess.map((s) => sessionRow(s, d, 'work')) : Y.empty(d.sessions ? 'No sessions yet today.' : 'Reading your day…'),
+      Y.rightLabel('latest first')), 'sessions');
+    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'),
+      h('div', { class: 'grid2 wk-grid', data: { k: 'grid' } }, h('div', { class: 'col', data: { k: 'left' } }, todoBlock(d)),
+        h('div', { class: 'col', data: { k: 'right' } }, sessions))];
   }
 
   /* ---------- the day ---------- */
@@ -157,8 +124,10 @@
   }
 
   /* a session (the 4 Oct item W2): one row with its time and short title (memory's, never the summary cut short);
-     opened, the one- or two-sentence summary, the time in every app, and Correct */
-  function sessionRow(s, d) {
+     opened, the one- or two-sentence summary, the time in every app, and Correct. The Day tab and Work both list
+     them (`page`: the page data its Correct's pending line lives in) */
+  const sessKey = (s) => `s:${s.start}:${s.app || ''}`;
+  function sessionRow(s, d, page) {
     const apps = s.apps || [], max = Math.max(1, ...apps.map(([, m]) => m || 0));
     const p = s.ref ? (d.pending || {})[s.ref] : null, canFix = !!(s.ref && (d.can || {}).correct);
     const head = [h('span', { class: 'tm', text: `${s.start}–${s.end}` }), h('span', { class: 'tt' }, h('span', { class: 'tx', text: s.title || s.app }),
@@ -170,8 +139,8 @@
         : h('div', { class: 't2', text: 'No app time measured in this stretch.' }),
       p ? h('div', { class: 'meta2' }, Y.fixLine(p)) : null,
       canFix && !Y.fixing(p) ? h('div', { class: 'acts inline' }, Y.correctKey()) : null];
-    return Y.fold(`s:${s.start}:${s.app || ''}`, head, meta, body, { cls: 'dayrow',
-      data: s.ref ? { cref: s.ref, cpage: 'day', kind: 'episode', title: s.title || '', text: words || '' } : null });
+    return Y.fold(sessKey(s), head, meta, body, { cls: 'dayrow',
+      data: s.ref ? { cref: s.ref, cpage: page || 'day', kind: 'episode', title: s.title || '', text: words || '' } : null });
   }
   /* a call today: when, where, who; opened, what was said (the gists, said to you) */
   function callRow(c) {
@@ -246,128 +215,46 @@
     return prevKeys ? prevKeys(e, a) : false;
   };
 
-  /* ---------- the thread's actions ---------- */
-  const A = Y.actions;
+  /* ---------- the list's own actions (Done / Not needed / Undo / Correct are the rows', pages/home.js and ui.js) ----------
+     Add: your words as a to-do, with an optional due day from the date field (a machine value; nothing is read out
+     of the words); memory adds it as the voice does and the list refreshes from memory. */
   const workData = () => Y.D.pages.work || {};
-  function readContinue(ref) {
-    Y.act('thread_continue', { ref }).then((r) => {
-      CONT[ref] = r.ok && r.cont ? r.cont : { error: r.error || 'I can’t read that thread right now.' };
-      if (Y.S.open.has('cont:' + ref) && Y.S.page === 'work') Y.renderMain();
-    });
-  }
-  function openContinue(ref) {
-    Y.S.open.add('cont:' + ref);
-    delete CONT[ref];   // read again each time it opens: where it stands may have moved
-    readContinue(ref);
-  }
-  /* Continue: opens the panel under the card (memory's next-step request and what to bring back); an older memory
-     puts a plan in the ask bar, unsent, as before */
-  A.continue = (t) => {
-    const ref = t.dataset.ref;
-    if (!(workData().can || {}).cont) {
-      t.disabled = true;
-      Y.act('continue', { ref, how: 'edit' }).then((r) => {
-        t.disabled = false;
-        Y.toast(r.ok ? 'In the ask bar with a plan, not sent. Change any word, then press Enter.' : (r.error || 'Couldn’t open the ask bar.'), !r.ok);
-      });
-      return;
-    }
-    if (Y.S.open.has('cont:' + ref)) Y.S.open.delete('cont:' + ref); else openContinue(ref);
-    Y.renderMain();
-  };
-  A['cont-pick'] = (t) => {
-    const ref = t.dataset.ref, i = Number(t.dataset.i), un = UNPICK[ref] || (UNPICK[ref] = new Set());
-    if (un.has(i)) un.delete(i); else un.add(i);
-    t.setAttribute('aria-checked', String(!un.has(i)));
-  };
-  A['cont-open'] = (t) => {
-    t.disabled = true;
-    Y.act('open_page', { ref: t.dataset.ref, place: Number(t.dataset.i) }).then((r) => {
-      t.disabled = false;
-      Y.toast(r.ok ? 'Opened in your browser. Nothing typed or sent.' : (r.error || 'Couldn’t open that page.'), !r.ok);
-    });
-  };
-  A['cont-ask'] = (t) => {
-    const ref = t.dataset.ref, how = t.dataset.how, c = CONT[ref] || {}, un = UNPICK[ref] || new Set();
-    const places = (c.places || []).map((_, i) => i).filter((i) => !un.has(i));
-    t.disabled = true;
-    Y.act('continue', { ref, how, places }).then((r) => {
-      t.disabled = false;
-      if (!r.ok) { Y.toast(r.error || 'Couldn’t hand that over.', true); return; }
-      Y.S.open.delete('cont:' + ref);
-      Y.renderMain();
-      if (how === 'ask') { Y.toast('Asked. You can follow each step in the thread.'); A['open-thread'](); }
-      else Y.toast('In the ask bar, not sent. Change any word, then press Enter.');
-    });
-  };
-  /* Done / Not a thread: the card says so with Undo and a 5 s drain, then leaves (the data drops it too); Undo reopens
-     it exactly. A close memory didn't take puts the card back. */
-  function putBack(card) {
-    const res = card.__res; if (!res) return;
-    clearTimeout(res.timer); card.__res = null; closing.delete(card.dataset.cref);
-    card.classList.remove('resolved'); card.replaceChildren(...res.kids);
-  }
-  A['thread-close'] = (t) => {
-    const card = t.closest('[data-cref]'); if (!card || card.__res) return;
-    const ref = card.dataset.cref, how = t.dataset.how;
-    const res = { kids: Array.from(card.childNodes), how };
-    card.__res = res; closing.set(ref, how);
-    res.p = Y.act('close_thread', { ref, how }).then((r) => {
-      if (!r.ok && card.__res === res) { putBack(card); Y.toast(r.error || 'Couldn’t close it. Memory didn’t answer.', true); }
-      return r;
-    });
-    card.classList.add('resolved');
-    card.replaceChildren(h('div', { class: 'confirm res' }, ic('check'),
-      h('span', { text: how === 'dismiss' ? 'Not a thread. I’ll stop treating it as one.' : 'Closed as done. It leaves your threads.' }),
-      key('Undo', { cls: 'xs ghost', data: { do: 'thread-undo' } }), h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
-    Y.pop(card.firstElementChild);
-    res.timer = setTimeout(() => {
-      if (card.__res !== res) return;
-      card.__res = null; card.__leaving = true; Y.leave(card);
-      setTimeout(() => Y.renderMain(), 460);
-    }, 5000);
-  };
-  A['thread-undo'] = (t) => {
-    const card = t.closest('[data-cref]'), res = card && card.__res; if (!res) return;
-    clearTimeout(res.timer); t.disabled = true;
-    res.p.then((first) => (first && first.ok ? Y.act('close_thread', { ref: card.dataset.cref, how: 'reopen' }) : { ok: true })).then((r) => {
-      if (r.ok) { putBack(card); Y.renderMain(); return; }
-      Y.toast(r.error || 'Couldn’t undo that. It’s under Closed lately.', true);
-      card.__res = null; card.__leaving = true; Y.leave(card);
-    });
-  };
-  A['thread-reopen'] = (t) => {
-    t.disabled = true;
-    Y.act('close_thread', { ref: t.dataset.ref, how: 'reopen' }).then((r) => {
-      if (!r.ok) { t.disabled = false; Y.toast(r.error || 'Couldn’t reopen it.', true); return; }
-      Y.toast('Reopened. It’s back in your threads.');
+  Y.actions['todo-add'] = (t) => {
+    const box = t.closest('.td-add'), inp = box && box.querySelector('.td-in'), day = box && box.querySelector('.td-day');
+    if (!inp || inp.disabled) return;
+    const text = inp.value.replace(/\s+/g, ' ').trim();
+    if (!text) { inp.focus(); return; }
+    inp.disabled = true;
+    Y.act('todo_add', { text, day: day ? day.value : '' }).then((r) => {
+      inp.disabled = false;
+      if (!r.ok) { Y.toast(r.error || 'Couldn’t add it. Memory didn’t answer.', true); inp.focus(); return; }
+      inp.value = ''; if (day) day.value = '';
+      Y.toast('Added to your list.');
     });
   };
 
-  /* Home's thread tile opens #work/thread:N: that card comes into view with its Continue open, once per visit (a
-     visit is one navigation, S.navs: the tile clicked again after going Home focuses it again; the data's own
-     re-renders within the visit don't) */
-  let focusedSub = '', focusedNav = -1;
-  function focusThread(main, S) {
-    if (!S.sub.startsWith('thread:')) { focusedSub = ''; return; }
-    if (focusedSub === S.sub && focusedNav === S.navs) return;
-    const ref = S.sub, d = workData();
-    if (!(d.threads || []).some((t) => t.ref === ref)) return;   // not open any more (or the data isn't here yet)
-    focusedSub = ref; focusedNav = S.navs;
-    if ((d.threads || []).some((t) => t.ref === ref && t.status === 'paused')) Y.S.open.add('f:paused');
-    if ((d.can || {}).cont && !Y.S.open.has('cont:' + ref)) { openContinue(ref); Y.renderMain(); }
-    setTimeout(() => {
-      const card = main.querySelector(`.thread[data-cref="${CSS.escape(ref)}"]`);
-      if (!card) return;
-      card.scrollIntoView({ block: 'center', behavior: window.Lattice.Motion.reduced ? 'auto' : 'smooth' });
-      card.classList.add('flash'); setTimeout(() => card.classList.remove('flash'), 1600);
-    }, 60);
+  /* Home's Now tile opens #work/at:<moment>: the session holding that moment (else the latest before it) opens and
+     comes into view, once per visit (a visit is one navigation, S.navs: the tile clicked again after going Home
+     focuses it again; the data's own re-renders within the visit don't); "see all" (#work/todos) brings the list */
+  let atNav = -1;
+  function focusSession(main, S) {
+    if (atNav === S.navs) return;
+    const at = Number(S.sub.slice(3)), list = workData().sessions;
+    if (!list) return;   // the data isn't here yet: the mount after it arrives
+    atNav = S.navs;
+    if (!list.length) { Y.focusBlock(main.querySelector('[data-k="sessions"]'), 'work-at'); return; }
+    const s = list.find((x) => x.start_at <= at && at <= x.end_at) || list.filter((x) => x.start_at <= at).slice(-1)[0] || list[list.length - 1];
+    const k = sessKey(s);
+    if (!Y.S.open.has('f:' + k)) { Y.S.open.add('f:' + k); Y.renderMain(); }
+    Y.focusBlock(main.querySelector(`[data-k="${CSS.escape('f:' + k)}"]`), 'work-at', 'center');
   }
 
   Y.pages.work = {
-    build: (d, S, D) => (S.sub === 'day' ? day(d, S) : threads(d, S)),
+    build: (d, S, D) => (S.sub === 'day' ? day(d, S) : work(d, S)),
     mount: (main, S, D) => {
-      if (S.sub !== 'day') { focusThread(main, S); return; }
+      if (S.sub === 'todos') Y.focusBlock(main.querySelector('[data-k="todos"]'), 'work-todos');
+      else if (S.sub.startsWith('at:')) focusSession(main, S);
+      if (S.sub !== 'day') return;
       const d = D.pages.day; if (!d) return;
       setTimeout(() => setHover(S.scrub != null ? S.scrub : (d.today && d.now_min != null ? Math.max(0, d.now_min - 30) : 720), null), 30);   // the design: 30 ms after mount
     }

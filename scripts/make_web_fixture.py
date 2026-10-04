@@ -290,6 +290,53 @@ class InventedMemory:
                                                        {"name": "noor.plays", "how": "call_chat"},
                                                        {"name": "Dev", "how": "likely"}], "gists": []}]
 
+class TodoMemory:
+    """An invented to-do list in memory's ``todos()`` shape (the window builds its rows with the real
+    ``web_data.todo_lists``): the user's own to-dos, ones told to Yuki or said on a call, Yuki's own promise and an
+    open loop, with due days in the past, today, tomorrow and none; a few done lately."""
+
+    @staticmethod
+    def _iso(at: float) -> str:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(at).astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _day(at: float) -> str:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(at).strftime("%Y-%m-%d")
+
+    def todos(self, include_done: bool = False) -> list[dict]:
+        def item(ref, text, source, *, due=None, title=None, since=1 * D, status="open", evidence=None):
+            return {"id": ref, "text": text, "source": source, "due": due, "status": status, "evidence": evidence,
+                    "since": self._iso(ago(since)), "owner": "yuki" if source == "commitment" else "user",
+                    "label": source, "title": title}
+        rows = [
+            item("todo:31", "Write the watering schedule", "user", due=self._iso(NOW + 10 * M), since=5 * H),
+            item("todo:29", "Order more seed trays", "user", due=self._day(NOW - 1 * D), since=3 * D),
+            item("commit:44", "Remind you to send take 2 of the new song to Noor before Wednesday's practice", "chat",
+                 due=self._day(NOW + 1 * D), title="Send take 2 to Noor", since=6 * H,
+                 evidence="the user said on 2026-10-03: \"remind me to send Noor the take before Wednesday\""),
+            item("commit:45", "Find a chart library that works offline for the planner", "commitment", since=2 * H,
+                 title="Find an offline chart library"),
+            item("loop:12", "Riya is waiting for the climbing photos from 27 September", "loop", since=4 * D,
+                 title="Climbing photos for Riya", evidence="asked by Riya in Signal on 2026-09-28"),
+            item("commit:46", "Bring 20 packets each of tomato and basil seeds to the meetup on the 18th", "call",
+                 due=self._day(NOW + 15 * D), title="Seeds for the meetup", since=26 * H,
+                 evidence="the user said in a call on 2026-10-02: \"I'll bring twenty packets of each\""),
+            item("todo:33", "Copy the September phone photos to the external drive", "user", since=2 * D),
+            item("todo:34", "Test the planner on the old laptop", "user", since=4 * D),
+            item("todo:35", "Add the train tickets for the 24th to the budget", "user", since=22 * M),
+        ]
+        if include_done:
+            rows += [item("todo:27", "Measure the balcony beds", "user", status="done", since=2 * D),
+                     item("commit:40", "Look up when the community hall opens on Sundays", "commitment", status="done",
+                          since=1 * D, title="Community hall Sunday hours"),
+                     item("todo:25", "Call the landlord about the lease", "user", status="done", since=5 * D)]
+        return rows
+
+
 def day_name(days_ago: int) -> str:
     """Memory's name for a user day (``YYYY-MM-DD``) some days before the fixture's now."""
     from datetime import datetime, timedelta
@@ -331,15 +378,15 @@ def build() -> dict:
     }
     home = {
         "now": {
-            # the current work thread (the 4 Oct decision: it replaced "In front")
-            "thread": {"ref": "thread:12", "title": "Garden planner: watering schedule", "app": "VS Code", "since_at": ago(42 * M),
-                       "min": None, "in_front": True, "next": "Write the timer that waters each bed on its own days",
-                       "shown": "The schedule screen is half built; the timer logic isn’t started."},
+            # what you are doing now (the 4 Oct decision: it replaced the current-thread tile): the current session's
+            # title and summary, the app in front since when, the moment Work opens at
+            "session": {"app": "VS Code", "since_at": ago(42 * M), "at": round(ago(42 * M), 1), "title": "Watering schedule screen",
+                        "summary": "You started on the garden planner’s watering schedule screen.", "ref": "episode:315"},
             "playing": {"status": "paused", "title": "Rain Study No. 4", "artist": "The Lo-Fi Trio", "app": "Music"},
             "call": now_call,
-            "goals": [{"ref": "G7", "text": "finish the watering schedule screen", "status": "open", "done": False, "thread": "W12"},
-                      {"ref": "G8", "text": "reply on the seed-swap thread", "status": "unknown", "done": False, "thread": "W15"},
-                      {"ref": "G6", "text": "order the seed trays", "status": "done", "done": True, "thread": None}],
+            "goals": [{"ref": "G7", "text": "finish the watering schedule screen", "status": "open", "done": False},
+                      {"ref": "G8", "text": "reply on the seed-swap forum", "status": "unknown", "done": False},
+                      {"ref": "G6", "text": "order the seed trays", "status": "done", "done": True}],
         },
         "needs": [
             {"kind": "question", "ref": "q:7", "at_label": "2 Oct, 12:19 PM", "title": "Is the Friday planning call still at 10?",
@@ -388,52 +435,6 @@ def build() -> dict:
         ],
         "since": ago(1 * H + 49 * M),
     }
-    threads = [
-        ("thread:12", "Garden planner: watering schedule", "active", 5 * M, "Bed sizes and soil types are in. The schedule screen is half built; the timer logic isn’t started.",
-         ["Write the watering schedule", "Pick a chart library", "Test on the old laptop"], ["Riya", "Noor", "VS Code", "Firefox"]),
-        ("thread:15", "Seed-swap meetup on the 18th", "active", 4 * M, "You offered to bring tomato and basil seeds. The venue is confirmed; the list of who brings what isn’t.",
-         ["Reply to the forum thread", "Count the seed packets"], ["Noor", "Firefox"]),
-        ("thread:9", "Flat lease renewal", "blocked", 24 * M, "Waiting on the landlord’s new figure before you can compare it with the two listings you saved.",
-         ["Ask Theo for the new figure"], ["Theo", "Thunderbird"]),
-        ("thread:18", "Budget for October", "active", 22 * M, "The sheet has September closed. October has rent and groceries in; the trip isn’t.",
-         ["Add the train tickets", "Check the sheet is saved"], ["Calc"]),
-        ("thread:7", "Learning Rust: the CLI exercise", "active", 1 * H, "Chapter 12 done. The grep clone parses arguments; the tests fail on case-insensitive search.",
-         ["Fix the case-insensitive test"], ["VS Code", "Firefox"]),
-        ("thread:21", "Mira’s birthday", "paused", 3 * H, "You looked at two book shops and one candle place. Nothing ordered yet; it’s on the 14th.",
-         ["Pick a gift", "Order by the 10th", "Card"], ["Mira", "Firefox"]),
-        ("thread:5", "Band practice recordings", "paused", 3 * H, "Three takes of the new song are in the Projects folder. You marked take 2 as the keeper.",
-         ["Send take 2 to Noor"], ["Noor", "Audacity"]),
-        ("thread:3", "Photo backup", "active", 2 * H, "The phone photos up to August are on the external drive. September is still only on the phone.",
-         ["Copy September", "Check the drive’s free space"], ["Files"]),
-    ]
-    # memory's next step per thread (the feedback round 3, W1c); one not written yet (the checklist's next shows)
-    nexts = {"thread:12": "Write the timer that waters each bed on its own days",
-             "thread:15": "Reply on the forum with who brings what", "thread:9": "Ask Theo for the new rent figure",
-             "thread:18": "Add the train tickets for the 24th", "thread:7": "Fix the case-insensitive search test",
-             "thread:21": "Pick between the two books you saved", "thread:5": "Send take 2 to Noor"}
-    people_names = {"Riya", "Noor", "Theo", "Mira", "Dev"}
-    done_counts = {"thread:12": 3, "thread:15": 2, "thread:9": 1, "thread:18": 1, "thread:7": 2, "thread:21": 0,
-                   "thread:5": 1, "thread:3": 1, "thread:2": 4}
-    goals = {"thread:12": "finish the watering schedule screen", "thread:15": "reply on the seed-swap thread"}
-
-    def checks(ref: str, open_items: list[str]) -> dict | None:
-        done = done_counts.get(ref, 0)
-        total = done + len(open_items)
-        return {"done": done, "total": total, "next": open_items[0] if open_items else None} if total else None
-
-    work = {
-        "threads": [{"ref": r, "title": t, "status": s, "last_at": ago(a), "state": st, "next": nexts.get(r), "open": o, "involves": inv,
-                     "people": [e for e in inv if e in people_names], "apps": [e for e in inv if e not in people_names],
-                     "checks": checks(r, o), "goal": goals.get(r)}
-                    for r, t, s, a, st, o, inv in threads],
-        "closed": [{"ref": "thread:2", "title": "Old laptop for Dev", "status": "done", "closed_at": ago(2 * D), "by_you": True},
-                   {"ref": "thread:4", "title": "Watching a cooking video", "status": "dismissed", "closed_at": ago(3 * D), "by_you": False}],
-        "pending": {}, "can": {"close": True, "cont": True, "correct": True},
-        "week": {"days": [{"dow": d, "today": i == 6, "pc": pc, "a": a, "f": f} for i, (d, pc, a, f) in enumerate(
-            [("Sun", 210, 90, 40), ("Mon", 520, 360, 80), ("Tue", 470, 330, 0), ("Wed", 560, 380, 90), ("Thu", 430, 300, 0),
-             ("Fri", 610, 360, 150), ("Sat", 452, 230, 114)])],
-            "totals": {"pc": 3252, "a": 2050, "f": 474}},
-    }
     day = {
         "date_label": "Saturday 3 Oct", "today": True, "first": "12 AM", "last": "9:49 PM", "now_min": 21 * 60 + 52,
         "off": [{"from": "1:31 AM", "to": "9:40 AM"}],
@@ -469,6 +470,23 @@ def build() -> dict:
                    ["Calls", "1h 56m", "1 on Mumble, 1 live"], ["Longest focus", "52m", "VS Code, 10:12 AM"]],
         "week_hours": week_hours(),
     }
+    # each session's moments (Home's Now tile opens Work at the one holding a moment)
+    midnight = NOW - (21 * 60 + 52) * M
+    for s in day["sessions"]:
+        s["start_at"], s["end_at"] = round(midnight + s["a"] * M, 1), round(midnight + s["b"] * M, 1)
+    # Work (the 4 Oct decision: no threads in the window): the whole to-do list and today's sessions, under the week
+    open_todos, done_todos = W.todo_lists(TodoMemory(), NOW, include_done=True)
+    can = {"end": True, "undo": True, "correct": True, "add": True}
+    work = {
+        "todos": {"open": open_todos, "done": done_todos, "n": len(open_todos), "can": can},
+        "sessions": [dict(s) for s in day["sessions"]], "pending": {}, "can": {"correct": True}, "next_at": None,
+        "week": {"days": [{"dow": d, "today": i == 6, "pc": pc, "a": a, "f": f} for i, (d, pc, a, f) in enumerate(
+            [("Sun", 210, 90, 40), ("Mon", 520, 360, 80), ("Tue", 470, 330, 0), ("Wed", 560, 380, 90), ("Thu", 430, 300, 0),
+             ("Fri", 610, 360, 150), ("Sat", 452, 230, 114)])],
+            "totals": {"pc": 3252, "a": 2050, "f": 474}},
+    }
+    home["todos"] = {"open": open_todos[:W.HOME_TODOS], "n": len(open_todos), "can": can}
+    home["pending"] = {}
     # Me is built by the real builder (web_data.build_me) over an invented memory, so the preview has exactly the
     # page's shapes: one summary per person, the review queue, topic groups, routines, misheard with its place
     me = W.build_me(InventedMemory(), now=NOW)
@@ -652,7 +670,7 @@ def build() -> dict:
         "offer": {"ok": True, "result": {"ok": True, "do": "todo_add", "state": "done", "message": "Added to your list.", "undo": True}},
         "offer_undo": {"ok": True, "result": {"ok": True, "state": "undone"}},
         "card_feedback": {"ok": True}, "answer": {"ok": True, "saved": True}, "skip_question": {"ok": True},
-        "continue": {"ok": True}, "askbar": {"ok": True}, "stop": {"ok": True}, "steer": {"ok": True, "delivered": True},
+        "askbar": {"ok": True}, "stop": {"ok": True}, "steer": {"ok": True, "delivered": True},
         "submit": {"ok": True}, "copy": {"ok": True}, "correct": {"ok": True}, "forget": {"ok": True}, "rule_edit": {"ok": True},
         "workflow_edit": {"ok": True, "state": "active"},
         "person": {"ok": True, "person": {"found": True, "facts": []}},
@@ -661,27 +679,10 @@ def build() -> dict:
         "call_pref": {"ok": True}, "stop_call": {"ok": True},
         "pin": {"ok": True, "pinned": True}, "resolve_heard": {"ok": True, "correction_id": None},
         "review_mark": {"ok": True, "correction_id": None}, "day_answer": {"ok": True, "sent": True},
-        # the feedback round 3: a thread's close and Undo / Reopen, Correct from your words and its Undo, Continue
-        "close_thread": {"ok": True, "status": "done"}, "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"},
-        "cancel_correction": {"ok": True}, "open_page": {"ok": True},
-        "thread_continue": {"ok": True, "cont": {
-            "ref": "thread:15", "title": "Seed-swap meetup on the 18th", "shown": "The venue is confirmed; the list of who brings what isn’t.",
-            "next": "Reply on the forum with who brings what", "open": ["Reply to the forum thread"], "last_at": ago(4 * M),
-            "ask": "Help me continue Seed-swap meetup on the 18th. Where it stands: The venue is confirmed; the list of who brings what "
-                   "isn’t. Next: Reply on the forum with who brings what",
-            "places": [{"kind": "page", "app": "Firefox", "title": "Seed swap on the 18th, the forum thread", "page": True, "last_at": ago(20 * M)}]},
-            "by_ref": {"thread:12": {"ok": True, "cont": {
-                "ref": "thread:12", "title": "Garden planner: watering schedule",
-                "shown": "Bed sizes and soil types are in. The schedule screen is half built; the timer logic isn’t started.",
-                "next": "Write the timer that waters each bed on its own days", "open": ["Write the watering schedule"],
-                "last_at": ago(5 * M),
-                "ask": "Help me continue Garden planner: watering schedule. Where it stands: Bed sizes and soil types are in. The "
-                       "schedule screen is half built; the timer logic isn’t started. Next: Write the timer that waters each bed on "
-                       "its own days",
-                "places": [{"kind": "window", "app": "VS Code", "title": "garden-planner, schedule.ts", "page": False, "last_at": ago(5 * M)},
-                           {"kind": "page", "app": "Firefox", "title": "Watering needs by plant, a gardening guide", "page": True,
-                            "last_at": ago(31 * M)},
-                           {"kind": "window", "app": "Notes", "title": "Balcony beds", "page": False, "last_at": ago(1 * D)}]}}}},
+        # Correct from your words and its Undo (the feedback round 3); the to-do list's Done / Not needed, Undo, Add
+        "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"}, "cancel_correction": {"ok": True},
+        "todo_end": {"ok": True, "ref": "todo:31", "how": "done", "undo": True, "until": ago(-10 * M)},
+        "todo_reopen": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40"},
         "thread_days": {"ok": True, "connector": {
             "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
             "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",
