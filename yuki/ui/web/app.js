@@ -125,7 +125,7 @@
     parse();
     const now = S.page + '/' + S.sub;
     if (now !== was || !S.booted) { S.navs++; render(true); B.send('want', { page: openKey(), sub: S.sub }); }
-    else if (chatWas !== S.chat) renderDrawer();
+    else if (chatWas !== S.chat) { renderDrawer(); renderRail(); }   // the rail's Thread shows open or closed
   }
   window.addEventListener('hashchange', route);
 
@@ -175,12 +175,15 @@
     const user = sh.user || {};
     const el = Y.clearing('nav', 'rail',
       h('div', { class: 'brand' }, face, h('div', null, h('div', { class: 'name', text: 'yuki' }), h('div', { class: 'st' }, statusLine()))),
-      h('div', { class: 'nav' }, items.map(([k, text, n]) => h('a', { attrs: { href: hashFor(k, '', S.chat), 'aria-current': S.page === k ? 'page' : null } },
+      // the links name only their page: whether the thread is open is read when you click (the click handler's
+      // data-nav, the thread action), never baked into an href drawn earlier (the 4 Oct bug: a rail drawn while the
+      // thread was open reopened it on the next tab after you had closed it)
+      h('div', { class: 'nav' }, items.map(([k, text, n]) => h('a', { data: { nav: k }, attrs: { href: hashFor(k, '', false), 'aria-current': S.page === k ? 'page' : null } },
         ic(k), text, n ? h('span', { class: 'n', text: n }) : null))),
       h('div', { class: 'sep' }),
       h('div', { class: 'nav' },
-        h('a', { attrs: { href: hashFor(S.page, S.sub, !S.chat), 'aria-current': S.chat ? 'page' : null } }, ic('chat'), 'Thread'),
-        h('a', { attrs: { href: hashFor('settings', '', S.chat), 'aria-current': S.page === 'settings' ? 'page' : null } }, ic('settings'), 'Settings')),
+        h('a', { data: { do: 'thread' }, attrs: { href: '#', 'aria-current': S.chat ? 'page' : null } }, ic('chat'), 'Thread'),
+        h('a', { data: { nav: 'settings' }, attrs: { href: hashFor('settings', '', false), 'aria-current': S.page === 'settings' ? 'page' : null } }, ic('settings'), 'Settings')),
       h('div', { class: 'foot' },
         sh.connected === false && S.booted ? h('div', { class: 'offline', text: 'Yuki isn’t running. Pages show memory; chat and voice wait for it.' }) : null,
         h('button', { class: 'askkey', data: { do: 'askbar' }, attrs: { type: 'button', title: sh.hotkey_words || 'Alt+Shift' } }, ic('key'), h('span', { text: 'Ask Yuki' }),
@@ -642,6 +645,13 @@
     if (ds.sub != null && t.closest('.seg')) { e.preventDefault(); return go(S.page, ds.sub); }
     if (ds.filter) { e.preventDefault(); return go('activity', ds.filter === 'all' ? '' : ds.filter); }
     if (ds.person) { e.preventDefault(); return go('me', ds.person); }
+    if (ds.nav) {   // a rail tab: the thread stays as it is now, open or closed
+      e.preventDefault();
+      S.touched = -Infinity;
+      // the tab you are on, clicked again: no hash change, so ask for its data again (42 R5)
+      if (ds.nav === S.page && !S.sub) B.send('want', { page: openKey(), sub: S.sub, again: true });
+      return go(ds.nav, '');
+    }
     if (t.tagName === 'A' && t.getAttribute('href') && t.getAttribute('href').startsWith('#')) {
       S.touched = -Infinity;   // a navigation is not a press that holds the next redraw (42 verification, missing 12)
       // the tab you are on, clicked again: no hash change, so ask for its data again (42 R5)
@@ -671,6 +681,8 @@
   };
   Y.actions.undo = (t) => { let box = t.parentElement; while (box && !Y.hasOrig(box)) box = box.parentElement; if (box) Y.restore(box); };
   Y.actions['open-thread'] = () => go(S.page, S.sub, { chat: true });
+  Y.actions.thread = () => go(S.page, S.sub, { chat: !S.chat });          // the rail's Thread: open or close it
+  Y.actions['close-thread'] = () => go(S.page, S.sub, { chat: false });
   /* a collapsible row (Yk.fold): open or close it in place, the design's 220 ms reveal; kept by key in S.open */
   Y.actions.fold = (t) => {
     const r = t.closest('[data-fold]'); if (!r) return;
