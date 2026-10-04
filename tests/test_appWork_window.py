@@ -555,3 +555,14 @@ def test_correct_moves_the_due_date_and_keeps_the_rest_as_your_correction(tmp_pa
     win._due_reader = lambda: Client({"due": "", "rest": "x"})
     assert win.a_correct_item({"ref": "todo:3", "words": "Lena owns this"})["correction_id"] == 5
     assert mem.calls[-1] == ("correct", "todo:3", "Lena owns this")                                # words whole
+
+
+def test_a_moved_due_date_reaches_the_page_with_the_date_it_had():
+    now = time.time()
+    got = W.pending_view({"todo:3": {"kind": "correct", "state": "moved", "words": "it's due Monday", "was": "2026-10-02",
+                                     "done_at": now},
+                          "todo:4": {"kind": "correct", "words": "x", "fid": 5, "at": now, "was": ""},
+                          "todo:5": {"kind": "correct", "state": "fixed", "words": "y", "was": "", "done_at": now}}, None, now)
+    assert got["todo:3"]["state"] == "moved" and got["todo:3"]["was"] == "2026-10-02"
+    assert got["todo:4"]["was"] == "" and got["todo:4"]["cid"] == 5
+    assert "was" not in got["todo:5"]                                                  # landed: no Undo any more

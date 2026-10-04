@@ -349,7 +349,13 @@ class TodoMemory:
             rows += [item("todo:27", "Measure the balcony beds", "user", status="done", since=2 * D),
                      item("commit:40", "Look up when the community hall opens on Sundays", "commitment", status="done",
                           since=1 * D, title="Community hall Sunday hours"),
-                     item("todo:25", "Call the landlord about the lease", "user", status="done", since=5 * D)]
+                     item("todo:25", "Call the landlord about the lease", "user", status="done", since=5 * D),
+                     # the promise memory saw kept (Work shows it once: struck through in You said you'd, review F3)
+                     item("commit:43", "Send Riya the planner link", "chat", status="done", since=5 * H,
+                          title="Send Riya the planner link"),
+                     # a loop you cleared a while ago: Put it back still works (review F7)
+                     item("loop:17", "Ana said she would lend you the ladder for the balcony", "loop", status="done",
+                          since=6 * D)]
         return rows
 
 

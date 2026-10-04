@@ -815,6 +815,18 @@ async function inPage(F) {
   fixIn.value = 'it is due Monday'; enter(fixIn); await sleep(200);
   check('WK5 Enter sends it (correct_item); your words take the source’s place, in full, with Undo while it waits', last('correct_item').ref === 'todo:31' && last('correct_item').words === 'it is due Monday'
     && r31().querySelector('.wm.wfx .corrected').textContent === 'you corrected it: “it is due Monday”' && !!r31().querySelector('[data-do="fix-undo"]'), r31().textContent);
+  // review F4: a Correct that only moved the due date says so, with Undo, and Undo puts the old date back
+  REPLY.cancel_correction = (m) => ({ ok: true, due_back: m.correction_id == null || m.correction_id === 98 });
+  r31().querySelector('[data-do="fix-undo"]').click(); await sleep(150);
+  check('WK17 Undo of a waiting Correct that moved nothing says nothing changed', last('cancel_correction').correction_id === 97 && toastTxt().includes('Taken back. Nothing changed.'), toastTxt());
+  REPLY.correct_item = (m) => ({ ok: true, ref: m.ref, due: '2026-10-05', correction_id: null, was_due: '2026-10-02' });
+  r31().querySelector('[data-do="correct"]').click(); await sleep(60);
+  const fixIn2 = r31().querySelector('.fixbox input'); fixIn2.value = 'it’s due Monday'; enter(fixIn2); await sleep(200);
+  check('WK17 a Correct that only moves the due date says "Moved the due date", with Undo (review F4)', r31().textContent.includes('Moved the due date from what you said: “it’s due Monday”')
+    && !!r31().querySelector('[data-do="fix-undo"]'), r31().textContent);
+  r31().querySelector('[data-do="fix-undo"]').click(); await sleep(150);
+  check('WK17 its Undo puts the date back (cancel_correction, no correction id) and says so', last('cancel_correction').ref === 'todo:31' && last('cancel_correction').correction_id == null
+    && toastTxt().includes('The due date is as it was.') && !r31().querySelector('[data-do="fix-undo"]'), toastTxt());
   REPLY.todo_add = (m) => ({ ok: true, ref: 'todo:90', due: '2026-10-05' });
   const addIn = wl().querySelector('.wl-in');
   addIn.value = 'Invented new thing by Monday'; enter(addIn); await sleep(30);
@@ -832,6 +844,14 @@ async function inPage(F) {
   doneRows[0].querySelector('[data-do="work-back"]').click(); await sleep(200);
   check('WK8 Put it back reopens it whatever its age (todo_reopen, any) and it is on the list at once', last('todo_reopen').ref === FW.todos.done[0].ref && last('todo_reopen').any === true
     && !!wl().querySelector(`.wrows .wrow[data-cref="${FW.todos.done[0].ref}"]`));
+  const keptRef = (FW.said.find((p) => p.closed) || {}).ref, doneLoop = FW.todos.done.find((t) => t.ref.startsWith('loop:'));
+  check('WK8 a promise I saw kept shows once: in You said you’d, not again in Recently done (review F3)', !!keptRef && !FW.todos.done.some((t) => t.ref === keptRef)
+    && !Array.from(wl().querySelectorAll('.wdone-l .wrow')).some((r) => r.querySelector(`[data-ref="${keptRef}"]`)));
+  const loopBack = doneLoop && Array.from(wl().querySelectorAll('.wdone-l [data-do="work-back"]')).find((b) => b.dataset.ref === doneLoop.ref);
+  if (loopBack) { loopBack.click(); await sleep(200); }
+  check('WK8 a loop you cleared long ago can be put back too (todo_reopen, any), to its own block with the next build (review F7)', !!loopBack
+    && last('todo_reopen').ref === doneLoop.ref && last('todo_reopen').any === true && toastTxt().includes('Put back where it was.')
+    && !wl().querySelector(`.wrows .wrow[data-cref="${doneLoop.ref}"]`), toastTxt());
   wl().querySelector('[data-do="work-donefold"]').click(); await sleep(60);
   // Waiting on
   const wait = () => sec('wait'), w0 = FW.waiting[0];
@@ -853,10 +873,24 @@ async function inPage(F) {
   check('WK10 Needs your reply: newest first, the quoted message, app and chat, how long; six show, the rest fold', rrows().length === R.length && rrows().filter(visible).length === 6
     && rrows()[0].querySelector('.wt').textContent === `${R[0].who} “${R[0].msg}”` && rrows()[0].querySelector('.wm').textContent.includes(`${R[0].app} · ${R[0].place}`)
     && /min|hour/.test(rrows()[0].querySelector('.wago').textContent) && rep().querySelector('[data-do="work-more"]').textContent === `Show ${R.length - 6} more`);
-  REPLY.work_open_chat = { ok: true, app: R[0].app, how: 'chat' };
+  REPLY.work_open_chat = { ok: true, app: R[0].app, how: 'chat', opened: true };
   rrows()[0].querySelector('.wr-hit').click(); await sleep(150);
   check('WK10 a click brings that chat forward (work_open_chat) and the row says opened until you reply', last('work_open_chat').key === R[0].key
     && rrows()[0].textContent.includes('opened · I’ll clear it once you reply') && toastTxt().includes(`Brought ${R[0].app} forward on your chat with ${R[0].who}.`), toastTxt());
+  // review F1: a desktop app brought forward (the chat a click away in it) is not marked opened
+  REPLY.work_open_chat = { ok: true, app: R[2].app, how: 'app', opened: false };
+  rrows()[2].querySelector('.wacts [data-do="work-open"]').click(); await sleep(150);
+  check('WK16 a chat app brought forward (not the chat itself) says so and is not marked opened (review F1)', last('work_open_chat').key === R[2].key
+    && !rrows()[2].textContent.includes('opened ·') && toastTxt().includes(`Brought ${R[2].app} forward. Your chat with ${R[2].who} is in it.`), toastTxt());
+  REPLY.work_open_chat = { ok: false, error: `I couldn’t find that chat in ${R[3].app}. Its tab isn’t the one on top.` };
+  rrows()[3].querySelector('.wr-hit').click(); await sleep(150);
+  check('WK16 a browser chat that can’t be found says so plainly and is not marked (review F1)', !rrows()[3].textContent.includes('opened ·') && toastTxt().includes('couldn’t find that chat'), toastTxt());
+  // review F5: the chat comes back later with a newer message: no stale "opened" from this window's own mark
+  const w5 = clone(Y.D.pages.work);
+  w5.replies.items[0] = Object.assign({}, w5.replies.items[0], { at: Date.now() / 1000 - 30, msg: 'Invented newer question?', opened: false });
+  await push('work', w5); await sleep(80);
+  check('WK16 a chat that needs a reply again after you opened it shows unopened (review F5)', rrows()[0].textContent.includes('Invented newer question?')
+    && !rrows()[0].textContent.includes('opened ·'), rrows()[0].textContent);
   REPLY.work_mark = { ok: true };
   const rr1 = rrows()[1];
   rr1.querySelector('[data-do="work-noreply"]').click(); await sleep(80);

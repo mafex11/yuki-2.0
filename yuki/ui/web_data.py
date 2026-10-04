@@ -1109,7 +1109,8 @@ def pending_view(pending: dict[str, Any] | None, prefixes: tuple[str, ...] | Non
     """The corrections a page shows on their rows (the feedback round 3, W3): ``{ref: {"kind", "words", "state",
     "cid", "at"}}`` for the refs starting with one of ``prefixes`` (all with None). ``state``: ``fixing`` (sent, the
     correction pass has not landed: "Got it, fixing it"), ``fixed`` (landed within :data:`FIXED_SHOWN_S`; the row
-    already shows the corrected text) or ``failed``; ``cid`` is the correction's id, for its Undo while it waits."""
+    already shows the corrected text), ``moved`` (the words only moved a due date) or ``failed``; ``cid`` is the
+    correction's id, for its Undo while it waits; ``was``, the due date the words moved it from (its Undo)."""
     now = time.time() if now is None else now
     out: dict[str, dict[str, Any]] = {}
     for ref, p in (pending or {}).items():
@@ -1119,7 +1120,9 @@ def pending_view(pending: dict[str, Any] | None, prefixes: tuple[str, ...] | Non
         if state != "fixing" and now - float(p.get("done_at") or 0) > FIXED_SHOWN_S:
             continue
         out[str(ref)] = {"kind": p.get("kind") or "correct", "words": p.get("words") or "", "state": state,
-                         "cid": p.get("fid"), "at": p.get("at"), "late": bool(p.get("late"))}
+                         "cid": p.get("fid"), "at": p.get("at"), "late": bool(p.get("late")),
+                         # a due date the words moved (``moved``: the date was all of it): Undo puts ``was`` back
+                         **({"was": p["was"]} if "was" in p and state in ("fixing", "moved") else {})}
     return out
 
 
