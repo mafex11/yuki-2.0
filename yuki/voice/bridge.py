@@ -60,6 +60,11 @@ RECENT_S = 180.0
 #: What the mouth reads for a result the bridge said itself (the thinker's own finishing line).
 RESULT_SAID_NOTE = ("Said aloud just now, word for word, the moment the action that did it succeeded. Do not "
                     "say it again or add to it; if they ask about it, answer from it.")
+#: appTakeover (review F5): what the talker reads for a request that ended because nobody went on with it after the
+#: user took over the keyboard or mouse (it waited paused, then stopped by itself; nothing else was done).
+PAUSED_OUT_NOTE = ("Stopped by itself: they took over the keyboard or mouse while it worked, it waited paused, and "
+                   "nobody went on with it for a long while, so nothing else was done. Say nothing about it; if they "
+                   "ask, say that plainly.")
 
 
 @dataclass
@@ -849,6 +854,15 @@ class VoiceBridge(QObject):
                 self.steps.closed(job.token)
             self._log("mouth_tool_result", job_id=job.job_id, result=kind, final=kind in ("done", "failed"),
                       chars=len(str(payload)))
+            if job.paused_out and kind in ("done", "failed", "withdrawn"):
+                # appTakeover (review F5): it ended because nobody went on with it after the user took over: settled
+                # quietly with what really happened (never "replaced by a newer request")
+                self._drop_items(job)
+                self._unowe(job)
+                await params.result_callback({"stopped": job.brief(), "how_to_handle_it": PAUSED_OUT_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
+                self._log("bridge", op="paused_out_settled", job_id=job.job_id)
+                return
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
                 # Replaced by the user's newer request: nothing of it is ever said. Its call settles quietly, so
                 # the talker knows it stopped, and its waiting lines go with it.
@@ -2314,6 +2328,11 @@ class VoiceBridge(QObject):
                 self.steps.closed(job.token)
             announce = self.announce
             if announce is None:
+                return
+            if job.paused_out and kind in ("done", "failed", "withdrawn"):
+                self._drop_items(job)   # appTakeover (review F5): what really happened, quietly
+                self._unowe(job)
+                await announce({"stopped": job.brief(), "how_to_handle_it": PAUSED_OUT_NOTE}, False)
                 return
             if kind == "withdrawn" or (kind in ("done", "failed") and job.superseded):
                 self._drop_items(job)

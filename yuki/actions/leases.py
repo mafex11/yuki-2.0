@@ -390,6 +390,11 @@ TAKEOVER_MOVE_MAX_PX = 400
 #: The window the travel is measured over (s), and how often the watch looks (s).
 TAKEOVER_WINDOW_S = 0.3
 TAKEOVER_POLL_S = 0.1
+#: Input already going on when the watch began (typing in a chat, keys held in a game as the request starts) is the
+#: baseline, not a takeover: keys, clicks and movement count only once the user has been still this long (s) since the
+#: watch began, or their last input was Yuki's own. The input gate's own "stopped typing" gap (``InputGate.quiet_s``),
+#: measured on the clock (review F3).
+TAKEOVER_QUIET_S = 0.8
 #: The mouse buttons among :data:`_REAL_INPUT_VKS` (a button going down is a click; any other key is typing).
 _MOUSE_VKS = frozenset({1, 2, 4, 5, 6})
 
@@ -507,7 +512,10 @@ class TakeoverWatch:
     * left out: every look while one of Yuki's own input moments runs or just ended (:data:`OWN_INPUT_SLACK_S`), or
       when one began since the previous look: its keys are consumed and not counted, and the cursor's places from
       before are forgotten (Yuki moves the cursor itself; review vfix2 for scroll); input that went to Yuki itself
-      (:func:`yuki_has_it`).
+      (:func:`yuki_has_it`);
+    * not counted yet: input that was already going on when the watch began (the user typing elsewhere, keys held in a
+      game): nothing counts until the user has been still for ``quiet_s`` since, or their last input was Yuki's own
+      (review F3: the next keystroke of typing that began before the request paused it).
 
     ``GetAsyncKeyState`` is asked only when ``GetLastInputInfo`` shows new input since the last look (or around one of
     Yuki's own moments): an idle desk costs two calls a look. Every source is a parameter (tests pass stubs).
@@ -515,18 +523,21 @@ class TakeoverWatch:
     Attributes:
         polls: Looks so far.
         max_travel: The farthest the cursor travelled in one window without counting (px): what jitter looked like.
-        ignored: Why input was not counted, by reason (``own``, ``yuki``).
+        ignored: Why input was not counted, by reason (``own``, ``yuki``, ``busy``: going on since before the watch).
+        armed: Whether the user's input counts yet (they were still for ``quiet_s`` since the watch began).
     """
 
     def __init__(self, *, move_px: int = TAKEOVER_MOVE_PX, window_s: float = TAKEOVER_WINDOW_S,
+                 quiet_s: float = TAKEOVER_QUIET_S,
                  age: Callable[[], float | None] = last_input_age_s,
                  keys: Callable[[], tuple[frozenset[int], frozenset[int]] | None] = key_states,
                  cursor: Callable[[], tuple[int, int] | None] = cursor_at,
                  span: Callable[[], tuple[float, float | None]] = own_input_span,
                  ours: Callable[[str, tuple[int, int] | None], bool] = yuki_has_it,
                  now: Callable[[], float] = time.monotonic) -> None:
-        self.move_px, self.window_s = float(move_px), float(window_s)
+        self.move_px, self.window_s, self.quiet_s = float(move_px), float(window_s), float(quiet_s)
         self.age, self.keys, self.cursor, self.span, self.ours, self.now = age, keys, cursor, span, ours, now
+        self.armed = False
         self.polls = 0
         self.max_travel = 0.0
         self.ignored: dict[str, int] = {}
@@ -545,6 +556,11 @@ class TakeoverWatch:
             return True
         return self._prev_t is not None and start >= self._prev_t - 0.05
 
+    def _was_own(self, last: float, t: float) -> bool:
+        """The last input (any source) came inside one of Yuki's own input moments (or the slack after it)."""
+        start, end = self.span()
+        return bool(start) and start - 0.05 <= last <= (t if end is None else end) + OWN_INPUT_SLACK_S
+
     def _skip(self, why: str) -> None:
         self.ignored[why] = self.ignored.get(why, 0) + 1
 
@@ -556,6 +572,8 @@ class TakeoverWatch:
         last = None if seconds is None or seconds == float("inf") else t - float(seconds)
         came = last is not None and (self._last_input is None or last > self._last_input + 0.005)
         first = self.polls == 0
+        if not self.armed and not own and (last is None or t - last >= self.quiet_s or self._was_own(last, t)):
+            self.armed = True   # still since the watch began (or the last input was Yuki's): from here, input counts
         found: str | None = None
         if first or came or own:
             states = self.keys()
@@ -594,6 +612,11 @@ class TakeoverWatch:
             self._samples.append((t, int(where[0]), int(where[1])))
         self._prev_t = t
         self.polls += 1
+        if found is not None and not self.armed:
+            # going on since before the watch began (typing elsewhere, a game's keys): the baseline, not a takeover
+            self._skip("busy")
+            self._far = None
+            return None
         if found is not None and self.ours(found, where):
             self._skip("yuki")
             self._samples.clear()

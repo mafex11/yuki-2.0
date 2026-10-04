@@ -870,3 +870,237 @@ def test_resume_pressed_before_the_request_reached_its_pause_still_reads_the_scr
     assert told == ["paused", "resumed"] and isinstance(events[-1], Final)
     assert PAUSED_SKIP in seen["text"]
     assert _presses(desk) == ["playpause", "nexttrack"] and "read again" in seen["text"]
+
+
+# -- review fixes (F1-F5) -----------------------------------------------------------------------------------------------
+
+
+def test_f1_an_irreversible_step_the_pause_caught_asks_nothing(tmp_path: Path):
+    """The pause lands while the brain writes a step marked "can't be undone": no question is asked while paused (the
+    island would show needs-you over paused, the voice would speak it), and the step is not run."""
+    from yuki.log.events import AskUser
+
+    desk = _desk()
+    watches = Watches()
+
+    def second_call(params: dict) -> SimpleNamespace:
+        watches.fire("keys")
+        return _response(_use("press", 1, key="nexttrack", expect_hwnd=PLAYER,
+                              risk={"reversible": False, "user_asked": False, "effect": "skips the song"}))
+
+    brain = Brain([_response(_press(0, "playpause")), second_call])
+    agent = _agent(brain, tmp_path, desk, watches=watches, limit=0.3)
+    events = _drive(agent, "play and skip")
+    assert not any(isinstance(e, AskUser) for e in events)
+    assert [e.state for e in events if isinstance(e, Paused)] == ["paused", "ended"]
+    assert _presses(desk) == ["playpause"]
+    assert isinstance(events[-1], ErrorEvent) and events[-1].text == "Stopped. Nothing else was done."
+
+
+def _pt():
+    return pytest.importorskip("test_appPT_send_countdown")
+
+
+def test_f1_a_send_the_pause_caught_says_nothing_and_never_counts_down(tmp_path: Path):
+    """The pause lands while the brain writes a send (a voice request): no "Sending to Sam", no countdown on the
+    island, no judge or second look for it, nothing sent."""
+    from yuki.log.events import Say, SendPending
+
+    pt = _pt()
+    desk = pt._desk()
+    holder: dict[str, Any] = {}
+
+    def second(params: dict) -> SimpleNamespace:
+        a = holder["agent"]
+        a._acting_token = a._acting_token or "acting"   # the request acts (its watch would be running)
+        assert a.pause("keys") is True
+        return pt._response(pt._send(), pt._done())
+
+    brain = pt.Brain([pt._check(), second])
+    agent = holder["agent"] = pt._agent(brain, tmp_path, desk, countdown=0.3)
+    agent.pause_timeout_s = 0.3
+    judged: list[str] = []
+    agent._authorize = lambda name, *a, **k: judged.append(name)
+    events = list(agent.run("tell sam omw", voice=True))
+    assert not [e for e in events if isinstance(e, (Say, SendPending))]
+    assert judged == [] and desk.sent == []
+    assert not any(isinstance(e, ToolCall) and e.name == "type_text" for e in events)   # never shown as a step
+    assert events[-1].text == "Stopped. Nothing else was done."
+
+
+def test_f1_a_pause_that_lands_as_the_step_shows_skips_every_gate(tmp_path: Path):
+    """The second guard: the pause comes the moment the send's step was shown (the generator waits on that event):
+    still no judge, no countdown, nothing said or sent; the step's result says it was not run."""
+    from yuki.agent.loop import PAUSED_SKIP
+    from yuki.log.events import Say, SendPending
+
+    pt = _pt()
+    desk = pt._desk()
+    brain = pt.Brain([pt._check(), pt._response(pt._send(), pt._done())])
+    agent = pt._agent(brain, tmp_path, desk, countdown=0.3)
+    agent.pause_timeout_s = 0.3
+    judged: list[str] = []
+    agent._authorize = lambda name, *a, **k: judged.append(name)
+    events = []
+    for ev in agent.run("tell sam omw", voice=True):
+        events.append(ev)
+        if isinstance(ev, ToolCall) and ev.name == "type_text":
+            agent._acting_token = agent._acting_token or "acting"
+            assert agent.pause("mouse") is True
+    assert not [e for e in events if isinstance(e, (Say, SendPending))]
+    assert judged == [] and desk.sent == []
+    assert any(isinstance(e, ToolResult) and e.name == "type_text" and e.summary == PAUSED_SKIP for e in events)
+
+
+def test_f2_a_say_line_in_a_response_the_pause_caught_is_never_spoken(tmp_path: Path):
+    from yuki.log.events import Say
+
+    desk = _desk()
+    watches = Watches()
+
+    def second_call(params: dict) -> SimpleNamespace:
+        watches.fire("mouse")
+        return _response(_use("say", 1, text="Skipping to the next one now"), _press(1, "nexttrack"))
+
+    brain = Brain([_response(_press(0, "playpause")), second_call])
+    agent = _agent(brain, tmp_path, desk, watches=watches, limit=0.3)
+    events = _drive(agent, "play and skip")
+    assert not any(isinstance(e, Say) for e in events)
+    assert _presses(desk) == ["playpause"]
+
+
+def test_f2_a_say_that_runs_once_paused_is_held(tmp_path: Path):
+    """A pause that lands between the say's start and its line going out: the line is held (logged, not said)."""
+    from yuki.log.events import Say
+
+    desk = _desk()
+    watches = Watches()
+    brain = Brain([_response(_press(0, "playpause")), _response(_use("say", 1, text="One moment"), _done())])
+    agent = _agent(brain, tmp_path, desk, watches=watches, limit=0.3)
+    orig = agent._dispatch
+
+    def dispatch(name: str, tool_input: dict) -> Any:
+        if name == "say":
+            watches.fire("keys")
+        return orig(name, tool_input)
+
+    agent._dispatch = dispatch
+    events = _drive(agent, "play it")
+    assert not any(isinstance(e, Say) for e in events)
+
+
+def test_f3_typing_already_going_on_when_the_watch_starts_is_not_a_takeover():
+    """The user types in a chat (or holds game keys) as the request reaches its first action: the next keystrokes are
+    the baseline. Once they have been still for the quiet gap, a key counts again."""
+    d = Desk()
+    d.last_input = d.t - 0.05                 # a key 50 ms before the watch
+    w = d.watch()
+    assert d.step(w) is None and not w.armed
+    for _ in range(6):                        # they keep typing: never a pause
+        d.tapped, d.last_input = frozenset({0x41}), d.t + 0.05
+        assert d.step(w) is None
+    assert w.ignored.get("busy", 0) >= 1 and not w.armed
+    for _ in range(9):                        # still for 0.9 s
+        assert d.step(w) is None
+    assert w.armed
+    d.tapped, d.last_input = frozenset({0x42}), d.t + 0.05
+    assert d.step(w) == "keys"                # now it is them taking over
+
+
+def test_f3_a_mouse_moving_when_the_watch_starts_counts_only_after_a_still_moment():
+    d = Desk()
+    d.last_input = d.t - 0.02
+    w = d.watch()
+    d.step(w)
+    for x in (560, 640, 720, 800):            # the hand was already moving
+        d.move(x, 500)
+        assert d.step(w) is None
+    for _ in range(9):
+        d.step(w)
+    got = []
+    for x in (860, 920, 980):
+        d.move(x, 500)
+        got.append(d.step(w))
+    assert "mouse" in got
+
+
+def test_f3_when_the_last_input_was_yukis_own_the_watch_counts_at_once():
+    """Yuki's own input moment just ended (its keys moved the input clock): the user is not busy, so their next key
+    counts (no quiet gap needed)."""
+    d = Desk()
+    d.span = (d.t - 0.6, d.t - 0.5)
+    d.last_input = d.t - 0.51                  # inside Yuki's own span (0.6 s ago: past its slack)
+    w = d.watch()
+    d.t += 0.1
+    assert w.poll() is None and w.armed
+    d.tapped, d.last_input = frozenset({0x41}), d.t + 0.05
+    assert d.step(w) == "keys"
+
+
+def test_f4_no_pause_while_a_full_screen_is_in_front_and_the_watch_goes_on(tmp_path: Path):
+    agent = _agent(Brain([]), tmp_path, _desk(), watches=Watches())
+    agent._acting_token = "acting"
+    full = [True]
+    agent.takeover_ok = lambda: not full[0]
+    assert agent.pause("keys") is False and not agent.paused     # refused: the watch keeps watching
+    full[0] = False
+    assert agent.pause("keys") is True and agent.paused
+
+
+def test_f4_the_app_reads_the_islands_full_screen_flag_and_wires_the_worker(qapp):
+    from yuki.ui.app import YukiUi
+
+    ui = SimpleNamespace(island=SimpleNamespace(inputs=SimpleNamespace(fullscreen=True)))
+    assert YukiUi._takeover_ok(ui) is False
+    ui.island.inputs.fullscreen = False
+    assert YukiUi._takeover_ok(ui) is True
+    src = Path(__file__).resolve().parents[1].joinpath("yuki", "ui", "app.py").read_text(encoding="utf-8")
+    assert "worker_agent.takeover_ok = self._takeover_ok" in src
+
+
+def test_f4_a_pause_behind_a_hidden_full_screen_island_still_shows_on_the_tray():
+    from yuki.ui.tray import tray_state
+
+    assert tray_state("game-quiet", fullscreen=True) == "game"
+    assert tray_state("game-quiet", fullscreen=True, paused=True) == "needs-you"
+
+
+def test_f5_an_unresumed_pause_settles_with_what_happened_never_as_replaced(qapp):
+    import asyncio
+
+    from yuki.voice.bridge import PAUSED_OUT_NOTE
+    from yuki.voice.mouth import WITHDRAWN_NOTE
+
+    bridge, job = _bridge_job()
+    bridge._on_paused_changed("worker", 9, "paused", "keys")
+    bridge._on_paused_changed("worker", 9, "ended", "keys")
+    got: list[tuple] = []
+
+    async def result_callback(result: Any, properties: Any = None) -> None:
+        got.append((result, properties))
+
+    async def go() -> None:
+        job.events = asyncio.Queue()
+        await job.events.put(("failed", "Stopped. Nothing else was done."))
+        await bridge._relay(job, SimpleNamespace(result_callback=result_callback))
+
+    asyncio.run(go())
+    assert len(got) == 1
+    result, props = got[0]
+    assert result.get("how_to_handle_it") == PAUSED_OUT_NOTE and "withdrawn" not in result
+    assert WITHDRAWN_NOTE not in str(result) and props.run_llm is False
+
+    announced: list[Any] = []
+
+    async def announce(payload: Any, speak: bool) -> None:
+        announced.append((payload, speak))
+
+    bridge.announce = announce
+
+    async def go_detached() -> None:
+        job.events = asyncio.Queue()
+        await job.events.put(("failed", "Stopped. Nothing else was done."))
+        await bridge._relay_detached(job)
+
+    asyncio.run(go_detached())
+    assert announced == [({"stopped": job.brief(), "how_to_handle_it": PAUSED_OUT_NOTE}, False)]

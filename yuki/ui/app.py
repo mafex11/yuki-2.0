@@ -379,6 +379,11 @@ class YukiUi(QObject):
         resume_clicked = getattr(self.island, "resume_clicked", None)
         if resume_clicked is not None:
             resume_clicked.connect(self._on_island_resume)
+        worker_agent = getattr(getattr(self.runtime, "worker", None), "agent", None)
+        if worker_agent is not None and hasattr(worker_agent, "takeover_ok"):
+            # review F4: no takeover pause while a full screen is in front (the island is hidden there, so a pause
+            # could not be seen); the input gate's short wait before Yuki's own input still yields to them
+            worker_agent.takeover_ok = self._takeover_ok
         partial = getattr(runtime_signals, "partial", None)
         if partial is not None:
             partial.connect(self._on_partial)
@@ -1304,6 +1309,11 @@ class YukiUi(QObject):
         if line and callable(emit):
             emit({"type": "said", "job": rid, "text": line})
         self.ui_log.event("takeover", id=rid, state=state, why=why or None)
+
+    def _takeover_ok(self) -> bool:
+        """appTakeover: whether the user taking over may pause a request now (the watch's thread asks; a plain read of
+        the island's measured full-screen flag): never while a full screen (a game, a video) is in front."""
+        return not bool(getattr(getattr(self.island, "inputs", None), "fullscreen", False))
 
     def _on_island_resume(self, request_id: int) -> None:
         """Resume on the island's paused bar or the run card: the request reads the screen again and goes on."""
