@@ -237,6 +237,7 @@ async function inPage(F) {
   // ---- Yuki opens it only when asked: the window brought forward for the thread, or a Steer press ----
   window.__push({ kind: 'focus', page: 'home', thread: true }); await settle();
   check('the window brought forward for the thread opens it', !!drawer(), state());
+  check('... on the page asked for (Home, not the tab you were on)', location.hash.startsWith('#home') && document.querySelector('.rail a[aria-current="page"]') && railLink('Home').getAttribute('aria-current') === 'page', state());
   await key('Escape');
   opened = await visitAll();
   check('closed after Yuki opened it: every tab, it stays closed', !opened.length, opened.join('; '));
@@ -246,6 +247,10 @@ async function inPage(F) {
   await click(closeX(), 'the drawer’s X');
   opened = await visitAll();
   check('closed after Steer: every tab, it stays closed', !opened.length, opened.join('; '));
+  window.__push({ kind: 'focus', thread: true }); await settle();
+  check('the thread asked with no page opens it where you are', !!drawer() && location.hash.startsWith('#settings'), state());
+  await click(closeX(), 'the drawer’s X');
+  check('closed again: it stays closed', !drawer() && !location.hash.includes('thread=1'), state());
   return results;
 }
 

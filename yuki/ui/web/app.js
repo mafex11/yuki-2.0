@@ -618,7 +618,11 @@
     }
     if (S.chat && !chatT) chatT = setTimeout(() => { chatT = 0; renderDrawer(); }, 100);   // a streamed reply: ~10 patches a second
   });
-  B.on('focus', (m) => { if (m.page && PAGES.includes(m.page)) go(m.page, m.sub || ''); if (m.thread) go(S.page, S.sub, { chat: true }); });
+  // one go(): two in a row would read S.page before the first hash change is routed (the thread opened on the old page)
+  B.on('focus', (m) => {
+    const asked = !!(m.page && PAGES.includes(m.page));
+    if (asked || m.thread) go(asked ? m.page : S.page, asked ? (m.sub || '') : S.sub, m.thread ? { chat: true } : undefined);
+  });
   B.on('appearance', (m) => { applyAppearance(m.appearance); render(false); });
   B.on('toast', (m) => Y.toast(m.text, !!m.warn));
   B.on('quiet', (m) => { L.Motion.setQuiet(!!m.on); if (splash) splash.quiet(!!m.on); });   // a full-screen app covers the window: one still frame
