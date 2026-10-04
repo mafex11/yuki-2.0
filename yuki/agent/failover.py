@@ -118,6 +118,12 @@ class FailoverClient:
         log: ``log(event_type, **fields)`` for every retry and failover; ``None`` to not log.
         sleep: Waits between retries (``threading.Event().wait`` by default: no busy loop).
         clock: Monotonic clock (tests).
+        role: The job these calls do (``thinker``, ``memory``; ``yuki.agent.providers``). ``None``: no routing.
+            While the role is on ``default`` (no ``ai.json``, or the role left as it was) every call takes the
+            path below, untouched. When the user moved the role to another provider in Settings → AI, the call
+            goes to that provider and model instead, through a client of this same class (retries and backoff
+            on that provider, then the user's backup if one is set; never a silent switch back to Claude).
+        settings: The settings the routed clients take their timeouts from (``from_settings`` passes them).
     """
 
     def __init__(
@@ -134,10 +140,16 @@ class FailoverClient:
         sleep: Callable[[float], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         regionless: bool = False,
+        role: str | None = None,
+        settings: Any = None,
     ) -> None:
         #: The Anthropic API backend: one endpoint, so a region in a chain means nothing and two
         #: entries naming the same model there are one target (``yuki.core.models``).
         self.regionless = regionless
+        self.role = role
+        self.settings = settings
+        #: (route, key file stamp, custom address, requested model) -> the routed client of that route
+        self._routed: dict[tuple[Any, ...], FailoverClient] = {}
         self.region = region
         self._factory = factory
         self.fallbacks = fallbacks or {}
@@ -158,8 +170,11 @@ class FailoverClient:
 
     @classmethod
     def from_settings(cls, settings: Any, *, log: Callable[..., Any] | None = None,
-                      factory: Callable[[str], Any] | None = None) -> "FailoverClient":
-        """The client for ``settings`` (region, chains, retries, timeouts), SDK retries off (these are ours)."""
+                      factory: Callable[[str], Any] | None = None, role: str | None = "thinker") -> "FailoverClient":
+        """The client for ``settings`` (region, chains, retries, timeouts), SDK retries off (these are ours).
+
+        ``role``: whose calls these are (the agent's: ``thinker``, the default), for Settings → AI.
+        """
         import os
 
         region = getattr(settings, "aws_region", None) or os.environ.get("AWS_REGION", "ap-south-1")
@@ -181,7 +196,7 @@ class FailoverClient:
             fallbacks=getattr(settings, "model_fallbacks", None) or {},
             retries=getattr(settings, "model_retries", 2), base_s=getattr(settings, "model_retry_base_s", 0.6),
             max_s=getattr(settings, "model_retry_max_s", 4.0), sticky_s=getattr(settings, "failover_sticky_s", 300.0),
-            log=log,
+            log=log, role=role, settings=settings,
         )
 
     # -- plumbing --------------------------------------------------------------------------
@@ -266,6 +281,14 @@ class FailoverClient:
 
     def run(self, params: dict[str, Any], call: Callable[[Any, dict[str, Any]], Any]) -> Any:
         """``call(client, params)`` on each target in turn until one works (see the module docstring)."""
+        if self.role is not None:
+            from yuki.agent.providers.config import route
+            from yuki.agent.providers.pricing import note_routed
+
+            chosen = route(self.role)
+            if chosen is not None:
+                return self._run_routed(chosen, params, call)
+            note_routed(None, None)
         model = str(params.get("model") or "")
         chain = self.chain(model)
         start = self._start_index(model, chain)
@@ -308,6 +331,55 @@ class FailoverClient:
             self._sticky.pop(model, None)
         assert last is not None
         raise last
+
+    # -- Settings → AI: a role moved to another provider ------------------------------------------------------------
+
+    def _routed_client(self, chosen: Any, requested: str) -> "FailoverClient":
+        """The client of ``chosen`` (a ``yuki.agent.providers.config.Route``): its targets are ``"@<provider>"``
+        places, built by ``yuki.agent.providers.client.sync_provider_client``; rebuilt when a key or the custom
+        address changes."""
+        from yuki.agent.providers import config, keys
+        from yuki.agent.providers.client import sync_provider_client
+
+        backup = chosen.backup
+        backup_model = (backup.model or (requested if backup.provider == "default" else "")) if backup else ""
+        stamp = (chosen.signature(), keys.version(), config.custom_base_url(), backup_model)
+        with self._lock:
+            client = self._routed.get(stamp)
+        if client is not None:
+            return client
+        settings = self.settings
+
+        def factory(place: str) -> Any:
+            return sync_provider_client(place.lstrip("@"), settings)
+
+        fallbacks = {}
+        if backup is not None and backup_model:
+            fallbacks[chosen.primary.model] = [{"model": backup_model, "region": f"@{backup.provider}"}]
+        client = FailoverClient(f"@{chosen.primary.provider}", factory, fallbacks=fallbacks, retries=self.retries,
+                                base_s=self.base_s, max_s=self.max_s, sticky_s=self.sticky_s, log=self._log,
+                                sleep=self._sleep, clock=self._clock)
+        with self._lock:
+            self._routed = {k: v for k, v in self._routed.items() if k[0] != stamp[0]}
+            self._routed[stamp] = client
+        return client
+
+    def _run_routed(self, chosen: Any, params: dict[str, Any], call: Callable[[Any, dict[str, Any]], Any]) -> Any:
+        from yuki.agent.providers.client import missing_model
+        from yuki.agent.providers.pricing import note_routed
+
+        if not chosen.primary.model:
+            raise missing_model(self.role or "")
+        requested = str(params.get("model") or "")
+        client = self._routed_client(chosen, requested)
+        self.counters["calls"] += 1
+        result = client.run({**params, "model": chosen.primary.model}, call)
+        used, target = client.last_model() or chosen.primary.model, client.last_target() or ""
+        provider = target.rpartition("@")[2] or chosen.primary.provider
+        name = used if provider == "default" else f"{provider}:{used}"
+        self._local.model, self._local.target = name, f"{used}@{provider}"
+        note_routed(requested, None if provider == "default" else name)
+        return result
 
 
 class _Messages:
@@ -385,14 +457,16 @@ class _FailoverStream:
         return None
 
 
-def make_client(settings: Any = None, *, log: Callable[..., Any] | None = None) -> FailoverClient:
+def make_client(settings: Any = None, *, log: Callable[..., Any] | None = None,
+                role: str | None = "memory") -> FailoverClient:
     """A failover Bedrock client for ``settings`` (default :class:`yuki.config.Settings`).
 
     The one-line change for any worker that builds ``anthropic.AnthropicBedrock(aws_region=...)``
-    itself (the memory workers): ``self._client = make_client(settings, log=self._log)``.
+    itself (the memory workers): ``self._client = make_client(settings, log=self._log)``. ``role``: whose calls
+    these are for Settings → AI (the memory passes, ``memory``, by default).
     """
     if settings is None:
         from yuki.config import Settings
 
         settings = Settings()
-    return FailoverClient.from_settings(settings, log=log)
+    return FailoverClient.from_settings(settings, log=log, role=role)

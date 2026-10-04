@@ -637,7 +637,19 @@ class Settings:
         return path if path.is_absolute() else self.project_root / path
 
     def price_for(self, model: str) -> dict[str, float] | None:
-        """The ``$/1M tokens`` rates for ``model`` (alias or id), or ``None``."""
+        """The ``$/1M tokens`` rates for ``model`` (alias or id), or ``None``.
+
+        A model on another provider (``openai:gpt-5-mini``, Settings → AI) is priced by
+        :mod:`yuki.agent.providers.pricing`: known list prices, OpenRouter's own, free and local at 0, else
+        ``None`` (never another model's rate).
+        """
+        if ":" in model:
+            from yuki.agent.providers.catalog import split_qualified
+
+            if split_qualified(model) is not None:
+                from yuki.agent.providers.pricing import rates
+
+                return rates(model, self.pricing)
         return self.pricing.get(resolve_model(model))
 
     def estimate_cost(self, model: str, usage: dict[str, int]) -> float | None:
@@ -651,7 +663,19 @@ class Settings:
 
         Returns:
             The estimate, or ``None`` when there is no price for the model.
+
+        After a call that Settings → AI sent to another provider, the callers still name the model they asked
+        for (the memory workers price with their Claude id): the model that actually answered on this thread
+        is priced instead (:func:`yuki.agent.providers.pricing.routed_name`), with OpenRouter's returned amount
+        when it is that call's.
         """
+        if model:
+            from yuki.agent.providers.catalog import split_qualified
+            from yuki.agent.providers.pricing import cost, routed_name
+
+            name = model if split_qualified(model) is not None else routed_name(model)
+            if name is not None:
+                return cost(name, usage, self.pricing)
         rates = self.price_for(model)
         if rates is None:
             return None

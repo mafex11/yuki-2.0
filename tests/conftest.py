@@ -39,6 +39,22 @@ def _no_side_calls():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _temp_ai_dir(tmp_path_factory: pytest.TempPathFactory):
+    """Settings → AI (``ai.json`` and the DPAPI key file) in a temp folder: no test ever reads the user's own choice
+    of AI or keys, so every test runs on the default path unless it writes its own ``ai.json`` there."""
+    folder = tmp_path_factory.mktemp("yuki-ai")
+    old = os.environ.get("YUKI_AI_DIR")
+    os.environ["YUKI_AI_DIR"] = str(folder)
+    try:
+        yield folder
+    finally:
+        if old is None:
+            os.environ.pop("YUKI_AI_DIR", None)
+        else:
+            os.environ["YUKI_AI_DIR"] = old
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
     """Point memory's default folder at a temp dir for the whole run (restored after)."""
     folder = tmp_path_factory.mktemp("yuki-memory")
