@@ -171,9 +171,9 @@ class AckVoice:
                     except Exception as exc:  # noqa: BLE001 - no line then: a tick
                         pcm, how = b"", f"error: {type(exc).__name__}"
                     if pcm:
+                        if self.cache is not None and key:
+                            self.cache.put(key, pcm)
                         break
-                    if pcm and self.cache is not None and key:
-                        self.cache.put(key, pcm)
                 if pcm:
                     with self._lock:
                         self._pcm[kind] = pcm
