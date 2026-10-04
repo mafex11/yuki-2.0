@@ -169,8 +169,33 @@ def cases() -> list[dict[str, Any]]:
         dict(id="good_job", issue="V12", check="short", messages=[
             u("what do you see on my screen?"), a("A design mockup of an app's state screens, and your code editor "
                                                   "on the other monitor."), u("Good job.")]),
+        # vGame (report 79): in a game or a call, act only on words said by name, briefly; ignore the rest silently
+        dict(id="focus_named_turnup", issue="vGame", check="not_quiet", named=True, call="Discord", state=GAME_CALL,
+             messages=[u("turn it up a bit")]),
+        dict(id="focus_named_pause_game", issue="vGame", check="not_quiet", named=True, state=GAME_ONLY,
+             messages=[u("Pause the music.")]),
+        dict(id="focus_callout", issue="vGame", check="quiet", call="Discord", state=GAME_CALL,
+             messages=[u("push B, I'm rotating, he's one shot")]),
+        dict(id="focus_team_hindi", issue="vGame", check="quiet", call="Discord", state=GAME_CALL,
+             messages=[u("भाई रुक जा, मैं आ रहा हूँ")]),
+        dict(id="focus_said_go_away", issue="vGame", check="end_quiet", call="Discord", state=GAME_CALL,
+             messages=[u("Yuki, turn it up"), call("media_key", {"key": "volumeup", "times": 3,
+                                                                  "say_when_done": "Louder."}, "v1"),
+                       result("v1", {"done": "volume up 3 steps", "said": "Louder."}), a("Louder."),
+                       u("dude I just said go away")]),
+        dict(id="focus_named_open_brief", issue="vGame", check="brief", named=True, state=GAME_ONLY,
+             desk=DESK_NO_ARC, messages=[u("open Telegram")]),
+        dict(id="focus_named_time_brief", issue="vGame", check="brief", named=True, call="Discord", state=GAME_CALL,
+             messages=[u("what time is it?")]),
+        dict(id="focus_after_nothing", issue="vGame", check="end_or_quiet", call="Discord", state=GAME_CALL,
+             messages=[u("Yuki?"), a("Yeah?"), u("ah nothing, forget it")]),
     ]
     return c
+
+
+#: vGame: the measured focus states a conversation puts in the talker's volatile block (``Conversation._prompt_state``).
+GAME_CALL = {"focus": {"game": "VALORANT", "call": True}}
+GAME_ONLY = {"focus": {"game": "fullscreen", "call": False}}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -299,6 +324,11 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
         return False
     if kind == "short":
         return not names and 0 < len(spoken.split()) <= 8
+    if kind == "end_or_quiet":   # vGame: in focus mode a quiet turn ends the conversation too (silently)
+        quiet = names == ["stay_quiet"] or (not names and row.get("marker") == "quiet")
+        return ("end_conversation" in names or quiet) and "go_quiet" not in names and not spoken
+    if kind == "brief":   # vGame: acts or answers, in a few words, with no question back
+        return "stay_quiet" not in names and bool(spoken or names) and "?" not in spoken and len(spoken.split()) <= 10
     return False
 
 
