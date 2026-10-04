@@ -10,6 +10,7 @@ User-facing text: second person, plain words, no ids or commands.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from yuki.agent.providers.catalog import PROVIDERS, ROLE_HINTS, ROLE_WORDS, ROLES
@@ -18,6 +19,9 @@ from yuki.agent.providers.catalog import PROVIDERS, ROLE_HINTS, ROLE_WORDS, ROLE
 SAVED_WORDS = "Saved on this PC, encrypted"
 #: How a change applies.
 APPLY_WORDS = "Changes apply from your next request. No restart needed."
+
+#: One edit of ai.json at a time (the window runs each action on its own thread).
+_edit = threading.Lock()
 
 _KEY_WORDS = {"saved": SAVED_WORDS, "env": "From your environment settings", "missing": "No key yet",
               "not_needed": "No key needed"}
@@ -149,6 +153,13 @@ def set_role(role: str, provider: str, model: str = "", backup_provider: str | N
         raise ValueError("unknown job")
     if provider not in PROVIDERS:
         raise ValueError("unknown service")
+    with _edit:
+        _write_role(config, role, provider, model, backup_provider, backup_model, price)
+    return role_line(role)
+
+
+def _write_role(config: Any, role: str, provider: str, model: str, backup_provider: str | None,
+                backup_model: str | None, price: dict[str, float] | None) -> None:
     data = config.load()
     entry = dict(data["roles"].get(role) or {})
     entry["provider"] = provider
@@ -166,7 +177,6 @@ def set_role(role: str, provider: str, model: str = "", backup_provider: str | N
         except (TypeError, ValueError):
             pass
     config.save(data)
-    return role_line(role)
 
 
 def set_key(provider: str, key: str) -> dict[str, Any]:
@@ -192,9 +202,10 @@ def set_custom(base_url: str, label: str = "") -> dict[str, Any]:
             raise ValueError("That address doesn't look right. It should start with https://")
         if parts.username or parts.password:
             raise ValueError("Leave the key out of the address and paste it in the key box instead.")
-    data = config.load()
-    data["custom"] = {"base_url": url, "label": " ".join(str(label or "").split())[:60]}
-    config.save(data)
+    with _edit:
+        data = config.load()
+        data["custom"] = {"base_url": url, "label": " ".join(str(label or "").split())[:60]}
+        config.save(data)
     return {"base_url": url}
 
 
