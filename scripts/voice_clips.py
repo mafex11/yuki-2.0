@@ -480,7 +480,7 @@ VFIX_CLIPS = [
 LIST_CLIPS = [
     ("k_name", "Yuki."), ("l_list", "What's on my list?"),
     ("l_plumber", "What did I tell you earlier about the plumber?"),
-    ("l_add", "Put renew the car insurance on my list."), ("l_time", "What time is it?"),
+    ("l_add", "Add the car insurance renewal to my to-do list."), ("l_time", "What time is it?"),
     ("l_totals", "I told you about the total list, right? What were the totals?"),
 ]
 

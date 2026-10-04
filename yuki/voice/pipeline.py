@@ -725,6 +725,47 @@ def settle_only_when_newest(aggregator: Any) -> None:
     aggregator._is_deferred = _is_deferred
 
 
+#: Tools whose result is answered at once even while the voice is still saying the words the talker wrote before the
+#: call (leftVoice: quick_memory's "Let me look.").
+ANSWER_WHILE_SPEAKING = frozenset({"quick_memory"})
+
+
+def answer_while_speaking(aggregator: Any, names: frozenset[str] = ANSWER_WHILE_SPEAKING) -> None:
+    """A result of one of ``names`` runs the talker at once, even while the voice is speaking (leftVoice).
+
+    Pipecat 1.11's assistant aggregator defers the run that answers a tool's result until the bot stops speaking (so
+    results landing mid-speech are bundled into one run). Measured offline 4 Oct (``voice_session_offline.py lists``):
+    with the talker's few words before its quick_memory call, the read's report came back while "Let me look." was
+    playing, and the answer's run waited the whole line out (+1.0-1.2 s before the answer, on top of its own first
+    token). The words before the call are the talker's own lead, so the answer may be written while they play: its
+    speech queues behind them in the voice. Results still queued behind this one are bundled as Pipecat does.
+    Plumbing: when a run starts, never what anyone said. ``aggregator`` is Pipecat 1.11's ``LLMAssistantAggregator``.
+    """
+    from pipecat.frames.frames import FunctionCallResultFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    handle = aggregator._handle_function_call_result
+    maybe_push = aggregator._maybe_push_context_after_function_result
+    current: dict[str, Any] = {"name": None}
+
+    async def _handle_function_call_result(frame: Any) -> None:
+        current["name"] = getattr(frame, "function_name", None)
+        try:
+            await handle(frame)
+        finally:
+            current["name"] = None
+
+    async def _maybe_push_context_after_function_result() -> None:
+        if (current["name"] in names and getattr(aggregator, "_bot_speaking", False)
+                and not aggregator.has_queued_frame(FunctionCallResultFrame)):
+            await aggregator.push_context_frame(FrameDirection.UPSTREAM)
+            return
+        await maybe_push()
+
+    aggregator._handle_function_call_result = _handle_function_call_result
+    aggregator._maybe_push_context_after_function_result = _maybe_push_context_after_function_result
+
+
 def bedrock_client(region: str, backend: str | None = None) -> Any:
     """The mouth's model client (Bedrock, or the Anthropic API per ``Settings.model_backend``: see
     :mod:`yuki.core.models`), keeping its connection between turns.
@@ -3064,6 +3105,7 @@ class Conversation:
                     max_context_tokens=8000, max_unsummarized_messages=None)),
         )
         settle_only_when_newest(assistant_agg)
+        answer_while_speaking(assistant_agg)   # leftVoice: a look's answer is written while its lead plays
         self._summarizer = getattr(assistant_agg, "_summarizer", None)
         hold = hold_until_connected(lambda: bool(getattr(stt, "_transport_is_active", lambda: True)()), self.log,
                                     on_connected=self._stt_connected)

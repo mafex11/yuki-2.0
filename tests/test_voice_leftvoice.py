@@ -217,3 +217,70 @@ def test_several_items_are_counted_in_the_line(n: int) -> None:
     params, pushed, settled = _params({"action": "add_todos", "items": [{"text": f"Thing {i}"} for i in range(n)]})
     asyncio.run(QuickMemory(_Memory()).handle(params))
     assert pushed[0].text == f"Added {n}, they're on Home under Your list." and settled[0][1].run_llm is False
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the answer to a look is written while its lead plays (Pipecat would wait for the bot to stop speaking)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _Aggregator:
+    """Pipecat 1.11's assistant aggregator, the parts answer_while_speaking wraps."""
+
+    def __init__(self, speaking: bool, queued: bool = False) -> None:
+        self._bot_speaking = speaking
+        self._queued = queued
+        self.pushed: list[Any] = []
+        self.deferred = False
+
+    def has_queued_frame(self, frame_type: Any) -> bool:
+        return self._queued
+
+    async def push_context_frame(self, direction: Any = None) -> None:
+        self.pushed.append(direction)
+
+    async def _maybe_push_context_after_function_result(self) -> None:   # Pipecat's own rule
+        if self._queued:
+            return
+        if self._bot_speaking:
+            self.deferred = True
+            return
+        await self.push_context_frame("UPSTREAM")
+
+    async def _handle_function_call_result(self, frame: Any) -> None:
+        await self._maybe_push_context_after_function_result()
+
+
+@pytest.mark.parametrize("name,speaking,queued,runs_now,deferred", [
+    ("quick_memory", True, False, True, False),    # the look's report while "Let me look." plays: answered at once
+    ("quick_memory", False, False, True, False),   # nothing playing: as before
+    ("quick_memory", True, True, False, False),    # more results queued: bundled, as Pipecat does
+    ("check_progress", True, False, False, True),  # any other tool: Pipecat's wait for the bot to stop
+])
+def test_a_looks_answer_runs_while_its_lead_plays(name: str, speaking: bool, queued: bool, runs_now: bool,
+                                                 deferred: bool) -> None:
+    from pipecat.processors.frame_processor import FrameDirection
+
+    from yuki.voice.pipeline import answer_while_speaking
+
+    agg = _Aggregator(speaking, queued)
+    answer_while_speaking(agg)
+    asyncio.run(agg._handle_function_call_result(SimpleNamespace(function_name=name)))
+    assert bool(agg.pushed) is runs_now and agg.deferred is deferred
+    if runs_now and speaking:
+        assert agg.pushed == [FrameDirection.UPSTREAM]
+    # the wrap is per result: a later call outside a result handler keeps Pipecat's rule
+    agg2 = _Aggregator(True)
+    answer_while_speaking(agg2)
+    asyncio.run(agg2._maybe_push_context_after_function_result())
+    assert agg2.deferred and not agg2.pushed
+
+
+def test_the_conversation_wraps_its_assistant_aggregator() -> None:
+    import inspect
+
+    from yuki.voice import pipeline
+
+    source = inspect.getsource(pipeline.Conversation)
+    assert "settle_only_when_newest(assistant_agg)" in source and "answer_while_speaking(assistant_agg)" in source
+    assert pipeline.ANSWER_WHILE_SPEAKING == frozenset({"quick_memory"})

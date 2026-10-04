@@ -379,7 +379,12 @@ def ask_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[st
         audio = first("audio_start")
         tool = first("mouth_tool", said_end - 0.3)
         result = first("to_mouth", tool["t"]) if tool else None
-        answer = first("audio_start", result["t"]) if result else None
+        # the answer after the report: the first words heard (a TTSTextFrame goes out as its audio plays) of the reply
+        # that follows the result, or of the words code said with it (the lead's audio may run straight into it)
+        after = first("reply_start", result["t"]) if result else None
+        coded = first("yuki_code", result["t"]) if result else None
+        start = min((e["t"] for e in (after, coded) if e), default=None)
+        answer = first("yuki_heard", start) if start is not None else None
         heard = first("user", said_end - 0.3)
 
         def ms(e: Any) -> Any:

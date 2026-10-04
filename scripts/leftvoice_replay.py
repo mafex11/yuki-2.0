@@ -61,6 +61,8 @@ def _lead_call(args: dict[str, Any], cid: str, lead: str) -> list[dict[str, Any]
 def cases() -> list[dict[str, Any]]:
     out = [
         dict(id="list_look", issue="list", check="looks_list", messages=[u(ASK_LIST)]),
+        # as a conversation begins: the name, its answer, then the ask
+        dict(id="list_named", issue="list", check="looks_list", messages=[u("Yuki."), a("Yeah?"), u(ASK_LIST)]),
         dict(id="list_reply", issue="list", check="says_items", messages=[
             u(ASK_LIST), *_lead_call({"action": "todos"}, "q1", "Let me look."), result("q1", v4.LIST_REPORT)]),
         dict(id="totals_look", issue="list", check="answers_or_looks", messages=[u(TOTALS)]),
