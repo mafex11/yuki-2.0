@@ -3,7 +3,7 @@
 Before this module every read was blind: whether the window had changed since the thinker's read was guessed ("you
 acted on it since"), and the view after actions re-walked the whole window every 0.1 s until two reads matched.  Here
 a window that Yuki reads or acts on is subscribed to UI Automation's structure-changed and property-changed events
-(states, values, names, focus, off-screen), and the subscription only counts:
+(states, values, names, focus, off-screen, scroll position), and the subscription only counts:
 
 * :meth:`EventHub.generation` - a number that grows with every event from the window.  A read taken at generation
   ``g`` is current while the generation is still ``g``, so the read before an action costs nothing when nothing
@@ -49,6 +49,10 @@ PROPERTIES = (
     30008,  # HasKeyboardFocus
     30022,  # IsOffscreen
     30010,  # IsEnabled
+    # report 58 review (F4): a scroll moves content without any name, value or structure change; without these a
+    # page scrolled between two reads looked unchanged to the events
+    30053,  # Scroll.HorizontalScrollPercent
+    30055,  # Scroll.VerticalScrollPercent
 )
 #: Automation events counted on the window's subtree: a menu opening or closing (Chromium's menus are inside the
 #: window's tree, Win32's are their own windows and show as new windows in the action's report).

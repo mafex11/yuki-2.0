@@ -274,12 +274,15 @@ class _PlayerDesk:
         self.clicks: list[tuple[int, int]] = []
         self.tick = False
         self.clock = None
+        self.parts: list = []
 
-    def get_window_tree(self, hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0) -> T.WindowTree:
+    def get_window_tree(self, hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0,
+                        part: tuple | None = None) -> T.WindowTree:
         self.reads += 1
+        self.parts.append(part)
         if self.tick and self.clock is not None:
             self.clock.name = f"1:{10 + self.reads:02d}"
-        return read(self.window, hwnd=hwnd, monkeypatch=self.mp, max_elements=max_elements)
+        return read(self.window, hwnd=hwnd, monkeypatch=self.mp, max_elements=max_elements, part=part)
 
     def format_window_tree(self, tree: T.WindowTree, **kw: Any) -> str:
         return T.format_window_tree(tree, **kw)
@@ -365,11 +368,15 @@ def test_a_click_result_says_what_changed_and_the_verdict_follows_it(monkeypatch
     text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
     lyrics = _ids(text, "Lyrics")
     out = d.dispatch("click", {"element": lyrics, "expect_hwnd": 7001, "toggle_to": "on"})
-    # a toggle with toggle_to keeps its own live read-back (vfix2 N4); a plain click on a button is bracketed
-    assert out.ok and out.payload["details"]["state_after"] == "on"
+    # review F3: a toggle keeps its live read-back (vfix2 N4) and is bracketed too: its side effects are said
+    assert out.ok and out.payload["details"]["state_after"] == "on" and out.payload["details"]["verified"] is True
+    said = out.content[0]["text"]
+    assert "read back: now on" in said
+    assert 'What changed: Button "Lyrics" turned on; Group "Lyrics view" appeared with 1 element(s) inside' in said
+    assert out.payload["details"]["screen_change"]["verified"] is True
     mute = _ids(text, "Mute")
     out = d.dispatch("click", {"element": mute, "expect_hwnd": 7001})
-    assert 'What changed: Button "Mute" is now called "Unmute" (was "Mute").' in out.content[0]["text"]
+    assert 'What changed: Button "Mute" is now called "Unmute".' in out.content[0]["text"]
     details = out.payload["details"]
     assert details["screen_change"]["verified"] is True and details["verified"] is True
     assert action_verdict("click", out)[1].startswith("the window changed: ")

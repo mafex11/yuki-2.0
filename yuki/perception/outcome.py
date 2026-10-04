@@ -59,8 +59,15 @@ class Change:
     #: each brings or takes with it.
     appeared: list[tuple[Any, int]] = field(default_factory=list)
     gone: list[tuple[Any, int]] = field(default_factory=list)
-    #: Other elements whose state, value or name changed: ``[(element after, [(kind, before, after)])]``.
+    #: Other elements whose state, value or name changed: ``[(element before, [(kind, before, after)])]`` (the
+    #: element as it was, so it is named as the thinker saw it: ``Text "1:12" is now called "1:13"``).
     changed: list[tuple[Any, list[tuple[str, Any, Any]]]] = field(default_factory=list)
+    #: How many of :attr:`changed` are weak evidence (report 58 review, F1): a read-only element's text or value, or
+    #: any progress value (a range), which a playing track, a clock or a timestamp changes on its own.
+    weak: int = 0
+    #: One of the two reads stopped at its limit (report 58 review, F5): what lies past it is neither "gone" nor
+    #: "appeared", and "nothing changed" holds only for the part both reads covered.
+    partial: bool = False
     #: Containers whose content moved: ``[(container, dy, dx, came_into_view, left_view)]``.
     moved: list[tuple[Any, int, int, int, int]] = field(default_factory=list)
     title: tuple[str, str] | None = None
@@ -74,6 +81,13 @@ class Change:
     def any(self) -> bool:
         return bool(self.target_changes or self.appeared or self.gone or self.changed or self.moved or self.title
                     or self.page)
+
+    @property
+    def evidence(self) -> bool:
+        """Whether something changed that an action makes and the window does not change on its own: the target,
+        what appeared or went, movement, the title or page, or a state, value or name of an interactive element."""
+        return bool(self.target_changes or self.appeared or self.gone or self.moved or self.title or self.page
+                    or len(self.changed) > self.weak)
 
 
 def _shown(element: Any) -> tuple:
@@ -96,6 +110,15 @@ def _differences(before: Any, after: Any) -> list[tuple[str, Any, Any]]:
     if n0 != n1:
         out.append(("name", n0, n1))
     return out
+
+
+def _weak(element: Any, diffs: list[tuple[str, Any, Any]]) -> bool:
+    """A change the window can make on its own (report 58 review, F1): any change of a read-only element (no
+    pattern, not interactive: a playback clock, a timestamp, a counter), or only a progress value moving (a range:
+    a playing track's position).  Facts about patterns and change kinds, never words."""
+    if not (fact(element, "is_interactive") or fact(element, "patterns") or fact(element, "states")):
+        return True
+    return all(kind == "range" for kind, _b, _a in diffs)
 
 
 def _roots(ids: set[int], by_id: dict[int, Any]) -> list[tuple[Any, int]]:
@@ -135,7 +158,8 @@ def _scrollers_of(element_id: int, by_id: dict[int, Any]) -> int:
 
 
 def diff(before: list[Any], after: list[Any], *, target: int | None = None,
-         reference: list[Any] | None = None, busy: set[int] | None = None) -> Change:
+         reference: list[Any] | None = None, busy: set[int] | None = None,
+         before_partial: bool = False, after_partial: bool = False) -> Change:
     """Compare two reads of one window whose ids are carried (the same id is the same element).
 
     Args:
@@ -145,6 +169,9 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         reference: an earlier read (the one the thinker acted from): elements that differ between it and ``before``
             were changing on their own, and are left out.
         busy: ids known to be changing on their own (the event watch saw them change before the action).
+        before_partial / after_partial: that read stopped at its limit (its cap) before the end of the window.  An
+            element the other read has past the last element both reads share (in that read's tree order) lies
+            beyond the limit: it is not counted as appeared or gone (report 58 review, F5).
     """
     b = {fact(e, "id"): e for e in before}
     a = {fact(e, "id"): e for e in after}
@@ -170,11 +197,29 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         if i in noisy:
             change.ignored += 1
             continue
-        change.changed.append((a[i], diffs))
-    # interactive changes first, then the rest, in tree order
-    change.changed.sort(key=lambda pair: not (fact(pair[0], "is_interactive") or fact(pair[0], "states")))
+        change.changed.append((b[i], diffs))
+        if _weak(a[i], diffs):
+            change.weak += 1
+    # strong changes first (interactive elements), then the rest, in tree order
+    change.changed.sort(key=lambda pair: _weak(pair[0], pair[1]))
     appeared = {i for i in a if i not in b}
     gone = {i for i in b if i not in a}
+    past_limit = 0
+    change.partial = before_partial or after_partial
+    shared = set(common)
+    if after_partial and gone and shared:
+        # the after-read stopped at its cap: what the before-read has beyond the last shared element was not reached
+        order = {fact(e, "id"): n for n, e in enumerate(before)}
+        reach = max(order[i] for i in shared)
+        beyond = {i for i in gone if order[i] > reach}
+        gone -= beyond
+        past_limit += len(beyond)
+    if before_partial and appeared and shared:
+        order = {fact(e, "id"): n for n, e in enumerate(after)}
+        reach = max(order[i] for i in shared)
+        beyond = {i for i in appeared if order[i] > reach}
+        appeared -= beyond
+        past_limit += len(beyond)
     change.appeared = _roots(appeared, a) if appeared else []
     change.gone = _roots(gone, b) if gone else []
     # movement inside scrolling containers (or the window when none scrolls)
@@ -215,8 +260,8 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
     elif p0 != p1 and (p0 or p1):
         change.page = (p0[1] if p0 else "", p1[1] if p1 else "")
     change.counts = {"appeared": len(appeared), "gone": len(gone), "changed": len(change.changed),
-                     "moved": len(change.moved), "ignored": change.ignored, "before": len(before),
-                     "after": len(after)}
+                     "weak": change.weak, "moved": len(change.moved), "ignored": change.ignored,
+                     "past_limit": past_limit, "before": len(before), "after": len(after)}
     return change
 
 
@@ -275,7 +320,8 @@ def _one_change(subject: str, kind: str, before: Any, after: Any) -> str:
             return f'{subject} changed from "{_clip(before)}" to "{_clip(after)}"'
         return f'{subject} now holds "{_clip(after)}"' if after else f"{subject} was emptied"
     if kind == "name":
-        return f'{subject} is now called "{_clip(after)}" (was "{_clip(before)}")'
+        # the subject is named as it was (the element before the change), so the old name is not said twice
+        return f'{subject} is now called "{_clip(after)}"' if after else f"{subject} lost its name"
     return f"{subject} changed"
 
 
@@ -320,6 +366,11 @@ def describe(change: Change, *, target_label: str = "") -> list[str]:
             lines.append(_one_change(label(element), kind, before, after))
     if len(change.changed) > NAMED_CHANGES:
         lines.append(f"and {len(change.changed) - NAMED_CHANGES} more element(s) changed")
+    if lines and not change.evidence:
+        lines.append("these can change on their own (a clock, a playing track), so they do not show what the action "
+                     "did")
+    if not lines and change.partial:
+        return ["nothing visible changed in the part of the window that was read; the rest was past the read's limit"]
     return lines or ["nothing visible changed in the window"]
 
 
@@ -328,6 +379,9 @@ def verdict(change: Change | None, *, opaque: bool = False, readable: bool = Tru
     did in a window whose content is exposed and was read both times, None when that cannot be told."""
     if change is None or not readable:
         return None, "the window could not be read before and after"
+    if change.any and not change.evidence:
+        # report 58 review (F1): a clock tick or a progress value is no proof the action did anything
+        return None, "only things that change on their own changed (a read-only text or a progress value)"
     if change.any:
         # the reason is kept in the run trace: the target's own change (a control the thinker acted on), else counts
         # only, so nothing the window showed is copied into it
@@ -343,4 +397,6 @@ def verdict(change: Change | None, *, opaque: bool = False, readable: bool = Tru
         return True, "the window changed: " + ", ".join(parts)
     if opaque:
         return None, "the window draws its own interface, so a change inside it cannot be seen"
+    if change.partial:
+        return None, "nothing changed in the part of the window read; the rest was past the read's limit"
     return False, "nothing visible changed in the window"

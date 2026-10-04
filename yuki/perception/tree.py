@@ -588,6 +588,15 @@ class WindowTree:
     left_out: list[dict] = field(default_factory=list)
     #: Elements kept although hidden in place (:attr:`UIElement.hidden`).
     hidden_controls: int = 0
+    #: Why a truncated read stopped (report 58 review, F6): ``"cap"`` (the
+    #: element cap, or a page's share of it), ``"clock"`` (the time limit),
+    #: ``"depth"``, ``"failed"`` (a branch the provider refused); ``""`` when
+    #: the read is whole.  Only ``"clock"`` means the read was cut short.
+    stopped_by: str = ""
+    #: A part read (``get_window_tree(part=...)``): the window's frame and one
+    #: element's subtree only; ``part_missing`` when that element was not met.
+    part: bool = False
+    part_missing: bool = False
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -1019,6 +1028,18 @@ class _CachedWalker:
         self.cancel = cancel
         self.elements: list[UIElement] = []
         self.truncated = False
+        #: Why the walk stopped short (report 58 review, F6): ``"cap"`` (the element cap, or a page's share of it),
+        #: ``"clock"`` (the deadline or ``cancel``), ``"depth"``, ``"failed"`` (a branch the provider refused);
+        #: ``""`` while nothing stopped it.  The clock wins over any other reason once it is hit.
+        self.stopped_by = ""
+        #: A part read (``look_at_window`` with ``within``): the RuntimeId of the element whose subtree alone is
+        #: kept (the window's frame, id 0, is kept too).  Everything else is walked through to find it, not kept,
+        #: so the cap is spent on the part only.  ``part_found`` once it was met, ``part_done`` once the walk left
+        #: it (the walk then stops: the part is read).
+        self.part: tuple[int, ...] | None = None
+        self.part_depth: int | None = None
+        self.part_found = False
+        self.part_done = False
         self.seen: set[tuple] = set()
         self._shapes: set[tuple] = set()
         #: ``[depth, kept id or -1, window handle]`` of every element on the
@@ -1118,6 +1139,27 @@ class _CachedWalker:
         if name and len(entry["named"]) < _LEFT_OUT_NAMES:
             entry["named"].append([role, name[:_LEFT_OUT_NAME_CHARS], side])
 
+    def _in_part(self, get: object, depth: int) -> bool:
+        """For a part read: whether the element met at ``depth`` lies in the part (it is the part's root or below
+        it). Meeting an element at the part root's depth or above once the part was entered ends the part."""
+        if self.part_depth is not None:
+            if depth > self.part_depth:
+                return True
+            self.part_depth = None
+            self.part_done = True
+            return False
+        if self.part_done or _runtime_id(get) != self.part:
+            return False
+        self.part_depth = depth
+        self.part_found = True
+        return True
+
+    def stop(self, reason: str) -> None:
+        """Note why the walk stopped short (:attr:`stopped_by`) and mark it truncated."""
+        self.truncated = True
+        if not self.stopped_by or reason == "clock":
+            self.stopped_by = reason
+
     def _add(self, element: object, depth: int, *, window: int = 0, hidden: bool = False) -> None:
         # Every element met, kept or not, closes the branches at its depth and
         # below: the walk is depth-first, so whatever sits deeper on the path
@@ -1130,6 +1172,8 @@ class _CachedWalker:
         # through (a window root that reports none), else its parent's.
         native = _native_handle(get) or window or (lineage[-1][2] if lineage else 0)
         lineage.append([depth, -1, native])
+        if self.part is not None and depth > 0 and not self._in_part(get, depth):
+            return
         bounds = _rect(get(_P_BOUNDING_RECT))
         if hidden:
             if self.hidden_kept >= _MAX_HIDDEN:
@@ -1258,7 +1302,7 @@ class _CachedWalker:
         if self.out_of_budget():
             return
         if depth > _MAX_DEPTH:
-            self.truncated = True
+            self.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
         if _hidden_in_place(get, self.viewport):
@@ -1286,14 +1330,16 @@ class _CachedWalker:
                 self.on_window(native, depth)  # type: ignore[operator]
 
     def out_of_budget(self) -> bool:
+        if self.part_done:
+            return True   # a part read has read its part: nothing left to keep, and nothing was cut
         if len(self.elements) >= self.max_elements:
-            self.truncated = True
+            self.stop("cap")
             return True
         if self.cancel is not None and self.cancel.is_set():
-            self.truncated = True
+            self.stop("clock")
             return True
         if time.monotonic() >= self.deadline:
-            self.truncated = True
+            self.stop("clock")
             return True
         return False
 
@@ -1456,7 +1502,7 @@ def _collect_pass_whole(
         try:
             walker.walk(child_root.BuildUpdatedCache(subtree_request), depth)
         except Exception:
-            walker.truncated = True
+            walker.stop("failed")
 
     walker.on_window = walk_child_window
 
@@ -1476,7 +1522,7 @@ def _collect_pass_whole(
             try:
                 walker.walk(child.BuildUpdatedCache(subtree_request), base_depth + 1)
             except Exception:
-                walker.truncated = True
+                walker.stop("failed")
             try:
                 child = tree_walker.GetNextSiblingElement(child)
             except Exception:
@@ -1488,7 +1534,7 @@ def _collect_pass_whole(
     try:
         walker._add(live_root.BuildUpdatedCache(root_request), 0)
     except Exception:
-        walker.truncated = True
+        walker.stop("failed")
     walk_children_of(live_root, 0)
 
     # Descendant HWNDs the walk never met (their owning element was off-screen,
@@ -1718,7 +1764,7 @@ class _ViewportPass:
         except Exception:
             # The element went away (a page re-rendering), or the provider
             # refused: that branch is missing, and the tree says so.
-            self.walker.truncated = True
+            self.walker.stop("failed")
             return None
         self.walker.fetches += 1
         return holder
@@ -1812,7 +1858,7 @@ class _ViewportPass:
         if walker.out_of_budget():
             return
         if depth > _MAX_DEPTH:
-            walker.truncated = True
+            walker.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
         if _hidden_in_place(get, self.clip or self.viewport):
@@ -2025,6 +2071,8 @@ class _ViewportPass:
             "offscreen_skipped": walker.offscreen_skipped,
             "background_pages": walker.background_pages,
             "truncated": walker.truncated,
+            "stopped_by": walker.stopped_by,
+            "part": (walker.part_depth, walker.part_found, walker.part_done),
             "left_out": {k: {**v, "named": [list(n) for n in v["named"]], "unread": [list(n) for n in v["unread"]]}
                          for k, v in walker.left_out.items()},
             "hidden_kept": walker.hidden_kept,
@@ -2043,6 +2091,8 @@ class _ViewportPass:
         walker.offscreen_skipped = mark["offscreen_skipped"]
         walker.background_pages = mark["background_pages"]
         walker.truncated = mark["truncated"]
+        walker.stopped_by = mark["stopped_by"]
+        walker.part_depth, walker.part_found, walker.part_done = mark["part"]
         walker.left_out = {k: {**v, "named": [list(n) for n in v["named"]], "unread": [list(n) for n in v["unread"]]}
                            for k, v in mark["left_out"].items()}
         walker.hidden_kept = mark["hidden_kept"]
@@ -2662,7 +2712,7 @@ def _collect_pass(
         raise
     except Exception:
         if viewport_pass.walker.elements:
-            viewport_pass.walker.truncated = True
+            viewport_pass.walker.stop("failed")
             return viewport_pass.walker  # it was reading: keep what it read
     walker = _collect_pass_whole(
         automation,
@@ -2819,6 +2869,7 @@ def _walk_window(
     publish: object | None = None,
     on_pass: object | None = None,
     cancel: threading.Event | None = None,
+    part: bool = False,
 ) -> _CachedWalker:
     """Collect the window's elements, waiting out a tree that is still building.
 
@@ -2856,6 +2907,8 @@ def _walk_window(
             deadline.
         on_pass: handed to :func:`_collect_pass` as ``on_start`` for every pass.
         cancel: once set, stop at the next check and return what there is.
+        part: a part read (``on_pass`` sets the walker's :attr:`_CachedWalker.part`): one pass, never the
+            thin-tree wait (a part is small by design, not a tree still building).
     """
     # A fresh IUIAutomation for this thread's apartment: COM interface pointers
     # cannot be shared across apartments, and an abandoned thread must not
@@ -2865,6 +2918,9 @@ def _walk_window(
         _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
     )
     child_handles = _surface_handles(hwnd)
+    # Report 58 review: ask the window (and its content windows) once for full accessibility, the way assistive
+    # technology announces itself to Chromium, Electron and CEF.
+    _announce_accessibility_client([hwnd, *child_handles])
     passes = 1
 
     def adopt(walker: _CachedWalker) -> _CachedWalker:
@@ -2886,6 +2942,8 @@ def _walk_window(
     )
     first_count = len(best.elements)
     best = adopt(best)
+    if part:
+        return best
 
     thin = (
         first_count < _THIN_TREE_ELEMENTS
@@ -3011,6 +3069,60 @@ def _wake_accessibility(handles: list[int], viewport: tuple[int, int, int, int] 
     return asked
 
 
+#: Windows already told by :func:`_announce_accessibility_client`, with when (monotonic); each is told at most once in
+#: :data:`_WAKE_MEMO_S`.
+_announced: dict[int, float] = {}
+_WM_GETOBJECT = 0x003D
+#: The custom object id Chromium raises ``EVENT_SYSTEM_ALERT`` for at start-up: a ``WM_GETOBJECT`` for it is how it
+#: tells that assistive technology is running (Chromium's accessibility overview, "Accessibility Detection").
+_OBJID_ACCESSIBILITY_PROBE = 1
+_SMTO_ABORTIFHUNG = 0x0002
+_ANNOUNCE_TIMEOUT_MS = 100
+
+
+def _announce_accessibility_client(handles: list[int]) -> int:
+    """Tell each window that an accessibility client is reading it, the way a screen reader does: answer
+    Chromium's start-up probe with ``WM_GETOBJECT`` for its custom object id (report 58 review, "the reliable
+    trigger").
+
+    For performance Chromium - and Electron and CEF, which are built on it (Spotify, Discord, T3 Code, every
+    Chromium browser) - exposes only part of its accessibility tree until it believes assistive technology is
+    running; this message is that belief's documented trigger, and it switches the app to its complete mode so the
+    real controls (sliders, toggles, the whole page) are in the tree.  A window that does not know the id ignores
+    it.  One message per window, sent with a short timeout and never to a hung window, at most once per
+    :data:`_WAKE_MEMO_S`, and only for a window being read (a window in play); never on a timer.  Window handles
+    only: nothing here knows which program drew a window.  Returns how many windows were told.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+    except Exception:
+        return 0
+    now = time.monotonic()
+    told = 0
+    for handle in handles[: _MAX_CHILD_WINDOWS + 1]:
+        if not handle:
+            continue
+        with _fresh_lock:
+            if now - _announced.get(handle, -_WAKE_MEMO_S) < _WAKE_MEMO_S:
+                continue
+            _announced[handle] = now
+            if len(_announced) > 256:
+                for stale in [h for h, at in _announced.items() if now - at >= _WAKE_MEMO_S]:
+                    _announced.pop(stale, None)
+        try:
+            result = wintypes.DWORD(0)
+            user32.SendMessageTimeoutW(wintypes.HWND(handle), _WM_GETOBJECT, wintypes.WPARAM(0),
+                                       wintypes.LPARAM(_OBJID_ACCESSIBILITY_PROBE), _SMTO_ABORTIFHUNG,
+                                       _ANNOUNCE_TIMEOUT_MS, ctypes.byref(result))
+            told += 1
+        except Exception:
+            continue
+    return told
+
+
 def ctypes_oleacc() -> object:
     """``oleacc.dll`` (the MSAA client library), loaded once."""
     import ctypes
@@ -3074,7 +3186,7 @@ def _silent_note(waited_s: float, on_screen: bool) -> tuple[str, str]:
 
 
 def get_window_tree(
-    hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0
+    hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0, part: tuple[int, ...] | None = None
 ) -> WindowTree:
     """Snapshot the UIA subtree of one window.
 
@@ -3103,6 +3215,11 @@ def get_window_tree(
             A window that has just been launched needs the best part of four
             seconds before its tree exists, so callers that have just opened
             something should raise this.
+        part: the RuntimeId of one element: only it and its subtree are kept
+            (with the window's frame as id 0), so ``max_elements`` is spent on
+            that part alone (report 58 review: ``look_at_window`` with
+            ``within``).  ``part_missing`` is set when the window has no such
+            element now.
 
     Raises:
         ValueError: the handle is not a window.
@@ -3129,6 +3246,8 @@ def get_window_tree(
         result["best"] = walker
 
     def _pass_started(walker: _CachedWalker) -> None:
+        if part:
+            walker.part = tuple(int(x) for x in part)
         result["live"] = walker
 
     def _worker() -> None:
@@ -3145,6 +3264,7 @@ def get_window_tree(
                 publish=_publish,
                 on_pass=_pass_started,
                 cancel=cancel,
+                part=bool(part),
             )
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             result["error"] = exc
@@ -3210,8 +3330,12 @@ def get_window_tree(
             return _silent(timeout_s)
         partial = True
     elements = list(chosen.elements)
-    if not chosen.complete and chosen.truncated and len(elements) < max_elements:
-        partial = True  # the worker returned, but only because its deadline stopped it
+    if not chosen.complete and chosen.truncated and getattr(chosen, "stopped_by", "clock") == "clock":
+        # the worker returned, but only because its deadline stopped it (report 58 review, F6: a page's share of
+        # the cap also stops a walk short of max_elements, and that is no clock)
+        partial = True
+    if partial:
+        chosen.stopped_by = "clock"
     note = ""
     if partial and elements:
         last = elements[-1]
@@ -3224,13 +3348,17 @@ def get_window_tree(
             f"frame down to {where} - what comes after that in the tree was not read"
         )
     status = "ok" if elements else "empty"
-    coverage = content_coverage(elements, chosen.viewport) if elements else None
+    part_missing = bool(part) and not getattr(chosen, "part_found", False)
+    coverage = content_coverage(elements, chosen.viewport) if elements and not part else None
     opaque = (
-        status == "ok" and not partial and not young
+        status == "ok" and not partial and not young and not part
         and coverage is not None and coverage < OPAQUE_COVERAGE
     )
-    _note_opaque(hwnd, opaque)
-    if status == "empty":
+    if not part:   # a part of a window says nothing about how much of the whole is exposed
+        _note_opaque(hwnd, opaque)
+    if part_missing:
+        note = "the part asked for is not in the window now (it went away, or it is out of view)"
+    elif status == "empty":
         note = "the window answered but exposes no elements with a size on screen"
     elif opaque:
         readable = sum(len(getattr(e, "name", None) or "") + len(getattr(e, "value", None) or "") for e in elements)
@@ -3239,7 +3367,7 @@ def get_window_tree(
             f"Any x,y inside it would be a guess: use the app's own keyboard shortcuts and check its title after "
             f"each step, or the app's own data when it is given"
         )
-    elif not partial:
+    elif not partial and not part:
         gaps = _surface_gaps(chosen)
         if gaps.any:
             parts = []
@@ -3302,6 +3430,9 @@ def get_window_tree(
         opaque=opaque,
         left_out=_left_out_list(getattr(chosen, "left_out", {}), len(elements)),
         hidden_controls=sum(1 for e in elements if e.hidden),
+        stopped_by=chosen.stopped_by if (chosen.truncated or partial) else "",
+        part=bool(part),
+        part_missing=part_missing,
     )
 
 

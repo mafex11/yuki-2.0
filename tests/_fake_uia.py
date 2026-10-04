@@ -226,7 +226,7 @@ class Live(Cached):
 
 
 def read(root: Node, *, hwnd: int = 7001, viewport: tuple[int, int, int, int] | None = None,
-         max_elements: int = 400, monkeypatch: Any = None) -> T.WindowTree:
+         max_elements: int = 400, monkeypatch: Any = None, part: tuple[int, ...] | None = None) -> T.WindowTree:
     """One pass of the real :class:`~yuki.perception.tree._ViewportPass` over ``root``, returned as a WindowTree the
     way :func:`~yuki.perception.tree.get_window_tree` builds one (no thread, no desktop)."""
     import time
@@ -237,13 +237,18 @@ def read(root: Node, *, hwnd: int = 7001, viewport: tuple[int, int, int, int] | 
     monkeypatch.setattr(T, "virtual_screen_bounds", lambda: (-10_000, -10_000, 10_000, 10_000))
     monkeypatch.setattr(T, "_child_window_at", lambda h, x, y: h)
     automation = Automation({hwnd: root})
-    walker = T._collect_pass(automation, hwnd, [], max_elements, time.monotonic() + 5.0)
+    def start(walker: Any) -> None:
+        walker.part = tuple(part) if part else None
+
+    walker = T._collect_pass(automation, hwnd, [], max_elements, time.monotonic() + 5.0, on_start=start)
     elements = list(walker.elements)
     return T.WindowTree(
         hwnd=hwnd, title=root.name, process_name="App.exe", elements=elements,
         truncated=walker.truncated, captured_at=time.time(), offscreen_skipped=walker.offscreen_skipped,
         fetches=walker.fetches, left_out=T._left_out_list(walker.left_out, len(elements)),
         hidden_controls=sum(1 for e in elements if e.hidden),
+        stopped_by=walker.stopped_by if walker.truncated else "", part=bool(part),
+        part_missing=bool(part) and not walker.part_found,
     )
 
 
