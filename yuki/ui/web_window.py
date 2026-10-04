@@ -113,7 +113,7 @@ TOPIC_PAGES: dict[str, tuple[str, ...]] = {
     "people": ("me", "home"),
     "voice": ("settings",),                          # the tray's voice, devices or hotkeys changed
 }
-#: After these, the pages may have changed (a run can move a thread or teach a procedure): their change stamps are
+#: After these, the pages may have changed (a run can add a to-do or teach a procedure): their change stamps are
 #: read, and the page is built only if one moved.
 CHECK_TOPICS: dict[str, tuple[str, ...]] = {"request_end": ("work", "playbook"), "practice": ("playbook",)}
 #: The agent's memory tools (``tool_finished`` carries the name) -> topic. Every memory write the agent can make is
@@ -129,7 +129,7 @@ DEBOUNCE_S = 1.5
 MAX_WAIT_S = 4.0
 MIN_GAP_S: dict[str, float] = {"home": 10.0, "shell": 5.0}
 DEFAULT_GAP_S = 2.0
-#: Data with no event (threads, the day's timeline, people, the playbook, portrait facts, a tray that is down): the
+#: Data with no event (the day's timeline, people, the playbook, portrait facts, a tray that is down): the
 #: open page's change stamps are read this often while it can be seen and no call records (a few indexed reads).
 FALLBACK_S: dict[str, float] = {"home": 300.0, "work": 300.0, "day": 120.0, "activity": 300.0, "me": 600.0,
                                 "playbook": 600.0}
@@ -1288,16 +1288,14 @@ class WebWindow:
     ACTIONS: dict[str, str] = {
         "offer": "a_offer", "offer_undo": "a_offer_undo", "card_feedback": "a_card_feedback", "answer": "a_answer",
         "skip_question": "a_skip_question", "stop": "a_stop", "stop_call": "a_stop_call", "steer": "a_steer",
-        "submit": "a_submit", "askbar": "a_askbar", "continue": "a_continue", "copy": "a_copy", "correct": "a_correct",
+        "submit": "a_submit", "askbar": "a_askbar", "copy": "a_copy", "correct": "a_correct",
         "forget": "a_forget", "rule_edit": "a_rule_edit", "person": "a_person", "workflow_edit": "a_workflow_edit",
         "pin": "a_pin", "resolve_heard": "a_resolve_heard", "review_mark": "a_review_mark",
         "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
         "motion": "a_motion", "call_pref": "a_call_pref", "quiet": "a_quiet",
-        # the feedback round 3 (W1, W3): close / dismiss / reopen a thread, its Continue, a page it brings back, and
-        # Correct from your own words with its Undo
-        "close_thread": "a_close_thread", "thread_continue": "a_thread_continue", "open_page": "a_open_page",
+        # the feedback round 3 (W3): Correct from your own words with its Undo
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
         "todo_end": "a_todo_end", "todo_undo": "a_todo_undo", "todo_add": "a_todo_add",
@@ -1397,83 +1395,14 @@ class WebWindow:
         self._grant_foreground()
         return self._tray("askbar", text=str(m.get("text") or ""))
 
-    def _continue_context(self, ref: str) -> dict[str, Any] | None:
-        fn = getattr(self.memory, "thread_continue", None) if self.memory is not None else None
-        return fn(ref) if callable(fn) else None
-
-    def a_continue(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Work's Continue (the feedback round 3, W1d): the concrete request memory builds for the thread
-        (``thread_continue``'s ``ask``: where it stands and the next step), with the windows and pages the user ticked
-        to bring back first (``places``: their places in that list, read again here; the page never sends text).
-        ``how``: ``ask`` hands it to Yuki as the user's request (they pressed Ask Yuki on the words shown), ``edit``
-        puts it in the ask bar unsent. An older memory: a plan from the thread's own fields (:func:`plan_text`)."""
-        ref = str(m.get("ref") or "")
-        cont = self._continue_context(ref)
-        if cont:
-            text = continue_text(cont, m.get("places"))
-        else:
-            thread = self.memory.thread(ref) if self.memory is not None else None
-            if not thread:
-                thread = next((t for t in (self.pages.get("work") or {}).get("threads", []) if t.get("ref") == ref), None)
-            if not thread:
-                return {"ok": False, "error": "I can't find that thread any more."}
-            text = plan_text(thread)
-        if str(m.get("how") or "edit") == "ask":
-            return {**self._tray("submit", text=text), "asked": True}
-        self._grant_foreground()
-        return self._tray("askbar", text=text)
-
-    def a_thread_continue(self, m: dict[str, Any]) -> dict[str, Any]:
-        """What a thread's Continue shows: memory's ``thread_continue`` (where it stands, the next step, the request
-        Yuki would get, the windows and pages worth bringing back). Reads only."""
-        cont = self._continue_context(str(m.get("ref") or ""))
-        if not cont:
-            return {"ok": False, "error": "I can't find that thread any more."}
-        places = [{"kind": p.get("kind") or "window", "app": p.get("app") or "", "title": p.get("title") or "",
-                   "page": bool(_web_url(p.get("url"))), "last_at": p.get("last_at")}
-                  for p in cont.get("places") or [] if isinstance(p, dict)]
-        return {"cont": {"ref": cont.get("ref"), "title": cont.get("title") or "", "shown": cont.get("shown"),
-                         "next": cont.get("next"), "open": list(cont.get("open") or [])[:3], "ask": cont.get("ask") or "",
-                         "last_at": cont.get("last_at"), "places": places}}
-
-    def a_open_page(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Continue's Open on one page it brings back: memory's own URL for that place (read again here by its place
-        in the list; http and https only), opened in the default browser. Types, clicks and sends nothing."""
-        cont = self._continue_context(str(m.get("ref") or ""))
-        places = [p for p in (cont or {}).get("places") or [] if isinstance(p, dict)]   # as a_thread_continue listed them
-        i = m.get("place")
-        url = _web_url(places[i].get("url")) if isinstance(i, int) and 0 <= i < len(places) else None
-        if not url:
-            return {"ok": False, "error": "That page can't be opened from here."}
-        self._grant_foreground()
-        try:
-            import webbrowser
-
-            ok = bool(webbrowser.open(url))
-        except Exception:  # noqa: BLE001
-            ok = False
-        return {} if ok else {"ok": False, "error": "Couldn't open that page."}
-
-    def a_close_thread(self, m: dict[str, Any]) -> dict[str, Any]:
-        """A thread's Close (done), Not a thread (dismiss) and their Undo or Reopen (reopen): memory's ``close_thread``,
-        at once, no model (the feedback round 3, W1a)."""
-        ref, how = str(m.get("ref") or ""), str(m.get("how") or "")
-        if how not in ("done", "dismiss", "reopen"):
-            return {"ok": False, "error": "Unknown choice."}
-        r = self._memory_op("close_thread")(ref, how) or {}
-        self.refresh("work")
-        self.refresh("home")
-        if not r.get("ok"):
-            return {"ok": False, "error": "That thread changed since you opened it. I’ll show it again."}
-        return {"status": r.get("status"), "how": how}
-
-    #: Which page shows the items of a ref kind (its Correct's live refresh).
-    REF_PAGES = {"fact": ("me", "home"), "journal": ("me",), "thread": ("work", "home"), "episode": ("day",),
+    #: Which page shows the items of a ref kind (its Correct's live refresh). Threads are not shown in the window (the
+    #: 4 Oct decision), so a thread ref is nothing here.
+    REF_PAGES = {"fact": ("me", "home"), "journal": ("me",), "episode": ("day", "work"),
                  "todo": ("home", "work"), "commit": ("home", "work"), "loop": ("home", "work")}
 
     def a_correct_item(self, m: dict[str, Any]) -> dict[str, Any]:
         """Correct (the feedback round 3, W3): the user's few words about what is wrong with one item (``fact:N``, a
-        person's summary, a routine; ``thread:N``; ``episode:N``; ``journal:N``, "It was..." on a misheard entry), to
+        person's summary, a routine; ``todo:N``; ``episode:N``; ``journal:N``, "It was..." on a misheard entry), to
         memory's ``correct_item``, which records it at once and wakes the correction pass. The row says "Got it,
         fixing it" until the pass lands (``_check_pending``), then shows the corrected text."""
         ref, words = str(m.get("ref") or ""), " ".join(str(m.get("words") or "").split())
@@ -1510,7 +1439,8 @@ class WebWindow:
         if not ended:
             return {"ok": False, "error": "That’s already off your list."}
         can_undo = ref.startswith("todo:") and callable(getattr(mem, "reopen_todo", None))
-        return {"ref": ended, "how": how, "undo": can_undo, **({"until": time.time() + self.TODO_UNDO_S} if can_undo else {})}
+        return {"ref": ended, "how": how, "undo": can_undo,
+                **({"until": time.time() + self.TODO_UNDO_S} if can_undo else {})}
 
     def a_todo_undo(self, m: dict[str, Any]) -> dict[str, Any]:
         """The Undo of a Done or Not needed on a to-do you added: memory's ``reopen_todo``; it is open again, as it was."""
@@ -2120,54 +2050,6 @@ def workflow_action(ref: str, verb: str, words: str = "") -> str | None:
     if verb == "save":
         return "save"
     return None
-
-
-def plan_text(thread: dict[str, Any]) -> str:
-    """Work's Continue with an older memory (no ``thread_continue``): the request from the thread's own fields
-    (title, where it stands, the next step or first open item), the same shape memory's ``ask`` has."""
-    title = " ".join(str(thread.get("title") or "this").split())
-    state = " ".join(str(thread.get("shown") or thread.get("state") or "").split())
-    nxt = " ".join(str(thread.get("next") or "").split())
-    open_items = [str(x) for x in thread.get("open") or [] if str(x).strip()]
-    parts = [f"Help me continue {title}."]
-    if state:
-        parts.append(f"Where it stands: {state}")
-    if nxt or open_items:
-        parts.append(f"Next: {nxt or open_items[0]}")
-    return " ".join(parts)
-
-
-def _web_url(url: Any) -> str | None:
-    """``url`` when it is an http or https address (what Continue may open), else ``None``."""
-    from urllib.parse import urlsplit
-
-    text = str(url or "").strip()
-    try:
-        return text if text and urlsplit(text).scheme in ("http", "https") and urlsplit(text).netloc else None
-    except ValueError:
-        return None
-
-
-def continue_text(cont: dict[str, Any], picked: Any = None) -> str:
-    """The request Continue hands Yuki: memory's ``ask`` (where the thread stands and the next step), and when the
-    user ticked windows or pages to bring back (``picked``: their places in ``cont["places"]``), those first, named
-    as memory has them."""
-    text = " ".join(str(cont.get("ask") or "").split()) or plan_text(cont)
-    places = [p for p in cont.get("places") or [] if isinstance(p, dict)]
-    chosen = [places[i] for i in (picked if isinstance(picked, list) else [])
-              if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(places)]
-    names = []
-    for p in chosen:
-        title, app = " ".join(str(p.get("title") or "").split()), " ".join(str(p.get("app") or "").split())
-        what = f"“{title}” in {app}" if title and app else (f"“{title}”" if title else app)
-        url = _web_url(p.get("url"))
-        if what and url:
-            what += f" ({url})"
-        if what and what not in names:
-            names.append(what)
-    if names:
-        text += " First bring back what I had open for it: " + "; ".join(names) + "."
-    return text
 
 
 def _hhmm(value: Any) -> str | None:
