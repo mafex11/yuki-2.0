@@ -189,6 +189,17 @@ def cases() -> list[dict[str, Any]]:
              messages=[u("what time is it?")]),
         dict(id="focus_after_nothing", issue="vGame", check="end_or_quiet", call="Discord", state=GAME_CALL,
              messages=[u("Yuki?"), a("Yeah?"), u("ah nothing, forget it")]),
+        # vGame review (F2/F4/F5): right after a goodbye the first words recognition heard the name open are named; a
+        # story about her is not; the friends' words after a named turn carry no named note any more
+        dict(id="focus_goodbye_confirmed", issue="vGame review", check="not_quiet", named=True, after_goodbye=True,
+             call="Discord", state=GAME_CALL, messages=[u("Yuki, pause the music.")]),
+        dict(id="focus_goodbye_story", issue="vGame review", check="end_or_quiet", after_goodbye=True,
+             call="Discord", state=GAME_CALL, messages=[u("I had a long talk with, uh, Yuki about it yesterday")]),
+        dict(id="focus_team_after_named", issue="vGame review", check="end_or_quiet", call="Discord",
+             state=GAME_CALL, messages=[u("Yuki, turn it up"), call("media_key", {"key": "volumeup", "times": 3,
+                                                                                   "say_when_done": "Louder."}, "v2"),
+                                        result("v2", {"done": "volume up 3 steps", "said": "Louder."}), a("Louder."),
+                                        u("push B, I'm rotating")]),
     ]
     return c
 
