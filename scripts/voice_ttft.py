@@ -72,15 +72,21 @@ def _supported(fn: Any, **kwargs: Any) -> dict[str, Any]:
 
 
 def request(mouth: Any, hands: Any, memory: Any, with_items: bool, lookup: str = "", history: int = 1, *,
-            channel: str = "marker", call: str | None = None, state: dict[str, Any] | None = None) -> dict[str, Any]:
+            channel: str = "marker", call: str | None = None, state: dict[str, Any] | None = None,
+            marks: bool = True) -> dict[str, Any]:
     from yuki.voice.pipeline import async_tool_instructions
 
     system = mouth.mouth_system_blocks(memory, tail=[async_tool_instructions()],
                                        **_supported(mouth.mouth_system_blocks, channel=channel, call=call,
-                                                    state=state))
+                                                    state=state, marks=marks))
     tools = []
+    extra = []
+    if hasattr(mouth, "fetch_recent"):   # vfix4: that tree's talker has its quick memory tool (and the Earlier block)
+        from yuki.voice.recall import QUICK_MEMORY
+
+        extra.append(QUICK_MEMORY)
     for t in (mouth.TELL_YUKI, mouth.CHECK_PROGRESS, mouth.MORE_OF_RESULT, mouth.STAY_QUIET, mouth.END_CONVERSATION,
-              mouth.GO_QUIET, *hands.HAND_TOOLS):
+              mouth.GO_QUIET, *extra, *hands.HAND_TOOLS):
         tools.append({"name": t["name"], "description": t["description"],
                       "input_schema": {"type": "object", "properties": t["properties"], "required": t["required"]}})
     desk = DESK
@@ -130,6 +136,8 @@ async def main(argv: list[str]) -> int:
     ap.add_argument("--history", type=int, default=1, help="the six-message conversation repeated this many times")
     ap.add_argument("--channel", choices=("marker", "guard"), default="marker", help="the speech channel (v3.16)")
     ap.add_argument("--call", default="", help="an app name: the request is built in call mode")
+    ap.add_argument("--no-marks", dest="marks", action="store_false",
+                    help="a voice that strips marks (Deepgram Aura, ElevenLabs): a tree that can leaves them out (vfix4)")
     ap.add_argument("--tokens-only", dest="tokens_only", action="store_true",
                     help="one call per variant (max_tokens 1): the prompt's size only")
     args = ap.parse_args(argv)
@@ -148,7 +156,7 @@ async def main(argv: list[str]) -> int:
         mouth, hands = load(Path(root).resolve(), name)
         memory = mouth.fetch_memory(MemoryAccess(path=args.db))
         variants.append((name, request(mouth, hands, memory, args.desk == "items", lookup, args.history,
-                                       channel=args.channel, call=args.call or None)))
+                                       channel=args.channel, call=args.call or None, marks=args.marks)))
     if args.tokens_only:
         for name, req in variants:
             response = await client.messages.create(model=s.voice_mouth_model, max_tokens=1, **req)

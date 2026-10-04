@@ -547,10 +547,29 @@ def test_the_cached_prompt_stays_under_its_measured_size() -> None:
     call) against main's 16.6k / 17.2k, and the time to first token was the same as main's in a call (p50 1,035 vs
     1,034 ms, 8 interleaved rounds, scripts/voice_ttft.py). A first draft at 18.4k in a call cost +300 ms: the step is
     between the two, so this guard stays tight."""
-    from yuki.voice.mouth import CALL_LAYER, HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT
+    from yuki.voice.mouth import CALL_LAYER, HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT
 
-    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 41_800
+    # vfix4: the voice marks are their own section (sent only with a voice that performs them): still counted here,
+    # so the guard holds for the largest core a conversation can send
+    assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) + len(VOICE_MARKS_PROMPT) <= 41_800
     assert len(CALL_LAYER) <= 2_300
+
+
+def test_each_voice_layout_with_the_quick_memory_tool_stays_at_mains_size() -> None:
+    """vfix4 review F6: one guard per voice layout, so neither sits past the ~18k step unnoticed. Measured 4 Oct with
+    ``scripts/voice_ttft.py --tokens-only`` (count of the whole request; an empty profile, so a real one adds the same
+    to each): main's talker 16,796 tokens; this tree with the quick memory tool, a Gemini conversation (the marks
+    section in the core) 16,784, an Aura or ElevenLabs one (no marks) 16,446. Main itself sits just under the step
+    with today's profile (17,662), so neither layout may grow past these characters without measuring again."""
+    import json
+
+    from yuki.voice.mouth import HANDS_PROMPT, MOUTH_PROMPT, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT
+    from yuki.voice.recall import QUICK_MEMORY
+
+    core = len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT)
+    tool = len(json.dumps(QUICK_MEMORY))
+    assert core + len(VOICE_MARKS_PROMPT) + tool <= 41_650   # Gemini (Leda performs the marks)
+    assert core + tool <= 40_600                              # Deepgram Aura, ElevenLabs (they strip the marks)
 
 
 def test_state_guidance_rides_only_on_the_turns_in_that_state() -> None:

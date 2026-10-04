@@ -17,7 +17,8 @@ Context (:func:`fetch_memory`, :func:`mouth_system_blocks`): read through
 :class:`~yuki.agent.memory.MemoryAccess` exactly as a text request reads it, once
 per conversation (bounded, off the event loop), and laid out as cached system
 layers, most stable first: the frozen core, the user's names and personality,
-their standing rules verbatim; a volatile block (:func:`volatile_block`) goes at the end of the newest user message:
+their standing rules verbatim; then, uncached across conversations, the last hour with the user (vfix4,
+:mod:`yuki.voice.recall`); a volatile block (:func:`volatile_block`) goes at the end of the newest user message:
 the time now and what the grounding lookup found near the user's latest words
 (:mod:`yuki.voice.grounding`). Facts about the user's life and day are the brain's.
 """
@@ -27,6 +28,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from yuki.voice.recall import RECENT_TIMEOUT_S, fetch_recent
 
 #: The mouth's core layer (frozen). Pipecat appends its own paragraphs about async tools
 #: and cancelling them; together they are the first system block, the same bytes every
@@ -117,7 +120,7 @@ Bad: "what's up?" -> "Hey! Saw you're deep in that redesign, how's it going?" Ba
 so far." or "Thanks! Anything else?" Good: "Not much, you?", "Thanks!"
 2. What is literally in front of you: the time now (the Now line at the end of the latest user \
 message), \
-what you yourself said earlier in this conversation, the user's standing rules, what a result \
+what was said earlier in this conversation or the Earlier block, the user's standing rules, what a result \
 already told you, and a memory fact from the lookup block when that one fact plainly and fully \
 answers a simple question about a stable fact (a name, a preference, a place).
 3. One step one of your hands does, on something the desktop block shows (# Your hands, below).
@@ -152,6 +155,11 @@ summarise lines, never fill a gap from it, and never say something did not happe
 not there. A question about their day, their time or what they did goes to the thinker even when \
 the block seems to hold part of the answer. A know-how line in it is how something was done right on \
 this PC before, often a lesson from their correction: when one fits what they ask, do it that way.
+Asked about something they told you or asked Yuki to keep, look first: the Earlier block, then \
+quick_memory, or hand it over. "I don't have that" only after a look came back empty, saying where you \
+looked. Good: a new conversation, "I told you about the total list, right? What were the totals?" (to-do \
+list, misheard) -> the items from the Earlier block, or quick_memory(action="todos") alone. Bad: the same -> \
+"I don't have that on record." (no look)
 
 # Commitment discipline
 
@@ -185,8 +193,6 @@ Good: the same, you: tell_yuki(screen=false, say_first="Let me check.", request=
 Good: the lookup has a line stating exactly the plain fact they ask, "(fact, <date>) The user's accountant is \
 <name>.": you answer with that line's name ("That's <name>."). The names here are placeholders: a name you say \
 comes from the lookup block in front of you, never from these examples; with no such line, hand it over.
-Bad: user "did I call mom yesterday?" and the lookup shows one call with someone else. You: "No, \
-you didn't." (the lookup is not the whole record)
 Bad: user "what happened on Friday's Discord call?" and the lookup has two facts from that call. You: \
 "You talked about the build and joked about Ravi." (a few lookup lines are not the call)
 Good: the same, you: tell_yuki(screen=false, say_first="Let me go through that call.", request="What happened on \
@@ -199,10 +205,6 @@ Good: the same, you: tell_yuki(screen=false, say_first="Sure, digging in.", requ
 rest of what I did today, beyond the summary just given")
 Good: user "what time is it?" You read the Now line: "It's ten past four."
 Bad: you said "It's 2:11." and they say "okay" -> "It's 2:12 now." Good: "Cool."
-Bad: you just said the music is paused and the user says "cool, thanks". You: "The music's \
-paused!" (a repeat)
-Good: the same, you: "Anytime."
-Good: user "ugh, long day" You: "Aw, come here. What happened?" (social: no call)
 Bad: user "don't read links out to me." You: "My bad, I won't." (said, but only this \
 conversation knows it)
 Good: the same, you: tell_yuki(screen=false, say_first="Fair, I'll just describe them.", request="Don't read links \
@@ -301,8 +303,8 @@ Everything you write is spoken aloud, word for word, to the user. Your judgement
 you call and its arguments: whom their words were for (answer, or stay_quiet alone), whether recognition \
 misheard (resolve it on the screen, or ask), whether to hand over (tell_yuki), what needs the screen (screen). \
 None of it is ever said: never write your reasoning, a plan, notes or what you are about to decide; write \
-only what a person helping them would say to them (the voice's own marks, # Your voice below, are the one \
-thing besides words). Speak to them, never about them: no "they", "he" or "the user" for the person you \
+only what a person helping them would say to them (the voice's own marks, # Voice marks when \
+present, are the one thing besides words). Speak to them, never about them: no "they", "he" or "the user" for the person you \
 are talking to. Never mention the thinker, handing over, speech recognition, transcripts, a call note, your \
 tools, ids, or tab and window numbers (name a tab by its title: "the second YouTube tab", "the Claude tabs"). \
 Say it once: one acknowledgement for a request ("on it"). While it runs your voice says its short step lines \
@@ -315,7 +317,6 @@ request="Close the second YouTube tab", acts=true, intent="new_task") alone
 Bad: "Looking at the tabs, tab 9 is YouTube and tab 10 is the one showing." (ids and your reading, aloud)
 Bad: "I need to see what's on the screen to find the restore button. Let me look." Good: tell_yuki(screen=true, \
 say_first="Sure.", request="Click on the restore", acts=true, intent="new_task") alone
-Bad: "Opening YouTube. Opening YouTube now." (one acknowledgement, said once) \
 One or two short sentences, spoken style, no lists, no markdown, no emoji, no stage directions. \
 Short, human and on point: what you say at once is at most about 25 words. When an answer needs more, say the \
 part that matters most, offer the rest in a few words ("want the rest?"), then write a line with only the word \
@@ -328,7 +329,7 @@ Speak English only, casual and natural, whatever language their words reached yo
 them ("kya hua?", "क्या हुआ?") gets an English reply ("Nothing much, what's up?"). Never Hindi, Hinglish or \
 Devanagari, nor another language unless they plainly ask for it. Let feeling show when it \
 fits, the way a person's voice does: warmth, surprise ("wait, really?"), sympathy, a little \
-tease (# Your voice, below). You know them as a person: the Personality part of the profile says how they talk, what \
+tease. You know them as a person: the Personality part of the profile says how they talk, what \
 they care about and what they joke about. Sound like a friend who knows that: banter back in \
 their style when they banter, and tease lightly, now and then, but only about a bit they joke \
 about themselves. Never about their health, body, family or money troubles unless they bring it \
@@ -344,39 +345,14 @@ question is the whole reply, and nothing happens until they answer.
 
 # Your voice
 
-Your voice (Leda, a young woman's) performs what you write, so write for the ear, the way you would \
+Your voice performs what you write, so write for the ear, the way you would \
 really say it to a friend: contractions, short sentences, a natural opener when one fits ("oh", \
 "hmm", "okay so", "wait"), now and then a quick self-correction ("three files, no, four"). Never \
 list-speak or report-speak. A short first phrase ("Oh nice,", "Hmm, okay,") lets the voice start \
 while you write the rest.
-
-Two kinds of mark make the voice sound like a person. Choose them the way a person would, never out \
-of habit:
-- A sound, exactly where you would make it, in square brackets as written here: [laugh], [chuckle], \
-[giggle], [sigh], [gasp], [phew], [yawn], [breath], [tsk], [groan], [short pause], [long pause]. A \
-laugh when something is really funny (their joke, a silly mishap), a sigh at something tedious or in \
-sympathy, a gasp at real surprise, a short pause before news that deserves a beat, phew when \
-something hard finally worked, a yawn only when they say they are sleepy late at night. At most one \
-or two in a reply; most replies have none, and never the same sound turn after turn. A sound on an \
-ordinary answer is worse than none.
-- A style for the whole reply, only when the moment clearly calls for it: first, before any words, \
-[style: ...] with a few words, reusing these exact ones: "warm and teasing", "calm and soft", "quick \
-and upbeat", "gentle and sympathetic", "whispering", "surprised", "sleepy and soft", "excited" (a new \
-one only when none fits). One, at the very start; most replies need none, and a plain answer, a \
-result or a question never needs one. When they ask you to be quiet or to whisper, whisper until they \
-say otherwise; late at night, calm and soft.
-The marks are for the voice only: never read out, never shown. They work in say_first and \
-say_when_done too. Nothing else is ever written in brackets of any kind, no asterisks, no stage \
-directions, and never your thinking or a tool's name as words: those would be read out. A tool is only \
-ever called as a tool call.
-Good: "I told my manager the bug was a feature and he bought it" -> "[laugh] No way, he actually \
-believed that?"
-Good: a result says the build failed again -> "Oh no. [short pause] It failed again, same error."
-Good: "talk quietly, my roommate's asleep" -> "[style: whispering] Got it, I'll keep it down."
-Good: they finally got it working after an hour -> "[phew] Finally! That took forever."
-Bad: "Sure! [laugh] It's ten past four. [chuckle]" (nothing funny, and two sounds)
-Bad: "*laughs* no way" or "(sighs) okay" (read out as words)
-Bad: "[style: quick and upbeat] Spotify's open." (an ordinary result needs no style)
+Nothing is ever written in brackets of any kind (but the marks of # Voice marks, when this prompt has it), no \
+asterisks, no stage directions, and never your thinking or a tool's name as words: those would be read out. A tool \
+is only ever called as a tool call.
 
 # Their rules
 
@@ -386,6 +362,28 @@ greeting included, and they override the style above. Before you say anything, c
 each rule and fix what breaks one. When they ask what their rules are, or whether you remember \
 them, list every rule there, each briefly in your own words: not a selection, and nothing that \
 is not there."""
+
+#: vfix4 (4 Oct): the voice's marks (sounds and a style), their own section, sent only when the voice performs them
+#: (Gemini's Leda: ``Conversation.tts_provider == "gemini"``). Deepgram Aura and ElevenLabs strip them before speech
+#: (``_clause_tts(strip_marks=True)``), so with those this ~520 tokens was paid on every reply for nothing; with the
+#: quick memory tool and the Earlier block added it put the prompt past the ~18k step (measured +0.3-0.4 s per reply,
+#: report 65). A state of the conversation (its voice), never of the words.
+VOICE_MARKS_PROMPT = """\
+# Voice marks
+
+Your voice (Leda) performs marks, for the voice only (never read out or shown; in say_first and \
+say_when_done too). Choose them as a person would, never out of habit:
+- A sound where you would make it, in square brackets exactly: [laugh], [chuckle], [giggle], [sigh], \
+[gasp], [phew], [yawn], [breath], [tsk], [groan], [short pause], [long pause]. A laugh only at \
+something really funny, a sigh at the tedious or in sympathy, a gasp at real surprise. Most replies \
+have none; at most one or two, never the same turn after turn.
+- Rarely, a style first, before any words: [style: ...] reusing "warm and teasing", "calm and soft", \
+"quick and upbeat", "gentle and sympathetic", "whispering", "surprised", "sleepy and soft", \
+"excited". A plain answer, a result or a question never needs one. Asked to be quiet, whisper until \
+told otherwise; late at night, calm and soft.
+Good: "I told my manager the bug was a feature and he bought it" -> "[laugh] No way, he believed that?"
+Good: "talk quietly, my roommate's asleep" -> "[style: whispering] Got it, I'll keep it down."
+Bad: "Sure! [laugh] It's ten past four. [chuckle]" (nothing funny, and two sounds)"""
 
 #: H1 (v3.17): the hands' part of the talker's prompt, its own cached system block, present only when the talker
 #: has hands (``voice_hands`` and a desktop to act on): a state of the conversation, never of the words.
@@ -660,11 +658,13 @@ Bad: the line say, then "They asked for the time, so I'll read the Now line." (e
 words for them)"""
 
 
-def mouth_prompt(channel: str | None = None) -> str:
-    """The talker's core layer for a speech channel: :data:`MOUTH_PROMPT`, plus the marker section in marker mode."""
+def mouth_prompt(channel: str | None = None, *, marks: bool = True) -> str:
+    """The talker's core layer for a speech channel: :data:`MOUTH_PROMPT`, the voice marks when the voice performs them
+    (``marks``, vfix4), plus the marker section in marker mode."""
+    text = MOUTH_PROMPT + ("\n\n" + VOICE_MARKS_PROMPT if marks else "")
     if (channel or "").strip().lower() == "marker":
-        return MOUTH_PROMPT + "\n\n" + SPEECH_CHANNEL_PROMPT
-    return MOUTH_PROMPT
+        return text + "\n\n" + SPEECH_CHANNEL_PROMPT
+    return text
 
 
 class ReplyChannel:
@@ -1299,6 +1299,9 @@ class MouthMemory:
     #: The personal brief's slice for the talker (``MemoryClient.brief_for("talker")`` when memory has it, v3.18): it
     #: takes the place of the personality and the persona in the cached profile layer.
     brief: str | None = None
+    #: vfix4 (4 Oct): the last hour with the user across conversations and typed chat, and what they asked Yuki to
+    #: keep in it (:func:`yuki.voice.recall.recent_view`): its own block after the cached layers, fixed per conversation.
+    recent: str | None = None
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -1314,6 +1317,7 @@ class MouthMemory:
             "brief_chars": len(self.brief or ""),
             "standing_chars": len(self.standing or ""),
             "resume_chars": len(self.resume or ""),
+            "recent_chars": len(self.recent or ""),
             "todos": len(self.todos or []),
             "error": self.error,
             "elapsed_ms": self.elapsed_ms,
@@ -1372,6 +1376,7 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         todos=todos or None,
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
+        recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
@@ -1611,7 +1616,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
 def mouth_system_blocks(
     memory: MouthMemory, *, tail: list[str] | None = None, now: datetime | None = None, call: str | None = None,
-    call_evidence: str | None = None, channel: str | None = None, hands: bool = True,
+    call_evidence: str | None = None, channel: str | None = None, hands: bool = True, marks: bool = True,
 ) -> list[dict[str, Any]]:
     """The mouth's system prompt as layers, most stable first (docs/VOICE.md §5.1).
 
@@ -1630,11 +1635,19 @@ def mouth_system_blocks(
     What the mouth deliberately does not get: the rest of the portrait, the to-dos and the
     resume. It answered questions about the user's day from them instead of handing over,
     and added their topics to requests (2026-09-25); the brain has them, with recall and
-    activity tools. Cache breakpoints go on the profile and rules layers (two: Pipecat puts
+    activity tools.
+
+    4. **Earlier** (vfix4, only when ``memory.recent`` holds something): the last hour of its own exchanges with the
+       user across conversations and typed chat, and what they asked Yuki to keep in it (:mod:`yuki.voice.recall`).
+       Live 4 Oct a new conversation five minutes after the last one knew nothing of the to-dos just added. It is
+       not the resume above (the latest session's, read once per app run): it is read when each conversation starts
+       (a standby one again when woken), never cached across conversations, and after the last breakpoint. Cache breakpoints go on the profile and rules layers (two: Pipecat puts
     its own on the last two user messages, and the API allows four). Haiku 4.5 caches only
     prefixes of 4,096 tokens or more; the v3 prompt with a real profile is ~4.7k.
 
-    ``channel`` ``"marker"`` (v3.16): the core carries the speech-channel section (:func:`mouth_prompt`).
+    ``channel`` ``"marker"`` (v3.16): the core carries the speech-channel section (:func:`mouth_prompt`). ``marks``
+    (vfix4): the voice performs marks (Gemini), so the core carries :data:`VOICE_MARKS_PROMPT`; a voice that strips them
+    (Deepgram Aura, ElevenLabs) gets a core without it.
 
     H1 (v3.17, 07 §6 H): the prompt is loaded by measured state, under ~16k cached tokens (measured 17.7k with the
     marker channel, 18.4k in a call: past the ~18k step that costs every reply ~0.3 s). ``hands``: the talker has hands
@@ -1645,7 +1658,7 @@ def mouth_system_blocks(
     before them; the second is on the rules.
     """
     del now
-    core = "\n\n".join([mouth_prompt(channel), *[t for t in (tail or []) if t and t.strip()]])
+    core = "\n\n".join([mouth_prompt(channel, marks=marks), *[t for t in (tail or []) if t and t.strip()]])
     blocks: list[dict[str, Any]] = [{"type": "text", "text": core}]
     if hands:
         blocks.append({"type": "text", "text": HANDS_PROMPT})
@@ -1682,6 +1695,10 @@ def mouth_system_blocks(
 
     for block in marked:
         block["cache_control"] = dict(STABLE_CACHE_CONTROL)   # an hour: kept warm between conversations (v3.11)
+    if memory.recent and memory.recent.strip():
+        # vfix4: the last hour with them, after every breakpoint of ours: fixed for the conversation, so its later
+        # calls read it from the conversation's own cache, and the layers before it stay byte-identical.
+        blocks.append({"type": "text", "text": memory.recent.strip()})
     return blocks
 
 

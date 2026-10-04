@@ -41,6 +41,7 @@ from yuki.config import Settings
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.hands import HAND_TOOLS
+from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
     ReplyChannel, mouth_system_blocks, volatile_block, with_markers,
@@ -923,7 +924,8 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             channel = hook("channel", default="guard")
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call,
                                                    call_evidence=hook("call_evidence", default=None),
-                                                   channel=channel, hands=bool(hook("hands", default=True)))
+                                                   channel=channel, hands=bool(hook("hands", default=True)),
+                                                   marks=bool(hook("marks", default=True)))
             messages = params.get("messages")
             if channel == "marker":
                 messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
@@ -2074,9 +2076,16 @@ class _Hooks:
         """
         user_turn = _last_role(context) == "user"
         call.user_turn = user_turn
+        job = getattr(self.c, "_recent_job", None)
+        if job is not None:
+            self.c._recent_job = None
         hands = getattr(self.c.bridge, "hands", None) if self.c.settings.voice_hands else None
         desk_task = (asyncio.ensure_future(hands.for_call(self.c.settings.voice_desk_wait_ms))
                      if hands is not None else None)
+        # vfix4: a woken conversation's first call waits a moment for the last hour, read again on the wake, alongside
+        # the desktop summary and the lookup (review F3: never in front of them)
+        recent_task = (asyncio.ensure_future(self._recent(job, getattr(self.c, "_recent_close", None)))
+                       if job is not None else None)
         practice = getattr(self.c, "practice", None)
         if practice is not None and user_turn:
             # the final words' lookup starts here, with the call (the observer sees the transcript a moment later:
@@ -2087,6 +2096,8 @@ class _Hooks:
         practice_task = (asyncio.ensure_future(self._practice_for(practice, user_turn))
                          if practice is not None else None)
         lookup_text = await self._lookup(call, user_turn)
+        if recent_task is not None:
+            await recent_task
         if practice_task is not None:
             self._practice(call, *(await practice_task))
         desk_text = None
@@ -2099,6 +2110,19 @@ class _Hooks:
                 call.desk_ms = round(snap.ms if how == "fresh" else (time.monotonic() - snap.at) * 1000, 1)
                 call.desk_tabs_ms = snap.tabs_ms
         return lookup_text, desk_text
+
+    async def _recent(self, job: Any, close: Any) -> None:
+        """Wait at most :attr:`Conversation.RECENT_WAIT_S` for the wake's read of the last hour, then close it: a read
+        that lands later is dropped, so the system prompt never changes after this call (review F4); this
+        conversation goes with the view read when it was built."""
+        try:
+            if not job.done():
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), self.c.RECENT_WAIT_S)
+        except Exception:  # noqa: BLE001 - past the bound: the view read at the build
+            pass
+        finally:
+            if callable(close):
+                close()
 
     async def _lookup(self, call: LlmCall, user_turn: bool) -> str | None:
         grounder = self.c.grounder
@@ -2280,6 +2304,11 @@ class _Hooks:
     def hands(self) -> bool:
         """Whether the talker has hands this conversation (its hands block is in the prompt only then)."""
         return bool(self.c.settings.voice_hands and getattr(self.c.bridge, "hands", None) is not None)
+
+    def marks(self) -> bool:
+        """vfix4: whether this conversation's voice performs the talker's marks (Gemini); Deepgram Aura and ElevenLabs
+        strip them (``_clause_tts(strip_marks=True)``), so their talker's core goes without the marks section."""
+        return str(getattr(self.c, "tts_provider", "") or "").strip().lower() == "gemini"
 
     def reply_cap(self) -> int:
         """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none)."""
@@ -2481,6 +2510,13 @@ class Conversation:
         self.practice: Any = None
         #: The playbook ids the talker's latest call was shown (a hand's trace carries them as ``injected``).
         self._shown_ids: list[int] = []
+        # -- vfix4 -------------------------------------------------------------------------------------------
+        #: The last hour read again on the wake (:meth:`_refresh_recent`), until the first call has waited for it.
+        self._recent_job: Any = None
+        #: Closes that read once the first call has stopped waiting (a later read is dropped).
+        self._recent_close: Any = None
+        #: The talker's quick memory tool (:class:`yuki.voice.recall.QuickMemory`), made with the services.
+        self.quick_memory: Any = None
 
     def _on_activity(self) -> None:
         self._activity.set()
@@ -2559,6 +2595,7 @@ class Conversation:
         self.started_at = now
         self.stt_ready_at = now
         self.observer.last_bot_stop = 0.0
+        self._refresh_recent()
         self._bind_bridge()
         self._boost()
         stream = getattr(self.transport.input(), "go_live", None)
@@ -2579,6 +2616,58 @@ class Conversation:
                      voiced=voiced)
         self.log.event("session", state="woken", session=self.session, **facts)
         self._activity.set()
+
+    #: How long the first call of a woken conversation waits for the last hour to be read again (s; measured tens of ms).
+    RECENT_WAIT_S = 0.4
+
+    def _refresh_recent(self) -> None:
+        """vfix4: read the last hour with the user again now that the conversation is woken (it was built dormant,
+        maybe long before: live 4 Oct the standby was built two seconds after the last conversation ended and woken
+        33 s later). Off the loop, on the voice pool. The first call waits for it at most :attr:`RECENT_WAIT_S`
+        (``_Hooks._recent``, alongside the desktop summary and the lookup); the Earlier block takes it only when it lands
+        by then and the read worked, else it keeps the view read at the build. Content-free log."""
+        memory, mouth_memory = self.memory, self.mouth_memory
+        if memory is None or mouth_memory is None:
+            return
+        import concurrent.futures
+        import threading
+
+        from yuki.voice.workers import shared
+
+        job: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        # Open until the first call has stopped waiting for it (``_Hooks._recent`` closes it): a read that lands
+        # later is dropped, so the system prompt never changes in the middle of the conversation (review F4).
+        gate = {"open": True}
+        lock = threading.Lock()
+
+        def close() -> None:
+            with lock:
+                gate["open"] = False
+
+        self._recent_job, self._recent_close = job, close
+        log, session, started = self.log, self.session, time.monotonic()
+
+        def work() -> None:
+            try:
+                from yuki.voice.recall import fetch_recent
+
+                failed = object()
+                text = fetch_recent(memory, failed=failed)
+                ok = text is not failed   # a failed read keeps the view read at the build (review F4)
+                with lock:
+                    before = mouth_memory.recent
+                    used = ok and gate["open"]
+                    if used:
+                        mouth_memory.recent = text
+                if log is not None:
+                    log.event("recent", op="woken", session=session, ok=ok, used=used,
+                              chars=len(text or "") if ok else 0,
+                              changed=used and (text or None) != (before or None),
+                              ms=round((time.monotonic() - started) * 1000))
+            finally:
+                job.set_result(None)
+
+        shared().submit(work)
 
     def _bind_bridge(self) -> None:
         """Wire the shared bridge (and the talker's hands) to this conversation: once it is live, never while dormant."""
@@ -2815,6 +2904,14 @@ class Conversation:
             for tool in HAND_TOOLS:
                 llm.register_function(tool["name"], self._hand_or_hold, cancel_on_interruption=False,
                                       timeout_secs=30)
+        if self.memory is not None:
+            # vfix4: the talker's quick look into memory (its to-do list, today's talk, a search) and its to-do adds;
+            # not cancelled by a barge-in (an add may already be saved, and its report must reach the context).
+            from yuki.voice.recall import QuickMemory
+
+            self.quick_memory = QuickMemory(self.memory, log=self.log, session=self.session)
+            llm.register_function(QUICK_MEMORY["name"], self.quick_memory.handle, cancel_on_interruption=False,
+                                  timeout_secs=20)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
         if provider == "gemini":
@@ -2907,7 +3004,8 @@ class Conversation:
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
-            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET, *hand_tools)
+            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET,
+                      *([QUICK_MEMORY] if self.memory is not None else []), *hand_tools)
         ])
         self._tools = tools
         context = LLMContext(tools=tools)

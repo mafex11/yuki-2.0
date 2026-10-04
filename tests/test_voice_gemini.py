@@ -374,10 +374,11 @@ def test_preflight_uses_aura_when_there_is_no_google_key(monkeypatch: pytest.Mon
 
 
 def test_the_mouth_is_told_about_its_voice_marks() -> None:
-    from yuki.voice.mouth import MOUTH_PROMPT
+    from yuki.voice.mouth import MOUTH_PROMPT, VOICE_MARKS_PROMPT, mouth_prompt
 
-    voice = MOUTH_PROMPT[MOUTH_PROMPT.index(chr(10) + "# Your voice"):MOUTH_PROMPT.index("# Their rules")]
+    voice = VOICE_MARKS_PROMPT   # vfix4: its own section, in the core only when the voice performs marks
     assert "[style:" in voice and "[sigh]" in voice
+    assert VOICE_MARKS_PROMPT in mouth_prompt("marker", marks=True) and "[sigh]" not in mouth_prompt("marker", marks=False)
     assert "<" not in voice  # angle-bracket marks made Haiku write XML-like markup as speech (2026-09-27)
     assert "tags of any kind" not in MOUTH_PROMPT
 
