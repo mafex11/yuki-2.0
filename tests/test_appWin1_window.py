@@ -158,7 +158,8 @@ def test_home_shows_the_thread_you_are_on_with_its_app_time_and_next_step(store)
     t = W.current_thread(client, NOW, front)
     assert t["ref"] == f"thread:{tid}" and t["title"] == "Yuki revamp" and t["app"] == "T3 Code"
     assert t["next"] == "Wire the misheard buttons." and t["in_front"] is True
-    assert 79 <= t["min"] <= 81                                                       # its stretch, to now
+    # its stretch, to now: the page counts from since_at (no minutes in the data, so it doesn't change every minute)
+    assert t["min"] is None and abs(t["since_at"] - (NOW - 80 * M)) < 2
     # another app in front now: the stretch ends at the last touch
     t2 = W.current_thread(client, NOW, {"app": "Discord", "since_at": NOW - 2 * M})
     assert t2["in_front"] is False and 69 <= t2["min"] <= 71
@@ -167,6 +168,39 @@ def test_home_shows_the_thread_you_are_on_with_its_app_time_and_next_step(store)
     client.close_thread(f"thread:{tid}", "done")
     assert W.current_thread(client, NOW, front) is None
     assert other and "work_threads" in W.PAGE_TABLES["home"]
+
+
+def test_the_tile_counts_from_the_threads_own_start_not_from_when_the_app_came_in_front(store):
+    client = MemoryClient(store)
+    a = _thread(store, "Seed-swap app", "The user wired the form.", at=NOW - 150 * M, app="VS Code")
+    _touch(store, a, NOW - 100 * M, "VS Code")
+    b = _thread(store, "Garden planner", "The user drew the beds.", at=NOW - 20 * M, app="VS Code")
+    _touch(store, b, NOW - 1 * M, "VS Code")
+    t = W.current_thread(client, NOW, {"app": "VS Code", "since_at": NOW - 150 * M})
+    assert t["ref"] == f"thread:{b}" and abs(t["since_at"] - (NOW - 20 * M)) < 2      # about 20 minutes, not 2h 30m
+
+
+def test_a_thread_just_closed_gives_way_to_the_open_one_touched_before_it(store):
+    client = MemoryClient(store)
+    y = _thread(store, "Garden planner", "The user drew the beds.", at=NOW - 5 * M, app="Figma")
+    x = _thread(store, "Seed-swap app", "The user wired the form.", at=NOW - 1 * M, app="VS Code")
+    client.close_thread(f"thread:{x}", "done")
+    t = W.current_thread(client, NOW, None)
+    assert t is not None and t["ref"] == f"thread:{y}" and t["app"] == "Figma"
+    assert t["in_front"] is False and t["min"] == 0
+
+
+def test_a_long_untouched_thread_you_dismiss_still_reaches_the_closed_fold(store):
+    client = MemoryClient(store)
+    old = _thread(store, "Old paused idea", "The user sketched it.", at=NOW - 10 * 86400)
+    for k in range(W.CLOSED_SHOWN * 3 + 2):                                       # many closed threads touched later
+        tid = _thread(store, f"Done thing {k}", "Finished.", at=NOW - 5 * 86400 + k * 60)
+        client.close_thread(f"thread:{tid}", "done")
+    time.sleep(0.05)                                                              # a later closed_at than all of them
+    client.close_thread(f"thread:{old}", "dismiss")                               # closed last, touched longest ago
+    data = W.build_work(client, week={"days": [], "totals": {}}, now=time.time())
+    assert data["closed"][0]["ref"] == f"thread:{old}" and data["closed"][0]["status"] == "dismissed"
+    assert len(data["closed"]) == W.CLOSED_SHOWN
 
 
 def test_home_has_no_in_front_tile_any_more(store):
@@ -197,7 +231,31 @@ def test_a_session_takes_its_title_and_summary_from_the_longest_episode_inside_i
     labels = W.session_labels(client, [s1, s2, s3], day0 - H)
     assert labels[id(s1)]["title"] == "Garden planner beds" and labels[id(s1)]["summary"] == "You finished the bed sizes screen."
     assert labels[id(s1)]["ref"].startswith("episode:")
-    assert id(s2) not in labels and id(s3) not in labels                            # no title written: the app shows
+    # no title written yet: the app shows as the title, but the session can still be corrected (its episode's ref)
+    assert labels[id(s2)]["title"] is None and labels[id(s2)]["ref"].startswith("episode:")
+    assert id(s3) not in labels                                                     # no episode at all
+
+
+def test_a_corrected_session_shows_fixed_on_its_new_episode(store, tmp_path):
+    day0 = NOW - 10 * H
+    store.commit_episodes(None, day0, [NewEpisode(day0, day0 + H, day0, day0 + H, True, "the user coded.", {},
+                                                  title="Garden planner beds", summary="You sized the beds.")])
+    client = MemoryClient(store)
+    [ep] = client.episodes(day0 - H, day0 + 2 * H)
+    old_ref = ep["ref"]
+    win = web_window.WebWindow(db_path=tmp_path / "x.db", connect=False)
+    win.ui_path = tmp_path / "ui.json"
+    fake = _FixMemory()
+    fake.store = store                                                              # the episode rows, read by id
+    win.memory = fake
+    win.refresh = lambda *a, **k: None
+    win.a_correct_item({"ref": old_ref, "words": "it was the seed-swap app"})
+    new_id = store.supersede_episode(ep["id"], "the user coded the seed-swap app.", title="Seed-swap app")
+    fake.status[41] = "done"
+    win._check_pending()
+    assert f"episode:{new_id}" in win.fixed and old_ref not in win.fixed
+    assert [e["ref"] for e in client.episodes(day0 - H, day0 + 2 * H)] == [f"episode:{new_id}"]
+    assert W.pending_view(win.shown_pending(), ("episode:",))[f"episode:{new_id}"]["state"] == "fixed"
 
 
 # -- W6: maybe misheard ------------------------------------------------------------------------------------------------------

@@ -19,11 +19,17 @@
     // the thread of work you are on (the 4 Oct decision: it replaced "In front"): "On <thread> in <app> · <time>"
     // and its next step; a click opens it on Work with its Continue
     if (n.thread) {
-      const t = n.thread, dur = t.min >= 1 ? fmt.dur(t.min) : '';
-      const where = [t.app ? 'in ' + t.app : '', dur].filter(Boolean).join(' · ');
+      // while its app is in front the minutes run on the page from since_at (the ticker's data-durfrom, once a
+      // minute); else the stretch's fixed length
+      const t = n.thread, live = !!(t.in_front && t.since_at);
+      const mins = live ? (Date.now() / 1000 - t.since_at) / 60 : (t.min || 0);
+      const dur = live || mins >= 1 ? fmt.dur(mins) : '';
+      const durEl = live ? h('span', { data: { durfrom: t.since_at }, text: dur }) : dur;
+      const head = t.app ? 'In ' + t.app : '';
+      const where = [t.app ? 'in ' + t.app : '', live ? '' : dur].filter(Boolean).join(' · ');   // no figure that goes stale
       tiles.push(h('button', { class: 'clear nowthread', data: { clear: '', do: 'thread-go', ref: t.ref },
         attrs: { type: 'button', 'aria-label': `On ${t.title}${where ? ' ' + where : ''}. Open it on Work.` } },
-      Y.label(where ? where[0].toUpperCase() + where.slice(1) : 'Your work now', null, 'front'),
+      Y.label(head && dur ? [head, ' · ', durEl] : head || (dur ? durEl : 'Your work now'), null, 'front'),
       h('div', { class: 'big' }, h('span', { text: t.title })),
       h('div', { class: 'sm', text: t.next ? 'Next: ' + t.next : (t.shown || '') })));
     }

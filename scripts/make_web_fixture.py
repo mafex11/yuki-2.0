@@ -316,7 +316,7 @@ def build() -> dict:
         "now": {
             # the current work thread (the 4 Oct decision: it replaced "In front")
             "thread": {"ref": "thread:12", "title": "Garden planner: watering schedule", "app": "VS Code", "since_at": ago(42 * M),
-                       "min": 42, "in_front": True, "next": "Write the timer that waters each bed on its own days",
+                       "min": None, "in_front": True, "next": "Write the timer that waters each bed on its own days",
                        "shown": "The schedule screen is half built; the timer logic isn’t started."},
             "playing": {"status": "paused", "title": "Rain Study No. 4", "artist": "The Lo-Fi Trio", "app": "Music"},
             "call": {"app": "Signal", "started_at": call_start, "recording": True,
@@ -438,7 +438,7 @@ def build() -> dict:
             {"a": 1120, "b": 1230, "start": "18:40", "end": "20:30", "title": "Hollow Knight evening", "app": "Hollow Knight", "mode": "full",
              "apps": [["Hollow Knight", 104]], "ref": "episode:312", "summary": "You played Hollow Knight, full screen."},
             {"a": 1230, "b": 1312, "start": "20:30", "end": "21:52", "title": "VS Code", "app": "VS Code", "mode": "active",
-             "apps": [["VS Code", 44], ["Signal", 12], ["Music", 6]],
+             "apps": [["VS Code", 44], ["Signal", 12], ["Music", 6]], "ref": "episode:315",
              "full": "Garden planner: you started on the watering schedule screen."},
         ],
         "pending": {}, "can": {"correct": True},

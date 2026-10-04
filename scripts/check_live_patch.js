@@ -696,7 +696,10 @@ async function inPage(F) {
   await go('#home'); await sleep(500);
   const tile = main().querySelector('.nowthread');
   check('Home: the current work thread replaces In front: its title, app and time, its next step', !!tile && tile.textContent.includes('Garden planner: watering schedule')
-    && tile.textContent.includes('In VS Code · 42m') && tile.textContent.includes('Next: ') && !/In front/.test(main().textContent), tile && tile.textContent);
+    && /In VS Code · 4\dm/.test(tile.textContent) && tile.textContent.includes('Next: ') && !/In front/.test(main().textContent), tile && tile.textContent);
+  const durEl = tile.querySelector('[data-durfrom]');
+  if (durEl) { durEl.dataset.durfrom = String(Date.now() / 1000 - 125 * 60); Y.tickSoon(); await sleep(60); }
+  check('Home: while its app is in front the tile’s minutes run on the page (the ticker), never a stale figure', !!durEl && durEl.textContent === '2h 05m', durEl && durEl.textContent);
   const nowD = Y.D.pages.home.now;   // (the call may have ended in the checks above)
   check('Home: Playing and Call stay beside it', main().querySelectorAll('.now > *').length === 1 + (nowD.playing ? 1 : 0) + (nowD.call ? 1 : 0) && !!nowD.playing,
     Array.from(main().querySelectorAll('.now > *')).map((x) => x.textContent.slice(0, 30)).join(' | '));
@@ -704,6 +707,12 @@ async function inPage(F) {
   tile.click(); await sleep(900);
   check('Home: the tile opens that thread on Work with its Continue', decodeURIComponent(location.hash) === '#work/thread:12' && !!cardOf('thread:12') && !!cardOf('thread:12').querySelector('.tcont'),
     `${decodeURIComponent(location.hash)} card ${!!cardOf('thread:12')} panel ${!!(cardOf('thread:12') && cardOf('thread:12').querySelector('.tcont'))}`);
+  cardOf('thread:12').querySelector('[data-do="continue"]').click(); await sleep(200);
+  const closedCont = !cardOf('thread:12').querySelector('.tcont');
+  await go('#home'); await sleep(400);
+  main().querySelector('.nowthread').click(); await sleep(900);
+  check('Home: the tile clicked again after Continue was closed opens it again', closedCont && !!cardOf('thread:12') && !!cardOf('thread:12').querySelector('.tcont'),
+    `closed ${closedCont} panel ${!!(cardOf('thread:12') && cardOf('thread:12').querySelector('.tcont'))}`);
   await go('#me'); await sleep(500);
   const mh2 = main().querySelector('.mhsec [data-resolve]');
   const mtx = mh2.querySelector('.tx').textContent;

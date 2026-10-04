@@ -344,14 +344,16 @@
     });
   };
 
-  /* Home's thread tile opens #work/thread:N: that card comes into view with its Continue open, once per visit */
-  let focusedSub = '';
+  /* Home's thread tile opens #work/thread:N: that card comes into view with its Continue open, once per visit (a
+     visit is one navigation, S.navs: the tile clicked again after going Home focuses it again; the data's own
+     re-renders within the visit don't) */
+  let focusedSub = '', focusedNav = -1;
   function focusThread(main, S) {
     if (!S.sub.startsWith('thread:')) { focusedSub = ''; return; }
-    if (focusedSub === S.sub) return;
+    if (focusedSub === S.sub && focusedNav === S.navs) return;
     const ref = S.sub, d = workData();
     if (!(d.threads || []).some((t) => t.ref === ref)) return;   // not open any more (or the data isn't here yet)
-    focusedSub = ref;
+    focusedSub = ref; focusedNav = S.navs;
     if ((d.threads || []).some((t) => t.ref === ref && t.status === 'paused')) Y.S.open.add('f:paused');
     if ((d.can || {}).cont && !Y.S.open.has('cont:' + ref)) { openContinue(ref); Y.renderMain(); }
     setTimeout(() => {

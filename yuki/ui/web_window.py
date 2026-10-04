@@ -1874,7 +1874,11 @@ class WebWindow:
             if state in ("done", "failed") or (state == "none" and age > 8 * 86400):
                 self.pending.pop(ref, None)
                 if state in ("done", "failed") and p.get("kind") == "correct":   # the row says "Fixed" a while
-                    self.fixed[ref] = {**p, "state": "fixed" if state == "done" else "failed", "done_at": time.time()}
+                    # a corrected session is a new episode row (the old one superseded): its "Fixed" goes on the new
+                    # ref, the one Day's rebuilt row has
+                    shown_ref = self._current_episode_ref(ref) if state == "done" else ref
+                    self.fixed[shown_ref] = {**p, "state": "fixed" if state == "done" else "failed",
+                                             "done_at": time.time()}
                 changed = True
             elif age > 600 and not p.get("late"):
                 p["late"] = True
@@ -1883,6 +1887,25 @@ class WebWindow:
             self._save_pending()
             for page in ("me", "home", "work", "day"):
                 self.refresh(page)
+
+    def _current_episode_ref(self, ref: str) -> str:
+        """``episode:N`` after a correction: memory supersedes the episode with a new row, so follow ``superseded_by``
+        to the current one (a short read by id; any other ref, or one that can't be read, stays as it is)."""
+        kind, _, num = ref.partition(":")
+        by_ids = getattr(getattr(self.memory, "store", None), "episodes_by_ids", None)
+        if kind != "episode" or not num.isdigit() or not callable(by_ids):
+            return ref
+        eid = int(num)
+        for _ in range(8):   # a few corrections in a row at most
+            try:
+                rows = by_ids([eid])
+            except Exception:  # noqa: BLE001
+                return ref
+            nxt = getattr(rows[0], "superseded_by", None) if rows else None
+            if not nxt:
+                break
+            eid = int(nxt)
+        return f"episode:{eid}"
 
     def shown_pending(self) -> dict[str, dict[str, Any]]:
         """The corrections the pages show on their rows: the ones waiting (``pending``, shared with the Qt window)

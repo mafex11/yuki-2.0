@@ -198,7 +198,8 @@ def current_thread(memory: Any, now: float, front: dict[str, Any] | None = None)
     the open thread memory's journal last saw you touch (``latest_work_events``, content-free), within
     :data:`CURRENT_THREAD_S`. ``app`` is the app of that touch; ``since_at`` the start of its current stretch (the
     thread's touches no further apart than :data:`CURRENT_GAP_S`); the stretch runs to now while that app is still
-    the one in front (``front``), else to the last touch. ``None`` when no open thread was touched lately. Reads only;
+    the one in front (``front``; ``min`` is then None and the page counts from ``since_at``), else to the last touch
+    (``min``, fixed). ``None`` when no open thread was touched lately. Reads only;
     the measured times are plumbing, nothing here judges what the work is."""
     store = getattr(memory, "store", None)
     latest = getattr(store, "latest_work_events", None)
@@ -207,12 +208,17 @@ def current_thread(memory: Any, now: float, front: dict[str, Any] | None = None)
     events = _safe(lambda: latest(since=now - CURRENT_THREAD_S - 6 * 3600, limit=200), []) or []
     if not events or float(events[0].get("at") or 0) < now - CURRENT_THREAD_S:
         return None
-    tid = events[0].get("work_thread_id")
-    # the thread just touched is among the most recently touched open ones (a short read: Home builds often)
+    # the newest touch on a thread that is still open (one you just closed, or one memory saw end, gives way to the
+    # open one you touched before it); the threads touched lately are among the most recently touched open ones (a
+    # short read: Home builds often)
     rows = _safe(lambda: memory.threads(statuses=("active", "blocked"), limit=8), []) or []
-    t = next((r for r in rows if r.get("id") == tid), None)
-    if t is None:
+    open_rows = {r.get("id"): r for r in rows}
+    hit = next((e for e in events if float(e.get("at") or 0) >= now - CURRENT_THREAD_S
+                and e.get("work_thread_id") in open_rows), None)
+    if hit is None:
         return None
+    tid = hit.get("work_thread_id")
+    t = open_rows[tid]
     mine = [e for e in events if e.get("work_thread_id") == tid]   # newest first
     last = float(mine[0].get("at") or now)
     start = last
@@ -222,12 +228,13 @@ def current_thread(memory: Any, now: float, front: dict[str, Any] | None = None)
             break
         start = at
     app = str(mine[0].get("app") or "").strip()
+    # while that app is still in front the stretch runs to now; it starts at the thread's own first touch, never at
+    # when the app came to the front (the app may have held other threads before this one)
     in_front = bool(front and app and str(front.get("app") or "").casefold() == app.casefold())
-    if in_front and front and front.get("since_at"):
-        start = min(start, float(front["since_at"]))
-    end = now if in_front else last
+    # in front: the page counts the minutes from since_at itself (its minute ticker), so the data stays the same from
+    # one minute to the next and the tile never shows a stale figure; else the stretch's fixed length
     return {"ref": t.get("ref"), "title": t.get("title") or "", "app": app, "since_at": start,
-            "min": max(0, round((end - start) / 60)), "in_front": in_front,
+            "min": None if in_front else max(0, round((last - start) / 60)), "in_front": in_front,
             "next": " ".join(str(t.get("next") or "").split()) or None,
             "shown": " ".join(str(t.get("shown") or "").split()) or None}
 
@@ -1065,6 +1072,20 @@ CLOSED_SHOWN_DAYS = 14
 CLOSED_SHOWN = 8
 
 
+def closed_threads(memory: Any) -> list[dict[str, Any]]:
+    """The threads closed as done or dismissed, as ``{"ref", "title", "status", "closed_at", "closed_by",
+    "last_seen"}``, newest closed first. Every closed one is read, not the most recently touched few: a thread you
+    dismiss may not have been touched for weeks, and it must still reach the fold (and its Reopen). The store's
+    plain rows (no checklists or typed names to work out); a memory without a store gets ``threads``' read."""
+    rows = _safe(lambda: memory.store.work_threads(("done", "dismissed")), None)
+    if rows is None:
+        out = _safe(lambda: memory.threads(statuses=("done", "dismissed"), limit=CLOSED_SHOWN * 3), []) or []
+    else:
+        out = [{"ref": f"thread:{t.id}", "title": t.title, "status": t.status, "closed_at": getattr(t, "closed_at", None),
+                "closed_by": getattr(t, "closed_by", None), "last_seen": t.last_seen} for t in rows]
+    return sorted(out, key=lambda t: -(epoch_of(t.get("closed_at")) or epoch_of(t.get("last_seen")) or 0))
+
+
 def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict[str, Any] | None = None,
                now: float | None = None) -> dict[str, Any]:
     """Threads of work (memory's ``threads``; the feedback round 3, W1): the open ones (active first, then paused,
@@ -1097,7 +1118,7 @@ def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict
     closed = []
     can_close = callable(getattr(memory, "close_thread", None))
     if can_close:   # only a memory that can reopen them shows them (an older one has no dismissed threads)
-        for t in _safe(lambda: memory.threads(statuses=("done", "dismissed"), limit=CLOSED_SHOWN * 3), []) or []:
+        for t in closed_threads(memory):
             at = epoch_of(t.get("closed_at")) or epoch_of(t.get("last_seen")) or 0
             if at < now - CLOSED_SHOWN_DAYS * 86400:
                 continue
@@ -1266,10 +1287,11 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
         # the feedback round 3, W2: the row is the session's short distinct title (memory's, never its summary cut
         # short), opened its one- or two-sentence summary and the time in every app. Until memory has written them:
         # the app as the title and the narrative's first sentence, whole, as the detail
-        if lab is not None:
+        if lab is not None and lab["title"]:
             extra = {"title": lab["title"], "ref": lab["ref"], **({"summary": lab["summary"]} if lab["summary"] else {})}
-        else:
-            extra = {"title": app, "full": natural(getattr(s, "title_full", "") or s.title)}
+        else:   # still correctable: the ref of its longest episode (correct_item takes any current one)
+            extra = {"title": app, "full": natural(getattr(s, "title_full", "") or s.title),
+                     **({"ref": lab["ref"]} if lab is not None and lab.get("ref") else {})}
         sessions.append({"a": int((s.start - since) // 60), "b": int((s.end - since) // 60), "start": hm(s.start),
                          "end": hm(s.end), "app": app, "mode": "full" if fs > s.present_s / 2 else "active",
                          "apps": [[name, round(secs / 60)] for name, secs in s.apps if secs >= 30], **extra})
@@ -1314,19 +1336,28 @@ def session_labels(memory: Any, sessions: list[Any], since: float) -> dict[int, 
     """Each Day session's label from memory's episodes (migration 35, the feedback round 3, W2): ``{id(session):
     {"title", "summary", "ref"}}`` from the longest titled episode inside it (an episode belongs to the session
     holding most of it; a session joins neighbouring episodes led by the same app, as its title already did). A
-    session with no titled episode yet is left out. Reads only (``episodes``), no model."""
+    session with no titled episode yet gets ``{"title": None, "summary": None, "ref"}`` from its longest episode, so
+    it can still be corrected (the page keeps the app as its title); one with no episode is left out. Reads only
+    (``episodes``), no model."""
     eps = []
     for e in _safe(lambda: memory.episodes(since, since + 86400.0, limit=200), []) or []:
-        title = " ".join(str(e.get("title") or "").split()) if isinstance(e, dict) else ""
-        s, u = epoch_of(e.get("start")) if title else None, epoch_of(e.get("end")) if title else None
-        if title and s is not None and u is not None and u > s:
+        if not isinstance(e, dict):
+            continue
+        title = " ".join(str(e.get("title") or "").split()) or None
+        s, u = epoch_of(e.get("start")), epoch_of(e.get("end"))
+        if s is not None and u is not None and u > s:
             eps.append((s, u, title, " ".join(str(e.get("summary") or "").split()) or None, e.get("ref")))
     out: dict[int, dict[str, Any]] = {}
     for sess in sessions:
         inside = [e for e in eps if min(e[1], sess.end) - max(e[0], sess.start) > (e[1] - e[0]) / 2]
-        if inside:
-            s, u, title, summary, ref = max(inside, key=lambda e: e[1] - e[0])
+        titled = [e for e in inside if e[2]]
+        if titled:
+            s, u, title, summary, ref = max(titled, key=lambda e: e[1] - e[0])
             out[id(sess)] = {"title": title, "summary": summary, "ref": ref}
+        elif inside:
+            ref = max(inside, key=lambda e: e[1] - e[0])[4]
+            if ref:
+                out[id(sess)] = {"title": None, "summary": None, "ref": ref}
     return out
 
 
