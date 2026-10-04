@@ -233,7 +233,8 @@
     const stopping = run && run.job != null;
     const el = h('aside', { class: 'drawer', data: { clear: '' }, aria: { label: 'Thread' } },
       h('div', { class: 'dh' }, h('b', { text: 'Thread' }), h('span', { class: 'r' }, h('span', { class: 'label', text: 'a new chat every day' }),
-        h('a', { class: 'key xs ghost', attrs: { href: '#' + S.page + (S.sub ? '/' + S.sub : ''), 'aria-label': 'Close' } }, ic('x')))),
+        // closes by the shell's action, read when pressed (never a page address baked in when the drawer was drawn)
+        h('a', { class: 'key xs ghost', data: { do: 'close-thread' }, attrs: { href: '#', 'aria-label': 'Close' } }, ic('x')))),
       bodyEl, row,
       h('div', { class: 'foot-hint' }, stopping
         ? [h('span', { text: run.question ? 'Enter answers' : 'Enter adds to it' }), h('span', { text: 'Esc on an empty box stops' })]
