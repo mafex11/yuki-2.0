@@ -818,11 +818,13 @@ def test_its_history_shows_the_format_it_writes_the_same_bytes_every_call() -> N
 
 def test_the_prompt_and_the_reminder_exist_only_in_marker_mode() -> None:
     from yuki.voice.mouth import (
-        MARKER_REMINDER, MOUTH_PROMPT, RERUN_NOTE, SPEECH_CHANNEL_PROMPT, MouthMemory, mouth_prompt,
-        mouth_system_blocks, volatile_block,
+        MARKER_REMINDER, MOUTH_PROMPT, RERUN_NOTE, SPEECH_CHANNEL_PROMPT, VOICE_MARKS_PROMPT, MouthMemory,
+        mouth_prompt, mouth_system_blocks, volatile_block,
     )
 
-    assert mouth_prompt("guard") == MOUTH_PROMPT and mouth_prompt(None) == MOUTH_PROMPT
+    # vfix4: the voice marks ride with a voice that performs them (the default), never with the marker section's place
+    assert mouth_prompt("guard", marks=False) == MOUTH_PROMPT and mouth_prompt(None, marks=False) == MOUTH_PROMPT
+    assert mouth_prompt("guard") == MOUTH_PROMPT + "\n\n" + VOICE_MARKS_PROMPT
     assert mouth_prompt("marker").endswith(SPEECH_CHANNEL_PROMPT)
     assert SPEECH_CHANNEL_PROMPT not in mouth_system_blocks(MouthMemory(), tail=["t"])[0]["text"]
     assert SPEECH_CHANNEL_PROMPT in mouth_system_blocks(MouthMemory(), tail=["t"], channel="marker")[0]["text"]
