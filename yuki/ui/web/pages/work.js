@@ -165,15 +165,13 @@
   }
 
   /* ---- Your list (the to-do list, shared with Home: Y.todoRow's work look, Y.todosOpen) ---- */
-  const madeHere = (ref) => W().listed.has(ref);
   function listItems(d) {
     const T = d.todos || {}, w = W();
     const open = Y.todosOpen(T).slice();
     // a promise you just moved here shows at once, before memory's next build has it (and once it has, it's that row)
     for (const [ref, view] of w.listed) if (!open.some((t) => t.ref === ref)) open.unshift(view);
-    // just added first (the last ten minutes, newest first), then the list's own order (late first, then by due)
-    const fresh = open.filter((t) => t.since && nowS() - t.since < 600 && (t.source === 'user' || madeHere(t.ref))).sort((a, b) => b.since - a.since);
-    return fresh.concat(open.filter((t) => !fresh.includes(t)));
+    // just added first (the last ten minutes, newest first), then the list's own order: Home's rule too (Y.todoOrder)
+    return Y.todoOrder(open);
   }
   function addLine(T) {
     if (!(T.can || {}).add) return null;

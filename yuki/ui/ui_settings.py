@@ -47,9 +47,14 @@ class UiSettings:
 
 #: The plain-words label and hint for ``takeover_move_px`` on the Settings page (appTakeover).
 TAKEOVER_MOVE_LABEL = "Pause when you move the mouse this far"
-TAKEOVER_MOVE_HINT = ("While Yuki works, typing, clicking or a big mouse movement pauses it so you can take over. "
-                      "Raise this if your mouse twitches on its own; lower it to pause on smaller moves.")
+TAKEOVER_MOVE_HINT = ("While I work, a key or a click always pauses me so you can take over, and so does moving the "
+                      "mouse this far. Pick a bigger move if your mouse drifts on its own.")
 TAKEOVER_MOVE_CHOICES: tuple[int, ...] = (24, 40, 64, 100, 160)
+#: Each choice in plain words, as the Settings page offers it (the window's Settings → While I work).
+TAKEOVER_MOVE_WORDS: dict[int, str] = {24: "A nudge", 40: "A short move (the usual)", 64: "A clear move",
+                                       100: "A long move", 160: "A big sweep"}
+#: A distance set by hand in ui.json that is none of the choices: shown as it is, in these words.
+TAKEOVER_MOVE_OWN = "Your own setting"
 
 
 #: The window engines a settings file may hold (``window_engine``); anything else reads as "web".

@@ -436,7 +436,7 @@ def _shows_many_sites(store: Store, process: str | None) -> bool:
         return False
 
 
-def board(store: Store, now: float | None = None) -> dict[str, Any]:
+def board(store: Store, now: float | None = None, *, replies: bool = True) -> dict[str, Any]:
     """What the Work page shows from this module, read only (no model):
 
     * ``replies``: the chats waiting on the user's reply, newest first: ``{"key" ("chat:<id>"), "who", "msg" (the
@@ -450,12 +450,16 @@ def board(store: Store, now: float | None = None) -> dict[str, Any]:
     * ``meetings``: ``[{"at", "all_day", "title", "seen" (the apps it was seen in)}]``, still ahead, soonest first.
     * ``listed``: the refs the user moved to their list (``commit:<id>``, ``loop:<id>``).
     * ``ready``: whether a check has run at all (else the page says it is still reading).
+
+    ``replies=False``: the chats are not read (``replies`` is empty): what Home's Your list needs (who owes what, what
+    was moved to the list) without reading every recent chat on each Home build.
     """
     now = time.time() if now is None else float(now)
     items = _items(store)
+    want_replies = replies
     replies: list[dict[str, Any]] = []
     shown_once: set[tuple[str, str]] = set()
-    for chat in reply_candidates(store, now):
+    for chat in (reply_candidates(store, now) if want_replies else ()):
         it = items.get(f"chat:{chat.thread_id}")
         if not it:
             continue

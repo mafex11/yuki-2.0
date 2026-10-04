@@ -816,7 +816,8 @@ class WebWindow:
             return W.build_activity(m, requests_csv=self.requests_csv(), people=self._people_ids())
         if name == "settings":
             live = {k: self.tray_state.get(k) for k in ("wake", "mic", "speaker") if k in self.tray_state}
-            data = W.build_settings(m, live=live, devices=self._devices(), policy_path=self.policy_path)
+            data = W.build_settings(m, live=live, devices=self._devices(), policy_path=self.policy_path,
+                                    ui_path=self.ui_path)
             keys = self.tray_state.get("hotkeys") if isinstance(self.tray_state.get("hotkeys"), dict) else {}
             if keys.get("voice"):
                 data["voice"]["hotkey"] = W.hotkey_words(str(keys["voice"]))
@@ -1409,7 +1410,7 @@ class WebWindow:
         "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
-        "motion": "a_motion", "call_pref": "a_call_pref", "quiet": "a_quiet",
+        "motion": "a_motion", "call_pref": "a_call_pref", "quiet": "a_quiet", "takeover_move": "a_takeover_move",
         # the feedback round 3 (W3): Correct from your own words with its Undo
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
@@ -1425,7 +1426,8 @@ class WebWindow:
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
-                                  "pause", "accent", "motion", "call_pref", "quiet", "ai_role", "ai_key", "ai_custom"})
+                                  "pause", "accent", "motion", "call_pref", "quiet", "ai_role", "ai_key", "ai_custom",
+                                  "takeover_move"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -2076,6 +2078,19 @@ class WebWindow:
 
     def a_motion(self, m: dict[str, Any]) -> dict[str, Any]:
         return self._ui(reduce_motion=bool(m.get("reduce")))
+
+    def a_takeover_move(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Settings → While I work: how far the mouse must move while Yuki works for Yuki to pause (``ui.json``
+        ``takeover_move_px``). The takeover watch reads the file each time a task starts acting (and after a resume),
+        so the next task uses it: no restart, nothing polled. Replies with the distance kept (12..400)."""
+        try:
+            px = int(m.get("px"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "That isn't one of the choices."}
+        self._ui(takeover_move_px=px)
+        from yuki.ui import ui_settings
+
+        return {"px": ui_settings.load(self.ui_path).takeover_move_px}
 
     # -- Settings → AI (report 67) ---------------------------------------------------------------------------------
 

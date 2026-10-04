@@ -526,7 +526,6 @@ def build() -> dict:
     # Work (the page approved on 4 Oct, report 68): memory's merged list split by the real web_data.work_columns over an
     # invented board (who owes what in the open loops), the chats waiting on a reply, and Today as work_today sends it
     rows = TodoMemory().todos(include_done=True)
-    open_todos, done_todos = W.todo_lists(None, NOW, include_done=True, rows=rows)
     can = {"end": True, "undo": True, "correct": True, "add": True, "mark": True, "reopen": True}
     cols = W.work_columns(rows, work_board(), [{"ref": "commit:43", "text": "Send Riya the planner link",
                                                 "title": "Send Riya the planner link", "closed_at": ago(50 * M),
@@ -549,7 +548,8 @@ def build() -> dict:
              ("Fri", 610, 360, 150), ("Sat", 452, 230, 114)])],
             "totals": {"pc": 3252, "a": 2050, "f": 474}},
     }
-    home["todos"] = {"open": open_todos[:W.HOME_TODOS], "n": len(open_todos), "can": can}
+    # Home's Your list is Work's Your list (report 69: web_data.home_list), its first HOME_TODOS shown on the page
+    home["todos"] = {"open": cols["list"], "n": len(cols["list"]), "shown": W.HOME_TODOS, "can": can}
     home["pending"] = {}
     # Me is built by the real builder (web_data.build_me) over an invented memory, so the preview has exactly the
     # page's shapes: one summary per person, the review queue, topic groups, routines, misheard with its place
@@ -705,6 +705,7 @@ def build() -> dict:
         "calls": [{"app": "Signal", "decision": "always"}, {"app": "Telegram", "decision": "ask"}, {"app": "Meet", "decision": "never"}],
         "call_knobs": W.call_knobs({}),
         "appearance": {"accent": "green", "reduce_motion": False, "accents": [{"key": "green", "label": "Mint"}, {"key": "orange", "label": "Orange"}]},
+        "takeover": W.takeover_view(40),
         "usage": {"mb": 312, "cpu": 0.4},
         "ai": ai_settings(),
     }

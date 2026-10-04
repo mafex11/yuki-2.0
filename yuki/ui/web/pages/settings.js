@@ -145,6 +145,14 @@
       h('div', { class: 'ai-say', data: { k: 'ai-apply' }, text: ai.apply || '' })];
   }
 
+  /* While I work (report 69): how far the mouse must move while I work for me to pause (keys and clicks always do).
+     The choices and their words come from Python (ui_settings.TAKEOVER_MOVE_WORDS); the takeover watch reads the
+     saved one each time a task starts, so the next task uses it */
+  function takeoverRows(tk) {
+    const opts = (tk.choices || []).map((c) => [String(c.px), c.words]);
+    return [srow(tk.label, pick(opts, String(tk.px), { change: 'takeover-move' }, tk.label), tk.hint)];
+  }
+
   function build(d, S, D) {
     const A = d.autonomy || { levels: [], kinds: [] }, v = d.voice || {}, pr = d.privacy || {}, ap = d.appearance || {}, co = d.coach || {};
     const live = D.shell.connected;
@@ -208,6 +216,7 @@
       h('div', { class: 'set-grid', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Autonomy, per kind of action', null, A.kinds.length ? dial(A) : Y.empty('The autonomy policy couldn’t be read.'), Y.rightLabel('sends always need your words')), 'autonomy'),
+          d.takeover ? Y.k(Y.sec('While I work', null, takeoverRows(d.takeover)), 'takeover') : null,
           Y.k(Y.sec('App access', apps.length, appsB, Y.rightLabel('look · act')), 'apps'),
           d.ai ? Y.k(Y.sec('AI', null, aiSection(d.ai), Y.rightLabel('keys stay on this PC'), 'ai'), 'ai') : null),
         h('div', { class: 'col', data: { k: 'right' } },
@@ -396,6 +405,15 @@
     if (t.dataset.change === 'voice-mic') save(t, 'voice', { mic: v }, `Microphone: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-speaker') save(t, 'voice', { speaker: v }, `Speaker: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
+    if (t.dataset.change === 'takeover-move') {
+      const tk = settings().takeover || {}, was = tk.px, px = Number(t.value);
+      save(t, 'takeover_move', { px }, null, () => { t.value = String(was); }).then((r) => {
+        if (!r.ok) return;
+        tk.px = typeof r.px === 'number' ? r.px : px;   // the distance Python kept (a canned reply: what you picked)
+        const c = (tk.choices || []).find((x) => x.px === tk.px);
+        Y.toast(`Saved: ${c ? c.words.toLowerCase() : 'your own setting'}. I use it from my next task.`);
+      });
+    }
     if (t.dataset.change === 'quiet-time') {
       const co = settings().coach || {}, was = co[t.dataset.which === 'start' ? 'quiet_start' : 'quiet_end'];
       quietSave(t, { [t.dataset.which]: t.value }, () => { t.value = was; });

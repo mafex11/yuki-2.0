@@ -149,6 +149,15 @@
     }
     return added ? out.sort(byDue) : out;
   };
+  /* Your list's order, one rule for Home and Work (report 69): what you added in the last ten minutes first, newest
+     first (and on Work a promise you just moved there), then the list's own order from Python (late first, then by
+     due) */
+  const FRESH_S = 600;
+  Y.todoOrder = (open) => {
+    const now = Date.now() / 1000, moved = (Y.S.work || {}).listed;
+    const fresh = open.filter((t) => t.since && now - t.since < FRESH_S && (t.source === 'user' || (moved && moved.has(t.ref)))).sort((a, b) => b.since - a.since);
+    return fresh.concat(open.filter((t) => !fresh.includes(t)));
+  };
   /* until when a to-do ended here can still be put back (Work's row of it), or null */
   Y.todoUndoUntil = (ref) => { const u = undoable.get(ref); if (u && u * 1000 > Date.now()) return u; undoable.delete(ref); return null; };
   function reopened(ref, view) {
@@ -210,10 +219,12 @@
     row.__t = t;   // its view, for an Undo that puts it back before the data has it again
     return row;
   };
-  /* Home's "Your list": the open to-dos, due first, a few lines; the rest on Work (see all) */
+  /* Home's "Your list": exactly Work's Your list (Python sends that list: never a promise you made or someone
+     owing you), in Work's order, its first few lines; the rest on Work (see all) */
   function yourList(d) {
     const T = d.todos; if (!T) return null;   // a snapshot from before the list: drawn once memory's data is in
-    const open = Y.todosOpen(T), gone = (T.open || []).length - open.length;
+    const all = Y.todosOpen(T), gone = (T.open || []).length - all.length;
+    const open = Y.todoOrder(all).slice(0, T.shown || 5);
     const n = Math.max(0, (T.n != null ? T.n : (T.open || []).length) - gone), more = Math.max(0, n - open.length);
     const body = open.length ? [h('div', { class: 'todos' }, open.map((t) => Y.todoRow(t, d, 'home', false))),
       more ? h('a', { class: 'td-more', attrs: { href: '#work/todos' }, text: `${more} more on Work` }) : null]

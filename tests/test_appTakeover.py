@@ -306,7 +306,9 @@ def test_the_movement_setting_is_kept_within_bounds(tmp_path: Path, monkeypatch:
     assert ui_settings.update(path, takeover_move_px=3).takeover_move_px == 12
     monkeypatch.setattr(ui_settings, "load", lambda path=None: ui_settings.UiSettings(takeover_move_px=64))
     assert takeover_move_px(None) == 64
-    assert ui_settings.TAKEOVER_MOVE_LABEL and "Yuki" in ui_settings.TAKEOVER_MOVE_HINT
+    # the Settings page's words (first person, as the page speaks): every choice said in plain words
+    assert ui_settings.TAKEOVER_MOVE_LABEL and "take over" in ui_settings.TAKEOVER_MOVE_HINT
+    assert set(ui_settings.TAKEOVER_MOVE_WORDS) == set(ui_settings.TAKEOVER_MOVE_CHOICES)
 
 
 # -- 3. the agent ---------------------------------------------------------------------------------------------------------

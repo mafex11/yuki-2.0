@@ -507,11 +507,29 @@ def todo_can(memory: Any) -> dict[str, bool]:
             "correct": callable(getattr(memory, "correct_item", None)), "add": callable(getattr(memory, "add_todo", None))}
 
 
+def home_list(memory: Any, now: float) -> list[dict[str, Any]]:
+    """Home's Your list: the items of Work's Your list (:func:`work_columns` ``list``: the same split, the same
+    order), so a loop where someone owes you (Waiting on) or a promise you made (You said you'd) never shows on Home
+    as your to-do. The board is read without the chats (``work_board(replies=False)``; an older memory without that
+    reads the whole board; none at all: nothing judged yet, as Work shows it then)."""
+    rows = _safe(lambda: memory.todos(include_done=False), []) or []
+    read = getattr(memory, "work_board", None)
+    board: dict[str, Any] = {}
+    if callable(read):
+        try:
+            board = read(now, replies=False) or {}
+        except TypeError:
+            board = _safe(lambda: read(now), {}) or {}
+        except Exception:  # noqa: BLE001 - memory can't say: nothing judged
+            board = {}
+    return work_columns(rows, board if isinstance(board, dict) else {}, [], now)["list"]
+
+
 def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | None = None,
                now: float | None = None, people: list[dict[str, Any]] | None = None,
                call_status: dict[str, Any] | None = None, pending: dict[str, Any] | None = None) -> dict[str, Any]:
     """Home: the Now strip (what you are doing now: :func:`now_session`; playing; the call), Needs you (questions), Running (the call, transcripts waiting; live runs come from the
-    tray), Offers, Your list (the open to-dos, due first, at most :data:`HOME_TODOS`; ``n`` is how many are open), Since
+    tray), Offers, Your list (Work's Your list, :func:`home_list`; the page shows :data:`HOME_TODOS`; ``n`` is how many), Since
     you were away (requests that finished, offers that ran) and the people lately.
     ``call_status``: the tray's forwarded ``call_status()`` (then the call and the transcripts waiting are not read);
     ``pending``: corrections sent on a to-do and not landed yet."""
@@ -557,13 +575,14 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
     # leaving the window (the window's live refresh rebuilds then; 42 verification, missing 4)
     moments = [epoch_of((card_offer(n) or {}).get("expires_at")) for n in cards if offer_open(n, now)]
     moments += [float(a["at"]) + AWAY_HOURS * 3600 for a in away if a.get("at")]
-    open_todos, _done = todo_lists(memory, now)
-    shown_todos = open_todos[:HOME_TODOS]
-    moments.append(todo_moment(shown_todos, now))
+    listed = home_list(memory, now)
+    moments.append(todo_moment(listed, now))
     next_at = min((m for m in moments if m and m > now), default=None)
     return {"now": now_strip, "needs": needs, "running": running, "offers": offers, "away": away,
             "people": (people or [])[:6], "since": since, "next_at": next_at,
-            "todos": {"open": shown_todos, "n": len(open_todos), "can": todo_can(memory)},
+            # Your list: exactly Work's Your list (report 69), in its order; the page shows the first ``shown`` (the
+            # ones you just added first, as Work does: Yk.todoOrder) and "N more on Work" for the rest
+            "todos": {"open": listed, "n": len(listed), "shown": HOME_TODOS, "can": todo_can(memory)},
             "pending": pending_view(pending, TODO_PREFIXES, now)}
 
 
@@ -2232,11 +2251,28 @@ VOICE_PROVIDERS = [{"key": "gemini", "label": "Gemini, Leda", "note": "The defau
                    {"key": "elevenlabs", "label": "ElevenLabs", "note": "Uses your ElevenLabs voice id"}]
 
 
+def takeover_view(px: Any) -> dict[str, Any]:
+    """Settings → While I work: how far the mouse must move while Yuki works for Yuki to pause (``ui.json``
+    ``takeover_move_px``, read by the takeover watch each time a task starts acting). ``px``: the saved distance; the
+    choices in plain words, the saved one among them (a distance set by hand that is none of them shows as itself)."""
+    from yuki.ui import ui_settings as U
+
+    try:
+        px = int(px)
+    except (TypeError, ValueError):
+        px = U.UiSettings().takeover_move_px
+    choices = [{"px": p, "words": U.TAKEOVER_MOVE_WORDS.get(p, U.TAKEOVER_MOVE_OWN)} for p in U.TAKEOVER_MOVE_CHOICES]
+    if px not in U.TAKEOVER_MOVE_CHOICES:
+        choices.append({"px": px, "words": U.TAKEOVER_MOVE_OWN})
+        choices.sort(key=lambda c: c["px"])
+    return {"px": px, "label": U.TAKEOVER_MOVE_LABEL, "hint": U.TAKEOVER_MOVE_HINT, "choices": choices}
+
+
 def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: dict[str, Any] | None = None,
-                   policy_path: Path | None = None) -> dict[str, Any]:
+                   policy_path: Path | None = None, ui_path: Path | None = None) -> dict[str, Any]:
     """Settings: the autonomy policy, app access (look: the privacy blocklist; act: the policy's per-app switch),
     voice (the tray's live state when it runs, else voice.json), offers and check-ins and quiet hours (the privacy
-    file), pause, calls, accent and motion (ui.json)."""
+    file), pause, calls, accent and motion and the takeover distance (ui.json; ``ui_path``: a test's own)."""
     from yuki.ui import policy, ui_settings
     from yuki.ui.window import data as D
     from yuki.ui.window import settings_io
@@ -2263,7 +2299,7 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
     st = _safe(memory.status, {}) or {}
     today_act = _safe(lambda: memory.activity(group_by="app", limit=50), {}) or {}
     seen_min = round(float((today_act.get("totals") or {}).get("present_s") or 0) / 60)
-    ui = ui_settings.load()
+    ui = ui_settings.load(ui_path)
     from yuki.ui import tokens as T
 
     return {
@@ -2290,6 +2326,8 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
         "appearance": {"accent": ui.accent, "reduce_motion": bool(ui.reduce_motion),
                        "accents": [{"key": k, "label": str((v or {}).get("label") or k.capitalize())}
                                    for k, v in T.ACCENTS.items()]},
+        # While I work: how far the mouse must move for me to pause (the takeover watch reads it as a task starts)
+        "takeover": takeover_view(ui.takeover_move_px),
         "usage": yuki_usage(),
         # Settings → AI (report 67): each job's service and model, each service's key status (never a key); no
         # network here (the page asks for model lists with the ai_models action, off the UI thread)
@@ -2389,7 +2427,8 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 #: to-do list (appTodo): your to-dos, the commitments (conversation facts) and the open loops.
 TODO_TABLES = ("todos", "conversation_facts", "open_loops")
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
-    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES),
+    # Home's Your list follows Work's split (report 69): who owes what and what you moved to the list are work_items
+    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES, "work_items"),
     "work": ("timeline", *TODO_TABLES, "work_items", "messages"),   # the Work page (4 Oct): replies, loops, meetings
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),

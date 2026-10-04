@@ -3478,14 +3478,14 @@ class MemoryClient:
 
     # -- the Work page (yuki.memory.workboard) ---------------------------------------------------------------------
 
-    def work_board(self, now: float | None = None) -> dict:
+    def work_board(self, now: float | None = None, *, replies: bool = True) -> dict:
         """The Work page's judged parts (:func:`yuki.memory.workboard.board`): the chats waiting on the user's reply,
         who owes what in the open loops, the meetings ahead, what the user moved to their list. Reads only; never
-        raises (``{}`` when memory can't say)."""
+        raises (``{}`` when memory can't say). ``replies=False``: without reading the chats (Home's Your list)."""
         from yuki.memory.workboard import board
 
         try:
-            return board(self.store, now)
+            return board(self.store, now, replies=replies)
         except Exception:
             return {}
 
