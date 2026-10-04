@@ -2266,6 +2266,15 @@ class Dispatcher:
                                                         part=rid)
                 except TypeError:
                     tree = None
+            if tree is not None and _field(tree, "part_missing"):
+                seen = self._models[int(hwnd)].seen.get(int(within)) if int(hwnd) in self._models else None
+                what = (f' ({seen[0]} "{seen[1][:60]}")' if seen and seen[1] else f" ({seen[0]})" if seen else "")
+                text = (f"element [{within}]{what} is not in window {hwnd} now: it went away, or it is out of view. "
+                        f"Read the whole window")
+                return ToolOutcome(name="look_at_window", ok=True, summary=text,
+                                   content=[{"type": "text", "text": text}],
+                                   payload={"status": "ok", "part_missing": True},
+                                   elapsed_ms=(time.perf_counter() - started) * 1000)
             if tree is not None and _field(tree, "part"):
                 # a part is no observation of the whole window: it is never the read an action is compared with
                 return self._tree_outcome(hwnd, tree, started, within=within, part=True)
@@ -3443,12 +3452,13 @@ class Dispatcher:
                 if via is not None:
                     return self._labelled(via, label)
             self._before_input("click")
+            aim_x, aim_y = self._aim(window, element_id, x, y)
             outcome = self._labelled(
                 self._from_action(
                     "click",
                     self.backend.click(
-                        x,
-                        y,
+                        aim_x,
+                        aim_y,
                         button=button,
                         clicks=self._opt_int(tool_input, "clicks", 1),
                         expect_hwnd=guard,
@@ -3462,6 +3472,30 @@ class Dispatcher:
 
         return self._bracketed("click", window, act, target=element_id if isinstance(element_id, int) else None,
                                target_label=self._short_label(found[1]) if found is not None else "")
+
+    def _aim(self, hwnd: int | None, element_id: Any, x: int, y: int) -> tuple[int, int]:
+        """Where a click on element ``element_id`` lands now (report 58 review, F4): its centre in the screen
+        model's latest read of ``hwnd`` - the outcome bracket's read just before the action, when it took one - so a
+        page that scrolled since the thinker's read is not clicked at the old place; ``(x, y)`` otherwise.
+
+        Raises:
+            ToolError: the latest read shows the element gone (nothing is sent).
+        """
+        if not hwnd or not isinstance(element_id, int) or isinstance(element_id, bool):
+            return x, y
+        model = self._models.get(int(hwnd))
+        if model is None or not model.latest:
+            return x, y
+        current = self._current_element(int(hwnd), element_id, {})
+        if current is None:
+            if element_id in model.seen:
+                raise ToolError(f"not clicked: element [{element_id}] is not in window {hwnd} now (a read just before "
+                                f"the click no longer has it); read the window again")
+            return x, y
+        centre = current.get("center") or ()
+        if current.get("hidden") or len(centre) < 2:
+            return x, y
+        return int(centre[0]), int(centre[1])
 
     def _check_point_on_control(self, x: int, y: int, target: int | None) -> None:
         """N4 (report 47): a click at raw x,y must land on a control of the latest read of the window there. Live 3 Oct
@@ -3574,7 +3608,8 @@ class Dispatcher:
             via = self._pattern_first("click", tool_input, "click") if button == "left" else None
             if via is None:
                 self._before_input("click")
-                via = self._from_action("click", self.backend.click(x, y, button=button, clicks=1,
+                aim_x, aim_y = self._aim(hwnd, element_id, x, y)
+                via = self._from_action("click", self.backend.click(aim_x, aim_y, button=button, clicks=1,
                                                                     expect_hwnd=guard))
             if via.ok:
                 self._mark_acted(hwnd, "click")

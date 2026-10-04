@@ -806,3 +806,153 @@ def test_a_new_page_and_a_retitled_page_are_said_apart() -> None:
     assert describe(moved)[0] == "the page is now https://www.youtube.com/watch?v=x (was https://www.youtube.com/)"
     retitled = diff(read_of("(1) Home", "https://www.youtube.com/"), read_of("(2) Home", "https://www.youtube.com/"))
     assert retitled.page is None and describe(retitled)[0] == 'the window\'s title is now "(2) Home"'
+
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (report 58, "Review fixes")
+# ---------------------------------------------------------------------------
+
+
+def test_review_f1_a_clock_tick_is_never_proof_even_with_no_recent_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.agent.tools as tools
+
+    monkeypatch.setattr(tools, "REFERENCE_FRESH_S", 0.0)   # the thinker took long, and no events flow
+    window = player_window()
+    clock = Node("Text", "1:10", (549, 926, 570, 940))
+    next(n for n in window.walk() if n.name == "Player controls").add(clock)
+    desk = _PlayerDesk(monkeypatch, window=window)
+    desk.clock, desk.tick = clock, True
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    out = d.dispatch("click", {"element": _ids(text, "Home"), "expect_hwnd": 7001})
+    record = out.payload["details"]["screen_change"]
+    assert record["verified"] is None and record["counts"]["weak"] == 1
+    assert out.payload["details"].get("verified") is not True
+    said = out.content[0]["text"]
+    # F7: named as it was before the change
+    assert 'Text "1:12" is now called "1:13"' in said and "can change on their own" in said
+
+
+def test_review_f1_an_interactive_change_is_still_proof() -> None:
+    def one(name: str) -> list[dict[str, Any]]:
+        base = dict(bounds=(0, 0, 10, 10), center=(5, 5), states=(), value=None, depth=1, parent=0)
+        return [{"id": 0, "role": "Window", "name": "W", "parent": -1, "depth": 0, "bounds": (0, 0, 9, 9),
+                 "center": (4, 4), "states": (), "value": None},
+                {"id": 1, "role": "Button", "name": name, "is_interactive": True, "patterns": ("invoke",), **base}]
+    change = diff(one("Play"), one("Pause"))
+    assert change.evidence and verdict(change)[0] is True
+
+
+def test_review_f2_within_walks_the_part_itself_so_the_cap_does_not_cut_it_again(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.agent.tools as tools
+
+    desk = _PlayerDesk(monkeypatch, window=chat_window(messages=60, visible_from=40))
+    d = _dispatcher(desk, verify=False)
+    d.max_tree_elements = 120
+    monkeypatch.setattr(tools, "WITHIN_TREE_ELEMENTS", 120)   # the same cap: only walking the part can help
+    monkeypatch.setattr(T, "_AFTER_PAGE_RESERVE", 100)          # the page gets 20 of the 120
+    first = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    assert "invented message number 56" not in first and "within=" in first
+    chat = _ids(first, "Messages in @Sam")
+    part = d.dispatch("look_at_window", {"hwnd": 7001, "within": chat}).content[0]["text"]
+    assert desk.parts[-1] == (42, 3)                      # walked from the list itself, found by its RuntimeId
+    assert "invented message number 55" in part and "stopped at its limit" not in part
+    assert f"only [{chat}]" in part
+    # the part is never the read an action is compared with, and the rest of the window keeps its ids
+    assert not d._observed_trees[7001].part
+    page = _ids(first, "@Sam")
+    assert d._element_target({"element": page, "expect_hwnd": 7001})[3].startswith(f'[{page}] Document "@Sam"')
+
+
+def test_review_f2_a_part_that_went_away_is_said_plainly(monkeypatch: pytest.MonkeyPatch) -> None:
+    desk = _PlayerDesk(monkeypatch)
+    d = _dispatcher(desk, verify=False)
+    first = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    library = _ids(first, "Your Library")
+    shell = next(n for n in desk.window.walk() if n.role == "Group" and n.invoke)
+    shell.children = [c for c in shell.children if c.name != "Your Library"]
+    out = d.dispatch("look_at_window", {"hwnd": 7001, "within": library})
+    assert "Your Library\") is not in window 7001 now" in out.summary
+
+
+def test_review_f4_scroll_position_events_are_subscribed_and_reuse_is_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.agent.tools as tools
+    from yuki.perception.events import PROPERTIES, EventHub
+
+    assert 30055 in PROPERTIES and 30053 in PROPERTIES     # vertical / horizontal scroll percent
+    source = _FakeSource()
+    hub = EventHub(lambda: source)
+    try:
+        desk = _PlayerDesk(monkeypatch, window=feed_window(offset=0))
+        d = _dispatcher(desk)
+        d.events = hub
+        hub.watch(7001, wait_s=1.0)
+        text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+        desk.window = feed_window(offset=600)               # the user scrolls; this provider raised nothing
+        monkeypatch.setattr(tools, "REUSE_MAX_S", 0.0)       # ... and the thinker's read is older than the limit
+        out = d.dispatch("click", {"element": _ids(text, "Invented video 9"), "expect_hwnd": 7001})
+        record = out.payload["details"]["screen_change"]
+        assert record["before_read"] == "fresh" and "moved" not in " ".join(record["lines"])
+        # and the click went where the video is now (the read just before it), not where the thinker saw it
+        assert desk.clicks[-1] == (255, 230)
+    finally:
+        hub.close()
+
+
+def test_review_f5_elements_past_a_capped_read_are_not_gone() -> None:
+    def els(n: int, extra: bool = False) -> list[dict[str, Any]]:
+        out = [{"id": 0, "role": "Window", "name": "W", "parent": -1, "depth": 0, "bounds": (0, 0, 900, 900),
+                "center": (1, 1), "states": (), "value": None}]
+        if extra:
+            out.append({"id": 100, "role": "Menu", "name": "Context", "parent": 0, "depth": 1,
+                        "bounds": (0, 0, 50, 50), "center": (2, 2), "states": (), "value": None})
+        out += [{"id": i, "role": "Button", "name": f"B{i}", "parent": 0, "depth": 1, "is_interactive": True,
+                 "bounds": (0, 100 + i * 20, 50, 115 + i * 20), "center": (3, 3), "states": (), "value": None}
+                for i in range(1, n + 1)]
+        return out
+    change = diff(els(8), els(8, extra=True)[:7], after_partial=True)
+    lines = describe(change)
+    assert not any("went away" in line for line in lines) and lines[0].startswith('Menu "Context" appeared')
+    assert change.counts["past_limit"] == 3
+    quiet = diff(els(8), els(8)[:6], after_partial=True)
+    assert not quiet.any and verdict(quiet)[0] is None and "part of the window" in describe(quiet)[0]
+
+
+def test_review_f6_a_page_share_cap_is_not_a_cut_short_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.agent.loop import action_verdict
+
+    monkeypatch.setattr(T, "_AFTER_PAGE_RESERVE", 4)
+    tree = read(feed_window(offset=0), monkeypatch=monkeypatch, max_elements=14)
+    assert tree.truncated and tree.stopped_by == "cap" and len(tree.elements) < 14
+    desk = _PlayerDesk(monkeypatch, window=feed_window(offset=0))
+    d = _dispatcher(desk)
+    d.max_tree_elements = 14
+    assert not d._cut_short(tree)
+    d.dispatch("look_at_window", {"hwnd": 7001})
+    out = d.dispatch("scroll", {"x": 960, "y": 600, "dy": -1, "expect_hwnd": 7001})
+    record = out.payload["details"]["screen_change"]
+    assert record is not None and record.get("partial") and "moved up by about 60 px" in out.content[0]["text"]
+    assert action_verdict("scroll", out)[0] is True
+
+
+def test_review_f8_events_follow_outcome_checks_so_the_voice_hands_never_subscribe() -> None:
+    from yuki.agent.tools import Dispatcher
+
+    quick = Dispatcher(backend=_PlayerDesk.__new__(_PlayerDesk), verify_outcomes=False)
+    assert quick.use_events is False and quick._hub() is None
+    thinker = Dispatcher(backend=_PlayerDesk.__new__(_PlayerDesk), verify_outcomes=True)
+    assert thinker.use_events is True
+    thinker.use_events = False
+    assert thinker.use_events is False
+
+
+def test_review_chromium_is_told_once_per_window_that_an_accessibility_client_reads_it(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    told: list[int] = []
+    monkeypatch.setattr(T, "_probe_window", lambda handle: told.append(handle))
+    monkeypatch.setattr(T, "_announced", {})
+    assert T._announce_accessibility_client([501, 502, 0]) == 2
+    assert T._announce_accessibility_client([501, 502]) == 0      # once per window, not on every read
+    assert told == [501, 502]

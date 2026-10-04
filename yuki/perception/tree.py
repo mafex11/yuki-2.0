@@ -2043,7 +2043,8 @@ class _ViewportPass:
         page = not self.stop_at_documents and _page_facts(get) is not None
         try:
             if page:
-                if not self._in_page:
+                if not self._in_page and walker.part is None:
+                    # (a part read keeps nothing after the page but its own part: no reserve)
                     reserve = max(_AFTER_PAGE_RESERVE, saved_cap // _AFTER_PAGE_SHARE)
                     walker.max_elements = max(len(walker.elements) + 1, saved_cap - reserve)
                 self._in_page += 1
@@ -3095,9 +3096,8 @@ def _announce_accessibility_client(handles: list[int]) -> int:
     """
     try:
         import ctypes
-        from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
+        ctypes.windll  # noqa: B018 - not on Windows: nothing to tell
     except Exception:
         return 0
     now = time.monotonic()
@@ -3113,14 +3113,22 @@ def _announce_accessibility_client(handles: list[int]) -> int:
                 for stale in [h for h, at in _announced.items() if now - at >= _WAKE_MEMO_S]:
                     _announced.pop(stale, None)
         try:
-            result = wintypes.DWORD(0)
-            user32.SendMessageTimeoutW(wintypes.HWND(handle), _WM_GETOBJECT, wintypes.WPARAM(0),
-                                       wintypes.LPARAM(_OBJID_ACCESSIBILITY_PROBE), _SMTO_ABORTIFHUNG,
-                                       _ANNOUNCE_TIMEOUT_MS, ctypes.byref(result))
+            _probe_window(handle)
             told += 1
         except Exception:
             continue
     return told
+
+
+def _probe_window(handle: int) -> None:
+    """One ``WM_GETOBJECT`` for Chromium's probe id to ``handle``, with a short timeout, never to a hung window."""
+    import ctypes
+    from ctypes import wintypes
+
+    result = wintypes.DWORD(0)
+    ctypes.windll.user32.SendMessageTimeoutW(wintypes.HWND(handle), _WM_GETOBJECT, wintypes.WPARAM(0),
+                                             wintypes.LPARAM(_OBJID_ACCESSIBILITY_PROBE), _SMTO_ABORTIFHUNG,
+                                             _ANNOUNCE_TIMEOUT_MS, ctypes.byref(result))
 
 
 def ctypes_oleacc() -> object:
