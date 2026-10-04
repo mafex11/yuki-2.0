@@ -48,16 +48,20 @@ def role_line(role: str) -> dict[str, Any]:
     out: dict[str, Any] = {"role": role, "words": ROLE_WORDS[role], "hint": ROLE_HINTS[role], "provider": provider,
                            "provider_words": _provider_words(provider), "model": model,
                            "backup_provider": choice.get("backup_provider") or "",
-                           "backup_model": choice.get("backup_model") or "", "warning": ""}
+                           "backup_model": choice.get("backup_model") or "", "warning": "", "blocked": False}
     if provider == "default":
         out["key"] = "not_needed"
         return out
     out["key"] = key_source(provider)
-    if out["key"] == "missing":
+    out["blocked"] = True   # until shown otherwise: this job can't run as set up
+    if provider == "custom" and not config.custom_base_url():
+        out["warning"] = "The other service has no address yet, so this job can't run. Add it below."
+    elif out["key"] == "missing":
         out["warning"] = f"No {PROVIDERS[provider].label} key yet, so this job can't run. Add the key below."
     elif not model:
         out["warning"] = "Pick a model for this job."
     else:
+        out["blocked"] = False
         out["warning"] = discover.fit_for(role, discover.model_facts(provider, model))
     return out
 
@@ -72,8 +76,8 @@ def providers_state() -> list[dict[str, Any]]:
     from yuki.agent.providers import config, discover
     from yuki.agent.providers.keys import env_names, key_source
 
-    chosen = {(r["provider"], r["model"]) for r in roles_state()} | {
-        (r["backup_provider"], r["backup_model"]) for r in roles_state()}
+    roles = roles_state()
+    chosen = {(r["provider"], r["model"]) for r in roles} | {(r["backup_provider"], r["backup_model"]) for r in roles}
     out = []
     for pid, info in PROVIDERS.items():
         if pid == "default":
@@ -129,7 +133,7 @@ def doctor_lines() -> tuple[str, list[str], list[str]]:
         key = {"saved": "key saved", "env": "key from the environment", "missing": "NO KEY",
                "not_needed": "no key needed"}[line["key"]]
         lines.append(f"{line['words']}: {line['provider_words']}, {line['model'] or 'no model picked'} ({key})")
-        if line["key"] == "missing" or not line["model"]:
+        if line["blocked"]:
             status = "fail"
             fixes.append(f"{line['words']}: {line['warning']} (Settings, AI)")
         elif line["warning"] and status == "ok":

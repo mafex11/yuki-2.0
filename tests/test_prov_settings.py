@@ -177,3 +177,30 @@ def test_doctor_runs_the_ai_line_in_the_checklist(ai_dir: Path, monkeypatch: pyt
     results = doctor.run_checks(Settings(), offline=True, timeout_s=20.0)
     names = [c.name for c in results]
     assert doctor.AI_ROLES_CHECK in names and names.index(doctor.AI_ROLES_CHECK) == names.index(doctor.MODELS_CHECK) + 1
+
+
+def test_other_service_without_an_address_is_blocked(ai_dir: Path) -> None:
+    from yuki.core.doctor import FAIL, OK, check_ai_roles
+
+    line = summary.set_role("memory", "custom", "some-model")
+    assert line["blocked"] and "no address yet" in line["warning"]
+    assert check_ai_roles(offline=True).status == FAIL
+    summary.set_custom("https://gateway.example.invalid/v1", "My gateway")
+    line = summary.role_line("memory")
+    assert not line["blocked"] and line["provider_words"] == "My gateway"
+    assert check_ai_roles(offline=True).status == OK   # memory upkeep: tool use isn't needed, so no warning
+
+
+def test_settings_edits_from_many_threads_all_land(ai_dir: Path) -> None:
+    """The window runs each action on its own thread: two quick picks never lose one another."""
+    import threading
+
+    picks = [("talker", "openai", "gpt-5-mini"), ("thinker", "gemini", "gemini-2.5-flash"),
+             ("memory", "ollama", "llama3.2"), ("talker", "openai", "gpt-5-mini")]
+    threads = [threading.Thread(target=summary.set_role, args=p) for p in picks * 5]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    roles = ai_config.load()["roles"]
+    assert [roles[r]["provider"] for r in ("talker", "thinker", "memory")] == ["openai", "gemini", "ollama"]
