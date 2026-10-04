@@ -4268,6 +4268,17 @@ class MemoryClient:
 
         return _p.workflows(self.store)
 
+    def launch_identities(self) -> dict:
+        """What practice memory learned the apps of Start entries run as (``yuki.memory.practice.launch_identities``,
+        appOpen): ``{entry name casefolded: [image names]}``, read back by ``launch_app`` so a game started through its
+        launcher is recognised by its own window. Never raises (``{}``)."""
+        from yuki.memory import practice as _p
+
+        try:
+            return _p.launch_identities(self.store)
+        except Exception:
+            return {}
+
     def workflow_edit(self, ref: Any, action: str, words: str = "") -> dict:
         """The user's say over one Playbook item (``yuki.memory.practice.workflow_edit``): ``save`` (it is right),
         ``edit`` (in their words: the practice worker re-distills it), ``disable`` / ``enable``, ``forget``; a

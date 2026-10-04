@@ -67,3 +67,19 @@ def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop("YUKI_MEMORY_DIR", None)
         else:
             os.environ["YUKI_MEMORY_DIR"] = old
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _temp_seen_ledger(tmp_path_factory: pytest.TempPathFactory):
+    """appOpen final check: the seen-windows ledger (``yuki.perception.windows``, written by the timeline) in a temp
+    folder, so a test that drives the timeline with the real windows module never writes the user's own file."""
+    folder = tmp_path_factory.mktemp("yuki-seen")
+    old = os.environ.get("YUKI_SEEN_FILE")
+    os.environ["YUKI_SEEN_FILE"] = str(folder / "seen_windows.json")
+    try:
+        yield folder
+    finally:
+        if old is None:
+            os.environ.pop("YUKI_SEEN_FILE", None)
+        else:
+            os.environ["YUKI_SEEN_FILE"] = old

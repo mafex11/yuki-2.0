@@ -111,8 +111,11 @@ MIGRATION_RUN_PREFIX = "knowhow:"
 #: ``ran_ok``: a run that followed it (or, for a pitfall, avoided it) worked; ``taught``: the user's own words (a
 #: correction quoted, a teach-back answer, Save or Edit on the Playbook page); ``ran_trouble``: followed and trouble
 #: followed (a pitfall: the failure it warns of happened again while it was shown); ``user_corrected``: followed and
-#: the user corrected the result; ``contradicted``: newer evidence says it is wrong.
-WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0, "taught": 3.0,
+#: the user corrected the result; ``contradicted``: newer evidence says it is wrong. ``demonstrated`` (appOpen, 5 Oct):
+#: right after one of Yuki's runs did not work, the user did the same thing themselves and it worked (their own
+#: actions, from the timeline and the launch facts, judged the same goal by the post-mortem): the outcome they reached
+#: is the verification. One source, like a run: the way stays a candidate until a run of Yuki's confirms it.
+WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0, "taught": 3.0, "demonstrated": 1.0,
                              "ran_trouble": -2.0, "user_corrected": -3.0, "contradicted": -3.0}
 #: ``succeeded`` (appLearn): the run a way was learned from (its ``observed`` run) ended done with its last action
 #: verified and nobody corrected it - what lets a way learned from a run be shown and announced (:func:`learned_way`).
@@ -126,7 +129,7 @@ NEUTRAL_EVENTS: tuple[str, ...] = ("injected", "cited", "superseded", "retired_b
 EVENT_TYPES: tuple[str, ...] = (*WEIGHTS, *NEUTRAL_EVENTS)
 #: The events that show a way worked (appLearn): the run it came from was a verified success, a later run that followed
 #: it worked, or the user's own word. A way learned from a run without one of them is never shown or announced.
-SUCCESS_EVENTS: tuple[str, ...] = ("succeeded", "ran_ok", "taught")
+SUCCESS_EVENTS: tuple[str, ...] = ("succeeded", "ran_ok", "taught", "demonstrated")
 #: How the practice learner judged a run (``runs.learn_note`` is ``"<mode>: <outcome>"``, written by it): the
 #: post-mortem outcomes that count as the job having worked in the end.
 WORKED_OUTCOMES: tuple[str, ...] = ("worked", "worked_after_trouble")
@@ -677,7 +680,13 @@ def executable_step(s: RunStep | dict[str, Any], *, slot: str | None = None, lit
         return {"do": "keys", "keys": keys[:4]} if 1 <= len(keys) <= 4 else None
     if do == "open_app":
         name = clip(inp.get("name") or inp.get("query") or app)
-        return {"do": "open_app", "name": name} if name else None
+        if not name:
+            return None
+        # appOpen: the program a launcher started for it (the hand's watched step, its own window verified: the step's
+        # app), kept when it is not just the name again, so launch_app recognises it next time
+        image = app_key(str(inp.get("image") or (app if verdict is True and inp.get("watch") else "") or "")) or ""
+        keep_image = bool(image) and app_key(name) != image
+        return {"do": "open_app", "name": name, **({"app": clip(image)} if keep_image else {})}
     if do == "open_url":
         url = clip(inp.get("url"))
         if not url or not literal_ok:
@@ -1302,6 +1311,8 @@ def provenance(store: Store, o: Playbook, events: Sequence[Any] | None = None) -
         return "user", "the user's own word (saved, taught or quoted)"
     if any(e.type in ("succeeded", "ran_ok") for e in events):
         return "success", "a run that worked marked it"
+    if any(e.type == "demonstrated" for e in events):
+        return "user", "the user did it themselves right after Yuki's try did not work, and it worked"
     keys = list(dict.fromkeys(str(e.run_key) for e in events if e.type == "observed" and _run_evidence(e.run_key)))
     if keys:
         if any(verified_run(store, k) and judged_ok(store, k) is not False for k in keys):
@@ -1777,6 +1788,29 @@ def pending_edits(store: Store) -> list[tuple[Playbook, str, float]]:
     return out
 
 
+def launch_identities(store: Store) -> dict[str, list[str]]:
+    """What practice memory learned the apps of Start entries run as (appOpen F3): ``{entry name casefolded: [image
+    names]}``, from the executable ``open_app`` steps of the live, enabled ways that count as learned
+    (:func:`learned_way`: resting on a success, the user's demonstration among them) that name the program their app
+    turned out to run as (``"app"``: ``VALORANT`` -> ``valorant-win64-shipping``). ``launch_app`` reads it back, so the
+    game's own window is recognised next time. Only machine fields; no model."""
+    ways = [o for o in live(store, ["procedure"]) if o.run]
+    if not ways:
+        return {}
+    from_run, proven, _succeeded = _success_sets(store, [o.id for o in ways])
+    out: dict[str, list[str]] = {}
+    for o in ways:
+        if not _is_way(store, o, from_run, proven):
+            continue
+        for step in o.run:
+            if step.get("do") == "open_app" and step.get("name") and step.get("app"):
+                images = out.setdefault(str(step["name"]).casefold(), [])
+                image = str(step["app"]).casefold()
+                if image not in images:
+                    images.append(image)
+    return out
+
+
 __all__ = [
     "KINDS", "WEIGHTS", "HALF_LIFE_DAYS", "Playbook", "RunHeader", "RunStep", "run_key", "input_summary",
     "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
@@ -1786,4 +1820,5 @@ __all__ = [
     "LEARNED_EVENT_NAME", "signal_learned",
     "stamp_successes", "provenance", "provenance_rank", "pitfall_rank", "pitfall_overflow", "retire_cleaned",
     "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX", "CLEAN_CHECKPOINT", "cap_enabled", "set_clean_state",
+    "launch_identities",
 ]
