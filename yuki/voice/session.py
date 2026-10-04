@@ -320,6 +320,69 @@ class VoiceSession(QObject):
         self._standby_timer = QTimer(self)
         self._standby_timer.setSingleShot(True)
         self._standby_timer.timeout.connect(self._ensure_standby)
+        # -- vGame (5 Oct) ------------------------------------------------------------------------------------
+        #: The game whose own voice chat memory sees now (``call_status()["sessions"]``, ``kind`` "game"), else None.
+        self.game_session: str | None = None
+        #: ``() -> dict | None``: the window in front when it is full screen (``avsignals.foreground_fullscreen``),
+        #: read at a wake (one Win32 look, no polling); the offline harness and tests replace it.
+        self.fullscreen_probe: Any = None
+        #: ``(pcm, kind)``: a test's stand-in for playing the instant acknowledgement (else the conversation's speaker).
+        self.play_sound: Any = None
+
+    # -- vGame: focus mode (a game or a call), the name heard while talking, the instant answers ---------------------
+
+    def _game_now(self) -> str | None:
+        """The full-screen game in front, by measured signals only: memory's game voice session (its name), else the
+        window in front being full screen (``"fullscreen"``). ``None``: none, or focus mode is off."""
+        if not getattr(self.settings, "voice_focus_mode", True):
+            return None
+        if self.game_session:
+            return self.game_session
+        probe = self.fullscreen_probe
+        if probe is None:
+            try:
+                from yuki.memory.avsignals import foreground_fullscreen as probe
+            except Exception:  # noqa: BLE001 - no probe: no game
+                return None
+        try:
+            return "fullscreen" if probe() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _name_while_talking(self) -> bool:
+        """Whether the wake word keeps listening while a conversation runs (its hits say a turn was said to Yuki)."""
+        return bool(getattr(self.settings, "voice_name_while_talking", True))
+
+    def _play_sound(self, pcm: bytes, kind: str) -> None:
+        """The conversation's instant acknowledgement: through its open speaker, off the calling thread; never raises."""
+        if self.play_sound is not None:
+            try:
+                self.play_sound(pcm, kind)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        speaker = self._speaker
+        if speaker is None:
+            return
+        threading.Thread(target=lambda: _quietly(speaker.write, pcm, gate=False), name="yuki-voice-ack",
+                         daemon=True).start()
+
+    def _dismiss_cue(self) -> None:
+        """The user dismissed Yuki on the fast path: the soft end tone now (the user's End tone choice), off the loop."""
+        def run() -> None:
+            try:
+                on = self.end_tone
+            except Exception:  # noqa: BLE001
+                on = True
+            if on:
+                self._earcon("ended")
+
+        threading.Thread(target=run, name="yuki-voice-dismiss-cue", daemon=True).start()
+
+    def _wire_fast(self, conversation: Any) -> None:
+        """vGame hooks of a conversation: the acknowledgement's output, the dismiss cue, the game in front."""
+        conversation.on_sound = self._play_sound
+        conversation.on_dismissed = self._dismiss_cue
 
     # -- public (GUI thread) ------------------------------------------------------
 
@@ -394,8 +457,9 @@ class VoiceSession(QObject):
         else:
             listen_from = (wake_at - WAKE_PREROLL_S) if wake_at is not None else time.monotonic()
         self.closing = False
-        if self._listener is not None:
+        if self._listener is not None and not self._name_while_talking():
             self._listener.pause()
+        self._wake_game = self._game_now()   # vGame: a full-screen game in front now (one look, at the wake)
         if self._wake_standby(via, listen_from, started, bool(name_end)):
             return True
         return self._start_cold(via, listen_from, started, bool(name_end))
@@ -407,7 +471,7 @@ class VoiceSession(QObject):
         session = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}"
         self.closing = False
         self._set_state("starting", via)
-        if self._listener is not None:
+        if self._listener is not None and not self._name_while_talking():
             self._listener.pause()
         self._thread = threading.Thread(target=self._thread_main,
                                         args=(session, via, listen_from, started, self.call_app, name_cut),
@@ -950,6 +1014,17 @@ class VoiceSession(QObject):
         call = status.get("call") if isinstance(status, dict) else None
         active = call is not None
         app, evidence, alone = call_facing(call)
+        # vGame: a game's own voice chat going on (memory's measured detector: a full-screen app in front drawing like a
+        # game, holding the microphone) is focus mode for the voice, whether or not it records
+        sessions = status.get("sessions") if isinstance(status, dict) else None
+        game = next((str(s.get("app") or "a game") for s in (sessions or []) if isinstance(s, dict)
+                     and s.get("kind") == "game" and not s.get("ended")), None)
+        if game != self.game_session:
+            self.game_session = game
+            self.log.event("wake", state="game_on" if game else "game_off")
+            for conversation in (self._conversation, self._standby_conv):
+                if conversation is not None and hasattr(conversation, "set_game"):
+                    conversation.set_game(self._game_now() if conversation is self._conversation else None)
         if active != self.call_active or app != self.call_app or evidence != self.call_evidence \
                 or alone != self.call_alone:
             changed = active != self.call_active or alone != self.call_alone
@@ -1168,7 +1243,7 @@ class VoiceSession(QObject):
             self._listener = listener
             self.log.event("wake", state="listening", during_call=self.call_active,
                            process=type(listener).__name__ != "WakeListener")
-        if self.in_conversation and not self.closing:
+        if self.in_conversation and not self.closing and not self._name_while_talking():
             self._listener.pause()
         else:
             self._listener.resume()
@@ -1195,8 +1270,23 @@ class VoiceSession(QObject):
             if self.closing:  # the last one is tearing down: this wake starts the next one right after
                 self._pending_wake = (at, heard_at or time.monotonic(), name_end)
                 self.log.event("wake", state="pending")
+            elif self._conversation is not None and hasattr(self._conversation, "name_heard"):
+                # vGame: the name said while talking: the turn it is in was said to Yuki (measured, never words)
+                self._conversation.name_heard(heard_at or time.monotonic())
+                self.log.event("wake", state="name_in_conversation",
+                               rescued=bool(getattr(self._listener, "rescued", False)))
+            return
+        if bool(getattr(self._listener, "rescued", False)) and (self._call_focus() or self._game_now()):
+            # vGame: in a game or a call a wake needs the main spotter's own hit; a sound-alike the second opinion
+            # rescued is not enough there (report 76: ~13 accidental wakes, several in Discord calls and VALORANT)
+            self.log.event("wake", state="ignored", why="rescued_in_focus")
             return
         self.start_conversation("wake", wake_at=at, heard_at=heard_at or None, name_end=name_end or None)
+
+    def _call_focus(self) -> bool:
+        """A call with fresh evidence and others in it (call mode), with focus mode on (vGame)."""
+        return bool(getattr(self.settings, "voice_focus_mode", True) and self.call_app
+                    and self.call_evidence != "stale")
 
     def _on_closing(self, reason: str) -> None:
         """The conversation decided to end: listen for the name again during its teardown."""
@@ -1419,9 +1509,16 @@ class VoiceSession(QObject):
         if conversation is None or not getattr(conversation, "ready", False):
             return False
         listener = self._listener
-        woken_by_name = (via == "wake" and name_cut and not bool(getattr(listener, "rescued", False))
+        # vGame: the spotter's own hit is the evidence the first words were said to Yuki, whether or not the name could
+        # be cut from them (its token times are often not the name's on a long stream: then the name is replayed too;
+        # live 5 Oct 5 of 7 wakes, 4 of them in a call, lost "said to Yuki" that way)
+        del name_cut
+        woken_by_name = (via == "wake" and not bool(getattr(listener, "rescued", False))
                          and not self._after_goodbye())
         conversation.after_goodbye = via == "wake" and self._after_goodbye()
+        self._wire_fast(conversation)
+        if hasattr(conversation, "set_game"):
+            conversation.set_game(getattr(self, "_wake_game", None))   # queued on its loop before the activation
         if not conversation.activate(listen_from=listen_from, woken_by_name=woken_by_name, call_app=self.call_app,
                                      call_evidence=self.call_evidence, heard_at=started):
             return False
@@ -1647,13 +1744,16 @@ class VoiceSession(QObject):
             )
             conversation.on_stt_connected = lambda: mark("stt_connected")
             conversation.on_tone = self._earcon   # v3.16: the conversation's earcons (error, note) via its speaker
+            self._wire_fast(conversation)          # vGame
+            if hasattr(conversation, "set_game"):
+                conversation.set_game(getattr(self, "_wake_game", None) if via == "wake" else self._game_now())
             output.on_write_failing = self._reopen_speaker
             output.on_write_failed = lambda exc, c=conversation: self._speaker_failed(c, exc)
             # What recognition hears starts after the name: the mouth is told its first words were said to it
             # (not when the name was a sound-alike the second opinion heard as the name: then it judges).
             listener = self._listener
             conversation.after_goodbye = via == "wake" and self._after_goodbye()
-            conversation.woken_by_name = (via == "wake" and name_cut and not self._after_goodbye()
+            conversation.woken_by_name = (via == "wake" and not self._after_goodbye()   # vGame: name_cut or not
                                           and not bool(getattr(listener, "rescued", False)))
             if facts.get("tts_note"):
                 self._thread_state.emit("starting", facts["tts_note"])

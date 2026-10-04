@@ -1422,6 +1422,11 @@ class _Turn:
     gave_up: bool = False                # the rerun was silent too: the error tone said so, the window was extended
     tts_silent: int = 0                  # replies of this turn whose voice played nothing at all
     repeat_dropped: bool = False         # V9: a reply to it was word for word the line said before, and was not said
+    # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
+    named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
+    fast: str | None = None              # "dismiss" (ended at once) | "name" (the name alone, answered at once)
+    ack_at: float | None = None          # when the instant acknowledgement started playing (monotonic)
+    quiet_seen: bool = False             # its quiet choice was passed to the conversation already (once per turn)
 
     @property
     def heard(self) -> bool:
@@ -1544,6 +1549,33 @@ class TurnObserver:
         #: V9: the last turn whose words left the speaker: ``{"written": all it wrote, "heard": what left the speaker}``
         #: (content, RAM only), for the speech channel's repeat guard.
         self.last_said: dict[str, str] | None = None
+        #: vGame: ``(turn)``: the talker chose silence on a user turn (stay_quiet or a quiet marker); set by the
+        #: conversation (in a game or a call that ends the conversation at once, silently).
+        self.on_quiet_turn: Callable[[Any], None] | None = None
+
+    def fast_handled(self, kind: str) -> None:
+        """vGame: the open user turn was answered by the fast path (``"dismiss"`` or ``"name"``): it was said to Yuki
+        and answered, never "for others" (the talker never ran on it)."""
+        turn = self.turn
+        if turn is None or turn.trigger != "user":
+            return
+        turn.fast = kind
+        turn.named = True
+        turn.tools.append("end_conversation" if kind == "dismiss" else "answer_name")
+        self.owes_reply_since = None
+        self._took_part(time.monotonic())
+
+    def _quiet_turn(self) -> None:
+        """The talker chose silence on the open user turn (vGame): tell the conversation, once per turn."""
+        turn = self.turn
+        if turn is None or turn.trigger != "user" or turn.quiet_seen or turn.counted or not turn.quiet:
+            return
+        turn.quiet_seen = True
+        if self.on_quiet_turn is not None:
+            try:
+                self.on_quiet_turn(turn)
+            except Exception:  # noqa: BLE001 - a hint to the conversation only
+                pass
 
     def cut_for_now(self) -> dict[str, str] | None:
         """The last reply they spoke over, as they heard it (v3.12), for the first user turn after it; else ``None``."""
@@ -1878,6 +1910,9 @@ class TurnObserver:
             row.update(marker=turn.marker, unmarked=turn.unmarked, scratch_chars=turn.scratch)
         if turn.rerun:
             row.update(rerun=True, gave_up=turn.gave_up)
+        if turn.trigger == "user" and (turn.named or turn.fast or turn.ack_at is not None):
+            # vGame: said to Yuki by measured evidence; what the fast path did; end of speech -> the instant "Mm-hm"
+            row.update(named=turn.named, fast=turn.fast, eos_to_ack_ms=ms(turn.speech_end, turn.ack_at))
         if turn.call:
             row["call_mode"] = True
             if turn.trigger == "user":
@@ -2048,6 +2083,7 @@ class TurnObserver:
                 self.owes_reply_since = None  # a turn that only called a tool: nothing to wait for
                 if self.state == "thinking":
                     self.set_state(self.idle_state())  # stay_quiet, a hand, a hand-off: not "Thinking" forever
+            self._quiet_turn()   # vGame: a quiet marker is known by now (a stay_quiet call comes just after)
             self._activity()
         elif isinstance(frame, LLMTextFrame):
             if self.turn is not None:
@@ -2071,6 +2107,8 @@ class TurnObserver:
                     self.turn.handoff_at = now
                 if frame.function_name != "stay_quiet":
                     self._took_part(now)
+                else:
+                    self._quiet_turn()   # vGame
         elif isinstance(frame, BotStartedSpeakingFrame):
             self.bot_speaking = True
             self.speech_pending_since = None
@@ -2354,10 +2392,16 @@ class _Hooks:
         return self.c.call_evidence if self.c.call_app else None
 
     def named(self) -> bool:
-        """Whether the call answers the first words after the wake word (the name was cut from them, v3.6)."""
+        """Whether the call answers words said to Yuki by name: the first words after the wake word (the name was cut
+        from them, v3.6), or (vGame) a turn the wake word heard the name in, or the turn right after the name alone."""
         c = self.c
         call = getattr(getattr(c, "_llm", None), "_yuki_call", None)
-        return bool(c.woken_by_name and (call is None or call.user_turn) and c.observer.user_turns <= 1)
+        if call is not None and not call.user_turn:
+            return False
+        turn = c.observer.turn
+        if turn is not None and turn.trigger == "user" and turn.named:
+            return True
+        return bool(c.woken_by_name and c.observer.user_turns <= 1)
 
     # -- v3.16: the speech channel and an unheard turn answered again --------------------------------------
 
@@ -2387,8 +2431,13 @@ class _Hooks:
         return str(getattr(self.c, "tts_provider", "") or "").strip().lower() == "gemini"
 
     def reply_cap(self) -> int:
-        """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none)."""
-        return int(getattr(self.c.settings, "voice_reply_words_cap", 0) or 0)
+        """The word cap of a spoken reply (``voice_reply_words_cap``; 0: none); vGame: shorter in a game or a call
+        (``voice_focus_reply_words``)."""
+        cap = int(getattr(self.c.settings, "voice_reply_words_cap", 0) or 0)
+        focus_cap = int(getattr(self.c.settings, "voice_focus_reply_words", 0) or 0)
+        if self.c.focus and focus_cap:
+            return min(cap, focus_cap) if cap else focus_cap
+        return cap
 
     def last_line(self) -> dict[str, str] | None:
         """V9: Yuki's last spoken line (``{"written", "heard"}``), so a reply that repeats it word for word is not
@@ -2526,6 +2575,34 @@ def _last_user_text(context: Any) -> str:
     return ""
 
 
+def fast_path_processor(conversation: Any) -> Any:
+    """vGame: the frame processor between speech recognition and the talker's context (``Conversation._fast_turn``).
+
+    It sees each transcript before the user aggregator does: a final one the fast path takes (a dismissal, the name
+    alone) never reaches the talker; an eager one that is a dismissal starts no speculative talker call. Every other
+    frame passes untouched. The turn observer saw the transcript already (observers see a frame as it is pushed here),
+    so the turn is logged as usual."""
+    from pipecat.frames.frames import EagerTranscriptionFrame, TranscriptionFrame
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+    class FastPath(FrameProcessor):
+        async def process_frame(self, frame: Any, direction: Any) -> None:
+            await super().process_frame(frame, direction)
+            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (TranscriptionFrame,
+                                                                             EagerTranscriptionFrame)):
+                try:
+                    taken = conversation._fast_turn(frame.text or "",
+                                                    final=not isinstance(frame, EagerTranscriptionFrame))
+                except Exception as exc:  # noqa: BLE001 - the talker then, as before
+                    taken = False
+                    conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                if taken:
+                    return
+            await self.push_frame(frame, direction)
+
+    return FastPath(name="yuki-fast-path")
+
+
 class Conversation:
     """One conversation's pipeline, run on the current asyncio loop.
 
@@ -2652,6 +2729,194 @@ class Conversation:
         self._recent_close: Any = None
         #: The talker's quick memory tool (:class:`yuki.voice.recall.QuickMemory`), made with the services.
         self.quick_memory: Any = None
+        # -- vGame (5 Oct) -----------------------------------------------------------------------------------
+        #: The full-screen game in front (its name from memory's game voice session, or ``"fullscreen"``), else
+        #: ``None``; with a call (fresh evidence) this is focus mode (:attr:`focus`). Set by the session.
+        self.game_app: str | None = None
+        #: When the wake word heard the name during this conversation (monotonic; the spotter keeps listening while a
+        #: conversation runs): a turn the name was heard in is said to Yuki (measured, never words).
+        self._names: deque[float] = deque(maxlen=16)
+        #: Until when the next turn counts as said to Yuki: the user said the name alone and was answered "Yeah?".
+        self._name_carry_until = 0.0
+        #: The instant acknowledgement lines in this conversation's voice (:class:`yuki.voice.fastpath.AckVoice`).
+        self.ack: Any = None
+        #: ``(pcm, kind)``: play a short clip of Yuki's voice now (24 kHz int16 mono) on the conversation's output,
+        #: outside the pipeline (the acknowledgement); set by the session.
+        self.on_sound: Callable[[bytes, str], None] | None = None
+        #: ``()``: the user dismissed Yuki on the fast path: the end cue now (the session's); set by the session.
+        self.on_dismissed: Callable[[], None] | None = None
+        self.observer.on_quiet_turn = self._quiet_turn
+
+    # -- vGame: the fast path, focus mode, the name heard while talking ---------------------------------------------
+
+    #: After the name alone ("Yuki." answered "Yeah?"), the next turn within this long is said to Yuki (s).
+    NAME_CARRY_S = 12.0
+    #: A name the wake word heard this long before the turn's start of speech still belongs to it (s): Flux reports a
+    #: start of turn ~0.3-1 s into speech, and the spotter hears the name ~0.35-0.7 s after it ends (measured 5 Oct).
+    NAME_BEFORE_S = 1.2
+    #: In focus mode Yuki's voice is this much quieter (dB): a game's sound and the friends stay on top.
+    FOCUS_GAIN_DB = -6.0
+
+    @property
+    def _call_focus(self) -> bool:
+        """A call with fresh evidence (a stale one may be over: then plain instructions are for Yuki, v3.10)."""
+        return bool(self.call_app and self.call_evidence != "stale")
+
+    @property
+    def focus(self) -> bool:
+        """vGame focus mode: a full-screen game in front or a call on, and the setting on."""
+        return bool(getattr(self.settings, "voice_focus_mode", True) and (self._call_focus or self.game_app))
+
+    def set_game(self, app: str | None) -> None:
+        """A full-screen game came to the front (``app``) or went (``None``). Thread-safe."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._set_game, app)
+        else:
+            self.game_app = app
+
+    def _set_game(self, app: str | None) -> None:
+        if bool(app) != bool(self.game_app):
+            self.log.event("session", state="game_on" if app else "game_off", session=self.session)
+        self.game_app = app
+        self._apply_gain()
+        self._activity.set()
+
+    def _apply_gain(self) -> None:
+        output = self.transport.output() if self.transport is not None else None
+        if output is not None and hasattr(output, "gain_db"):
+            output.gain_db = self.FOCUS_GAIN_DB if self.focus else 0.0
+
+    def name_heard(self, at: float) -> None:
+        """The wake word heard the name while this conversation runs (``at``: monotonic). Thread-safe."""
+        loop = self._loop
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(self._names.append, float(at))
+
+    def _named_turn(self) -> tuple[bool, str]:
+        """Whether the open user turn was said to Yuki by measured evidence, and which: the first words after a wake by
+        name, the turn right after the name alone, or the wake word heard the name in it."""
+        obs = self.observer
+        now = time.monotonic()
+        if self.woken_by_name and obs.user_turns <= 1:
+            return True, "wake"
+        if now < self._name_carry_until:
+            self._name_carry_until = 0.0
+            return True, "after_name"
+        start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
+        if any(start - self.NAME_BEFORE_S <= t <= now for t in self._names):
+            return True, "spotter"
+        return False, ""
+
+    def _busy_for_dismiss(self) -> bool:
+        """Something runs that "stop" could mean (a voice task, a scroll, a hand at work)."""
+        try:
+            return bool(self.bridge.open_voice_jobs() or self._scrolling_line() or getattr(self.bridge, "busy_tools", 0))
+        except Exception:  # noqa: BLE001 - when unsure, "stop" is the talker's
+            return True
+
+    def _fast_turn(self, text: str, *, final: bool) -> bool:
+        """vGame: the fast path on a transcript before the talker (``FastPath``). ``True``: the frame is taken.
+
+        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation on the final words, with no model call
+        (an eager transcript that is one starts no talker call). The name alone, said to Yuki, is answered "Yeah?" at
+        once and the next turn counts as said to her. A turn said to her by name gets the instant "Mm-hm" and goes on
+        to the talker as before."""
+        from yuki.voice.fastpath import bare_name, dismissal
+
+        if self.dormant or self._stop.is_set():
+            return False
+        s = self.settings
+        phrase = None
+        busy = False
+        if getattr(s, "voice_fast_dismiss", True):
+            busy = self._busy_for_dismiss()
+            phrase = dismissal(text, busy=busy)
+        if phrase is not None:
+            if final:
+                self._fast_dismiss(phrase, busy)
+            return True
+        if not final:
+            return False
+        named, how = self._named_turn()
+        turn = self.observer.turn
+        if turn is not None and turn.trigger == "user" and named:
+            turn.named = True
+        if not named or not getattr(s, "voice_fast_ack", True):
+            return False
+        if bare_name(text):
+            self.observer.fast_handled("name")
+            self._name_carry_until = time.monotonic() + self.NAME_CARRY_S
+            self._ack("name", how)
+            return True
+        self._ack("request", how)
+        return False
+
+    def _fast_dismiss(self, phrase: str, busy: bool) -> None:
+        obs = self.observer
+        turn = obs.turn
+        obs.fast_handled("dismiss")
+        now = time.monotonic()
+        self.log.event("fast_path", op="dismiss", session=self.session, phrase=phrase, busy=busy,
+                       call_mode=bool(self.call_app), game=bool(self.game_app),
+                       eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
+                       else None)
+        if self.on_dismissed is not None:
+            try:
+                self.on_dismissed()
+            except Exception:  # noqa: BLE001 - the cue is a courtesy; the end is not
+                pass
+        self.log.event("session", state="end_asked", session=self.session, waited_ms=0, fast=True)
+        self._set_stop("user_asked")
+
+    def _ack(self, kind: str, how: str) -> None:
+        """Play the instant acknowledgement (``"request"``: "Mm-hm.", ``"name"``: "Yeah?") unless Yuki is speaking."""
+        obs = self.observer
+        turn = obs.turn
+        if obs.bot_speaking or obs.speech_pending or (self.after_goodbye and obs.user_turns <= 1):
+            return
+        sound = self.on_sound
+        pcm = self.ack.pcm(kind) if self.ack is not None else None
+        now = time.monotonic()
+        played = "none"
+        try:
+            if pcm and sound is not None:
+                from yuki.voice.fastpath import scale
+
+                sound(scale(pcm, self.FOCUS_GAIN_DB if self.focus else 0.0), kind)
+                played = "voice"
+            elif self.on_tone is not None:
+                self.on_tone("tick")   # no line in this voice (yet): a soft tick, never silence
+                played = "tick"
+        except Exception as exc:  # noqa: BLE001 - an acknowledgement never breaks the turn
+            self.log.event("fast_path", op="ack_error", error=f"{type(exc).__name__}: {str(exc)[:120]}")
+            return
+        if played == "none":
+            return
+        if turn is not None and turn.trigger == "user":
+            turn.ack_at = now
+        self.log.event("fast_path", op="ack", session=self.session, kind=kind, by=how, played=played,
+                       focus=self.focus, eos_to_ack_ms=round((now - turn.speech_end) * 1000)
+                       if turn is not None and turn.speech_end else None)
+
+    def _quiet_turn(self, turn: Any) -> None:
+        """vGame: the talker chose silence on the user's words. In a game or a call (focus mode) with nothing owed or
+        running, the conversation ends at once, silently: talk not said to Yuki is ignored, and what follows is not
+        transcribed or judged any more (live, 13 of 37 dismissals were judged as said to the friends and it stayed;
+        an accidental wake listened on). The name opens it again in ~0.2 s (the standby)."""
+        if not self.focus or not getattr(self.settings, "voice_focus_close_on_quiet", True):
+            return
+        if self._stop.is_set() or self.dormant:
+            return
+        now = time.monotonic()
+        owed = (self.bridge.open_voice_jobs() + (self.gate.holding if self.gate is not None else 0)
+                + int(bool(self._held_pending(now))) + self._owed_pending() + int(self._scrolling_line() is not None))
+        if owed:
+            self.log.event("session", state="focus_quiet_kept", session=self.session, owed=int(owed))
+            return
+        self.log.event("session", state="focus_quiet_end", session=self.session, game=bool(self.game_app),
+                       call_mode=self._call_focus, turn=getattr(turn, "n", None))
+        self._set_stop("not_for_yuki")
 
     def _on_activity(self) -> None:
         self._activity.set()
@@ -2683,7 +2948,28 @@ class Conversation:
             self.log.event("session", state="call_mode_on" if app else "call_mode_off", session=self.session,
                            **({"evidence": evidence} if app else {}))
         self.call_app, self.call_evidence = app, (evidence if app else None)
+        self._apply_gain()   # vGame: quieter in a call
         self._activity.set()
+
+    #: vGame: silence sent to speech recognition once a standby's socket is up (s). Measured 5 Oct (a Flux socket idle
+    #: 25-60 s, then 0.6 s of words at once and the rest live, 7 runs each): with no audio since it opened, its first
+    #: answer came 0.34-1.17 s after the words (4 of 7 near a second) and the end of the turn 0.62-1.57 s after the
+    #: speech ended (median 1.30); with half a second of silence sent when it opened, 0.37-0.48 s and 0.66-1.03 s
+    #: (median 0.85). Billed as half a second of audio per standby.
+    STT_WARM_S = 0.5
+
+    async def _warm_stt(self) -> None:
+        """Send :data:`STT_WARM_S` of silence on the standby's speech recognition socket (never raises)."""
+        stt = getattr(self, "_stt", None)
+        if stt is None or not getattr(self.settings, "voice_stt_warm", True):
+            return
+        started = time.monotonic()
+        try:
+            await stt._transport_send_audio(b"\0\0" * int(16_000 * self.STT_WARM_S))
+            self._stt_warmed_at = time.monotonic()
+            self.log.event("stt_warm", session=self.session, ms=round((time.monotonic() - started) * 1000))
+        except Exception as exc:  # noqa: BLE001 - only a head start
+            self.log.event("stt_warm", session=self.session, error=f"{type(exc).__name__}: {str(exc)[:120]}")
 
     def _stt_connected(self) -> None:
         self.stt_ready_at = time.monotonic()
@@ -2733,6 +3019,7 @@ class Conversation:
         self._refresh_recent()
         self._bind_bridge()
         self._boost()
+        self._apply_gain()   # vGame: quieter in a game or a call
         stream = getattr(self.transport.input(), "go_live", None)
         facts: dict[str, Any] = {}
         if callable(stream):
@@ -3005,6 +3292,7 @@ class Conversation:
         async def on_connected(_service: Any) -> None:
             if self.dormant:
                 self._stt_connected()   # a standby is ready once its socket is up (no audio flows to say so)
+                asyncio.ensure_future(self._warm_stt())   # vGame: its first words after the wake come back sooner
 
         stt.add_event_handler("on_connected", on_connected)
         stt.add_event_handler("on_update", on_update)
@@ -3109,6 +3397,17 @@ class Conversation:
                 api_key=get_key(ELEVENLABS) or "",
                 settings=ElevenLabsTTSService.Settings(voice=voice, model=s.voice_tts_model, **tuning))
         self._stt = stt
+        if getattr(s, "voice_fast_ack", True):
+            # vGame: the instant acknowledgement in this voice, from disk or rendered once, off the voice loop
+            from yuki.voice.fastpath import AckVoice
+            from yuki.voice.ttscache import TTSCache
+            from yuki.voice.workers import shared as _ack_workers
+
+            ack_cache = TTSCache(Path(s.voice_tts_cache_dir) if getattr(s, "voice_tts_cache_dir", "") else None)
+            self.ack = AckVoice(provider=provider, voice=voice,
+                                model=s.voice_tts_model if provider == "elevenlabs" else "", cache=ack_cache,
+                                log=self.log)
+            _ack_workers().submit(self.ack.load)
         if getattr(s, "voice_speech_guard", True) and callable(getattr(tts, "set_guard", None)):
             # Every line passes one cheap check before it is heard (v3.10): only what a person says to the user.
             from yuki.voice.speechguard import SpeechGuard
@@ -3182,7 +3481,10 @@ class Conversation:
                                     on_connected=self._stt_connected)
         output = self.transport.output()
         self.observer.output_processor = output
-        pipeline = Pipeline([self.transport.input(), hold, stt, user_agg, llm, tts, output, assistant_agg])
+        # vGame: the fast path sits between speech recognition and the talker's context ("go away" ends here, the name
+        # alone is answered here, a request by name gets its instant "Mm-hm" here)
+        fast = fast_path_processor(self)
+        pipeline = Pipeline([self.transport.input(), hold, stt, fast, user_agg, llm, tts, output, assistant_agg])
         self.worker = PipelineWorker(
             pipeline,
             params=PipelineParams(enable_metrics=True, enable_usage_metrics=True,
@@ -3205,7 +3507,8 @@ class Conversation:
     def _gate_state(self) -> dict[str, Any]:
         state = self.observer.live_state()
         state["busy_tools"] = self.bridge.busy_tools
-        state["call_mode"] = bool(self.call_app)  # the user is in a voice call (the attention gate; v3.5)
+        # the user is in a voice call (the attention gate; v3.5), or (vGame) a full-screen game is in front
+        state["call_mode"] = bool(self.call_app or self.focus)
         state["jobs_open"] = self.bridge.open_voice_jobs()
         if self._voice_activity is not None:
             since, last = self._voice_activity()
@@ -3221,7 +3524,7 @@ class Conversation:
         return {"user_speaking": obs.user_speaking, "user_sound": bool(gate.get("user_sound")),
                 "bot_busy": bool(obs.bot_speaking or obs.generating or obs.speech_pending or obs.owes_reply
                                  or self.bridge.busy_tools),
-                "call_mode": bool(self.call_app), "quiet_for": self._quiet_for()}
+                "call_mode": bool(self.call_app or self.focus), "quiet_for": self._quiet_for()}   # vGame: no steps
 
     def _price_turn(self, usage: dict[str, int]) -> float | None:
         """One reply turn's cost (the observer's): as before on Claude; after Settings → AI moved the talker, each
@@ -3309,6 +3612,7 @@ class Conversation:
             self.observer.set_state("listening")
             self._awake()   # the thinker's cache, the first desktop block (v3.6, v3.7), in the background
             self._boost()
+            self._apply_gain()   # vGame
         self.gate.start()
         warm = asyncio.create_task(self._warm())
         watch = asyncio.create_task(self._watch(runner))
@@ -3717,6 +4021,9 @@ class Conversation:
         they answer), not while a voice task is open (a follow-up routes by that task's state), not while dormant."""
         if not getattr(self.settings, "voice_router", False) or self.dormant or not getattr(call, "user_turn", False):
             return
+        turn = self.observer.turn
+        if self.focus and not (turn is not None and turn.named):
+            return   # vGame: in a game or a call only words said to Yuki by name start the thinker early
         self._cancel_route()
         pending = getattr(self.bridge, "routed_job", None)
         if callable(pending) and pending() is not None:
@@ -4182,6 +4489,9 @@ class Conversation:
             # N7 (report 47): another app's text field changed while they spoke this turn (typing or dictation)
             state["dictating"] = (f"{dictating.get('app')} \"{dictating.get('title')}\" (the field "
                                   f"{dictating.get('field')})")
+        if self.focus:
+            # vGame: a full-screen game in front or a call on: Yuki stays out of the way (mouth.FOCUS_GUIDE)
+            state["focus"] = {"game": self.game_app or None, "call": self._call_focus}
         return state
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").
@@ -4276,6 +4586,8 @@ class Conversation:
         if facts.get("marker") is not None or facts.get("scratch_chars"):
             self.log.event("marker", session=self.session, user_turn=bool(getattr(call, "user_turn", False)),
                            turn=turn.n if turn is not None else None, **facts)
+        if turn is not None and turn.marker == "quiet" and getattr(call, "user_turn", False):
+            self.observer._quiet_turn()   # vGame: silence chosen on the user's words
 
     # -- loop stalls (04 F4) -------------------------------------------------------------------------------------
 

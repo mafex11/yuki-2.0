@@ -361,6 +361,8 @@ TONES: dict[str, tuple[tuple[tuple[float, float], ...], float, float]] = {
     "error": (((620.0, 0.12), (410.0, 0.2)), -16.0, 0.012),
     "ended": (((587.0, 0.11), (440.0, 0.22)), -26.0, 0.04),
     "note": (((880.0, 0.06), (880.0, 0.06)), -24.0, 0.012),
+    # vGame: the instant acknowledgement when the voice has no rendered "Mm-hm" (a voice it cannot render ahead)
+    "tick": (((1320.0, 0.045),), -26.0, 0.01),
 }
 
 
