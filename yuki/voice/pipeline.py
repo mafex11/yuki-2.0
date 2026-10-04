@@ -725,6 +725,11 @@ def settle_only_when_newest(aggregator: Any) -> None:
     aggregator._is_deferred = _is_deferred
 
 
+#: Tools whose result is answered at once even while the voice is still saying the words the talker wrote before the
+#: call (leftVoice: quick_memory's "Let me look."): see ``Conversation._answer_look_now`` and ``ClauseTTS``.
+ANSWER_WHILE_SPEAKING = frozenset({"quick_memory"})
+
+
 def bedrock_client(region: str, backend: str | None = None) -> Any:
     """The mouth's model client (Bedrock, or the Anthropic API per ``Settings.model_backend``: see
     :mod:`yuki.core.models`), keeping its connection between turns.
@@ -771,6 +776,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             super().__init__(*args, **kwargs)
             #: Tool call ids of replies that said words before calling (see ``chronological``).
             self._yuki_spoke: set[str] = set()
+            #: Tool call ids that were the only call of their reply (leftVoice review LV-1: Pipecat answers a reply's
+            #: calls once, after the last; only a lone look may be answered at once on its own copy).
+            self._yuki_solo: set[str] = set()
             #: Tool call ids whose say_first was spoken while the call was still being written (v3.5).
             self._yuki_early: set[str] = set()
             #: Tool calls of a speculative reply (eager end of turn), run when the turn is confirmed.
@@ -810,6 +818,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if len(self._yuki_hold) > 64:
                 for old in list(self._yuki_hold)[:32]:
                     del self._yuki_hold[old]
+            if function_calls and len(function_calls) == 1:
+                if len(self._yuki_solo) > 64:
+                    self._yuki_solo.clear()   # ids of long-settled calls; a live one is re-added just below
+                self._yuki_solo.add(str(getattr(function_calls[0], "tool_call_id", function_calls[0])))
             if self._yuki_words is not None:
                 # The reply is complete: its words are said, unless a call it makes will be held until the
                 # user answers (then nothing of it was said or done, and the call's report says so).
@@ -1275,7 +1287,39 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
                     return
             await super()._push_tts_frames(src_frame, *args, **kwargs)
 
+        async def _maybe_pause_frame_processing(self) -> None:
+            if getattr(self, "_yuki_no_pause", False):
+                return   # a lead before a look: the look's result goes on at once (process_frame below)
+            await super()._maybe_pause_frame_processing()
+
         async def process_frame(self, frame: Any, direction: Any) -> None:
+            from pipecat.frames.frames import (
+                FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+            )
+
+            if isinstance(frame, LLMFullResponseStartFrame):
+                # A new reply: a look flagged after the last reply's end (a speculative reply's held calls run once
+                # the turn is confirmed, after its end has passed) is not this reply's (review fixes).
+                self._yuki_answer_next = False
+            elif isinstance(frame, FunctionCallsStartedFrame):
+                # leftVoice: Pipecat pauses this service's frames after a reply that had words until they have played
+                # ("to avoid audio overlapping"), and the tool's result waits in that queue: with "Let me look."
+                # before a quick_memory call the answer's run started only when the line ended (+1.0-1.2 s,
+                # measured offline). A reply that ends on such a call is not paused: its result reaches the
+                # conversation at once and the answer is written while the lead plays; its audio still plays after
+                # the lead's, in order (the audio contexts are played one after another).
+                names = {getattr(fc, "function_name", "") for fc in getattr(frame, "function_calls", None) or ()}
+                self._yuki_answer_next = bool(names) and names <= ANSWER_WHILE_SPEAKING
+            elif isinstance(frame, InterruptionFrame):
+                self._yuki_answer_next = False
+            elif isinstance(frame, LLMFullResponseEndFrame) and getattr(self, "_yuki_answer_next", False):
+                self._yuki_answer_next = False
+                self._yuki_no_pause = True
+                try:
+                    await super().process_frame(frame, direction)
+                finally:
+                    self._yuki_no_pause = False
+                return
             if _WORDS_DONE is not None and isinstance(frame, _WORDS_DONE):
                 from pipecat.frames.frames import AggregatedTextFrame
 
@@ -1353,6 +1397,7 @@ class _Turn:
     action_at: float | None = None       # a hand's action went out (v3.3: end of speech -> action)
     handoff_at: float | None = None      # a tell_yuki call started: the job is submitted now (v3.5)
     reply: list[str] = field(default_factory=list)
+    reply_from: int = 0                  # where the newest mouth run's words start in reply (leftVoice)
     spoken: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     tokens: dict[str, int] = field(default_factory=dict)
@@ -1488,6 +1533,9 @@ class TurnObserver:
         self.on_audible: Callable[[float, Any], None] | None = None
         #: The user's turn being answered again (``Conversation._reply_watch``): the rerun's reply stays in it (v3.16).
         self.rerun_turn: _Turn | None = None
+        #: The turn whose look is being answered at once (``Conversation._answer_look_now``): that run's reply stays in
+        #: it, so its lead's first audio and voice use are logged in it (leftVoice second review, LVC-2).
+        self.look_now_turn: _Turn | None = None
         #: Words were heard since Yuki last started speaking: a stretch with none (the voice's breath of silence for a
         #: reply that had nothing audible) is no answer and no exchange (v3.16, 04 §4.1).
         self._stretch_words = False
@@ -1978,14 +2026,18 @@ class TurnObserver:
         elif isinstance(frame, LLMFullResponseStartFrame):
             self.generating = True
             rerun, self.rerun_turn = self.rerun_turn, None
+            look_now, self.look_now_turn = self.look_now_turn, None
             if rerun is not None and rerun is self.turn:
                 pass   # the user's turn answered again (v3.16): its new reply is still that turn's answer
+            elif look_now is not None and look_now is self.turn:
+                pass   # a look answered at once while its lead is still on its way (leftVoice): the same answer
             elif self.turn is None or self.turn.first_audio is not None or self.turn.responses:
                 # A new mouth run after this turn already had one (a result, a progress line,
                 # a follow-up to a tool-only reply) is its own turn, with its own stages.
                 self._open("result")
             if self.turn.llm is None and self._pending_call is not None:
                 self.turn.llm, self._pending_call = self._pending_call, None
+            self.turn.reply_from = len(self.turn.reply)
             self._activity()
         elif isinstance(frame, LLMFullResponseEndFrame):
             self.generating = False
@@ -2394,6 +2446,64 @@ def _last_role(context: Any) -> str | None:
         if isinstance(message, dict) and message.get("role") in ("user", "assistant", "developer", "tool"):
             return str(message.get("role"))
     return None
+
+
+def _holds_words_since_user(messages: list[Any], words: str) -> bool:
+    """Whether an assistant message after the newest user message already says ``words`` (whitespace aside)."""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            return False
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, str) and " ".join(content.split()) == words:
+            return True
+    return False
+
+
+def _said_count(context: Any) -> int | None:
+    """How many user and developer messages the talker's context holds (a newer one means the user said more)."""
+    try:
+        messages = context.get_messages()
+    except Exception:  # noqa: BLE001
+        return None
+    return sum(1 for m in messages or [] if isinstance(m, dict) and m.get("role") in ("user", "developer"))
+
+
+def _reply_words(observer: Any) -> str:
+    """The current reply's words so far (the observer's turn, from where the newest run began), tags stripped."""
+    turn = getattr(observer, "turn", None)
+    if turn is None:
+        return ""
+    return " ".join(strip_tags("".join(turn.reply[getattr(turn, "reply_from", 0):])).split())
+
+
+async def _add_asked_more(conv: Any, context: Any, result: Any, call_id: str) -> bool:
+    """Whether the words a code-said add came from asked for more that is not answered yet (third check LVV-1).
+
+    :func:`yuki.voice.recall.rest_asked`: one short isolated check by the fast model, run while the add's line plays,
+    with their words and Yuki's words so far (its lead, then the line). ``conv`` is the :class:`Conversation`. No
+    client (a bare conversation), no verdict in time or an error: more, so the talker runs and decides (never
+    silent)."""
+    from yuki.voice.recall import rest_asked
+
+    observer = getattr(conv, "observer", None)
+    said = " ".join(str(result.get("said") or "").split())
+    words = _reply_words(observer)
+    if said and said not in words:
+        words = f"{words} {said}".strip()
+    user = _last_user_text(context) or str(getattr(observer, "last_user_text", "") or "")
+    client = getattr(conv, "_client", None)
+    settings = getattr(conv, "settings", None)
+    started = time.monotonic()
+    if client is None or settings is None:
+        more, how = True, "no_client"
+    else:
+        more, how = await rest_asked(client, settings.voice_mouth_model, user=user, said=words)
+    if conv.log is not None:
+        conv.log.event("quick_memory", session=conv.session, op="add_rest", call=call_id, more=more, how=how,
+                       ms=round((time.monotonic() - started) * 1000))
+    return more
 
 
 def _last_user_text(context: Any) -> str:
@@ -2939,8 +3049,11 @@ class Conversation:
             # not cancelled by a barge-in (an add may already be saved, and its report must reach the context).
             from yuki.voice.recall import QuickMemory
 
-            self.quick_memory = QuickMemory(self.memory, log=self.log, session=self.session)
-            llm.register_function(QUICK_MEMORY["name"], self.quick_memory.handle, cancel_on_interruption=False,
+            self.quick_memory = QuickMemory(self.memory, log=self.log, session=self.session,
+                                            alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ()),
+                                            mark_spoken=lambda call_id: getattr(self._llm, "_yuki_spoke", set()).add(
+                                                str(call_id)))
+            llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
                                   timeout_secs=20)
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
@@ -3737,6 +3850,135 @@ class Conversation:
             except Exception:  # noqa: BLE001
                 pass
         return max(0.0, now - max(marks))
+
+    async def _quick_memory_call(self, params: Any) -> None:
+        """The talker's quick memory tool (vfix4's :class:`yuki.voice.recall.QuickMemory`), its answer written while the
+        words before the call are still being said (leftVoice).
+
+        The talker says a few words before a look ("Let me look."). Pipecat keeps every frame after a reply's words in
+        order behind their audio (the voice's queue pauses until they have played, the speaker plays frames in order),
+        so the look's report reached the conversation, and the run that answers it started, only once "Let me look."
+        had played: measured offline 4 Oct, the answer's run began 1.0-1.2 s after the report was ready. When the reply
+        that made the call spoke, the report is settled without a run (``run_llm`` false: it still goes into the
+        conversation in its place) and the answer's run starts at once on a copy of the conversation that already
+        holds the call and its report (:meth:`_answer_look_now`); its words queue behind the lead in the voice. A reply
+        that called it with no words first waits behind nothing, so it settles as before. A clean add said by code
+        (:class:`~yuki.voice.recall.QuickMemory`) waits behind its own line, lead or not (third check LVV-1): when the
+        same words asked for more (:func:`_add_asked_more`, checked while the line plays) the run that does the rest
+        starts at once the same way; when the add was all of it, the turn ends with the line, with no run.
+        Plumbing: when the run starts, never what anyone said.
+
+        Review fixes (LV-1, LV-2): only a look that was the only call of its reply is answered this way (Pipecat answers
+        a reply's several calls once, after the last, with every report), and only when, as the report comes back, the
+        user is not speaking and has said nothing since the call (no user or developer message newer than it). Else the
+        report settles as on main and Pipecat's aggregator decides, so Yuki never talks over the user or answers twice.
+        """
+        llm = getattr(self, "_llm", None)
+        call_id = str(getattr(params, "tool_call_id", "") or "")
+        spoke = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_spoke", ())
+        solo = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_solo", ())
+        if solo:
+            original = params.result_callback
+            # Second review (LVC-1): what the user says is watched in the live conversation. The run's own context
+            # is often a frozen copy: an eager end of turn runs on Pipecat's provisional copy (the conversation plus
+            # the speculated turn), the answer-now run on its own copy, and neither ever grows. The user and
+            # developer messages of the context the run answered are the turn being answered and everything before
+            # it; more of them in the live conversation is the user going on. Counted on the run's context, so the
+            # eager turn's own commit (it can land just after its held call starts) is not taken for new words.
+            ran_on = getattr(params, "context", None)
+            live = getattr(self, "_llm_context", None) or ran_on
+            said = _said_count(ran_on)
+
+            async def settle(result: Any, *, properties: Any = None) -> None:
+                if properties is not None and getattr(properties, "run_llm", None) is False:
+                    await original(result, properties=properties)   # settled with no run: nothing to answer
+                    return
+                said_by_code = isinstance(result, dict) and bool(result.get("said"))
+                if not spoke and not said_by_code:
+                    await original(result, properties=properties)   # no words before it to wait behind
+                    return
+                if said_by_code and not await _add_asked_more(self, ran_on, result, call_id):
+                    # Third check LVV-1: a clean add that was all they asked ends the turn with its line, no run
+                    # (a run there wandered: "What's up?", an offer about the screen, once a pause).
+                    from pipecat.frames.frames import FunctionCallResultProperties
+
+                    await original(result, properties=FunctionCallResultProperties(run_llm=False))
+                    return
+                user_speaking = bool(getattr(self.observer, "user_speaking", False))
+                now_said = _said_count(live)
+                newer = said is None or now_said is None or now_said > said
+                if user_speaking or newer:
+                    # The user is talking, or has said more since the call: as on main, the report just goes in and
+                    # their own turn (or Pipecat, once they stop) answers with it.
+                    if self.log is not None:
+                        self.log.event("quick_memory", session=self.session, op="answer_later", call=call_id,
+                                       user_speaking=user_speaking, newer=newer)
+                    await original(result, properties=properties)
+                    return
+                from pipecat.frames.frames import FunctionCallResultProperties
+
+                await original(result, properties=FunctionCallResultProperties(run_llm=False))
+                await self._answer_look_now(params, result)
+
+            params.result_callback = settle
+        await self.quick_memory.handle(params)
+
+    async def _answer_look_now(self, params: Any, result: Any) -> None:
+        """Run the talker now on the conversation as it will be once the look's call and report are in it (leftVoice).
+
+        The shared conversation gets them only when their frames have passed the lead's audio; the copy has them now:
+        the conversation so far without this call's own messages (a placeholder already there is replaced), then the
+        call and its report. The run's words reach the conversation in order, after the report, as any answer's do.
+
+        The copy is made from the context the look's run answered, not the live conversation (second review, LVC-1):
+        the live one gets the call, its lead and an earlier look's report only once their audio has played, so it
+        would lack them; that the user has said nothing since is checked on the live one before this runs."""
+        import json
+
+        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
+
+        llm = getattr(self, "_llm", None)
+        context = getattr(params, "context", None)
+        if llm is None or context is None:
+            return
+        call_id = str(params.tool_call_id)
+
+        def mine(message: Any) -> bool:
+            if not isinstance(message, dict):
+                return False
+            if message.get("tool_call_id") == call_id:
+                return True
+            calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+            return bool(calls) and any(isinstance(c, dict) and c.get("id") == call_id for c in calls)
+
+        messages = [m for m in context.get_messages() if not mine(m)]
+        observer = getattr(self, "observer", None)
+        turn = getattr(observer, "turn", None)
+        # Second review: the reply's own words before the call ("It's ten to eleven. Adding it now.") go in too, as
+        # ``chronological`` orders them, so the answer knows what was already said (offline 4 Oct: without them the
+        # add-and-ask answer gave the time a second time). Words the conversation already holds are not repeated.
+        words = _reply_words(observer)
+        said = result.get("said") if isinstance(result, dict) else None
+        if isinstance(said, str) and said.strip() and " ".join(said.split()) not in words:
+            # third check LVV-1: a clean add's line, said by code, is words of this reply before the answer too (text
+            # replays 4 Oct: only in the report, the answer said the add again or chatted; before the call, it did not)
+            words = f"{words} {' '.join(said.split())}".strip()
+        if words and not _holds_words_since_user(messages, words):
+            messages.append({"role": "assistant", "content": words})
+        args = params.arguments if isinstance(params.arguments, dict) else {}
+        messages.append({"role": "assistant", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": params.function_name, "arguments": json.dumps(args, ensure_ascii=False)}}]})
+        messages.append({"role": "tool", "tool_call_id": call_id,
+                         "content": json.dumps(result, ensure_ascii=False) if result else "COMPLETED"})
+        copy = LLMContext(messages=messages, tools=context.tools, tool_choice=context.tool_choice)
+        if observer is not None and turn is not None:
+            observer.look_now_turn = turn   # LVC-2: the run's reply stays in the turn whose lead it follows
+        if self.log is not None:
+            self.log.event("quick_memory", session=self.session, op="answer_now", call=call_id,
+                           bot_speaking=bool(self.observer.bot_speaking))
+        await llm.queue_frame(LLMContextFrame(context=copy))
 
     async def _speak(self, text: str) -> None:
         """Say ``text`` now by code (no mouth run): a job's own finishing line with no tell_yuki call to carry it."""
