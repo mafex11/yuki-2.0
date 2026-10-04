@@ -89,6 +89,11 @@ SHOWN = {"op": "ADD", "kind": "procedure", "intent": "open Starfall", "from_user
                                          "from": []},
                                         {"do": "Wait for the game's own window, full screen", "from": []}],
          "family": "opening a game that starts through a launcher"}
+#: The demonstration pass's answer (record_shown_way): the model's judgement that the user did the same thing.
+DEMO = {"showed": True, "from_user": ["u2", "u3", "u4"], "entry": "Starfall", "intent": "open Starfall",
+        "steps": ["Open the Start entry Starfall: Fake Launcher starts the game",
+                  "Wait for the game's own window, full screen; Fake Launcher's windows are not the game"],
+        "family": "opening a game that starts through a launcher", "why": "the user started the game themselves"}
 
 
 def first_pass(store: Any, worker: Worker) -> L.LearnResult:
@@ -105,16 +110,16 @@ def test_the_users_own_fix_after_a_failed_opening_becomes_a_verified_way_and_lau
     assert first.outcome == "failed" and P.live(store, ["procedure"]) == []
     timeline(store)
     # once its follow-up window has passed, the run is looked at again with what the user did
-    worker.answers.append({"outcome": "failed", "cause": "the launcher's window is not the game",
-                           "operations": [SHOWN], "used": []})
+    worker.answers.append(dict(DEMO))
     res = L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
-    assert len(res) == 1 and res[0].mode == "postmortem" and any("stayed at" in r for r in res[0].reasons)
+    assert len(res) == 1 and res[0].mode == "demonstration" and res[0].outcome == "shown"
+    assert worker.calls[-1]["tool"]["name"] == "record_shown_way" and worker.calls[-1]["system"] == L.DEMO_PROMPT
     sent = worker.calls[-1]["user"]
     assert "WHAT THE USER DID AFTER IT" in sent
     assert "Yuki's own effect" in sent.split("[u1]")[1].split("\n")[0]             # the opening's own window
     u4 = sent.split("[u4]")[1].split("\n")[0]
     assert "full screen" in u4 and "starfall-win64-shipping.exe <- starfall.exe <- fakelauncher.exe" in u4
-    assert 'Start entries that run fakelauncher.exe: "Starfall" (--launch-product=starfall), "Fake Launcher"' in u4
+    assert 'Start entries that run fakelauncher.exe: "Starfall" (with --launch-product=starfall), "Fake Launcher"' in u4
     ways = P.live(store, ["procedure"])
     assert len(ways) == 1 and ways[0].origin == "demonstrated"
     assert ways[0].run == [{"do": "open_app", "name": "Starfall", "app": "starfall-win64-shipping"}]
@@ -129,8 +134,9 @@ def test_the_users_own_fix_after_a_failed_opening_becomes_a_verified_way_and_lau
     assert MemoryClient(store).launch_identities() == {"starfall": ["starfall-win64-shipping"]}
     # looked at again once only
     assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 60) == []
-    assert P.run_header(store, P.run_key("hand", "S5", "voice-s1-3-h1")).signals[L.RECHECK_KEY]["result"].startswith(
-        "postmortem")
+    head = P.run_header(store, P.run_key("hand", "S5", "voice-s1-3-h1"))
+    assert head.signals[L.RECHECK_KEY]["result"] == "demonstration: shown"
+    assert P.judged_ok(store, head.run_key) is False                               # Yuki's run did not work
 
 
 @pytest.mark.parametrize("bad, why", [
@@ -143,9 +149,32 @@ def test_a_shown_way_is_checked_in_code_against_what_the_user_really_did(store, 
     worker = Worker(store)
     first_pass(store, worker)
     timeline(store)
-    worker.answers.append({"outcome": "failed", "cause": "", "operations": [{**SHOWN, **bad}], "used": []})
+    worker.answers.append({**DEMO, **bad})
     res = L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
     assert P.live(store, ["procedure"]) == [] and any(why in r for r in res[0].rejected)
+    assert res[0].outcome == "refused in code"
+
+
+def test_when_the_model_judges_it_was_not_the_same_goal_nothing_is_written(store):
+    worker = Worker(store)
+    first_pass(store, worker)
+    timeline(store)
+    worker.answers.append({"showed": False, "why": "the user went on with other work"})
+    res = L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
+    assert res[0].outcome == "not the same goal" and P.live(store, ["procedure"]) == []
+
+
+def test_the_post_mortem_may_name_only_the_entry_and_the_listed_arguments_are_left_out(store):
+    """Seen with the real model on the 5 Oct data: it named the entry with its arguments and no items."""
+    ctx = L.Ctx(mode="postmortem", user_items={
+        "u3": {"label": "u3", "worked": False, "yuki": False, "image": "", "entries": []},
+        "u4": {"label": "u4", "worked": True, "yuki": False, "image": "starfall-win64-shipping.exe",
+               "entries": [{"name": "Starfall", "arguments": "--launch-product=starfall"}, {"name": "Fake Launcher"}]}})
+    raw = {**SHOWN, "from_user": [], "entry": "Starfall (with --launch-product=starfall)",
+           "steps": [{"do": "Open the Start entry Starfall", "from": [9]}]}
+    checked = L.check({"outcome": "failed", "operations": [raw], "used": []}, ctx)
+    assert checked.ops and checked.ops[0]["demonstrated"] == {"items": ["u4"], "entry": "Starfall",
+                                                              "image": "starfall-win64-shipping"}
 
 
 def test_a_run_that_worked_by_itself_learns_no_way_from_what_the_user_did_next(store):
