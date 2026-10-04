@@ -772,7 +772,7 @@ class Hands:
             try:
                 self._authorizer = Authorizer(lambda: agent.client, agent.settings, log=judge_log,
                                               policy=getattr(agent.authorizer, "policy", None))
-                self._judge_client = lambda: agent.client
+                self._judge_client = self._authorizer.model_client   # always Claude (the check's own client)
             except Exception:  # noqa: BLE001
                 self._authorizer = False
         return self._authorizer or None

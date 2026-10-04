@@ -147,7 +147,8 @@ def test_doctor_reports_each_job_and_never_the_key(ai_dir: Path) -> None:
 
     c = check_ai_roles(offline=True)
     assert c.name == AI_ROLES_CHECK and c.status == OK
-    assert c.detail == "Voice replies: Claude (as now); Doing things: Claude (as now); Memory upkeep: Claude (as now)"
+    assert c.detail == ("Voice replies: Claude (as now); Doing things: Claude (as now); Memory upkeep: Claude (as now);"
+                        " Safety check that approves actions: always Claude")
     summary.set_role("thinker", "openai", "gpt-5-mini")
     c = check_ai_roles(offline=True)
     assert c.status == FAIL and "Doing things: OpenAI, gpt-5-mini (NO KEY)" in c.detail and "Settings" in c.fix

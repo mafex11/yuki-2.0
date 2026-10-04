@@ -1094,7 +1094,10 @@ class Authorizer:
     denial counters.
 
     Args:
-        client: A callable returning the model client (the agent's failover client).
+        client: A callable returning the model client (the agent's failover client). The check always runs on the
+            default Claude path (:meth:`yuki.agent.failover.FailoverClient.claude_only`: Bedrock with its normal
+            chain and pricing), whatever Settings → AI chose for "Doing things" (the user's decision, 4 Oct); the
+            agent's second look and helpers keep the routed client.
         settings: ``judge_model``, ``judge_timeout_s``, ``estimate_cost``.
         log: ``log(event_type, **fields)`` (the session logger's).
         policy: The policy reader (tests pass one on a temp file).
@@ -1102,13 +1105,20 @@ class Authorizer:
 
     def __init__(self, client: Callable[[], Any], settings: Any, log: Callable[..., None] | None = None,
                  policy: PolicyReader | None = None) -> None:
-        self._client = client
+        self._agent_client = client
+        self._client = self.model_client
         self.settings = settings
         self._log = log or (lambda *a, **k: None)
         self.policy = policy or PolicyReader()
         self._lock = threading.Lock()
         self._generation = 0
         self.begin_request()
+
+    def model_client(self) -> Any:
+        """The client the check's model calls go through: the agent's, pinned to the default Claude path."""
+        from yuki.agent.failover import claude_path
+
+        return claude_path(self._agent_client())
 
     def begin_request(self) -> None:
         self._generation += 1

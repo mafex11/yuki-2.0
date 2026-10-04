@@ -204,6 +204,7 @@ async function inPage(F) {
   check('memory upkeep shows its local model', memSel.length === 2 && memSel[0].value === 'ollama' && memSel[1].value === 'llama3.2:3b', Array.from(memSel).map((s) => s.value).join(','));
   check('local models are marked free and small', Array.from(memSel[1].options).some((o) => o.textContent.includes('free, small')));
   check('a moved job has a backup row', !!row('ai-backup-memory') && !row('ai-backup-thinker'));
+  check('doing things says the safety check stays on Claude', row('ai-role-thinker').textContent.includes('The safety check that approves actions always uses Claude.') && !row('ai-role-memory').textContent.includes('safety check'), row('ai-role-thinker').textContent);
   await sleep(300); await frames();
   check('opening Settings asks Ollama once (off the UI thread)', acts('ai_models').filter((m) => m.provider === 'ollama').length === 1, JSON.stringify(acts('ai_models')));
   check('Ollama status in plain words', row('ai-prov-ollama').textContent.includes('2 models on this PC'), row('ai-prov-ollama').textContent);

@@ -19,6 +19,11 @@ from yuki.agent.providers.catalog import PROVIDERS, ROLE_HINTS, ROLE_WORDS, ROLE
 SAVED_WORDS = "Saved on this PC, encrypted"
 #: How a change applies.
 APPLY_WORDS = "Changes apply from your next request. No restart needed."
+#: Under Doing things: the safety check stays on Claude whatever that job runs on (the user's decision, 4 Oct;
+#: ``yuki.agent.judge.Authorizer.model_client``).
+SAFETY_WORDS = "The safety check that approves actions always uses Claude."
+#: The doctor's line for it.
+SAFETY_DOCTOR_LINE = "Safety check that approves actions: always Claude"
 
 #: One edit of ai.json at a time (the window runs each action on its own thread).
 _edit = threading.Lock()
@@ -48,7 +53,8 @@ def role_line(role: str) -> dict[str, Any]:
     out: dict[str, Any] = {"role": role, "words": ROLE_WORDS[role], "hint": ROLE_HINTS[role], "provider": provider,
                            "provider_words": _provider_words(provider), "model": model,
                            "backup_provider": choice.get("backup_provider") or "",
-                           "backup_model": choice.get("backup_model") or "", "warning": "", "blocked": False}
+                           "backup_model": choice.get("backup_model") or "", "warning": "", "blocked": False,
+                           "note": SAFETY_WORDS if role == "thinker" else ""}
     if provider == "default":
         out["key"] = "not_needed"
         return out
@@ -149,6 +155,7 @@ def doctor_lines() -> tuple[str, list[str], list[str]]:
         if line["backup_provider"]:
             lines[-1] += f", backup {_provider_words(line['backup_provider'])}" + (
                 f" {line['backup_model']}" if line["backup_model"] else "")
+    lines.append(SAFETY_DOCTOR_LINE)   # whatever Doing things runs on (yuki.agent.judge.Authorizer.model_client)
     return status, lines, fixes
 
 
@@ -252,5 +259,5 @@ def openrouter_price(model: str) -> dict[str, float] | None:
     return cached_price("openrouter", model)
 
 
-__all__ = ["APPLY_WORDS", "SAVED_WORDS", "doctor_lines", "models_reply", "ollama_words", "openrouter_price", "page",
-           "providers_state", "role_line", "roles_state", "set_custom", "set_key", "set_role"]
+__all__ = ["APPLY_WORDS", "SAFETY_DOCTOR_LINE", "SAFETY_WORDS", "SAVED_WORDS", "doctor_lines", "models_reply",
+           "ollama_words", "openrouter_price", "page", "providers_state", "role_line", "roles_state", "set_custom", "set_key", "set_role"]
