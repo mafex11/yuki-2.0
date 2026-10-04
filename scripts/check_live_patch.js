@@ -899,6 +899,15 @@ async function inPage(F) {
   check('WK8 a loop you cleared long ago can be put back too (todo_reopen, any), to its own block with the next build (review F7)', !!loopBack
     && last('todo_reopen').ref === doneLoop.ref && last('todo_reopen').any === true && toastTxt().includes('Put back where it was.')
     && !wl().querySelector(`.wrows .wrow[data-cref="${doneLoop.ref}"]`), toastTxt());
+  // leftUI review 1: a promise said on a call goes back to You said you'd, so it is never drawn as your to-do meanwhile
+  const doneSaid = FW.todos.done.find((t) => t.goes === 'said');
+  const saidBack = doneSaid && Array.from(wl().querySelectorAll('.wdone-l [data-do="work-back"]')).find((b) => b.dataset.ref === doneSaid.ref);
+  if (saidBack) { saidBack.click(); await sleep(200); }
+  check('WK8 a promise you said put back goes to You said you’d with the next build: not drawn in Your list here or on Home meanwhile (leftUI review 1)', !!saidBack
+    && last('todo_reopen').ref === doneSaid.ref && toastTxt().includes('Put back where it was.')
+    && !wl().querySelector(`.wrows .wrow[data-cref="${doneSaid.ref}"]`)
+    && !Y.todosOpen(Y.D.pages.home.todos).some((t) => t.ref === doneSaid.ref)
+    && Y.todosOpen(Y.D.pages.home.todos).some((t) => t.ref === FW.todos.done[0].ref), toastTxt());
   wl().querySelector('[data-do="work-donefold"]').click(); await sleep(60);
   // Waiting on
   const wait = () => sec('wait'), w0 = FW.waiting[0];

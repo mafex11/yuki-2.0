@@ -1400,12 +1400,27 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
     raw = {str(r.get("id")): r for r in rows if isinstance(r, dict)}
     open_todos, done_todos = todo_lists(None, now, include_done=True, rows=rows)
     lst, said, waiting = [], [], []
+
+    def column(t: dict[str, Any], loop: dict[str, Any] | None) -> str:
+        """Which block a row of memory's list belongs in: ``waiting``, ``said`` or ``list`` (one rule for the open rows
+        and for where Put it back returns a done one)."""
+        kind = t["ref"].partition(":")[0]
+        if t["ref"] in listed:
+            return "list"
+        if kind == "loop" and loop and loop.get("kind") == "waiting":
+            return "waiting"
+        if ((kind == "commit" and t.get("source") in ("chat", "call"))
+                or (kind == "loop" and loop and loop.get("kind") == "promised")):
+            return "said"
+        return "list"
+
     for t in open_todos:
         ref = t["ref"]
         kind, _, number = ref.partition(":")
         loop = loops.get(int(number)) if kind == "loop" and number.isdigit() else None
         moved = ref in listed
-        if kind == "loop" and loop and loop.get("kind") == "waiting" and not moved:
+        col = column(t, loop)
+        if col == "waiting":
             waiting.append({"ref": ref, "who": loop.get("who") or "",
                             "what": dates_said(loop.get("what") or "", now) or t["text"],
                             "where": loop.get("where") or "", "since": t.get("since"),
@@ -1414,8 +1429,7 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
                             "basis": loop.get("basis") if loop.get("basis") in ("offered", "asked") else "",
                             "text": t["text"]})
             continue
-        if not moved and ((kind == "commit" and t.get("source") in ("chat", "call"))
-                          or (kind == "loop" and loop and loop.get("kind") == "promised")):
+        if col == "said":
             quote = _quote_of(raw.get(ref, {}).get("evidence")) if kind == "commit" else ""
             if kind == "commit":
                 where = ("on a call" if t.get("source") == "call" else "said to me")
@@ -1442,9 +1456,16 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
         return loops.get(int(number)) if kind == "loop" and number.isdigit() else None
 
     # a promise memory saw kept shows once: struck through in You said you'd (Not done yet), not again in Recently
-    # done (review F3). Every row there can be put back (memory's reopen_item at any age; review F7).
+    # done (review F3). Every row there can be put back (memory's reopen_item at any age; review F7); ``goes`` is the
+    # block it goes back to, so only a row going back to Your list is drawn there at once (leftUI review 1); "" for a
+    # loop the board holds no judgement of (it only judges open loops), which memory's next build places
+    def goes(t: dict[str, Any]) -> str:
+        loop = loop_of(t["ref"])
+        return "" if t["ref"].startswith("loop:") and loop is None and t["ref"] not in listed else column(t, loop)
+
     done = [{**t, "title": t.get("title") or _loop_title(loop_of(t["ref"]), now) or None,
-             "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:", "loop:"))}
+             "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:", "loop:")),
+             "goes": goes(t)}
             for t in done_todos if t["ref"] not in kept_refs]
     return {"list": lst, "done": done, "said": said, "waiting": waiting}
 

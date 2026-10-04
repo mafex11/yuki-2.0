@@ -430,8 +430,9 @@
     Y.act('todo_reopen', { ref, any: true }).then((r) => {
       if (!r.ok) { t.disabled = false; Y.toast(r.error || 'I can’t put that back any more.', true); return; }
       const view = (workData().todos.done || []).find((x) => x.ref === ref);
-      // a loop goes back to its own block (Waiting on, You said you'd or Your list) with memory's next build
-      const loop = ref.startsWith('loop:');
+      /* only a row going back to Your list (Python's `goes`) is drawn there at once, on Home and here; a promise or a
+         wait goes back to its own block (You said you'd, Waiting on) with memory's next build (leftUI review 1) */
+      const loop = !view || (view.goes != null ? view.goes !== 'list' : ref.startsWith('loop:'));
       if (view && Y.todoReopened && !loop) Y.todoReopened(ref, view);
       const w = W(); w.arrived.add(ref);
       const at = listItems(workData()).findIndex((x) => x.ref === ref);

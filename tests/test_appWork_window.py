@@ -169,6 +169,22 @@ def test_a_kept_promise_shows_once_and_reads_as_a_sentence(tmp_path):
     assert told["meta"] == "you told me at 1 PM"
 
 
+def test_each_done_row_says_which_block_put_it_back_returns_it_to():
+    """leftUI review 1: only a row going back to Your list is drawn there at once (Home's list too), so each done row
+    carries the block it returns to, by the same rule as the open rows; a loop the board no longer judges says ""."""
+    rows = _rows() + [_row("commit:30", "Bring the invented chairs", "call", status="done"),
+                      _row("commit:31", "Send Ola the invented notes", "chat", status="done"),
+                      _row("commit:32", "Look up the invented hall hours", "commitment", status="done"),
+                      _row("loop:6", "The user promised Noor the drum loop.", "loop", status="done"),
+                      _row("loop:33", "Ola said she would bring the invented ladder.", "loop", status="done")]
+    rows = [r for r in rows if not (r["id"] == "loop:6" and r.get("status") == "open")]
+    goes = {t["ref"]: t["goes"] for t in W.work_columns(rows, BOARD, [], NOW)["done"]}
+    assert goes == {"todo:9": "list", "commit:30": "said", "commit:31": "said", "commit:32": "list",
+                    "loop:6": "said", "loop:33": ""}
+    moved = {t["ref"]: t["goes"] for t in W.work_columns(rows, {**BOARD, "listed": ["commit:30"]}, [], NOW)["done"]}
+    assert moved["commit:30"] == "list"
+
+
 def test_the_add_field_quote_reader_takes_only_memorys_own_format():
     assert W._quote_of('the user said in a call on 2026-10-03: "I can print the flyers"') == "I can print the flyers"
     assert W._quote_of("asked by Riya in Signal") == ""

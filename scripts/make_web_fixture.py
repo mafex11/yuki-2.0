@@ -353,6 +353,10 @@ class TodoMemory:
                      # the promise memory saw kept (Work shows it once: struck through in You said you'd, review F3)
                      item("commit:43", "Send Riya the planner link", "chat", status="done", since=5 * H,
                           title="Send Riya the planner link"),
+                     # a promise said on a call, marked done: Put it back returns it to You said you'd, never to
+                     # Your list (leftUI review 1)
+                     item("commit:44", "Bring the folding chairs to the seed swap", "call", status="done", since=8 * H,
+                          title="Bring the folding chairs"),
                      # a loop you cleared a while ago: Put it back still works (review F7)
                      item("loop:17", "Ana said she would lend you the ladder for the balcony", "loop", status="done",
                           since=6 * D)]
