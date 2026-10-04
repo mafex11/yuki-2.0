@@ -1487,7 +1487,13 @@ class _LazyRealBackend:
         the user (the 25 Sept live "open YouTube on Chrome" did). Returns how many apps."""
         import importlib
 
-        return len(importlib.import_module("yuki.actions.launch").get_start_apps())
+        launch = importlib.import_module("yuki.actions.launch")
+        apps = launch.get_start_apps()
+        try:
+            launch._start_links(apps)   # appOpen: the shortcuts' targets and arguments (~0.15 s), read once too
+        except Exception:  # noqa: BLE001 - a launch reads them itself then
+            pass
+        return len(apps)
 
     def prewarm_shell(self) -> bool:
         """Open the persistent PowerShell session now, before anything needs it.
