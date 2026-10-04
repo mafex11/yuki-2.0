@@ -421,6 +421,11 @@ def plan(which: str) -> list[dict]:
         for name, text in VFIX_CLIPS:
             items.append({"set": "vfix", "name": name, "language": "en", "text": text, "provider": provider,
                           "voice": voice, "wake": name == "k_name"})
+    if which in ("lists",):
+        provider, voice = VFIX_USER
+        for name, text in LIST_CLIPS:
+            items.append({"set": "lists", "name": name, "language": "en", "text": text, "provider": provider,
+                          "voice": voice, "wake": name == "k_name"})
     if which in ("names",):
         for provider, voice in NAMES_VOICES:
             tag = voice.replace("aura-2-", "").replace("-en", "")[:6]
@@ -469,12 +474,21 @@ VFIX_CLIPS = [
     ("e_mistake", "Oh, never mind, wrong moment, sorry. You can go back to sleep."),
 ]
 
+#: leftVoice (report 71): quick memory reads by voice, for voice_session_offline.py's "lists" scenario (report 65's
+#: "what's on my list" silence); a plain question as the control. Generic words, invented items.
+LIST_CLIPS = [
+    ("k_name", "Yuki."), ("l_list", "What's on my list?"),
+    ("l_plumber", "What did I tell you earlier about the plumber?"),
+    ("l_add", "Put renew the car insurance on my list."), ("l_time", "What time is it?"),
+    ("l_totals", "I told you about the total list, right? What were the totals?"),
+]
+
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--set", default="all", choices=("stt", "wake", "scenario", "v3", "v34", "v35", "names", "v314",
-                                                     "v318", "vfix", "all"))
+                                                     "v318", "vfix", "lists", "all"))
     ap.add_argument("--dry-run", action="store_true", help="count characters only")
     args = ap.parse_args(argv)
     items = plan(args.set)

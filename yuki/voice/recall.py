@@ -71,7 +71,8 @@ SEARCH_EMBED_WAIT_S = 0.4
 QUICK_MEMORY: dict[str, Any] = {
     "name": "quick_memory",
     "description": (
-        "Your quick look into memory, alone, no words before it; its report says what to say. todos: their to-do "
+        "Your quick look into memory, after a few words in the same reply (\"Let me look.\"); its report says what "
+        "to say. todos: their to-do "
         "list. add_todos: put items on it when they ask, one each, their words. today: today's talk with you. "
         "search: memory for query."
     ),
@@ -94,6 +95,14 @@ EMPTY_LIST_NOTE = ("Their list has nothing open, read now. Say plainly you looke
 ADDED_NOTE = ("Saved and checked: nothing more to do. Say: \"Added {n}, they're on Home under Your list.\" (that, or as "
               "short in your words, always with how many and where: Home, Your list). Never read them back unless "
               "they ask.")
+#: leftVoice: a clean add (every item saved, with its due when it had one) is confirmed by code, in these words, the
+#: moment memory has it: no second talker run (its first token alone is ~1.2-1.5 s). Formatting: a count and the place.
+ADDED_ONE_LINE = "Added it, it's on Home under Your list."
+ADDED_LINE = "Added {n}, they're on Home under Your list."
+ADDED_SAID_NOTE = ("Said aloud just now in your voice, word for word: your own words to them, already heard. Saved and "
+                   "checked: nothing more to do. Never say it again; if they ask, answer from it.")
+#: An item kept without the due it was given (memory could not read the due): the talker says so, not code.
+NO_TIME_MARK = " (saved without its time: it could not be read)"
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
                   "on their list.")
 MAYBE_SAVED_NOTE = ("Memory was too slow to answer, so {n} of them may or may not have saved. Say so plainly; before "
@@ -358,6 +367,22 @@ def _search_lines(hits: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+def added_line(report: dict[str, Any]) -> str | None:
+    """The words that confirm an add by code, or ``None`` when the talker should say it (leftVoice).
+
+    Only a clean add: every item saved, none kept without the due it was given, nothing unsure or unsaved. Anything
+    else needs the talker's words (what did not save, what to do next). Facts of the report's own bookkeeping."""
+    items = report.get("items") if isinstance(report, dict) else None
+    n = report.get("added") if isinstance(report, dict) else None
+    if not isinstance(n, int) or n < 1 or not isinstance(items, list) or len(items) != n:
+        return None
+    if report.get("may_have_saved") or report.get("not_saved") or report.get("failed"):
+        return None
+    if any(str(item).endswith(NO_TIME_MARK) for item in items):
+        return None
+    return ADDED_ONE_LINE if n == 1 else ADDED_LINE.format(n=n)
+
+
 class QuickMemory:
     """The ``quick_memory`` tool's handler: one memory read or write off the voice loop, its report for the talker.
 
@@ -378,10 +403,23 @@ class QuickMemory:
             payload = {"failed": f"memory could not be read ({type(exc).__name__})",
                        "how_to_handle_it": NOTHING_NOTE.format(where="memory")}
             facts = {"ok": False}
+        line = added_line(payload) if str(args.get("action") or "").strip() == "add_todos" else None
+        push = getattr(getattr(params, "llm", None), "push_frame", None)
+        said = bool(line and callable(push))
         if self.log is not None:
             self.log.event("quick_memory", session=self.session, op=str(args.get("action") or ""),
                            ms=round((time.monotonic() - started) * 1000), call=getattr(params, "tool_call_id", None),
-                           **facts)
+                           **facts, **({"said_by": "code"} if said else {}))
+        if said:
+            # leftVoice: a clean add is confirmed by code in Yuki's voice, as a hand's done line is: the talker is not
+            # run again for it (that second run was ~1.5 s of silence before "Added ..."); its words go into the
+            # conversation as Yuki's own, and the call settles with them as said.
+            from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
+            await push(TTSSpeakFrame(text=line))
+            await params.result_callback({**payload, "said": line, "how_to_handle_it": ADDED_SAID_NOTE},
+                                         properties=FunctionCallResultProperties(run_llm=False))
+            return
         await params.result_callback(payload)
 
     def run(self, args: dict[str, Any], *, now: float | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -451,7 +489,7 @@ class QuickMemory:
                         raise
                     # a due memory cannot read: the to-do is kept without it, and the report says so
                     write(text, None)
-                    added.append(f"{text} (saved without its time: it could not be read)")
+                    added.append(text + NO_TIME_MARK)
             except _OutOfTime as out:
                 # the write that ran out may finish on its own; one that never started did not
                 unsure = 1 if out.sent else 0

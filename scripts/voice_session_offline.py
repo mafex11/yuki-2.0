@@ -69,6 +69,8 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     desk = _hands_desk(timeline)
     runtime = TimedBrain([[(3.0, "done", "Done.")]] * 10, timeline)
     memory = service = None
+    if getattr(args, "fake_memory", False):
+        args.db = fake_memory(tmp / "fake")   # leftVoice: an invented memory (to-dos, a morning exchange)
     if getattr(args, "db", None):
         # v3.18: memory on a COPY (practice memory's lines for the talker, the hands' run traces, the grounding
         # lookup), its embedder served from a stand-in service process over its pipe as live; never the real memory
@@ -189,6 +191,15 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                  ("k_name", 1.0, standby_again(1.5)), ("e_whatsup", 0.35, None), ("e_goaway", 1.0, settled(0.8)),
                  ("k_name", 1.0, standby_again(1.5)), ("e_bye", 0.35, None),
                  ("k_name", 1.0, standby_again(1.5)), ("e_mistake", 0.35, None)]
+        script = [(clip(n), after, wait) for n, after, wait in lines]
+        names = [n for n, _a, _w in lines]
+    elif scenario == "lists":
+        # leftVoice (report 65's "what's on my list" silence): each ask in a conversation of its own, after the name
+        # (clips: voice_clips.py --set lists); with --fake-memory the quick memory tool reads an invented list
+        first = prewarmed() if args.prewarm else None
+        lines = []
+        for i, ask in enumerate(a.strip() for a in args.asks.split(",") if a.strip()):
+            lines += [("k_name", 1.0, first if i == 0 else standby_again(1.5)), (ask, 0.35, None)]
         script = [(clip(n), after, wait) for n, after, wait in lines]
         names = [n for n, _a, _w in lines]
     else:
@@ -314,12 +325,73 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                          "yuki_said_after": said, "tools": tools})
         report["endings"] = rows
         report["quiet_after"] = bool(getattr(session, "quiet", False))
+    if scenario == "lists" and mic is not None:
+        report["asks"] = ask_rows(names, mic.lines, timeline.events, t0,
+                                  lambda n: speech_end_offset(clip(n)))
     if io_seen is not None:
         report["loop_io"] = sorted(({"event": k[0], "where": k[1], "what": k[2], "n": n} for k, n in io_seen.items()),
                                    key=lambda r: -r["n"])
     out = args.out / f"{scenario}-{variant}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     return report
+
+
+#: leftVoice: the invented memory of the "lists" scenario (never a real person's items).
+FAKE_TODOS = ["Buy printer ink", "Call the plumber about the kitchen leak", "Renew the gym pass",
+              "Email Tara the slides", "Book the dentist for Friday"]
+FAKE_MORNING = ("The plumber said he can only come on Thursday after four, so remind me to be home by then.",
+                "Got it, Thursday after four for the plumber.")
+
+
+def fake_memory(folder: Path) -> Path:
+    """A new memory in ``folder`` (its own key) holding :data:`FAKE_TODOS` (added yesterday) and one exchange two hours
+    ago (both outside the last hour's view, so a question about them needs a look). Returns the folder, for ``--db``."""
+    from yuki.memory.api import MemoryClient
+
+    folder.mkdir(parents=True, exist_ok=True)
+    client = MemoryClient.open(folder / "memory.db")
+    try:
+        for i, text in enumerate(FAKE_TODOS):   # added yesterday: not in the last hour's view, so a look is needed
+            client.store.add_todo(text, at=time.time() - 86_400 + i)
+        client.log_turn("20261004-070000-fakefa", "voice-1", time.time() - 7200, FAKE_MORNING[0], FAKE_MORNING[1], [],
+                        "voice")
+        client.store.flush_turns(5.0)
+    finally:
+        client.close()
+    return folder
+
+
+def ask_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[str, Any]], t0: float,
+             end_of: Any) -> list[dict[str, Any]]:
+    """leftVoice: per ask (each line after the name), from the end of its speech: the first audio Yuki played, the
+    talker's tool call and its result, and the first audio after the result (the answer itself)."""
+    rows = []
+    for i, name in enumerate(names):
+        if name == "k_name" or i >= len(lines):
+            continue
+        said_end = lines[i]["started_at"] + end_of(name) - t0
+        nxt = lines[i + 1]["started_at"] - t0 if i + 1 < len(lines) else float("inf")
+        mine = [e for e in events if said_end - 0.3 < e["t"] < nxt]
+
+        def first(kind: str, after: float = said_end, rows_: list[dict[str, Any]] = mine) -> Any:
+            return next((e for e in rows_ if e["kind"] == kind and e["t"] >= after), None)
+
+        audio = first("audio_start")
+        tool = first("mouth_tool", said_end - 0.3)
+        result = first("to_mouth", tool["t"]) if tool else None
+        answer = first("audio_start", result["t"]) if result else None
+        heard = first("user", said_end - 0.3)
+
+        def ms(e: Any) -> Any:
+            return round((e["t"] - said_end) * 1000) if e else None
+
+        rows.append({"ask": name, "heard": heard["text"] if heard else None, "transcript_ms": ms(heard),
+                     "first_audio_ms": ms(audio), "tool": tool["name"] if tool else None,
+                     "tool_args": tool.get("args") if tool else None, "tool_ms": ms(tool), "result_ms": ms(result),
+                     "answer_audio_ms": ms(answer),
+                     "said_by_code": [e["text"] for e in mine if e["kind"] == "yuki_code"],
+                     "said": [e["text"] for e in mine if e["kind"] == "yuki"]})
+    return rows
 
 
 #: Audit events that touch the disk (v3.17, D7: none may run on the voice loop's own thread).
@@ -386,6 +458,8 @@ def summary(report: dict[str, Any]) -> str:
         for row in report["endings"]:
             lines.append("ending: " + json.dumps(row, ensure_ascii=False))
         lines.append(f"quiet time after (go_quiet): {report.get('quiet_after')}")
+    for row in report.get("asks") or []:
+        lines.append("ask: " + json.dumps(row, ensure_ascii=False))
     lines.append("session timings: " + json.dumps(report["session_timings_ms"]))
     lines.append(f"mic levels: {report['mic_levels']}")
     if report.get("loop_io") is not None:
@@ -397,7 +471,7 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency", "endings"))
+    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency", "endings", "lists"))
     ap.add_argument("--clips", type=Path, required=True, help="the folder with manifest.json of the v34 clips")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--echo", default="aec", choices=("aec", "half", "none"))
@@ -415,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="v3.17: count every disk access on the voice loop's thread (where in the code, which file)")
     ap.add_argument("--db", type=Path, default=None,
                     help="v3.18: a folder with a COPY of memory (memory.db, memory.key): practice lines, hand traces")
+    ap.add_argument("--fake-memory", dest="fake_memory", action="store_true",
+                    help="leftVoice: a new memory of invented to-dos and one exchange two hours ago (lists)")
+    ap.add_argument("--asks", default="l_time,l_list",
+                    help="lists: the clips to ask, each after the name in a conversation of its own")
     ap.add_argument("--one-breath", dest="one_breath", action="store_true",
                     help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
     args = ap.parse_args(argv)

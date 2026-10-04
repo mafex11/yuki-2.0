@@ -277,7 +277,8 @@ def test_the_tool_schema_is_lean_and_the_prompt_stays_in_its_budget() -> None:
     assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) + len(VOICE_MARKS_PROMPT) <= 41_800
     assert len(MOUTH_PROMPT) + len(SPEECH_CHANNEL_PROMPT) + len(HANDS_PROMPT) <= 39_900
     # the judgement is the talker's, with a worked example of the live case; no word list decides it
-    assert 'quick_memory(action="todos") alone' in MOUTH_PROMPT and "(no look)" in MOUTH_PROMPT
+    # (leftVoice: the look is no longer "alone": a few words come first, heard while it reads)
+    assert 'or quick_memory(action="todos")' in MOUTH_PROMPT and "(no look)" in MOUTH_PROMPT
     assert "the Earlier block" in MOUTH_PROMPT
 
 
