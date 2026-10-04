@@ -67,3 +67,105 @@ def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
             os.environ.pop("YUKI_MEMORY_DIR", None)
         else:
             os.environ["YUKI_MEMORY_DIR"] = old
+
+
+# -- a pinned clock (report 76: tests that format "today"/"yesterday" failed after midnight) --------------------------
+#
+# ``pinned_clock`` (opt-in) moves the wall clock a test sees to a fixed local time of a fixed day, ticking from there:
+# ``time.time``, ``time.localtime``/``gmtime``/``strftime`` without a time, and ``datetime.now``/``today`` and
+# ``date.today`` in every loaded ``yuki`` and ``test_*`` module (their ``datetime``/``date`` names are swapped for
+# subclasses that read the pinned clock). ``time.monotonic`` and ``perf_counter`` are left alone, so timeouts and waits
+# behave. Pick the time with ``@pytest.mark.clock("00:30")`` (default noon). ``YUKI_TEST_CLOCK=HH:MM`` pins every test
+# of the run (``scripts/sweep.py --clock 00:30``): how the after-midnight failures are found.
+
+import datetime as _dt
+import sys as _sys
+import time as _time
+from dataclasses import dataclass as _dataclass
+
+PINNED_DAY = _dt.date(2026, 9, 25)   # a Friday; fixed so day names in assertions never move
+
+
+@_dataclass
+class PinnedClock:
+    """The pinned wall clock: ``now()`` (epoch seconds, ticking) and ``start`` (where it was pinned)."""
+
+    start: float
+    _mono0: float
+
+    def now(self) -> float:
+        return self.start + (_REAL_MONOTONIC() - self._mono0)
+
+
+_REAL_TIME = _time.time
+_REAL_MONOTONIC = _time.monotonic
+_REAL_LOCALTIME = _time.localtime
+_REAL_GMTIME = _time.gmtime
+_REAL_STRFTIME = _time.strftime
+_REAL_DATETIME = _dt.datetime
+_REAL_DATE = _dt.date
+
+
+def _pin(monkeypatch: pytest.MonkeyPatch, hhmm: str) -> PinnedClock:
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    start = _REAL_DATETIME.combine(PINNED_DAY, _dt.time(hour, minute)).timestamp()
+    clock = PinnedClock(start, _REAL_MONOTONIC())
+
+    class PinnedDatetime(_REAL_DATETIME):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(clock.now(), tz)
+
+        @classmethod
+        def today(cls):
+            return cls.fromtimestamp(clock.now())
+
+        @classmethod
+        def utcnow(cls):
+            return cls.fromtimestamp(clock.now(), _dt.timezone.utc).replace(tzinfo=None)
+
+    class PinnedDate(_REAL_DATE):
+        @classmethod
+        def today(cls):
+            return cls.fromtimestamp(clock.now())
+
+    monkeypatch.setattr(_time, "time", clock.now)
+    monkeypatch.setattr(_time, "localtime", lambda secs=None: _REAL_LOCALTIME(clock.now() if secs is None else secs))
+    monkeypatch.setattr(_time, "gmtime", lambda secs=None: _REAL_GMTIME(clock.now() if secs is None else secs))
+    monkeypatch.setattr(_time, "strftime", lambda fmt, t=None: _REAL_STRFTIME(fmt, _REAL_LOCALTIME(clock.now())
+                                                                              if t is None else t))
+    monkeypatch.setattr(_dt, "datetime", PinnedDatetime)
+    monkeypatch.setattr(_dt, "date", PinnedDate)
+    for name, module in list(_sys.modules.items()):
+        if module is None or not (name == "yuki" or name.startswith("yuki.") or name.split(".")[-1].startswith("test_")):
+            continue
+        attrs = getattr(module, "__dict__", {})
+        if attrs.get("datetime") is _REAL_DATETIME:
+            monkeypatch.setattr(module, "datetime", PinnedDatetime)
+        if attrs.get("date") is _REAL_DATE:
+            monkeypatch.setattr(module, "date", PinnedDate)
+    return clock
+
+
+def _clock_mark(request: pytest.FixtureRequest) -> str | None:
+    mark = request.node.get_closest_marker("clock")
+    return str(mark.args[0]) if mark is not None and mark.args else None
+
+
+@pytest.fixture()
+def pinned_clock(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> PinnedClock:
+    """The wall clock pinned to ``@pytest.mark.clock("HH:MM")`` (default noon) of :data:`PINNED_DAY`, ticking."""
+    return _pin(monkeypatch, _clock_mark(request) or "12:00")
+
+
+@pytest.fixture(autouse=True)
+def _clock_for_the_run(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """``YUKI_TEST_CLOCK=HH:MM`` (the sweep's ``--clock``) pins every test that does not pin its own."""
+    pinned = os.environ.get("YUKI_TEST_CLOCK", "").strip()
+    if pinned and "pinned_clock" not in request.fixturenames:
+        _pin(monkeypatch, pinned)
+    yield
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "clock(hhmm): the local time pinned_clock starts at (default 12:00)")
