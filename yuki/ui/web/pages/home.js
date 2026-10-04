@@ -199,7 +199,7 @@
     });
     row.classList.add('resolved');
     row.replaceChildren(h('div', { class: 'confirm res' }, ic('check'), h('span', { text: END_WORDS[how] || END_WORDS.done }),
-      row.dataset.undo ? key('Undo', { cls: 'xs ghost', data: { do: 'todo-undo' } }) : null, h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
+      row.dataset.undo ? key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen' } }) : null, h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
     Y.pop(row.firstElementChild);
     res.timer = setTimeout(() => {
       if (row.__res !== res) return;
@@ -207,10 +207,10 @@
       setTimeout(() => Y.renderMain(), 460);
     }, 5000);
   };
-  Y.actions['todo-undo'] = (t) => {
+  Y.actions['todo-reopen'] = (t) => {
     const row = t.closest('[data-cref]'), res = row && row.__res; if (!res) return;
     clearTimeout(res.timer); t.disabled = true;
-    res.p.then((first) => (first && first.ok ? Y.act('todo_undo', { ref: row.dataset.cref }) : { ok: true })).then((r) => {
+    res.p.then((first) => (first && first.ok ? Y.act('todo_reopen', { ref: row.dataset.cref }) : { ok: true })).then((r) => {
       if (r.ok) { putBack(row); Y.renderMain(); return; }
       Y.toast(r.error || 'Couldn’t put it back.', true);
       row.__res = null; row.__leaving = true; Y.leave(row);

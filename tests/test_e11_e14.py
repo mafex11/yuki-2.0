@@ -254,24 +254,8 @@ def test_a_person_row_carries_the_rhythm_figure_and_the_words_around_it(store):
     assert "rhythm" not in W.person_from_index({"name": "X", "routes": []})   # an older memory: no figure
 
 
-def test_work_shows_the_checklist_people_apps_and_goal_from_memory(store):
-    rhythm_world(store)
-    _thread(store, "Google Chrome", "chrome.exe", "a page")
-    w = _work(store, "Seed swap", ["Count the packets", "Reply on the forum"], ["RIYACLIMBS", "chrome", "seed list.xlsx"])
-    _milestone(store, w, NOW - 600)
-
-    class Mem(MemoryClient):
-        def goals(self, scope=None, statuses=("open", "unknown"), today=False, limit=30):
-            return [{"id": "G2", "thread": f"W{w}", "text": "bring 20 packets", "status": "open"},
-                    {"id": "G1", "thread": f"W{w}", "text": "an older goal", "status": "open"},
-                    {"id": "G3", "thread": None, "text": "a day goal", "status": "open"}]
-
-    data = W.build_work(Mem(store), week={"days": [], "totals": {}})
-    t = next(x for x in data["threads"] if x["title"] == "Seed swap")
-    assert t["checks"] == {"done": 1, "total": 3, "next": "Count the packets"}
-    assert t["people"] == ["Riya"] and t["apps"] == ["chrome", "seed list.xlsx"]   # the person once, by index name
-    assert t["goal"] == "bring 20 packets"
-    assert W.thread_checks({"checks": {"done": 0, "open": 0, "total": 0}}) is None
+# Work's thread cards (checklist, people, apps, goal) left the window with appTodo (4 Oct): no threads in the
+# window; memory still keeps them for the agent (tests/test_appTodo_window.py).
 
 
 def test_home_has_todays_goals_open_first_on_the_now_strip():
@@ -286,8 +270,8 @@ def test_home_has_todays_goals_open_first_on_the_now_strip():
                     {"id": "G3", "text": "", "status": "open"}]
 
     d = W.build_home(Mem(), requests_csv=None)
-    assert d["now"]["goals"] == [{"ref": "G2", "text": "finish the schedule", "status": "open", "done": False, "thread": "W3"},
-                                 {"ref": "G1", "text": "send the invoice", "status": "done", "done": True, "thread": None}]
+    assert d["now"]["goals"] == [{"ref": "G2", "text": "finish the schedule", "status": "open", "done": False},
+                                 {"ref": "G1", "text": "send the invoice", "status": "done", "done": True}]
     assert W.goals_today(object()) == []                                            # a memory without goals
 
 

@@ -1298,7 +1298,7 @@ class WebWindow:
         # the feedback round 3 (W3): Correct from your own words with its Undo
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
-        "todo_end": "a_todo_end", "todo_undo": "a_todo_undo", "todo_add": "a_todo_add",
+        "todo_end": "a_todo_end", "todo_reopen": "a_todo_reopen", "todo_add": "a_todo_add",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
@@ -1442,7 +1442,7 @@ class WebWindow:
         return {"ref": ended, "how": how, "undo": can_undo,
                 **({"until": time.time() + self.TODO_UNDO_S} if can_undo else {})}
 
-    def a_todo_undo(self, m: dict[str, Any]) -> dict[str, Any]:
+    def a_todo_reopen(self, m: dict[str, Any]) -> dict[str, Any]:
         """The Undo of a Done or Not needed on a to-do you added: memory's ``reopen_todo``; it is open again, as it was."""
         fn = getattr(self._memory(), "reopen_todo", None)
         back = fn(str(m.get("ref") or "")) if callable(fn) else None

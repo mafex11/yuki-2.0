@@ -682,7 +682,7 @@ def build() -> dict:
         # Correct from your words and its Undo (the feedback round 3); the to-do list's Done / Not needed, Undo, Add
         "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"}, "cancel_correction": {"ok": True},
         "todo_end": {"ok": True, "ref": "todo:31", "how": "done", "undo": True, "until": ago(-10 * M)},
-        "todo_undo": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40"},
+        "todo_reopen": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40"},
         "thread_days": {"ok": True, "connector": {
             "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
             "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",

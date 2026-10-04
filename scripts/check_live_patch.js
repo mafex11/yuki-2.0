@@ -562,7 +562,7 @@ async function inPage(F) {
 
   // ---- Activity: grouped by request, no Undo anywhere, a group opens to its steps ----
   await go('#activity'); await sleep(500);
-  check('A the Activity tab has no Undo', !/\bUndo\b/.test(main().textContent) && !main().querySelector('[data-until], [data-do="todo-undo"], [data-do="offer-undo"]'));
+  check('A the Activity tab has no Undo', !/\bUndo\b/.test(main().textContent) && !main().querySelector('[data-until], [data-do="todo-reopen"], [data-do="offer-undo"]'));
   const g = Array.from(main().querySelectorAll('.lgroup')).find((x) => x.querySelectorAll('.lstep').length >= 2);
   check('C actions are grouped under the request they belonged to', !!g);
   if (g) {
@@ -699,16 +699,16 @@ async function inPage(F) {
   REPLY.todo_end = (m) => ({ ok: true, ref: m.ref, how: m.how, undo: m.ref.startsWith('todo:') });
   const r0 = rowOf(list(), 'todo:29');
   r0.querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
-  check('T2 Done ends it at once (todo_end) and says so, with Undo', r0.textContent.includes('Done. It’s off your list.') && !!r0.querySelector('[data-do="todo-undo"]')
+  check('T2 Done ends it at once (todo_end) and says so, with Undo', r0.textContent.includes('Done. It’s off your list.') && !!r0.querySelector('[data-do="todo-reopen"]')
     && last('todo_end').ref === 'todo:29' && last('todo_end').how === 'done');
   await push('home', clone(FH));
   check('T2 a patch with the old data keeps it ended', r0.isConnected && r0.textContent.includes('off your list'));
-  REPLY.todo_undo = { ok: true, ref: 'todo:29' };
-  r0.querySelector('[data-do="todo-undo"]').click(); await sleep(150);
-  check('T2 Undo puts it back (todo_undo) and the row is back', last('todo_undo').ref === 'todo:29' && !!rowOf(list(), 'todo:29') && !!rowOf(list(), 'todo:29').querySelector('.td-tick'));
+  REPLY.todo_reopen = { ok: true, ref: 'todo:29' };
+  r0.querySelector('[data-do="todo-reopen"]').click(); await sleep(150);
+  check('T2 Undo puts it back (todo_reopen) and the row is back', last('todo_reopen').ref === 'todo:29' && !!rowOf(list(), 'todo:29') && !!rowOf(list(), 'todo:29').querySelector('.td-tick'));
   const r1 = rowOf(list(), 'commit:44');
   r1.querySelector('[data-do="todo-end"][data-how="not_needed"]').click(); await sleep(80);
-  check('T2 Not needed says so; a commitment has no Undo', r1.textContent.includes('Not needed. It’s off your list.') && !r1.querySelector('[data-do="todo-undo"]')
+  check('T2 Not needed says so; a commitment has no Undo', r1.textContent.includes('Not needed. It’s off your list.') && !r1.querySelector('[data-do="todo-reopen"]')
     && last('todo_end').ref === 'commit:44' && last('todo_end').how === 'not_needed');
   const h2 = clone(FH);
   h2.todos.open = [{ ref: 'todo:41', text: 'Invented to-do said by voice', title: null, from: '', due: 'due today, 6 PM', over: false, due_at: Date.now() / 1000 + 3600,
