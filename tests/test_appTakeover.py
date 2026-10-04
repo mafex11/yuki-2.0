@@ -452,8 +452,10 @@ def test_the_pause_catches_the_next_action_reads_the_screen_again_and_goes_on(tm
     paused = [e for e in events if isinstance(e, Paused)]
     assert [(p.state, p.why) for p in paused] == [("paused", "mouse"), ("resumed", "mouse")]
     assert told == [("paused", "mouse"), ("resumed", "mouse")]
-    skipped = [e for e in events if isinstance(e, ToolResult) and e.summary == PAUSED_SKIP]
-    assert len(skipped) == 1 and not skipped[0].ok
+    # caught before its step began (review F1): never shown, never run; the brain is told it was not run
+    assert not any(isinstance(e, ToolResult) and e.summary == PAUSED_SKIP for e in events)
+    assert [e.name for e in events if isinstance(e, ToolCall)].count("press") == 2
+    assert PAUSED_SKIP in seen["text"]
     assert _presses(desk) == ["playpause", "nexttrack"]          # once, after the resume
     assert "you were paused" in seen["text"] and "read again" in seen["text"]
     assert "The window in front now, read again after the pause" in seen["text"]   # the full re-read
@@ -866,5 +868,5 @@ def test_resume_pressed_before_the_request_reached_its_pause_still_reads_the_scr
     agent.on_pause = lambda state, why, s: told.append(state)
     events = _drive(agent, "play and skip")
     assert told == ["paused", "resumed"] and isinstance(events[-1], Final)
-    assert any(isinstance(e, ToolResult) and e.summary == PAUSED_SKIP for e in events)
+    assert PAUSED_SKIP in seen["text"]
     assert _presses(desk) == ["playpause", "nexttrack"] and "read again" in seen["text"]

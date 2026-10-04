@@ -561,6 +561,10 @@ class Agent:
         #: moment the user takes over, ``resumed`` / ``ended`` from the request's thread), so the island shows it while
         #: the request is still in a model call. Never raises into the request.
         self.on_pause: Any = None
+        #: Whether a takeover may pause the request now (``takeover_ok() -> bool``; ``None``: always). The desktop sets
+        #: it to "no full screen in front": in a full-screen game or video the island is hidden, so a pause could not
+        #: be seen; there the input gate's short wait before Yuki's own input stays the only yield (review F4).
+        self.takeover_ok: Any = None
         #: A pause nobody resumes ends the request after this long (s; ``Settings.takeover_idle_stop_s``).
         self.pause_timeout_s = float(getattr(self.settings, "takeover_idle_stop_s", 600.0) or 600.0)
         self._paused = threading.Event()
@@ -1014,6 +1018,13 @@ class Agent:
                 # Yuki asked something, or a send counts down on the island: the user's hand is on Yuki's card (the
                 # answer, Stop, a chip), not taking over; and for a moment after, while that hand moves on
                 return False
+            allowed = self.takeover_ok
+            if callable(allowed):
+                try:
+                    if not allowed():
+                        return False   # a full screen in front: a pause could not be seen there (the watch goes on)
+                except Exception:  # noqa: BLE001 - unknown: pause as usual
+                    pass
             self._pause_why, self._pause_at = str(why or ""), time.monotonic()
             self._pauses += 1
             self._resume_asked = False
@@ -2674,6 +2685,20 @@ class Agent:
             turn.stop_after = True
             return
 
+        if self._paused.is_set() and (name in ACTION_TOOL_NAMES or name == "say"):
+            # appTakeover (review F1, F2): the user took over before this call began: nothing of it runs or shows: no
+            # step on the island, no "can't be undone" question, no judge or second look, no send countdown and no
+            # spoken line (Yuki says nothing while paused). The rest of the response is skipped the same way.
+            turn.gated.add(tool_id)
+            turn.record(tool_id, self._skip(tool_id, name, PAUSED_SKIP))
+            if name in ACTION_TOOL_NAMES:
+                self._note_action(name, False, "not run: the user took over (paused)")
+                self._trace_step(name, tool_input, ok=False, kind="control", why="paused: the user took over",
+                                 result=PAUSED_SKIP)
+            self.logger.log("takeover", state="skipped", tool=name, tool_use_id=tool_id)
+            turn.stop_after = True
+            return
+
         # (v3.15 held a long job's done once to ask for a learned note: a whole extra model call per long job. Phase C
         # learns from the run trace instead - the distiller reads the steps themselves - so done goes out at once.)
         acts = name in ACTION_TOOL_NAMES
@@ -2708,6 +2733,11 @@ class Agent:
             yield ToolResult(name, False, text, about=step_words)
             turn.stop_after = True
             return
+        if acts and self._paused.is_set():
+            # appTakeover (review F1): the user took over while this step was being shown: none of the gates below run
+            # (no question, no judge or second look, no send countdown, nothing said)
+            yield from self._paused_skip(turn, tool_id, name, tool_input, step_words)
+            return
 
         # The loop breaker refuses a call that already failed the same way too often, and every
         # action once it has stopped the request's actions (yuki.agent.loopguard). Calls are compared
@@ -2727,6 +2757,9 @@ class Agent:
             self._trace_step(name, tool_input, ok=False, why="refused before it ran", result=refused)
             yield ToolResult(name, False, refused, about=step_words)
             turn.stop_after = True
+            return
+        if decision == "confirm" and self._paused.is_set():
+            yield from self._paused_skip(turn, tool_id, name, tool_input, step_words)   # appTakeover: never asked paused
             return
         if decision == "confirm":
             # Declared irreversible and not asked for: the user confirms first (the ask_user card).
@@ -2766,7 +2799,8 @@ class Agent:
 
         judged = None
         sends = confirmed = False
-        if acts or self._outbound_read(name):
+        if (acts and not self._paused.is_set()) or (not acts and self._outbound_read(name)):
+            # (appTakeover: an action the pause caught is not judged: it is skipped below)
             # Revamp D (S1): calls whose metadata can destroy or reach someone, and kinds the user's policy holds back,
             # pass the authorization judge, which sees only the user's own words and this call (and a fetch_url after
             # a read_file: review 34 M2).
@@ -2799,7 +2833,7 @@ class Agent:
                     signal = ("send", "a message to a person is about to be sent")
                 elif self._learning.get("actions", 0) == 0 and _close_call(self._frame):
                     signal = ("close_call", "the task frame calls two candidates a close call")
-                if signal is not None and self._consult_due(signal[0]):
+                if signal is not None and not self._paused.is_set() and self._consult_due(signal[0]):
                     advice = self._consult(signal[0], signal[1],
                                            pending=judge_call_text(name, tool_input, target=target))
                     if (advice is not None and advice.blocking and advice.verdict in ("revise", "ask_user")
@@ -2819,7 +2853,7 @@ class Agent:
                 turn.stop_after = True
                 return
 
-        if (acts and sends and not confirmed and float(self.send_countdown_s or 0) > 0
+        if (acts and sends and not confirmed and float(self.send_countdown_s or 0) > 0 and not self._paused.is_set()
                 and not self._text_approved(self._send_text(name, tool_input, target)[0])):
             # appPT: a plain send that passed the situation check and the judge shows who / where / the text for a few
             # seconds to stop or swap (the user's 3 Oct "Sending to X ... 3 s to stop"). Never when the user already
@@ -2843,15 +2877,9 @@ class Agent:
                 return
 
         if acts and self._paused.is_set():
-            # appTakeover: the user took over: no new action starts (the request waits for them after this turn). Not a
-            # failure of the call: the loop breaker and the escalation signals leave it out.
-            turn.gated.add(tool_id)
-            turn.record(tool_id, self._skip(tool_id, name, PAUSED_SKIP))
-            self._note_action(name, False, "not run: the user took over (paused)")
-            self._trace_step(name, tool_input, ok=False, kind="control", why="paused: the user took over",
-                             result=PAUSED_SKIP)
-            yield ToolResult(name, False, PAUSED_SKIP, about=step_words)
-            turn.stop_after = True
+            # appTakeover: the user took over while the gates ran: no new action starts (the request waits for them
+            # after this turn)
+            yield from self._paused_skip(turn, tool_id, name, tool_input, step_words)
             return
         if acts:
             self._acting_start()
@@ -3048,8 +3076,10 @@ class Agent:
 
         if outcome.kind == "say":
             # A progress line for the user; the run does not pause for it.
-            self.logger.log("say", text=outcome.control_input["text"], tool_use_id=tool_id)
-            yield Say(outcome.control_input["text"])
+            self.logger.log("say", text=outcome.control_input["text"], tool_use_id=tool_id,
+                            **({"held": "paused"} if self._paused.is_set() else {}))
+            if not self._paused.is_set():   # appTakeover (review F2): Yuki says nothing while the user has taken over
+                yield Say(outcome.control_input["text"])
 
         # What the view after this turn's actions should show, and whether an
         # explicit read after the last action already shows it.
@@ -3308,6 +3338,19 @@ class Agent:
         self.logger.log("heard_alias", ok=bool(row), chars=len(heard))
         return (f"Kept: \"{heard}\" is how speech recognition hears {name}; it resolves to them from now on."
                 if row else f"Not kept: memory's people index has no one called {name}.")
+
+    def _paused_skip(self, turn: _Turn, tool_id: str, name: str, tool_input: dict[str, Any],
+                     step_words: dict[str, Any]) -> Iterator[AgentEvent]:
+        """appTakeover: an action whose step was already shown, kept from running because the user took over (the
+        request waits for them after this turn). Not a failure of the call: the loop breaker and the escalation signals
+        leave it out."""
+        turn.gated.add(tool_id)
+        turn.record(tool_id, self._skip(tool_id, name, PAUSED_SKIP))
+        self._note_action(name, False, "not run: the user took over (paused)")
+        self._trace_step(name, tool_input, ok=False, kind="control", why="paused: the user took over",
+                         result=PAUSED_SKIP)
+        yield ToolResult(name, False, PAUSED_SKIP, about=step_words)
+        turn.stop_after = True
 
     def _skip(self, tool_use_id: str, name: str, text: str) -> dict[str, Any]:
         """Answer a tool that never ran, and record that in the transcript.
