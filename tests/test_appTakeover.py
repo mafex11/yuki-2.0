@@ -762,3 +762,109 @@ def test_no_still_on_it_line_while_paused_and_an_unresumed_end_is_quiet(qapp):
     assert posted == [] and armed                                  # nothing said, checked again later
     bridge._on_paused_changed("worker", 9, "ended", "keys")
     assert job.superseded and job.paused_out and not job.paused   # its end is never spoken
+
+
+# -- the tray app's wiring (a bare YukiUi: no lanes, no voice, no window) ----------------------------------------------
+
+
+def _bare_ui(qapp) -> Any:
+    from PySide6.QtCore import QObject
+
+    from yuki.ui.app import YukiUi
+    from yuki.ui.island import Island
+
+    ui = YukiUi.__new__(YukiUi)
+    QObject.__init__(ui)
+    ui.events, ui.emitted, ui.resumes = [], [], []
+    ui.ui_log = SimpleNamespace(event=lambda name, **f: ui.events.append((name, f)))
+    ui.island = Island(bindings={"voice": "ctrl+alt+y", "cancel": "alt+shift+x"})
+    ui.island.screen_state = lambda: (5, "accepts")
+    ui.window_host = SimpleNamespace(emit=ui.emitted.append, user_answer=lambda job, text: ui.emitted.append(
+        {"type": "answer", "job": job, "text": text}))
+    ui.runtime = SimpleNamespace(resume=lambda rid, words=None, by="": ui.resumes.append((rid, words, by)) or True,
+                                 paused_id=lambda: 5)
+    ui._paused_runs = set()
+    ui.island.resume_clicked.connect(ui._on_island_resume)
+    return ui
+
+
+def test_the_app_shows_the_pause_on_the_island_and_the_thread_and_resume_goes_out(qapp):
+    from yuki.ui.island import PAUSED_NOTE, RESUMED_NOTE
+
+    ui = _bare_ui(qapp)
+    try:
+        ui.island.strip.start_run(5, line="Pressing play", request="play and skip")
+        ui.island.strip.run_step(5, "Pressing play", 1)
+        ui._on_paused_changed("worker", 5, "paused", "mouse")
+        assert ui.island.state == "paused" and ui._paused_runs == {5}
+        assert ui.emitted[-1] == {"type": "said", "job": 5, "text": PAUSED_NOTE}
+        ui.island.window.k_resume.clicked.emit()
+        assert ui.resumes == [(5, None, "island")]
+        ui._on_paused_changed("worker", 5, "resumed", "mouse")
+        assert ui.island.state == "working" and ui._paused_runs == set()
+        assert ui.emitted[-1]["text"] == RESUMED_NOTE
+        ui._on_paused_changed("worker", 5, "paused", "keys")
+        ui._on_paused_changed("worker", 5, "ended", "keys")
+        assert ui.island.state == "working" and ui._paused_runs == {5}   # kept: its end line says nothing else ran
+    finally:
+        ui.island.stop()
+
+
+def test_typing_to_yuki_while_paused_resumes_with_the_words(qapp):
+    from yuki.ui.app import YukiUi
+
+    ui = _bare_ui(qapp)
+    cards: list[str] = []
+    ui._question, ui._pending_ask, ui._nudge_reply = None, None, None
+    ui.overlay = SimpleNamespace(add_card=lambda text, *a, **k: cards.append(text), expand_input=lambda: None)
+    try:
+        YukiUi._on_submitted(ui, "use the other playlist")
+        assert ui.resumes == [(5, "use the other playlist", "typed")]
+        assert ui.emitted[-1] == {"type": "answer", "job": 5, "text": "use the other playlist"} and cards
+    finally:
+        ui.island.stop()
+
+
+def test_a_paused_run_that_is_stopped_ends_saying_nothing_else_was_done(qapp):
+    from yuki.ui.app import YukiUi
+
+    finals: list[tuple] = []
+    ui = SimpleNamespace(_acting=set(), _question=None, _island_answered=lambda rid: None, _runs={},
+                         _stopped={5: "paused"}, _handed=set(), _send_stopped={}, _esc=None, _paused_runs={5},
+                         _ask_outcome=lambda *a, **k: None, _end_run=lambda rid: True, cards={},
+                         overlay=SimpleNamespace(isVisible=lambda: False, closing=False),
+                         strip=SimpleNamespace(run_id=None, show_final=lambda text, **k: finals.append((text, k))),
+                         nudges=SimpleNamespace(make_way=lambda: None, try_show=lambda: None), _settled={},
+                         ui_log=SimpleNamespace(event=lambda *a, **k: None))
+    YukiUi._settle(ui, "worker", 5, "Cancelled by the user.", tone="error")
+    assert finals[-1][0] == "Stopped. Nothing else was done." and finals[-1][1]["outcome"] == "stopped"
+    assert ui._paused_runs == set()
+
+
+def test_resume_pressed_before_the_request_reached_its_pause_still_reads_the_screen_again(tmp_path: Path):
+    """Resume came while the model call was still out (the island showed the pause at once): the caught action is not
+    run, the screen is read again, and the island is told "resumed" (never left saying paused)."""
+    from yuki.agent.loop import PAUSED_SKIP
+
+    desk = _desk()
+    watches = Watches()
+    told: list[str] = []
+    seen: dict[str, str] = {}
+
+    def second_call(params: dict) -> SimpleNamespace:
+        watches.fire("mouse")
+        assert agent.paused and agent.resume(by="island") is True
+        assert not agent.paused and agent.resume() is False      # asked once; it is going on
+        return _response(_press(1, "nexttrack"))
+
+    def third(params: dict) -> SimpleNamespace:
+        seen["text"] = _texts(params)
+        return _response(_press(2, "nexttrack"), _done())
+
+    brain = Brain([_response(_press(0, "playpause")), second_call, third, _response(_done(1))])
+    agent = _agent(brain, tmp_path, desk, watches=watches)
+    agent.on_pause = lambda state, why, s: told.append(state)
+    events = _drive(agent, "play and skip")
+    assert told == ["paused", "resumed"] and isinstance(events[-1], Final)
+    assert any(isinstance(e, ToolResult) and e.summary == PAUSED_SKIP for e in events)
+    assert _presses(desk) == ["playpause", "nexttrack"] and "read again" in seen["text"]

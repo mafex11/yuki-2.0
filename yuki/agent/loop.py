@@ -572,6 +572,7 @@ class Agent:
         self._pauses = 0
         self._stopped_paused = False
         self._pause_quiet_until = 0.0
+        self._resume_asked = False
         self._watch: Any = None
         self._pending_answer: str | None = None
         self._awaiting_answer = False
@@ -1015,6 +1016,7 @@ class Agent:
                 return False
             self._pause_why, self._pause_at = str(why or ""), time.monotonic()
             self._pauses += 1
+            self._resume_asked = False
             self._paused.set()
             self._pause_wake.clear()
         self.logger.log("takeover", state="paused", why=self._pause_why, n=self._pauses)
@@ -1033,21 +1035,26 @@ class Agent:
     def resume(self, words: str | None = None, *, by: str = "") -> bool:
         """Go on after the user took over (``by``: who asked: the island, the run card, voice, typing). ``words``: what
         they typed or said with it, added to the request as theirs (:meth:`steer`). The request reads the screen again
-        before its next step. Safe from any thread. ``False`` when it is not paused."""
+        before its next step. Safe from any thread. ``False`` when it is not paused.
+
+        The pause itself ends where the request waits (:meth:`_hold_paused`): a resume asked before the request got
+        there (Resume pressed while a model call was still out) still reads the screen again first, and the island is
+        told "resumed" from there, never left saying paused."""
         with self._pause_lock:
-            if not self._paused.is_set():
+            if not self._paused.is_set() or self._resume_asked:
                 return False
             if words and str(words).strip():
                 self.steer(str(words))
-            self._paused.clear()
+            self._resume_asked = True
             self._pause_wake.set()
         self.logger.log("takeover", state="resume_asked", by=by or None, words=bool(words and str(words).strip()))
         return True
 
     @property
     def paused(self) -> bool:
-        """Whether the request is paused because the user took over. Safe to read from any thread."""
-        return self._paused.is_set()
+        """Whether the request is paused because the user took over (and nobody asked it to go on yet). Safe to read
+        from any thread."""
+        return self._paused.is_set() and not self._resume_asked
 
     def _watch_on(self, grace_s: float = 0.0) -> None:
         """Start watching for the user taking over (once per acting stretch; never while paused). Never raises."""
@@ -1083,12 +1090,13 @@ class Agent:
         yield Paused("paused", why)
         limit = float(self.pause_timeout_s or 600.0)
         timed_out = False
-        while self._paused.is_set() and not self._cancelled.is_set():
+        while not self._resume_asked and not self._cancelled.is_set():
             left = limit - (time.monotonic() - since)
             if left <= 0:
                 timed_out = True
                 break
             self._pause_wake.wait(min(0.5, left))
+            self._pause_wake.clear()
         took = time.monotonic() - since
         self._paused_s += took
         self._waited_s += took    # the user's time, not the work's
@@ -1103,7 +1111,9 @@ class Agent:
             self._stopped_paused = True
             self.logger.log("takeover", state="stopped", why=why, seconds=round(took, 1))
             return False
-        self._paused.clear()
+        with self._pause_lock:
+            self._paused.clear()
+            self._resume_asked = False
         self.logger.log("takeover", state="resumed", why=why, seconds=round(took, 1))
         self._tell_pause("resumed", why, round(took, 1))
         yield Paused("resumed", why, round(took, 1))
@@ -1250,7 +1260,7 @@ class Agent:
         self._paused.clear()
         self._pause_wake.clear()
         self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
-        self._pause_quiet_until = 0.0
+        self._pause_quiet_until, self._resume_asked = 0.0, False
         stale = self.take_steers()
         self._pending_answer = None
         self._awaiting_answer = False
@@ -1633,6 +1643,7 @@ class Agent:
         """The request ended: withdraw the marker, if one was published. Never raises."""
         self._watch_off()
         self._paused.clear()
+        self._resume_asked = False
         token, self._acting_token = self._acting_token, None
         if token is None:
             return
