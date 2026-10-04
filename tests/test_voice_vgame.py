@@ -453,10 +453,12 @@ def _fake_session(**over: Any) -> Any:
 
     s = SimpleNamespace(settings=Settings(), log=Log(), _listener=SimpleNamespace(rescued=False), closing=False,
                         in_conversation=False, _conversation=None, call_app=None, call_evidence=None,
-                        _pending_wake=None, started=[])
+                        _pending_wake=None, started=[], _dismissed_at=None,
+                        DISMISSED_HIT_S=VoiceSession.DISMISSED_HIT_S)
     s._wake_allowed = lambda: True
     s._game_now = lambda: None
     s._call_focus = lambda: VoiceSession._call_focus(s)
+    s._said_before_dismissal = lambda at, end: VoiceSession._said_before_dismissal(s, at, end)
     s.start_conversation = lambda *a, **k: s.started.append(k)
     for k, v in over.items():
         setattr(s, k, v)

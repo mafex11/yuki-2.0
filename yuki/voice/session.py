@@ -150,11 +150,23 @@ def save_prefs(prefs: dict[str, Any], path: Path = PREFS_PATH) -> None:
         pass
 
 
+#: Window classes of the shell that may cover a monitor without a caption and are never a game (review F8): the
+#: desktop, the taskbars and perception's own list, plus the shell's CoreWindow surfaces (Start, Search, the emoji and
+#: clipboard panel; a UWP app in front is its ApplicationFrameWindow, not a bare CoreWindow).
+_SHELL_CLASSES = frozenset({
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
+    "TopLevelWindowForOverflowXamlIsland", "Shell_InputSwitchTopLevelWindow", "ForegroundStaging",
+    "MultitaskingViewFrame", "XamlExplorerHostIslandWindow", "Xaml_WindowedPopupClass", "Windows.UI.Core.CoreWindow",
+})
+
+
 def fullscreen_front() -> bool:
     """vGame: whether the window in front is full screen (a game, an F11 video), read at a wake.
 
     The shell's own report of a Direct3D full-screen app, else a window without a caption covering its whole monitor
-    that is not the desktop or the taskbar (the test memory's watcher makes, without its imports: measured 5 Oct its
+    that is not one of the shell's own (:data:`_SHELL_CLASSES`) and, unless the shell reports a full-screen app (busy or
+    presentation mode), is a user window: visible, not cloaked, not a tool window, titled (the test memory's watcher
+    makes, ``is_fullscreen_front`` with ``is_user_window``, without its imports: measured 5 Oct its
     module took ~0.3 s to import and its probe ~0.3 s on a first call, too slow for the wake's path). Win32 reads only,
     well under a millisecond; never raises."""
     import ctypes
@@ -171,12 +183,20 @@ def fullscreen_front() -> bool:
             return False
         name = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(ctypes.c_void_p(hwnd), name, 64)
-        if name.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
-            return False
+        if name.value in _SHELL_CLASSES:
+            return False   # the desktop, the taskbar, Start, Search, the emoji and clipboard panel (review F8)
         user32.GetWindowLongW.restype = ctypes.c_long
         style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), -16) & 0xFFFFFFFF   # GWL_STYLE
         if style & 0x00C00000 == 0x00C00000:   # WS_CAPTION: a normal window, maximized or not
             return False
+        if state.value not in (2, 4):   # not QUNS_BUSY / QUNS_PRESENTATION_MODE: it must be a user window (review F8,
+            ex_style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), -20) & 0xFFFFFFFF   # the watcher's own test)
+            cloaked = ctypes.c_int(0)
+            ctypes.windll.dwmapi.DwmGetWindowAttribute(ctypes.c_void_p(hwnd), 14, ctypes.byref(cloaked),
+                                                       ctypes.sizeof(cloaked))   # DWMWA_CLOAKED
+            if not user32.IsWindowVisible(ctypes.c_void_p(hwnd)) or cloaked.value or ex_style & 0x00000080 \
+                    or user32.GetWindowTextLengthW(ctypes.c_void_p(hwnd)) <= 0:   # WS_EX_TOOLWINDOW, no title
+                return False
 
         class _MonitorInfo(ctypes.Structure):
             _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
@@ -373,6 +393,12 @@ class VoiceSession(QObject):
         self.fullscreen_probe: Any = None
         #: ``(pcm, kind)``: a test's stand-in for playing the instant acknowledgement (else the conversation's speaker).
         self.play_sound: Any = None
+        #: The game in front and whether the last wake needs the name confirmed by speech recognition (set at a wake).
+        self._wake_game: str | None = None
+        self._wake_strict = False
+        #: Review F1: when the last conversation the user dismissed decided to end (monotonic): a name hit for words
+        #: from before then ("Yuki, go away" heard late) is not a new wake.
+        self._dismissed_at: float | None = None
 
     # -- vGame: focus mode (a game or a call), the name heard while talking, the instant answers ---------------------
 
@@ -404,7 +430,9 @@ class VoiceSession(QObject):
         speaker = self._speaker
         if speaker is None:
             return
-        threading.Thread(target=lambda: _quietly(speaker.write, pcm, gate=False), name="yuki-voice-ack",
+        # gate=True (review F6): it is Yuki's voice, not a tone: on speakers the echo guard treats it like her replies
+        # until the canceller has converged, so no residue of "Mm-hm" reaches speech recognition as the user's words
+        threading.Thread(target=lambda: _quietly(speaker.write, pcm, gate=True), name="yuki-voice-ack",
                          daemon=True).start()
 
     def _dismiss_cue(self) -> None:
@@ -492,6 +520,15 @@ class VoiceSession(QObject):
             # there fed that much old audio to speech recognition before the request. Use the batch instead.
             self.log.event("wake", state="name_end_ignored", drift_ms=round((wake_at - name_end) * 1000))
             name_end = None
+        self._wake_game = self._game_now()   # vGame: a full-screen game in front now (one look, at the wake)
+        # Review F2/F5: in a game or a call, or right after a goodbye, the spotter's hit alone does not make the first
+        # words said to Yuki (accidental wakes on sound-alikes; the name said in a story): the name is kept in what
+        # speech recognition hears, and the first words count as said to Yuki when it wrote the name opening them.
+        self._wake_strict = via == "wake" and bool(self._wake_game or self._call_focus() or self._after_goodbye())
+        if self._wake_strict and name_end:
+            self.log.event("wake", state="name_kept", game=bool(self._wake_game), call=self._call_focus(),
+                           after_goodbye=self._after_goodbye())
+            name_end = None
         if name_end:
             listen_from = name_end
         else:
@@ -499,7 +536,6 @@ class VoiceSession(QObject):
         self.closing = False
         if self._listener is not None and not self._name_while_talking():
             self._listener.pause()
-        self._wake_game = self._game_now()   # vGame: a full-screen game in front now (one look, at the wake)
         if self._wake_standby(via, listen_from, started, bool(name_end)):
             return True
         return self._start_cold(via, listen_from, started, bool(name_end))
@@ -1303,8 +1339,33 @@ class VoiceSession(QObject):
         end = getattr(listener, "name_end", None) if listener is not None else None
         return float(end) if end else 0.0
 
+    #: Review F1: a name hit is checked against the last dismissal for this long after it (s): the spotter runs behind
+    #: the mic by up to ~1.8 s at worst (live logs), plus the teardown.
+    DISMISSED_HIT_S = 6.0
+
+    def _said_before_dismissal(self, at: float, name_end: float) -> bool:
+        """Review F1: whether a name hit is for words said before the user dismissed the last conversation ("Yuki, go
+        away": the eager end of turn can close it before the spotter reports the name). Measured times only: where the
+        name ended (else the start of the audio batch that heard it) against when the conversation decided to end."""
+        dismissed = self._dismissed_at
+        if dismissed is None or time.monotonic() - dismissed > self.DISMISSED_HIT_S:
+            return False
+        said = name_end or at
+        return bool(said) and said < dismissed
+
+    def _note_dismissed(self, reason: str) -> None:
+        """Remember when a conversation the user dismissed decided to end (its own clock, else now)."""
+        if reason == "user_asked":
+            stopped = getattr(self._conversation, "stopped_at", None)
+            self._dismissed_at = float(stopped) if isinstance(stopped, (int, float)) and stopped else time.monotonic()
+
     def _on_wake_heard(self, at: float, heard_at: float = 0.0, name_end: float = 0.0) -> None:
         if not self._wake_allowed():
+            return
+        if self._said_before_dismissal(at, name_end):
+            # review F1: the name in "Yuki, go away" heard after the fast dismissal closed it: never a new wake
+            self.log.event("wake", state="ignored", why="before_dismissal",
+                           before_ms=round((self._dismissed_at - (name_end or at)) * 1000))
             return
         if self.in_conversation:
             if self.closing:  # the last one is tearing down: this wake starts the next one right after
@@ -1330,6 +1391,7 @@ class VoiceSession(QObject):
 
     def _on_closing(self, reason: str) -> None:
         """The conversation decided to end: listen for the name again during its teardown."""
+        self._note_dismissed(reason)   # review F1: before any hit can be kept as the next wake
         self.closing = True
         if self._listener is not None and self._wake_allowed():
             self._listener.resume()
@@ -1354,6 +1416,7 @@ class VoiceSession(QObject):
     def _on_thread_done(self, reason: str, error: str) -> None:
         if reason == "user_asked":
             self._goodbye_at = time.monotonic()
+            self._note_dismissed(reason)   # review F1 (its own stop time; the same as at closing)
         self._arm_standby(1500 if not error else 10_000)   # the next conversation waits ready for the name (v3.11)
         self._thread = None
         self._conversation = None
@@ -1362,6 +1425,9 @@ class VoiceSession(QObject):
         self._emit_devices()
         self.conversation_changed.emit(False)
         pending, self._pending_wake = self._pending_wake, None
+        if pending is not None and self._said_before_dismissal(pending[0], pending[2]):
+            self.log.event("wake", state="ignored", why="before_dismissal", pending=True)   # review F1
+            pending = None
         if self._wake_allowed():
             self._apply_wake()
         else:
@@ -1543,6 +1609,16 @@ class VoiceSession(QObject):
             else:
                 self._finish_woken(conversation, reason, error, settings)
 
+    def _wake_evidence(self, via: str, listener: Any) -> tuple[bool, bool]:
+        """``(woken_by_name, name_check)`` for a conversation starting now.
+
+        ``woken_by_name``: the spotter's own hit makes the first words said to Yuki (vGame: whether or not the name could
+        be cut from them). Not for a sound-alike the second opinion rescued, and (review F2/F5) not in a game or a call
+        or right after a goodbye (:attr:`_wake_strict`): there ``name_check`` is set instead, and the first words are
+        said to Yuki when speech recognition wrote the name opening them (the name was kept in what it hears)."""
+        woken = via == "wake" and not bool(getattr(listener, "rescued", False)) and not self._wake_strict
+        return woken, via == "wake" and not woken
+
     def _wake_standby(self, via: str, listen_from: float, started: float, name_cut: bool) -> bool:
         """Wake the dormant conversation (GUI thread): its words stream at once, the devices open alongside."""
         conversation = self._standby_conv
@@ -1553,8 +1629,7 @@ class VoiceSession(QObject):
         # be cut from them (its token times are often not the name's on a long stream: then the name is replayed too;
         # live 5 Oct 5 of 7 wakes, 4 of them in a call, lost "said to Yuki" that way)
         del name_cut
-        woken_by_name = (via == "wake" and not bool(getattr(listener, "rescued", False))
-                         and not self._after_goodbye())
+        woken_by_name, conversation.name_check = self._wake_evidence(via, listener)
         conversation.after_goodbye = via == "wake" and self._after_goodbye()
         self._wire_fast(conversation)
         if hasattr(conversation, "set_game"):
@@ -1793,8 +1868,7 @@ class VoiceSession(QObject):
             # (not when the name was a sound-alike the second opinion heard as the name: then it judges).
             listener = self._listener
             conversation.after_goodbye = via == "wake" and self._after_goodbye()
-            conversation.woken_by_name = (via == "wake" and not self._after_goodbye()   # vGame: name_cut or not
-                                          and not bool(getattr(listener, "rescued", False)))
+            conversation.woken_by_name, conversation.name_check = self._wake_evidence(via, listener)
             if facts.get("tts_note"):
                 self._thread_state.emit("starting", facts["tts_note"])
             self._conversation = conversation

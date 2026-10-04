@@ -42,9 +42,13 @@ DISMISS_PHRASES = frozenset({
 #: Of those, the ones that mean "stop that" while something runs (a task, a scroll, a hand): a dismissal only when
 #: nothing does; otherwise the talker decides (it stops the scroll or cancels the task).
 WHEN_IDLE_ONLY = frozenset({"stop", "stop it", "cancel", "never mind", "nevermind", "leave it"})
+#: Of those, the ones that also confirm an answer ("The report from yesterday?" "That's it."): a dismissal only when
+#: Yuki's last line was not a question and nothing runs (review F3, 5 Oct); otherwise the talker decides.
+WHEN_NOT_ASKED = frozenset({"that's it", "thats it", "that's all", "thats all"})
 #: Words that may stand around a dismissal without changing it ("okay okay go away", "dude, shut up", "Yuki, bye").
+#: Not "yes"/"yeah": "Yeah, that's it." confirms (review F3); "no" stays ("No, that's all." answers "anything else").
 FILLER_WORDS = frozenset({
-    "yuki", "hey", "ok", "okay", "yeah", "yes", "no", "nah", "dude", "bro", "man", "please", "just", "now",
+    "yuki", "hey", "ok", "okay", "no", "nah", "dude", "bro", "man", "please", "just", "now",
     "for now", "you", "so", "oh", "uh", "um", "and", "then", "thanks", "thank you", "alright", "all right", "sorry",
     "i said", "i just said", "already", "again", "seriously",
 })
@@ -64,12 +68,16 @@ def words(text: str) -> list[str]:
     return "".join(ch if (ch.isalnum() or ch == "'") else " " for ch in text).split()
 
 
-def dismissal(text: str, *, busy: bool = False) -> str | None:
+def dismissal(text: str, *, busy: bool = False, asked: bool = False) -> str | None:
     """The dismiss phrase ``text`` consists of (with fillers around it), or ``None`` when it is anything else.
 
-    ``busy``: something is running (a voice task, a scroll, a hand): :data:`WHEN_IDLE_ONLY` phrases are then not a
-    dismissal. Every word must belong to the vocabulary; at least one must be a dismiss phrase.
+    ``busy``: something is running (a voice task, a scroll, a hand): :data:`WHEN_IDLE_ONLY` and :data:`WHEN_NOT_ASKED`
+    phrases are then not a dismissal. ``asked``: Yuki's last line was a question: :data:`WHEN_NOT_ASKED` phrases are
+    then an answer, not a dismissal. Every word must belong to the vocabulary; at least one must be a dismiss phrase.
+    A transcript written as a question ("So that's it?") is never a command.
     """
+    if (text or "").rstrip().endswith("?"):
+        return None   # speech recognition's own punctuation: asked, not told (a fixed format)
     tokens = words(text)
     if not tokens or len(tokens) > MAX_WORDS:
         return None
@@ -78,8 +86,11 @@ def dismissal(text: str, *, busy: bool = False) -> str | None:
     while i < len(tokens):
         for k in range(min(_LONGEST, len(tokens) - i), 0, -1):
             phrase = " ".join(tokens[i:i + k])
-            if phrase in DISMISS_PHRASES and not (busy and phrase in WHEN_IDLE_ONLY):
-                found = found or phrase
+            if phrase in DISMISS_PHRASES:
+                # a phrase that is not a dismissal now ("that's all" answering her question) is neutral: another
+                # phrase in the same words may still be one ("That's all for now. Bye.")
+                if not (busy and phrase in WHEN_IDLE_ONLY) and not ((busy or asked) and phrase in WHEN_NOT_ASKED):
+                    found = found or phrase
                 i += k
                 break
             if phrase in FILLER_WORDS:
@@ -94,6 +105,28 @@ def bare_name(text: str) -> bool:
     """Whether ``text`` is the name alone ("Yuki.", "Hey Yuki?"): the user called her and has not asked yet."""
     tokens = words(text)
     return bool(tokens) and NAME in tokens and all(t == NAME or t in NAME_COMPANIONS for t in tokens)
+
+
+def name_opens(text: str) -> bool:
+    """Whether speech recognition wrote the name opening one of the sentences of ``text`` ("Yuki, pause the music.",
+    "Push B. Hey Yuki, turn it up", "Yuki."), not inside one ("I had a long talk with, uh, Yuki").
+
+    The second, independent hearing of the wake word (review F2/F5, 5 Oct): in a game, a call or right after a goodbye
+    the spotter's hit alone is not enough to treat the words as said to Yuki (accidental wakes on sound-alikes; the name
+    said in a story), so the name is kept in what recognition hears and must open what was said. Sentences are split
+    on recognition's own end punctuation (a fixed format); the companions ("hey", "okay") may come before the name."""
+    sentence: list[str] = []
+    for ch in (text or "") + ".":
+        if ch in ".?!":
+            tokens = words("".join(sentence))
+            while tokens and tokens[0] in NAME_COMPANIONS:
+                tokens.pop(0)
+            if tokens and tokens[0] == NAME:
+                return True
+            sentence = []
+        else:
+            sentence.append(ch)
+    return False
 
 
 #: The acknowledgement lines (Yuki's own voice, rendered once per voice): a request, and the name alone.
@@ -210,5 +243,5 @@ class AckVoice:
             return response.read()
 
 
-__all__ = ["DISMISS_PHRASES", "WHEN_IDLE_ONLY", "FILLER_WORDS", "ACK_LINES", "AckVoice", "dismissal", "bare_name",
-           "words", "trim", "scale"]
+__all__ = ["DISMISS_PHRASES", "WHEN_IDLE_ONLY", "WHEN_NOT_ASKED", "FILLER_WORDS", "ACK_LINES", "AckVoice", "dismissal",
+           "bare_name", "name_opens", "words", "trim", "scale"]

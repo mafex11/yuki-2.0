@@ -1564,6 +1564,9 @@ class TurnObserver:
         turn.tools.append("end_conversation" if kind == "dismiss" else "answer_name")
         self.owes_reply_since = None
         self._took_part(time.monotonic())
+        if self.state == "thinking":
+            self.set_state(self.idle_state())   # review F9: answered at once; the pill waits for the command
+        self._activity()
 
     def _quiet_turn(self) -> None:
         """The talker chose silence on the open user turn (vGame): tell the conversation, once per turn."""
@@ -2396,15 +2399,15 @@ class _Hooks:
 
     def named(self) -> bool:
         """Whether the call answers words said to Yuki by name: the first words after the wake word (the name was cut
-        from them, v3.6), or (vGame) a turn the wake word heard the name in, or the turn right after the name alone."""
+        from them, v3.6), or (vGame) a turn the wake word heard the name in, or the turn right after the name alone.
+
+        Review F4: decided for the words this call answers (the fast path's mark for the utterance), never from the
+        observer's open turn, which during a speculative call on Flux's eager end of turn is still the last one."""
         c = self.c
         call = getattr(getattr(c, "_llm", None), "_yuki_call", None)
         if call is not None and not call.user_turn:
             return False
-        turn = c.observer.turn
-        if turn is not None and turn.trigger == "user" and turn.named:
-            return True
-        return bool(c.woken_by_name and c.observer.user_turns <= 1)
+        return c._utterance_named()
 
     # -- v3.16: the speech channel and an unheard turn answered again --------------------------------------
 
@@ -2750,6 +2753,15 @@ class Conversation:
         self.on_sound: Callable[[bytes, str], None] | None = None
         #: ``()``: the user dismissed Yuki on the fast path: the end cue now (the session's); set by the session.
         self.on_dismissed: Callable[[], None] | None = None
+        #: Review F2/F5: the first words decide whether they were said to Yuki: speech recognition must have written
+        #: the name opening them (a wake in a game or a call, or right after a goodbye). Set by the session at the wake.
+        self.name_check = False
+        #: Review F4: ``(start of speech, named, how)`` of the words being finished now, set by the fast path on each
+        #: eager and final transcript (:meth:`_utterance_named`).
+        self._utterance: tuple[float, bool, str] | None = None
+        #: Review F1: when this conversation decided to end (monotonic): a name heard in words from before it is not a
+        #: new wake (the session reads it).
+        self.stopped_at: float | None = None
         self.observer.on_quiet_turn = self._quiet_turn
 
     # -- vGame: the fast path, focus mode, the name heard while talking ---------------------------------------------
@@ -2804,23 +2816,48 @@ class Conversation:
             return   # Yuki's own voice saying her name (on speakers the mic hears it), not the user calling her
         self._names.append(at)
 
-    def _named_turn(self, *, final: bool = True) -> tuple[bool, str]:
-        """Whether the user's words now were said to Yuki by measured evidence, and which: the first words after a wake
-        by name, the turn right after the name alone, or the wake word heard the name in it. ``final``: the final
-        transcript (its turn is open and counted); else the eager one (not counted yet, and nothing is used up)."""
+    def _named_turn(self, text: str = "", *, final: bool = True) -> tuple[bool, str]:
+        """Whether the user's words now (``text``) were said to Yuki by measured evidence, and which: the first words
+        after a wake by name, the turn right after the name alone, or the wake word heard the name in it. ``final``: the
+        final transcript (its turn is open and counted); else the eager one (not counted yet, and nothing is used up).
+
+        Review F2/F5 (5 Oct): in a game or a call, and right after a goodbye, the spotter's hit alone is not enough
+        (accidental wakes on sound-alikes, the name said in a story): the first words are said to Yuki when speech
+        recognition also wrote the name opening them (:attr:`name_check`, the name is kept in what it hears), and in
+        focus mode a name the spotter heard mid-conversation counts the same way."""
+        from yuki.voice.fastpath import name_opens
+
         obs = self.observer
         now = time.monotonic()
         turns = obs.user_turns if final else obs.user_turns + 1
-        if self.woken_by_name and turns <= 1:
-            return True, "wake"
+        if turns <= 1:
+            if self.woken_by_name:
+                return True, "wake"
+            if self.name_check and name_opens(text):
+                return True, "wake_confirmed"
         if now < self._name_carry_until:
             if final:
                 self._name_carry_until = 0.0
             return True, "after_name"
         start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
-        if any(start - self.NAME_BEFORE_S <= t <= now for t in self._names):
+        if any(start - self.NAME_BEFORE_S <= t <= now for t in self._names) \
+                and (not self.focus or name_opens(text)):
             return True, "spotter"
         return False, ""
+
+    def _utterance_named(self) -> bool:
+        """Review F4: whether the words being finished now were said to Yuki, for a talker call or the router that
+        answers them (a speculative one on Flux's eager end of turn included, when the observer's open turn is still the
+        last one). Set by the fast path on each transcript of the utterance; nothing set for this utterance: no."""
+        mark = self._utterance
+        start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
+        return bool(mark is not None and mark[0] == start and mark[1])
+
+    def _asked_last(self) -> bool:
+        """Review F3: Yuki's last line heard was a question (her own words, written with a question mark: a fixed
+        format), so "that's it" may be its answer, not a goodbye."""
+        said = getattr(self.observer, "last_said", None) or {}
+        return str(said.get("written") or said.get("heard") or "").rstrip().endswith("?")
 
     def _busy_for_dismiss(self) -> bool:
         """Something runs that "stop" could mean (a voice task, a scroll, a hand at work)."""
@@ -2847,20 +2884,23 @@ class Conversation:
         busy = False
         if getattr(s, "voice_fast_dismiss", True):
             busy = self._busy_for_dismiss()
-            phrase = dismissal(text, busy=busy)
+            phrase = dismissal(text, busy=busy, asked=self._asked_last())
         if phrase is not None:
             self._fast_dismiss(phrase, busy, eager=not final, text=text)
             return True
+        named, how = self._named_turn(text, final=final)
+        # review F4: the talker call and the router answering these words read this, not the observer's open turn
+        self._utterance = (float(getattr(self.observer, "_user_started_at", 0.0) or 0.0), named, how)
         if not final:
             # the acknowledgement already on the eager end of turn (~0.15 s sooner); a premature one is a backchannel
-            named, how = self._named_turn(final=False)
             if not named or not getattr(s, "voice_fast_ack", True) or not text.strip():
                 return False
             if bare_name(text):
                 return True   # the name alone is answered on its final words: no speculative talker reply to it
+            if self._eager_ack_at is not None and time.monotonic() - self._eager_ack_at < self.EAGER_ACK_S:
+                return False   # review F7: once per utterance ("open... uh... Spotify": eager, resumed, eager again)
             self._ack("request", how, eager=True)
             return False
-        named, how = self._named_turn()
         turn = self.observer.turn
         if turn is not None and turn.trigger == "user" and named:
             turn.named = True
@@ -2913,8 +2953,8 @@ class Conversation:
         ``eager``: on the eager end of turn (the turn is not open yet: its time is kept for the final words)."""
         obs = self.observer
         turn = None if eager else obs.turn
-        if obs.bot_speaking or obs.speech_pending or (self.after_goodbye and obs.user_turns <= 1):
-            return
+        if obs.bot_speaking or obs.speech_pending:
+            return   # (right after a goodbye the first words are named only when recognition heard the name open them)
         sound = self.on_sound
         pcm = self.ack.pcm(kind) if self.ack is not None else None
         now = time.monotonic()
@@ -2979,6 +3019,8 @@ class Conversation:
     def _set_stop(self, reason: str) -> None:
         if self.reason == "running":
             self.reason = reason
+        if self.stopped_at is None:
+            self.stopped_at = time.monotonic()   # review F1
         self._stop.set()
         self._activity.set()
 
@@ -4068,9 +4110,8 @@ class Conversation:
         they answer), not while a voice task is open (a follow-up routes by that task's state), not while dormant."""
         if not getattr(self.settings, "voice_router", False) or self.dormant or not getattr(call, "user_turn", False):
             return
-        turn = self.observer.turn
-        if self.focus and not (turn is not None and turn.named):
-            return   # vGame: in a game or a call only words said to Yuki by name start the thinker early
+        if self.focus and not self._utterance_named():
+            return   # vGame: in a game or a call only words said to Yuki by name start the thinker early (review F4)
         self._cancel_route()
         pending = getattr(self.bridge, "routed_job", None)
         if callable(pending) and pending() is not None:
