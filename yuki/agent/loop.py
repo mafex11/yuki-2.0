@@ -309,8 +309,18 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
     if isinstance(own, bool) and change is not None and change.get("verified") is own and change.get("why"):
         # report 58: the window read before and after the action, compared (yuki.perception.outcome)
         return own, str(change["why"])
+    if name == "launch_app" and isinstance(own, bool):
+        # appOpen F2: launch_app's own verdict is the app's own window in front (never a launcher's window)
+        return own, ("the app's own window is in front" if own else
+                     "its report says the app's own window is not in front")
     if isinstance(own, bool):
         return own, "its report says it was " + ("seen" if own else "not seen")
+    if name == "launch_app" and "verified" in details and own is None:
+        # appOpen F2: no window of the app itself yet (a game its launcher is still starting), or one nothing can
+        # recognise as its: not done, and not a failure either
+        if details.get("starting"):
+            return None, "it is still starting through its launcher: no window of the app itself yet"
+        return None, "no window it could recognise as the app's own came up in front"
     if name == "scroll" and details.get("unverifiable") == "page":
         # V6: a web page that takes no UI Automation scrolling never shows its scroll from here: expected, not trouble
         return None, finish_gate.PAGE_SCROLL_UNVERIFIABLE

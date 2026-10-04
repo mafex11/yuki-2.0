@@ -29,6 +29,7 @@ import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from typing import Iterable
 
 import psutil
 import win32con
@@ -451,6 +452,32 @@ def _covers_monitor_without_caption(hwnd: int, rect: tuple[int, int, int, int]) 
         return False
 
 
+#: Windows seen on screen as user windows by :func:`list_windows` (``{hwnd: last seen, monotonic}``), newest last,
+#: at most :data:`_SEEN_CAP`. A hidden window that is in here was on screen before (an app closed to the tray): showing
+#: it again brings back what the user had. One never seen (a tray-icon host with a caption, appOpen 5 Oct: the Riot
+#: Client's "BackgroundModeTrayIconClass") is not shown by a launch.
+_seen_on_screen: dict[int, float] = {}
+_SEEN_CAP = 4096
+_seen_lock = threading.Lock()
+
+
+def note_on_screen(hwnds: Iterable[int]) -> None:
+    """Remember these windows as seen on screen (cheap: a dict update)."""
+    now = time.monotonic()
+    with _seen_lock:
+        for hwnd in hwnds:
+            _seen_on_screen.pop(int(hwnd), None)
+            _seen_on_screen[int(hwnd)] = now
+        while len(_seen_on_screen) > _SEEN_CAP:
+            _seen_on_screen.pop(next(iter(_seen_on_screen)))
+
+
+def was_on_screen(hwnd: int) -> bool:
+    """Whether :func:`list_windows` ever saw this window on screen in this process (appOpen)."""
+    with _seen_lock:
+        return int(hwnd) in _seen_on_screen
+
+
 def list_windows() -> list[WindowInfo]:
     """All user windows in Z-order (topmost first)."""
     foreground = _user32.GetForegroundWindow()
@@ -462,6 +489,7 @@ def list_windows() -> list[WindowInfo]:
         return True
 
     win32gui.EnumWindows(_collect, None)
+    note_on_screen(handles)
 
     windows: list[WindowInfo] = []
     for hwnd in handles:

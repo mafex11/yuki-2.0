@@ -133,6 +133,13 @@ _NOOP_NOTE = (
     "or down, and offer the volume that may be the low one (the app's own player volume or the system volume, as the "
     "report names them). No other hand and no hand-off unless they say which."
 )
+#: What the talker reads when an app was handed to its launcher and its own window is not up yet (appOpen, 5 Oct).
+_STARTING_NOTE = (
+    "It is starting: its launcher took it and its own window is not up yet (a game takes a minute or two). Say that "
+    "in a few words from the report (\"It's starting, give it a minute.\"), naming what is in front instead when the "
+    "report says so; never say it is open. Do not hand it over and do not open it again: Yuki watches for its window, "
+    "and your desktop block shows it once it is up."
+)
 #: V6 (3 Oct): a hand whose effect cannot be read back by the nature of its target (a web page that does not report
 #: its scroll): done, nothing said, nothing handed over.
 _EXPECTED_NOTE = (
@@ -723,6 +730,9 @@ class Hands:
         #: :class:`yuki.voice.practice.PracticeLookup`: the learned ways the talker was offered (run_skill runs only
         #: those), set by the conversation.
         self.practice: Any = None
+        #: appOpen: the watches of openings still starting (their results, newest last) and the stop of the running one.
+        self.watched: list[dict[str, Any]] = []
+        self._watch_stop: threading.Event | None = None
         #: Traces kept (one per hand, and one per skill run), for the tests and the log.
         self.traces_queued = 0
         self._trace_n = 0
@@ -1269,7 +1279,7 @@ class Hands:
         if self.bridge is not None:
             self.bridge.busy_tools += 1
         try:
-            ok, report, facts = await asyncio.to_thread(self._run, name, args)
+            ok, report, facts = await asyncio.to_thread(self._acting_run, name, args)
         except Exception as exc:  # noqa: BLE001 - a hand's crash is a failed hand
             ok, report, facts = False, f"{type(exc).__name__}: {exc}", {}
         finally:
@@ -1324,9 +1334,15 @@ class Hands:
         # v3.18: every hand that acted is kept as a run trace for practice memory (off the loop, in order)
         if name == SKILL_HAND:
             self._trace_skill(args, ok=ok, report=report, facts=facts, ms=ms, call=params.tool_call_id)
+        elif facts.get("starting"):
+            # appOpen: the trace waits for the watch, so the learner reads the opening together with its outcome
+            self._watch_open(name, args, report=report, facts=facts, ms=ms, call=params.tool_call_id)
         elif not facts.get("refused"):
             self._trace(name, args, ok=ok, verified=verified, report=report, facts=facts, ms=ms,
                         call=params.tool_call_id)
+        if ok and facts.get("starting"):
+            await params.result_callback({"starting": report[:700], "how_to_say_it": _STARTING_NOTE})
+            return
         if confirmed and rest:
             # fx2: the rest of their request is still to do: the talker gets its turn back (run_llm) with the screen
             # as it is once it settled (the new window's items, a popup that came with it), and does the rest with
@@ -1525,6 +1541,99 @@ class Hands:
             self.log.event("hand_trace", op="queued", name=name, ok=bool(ok), verified=verified, ms=round(ms),
                            target=bool(target), app=bool(app), injected=len(shown), call=call)
 
+    def _watch_open(self, name: str, args: dict[str, Any], *, report: str, facts: dict[str, Any], ms: float,
+                    call: Any = None) -> None:
+        """appOpen F1/F3: an opening handed to a launcher whose app has no window yet. A light, bounded watch
+        (``backend.watch_launch``: one window list a second, at most ``yuki.actions.launch.WATCH_MAX_S``) on its own
+        thread reports the app's window when it shows - or what came up instead - to the shared action log, the
+        screen's step line and the log. It never speaks and never acts; a newer watch replaces it. Then the opening is
+        kept as one run of two steps (the hand, then the watch with its verdict), so practice memory's learner reads
+        the opening together with its outcome."""
+        request_id, words, shown = self._trace_ids(call)
+        started_at = time.time() - float(ms or 0) / 1000.0
+        watch = getattr(self.backend, "watch_launch", None)
+        launcher = dict(facts.get("launcher") or {})
+        previous = getattr(self, "_watch_stop", None)
+        if previous is not None:
+            previous.set()
+        stop = threading.Event()
+        self._watch_stop = stop
+        app_name = str(launcher.get("name") or args.get("name") or "it")
+
+        def run() -> None:
+            began = time.monotonic()
+            try:
+                result = watch(launcher, stop=stop) if callable(watch) else {
+                    "verified": None, "summary": "no watch on this desktop"}
+            except Exception as exc:  # noqa: BLE001 - a watch that failed says so
+                result = {"verified": None, "summary": f"the watch failed: {type(exc).__name__}"}
+            result = result if isinstance(result, dict) else {"verified": None, "summary": str(result)}
+            verdict = result.get("verified")
+            summary = str(result.get("summary") or "")
+            watch_ms = round((time.monotonic() - began) * 1000)
+            try:
+                self.actions.add("your hand", f"watched {app_name} start", summary[:400], ok=verdict is not False,
+                                 verified=verdict)
+            except Exception:  # noqa: BLE001
+                pass
+            if self.on_step is not None:
+                try:
+                    self.on_step("open_app", hand_words(name, args, result.get("process_name") or facts.get("app")),
+                                 verdict is True, summary[:400], watch_ms)
+                except Exception:  # noqa: BLE001 - the screen never breaks a hand
+                    pass
+            if self.log is not None:
+                self.log.event("hands", op="open_watch", verified=verdict, ms=watch_ms,
+                               in_front=bool(result.get("in_front")), fullscreen=bool(result.get("fullscreen")),
+                               launcher_front=bool(result.get("launcher_front")), call=call)
+            self._trace_opening(name, args, report=report, facts=facts, ms=ms, started_at=started_at,
+                                request_id=request_id, words=words, shown=shown, watch=result, watch_ms=watch_ms)
+            self.watched.append(result)
+
+        threading.Thread(target=run, name="yuki-open-watch", daemon=True).start()
+
+    def _trace_opening(self, name: str, args: dict[str, Any], *, report: str, facts: dict[str, Any], ms: float,
+                       started_at: float, request_id: str, words: list[str], shown: list[int], watch: dict[str, Any],
+                       watch_ms: float) -> None:
+        """One opening and its watch as a run of two steps (``MemoryAccess.record_run``): the hand (could not tell
+        yet: still starting) and the watch, verified when the app's own window showed, not when it did not."""
+        memory = self.memory
+        if memory is None or not callable(getattr(memory, "record_run", None)):
+            return
+        verdict = watch.get("verified")
+        shown_app = str(watch.get("process_name") or "") or None
+        steps = [
+            {"tool": "launch_app", "kind": "action", "app": None, "target": f'app "{args.get("name")}"',
+             "input": {"name": args.get("name")}, "ok": True, "verdict": None,
+             "why": "still starting: no window of it yet when the hand returned", "result": str(report or "")[:600],
+             "ms": float(ms or 0.0), "at": started_at},
+            {"tool": "launch_app", "kind": "action", "app": shown_app if verdict is True else None,
+             "target": f'app "{args.get("name")}", watched', "input": {"name": args.get("name"), "watch": True},
+             "ok": verdict is not False, "verdict": verdict,
+             "why": ("its own window showed" if verdict is True else "its own window did not show" if verdict is False
+                     else "the watch stopped before it could tell"),
+             "result": str(watch.get("summary") or "")[:600], "ms": float(watch_ms or 0.0),
+             "at": started_at + float(ms or 0) / 1000.0},
+        ]
+        ended = started_at + (float(ms or 0) + float(watch_ms or 0)) / 1000.0
+        run = {"source": "hand", "session_id": getattr(memory, "session_id", None), "request_id": request_id,
+               "lane": "voice", "at": started_at, "ended_at": ended, "words": " / ".join(words[-2:]),
+               "reply": str(watch.get("summary") or "")[:300],
+               "outcome": "final" if verdict is True else "unverified", "steps": steps,
+               "wall_s": max(0.0, ended - started_at), "app": shown_app, "injected": list(shown), "cited": []}
+
+        def write() -> None:
+            try:
+                memory.record_run(run)
+            except Exception as exc:  # noqa: BLE001 - memory never breaks a hand
+                if self.log is not None:
+                    self.log.event("hand_trace", op="error", name=name, error=type(exc).__name__)
+
+        self._queue(write)
+        if self.log is not None:
+            self.log.event("hand_trace", op="queued", name=name, ok=True, verified=verdict, ms=round(ms), steps=2,
+                           injected=len(shown))
+
     def _trace_skill(self, args: dict[str, Any], *, ok: bool, report: str, facts: dict[str, Any], ms: float,
                      call: Any = None) -> None:
         """Keep one learned way's run as a run trace: one step per action (and the look that found the screen did not
@@ -1645,6 +1754,29 @@ class Hands:
             raise _Refused(f"your last hand did not show the effect it was for ({self.halted}); your hands stay "
                            f"still until the user speaks again. Nothing was done. Tell them in a few words what the "
                            f"report showed, or hand it to the thinker with the state; never repeat it blindly")
+
+    def _acting_run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """:meth:`_run` inside memory's "Yuki is acting" marker (appOpen F3): what a hand puts on screen is recorded as
+        Yuki's doing, not the user's (5 Oct the Riot window the open_app hand brought up was logged as the user's own
+        for 107 s). Blocking, off the loop; the marker is a small file write. Sound-only hands publish nothing."""
+        memory = self.memory
+        begin = getattr(memory, "acting_begin", None) if memory is not None else None
+        token = f"voice-hand-{id(self)}-{time.monotonic_ns()}"
+        published = False
+        if callable(begin) and name not in AUDIO_HANDS:
+            words = [str(w) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
+            try:
+                published = bool(begin(token, " / ".join(words[-2:]) or name, lane="voice"))
+            except Exception:  # noqa: BLE001 - the marker never breaks a hand
+                published = False
+        try:
+            return self._run(name, args)
+        finally:
+            if published:
+                try:
+                    memory.acting_end(token)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:  # noqa: C901
         """Blocking: validate, act through the backend, verify, return ``(ok, report, facts)``."""
@@ -1809,9 +1941,23 @@ class Hands:
             if not query:
                 raise _Refused("no app name given")
             facts["sent_at"] = time.monotonic()
-            ok, report, facts = self._report(self.backend.launch_app(query), "", facts)
-            # launch_app's ok is its window found and in front, ready for input.
-            facts["verified"] = ok
+            result = self.backend.launch_app(query)
+            ok, report, facts = self._report(result, "", facts)
+            # appOpen F2 (5 Oct): launch_app says itself whether the app's own window is in front
+            # (details["verified"]); its ok is only "nothing failed". A launcher's window (the Riot Client's tray
+            # window for "open Valorant"), no window, or a window it cannot recognise is never "verified".
+            details = getattr(result, "details", None)
+            if isinstance(details, dict) and "verified" in details:
+                own = details.get("verified")
+                facts["verified"] = own if own is None else bool(own) and ok
+            else:
+                facts["verified"] = ok   # a backend that does not report it (stubs written before appOpen)
+            if _detail(result, "process_name"):
+                facts["app"] = str(_detail(result, "process_name"))
+            if ok and _detail(result, "starting") and isinstance(_detail(result, "launcher"), dict):
+                # a game handed to its launcher, no window of it yet: said as starting, nothing handed over; a light
+                # watch reports its window when it shows (or what came up instead) to the action log and the trace
+                facts.update(starting=True, settled=True, launcher=dict(_detail(result, "launcher")))
             return ok, report, facts
         if name == "open_yuki":
             # Yuki's own window (v3.15), through the tray's opener: the page is the model's choice from the enum.

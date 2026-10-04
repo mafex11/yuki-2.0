@@ -217,12 +217,16 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Start an installed app by name and bring its window to the front, waited on until it takes input. Several "
             "matches: the candidates come back instead. args are command-line arguments (a URL, file or folder); "
-            "with args it returns once the content is ready ('content ready' or 'content still not ready')."
+            "with args it returns once the content is ready ('content ready' or 'content still not ready'). A game "
+            "started through its launcher may come back still starting (not done; the launcher's own window is never "
+            "the game): call it again with wait_s to wait for the game's own window - it is never started twice."
         ),
         "input_schema": _obj(
             {
                 "query": {"type": "string", "description": "App name, e.g. 'spotify'."},
                 "args": {"type": "array", "items": {"type": "string"}},
+                "wait_s": {"type": "integer", "description": "How long to wait for its window, in seconds (default "
+                                                             "8, at most 60): for a game still starting."},
             },
             ["query"],
         ),
@@ -611,6 +615,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 #: its report (:mod:`yuki.agent.finish`), not by the model: about 40 output tokens less per finishing call. The line
 #: travels to the voice in this same field of the ``tool_call`` event (a string there, so voice v3.17's
 #: verified-result path reads it unchanged). A string sent here by an older habit counts as ``finish_words``.
+#: appOpen: the longest a launch_app call waits for a game its launcher is still starting (the thinker asks with wait_s).
+LAUNCH_WAIT_MAX_S = 60
+
 FINISHES_FIELD = "finishes_with"
 FINISHES_SCHEMA: dict[str, Any] = {
     "type": "boolean",
@@ -1469,6 +1476,7 @@ class _LazyRealBackend:
         "run_powershell",
         "open_url",
         "window_action",
+        "watch_launch",
     }
 
     def window_exists(self, hwnd: int) -> bool:
@@ -3204,12 +3212,15 @@ class Dispatcher:
     def _do_launch_app(self, tool_input: dict[str, Any]) -> ToolOutcome:
         query = self._need_str(tool_input, "query")
         args = self._opt_str_list(tool_input, "args")
+        # appOpen: a game still starting through its launcher is waited on longer when asked (bounded)
+        wait_s = max(0, min(LAUNCH_WAIT_MAX_S, self._opt_int(tool_input, "wait_s", 0)))
         # Only pass args when there are some, so a backend written before the
         # parameter existed keeps working for plain launches.
+        kwargs: dict[str, Any] = {"timeout_s": float(wait_s)} if wait_s else {}
         result = (
-            self.backend.launch_app(query, args=args)
+            self.backend.launch_app(query, args=args, **kwargs)
             if args
-            else self.backend.launch_app(query)
+            else self.backend.launch_app(query, **kwargs)
         )
         return self._from_action("launch_app", result)
 

@@ -110,7 +110,9 @@ from yuki.perception.windows import (
     hidden_main_window,
     is_user_window,
     list_windows,
+    note_on_screen,
     process_package_ids,
+    was_on_screen,
     window_info,
 )
 
@@ -467,7 +469,10 @@ def _find_app_window(identity: _AppIdentity, pids: set[int]) -> tuple[int | None
     ]
     if elsewhere:
         return elsewhere[0], "open"
-    hidden = [h for h in windows if hidden_main_window(h) and identity.owns_window(h)]
+    # appOpen (5 Oct): only a window that was on screen before (an app closed to the tray) is brought back by
+    # showing it; one never seen on screen (a tray-icon host that has a caption and a system menu, like the Riot
+    # Client's "BackgroundModeTrayIconClass") is not the app's window to show: the entry is started instead
+    hidden = [h for h in windows if hidden_main_window(h) and identity.owns_window(h) and was_on_screen(h)]
     if not hidden:
         return None, ""
 
@@ -493,6 +498,7 @@ def _show_window(hwnd: int, timeout_s: float = _SHOW_S) -> bool:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if is_user_window(hwnd):
+            note_on_screen([hwnd])
             return True
         time.sleep(_POLL_S)
     return is_user_window(hwnd)
@@ -1692,6 +1698,624 @@ def _restore_background_app(
     )
 
 
+# ---------------------------------------------------------------------------
+# Launcher entries: a Start entry that has another program start the app (appOpen, 5 Oct)
+# ---------------------------------------------------------------------------
+#: ``PKEY_Link_Arguments``: the arguments a desktop Start entry's shortcut passes to its program.
+_PKEY_LINK_ARGUMENTS = ("{436F2667-14E2-4FEB-B30A-146C53B5B674}", 100)
+#: Schemes of web links: a Start entry that is a web page opens a page in the browser (``open_url``'s job), not an
+#: app through a launcher. Parsing a fixed machine format (the URI's scheme), not judging an app.
+_WEB_SCHEMES = ("http", "https")
+#: How often the launch watches a launcher's hand-off within the call (a game's window takes seconds to minutes).
+LAUNCHER_POLL_S = 0.25
+#: The background watch (:func:`watch_launch`): how often it looks, and for how long at most. Games here took about
+#: 90 s from Play to a full-screen window (5 Oct: VALORANT 00:17:05 -> 00:18:37); light: one window list a second.
+WATCH_POLL_S = 1.0
+WATCH_MAX_S = 180.0
+#: A launch handed to a launcher this recently is not handed to it again (a second "open it" while the game is still
+#: starting waits for it instead: re-running the shortcut can raise the launcher's own "already running" prompt).
+LAUNCH_PENDING_S = 180.0
+#: Shortest squashed name that may be matched as a part of another (shorter ones only match whole).
+_NAME_PART_MIN = 4
+
+_links_lock = threading.Lock()
+_links_cache: tuple[int, dict[str, dict[str, str]]] | None = None
+_pending_lock = threading.Lock()
+_pending: dict[str, float] = {}
+_exe_names_cache: dict[str, frozenset[str]] = {}
+_proc_cache: dict[int, tuple[float, "_Proc"]] = {}
+
+#: ``(entry name) -> image names``: what practice memory learned for a Start entry (the program its app runs as),
+#: set by the tray (:func:`set_learned_images`). ``None`` here (tests, the memory service): nothing learned is read.
+_learned_images_provider = None
+
+
+def set_learned_images(provider) -> None:  # noqa: ANN001 - a callable or None
+    """Where :func:`launch_app` reads what practice memory learned an entry's app runs as (appOpen F3): a callable
+    ``(entry name) -> [image names]`` (the tray wires memory's ``launch_identities``), or ``None``."""
+    global _learned_images_provider
+    _learned_images_provider = provider
+
+
+def _learned_images(name: str) -> set[str]:
+    """Image names (lowercased, ``.exe``) learned for this entry; never raises, ``set()`` when none."""
+    provider = _learned_images_provider
+    if provider is None:
+        return set()
+    try:
+        found = provider(name) or []
+    except Exception:
+        return set()
+    out = set()
+    for image in found:
+        image = os.path.basename(str(image or "").strip()).lower()
+        if image:
+            out.add(image if image.endswith(".exe") else image + ".exe")
+    return out
+
+
+def _start_links(apps: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """``{appid: {"target", "arguments"}}`` of every desktop Start entry (one COM pass, ~0.15 s for ~250 entries,
+    cached for the Start list it was read for)."""
+    global _links_cache
+    with _links_lock:
+        if _links_cache is not None and _links_cache[0] == id(apps):
+            return _links_cache[1]
+
+    def read() -> dict[str, dict[str, str]]:
+        import pywintypes
+        from win32com.shell import shell
+
+        out: dict[str, dict[str, str]] = {}
+        for app in apps:
+            appid = app.get("appid") or ""
+            if not appid or _is_packaged(appid):
+                continue
+            try:
+                item = shell.SHCreateItemFromParsingName("shell:AppsFolder\\" + appid, None, shell.IID_IShellItem2)
+            except Exception:
+                continue
+            values = {}
+            for key, (fmtid, pid) in (("target", _PKEY_LINK_TARGET_PARSING_PATH), ("arguments", _PKEY_LINK_ARGUMENTS)):
+                try:
+                    values[key] = str(item.GetString((pywintypes.IID(fmtid), pid)) or "")
+                except Exception:
+                    values[key] = ""
+            out[appid] = values
+        return out
+
+    links, _error = _run_in_com_thread(read, timeout_s=10.0)
+    links = links or {}
+    with _links_lock:
+        _links_cache = (id(apps), links)
+    return links
+
+
+def _uri_scheme(value: str) -> str:
+    """The scheme of a URI (``steam`` of ``steam://rungameid/730``), ``""`` for anything else (a path, a drive)."""
+    if "://" not in (value or ""):
+        return ""
+    try:
+        scheme = urlsplit(value).scheme
+    except ValueError:
+        return ""
+    return scheme.lower() if len(scheme) > 1 else ""
+
+
+def _launcher_entry(chosen: dict[str, str], apps: list[dict[str, str]]) -> dict | None:
+    """Whether a Start entry has another program start its app, from facts of the entry (never which app it is).
+
+    A *launcher entry* is a desktop entry that is either
+
+    * a link (its AppID, or its shortcut's target) with a non-web scheme (``steam://rungameid/730``): the program
+      registered for that scheme takes it (Steam starts the game); or
+    * a shortcut that passes arguments to a program that another Start entry runs too (``VALORANT`` is
+      ``RiotClientServices.exe --launch-product=valorant ...``, ``Riot Client`` the same program bare). A program
+      inside the Windows folder is everybody's host (``cmd.exe /k ...``), never a launcher.
+
+    Returns:
+        ``{"kind": "link" | "shortcut", "carrier_exe", "arguments", "uri", "siblings"}`` or ``None``.
+    """
+    appid = chosen["appid"]
+    if _is_packaged(appid):
+        return None
+    links = _start_links(apps)
+    link = links.get(appid) or {}
+    target, arguments = str(link.get("target") or ""), str(link.get("arguments") or "")
+    for value in (appid, target):
+        scheme = _uri_scheme(value)
+        if scheme:
+            if scheme in _WEB_SCHEMES:
+                return None
+            return {"kind": "link", "carrier_exe": _handler_path(value), "arguments": "", "uri": value,
+                    "siblings": []}
+    if not _is_program_file(target) or not arguments.strip():
+        return None
+    windows_dir = os.path.normcase(os.environ.get("SystemRoot") or r"C:\Windows")
+    exe = os.path.normcase(os.path.abspath(target))
+    if _is_within(exe, windows_dir):
+        return None
+    siblings = sorted(
+        app["name"] for app in apps
+        if app.get("appid") != appid
+        and os.path.normcase(os.path.abspath(str((links.get(app.get("appid") or "") or {}).get("target") or "x")))
+        == exe
+    )
+    if not siblings:
+        return None
+    return {"kind": "shortcut", "carrier_exe": target, "arguments": arguments, "uri": "", "siblings": siblings}
+
+
+def _squash(text: str) -> str:
+    """Letters and digits only, lowercased: names compared without spaces, case or punctuation."""
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _exe_names(exe: str) -> frozenset[str]:
+    """The names a program file goes by, squashed: its file name's stem and its version resource's ProductName and
+    FileDescription (``VALORANT-Win64-Shipping.exe`` -> ``{"valorantwin64shipping", "valorant"}``). Cached."""
+    key = os.path.normcase(exe or "")
+    if not key:
+        return frozenset()
+    cached = _exe_names_cache.get(key)
+    if cached is not None:
+        return cached
+    names = {_squash(os.path.splitext(os.path.basename(exe))[0])}
+    try:
+        import win32api
+
+        lang, codepage = win32api.GetFileVersionInfo(exe, r"\VarFileInfo\Translation")[0]
+        for field_name in ("ProductName", "FileDescription"):
+            try:
+                value = win32api.GetFileVersionInfo(exe, rf"\StringFileInfo\{lang:04x}{codepage:04x}\{field_name}")
+            except Exception:
+                value = ""
+            names.add(_squash(value or ""))
+    except Exception:
+        pass
+    out = frozenset(n for n in names if n)
+    _exe_names_cache[key] = out
+    return out
+
+
+def _names_agree(names: frozenset[str] | set[str], entry: str) -> bool:
+    """Whether a program's names and a Start entry's name are the same name: equal once squashed, or one a part of the
+    other when that part is at least :data:`_NAME_PART_MIN` characters (``"fearstofathom"`` in ``"fearstofathom
+    episode1"``). Deterministic name matching, no list of apps."""
+    wanted = _squash(entry)
+    if not wanted:
+        return False
+    for name in names:
+        if not name:
+            continue
+        if name == wanted:
+            return True
+        if len(name) >= _NAME_PART_MIN and name in wanted:
+            return True
+        if len(wanted) >= _NAME_PART_MIN and wanted in name:
+            return True
+    return False
+
+
+class _Proc:
+    """One process's facts. ``created`` (its start time) is read only when asked: reading it is slow for protected
+    processes (0.9 s for all of them cold), and only processes under a launcher need it."""
+
+    __slots__ = ("pid", "ppid", "exe", "image", "_created")
+
+    def __init__(self, pid: int, ppid: int, exe: str, image: str, created: float | None = None) -> None:
+        self.pid, self.ppid, self.exe, self.image, self._created = pid, ppid, exe, image, created
+
+    @property
+    def created(self) -> float:
+        if self._created is None:
+            try:
+                self._created = float(psutil.Process(self.pid).create_time())
+            except Exception:
+                self._created = 0.0
+        return self._created
+
+
+def _ppid_map() -> dict[int, int]:
+    """``{pid: parent pid}`` of every process in one system snapshot (~12 ms). ``psutil.Process.ppid`` takes the same
+    snapshot per call on Windows, so asking each process apart costs a snapshot each (3.5 s for all of them)."""
+    try:
+        return dict(psutil._psplatform.ppid_map())   # noqa: SLF001 - psutil's own one-snapshot reader
+    except Exception:
+        return {}
+
+
+def _proc(pid: int, image_hint: str = "", ppids: dict[int, int] | None = None) -> _Proc | None:
+    """The facts of a running process, or ``None`` (gone, or not readable). Cached per pid; ``image_hint`` (its image
+    name as just listed) drops an entry of a pid reused since."""
+    if not pid:
+        return None
+    pid = int(pid)
+    cached = _proc_cache.get(pid)
+    if cached is not None and (not image_hint or cached[1].image == image_hint.lower()):
+        return cached[1]
+    try:
+        process = psutil.Process(pid)
+        exe = process.exe() or ""
+    except Exception:
+        exe = ""
+        process = None
+    if process is None:
+        return None
+    try:
+        image = (process.name() or os.path.basename(exe)).lower()
+    except Exception:
+        image = os.path.basename(exe).lower()
+    if ppids is not None and pid in ppids:
+        ppid = int(ppids[pid] or 0)
+    else:
+        try:
+            ppid = int(process.ppid() or 0)
+        except Exception:
+            ppid = 0
+    facts = _Proc(pid, ppid, os.path.normcase(exe), image)
+    if len(_proc_cache) > 2048:
+        _proc_cache.clear()
+    _proc_cache[pid] = (0.0, facts)
+    return facts
+
+
+def _ancestors(p: _Proc, depth: int = 8, table: dict[int, _Proc] | None = None) -> list[_Proc]:
+    """The process's parents, nearest first. ``table``: a process table read at once (:func:`_process_table`)
+    instead of one lookup per parent. A pid reused by a newer process is not taken for the parent (only checked when
+    both start times are known: reading them is slow)."""
+    out: list[_Proc] = []
+    current = p
+    for _ in range(depth):
+        if not current.ppid or current.ppid == current.pid:
+            break
+        parent = table.get(current.ppid) if table is not None else _proc(current.ppid)
+        if parent is None:
+            break
+        if parent._created and current._created and parent._created > current._created:
+            break
+        out.append(parent)
+        current = parent
+    return out
+
+
+def _process_table() -> dict[int, _Proc]:
+    """Every process at once: one parent snapshot (:func:`_ppid_map`) and the image names and paths (~35 ms)."""
+    ppids = _ppid_map()
+    table: dict[int, _Proc] = {}
+    try:
+        for process in psutil.process_iter(["pid", "name", "exe"]):
+            info = process.info
+            try:
+                pid = int(info["pid"])
+                exe = info.get("exe") or ""
+                table[pid] = _Proc(pid, int(ppids.get(pid) or 0), os.path.normcase(exe),
+                                   str(info.get("name") or os.path.basename(exe)).lower())
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return table
+    return table
+
+
+def _user_windows() -> list:
+    """The user windows on screen now (:func:`yuki.perception.windows.list_windows`)."""
+    try:
+        return list_windows()
+    except Exception:
+        return []
+
+
+def _foreground() -> int:
+    try:
+        return int(_user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _start_entry(appid: str, timeout_s: float) -> tuple[bool, str]:
+    """Start a Start entry the way the Start menu does (``shell:AppsFolder\\<AppID>``: a shortcut's own arguments, a
+    link's scheme handler). ``(ok, error)``."""
+    result = run_powershell(f"Start-Process -FilePath {_quote('shell:AppsFolder' + chr(92) + appid)}",
+                            timeout_s=timeout_s)
+    return bool(result.ok), ("" if result.ok else str(result.details.get("stderr") or result.summary))
+
+
+class _LauncherApp:
+    """What makes a process or window the app of a launcher entry, and what is only the launcher's (appOpen F1).
+
+    The *carrier* is the program that takes the launch: the shortcut's program (``RiotClientServices.exe``) or the
+    link's scheme handler (``steam.exe``). Its own windows - its tray-icon host, its client window with a Play button
+    - are **never** the app. The app is, in order:
+
+    * a window that declares the entry's own explicit AppUserModelID;
+    * a process running a program practice memory learned for this entry (``learned``: its image name);
+    * a process started under the carrier (the carrier, or a program it or this launch started, is among its
+      ancestors) whose program's names agree with the entry's name (:func:`_names_agree`: ``VALORANT-Win64-
+      Shipping.exe``'s product name is ``VALORANT``).
+
+    A window under the carrier from a process that started after the launch, whose names do not agree, is a
+    *candidate*: reported, never verified. Older ones under it are the launcher's own.
+    """
+
+    def __init__(self, name: str, appid: str, carrier_exe: str, learned: set[str] | frozenset[str] = frozenset(),
+                 uri: str = "") -> None:
+        self.name = name
+        self.appid = (appid or "").lower()
+        self.carrier_exe = os.path.normcase(os.path.abspath(carrier_exe)) if carrier_exe else ""
+        self.carrier_image = os.path.basename(self.carrier_exe).lower()
+        self.learned = {i.lower() for i in learned}
+        self.uri = uri
+        self.launched_pids: set[int] = set()
+        #: Processes under the carrier started after this (wall clock) are this launch's: candidates when their names
+        #: do not agree; older ones are the launcher's own (its client window, its helpers).
+        self.since = 0.0
+
+    def describe(self) -> dict:
+        return {"name": self.name, "appid": self.appid, "carrier_exe": self.carrier_exe,
+                "learned": sorted(self.learned), "uri": self.uri, "since": self.since}
+
+    def is_carrier(self, p: _Proc) -> bool:
+        return bool(self.carrier_exe) and p.exe == self.carrier_exe
+
+    def under_carrier(self, p: _Proc, table: dict[int, _Proc] | None = None) -> bool:
+        """The carrier itself, or started (at any depth) by it or by this launch."""
+        if self.is_carrier(p) or p.pid in self.launched_pids:
+            return True
+        return any(self.is_carrier(a) or a.pid in self.launched_pids for a in _ancestors(p, table=table))
+
+    def owns(self, p: _Proc | None, table: dict[int, _Proc] | None = None) -> str:
+        """How ``p`` is known to be the app (``""``: it is not)."""
+        if p is None:
+            return ""
+        if p.image in self.learned:
+            return "the program learned for it"
+        if self.under_carrier(p, table) and _names_agree(_exe_names(p.exe), self.name):
+            return "started under its launcher, and its program is named for it"
+        return ""
+
+    def window_how(self, hwnd: int, p: _Proc | None) -> str:
+        explicit = self.appid and not self.appid.startswith("microsoft.autogenerated.") and not _uri_scheme(self.appid)
+        if explicit and _window_appid(hwnd).lower() == self.appid:
+            return "window AppUserModelID"
+        return self.owns(p)
+
+    def _new(self, p: _Proc) -> bool:
+        return bool(self.since) and p.created >= self.since and not self.is_carrier(p)
+
+    def read(self, *, scan: bool = False) -> dict:
+        """What is there now: ``{"app": [windows], "launcher": [windows], "candidates": [windows], "foreground"}``
+        (and ``"app_procs"`` with ``scan``), each window ``{"hwnd", "title", "process_name", "pid", "fullscreen",
+        "in_front", "how"}``."""
+        foreground = _foreground()
+        app, launcher, candidates = [], [], []
+        for w in _user_windows():
+            p = _proc(w.pid, str(w.process_name or ""))
+            entry = {"hwnd": int(w.hwnd), "title": w.title, "process_name": w.process_name, "pid": int(w.pid),
+                     "fullscreen": bool(getattr(w, "is_fullscreen", False)), "in_front": int(w.hwnd) == foreground}
+            how = self.window_how(int(w.hwnd), p)
+            if how:
+                app.append({**entry, "how": how})
+            elif p is not None and self.under_carrier(p):
+                (candidates if self._new(p) else launcher).append(entry)
+        out: dict = {"app": app, "launcher": launcher, "candidates": candidates, "foreground": foreground}
+        if scan:
+            table = _process_table()
+            procs = []
+            for p in table.values():
+                how = self.owns(p, table)
+                if how:
+                    procs.append({"pid": p.pid, "image": p.image, "how": how, "since": p.created})
+            out["app_procs"] = procs
+        return out
+
+
+def _launch_pending(appid: str) -> float | None:
+    """Seconds since this entry was handed to its launcher, when that is within :data:`LAUNCH_PENDING_S`."""
+    with _pending_lock:
+        at = _pending.get(appid.lower())
+    if at is None:
+        return None
+    age = time.monotonic() - at
+    return age if age < LAUNCH_PENDING_S else None
+
+
+def _mark_pending(appid: str) -> None:
+    with _pending_lock:
+        _pending[appid.lower()] = time.monotonic()
+
+
+def _window_line(w: dict) -> str:
+    return f"hwnd {w['hwnd']} ({w['process_name']}) \"{w['title']}\"" + (", full screen" if w.get("fullscreen") else "")
+
+
+def _launcher_name(plan: dict, siblings: list[str]) -> str:
+    """How the carrier is called in a summary: its sibling entry's name (``Riot Client``), else its program file."""
+    return siblings[0] if siblings else (os.path.basename(plan.get("carrier_exe") or "") or "its launcher")
+
+
+def _starting_summary(name: str, carrier: str, state: dict, waited_s: float, *, handed: str) -> str:
+    """The plain words of a launcher launch whose app has no window yet: what took it, what is on screen instead."""
+    parts = [handed]
+    procs = state.get("app_procs") or []
+    if procs:
+        images = sorted({p["image"] for p in procs})
+        parts.append(f"{', '.join(images)} is running for it, no window of it yet")
+    else:
+        parts.append(f"no process of {name} yet")
+    front = next((w for w in state.get("launcher") or [] if w.get("in_front")), None)
+    if front is not None:
+        parts.append(f"the launcher's own window is in front: {_window_line(front)} - it may be waiting for Play, "
+                     f"an update or a sign-in; that window is {carrier}'s, not {name}")
+    for w in (state.get("candidates") or [])[:3]:
+        parts.append(f"a new window under {carrier} appeared: {_window_line(w)} - not confirmed as {name} (its "
+                     f"program is not named for it)")
+    parts.append(f"after {waited_s:.0f} s it is still starting; a game can take a minute or two to show its window")
+    return "; ".join(parts)
+
+
+def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, details: dict) -> tuple[bool, str]:
+    """Open a launcher entry's app (appOpen F1): never its launcher's windows, never its hidden tray window.
+
+    1. The app already running: its window is brought to the front (verified when it is in front), or, with no
+       window yet, the call says it is starting and does not hand the launch over again.
+    2. Handed over within :data:`LAUNCH_PENDING_S`: not handed again; waited on.
+    3. Otherwise the entry is started the way the Start menu does (``shell:AppsFolder``, the shortcut's own
+       arguments kept), and the app's window is waited for, within ``timeout_s``, at :data:`LAUNCHER_POLL_S`.
+
+    ``details`` gets ``launcher`` (what to watch, for :func:`watch_launch`), ``verified`` (True only for the app's
+    own window in front, None while it is starting), ``starting`` (no window of it yet), ``launcher_front`` and
+    ``candidates``.
+
+    Returns:
+        ``(ok, summary)``: ``ok`` is False only when starting the entry failed.
+    """
+    name = chosen["name"]
+    carrier = _launcher_name(plan, list(plan.get("siblings") or []))
+    learned = _learned_images(name)
+    app = _LauncherApp(name, chosen["appid"], plan.get("carrier_exe") or "", learned, plan.get("uri") or "")
+    app.since = time.time()
+    details["launcher"] = {**app.describe(), "carrier": carrier, "arguments": plan.get("arguments") or "",
+                           "kind": plan.get("kind")}
+    details["via"] = "launcher"
+    started = time.monotonic()
+    state = app.read(scan=True)
+    if state["app"]:
+        return _launcher_found(app, state, details, started, already=True, timeout_s=timeout_s)
+    pending = _launch_pending(chosen["appid"])
+    if state.get("app_procs") or pending is not None:
+        details["already_running"] = bool(state.get("app_procs"))
+        details["launched"] = False
+        handed = (f"{name} is already starting" if state.get("app_procs")
+                  else f"{name} was handed to {carrier} {pending:.0f} s ago, not handed again")
+    else:
+        details["already_running"] = False
+        ok, error = _start_entry(chosen["appid"], max(2.0, min(timeout_s, 15.0)))
+        details["launched"] = ok
+        if not ok:
+            details["launch_error"] = error
+            details["verified"] = False
+            return False, f"could not start {name!r} through {carrier}: {error}"
+        _mark_pending(chosen["appid"])
+        args = plan.get("arguments") or plan.get("uri") or ""
+        handed = f"started {name!r} the way the Start menu does: {carrier} took it" + (f" ({args})" if args else "")
+    deadline = started + max(0.0, timeout_s)
+    while time.monotonic() < deadline:
+        state = app.read()
+        if state["app"]:
+            return _launcher_found(app, state, details, started, already=False, timeout_s=timeout_s, lead=handed)
+        time.sleep(LAUNCHER_POLL_S)
+    state = app.read(scan=True)
+    if state["app"]:
+        return _launcher_found(app, state, details, started, already=False, timeout_s=timeout_s, lead=handed)
+    waited = time.monotonic() - started
+    details.update(starting=True, verified=None, hwnd=None, waited_ms=round(waited * 1000.0, 1),
+                   launcher_front=any(w.get("in_front") for w in state.get("launcher") or []),
+                   candidates=[{k: w[k] for k in ("hwnd", "title", "process_name")} for w in state["candidates"]],
+                   app_running=sorted({p["image"] for p in state.get("app_procs") or []}))
+    return True, _starting_summary(name, carrier, state, waited, handed=handed)
+
+
+def _launcher_found(app: _LauncherApp, state: dict, details: dict, started: float, *, already: bool,
+                    timeout_s: float, lead: str = "") -> tuple[bool, str]:
+    """The app's own window is there: bring it to the front (unless it is) and say so; verified when it is in front."""
+    w = sorted(state["app"], key=lambda x: (not x.get("in_front"), not x.get("fullscreen")))[0]
+    hwnd = w["hwnd"]
+    details.update(hwnd=hwnd, title=w["title"], process_name=w["process_name"], window_reason=w["how"],
+                   already_running=already if already else details.get("already_running", False),
+                   fullscreen=bool(w.get("fullscreen")), starting=False,
+                   waited_ms=round((time.monotonic() - started) * 1000.0, 1))
+    if w.get("in_front"):
+        details["foreground"] = True
+        forward = "it is in front" + (", full screen" if w.get("fullscreen") else "")
+    else:
+        forward = _bring_forward(hwnd, time.monotonic() + max(_FOCUS_FLOOR_S, min(timeout_s, 4.0)), details)
+    details["verified"] = bool(details.get("foreground"))
+    head = f"{app.name} is already running" if already else (lead or f"started {app.name!r}")
+    return True, f"{head}: its own window {_window_line(w)} ({w['how']}); {forward}"
+
+
+def watch_launch(launcher: dict, *, timeout_s: float = WATCH_MAX_S, poll_s: float = WATCH_POLL_S,
+                 stop: threading.Event | None = None) -> dict:
+    """Watch, lightly and for a bounded time, for a launcher entry's app window after a launch that is still starting
+    (``launch_app``'s ``details["launcher"]``). Never acts on the desktop: it reads the window list once every
+    ``poll_s`` and stops at the app's window, at ``timeout_s``, or when ``stop`` is set (a new request).
+
+    Returns:
+        ``{"verified": True | False | None, "summary", "hwnd", "process_name", "title", "fullscreen", "in_front",
+        "waited_s", ...}``: True - the app's own window showed; False - it did not within ``timeout_s`` (what is in
+        front instead is said); None - the watch was stopped first.
+    """
+    name = str(launcher.get("name") or "it")
+    carrier = str(launcher.get("carrier") or "its launcher")
+    app = _LauncherApp(name, str(launcher.get("appid") or ""), str(launcher.get("carrier_exe") or ""),
+                       set(launcher.get("learned") or ()) | _learned_images(name), str(launcher.get("uri") or ""))
+    app.since = float(launcher.get("since") or time.time())
+    started = time.monotonic()
+    deadline = started + max(0.0, float(timeout_s))
+    stopped = False
+    while True:
+        state = app.read()
+        if state["app"]:
+            w = sorted(state["app"], key=lambda x: (not x.get("in_front"), not x.get("fullscreen")))[0]
+            where = ("in front" + (", full screen" if w.get("fullscreen") else "")) if w.get("in_front") else (
+                "on screen, not in front")
+            waited = round(time.monotonic() - started, 1)
+            return {"verified": True, "summary": f"{name}'s own window is up after {waited:.0f} s: "
+                                                 f"{_window_line(w)} ({w['how']}), {where}",
+                    "hwnd": w["hwnd"], "process_name": w["process_name"], "title": w["title"],
+                    "fullscreen": bool(w.get("fullscreen")), "in_front": bool(w.get("in_front")),
+                    "waited_s": waited, "how": w["how"]}
+        if stop is not None and stop.is_set():
+            stopped = True
+            break
+        if time.monotonic() >= deadline:
+            break
+        if stop is not None:
+            if stop.wait(poll_s):
+                stopped = True
+                break
+        else:
+            time.sleep(poll_s)
+    state = app.read(scan=True)
+    waited = round(time.monotonic() - started, 1)
+    front = next((w for w in state.get("launcher") or [] if w.get("in_front")), None)
+    running = sorted({p["image"] for p in state.get("app_procs") or []})
+    base = {"hwnd": None, "process_name": front["process_name"] if front else "",
+            "title": front["title"] if front else "", "fullscreen": False, "in_front": False, "waited_s": waited,
+            "launcher_front": front is not None, "app_running": running}
+    if stopped:
+        return {**base, "verified": None, "summary": f"stopped watching for {name}'s window after {waited:.0f} s"}
+    parts = [f"no window of {name} within {waited:.0f} s"]
+    if running:
+        parts.append(f"{', '.join(running)} is running for it, with no window")
+    if front is not None:
+        parts.append(f"in front instead: {_window_line(front)}, {carrier}'s own window, not {name}")
+    for w in (state.get("candidates") or [])[:2]:
+        parts.append(f"a window under {carrier}: {_window_line(w)}, not confirmed as {name}")
+    return {**base, "verified": False, "summary": "; ".join(parts)}
+
+
+def _launch_verdict(ok: bool, details: dict) -> bool | None:
+    """``details["verified"]`` of a launch (appOpen F2): True only when a window of the app itself - recognised by
+    its identity, not "not confirmed" - came up and is in front; False when the launch failed or the page it was
+    handed is not there; None when no window of it appeared or nothing can recognise its windows. ``ok`` stays
+    "nothing failed"; callers read this for "done"."""
+    if not ok:
+        return False
+    page = details.get("page_verified")
+    if page is not None:
+        return bool(page) and bool(details.get("foreground", True))
+    if not details.get("hwnd") or not details.get("foreground"):
+        return None
+    identity = details.get("identity") if isinstance(details.get("identity"), dict) else {}
+    if identity and not identity.get("confirmable", True):
+        return None
+    if "not confirmed" in str(details.get("window_reason") or ""):
+        return None
+    return True
+
+
 def launch_app(
     query: str,
     *,
@@ -1757,6 +2381,8 @@ def launch_app(
     started = time.perf_counter()
 
     def finish(ok: bool, summary: str, details: dict) -> ActionResult:
+        if "verified" not in details:
+            details["verified"] = _launch_verdict(ok, details)
         return ActionResult(
             ok=ok,
             summary=summary,
@@ -1803,6 +2429,20 @@ def launch_app(
         "timings_ms": timings,
     }
     start_budget = max(2.0, min(timeout_s, 15.0))
+    if not arg_list:
+        # appOpen F1: a Start entry that has another program start its app (a game through its launcher) is started
+        # the way the Start menu does and only the app's own window counts - never the launcher's, never a hidden
+        # tray window of it (5 Oct: "open Valorant" showed the Riot Client's tray window and called it done)
+        try:
+            launcher = _launcher_entry(chosen, apps)
+        except Exception as exc:  # noqa: BLE001 - then it launches as any other entry
+            launcher = None
+            details["launcher_error"] = f"{type(exc).__name__}: {exc}"
+        mark("launcher")
+        if launcher is not None:
+            ok, summary = _launch_via_launcher(chosen, launcher, timeout_s, details)
+            mark("launcher_wait")
+            return finish(ok, summary, details)
     plan: dict | None = None
     if arg_list:
         details["args"] = arg_list
@@ -2469,8 +3109,8 @@ _ASSOCF_IS_PROTOCOL = 0x1000
 _HANDLER_WINDOW_S = 3.0
 
 
-def _default_handler(target: str) -> str:
-    """Lowercased image name of the program Windows opens ``target`` with, or ``""``.
+def _handler_path(target: str) -> str:
+    """The program (full path) Windows opens ``target`` with, or ``""``.
 
     Read from the shell's own association (``AssocQueryStringW``): the URL's
     scheme, ``Folder`` for a directory, else the file's extension.  A registry
@@ -2510,7 +3150,12 @@ def _default_handler(target: str) -> str:
             return ""
     except Exception:
         return ""
-    return os.path.basename(buffer.value).lower()
+    return buffer.value
+
+
+def _default_handler(target: str) -> str:
+    """Lowercased image name of the program Windows opens ``target`` with, or ``""`` (:func:`_handler_path`)."""
+    return os.path.basename(_handler_path(target)).lower()
 
 
 def open_url(
