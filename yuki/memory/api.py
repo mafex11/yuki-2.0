@@ -2488,7 +2488,9 @@ class MemoryClient:
         (``[{"call_id", "app", "process", "track_kind": "call" | "game",
         "state": "recording" | "starting" | "paused" | "off" | "unavailable" |
         "asking", "reason", "speech_s"}]``: each app's own audio, the other
-        people).
+        people). ``stall`` (report 76): a row that records but kept nothing new for ``[calls] stall_min``
+        (``{"call_id", "app", "kind", "since", "minutes", "reason": "no_audio" | "no_speech"}``) or None; the
+        island says so.
         """
         try:
             from yuki.memory.calls import CallConfig
@@ -2525,6 +2527,7 @@ class MemoryClient:
             except Exception:
                 pass
             mic, tracks = self._call_tracks(rows) if rows else (dict(off), [])
+            stall = self._call_stall(rows)
             sessions = [{"id": r.id, "app": r.app, "kind": r.kind, "status": r.status, "asking": asking(r),
                          "ended": False} for r in rows]
             card = None
@@ -2540,7 +2543,7 @@ class MemoryClient:
                          or any(t.get("state") == "recording" for t in tracks))
             if c is None:
                 return {"call": None, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
-                        "tracks": tracks, "pending_card": card}
+                        "tracks": tracks, "pending_card": card, "stall": stall}
             session_start = None
             try:   # the call session this row is in: its first row of the same hold (or merged), for the pill
                 from yuki.memory.callspans import session_start as _session_start
@@ -2567,7 +2570,7 @@ class MemoryClient:
                 "kind": c.kind,
             }
             return {"call": call, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
-                    "tracks": tracks, "pending_card": card}
+                    "tracks": tracks, "pending_card": card, "stall": stall}
         except Exception:
             return {"call": None, "recording": False, "waiting": None}
 
@@ -2597,6 +2600,23 @@ class MemoryClient:
                            "reason": t.get("reason"),
                            "speech_s": round(speech.get(("others", r.process or ""), 0.0), 1)})
         return mic, tracks
+
+    def _call_stall(self, rows: list) -> dict | None:
+        """A row going on that records but kept nothing new for a while (the call worker's measured flag in its
+        ``call_tracks`` state: ``{"call_id", "app", "kind", "since", "minutes", "reason": "no_audio" |
+        "no_speech"}``), or None. Only for one of ``rows``. Content-free."""
+        import json as _json
+
+        from yuki.memory.calls import TRACKS_STATE
+
+        try:
+            data = _json.loads(self.store.nudge_state(TRACKS_STATE) or "{}")
+        except Exception:
+            return None
+        stall = data.get("stall") if isinstance(data, dict) else None
+        if not isinstance(stall, dict) or stall.get("call_id") not in {r.id for r in rows}:
+            return None
+        return dict(stall)
 
     def _call_others(self, call_id: int) -> int | None:
         try:

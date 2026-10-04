@@ -406,6 +406,96 @@ def check_spool_disk() -> Check:
     return Check("Disk space for call audio", status, detail, fix)
 
 
+CALL_RECORDING_CHECK = "Call recording"
+
+
+def _when(ts: float) -> str:
+    """``"3 October, 8 PM"`` (``"3 October, 8:15 PM"`` off the hour): the user's natural dates."""
+    dt = datetime.fromtimestamp(ts)
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    clock = f"{hour} {dt:%p}" if dt.minute == 0 else f"{hour}:{dt:%M} {dt:%p}"
+    return f"{dt.day} {dt:%B}, {clock}"
+
+
+def check_call_recording(db: Path | None = None, *, now: float | None = None, days: float = 7.0) -> Check:
+    """Calls that show "recording" but keep nothing (report 76: three calls in a week showed "recording" for up to
+    an hour and kept nothing, silently). Read-only, content-free, from the database:
+
+    * now: the call worker's measured flag (a row records but kept nothing new for ``[calls] stall_min``);
+    * now: a row still open that the worker has not seen alive for 10 minutes while the service runs (stuck);
+    * the last ``days``: calls whose microphone recording started and ran at least ``stall_min`` but kept no piece
+      of audio on any track (a silent loss)."""
+    import json as _json
+
+    try:
+        from yuki.memory.calls import TRACKS_STATE, CallConfig
+        from yuki.memory.store import CALL_OPEN_STATUSES, default_db_path
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(CALL_RECORDING_CHECK, SKIP, "no memory database yet")
+    stall_s = CallConfig().stall_min * 60.0
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        conn.row_factory = sqlite3.Row
+        problems: list[str] = []
+        row = conn.execute("SELECT value FROM nudge_state WHERE name=?", (TRACKS_STATE,)).fetchone()
+        try:
+            stall = (_json.loads(row["value"]) or {}).get("stall") if row else None
+        except Exception:
+            stall = None
+        marks = ",".join("?" * len(CALL_OPEN_STATUSES))
+        open_rows = conn.execute(f"SELECT id, app, kind, detected_at, last_alive_at FROM calls WHERE status IN ({marks})"
+                                 " AND ended_at IS NULL", CALL_OPEN_STATUSES).fetchall()
+        if isinstance(stall, dict) and stall.get("call_id") in {r["id"] for r in open_rows}:
+            what = ("the microphone sends no sound" if stall.get("reason") == "no_audio"
+                    else "nothing new was kept")
+            problems.append(f"the {stall.get('app') or 'call'} recording shows on, but {what} for "
+                            f"{int(stall.get('minutes') or 0)} min")
+        running = True
+        try:
+            from yuki.memory.api import service_running
+
+            running = service_running(db)
+        except Exception:
+            running = True
+        for r in open_rows if running else []:
+            seen = r["last_alive_at"] if r["last_alive_at"] is not None else r["detected_at"]
+            if now - float(seen) > 600.0:
+                app = r["app"] or ""
+                what = ((f"{app} voice chat" if app else "a game's voice chat") if r["kind"] == "game"
+                        else (f"a {app} call" if app else "a call"))
+                problems.append(f"{what} from {_when(float(r['detected_at']))} is still marked "
+                                f"open, last seen {int((now - float(seen)) // 60)} min ago")
+        lost = conn.execute(
+            # how long the microphone recorded: to its last stop (a Stop pressed mid-call), else to the row's end
+            "SELECT * FROM (SELECT c.id, c.app, c.recording_started_at AS rs,"
+            " CASE WHEN c.recording_stopped_at >= c.recording_started_at THEN c.recording_stopped_at"
+            " ELSE coalesce(c.ended_at, c.last_alive_at) END AS ended"
+            " FROM calls c WHERE c.recording_started_at IS NOT NULL AND c.recording_started_at >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM call_chunks k WHERE k.call_id = c.id OR k.track_call_id = c.id))"
+            " WHERE ended - rs >= ? ORDER BY rs", (now - days * 86400.0, stall_s)).fetchall()
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, WARN, f"could not read the calls ({type(exc).__name__}: {exc})")
+    finally:
+        conn.close()
+    if lost:
+        listed = "; ".join(f"{_when(float(r['rs']))}, {r['app'] or 'a call'}, {int((r['ended'] - r['rs']) // 60)} min"
+                           for r in lost[-3:])
+        problems.append(f"{len(lost)} recorded call{'s' if len(lost) != 1 else ''} in the last {days:g} days kept "
+                        f"nothing ({listed})")
+    if not problems:
+        return Check(CALL_RECORDING_CHECK, OK, "every recording in the last week kept audio")
+    return Check(CALL_RECORDING_CHECK, WARN, "; ".join(problems),
+                 "Check that the microphone works in Windows sound settings; if it keeps happening, send "
+                 "logs\\memory-*.jsonl to whoever maintains Yuki.")
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -515,6 +605,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Wake word model", check_wake_model),
         ("Disk space for call audio", check_spool_disk),
         ("Call transcription models", check_whisper),
+        (CALL_RECORDING_CHECK, check_call_recording),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

@@ -187,6 +187,10 @@ class CallConfig:
     #: A restarted service adopts the open row of a call whose app still holds the microphone with the same
     #: ``since`` (within ``HOLD_MATCH_S``) when the row was alive at most this long ago.
     adopt_within_s: float = 600.0
+    #: A row that records (the microphone or an app track listening) but kept no new chunk for this many minutes is
+    #: flagged as stalled: logged once (``call_recording_stalled``), shown on the island and by the doctor
+    #: (report 76: three calls showed "recording" for up to an hour and kept nothing, and nobody noticed).
+    stall_min: float = 10.0
     #: An app seen showing at least this many different sites in the last ``sites_days`` is a browser: a call
     #: in it is its site's (the standing answer is kept for the site's service, not the browser).
     browser_sites: int = 2
@@ -302,6 +306,7 @@ class CallConfig:
             screen_alive_s=max(0.0, num("screen_alive_s", d.screen_alive_s)),
             alive_write_s=max(5.0, num("alive_write_s", d.alive_write_s)),
             adopt_within_s=max(0.0, num("adopt_within_s", d.adopt_within_s)),
+            stall_min=max(1.0, num("stall_min", d.stall_min)),
             browser_sites=max(2, int(num("browser_sites", d.browser_sites))),
             sites_days=max(1.0, num("sites_days", d.sites_days)),
             poll_s=max(1.0, num("poll_s", d.poll_s)),
@@ -1269,6 +1274,11 @@ class RecordingSession:
         self.opened_as: str | None = None
         self.stop_reason: str | None = None
         self.backend = None   # no speech-to-text during a call
+        #: Liveness, measured (``time.time()``): since when the source is open (None while paused), the last read
+        #: that brought any audio (silence included), and the last chunk spooled. The worker's stall flag reads them.
+        self.listening_since: float | None = None
+        self.last_audio_at: float | None = None
+        self.last_kept_at: float | None = None
 
     # -- control -------------------------------------------------------------
 
@@ -1290,11 +1300,13 @@ class RecordingSession:
                 self.device = getattr(source, "device_used", None)
                 self.opened_as = getattr(source, "opened_as", None)
                 self._source = source
+                self.listening_since = time.time()
 
     def pause(self) -> None:
         """Close the source (the microphone, or the app's audio) now; what was heard so far is still spooled."""
         with self._source_lock:
             source, self._source = self._source, None
+            self.listening_since = None
         if source is not None:
             source.stop()
             self.last_source = source   # its counters (an app track's packets and gaps) for the stop log
@@ -1336,6 +1348,7 @@ class RecordingSession:
                         self._drain.set()
                     continue
                 at, samples = got
+                self.last_audio_at = time.time()
                 for chunk in self.chunker.feed(at, samples):
                     self._spool(chunk)
             for chunk in self.chunker.flush():
@@ -1364,6 +1377,7 @@ class RecordingSession:
             self.log("error", where="calls.spool", track=tr.label, error=f"{type(exc).__name__}: {exc}")
             return
         ms = (time.perf_counter() - t0) * 1000.0
+        self.last_kept_at = time.time()
         st = self.stats
         st.chunks += 1
         st.audio_s += chunk.seconds
@@ -1851,6 +1865,8 @@ class CallWorker:
         self._capture_last: dict[str, float] = {}
         self._capture_keys: dict[int, str] = {}
         self._mic_state: dict[str, Any] = {"state": "off", "call_id": None, "reason": None}
+        #: A row that records but keeps nothing (:meth:`_check_stall`), or None.
+        self._stall: dict[str, Any] | None = None
         self._tracks_written: str | None = None
         self.paused = False
         self._event: _NamedEvent | None = None
@@ -2068,18 +2084,37 @@ class CallWorker:
             self._event.close()
             self._log("calls_stop")
 
-    def close(self, reason: str = "service_stop") -> None:
-        """End every open row (each track's last chunk is spooled), the waiting card and the capture watch."""
-        now = time.time()
+    def close(self, reason: str = "service_stop", now: float | None = None) -> None:
+        """Stop every open row's recordings (each track's last chunk is spooled), the waiting card and the capture
+        watch. On ``service_stop`` (an install, a restart from the tray, Windows shutting down) a row is **left open**
+        (:meth:`_suspend`), not ended: the service stopping is not the call ending. The next start adopts it when
+        the call goes on (:meth:`recover`: same microphone hold, within ``adopt_within_s``), else ends it at this
+        moment. Before, every install cut the call in two (call 63 on 3 Oct, and the "timer restarts" the user
+        reported). Any other reason ends the rows."""
+        now = time.time() if now is None else float(now)
         for r in self._rows():
             try:
-                self._end(r, reason, now, ask=False)
+                if reason == "service_stop":
+                    self._suspend(r, now)
+                else:
+                    self._end(r, reason, now, ask=False)
             except Exception as exc:
                 self._log("error", where="calls.close", error=f"{type(exc).__name__}: {exc}")
         self.active = self.game = None
         if self.after is not None:
             self._close_after(now, reason)
         self._sync_watch(False, now)
+
+    def _suspend(self, r: _Active, now: float) -> None:
+        """The service stops while row ``r`` goes on: its microphone and app track stop (each spools its last
+        chunk; the row's own stop reason is left for its real end), and the row stays open, alive as of ``now``,
+        for :meth:`recover` to adopt or end at the next start."""
+        if r.session is not None:
+            self._stop_recording(r, "service_stop", final=False)
+        self._stop_track(r, "service_stop")
+        self.store.update_call(r.call_id, last_alive_at=now)
+        self._log("call_suspended", call_id=r.call_id, app=r.app, call_kind=r.kind, status=r.status,
+                  held=r.key in self._held, seconds=round(now - r.detected_at, 1))
 
     def stop(self) -> None:
         self._stop.set()
@@ -2200,6 +2235,7 @@ class CallWorker:
             if self.after is not None:
                 self._close_after(now, reason)
             self._sync_audio(cfg, now)
+            self._check_stall(cfg, now)
             self._note_tracks()
             return
         cands = self._candidates(cfg, now)
@@ -2234,7 +2270,40 @@ class CallWorker:
         if self.after is not None:
             self._drive_after(cfg, now)
         self._sync_audio(cfg, now)
+        self._check_stall(cfg, now)
         self._note_tracks()
+
+    def _check_stall(self, cfg: CallConfig, now: float) -> None:
+        """Flag a row that records but keeps nothing (:attr:`CallConfig.stall_min`), measured on its open
+        recordings: the microphone it owns and every app track writing into it. Nothing is flagged while nothing
+        listens (a paused microphone already says why). ``reason`` "no_audio": the microphone's source brought no
+        audio at all (silence included) in that time, a dead capture; "no_speech": audio arrives but no chunk was
+        kept (nobody spoke, the user muted, or the gate drops everything). Logged once per stall
+        (``call_recording_stalled``) and when chunks flow again (``call_recording_flowing``); content-free."""
+        limit = cfg.stall_min * 60.0
+        stall: dict[str, Any] | None = None
+        for r in self._rows():
+            sessions = [s for s in ([r.session] + [o.track for o in self._rows() if o.track_target == r.call_id])
+                        if s is not None and s.listening_since is not None]
+            if not sessions:
+                continue
+            since = max(max(s.last_kept_at or 0.0, s.listening_since or 0.0) for s in sessions)
+            if now - since < limit:
+                continue
+            mic = r.session if r.session is not None and r.session.listening_since is not None else None
+            dead = mic is not None and now - max(mic.last_audio_at or 0.0, mic.listening_since or 0.0) >= limit
+            stall = {"call_id": r.call_id, "app": r.app, "kind": r.kind, "since": round(since, 1),
+                     "minutes": int((now - since) // 60), "reason": "no_audio" if dead else "no_speech"}
+            break
+        before = self._stall
+        if stall is not None and (before is None or (before["call_id"], before["reason"])
+                                  != (stall["call_id"], stall["reason"])):
+            self._log("call_recording_stalled", call_id=stall["call_id"], app=stall["app"], call_kind=stall["kind"],
+                      reason=stall["reason"], quiet_min=stall["minutes"])
+        elif stall is None and before is not None:
+            self._log("call_recording_flowing", call_id=before["call_id"], app=before["app"],
+                      call_kind=before["kind"], stalled_min=round((now - before["since"]) / 60.0, 1))
+        self._stall = stall
 
     def _goes_on(self, cfg: CallConfig, act: _Active, now: float) -> bool:
         """One poll of the open call's life (:class:`CallLife`); ends it (and returns False) when it is over."""
@@ -3021,6 +3090,9 @@ class CallWorker:
                         "state": r.track_state if r.track_state else "off", "reason": r.track_reason,
                         "into": r.track_target} for r in rows],
             "watch": getattr(self._watch, "mode", None) if self._watch is not None else "off",
+            # a row recording but keeping nothing (:meth:`_check_stall`): {"call_id", "app", "kind", "since",
+            # "minutes", "reason"} or None
+            "stall": dict(self._stall) if self._stall is not None else None,
         }
 
     def _note_tracks(self) -> None:
