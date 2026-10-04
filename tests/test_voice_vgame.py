@@ -232,7 +232,7 @@ def test_the_acknowledgement_plays_on_the_eager_end_of_turn_once(tmp_path: Path)
 def test_the_name_alone_is_never_acknowledged_on_its_eager_words(tmp_path: Path) -> None:
     conv, _log, sounds, _tones, _dismissed = _conversation(tmp_path)
     conv.woken_by_name = True
-    conv._fast_turn("Yuki", final=False)
+    assert conv._fast_turn("Yuki", final=False) is True   # taken: no speculative talker reply to the name alone
     assert sounds == []
 
 
@@ -348,6 +348,24 @@ def test_focus_quiet_keeps_the_conversation_while_something_is_owed(tmp_path: Pa
     turn.marker = "quiet"
     conv.observer._quiet_turn()
     assert not conv._stop.is_set() and log.of("session", state="focus_quiet_kept")
+
+
+def test_focus_quiet_keeps_a_named_turn_while_they_are_still_talking(tmp_path: Path) -> None:
+    """"Yuki, open..." (a pause Flux ends the turn on) "...Spotify": the half said to Yuki is not talk to the others."""
+    conv, log, _s, _t, _d = _conversation(tmp_path, call=True)
+    turn = _open_turn(conv, "Yuki, open")
+    turn.named = True
+    turn.tools.append("stay_quiet")
+    conv.observer.user_speaking = True
+    conv.observer._quiet_turn()
+    assert not conv._stop.is_set() and log.of("session", state="focus_quiet_kept", still_talking=True)
+    # talk to the others while they go on talking still ends it
+    conv2, _l2, _s2, _t2, _d2 = _conversation(tmp_path, call=True)
+    other = _open_turn(conv2, "nah he's lurking")
+    other.tools.append("stay_quiet")
+    conv2.observer.user_speaking = True
+    conv2.observer._quiet_turn()
+    assert conv2.reason == "not_for_yuki"
 
 
 def test_outside_focus_a_quiet_turn_changes_nothing(tmp_path: Path) -> None:

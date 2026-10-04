@@ -2854,8 +2854,11 @@ class Conversation:
         if not final:
             # the acknowledgement already on the eager end of turn (~0.15 s sooner); a premature one is a backchannel
             named, how = self._named_turn(final=False)
-            if named and getattr(s, "voice_fast_ack", True) and not bare_name(text) and text.strip():
-                self._ack("request", how, eager=True)
+            if not named or not getattr(s, "voice_fast_ack", True) or not text.strip():
+                return False
+            if bare_name(text):
+                return True   # the name alone is answered on its final words: no speculative talker reply to it
+            self._ack("request", how, eager=True)
             return False
         named, how = self._named_turn()
         turn = self.observer.turn
@@ -2952,6 +2955,11 @@ class Conversation:
                 + int(bool(self._held_pending(now))) + self._owed_pending() + int(self._scrolling_line() is not None))
         if owed:
             self.log.event("session", state="focus_quiet_kept", session=self.session, owed=int(owed))
+            return
+        if getattr(turn, "named", False) and (self.observer.user_speaking or self._user_voiced(now)):
+            # said to Yuki and they are still talking: a sentence split at a pause ("Yuki, open..." "...Spotify"), not
+            # talk to the others; the call idle decides as before
+            self.log.event("session", state="focus_quiet_kept", session=self.session, owed=0, still_talking=True)
             return
         self.log.event("session", state="focus_quiet_end", session=self.session, game=bool(self.game_app),
                        call_mode=self._call_focus, turn=getattr(turn, "n", None))
