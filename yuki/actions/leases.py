@@ -578,6 +578,8 @@ class TakeoverWatch:
             if self._far is not None:
                 if math.dist(where, self._far) >= self.move_px:
                     found = found or "mouse"
+                else:
+                    self._samples.clear()   # it came straight back: that far place was a glitch, measured from here on
                 self._far = None
             if found is None:
                 self._samples = [s for s in self._samples if t - s[0] <= self.window_s]

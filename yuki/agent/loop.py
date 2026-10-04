@@ -3756,7 +3756,8 @@ class Agent:
                 dispatcher.notices = queue.SimpleQueue()
             except Exception:  # noqa: BLE001 - a dispatcher double without the attribute
                 return
-        dispatcher.cancel_check = lambda: self._cancelled.is_set()
+        # appTakeover: a pause (the user took over) also ends a wait to send input: nothing is sent
+        dispatcher.cancel_check = lambda: self._cancelled.is_set() or self._paused.is_set()
         try:
             from yuki.agent.tools import _LazyRealBackend
 
