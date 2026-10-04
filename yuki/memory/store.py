@@ -1087,6 +1087,9 @@ class ConversationFact:
     value: str | None = None
     #: resource: the words speech recognition must hear right ("janedoe"), model-chosen.
     keyterms: list[str] = field(default_factory=list)
+    #: commitment (migration 37): when the user last put it back after it ended (Not done yet, Put it back, Undo);
+    #: memory closes it again only on evidence dated after this. ``None``: never put back.
+    reopened_at: float | None = None
 
 
 @dataclass
@@ -2957,6 +2960,14 @@ MIGRATIONS: tuple[str, ...] = (
         updated_at      REAL NOT NULL
     );
     CREATE INDEX work_items_kind ON work_items(kind, updated_at);
+    """,
+    # 37 (2026-10-04, leftMem, docs/research/revamp-2026-10-02/70-build-leftMem.md): conversation_facts.reopened_at,
+    # when the user last put an ended commitment back (the Work page's Not done yet, Put it back, Undo): memory closes
+    # it again only on evidence dated after that moment, never on what closed it before (yuki.memory.commitments).
+    # Content-free; carried to a commitment's new version. Additive only; one self-contained entry (renumber freely
+    # at a merge).
+    """
+    ALTER TABLE conversation_facts ADD COLUMN reopened_at REAL;
     """,
 )
 
@@ -5583,6 +5594,7 @@ class Store:
             title=self._dec(r["title_ciphertext"]) if "title_ciphertext" in r.keys() else None,
             value=self._dec(r["value_ciphertext"]) if "value_ciphertext" in r.keys() else None,
             keyterms=self._keyterms(r),
+            reopened_at=r["reopened_at"] if "reopened_at" in r.keys() else None,
         )
 
     def _keyterms(self, r: sqlite3.Row) -> list[str]:
@@ -5692,6 +5704,9 @@ class Store:
                 out.append((True, self._insert_cfact(conn, ch, now, batch_id)))
             elif ch.op == "UPDATE":
                 new_id = self._insert_cfact(conn, ch, now, batch_id)
+                # a commitment the user put back stays put back in its new version (migration 37)
+                conn.execute("UPDATE conversation_facts SET reopened_at=(SELECT reopened_at FROM conversation_facts"
+                             " WHERE id=?) WHERE id=?", (int(ch.fact_id), new_id))
                 self._end_cfact(conn, int(ch.fact_id), "superseded", at, now, superseded_by=new_id, note=ch.end_note)
                 out.append((True, new_id))
             elif ch.op == "INVALIDATE":
