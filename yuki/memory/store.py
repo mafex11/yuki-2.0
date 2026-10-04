@@ -6428,6 +6428,14 @@ class Store:
         )
         checkin_id = int(cur.lastrowid)
         nudge_id = None
+        if nudge is not None and nudge.text:
+            # Yuki's own internal words never reach a card (report 76; yuki.core.ownwords: the sentences that carry
+            # one go, and a card with nothing left is not written)
+            from yuki.core.ownwords import strip_internal
+
+            clean = strip_internal(nudge.text)
+            if clean != nudge.text:
+                nudge = replace(nudge, text=clean) if clean else None
         if nudge is not None:
             cur = conn.execute(
                 "INSERT INTO nudges(at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext,"

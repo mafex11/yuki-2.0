@@ -359,7 +359,10 @@ class InputGate:
             if t - started >= self.max_s:
                 return {"waited": True, "ok": False, "ms": ms, "real": last_real is not None,
                         "why": f"the user kept typing or clicking for {self.max_s:g} s"}
-            if notify is not None and not notified and t - started >= self.notify_after_s:
+            # the line says "you're typing or clicking": only when a key or a click was measured within ``quiet_s``
+            # (report 76: 15 false waits before V8), never on the input that made the gate look, whose kind is unknown
+            measured = watch.last_real is not None and watch.last_real > trigger and t - watch.last_real <= self.quiet_s
+            if notify is not None and not notified and measured and t - started >= self.notify_after_s:
                 notified = True
                 try:
                     notify(INPUT_WAIT_LINE)

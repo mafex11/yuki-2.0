@@ -936,7 +936,8 @@ def test_the_dispatcher_yields_before_global_input_and_the_loop_says_it(tmp_path
     agent = _agent(client, tmp_path, backend=desk, judge=False)
     agent.dispatcher.notices = queue.SimpleQueue()
     # (pretend key and cursor reads: a test never reads the real keyboard; the line is said at once here)
-    keys = iter([True])   # a key held down on the first look only: they were typing, then stopped
+    # a key held down on the first two looks (the first is only a baseline, report 76: the line needs a measured key)
+    keys = iter([True, True])
     agent.dispatcher.input_gate = InputGate(recent_s=1.0, quiet_s=0.05, max_s=5.0, age=lambda: next(ages, 5.0),
                                             poll_s=0.01, notify_after_s=0.0, held=lambda: next(keys, False),
                                             cursor=lambda: (1, 1))
