@@ -3,7 +3,7 @@
 // yuki/ui/web/index.html in Playwright's chrome-headless-shell (its own binary, never the user's Chrome, never a
 // visible window, a throwaway profile in %TEMP% deleted afterwards); a stub chrome.webview plays the host and pushes
 // the invented fixture (yuki/ui/web/fixtures/window.js). Every countdown line in the window is pressed for real (Work's
-// Done on a thread card, Me's Right on a fact to review and on a misheard entry), its animation is held at the start,
+// Done on a to-do, Me's Right on a fact to review and on a misheard entry), its animation is held at the start,
 // the middle and the end, and each frame is read back as pixels: how many dots, each one's width, height and place.
 // At device scales 1 and 1.5 (a 150% display). Prints one line per check and exits 1 if any failed.
 //
@@ -155,7 +155,7 @@ async function main() {
 
     // the countdowns in the window: where to go, what to press
     const CASES = [
-      { name: 'Work: Done on a thread card', page: 'work', press: '[data-cref] [data-do="thread-close"][data-how="done"]' },
+      { name: 'Work: Done on a to-do', page: 'work', press: '.todo[data-cref] [data-do="todo-end"][data-how="done"]' },
       { name: 'Me: Right on a fact to review', page: 'me', press: '.rv[data-resolve] [data-do="resolve"][data-verdict="right"]' },
       { name: 'Me: Right on a misheard entry', page: 'me', press: '[data-resolve][data-op="heard"] [data-do="resolve"]' }
     ];
