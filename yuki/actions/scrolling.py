@@ -405,6 +405,38 @@ def marker_in_page(automation: Any, page: Any, x: int, y: int, deadline: float) 
     return best
 
 
+#: An element covering at least this share of its window is the window's own surface (a frame, a renderer pane).
+WINDOW_SIZED = 0.9
+
+
+def window_sized(element: Any, hwnd: int | None) -> bool:
+    """Whether ``element`` covers at least :data:`WINDOW_SIZED` of window ``hwnd``'s rectangle. Rectangles only."""
+    if not hwnd:
+        return False
+    try:
+        import win32gui
+
+        left, top, right, bottom = win32gui.GetWindowRect(int(hwnd))
+        r = element.CurrentBoundingRectangle
+    except Exception:  # noqa: BLE001
+        return False
+    window = max(0, right - left) * max(0, bottom - top)
+    area = max(0, r.right - r.left) * max(0, r.bottom - r.top)
+    return window > 0 and area >= WINDOW_SIZED * window
+
+
+def page_below(automation: Any, element: Any) -> Any:
+    """The first page (a Document) at or below ``element``, or ``None``."""
+    try:
+        if _role(element) == PAGE_ROLE:
+            return element
+        condition = automation.CreatePropertyCondition(_P_CONTROL_TYPE, 50030)  # UIA_DocumentControlTypeId
+        found = element.FindFirst(_TREE_SCOPE_DESCENDANTS, condition)
+        return found if found else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _marker(element: Any) -> Callable[[], int | None]:
     """The top (or left) edge of ``element`` on screen, re-read each call."""
     def read() -> int | None:
@@ -463,6 +495,18 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
                                    started + budget_s * 0.5)
             shared["page_marker"] = inner is not None
             watched = inner
+        elif not page and at_point is not None and window_sized(at_point, hwnd or _root_of(x, y)):
+            # report 58: on Chromium/CEF the point answers with the renderer's whole pane (13:30 on 3 Oct: "nothing
+            # under the point moved: it did not scroll" while the page scrolled). A window-sized surface never moves,
+            # so it can show no scroll: watch inside the page below it, or nothing
+            below = page_below(automation, at_point)
+            shared["surface"] = True
+            if below is not None:
+                page = True
+                watched = marker_in_page(automation, below, x, y, started + budget_s * 0.5)
+                shared["page_marker"] = watched is not None
+            else:
+                watched = None
         shared["page"] = page
 
         def cursor() -> tuple[int, int] | None:

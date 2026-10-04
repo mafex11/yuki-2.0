@@ -616,12 +616,15 @@ def _describe_outcome(
     if page_phrase:
         parts.append(page_phrase)
     described = focus.describe() if focus is not None else "unknown"
+    # Report 58: where focus is, as a fact; never worded as a verdict on the action ("unchanged" read as "nothing
+    # happened" while the lyrics view opened and shut on 3 Oct). What the action changed in the window is the
+    # dispatcher's before/after account (yuki.perception.outcome).
     if facts["focus_changed"]:
         parts.append(f"focus now {described}")
     elif described in ("unknown", "nothing"):
-        parts.append(f"focus unchanged ({described})")
+        parts.append(f"focus: {described}")
     else:
-        parts.append(f"focus unchanged, still {described}")
+        parts.append(f"focus still on {described}")
     return "; ".join(parts), facts
 
 
@@ -1443,7 +1446,8 @@ def _describe_page_change(
     if after is None:
         return f"the page {_page_phrase(before)} could not be read afterwards", facts
     if _same_page(before, after):
-        return f"page unchanged: {_page_phrase(before)}", facts
+        # the same page title and address: a fact about the page's identity, not about its content (report 58)
+        return f"same page: {_page_phrase(before)}", facts
     if before.get("url") == after.get("url") and _titled(before) and _titled(after):
         if not after.get("url"):  # a document that is not a web page
             return (
@@ -1857,10 +1861,11 @@ def click(
         ``foreground_title_before``, ``focused_control_hwnd``, the focused
         control's ``focus_role``/``focus_name``/``focus_value``,
         ``focus_accepts_text``, and the ``focus_changed`` /
-        ``foreground_changed`` / ``foreground_title_changed`` flags.  A click
-        that hit nothing says "focus unchanged" and "page unchanged", which is
-        the signal that the coordinate was wrong; retrying the same point is
-        then pointless.
+        ``foreground_changed`` / ``foreground_title_changed`` flags.  Focus and
+        page staying put ("focus still on ...", "same page: ...") is not by
+        itself a sign that the click did nothing: a single-page app changes its
+        content under the same page and focus.  Whether the window changed is
+        the dispatcher's before/after account (report 58).
     """
     started = time.perf_counter()
     details = {
@@ -2562,10 +2567,10 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     With ``expect_hwnd`` the window must also be ready for input (see
     :func:`_refuse_unless_ready`), or nothing is sent.  Afterwards the focus is
     watched for up to :data:`_KEY_FOCUS_WATCH_S` and the result says where it is
-    now - "focus now Edit ... (takes text)" or "focus unchanged, still Document
+    now - "focus now Edit ... (takes text)" or "focus still on Document
     ..." - with the same ``focus_*``/``*_changed`` details as :func:`click`.  A
-    shortcut meant to open a text field that reports "focus unchanged" did not
-    open it (yet), and typing next would go into whatever still has focus.  Any
+    shortcut meant to open a text field that reports "focus still on" what had
+    it did not open one (yet), and typing next would go there.  Any
     new top-level window of the target process that showed meanwhile is named
     too (``details["new_windows"]``), and so is what happened to the page the
     foreground window shows (before -> after, watched for up to

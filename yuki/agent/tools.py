@@ -123,12 +123,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "look_at_window",
         "label": "Reading a window",
         "description": (
-            "Read one window's UI Automation tree: roles, names, values, click points, shortcuts, which elements act "
-            "and which patterns they support. Status ok (it answered), busy (still loading: read again shortly) or "
-            "empty. After a turn whose actions all worked, the window acted on is read for you and attached as "
-            "'Window after your actions'."
+            "Read one window's UI Automation tree: roles, names, values, states, click points, how elements act. Ids "
+            "hold while their element exists. Status ok, busy (read again shortly) or empty. After actions that "
+            "worked, the window is read for you."
         ),
-        "input_schema": _obj({"hwnd": {"type": "integer"}}, ["hwnd"]),
+        "input_schema": _obj({"hwnd": {"type": "integer"},
+                              "within": {"type": "integer", "description": "An element id: only its part, in full."}},
+                             ["hwnd"]),
     },
     {
         "name": "read_page",
@@ -1042,6 +1043,33 @@ _AUTO_VIEW_POLL_S = 0.1
 #: coarse measure the tree module uses for coverage.
 _VIEW_CELL = 32
 
+#: Report 58: the thinker's read of a window keeps up to this many elements (was 400: every 4 Oct Spotify read stopped
+#: at 324 and lost what came last); the text stays bounded by the formatter's budget, which folds long lists.
+TREE_ELEMENTS = 1000
+#: ... and a read of one part asked for in full (``look_at_window`` with ``within``) up to this many.
+WITHIN_TREE_ELEMENTS = 1500
+#: A re-read while the view after actions settles gets at least this budget (s): on 3 Oct one got 0.3 s and replaced
+#: a whole read with "these 189 elements are everything read until then".
+_REREAD_MIN_S = 1.5
+
+#: Outcome verification (report 58): around an action on a window, the window is read before (unless its events say
+#: the latest read is still current) and after; the after-read waits for the action's first event at most this long,
+#: then for the window to be quiet this long, at most the cap (s). Without events it reads at once (the input
+#: actions already watched focus and page for most of a second).
+OUTCOME_FIRST_EVENT_S = 0.6
+OUTCOME_QUIET_S = 0.25
+OUTCOME_CAP_S = 1.5
+#: Read budgets for those two reads (s).
+OUTCOME_READ_S = 2.0
+#: Lines of "what changed" put into an action's result.
+OUTCOME_LINES = 4
+#: A read of the window at most this old (s), compared with a fresh read just before the action, tells which
+#: elements were changing on their own (a clock, a progress bar), so the account leaves them out.
+REFERENCE_FRESH_S = 6.0
+#: A read stays current by the window's events for at most this long (s): past it the window is read again
+#: (report 58 review, F4: a provider may move content without any event Yuki subscribes to).
+REUSE_MAX_S = 2.0
+
 
 def effective_screenshot_policy(policy: str | None = None) -> str:
     """The screenshot policy in force, resolving ``None`` from :class:`Settings`.
@@ -1682,51 +1710,16 @@ def _shown_as(element: Any) -> tuple:
 
 
 def carry_ids(previous: dict[int, Any], elements: list[Any], ceiling: int) -> tuple[dict[int, int], int]:
-    """Ids for a new read of a window that keep the previous read's ids for the same elements (v3.15).
-
-    Matched by structure only: the same role and name under the same (already matched) parent, else a named
-    element whose role and name are unique among the unmatched; among unnamed look-alikes, the nearest by
-    position. Everything else gets an id above ``ceiling`` (never one used before in this window's reads), so an
-    id the model holds from an earlier read either still means the same element or is gone.
+    """Ids for a new read of a window that keep the previous read's ids for the same elements (v3.15; report 58:
+    by RuntimeId first, then AutomationId, then structure - :func:`yuki.perception.model.carry_refs`). Everything
+    else gets an id above ``ceiling`` (never one used before in this window's reads), so an id the model holds from
+    an earlier read either still means the same element or is gone.
 
     Returns ``(new read's id -> carried id, new ceiling)``.
     """
-    by_place: dict[tuple, list[int]] = {}
-    by_name: dict[tuple, list[int]] = {}
-    for old_id in sorted(previous):
-        old = previous[old_id]
-        role, name = _field(old, "role"), _field(old, "name") or ""
-        by_place.setdefault((role, name, _field(old, "parent", -1)), []).append(old_id)
-        if name:
-            by_name.setdefault((role, name), []).append(old_id)
-    used: set[int] = set()
-    mapping: dict[int, int] = {}
-    top = ceiling
-    for element in elements:
-        own = _field(element, "id")
-        parent = _field(element, "parent", -1)
-        parent = mapping.get(parent, -1) if isinstance(parent, int) and parent >= 0 else -1
-        role, name = _field(element, "role"), _field(element, "name") or ""
-        free = [i for i in by_place.get((role, name, parent), ()) if i not in used]
-        if not free and name:
-            free = [i for i in by_name.get((role, name), ()) if i not in used]
-            free = free if len(free) == 1 else []
-        if len(free) > 1:
-            cx, cy = (tuple(_field(element, "center") or (0, 0)) + (0, 0))[:2]
+    from yuki.perception.model import carry_refs
 
-            def distance(i: int) -> float:
-                ox, oy = (tuple(_field(previous[i], "center") or (0, 0)) + (0, 0))[:2]
-                return abs(ox - cx) + abs(oy - cy)
-
-            free.sort(key=distance)
-        if free:
-            carried = free[0]
-        else:
-            top += 1
-            carried = top
-        used.add(carried)
-        mapping[own] = carried
-    return mapping, max(top, max(mapping.values(), default=ceiling))
+    return carry_refs(previous, elements, ceiling)
 
 
 @dataclass
@@ -1791,10 +1784,12 @@ class Dispatcher:
         *,
         screenshot_policy: str = "never",
         tool_timeout_s: float = 20.0,
-        max_tree_elements: int = 400,
+        max_tree_elements: int = TREE_ELEMENTS,
         tree_timeout_s: float = 6.0,
+        verify_outcomes: bool | None = None,
     ) -> None:
         self.backend = backend if backend is not None else default_backend()
+        self._verify_choice = verify_outcomes
         self.screenshot_policy = screenshot_policy
         self.tool_timeout_s = tool_timeout_s
         self.max_tree_elements = max_tree_elements
@@ -1808,6 +1803,25 @@ class Dispatcher:
         #: any of them used (a new element never reuses an id).
         self._id_lineage: dict[int, set[int]] = {}
         self._id_ceiling: dict[int, int] = {}
+        #: hwnd -> the window's screen model (report 58): ids carried across every read of it by RuntimeId, then
+        #: AutomationId, then structure, and what each id was once it is gone (yuki.perception.model.WindowModel).
+        self._models: dict[int, Any] = {}
+        #: The latest read handed to the model, as the backend's own tree object with its ids carried.
+        self.last_tree: Any = None
+        #: Report 58: compare the window before and after each click, key and scroll and say what changed (on for
+        #: the real desktop; a stub desk turns it on to test it). ``events``: the UI Automation event hub that says
+        #: whether a read is still current and when a window has settled (yuki.perception.events; the process's
+        #: shared one on the real desktop, None: reads instead).
+        self.verify_outcomes = (isinstance(self.backend, _LazyRealBackend) if self._verify_choice is None
+                                else bool(self._verify_choice))
+        #: Whether reads use the event hub: unset, it follows ``verify_outcomes`` (report 58 review, F8: the voice's
+        #: quick hands, which do not bracket their actions, never subscribe a window), set it to force either way.
+        self._use_events: bool | None = None
+        self.events: Any = None
+        #: hwnd -> (event generation, monotonic time, opaque) when the model's latest observation of it was taken,
+        #: and that read itself (reused by the view after actions while the window's events show no change).
+        self._observed: dict[int, tuple[int | None, float, bool]] = {}
+        self._observed_trees: dict[int, Any] = {}
         #: The window of the most recent tree read, the default for an element id.
         self._latest_tree_hwnd: int | None = None
         #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
@@ -2235,44 +2249,400 @@ class Dispatcher:
 
     def _do_look_at_window(self, tool_input: dict[str, Any]) -> ToolOutcome:
         hwnd = self._need_int(tool_input, "hwnd")
+        within = tool_input.get("within")
+        if within is not None and (isinstance(within, bool) or not isinstance(within, int)):
+            raise ToolError(f"'within' must be an element id, got {within!r}")
         started = time.perf_counter()
-        tree = self.backend.get_window_tree(
-            hwnd, max_elements=self.max_tree_elements, timeout_s=self.tree_timeout_s
-        )
-        return self._tree_outcome(hwnd, tree, started)
+        generation, at = self._generation(hwnd), time.monotonic()
+        if within is not None:
+            # report 58 review (F2): the part is walked from its own element, found again by its RuntimeId, so the
+            # whole cap goes to it; a provider without RuntimeIds (or a backend without part reads) gets the whole
+            # window with the larger cap, and only that part listed
+            cap = max(self.max_tree_elements, WITHIN_TREE_ELEMENTS)
+            rid = self._runtime_id_of(hwnd, within)
+            tree = None
+            if rid:
+                try:
+                    tree = self.backend.get_window_tree(hwnd, max_elements=cap, timeout_s=self.tree_timeout_s,
+                                                        part=rid)
+                except TypeError:
+                    tree = None
+            if tree is not None and _field(tree, "part_missing"):
+                seen = self._models[int(hwnd)].seen.get(int(within)) if int(hwnd) in self._models else None
+                what = (f' ({seen[0]} "{seen[1][:60]}")' if seen and seen[1] else f" ({seen[0]})" if seen else "")
+                text = (f"element [{within}]{what} is not in window {hwnd} now: it went away, or it is out of view. "
+                        f"Read the whole window")
+                return ToolOutcome(name="look_at_window", ok=True, summary=text,
+                                   content=[{"type": "text", "text": text}],
+                                   payload={"status": "ok", "part_missing": True},
+                                   elapsed_ms=(time.perf_counter() - started) * 1000)
+            if tree is not None and _field(tree, "part"):
+                # a part is no observation of the whole window: it is never the read an action is compared with
+                return self._tree_outcome(hwnd, tree, started, within=within, part=True)
+            tree = self.backend.get_window_tree(hwnd, max_elements=cap, timeout_s=self.tree_timeout_s)
+        else:
+            tree = self.backend.get_window_tree(hwnd, max_elements=self.max_tree_elements,
+                                                timeout_s=self.tree_timeout_s)
+        outcome = self._tree_outcome(hwnd, tree, started, within=within)
+        self._note_observed(hwnd, generation, at, tree)
+        return outcome
 
-    def _tree_outcome(self, hwnd: int, tree: Any, started: float, *, carried: bool = False) -> ToolOutcome:
+    def _runtime_id_of(self, hwnd: int, element_id: int) -> tuple[int, ...] | None:
+        """The RuntimeId of element ``element_id`` of ``hwnd`` as the screen model holds it (``None``: unknown)."""
+        model = self._models.get(int(hwnd))
+        element = model.latest.get(int(element_id)) if model is not None else None
+        raw = _field(element, "runtime_id") if element is not None else None
+        try:
+            return tuple(int(x) for x in raw) if raw else None
+        except (TypeError, ValueError):
+            return None
+
+    # -- the screen model: events and observations (report 58) ---------------
+
+    @property
+    def use_events(self) -> bool:
+        """Whether reads use the event hub (report 58 review, F8): as set, else whatever ``verify_outcomes`` is."""
+        return self.verify_outcomes if self._use_events is None else self._use_events
+
+    @use_events.setter
+    def use_events(self, value: bool) -> None:
+        self._use_events = bool(value)
+
+    def _hub(self) -> Any:
+        """The event hub (``None``: no events; reads stand in): the process's shared one on the real desktop."""
+        if not self.use_events:
+            return None
+        if self.events is None and isinstance(self.backend, _LazyRealBackend):
+            try:
+                from yuki.perception.events import shared_hub
+
+                self.events = shared_hub()
+            except Exception:  # noqa: BLE001 - reads stand in
+                self.use_events = False
+                return None
+        return self.events
+
+    def _generation(self, hwnd: int) -> int | None:
+        """Keep ``hwnd`` in play and return its event generation (``None`` while its events are not flowing)."""
+        hub = self._hub()
+        if hub is None:
+            return None
+        try:
+            hub.watch(int(hwnd))
+            return hub.generation(int(hwnd))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _note_observed(self, hwnd: int, generation: int | None, at: float, tree: Any) -> None:
+        if str(_field(tree, "status") or "ok") == "ok":
+            self._observed[int(hwnd)] = (generation, at, bool(_field(tree, "opaque")))
+            self._observed_trees[int(hwnd)] = tree
+            if len(self._observed_trees) > 16:
+                for old in sorted(self._observed_trees, key=lambda h: self._observed.get(h, (None, 0.0))[1])[:4]:
+                    if old != int(hwnd):
+                        self._observed_trees.pop(old, None)
+
+    def _observe(self, hwnd: int, *, timeout_s: float = OUTCOME_READ_S) -> tuple[list[Any] | None, bool]:
+        """A read of ``hwnd`` for the screen model only (not handed to the model as a read): ``(elements, partial)``,
+        its ids carried, so the same id is the same element as in what the thinker saw; ``partial`` when the read
+        stopped at its cap.  ``(None, False)`` when the window gave no usable read."""
+        generation, at = self._generation(hwnd), time.monotonic()
+        try:
+            tree = self.backend.get_window_tree(int(hwnd), max_elements=self.max_tree_elements, timeout_s=timeout_s)
+        except Exception:  # noqa: BLE001 - gone or wedged
+            return None, False
+        if str(_field(tree, "status") or "ok") != "ok" or self._cut_short(tree):
+            return None, False   # a read the clock cut short cannot say what is gone or what changed
+        elements = list(_field(tree, "elements") or [])
+        if not elements or not all(isinstance(_field(e, "id"), int) for e in elements):
+            return None, False
+        partial = bool(_field(tree, "truncated"))
+        carried = self.window_model(int(hwnd)).carry(elements, self._reads, partial=partial)
+        self._note_observed(hwnd, generation, at, tree)
+        return carried, partial
+
+    def _reusable(self, hwnd: int, generation: int | None) -> Any:
+        """The latest observation of ``hwnd`` when it is still current: the window's events show nothing since it
+        was taken, and it is at most :data:`REUSE_MAX_S` old (report 58 review, F4: an event a provider does not
+        raise - content moved with no scroll, name or structure event - must not keep an old read current for
+        long).  ``None`` otherwise."""
+        seen = self._observed.get(int(hwnd))
+        tree = self._observed_trees.get(int(hwnd))
+        if generation is None or seen is None or tree is None or seen[0] != generation:
+            return None
+        if time.monotonic() - seen[1] > REUSE_MAX_S:
+            return None
+        return tree
+
+    def _current(self, hwnd: int) -> tuple[list[Any] | None, bool, bool]:
+        """The window as it is now, for the read before an action: ``(elements, fresh, partial)``. The model's
+        latest observation while it is still current (:meth:`_reusable`); else a new read."""
+        last = self._reusable(hwnd, self._generation(hwnd))
+        if last is not None:
+            # the same read again, its ids carried (an identity carry: the model already holds it)
+            elements = list(_field(last, "elements") or [])
+            if elements:
+                partial = bool(_field(last, "truncated"))
+                return self.window_model(int(hwnd)).carry(elements, self._reads, partial=partial), False, partial
+        # Without events a fresh read is the only way to know the window as it is now, and comparing it with the
+        # thinker's read is what shows the elements that change on their own (a clock, a progress bar).
+        elements, partial = self._observe(hwnd)
+        return elements, True, partial
+
+    def _settled_after(self, hwnd: int, generation: int | None) -> None:
+        """Wait for the action's effect to show and the window to go quiet, on its events (bounded); without events
+        return at once."""
+        hub = self._hub()
+        if hub is None or generation is None:
+            return
+        try:
+            hub.wait_change(int(hwnd), generation, OUTCOME_FIRST_EVENT_S)
+            hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=OUTCOME_CAP_S)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _bracketed(self, name: str, hwnd: int | None, act: Callable[[], ToolOutcome], *, target: int | None = None,
+                   target_label: str = "",
+                   before_hook: Callable[[list[Any] | None], ToolOutcome | None] | None = None,
+                   after_hook: Callable[[ToolOutcome, list[Any] | None], ToolOutcome] | None = None) -> ToolOutcome:
+        """Run ``act`` between two reads of ``hwnd`` and say what it changed there (report 58).
+
+        The account (:mod:`yuki.perception.outcome`) goes into the result as "What changed: ..." and its verdict
+        into ``details["verified"]`` together with the action's own facts (a new window, the foreground, the focus,
+        the page): something changed is verified; nothing changed in a window whose content is exposed is not; a
+        window that could not be read twice keeps the action's own verdict. A scroll the window's content shows
+        moving is a scroll that worked, whatever a single point under it said.
+
+        ``before_hook`` is given the read before the action (``None`` when there is none) and may return an outcome
+        that stands instead of acting; ``after_hook`` is given the action's outcome and the read after it (``None``
+        when there is none) and returns the outcome to report (report 58 review, F3: a toggle reads its own state
+        from these same two reads, so its side effects are in the account too).
+        """
+        if not hwnd or not self.verify_outcomes:
+            return self._hooked(act, before_hook, after_hook)
+        prepare_started = time.monotonic()
+        before: list[Any] | None = None
+        fresh = before_partial = False
+        generation: int | None = None
+        reference: list[Any] | None = None
+        busy_rids: set[tuple] = set()
+        try:
+            hwnd = int(hwnd)
+            model = self.window_model(hwnd)
+            seen = self._observed.get(hwnd)
+            # the read the thinker acted from, when recent: what changed between it and the read before the action
+            # was changing on its own
+            reference = (list(model.latest.values()) if model.latest and seen is not None
+                         and time.monotonic() - seen[1] < REFERENCE_FRESH_S else None)
+            before, fresh, before_partial = self._current(hwnd)
+            started_at = time.monotonic()
+            generation = self._generation(hwnd)
+            # elements already changing on their own before the action (a clock, a progress bar), from the events
+            hub = self._hub()
+            if hub is not None and generation is not None:
+                busy_rids = set(hub.busy_since(hwnd, started_at - OUTCOME_CAP_S))
+        except Exception:  # noqa: BLE001 - the action runs either way
+            before = None
+        if before is None:
+            return self._hooked(act, before_hook, after_hook)
+        if before_hook is not None:
+            instead = before_hook(before)
+            if instead is not None:
+                return instead
+        prepared_ms = round((time.monotonic() - prepare_started) * 1000.0, 1)
+        outcome = act()
+        if not outcome.ok and name != "scroll":
+            return after_hook(outcome, None) if after_hook is not None else outcome
+        after: list[Any] | None = None
+        try:
+            waited = time.monotonic()
+            self._settled_after(hwnd, generation)
+            settle_ms = round((time.monotonic() - waited) * 1000.0, 1)
+            read_started = time.monotonic()
+            after, after_partial = self._observe(hwnd)
+            if after_hook is not None:
+                outcome = after_hook(outcome, after)
+            # content-free facts for the log: what the bracket cost and whether events spared the read before
+            diag = {"before_read": "fresh" if fresh else "current by events", "events": generation is not None,
+                    "before_ms": prepared_ms, "settle_ms": settle_ms,
+                    "after_read_ms": round((time.monotonic() - read_started) * 1000.0, 1)}
+            if before_partial or after_partial:
+                diag["partial"] = True
+            if after is None:
+                return self._with_change(outcome, None, [], None, "the window could not be read after it", diag)
+            from yuki.perception.model import fact
+            from yuki.perception.outcome import describe, diff, verdict
+
+            busy = {fact(e, "id") for e in before if tuple(fact(e, "runtime_id") or ()) in busy_rids}
+            change = diff(before, after, target=target, reference=reference if fresh else None, busy=busy,
+                          before_partial=before_partial, after_partial=after_partial)
+            opaque = bool((self._observed.get(hwnd) or (None, 0.0, False))[2])
+            verified, why = verdict(change, opaque=opaque)
+            lines = describe(change, target_label=target_label)
+            return self._with_change(outcome, verified, lines, change, why, diag)
+        except Exception as exc:  # noqa: BLE001 - the action's own report stands
+            if isinstance(outcome.payload, dict):
+                outcome.payload = {**outcome.payload, "screen_change_error": f"{type(exc).__name__}: {exc}"}
+            return outcome
+
+    @staticmethod
+    def _hooked(act: Callable[[], ToolOutcome], before_hook: Callable[[list[Any] | None], ToolOutcome | None] | None,
+                after_hook: Callable[[ToolOutcome, list[Any] | None], ToolOutcome] | None) -> ToolOutcome:
+        """``act`` with its hooks and no reads of the bracket's own (outcome checks off, or no read before)."""
+        if before_hook is not None:
+            instead = before_hook(None)
+            if instead is not None:
+                return instead
+        outcome = act()
+        return after_hook(outcome, None) if after_hook is not None else outcome
+
+    def _with_change(self, outcome: ToolOutcome, verified: bool | None, lines: list[str], change: Any,
+                     why: str, diag: dict[str, Any] | None = None) -> ToolOutcome:
+        """The action's result with what changed on screen added (text, details, verdict)."""
+        outer = outcome.payload if isinstance(outcome.payload, dict) else {}
+        # an element-targeted type_text nests the typing's own report (action_verdict reads it there)
+        nested = outcome.name == "type_text" and isinstance(outer.get("type_text"), dict)
+        payload = outer["type_text"] if nested else outer
+        details = dict(payload.get("details") or {}) if isinstance(payload.get("details"), dict) else {}
+        effects = [details.get(k) for k in ("foreground_changed", "focus_changed", "foreground_title_changed",
+                                            "page_changed", "window_state_changed")]
+        own = details.get("verified")
+        if details.get("toggle_to") and isinstance(own, bool):
+            # a toggle's own read-back of its state is the verdict (did it reach the state asked for); what else
+            # changed is the account
+            final: bool | None = own
+        elif details.get("readback") == "missing" or details.get("enter_withheld"):
+            final = own if isinstance(own, bool) else None   # the text did not arrive: no send to see
+            if details.get("readback") == "missing":
+                final = False
+        elif verified is True or own is True or any(e is True for e in effects) or details.get("new_windows"):
+            final = True
+        elif verified is False:
+            final = False
+        else:
+            final = own if isinstance(own, bool) else None
+        if verified is False and final is True:
+            # the effect is outside the window read (a new window, another window in front, the focus): say so,
+            # never "nothing changed"
+            lines = ["nothing changed inside this window itself; what changed is in the facts above (the window in "
+                     "front, the focus, a new window)"]
+        record = {"verified": verified, "why": why, "lines": lines[:8], **(diag or {})}
+        if change is not None:
+            record["counts"] = dict(change.counts)
+        details["screen_change"] = record
+        if final is not None:
+            details["verified"] = final
+        else:
+            details.pop("verified", None)
+        if outcome.name == "scroll" and verified is True and change is not None and change.moved:
+            details["verified"] = True
+            details.pop("unverifiable", None)
+            if not outcome.ok:
+                outcome.ok = True
+                outcome.summary = f"{outcome.summary}; but the window's content did move"
+        if nested:
+            outcome.payload = {**outer, "type_text": {**payload, "details": details}}
+        else:
+            outcome.payload = {**payload, "details": details}
+        if lines:
+            # the account goes to the model with the result; the one-line summary (run trace, cards) stays as it was,
+            # so what was on screen is not copied into practice memory's traces
+            said = "What changed: " + "; ".join(lines[:OUTCOME_LINES]) + "."
+            if outcome.content and outcome.content[0].get("type") == "text":
+                outcome.content[0]["text"] = f"{outcome.content[0]['text']}\n{said}"
+            else:
+                outcome.content = [{"type": "text", "text": said}, *(outcome.content or [])]
+        return outcome
+
+    def window_model(self, hwnd: int) -> Any:
+        """The screen model of ``hwnd`` (created on first use): ids carried across reads, what a gone id was."""
+        from yuki.perception.model import WindowModel
+
+        model = self._models.get(int(hwnd))
+        if model is None:
+            model = self._models[int(hwnd)] = WindowModel(int(hwnd))
+            if len(self._models) > 64:
+                for old in sorted(self._models, key=lambda h: self._models[h].read)[:16]:
+                    if old != int(hwnd):
+                        self._models.pop(old, None)
+        return model
+
+    def _carry_tree(self, hwnd: int, tree: Any, *, partial: bool = False) -> Any:
+        """``tree`` with its ids carried from the window's earlier reads (report 58: every read, explicit or not);
+        ``partial``: the read covers only part of the window whatever its own flags say (a part read)."""
+        if str(_field(tree, "status") or "ok") != "ok":
+            return tree   # a busy or empty read says nothing about which elements are gone
+        elements = list(_field(tree, "elements") or [])
+        if not elements or not all(isinstance(_field(e, "id"), int) for e in elements):
+            return tree
+        model = self.window_model(hwnd)
+        carried = _tree_with(tree, model.carry(elements, self._reads,
+                                               partial=partial or bool(_field(tree, "truncated"))))
+        left_out = _field(tree, "left_out")
+        if left_out:
+            # the read's notes of what it left out name their parent by the read's own ids: carry them too
+            moved = [{**entry, "parent": model.mapping.get(int(entry.get("parent", -1)), -1)
+                      if int(entry.get("parent", -1)) >= 0 else -1} for entry in left_out if isinstance(entry, dict)]
+            if isinstance(carried, dict):
+                carried["left_out"] = moved
+            else:
+                carried.left_out = moved
+        return carried
+
+    def _format_tree(self, tree: Any, within: int | None = None) -> str:
+        """The backend's own text for a tree; ``within`` lists one element's part in full (a backend whose formatter
+        takes no ``within``, a stub's, gives the whole tree)."""
+        if within is None:
+            return self.backend.format_window_tree(tree)
+        try:
+            return self.backend.format_window_tree(tree, within=within)
+        except TypeError:
+            return self.backend.format_window_tree(tree)
+
+    def _tree_outcome(self, hwnd: int, tree: Any, started: float, *, carried: bool = False,
+                      within: int | None = None, part: bool = False) -> ToolOutcome:
         """Format one tree read exactly as ``look_at_window`` returns it.
 
         The text is the backend's own :func:`format_window_tree` behind a
         one-line header, so whatever that formatter reports (page title and
         address, selected tab, status and notes) reaches the model unchanged,
         for explicit looks and the automatic view after actions alike.
+
+        Every read's ids are carried from the window's earlier reads (report 58), so an id from any earlier read
+        still means the same element, or is reported gone; ``carried`` is kept for callers that pass it.
+
+        ``part``: the read holds one element's subtree only (``within``, report 58 review F2): the rest of the
+        window keeps its ids and its latest facts, so nothing outside the part is taken for gone.
         """
-        text = self.backend.format_window_tree(tree)
+        self._reads += 1
+        previous = self._latest_trees.get(int(hwnd)) if part else None
+        tree = self._carry_tree(int(hwnd), tree, partial=part)
+        #: The latest read handed to the model, as the backend's own tree object with its ids carried.
+        self.last_tree = tree
+        text = self._format_tree(tree, within)
         payload = _plain(tree)
         elements = payload.get("elements") or [] if isinstance(payload, dict) else []
         truncated = bool(payload.get("truncated")) if isinstance(payload, dict) else False
         status = str(payload.get("status") or "ok") if isinstance(payload, dict) else "ok"
         note = str(payload.get("note") or "") if isinstance(payload, dict) else ""
-        self._reads += 1
         self._latest_trees[int(hwnd)] = (
             self._reads,
             {
-                int(element["id"]): element
-                for element in elements
-                if isinstance(element, dict) and isinstance(element.get("id"), int)
+                **(previous[1] if previous is not None else {}),
+                **{
+                    int(element["id"]): element
+                    for element in elements
+                    if isinstance(element, dict) and isinstance(element.get("id"), int)
+                },
             },
         )
         self._latest_tree_hwnd = int(hwnd)
-        ids = [int(element["id"]) for element in elements if isinstance(element, dict)
-               and isinstance(element.get("id"), int)]
-        if carried:
+        model = self.window_model(int(hwnd))
+        if model.read == self._reads:
+            self._id_lineage[int(hwnd)] = set(model.lineage)
+            self._id_ceiling[int(hwnd)] = model.ceiling
+        else:   # a busy or empty read: nothing to carry, the earlier ids keep their meaning
             self._id_lineage[int(hwnd)] = self._id_lineage.get(int(hwnd), set()) | {self._reads}
-            self._id_ceiling[int(hwnd)] = max([self._id_ceiling.get(int(hwnd), -1), *ids])
-        else:
-            self._id_lineage[int(hwnd)] = {self._reads}
-            self._id_ceiling[int(hwnd)] = max(ids, default=-1)
         opaque = bool(payload.get("opaque")) if isinstance(payload, dict) else False
         self._note_read(int(hwnd), payload if isinstance(payload, dict) else {}, opaque)
         header = (
@@ -2439,17 +2809,51 @@ class Dispatcher:
         """
         started = time.perf_counter()
         deadline = started + max(cap_s, 0.0)
-        tree = self.backend.get_window_tree(
+        generation, observed_at = self._generation(hwnd), time.monotonic()
+        reused = self._still_current(hwnd, generation)
+        tree = reused if reused is not None else self.backend.get_window_tree(
             hwnd, max_elements=self.max_tree_elements, timeout_s=max(cap_s, 0.1)
         )
-        reads = 1
+        reads = 0 if reused is not None else 1
         signature = _tree_signature(tree)
         changed_at = time.perf_counter()
         settled = False
-        if not settle:
+        hub = self._hub()
+        if reused is not None:
+            # report 58: the read taken after the last action (it already waited for the window to go quiet) is
+            # still current by the window's events: nothing is read again
+            settled = True
+            reason = "the read after the last action, still current by the window's events"
+            observed_at = self._observed[int(hwnd)][1]
+        elif not settle:
             reason = "one read: the action had already reported the content ready"
         elif signature[0] != "ok":
             reason = f"one read: the window's status is {signature[0]}"
+        elif hub is not None and generation is not None and hub.generation(int(hwnd)) is not None:
+            # report 58: the window's events say whether it is still changing; nothing is re-read while it is not
+            quiet, waited = hub.wait_quiet(int(hwnd), quiet_s=quiet_s,
+                                           cap_s=max(deadline - time.perf_counter(), 0.0))
+            if hub.generation(int(hwnd)) == generation:
+                settled = True
+                reason = f"no change in the window's events for {waited * 1000:.0f} ms after the read"
+            else:
+                newer_generation, newer_at = hub.generation(int(hwnd)), time.monotonic()
+                try:
+                    newer = self.backend.get_window_tree(
+                        hwnd, max_elements=self.max_tree_elements,
+                        timeout_s=max(deadline - time.perf_counter(), _REREAD_MIN_S))
+                except Exception as exc:  # gone or wedged: keep the read there is
+                    newer = None
+                    reason = f"re-reading stopped: {type(exc).__name__}: {exc}"
+                if newer is not None and _tree_signature(newer)[0] == "ok" and not (
+                        self._cut_short(newer) and not self._cut_short(tree)):
+                    tree, generation, observed_at = newer, newer_generation, newer_at
+                    signature = _tree_signature(tree)
+                    reads += 1
+                settled = quiet
+                if newer is not None:
+                    reason = (f"read again once its events went quiet ({waited * 1000:.0f} ms)" if quiet else
+                              f"still changing when the {cap_s:g} s limit was reached; read as it was then")
         else:
             reason = f"still changing when the {cap_s:g} s limit was reached"
             while True:
@@ -2464,7 +2868,8 @@ class Dispatcher:
                     newer = self.backend.get_window_tree(
                         hwnd,
                         max_elements=self.max_tree_elements,
-                        timeout_s=max(remaining, quiet_s),
+                        # report 58: never a read so short it is cut off (3 Oct: 0.3 s, 189 elements kept)
+                        timeout_s=max(remaining, _REREAD_MIN_S),
                     )
                 except Exception as exc:  # gone or wedged: keep the last good read
                     reason = f"re-reading stopped: {type(exc).__name__}: {exc}"
@@ -2473,6 +2878,10 @@ class Dispatcher:
                 newer_signature = _tree_signature(newer)
                 if newer_signature[0] != "ok":
                     reason = f"re-reading stopped: the window turned {newer_signature[0]}"
+                    break
+                if self._cut_short(newer) and not self._cut_short(tree):
+                    # a re-read the clock cut short never replaces a whole read
+                    reason = "re-reading stopped: a re-read was cut short by the time limit; the whole read is kept"
                     break
                 tree = newer
                 now = time.perf_counter()
@@ -2485,23 +2894,15 @@ class Dispatcher:
                     break
         previous = self._latest_trees.get(int(hwnd)) if changes else None
         changes_text = None
+        outcome = self._tree_outcome(hwnd, tree, started)
+        self._note_observed(hwnd, generation, observed_at, tree)
         if previous is not None and signature[0] == "ok":
-            elements = list(_field(tree, "elements") or [])
-            mapping, _top = carry_ids(previous[1], elements, self._id_ceiling.get(int(hwnd), max(previous[1], default=-1)))
-            renumbered = []
-            for element in elements:
-                parent = _field(element, "parent", -1)
-                renumbered.append(_renumbered(element, mapping[_field(element, "id")],
-                                              mapping.get(parent, -1) if isinstance(parent, int) and parent >= 0
-                                              else -1))
-            tree = _tree_with(tree, renumbered)
-            outcome = self._tree_outcome(hwnd, tree, started, carried=True)
+            carried = self.last_tree   # the same read with its ids carried
+            renumbered = list(_field(carried, "elements") or [])
             try:
-                changes_text = self._changes_text(int(hwnd), previous, tree, renumbered, near)
+                changes_text = self._changes_text(int(hwnd), previous, carried, renumbered, near)
             except Exception:  # noqa: BLE001 - the whole tree then, as before
                 changes_text = None
-        else:
-            outcome = self._tree_outcome(hwnd, tree, started)
         full = str(outcome.content[0]["text"]) if outcome.content else ""
         return WindowView(
             hwnd=hwnd,
@@ -2515,6 +2916,22 @@ class Dispatcher:
             changes=changes_text is not None,
             full_chars=len(full),
         )
+
+    def _still_current(self, hwnd: int, generation: int | None) -> Any:
+        """The tree of the latest observation of ``hwnd`` (the read after an action) while it is still current
+        (:meth:`_reusable`), else ``None``."""
+        return self._reusable(hwnd, generation)
+
+    def _cut_short(self, tree: Any) -> bool:
+        """Whether a read was stopped by the clock.  The reader says why it stopped (report 58 review, F6: a page's
+        share of the cap also stops a read below the cap, and that is no clock); a tree that does not say (a stub,
+        an older reader) is judged as before: truncated with fewer elements than the cap."""
+        if not _field(tree, "truncated"):
+            return False
+        stopped = _field(tree, "stopped_by")
+        if isinstance(stopped, str) and stopped:
+            return stopped == "clock"
+        return len(_field(tree, "elements") or []) < self.max_tree_elements
 
     def _changes_text(self, hwnd: int, previous: tuple[int, dict[int, Any]], tree: Any, elements: list[Any],
                       near: int | None) -> str | None:
@@ -2882,8 +3299,17 @@ class Dispatcher:
                     f"window {hwnd} is #{read}; nothing was sent. Use an id from read "
                     f"#{read}, or look at the window again"
                 )
-        element = elements.get(element_id)
+        element = self._current_element(hwnd, element_id, elements)
         if element is None:
+            gone = self._models[hwnd].gone(element_id) if hwnd in self._models else None
+            if gone is not None:
+                role, name, last = gone
+                what = f'{role} "{name[:60]}"' if name else role
+                raise ToolError(
+                    f"element [{element_id}] ({what}, seen in read #{last}) is not in window {hwnd} now: it went away "
+                    f"or the app hid it; nothing was sent. Read the window again (a control hidden until the "
+                    f"pointer comes near it shows after a hover)"
+                )
             raise ToolError(
                 f"read #{read} of window {hwnd} has no element [{element_id}] (its ids "
                 f"run 0-{max(elements) if elements else 0}); nothing was sent"
@@ -2897,6 +3323,19 @@ class Dispatcher:
         if element.get("name"):
             label += f" \"{str(element['name'])[:60]}\""
         return x, y, hwnd, f"{label} of read #{read} at ({x},{y})"
+
+    def _current_element(self, hwnd: int, element_id: int, shown: dict[int, Any]) -> dict[str, Any] | None:
+        """The element ``element_id`` of ``hwnd`` as the window is now (report 58): the screen model's latest
+        observation when one was taken after the read the thinker saw (the same id is the same element, at its
+        place now), else that read's. ``None`` when the window no longer has it."""
+        model = self._models.get(int(hwnd))
+        if model is not None and model.latest:
+            current = model.latest.get(int(element_id))
+            if current is not None:
+                return current if isinstance(current, dict) else _plain(current)
+            if int(element_id) in model.seen:
+                return None   # the window had it once and its latest observation does not: gone
+        return shown.get(int(element_id))
 
     def _point(self, tool_input: dict[str, Any]) -> tuple[int, int, int | None, str]:
         """``(x, y, expect_hwnd, label)``: an element id's centre, else x and y."""
@@ -2935,7 +3374,7 @@ class Dispatcher:
             hwnd = self._latest_tree_hwnd if hwnd is None else hwnd
             if hwnd is None or hwnd not in self._latest_trees:
                 return None
-            element = self._latest_trees[hwnd][1].get(int(element_id))
+            element = self._current_element(int(hwnd), int(element_id), self._latest_trees[hwnd][1])
             return (int(hwnd), element) if isinstance(element, dict) else None
         except Exception:  # noqa: BLE001
             return None
@@ -2996,31 +3435,68 @@ class Dispatcher:
         if not label and self.guard_raw_clicks:
             target = self._check_raw_point(x, y, tool_input)
             self._check_point_on_control(x, y, target)
+        found = self._read_element(tool_input) if label else None
+        if found is not None and found[1].get("hidden") and "range" in (found[1].get("patterns") or ()):
+            # report 58: a slider the app hides behind its own drawing has no point of its own to click
+            raise ToolError(f"not clicked: {label} is a slider the app keeps out of sight; set it with set_slider "
+                            f"on this id (it reads back the new value)")
         toggle = self._toggle_state(tool_input) if label else None
         if toggle is not None:
             # N4: a toggle is read live first and clicked only toward the wanted state, then read back
             return self._click_toggle(tool_input, toggle, button=button, guard=guard, label=label, x=x, y=y)
-        if label and button == "left" and self._opt_int(tool_input, "clicks", 1) == 1:
-            via = self._pattern_first("click", tool_input, "click")
-            if via is not None:
-                return self._labelled(via, label)
-        self._before_input("click")
-        outcome = self._labelled(
-            self._from_action(
-                "click",
-                self.backend.click(
-                    x,
-                    y,
-                    button=button,
-                    clicks=self._opt_int(tool_input, "clicks", 1),
-                    expect_hwnd=guard,
+        window = guard or target or (found[0] if found is not None else None) or self._pointed_window(x, y)
+        element_id = tool_input.get("element") if label else None
+
+        def act() -> ToolOutcome:
+            if label and button == "left" and self._opt_int(tool_input, "clicks", 1) == 1:
+                via = self._pattern_first("click", tool_input, "click")
+                if via is not None:
+                    return self._labelled(via, label)
+            self._before_input("click")
+            aim_x, aim_y = self._aim(window, element_id, x, y)
+            outcome = self._labelled(
+                self._from_action(
+                    "click",
+                    self.backend.click(
+                        aim_x,
+                        aim_y,
+                        button=button,
+                        clicks=self._opt_int(tool_input, "clicks", 1),
+                        expect_hwnd=guard,
+                    ),
                 ),
-            ),
-            label,
-        )
-        if outcome.ok:
-            self._mark_acted(guard or target or self._pointed_window(x, y), "click")
-        return outcome
+                label,
+            )
+            if outcome.ok:
+                self._mark_acted(guard or target or self._pointed_window(x, y), "click")
+            return outcome
+
+        return self._bracketed("click", window, act, target=element_id if isinstance(element_id, int) else None,
+                               target_label=self._short_label(found[1]) if found is not None else "")
+
+    def _aim(self, hwnd: int | None, element_id: Any, x: int, y: int) -> tuple[int, int]:
+        """Where a click on element ``element_id`` lands now (report 58 review, F4): its centre in the screen
+        model's latest read of ``hwnd`` - the outcome bracket's read just before the action, when it took one - so a
+        page that scrolled since the thinker's read is not clicked at the old place; ``(x, y)`` otherwise.
+
+        Raises:
+            ToolError: the latest read shows the element gone (nothing is sent).
+        """
+        if not hwnd or not isinstance(element_id, int) or isinstance(element_id, bool):
+            return x, y
+        model = self._models.get(int(hwnd))
+        if model is None or not model.latest:
+            return x, y
+        current = self._current_element(int(hwnd), element_id, {})
+        if current is None:
+            if element_id in model.seen:
+                raise ToolError(f"not clicked: element [{element_id}] is not in window {hwnd} now (a read just before "
+                                f"the click no longer has it); read the window again")
+            return x, y
+        centre = current.get("center") or ()
+        if current.get("hidden") or len(centre) < 2:
+            return x, y
+        return int(centre[0]), int(centre[1])
 
     def _check_point_on_control(self, x: int, y: int, target: int | None) -> None:
         """N4 (report 47): a click at raw x,y must land on a control of the latest read of the window there. Live 3 Oct
@@ -3073,6 +3549,13 @@ class Dispatcher:
         except Exception:  # noqa: BLE001
             return None
         want = element.get("bounds") or (0, 0, 0, 0)
+        rid = element.get("runtime_id")
+        if rid:   # report 58: the very element, when the provider gives it an identity
+            exact = [e for e in (tree or {}).get("elements") or [] if isinstance(e, dict)
+                     and e.get("runtime_id") and list(e["runtime_id"]) == list(rid) and e.get("role") == element.get(
+                         "role")]
+            if exact:
+                return exact[0]
         same = [e for e in (tree or {}).get("elements") or [] if isinstance(e, dict)
                 and e.get("role") == element.get("role") and e.get("name") == element.get("name") and e.get("bounds")]
         if not same:
@@ -3082,46 +3565,76 @@ class Dispatcher:
     def _click_toggle(self, tool_input: dict[str, Any], toggle: tuple[int, dict[str, Any], str], *, button: str,
                       guard: int | None, label: str, x: int, y: int) -> ToolOutcome:
         """N4: read the toggle's live state, click only when it is not the wanted one, read it back. Live 3 Oct
-        Spotify's Lyrics toggle was clicked six times from stale reads and the lyrics view flipped open and shut."""
+        Spotify's Lyrics toggle was clicked six times from stale reads and the lyrics view flipped open and shut.
+
+        Report 58 review (F3): the live reads are the outcome bracket's own two reads of the window, so the result
+        also says what else the toggle changed there ("Group "Lyrics view" appeared ..."); without outcome checks
+        (or when the window cannot be read twice) it reads the toggle alone, as before."""
         hwnd, element, read_state = toggle
         want = tool_input.get("toggle_to")
         if want not in ("on", "off"):
             raise ToolError(f"not clicked: {label} is a toggle (it was {read_state} in the read): give toggle_to, on "
                             f"or off, the state they want; it is clicked only when it is not there already")
-        live = self._live_element(hwnd, element)
-        if live is None:
-            raise ToolError(f"not clicked: {label} is not in a fresh read of its window: it may be hidden until the "
-                            f"pointer comes near it, or gone. Hover where it appears, read again, and click it from "
-                            f"that read")
-        now = "on" if "on" in (live.get("states") or []) else "off" if "off" in (live.get("states") or []) else None
-        if now == want:
-            outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just now): not "
-                                                                 f"clicked, nothing changed",
-                                  content=[{"type": "text", "text": f"{label} is already {want} (read live just "
-                                                                    f"now): not clicked, nothing changed"}],
-                                  payload={"details": {"verified": True, "noop": True, "state": now}})
-            return self._labelled(outcome, label)
-        via = self._pattern_first("click", tool_input, "click") if button == "left" else None
-        if via is None:
-            self._before_input("click")
-            via = self._from_action("click", self.backend.click(x, y, button=button, clicks=1, expect_hwnd=guard))
-        if via.ok:
-            self._mark_acted(hwnd, "click")
-        after = self._live_element(hwnd, element)
-        state = None if after is None else ("on" if "on" in (after.get("states") or []) else
-                                            "off" if "off" in (after.get("states") or []) else None)
-        verified = state == want
-        note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
-        if via.ok and not verified:
-            note += f" (wanted {want}): do not click it again from this read; read the window first"
-        via.summary += note
-        if via.content and via.content[0].get("type") == "text":
-            via.content[0]["text"] += note
-        if isinstance(via.payload, dict):
-            details = dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict) else {}
-            details.update(verified=verified, state_before=now, state_after=state, toggle_to=want)
-            via.payload = {**via.payload, "details": details}
-        return self._labelled(via, label)
+        element_id = tool_input.get("element")
+        element_id = element_id if isinstance(element_id, int) and not isinstance(element_id, bool) else None
+        held: dict[str, Any] = {}
+
+        def state_of(found: Any) -> str | None:
+            states = [str(s) for s in (_field(found, "states") or ())]
+            return "on" if "on" in states else "off" if "off" in states else None
+
+        def in_read(read: list[Any] | None) -> tuple[bool, Any]:
+            """``(read, the toggle in it)``: from the bracket's read by its carried id, else a live read of its own."""
+            if read is not None and element_id is not None:
+                return True, next((e for e in read if _field(e, "id") == element_id), None)
+            return False, self._live_element(hwnd, element)
+
+        def before(read: list[Any] | None) -> ToolOutcome | None:
+            _from_bracket, live = in_read(read)
+            if live is None:
+                raise ToolError(f"not clicked: {label} is not in a fresh read of its window: it may be hidden until "
+                                f"the pointer comes near it, or gone. Hover where it appears, read again, and click "
+                                f"it from that read")
+            now = held["now"] = state_of(live)
+            if now == want:
+                outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just "
+                                                                     f"now): not clicked, nothing changed",
+                                      content=[{"type": "text", "text": f"{label} is already {want} (read live just "
+                                                                        f"now): not clicked, nothing changed"}],
+                                      payload={"details": {"verified": True, "noop": True, "state": now}})
+                return self._labelled(outcome, label)
+            return None
+
+        def act() -> ToolOutcome:
+            via = self._pattern_first("click", tool_input, "click") if button == "left" else None
+            if via is None:
+                self._before_input("click")
+                aim_x, aim_y = self._aim(hwnd, element_id, x, y)
+                via = self._from_action("click", self.backend.click(aim_x, aim_y, button=button, clicks=1,
+                                                                    expect_hwnd=guard))
+            if via.ok:
+                self._mark_acted(hwnd, "click")
+            return via
+
+        def after(via: ToolOutcome, read: list[Any] | None) -> ToolOutcome:
+            _from_bracket, found = in_read(read)
+            state = None if found is None else state_of(found)
+            verified = state == want
+            note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
+            if via.ok and not verified:
+                note += f" (wanted {want}): do not click it again from this read; read the window first"
+            via.summary += note
+            if via.content and via.content[0].get("type") == "text":
+                via.content[0]["text"] += note
+            if isinstance(via.payload, dict):
+                details = (dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict)
+                           else {})
+                details.update(verified=verified, state_before=held.get("now"), state_after=state, toggle_to=want)
+                via.payload = {**via.payload, "details": details}
+            return self._labelled(via, label)
+
+        return self._bracketed("click", hwnd, act, target=element_id,
+                               target_label=self._short_label(element), before_hook=before, after_hook=after)
 
     def _pointed_window(self, x: int, y: int) -> int | None:
         locate = getattr(self.backend, "window_at", None)
@@ -3226,63 +3739,139 @@ class Dispatcher:
             if via is not None:
                 return self._labelled(via, target[3])
         self._before_input("type_text")
-        if target is None:
-            return self._from_action("type_text", self.backend.type_text(text, **options))
-        # Focus the element first by clicking it, guarded to its window; type
-        # only if that click went through.
-        x, y, guard, label = target
-        focus = self._from_action("type_text", self.backend.click(x, y, expect_hwnd=guard))
-        if not focus.ok:
-            return self._labelled(focus, f"{label} (clicked to focus it; nothing typed)")
-        typed = self._from_action("type_text", self.backend.type_text(text, **options))
-        typed.payload = {"focus_click": focus.payload, "type_text": typed.payload}
-        typed.elapsed_ms += focus.elapsed_ms
-        return self._labelled(typed, f"{label} (clicked to focus it)")
+
+        def act() -> ToolOutcome:
+            if target is None:
+                return self._from_action("type_text", self.backend.type_text(text, **options))
+            # Focus the element first by clicking it, guarded to its window; type
+            # only if that click went through.
+            x, y, guard, label = target
+            focus = self._from_action("type_text", self.backend.click(x, y, expect_hwnd=guard))
+            if not focus.ok:
+                return self._labelled(focus, f"{label} (clicked to focus it; nothing typed)")
+            typed = self._from_action("type_text", self.backend.type_text(text, **options))
+            typed.payload = {"focus_click": focus.payload, "type_text": typed.payload}
+            typed.elapsed_ms += focus.elapsed_ms
+            return self._labelled(typed, f"{label} (clicked to focus it)")
+
+        if not options["press_enter"]:
+            return act()   # the field's own read-back says whether the text arrived
+        # report 58: Enter sends or submits; what that did shows in the window (the message in the chat, the box empty)
+        return self._bracketed("type_text", target[2] if target is not None else self._key_window(tool_input), act)
 
     def _do_hotkey(self, tool_input: dict[str, Any]) -> ToolOutcome:
         keys = tool_input.get("keys")
         if not isinstance(keys, list) or not keys or not all(isinstance(k, str) for k in keys):
             raise ToolError(f"'keys' must be a non-empty list of strings, got {keys!r}")
-        if not (len(keys) == 1 and keys[0].strip().casefold() in self.SYSTEM_KEYS):
+        system = len(keys) == 1 and keys[0].strip().casefold() in self.SYSTEM_KEYS
+        if not system:
             self._before_input("hotkey")
-        return self._from_action(
-            "hotkey", self.backend.hotkey(*keys, expect_hwnd=self._opt_hwnd(tool_input))
-        )
+
+        def act() -> ToolOutcome:
+            return self._from_action("hotkey", self.backend.hotkey(*keys, expect_hwnd=self._opt_hwnd(tool_input)))
+
+        # a system key (media, volume) acts outside any window: nothing in one to compare
+        return act() if system else self._bracketed("hotkey", self._key_window(tool_input), act)
 
     def _do_press(self, tool_input: dict[str, Any]) -> ToolOutcome:
         key = self._need_str(tool_input, "key")
-        if key.strip().casefold() not in self.SYSTEM_KEYS:
+        system = key.strip().casefold() in self.SYSTEM_KEYS
+        if not system:
             self._before_input("press")
-        return self._from_action(
-            "press",
-            self.backend.press(
-                key,
-                times=self._opt_int(tool_input, "times", 1),
-                expect_hwnd=self._opt_hwnd(tool_input),
-            ),
-        )
+
+        def act() -> ToolOutcome:
+            return self._from_action(
+                "press",
+                self.backend.press(
+                    key,
+                    times=self._opt_int(tool_input, "times", 1),
+                    expect_hwnd=self._opt_hwnd(tool_input),
+                ),
+            )
+
+        return act() if system else self._bracketed("press", self._key_window(tool_input), act)
+
+    def _scroller_at(self, hwnd: int | None, x: int, y: int) -> tuple[int, str] | None:
+        """``(id, label)`` of the smallest scrollable element of the window's latest read whose box holds (x, y), when
+        it has a RuntimeId to be found again by; ``None`` otherwise."""
+        if not hwnd or int(hwnd) not in self._latest_trees:
+            return None
+        model = self._models.get(int(hwnd))
+        pool = model.latest.values() if model is not None and model.latest else self._latest_trees[int(hwnd)][1].values()
+        best: tuple[int, int, dict[str, Any]] | None = None
+        for raw in pool:
+            element = raw if isinstance(raw, dict) else _plain(raw)
+            b = element.get("bounds")
+            if not element.get("is_scrollable") or not element.get("runtime_id") or not b or len(b) != 4:
+                continue
+            if not (int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3])):
+                continue
+            area = (int(b[2]) - int(b[0])) * (int(b[3]) - int(b[1]))
+            if best is None or area < best[0]:
+                best = (area, int(element["id"]), element)
+        if best is None:
+            return None
+        return best[1], f"[{best[1]}] {self._short_label(best[2])} (the scrolling area at ({x},{y}))"
+
+    def _key_window(self, tool_input: dict[str, Any]) -> int | None:
+        """The window keys go to: ``expect_hwnd``, else the one in front (``None`` when it cannot be told)."""
+        hwnd = self._opt_hwnd(tool_input)
+        if hwnd is not None or not self.verify_outcomes:
+            return hwnd
+        try:
+            return self.foreground_hwnd()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _short_label(element: dict[str, Any] | None) -> str:
+        """``Button "Lyrics"`` for the account of what changed."""
+        if not isinstance(element, dict):
+            return ""
+        name = " ".join(str(element.get("name") or "").split())[:50]
+        role = str(element.get("role") or "element")
+        return f'{role} "{name}"' if name else role
 
     def _do_scroll(self, tool_input: dict[str, Any]) -> ToolOutcome:
         x, y, guard, label = self._point(tool_input)
-        if label:
-            via = self._pattern_first("scroll", tool_input, "scroll", dy=self._opt_int(tool_input, "dy", 0),
-                                      dx=self._opt_int(tool_input, "dx", 0))
-            if via is not None:
-                return self._continue_scrolling(tool_input, self._labelled(via, label), x, y, guard)
-        self._before_input("scroll")
-        return self._continue_scrolling(tool_input, self._labelled(
-            self._from_action(
-                "scroll",
-                self.backend.scroll(
-                    x,
-                    y,
-                    dy=self._opt_int(tool_input, "dy", 0),
-                    dx=self._opt_int(tool_input, "dx", 0),
-                    expect_hwnd=guard,
+        found = self._read_element(tool_input) if label else None
+        window = guard or (found[0] if found is not None else None) or self._pointed_window(x, y)
+
+        def act() -> ToolOutcome:
+            if label:
+                via = self._pattern_first("scroll", tool_input, "scroll", dy=self._opt_int(tool_input, "dy", 0),
+                                          dx=self._opt_int(tool_input, "dx", 0))
+                if via is not None:
+                    return self._labelled(via, label)
+            else:
+                # report 58: at a raw point, the scrolling area the latest read shows there is scrolled through its
+                # pattern, found again by its RuntimeId (on Chromium the point itself answers with the renderer pane)
+                area = self._scroller_at(window, x, y)
+                if area is not None:
+                    via = self._pattern_first("scroll", {**tool_input, "element": area[0], "expect_hwnd": window},
+                                              "scroll", dy=self._opt_int(tool_input, "dy", 0),
+                                              dx=self._opt_int(tool_input, "dx", 0))
+                    if via is not None and via.ok:
+                        return self._labelled(via, area[1])
+                    # it would not scroll that way: the wheel at the point, as before
+            self._before_input("scroll")
+            return self._labelled(
+                self._from_action(
+                    "scroll",
+                    self.backend.scroll(
+                        x,
+                        y,
+                        dy=self._opt_int(tool_input, "dy", 0),
+                        dx=self._opt_int(tool_input, "dx", 0),
+                        expect_hwnd=guard,
+                    ),
                 ),
-            ),
-            label,
-        ), x, y, guard)
+                label,
+            )
+
+        # report 58: a scroll is judged by the window's content moving, not by one point under it
+        first = self._bracketed("scroll", window, act)
+        return self._continue_scrolling(tool_input, first, x, y, guard)
 
     def _continue_scrolling(self, tool_input: dict[str, Any], first: ToolOutcome, x: int, y: int,
                             guard: int | None) -> ToolOutcome:

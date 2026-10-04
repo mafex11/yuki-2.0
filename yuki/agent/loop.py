@@ -276,6 +276,10 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
         payload = payload["type_text"]
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
     own = details.get("verified")
+    change = details.get("screen_change") if isinstance(details.get("screen_change"), dict) else None
+    if isinstance(own, bool) and change is not None and change.get("verified") is own and change.get("why"):
+        # report 58: the window read before and after the action, compared (yuki.perception.outcome)
+        return own, str(change["why"])
     if isinstance(own, bool):
         return own, "its report says it was " + ("seen" if own else "not seen")
     if name == "scroll" and details.get("unverifiable") == "page":

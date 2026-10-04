@@ -144,6 +144,9 @@ _P_RANGE_VALUE_VALUE = 30047
 _P_RANGE_VALUE_IS_READONLY = 30048
 _P_RANGE_VALUE_MINIMUM = 30049
 _P_RANGE_VALUE_MAXIMUM = 30050
+#: The app's own name for a control (a web page's ``id``, a XAML ``x:Name``): part of an element's identity across
+#: reads when the provider gives no RuntimeId (appPerception, report 58).
+_P_AUTOMATION_ID = 30011
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -181,7 +184,7 @@ _CACHED_PROPERTIES = (
 #: without one simply reads it as absent).
 _OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET,
                         _P_IS_RANGE_VALUE_AVAILABLE, _P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_IS_READONLY,
-                        _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM)
+                        _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM, _P_AUTOMATION_ID)
 
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_CHILDREN = 2
@@ -501,6 +504,21 @@ class UIElement:
     #: ``(PositionInSet, SizeOfSet)`` when the provider reports them (a list's
     #: own numbering, ``aria-posinset``), else ``None``.
     position: tuple[int, int] | None = None
+    #: UI Automation's RuntimeId: the element's identity for as long as it lives
+    #: (``None`` when the provider gives none).  What keeps an element's id the
+    #: same across reads (:mod:`yuki.perception.model`) and finds it again live.
+    runtime_id: tuple[int, ...] | None = None
+    #: The app's own name for the control (AutomationId), ``""`` when none.
+    automation_id: str = ""
+    #: A state control the app keeps hidden in place behind its own drawing (a
+    #: web page's visually hidden ``<input type=range>`` inside the volume
+    #: label, the checkbox behind a switch): reported off-screen with no box or a
+    #: 1-2 px one inside the visible area.  Kept for its state and its pattern;
+    #: its ``bounds`` are its nearest kept ancestor's, so there is no point of
+    #: its own to aim at (act on it by id).  Report 58, root cause 1.
+    hidden: bool = False
+    #: A slider's ``(value, minimum, maximum)`` (RangeValue), else ``None``.
+    range: tuple[float, float, float] | None = None
 
 
 #: The pattern flags :class:`UIElement` reports, in the order they are listed:
@@ -559,6 +577,26 @@ class WindowTree:
     #: inside it can be aimed at through UI Automation (what text it exposes is
     #: still in its elements).
     opaque: bool = False
+    #: What the read left out, per kept element (report 58, root cause 2): one
+    #: dict per parent, ``{"parent": id, "above": n, "below": n, "left": n,
+    #: "right": n, "hidden": n, "named": [[role, name, side], ...],
+    #: "unread": [[role, name], ...], "unread_count": n}``.  The sides count
+    #: children reported off-screen, by where they lie against the parent's
+    #: visible box (``hidden``: off-screen while overlapping it - kept out of view
+    #: by the app itself); ``unread`` are children already fetched that the
+    #: element cap or the clock stopped the walk before.
+    left_out: list[dict] = field(default_factory=list)
+    #: Elements kept although hidden in place (:attr:`UIElement.hidden`).
+    hidden_controls: int = 0
+    #: Why a truncated read stopped (report 58 review, F6): ``"cap"`` (the
+    #: element cap, or a page's share of it), ``"clock"`` (the time limit),
+    #: ``"depth"``, ``"failed"`` (a branch the provider refused); ``""`` when
+    #: the read is whole.  Only ``"clock"`` means the read was cut short.
+    stopped_by: str = ""
+    #: A part read (``get_window_tree(part=...)``): the window's frame and one
+    #: element's subtree only; ``part_missing`` when that element was not met.
+    part: bool = False
+    part_missing: bool = False
 
 
 #: Roles whose whole purpose is to hold text the user types.  A control with a
@@ -819,6 +857,39 @@ def _description(get: object, name: str) -> str:
     return ""
 
 
+def _automation_id(get: object) -> str:
+    """The cached AutomationId, ``""`` when none (an optional property: absent on an older UI Automation)."""
+    try:
+        return _as_text(get(_P_AUTOMATION_ID))[:120]  # type: ignore[operator]
+    except Exception:
+        return ""
+
+
+#: Hidden-in-place controls (:func:`_hidden_in_place`) one read keeps, at most.
+_MAX_HIDDEN = 40
+#: Unread children (cap or clock) looked at per level for their names; the rest are only counted.
+_UNREAD_LOOKED = 40
+#: Names of left-out children kept per parent (:attr:`WindowTree.left_out`), and how much of each.
+_LEFT_OUT_NAMES = 4
+_LEFT_OUT_NAME_CHARS = 60
+
+
+def _side_of(bounds: tuple[int, int, int, int] | None, box: tuple[int, int, int, int] | None) -> str:
+    """Where an off-screen child lies against its parent's visible box: ``above`` / ``below`` / ``left`` /
+    ``right``, or ``hidden`` (no box, or overlapping it: kept out of view by the app itself)."""
+    if bounds is None or box is None:
+        return "hidden"
+    if bounds[3] <= box[1] + _EDGE_SLACK:
+        return "above"
+    if bounds[1] >= box[3] - _EDGE_SLACK:
+        return "below"
+    if bounds[2] <= box[0] + _EDGE_SLACK:
+        return "left"
+    if bounds[0] >= box[2] - _EDGE_SLACK:
+        return "right"
+    return "hidden"
+
+
 def _set_position(get: object) -> tuple[int, int] | None:
     """``(PositionInSet, SizeOfSet)`` when the provider gives both as a sensible pair."""
     try:
@@ -834,21 +905,78 @@ def _set_position(get: object) -> tuple[int, int] | None:
     return None
 
 
+def _range_numbers(get: object) -> tuple[float, float, float] | None:
+    """A RangeValue's ``(value, minimum, maximum)`` when the element has one and all three are numbers, else ``None``."""
+    try:
+        if not _as_bool(get(_P_IS_RANGE_VALUE_AVAILABLE)):  # type: ignore[operator]
+            return None
+        value, low, high = (get(p) for p in (_P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_MINIMUM,  # type: ignore[operator]
+                                             _P_RANGE_VALUE_MAXIMUM))
+    except Exception:
+        return None
+    numbers = [v for v in (value, low, high) if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if len(numbers) != 3:
+        return None
+    return (float(value), float(low), float(high))
+
+
 def _slider_value(get: object) -> str | None:
     """A slider's RangeValue as a read shows it ("37 (range 0-100)"), or ``None`` without one. An optional property:
     an older UI Automation, or a provider without it, reads as absent (its "not supported" sentinel is no number)."""
     try:
         if not _as_bool(get(_P_IS_RANGE_VALUE_AVAILABLE)):  # type: ignore[operator]
             return None
-        value, low, high = (get(p) for p in (_P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_MINIMUM,  # type: ignore[operator]
-                                             _P_RANGE_VALUE_MAXIMUM))
         read_only = _as_bool(get(_P_RANGE_VALUE_IS_READONLY))  # type: ignore[operator]
     except Exception:
         return None
-    numbers = [v for v in (value, low, high) if isinstance(v, (int, float)) and not isinstance(v, bool)]
-    if len(numbers) != 3:
+    numbers = _range_numbers(get)
+    if numbers is None:
         return "slider"
-    return f"{float(value):g} (range {float(low):g}-{float(high):g}{', read-only' if read_only else ''})"
+    value, low, high = numbers
+    return f"{value:g} (range {low:g}-{high:g}{', read-only' if read_only else ''})"
+
+
+#: A box at most this many px wide or tall is "no box" for :func:`_hidden_in_place`: a visually hidden web control is
+#: clipped to 1 px (``clip: rect(0 0 0 0); width: 1px; height: 1px``), or to nothing.
+_HIDDEN_BOX_PX = 2
+
+
+def _state_control(get: object) -> bool:
+    """Whether an element carries a state the reader must not lose: a RangeValue (a slider) or a Toggle (a checkbox,
+    a switch, a pressed button)."""
+    try:
+        return _as_bool(get(_P_IS_RANGE_VALUE_AVAILABLE)) or _as_bool(get(_P_IS_TOGGLE_AVAILABLE))  # type: ignore[operator]
+    except Exception:
+        return False
+
+
+def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> bool:
+    """A state control the app hides in place behind its own drawing (report 58, root cause 1).
+
+    Seen on 3-4 Oct in every Spotify read: the volume and progress sliders are
+    web range inputs clipped to nothing inside their labels, so UI Automation
+    reports them off-screen (or with no box at all) while the label sits in
+    plain view; a switch's checkbox is hidden the same way.  True when the
+    element has a RangeValue or Toggle pattern and either no box, or reports
+    off-screen with a box of at most :data:`_HIDDEN_BOX_PX` lying inside
+    ``area`` (the visible part of the window, or of the scrolling container it
+    is in).  A list row scrolled out of view has a full-size box outside
+    ``area``, so it is never taken for one.  Facts about patterns and
+    rectangles only.
+    """
+    if not _state_control(get):
+        return False
+    try:
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        offscreen = _as_bool(get(_P_IS_OFFSCREEN))  # type: ignore[operator]
+    except Exception:
+        return False
+    if bounds is None:
+        return True
+    if not offscreen:
+        return False
+    small = bounds[2] - bounds[0] <= _HIDDEN_BOX_PX or bounds[3] - bounds[1] <= _HIDDEN_BOX_PX
+    return small and (area is None or _contains(area, bounds))
 
 
 def _states(get: object) -> tuple[str, ...]:
@@ -900,6 +1028,18 @@ class _CachedWalker:
         self.cancel = cancel
         self.elements: list[UIElement] = []
         self.truncated = False
+        #: Why the walk stopped short (report 58 review, F6): ``"cap"`` (the element cap, or a page's share of it),
+        #: ``"clock"`` (the deadline or ``cancel``), ``"depth"``, ``"failed"`` (a branch the provider refused);
+        #: ``""`` while nothing stopped it.  The clock wins over any other reason once it is hit.
+        self.stopped_by = ""
+        #: A part read (``look_at_window`` with ``within``): the RuntimeId of the element whose subtree alone is
+        #: kept (the window's frame, id 0, is kept too).  Everything else is walked through to find it, not kept,
+        #: so the cap is spent on the part only.  ``part_found`` once it was met, ``part_done`` once the walk left
+        #: it (the walk then stops: the part is read).
+        self.part: tuple[int, ...] | None = None
+        self.part_depth: int | None = None
+        self.part_found = False
+        self.part_done = False
         self.seen: set[tuple] = set()
         self._shapes: set[tuple] = set()
         #: ``[depth, kept id or -1, window handle]`` of every element on the
@@ -934,6 +1074,10 @@ class _CachedWalker:
         self.raw_pages = 0
         #: Scans for page Documents made past ``IsOffscreen`` (diagnostic).
         self.page_scans = 0
+        #: What was left out, by the kept parent's id (see :meth:`note_left_out`).
+        self.left_out: dict[int, dict] = {}
+        #: Hidden-in-place controls kept (:func:`_hidden_in_place`).
+        self.hidden_kept = 0
         #: Called as ``on_window(native_hwnd, depth)`` after an element that owns
         #: a window handle has been walked, so the pass can splice that HWND's own
         #: subtree in right there - keeping depth-first order and real depths -
@@ -963,7 +1107,60 @@ class _CachedWalker:
         return ("shape", role, name, bounds)
 
     # -- element decoding ---------------------------------------------------
-    def _add(self, element: object, depth: int, *, window: int = 0) -> None:
+    def kept_ancestor(self, depth: int) -> int:
+        """The id of the nearest kept element on the current path above ``depth`` (-1: none)."""
+        for entry in reversed(self._lineage):
+            if entry[0] < depth and entry[1] >= 0:
+                return entry[1]
+        return -1
+
+    def note_left_out(self, depth: int, bounds: tuple[int, int, int, int] | None, role: str, name: str,
+                      *, unread: bool = False, count: int = 1) -> None:
+        """Count a child the walk did not read under its nearest kept ancestor (:attr:`WindowTree.left_out`).
+
+        ``unread``: the cap or the clock stopped the walk before it (it was fetched, not read); otherwise it
+        reported itself off-screen, and the side it lies on against the parent's visible box is counted.
+        """
+        parent = self.kept_ancestor(depth)
+        entry = self.left_out.get(parent)
+        if entry is None:
+            entry = self.left_out[parent] = {"parent": parent, "above": 0, "below": 0, "left": 0, "right": 0,
+                                             "hidden": 0, "named": [], "unread": [], "unread_count": 0}
+        if unread:
+            entry["unread_count"] += count
+            if name and len(entry["unread"]) < _LEFT_OUT_NAMES:
+                entry["unread"].append([role, name[:_LEFT_OUT_NAME_CHARS]])
+            return
+        box = self.elements[parent].bounds if 0 <= parent < len(self.elements) else self.viewport
+        if box is not None and self.viewport is not None:
+            box = _overlap(box, self.viewport) or box
+        side = _side_of(bounds, box)
+        entry[side] += 1
+        if name and len(entry["named"]) < _LEFT_OUT_NAMES:
+            entry["named"].append([role, name[:_LEFT_OUT_NAME_CHARS], side])
+
+    def _in_part(self, get: object, depth: int) -> bool:
+        """For a part read: whether the element met at ``depth`` lies in the part (it is the part's root or below
+        it). Meeting an element at the part root's depth or above once the part was entered ends the part."""
+        if self.part_depth is not None:
+            if depth > self.part_depth:
+                return True
+            self.part_depth = None
+            self.part_done = True
+            return False
+        if self.part_done or _runtime_id(get) != self.part:
+            return False
+        self.part_depth = depth
+        self.part_found = True
+        return True
+
+    def stop(self, reason: str) -> None:
+        """Note why the walk stopped short (:attr:`stopped_by`) and mark it truncated."""
+        self.truncated = True
+        if not self.stopped_by or reason == "clock":
+            self.stopped_by = reason
+
+    def _add(self, element: object, depth: int, *, window: int = 0, hidden: bool = False) -> None:
         # Every element met, kept or not, closes the branches at its depth and
         # below: the walk is depth-first, so whatever sits deeper on the path
         # belongs to a sibling's subtree that is finished.
@@ -975,7 +1172,18 @@ class _CachedWalker:
         # through (a window root that reports none), else its parent's.
         native = _native_handle(get) or window or (lineage[-1][2] if lineage else 0)
         lineage.append([depth, -1, native])
+        if self.part is not None and depth > 0 and not self._in_part(get, depth):
+            return
         bounds = _rect(get(_P_BOUNDING_RECT))
+        if hidden:
+            if self.hidden_kept >= _MAX_HIDDEN:
+                return
+            # No box of its own to aim at: it stands where the label or bar that hides it is.
+            parent = next((entry[1] for entry in reversed(lineage[:-1]) if entry[1] >= 0), -1)
+            if 0 <= parent < len(self.elements):
+                bounds = self.elements[parent].bounds
+            elif bounds is None:
+                return
         if bounds is None:
             return
         name = _as_text(get(_P_NAME))
@@ -1045,8 +1253,14 @@ class _CachedWalker:
                 parent=next((entry[1] for entry in reversed(lineage[:-1]) if entry[1] >= 0), -1),
                 description=_description(get, name),
                 position=_set_position(get),
+                runtime_id=identity[1] if identity[0] == "rid" else None,
+                automation_id=_automation_id(get),
+                hidden=hidden,
+                range=_range_numbers(get) if ranged is not None else None,
             )
         )
+        if hidden:
+            self.hidden_kept += 1
         lineage[-1][1] = len(self.elements) - 1
 
     def window_at(self, depth: int) -> int:
@@ -1088,11 +1302,13 @@ class _CachedWalker:
         if self.out_of_budget():
             return
         if depth > _MAX_DEPTH:
-            self.truncated = True
+            self.stop("depth")
             return
-        offscreen = _as_bool(
-            element.GetCachedPropertyValue(_P_IS_OFFSCREEN)  # type: ignore[attr-defined]
-        )
+        get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+        if _hidden_in_place(get, self.viewport):
+            self._add(element, depth, hidden=True)  # its state is the point; nothing below it is read
+            return
+        offscreen = _as_bool(get(_P_IS_OFFSCREEN))
         if offscreen:
             # Scrolled-out or hidden: the whole subtree is invisible to the
             # user, and in Chromium that subtree can be thousands of nodes.
@@ -1114,16 +1330,41 @@ class _CachedWalker:
                 self.on_window(native, depth)  # type: ignore[operator]
 
     def out_of_budget(self) -> bool:
+        if self.part_done:
+            return True   # a part read has read its part: nothing left to keep, and nothing was cut
         if len(self.elements) >= self.max_elements:
-            self.truncated = True
+            self.stop("cap")
             return True
         if self.cancel is not None and self.cancel.is_set():
-            self.truncated = True
+            self.stop("clock")
             return True
         if time.monotonic() >= self.deadline:
-            self.truncated = True
+            self.stop("clock")
             return True
         return False
+
+
+def _onscreen_condition(automation: object, view: object) -> object:
+    """``view`` AND (not off-screen OR a state control): the filter of a whole-subtree batch.
+
+    The ``IsOffscreen == False`` half keeps a batch bounded by what is on screen;
+    the other half lets through the RangeValue and Toggle elements a page hides
+    in place (:func:`_hidden_in_place` decides, per element, whether to keep
+    one), which the plain filter dropped before the walk ever saw them: every
+    Spotify read of 3-4 Oct lacked its volume slider for exactly that reason.
+    A filtered batch skips a failing element but still looks below it, so this
+    costs nothing for the rest of the batch.
+    """
+    onscreen = automation.CreatePropertyCondition(_P_IS_OFFSCREEN, False)  # type: ignore[attr-defined]
+    try:
+        state = automation.CreateOrCondition(  # type: ignore[attr-defined]
+            automation.CreatePropertyCondition(_P_IS_RANGE_VALUE_AVAILABLE, True),  # type: ignore[attr-defined]
+            automation.CreatePropertyCondition(_P_IS_TOGGLE_AVAILABLE, True),  # type: ignore[attr-defined]
+        )
+        shown = automation.CreateOrCondition(onscreen, state)  # type: ignore[attr-defined]
+    except Exception:
+        shown = onscreen  # a UI Automation without the property: the plain filter, as before
+    return automation.CreateAndCondition(view, shown)  # type: ignore[attr-defined]
 
 
 def _build_cache_request(
@@ -1261,7 +1502,7 @@ def _collect_pass_whole(
         try:
             walker.walk(child_root.BuildUpdatedCache(subtree_request), depth)
         except Exception:
-            walker.truncated = True
+            walker.stop("failed")
 
     walker.on_window = walk_child_window
 
@@ -1281,7 +1522,7 @@ def _collect_pass_whole(
             try:
                 walker.walk(child.BuildUpdatedCache(subtree_request), base_depth + 1)
             except Exception:
-                walker.truncated = True
+                walker.stop("failed")
             try:
                 child = tree_walker.GetNextSiblingElement(child)
             except Exception:
@@ -1293,7 +1534,7 @@ def _collect_pass_whole(
     try:
         walker._add(live_root.BuildUpdatedCache(root_request), 0)
     except Exception:
-        walker.truncated = True
+        walker.stop("failed")
     walk_children_of(live_root, 0)
 
     # Descendant HWNDs the walk never met (their owning element was off-screen,
@@ -1428,10 +1669,7 @@ class _ViewportPass:
         self.walker = _CachedWalker(max_elements=max_elements, deadline=deadline, cancel=cancel)
         if on_start is not None:
             on_start(self.walker)  # type: ignore[operator]
-        onscreen = automation.CreateAndCondition(  # type: ignore[attr-defined]
-            automation.ControlViewCondition,  # type: ignore[attr-defined]
-            automation.CreatePropertyCondition(_P_IS_OFFSCREEN, False),  # type: ignore[attr-defined]
-        )
+        onscreen = _onscreen_condition(automation, automation.ControlViewCondition)  # type: ignore[attr-defined]
         self.root_request = _build_cache_request(
             automation,
             _TREE_SCOPE_ELEMENT | _TREE_SCOPE_CHILDREN,
@@ -1526,7 +1764,7 @@ class _ViewportPass:
         except Exception:
             # The element went away (a page re-rendering), or the provider
             # refused: that branch is missing, and the tree says so.
-            self.walker.truncated = True
+            self.walker.stop("failed")
             return None
         self.walker.fetches += 1
         return holder
@@ -1558,14 +1796,7 @@ class _ViewportPass:
                     mode=_AUTOMATION_ELEMENT_MODE_FULL,
                 )
             else:
-                tree_filter = (
-                    automation.CreateAndCondition(  # type: ignore[attr-defined]
-                        view,
-                        automation.CreatePropertyCondition(_P_IS_OFFSCREEN, False),  # type: ignore[attr-defined]
-                    )
-                    if self.trust_offscreen
-                    else view
-                )
+                tree_filter = _onscreen_condition(automation, view) if self.trust_offscreen else view
                 request = _build_cache_request(
                     automation,
                     _TREE_SCOPE_DESCENDANTS,
@@ -1593,10 +1824,29 @@ class _ViewportPass:
 
     # -- traversal ----------------------------------------------------------
     def _walk_children(self, holder: object, depth: int, *, live: bool) -> None:
-        for child in _CachedWalker._cached_children(holder):
+        children = _CachedWalker._cached_children(holder)
+        for index, child in enumerate(children):
             if self.walker.out_of_budget():
+                self._note_unread(children[index:], depth + 1)
                 return
             self._visit(child, depth + 1, live=live)
+
+    def _note_unread(self, children: list[object], depth: int) -> None:
+        """Children already fetched that the cap or the clock stopped the walk before: counted under their parent,
+        named when they have a name (report 58: a depth-first cut used to drop whatever came last - a chat's newest
+        messages, a player bar - with only "TRUNCATED" to say so)."""
+        walker = self.walker
+        for child in children[:_UNREAD_LOOKED]:
+            try:
+                get = child.GetCachedPropertyValue  # type: ignore[attr-defined]
+                if _as_bool(get(_P_IS_OFFSCREEN)) and not _hidden_in_place(get, self.clip or self.viewport):
+                    continue
+                walker.note_left_out(depth, None, _role_name(get(_P_CONTROL_TYPE)), _as_text(get(_P_NAME)),
+                                     unread=True)
+            except Exception:
+                continue
+        if len(children) > _UNREAD_LOOKED:
+            walker.note_left_out(depth, None, "", "", unread=True, count=len(children) - _UNREAD_LOOKED)
 
     def _visit(self, element: object, depth: int, *, live: bool) -> None:
         """Keep ``element`` (if it is worth keeping) and walk what is below it.
@@ -1608,11 +1858,25 @@ class _ViewportPass:
         if walker.out_of_budget():
             return
         if depth > _MAX_DEPTH:
-            walker.truncated = True
+            walker.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+        if _hidden_in_place(get, self.clip or self.viewport):
+            # A slider or switch the page hides in place: kept for its state, nothing below it read.
+            runtime_id = _runtime_id(get)
+            if runtime_id is not None:
+                if runtime_id in self.visited:
+                    return
+                self.visited.add(runtime_id)
+            walker._add(element, depth, hidden=True)
+            return
         if not self._shown(element, get, depth, live=live):
             walker.offscreen_skipped += 1
+            try:
+                walker.note_left_out(depth, _rect(get(_P_BOUNDING_RECT)), _role_name(get(_P_CONTROL_TYPE)),
+                                     _as_text(get(_P_NAME)))
+            except Exception:
+                pass
             return
         runtime_id = _runtime_id(get)
         if runtime_id is not None:
@@ -1779,8 +2043,10 @@ class _ViewportPass:
         page = not self.stop_at_documents and _page_facts(get) is not None
         try:
             if page:
-                if not self._in_page:
-                    walker.max_elements = max(len(walker.elements) + 1, saved_cap - _AFTER_PAGE_RESERVE)
+                if not self._in_page and walker.part is None:
+                    # (a part read keeps nothing after the page but its own part: no reserve)
+                    reserve = max(_AFTER_PAGE_RESERVE, saved_cap // _AFTER_PAGE_SHARE)
+                    walker.max_elements = max(len(walker.elements) + 1, saved_cap - reserve)
                 self._in_page += 1
                 try:
                     self._read_page(depth, live_element, walk)
@@ -1806,6 +2072,11 @@ class _ViewportPass:
             "offscreen_skipped": walker.offscreen_skipped,
             "background_pages": walker.background_pages,
             "truncated": walker.truncated,
+            "stopped_by": walker.stopped_by,
+            "part": (walker.part_depth, walker.part_found, walker.part_done),
+            "left_out": {k: {**v, "named": [list(n) for n in v["named"]], "unread": [list(n) for n in v["unread"]]}
+                         for k, v in walker.left_out.items()},
+            "hidden_kept": walker.hidden_kept,
         }
 
     def _restore(self, mark: dict, base: int, tail: list[UIElement]) -> None:
@@ -1821,6 +2092,11 @@ class _ViewportPass:
         walker.offscreen_skipped = mark["offscreen_skipped"]
         walker.background_pages = mark["background_pages"]
         walker.truncated = mark["truncated"]
+        walker.stopped_by = mark["stopped_by"]
+        walker.part_depth, walker.part_found, walker.part_done = mark["part"]
+        walker.left_out = {k: {**v, "named": [list(n) for n in v["named"]], "unread": [list(n) for n in v["unread"]]}
+                           for k, v in mark["left_out"].items()}
+        walker.hidden_kept = mark["hidden_kept"]
 
     def _read_page(self, depth: int, live_element: object | None, walk: Callable[[], None]) -> None:
         """Walk a page's content; re-read it in the raw view if the control view
@@ -2437,7 +2713,7 @@ def _collect_pass(
         raise
     except Exception:
         if viewport_pass.walker.elements:
-            viewport_pass.walker.truncated = True
+            viewport_pass.walker.stop("failed")
             return viewport_pass.walker  # it was reading: keep what it read
     walker = _collect_pass_whole(
         automation,
@@ -2594,6 +2870,7 @@ def _walk_window(
     publish: object | None = None,
     on_pass: object | None = None,
     cancel: threading.Event | None = None,
+    part: bool = False,
 ) -> _CachedWalker:
     """Collect the window's elements, waiting out a tree that is still building.
 
@@ -2631,6 +2908,8 @@ def _walk_window(
             deadline.
         on_pass: handed to :func:`_collect_pass` as ``on_start`` for every pass.
         cancel: once set, stop at the next check and return what there is.
+        part: a part read (``on_pass`` sets the walker's :attr:`_CachedWalker.part`): one pass, never the
+            thin-tree wait (a part is small by design, not a tree still building).
     """
     # A fresh IUIAutomation for this thread's apartment: COM interface pointers
     # cannot be shared across apartments, and an abandoned thread must not
@@ -2640,6 +2919,9 @@ def _walk_window(
         _CUIAUTOMATION_CLSID, interface=module.IUIAutomation
     )
     child_handles = _surface_handles(hwnd)
+    # Report 58 review: ask the window (and its content windows) once for full accessibility, the way assistive
+    # technology announces itself to Chromium, Electron and CEF.
+    _announce_accessibility_client([hwnd, *child_handles])
     passes = 1
 
     def adopt(walker: _CachedWalker) -> _CachedWalker:
@@ -2661,6 +2943,8 @@ def _walk_window(
     )
     first_count = len(best.elements)
     best = adopt(best)
+    if part:
+        return best
 
     thin = (
         first_count < _THIN_TREE_ELEMENTS
@@ -2671,6 +2955,9 @@ def _walk_window(
     )
     if not thin or len(best.elements) >= max_elements or time.monotonic() >= deadline:
         return best
+    # Report 58: a content window that exposed nothing is asked once more, the way a screen reader asks (an MSAA
+    # client request): some providers build their whole tree only for such a client.
+    _wake_accessibility(child_handles, best.viewport)
     if not young and measured_opaque(hwnd):
         # Measured opaque minutes ago and not just opened: it was already watched
         # for a tree to wake, and polling it again only costs the reader time.
@@ -2725,6 +3012,130 @@ def _walk_window(
             break  # populated, and has stopped growing
     best.passes = passes
     return best
+
+
+#: Content windows already asked by :func:`_wake_accessibility`, with when (monotonic): each is asked at most once
+#: in this long (s).
+_WAKE_MEMO_S = 600.0
+_woken: dict[int, float] = {}
+_OBJID_CLIENT = 0xFFFFFFFC
+_IID_IACCESSIBLE = "{618736E0-3C3D-11CF-810C-00AA00389B71}"
+
+
+def _wake_accessibility(handles: list[int], viewport: tuple[int, int, int, int] | None) -> int:
+    """Ask each large descendant window that a thin read found empty for its accessible object, as an assistive
+    technology does (``AccessibleObjectFromWindow(OBJID_CLIENT)``), once per :data:`_WAKE_MEMO_S`.
+
+    Chromium and the apps built on it (Electron, CEF) turn on their accessibility tree when a client asks for it;
+    a renderer window can answer UI Automation's own first question with an empty root and build the tree only for
+    a client request.  This is that request, made only for a content window that a read just found empty (the thin
+    read's gap), never on every read: an app's accessibility mode is the app's cost, and the reads of 3-4 Oct show
+    the tree complete once it is on.  Returns how many windows were asked.  Window facts only; nothing here knows
+    which program drew them.
+    """
+    if not handles:
+        return 0
+    try:
+        import comtypes
+        from comtypes import GUID, IUnknown
+
+        oleacc = ctypes_oleacc()
+    except Exception:
+        return 0
+    view_area = _area(viewport) if viewport else 0
+    now = time.monotonic()
+    asked = 0
+    for handle in handles[:_MAX_CHILD_WINDOWS]:
+        rect = _window_rect(handle)
+        if rect is None or (view_area and _area(_overlap(rect, viewport) if viewport else rect)
+                            < _SURFACE_MIN_SHARE * view_area):
+            continue
+        with _fresh_lock:
+            if now - _woken.get(handle, -_WAKE_MEMO_S) < _WAKE_MEMO_S:
+                continue
+            _woken[handle] = now
+            if len(_woken) > 256:
+                for stale in [h for h, at in _woken.items() if now - at >= _WAKE_MEMO_S]:
+                    _woken.pop(stale, None)
+        try:
+            import ctypes
+
+            pointer = comtypes.POINTER(IUnknown)()
+            oleacc.AccessibleObjectFromWindow(ctypes.c_void_p(handle), ctypes.c_ulong(_OBJID_CLIENT),
+                                              ctypes.byref(GUID(_IID_IACCESSIBLE)), ctypes.byref(pointer))
+            asked += 1
+            del pointer   # released at once: the request is the point, not the object
+        except Exception:
+            continue
+    return asked
+
+
+#: Windows already told by :func:`_announce_accessibility_client`, with when (monotonic); each is told at most once in
+#: :data:`_WAKE_MEMO_S`.
+_announced: dict[int, float] = {}
+_WM_GETOBJECT = 0x003D
+#: The custom object id Chromium raises ``EVENT_SYSTEM_ALERT`` for at start-up: a ``WM_GETOBJECT`` for it is how it
+#: tells that assistive technology is running (Chromium's accessibility overview, "Accessibility Detection").
+_OBJID_ACCESSIBILITY_PROBE = 1
+_SMTO_ABORTIFHUNG = 0x0002
+_ANNOUNCE_TIMEOUT_MS = 100
+
+
+def _announce_accessibility_client(handles: list[int]) -> int:
+    """Tell each window that an accessibility client is reading it, the way a screen reader does: answer
+    Chromium's start-up probe with ``WM_GETOBJECT`` for its custom object id (report 58 review, "the reliable
+    trigger").
+
+    For performance Chromium - and Electron and CEF, which are built on it (Spotify, Discord, T3 Code, every
+    Chromium browser) - exposes only part of its accessibility tree until it believes assistive technology is
+    running; this message is that belief's documented trigger, and it switches the app to its complete mode so the
+    real controls (sliders, toggles, the whole page) are in the tree.  A window that does not know the id ignores
+    it.  One message per window, sent with a short timeout and never to a hung window, at most once per
+    :data:`_WAKE_MEMO_S`, and only for a window being read (a window in play); never on a timer.  Window handles
+    only: nothing here knows which program drew a window.  Returns how many windows were told.
+    """
+    try:
+        import ctypes
+
+        ctypes.windll  # noqa: B018 - not on Windows: nothing to tell
+    except Exception:
+        return 0
+    now = time.monotonic()
+    told = 0
+    for handle in handles[: _MAX_CHILD_WINDOWS + 1]:
+        if not handle:
+            continue
+        with _fresh_lock:
+            if now - _announced.get(handle, -_WAKE_MEMO_S) < _WAKE_MEMO_S:
+                continue
+            _announced[handle] = now
+            if len(_announced) > 256:
+                for stale in [h for h, at in _announced.items() if now - at >= _WAKE_MEMO_S]:
+                    _announced.pop(stale, None)
+        try:
+            _probe_window(handle)
+            told += 1
+        except Exception:
+            continue
+    return told
+
+
+def _probe_window(handle: int) -> None:
+    """One ``WM_GETOBJECT`` for Chromium's probe id to ``handle``, with a short timeout, never to a hung window."""
+    import ctypes
+    from ctypes import wintypes
+
+    result = wintypes.DWORD(0)
+    ctypes.windll.user32.SendMessageTimeoutW(wintypes.HWND(handle), _WM_GETOBJECT, wintypes.WPARAM(0),
+                                             wintypes.LPARAM(_OBJID_ACCESSIBILITY_PROBE), _SMTO_ABORTIFHUNG,
+                                             _ANNOUNCE_TIMEOUT_MS, ctypes.byref(result))
+
+
+def ctypes_oleacc() -> object:
+    """``oleacc.dll`` (the MSAA client library), loaded once."""
+    import ctypes
+
+    return ctypes.oledll.oleacc
 
 
 def _has_content(walker: object) -> bool:
@@ -2783,7 +3194,7 @@ def _silent_note(waited_s: float, on_screen: bool) -> tuple[str, str]:
 
 
 def get_window_tree(
-    hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0
+    hwnd: int, *, max_elements: int = 400, timeout_s: float = 3.0, part: tuple[int, ...] | None = None
 ) -> WindowTree:
     """Snapshot the UIA subtree of one window.
 
@@ -2812,6 +3223,11 @@ def get_window_tree(
             A window that has just been launched needs the best part of four
             seconds before its tree exists, so callers that have just opened
             something should raise this.
+        part: the RuntimeId of one element: only it and its subtree are kept
+            (with the window's frame as id 0), so ``max_elements`` is spent on
+            that part alone (report 58 review: ``look_at_window`` with
+            ``within``).  ``part_missing`` is set when the window has no such
+            element now.
 
     Raises:
         ValueError: the handle is not a window.
@@ -2838,6 +3254,8 @@ def get_window_tree(
         result["best"] = walker
 
     def _pass_started(walker: _CachedWalker) -> None:
+        if part:
+            walker.part = tuple(int(x) for x in part)
         result["live"] = walker
 
     def _worker() -> None:
@@ -2854,6 +3272,7 @@ def get_window_tree(
                 publish=_publish,
                 on_pass=_pass_started,
                 cancel=cancel,
+                part=bool(part),
             )
         except BaseException as exc:  # noqa: BLE001 - reported to the caller
             result["error"] = exc
@@ -2919,8 +3338,12 @@ def get_window_tree(
             return _silent(timeout_s)
         partial = True
     elements = list(chosen.elements)
-    if not chosen.complete and chosen.truncated and len(elements) < max_elements:
-        partial = True  # the worker returned, but only because its deadline stopped it
+    if not chosen.complete and chosen.truncated and getattr(chosen, "stopped_by", "clock") == "clock":
+        # the worker returned, but only because its deadline stopped it (report 58 review, F6: a page's share of
+        # the cap also stops a walk short of max_elements, and that is no clock)
+        partial = True
+    if partial:
+        chosen.stopped_by = "clock"
     note = ""
     if partial and elements:
         last = elements[-1]
@@ -2933,13 +3356,17 @@ def get_window_tree(
             f"frame down to {where} - what comes after that in the tree was not read"
         )
     status = "ok" if elements else "empty"
-    coverage = content_coverage(elements, chosen.viewport) if elements else None
+    part_missing = bool(part) and not getattr(chosen, "part_found", False)
+    coverage = content_coverage(elements, chosen.viewport) if elements and not part else None
     opaque = (
-        status == "ok" and not partial and not young
+        status == "ok" and not partial and not young and not part
         and coverage is not None and coverage < OPAQUE_COVERAGE
     )
-    _note_opaque(hwnd, opaque)
-    if status == "empty":
+    if not part:   # a part of a window says nothing about how much of the whole is exposed
+        _note_opaque(hwnd, opaque)
+    if part_missing:
+        note = "the part asked for is not in the window now (it went away, or it is out of view)"
+    elif status == "empty":
         note = "the window answered but exposes no elements with a size on screen"
     elif opaque:
         readable = sum(len(getattr(e, "name", None) or "") + len(getattr(e, "value", None) or "") for e in elements)
@@ -2948,7 +3375,7 @@ def get_window_tree(
             f"Any x,y inside it would be a guess: use the app's own keyboard shortcuts and check its title after "
             f"each step, or the app's own data when it is given"
         )
-    elif not partial:
+    elif not partial and not part:
         gaps = _surface_gaps(chosen)
         if gaps.any:
             parts = []
@@ -2971,8 +3398,9 @@ def get_window_tree(
                 )
             note = (
                 "; ".join(parts)
-                + " - the rest is drawn without accessibility (video, canvas) or has "
-                "not been exposed yet; look again shortly if you expected content there"
+                # report 58: a sparse page (T3 Code's new thread) is mostly empty space, not hidden content
+                + " - the rest is empty space, drawn without accessibility (video, canvas), or not "
+                "exposed yet; look again shortly if you expected content there"
             )
     if elements and chosen.offscreen_pages:
         # Said because it changes what the reader can do: the window is on
@@ -3008,7 +3436,27 @@ def get_window_tree(
         background_pages=chosen.background_pages,
         coverage=round(coverage, 3) if coverage is not None else None,
         opaque=opaque,
+        left_out=_left_out_list(getattr(chosen, "left_out", {}), len(elements)),
+        hidden_controls=sum(1 for e in elements if e.hidden),
+        stopped_by=chosen.stopped_by if (chosen.truncated or partial) else "",
+        part=bool(part),
+        part_missing=part_missing,
     )
+
+
+def _left_out_list(left_out: dict[int, dict], count: int) -> list[dict]:
+    """:attr:`_CachedWalker.left_out` as the tree's list: entries with something in them, parents that exist in the
+    returned elements (or -1), in parent order."""
+    out = []
+    for parent in sorted(left_out):
+        entry = left_out[parent]
+        if parent >= count:
+            continue
+        if not (entry["unread_count"] or any(entry[s] for s in ("above", "below", "left", "right", "hidden"))):
+            continue
+        out.append({**entry, "named": [list(n) for n in entry["named"]],
+                    "unread": [list(n) for n in entry["unread"]]})
+    return out
 
 
 #: How long :func:`wait_for_content` waits by default for a window to expose
@@ -3320,6 +3768,8 @@ class PageIdentity:
 #: window (see :meth:`_ViewportPass._content`). Chrome's tab strip, toolbar
 #: buttons and side panel after the page came to 20-70 elements (2026-09-24).
 _AFTER_PAGE_RESERVE = 80
+#: ... and at least this fraction (1/n) of a larger cap (report 58: the thinker's cap is 1,000).
+_AFTER_PAGE_SHARE = 8
 
 
 def _inside_document(element: UIElement, by_id: dict[int, UIElement]) -> bool:
@@ -4988,8 +5438,25 @@ def _origin(address: str) -> str:
     return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
 
 
-def format_window_tree(tree: WindowTree) -> str:
+#: The text a read gives the model is kept under about this many characters (report 58): past it, the middle of
+#: the longest lists is folded (both ends kept) and the fold says how to see it. Measured on the 3-4 Oct reads:
+#: Discord 257 elements = 16k characters, Spotify 324 = 19k.
+FORMAT_BUDGET_CHARS = 22000
+#: With ``within`` (one part of the window, asked for in full) the budget is this much larger.
+FORMAT_WITHIN_BUDGET_CHARS = 60000
+#: A list is folded only when it has at least this many items; this many from each end are kept at first, fewer
+#: (down to one) while the text is still over budget.
+_FOLD_MIN_ITEMS = 8
+_FOLD_KEEP = (4, 2, 1)
+
+
+def format_window_tree(tree: WindowTree, *, within: int | None = None,
+                       budget: int | None = None) -> str:
     """Compact text rendering of a window tree, one line per element.
+
+    ``within``: the id of one element: only it and what is below it are listed, with the larger
+    :data:`FORMAT_WITHIN_BUDGET_CHARS` budget (how a folded list or a part the read stopped short of is seen in
+    full). ``budget``: characters, :data:`FORMAT_BUDGET_CHARS` by default.
 
     The header is one line.  When the window shows a page (a Document whose
     Value is an address, see :func:`page_identity`) it starts with
@@ -5087,6 +5554,14 @@ def format_window_tree(tree: WindowTree) -> str:
     listed = _drop_redundant(
         [element for element in tree.elements if _listed(element)], tree.elements
     )
+    if budget is None:
+        budget = FORMAT_WITHIN_BUDGET_CHARS if within is not None else FORMAT_BUDGET_CHARS
+    if within is not None:
+        part = _subtree_ids(tree.elements, within)
+        if not part:
+            return lines[0] + f"\n(this read has no element [{within}]; read the whole window)"
+        listed = [element for element in listed if element.id in part]
+        lines[0] += f" | only [{within}] and what is below it"
     parents = _parents(listed, tree.elements)
     has_child = [False] * len(listed)
     for parent in parents:
@@ -5120,6 +5595,8 @@ def format_window_tree(tree: WindowTree) -> str:
 
     def wants_point(index: int) -> bool:
         element = listed[index]
+        if getattr(element, "hidden", False):
+            return False  # it has no point of its own: it is acted on by its id
         if element.is_interactive or _has_marks(element):
             return True
         if has_child[index]:
@@ -5145,6 +5622,8 @@ def format_window_tree(tree: WindowTree) -> str:
             flags.append("focused")
         if element.is_scrollable:
             flags.append("scrollable")
+        if getattr(element, "hidden", False):
+            flags.append("hidden")
         if flags:
             parts.append(f"[{' '.join(flags)}]")
         return parts
@@ -5168,6 +5647,8 @@ def format_window_tree(tree: WindowTree) -> str:
             "gives one, else as listed here)"
         )
 
+    #: (first listed index, end index, text) of every line, in order: what the budget folds.
+    entries: list[tuple[int, int, str]] = []
     index = 0
     while index < len(listed):
         element = listed[index]
@@ -5188,7 +5669,7 @@ def format_window_tree(tree: WindowTree) -> str:
                 f"[{member.id}]{point(member)}" if key[3] else f"[{member.id}]"
                 for member in members
             )
-            lines.append(" ".join(parts) + ": " + where)
+            entries.append((index, end, " ".join(parts) + ": " + where))
             index = end
             continue
         parts = [f"{indent}[{element.id}] {role}"]
@@ -5223,13 +5704,236 @@ def format_window_tree(tree: WindowTree) -> str:
         if wants_point(index):
             parts.append(point(element))
         parts.extend(marks(element))
-        lines.append(" ".join(parts))
+        entries.append((index, index + 1, " ".join(parts)))
         index += 1
     if relative_used:
         lines[0] += (
             " | values starting with / are addresses on the same host as the "
             "Document they are in"
         )
+    if any(getattr(element, "hidden", False) for element in listed):
+        lines[0] += (
+            " | [hidden] = a control the app keeps out of sight behind its own drawing (a slider, a switch): act "
+            "on it by its id; it has no point of its own"
+        )
+    # What the read left out, as a line under the listed element it belongs to (report 58).
+    position = {element.id: i for i, element in enumerate(listed)}
+    by_id_all = {element.id: element for element in tree.elements}
+    root_id = tree.elements[0].id if tree.elements else 0
+    notes: dict[int, list[str]] = {}
+    for entry in getattr(tree, "left_out", None) or []:
+        anchor = _listed_anchor(int(entry.get("parent", -1)), position, by_id_all, within is not None)
+        if anchor is None:
+            continue  # outside the part asked for (within)
+        anchor_id = listed[anchor].id if anchor >= 0 else root_id
+        text = _left_out_text(entry, anchor_id)
+        if text:
+            notes.setdefault(anchor, []).append(text)
+    for parent, text in _set_range_notes(listed, parents).items():
+        if parent not in notes:  # the read's own count of what is off screen there says it already
+            notes[parent] = [text]
+    out = _fold_entries(entries, listed, parents, levels, notes, budget - len(lines[0]), root_id)
+    lines.extend(out)
     if not listed and status != "busy":  # a busy window's note already says why
         lines.append("(no named or interactive elements - UIA exposes nothing usable here)")
     return "\n".join(lines)
+
+
+def _subtree_ids(elements: list[UIElement], root: int) -> set[int]:
+    """Ids of ``root`` and every element below it, by parent links (empty when ``root`` is not in the read)."""
+    ids = {element.id for element in elements}
+    if root not in ids:
+        return set()
+    children: dict[int, list[int]] = {}
+    for element in elements:
+        children.setdefault(getattr(element, "parent", -1), []).append(element.id)
+    out, stack = set(), [root]
+    while stack:
+        current = stack.pop()
+        if current in out:
+            continue
+        out.add(current)
+        stack.extend(children.get(current, ()))
+    return out
+
+
+def _listed_anchor(parent: int, position: dict[int, int], by_id: dict[int, UIElement],
+                   part: bool = False) -> int | None:
+    """The listed index a left-out note goes under: the element itself or its nearest listed ancestor; ``-1`` (the
+    top of the list) when none is listed; ``None`` for a ``part`` read (``within``) when the note is outside it."""
+    hops = 0
+    current = parent
+    while current >= 0 and hops <= _MAX_DEPTH:
+        if current in position:
+            return position[current]
+        above = by_id.get(current)
+        if above is None:
+            break
+        current = getattr(above, "parent", -1)
+        hops += 1
+    return None if part else -1
+
+
+def _set_range_notes(listed: list[UIElement], parents: list[int]) -> dict[int, str]:
+    """``listed parent index -> note`` for lists whose items carry the app's own numbering (PositionInSet /
+    SizeOfSet) and whose listed items do not reach both ends: "items 19-28 of 28 are listed; 18 before them are out
+    of view".  A chat's rendered history above the view, a long library below it, said from the numbers the app
+    itself gives (report 58).  Numbers only."""
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for index, element in enumerate(listed):
+        position = getattr(element, "position", None)
+        if position and parents[index] >= 0:
+            spans.setdefault(parents[index], []).append((int(position[0]), int(position[1])))
+    out: dict[int, str] = {}
+    for parent, items in spans.items():
+        sizes = {n for _k, n in items}
+        if len(sizes) != 1 or len(items) < 2:
+            continue
+        size = sizes.pop()
+        low, high = min(k for k, _n in items), max(k for k, _n in items)
+        before, after = low - 1, size - high
+        if before <= 0 and after <= 0:
+            continue
+        parts = [f"{n} {side}" for n, side in ((before, "before them"), (after, "after them")) if n > 0]
+        out[parent] = (f"(left out: items {low}-{high} of {size} are listed; {' and '.join(parts)} are out of view - "
+                       f"scroll it to bring them in)")
+    return out
+
+
+def _left_out_text(entry: dict, anchor_id: int) -> str:
+    """One ``(left out: ...)`` line from a :attr:`WindowTree.left_out` entry, or ``""`` when it holds nothing."""
+    parts: list[str] = []
+    named = entry.get("named") or []
+    sides = [(entry.get(side) or 0, side) for side in ("above", "below", "left", "right")]
+    if any(n for n, _side in sides):
+        names = [f'{role} "{_one_line(name, 50)}" ({side})' for role, name, side in named if side != "hidden"]
+        parts.append(
+            "off screen: " + ", ".join(f"{n} {side}" for n, side in sides if n)
+            + (f" ({'; '.join(names)})" if names else "")
+            + " - scroll it to bring them into view"
+        )
+    hidden = entry.get("hidden") or 0
+    if hidden:
+        names = [f'{role} "{_one_line(name, 50)}"' for role, name, side in named if side == "hidden"]
+        parts.append("kept out of sight by the app: " + (", ".join(names) if names else f"{hidden} element(s)")
+                     + (f" and {hidden - len(names)} more" if names and hidden > len(names) else ""))
+    unread = entry.get("unread_count") or 0
+    if unread:
+        names = [f'{role} "{_one_line(name, 50)}"' for role, name in entry.get("unread") or []]
+        what = ", ".join(names) if names else f"{unread} part(s)"
+        more = unread - len(names) if names else 0
+        parts.append(f"not read, the read stopped at its limit: {what}" + (f" and {more} more" if more > 0 else "")
+                     + f"; look_at_window with within={anchor_id} reads this part in full")
+    return f"(left out: {'; '.join(parts)})" if parts else ""
+
+
+def _fold_entries(entries: list[tuple[int, int, str]], listed: list[UIElement], parents: list[int],
+                  levels: list[int], notes: dict[int, list[str]], budget: int, root_id: int) -> list[str]:
+    """The element lines with the left-out notes, kept under ``budget`` characters (report 58).
+
+    Nothing is folded while the text fits.  Past the budget, the middle of the
+    longest lists - a parent with at least :data:`_FOLD_MIN_ITEMS` listed
+    children, each child with everything listed below it - is folded into one
+    line that says how many items it holds and how to list them, keeping
+    :data:`_FOLD_KEEP` items at each end (both ends: the top of a feed and the
+    newest end of a chat are both kept, and nothing here guesses which a list
+    is).  An item that is focused or selected, or holds what is, is never
+    folded.  If folding every list down to one item at each end is not enough,
+    the text is cut where the budget ends and the cut says where.  Facts about
+    structure only.
+    """
+    count = len(listed)
+    ends = list(range(1, count + 1))
+    for index in range(count - 1, -1, -1):
+        parent = parents[index]
+        if parent >= 0:
+            ends[parent] = max(ends[parent], ends[index])
+    protected = [False] * count
+    for index, element in enumerate(listed):
+        if element.is_focused or "selected" in (getattr(element, "states", ()) or ()):
+            current = index
+            hops = 0
+            while current >= 0 and hops <= _MAX_DEPTH:
+                protected[current] = True
+                current = parents[current]
+                hops += 1
+    entry_at = {start: (end, text) for start, end, text in entries}
+
+    def render(folded: dict[int, tuple[int, str]]) -> list[str]:
+        out: list[str] = []
+        for note in notes.get(-1, ()):
+            out.append(note)
+        index = 0
+        while index < count:
+            if index in folded:
+                stop, line = folded[index]
+                out.append(line)
+                index = stop
+                continue
+            if index not in entry_at:
+                index += 1
+                continue
+            end, text = entry_at[index]
+            out.append(text)
+            for covered in range(index, end):
+                for note in notes.get(covered, ()):
+                    out.append(" " * min(levels[covered] + 1, _FORMAT_MAX_INDENT) + note)
+            index = end
+        return out
+
+    def size(lines: list[str]) -> int:
+        return sum(len(line) + 1 for line in lines)
+
+    folded: dict[int, tuple[int, str]] = {}
+    lines = render(folded)
+    if size(lines) <= budget:
+        return lines
+    siblings: dict[int, list[int]] = {}
+    for index, parent in enumerate(parents):
+        siblings.setdefault(parent, []).append(index)
+    groups = []
+    for parent, members in siblings.items():
+        if len(members) < _FOLD_MIN_ITEMS:
+            continue
+        # each member's block must be its own contiguous run of lines
+        if any(ends[a] > b for a, b in zip(members, members[1:])):
+            continue
+        groups.append((parent, members))
+    for keep in _FOLD_KEEP:
+        # the lists whose folding saves the most go first
+        groups.sort(key=lambda g: -(ends[g[1][-1]] - g[1][0]))
+        for parent, members in groups:
+            middle = members[keep:len(members) - keep]
+            runs: list[list[int]] = [[]]
+            for member in middle:
+                if protected[member]:
+                    runs.append([])
+                else:
+                    runs[-1].append(member)
+            for run in runs:
+                if len(run) < 2:
+                    continue
+                for start in [s for s in folded if run[0] <= s < ends[run[-1]]]:
+                    del folded[start]
+                first, last = listed[run[0]], listed[run[-1]]
+                anchor = listed[parent].id if parent >= 0 else root_id
+                roles = sorted({_FORMAT_ROLE.get(listed[m].role, listed[m].role) for m in run})
+                indent = " " * min(levels[run[0]], _FORMAT_MAX_INDENT)
+                folded[run[0]] = (
+                    ends[run[-1]],
+                    f"{indent}... {len(run)} more {'/'.join(roles)} items folded here ([{first.id}] to "
+                    f"[{last.id}]) to keep this short; look_at_window with within={anchor} lists them all",
+                )
+            lines = render(folded)
+            if size(lines) <= budget:
+                return lines
+    kept: list[str] = []
+    used = 0
+    for position, line in enumerate(lines):
+        if used + len(line) + 1 > budget:
+            kept.append(f"... {len(lines) - position} more lines left out to keep this short; look_at_window with "
+                        f"within=<an element id above> lists one part in full")
+            break
+        kept.append(line)
+        used += len(line) + 1
+    return kept
