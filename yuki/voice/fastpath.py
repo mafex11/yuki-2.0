@@ -162,12 +162,16 @@ class AckVoice:
                 key = self.key(kind)
                 pcm = self.cache.get(key) if (self.cache is not None and key) else None
                 how = "cache"
-                if not pcm:
-                    how = "rendered"
+                for attempt in range(2 if not pcm else 0):
+                    # rendered once by the voice itself; offline 5 Oct one of four renders came back with no sound in
+                    # it, so an empty one is asked again once (never cached)
+                    how = "rendered" if attempt == 0 else "rendered_again"
                     try:
                         pcm = trim(self._render(text) or b"")
                     except Exception as exc:  # noqa: BLE001 - no line then: a tick
                         pcm, how = b"", f"error: {type(exc).__name__}"
+                    if pcm:
+                        break
                     if pcm and self.cache is not None and key:
                         self.cache.put(key, pcm)
                 if pcm:

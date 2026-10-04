@@ -18,7 +18,7 @@ Usage::
         latency  "Yuki." then "Pause the music.", twice (cold, then warm): the wake word to listening
         endings  vfix: "shut up", "go away", "bye bye" and a mistaken wake, each after the name: every one ends the
                  conversation at once and leaves the wake word on (clips: voice_clips.py --set vfix)
-        game     vGame: in a Discord call with VALORANT in front: "Yuki, pause the music" (instant "Mm-hm"), talk to the
+        game     vGame: in a Discord call with VALORANT in front: "Yuki, turn it up a bit" (instant "Mm-hm"), talk to the
                  team (the conversation ends at once, silently, and more talk does not wake it), the name, a pause and
                  a request, then "go away" (ends on the transcript, no model call). Clips: a folder whose manifest has
                  the v34 clips and vfix's e_goaway (vGame: --clips of a merged manifest)
@@ -207,7 +207,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         # the conversation at once; the second line of it finds no conversation (and must not wake one); the name, a
         # pause and a request; then "go away" ends on its transcript.
         first = prewarmed() if args.prewarm else None
-        lines = [("k_pause", 1.0, first), ("k_clutch", 1.0, settled(0.8)), ("k_insane", 2.5, no_conversation(1.0)),
+        lines = [("k_turnup", 1.0, first), ("k_clutch", 1.0, settled(0.8)), ("k_insane", 2.5, no_conversation(1.0)),
                  ("k_name", 1.5, standby_again(1.5)), ("k_pause_cmd", 1.4, None), ("e_goaway", 1.0, settled(0.8))]
         script = [(clip(n), after, wait) for n, after, wait in lines]
         names = [n for n, _a, _w in lines]
