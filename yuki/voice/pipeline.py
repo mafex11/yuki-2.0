@@ -2078,16 +2078,14 @@ class _Hooks:
         call.user_turn = user_turn
         job = getattr(self.c, "_recent_job", None)
         if job is not None:
-            # vfix4: a woken conversation's first call waits a moment for the last hour, read again on the wake
             self.c._recent_job = None
-            if not job.done():
-                try:
-                    await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), self.c.RECENT_WAIT_S)
-                except Exception:  # noqa: BLE001 - past the bound it goes with the view read when it was built
-                    pass
         hands = getattr(self.c.bridge, "hands", None) if self.c.settings.voice_hands else None
         desk_task = (asyncio.ensure_future(hands.for_call(self.c.settings.voice_desk_wait_ms))
                      if hands is not None else None)
+        # vfix4: a woken conversation's first call waits a moment for the last hour, read again on the wake, alongside
+        # the desktop summary and the lookup (review F3: never in front of them)
+        recent_task = (asyncio.ensure_future(self._recent(job, getattr(self.c, "_recent_close", None)))
+                       if job is not None else None)
         practice = getattr(self.c, "practice", None)
         if practice is not None and user_turn:
             # the final words' lookup starts here, with the call (the observer sees the transcript a moment later:
@@ -2098,6 +2096,8 @@ class _Hooks:
         practice_task = (asyncio.ensure_future(self._practice_for(practice, user_turn))
                          if practice is not None else None)
         lookup_text = await self._lookup(call, user_turn)
+        if recent_task is not None:
+            await recent_task
         if practice_task is not None:
             self._practice(call, *(await practice_task))
         desk_text = None
@@ -2110,6 +2110,19 @@ class _Hooks:
                 call.desk_ms = round(snap.ms if how == "fresh" else (time.monotonic() - snap.at) * 1000, 1)
                 call.desk_tabs_ms = snap.tabs_ms
         return lookup_text, desk_text
+
+    async def _recent(self, job: Any, close: Any) -> None:
+        """Wait at most :attr:`Conversation.RECENT_WAIT_S` for the wake's read of the last hour, then close it: a read
+        that lands later is dropped, so the system prompt never changes after this call (review F4); this
+        conversation goes with the view read when it was built."""
+        try:
+            if not job.done():
+                await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(job)), self.c.RECENT_WAIT_S)
+        except Exception:  # noqa: BLE001 - past the bound: the view read at the build
+            pass
+        finally:
+            if callable(close):
+                close()
 
     async def _lookup(self, call: LlmCall, user_turn: bool) -> str | None:
         grounder = self.c.grounder
@@ -2500,6 +2513,8 @@ class Conversation:
         # -- vfix4 -------------------------------------------------------------------------------------------
         #: The last hour read again on the wake (:meth:`_refresh_recent`), until the first call has waited for it.
         self._recent_job: Any = None
+        #: Closes that read once the first call has stopped waiting (a later read is dropped).
+        self._recent_close: Any = None
         #: The talker's quick memory tool (:class:`yuki.voice.recall.QuickMemory`), made with the services.
         self.quick_memory: Any = None
 
@@ -2608,29 +2623,46 @@ class Conversation:
     def _refresh_recent(self) -> None:
         """vfix4: read the last hour with the user again now that the conversation is woken (it was built dormant,
         maybe long before: live 4 Oct the standby was built two seconds after the last conversation ended and woken
-        33 s later). Off the loop, on the voice pool; the talker's Earlier block takes it as soon as it is read, and
-        the first call waits for it at most :attr:`RECENT_WAIT_S` (``_Hooks.before_call``). Content-free log."""
+        33 s later). Off the loop, on the voice pool. The first call waits for it at most :attr:`RECENT_WAIT_S`
+        (``_Hooks._recent``, alongside the desktop summary and the lookup); the Earlier block takes it only when it lands
+        by then and the read worked, else it keeps the view read at the build. Content-free log."""
         memory, mouth_memory = self.memory, self.mouth_memory
         if memory is None or mouth_memory is None:
             return
         import concurrent.futures
+        import threading
 
         from yuki.voice.workers import shared
 
         job: concurrent.futures.Future[Any] = concurrent.futures.Future()
-        self._recent_job = job
+        # Open until the first call has stopped waiting for it (``_Hooks._recent`` closes it): a read that lands
+        # later is dropped, so the system prompt never changes in the middle of the conversation (review F4).
+        gate = {"open": True}
+        lock = threading.Lock()
+
+        def close() -> None:
+            with lock:
+                gate["open"] = False
+
+        self._recent_job, self._recent_close = job, close
         log, session, started = self.log, self.session, time.monotonic()
 
         def work() -> None:
             try:
                 from yuki.voice.recall import fetch_recent
 
-                text = fetch_recent(memory)
-                before = mouth_memory.recent
-                mouth_memory.recent = text
+                failed = object()
+                text = fetch_recent(memory, failed=failed)
+                ok = text is not failed   # a failed read keeps the view read at the build (review F4)
+                with lock:
+                    before = mouth_memory.recent
+                    used = ok and gate["open"]
+                    if used:
+                        mouth_memory.recent = text
                 if log is not None:
-                    log.event("recent", op="woken", session=session, chars=len(text or ""),
-                              changed=(text or None) != (before or None),
+                    log.event("recent", op="woken", session=session, ok=ok, used=used,
+                              chars=len(text or "") if ok else 0,
+                              changed=used and (text or None) != (before or None),
                               ms=round((time.monotonic() - started) * 1000))
             finally:
                 job.set_result(None)

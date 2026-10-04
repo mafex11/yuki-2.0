@@ -63,6 +63,8 @@ LIST_ITEMS = 15
 LIST_ITEM_CHARS = 100
 #: Bound on one quick memory read or write.
 QUICK_TIMEOUT_S = 4.0
+#: Bound on a whole voice add, every item together (Pipecat gives a tool call 20 s; the talker's reply follows it).
+ADD_BUDGET_S = 10.0
 #: The search's wait for the query's embedding (past it the search is keyword only, as the grounding lookup does).
 SEARCH_EMBED_WAIT_S = 0.4
 
@@ -86,16 +88,30 @@ QUICK_MEMORY: dict[str, Any] = {
 
 TODOS_NOTE = ("Their list, read now. Tell them in a few words: how many, then the items briefly, in plain words (a "
               "long list: the first few and offer the rest on a more line). Never ids, never read it like a list.")
-EMPTY_LIST_NOTE = "Their list has nothing open, read now. Say so plainly: you looked at their list and it is empty."
+EMPTY_LIST_NOTE = ("Their list has nothing open, read now. Say plainly you looked at their list and it is empty; never "
+                   "that they did not tell you. When they say they told you something, say the list is empty and offer "
+                   "to look through today's chat for it (quick_memory today) or dig further (a hand-over).")
 ADDED_NOTE = ("Saved and checked: nothing more to do. Tell them in a few words how many you added and where they are: "
               "in your window, on Home under Your list (\"Added {n}, they're on Home under Your list.\"). Never read "
               "them back unless they ask.")
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
                   "on their list.")
+MAYBE_SAVED_NOTE = ("Memory was too slow to answer, so {n} of them may or may not have saved. Say so plainly; before "
+                    "adding anything again, read their list (quick_memory todos) so nothing goes on it twice.")
 FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few words. When it does not hold what "
               "they mean, say where you looked ({where}) and offer to dig further, which is a hand-over.")
 NOTHING_NOTE = ("Nothing found in {where}. Say that plainly, naming where you looked, and offer to dig further "
                 "(a hand-over); never that they did not tell you.")
+WHOSE_NOTE = ("A hit marked as another AI tool's text, or whose from line says someone else said it, is never theirs: "
+              "never give it as their own words or plans.")
+
+
+class _OutOfTime(Exception):
+    """A voice add ran out of time: ``sent`` when the write was made and got no answer (it may still commit)."""
+
+    def __init__(self, *, sent: bool) -> None:
+        super().__init__("out of time")
+        self.sent = sent
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -262,14 +278,16 @@ def _turns(client: Any, since: float, until: float, limit: int) -> list[dict[str
     return out
 
 
-def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RECENT_TIMEOUT_S) -> str | None:
+def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RECENT_TIMEOUT_S,
+                 failed: Any = None) -> Any:
     """:func:`recent_view` read from memory now (blocking, bounded by ``timeout_s``; call it off the voice loop).
 
-    ``memory`` is :class:`~yuki.agent.memory.MemoryAccess` (its ``call``). Never raises: ``None`` without memory, on a
-    failure, past the bound, or when the hour holds nothing."""
+    ``memory`` is :class:`~yuki.agent.memory.MemoryAccess` (its ``call``). Never raises: ``None`` when the hour holds
+    nothing; ``failed`` (default ``None``) without memory, on a failure or past the bound, so a caller that already has
+    a view can keep it rather than take a failed read for an empty hour (review F4)."""
     call = getattr(memory, "call", None)
     if not callable(call):
-        return None
+        return failed
     now = time.time() if now is None else float(now)
 
     def read(client: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -281,7 +299,7 @@ def fetch_recent(memory: Any, *, now: float | None = None, timeout_s: float = RE
     try:
         turns, todos, rules = call("recent talk", read, timeout_s=timeout_s)
     except Exception:  # noqa: BLE001 - the talker starts without it
-        return None
+        return failed
     return recent_view(turns, todos, rules, now=now)
 
 
@@ -310,7 +328,17 @@ def todo_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"list": "\n".join([head, *lines, *tail]), "how_to_handle_it": TODOS_NOTE}
 
 
+#: Marks a hit that is text typed into, or read from, another AI tool (``recall``'s ``other_ai``), as the thinker's
+#: formatter and the MCP server mark it.
+OTHER_AI_MARK = " [text for or from another AI tool - not a fact about the user]"
+#: One hit's source line (where, when, whose words; the quote last, so a cut takes the quote first) is cut to this.
+SOURCE_CHARS = 160
+
+
 def _search_lines(hits: list[dict[str, Any]]) -> list[str]:
+    """A memory search's hits for the talker: dated, a joke or an uncertain item marked, text for or from another AI
+    tool marked, and where each came from (``recall``'s ``source``: whose words, which app), so someone else's words
+    on a call or another AI's text are never given as the user's own (review F1)."""
     out = []
     for hit in hits or []:
         if not isinstance(hit, dict) or not str(hit.get("fact") or hit.get("text") or "").strip():
@@ -319,8 +347,11 @@ def _search_lines(hits: list[dict[str, Any]]) -> list[str]:
         when = f"{datetime.fromtimestamp(at):%a %d %b %H:%M}" if at is not None else "undated"
         note = " (a joke, not a fact)" if hit.get("nature") == "humor" else (
             " (maybe misheard)" if hit.get("nature") == "uncertain" else "")
+        mark = OTHER_AI_MARK if hit.get("other_ai") else ""
+        source = _clip(hit.get("source"), SOURCE_CHARS)
         out.append(f"- ({hit.get('kind') or 'memory'}, {when}){note} "
-                   f"{_clip(hit.get('fact') or hit.get('text'), SEARCH_ITEM_CHARS)}")
+                   f"{_clip(hit.get('fact') or hit.get('text'), SEARCH_ITEM_CHARS)}{mark}"
+                   + (f"\n  from: {source}" if source else ""))
         if len(out) >= SEARCH_ITEMS:
             break
     return out
@@ -388,31 +419,62 @@ class QuickMemory:
             return ({"failed": "no items were given", "how_to_handle_it": (
                 "Nothing was added. Call it again with each to-do as one item, or ask them what to add.")},
                     {"ok": False, "items": 0})
-        added, why = [], ""
-        for text, due in wanted:
+        # Review F5: the whole add has one budget (:data:`ADD_BUDGET_S`, well inside the tool's own timeout), and it
+        # stops at the first write that ran out of time: that write may still finish on memory's own thread, so it
+        # is reported as "may have saved" (check the list before adding again), never as "not saved".
+        deadline = time.monotonic() + ADD_BUDGET_S
+        added, why, unsure, untried = [], "", 0, 0
+
+        def write(text: str, due: str | None) -> None:
+            bound = min(QUICK_TIMEOUT_S, deadline - time.monotonic())
+            if bound <= 0.05:
+                raise _OutOfTime(sent=False)
+            started = time.monotonic()
             try:
-                self.memory.add_todo(text, due, timeout_s=QUICK_TIMEOUT_S)
+                self.memory.add_todo(text, due, timeout_s=bound)
             except Exception as exc:  # noqa: BLE001
-                cause = getattr(exc, "__cause__", None)
-                if due and isinstance(cause, ValueError):
-                    try:   # a due memory cannot read: the to-do is kept without it, and the report says so
-                        self.memory.add_todo(text, None, timeout_s=QUICK_TIMEOUT_S)
-                        added.append(f"{text} (saved without its time: it could not be read)")
-                        continue
-                    except Exception as again:  # noqa: BLE001
-                        exc = again
+                # no answer within the bound (memory's own error carries no cause then): it may yet commit
+                if getattr(exc, "__cause__", None) is None and time.monotonic() - started >= bound * 0.95:
+                    raise _OutOfTime(sent=True) from None
+                raise
+
+        for i, (text, due) in enumerate(wanted):
+            try:
+                try:
+                    write(text, due)
+                    added.append(text)
+                except _OutOfTime:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if not (due and isinstance(getattr(exc, "__cause__", None), ValueError)):
+                        raise
+                    # a due memory cannot read: the to-do is kept without it, and the report says so
+                    write(text, None)
+                    added.append(f"{text} (saved without its time: it could not be read)")
+            except _OutOfTime as out:
+                # the write that ran out may finish on its own; one that never started did not
+                unsure = 1 if out.sent else 0
+                untried = len(wanted) - i - unsure
+                why = why or "memory was too slow to answer"
+                break
+            except Exception as exc:  # noqa: BLE001
                 why = why or f"memory did not take it ({type(exc).__name__})"
-                continue
-            added.append(text)
-        facts = {"ok": bool(added), "items": len(added), "asked": len(wanted)}
+        not_saved = len(wanted) - len(added) - unsure
+        facts = {"ok": bool(added), "items": len(added), "asked": len(wanted), "unsure": unsure, "untried": untried}
+        notes = []
+        if unsure:
+            notes.append(MAYBE_SAVED_NOTE.format(n=unsure))
+        if not_saved:
+            notes.append(NOT_SAVED_NOTE.format(why=why, part=f" for {not_saved} of them" if added or unsure else ""))
         if not added:
-            return {"failed": why, "how_to_handle_it": NOT_SAVED_NOTE.format(why=why, part="")}, facts
+            return {"failed": why, **({"may_have_saved": unsure} if unsure else {}),
+                    **({"not_saved": not_saved} if not_saved else {}), "how_to_handle_it": " ".join(notes)}, facts
         report: dict[str, Any] = {"added": len(added), "where": LIST_PLACE, "items": added,
-                                  "how_to_handle_it": ADDED_NOTE.format(n=len(added))}
-        if len(added) < len(wanted):
-            report["not_saved"] = len(wanted) - len(added)
-            report["how_to_handle_it"] += " " + NOT_SAVED_NOTE.format(
-                why=why, part=f" for {len(wanted) - len(added)} of them")
+                                  "how_to_handle_it": " ".join([ADDED_NOTE.format(n=len(added)), *notes])}
+        if unsure:
+            report["may_have_saved"] = unsure
+        if not_saved:
+            report["not_saved"] = not_saved
         return report, facts
 
     def _today(self, now: float) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -446,7 +508,8 @@ class QuickMemory:
         if not lines:
             return {"found": "", "how_to_handle_it": NOTHING_NOTE.format(where="a memory search")}, {"ok": True,
                                                                                                     "items": 0}
-        return ({"found": "\n".join(lines), "how_to_handle_it": FOUND_NOTE.format(where="a memory search")},
+        return ({"found": "\n".join(lines),
+                 "how_to_handle_it": FOUND_NOTE.format(where="a memory search") + " " + WHOSE_NOTE},
                 {"ok": True, "items": len(lines)})
 
 

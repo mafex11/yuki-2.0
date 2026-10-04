@@ -26,6 +26,19 @@ DICTATED = ("okay so today I need to buy printer ink, call the plumber about the
             "email Tara the slides, book the dentist for Friday, water the balcony plants and back up the laptop")
 
 
+def _warm() -> None:
+    """What a running app has made long before a wake: the voice pool and memory's day module (a cold first import
+    in a test process can take longer than the first call's wait for the wake read)."""
+    import threading
+
+    import yuki.memory.checkins  # noqa: F401
+    from yuki.voice.workers import shared
+
+    ran = threading.Event()
+    shared().submit(ran.set)
+    assert ran.wait(5.0)
+
+
 def _turn(i: int, at: float, user: str, reply: str, session: str = "s1") -> dict[str, Any]:
     return {"id": i, "session_id": session, "request_id": i, "at": at, "user": user, "reply": reply,
             "actions": [], "outcome": "voice"}
@@ -162,7 +175,7 @@ def test_the_replay_by_voice_adds_the_list_and_says_how_many_and_where(memory) -
     _session_a(client, now, by_thinker=False)
     report, facts = QuickMemory(access).run({"action": "add_todos", "items": [
         {"text": t} for t in ITEMS[:6]] + [{"text": ITEMS[6], "due": "2026-10-09 18:00"}]})
-    assert facts == {"ok": True, "items": 7, "asked": 7}
+    assert facts == {"ok": True, "items": 7, "asked": 7, "unsure": 0, "untried": 0}
     assert report["added"] == 7 and report["where"] == LIST_PLACE and "Added 7" in report["how_to_handle_it"]
     rows = client.todos()
     assert sorted(r["text"] for r in rows if r["source"] == "user") == sorted(ITEMS)
@@ -315,6 +328,7 @@ def test_a_woken_conversation_reads_the_hour_again_and_its_first_call_waits_for_
     conv = Conversation.__new__(Conversation)
     conv.memory, conv.mouth_memory, conv.log, conv.session = Access(), MouthMemory(recent=None), _Log(), "s"
     conv._recent_job = None
+    _warm()
     conv._refresh_recent()
     job = conv._recent_job
     assert job is not None
@@ -335,3 +349,175 @@ def test_a_woken_conversation_reads_the_hour_again_and_its_first_call_waits_for_
     assert conv.mouth_memory.recent and "Added 7 to-dos" in conv.mouth_memory.recent
     kind, facts = conv.log.events[0]
     assert kind == "recent" and facts["op"] == "woken" and facts["changed"] is True and "to-dos" not in repr(facts)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# review fixes (F1-F5)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def test_a_search_marks_another_ais_text_and_says_whose_words_each_hit_is() -> None:
+    """F1: someone else's words on a call, or text for another AI tool, are never given as the user's own."""
+
+    class Access:
+        def call_method(self, name: str, *args: Any, timeout_s: float, **kwargs: Any) -> Any:
+            assert name == "recall"
+            return [
+                {"kind": "fact", "at": "2026-10-03T21:00:00", "nature": "fact", "other_ai": False,
+                 "fact": "Said he will pay 500 back on Friday",
+                 "source": "Discord, Sat 03 Oct 21:00; someone else said, not the user"},
+                {"kind": "fact", "at": "2026-10-03T22:00:00", "nature": "fact", "other_ai": True,
+                 "fact": "The user plans to move to Lisbon", "source": "ChatGPT, Sat 03 Oct 22:00; on screen"},
+                {"kind": "fact", "at": "2026-10-03T23:00:00", "nature": "fact", "fact": "Booked the dentist"},
+            ]
+
+    report, facts = QuickMemory(Access()).run({"action": "search", "query": "pay back"})
+    found = report["found"]
+    assert facts == {"ok": True, "items": 3}
+    first, second, third = found.split("\n- ")
+    assert "pay 500 back" in first and "from: Discord, Sat 03 Oct 21:00; someone else said, not the user" in first
+    assert "move to Lisbon" in second and recall.OTHER_AI_MARK.strip() in second and "from: ChatGPT" in second
+    assert "Booked the dentist" in third and "from:" not in third and "another AI" not in third
+    assert recall.WHOSE_NOTE in report["how_to_handle_it"]
+
+
+def test_an_empty_list_is_never_said_as_they_did_not_tell_you_and_offers_a_further_look() -> None:
+    """F2: the list can be empty while they did tell Yuki (said only in chat, marked done, a failed add)."""
+    report = recall.todo_report([])
+    note = report["how_to_handle_it"]
+    assert "never that they did not tell you" in note and "today's chat" in note and "hand-over" in note
+
+
+class _SlowClient:
+    """A memory client whose writes take ``delay`` seconds each (recording every write that completed)."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay, self.done = delay, []
+
+    def add_todo(self, text: str, due: Any = None) -> str:
+        time.sleep(self.delay)
+        self.done.append(text)
+        return f"todo:{len(self.done)}"
+
+
+def test_an_add_that_runs_out_of_time_says_it_may_have_saved_and_stops(monkeypatch) -> None:
+    """F5: a write past its bound may still commit on memory's own thread: "may have saved, check the list first",
+    never "not saved"; the rest are not tried."""
+    from yuki.agent.memory import MemoryAccess
+
+    monkeypatch.setattr(recall, "QUICK_TIMEOUT_S", 0.15)
+    client = _SlowClient(1.2)
+    access = MemoryAccess(lambda: client, session_id="20261004-094000-aaaaaa")
+    started = time.monotonic()
+    report, facts = QuickMemory(access).run({"action": "add_todos", "items": [{"text": t} for t in ITEMS]})
+    assert time.monotonic() - started < 1.0   # one bound (0.15 s), not seven (1.05 s), and before the write lands
+    assert facts == {"ok": False, "items": 0, "asked": 7, "unsure": 1, "untried": 6}
+    assert report["may_have_saved"] == 1 and report["not_saved"] == 6
+    note = report["how_to_handle_it"]
+    assert "may or may not have saved" in note and "read their list" in note and "for 6 of them" in note
+    deadline = time.monotonic() + 3.0
+    while not client.done and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert client.done == [ITEMS[0]]   # it did commit after the bound; nothing else was sent
+
+
+def test_a_voice_add_has_one_budget_for_all_its_items(monkeypatch) -> None:
+    """F5: slow but answering writes stop at the add's budget, inside the tool's own timeout."""
+    from yuki.agent.memory import MemoryAccess
+
+    monkeypatch.setattr(recall, "QUICK_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(recall, "ADD_BUDGET_S", 0.5)
+    client = _SlowClient(0.2)
+    access = MemoryAccess(lambda: client, session_id="20261004-094000-aaaaaa")
+    started = time.monotonic()
+    report, facts = QuickMemory(access).run({"action": "add_todos", "items": [{"text": t} for t in ITEMS]})
+    assert time.monotonic() - started < 0.75
+    n = facts["items"]
+    assert 1 <= n <= 2 and report["added"] == n and n + facts["unsure"] + facts["untried"] == 7   # 0.2 s each in 0.5 s
+    assert f"Added {n}" in report["how_to_handle_it"] and report["not_saved"] == facts["untried"]
+
+
+def _woken(access: Any, recent: str | None) -> Any:
+    from yuki.voice.mouth import MouthMemory
+    from yuki.voice.pipeline import Conversation
+
+    conv = Conversation.__new__(Conversation)
+    conv.memory, conv.mouth_memory, conv.log, conv.session = access, MouthMemory(recent=recent), _Log(), "s"
+    conv._recent_job = conv._recent_close = None
+    _warm()
+
+    class Settings:
+        voice_hands = False
+        voice_grounding_wait_ms = 300.0
+
+    conv.settings, conv.bridge, conv.grounder, conv.practice = Settings(), object(), None, None
+    conv._shown_ids = []
+    return conv
+
+
+def _first_call(conv: Any) -> None:
+    from yuki.voice.pipeline import _Hooks
+
+    class Call:
+        user_turn = True
+
+    msgs = [{"role": "user", "content": "what were the to-dos I told you?"}]
+    asyncio.run(_Hooks(conv).before_call(type("Ctx", (), {"get_messages": lambda self: msgs, "messages": msgs})(),
+                                         Call()))
+
+
+class _Access:
+    def __init__(self, delay: float, *, fail: bool = False) -> None:
+        self.delay, self.fail = delay, fail
+        self.turns = [_turn(1, time.time() - 120, "make a to do list of this", "Added 7 to-dos to your list.")]
+
+    def call(self, what: str, fn: Any, *, timeout_s: float) -> Any:
+        time.sleep(self.delay)
+        if self.fail:
+            raise RuntimeError("no answer")
+        return fn(self)
+
+    def turns_on(self, day: str, limit: int = 200) -> list[dict[str, Any]]:
+        return list(self.turns)
+
+
+def test_a_failed_wake_read_keeps_the_view_read_at_the_build() -> None:
+    """F4: a failed read is not an empty hour."""
+    conv = _woken(_Access(0.0, fail=True), "the view read at the build")
+    conv._refresh_recent()
+    job = conv._recent_job
+    _first_call(conv)
+    assert job.done() and conv.mouth_memory.recent == "the view read at the build"
+    kind, facts = conv.log.events[0]
+    assert kind == "recent" and facts["ok"] is False and facts["used"] is False and facts["changed"] is False
+
+
+def test_a_wake_read_landing_after_the_first_call_never_changes_the_prompt() -> None:
+    """F4: past the first call's wait the conversation keeps its view (its system prompt, and so its cache, fixed)."""
+    conv = _woken(_Access(0.7), "the view read at the build")
+    conv._refresh_recent()
+    job = conv._recent_job
+    _first_call(conv)
+    assert conv.mouth_memory.recent == "the view read at the build"
+    job.result(timeout=2.0)
+    assert conv.mouth_memory.recent == "the view read at the build"
+    kind, facts = conv.log.events[0]
+    assert facts["ok"] is True and facts["used"] is False and facts["changed"] is False
+
+
+def test_the_wake_read_waits_alongside_the_lookup_not_in_front_of_it() -> None:
+    """F3: the first call's wait for the wake read overlaps the grounding lookup's."""
+
+    class Grounder:
+        async def for_call(self, wait_ms: float) -> tuple[Any, str]:
+            await asyncio.sleep(0.3)
+            return None, "none"
+
+    conv = _woken(_Access(0.3), None)
+    conv.grounder = Grounder()
+    conv._refresh_recent()
+    started = time.monotonic()
+    _first_call(conv)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.55, elapsed   # in front of it, the two would take 0.6 s and more
+    assert conv.mouth_memory.recent and "Added 7 to-dos" in conv.mouth_memory.recent
