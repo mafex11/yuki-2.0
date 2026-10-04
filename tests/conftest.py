@@ -77,8 +77,10 @@ def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
 # import datetime`` binds them, are swapped for subclasses that read the pinned clock; the datetime module itself stays
 # real, so pickling works). ``time.monotonic`` and ``perf_counter`` are left alone, so timeouts and waits
 # behave. Pick the time with ``@pytest.mark.clock("00:30")`` (default noon, on :data:`PINNED_DAY`). ``YUKI_TEST_CLOCK=HH:MM``
-# pins every test of the run to that time of the real today (``scripts/sweep.py --clock 00:30``): how the after-midnight
-# failures are found. Today, not a fixed day: a test whose data is dated "now-ish" by the real clock must keep its order.
+# pins every test of the run to the latest real moment at that time (today, or yesterday when it is still ahead;
+# ``scripts/sweep.py --clock 00:30``): how the after-midnight failures are found. Never a fixed day and never the future:
+# file times and other clocks a test can't pin keep their real order. Modules first imported inside a test body keep
+# the real ``datetime`` class.
 
 import datetime as _dt
 import sys as _sys
@@ -187,6 +189,15 @@ def _run_clock_modules(request: pytest.FixtureRequest, monkeypatch: pytest.Monke
     yield
 
 
+def _run_day(hhmm: str) -> _dt.date:
+    """The most recent day on which ``hhmm`` has already passed: today, or yesterday when it is still ahead. A pinned
+    run is never in the future, so file times and other clocks a test can't pin stay behind it, as they really are."""
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    now = _REAL_DATETIME.fromtimestamp(_REAL_TIME())
+    today = now.date()
+    return today if (hour, minute) <= (now.hour, now.minute) else today - _dt.timedelta(days=1)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """``YUKI_TEST_CLOCK=HH:MM`` (the sweep's ``--clock``) pins the whole run, before any test module is imported, so a
     module's own ``NOW = time.time()`` reads the pinned clock too, as it would really run at that hour."""
@@ -194,7 +205,7 @@ def pytest_configure(config: pytest.Config) -> None:
     pinned = os.environ.get("YUKI_TEST_CLOCK", "").strip()
     if pinned and not _RUN_CLOCK:
         patch = pytest.MonkeyPatch()
-        _RUN_CLOCK.append((patch, _pin(patch, pinned, _REAL_DATE.fromtimestamp(_REAL_TIME()))))
+        _RUN_CLOCK.append((patch, _pin(patch, pinned, _run_day(pinned))))
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
