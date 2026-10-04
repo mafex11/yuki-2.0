@@ -4064,7 +4064,7 @@ class Agent:
             advice = second_look.run_consult(client, params, signal=signal,
                                              timeout_s=float(getattr(self.settings, "consult_timeout_s", 30.0)))
         if advice.usage:
-            cost = self.settings.estimate_cost(model, advice.usage)
+            cost = self.settings.estimate_cost(advice.model or model, advice.usage)   # the model that answered
             if cost is not None:
                 advice.cost_usd = round(float(cost), 6)
                 self._cost_usd += float(cost)

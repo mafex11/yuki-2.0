@@ -10,8 +10,12 @@ Shape (unknown keys are kept, so an older and a newer build can share the file):
         "memory":  {"provider": "ollama", "model": "llama3.2"}
       },
       "custom": {"label": "My gateway", "base_url": "https://example.invalid/v1"},
-      "prices": {"openrouter:some/model": {"input": 0.0, "output": 0.0}}
+      "prices": {"openrouter:some/model": {"input": 0.0, "output": 0.0}},
+      "facts": {"openrouter:some/model": {"tools": true, "images": false, "small": false, "context": 32768}}
     }
+
+``prices`` and ``facts`` are what the service's own list said about a model when you picked it in Settings (the
+window is the only process that reads those lists): the tray, where the agent runs, and the doctor read them here.
 
 No file, an unreadable file, or a role on ``default`` means what Yuki always did (Claude through Bedrock, or the
 Anthropic API per ``Settings.model_backend``): :func:`route` answers ``None`` and the callers take their existing
@@ -126,6 +130,8 @@ def load_from(data: dict[str, Any]) -> dict[str, Any]:
                      "base_url": str(custom.get("base_url") or "").strip()}
     prices = data.get("prices") if isinstance(data.get("prices"), dict) else {}
     out["prices"] = {str(k): v for k, v in prices.items() if isinstance(v, dict)}
+    facts = data.get("facts") if isinstance(data.get("facts"), dict) else {}
+    out["facts"] = {str(k): v for k, v in facts.items() if isinstance(v, dict)}
     out.setdefault("version", 1)
     return out
 
@@ -193,5 +199,17 @@ def saved_price(name: str, path: Path | None = None) -> dict[str, float] | None:
         return None
 
 
-__all__ = ["DIR_ENV", "Route", "Target", "ai_dir", "config_path", "current", "custom_base_url", "load", "load_from",
-           "route", "save", "saved_price"]
+#: The model facts kept in ai.json (``yuki.agent.providers.catalog.ModelInfo`` fields).
+FACT_KEYS = ("tools", "images", "small", "context", "params_b", "run_context")
+
+
+def saved_facts(name: str, path: Path | None = None) -> dict[str, Any] | None:
+    """What the service's list said about a qualified model when Settings saved the choice, else ``None``."""
+    entry = current(path)["facts"].get(name)
+    if not isinstance(entry, dict):
+        return None
+    return {k: entry[k] for k in FACT_KEYS if k in entry}
+
+
+__all__ = ["DIR_ENV", "FACT_KEYS", "Route", "Target", "ai_dir", "config_path", "current", "custom_base_url", "load",
+           "load_from", "route", "save", "saved_facts", "saved_price"]

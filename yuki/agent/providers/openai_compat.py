@@ -47,6 +47,11 @@ _FINISH = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
 #: Services documented to take ``parallel_tool_calls`` (others may refuse an unknown field, so it isn't sent there).
 PARALLEL_FLAG = frozenset({"openai", "openrouter"})
 
+#: Services whose current models all take images: there a model the catalog doesn't know gets them. Where the models
+#: mix text-only and vision ones (OpenRouter, Ollama, another service), an image goes only to a model known to take
+#: it (the catalog, or the service's own list, kept in ai.json when you picked the model); else the note below.
+IMAGES_IF_UNKNOWN = frozenset({"openai", "gemini"})
+
 IMAGE_LEFT_OUT = "[An image was here, but this model can't see images.]"
 DOCUMENT_LEFT_OUT = "[A document was attached here, but this model can't read attachments.]"
 
@@ -138,7 +143,8 @@ def parse_arguments(raw: Any) -> Any:
 def to_openai_request(params: dict[str, Any], provider: Provider, model_info: ModelInfo | None = None,
                       *, stream: bool = False) -> dict[str, Any]:
     """The chat-completions body for Anthropic ``params`` (see the module docstring)."""
-    images_ok = bool(provider.images) and (model_info is None or model_info.images is not False)
+    known = model_info.images if model_info is not None else None
+    images_ok = bool(provider.images) and (known if known is not None else provider.id in IMAGES_IF_UNKNOWN)
     out: list[dict[str, Any]] = []
     system = _system_text(params.get("system"))
     if system:
@@ -244,6 +250,14 @@ def wants_thinking(params: dict[str, Any]) -> bool:
     return isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive")
 
 
+def one_call_only(params: dict[str, Any]) -> bool:
+    """Whether the request asked for at most one tool call per reply (``disable_parallel_tool_use``: the voice's
+    Pipecat service runs only one). Only OpenAI and OpenRouter can be asked for that, and a model may not listen,
+    so the answer itself is held to its first tool call (the rest are counted in ``skipped_calls``, never run)."""
+    choice = params.get("tool_choice")
+    return bool(params.get("tools")) and isinstance(choice, dict) and bool(choice.get("disable_parallel_tool_use"))
+
+
 # -- response --------------------------------------------------------------------------------------------------------
 
 
@@ -269,8 +283,9 @@ def stop_reason(finish: Any, has_tool_calls: bool) -> str:
     return _FINISH.get(str(finish or "stop"), "end_turn")
 
 
-def from_openai_response(data: dict[str, Any], *, model: str, thinking: bool = False) -> Any:
-    """An ``anthropic.types.Message`` for one chat-completions response."""
+def from_openai_response(data: dict[str, Any], *, model: str, thinking: bool = False, one_call: bool = False) -> Any:
+    """An ``anthropic.types.Message`` for one chat-completions response (``one_call``: only its first tool call,
+    see :func:`one_call_only`)."""
     from anthropic.types import Message, TextBlock, ThinkingBlock, ToolUseBlock
 
     choices = data.get("choices") or [{}]
@@ -286,6 +301,8 @@ def from_openai_response(data: dict[str, Any], *, model: str, thinking: bool = F
     if text:
         content.append(TextBlock(type="text", text=str(text)))
     calls = msg.get("tool_calls") or []
+    if one_call:
+        calls = calls[:1]
     for call in calls:
         fn = call.get("function") or {}
         content.append(ToolUseBlock(type="tool_use", id=str(call.get("id") or _new_id("toolu_")),
@@ -309,9 +326,12 @@ class StreamTranslator:
     a call that still can't be passed on whole fails the answer as a broken stream (retried), never runs in part.
     """
 
-    def __init__(self, model: str, *, thinking: bool = False) -> None:
+    def __init__(self, model: str, *, thinking: bool = False, one_call: bool = False) -> None:
         self.model = model
         self.thinking = thinking
+        #: Pass on only the answer's first tool call (:func:`one_call_only`); the others' keys, never run.
+        self.one_call = one_call
+        self.skipped: set[Any] = set()
         self.started = False
         self.index = -1               # the Anthropic index of the open block (-1: none)
         self.open_kind: str | None = None
@@ -382,6 +402,9 @@ class StreamTranslator:
                                                         delta=TextDelta(type="text_delta", text=text)))
             for position, call in enumerate(delta.get("tool_calls") or []):
                 key = call.get("index", position)
+                if self.one_call and (key in self.skipped or (key not in self.tools and self.tools)):
+                    self.skipped.add(key)   # a second call in a reply that may hold only one: left out, counted
+                    continue
                 state = self.tools.setdefault(key, {"id": None, "name": None, "args": "", "pending": "",
                                                     "opened": False, "closed": False, "sent": ""})
                 fn = call.get("function") or {}
@@ -463,6 +486,11 @@ class StreamTranslator:
         self.done = True
         self.final_usage = usage
         return events
+
+    @property
+    def skipped_calls(self) -> int:
+        """How many tool calls were left out of the answer (``one_call``)."""
+        return len(self.skipped)
 
 
 class StreamCutError(Exception):
@@ -605,9 +633,16 @@ class _Base:
         return httpx2.Timeout(read, connect=connect, write=30.0, pool=10.0)
 
     def _check_body(self, data: Any, request: Any) -> None:
-        """An error carried in a 200 body (OpenRouter puts upstream failures there)."""
-        if isinstance(data, dict) and isinstance(data.get("error"), dict) and not data.get("choices"):
-            code = data["error"].get("code")
+        """An error carried in a 200 body or a stream chunk. OpenRouter puts upstream failures there, and when the
+        model fails mid-answer it sends a chunk with an ``error`` object *and* ``choices`` whose ``finish_reason`` is
+        ``"error"``: that is a failed answer (raised, so it's retried or failed over), never a finished one."""
+        if not isinstance(data, dict):
+            return
+        choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+        failed = any(isinstance(c, dict) and c.get("finish_reason") == "error" for c in choices)
+        if isinstance(data.get("error"), dict) or failed:
+            err = data.get("error") if isinstance(data.get("error"), dict) else {}
+            code = err.get("code")
             status = code if isinstance(code, int) and 400 <= code < 600 else 502
             raise status_error(self.provider, status, data, request, key=self._key)
 
@@ -713,7 +748,8 @@ class _SyncMessages:
         if params.pop("stream", False):
             return _SyncRawStream(self._owner, params)
         data = self._owner.post(self._owner._body(params, False))
-        message = from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params))
+        message = from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params),
+                                       one_call=one_call_only(params))
         note_cost(message.usage)
         return message
 
@@ -749,7 +785,8 @@ class _SyncRawStream:
 
     def __init__(self, owner: OpenAICompatClient, params: dict[str, Any]) -> None:
         self.response, chunks, request = owner.open_stream(owner._body(params, True))
-        self.translator = StreamTranslator(str(params.get("model") or ""), thinking=wants_thinking(params))
+        self.translator = StreamTranslator(str(params.get("model") or ""), thinking=wants_thinking(params),
+                                           one_call=one_call_only(params))
         self._events = _raw_events(owner, params, chunks, request, self.translator)
 
     def __iter__(self) -> Iterator[Any]:
@@ -944,7 +981,8 @@ class _AsyncMessages:
             await stream.open()
             return stream
         data = await self._owner.post(self._owner._body(params, False))
-        message = from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params))
+        message = from_openai_response(data, model=str(params.get("model") or ""), thinking=wants_thinking(params),
+                                       one_call=one_call_only(params))
         note_cost(message.usage)
         return message
 
@@ -963,7 +1001,8 @@ class _AsyncRawStream:
         self._owner = owner
         self._params = params
         self.response: Any = None
-        self.translator = StreamTranslator(str(params.get("model") or ""), thinking=wants_thinking(params))
+        self.translator = StreamTranslator(str(params.get("model") or ""), thinking=wants_thinking(params),
+                                           one_call=one_call_only(params))
         self._gen: Any = None
 
     async def open(self) -> None:

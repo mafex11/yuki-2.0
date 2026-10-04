@@ -851,6 +851,9 @@ class Verdict:
     #: shown with it are always the same stage's).
     first_why: str = ""
     first_question: str = ""
+    #: The model that actually answered (the client's ``last_model``, read on the judge's own thread: after Settings →
+    #: AI moved doing things, ``provider:model``), so the cost is that model's; ``None``: not known (the asked model).
+    model: str | None = None
 
     @property
     def allowed(self) -> bool:
@@ -948,6 +951,9 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
         returned = False
         try:
             with client.messages.stream(**params) as stream:
+                last_model = getattr(client, "last_model", None)   # per thread: read on the thread that opened it
+                used = last_model() if callable(last_model) else None
+                verdict.model = used if isinstance(used, str) else None
                 for event in stream:
                     kind = getattr(event, "type", "")
                     if kind == "message_start":
@@ -978,7 +984,7 @@ def decide(client: Any, params: dict[str, Any], *, timeout_s: float = 4.0, need:
                         lasting = _field(partial, "lasting")
                         early = Verdict(decision="allow", sends=_field(partial, "sends") is True,
                                         scope="window" if _field(partial, "scope") == "window" else "call",
-                                        first_ms=verdict.first_ms, usage=dict(verdict.usage),
+                                        first_ms=verdict.first_ms, usage=dict(verdict.usage), model=verdict.model,
                                         lasting=lasting if isinstance(lasting, bool) else None)
                         early.ms = round((time.perf_counter() - started) * 1000, 1)
                         box["verdict"] = early
@@ -1269,7 +1275,7 @@ class Authorizer:
         if not v.usage or not callable(estimate):
             return
         try:
-            cost = estimate(model, v.usage)
+            cost = estimate(v.model or model, v.usage)   # the model that answered (Settings → AI may have moved it)
         except Exception:  # noqa: BLE001
             cost = None
         if cost is not None:

@@ -108,7 +108,11 @@ class ModelInfo:
     price: dict[str, float] | None = field(default=None, compare=False)
     #: The size in billions of parameters when the service says so (Ollama), else ``None``.
     params_b: float | None = None
+    #: The longest request the model can take, in tokens, when the service says so.
     context: int | None = None
+    #: The context a local service actually runs the model with (Ollama: the model's own ``num_ctx`` setting), when
+    #: set; Ollama otherwise runs every model with a short default window and cuts the start of a longer request.
+    run_context: int | None = None
 
 
 def _m(id: str, label: str, *, tools: bool | None = True, small: bool = False, images: bool | None = None,

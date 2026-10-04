@@ -24,6 +24,11 @@ from yuki.agent.providers.catalog import MODELS, PROVIDERS, ModelInfo, known_mod
 LIST_TTL_S = 300.0
 #: Below this many billions of parameters a local model is marked small (it may get multi-step work wrong).
 SMALL_MODEL_B = 8.0
+#: The context (tokens) a model needs for doing things: the system prompt (up to 13k characters, test_d_brain) and
+#: the tool definitions (up to 39k characters) are about 13k tokens before the request, the screen and the steps so
+#: far; 32k leaves room for a few steps. Ollama runs a model with a short default window unless told otherwise and
+#: silently cuts the start of a longer request (the rules and the tools), so a shorter window is warned about.
+THINKER_CONTEXT_TOKENS = 32_000
 
 _lock = threading.Lock()
 _lists: dict[str, tuple[float, list[ModelInfo] | None]] = {}
@@ -103,18 +108,59 @@ def ollama_models(*, base_url: str | None = None, transport: Any = None, with_ca
         if not name:
             continue
         size = _size_b(item.get("details") or {})
-        tools = images = None
+        tools = images = context = run_context = None
         if with_capabilities:
-            try:   # Ollama 0.6+: what the model can do (tools, vision)
+            try:   # Ollama 0.6+: what the model can do (tools, vision), its longest context, its own num_ctx
                 shown = _post(f"{root}/api/show", {"model": name}, timeout=3.0, transport=transport)
                 caps = shown.get("capabilities") if isinstance(shown, dict) else None
                 if isinstance(caps, list):
                     tools, images = "tools" in caps, "vision" in caps
+                context, run_context = _ollama_contexts(shown)
             except Exception:  # noqa: BLE001 - an older Ollama: not known
                 pass
         out.append(ModelInfo(name, name, tools=tools, small=size is not None and size < SMALL_MODEL_B,
-                             images=images, free=True, price={"input": 0.0, "output": 0.0}, params_b=size))
+                             images=images, free=True, price={"input": 0.0, "output": 0.0}, params_b=size,
+                             context=context, run_context=run_context))
     return out
+
+
+def _ollama_contexts(shown: Any) -> tuple[int | None, int | None]:
+    """``(longest, runs_with)`` from Ollama's ``/api/show``: the model's trained context (``model_info``'s
+    ``<family>.context_length``) and the ``num_ctx`` its Modelfile sets (``parameters``, one ``name value`` per line),
+    each ``None`` when not given."""
+    if not isinstance(shown, dict):
+        return None, None
+    longest = None
+    info = shown.get("model_info") if isinstance(shown.get("model_info"), dict) else {}
+    for key, value in info.items():
+        if str(key).endswith(".context_length") and isinstance(value, int):
+            longest = value
+    runs = None
+    for line in str(shown.get("parameters") or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "num_ctx" and parts[1].isdigit():
+            runs = int(parts[1])
+    return longest, runs
+
+
+def ollama_server_context() -> int | None:
+    """The context Ollama is told to run every model with on this PC (its ``OLLAMA_CONTEXT_LENGTH`` setting, in
+    this process's environment or the user's), else ``None`` (Ollama's own short default)."""
+    import os
+
+    raw = os.environ.get("OLLAMA_CONTEXT_LENGTH")
+    if raw is None:
+        try:
+            import winreg
+
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                raw = str(winreg.QueryValueEx(key, "OLLAMA_CONTEXT_LENGTH")[0])
+        except (ImportError, OSError):
+            raw = None
+    try:
+        return int(str(raw).strip()) if raw is not None else None
+    except ValueError:
+        return None
 
 
 def openrouter_models(*, transport: Any = None) -> list[ModelInfo]:
@@ -209,16 +255,53 @@ def cached_price(provider_id: str, model: str) -> dict[str, float] | None:
 
 
 def model_facts(provider_id: str, model: str) -> ModelInfo | None:
-    """What is known about one model: the catalog, else what the service's list said (this process)."""
+    """What is known about one model: the catalog, else what the service's list said (read in this process, or kept
+    in ai.json when you picked the model in Settings: the tray and the doctor never read the lists themselves)."""
     known = known_model(provider_id, model)
     if known is not None:
         return known
     with _lock:
-        return _facts.get((provider_id, model))
+        listed = _facts.get((provider_id, model))
+    if listed is not None:
+        return listed
+    from yuki.agent.providers import config
+
+    saved = config.saved_facts(f"{provider_id}:{model}")
+    if not saved:
+        return None
+
+    def number(key: str) -> Any:
+        value = saved.get(key)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    def flag(key: str) -> bool | None:
+        value = saved.get(key)
+        return value if isinstance(value, bool) else None
+
+    context, runs = number("context"), number("run_context")
+    return ModelInfo(model, model, tools=flag("tools"), small=flag("small") is True, images=flag("images"),
+                     free=provider_id == "ollama", params_b=number("params_b"),
+                     context=int(context) if context is not None else None,
+                     run_context=int(runs) if runs is not None else None)
 
 
-def fit_for(role: str, info: ModelInfo | None) -> str:
-    """A plain warning when ``info`` doesn't suit ``role``, else ``""`` (facts only: tools, size)."""
+def listed_facts(provider_id: str, model: str) -> dict[str, Any] | None:
+    """What the service's list (read in this process) said about a model the catalog doesn't know, as the dict
+    Settings keeps in ai.json with the choice (``None``: nothing to keep)."""
+    if not model or known_model(provider_id, model) is not None:
+        return None
+    with _lock:
+        info = _facts.get((provider_id, model))
+    if info is None:
+        return None
+    from yuki.agent.providers.config import FACT_KEYS
+
+    out = {k: getattr(info, k) for k in FACT_KEYS if getattr(info, k, None) is not None}
+    return out or None
+
+
+def fit_for(role: str, info: ModelInfo | None, provider_id: str = "") -> str:
+    """A plain warning when ``info`` doesn't suit ``role``, else ``""`` (facts only: tools, context, size)."""
     if role != "thinker":
         if info is not None and info.tools is False and role == "talker":
             return "This model can't use tools, so it can't hand work over or use your to-do list from voice."
@@ -227,6 +310,15 @@ def fit_for(role: str, info: ModelInfo | None) -> str:
         return "I don't know if this model can use tools. Doing things needs tools; if it can't, requests will fail."
     if info.tools is False:
         return "This model can't use tools, so it can't do things for you. Pick another for this job."
+    if info.context is not None and info.context < THINKER_CONTEXT_TOKENS:
+        return ("This model can't read a request as long as doing things sends, so the start of it (my rules) "
+                "would be cut off. Pick a bigger model.")
+    if provider_id == "ollama":
+        window = info.run_context or ollama_server_context()
+        if window is None or window < THINKER_CONTEXT_TOKENS:
+            return ("Ollama reads only a short part of each request unless you raise its context length, so most of "
+                    "what doing things sends (my rules and tools) would be cut off without a word. In Ollama's "
+                    "settings, set the context length to 32k or more.")
     if info.small:
         return "This is a small model. It may get multi-step work in your apps wrong."
     return ""

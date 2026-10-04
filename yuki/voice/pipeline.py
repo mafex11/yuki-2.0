@@ -983,10 +983,14 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
             chain = [None, *hooks.fallbacks()]
             start = hooks.sticky_index(len(chain))
+            # Settings → AI moved the talker: its client already retries there and then tries the user's backup, so
+            # this layer makes one attempt (two layers would multiply the attempts and the wait before a reply)
+            routed = getattr(hooks, "routed", None)
+            tries = 1 if callable(routed) and routed() else 2
             last: BaseException | None = None
             for index in range(start, len(chain)):
                 target = chain[index]
-                for attempt in range(2 if index == 0 else 1):
+                for attempt in range(tries if index == 0 else 1):
                     try:
                         if target is None:
                             response = await super()._create_message_stream(api_call, params)
@@ -1008,7 +1012,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         if kind == "fatal":
                             raise
                         hooks.model_problem(index, target, exc, kind)
-                        if kind == "retry" and attempt == 0 and index == 0:
+                        if kind == "retry" and attempt + 1 < tries and index == 0:
                             await asyncio.sleep(0.4)
                             continue
                         break
@@ -1740,9 +1744,14 @@ class TurnObserver:
             "output_tokens": turn.tokens.get("completion_tokens", 0),
         }
         usage["input_tokens"] = max(0, usage["input_tokens"])
-        from yuki.agent.providers.client import talker_price_model   # Settings → AI may have moved the talker
+        # Settings → AI may have moved the talker: the conversation prices the turn as the model(s) that answered
+        price_turn = getattr(self, "price_turn", None)
+        if callable(price_turn):
+            cost = price_turn(usage)
+        else:
+            from yuki.agent.providers.client import talker_price_model
 
-        cost = self.settings.estimate_cost(talker_price_model(self.settings), usage)
+            cost = self.settings.estimate_cost(talker_price_model(self.settings), usage)
         # What memory and the chat keep is the words: the voice's marks (<sigh>, <style: ...>) are cut out.
         # What was heard: a line the spoken-line check dropped was never said, so it is never "the reply" either.
         spoken = "".join(turn.spoken).strip()
@@ -2183,9 +2192,13 @@ class _Hooks:
 
     # -- the mouth's model failover (v3.5) ----------------------------------------
 
-    def fallbacks(self) -> list[dict[str, Any]]:
+    def routed(self) -> bool:
+        """Whether Settings → AI moved the talker to another service (its client then does the retries)."""
         routed = getattr(getattr(self.c, "_client", None), "routed", None)
-        if callable(routed) and routed():
+        return bool(callable(routed) and routed())
+
+    def fallbacks(self) -> list[dict[str, Any]]:
+        if self.routed():
             return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
         return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(s.voice_mouth_model, [])
@@ -2479,6 +2492,7 @@ class Conversation:
             call_mode=lambda: bool(self.call_app),
         )
         self.observer.on_chat = on_chat
+        self.observer.price_turn = self._price_turn
         self.observer.cut_before = lambda: bool(self.woken_by_name and self.observer.user_turns == 0)
         # The names a heard word may be a mishearing of: the user's people and names, never Yuki's own name
         # (v3.6: live 04:46:47 "yucky" was flagged as close to Yuki, the mouth asked about it and held the
@@ -3089,6 +3103,13 @@ class Conversation:
                 "bot_busy": bool(obs.bot_speaking or obs.generating or obs.speech_pending or obs.owes_reply
                                  or self.bridge.busy_tools),
                 "call_mode": bool(self.call_app), "quiet_for": self._quiet_for()}
+
+    def _price_turn(self, usage: dict[str, int]) -> float | None:
+        """One reply turn's cost (the observer's): as before on Claude; after Settings → AI moved the talker, each
+        reply stream as the model that answered it (yuki.agent.providers.client.price_talker_turn)."""
+        from yuki.agent.providers.client import price_talker_turn
+
+        return price_talker_turn(self.settings, getattr(self, "_client", None), usage)
 
     async def _progress_answer(self, log_text: str, question: str) -> tuple[str | None, dict[str, Any]]:
         from yuki.agent.providers.client import talker_price_model

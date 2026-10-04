@@ -80,16 +80,42 @@ def fit_claude_params(params: dict[str, Any], info: Any) -> dict[str, Any]:
     return out
 
 
+def _field(block: Any, name: str) -> Any:
+    return block.get(name) if isinstance(block, dict) else getattr(block, name, None)
+
+
+def strip_unsigned_thinking(params: dict[str, Any]) -> dict[str, Any]:
+    """``params`` without the reasoning blocks another service produced (a ``thinking`` block with no signature:
+    the OpenAI-protocol adapter's). Claude checks every thinking block's signature, so a conversation that began on
+    another service and is handed to Claude (the user's backup) would be refused with them. Nothing else changes; a
+    request with none is returned as it is."""
+    messages = params.get("messages")
+    if not isinstance(messages, list):
+        return params
+    out, changed = [], False
+    for message in messages:
+        role = _field(message, "role")
+        content = _field(message, "content")
+        if role == "assistant" and isinstance(content, list):
+            kept = [b for b in content if not (_field(b, "type") == "thinking" and not _field(b, "signature"))]
+            if len(kept) != len(content):
+                changed = True
+                base = dict(message) if isinstance(message, dict) else {"role": role}
+                message = {**base, "content": kept or [{"type": "text", "text": "(thought it over)"}]}
+        out.append(message)
+    return {**params, "messages": out} if changed else params
+
+
 class _FittedMessages:
-    """``messages`` / ``beta.messages`` of an Anthropic API client with :func:`fit_claude_params` applied (whatever
-    the wrapped call returns, coroutines included)."""
+    """``messages`` / ``beta.messages`` of a Claude client with :func:`fit_claude_params` and
+    :func:`strip_unsigned_thinking` applied (whatever the wrapped call returns, coroutines included)."""
 
     def __init__(self, inner: Any, facts: Callable[[str], Any]) -> None:
         self._inner = inner
         self._facts = facts
 
     def _fit(self, params: dict[str, Any]) -> dict[str, Any]:
-        return fit_claude_params(params, self._facts(str(params.get("model") or "")))
+        return strip_unsigned_thinking(fit_claude_params(params, self._facts(str(params.get("model") or ""))))
 
     def create(self, **params: Any) -> Any:
         return self._inner.create(**self._fit(params))
@@ -111,13 +137,16 @@ class _FittedBeta:
 
 
 class FittedClaudeClient:
-    """The Anthropic API client (user's key) with each request fitted to the Claude model it names."""
+    """A Claude client with each request fitted to the Claude model it names: the Anthropic API client (user's key),
+    or the app's usual client when it is a role's backup (``backend=None``: only another service's unsigned
+    reasoning is taken out)."""
 
-    def __init__(self, inner: Any, facts: Callable[[str], Any]) -> None:
+    def __init__(self, inner: Any, facts: Callable[[str], Any], backend: str | None = "anthropic") -> None:
         self._inner = inner
         self.messages = _FittedMessages(inner.messages, facts)
         self.beta = _FittedBeta(inner.beta, facts)
-        self.model_backend = "anthropic"
+        if backend is not None:
+            self.model_backend = backend
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -135,8 +164,9 @@ def sync_provider_client(provider_id: str, settings: Any = None, *, transport: A
 
         from yuki.core.models import sync_client
 
-        return sync_client(getattr(settings, "aws_region", None), backend=getattr(settings, "model_backend", None),
-                           max_retries=0, timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0))
+        return FittedClaudeClient(sync_client(
+            getattr(settings, "aws_region", None), backend=getattr(settings, "model_backend", None), max_retries=0,
+            timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0)), lambda _model: None, backend=None)
     key = _key(provider_id)
     if info.kind == "anthropic":
         import anthropic
@@ -162,8 +192,9 @@ def async_provider_client(provider_id: str, settings: Any = None, *, transport: 
     if info.kind == "default":
         from yuki.core.models import async_client
 
-        return async_client(getattr(settings, "aws_region", None), backend=getattr(settings, "model_backend", None),
-                            max_retries=0)
+        return FittedClaudeClient(async_client(getattr(settings, "aws_region", None),
+                                               backend=getattr(settings, "model_backend", None), max_retries=0),
+                                  lambda _model: None, backend=None)
     key = _key(provider_id)
     if info.kind == "anthropic":
         import anthropic
@@ -189,13 +220,16 @@ def missing_model(role: str) -> ProviderSetupError:
 
 
 class _Prefetched:
-    """An opened raw stream whose first event was already read (so a failure at its start could be retried)."""
+    """An opened raw stream whose first event was already read (so a failure at its start could be retried).
+    ``on_end(stream)`` runs once when the stream has been read to its end (the talker's usage record)."""
 
-    def __init__(self, stream: Any, first: Any, has_first: bool) -> None:
+    def __init__(self, stream: Any, first: Any, has_first: bool,
+                 on_end: Callable[[Any], None] | None = None) -> None:
         self._stream = stream
         self._first = first
         self._has_first = has_first
         self._it = stream.__aiter__()
+        self._on_end = on_end
 
     def __aiter__(self) -> "_Prefetched":
         return self
@@ -204,7 +238,16 @@ class _Prefetched:
         if self._has_first:
             self._has_first = False
             return self._first
-        return await self._it.__anext__()
+        try:
+            return await self._it.__anext__()
+        except StopAsyncIteration:
+            on_end, self._on_end = self._on_end, None
+            if on_end is not None:
+                try:
+                    on_end(self._stream)
+                except Exception:  # noqa: BLE001 - bookkeeping never breaks a reply
+                    pass
+            raise
 
     async def close(self) -> None:
         close = getattr(self._stream, "close", None)
@@ -292,14 +335,18 @@ class _AsyncRoleMessages:
         if self._owner.route() is None:
             return await self._default().create(**params)
         if params.get("stream"):
+            owner = self._owner
+
             async def open_raw(client: Any, sent: dict[str, Any]) -> Any:
+                name = owner._answering   # set by ``_run`` just before this call (read before the first await)
                 stream = await (client.beta.messages if self._beta else client.messages).create(**sent)
                 it = stream.__aiter__()
                 try:
                     first, has_first = await it.__anext__(), True
                 except StopAsyncIteration:
                     first, has_first = None, False
-                return _Prefetched(_IterHolder(stream, it), first, has_first)
+                return _Prefetched(_IterHolder(stream, it), first, has_first,
+                                   on_end=lambda done: owner._note_stream(name, done))
 
             return await self._owner._run(params, open_raw)
 
@@ -368,6 +415,11 @@ class AsyncRoleClient:
         self.messages = _AsyncRoleMessages(self, beta=False)
         self.beta = _AsyncBeta(self)
         self._last: str | None = None
+        #: The target of the call being opened now (``provider:model``, or the Claude id for a ``default`` backup).
+        self._answering: str | None = None
+        #: ``(model name, usage tokens or None, returned cost or None)`` per routed raw stream read to its end since
+        #: the last :meth:`take_stream_usage` (the voice prices each reply turn with them).
+        self._streams: list[tuple[str, dict[str, int] | None, float | None]] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._default, name)
@@ -382,8 +434,35 @@ class AsyncRoleClient:
         return self.route() is not None
 
     def last_model(self) -> str | None:
-        """``provider:model`` of the last routed call (``None`` after a default one)."""
+        """``provider:model`` of the last routed call (the Claude model id when the user's ``default`` backup
+        answered it; ``None`` after a call that went the default way)."""
         return self._last
+
+    def _note_stream(self, name: str | None, stream: Any) -> None:
+        """A routed raw stream (the Pipecat service's reply) was read to its end: keep what it used and cost. The
+        OpenAI-protocol adapter's own count is complete (cached prompt tokens included, which Pipecat reads only from
+        the stream's first event); a Claude stream's count is Pipecat's (``None`` here)."""
+        if not name:
+            return
+        from yuki.agent.providers.pricing import usage_cost_fields
+
+        translator = getattr(stream, "translator", None)
+        skipped = getattr(translator, "skipped_calls", 0)
+        if isinstance(skipped, int) and skipped:
+            # the reply held more tool calls than the voice runs: only the first was passed on (said in the log)
+            self._event("tool_calls_skipped", role=self.role, target=name, count=skipped)
+        usage = getattr(translator, "final_usage", None)
+        tokens = None
+        if usage is not None:
+            from yuki.log.requests import usage_tokens
+
+            tokens = usage_tokens(usage)
+        self._streams = [*self._streams[-49:], (name, tokens, usage_cost_fields(usage) if usage is not None else None)]
+
+    def take_stream_usage(self) -> list[tuple[str, dict[str, int] | None, float | None]]:
+        """The routed raw streams read since the last call (and forget them): see :meth:`_note_stream`."""
+        taken, self._streams = self._streams, []
+        return taken
 
     def prompt_caching(self) -> str:
         """``explicit`` | ``auto`` | ``none``: the prompt cache of where this role's calls go now."""
@@ -440,10 +519,13 @@ class AsyncRoleClient:
             if not target.model:
                 continue
             sent = adapt_params({**params, "model": requested}, target.model)
+            if target.provider == "default":   # the voice's own Claude client: another service's reasoning taken out
+                sent = strip_unsigned_thinking(sent)
             for attempt in range(retries + 1):
                 try:
                     client = self._default if target.provider == "default" and self._default is not None \
                         else self._client(target.provider)
+                    self._answering = target.name if target.provider != "default" else target.model
                     result = await call(client, sent)
                 except asyncio.CancelledError:
                     raise
@@ -468,7 +550,7 @@ class AsyncRoleClient:
                                     error=type(exc).__name__)
                     break
                 else:
-                    self._last = target.name if target.provider != "default" else None
+                    self._last = target.name if target.provider != "default" else target.model
                     if index:
                         self._event("model_failover_ok", role=self.role, used=target.name)
                     return result
@@ -493,5 +575,27 @@ def talker_price_model(settings: Any, client: Any = None) -> str:
     return last or r.primary.name
 
 
+def price_talker_turn(settings: Any, client: Any, usage: dict[str, int]) -> float | None:
+    """The cost of one voice reply turn (``usage``: the tokens Pipecat counted for it).
+
+    Talker on ``default``: ``Settings.voice_mouth_model``'s price, as before. Talker moved: each routed reply stream
+    the turn read is priced as the model that actually answered it (the user's backup included), with the adapter's
+    own token count (cached prompt tokens included) or OpenRouter's returned amount; a stream with no count of its
+    own (Claude) is priced from Pipecat's count. ``None`` when any price isn't known (never invented)."""
+    take = getattr(client, "take_stream_usage", None)
+    records = take() if callable(take) else []
+    if not records:
+        return settings.estimate_cost(talker_price_model(settings, client), usage)
+    if any(tokens is None for _name, tokens, _returned in records):
+        return settings.estimate_cost(records[-1][0], usage)
+    total = 0.0
+    for name, tokens, returned in records:
+        cost = returned if returned is not None else settings.estimate_cost(name, tokens or {})
+        if cost is None:
+            return None
+        total += float(cost)
+    return total
+
+
 __all__ = ["AsyncRoleClient", "FittedClaudeClient", "ProviderSetupError", "async_provider_client", "fit_claude_params",
-           "missing_model", "role_async_client", "sync_provider_client", "talker_price_model"]
+           "missing_model", "price_talker_turn", "role_async_client", "sync_provider_client", "talker_price_model"]

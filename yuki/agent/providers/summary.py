@@ -62,7 +62,7 @@ def role_line(role: str) -> dict[str, Any]:
         out["warning"] = "Pick a model for this job."
     else:
         out["blocked"] = False
-        out["warning"] = discover.fit_for(role, discover.model_facts(provider, model))
+        out["warning"] = discover.fit_for(role, discover.model_facts(provider, model), provider)
     return out
 
 
@@ -180,6 +180,15 @@ def _write_role(config: Any, role: str, provider: str, model: str, backup_provid
                                                               if k in ("input", "output", "cache_read")}
         except (TypeError, ValueError):
             pass
+    # what the service's own list said about the picked models (tools, images, size, context): the tray, where the
+    # agent runs, and the doctor never read the lists, so they read these (yuki.agent.providers.discover.model_facts)
+    from yuki.agent.providers.discover import listed_facts
+
+    for pid, mid in ((provider, entry["model"]), (entry.get("backup_provider") or "", entry.get("backup_model") or "")):
+        if pid and pid != "default" and mid:
+            facts = listed_facts(pid, mid)
+            if facts:
+                data["facts"][f"{pid}:{mid}"] = facts
     config.save(data)
 
 
