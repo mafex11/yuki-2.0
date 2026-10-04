@@ -80,7 +80,11 @@ user: their name, an @mention of them, a reply to their message, or plainly addr
 - needs_reply false: the user sent the newest message; the newest message closes the exchange (thanks, ok, a \
 reaction, a laugh, goodbye); people talk among themselves; a bot, an AI assistant (ChatGPT, Claude and the like), \
 a notification, an announcement, a broadcast or an automated message; anything you are unsure about.
-Give one entry for every chat shown, needs_reply false for most. For a chat that needs a reply give who (the person waiting, their name as shown; first name only when it is a \
+Give one entry for every chat shown, needs_reply false for most. Some lines in a chat are the app's own notices shown under someone's name ("You \
+joined the huddle", "A huddle happened", "missed call"): they are not that person's words. Under a chat, "calls in \
+this app since" lists the calls memory recorded in that same app after the first message shown (times only): an \
+ask to talk or for a call that a call then followed was answered by the call, so it needs no reply. For a chat that \
+needs a reply give who (the person waiting, their name as shown; first name only when it is a \
 full name), quote (the M number of the message that asks for the answer, usually the newest of theirs) and place \
 ("your DM" for a one-to-one chat, else the group or channel name as shown, short).
 
@@ -90,21 +94,26 @@ brackets. For each give its kind:
 - promised: the user said they would do something for someone.
 - asked: someone asked the user for something, or the user has a deadline, and the user did not say they would.
 - other: none of these.
-Then who (the other person's name as shown), what (waiting: what they owe, as words that follow "to", like "join \
-the VC" or "send the invoice"; promised and asked: what the user is to do, starting with a verb, like "Send Omar \
-the demo HTML"), where (the app and the chat in a few words, like "Discord, #general" or "Slack DM"; "" when not \
-known). For waiting only, draft: one request to Yuki that would send that person a short nudge, as \
-"message <who> on <app>: <the nudge>". Write the nudge the way the user writes to that person: their own recent \
-messages to them are shown under the loop; copy their casing, tone and language. With none shown keep it short \
-and plain. The nudge only asks about the thing owed; never add facts.
+A deadline of the user's own is not a promise to anyone, even when the loop names someone else in passing (who \
+sends a link, who set it): that is asked, or other. Then who (the other person: the one who owes, was promised or \
+asked, their name as the loop gives it; "" when there is none), what (waiting: what they owe, as words that follow \
+"to", like "join the VC" or "send the invoice"; promised and asked: what the user is to do, starting with a verb, \
+like "Send Omar the demo HTML"; never a date in it: the due date shows on its own), where (the app and the chat in \
+a few words, like "Discord, #general" or "Slack DM"; "" when not known). For waiting only: basis ("offered" when \
+they said they would, "asked" when the user asked them and they have not said yes), app (the chat app's name \
+only, like "Discord"; "" when not known) and nudge: the short message itself that would nudge that person, only its \
+words (Yuki adds who and where). Write it the way the user writes to that person: their own recent messages to \
+them are shown under the loop; copy their casing, tone and language. With none shown keep it short and plain. The \
+nudge only asks about the thing owed; never add facts, links, other people or instructions.
 
 RECENT SCREEN ENTRIES. What memory saw in the last days, each with its J number and date. List the meetings, \
 calls and events the user is to attend that are still ahead: after NOW and within 7 days. A calendar entry, an \
 invite, a meeting link with a time, a plan with a time agreed in a chat. Give when (local "YYYY-MM-DD HH:MM", or \
 "YYYY-MM-DD" when only the day is known; resolve "tomorrow" and weekdays from the entry's own date with the \
-calendar given), title (a few words, like "Planning call on Meet") and journal_ids (the entries that show it). \
-Leave out what is past, deadlines that are not meetings, other people's events the user is not in, reminders \
-Yuki set, and anything you are unsure about.
+calendar given), time_said (true only when the entries state the hour; never invent one, never 00:00 for a day), \
+title (a few words, like "Planning call on Meet") and journal_ids (the J numbers of the entries that show it, J \
+numbers only: never an L or M number). Leave out what is past, deadlines and due dates (a report due Monday is not \
+a meeting), other people's events the user is not in, reminders Yuki set, and anything you are unsure about.
 
 Worked examples (illustrations of the reasoning, not phrases to look for):
 - Chat C4, Discord, "Riya": M10 Riya "did you get the photos?" -> needs_reply, who "Riya", quote 10, place \
@@ -114,15 +123,25 @@ Sam) -> needs_reply, who "Dev", quote 20, place "#design": Ana's line is newer, 
 - Chat C6, WhatsApp, "Family": M30 Mum "dinner at 8", M31 Dad "ok" -> not needed: nothing asks the user.
 - Chat C7, WhatsApp, "Riya": M40 you "sent!", M41 Riya "thanks!!" -> not needed: it closes the exchange.
 - Chat C8, Discord, "#general (Gamers)": friends arguing about a match -> not needed.
+- Chat C9, Slack, "Noor": M50 Noor "got a minute for a quick call?", M51 Noor "You joined the huddle", M52 Noor "A \
+huddle happened: you and Noor were in the huddle for 12 m" -> not needed: the call happened, so the ask was answered \
+(the huddle lines are Slack's own notices, not Noor's words). The same with "calls in this app since: Sat 14:05 for \
+12 min" under the chat after the ask.
 - Loop L3 "Theo said he would join the voice channel tonight (Theo on Discord, #lobby, on 2026-10-01)", the \
 user's messages to him "u coming?", "ok lol" -> waiting, who "Theo", what "join the voice channel", where \
-"Discord, #lobby", draft "message Theo on Discord: hey, still joining the call?".
+"Discord, #lobby", basis "offered", app "Discord", nudge "hey, still joining the call?".
 - Loop L4 "The user will send Asha the invoice by Friday (the user promised Asha on WhatsApp on 2026-10-02)" -> \
 promised, who "Asha", what "Send Asha the invoice", where "WhatsApp".
 - Loop L5 "Mira asked the user to fix the login bug (asked by Mira in Slack on 2026-09-30)" -> asked, who \
 "Mira", what "Fix the login bug", where "Slack".
+- Loop L6 "The user wants the grant form finished by 2026-10-09; Ola still has to send the budget links (person: \
+grant deadline)" -> asked, who "", what "Finish the grant form": the user's own deadline, promised to nobody; Ola \
+is only named in passing.
 - J88 (Fri 2026-10-02) "The user's Google Calendar shows 'Planning call' tomorrow at 11:00 on Google Meet" -> \
-meeting when "2026-10-03 11:00", title "Planning call on Meet", journal_ids [88].
+meeting when "2026-10-03 11:00", time_said true, title "Planning call on Meet", journal_ids [88].
+- J89 (Fri 2026-10-02) "The seed swap is on Sunday at the community hall" -> meeting when "2026-10-04", time_said \
+false, title "Seed swap", journal_ids [89].
+- J90 (Fri 2026-10-02) "The quarterly report is due Monday" -> not a meeting: a due date.
 
 Call record_work_board exactly once."""
 
@@ -151,14 +170,19 @@ TOOL: dict[str, Any] = {
                     "who": {"type": "string"},
                     "what": {"type": "string"},
                     "where": {"type": "string"},
-                    "draft": {"type": "string", "description": "waiting only: \"message <who> on <app>: <nudge>\"."},
+                    "basis": {"type": "string", "enum": ["offered", "asked", ""],
+                              "description": "waiting only: they offered, or the user asked them."},
+                    "app": {"type": "string", "description": "waiting only: the chat app's name, like \"Discord\"."},
+                    "nudge": {"type": "string", "description": "waiting only: the nudge's own words, nothing else."},
                 }}},
             "meetings": {"type": "array", "items": {
-                "type": "object", "required": ["when", "title", "journal_ids"],
+                "type": "object", "required": ["when", "time_said", "title", "journal_ids"],
                 "properties": {
                     "when": {"type": "string", "description": "\"YYYY-MM-DD HH:MM\" or \"YYYY-MM-DD\", local."},
+                    "time_said": {"type": "boolean", "description": "Whether the entries state the hour."},
                     "title": {"type": "string"},
-                    "journal_ids": {"type": "array", "items": {"type": "integer"}},
+                    "journal_ids": {"type": "array", "items": {"type": "integer"},
+                                    "description": "The J numbers of the entries shown (J numbers only)."},
                 }}},
         },
     },
@@ -264,17 +288,39 @@ def newest_message(store: Store, thread_id: int) -> Msg | None:
     return msgs[-1] if msgs else None
 
 
-def loop_style(store: Store, loop: Any, limit: int = STYLE_MESSAGES) -> list[str]:
-    """The user's own newest messages in the chat an open loop came from (its journal entries' capture threads, by
-    provenance), oldest first: how they write to that person, for the nudge draft. ``[]`` when none."""
+def _loop_threads(store: Store, loop: Any) -> list[int]:
+    """The capture threads an open loop came from (its journal entries' threads, by provenance)."""
     ids = [int(i) for i in getattr(loop, "source_ids", None) or [] if isinstance(i, int)]
     if not ids:
         return []
     try:
-        threads = [int(r[0]) for r in store._query(
+        return [int(r[0]) for r in store._query(
             "SELECT DISTINCT thread_id FROM journal WHERE id IN (%s) AND thread_id IS NOT NULL" % ",".join("?" * len(ids)),
             ids)]
     except Exception:
+        return []
+
+
+def loop_app(store: Store, loop: Any) -> str:
+    """The app of the chat an open loop came from (its capture thread's own metadata, by provenance), as shown
+    ("Discord"), or ``""``: where a nudge goes is memory's record, never the model's words (second review S5)."""
+    from yuki.core.appnames import shown
+
+    for tid in _loop_threads(store, loop)[:3]:
+        try:
+            rows = store._query("SELECT app, process FROM threads WHERE id=? AND kind='conversation'", (tid,))
+        except Exception:
+            continue
+        if rows and (rows[0]["app"] or rows[0]["process"]):
+            return shown(rows[0]["app"], rows[0]["process"]) or str(rows[0]["app"] or "")
+    return ""
+
+
+def loop_style(store: Store, loop: Any, limit: int = STYLE_MESSAGES) -> list[str]:
+    """The user's own newest messages in the chat an open loop came from (its journal entries' capture threads, by
+    provenance), oldest first: how they write to that person, for the nudge draft. ``[]`` when none."""
+    threads = _loop_threads(store, loop)
+    if not threads:
         return []
     out: list[tuple[float, str]] = []
     for tid in threads[:3]:
@@ -406,6 +452,7 @@ def board(store: Store, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else float(now)
     items = _items(store)
     replies: list[dict[str, Any]] = []
+    shown_once: set[tuple[str, str]] = set()
     for chat in reply_candidates(store, now):
         it = items.get(f"chat:{chat.thread_id}")
         if not it:
@@ -417,6 +464,10 @@ def board(store: Store, now: float | None = None) -> dict[str, Any]:
             continue
         if it["mark"] == "no_reply" and not fresh:   # dismissed, then a newer message: shown once it is judged
             continue
+        same = (chat.app, data.get("msg") or "")
+        if same in shown_once:   # one chat captured as two threads (its name read two ways): the newest row only
+            continue
+        shown_once.add(same)
         replies.append({"key": f"chat:{chat.thread_id}", "who": data.get("who") or "", "msg": data.get("msg") or "",
                         "at": data.get("at") or chat.newest.when, "app": chat.app, "place": data.get("place") or "",
                         "opened": marked == "opened", "newest_at": chat.newest.when})
@@ -669,6 +720,7 @@ class WorkBoardChecker:
                                  "journal_max": self._newest_journal()}
         if chats:
             lines.append("CHATS:")
+            calls = self._calls_since(min(c.messages[0].when for c in chats)) if chats else []
             for c in chats:
                 shown["chats"][c.thread_id] = c
                 lines.append(f"- C{c.thread_id} {safe(c.app, 30)}, \"{safe(c.name, 80)}\":")
@@ -676,10 +728,15 @@ class WorkBoardChecker:
                     shown["msgs"][msg.id] = (c.thread_id, msg)
                     who = "you" if msg.is_me else safe(msg.sender or "?", 40)
                     lines.append(f"  M{msg.id} {_local(msg.when, '%a %H:%M')} {who}: \"{safe(msg.text, 240)}\"")
+                held = self._chat_calls(c, calls)
+                if held:
+                    lines.append("  calls in this app since: " + ", ".join(held))
         if loops:
             lines.append("OPEN LOOPS:")
+            shown["loop_apps"] = {}
             for lp in loops:
                 shown["loops"][lp.id] = (lp, self._loop_basis(lp))
+                shown["loop_apps"][lp.id] = loop_app(self.store, lp)
                 person = f" (person: {safe(lp.person, 40)})" if lp.person else ""
                 lines.append(f"- L{lp.id} opened {_local(lp.opened_at, '%a %Y-%m-%d')}{person}: {safe(lp.text, 400)}")
                 style = loop_style(self.store, lp)
@@ -705,6 +762,33 @@ class WorkBoardChecker:
             n for n, on in (("chats", bool(chats)), ("loops", bool(loops)), ("meetings", meetings)) if on)
             + ". Give [] for the others. Call record_work_board once."]
         return "\n".join(lines), shown
+
+    def _calls_since(self, since: float) -> list[Any]:
+        try:
+            return list(self.store.calls(since=since - 60.0))
+        except Exception:
+            return []
+
+    def _chat_calls(self, chat: Chat, calls: Sequence[Any]) -> list[str]:
+        """The calls memory recorded in this chat's own app after its first message shown, as times only ("Sat 14:05
+        for 12 min"): evidence that an ask to talk was answered by a call (second review M1). Content-free. Not for a
+        browser (measured: a call in it belongs to no particular chat), nor for a chat with no app on record."""
+        from yuki.core.appnames import app_key
+
+        key = app_key(chat.process or "")
+        if not key or not calls:
+            return []
+        start = chat.messages[0].when
+        held = [c for c in calls if app_key(getattr(c, "process", None) or "") == key
+                and float(getattr(c, "detected_at", 0) or 0) >= start - 60.0]
+        if not held or _shows_many_sites(self.store, chat.process):
+            return []
+        out = []
+        for c in sorted(held, key=lambda c: float(c.detected_at))[-3:]:
+            end = getattr(c, "ended_at", None)
+            mins = f" for {max(1, round((float(end) - float(c.detected_at)) / 60.0))} min" if end else " (still on)"
+            out.append(f"{_local(float(c.detected_at), '%a %H:%M')}{mins}")
+        return out
 
     def _meeting_entries(self, now: float) -> list[Any]:
         """The screen entries of the last :data:`MEETING_DAYS_BACK` days nearest in meaning to a meeting or event
@@ -772,20 +856,34 @@ class WorkBoardChecker:
                 rejected.append(f"L{lid}: not a loop shown")
                 continue
             lgot[lid] = d
-        for lid, (_loop, basis) in shown["loops"].items():
+        apps = shown.get("loop_apps") or {}
+        for lid, (loop, basis) in shown["loops"].items():
             d = lgot.get(lid) or {}
             kind = d.get("kind") if d.get("kind") in LOOP_KINDS else "other"
             what = _clip(d.get("what"), 120)
             who = _clip(d.get("who"), 40)
+            # who must be someone the loop itself names (its words or its person), as a quote must be one of the
+            # chat's own messages (second review M2): else nobody is waited on or promised
+            words = f"{getattr(loop, 'text', '') or ''} {getattr(loop, 'person', '') or ''}".casefold()
+            if who and who.casefold() not in words:
+                rejected.append(f"L{lid}: who not named in the loop")
+                who = ""
+                if kind == "promised":
+                    kind = "asked"
             if kind in ("waiting", "promised", "asked") and not what:
                 rejected.append(f"L{lid}: {kind} without what")
                 kind = "other"
-            if kind == "waiting" and not who:
-                rejected.append(f"L{lid}: waiting on nobody")
-                kind = "other"
+            if kind in ("waiting", "promised") and not who:
+                rejected.append(f"L{lid}: {kind} with nobody")
+                kind = "other" if kind == "waiting" else "asked"
             data = {"kind": kind, "who": who, "what": what, "where": _clip(d.get("where"), 60)}
             if kind == "waiting":
-                data["draft"] = _clip(d.get("draft"), 300)
+                # the request is built here from the validated who and memory's own app for the loop's chat; the
+                # model gives only the nudge's words (second review S5)
+                body = _clip(d.get("nudge"), 240)
+                app = apps.get(lid) or _clip(d.get("app"), 30)
+                data["draft"] = (f"message {who} on {app}: {body}" if app else f"message {who}: {body}") if body else ""
+                data["basis"] = d.get("basis") if d.get("basis") in ("offered", "asked") else ""
             writes.append((f"loop:{lid}", "loop", basis, data))
         if shown["meetings"]:
             items: list[dict[str, Any]] = []
@@ -793,6 +891,9 @@ class WorkBoardChecker:
                 if not isinstance(d, dict):
                     continue
                 at, all_day = parse_when(d.get("when"))
+                if at is not None and not all_day and d.get("time_said") is False:   # no hour stated: the day only
+                    day = datetime.fromtimestamp(at)
+                    at, all_day = datetime(day.year, day.month, day.day).timestamp(), True
                 ids = [int(i) for i in d.get("journal_ids") or [] if isinstance(i, int) and i in shown["journal"]]
                 title = _clip(d.get("title"), 80)
                 if at is None or not title:

@@ -184,14 +184,14 @@ def test_loops_get_a_kind_who_and_what_and_a_waiting_one_a_draft(store):
                             opened_at=NOW - 7200)
     answer = {"chats": [], "loops": [
         {"loop": w, "kind": "waiting", "who": "Theo", "what": "join the voice channel", "where": "Discord",
-         "draft": "message Theo on Discord: hey, still joining the call?"},
+         "basis": "offered", "app": "Telegram", "nudge": "hey, still joining the call?"},
         {"loop": p, "kind": "promised", "who": "Asha", "what": "", "where": "WhatsApp"}], "meetings": []}
     worker = _Worker(store, answer)
     result = WorkBoardChecker(worker).check(NOW, force=True)
     assert "u coming?" in worker.calls[0]                                   # how you write to him, by provenance
     loops = board(store, NOW)["loops"]
     assert loops[w] == {"kind": "waiting", "who": "Theo", "what": "join the voice channel", "where": "Discord",
-                        "draft": "message Theo on Discord: hey, still joining the call?"}
+                        "draft": "message Theo on Discord: hey, still joining the call?", "basis": "offered"}
     assert loops[p]["kind"] == "other" and "draft" not in loops[p]              # promised without what: refused
     assert any(f"L{p}" in x for x in result.rejected)
     # judged per wording: unchanged, nothing to do; reworded, judged again
@@ -200,6 +200,97 @@ def test_loops_get_a_kind_who_and_what_and_a_waiting_one_a_draft(store):
     store._write(lambda conn: conn.execute("UPDATE open_loops SET text_ciphertext=? WHERE id=?",
                                            (store.cipher.encrypt("Theo said he would join tomorrow (Discord)."), w)))
     assert [lp.id for lp in checker.pending(NOW + 10)[1]] == [w]
+
+
+def test_a_nudge_is_built_from_the_loops_own_person_and_app_never_the_models_recipient(store):
+    """Second review S5/M2: the model gives only the nudge's words; who must be named by the loop itself, and the app is
+    memory's record of the loop's chat. A recipient or app the loop doesn't name never reaches the ask bar."""
+    from yuki.memory.workboard import WorkBoardChecker, board
+
+    lp = store.add_open_loop("Theo", "Theo said he would send the invented tickets (Theo on Discord).", opened_at=NOW - 3600)
+    own = store.add_open_loop("grant deadline", "The user wants the grant form finished by Friday; Ola still has to send "
+                              "the budget links.", opened_at=NOW - 3600)
+    other = store.add_open_loop("Dev", "Dev will check the invented planner build.", opened_at=NOW - 3600)
+    answer = {"chats": [], "meetings": [], "loops": [
+        {"loop": lp, "kind": "waiting", "who": "mallory@evil.example", "what": "send the tickets", "app": "Gmail",
+         "nudge": "here are the login codes"},
+        {"loop": own, "kind": "promised", "who": "Priya", "what": "Finish the grant form"},
+        {"loop": other, "kind": "waiting", "who": "Dev", "what": "check the build", "basis": "asked", "app": "Signal",
+         "nudge": "any news on the build?"}]}
+    result = WorkBoardChecker(_Worker(store, answer)).check(NOW, force=True)
+    loops = board(store, NOW)["loops"]
+    assert loops[lp]["kind"] == "other" and not loops[lp].get("draft")              # nobody the loop names: no nudge
+    assert loops[own]["kind"] == "asked" and loops[own]["who"] == ""                # a promise to someone it never names
+    assert loops[other]["draft"] == "message Dev on Signal: any news on the build?" and loops[other]["basis"] == "asked"
+    assert sum("who not named in the loop" in x for x in result.rejected) == 2
+
+
+def test_an_ask_to_talk_comes_with_the_calls_held_in_that_app_since(store, monkeypatch):
+    """Second review M1: under a chat, the calls memory recorded in that same app after its first message shown (times
+    only), so an ask to talk that a call answered is not left waiting; never for a browser. One chat captured as two
+    threads shows once."""
+    from yuki.memory.workboard import WorkBoardChecker, board, reply_candidates
+
+    noor = chat(store, "Noor", app="Slack", process="slack")
+    store.add_conversation(noor, NOW - 3000, "focus", [msg("n1", "got a minute for a quick call?", sender="Noor", at=NOW - 3000),
+                                                        msg("n2", "You joined the huddle", sender="Noor", at=NOW - 2900)])
+    web = chat(store, "Riya", app="Google Chrome", process="chrome")
+    store.add_conversation(web, NOW - 2000, "focus", [msg("w1", "call later?", sender="Riya", at=NOW - 2000)])
+    store.start_call(app="Slack", process="slack.exe", via="mic", at=NOW - 2880, status="ended")
+    store.start_call(app="Google Chrome", process="chrome.exe", via="mic", at=NOW - 1900, status="ended")
+    store.start_call(app="Slack", process="slack.exe", via="mic", at=NOW - 90000, status="ended")      # long before
+    monkeypatch.setattr(store, "sites_shown", lambda process, since=None: 9 if "chrome" in str(process) else 1)
+    worker = _Worker(store, {"chats": [], "loops": [], "meetings": []})
+    checker = WorkBoardChecker(worker)
+    user, _shown = checker.message(reply_candidates(store, NOW), [], False, NOW)
+    lines = user.splitlines()
+    at = next(i for i, x in enumerate(lines) if x.startswith(f"- C{noor} "))
+    assert lines[at + 3].startswith("  calls in this app since: ") and lines[at + 3].count(":") >= 2
+    assert lines[at + 3].count(" min") + lines[at + 3].count("still on") == 1                  # only the one after
+    wat = next(i for i, x in enumerate(lines) if x.startswith(f"- C{web} "))
+    assert not lines[wat + 2].startswith("  calls in this app")                                   # a browser: none
+    # the same chat captured twice (its name read two ways): one row on the page
+    twin = chat(store, "Noor (DM)", app="Slack", process="slack")
+    store.add_conversation(twin, NOW - 3000, "focus", [msg("t1", "got a minute for a quick call?", sender="Noor", at=NOW - 3000),
+                                                        msg("t2", "You joined the huddle", sender="Noor", at=NOW - 2900)])
+    ans = {"chats": [{"chat": c, "needs_reply": True, "who": "Noor", "place": "your DM"} for c in (noor, twin)],
+           "loops": [], "meetings": []}
+    store._write(lambda conn: conn.execute("DELETE FROM work_items"))
+    WorkBoardChecker(_Worker(store, ans)).check(NOW, force=True)
+    rows = board(store, NOW)["replies"]
+    assert [r["msg"] for r in rows if r["app"] == "Slack"] == ["You joined the huddle"]
+
+
+def test_a_day_with_no_hour_said_is_a_day_and_meetings_cite_j_numbers_only(store):
+    """Second review M3: a day-only event never gets an invented midnight; the schema asks for J numbers only."""
+    from yuki.memory.workboard import TOOL, WorkBoardChecker, board
+
+    j = store.add_journal(NOW - 3600, None, "Firefox", "The seed swap is on Tuesday at the community hall.", 5)
+    tue = (datetime.fromtimestamp(NOW).date() + timedelta(days=3)).strftime("%Y-%m-%d")
+    answer = {"chats": [], "loops": [], "meetings": [
+        {"when": f"{tue} 00:00", "time_said": False, "title": "Seed swap", "journal_ids": [j]}]}
+    WorkBoardChecker(_Worker(store, answer)).check(NOW, force=True)
+    m = board(store, NOW)["meetings"]
+    assert len(m) == 1 and m[0]["all_day"] is True
+    props = TOOL["input_schema"]["properties"]["meetings"]["items"]
+    assert "time_said" in props["required"] and "J numbers only" in props["properties"]["journal_ids"]["description"]
+
+
+def test_continue_reopens_pages_you_viewed_never_a_link_someone_shared(store):
+    """Second review S2: a link someone pasted in a chat of the thread is not among Continue's places."""
+    from yuki.memory.store import WorkOp
+
+    now = time.time()
+    [op] = store.apply_work([WorkOp("starts", None, title="Invented report", state="Writing it.", at=now, seen_at=now)])
+    tid = op.result_id
+    store.upsert_links([
+        {"url": "https://docs.example/report", "how": "viewed", "at": now - 100, "until": now - 50, "title": "Report",
+         "host": "docs.example", "app": "Firefox", "work_thread_id": tid},
+        {"url": "https://evil.example/payload.exe", "how": "shared", "at": now - 40, "until": now - 30,
+         "title": "payload", "host": "evil.example", "app": "Discord", "sender": "Mallory", "work_thread_id": tid}])
+    ctx = MemoryClient(store).thread_continue(f"thread:{tid}")
+    urls = [pl["url"] for pl in ctx["places"]]
+    assert "https://docs.example/report" in urls and not any("evil.example" in (u or "") for u in urls)
 
 
 def test_meetings_lie_ahead_within_a_week_and_rest_on_entries_shown(store):
