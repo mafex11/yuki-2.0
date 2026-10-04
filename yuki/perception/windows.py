@@ -452,30 +452,133 @@ def _covers_monitor_without_caption(hwnd: int, rect: tuple[int, int, int, int]) 
         return False
 
 
-#: Windows seen on screen as user windows by :func:`list_windows` (``{hwnd: last seen, monotonic}``), newest last,
-#: at most :data:`_SEEN_CAP`. A hidden window that is in here was on screen before (an app closed to the tray): showing
-#: it again brings back what the user had. One never seen (a tray-icon host with a caption, appOpen 5 Oct: the Riot
-#: Client's "BackgroundModeTrayIconClass") is not shown by a launch.
+#: Windows seen on screen as user windows (``{hwnd: last seen, monotonic}``), newest last, at most :data:`_SEEN_CAP`.
+#: A hidden window that is in here was on screen before (an app closed to the tray): showing it again brings back what
+#: the user had. One never seen (a tray-icon host with a caption, appOpen 5 Oct: the Riot Client's
+#: "BackgroundModeTrayIconClass") is not shown by a launch. Fed in this process by :func:`list_windows` and the overview
+#: (:func:`_enumerate_desktop`); across processes and restarts by the seen ledger (:data:`SEEN_FILE`).
 _seen_on_screen: dict[int, float] = {}
 _SEEN_CAP = 4096
 _seen_lock = threading.Lock()
+#: appOpen second review (V1): the seen ledger - ``{hwnd: [pid, process start]}``, content-free - written by the memory
+#: service's timeline for every window that comes to the front (it follows the foreground all the time; a launch only
+#: looks now and then), read by :func:`was_on_screen` in any process. A Yuki restart, or a window the user closed to
+#: the tray while Yuki never listed windows, still counts as seen. Keyed with the process's start so a reused handle
+#: never counts. ``None``: ``%LOCALAPPDATA%\Yuki\seen_windows.json`` (tests point it elsewhere).
+SEEN_FILE: str | None = None
+SEEN_LEDGER_CAP = 512
+_ledger: dict[int, tuple[int, float]] = {}
+_ledger_read: tuple[str, float] | None = None
 
 
-def note_on_screen(hwnds: Iterable[int]) -> None:
-    """Remember these windows as seen on screen (cheap: a dict update)."""
+def _seen_path() -> str:
+    if SEEN_FILE:
+        return SEEN_FILE
+    from yuki.core.paths import data_dir
+
+    return str(data_dir() / "seen_windows.json")
+
+
+def _process_start(pid: int) -> float:
+    try:
+        return round(float(psutil.Process(int(pid)).create_time()), 2)
+    except Exception:
+        return 0.0
+
+
+def _load_ledger() -> dict[int, tuple[int, float]]:
+    """The ledger as last written (re-read only when the file changed); ``{}`` when there is none."""
+    global _ledger, _ledger_read
+    path = _seen_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _ledger_read == (path, mtime):
+        return _ledger
+    try:
+        import json
+
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        _ledger = {int(k): (int(v[0]), float(v[1])) for k, v in (raw or {}).items()}
+    except Exception:
+        _ledger = {}
+    _ledger_read = (path, mtime)
+    return _ledger
+
+
+def note_on_screen(hwnds: Iterable[int], *, persist: bool = False) -> None:
+    """Remember these windows as seen on screen (cheap: a dict update). ``persist`` (the timeline, one writer): also
+    keep them in the seen ledger, written only when a window is new to it."""
     now = time.monotonic()
+    fresh: list[int] = []
     with _seen_lock:
         for hwnd in hwnds:
-            _seen_on_screen.pop(int(hwnd), None)
-            _seen_on_screen[int(hwnd)] = now
+            hwnd = int(hwnd)
+            if hwnd not in _seen_on_screen:
+                fresh.append(hwnd)
+            _seen_on_screen.pop(hwnd, None)
+            _seen_on_screen[hwnd] = now
         while len(_seen_on_screen) > _SEEN_CAP:
             _seen_on_screen.pop(next(iter(_seen_on_screen)))
+    if persist and fresh:
+        try:
+            _persist_seen(fresh)
+        except Exception:  # noqa: BLE001 - a ledger that cannot be written costs a re-launch, never the caller
+            pass
+
+
+def _persist_seen(hwnds: list[int]) -> None:
+    import json
+
+    with _seen_lock:
+        ledger = dict(_load_ledger())
+        changed = False
+        for hwnd in hwnds:
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                continue
+            entry = (int(pid), _process_start(pid))
+            if not pid or ledger.get(hwnd) == entry:
+                continue
+            ledger.pop(hwnd, None)
+            ledger[hwnd] = entry
+            changed = True
+        if not changed:
+            return
+        while len(ledger) > SEEN_LEDGER_CAP:
+            ledger.pop(next(iter(ledger)))
+        path = _seen_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({str(k): list(v) for k, v in ledger.items()}, fh)
+        os.replace(tmp, path)
+        global _ledger, _ledger_read
+        _ledger = ledger
+        try:
+            _ledger_read = (path, os.path.getmtime(path))
+        except OSError:
+            _ledger_read = None
 
 
 def was_on_screen(hwnd: int) -> bool:
-    """Whether :func:`list_windows` ever saw this window on screen in this process (appOpen)."""
+    """Whether this window was ever seen on screen: by this process (:func:`list_windows`, the overview), or by the
+    timeline (the seen ledger, same window of the same process) - appOpen."""
+    hwnd = int(hwnd)
     with _seen_lock:
-        return int(hwnd) in _seen_on_screen
+        if hwnd in _seen_on_screen:
+            return True
+        entry = _load_ledger().get(hwnd)
+    if entry is None:
+        return False
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+    except Exception:
+        return False
+    return bool(pid) and entry[0] == int(pid) and abs(entry[1] - _process_start(pid)) < 1.0
 
 
 def list_windows() -> list[WindowInfo]:
@@ -1119,6 +1222,7 @@ def _enumerate_desktop() -> tuple[list[int], list[tuple[int, int]], set[int]]:
         return True
 
     win32gui.EnumWindows(_collect, None)
+    note_on_screen(user)   # appOpen second review (V1): the overview sees what is on screen too
     return user, hidden, elsewhere
 
 

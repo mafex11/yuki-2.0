@@ -610,3 +610,229 @@ def test_review_f2_a_program_named_for_a_sibling_entry_too_is_the_app_only_under
     world.proc(501, r"C:\Other\notesplus.exe", ppid=502, created=time.time())
     world.proc(502, r"C:\Tools\notesplus.exe", ppid=4, created=time.time() - 5)
     assert "under its launcher" in app.owns(world.procs[501])
+
+
+# -- second review (5 Oct) --------------------------------------------------------------------------------------------
+
+
+def test_second_review_v1_a_window_the_timeline_saw_counts_as_seen_in_any_process_and_after_a_restart(
+        tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeline (memory service) follows the foreground all the time; a launch in another process, or after a Yuki
+    restart, reads what it saw. Same window of the same process only: a reused handle never counts."""
+    from yuki.perception import windows as W
+
+    owner = {71001: 4242, 71002: 4243}
+    starts = {4242: 1000.0, 4243: 2000.0}
+    monkeypatch.setattr(W, "SEEN_FILE", str(tmp_path / "seen_windows.json"))
+    monkeypatch.setattr(W, "_ledger", {})
+    monkeypatch.setattr(W, "_ledger_read", None)
+    monkeypatch.setattr(W.win32process, "GetWindowThreadProcessId", lambda h: (1, owner.get(int(h), 0)))
+    monkeypatch.setattr(W, "_process_start", lambda pid: starts.get(int(pid), 0.0))
+    monkeypatch.setattr(W, "_seen_on_screen", {})
+    W.note_on_screen([71001], persist=True)                 # the timeline: the app's window was in front
+    assert (tmp_path / "seen_windows.json").exists()
+    monkeypatch.setattr(W, "_seen_on_screen", {})           # another process, or Yuki restarted: nothing in memory
+    monkeypatch.setattr(W, "_ledger_read", None)
+    assert W.was_on_screen(71001) and not W.was_on_screen(71002)
+    starts[4242] = 3000.0                                   # the handle now belongs to a newer process of that pid
+    assert not W.was_on_screen(71001)
+    W.note_on_screen([71002])                               # this process's own listing is not written
+    assert "71002" not in (tmp_path / "seen_windows.json").read_text()
+
+
+def test_second_review_v1_the_timeline_writes_the_seen_ledger() -> None:
+    import inspect
+
+    from yuki.memory import timeline
+
+    source = inspect.getsource(timeline.TimelineRecorder)
+    assert 'getattr(self._windows, "note_on_screen", None)' in source and "persist=True" in source
+
+
+def _restore_world(monkeypatch: pytest.MonkeyPatch, *, new_window_pid: int, still_hidden: bool = True) -> dict:
+    """An app running with its main window hidden (never seen), asked for a new window by starting it again."""
+    old_pid, hidden_main, new_hwnd = 800, 81001, 81002
+    shown: set[int] = set()
+    monkeypatch.setattr(L, "_window_snapshot", lambda: ({}, set(), {}))
+    monkeypatch.setattr(L._user32, "GetForegroundWindow", lambda: 0)
+    monkeypatch.setattr(L, "_top_level_windows", lambda pids: [hidden_main])
+    monkeypatch.setattr(L, "is_user_window", lambda h: h == new_hwnd or h in shown)
+    monkeypatch.setattr(L, "hidden_main_window", lambda h: h == hidden_main and h not in shown)
+    monkeypatch.setattr(L, "_open_new_window", lambda chosen, identity, budget: (901, "Start-Process app.exe", ""))
+
+    def wait(identity: Any, *a: Any, **k: Any) -> tuple:
+        if not still_hidden:
+            shown.add(hidden_main)
+            return hidden_main, "its window, hidden before (running in the background), was shown", [hidden_main]
+        return new_hwnd, "new window from a new process", [new_hwnd]
+
+    monkeypatch.setattr(L, "_wait_for_new_window", wait)
+    monkeypatch.setattr(L, "window_info", lambda h: SimpleNamespace(title="App is already running",
+                                                                   process_name="app.exe"))
+    monkeypatch.setattr(L, "_note_fresh", lambda h: None)
+
+    def forward(hwnd: int, deadline: float, details: dict) -> str:
+        details["foreground"] = True
+        return "in the foreground"
+
+    monkeypatch.setattr(L, "_bring_forward", forward)
+    monkeypatch.setattr(L, "_window_pid", lambda h: new_window_pid if h == new_hwnd else old_pid)
+    monkeypatch.setattr(L.psutil, "pid_exists", lambda pid: pid == old_pid)
+    identity = SimpleNamespace(owns_window=lambda h: "same program file", add_launched=lambda pid: None, name="App")
+    details: dict = {}
+    ok, summary = L._restore_background_app({"name": "App", "appid": r"C:\Apps\app.exe"}, identity, None, {old_pid},
+                                            details, 0.5)
+    details["identity"] = {"confirmable": True}
+    return {"ok": ok, "summary": summary, "details": details, "verdict": L._launch_verdict(ok, details)}
+
+
+def test_second_review_v1_a_new_processs_prompt_while_the_app_keeps_its_window_hidden_is_not_verified(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """An app whose single-instance guard answers a second start with an "already running" prompt: that prompt is
+    reported, never called the app's window."""
+    out = _restore_world(monkeypatch, new_window_pid=901)
+    assert out["ok"] and out["verdict"] is None and "not confirmed" in out["details"]["window_reason"]
+
+
+def test_second_review_v1_the_running_instance_showing_its_own_window_is_verified(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    out = _restore_world(monkeypatch, new_window_pid=901, still_hidden=False)   # the old process shows its window
+    assert out["verdict"] is True and "not confirmed" not in out["details"]["window_reason"]
+
+
+def test_second_review_v2_a_game_with_no_program_names_is_its_window_titled_for_it_under_the_launcher(
+        world: World) -> None:
+    """cs2.exe has no version resource: its stem is nothing like "Counter-Strike 2". Under its launcher, a window
+    titled for the entry is the game - started now, or running already (nothing handed over again)."""
+
+    def racer_starts() -> None:
+        world.proc(310, RACER, ppid=300, created=time.time())
+        world.window(9310, 310, "Pixel Racer", front=True, fullscreen=True)
+
+    world.on_start = racer_starts
+    result = L.launch_app("Pixel Racer", timeout_s=0.2)
+    assert result.details["verified"] is True and result.details["hwnd"] == 9310
+    assert "titled for it" in result.details["window_reason"]
+    watch = L.watch_launch(result.details["launcher"], timeout_s=0.01, poll_s=0.001)
+    assert watch["verified"] is True
+    world.started.clear()
+    world.on_start = None
+    again = L.launch_app("Pixel Racer", timeout_s=0.05)                     # running already
+    assert world.started == [] and again.details["verified"] is True
+
+
+def test_second_review_v2_the_launchers_own_windows_are_still_never_the_game(world: World) -> None:
+    world.proc(311, RACER.replace("pr_main", "storehelper"), ppid=300, created=time.time())
+    world.window(9311, 311, "Fake Store", front=True)                         # a launcher helper, titled for the store
+    state = L._LauncherApp("Pixel Racer", "fakestore://rungameid/42", STORE).read()
+    assert state["app"] == [] and [w["hwnd"] for w in state["launcher"]] == [9311]
+
+
+CLIP = r"C:\Tools\Clip Player\clipplayer.exe"
+CLIP_APPS = [
+    {"name": "Clip Player", "appid": CLIP},
+    {"name": "Clip Player skinned", "appid": "Microsoft.AutoGenerated.{CCCCCCCC-2222-3333-4444-555555555555}"},
+    {"name": "Clip Player - reset preferences",
+     "appid": "Microsoft.AutoGenerated.{DDDDDDDD-2222-3333-4444-555555555555}"},
+]
+CLIP_LINKS = {
+    CLIP: {"target": CLIP, "arguments": ""},
+    CLIP_APPS[1]["appid"]: {"target": CLIP, "arguments": "--intf skins"},
+    CLIP_APPS[2]["appid"]: {"target": CLIP, "arguments": "--reset-config --reset-plugins-cache vlc://quit"},
+}
+
+
+@pytest.fixture()
+def clip(world: World, monkeypatch: pytest.MonkeyPatch) -> World:
+    """A media player whose other Start entries are commands of the same program (VLC's "skinned" and "reset
+    preferences"): its carrier is the app itself."""
+    monkeypatch.setattr(L, "get_start_apps", lambda refresh=False: APPS + CLIP_APPS)
+    monkeypatch.setattr(L, "_start_links", lambda apps: {**LINKS, **CLIP_LINKS})
+    monkeypatch.setitem(NAMES, CLIP, {"Clip Player"})
+    return world
+
+
+def test_second_review_v4_the_players_idle_window_is_not_its_other_entries(clip: World) -> None:
+    clip.proc(600, CLIP, ppid=4, created=time.time() - 600.0)
+    clip.window(9600, 600, "Clip Player", front=True)                         # open and idle
+    result = L.launch_app("Clip Player skinned", timeout_s=0.02)
+    assert clip.started == [CLIP_APPS[1]["appid"]]                           # the entry itself is run
+    assert result.details["verified"] is None and result.details["starting"] is False
+    assert result.details["launcher"]["carrier_is_app"] is True
+    reset = L.launch_app("Clip Player - reset preferences", timeout_s=0.02)
+    assert clip.started[-1] == CLIP_APPS[2]["appid"] and reset.details["verified"] is None
+
+
+def test_second_review_v4_a_command_of_the_program_gets_no_game_wording_no_watch_and_no_pending(clip: World) -> None:
+    result = L.launch_app("Clip Player - reset preferences", timeout_s=0.02)
+    assert result.ok and result.details["starting"] is False and result.details["verified"] is None
+    assert "a game can take" not in result.summary and "is the program of" in result.summary
+    assert L._launch_pending(CLIP_APPS[2]["appid"]) is None
+
+    def fresh_instance() -> None:                                             # the skinned interface coming up
+        clip.proc(601, CLIP, ppid=4, created=time.time())
+        clip.window(9601, 601, "Clip Player", front=True)
+
+    clip.on_start = fresh_instance
+    skinned = L.launch_app("Clip Player skinned", timeout_s=0.2)
+    assert skinned.details["verified"] is True and skinned.details["hwnd"] == 9601
+
+
+def test_second_review_v4_a_window_titled_exactly_for_the_entry_still_counts() -> None:
+    app = L._LauncherApp("Razer Synapse", "x", r"C:\Tools\appengine.exe", siblings=["Razer Chroma"])
+    assert app.titled_for_it("Razer Synapse") and not app.titled_for_it("Razer Chroma")
+    vlc = L._LauncherApp("VLC media player skinned", "x", CLIP, siblings=["VLC media player"])
+    assert not vlc.titled_for_it("VLC media player") and vlc.titled_for_it("VLC media player", fresh=True)
+
+
+def test_second_review_v3_a_shell_or_system_entry_is_recognised_by_the_program_that_shows_it(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control Panel (a shell location), Services (a console snap-in): their windows are Explorer's and MMC's - a
+    registry fact - so a new one in front is verified, and Explorer running is not "the app already running"."""
+    targets = {"Microsoft.Windows.ControlPanel": "::{5399E694-6CE5-4D6C-8FCE-1D8870FDCBA0}",
+               "x-services": r"C:\WINDOWS\system32\services.msc"}
+    monkeypatch.setattr(L, "_appid_path", lambda appid: None)
+    monkeypatch.setattr(L, "_apps_folder_strings", lambda appid, keys: {"target": targets.get(appid, "")})
+    monkeypatch.setattr(L, "_handler_path", lambda t: r"C:\WINDOWS\system32\mmc.exe" if t.endswith(".msc") else "")
+    monkeypatch.setattr(L, "_is_program_file", lambda path: str(path).lower().endswith(".exe"))
+    panel = L._identity_for({"name": "Control Panel", "appid": "Microsoft.Windows.ControlPanel"}, None)
+    assert panel.confirmable and panel.via_handler and any(p.endswith("explorer.exe") for p in panel.exe_paths)
+    assert panel.running_pids() == set()
+    services = L._identity_for({"name": "Services", "appid": "x-services"}, None)
+    assert services.confirmable and any(p.endswith("mmc.exe") for p in services.exe_paths)
+    assert not L._identity_for({"name": "Nothing", "appid": "x-none"}, None).confirmable
+
+
+def test_second_review_v3_the_thinker_is_told_when_only_bringing_the_window_forward_failed() -> None:
+    from yuki.agent.loop import action_verdict
+    from yuki.agent.tools import ToolOutcome
+
+    def outcome(details: dict) -> ToolOutcome:
+        return ToolOutcome(name="launch_app", ok=True, summary="", payload={"ok": True, "details": details})
+
+    verdict, why = action_verdict("launch_app", outcome({"verified": None, "hwnd": 5, "foreground": False,
+                                                         "window_reason": "new window from a new process"}))
+    assert verdict is None and "could not be brought to the front" in why
+    verdict, why = action_verdict("launch_app", outcome({"verified": None, "hwnd": 5, "foreground": True,
+                                                         "window_reason": "new window (not confirmed)"}))
+    assert verdict is None and "recognise" in why
+
+
+def test_second_review_v3_a_handler_that_hands_the_target_on_still_gets_its_window_brought_up(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PDF entry's handler is LaunchWinApp.exe, which hands it to the browser: the browser's new window is accepted,
+    unconfirmed, as before; the handler's own window would be verified."""
+    identity = L._AppIdentity("Manual", aumid="x-manual", exe_paths=[r"C:\WINDOWS\system32\LaunchWinApp.exe"],
+                              via_handler=True)
+    monkeypatch.setattr(identity, "owns_window", lambda h: "same program file" if h == 92002 else "")
+    snapshots = iter([({92001: 50}, {50}, {92001: ("Manual.pdf", "msedge.exe")})] * 3)
+    monkeypatch.setattr(L, "_window_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(L, "is_user_window", lambda h: True)
+    monkeypatch.setattr(L._user32, "GetForegroundWindow", lambda: 0)
+    hwnd, reason, _ = L._wait_for_new_window(identity, {}, set(), 0, time.monotonic() + 0.5)
+    assert hwnd == 92001 and "not confirmed" in reason
+    assert L._launch_verdict(True, {"hwnd": hwnd, "foreground": True, "window_reason": reason,
+                                    "identity": identity.describe()}) is None
+    snapshots = iter([({92002: 51}, {51}, {92002: ("Help", "hh.exe")})] * 3)
+    hwnd, reason, _ = L._wait_for_new_window(identity, {}, set(), 0, time.monotonic() + 0.5)
+    assert hwnd == 92002 and "not confirmed" not in reason

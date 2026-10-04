@@ -361,6 +361,10 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
         # recognise as its: not done, and not a failure either
         if details.get("starting"):
             return None, "it is still starting through its launcher: no window of the app itself yet"
+        if details.get("hwnd") and not details.get("foreground") and \
+                "not confirmed" not in str(details.get("window_reason") or ""):
+            # second review V3: its own window came up; only bringing it to the front failed
+            return None, "its window came up but could not be brought to the front"
         return None, "no window it could recognise as the app's own came up in front"
     if name == "scroll" and details.get("unverifiable") == "page":
         # V6: a web page that takes no UI Automation scrolling never shows its scroll from here: expected, not trouble

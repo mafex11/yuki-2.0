@@ -335,8 +335,9 @@ def test_review_f1_a_chain_yuki_started_before_the_user_went_to_start_stays_yuki
 
 
 def test_review_f3_a_verified_opening_is_not_doubted_and_never_takes_the_users_way(store):
-    two = [P.RunStep(step=n, at=NOW, tool="launch_app", kind="action", app=None, target="", input="{}", ok=True,
-                     verdict=v, why="", result="", ms=1.0, cost_usd=None, cited=[]) for n, v in ((1, None), (2, True))]
+    two = [P.RunStep(step=n, at=NOW, tool="launch_app", kind="action", app=None, target="",
+                     input='{"name":"Starfall","handed_to":"fakelauncher.exe"}', ok=True, verdict=v, why="", result="",
+                     ms=1.0, cost_usd=None, cited=[]) for n, v in ((1, None), (2, True))]
     assert not L.doubtful_open(two)                                  # the watch verified it
     assert L.doubtful_open(two[:1]) and L.doubtful_open([two[1], two[0]])
     worker = Worker(store, answers=[{"outcome": "worked", "operations": [], "used": []}] * 3)
@@ -369,3 +370,151 @@ def test_review_f4_the_program_learned_must_belong_to_the_entry(item, why):
                                                       **item}})
     checked = L.check({"outcome": "failed", "operations": [{**SHOWN, "from_user": ["u4"]}], "used": []}, ctx)
     assert checked.ops == [] and any(why in r for r in checked.rejected)
+
+
+# -- second review (5 Oct) --------------------------------------------------------------------------------------------
+
+
+def _rows(store: Any, rows: list[tuple]) -> None:
+    """``(start, active, passive, process, app, title, fullscreen)`` timeline rows."""
+    for start, active, passive, process, app, title, full in rows:
+        store.save_timeline(TimelineRow(id=None, started_at=start, ended_at=start + active + passive, state="present",
+                                        process=process, app=app, title=title, active_s=active, passive_s=passive,
+                                        fullscreen=full))
+
+
+def _game_chain(*, window_at: float, chain_at: float) -> None:
+    lineage.clear()
+    lineage.add({"at": window_at, "image": "starfall-win64-shipping.exe", "exe": GAME, "started": chain_at + 1.0,
+                 "parents": [{"image": "starfall.exe", "exe": BOOT, "started": chain_at},
+                             {"image": "fakelauncher.exe", "exe": CARRIER, "started": NOW - 86400.0}],
+                 "by_yuki": False})
+    # the launcher's own UX process, running under it since long before the request
+    lineage.add({"at": NOW + 200.0, "image": "fakelauncher ux.exe", "exe": CARRIER.replace("fakelauncher.exe",
+                                                                                          r"uxakelauncher ux.exe"),
+                 "started": NOW - 3600.0, "parents": [{"image": "fakelauncher.exe", "exe": CARRIER,
+                                                        "started": NOW - 86400.0}], "by_yuki": False})
+
+
+def _failed_voice_opening(store: Any, worker: Worker) -> P.RunHeader:
+    P.record_run(store, _voice_opening(handed=True, verdict=False))
+    worker.answers.append({"outcome": "failed", "cause": "the game never came up", "operations": [PIT], "used": []})
+    L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
+    return P.run_header(store, P.run_key("hand", "S5", "voice-s1-3-h1"))
+
+
+@pytest.mark.parametrize("launcher_process", ["fakelauncher", "fakelauncher ux"], ids=["S3c", "S3d"])
+def test_second_review_l1_a_launcher_update_that_delays_the_game_is_not_the_users_fix(store, launcher_process):
+    """The launcher's window comes up by itself ("Updating 97%") long after the hand-off and the user only glances at
+    it; the game Yuki's hand-off started then shows on its own. Yuki's, never a way the user showed."""
+    worker = Worker(store)
+    head = _failed_voice_opening(store, worker)
+    calls = len(worker.calls)
+    _rows(store, [(NOW + 200.0, 0.0, 80.0, launcher_process, "Fake Launcher", "Updating 97%", False),
+                  (NOW + 300.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)])
+    _game_chain(window_at=NOW + 300.0, chain_at=NOW + 298.0)
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"]
+    assert game and game[0]["yuki"] and "started by Yuki's own launch" in game[0]["yuki_why"]
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls and P.live(store, ["procedure"]) == []
+
+
+def test_second_review_l1_pressing_play_in_the_launchers_window_is_still_the_users_fix(store):
+    worker = Worker(store)
+    head = _failed_voice_opening(store, worker)
+    _rows(store, [(NOW + 200.0, 12.0, 0.0, "fakelauncher ux", "Fake Launcher", "Fake Launcher", False),
+                  (NOW + 300.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)])
+    _game_chain(window_at=NOW + 300.0, chain_at=NOW + 211.0)      # started as the user pressed Play
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"]
+    assert game and not game[0]["yuki"] and game[0]["worked"] and game[0]["fresh"]
+
+
+def test_second_review_l2_a_way_the_first_post_mortem_learned_is_not_learned_again(store):
+    """A quick user: the first post-mortem already saw what they did and wrote the way. The recheck neither writes it
+    again (a second version, a second announcement) nor undoes the user's "No"."""
+    worker = Worker(store)
+    _game_from(store, chain_at=NOW + 238.0, window_at=NOW + 240.0, start_row_at=NOW + 190.0)
+    P.record_run(store, _voice_opening(handed=True, verdict=False))
+    worker.answers.append({"outcome": "failed", "cause": "the game never came up",
+                           "operations": [{**SHOWN, "from_user": ["u1", "u2"]}], "used": []})
+    first = L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
+    assert first and "demonstrated" in (first[0].written or {})
+    ways = P.live(store, ["procedure"])
+    assert len(ways) == 1
+    assert P.workflow_edit(store, f"pb:{ways[0].id}", "forget", now=END + 200.0)["ok"]   # the user said No
+    calls = len(worker.calls)
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls
+    head = P.run_header(store, P.run_key("hand", "S5", "voice-s1-3-h1"))
+    assert head.signals[L.RECHECK_KEY]["result"] == "already learned what the user showed"
+    assert len(store._query("SELECT id FROM playbooks WHERE kind='procedure'")) == 1     # no second version
+    assert P.live(store, ["procedure"]) == []                            # the No stands
+
+
+def test_second_review_l3_switching_to_a_game_already_running_is_not_a_way_shown(store):
+    """The service restarted while the game ran (started 2 h earlier); Yuki could not bring it forward and the user
+    alt-tabbed to it. Its program started before the request: no demonstration pass, and none could be written."""
+    worker = Worker(store)
+    run = _voice_opening(handed=False, verdict=False)
+    run["steps"] = run["steps"][:1]
+    run["steps"][0].update(verdict=False, ok=True, why="its window would not come to the front")
+    P.record_run(store, run)
+    worker.answers.append({"outcome": "failed", "cause": "focus refused", "operations": [], "used": []})
+    L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
+    calls = len(worker.calls)
+    _rows(store, [(NOW + 20.0, 400.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)])
+    _game_chain(window_at=NOW + 20.0, chain_at=NOW - 7200.0)
+    head = P.run_header(store, P.run_key("hand", "S5", "voice-s1-3-h1"))
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
+    assert items[0]["image"] and items[0]["entries"] and items[0]["fresh"] is False
+    assert not L.demonstration_item(items[0])
+    assert "already running before the request" in L._user_item_line(items[0], lambda v, n: str(v)[:n])
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls
+    ctx = L.Ctx(mode="postmortem", user_items={it["label"]: it for it in items})
+    checked = L.check({"outcome": "failed", "operations": [{**SHOWN, "from_user": ["u1"]}], "used": []}, ctx)
+    assert checked.ops == [] and any("already running before the request" in r for r in checked.rejected)
+
+
+def test_second_review_l4_l5_unknown_starts_and_the_users_other_windows_cost_no_recheck(store):
+    """Lineage lost (service restart): the game Yuki's own slow launch started shows with no launch facts - who
+    started it is unknown, never the user's doing. The user reading the browser meanwhile is no evidence either."""
+    worker = Worker(store)
+    head = _failed_voice_opening(store, worker)
+    calls = len(worker.calls)
+    lineage.clear()
+    _rows(store, [(NOW + 200.0, 190.0, 0.0, "chrome", "Google Chrome", "Some article", False),
+                  (NOW + 400.0, 120.0, 0.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)])
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S + 5)
+    game = [it for it in items if it["process"] == "starfall-win64-shipping"][0]
+    browser = [it for it in items if it["process"] == "chrome"][0]
+    assert game["unknown"] and not game["worked"] and browser["worked"] and not browser["unknown"]
+    assert "who started it is not known" in L._user_item_line(game, lambda v, n: str(v)[:n])
+    assert L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls                                    # no recheck post-mortem
+    assert P.run_header(store, head.run_key).signals[L.RECHECK_KEY]["result"] == "nothing new"
+
+
+def test_second_review_l6_the_watch_step_is_not_a_second_open() -> None:
+    def step(n: int, inp: str, verdict: Any, app: Any = None) -> P.RunStep:
+        return P.RunStep(step=n, at=NOW + n, tool="launch_app", kind="action", app=app, target="", input=inp, ok=True,
+                         verdict=verdict, why="", result="", ms=1.0, cost_usd=None, cited=[])
+
+    ctx = L.Ctx(mode="distill", steps={1: step(1, '{"name":"Starfall"}', None),
+                                       2: step(2, '{"name":"Starfall","watch":true}', True, "starfall-win64-shipping")})
+    run = L.executable_run([{"do": "Open Starfall", "from": [1, 2]}], ctx, [])
+    assert run == [{"do": "open_app", "name": "Starfall", "app": "starfall-win64-shipping"}]
+    run = L.executable_run([{"do": "Open Starfall", "from": [1]}, {"do": "Wait for it", "from": [2]}], ctx, [])
+    assert run == [{"do": "open_app", "name": "Starfall", "app": "starfall-win64-shipping"}]
+
+
+def test_second_review_v3_a_plain_opening_that_could_not_be_confirmed_is_not_doubtful() -> None:
+    def step(inp: str, verdict: Any) -> P.RunStep:
+        return P.RunStep(step=1, at=NOW, tool="launch_app", kind="action", app=None, target="", input=inp, ok=True,
+                         verdict=verdict, why="", result="", ms=1.0, cost_usd=None, cited=[])
+
+    assert not L.doubtful_open([step('{"name":"File Explorer"}', None)])
+    assert L.doubtful_open([step('{"name":"File Explorer"}', False)])
+    assert L.doubtful_open([step('{"name":"Starfall","handed_to":"fakelauncher.exe"}', None)])

@@ -1535,6 +1535,14 @@ class TimelineRecorder:
                 return
         except Exception:
             return
+        # appOpen second review (V1): the seen ledger - this window was on screen, so a launch may show it again once
+        # its app hides it in the tray (content-free: the handle, its process and that process's start)
+        seen = getattr(self._windows, "note_on_screen", None)
+        if seen is not None:
+            try:
+                seen([hwnd], persist=True)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         pid = self._w._window_pid(hwnd)
         facts = self._procs.get(pid)
         rules = self.privacy.rules()

@@ -317,8 +317,13 @@ class _AppIdentity:
         aumid: str = "",
         exe_paths: tuple[str, ...] | list[str] = (),
         image_names: tuple[str, ...] | list[str] | frozenset[str] = (),
+        via_handler: bool = False,
     ) -> None:
         self.name = name
+        #: second review V3: ``exe_paths`` is the program Windows opens the entry's target with (a document's, a
+        #: shell location's: Explorer, MMC, the browser), not the app's own program - it shows the entry's window,
+        #: but its running processes are not "the app already running" (Explorer always runs)
+        self.via_handler = bool(via_handler)
         self.aumid = (aumid or "").lower()
         self.packaged = _is_packaged(self.aumid)
         self.family = self.aumid.split("!", 1)[0] if self.packaged else ""
@@ -347,6 +352,7 @@ class _AppIdentity:
             "image_names": sorted(self.image_names),
             "launched_pids": sorted(self.launched_pids),
             "confirmable": self.confirmable,
+            **({"via_handler": True} if self.via_handler else {}),
         }
 
     def add_launched(self, pid: int | None) -> None:
@@ -415,7 +421,7 @@ class _AppIdentity:
 
     def running_pids(self) -> set[int]:
         """Processes of the app that exist right now."""
-        if not self.confirmable:
+        if not self.confirmable or self.via_handler:
             return set()
         return {pid for pid in psutil.pids() if self.owns_pid(pid)}
 
@@ -615,11 +621,16 @@ def _wait_for_new_window(
                 shown_reason(owned[-1], "new window from an already running process"),
                 fresh,
             )
-        if fresh and not identity.confirmable:
+        # second review V3: a handler that only hands the target on (LaunchWinApp.exe for a PDF, to the browser) owns
+        # no window: a new window is then accepted as before, unconfirmed
+        if fresh and (not identity.confirmable or getattr(identity, "via_handler", False)):
             return (
                 fresh[-1],
                 (
-                    f"new window (not confirmed as {identity.name!r}'s: nothing is known "
+                    f"new window (not confirmed as {identity.name!r}'s: it is not a window of the program "
+                    f"its target opens with)"
+                    if identity.confirmable
+                    else f"new window (not confirmed as {identity.name!r}'s: nothing is known "
                     f"to recognise its windows by)"
                 ),
                 fresh,
@@ -857,7 +868,27 @@ def _identity_for(chosen: dict[str, str], plan: dict | None) -> _AppIdentity:
     target = _apps_folder_strings(appid, {"target": _PKEY_LINK_TARGET_PARSING_PATH})["target"]
     if _is_program_file(target):
         exe_paths.append(target)
+    if not exe_paths and plan is None:
+        # second review V3: an entry that is no program (a shell location, a console snap-in, a document, a folder,
+        # a web link) is shown by the program Windows opens its target with - a registry fact (the shell's own
+        # association; a shell namespace location is Explorer's) - so its new window can be recognised by that
+        handler = _target_handler(target or path or "")
+        if handler:
+            return _AppIdentity(chosen["name"], aumid=appid, exe_paths=[handler], via_handler=True)
     return _AppIdentity(chosen["name"], aumid=appid, exe_paths=exe_paths)
+
+
+def _target_handler(target: str) -> str:
+    """The program file Windows opens a Start entry's target with (``""``: none known): Explorer for a shell namespace
+    location (``::{CLSID}``, ``shell:``), else the shell's association for the target (:func:`_handler_path`)."""
+    target = (target or "").strip()
+    if not target:
+        return ""
+    if target.startswith("::{") or target.lower().startswith("shell:"):
+        handler = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "explorer.exe")
+    else:
+        handler = _handler_path(target)
+    return handler if _is_program_file(handler) else ""
 
 
 def _package_install_dir(aumid: str) -> tuple[str, str]:
@@ -1653,6 +1684,10 @@ def _restore_background_app(
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
     hidden_before = {h for h in _top_level_windows(running) if not is_user_window(h)}
+    # appOpen second review (V1): the running instance's own main-style windows it keeps hidden (never seen on screen,
+    # or showing them failed). If they stay hidden and the window that came is a new process's, that
+    # window may be the program's "already running" prompt rather than the app: reported, not verified
+    kept_hidden = [h for h in hidden_before if hidden_main_window(h) and identity.owns_window(h)]
     pid, via, error = _open_new_window(chosen, identity, max(2.0, min(timeout_s, 15.0)))
     details.update(via=via, pid=pid, launched=not error or pid is not None)
     if error:
@@ -1685,6 +1720,10 @@ def _restore_background_app(
             f"{timeout_s:g}s - it is still running with no window"
         )
     info = window_info(hwnd)
+    if kept_hidden and _window_pid(hwnd) not in running and any(psutil.pid_exists(p) for p in running) and not any(
+            is_user_window(h) for h in kept_hidden):
+        reason = (f"{reason} (not confirmed as {name!r}'s own window: its running instance kept its own window "
+                  f"hidden, and this one came from the new process the launch started)")
     details.update(
         hwnd=hwnd,
         window_reason=reason,
@@ -1695,7 +1734,7 @@ def _restore_background_app(
     forward = _bring_forward(hwnd, deadline, details)
     return True, (
         f"{lead}; opened a new window ({via}): hwnd {hwnd} ({details['process_name']}) "
-        f"\"{details['title']}\"; {forward}"
+        f"\"{details['title']}\" - {reason}; {forward}"
     )
 
 
@@ -1909,6 +1948,17 @@ def _names_agree(names: frozenset[str] | set[str], entry: str) -> bool:
     return False
 
 
+def _title_score(title: str, entry: str) -> int:
+    """How a window title agrees with a name: 2 the same once squashed, 1 one a part of the other
+    (:func:`_names_agree`), 0 not at all."""
+    squashed = _squash(title)
+    if not squashed:
+        return 0
+    if squashed == _squash(entry):
+        return 2
+    return 1 if _names_agree(frozenset({squashed}), entry) else 0
+
+
 class _Proc:
     """One process's facts. ``created`` (its start time) is read only when asked: reading it is slow for protected
     processes (0.9 s for all of them cold), and only processes under a launcher need it."""
@@ -2106,6 +2156,19 @@ class _LauncherApp:
             return True
         return bool(self.carrier_exe) and any(_names_agree(names, n) for n in _exe_names(self.carrier_exe))
 
+    def titled_for_it(self, title: str, *, fresh: bool = False) -> bool:
+        """Whether a window title names this entry rather than the launcher or another of its entries (second review
+        V4: VLC's idle window "VLC media player" is the bare entry's, not "VLC media player skinned"'s). The title is
+        this entry's name exactly, or agrees with it better than with every sibling entry and the carrier's own names;
+        a window of a process started since this launch (``fresh``) only has to agree. Name matching, no app list."""
+        mine = _title_score(title, self.name)
+        if not mine:
+            return False
+        if mine == 2 or fresh:
+            return True
+        others = [*self.siblings, *(_exe_names(self.carrier_exe) if self.carrier_exe else ())]
+        return mine > max((_title_score(title, other) for other in others), default=0)
+
     def window_how(self, hwnd: int, p: _Proc | None, title: str = "") -> str:
         explicit = self.appid and not self.appid.startswith("microsoft.autogenerated.") and not _uri_scheme(self.appid)
         if explicit and _window_appid(hwnd).lower() == self.appid:
@@ -2113,10 +2176,20 @@ class _LauncherApp:
         if p is not None and self.is_carrier(p):
             # review F2: for some entries the carrier is the app itself (one program, several entries by argument)
             # (a fresh instance of the carrier is not enough: Steam started by a store link shows its own window)
-            if title and _names_agree(frozenset({_squash(title)}), self.name):
+            if title and self.titled_for_it(title, fresh=self._started_since(p)):
                 return "its own program's window, titled for it"
             return ""
-        return self.owns(p)
+        how = self.owns(p)
+        if how or p is None or not title:
+            return how
+        # second review V2: a game whose program has no names of its own (cs2.exe: no version resource), running under
+        # the launcher, in a window titled for the entry ("Counter-Strike 2") - the same title test as the carrier's
+        if self.under_carrier(p) and self.titled_for_it(title):
+            return "started under its launcher, its window titled for it"
+        return ""
+
+    def _started_since(self, p: _Proc) -> bool:
+        return bool(self.since) and p.created >= self.since
 
     def _new(self, p: _Proc) -> bool:
         return bool(self.since) and p.created >= self.since and not self.is_carrier(p)
@@ -2226,6 +2299,11 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
     details["launcher"] = {**app.describe(), "carrier": carrier, "arguments": plan.get("arguments") or "",
                            "kind": plan.get("kind"), "handed_to": app.carrier_image, "handed_at": round(app.since, 2)}
     details["via"] = "launcher"
+    # second review V4: the carrier is the app itself (its program is named for the entry: "VLC media player - reset
+    # preferences", "Python 3.12 Module Docs"): a command of that program, which may run without a window of its own -
+    # no game wording, no watch, not held as a pending hand-off
+    carrier_is_app = bool(plan.get("carrier_exe")) and _names_agree(_exe_names(plan.get("carrier_exe") or ""), name)
+    details["launcher"]["carrier_is_app"] = carrier_is_app
     started = time.monotonic()
     state = app.read(scan=True)
     if state["app"]:
@@ -2255,7 +2333,8 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
             details["launch_error"] = error
             details["verified"] = False
             return False, f"could not start {name!r} through {carrier}: {error}"
-        _mark_pending(chosen["appid"])
+        if not carrier_is_app:
+            _mark_pending(chosen["appid"])
         args = plan.get("arguments") or plan.get("uri") or ""
         handed = f"started {name!r} the way the Start menu does: {carrier} took it" + (f" ({args})" if args else "")
     deadline = started + max(0.0, timeout_s)
@@ -2268,6 +2347,12 @@ def _launch_via_launcher(chosen: dict[str, str], plan: dict, timeout_s: float, d
     if state["app"]:
         return _launcher_found(app, state, details, started, already=False, timeout_s=timeout_s, lead=handed)
     waited = time.monotonic() - started
+    if carrier_is_app:
+        details.update(starting=False, verified=None, hwnd=None, waited_ms=round(waited * 1000.0, 1),
+                       candidates=[{k: w[k] for k in ("hwnd", "title", "process_name")} for w in state["candidates"]])
+        return True, (f"{handed}; {carrier} is the program of {name} itself, and no window titled for {name} came up "
+                      f"within {waited:.0f} s (a command of the program can run without a window of its own) - not "
+                      f"confirmed")
     details.update(starting=True, verified=None, hwnd=None, waited_ms=round(waited * 1000.0, 1),
                    launcher_front=any(w.get("in_front") for w in state.get("launcher") or []),
                    candidates=[{k: w[k] for k in ("hwnd", "title", "process_name")} for w in state["candidates"]],
