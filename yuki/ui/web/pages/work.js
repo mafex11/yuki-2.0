@@ -230,8 +230,11 @@
   }
 
   /* ---- Needs your reply: chats where the other person spoke last ---- */
+  /* the page's own opened mark until memory's build has it: per chat AND its newest message, so a chat that comes
+     back later with a new message shows unopened (as memory's own mark lapses then) */
+  const openKey = (n) => `${n.key}@${n.at || ''}`;
   function replyRow(n, i) {
-    const opened = n.opened || W().opened.has(n.key);
+    const opened = n.opened || W().opened.has(openKey(n));
     return h('div', { class: 'wrow wr' + (opened ? ' opened' : '') + (i >= SHOWN ? ' more' : ''), data: { k: 'reply:' + n.key, rkey: n.key } },
       h('button', { class: 'wr-hit', data: { do: 'work-open' }, attrs: { type: 'button', 'aria-label': `Open ${n.who}’s chat in ${n.app}` } }, av(n.who),
         h('span', { class: 'wtx' }, h('span', { class: 'wt' }, h('b', { text: n.who }), ' ', h('span', { class: 't2', text: `“${n.msg}”` })),
@@ -423,11 +426,13 @@
     Y.act('todo_reopen', { ref, any: true }).then((r) => {
       if (!r.ok) { t.disabled = false; Y.toast(r.error || 'I can’t put that back any more.', true); return; }
       const view = (workData().todos.done || []).find((x) => x.ref === ref);
-      if (view && Y.todoReopened) Y.todoReopened(ref, view);
+      // a loop goes back to its own block (Waiting on, You said you'd or Your list) with memory's next build
+      const loop = ref.startsWith('loop:');
+      if (view && Y.todoReopened && !loop) Y.todoReopened(ref, view);
       const w = W(); w.arrived.add(ref);
       const at = listItems(workData()).findIndex((x) => x.ref === ref);
       if (at >= SHOWN) w.more.list = true;
-      Y.toast('Back on your list.');
+      Y.toast(loop ? 'Put back where it was.' : 'Back on your list.');
       Y.renderMain();
     });
   };
@@ -451,7 +456,7 @@
     const key0 = row.dataset.rkey, n = ((workData().replies || {}).items || []).find((x) => x.key === key0) || {};
     Y.act('work_open_chat', { key: key0 }).then((r) => {
       if (!r.ok) { Y.toast(r.error || 'I couldn’t bring that chat forward.', true); return; }
-      W().opened.add(key0);
+      if (r.opened && n.key) W().opened.add(openKey(n));   // a desktop app brought forward: the chat is a click away, not marked
       Y.toast(r.how === 'chat' ? `Brought ${r.app} forward on your chat with ${n.who}.` : r.how === 'page' ? `Opened your chat with ${n.who}.` : `Brought ${r.app} forward. Your chat with ${n.who} is in it.`);
       Y.renderMain();
     });

@@ -278,6 +278,57 @@ def test_put_it_back_reopens_todos_commitments_and_loops_within_their_rules(stor
     assert [x.id for x in store.open_loops("open")] == [lp]
     assert store._query("SELECT count(*) FROM portrait_facts WHERE kind='correction' AND valid_to IS NULL")[0][0] == 0
     assert m.reopen_item("thread:4") is None and m.reopen_item("todo:x") is None
+    # an old loop: not an Undo, but Put it back (any age) still reopens it (review F7)
+    assert m.end_todo(f"loop:{lp}", "done") == f"loop:{lp}"
+    store._write(lambda conn: conn.execute("UPDATE open_loops SET resolved_at=resolved_at-7200 WHERE id=?", (lp,)))
+    assert m.reopen_item(f"loop:{lp}") is None and m.reopen_item(f"loop:{lp}", any_age=True) == f"loop:{lp}"
+    assert [x.id for x in store.open_loops("open")] == [lp]
+
+
+def test_a_chat_says_whether_its_app_is_a_browser_by_measure(store, monkeypatch):
+    """Review F1: Open chat needs to know a chat lives in a browser (another tab on top is not the chat). Measured from
+    the timeline as the call watcher measures it (many sites shown), never a list of app names."""
+    from yuki.memory.workboard import chat_place
+
+    t = store.upsert_thread("Google Chrome", "#design", "https://chat.example.com/c/design", process="chrome",
+                            scope="#design", kind="conversation")
+    monkeypatch.setattr(store, "sites_shown", lambda process, since=None: 12)
+    p = chat_place(store, t)
+    assert p["browser"] is True and p["url"] == "https://chat.example.com/c/design" and p["name"] == "#design"
+    monkeypatch.setattr(store, "sites_shown", lambda process, since=None: 1)
+    assert chat_place(store, t)["browser"] is False
+
+
+def test_the_due_date_an_item_has_reads_back_as_set_due_takes_it(store):
+    m = MemoryClient(store)
+    t = m.add_todo("Invented deck")
+    assert m.due_of(t) == ""
+    m.set_due(t, "2026-10-05")
+    assert m.due_of(t) == "2026-10-05"
+    m.set_due(t, "2026-10-05 17:30")
+    assert m.due_of(t) == "2026-10-05 17:30"
+    c = f"commit:{store.add_conversation_fact('commitment', 'The user will print the invented flyers', owner='user', origin='model')}"
+    m.set_due(c, "2026-10-06")
+    assert m.due_of(c) == "2026-10-06"
+    assert m.due_of("loop:3") is None and m.due_of("todo:999") is None
+
+
+def test_adding_from_words_waits_a_bounded_time_and_writes_once(store, monkeypatch):
+    """Review F2: a slow due read is given a few seconds at most; the to-do is then written once with the words whole."""
+    m = MemoryClient(store)
+
+    class Slow:
+        def __init__(self):
+            self.messages = SimpleNamespace(create=self.create)
+
+        def create(self, **req):
+            time.sleep(1.0)
+            return SimpleNamespace(content=[SimpleNamespace(type="tool_use", input={"text": "pay rent", "due": "2026-10-04"})])
+
+    ref, due = m.add_todo_words("pay rent tomorrow", Slow(), wait_s=0.2)
+    assert due is None and [x.text for x in store.todos(("open",))] == ["pay rent tomorrow"]
+    time.sleep(1.0)
+    assert len(store.todos(("open",))) == 1
 
 
 def test_the_add_field_reads_a_due_date_from_your_words():

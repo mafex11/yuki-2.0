@@ -3391,7 +3391,8 @@ class MemoryClient:
         * ``commit:N`` a commitment ended as done, not needed or not theirs: by the user within
           :data:`REOPEN_WITHIN_S`; with ``any_age``, one memory closed itself (the to-do check saw it done: Not done
           yet) or one done at any age (Put it back). It is active again, its end note cleared;
-        * ``loop:N`` an open loop the user ended within :data:`REOPEN_WITHIN_S`: open again, its portrait fact current
+        * ``loop:N`` an open loop ended within :data:`REOPEN_WITHIN_S`, or at any age with ``any_age`` (Put it back
+          from Recently done; review F7): open again, its portrait fact current
           again and the correction that closed it ended (history kept: nothing is deleted).
 
         Returns the id, or ``None`` (not ended, too late, or a kind that can't be put back). Never raises."""
@@ -3424,7 +3425,7 @@ class MemoryClient:
             elif prefix == "loop":
                 def op(conn: Any) -> bool:
                     row = conn.execute("SELECT portrait_fact_id, resolved_at FROM open_loops WHERE id=? AND status='done'"
-                                       " AND resolved_at >= ?", (n, since)).fetchone()
+                                       " AND (? OR resolved_at >= ?)", (n, int(bool(any_age)), since)).fetchone()
                     if row is None:
                         return False
                     at = float(row["resolved_at"])
@@ -3521,14 +3522,41 @@ class MemoryClient:
         prefix, _, number = str(key or "").partition(":")
         return chat_place(self.store, int(number)) if prefix == "chat" and number.isdigit() else None
 
-    def add_todo_words(self, words: str, client: Any = None) -> tuple[str, str | None]:
+    def add_todo_words(self, words: str, client: Any = None, *, wait_s: float | None = None) -> tuple[str, str | None]:
         """Add a to-do from the words the user typed, a due date read from them (``"by Monday"``: one small model
-        call, :func:`yuki.memory.workboard.read_due`; without a client or on a failure, the words whole and no due).
-        Returns ``(id, due)``."""
-        from yuki.memory.workboard import read_due
+        call, :func:`yuki.memory.workboard.read_due`, given at most ``wait_s`` seconds (default
+        :data:`~yuki.memory.workboard.READ_WAIT_S`); without a client, on a failure or past that, the words whole and
+        no due). Returns ``(id, due)``."""
+        from yuki.memory.workboard import READ_WAIT_S, read_due, within
 
-        text, due = read_due(client, words)
+        words = " ".join((words or "").split())
+        text, due = within(READ_WAIT_S if wait_s is None else wait_s, lambda: read_due(client, words), (words, None))
         return self.add_todo(text, due), due
+
+    def due_of(self, ref: str) -> str | None:
+        """An open to-do's or commitment's due date as :meth:`set_due` takes it (``"YYYY-MM-DD"``, ``"YYYY-MM-DD
+        HH:MM"``), ``""`` when it has none, ``None`` when it isn't one of those or can't be read. Correct's Undo puts a
+        moved due date back with it."""
+        prefix, _, number = str(ref or "").strip().strip("[]").partition(":")
+        if prefix not in ("todo", "commit") or not number.strip().isdigit():
+            return None
+        try:
+            if prefix == "todo":
+                rows = self.store._query("SELECT due_at, due_all_day AS day FROM todos WHERE id=?", (int(number),))
+            else:
+                rows = self.store._query("SELECT due_at, NULL AS day FROM conversation_facts WHERE id=? AND"
+                                         " kind='commitment'", (int(number),))
+        except Exception:
+            return None
+        if not rows:
+            return None
+        at = rows[0]["due_at"]
+        if at is None:
+            return ""
+        when = datetime.fromtimestamp(float(at))
+        # a commitment's day is its midnight (set_due writes it so)
+        day = bool(rows[0]["day"]) if prefix == "todo" else (when.hour, when.minute, when.second) == (0, 0, 0)
+        return when.strftime("%Y-%m-%d") if day else when.strftime("%Y-%m-%d %H:%M")
 
     def aliases(self) -> list[dict]:
         """Names the user corrected: ``[{"heard": "Barun", "name": "Varun", "why", "since"}]``, oldest first."""

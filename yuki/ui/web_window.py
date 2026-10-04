@@ -356,12 +356,28 @@ def app_windows(process: str | None) -> list[tuple[int, str]]:
 
 
 def bring_forward(place: dict[str, Any]) -> tuple[bool, str]:
-    """Bring a chat forward: the app's window that shows it (its title holds the chat's name), else the app's
-    topmost window, restored if minimised and focused; with no window of the app open, a web chat's own address in
-    the browser. Types, clicks and sends nothing. ``(ok, how)``: ``"chat"`` (its window), ``"app"``, ``"page"``."""
+    """Bring a chat forward. Types, clicks and sends nothing. ``(ok, how)``:
+
+    * ``"chat"``: the app's window whose title holds the chat's name, restored if minimised and focused;
+    * ``"page"``: the chat's own address opened (the browser focuses or opens its tab), for a chat in a browser
+      (``browser``: measured by memory) with no window showing it, or any chat whose app has no window open;
+    * ``"app"``: a desktop app's topmost window (one window holds all its chats, so the chat is a click away);
+    * ``(False, "lost")``: a browser chat with no window showing it and no address (another tab on top is not it);
+      ``(False, "")``: nothing of the app open and no address."""
     windows = app_windows(place.get("process"))
     name = " ".join(str(place.get("name") or "").split()).casefold()
     pick = next(((h, t) for h, t in windows if name and name in t.casefold()), None)
+    url = str(place.get("url") or "")
+    web = url.startswith(("https://", "http://"))
+    if pick is None and web and (place.get("browser") or not windows):
+        import webbrowser
+
+        try:
+            return bool(webbrowser.open(url)), "page"
+        except Exception:  # noqa: BLE001
+            return False, ""
+    if pick is None and windows and place.get("browser"):
+        return False, "lost"
     how = "chat" if pick else "app"
     pick = pick or (windows[0] if windows else None)
     if pick is not None:
@@ -369,14 +385,6 @@ def bring_forward(place: dict[str, Any]) -> tuple[bool, str]:
         if user32.IsIconic(pick[0]):
             user32.ShowWindow(pick[0], 9)   # SW_RESTORE
         return bool(user32.SetForegroundWindow(pick[0])), how
-    url = str(place.get("url") or "")
-    if url.startswith(("https://", "http://")):
-        import webbrowser
-
-        try:
-            return bool(webbrowser.open(url)), "page"
-        except Exception:  # noqa: BLE001
-            return False, ""
     return False, ""
 
 
@@ -1509,27 +1517,39 @@ class WebWindow:
         fn = getattr(self._memory(), "correct_item", None)
         if not callable(fn):   # an older memory: the fixed-format correction (facts only)
             return self.a_correct({**m, "how": "correct", "words": words})
-        moved = None
-        if ref.split(":")[0] in ("todo", "commit") and callable(getattr(self._memory(), "set_due", None)):
-            # the Work page (report 68): "it's due Monday" moves the due date (one small model call reads it); the
-            # rest of your words go to the correction pass as before
-            from yuki.memory.workboard import read_correction
+        moved, was = None, None
+        mem = self._memory()
+        if ref.split(":")[0] in ("todo", "commit") and callable(getattr(mem, "set_due", None)):
+            # the Work page (report 68): "it's due Monday" moves the due date (one small model call reads it, given
+            # READ_WAIT_S at most; past it the words go whole to the correction pass, written once); the rest of your
+            # words go to the correction pass as before. The date it had is kept so Undo can put it back (review F4).
+            from yuki.memory.workboard import READ_WAIT_S, read_correction, within
 
-            due, rest = read_correction(self._due_reader(), str(m.get("title") or m.get("text") or ""), words)
-            if due and self._memory().set_due(ref, due):
-                moved, words = due, rest
-                if not words:
+            item = str(m.get("title") or m.get("text") or "")
+            due, rest = within(READ_WAIT_S, lambda: read_correction(self._due_reader(), item, words), (None, words))
+            had = mem.due_of(ref) if callable(getattr(mem, "due_of", None)) else None
+            if due and mem.set_due(ref, due):
+                moved, was, words = due, had, rest
+                if not words:   # the due date was all of it: "Moved", with Undo, a while
+                    self.fixed[ref] = {"kind": "correct", "state": "moved", "words": " ".join(str(m.get("words") or "").split()),
+                                       "due": due, **({"was": was} if was is not None else {}), "done_at": time.time()}
                     for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
                         self.refresh(page)
-                    return {"ref": ref, "due": due, "correction_id": None}
+                    return {"ref": ref, "due": due, "correction_id": None, **({"was_due": was} if was is not None else {})}
         r = fn(ref, words) or {}
         if not r.get("ok"):
+            if moved and was is not None:   # nothing landed for the rest: the date goes back too (one answer, one change)
+                mem.set_due(ref, was or None)
             return {"ok": False, "error": str(r.get("error") or "That can’t be corrected here.")}
         cid = r.get("correction_id")
         self._record_pending(ref, "correct", words, str(m.get("text") or ""), str(m.get("title") or ""), cid)
+        if moved and was is not None and ref in self.pending:
+            self.pending[ref].update(due=moved, was=was)
+            self._save_pending()
         for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
             self.refresh(page)
-        return {"correction_id": cid, "ref": ref, **({"due": moved} if moved else {})}
+        return {"correction_id": cid, "ref": ref, **({"due": moved} if moved else {}),
+                **({"was_due": was} if moved and was is not None else {})}
 
     #: How long a to-do you marked done here can be put back (memory's ``reopen_todo`` window).
     TODO_UNDO_S = 10 * 60.0
@@ -1611,9 +1631,13 @@ class WebWindow:
             return {"ok": False, "error": "That date isn’t one I can read. Pick it again."}
         mem = self._memory()
         if due is None and m.get("words") and callable(getattr(mem, "add_todo_words", None)):
-            ref, due = mem.add_todo_words(text, self._due_reader())
-        else:
-            ref = mem.add_todo(text, due)
+            # the read (and the client's first build) gets READ_WAIT_S at most, then the add is written once with
+            # whatever it got: the page always hears back before it gives up, and a late answer writes nothing
+            from yuki.memory.workboard import READ_WAIT_S, read_due, within
+
+            words = text
+            text, due = within(READ_WAIT_S, lambda: read_due(self._due_reader(), words), (words, None))
+        ref = mem.add_todo(text, due)
         self._todo_refresh()
         return {"ref": ref, "due": due}
 
@@ -1632,9 +1656,10 @@ class WebWindow:
         return {} if ok else {"ok": False, "error": "That changed since you opened it. I’ll show it again."}
 
     def a_work_open_chat(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Needs your reply's Open chat: the chat's app brought forward (its window that shows the chat when one does;
-        a web chat with no window open, its address), and the row marked opened until your reply is captured. Types,
-        clicks and sends nothing."""
+        """Needs your reply's Open chat: the chat brought forward (:func:`bring_forward`: its window, or its own
+        address), and the row marked opened until your reply is captured, only when what came forward shows the chat;
+        a desktop app's window brought forward (the chat a click away in it) is not marked. Types, clicks and sends
+        nothing."""
         key = str(m.get("key") or "")
         place = self._memory_op("work_chat")(key)
         if not place:
@@ -1642,10 +1667,13 @@ class WebWindow:
         ok, how = bring_forward(place)
         app = str(place.get("app") or "the app")
         if not ok:
+            if how == "lost":
+                return {"ok": False, "error": f"I couldn’t find that chat in {app}. Its tab isn’t the one on top."}
             return {"ok": False, "error": f"{app} isn’t open, so I couldn’t bring the chat forward."}
-        self._memory_op("work_mark")(key, "opened")
-        self.refresh("work")
-        return {"app": app, "how": how}
+        if how in ("chat", "page"):
+            self._memory_op("work_mark")(key, "opened")
+            self.refresh("work")
+        return {"app": app, "how": how, "opened": how in ("chat", "page")}
 
     def a_work_continue(self, m: dict[str, Any]) -> dict[str, Any]:
         """A "Worked on today" row: the Continue run at once (the thread's windows and pages, read again here from
@@ -1674,20 +1702,35 @@ class WebWindow:
 
     def a_cancel_correction(self, m: dict[str, Any]) -> dict[str, Any]:
         """The Undo of a Correct while it waits (memory's ``cancel_correction``); once the pass started it is too late
-        and the correction stands."""
+        and the correction stands. A due date the same words moved goes back to the date it had (``due_back``), even
+        when the rest is too late to take back (review F4)."""
         ref, cid = str(m.get("ref") or ""), m.get("correction_id")
+        waiting = self.pending.get(ref) or {}
+        entry = waiting or (self.fixed.get(ref) if (self.fixed.get(ref) or {}).get("state") == "moved" else None) or {}
         if not isinstance(cid, int):
-            cid = (self.pending.get(ref) or {}).get("fid")
-        if not isinstance(cid, int):
+            cid = waiting.get("fid")
+        if not isinstance(cid, int) and "was" not in entry:
             return {"ok": False, "error": "There’s nothing to undo."}
-        r = self._memory_op("cancel_correction")(cid) or {}
+        due_back = False
+        if "was" in entry:
+            due_back = bool(self._memory_op("set_due")(ref, entry.get("was") or None))
+            entry.pop("was", None)
+            if entry is not waiting:
+                self.fixed.pop(ref, None)
+        r = (self._memory_op("cancel_correction")(cid) or {}) if isinstance(cid, int) else {"ok": True}
         if not r.get("ok"):
+            if due_back:
+                self._save_pending()
+                for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
+                    self.refresh(page)
+                return {"ok": False, "too_late": True, "due_back": True,
+                        "error": "I put the due date back, but I’d already started on the rest, so that stands."}
             return {"ok": False, "too_late": True, "error": self.TOO_LATE}
         self.pending.pop(ref, None)
         self._save_pending()
         for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
             self.refresh(page)
-        return {}
+        return {"due_back": due_back}
 
     def a_copy(self, m: dict[str, Any]) -> dict[str, Any]:
         return {"ok": set_clipboard(str(m.get("text") or ""))}

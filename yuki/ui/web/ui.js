@@ -232,14 +232,17 @@
   const FIX_WORDS = {
     fixing: (w) => `Got it, fixing it${w ? ': “' + w + '”' : '.'}`,
     fixed: (w) => `Fixed${w ? ' from what you said: “' + w + '”' : '.'}`,
+    moved: (w) => `Moved the due date${w ? ' from what you said: “' + w + '”' : '.'}`,
     failed: (w) => `I couldn’t fix it${w ? ' from “' + w + '”' : ''}. Try saying it another way.`
   };
   /* the row's status line for a correction you sent (the page data's pending[ref]) */
   function fixLine(p) {
     if (!p || (p.kind && p.kind !== 'correct')) return null;
     const st = FIX_WORDS[p.state] ? p.state : 'fixing';
-    return h('span', { class: 'fixline ' + st }, ic(st === 'failed' ? 'x' : st === 'fixed' ? 'check' : 'edit'), h('span', { text: FIX_WORDS[st](p.words || '') }),
-      st === 'fixing' && p.cid != null ? key('Undo', { cls: 'xs ghost', data: { do: 'fix-undo', cid: p.cid }, title: 'Take it back before I start on it' }) : null);
+    /* Undo while the pass waits, or while a due date the words moved can go back (p.was: the date it had) */
+    const undo = (st === 'fixing' && (p.cid != null || p.was != null)) || (st === 'moved' && p.was != null);
+    return h('span', { class: 'fixline ' + st }, ic(st === 'failed' ? 'x' : st === 'fixed' || st === 'moved' ? 'check' : 'edit'), h('span', { text: FIX_WORDS[st](p.words || '') }),
+      undo ? key('Undo', { cls: 'xs ghost', data: p.cid != null ? { do: 'fix-undo', cid: p.cid } : { do: 'fix-undo' }, title: 'Take it back, as it was' }) : null);
   }
   /* a correction you sent is still waiting for its pass (its row shows "Got it, fixing it" in place of Correct) */
   const fixing = (p) => !!p && (!p.kind || p.kind === 'correct') && (p.state || 'fixing') === 'fixing';
@@ -282,7 +285,11 @@
       fixClose(row);
       if (rule) { toast('Saved your rule as you said it.'); Y.renderMain(); return; }
       const d = Y.D.pages[page];
-      if (d) { d.pending = d.pending || {}; d.pending[ref] = { kind: 'correct', words, state: 'fixing', cid: r.correction_id != null ? r.correction_id : null, at: Date.now() / 1000 }; }
+      if (d) {
+        d.pending = d.pending || {};
+        d.pending[ref] = { kind: 'correct', words, state: r.due && r.correction_id == null ? 'moved' : 'fixing', cid: r.correction_id != null ? r.correction_id : null,
+          at: Date.now() / 1000, ...(r.due && r.was_due != null ? { due: r.due, was: r.was_due } : {}) };
+      }
       Y.renderMain();
     });
   };
@@ -290,10 +297,10 @@
     const Y = window.Yk, row = fixRow(t); if (!row) return;
     const ref = row.dataset.cref, page = fixPage(row);
     t.disabled = true;
-    Y.act('cancel_correction', { ref, correction_id: Number(t.dataset.cid) }).then((r) => {
+    Y.act('cancel_correction', { ref, correction_id: t.dataset.cid != null ? Number(t.dataset.cid) : null }).then((r) => {
       if (!r.ok) { toast(r.error || 'Too late to undo.', true); return; }
       const d = Y.D.pages[page]; if (d && d.pending) delete d.pending[ref];
-      toast('Taken back. Nothing changed.');
+      toast(r.due_back ? 'Taken back. The due date is as it was.' : 'Taken back. Nothing changed.');
       Y.renderMain();
     });
   };

@@ -373,7 +373,21 @@ def chat_place(store: Store, thread_id: int) -> dict[str, Any] | None:
     r = rows[0]
     chat = Chat(int(r["id"]), shown(r["app"], r["process"]) or str(r["app"] or ""), r["process"],
                 store._dec(r["title_ciphertext"]) or "", store._dec(r["scope_ciphertext"]), store._dec(r["url_ciphertext"]))
-    return {"app": chat.app, "process": chat.process, "title": chat.title, "name": chat.name, "url": chat.url}
+    return {"app": chat.app, "process": chat.process, "title": chat.title, "name": chat.name, "url": chat.url,
+            "browser": _shows_many_sites(store, chat.process)}
+
+
+#: An app the timeline saw showing at least this many different sites in the last 30 days is a browser (measured, as
+#: the call watcher measures it: a browser shows many sites, an app built on a web view shows its own one).
+BROWSER_SITES = 2
+
+
+def _shows_many_sites(store: Store, process: str | None) -> bool:
+    """Whether the app is a browser, measured from the timeline (content-free), never a list of names."""
+    try:
+        return int(store.sites_shown(process, since=time.time() - 30 * 86400.0) or 0) >= BROWSER_SITES
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def board(store: Store, now: float | None = None) -> dict[str, Any]:
@@ -824,6 +838,31 @@ DUE_TOOL: dict[str, Any] = {
     "input_schema": {"type": "object", "required": ["text", "due"], "properties": {
         "text": {"type": "string"}, "due": {"type": "string", "description": "\"YYYY-MM-DD HH:MM\", \"YYYY-MM-DD\" or \"\"."}}},
 }
+
+
+#: The longest the window's add field and Correct wait for their one small call (the due date read from your words).
+#: The page gives up at 15 s and a model client may retry for far longer, so past this the words go in whole and the
+#: late answer is dropped: nothing is written after the page was told, and nothing twice (review F2).
+READ_WAIT_S = 6.0
+
+
+def within(wait_s: float, fn: Any, fallback: Any) -> Any:
+    """``fn()`` if it answers within ``wait_s`` seconds, else ``fallback`` (it runs on a short daemon thread; a late
+    answer is dropped). Only for reads that write nothing: the caller writes after, with whichever it got."""
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["v"] = fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+    t = threading.Thread(target=run, name="yuki-work-read", daemon=True)
+    t.start()
+    t.join(max(0.0, float(wait_s)))
+    return box.get("v", fallback)
 
 
 def read_due(client: Any, words: str, now: float | None = None, *, model: str = MODEL) -> tuple[str, str | None]:

@@ -127,6 +127,25 @@ def test_a_promise_moved_to_your_list_leaves_you_said_youd_and_a_kept_one_stays_
     assert moved["moved"] and moved["meta"].startswith("you told me")
 
 
+def test_a_kept_promise_shows_once_and_reads_as_a_sentence(tmp_path):
+    """Review F3, F6, F7: the kept promise memory also lists as done shows only in You said you'd; a time today reads
+    "at 2:50 PM" inside a sentence; every Recently done row (loops too) can be put back."""
+    rows = _rows() + [_row("commit:10", "Send Riya the link", "chat", status="done"),
+                      _row("loop:11", "Dev said he would bring the invented chairs.", "loop", status="done")]
+    kept = [{"ref": "commit:10", "text": "Send Riya the link", "title": None, "closed_at": NOW - 600, "since": NOW - 3 * H}]
+    cols = W.work_columns(rows, BOARD, kept, NOW)
+    assert [p["ref"] for p in cols["said"]].count("commit:10") == 1
+    assert "commit:10" not in {t["ref"] for t in cols["done"]}
+    k = next(p for p in cols["said"] if p["ref"] == "commit:10")
+    assert k["closed"] == "closed itself: I saw it done at 2:50 PM"
+    assert {t["ref"]: t["back"] for t in cols["done"]} == {"todo:9": True, "loop:11": True}
+    added = W.work_columns([_row("todo:12", "Invented", since=NOW - 2 * H)], BOARD, [], NOW)["list"][0]
+    assert added["meta"] == "added at 1 PM"
+    told = W.work_columns([_row("commit:13", "Invented", "chat", owner="user", since=NOW - 2 * H)],
+                          {**BOARD, "listed": ["commit:13"]}, [], NOW)["list"][0]
+    assert told["meta"] == "you told me at 1 PM"
+
+
 def test_the_add_field_quote_reader_takes_only_memorys_own_format():
     assert W._quote_of('the user said in a call on 2026-10-03: "I can print the flyers"') == "I can print the flyers"
     assert W._quote_of("asked by Riya in Signal") == ""
@@ -271,7 +290,7 @@ def test_open_chat_only_brings_it_forward_and_marks_it_opened(tmp_path, monkeypa
     win, refreshed, trayed = _win(tmp_path, mem)
     seen = []
     monkeypatch.setattr(web_window, "bring_forward", lambda place: seen.append(place) or (True, "chat"))
-    assert win.a_work_open_chat({"key": "chat:3"}) == {"app": "Signal", "how": "chat"}
+    assert win.a_work_open_chat({"key": "chat:3"}) == {"app": "Signal", "how": "chat", "opened": True}
     assert seen[0]["process"] == "signal" and mem.calls[-1] == ("mark", "chat:3", "opened") and trayed == []   # nothing sent
     monkeypatch.setattr(web_window, "bring_forward", lambda place: (False, ""))
     r = win.a_work_open_chat({"key": "chat:3"})
@@ -288,6 +307,57 @@ def test_bring_forward_opens_a_web_chat_only_by_its_own_address(monkeypatch):
     assert web_window.bring_forward({"process": "chrome", "name": "Riya", "url": "https://chat.example.com/riya"}) == (True, "page")
     assert web_window.bring_forward({"process": "signal", "name": "Riya", "url": "file:///x"}) == (False, "")
     assert opened == ["https://chat.example.com/riya"]
+
+
+class _User32:
+    def __init__(self):
+        self.focused = []
+
+    def IsIconic(self, h):
+        return False
+
+    def ShowWindow(self, h, n):
+        return True
+
+    def SetForegroundWindow(self, h):
+        self.focused.append(h)
+        return True
+
+
+def test_bring_forward_never_passes_another_browser_tab_off_as_the_chat(monkeypatch):
+    """Review F1: Chrome open on other tabs; the chat's own address opens, no unrelated window is focused."""
+    import webbrowser
+
+    opened, user32 = [], _User32()
+    monkeypatch.setattr(web_window.ctypes, "windll", type("W", (), {"user32": user32})(), raising=False)
+    monkeypatch.setattr(web_window, "app_windows",
+                        lambda process: [(111, "Inbox (3) - Mail - Google Chrome"), (222, "Some other - Google Chrome")])
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url) or True)
+    web = {"process": "chrome", "name": "#design", "url": "https://chat.example.com/c/design", "browser": True}
+    assert web_window.bring_forward(web) == (True, "page")
+    assert opened == ["https://chat.example.com/c/design"] and user32.focused == []
+    # no address: nothing passed off as the chat
+    assert web_window.bring_forward({**web, "url": ""}) == (False, "lost") and user32.focused == []
+    # the tab on top IS the chat: its window
+    monkeypatch.setattr(web_window, "app_windows", lambda process: [(333, "#design - Acme - Google Chrome")])
+    assert web_window.bring_forward(web) == (True, "chat") and user32.focused == [333]
+    # a desktop chat app (not a browser): its own window, even with an address on record
+    monkeypatch.setattr(web_window, "app_windows", lambda process: [(444, "Acme")])
+    assert web_window.bring_forward({**web, "process": "chatapp", "browser": False}) == (True, "app")
+    assert user32.focused[-1] == 444 and len(opened) == 1
+
+
+def test_open_chat_marks_opened_only_when_the_chat_itself_came_forward(tmp_path, monkeypatch):
+    mem = _Mem()
+    win, _, _ = _win(tmp_path, mem)
+    monkeypatch.setattr(web_window, "bring_forward", lambda place: (True, "app"))
+    r = win.a_work_open_chat({"key": "chat:3"})
+    assert r["how"] == "app" and r["opened"] is False and ("mark", "chat:3", "opened") not in mem.calls
+    monkeypatch.setattr(web_window, "bring_forward", lambda place: (True, "page"))
+    assert win.a_work_open_chat({"key": "chat:3"})["opened"] is True and mem.calls[-1] == ("mark", "chat:3", "opened")
+    monkeypatch.setattr(web_window, "bring_forward", lambda place: (False, "lost"))
+    r = win.a_work_open_chat({"key": "chat:3"})
+    assert r["ok"] is False and "couldn’t find that chat" in r["error"]
 
 
 def test_app_windows_reads_without_failing():
@@ -325,12 +395,101 @@ def test_promises_end_as_done_or_not_mine_and_undo_and_put_back_reopen(tmp_path)
     assert win.a_todo_reopen({"ref": "todo:2", "any": True}) == {"ref": "todo:2"} and mem.calls[-1] == ("reopen", "todo:2", True)
 
 
+class _DueClient:
+    """An invented model client: answers ``data`` after ``delay`` seconds (a slow or throttled call)."""
+
+    def __init__(self, data, delay=0.0):
+        self.data, self.delay = data, delay
+        self.messages = SimpleNamespace(create=self.create)
+
+    def create(self, **req):
+        time.sleep(self.delay)
+        return SimpleNamespace(content=[SimpleNamespace(type="tool_use", input=self.data)])
+
+
 def test_the_add_field_reads_its_due_from_your_words_and_the_date_field_still_works(tmp_path):
     mem = _Mem()
     win, _, _ = _win(tmp_path, mem)
-    assert win.a_todo_add({"text": " send Sam the deck by Monday ", "words": True}) == {"ref": "todo:9", "due": "2026-10-05"}
-    assert mem.calls[-1] == ("words", "send Sam the deck by Monday")
+    win._due_reader = lambda: _DueClient({"text": "send Sam the deck", "due": "2026-10-05"})
+    assert win.a_todo_add({"text": " send Sam the deck by Monday ", "words": True}) == {"ref": "todo:8", "due": "2026-10-05"}
+    assert mem.calls[-1] == ("add", "send Sam the deck", "2026-10-05")
     assert win.a_todo_add({"text": "Another", "day": "2026-10-06"}) == {"ref": "todo:8", "due": "2026-10-06"}
+
+
+def test_a_slow_due_read_never_makes_the_page_give_up_while_the_add_lands_later(tmp_path, monkeypatch):
+    """Review F2: a slow (throttled) call is given READ_WAIT_S at most; the to-do is written once, at once, with the
+    words whole, and the late answer writes nothing."""
+    from yuki.memory import workboard
+
+    monkeypatch.setattr(workboard, "READ_WAIT_S", 0.2)
+    mem = _Mem()
+    win, _, _ = _win(tmp_path, mem)
+    win._due_reader = lambda: _DueClient({"text": "send Sam the deck", "due": "2026-10-05"}, delay=1.0)
+    t0 = time.monotonic()
+    assert win.a_todo_add({"text": "send Sam the deck by Monday", "words": True}) == {"ref": "todo:8", "due": None}
+    assert time.monotonic() - t0 < 0.9
+    time.sleep(1.0)                                             # the late answer arrives: nothing more is written
+    assert [c for c in mem.calls if c[0] == "add"] == [("add", "send Sam the deck by Monday", None)]
+    # the same for Correct: the words go whole to the correction pass, once, and no date moves
+    class Mem(_Mem):
+        def set_due(self, ref, due):
+            self.calls.append(("due", ref, due))
+            return ref
+
+        def correct_item(self, ref, words):
+            self.calls.append(("correct", ref, words))
+            return {"ok": True, "ref": ref, "correction_id": 5}
+
+    mem = Mem()
+    win, _, _ = _win(tmp_path, mem)
+    win._record_pending = lambda *a, **k: None
+    win._due_reader = lambda: _DueClient({"due": "2026-10-05", "rest": ""}, delay=1.0)
+    assert win.a_correct_item({"ref": "todo:3", "words": "it's due Monday"})["correction_id"] == 5
+    time.sleep(1.0)
+    assert mem.calls == [("correct", "todo:3", "it's due Monday")]
+
+
+def test_undo_of_a_correct_puts_a_moved_due_date_back(tmp_path):
+    """Review F4: the date the item had goes back with Undo, for a due-only correction and one with more in it."""
+    class Mem(_Mem):
+        due = {"todo:3": "2026-10-02", "commit:4": ""}
+
+        def due_of(self, ref):
+            return self.due.get(ref)
+
+        def set_due(self, ref, due):
+            self.calls.append(("due", ref, due))
+            return ref
+
+        def correct_item(self, ref, words):
+            self.calls.append(("correct", ref, words))
+            return {"ok": True, "ref": ref, "correction_id": 5}
+
+        def cancel_correction(self, cid):
+            self.calls.append(("cancel", cid))
+            return {"ok": cid == 5}
+
+    mem = Mem()
+    win, _, _ = _win(tmp_path, mem)
+    win._save_pending = lambda: None
+    win._due_reader = lambda: _DueClient({"due": "2026-10-05", "rest": ""})
+    r = win.a_correct_item({"ref": "todo:3", "words": "it's due Monday"})
+    assert r == {"ref": "todo:3", "due": "2026-10-05", "correction_id": None, "was_due": "2026-10-02"}
+    assert win.shown_pending()["todo:3"]["state"] == "moved"                       # "Moved the due date", with Undo
+    assert win.a_cancel_correction({"ref": "todo:3", "correction_id": None}) == {"due_back": True}
+    assert mem.calls[-1] == ("due", "todo:3", "2026-10-02") and "todo:3" not in win.shown_pending()
+    assert win.a_cancel_correction({"ref": "todo:3"})["ok"] is False                 # nothing left to undo
+    # a date and more: Undo cancels the pass and the date goes back to none
+    win._due_reader = lambda: _DueClient({"due": "2026-10-09", "rest": "it's for Asha"})
+    r = win.a_correct_item({"ref": "commit:4", "words": "due Friday, and it's for Asha"})
+    assert r["was_due"] == "" and win.pending["commit:4"]["was"] == ""
+    assert win.a_cancel_correction({"ref": "commit:4", "correction_id": 5}) == {"due_back": True}
+    assert ("due", "commit:4", None) in mem.calls and mem.calls[-1] == ("cancel", 5)
+    # too late for the rest: the date still goes back, and the page is told the rest stands
+    win.a_correct_item({"ref": "commit:4", "words": "due Friday, and it's for Asha"})
+    win.pending["commit:4"]["fid"] = 6
+    r = win.a_cancel_correction({"ref": "commit:4", "correction_id": 6})
+    assert r["ok"] is False and r["due_back"] is True and "due date back" in r["error"]
 
 
 def test_the_ask_bar_shows_where_a_draft_came_from_and_sends_nothing():

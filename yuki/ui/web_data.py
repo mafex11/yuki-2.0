@@ -425,16 +425,17 @@ def due_words(at: float | None, all_day: bool, now: float) -> tuple[str, bool]:
     return (f"was due {words}" if over else f"due {words}"), over
 
 
-def week_words(at: float | None, now: float) -> str:
-    """When something happened, the one way the Work page says it: ``8:01 PM`` today, ``yesterday``, a weekday within
-    the last six days (``Wednesday``), else ``25 September``. A deterministic format, nothing else."""
+def week_words(at: float | None, now: float, *, in_sentence: bool = False) -> str:
+    """When something happened, the one way the Work page says it: ``8:01 PM`` today (``at 8:01 PM`` inside a
+    sentence, ``in_sentence``: "I saw it done at 8:01 PM"), ``yesterday``, a weekday within the last six days
+    (``Wednesday``), else ``25 September``. A deterministic format, nothing else."""
     from yuki.ui.window.data import nat_day, nat_time
 
     if not at:
         return ""
     today, d = datetime.fromtimestamp(now).date(), datetime.fromtimestamp(at).date()
     if d == today:
-        return nat_time(at)
+        return f"at {nat_time(at)}" if in_sentence else nat_time(at)
     if d == today - timedelta(days=1):
         return "yesterday"
     if timedelta(days=0) < today - d <= timedelta(days=6):
@@ -1303,8 +1304,8 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
 def _from_words(t: dict[str, Any], loop: dict[str, Any] | None, now: float) -> str:
     """Where a row of Your list came from, in the Work page's words (Home keeps ``from``): ``added Wednesday``, ``you
     told me, yesterday``, ``you said it on a call, Tuesday``, ``Mira asked in Slack, Wednesday``."""
-    src, day = t.get("source"), week_words(t.get("since"), now)
-    tail = f", {day}" if day else ""
+    src, day = t.get("source"), week_words(t.get("since"), now, in_sentence=True)
+    tail = (f" {day}" if day.startswith("at ") else f", {day}") if day else ""   # "you told me at 3 PM", "..., yesterday"
     if src == "user":
         return f"added {day}" if day else ""
     if src == "chat":
@@ -1359,14 +1360,18 @@ def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[d
         lst.append({**t, "meta": _from_words(t, loop, now), "moved": moved})
     for k in kept:
         said.append({"ref": k["ref"], "title": k.get("title") or k["text"], "text": k["text"],
-                     "closed": f"closed itself: I saw it done {week_words(k['closed_at'], now)}",
+                     "closed": f"closed itself: I saw it done {week_words(k['closed_at'], now, in_sentence=True)}",
                      "closed_at": k["closed_at"], "since": k.get("since")})
+    kept_refs = {k["ref"] for k in kept}
+
     def loop_of(ref: str) -> dict[str, Any] | None:
         kind, _, number = ref.partition(":")
         return loops.get(int(number)) if kind == "loop" and number.isdigit() else None
 
-    done = [{**t, "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:"))}
-            for t in done_todos]
+    # a promise memory saw kept shows once: struck through in You said you'd (Not done yet), not again in Recently
+    # done (review F3). Every row there can be put back (memory's reopen_item at any age; review F7).
+    done = [{**t, "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:", "loop:"))}
+            for t in done_todos if t["ref"] not in kept_refs]
     return {"list": lst, "done": done, "said": said, "waiting": waiting}
 
 
