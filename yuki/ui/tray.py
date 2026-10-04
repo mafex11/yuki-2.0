@@ -191,7 +191,7 @@ def tray_state(island_state: str, *, listening: str = "on", recording: bool = Fa
     then a full screen, then a call (recorded, or its consent card waiting), else resting."""
     if island_state in ("working", "thinking", "send-countdown"):   # a send countdown is a request running
         return "working"
-    if island_state == "needs-you":
+    if island_state in ("needs-you", "paused"):   # appTakeover: paused because you took over: it waits for you
         return "needs-you"
     if island_state == "voice-stopped":
         return "stopped"
