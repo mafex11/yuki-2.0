@@ -31,7 +31,7 @@
   Y.remeasure = () => field.remeasure();
   // the moment of your last action: a build that started before it is not drawn over what the action just showed
   // (actions that only read or open something leave the page's data alone)
-  const READS = new Set(['person', 'copy', 'askbar', 'thread_days', 'chat_day']);
+  const READS = new Set(['person', 'copy', 'askbar', 'thread_days', 'chat_day', 'work_nudge', 'work_continue']);
   Y.act = (action, fields) => {
     if (!READS.has(action)) S.actedAt = Date.now();
     return B.request('act', Object.assign({ action: action }, fields || {}));
@@ -118,7 +118,7 @@
     if (hsh !== location.hash) location.hash = hsh; else route();
   }
   /* the data key of the open page (Work's Day tab has its own) */
-  const openKey = () => (S.page === 'work' && S.sub === 'day' ? 'day' : S.page);
+  const openKey = () => (S.page === 'work' && /^day(\/|$)/.test(S.sub) ? 'day' : S.page);   // #work/day, #work/day/at:<moment>
   Y.openKey = openKey;
   function route() {
     const was = S.page + '/' + S.sub, chatWas = S.chat;
@@ -209,12 +209,12 @@
   function mainView() {
     const name = S.page;
     const pg = Y.pages[name];
-    const dataKey = name === 'work' && S.sub === 'day' ? 'day' : name;
+    const dataKey = openKey();
     const d = D.pages[dataKey];
     const main = h('main', { class: 'main', attrs: { id: 'main' } });
     if (!pg) return main;
     if (!d) {
-      const titles = { home: 'Home', work: S.sub === 'day' ? 'Day' : 'Work', me: 'Me', playbook: 'Playbook', activity: 'Activity', settings: 'Settings' };
+      const titles = { home: 'Home', work: dataKey === 'day' ? 'Day' : 'Work', me: 'Me', playbook: 'Playbook', activity: 'Activity', settings: 'Settings' };
       Y.append(main, Y.head(titles[name], h('span', { text: D.memory_error || 'Reading your memory…' })));
       return main;
     }

@@ -132,7 +132,7 @@ def test_a_to_do_added_by_voice_is_on_home_and_work_at_once(store):
     assert home["todos"]["open"][0]["text"] == "Invented to-do 0" and home["todos"]["open"][0]["due"] == "due today"
     assert home["todos"]["can"] == {"end": True, "undo": True, "correct": True, "add": True}
     work = W.build_work(client, week={"days": [], "totals": {}})
-    assert len(work["todos"]["open"]) == 7 and work["todos"]["done"] == [] and isinstance(work["sessions"], list)
+    assert len(work["todos"]["open"]) == 7 and work["todos"]["done"] == [] and isinstance(work["today"], dict)
     assert "threads" not in work and "closed" not in work and work["can"] == {"correct": True}
     client.end_todo("todo:1", "done")
     again = W.build_work(client, week={"days": [], "totals": {}})
@@ -271,11 +271,11 @@ def test_done_not_needed_undo_and_add_go_straight_to_memory(tmp_path):
     assert {"home", "work", "activity"} <= set(refreshed)
     r = win.a_todo_end({"ref": "commit:4", "how": "not_needed"})
     assert r["undo"] is False and "until" not in r and mem.calls[-1] == ("end", "commit:4", "not_needed")
-    assert win.a_todo_end({"ref": "todo:1", "how": "wrong"})["ok"] is False             # only the two buttons' choices
+    assert win.a_todo_end({"ref": "todo:1", "how": "later"})["ok"] is False             # only the buttons' choices (wrong: Not mine, report 68)
     assert win.a_todo_end({"ref": "thread:1", "how": "done"})["ok"] is False           # nothing open with that id
     assert win.a_todo_reopen({"ref": "todo:1"}) == {"ref": "todo:1"}
     assert win.a_todo_reopen({"ref": "todo:2"})["ok"] is False
-    assert win.a_todo_add({"text": "  Invented  new to-do ", "day": "2026-10-06"}) == {"ref": "todo:9"}
+    assert win.a_todo_add({"text": "  Invented  new to-do ", "day": "2026-10-06"}) == {"ref": "todo:9", "due": "2026-10-06"}
     assert mem.calls[-1] == ("add", "Invented new to-do", "2026-10-06")
     win.a_todo_add({"text": "Another", "day": "2026-10-06", "time": "17:30"})
     assert mem.calls[-1] == ("add", "Another", "2026-10-06 17:30")
@@ -389,7 +389,8 @@ def test_the_fixture_has_the_list_the_now_tile_and_no_threads():
     data = web_window.load_fixture()
     home, work = data["pages"]["home"], data["pages"]["work"]
     assert home["todos"]["open"] and home["todos"]["n"] >= len(home["todos"]["open"]) and home["now"]["session"]["title"]
-    assert work["todos"]["open"] and work["todos"]["done"] and work["sessions"]
-    assert all("start_at" in s and "end_at" in s for s in work["sessions"])
-    text = json.dumps({"home_now": home["now"], "work": work})
+    assert work["todos"]["open"] and work["todos"]["done"] and work["today"]["worked"]
+    assert all("start_at" in s and "end_at" in s for s in data["pages"]["day"]["sessions"])   # the Now tile opens Day at one
+    # the Work page (report 68): Worked on today carries a thread's id for its Continue run, never a thread shown
+    text = json.dumps({"home_now": home["now"], "work": {k: v for k, v in work.items() if k != "today"}})
     assert "thread:" not in text and '"threads"' not in text

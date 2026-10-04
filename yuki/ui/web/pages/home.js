@@ -18,14 +18,14 @@
     const tiles = [];
     // Now: what you are doing right now (the 4 Oct decision: threads left the window): the current session's title,
     // the app in front and how long (the minutes run on the page from since_at: the ticker's data-durfrom, so no
-    // figure goes stale); a click opens Work at that session (data-at: the moment the app came to the front). With no
+    // figure goes stale); a click opens Work's Day tab at that session (data-at: the moment the app came to the front). With no
     // session title yet the app is the title (never the raw window title)
     if (n.session) {
       const t = n.session, title = t.title || t.app || 'At the PC';
       const durEl = t.since_at ? h('span', { data: { durfrom: t.since_at }, text: fmt.dur((Date.now() / 1000 - t.since_at) / 60) }) : null;
       const inApp = t.title && t.app ? t.app : '';
       tiles.push(h('button', { class: 'clear nowsess', data: { clear: '', do: 'now-go', at: t.at || t.since_at || null },
-        attrs: { type: 'button', 'aria-label': `Now: ${title}${inApp ? ' in ' + inApp : ''}. Open today’s sessions on Work.` } },
+        attrs: { type: 'button', 'aria-label': `Now: ${title}${inApp ? ' in ' + inApp : ''}. Open today’s sessions on the Day tab.` } },
       Y.label(['Now', inApp ? ' · in ' + inApp : '', durEl ? [' · ', durEl] : null], null, 'front'),
       h('div', { class: 'big' }, h('span', { text: title })),
       t.summary ? h('div', { class: 'sm', text: t.summary }) : null));
@@ -156,14 +156,41 @@
     const P = Y.D.pages || {};
     reopening.set(ref, { view: Object.assign({}, view, { status: 'open' }), at: Date.now(), seen: new Set([(P.home || {}).todos, (P.work || {}).todos]) });
   }
+  Y.todoReopened = reopened;   // the Work page's Put it back: open at once, before memory's next build has it
   function todoMeta(t, full) {
     const bits = [t.due ? h('span', { class: 'td-due' + (t.over ? ' over' : ''), text: t.due }) : null,
       t.from ? h('span', { text: t.from }) : null, full && t.added ? h('span', { text: 'added ' + t.added }) : null].filter(Boolean);
     return bits.length ? h('div', { class: 'td-m' }, bits) : null;
   }
+  /* Work's look of the same row (the Work page, 4 Oct): one line and a short mono meta line (when it is due, in bold
+     when late, and where it came from; your correction, in full, takes the source's place), a hollow dot to tick, and
+     Done / Not needed / Correct over the end of the line on hover or keyboard focus. Undo wherever memory can put it
+     back (reopen_item: your to-dos, promises and loops alike). */
+  function workRow(t, d) {
+    const can = (d.todos || {}).can || {}, p = (d.pending || {})[t.ref];
+    const words = t.title || t.text, src = t.meta || t.from || '';
+    const fixed = p && (!p.kind || p.kind === 'correct') ? p.words : '';
+    const row = h('div', { class: 'wrow wli' + (t.over ? ' late' : ''),
+      data: { k: 'todo:' + t.ref, cref: t.ref, cpage: 'work', kind: 'todo', title: t.title || '', text: t.text, undo: can.reopen || t.undo ? '1' : null } },
+    can.end ? h('button', { class: 'ck', data: { do: 'todo-end', how: 'done' }, attrs: { type: 'button', 'aria-label': 'Done: ' + t.text }, title: 'Done' }, h('i', { class: 'box' }), ic('check'))
+      : h('span', { class: 'ck' }, h('i', { class: 'box' })),
+    h('div', { class: 'wtx' },
+      h('div', { class: 'wt', text: words, title: words !== t.text ? t.text : '' }),
+      h('div', { class: 'wm' + (fixed ? ' wfx' : ''), title: fixed ? src : '' }, h('span', { class: 'due', text: t.due || 'no date' }),
+        fixed ? h('span', { class: 'corrected', text: `you corrected it: “${fixed}”` }) : (src ? h('span', { text: src }) : null)),
+      p ? h('div', { class: 'td-fix' }, Y.fixLine(p)) : null,
+      h('div', { class: 'fixslot' })),
+    h('div', { class: 'wacts' },
+      can.end ? key('Done', { cls: 'xs', data: { do: 'todo-end', how: 'done' } }) : null,
+      can.end ? key('Not needed', { cls: 'xs ghost', data: { do: 'todo-end', how: 'not_needed' }, title: 'You don’t need it any more: it leaves your list' }) : null,
+      can.correct && !Y.fixing(p) ? Y.correctKey() : null));
+    row.__t = t;
+    return row;
+  }
   /* one open to-do; `page` is the page data it lives in (its Correct's pending line), `full` on Work (the whole
      words under the title, when it was added, an open loop's evidence) */
   Y.todoRow = (t, d, page, full) => {
+    if (page === 'work') return workRow(t, d);
     const can = (d.todos || {}).can || {}, p = (d.pending || {})[t.ref];
     const words = t.title || t.text;   // memory's few-word title when it has one (Home and Work); Work adds the whole
     const row = h('div', { class: 'todo' + (t.over ? ' over' : ''),
@@ -212,33 +239,60 @@
   function putBack(row) {
     const res = row.__res; if (!res) return;
     clearTimeout(res.timer); row.__res = null; ending.delete(row.dataset.cref);
-    row.classList.remove('resolved'); row.replaceChildren(...res.kids);
+    row.className = res.cls; row.replaceChildren(...res.kids);
   }
+  /* Work's words for a settled row: the title struck through beside them when done */
+  const WORK_END_WORDS = { done: 'Done. It’s in Recently done.', not_needed: 'Off your list. Not needed.' };
   Y.actions['todo-end'] = (t) => {
     const row = t.closest('[data-cref]'); if (!row || row.__res) return;
-    const ref = row.dataset.cref, how = t.dataset.how;
-    const res = { kids: Array.from(row.childNodes), how };
+    const ref = row.dataset.cref, how = t.dataset.how, wli = row.classList.contains('wli');
+    const hadFocus = row.contains(document.activeElement);
+    const res = { kids: Array.from(row.childNodes), how, cls: row.className };
     row.__res = res; ending.set(ref, how);
     res.p = Y.act('todo_end', { ref, how }).then((r) => {
       if (!r.ok && row.__res === res) { putBack(row); Y.toast(r.error || 'Couldn’t change it. Memory didn’t answer.', true); }
       if (r.ok && r.undo) undoable.set(ref, r.until || Date.now() / 1000 + 600);   // Work's row keeps its Undo
       return r;
     });
-    row.classList.add('resolved');
-    row.replaceChildren(h('div', { class: 'confirm res' }, ic('check'), h('span', { text: END_WORDS[how] || END_WORDS.done }),
-      row.dataset.undo ? key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen' } }) : null, h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
-    Y.pop(row.firstElementChild);
+    const undo = row.dataset.undo ? key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen' } }) : null;
+    const drain = h('i', { class: 'res-drain', aria: { hidden: 'true' } });
+    if (wli) {   // Work: the dot fills lit with a check and the title strikes through beside what happened
+      const title = (row.querySelector('.wt') || {}).textContent || '';
+      const ck = how === 'done' ? h('span', { class: 'ck' }, h('i', { class: 'box' }), ic('check')) : h('span', { class: 'ckd' }, ic('dash'));
+      row.classList.add('settling'); if (how === 'done') row.classList.add('isdone');
+      row.replaceChildren(ck, h('div', { class: 'confirm res wsettle' }, how === 'done' ? h('span', { class: 'wt', text: title }) : null,
+        h('span', { text: WORK_END_WORDS[how] || WORK_END_WORDS.done }), undo, drain));
+      Y.pop(row.lastElementChild);
+      if (hadFocus && undo) undo.focus({ preventScroll: true });
+      Y.renderMain();   // the head's "due tomorrow" follows the list at once (this row is held while it settles)
+    } else {
+      row.classList.add('resolved');
+      row.replaceChildren(h('div', { class: 'confirm res' }, ic('check'), h('span', { text: END_WORDS[how] || END_WORDS.done }), undo, drain));
+      Y.pop(row.firstElementChild);
+    }
     res.timer = setTimeout(() => {
       if (row.__res !== res) return;
-      row.__res = null; row.__leaving = true; Y.leave(row);
+      row.__res = null; row.__leaving = true;
+      if (wli && row.contains(document.activeElement)) {   // keyboard focus goes on to the next row (or the one above)
+        let n = row.nextElementSibling; while (n && !(n.classList.contains('wrow') && !n.__leaving)) n = n.nextElementSibling;
+        if (!n) { n = row.previousElementSibling; while (n && !(n.classList.contains('wrow') && !n.__leaving)) n = n.previousElementSibling; }
+        const f = n && n.querySelector('button'); if (f) f.focus({ preventScroll: true });
+      }
+      Y.leave(row);
       setTimeout(() => Y.renderMain(), 460);
     }, 5000);
   };
   Y.actions['todo-reopen'] = (t) => {
     const row = t.closest('[data-cref]'), res = row && row.__res; if (!res) return;
+    const back = row.contains(document.activeElement);
     clearTimeout(res.timer); t.disabled = true;
     res.p.then((first) => (first && first.ok ? Y.act('todo_reopen', { ref: row.dataset.cref }) : { ok: true })).then((r) => {
-      if (r.ok) { reopened(row.dataset.cref, row.__t || {}); putBack(row); Y.renderMain(); return; }
+      if (r.ok) {
+        reopened(row.dataset.cref, row.__t || {}); putBack(row); Y.renderMain();
+        // from the keyboard: back onto the same button the row was ended with
+        if (back) { const b = row.querySelector(`[data-do="todo-end"][data-how="${res.how}"]:not(.ck)`) || row.querySelector('button'); if (b) b.focus({ preventScroll: true }); }
+        return;
+      }
       Y.toast(r.error || 'Couldn’t put it back.', true);
       row.__res = null; row.__leaving = true; Y.leave(row);
     });
@@ -349,8 +403,8 @@
   A['answer-typed'] = (t) => answered(t, t.value.trim());
   A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
-  /* the Now tile: Work, at the session holding the tile's moment (its row opens and comes into view) */
-  A['now-go'] = (t) => Y.go('work', 'at:' + Math.round(Number(t.dataset.at) || Date.now() / 1000));
+  /* the Now tile: Work's Day tab, at the session holding the tile's moment (its row opens and comes into view) */
+  A['now-go'] = (t) => Y.go('work', 'day/at:' + Math.round(Number(t.dataset.at) || Date.now() / 1000));
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
   /* Learned proposals (practice memory, E13): Save keeps it, Edit is your words (memory re-distills the next
      version from them), No drops it; a question is answered in your words or skipped. Python maps the choice onto

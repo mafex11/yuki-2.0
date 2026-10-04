@@ -103,6 +103,19 @@ async function main() {
     for (let i = 0; i < 50; i++) { if (await evaluate('!!(window.__sent && window.__sent.some((m) => m.op === "ready"))')) break; await sleep(100); }
     const out = await evaluate(`(${inPage.toString()})(${JSON.stringify(fixture())})`);
     results.push(...out);
+    // the Work page's two columns end level at each width the design names (report 68), the window sized by the
+    // DevTools protocol (a headless viewport, nothing on screen)
+    for (const [w, hh] of [[1280, 800], [1440, 900], [1920, 1080]]) {
+      await send('Emulation.setDeviceMetricsOverride', { width: w, height: hh, deviceScaleFactor: 1, mobile: false });
+      await evaluate('location.hash = "#work"; new Promise((r) => setTimeout(r, 700))');
+      const m = await evaluate(`(() => { const c = Array.from(document.querySelectorAll('.wk-grid > .col')).map((x) => x.getBoundingClientRect().bottom);
+        const rows = Array.from(document.querySelectorAll('.wk-grid .wrow .wt')).filter((t) => t.offsetParent && t.scrollWidth > t.clientWidth + 1 && getComputedStyle(t).textOverflow !== 'ellipsis');
+        const wrapped = Array.from(document.querySelectorAll('.wk-grid .wrow:not(.editing) .wt')).filter((t) => t.offsetParent && t.getClientRects().length && t.getBoundingClientRect().height > 26);
+        return { c, unclipped: rows.length, wrapped: wrapped.length }; })()`);
+      results.push({ name: `WK13 at ${w}px the Work columns end within 7 px and every row stays one line`, ok: m.c.length === 2 && Math.abs(m.c[0] - m.c[1]) <= 7 && !m.unclipped && !m.wrapped,
+        detail: `${m.c.map(Math.round).join(' vs ')}, ${m.wrapped} wrapped` });
+    }
+    await send('Emulation.clearDeviceMetricsOverride');
     if (errors.length) results.push({ name: 'no script errors in the page', ok: false, detail: errors.slice(0, 5).join(' | ') });
     else results.push({ name: 'no script errors in the page', ok: true });
     ws.close();
@@ -733,34 +746,173 @@ async function inPage(F) {
   check('N1 Playing and the call stay beside it', main().querySelectorAll('.now > *').length === 1 + (nowD.playing ? 1 : 0) + (nowD.call ? 1 : 0) && !!nowD.playing);
   check('N1 no thread tile, no "Next:" line, no "In front"', !main().querySelector('.nowthread') && !/Next: |In front/.test(main().querySelector('.now').textContent));
   tile.click(); await sleep(900);
-  const lastS = FW.sessions[FW.sessions.length - 1], openS = main().querySelector('[data-k="sessions"] .fx.open');
-  check('N2 a click opens Work at the session holding the tile’s moment (review F2: not the clock), opened', decodeURIComponent(location.hash) === '#work/at:' + Math.round(FH.now.session.at) && !!openS
+  const lastS = F.pages.day.sessions[F.pages.day.sessions.length - 1], openS = main().querySelector('[data-k="sessions"] .fx.open');
+  check('N2 a click opens the Day tab at the session holding the tile’s moment (review F2: not the clock), opened', decodeURIComponent(location.hash) === '#work/day/at:' + Math.round(FH.now.session.at) && !!openS
     && openS.querySelector('.fx-h .tx').textContent === lastS.title, `${decodeURIComponent(location.hash)} ${openS && openS.querySelector('.fx-h .tx').textContent}`);
-  // Work: the full list beside today's sessions; no threads
-  const wt = () => main().querySelector('[data-k="todos"]');
-  check('T5 Work has the full To-dos block: the open ones, Add, the done ones folded', !!wt() && wt().querySelectorAll('.todos > .todo:not(.done)').length >= FW.todos.open.length - 1
-    && !!wt().querySelector('.td-add .td-in') && !!wt().querySelector('.tdfold[data-fold="todos-done"]') && !wt().querySelector('.tdfold[data-fold="todos-done"]').classList.contains('open'),
-  wt() && `${wt().querySelectorAll('.todos > .todo:not(.done)').length} of ${FW.todos.open.length}`);
-  const lr = rowOf(wt(), 'loop:12');
-  check('T5 a row on Work: its title, its whole words, where it came from and why', !!lr && lr.querySelector('.td-t').textContent === 'Climbing photos for Riya' && !!lr.querySelector('.td-d')
-    && !!lr.querySelector('.td-ev') && lr.querySelector('.td-m').textContent.includes('I noticed it') && !/\d{4}-\d{2}-\d{2}/.test(lr.textContent), lr && lr.textContent);
-  check('T5 the commitment ended on Home is gone here too', !rowOf(wt(), 'commit:44'));
-  REPLY.todo_add = { ok: true, ref: 'todo:42' };
-  const ai = wt().querySelector('.td-in');
-  ai.value = 'Invented new to-do'; enter(ai); await sleep(200);
-  check('T6 Add sends your words to memory (todo_add) and clears the line', last('todo_add').text === 'Invented new to-do' && wt().querySelector('.td-in').value === '');
-  const ws = Array.from(main().querySelectorAll('[data-k="sessions"] .fx'));
-  check('T7 today’s sessions sit beside the list, latest first', ws.length === FW.sessions.length && ws[0].querySelector('.fx-h .tx').textContent === lastS.title);
-  const cols = Array.from(main().querySelectorAll('.wk-grid > .col')).map((c) => c.getBoundingClientRect().height);
-  check('T7 the page stays balanced: two columns, neither under a third of the other', cols.length === 2 && Math.min(...cols) >= Math.max(...cols) / 3, cols.map(Math.round).join(' vs '));
-  check('T8 no threads on Work: no thread cards, Continue, Closed lately or Threads tab', !main().querySelector('.thread, [data-do="continue"], [data-do="thread-close"], .tfold')
-    && !/\bThreads?\b|Continue|Closed lately|Not a thread/.test(main().textContent), main().textContent.slice(0, 200));
+  // ---- the Work page (report 68): Today, Your list, Waiting on, Needs your reply, You said you'd ----
+  await go('#work'); await sleep(900);
+  const sec = (k) => main().querySelector(`[data-k="${k}"]`);
+  const wrow = (k, key) => main().querySelector(`[data-k="${k}"] .wrow[data-k="${key}"]`);
+  const visible = (el) => !!el && el.offsetParent !== null && getComputedStyle(el).display !== 'none';
+  const toastTxt = () => Array.from(document.querySelectorAll('.toast')).map((t) => t.textContent).join(' | ');
+  const tomorrowN = FW.todos.open.filter((t) => t.tomorrow).length;
+  const dueEl = main().querySelector('[data-wkdue]');
+  check('WK1 the head keeps the week bars and says how many are due tomorrow', !!main().querySelector('[data-figure="week"]') && !!dueEl && !dueEl.hidden
+    && dueEl.textContent.trim() === `${tomorrowN} due tomorrow`, dueEl && dueEl.textContent);
+  check('WK1 the toggle reads Work | Day, Work pressed', Array.from(main().querySelectorAll('.ph .seg button')).map((b) => b.textContent + ':' + b.getAttribute('aria-pressed')).join(',') === 'Work:true,Day:false');
+  const today = sec('today'), cl = today ? Array.from(today.children) : [];
+  const dayTot = Object.fromEntries(F.pages.day.totals.map(([a, b]) => [a, b]));
+  check('WK1 Today: four clearings, Focus today with its meter and your usual, the same numbers as the Day tab', cl.length === 4 && cl[0].textContent.includes('Focus today')
+    && cl[0].querySelector('.doto').textContent === dayTot.Active && cl[0].querySelectorAll('.fmeter i').length > 0 && !!cl[0].querySelector('.fmeter i.u')
+    && /Your usual by now is about \dh \d\dm/.test(cl[0].textContent) && cl[1].querySelector('.doto').textContent === dayTot['Longest focus'], today && today.textContent.slice(0, 200));
+  check('WK1 Your day › opens Day; Worked on today rows and Coming up with where they were seen', !!cl[0].querySelector('a.golink[href="#work/day"]')
+    && cl[2].querySelectorAll('.tw[data-do="work-continue"]').length === FW.today.worked.length && cl[3].querySelectorAll('.tc').length === FW.today.coming.length
+    && cl[3].textContent.includes(FW.today.coming_seen));
+  cl[2].querySelector('.tw').click(); await sleep(120);
+  check('WK2 a Worked on today row starts the Continue run (work_continue with the thread, nothing else sent)', last('work_continue').ref === FW.today.worked[0][2]
+    && Object.keys(last('work_continue')).filter((k) => !['op', 'id', 'action', 'ref'].includes(k)).length === 0 && /Picking up .*type and send nothing/.test(toastTxt()), toastTxt());
+  const empty = clone(FW);
+  Object.assign(empty, { waiting: [], said: [], replies: { items: [], ready: true } }); empty.todos = Object.assign({}, empty.todos, { open: [], done: [], n: 0 });
+  empty.today = Object.assign({}, empty.today, { worked: [], coming: [], longest: null, usual: null });
+  await push('work', empty); await sleep(100);
+  const txt = main().textContent;
+  check('WK14 each block has its empty line in plain words', ['Nothing on your list. Add one above', 'Nobody owes you anything right now.', 'You’re caught up. Nobody is waiting on an answer.',
+    'No promises open.', 'No usual yet', 'Nothing I could tie to your work yet today.', 'Nothing coming up that I’ve seen'].every((s) => txt.includes(s)),
+  ['Nothing on your list', 'Nobody owes you', 'caught up', 'No promises', 'No usual', 'tie to your work', 'coming up'].filter((s) => !txt.includes(s)).join(', '));
+  await push('work', Object.assign(clone(empty), { replies: { items: [], ready: false } })); await sleep(80);
+  check('WK14 before memory has read the chats, it says so (never "caught up")', main().textContent.includes('I haven’t read your chats for this yet') && !main().textContent.includes('caught up'));
+  await push('work', clone(FW)); await sleep(150);
+  // Your list
+  const wl = () => sec('list');
+  const lrows = () => Array.from(wl().querySelectorAll('.wrows > .wrow.wli'));
+  const nList = FW.todos.open.length;
+  check('WK3 Your list: the add field, hollow-dot rows, the first 6 by position and "Show N more"', !!wl().querySelector('.wadd .wl-in') && lrows().length === nList
+    && lrows().filter(visible).length === 6 && wl().querySelector('[data-do="work-more"]').textContent === `Show ${nList - 6} more` && !!lrows()[0].querySelector('.ck .box'),
+  `${lrows().filter(visible).length} of ${lrows().length}`);
+  check('WK3 just added first: the item you said a moment ago leads and slid in once', lrows()[0].dataset.cref === 'todo:36' && !lrows()[0].classList.contains('arriving') && (Y.S.work.slid || 0) >= 1, `${lrows()[0].dataset.cref} slid ${Y.S.work.slid}`);
+  check('WK3 due words in natural words, late in bold, where it came from; never an ISO date', /was due yesterday/.test(wl().textContent) && !!wl().querySelector('.wrow.late .due')
+    && /due tomorrow/.test(wl().textContent) && /Riya asked in Signal, \w+/.test(wl().textContent) && !/\d{4}-\d{2}-\d{2}/.test(wl().textContent));
+  REPLY.todo_end = (m) => ({ ok: true, ref: m.ref, how: m.how, undo: true });
+  REPLY.todo_reopen = (m) => ({ ok: true, ref: m.ref });
+  const r29 = () => wl().querySelector('.wrow[data-cref="todo:29"]');
+  const row29 = r29();
+  row29.querySelector('.ck').click(); await sleep(80);
+  check('WK4 the dot (Done) ends it at once: filled, struck through, "Done. It’s in Recently done." with Undo and a drain', last('todo_end').ref === 'todo:29' && last('todo_end').how === 'done'
+    && row29.classList.contains('isdone') && row29.textContent.includes('Done. It’s in Recently done.') && !!row29.querySelector('[data-do="todo-reopen"]') && !!row29.querySelector('.res-drain'), row29.textContent);
+  await push('work', clone(FW));
+  check('WK4 a redraw meanwhile keeps the row settling with its Undo', row29.isConnected && !!row29.querySelector('[data-do="todo-reopen"]'));
+  row29.querySelector('[data-do="todo-reopen"]').click(); await sleep(200);
+  check('WK4 Undo puts it back as it was (todo_reopen)', last('todo_reopen').ref === 'todo:29' && !!r29() && !!r29().querySelector('.ck .box') && !r29().classList.contains('isdone'));
+  const r33 = wl().querySelector('.wrow[data-cref="todo:33"]');
+  r33.querySelector('[data-do="todo-end"][data-how="not_needed"]').click(); await sleep(80);
+  check('WK4 Not needed says so, with Undo', last('todo_end').how === 'not_needed' && r33.textContent.includes('Off your list. Not needed.') && !!r33.querySelector('[data-do="todo-reopen"]'));
+  r33.querySelector('[data-do="todo-reopen"]').click(); await sleep(200);
+  REPLY.correct_item = (m) => ({ ok: true, correction_id: 97, ref: m.ref });
+  const r31 = () => wl().querySelector('.wrow[data-cref="todo:31"]');
+  r31().querySelector('[data-do="correct"]').click(); await sleep(60);
+  const fixIn = r31().querySelector('.fixbox input');
+  check('WK5 Correct opens a one-line "What’s wrong?" under the row', !!fixIn && r31().querySelector('.fixbox').textContent.includes('What’s wrong?'));
+  fixIn.value = 'it is due Monday'; enter(fixIn); await sleep(200);
+  check('WK5 Enter sends it (correct_item); your words take the source’s place, in full, with Undo while it waits', last('correct_item').ref === 'todo:31' && last('correct_item').words === 'it is due Monday'
+    && r31().querySelector('.wm.wfx .corrected').textContent === 'you corrected it: “it is due Monday”' && !!r31().querySelector('[data-do="fix-undo"]'), r31().textContent);
+  REPLY.todo_add = (m) => ({ ok: true, ref: 'todo:90', due: '2026-10-05' });
+  const addIn = wl().querySelector('.wl-in');
+  addIn.value = 'Invented new thing by Monday'; enter(addIn); await sleep(30);
+  check('WK6 Add: Enter adds at once (the row shows, "adding it…") and clears the field', !!wl().querySelector('.wrow.adding') && wl().querySelector('.wrow.adding .wt').textContent === 'Invented new thing by Monday'
+    && wl().querySelector('.wl-in').value === '');
+  await sleep(150);
+  check('WK6 your words go to memory to read the due from them (todo_add, words)', last('todo_add').text === 'Invented new thing by Monday' && last('todo_add').words === true && /with its due date/.test(toastTxt()), toastTxt());
+  wl().querySelector('[data-do="work-more"]').click(); await sleep(60);
+  check('WK7 Show N more opens the rest; Show fewer folds them', lrows().filter(visible).length === lrows().length && wl().querySelector('[data-do="work-more"]').textContent === 'Show fewer');
+  wl().querySelector('[data-do="work-more"]').click(); await sleep(60);
+  wl().querySelector('[data-do="work-donefold"]').click(); await sleep(80);
+  const doneRows = Array.from(wl().querySelectorAll('.wdone-l .wrow'));
+  check('WK8 Recently done folds open, each row with Put it back', doneRows.length === FW.todos.done.length && doneRows.every((r) => !!r.querySelector('[data-do="work-back"]'))
+    && wl().querySelector('[data-do="work-donefold"]').getAttribute('aria-expanded') === 'true');
+  doneRows[0].querySelector('[data-do="work-back"]').click(); await sleep(200);
+  check('WK8 Put it back reopens it whatever its age (todo_reopen, any) and it is on the list at once', last('todo_reopen').ref === FW.todos.done[0].ref && last('todo_reopen').any === true
+    && !!wl().querySelector(`.wrows .wrow[data-cref="${FW.todos.done[0].ref}"]`));
+  wl().querySelector('[data-do="work-donefold"]').click(); await sleep(60);
+  // Waiting on
+  const wait = () => sec('wait'), w0 = FW.waiting[0];
+  const wr0 = () => wait().querySelector(`.wrow[data-wref="${w0.ref}"]`);
+  check('WK9 Waiting on: "<who> to <what>", where and when, one dot per day waited and the age in words', wait().querySelectorAll('.wrows > .wrow').length === FW.waiting.length
+    && wr0().querySelector('.wt').textContent === `${w0.who} to ${w0.what}` && /\d day|yesterday|hour|min/.test(wr0().querySelector('.wage').textContent) && wr0().querySelectorAll('.adots i').length === 3,
+  wr0() && wr0().textContent);
+  REPLY.work_nudge = { ok: true, text: w0.draft };
+  wr0().querySelector('[data-do="work-nudge"]').click(); await sleep(120);
+  check('WK9 Draft a nudge puts the draft in the ask bar, unsent (work_nudge with the loop only; nothing sent here)', last('work_nudge').ref === w0.ref && !('text' in last('work_nudge'))
+    && !acts('submit').some((m) => m.text === w0.draft) && /not sent/.test(toastTxt()), toastTxt());
+  wr0().querySelector('[data-do="work-gotit"]').click(); await sleep(80);
+  check('WK9 They did it clears it (todo_end done) with Undo', last('todo_end').ref === w0.ref && last('todo_end').how === 'done' && wr0().textContent.includes('Off your waiting list') && !!wr0().querySelector('[data-do="work-undo"]'));
+  wr0().querySelector('[data-do="work-undo"]').click(); await sleep(200);
+  check('WK9 its Undo puts it back (todo_reopen)', last('todo_reopen').ref === w0.ref && !!wr0().querySelector('[data-do="work-gotit"]'));
+  // Needs your reply
+  const rep = () => sec('reply'), R = FW.replies.items;
+  const rrows = () => Array.from(rep().querySelectorAll('.wrows > .wrow.wr'));
+  check('WK10 Needs your reply: newest first, the quoted message, app and chat, how long; six show, the rest fold', rrows().length === R.length && rrows().filter(visible).length === 6
+    && rrows()[0].querySelector('.wt').textContent === `${R[0].who} “${R[0].msg}”` && rrows()[0].querySelector('.wm').textContent.includes(`${R[0].app} · ${R[0].place}`)
+    && /min|hour/.test(rrows()[0].querySelector('.wago').textContent) && rep().querySelector('[data-do="work-more"]').textContent === `Show ${R.length - 6} more`);
+  REPLY.work_open_chat = { ok: true, app: R[0].app, how: 'chat' };
+  rrows()[0].querySelector('.wr-hit').click(); await sleep(150);
+  check('WK10 a click brings that chat forward (work_open_chat) and the row says opened until you reply', last('work_open_chat').key === R[0].key
+    && rrows()[0].textContent.includes('opened · I’ll clear it once you reply') && toastTxt().includes(`Brought ${R[0].app} forward on your chat with ${R[0].who}.`), toastTxt());
+  REPLY.work_mark = { ok: true };
+  const rr1 = rrows()[1];
+  rr1.querySelector('[data-do="work-noreply"]').click(); await sleep(80);
+  check('WK10 No reply needed clears it (work_mark no_reply) with Undo', last('work_mark').key === R[1].key && last('work_mark').mark === 'no_reply' && rr1.textContent.includes('Cleared. No reply needed.'));
+  rr1.querySelector('[data-do="work-undo"]').click(); await sleep(200);
+  check('WK10 its Undo takes the mark back (work_mark none)', last('work_mark').key === R[1].key && last('work_mark').mark === null && !!rr1.querySelector('[data-do="work-noreply"]'));
+  // You said you'd
+  const said = () => sec('said'), S0 = FW.said.find((p) => !p.closed && p.quote);
+  const sr = (ref) => said().querySelector(`.wrow[data-sref="${ref}"]`);
+  check('WK11 You said you’d: where and when and your own words', !!sr(S0.ref) && sr(S0.ref).querySelector('.wm').textContent.includes(`you said “${S0.quote}”`));
+  const closed = FW.said.find((p) => p.closed);
+  check('WK11 a promise I saw kept closes itself, struck through, with Not done yet', !!sr(closed.ref) && sr(closed.ref).classList.contains('wclosed') && sr(closed.ref).textContent.includes('closed itself')
+    && !!sr(closed.ref).querySelector('[data-do="work-notyet"]'));
+  const s0 = sr(S0.ref);
+  s0.querySelector('[data-do="work-list"]').click(); await sleep(120);
+  check('WK11 Add to list: in Your list at once with its due date (work_mark listed), and it says so here with Undo', last('work_mark').key === S0.ref && last('work_mark').mark === 'listed'
+    && !!wl().querySelector(`.wrow[data-cref="${S0.ref}"]`) && (!S0.due || wl().querySelector(`.wrow[data-cref="${S0.ref}"] .due`).textContent === S0.due)
+    && s0.textContent.includes('Added to your list.') && !!s0.querySelector('[data-do="work-undo"]'));
+  s0.querySelector('[data-do="work-undo"]').click(); await sleep(200);
+  check('WK11 its Undo takes it back off your list (work_mark none)', last('work_mark').mark === null && !wl().querySelector(`.wrow[data-cref="${S0.ref}"]`) && !!sr(S0.ref).querySelector('[data-do="work-list"]'));
+  sr(S0.ref).querySelector('[data-do="work-said"][data-how="wrong"]').click(); await sleep(80);
+  check('WK11 Not mine (todo_end wrong) with Undo', last('todo_end').ref === S0.ref && last('todo_end').how === 'wrong' && sr(S0.ref).textContent.includes('Not yours'));
+  sr(S0.ref).querySelector('[data-do="work-undo"]').click(); await sleep(200);
+  const S1 = FW.said.filter((p) => !p.closed)[1];
+  sr(S1.ref).querySelector('[data-do="work-said"][data-how="done"]').click(); await sleep(80);
+  check('WK11 Done (todo_end done) with Undo', last('todo_end').ref === S1.ref && last('todo_end').how === 'done' && sr(S1.ref).textContent.includes('Marked done'));
+  sr(S1.ref).querySelector('[data-do="work-undo"]').click(); await sleep(200);
+  sr(closed.ref).querySelector('[data-do="work-notyet"]').click(); await sleep(150);
+  check('WK11 Not done yet reopens it (todo_reopen, any)', last('todo_reopen').ref === closed.ref && last('todo_reopen').any === true && /Reopened/.test(toastTxt()));
+  // keyboard: focus moves to Undo after an action, back to the same button after Undo
+  const r34 = () => wl().querySelector('.wrow[data-cref="todo:34"]');
+  const nn = r34().querySelector('[data-do="todo-end"][data-how="not_needed"]');
+  nn.focus(); nn.click(); await sleep(80);
+  check('WK12 from the keyboard, focus goes onto Undo after an action', document.activeElement && document.activeElement.dataset.do === 'todo-reopen' && r34().contains(document.activeElement));
+  document.activeElement.click(); await sleep(250);
+  check('WK12 after Undo, focus is back on the same button', document.activeElement && document.activeElement.dataset.how === 'not_needed' && r34().contains(document.activeElement),
+    document.activeElement && document.activeElement.outerHTML.slice(0, 80));
+  // the head's count follows the list as you tick things off
+  const dueN = () => Number((main().querySelector('[data-wkdue] b') || {}).textContent || 0);
+  const n0 = dueN(), tom = FW.todos.open.find((t) => t.tomorrow);
+  wl().querySelector(`.wrow[data-cref="${tom.ref}"] .ck`).click(); await sleep(80);
+  check('WK12 "N due tomorrow" follows the list at once', dueN() === n0 - 1 || (n0 === 1 && main().querySelector('[data-wkdue]').hidden), `${n0} -> ${dueN()}`);
+  wl().querySelector(`.wrow[data-cref="${tom.ref}"] [data-do="todo-reopen"]`).click(); await sleep(250);
+  // the columns end level; every block has its empty line in plain words
+  const cols = Array.from(main().querySelectorAll('.wk-grid > .col')).map((c) => c.getBoundingClientRect().bottom);
+  check('WK13 two balanced columns: they end within 7 px of each other', cols.length === 2 && Math.abs(cols[0] - cols[1]) <= 7, cols.map(Math.round).join(' vs '));
+  await push('work', clone(FW)); await sleep(100);
+  check('WK15 no threads on Work and no ISO dates anywhere on it', !main().querySelector('.thread, [data-do="thread-close"], .tfold') && !/\bThreads?\b|Closed lately|Not a thread/.test(main().textContent)
+    && !/\d{4}-\d{2}-\d{2}/.test(main().textContent));
   // open_yuki's "todos": the window opens on Home at Your list; "see all" opens Work at the list
-  window.__push({ kind: 'focus', page: 'home', sub: 'list' }); await sleep(400);
+  await go('#home'); await sleep(400);
+    window.__push({ kind: 'focus', page: 'home', sub: 'list' }); await sleep(400);
   check('T9 open_yuki todos opens Home at Your list, brought into view', location.hash === '#home/list' && !!list() && list().classList.contains('flash')
     && list().getBoundingClientRect().top < window.innerHeight, `${location.hash} ${list() && list().className}`);
   list().querySelector('a.td-all').click(); await sleep(500);
-  check('T9 see all opens Work at the list', location.hash === '#work/todos' && !!wt() && wt().classList.contains('flash'));
+  check('T9 see all opens Work at Your list', location.hash === '#work/todos' && !!sec('list') && sec('list').classList.contains('flash'));
   // ---- review F3: Undo after the refresh that already dropped the row: the row is back at once, not after the
   // next build (a stale copy of that refresh doesn't take it away again) ----
   await go('#home'); await sleep(400);
@@ -779,21 +931,6 @@ async function inPage(F) {
   check('F3 a late copy of the refresh that dropped it keeps it there', back3());
   await push('home', clone(FH)); await sleep(80);
   check('F3 the build that has it again takes over: one row of it', list().querySelectorAll('.todo[data-cref="todo:29"]').length === 1);
-  // ---- review F5: after the 5 s drain the Undo isn't gone: Work keeps it on the row for the rest of memory's 10
-  // minutes ----
-  rowOf(list(), 'todo:29').querySelector('[data-do="todo-end"][data-how="done"]').click(); await sleep(80);
-  const w5 = clone(FW), t29 = w5.todos.open.find((t) => t.ref === 'todo:29');
-  w5.todos.open = w5.todos.open.filter((t) => t.ref !== 'todo:29'); w5.todos.done = [Object.assign({}, t29, { status: 'done' })].concat(w5.todos.done || []);
-  await push('home', dropped()); await push('work', w5);
-  await go('#work'); await sleep(400);
-  const just = () => wt().querySelector('.td-just .todo[data-dref="todo:29"]');
-  check('F5 Work shows the to-do you just ended, in view, with Undo and the minutes left', !!just() && !!just().querySelector('[data-do="todo-reopen-done"]')
-    && /(^|\D)(9|10) min left/.test(just().textContent) && !wt().querySelector('.tdfold[data-fold="todos-done"] [data-k="done:todo:29"]'), just() && just().textContent);
-  check('F5 a done row you didn’t just end has no Undo', !wt().querySelector('[data-k="done:todo:27"] [data-do="todo-reopen-done"]'));
-  const nR = acts('todo_reopen').length;
-  just().querySelector('[data-do="todo-reopen-done"]').click(); await sleep(200);
-  check('F5 its Undo puts it back (todo_reopen): open again at once, the Undo row gone', acts('todo_reopen').length === nR + 1 && last('todo_reopen').ref === 'todo:29'
-    && !!rowOf(wt(), 'todo:29') && !!rowOf(wt(), 'todo:29').querySelector('.td-tick') && !just());
   let foreign = '';
   for (const hsh of ['#home', '#work', '#work/day', '#me']) { await go(hsh); await sleep(300); if (/[ऀ-ॿ]/.test(main().textContent)) foreign += hsh + ' '; }
   check('English only on Home, Work, Day and Me', !foreign, foreign);

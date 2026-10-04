@@ -142,6 +142,7 @@ def test_migration_33_runs_on_a_v32_file_with_rows_and_pins_user_facts_only(tmp_
                           ("episodes", "summary_ciphertext"), ("correction_passes", "target")):
         conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
     conn.execute("DROP TABLE undo_images")
+    conn.execute("DROP TABLE work_items")   # migration 36 (the Work page) too
     conn.execute("PRAGMA user_version=32")
     conn.close()
     s = Store.open(db)

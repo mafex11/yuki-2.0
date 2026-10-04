@@ -415,9 +415,44 @@ def due_words(at: float | None, all_day: bool, now: float) -> tuple[str, bool]:
     today = datetime.fromtimestamp(now).date()
     day_of = datetime.fromtimestamp(at).date()
     over = day_of < today if all_day else at < now
-    day = "tomorrow" if day_of == today + timedelta(days=1) else nat_day(at, today=today)
+    if day_of == today + timedelta(days=1):
+        day = "tomorrow"
+    elif day_of not in (today, today - timedelta(days=1)) and abs((day_of - today).days) <= 6:
+        day = f"{day_of:%A}"   # within the week either way: "due Monday", "was due Wednesday" (the Work page, 4 Oct)
+    else:
+        day = nat_day(at, today=today)
     words = day if all_day else f"{day}, {nat_time(at)}"
     return (f"was due {words}" if over else f"due {words}"), over
+
+
+def week_words(at: float | None, now: float) -> str:
+    """When something happened, the one way the Work page says it: ``8:01 PM`` today, ``yesterday``, a weekday within
+    the last six days (``Wednesday``), else ``25 September``. A deterministic format, nothing else."""
+    from yuki.ui.window.data import nat_day, nat_time
+
+    if not at:
+        return ""
+    today, d = datetime.fromtimestamp(now).date(), datetime.fromtimestamp(at).date()
+    if d == today:
+        return nat_time(at)
+    if d == today - timedelta(days=1):
+        return "yesterday"
+    if timedelta(days=0) < today - d <= timedelta(days=6):
+        return f"{d:%A}"
+    return nat_day(at, today=today)
+
+
+def ahead_words(at: float | None, all_day: bool, now: float) -> str:
+    """When something comes up: ``today 4 PM``, ``tomorrow 11 AM``, ``Monday 4 PM`` within the week, else ``12 October
+    4 PM`` (a day alone without the time)."""
+    from yuki.ui.window.data import nat_day, nat_time
+
+    if not at:
+        return ""
+    today, d = datetime.fromtimestamp(now).date(), datetime.fromtimestamp(at).date()
+    day = ("today" if d == today else "tomorrow" if d == today + timedelta(days=1)
+           else f"{d:%A}" if timedelta(days=0) < d - today <= timedelta(days=6) else nat_day(at, today=today))
+    return day if all_day else f"{day} {nat_time(at)}"
 
 
 def todo_view(t: dict[str, Any], now: float) -> dict[str, Any]:
@@ -432,19 +467,25 @@ def todo_view(t: dict[str, Any], now: float) -> dict[str, Any]:
     ref, source = str(t.get("id") or ""), str(t.get("source") or "")
     since = epoch_of(t.get("since"))
     evidence = natural(" ".join(str(t.get("evidence") or "").split())) if source == "loop" else ""
+    today = datetime.fromtimestamp(now).date()
+    tomorrow = due_at is not None and datetime.fromtimestamp(due_at).date() == today + timedelta(days=1)
     return {"ref": ref, "text": " ".join(str(t.get("text") or "").split()),
             "title": " ".join(str(t.get("title") or "").split()) or None, "from": TODO_FROM.get(source, ""),
             "due": due, "over": over, "due_at": due_at, "all_day": all_day, "since": since,
-            "added": nat_day(since, today=datetime.fromtimestamp(now).date()) if since else "",
+            "added": nat_day(since, today=today) if since else "",
             "evidence": evidence or None, "undo": ref.startswith("todo:"),
-            "status": "open" if t.get("status") == "open" else "done"}
+            "status": "open" if t.get("status") == "open" else "done",
+            # the Work page (4 Oct): which source and whose, and whether it is due tomorrow (its head's count)
+            "source": source, "tomorrow": bool(tomorrow)}
 
 
-def todo_lists(memory: Any, now: float, *,
-               include_done: bool = False) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def todo_lists(memory: Any, now: float, *, include_done: bool = False,
+               rows: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """``(open, done)``: the open to-dos, the ones due first (soonest, so the overdue lead) then the undated newest
-    first; with ``include_done``, the ones done lately (memory's order: newest first). Empty when memory can't say."""
-    rows = _safe(lambda: memory.todos(include_done=include_done), []) or []
+    first; with ``include_done``, the ones done lately (memory's order: newest first). Empty when memory can't say.
+    ``rows``: memory's ``todos()`` already read."""
+    if rows is None:
+        rows = _safe(lambda: memory.todos(include_done=include_done), []) or []
     views = [todo_view(t, now) for t in rows if isinstance(t, dict) and t.get("id")]
     opened = sorted((v for v in views if v["status"] == "open"),
                     key=lambda v: (v["due_at"] is None, v["due_at"] or 0.0, -(v["since"] or 0.0)))
@@ -1144,26 +1185,218 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
 
 
 # -- Work and the Day ----------------------------------------------------------------------------------------------
-# Work (the 4 Oct decision: threads left the window; memory keeps them for the agent, nothing shows them): the to-do
-# list and today's sessions side by side, under the week figure; the Day tab is the day's skyline as before.
+# Work (the user, 4 Oct: "a to-do list and other things that can help me track work and help me with work"; threads
+# left the window, memory keeps them for the agent and the Continue run): the week's hours in the head, then Today
+# (focus against your usual, the longest stretch, what you worked on, what's coming up), then two columns: Your list
+# and Waiting on; Needs your reply and You said you'd. The judged parts (who waits on a reply, who owes what, the
+# meetings) are memory's (yuki.memory.workboard); everything else is a query and a deterministic format.
+
+#: Today's "Worked on today": the threads with the most time today, at most.
+WORKED_SHOWN = 3
+#: "Your usual by now": the same weekday this many weeks back (at least USUAL_MIN_DAYS with time at the PC), else
+#: every day of the last USUAL_FALLBACK_DAYS.
+USUAL_WEEKS = 4
+USUAL_MIN_DAYS = 2
+USUAL_FALLBACK_DAYS = 7
+
+
+def _quote_of(evidence: Any) -> str:
+    """A commitment's own words from memory's to-do evidence (``the user said in a call on 2026-10-02: "…"``, the
+    format :func:`yuki.memory.nudges.todo_items` writes): the quoted part, or ``""``."""
+    t = " ".join(str(evidence or "").split())
+    i = t.find(': "')
+    return t[i + 3:-1] if i >= 0 and t.endswith('"') and len(t) > i + 4 else ""
+
+
+def active_minutes_by_day(memory: Any, days: list[date], seconds_into_day: float) -> dict[date, float]:
+    """Minutes at the PC, not full screen, on each of ``days`` from its midnight up to ``seconds_into_day`` (the
+    timeline, as the week figure reads it: active and passive time of present stretches, the full-screen part taken
+    off). One read for all the days."""
+    out = {d: 0.0 for d in days}
+    for d in days:   # each day's own stretch only (midnight to this time of day): a few small indexed reads
+        d0 = datetime.combine(d, datetime.min.time()).timestamp()
+        for r in _safe(lambda: memory.day_timeline(d0, d0 + seconds_into_day), []) or []:
+            if r.get("state") != "present" or r.get("fullscreen"):
+                continue
+            s0, e0 = float(r.get("start") or 0), float(r.get("end") or 0)
+            ov = min(e0, d0 + seconds_into_day) - max(s0, d0)
+            if ov > 0:
+                present = float(r.get("active_s") or 0) + float(r.get("passive_s") or 0)
+                out[d] += present * ov / max(1e-6, e0 - s0) / 60.0
+    return out
+
+
+#: "Your usual by now" moves slowly: read again at most this often (seconds), per memory file and day.
+USUAL_CACHE_S = 600.0
+_usual_cache: dict[Any, tuple[float, float | None]] = {}
+
+
+def usual_by_now(memory: Any, now: float) -> float | None:
+    """Your usual minutes at the PC (not full screen) by this time of day: the median over the same weekday of the
+    last :data:`USUAL_WEEKS` weeks (days with any such time), or, with fewer than :data:`USUAL_MIN_DAYS` of them, over
+    the last :data:`USUAL_FALLBACK_DAYS` days. ``None`` with too little history."""
+    import statistics
+
+    today = datetime.fromtimestamp(now).date()
+    key = (str(getattr(getattr(memory, "store", None), "path", id(memory))), today)
+    hit = _usual_cache.get(key)
+    if hit is not None and 0 <= now - hit[0] < USUAL_CACHE_S:
+        return hit[1]
+    value = _usual(memory, now, today)
+    _usual_cache.clear()
+    _usual_cache[key] = (now, value)
+    return value
+
+
+def _usual(memory: Any, now: float, today: date) -> float | None:
+    import statistics
+
+    into = now - datetime.combine(today, datetime.min.time()).timestamp()
+    same = [today - timedelta(days=7 * k) for k in range(1, USUAL_WEEKS + 1)]
+    recent = [today - timedelta(days=k) for k in range(1, USUAL_FALLBACK_DAYS + 1)]
+    mins = active_minutes_by_day(memory, sorted(set(same) | set(recent)), into)
+    used = [mins[d] for d in same if mins.get(d, 0) >= 1]
+    if len(used) < USUAL_MIN_DAYS:
+        used = [mins[d] for d in recent if mins.get(d, 0) >= 1]
+        if len(used) < 3:
+            return None
+    return float(statistics.median(used))
+
+
+def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[str, Any], now: float) -> dict[str, Any]:
+    """Today on the Work page, the same figures as the Day tab (``v``: the day view both read): ``focus`` minutes
+    (the Day's Active: at the PC, not full screen) and your ``usual`` by now; the ``longest`` stretch in one app
+    (the Day's Longest focus) with the session it was in; ``worked``: the threads of work with the most time today
+    (``[title, minutes, thread ref]``, from today's sessions grouped by the thread their journal entries belong to);
+    ``coming``: memory's meetings ahead (``[when words, title]``) and where they were seen."""
+    from yuki.ui.window.data import nat_time
+
+    t = v.totals if v is not None else {}
+    focus = round(max(0.0, float(t.get("present_s", 0) or 0) - float(t.get("fullscreen_s", 0) or 0)) / 60.0)
+    usual = usual_by_now(memory, now)
+    longest = None
+    if v is not None:
+        secs, app, start = longest_focus(v)
+        if secs >= 60:
+            inside = next((s for s in sessions if s.get("start_at", 0) - 60 <= start <= s.get("end_at", 0)), None)
+            title = inside.get("title") if inside and inside.get("title") and inside.get("title") != app else None
+            longest = {"min": round(secs / 60.0), "app": app, "title": title, "at": start, "from": nat_time(start)}
+    worked: list[list[Any]] = []
+    spans = [(s["start_at"], s["end_at"]) for s in sessions if s.get("start_at") and s.get("end_at")]
+    threads = _safe(lambda: memory.work_threads_for(spans), None) if spans else None
+    if threads:
+        mins: dict[str, list[Any]] = {}
+        for s, th in zip([s for s in sessions if s.get("start_at") and s.get("end_at")], threads):
+            if not th:
+                continue
+            m = sum(int(x[1] or 0) for x in s.get("apps") or [])
+            row = mins.setdefault(th["ref"], [th["title"], 0, th["ref"]])
+            row[1] += m
+        worked = sorted((r for r in mins.values() if r[1] >= 1), key=lambda r: -r[1])[:WORKED_SHOWN]
+    coming = [[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
+    seen = list(dict.fromkeys(a for m in (board.get("meetings") or [])[:3] for a in m.get("seen") or []))
+    return {"focus": focus, "usual": round(usual) if usual is not None else None, "longest": longest,
+            "worked": worked, "coming": coming,
+            "coming_seen": f"seen on your screen in {_and(seen)}" if seen else ""}
+
+
+def _from_words(t: dict[str, Any], loop: dict[str, Any] | None, now: float) -> str:
+    """Where a row of Your list came from, in the Work page's words (Home keeps ``from``): ``added Wednesday``, ``you
+    told me, yesterday``, ``you said it on a call, Tuesday``, ``Mira asked in Slack, Wednesday``."""
+    src, day = t.get("source"), week_words(t.get("since"), now)
+    tail = f", {day}" if day else ""
+    if src == "user":
+        return f"added {day}" if day else ""
+    if src == "chat":
+        return "you told me" + tail
+    if src == "call":
+        return "you said it on a call" + tail
+    if src == "commitment":
+        return "I said I’d do it"
+    if src == "loop" and loop and loop.get("who") and loop.get("kind") in ("asked", "promised"):
+        where = f" in {loop['where']}" if loop.get("where") else ""
+        if loop["kind"] == "asked":
+            return f"{loop['who']} asked{where}{tail}"
+        return f"you promised {loop['who']}{where}{tail}"
+    return "I noticed it" + tail
+
+
+def work_columns(rows: list[dict[str, Any]], board: dict[str, Any], kept: list[dict[str, Any]],
+                 now: float) -> dict[str, Any]:
+    """memory's merged to-do list split over the page so each thing shows once: ``list`` (Your list: your to-dos,
+    Yuki's own promises, loops asked of you or not judged yet, and whatever you moved there), ``done`` (Recently
+    done), ``said`` (You said you'd: what you said on a call or told me, and loops where you promised someone; one
+    memory saw kept stays a while, struck through), ``waiting`` (loops where someone owes you)."""
+    loops = {int(k): v for k, v in (board.get("loops") or {}).items()}
+    listed = set(board.get("listed") or [])
+    raw = {str(r.get("id")): r for r in rows if isinstance(r, dict)}
+    open_todos, done_todos = todo_lists(None, now, include_done=True, rows=rows)
+    lst, said, waiting = [], [], []
+    for t in open_todos:
+        ref = t["ref"]
+        kind, _, number = ref.partition(":")
+        loop = loops.get(int(number)) if kind == "loop" and number.isdigit() else None
+        moved = ref in listed
+        if kind == "loop" and loop and loop.get("kind") == "waiting" and not moved:
+            waiting.append({"ref": ref, "who": loop.get("who") or "", "what": loop.get("what") or t["text"],
+                            "where": loop.get("where") or "", "since": t.get("since"),
+                            "day": week_words(t.get("since"), now), "draft": loop.get("draft") or "",
+                            "text": t["text"]})
+            continue
+        if not moved and ((kind == "commit" and t.get("source") in ("chat", "call"))
+                          or (kind == "loop" and loop and loop.get("kind") == "promised")):
+            quote = _quote_of(raw.get(ref, {}).get("evidence")) if kind == "commit" else ""
+            if kind == "commit":
+                where = ("on a call" if t.get("source") == "call" else "said to me")
+            else:
+                where = loop.get("where") or ""
+            said.append({"ref": ref, "title": (loop or {}).get("what") or t.get("title") or t["text"], "text": t["text"],
+                         "where": where, "day": week_words(t.get("since"), now), "quote": quote,
+                         "who": (loop or {}).get("who") or "", "due": t.get("due") or "", "over": t.get("over"),
+                         "due_at": t.get("due_at"), "all_day": t.get("all_day"), "since": t.get("since"),
+                         "tomorrow": t.get("tomorrow")})
+            continue
+        lst.append({**t, "meta": _from_words(t, loop, now), "moved": moved})
+    for k in kept:
+        said.append({"ref": k["ref"], "title": k.get("title") or k["text"], "text": k["text"],
+                     "closed": f"closed itself: I saw it done {week_words(k['closed_at'], now)}",
+                     "closed_at": k["closed_at"], "since": k.get("since")})
+    def loop_of(ref: str) -> dict[str, Any] | None:
+        kind, _, number = ref.partition(":")
+        return loops.get(int(number)) if kind == "loop" and number.isdigit() else None
+
+    done = [{**t, "meta": _from_words(t, loop_of(t["ref"]), now), "back": t["ref"].startswith(("todo:", "commit:"))}
+            for t in done_todos]
+    return {"list": lst, "done": done, "said": said, "waiting": waiting}
 
 
 def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict[str, Any] | None = None,
                now: float | None = None) -> dict[str, Any]:
-    """Work: ``todos``, the whole to-do list (``open``, due first; ``done``, the ones done lately, for the fold;
-    ``can``: its buttons; ``n``: how many are open); ``sessions``, today's sessions as the Day tab shows them (each
-    with ``start_at`` and ``end_at``: Home's Now tile opens Work at the one holding a moment); the week figure;
-    ``pending``: corrections sent on a to-do or a session and not landed yet; ``can``: Correct."""
+    """Work: ``todos`` (Your list: ``open`` in the list's order, each with its ``meta`` line; ``done``, Recently
+    done, with ``back`` where memory can put it back; ``can``: its buttons; ``n``), ``waiting`` (Waiting on),
+    ``replies`` (Needs your reply: ``ready`` false until memory has read the chats once), ``said`` (You said you'd),
+    ``today`` (:func:`work_today`), the week figure, ``pending`` (corrections sent and not landed) and ``can``."""
     from yuki.ui.window.data import build_day as qt_build_day
 
     now = time.time() if now is None else now
     v = _safe(lambda: qt_build_day(memory, datetime.fromtimestamp(now).date(), now=now, extras=False), None)
     sessions = day_sessions(memory, v) if v is not None else []
-    open_todos, done_todos = todo_lists(memory, now, include_done=True)
-    return {"todos": {"open": open_todos, "done": done_todos, "n": len(open_todos), "can": todo_can(memory)},
-            "sessions": sessions, "week": week if week is not None else week_figure(memory),
+    rows = _safe(lambda: memory.todos(include_done=True), []) or []
+    board = _safe(lambda: memory.work_board(now), {}) or {}
+    kept = _safe(lambda: memory.work_kept(now), []) or []
+    cols = work_columns(rows, board, kept, now)
+    replies = [{"key": r["key"], "who": r.get("who") or "", "msg": r.get("msg") or "", "app": r.get("app") or "",
+                "place": r.get("place") or "", "at": r.get("at"), "opened": bool(r.get("opened"))}
+               for r in board.get("replies") or []]
+    can = todo_can(memory)
+    can.update({"mark": callable(getattr(memory, "work_mark", None)), "reopen": callable(getattr(memory, "reopen_item", None))})
+    return {"todos": {"open": cols["list"], "done": cols["done"], "n": len(cols["list"]), "can": can},
+            "waiting": cols["waiting"], "said": cols["said"],
+            "replies": {"items": replies, "ready": bool(board.get("ready"))},
+            "today": work_today(memory, v, sessions, board, now),
+            "week": week if week is not None else week_figure(memory),
             "pending": pending_view(pending, ("episode:", *TODO_PREFIXES), now),
-            "next_at": todo_moment(open_todos, now),
+            "next_at": todo_moment(cols["list"], now),
             "can": {"correct": callable(getattr(memory, "correct_item", None))}}
 
 
@@ -2094,7 +2327,7 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 TODO_TABLES = ("todos", "conversation_facts", "open_loops")
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
     "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES),
-    "work": ("timeline", *TODO_TABLES),
+    "work": ("timeline", *TODO_TABLES, "work_items", "messages"),   # the Work page (4 Oct): replies, loops, meetings
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
     "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),

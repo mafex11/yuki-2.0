@@ -199,7 +199,7 @@ def test_an_older_memory_without_correct_item_uses_the_fixed_format(tmp_path):
 def test_the_fixture_has_the_round_3_shapes():
     data = web_window.load_fixture()
     work, day, home, me = (data["pages"][k] for k in ("work", "day", "home", "me"))
-    assert "threads" not in work and "closed" not in work and work["todos"]["open"] and work["sessions"]
+    assert "threads" not in work and "closed" not in work and work["todos"]["open"] and work["today"]
     assert "front" not in home["now"] and "thread" not in home["now"] and home["now"]["session"]["title"]
     titles = [s["title"] for s in day["sessions"]]
     assert len(set(titles)) == len(titles) and not any(t.endswith("…") for t in titles)

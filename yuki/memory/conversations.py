@@ -1868,6 +1868,21 @@ class ConversationWorker:
             self._log("conversation_error", purpose="commitments", error=f"{type(exc).__name__}: {exc}")
             return None
 
+    def check_work_board(self, now: float | None = None, *, dry_run: bool = False, force: bool = False) -> Any:
+        """The Work page's judgements (:mod:`yuki.memory.workboard`): which chats wait on the user's reply, who owes
+        what in the open loops, the meetings ahead; at most every 15 minutes, only for what changed (one Haiku
+        call). Never raises; returns the :class:`~yuki.memory.workboard.CheckResult` (``None`` when it could not
+        run)."""
+        try:
+            if getattr(self, "_work_board", None) is None:
+                from yuki.memory.workboard import WorkBoardChecker
+
+                self._work_board = WorkBoardChecker(self)
+            return self._work_board.check(now, dry_run=dry_run, force=force)
+        except Exception as exc:
+            self._log("conversation_error", purpose="work_board", error=f"{type(exc).__name__}: {exc}")
+            return None
+
     def reembed_turns(self, *, dry_run: bool = False, batch: int = 32) -> dict[str, int]:
         """Embed again the exchanges stored before migration 27 whose text carried Yuki's own notes (the voice
         hand-off's ~1.5-2.8k characters): their vectors then rest on the user's words, Yuki's reply and actions
@@ -1910,6 +1925,7 @@ class ConversationWorker:
                     result.summaries.append(self.summarize(sid, turns, now))
                 self.sort_owners()
                 self.check_commitments(wall)
+                self.check_work_board(wall)
                 if any(not r.ok for r in [*result.extractions, *result.summaries]):
                     self._retry_at = wall + self.retry_after_s
             if result.extractions or result.summaries:

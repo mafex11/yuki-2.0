@@ -2932,6 +2932,32 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE episodes ADD COLUMN summary_ciphertext TEXT;
     ALTER TABLE correction_passes ADD COLUMN target TEXT;
     """,
+    # 36 (2026-10-04, the Work page, docs/research/revamp-2026-10-02/68-build-appWork.md): work_items, one row per
+    # thing the Work page shows that needs a judgement or a mark of the user's (yuki.memory.workboard):
+    # - a chat (key "chat:<capture thread id>"): whether its newest messages wait on the user's reply, who and the
+    #   message to quote, judged on its newest message (basis); the user's marks: no_reply (No reply needed),
+    #   opened (Open chat); a mark lapses when a newer message arrives (mark_basis);
+    # - an open loop ("loop:<id>"): who owes what (waiting on someone, the user's own promise, asked of the user) in
+    #   a few words, and the nudge draft for one the user waits on, judged on the loop's last change;
+    # - "meetings": the meetings and calls coming up, read from what memory saw on screen, judged on the journal;
+    # - a commitment or loop the user moved to their list ("commit:<id>" / "loop:<id>", mark listed).
+    # Verdicts and words are encrypted; basis, marks and times are content-free. Additive only; one self-contained
+    # entry (renumber freely at a merge).
+    """
+    CREATE TABLE work_items (
+        id              INTEGER PRIMARY KEY,
+        key             TEXT NOT NULL UNIQUE,
+        kind            TEXT NOT NULL,           -- reply | loop | meetings | place
+        basis           TEXT,                    -- what the verdict was judged on (content-free)
+        data_ciphertext TEXT,                    -- the verdict as JSON
+        judged_at       REAL,
+        mark            TEXT,                    -- the user's: no_reply | opened | listed
+        mark_basis      TEXT,                    -- the basis the mark was set on
+        mark_at         REAL,
+        updated_at      REAL NOT NULL
+    );
+    CREATE INDEX work_items_kind ON work_items(kind, updated_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`

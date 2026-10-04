@@ -310,6 +310,96 @@ def set_clipboard(text: str) -> bool:
         user32.CloseClipboard()
 
 
+def app_windows(process: str | None) -> list[tuple[int, str]]:
+    """The windows a user can switch to of one app (``process``: memory's app key, ``discord``), on screen or
+    minimised, topmost first: ``[(hwnd, title)]``. Plain Win32 reads (no UI Automation): top level, unowned, visible,
+    with a title."""
+    from yuki.core.appnames import app_key
+
+    want = app_key(process or "")
+    if not want:
+        return []
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    found: list[tuple[int, str]] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def image(hwnd: int) -> str:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(0x1000, False, pid.value)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+            ok = kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+            return os.path.basename(buf.value) if ok else ""
+        finally:
+            kernel32.CloseHandle(h)
+
+    def each(hwnd: int, _l: int) -> bool:
+        try:
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, 4):   # GW_OWNER
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            if app_key(image(hwnd)) == want:
+                found.append((int(hwnd), buf.value))
+        except Exception:  # noqa: BLE001 - a window that closed meanwhile
+            pass
+        return True
+
+    user32.EnumWindows(proto(each), 0)
+    return found
+
+
+def bring_forward(place: dict[str, Any]) -> tuple[bool, str]:
+    """Bring a chat forward: the app's window that shows it (its title holds the chat's name), else the app's
+    topmost window, restored if minimised and focused; with no window of the app open, a web chat's own address in
+    the browser. Types, clicks and sends nothing. ``(ok, how)``: ``"chat"`` (its window), ``"app"``, ``"page"``."""
+    windows = app_windows(place.get("process"))
+    name = " ".join(str(place.get("name") or "").split()).casefold()
+    pick = next(((h, t) for h, t in windows if name and name in t.casefold()), None)
+    how = "chat" if pick else "app"
+    pick = pick or (windows[0] if windows else None)
+    if pick is not None:
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(pick[0]):
+            user32.ShowWindow(pick[0], 9)   # SW_RESTORE
+        return bool(user32.SetForegroundWindow(pick[0])), how
+    url = str(place.get("url") or "")
+    if url.startswith(("https://", "http://")):
+        import webbrowser
+
+        try:
+            return bool(webbrowser.open(url)), "page"
+        except Exception:  # noqa: BLE001
+            return False, ""
+    return False, ""
+
+
+def continue_request(cont: dict[str, Any]) -> str:
+    """The request a "Worked on today" row hands Yuki (the Continue run): bring back the windows and pages the thread
+    had, named as memory has them, and nothing else: no typing, clicking or sending."""
+    title = " ".join(str(cont.get("title") or "that").split())
+    names = []
+    for p in cont.get("places") or []:
+        if not isinstance(p, dict):
+            continue
+        t, app = " ".join(str(p.get("title") or "").split()), " ".join(str(p.get("app") or "").split())
+        what = f"“{t}” in {app}" if t and app else (f"“{t}”" if t else app)
+        url = str(p.get("url") or "")
+        if what and url.startswith(("https://", "http://")):
+            what += f" ({url})"
+        if what and what not in names:
+            names.append(what)
+    had = f": {'; '.join(names)}" if names else ""
+    return (f"Pick up {title}. Bring back the windows and pages I had open for it{had}. Only reopen them; "
+            "don't type, click or send anything.")
+
+
 class WebWindow:
     """One window's run: the page's requests, memory, the pipe, the snapshot, the timings.
 
@@ -1299,6 +1389,10 @@ class WebWindow:
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
         "todo_end": "a_todo_end", "todo_reopen": "a_todo_reopen", "todo_add": "a_todo_add",
+        # the Work page (report 68): a row's mark (No reply needed, a promise moved to your list), Open chat, a
+        # Worked-on-today row's Continue run, Draft a nudge (the ask bar, unsent)
+        "work_mark": "a_work_mark", "work_open_chat": "a_work_open_chat", "work_continue": "a_work_continue",
+        "work_nudge": "a_work_nudge",
         # Settings → AI (report 67): each job's service and model, a key, the other service's address, a model list,
         # a one-call test. Written here (ai.json, the DPAPI key file): no tray needed, every process follows
         "ai_role": "a_ai_role", "ai_key": "a_ai_key", "ai_custom": "a_ai_custom", "ai_models": "a_ai_models",
@@ -1415,6 +1509,19 @@ class WebWindow:
         fn = getattr(self._memory(), "correct_item", None)
         if not callable(fn):   # an older memory: the fixed-format correction (facts only)
             return self.a_correct({**m, "how": "correct", "words": words})
+        moved = None
+        if ref.split(":")[0] in ("todo", "commit") and callable(getattr(self._memory(), "set_due", None)):
+            # the Work page (report 68): "it's due Monday" moves the due date (one small model call reads it); the
+            # rest of your words go to the correction pass as before
+            from yuki.memory.workboard import read_correction
+
+            due, rest = read_correction(self._due_reader(), str(m.get("title") or m.get("text") or ""), words)
+            if due and self._memory().set_due(ref, due):
+                moved, words = due, rest
+                if not words:
+                    for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
+                        self.refresh(page)
+                    return {"ref": ref, "due": due, "correction_id": None}
         r = fn(ref, words) or {}
         if not r.get("ok"):
             return {"ok": False, "error": str(r.get("error") or "That can’t be corrected here.")}
@@ -1422,7 +1529,7 @@ class WebWindow:
         self._record_pending(ref, "correct", words, str(m.get("text") or ""), str(m.get("title") or ""), cid)
         for page in self.REF_PAGES.get(ref.split(":")[0], ("me",)):
             self.refresh(page)
-        return {"correction_id": cid, "ref": ref}
+        return {"correction_id": cid, "ref": ref, **({"due": moved} if moved else {})}
 
     #: How long a to-do you marked done here can be put back (memory's ``reopen_todo`` window).
     TODO_UNDO_S = 10 * 60.0
@@ -1432,33 +1539,60 @@ class WebWindow:
             self.refresh(page)
 
     def a_todo_end(self, m: dict[str, Any]) -> dict[str, Any]:
-        """A to-do's Done or Not needed (the list on Home and Work): memory's ``end_todo`` by the item's id, at once,
-        no model. ``undo``: whether its Undo can put it back (a to-do you added, within :data:`TODO_UNDO_S`)."""
+        """A to-do's Done or Not needed (the list on Home and Work), and a promise's Done or Not mine (``wrong``: it
+        was never yours; the extractor is shown it so the like is not taken again): memory's ``end_todo`` by the
+        item's id, at once, no model. ``undo``: whether its Undo can put it back (memory's ``reopen_item``: a to-do,
+        a commitment or a loop, within :data:`TODO_UNDO_S`; an older memory: a to-do you added)."""
         ref, how = str(m.get("ref") or ""), str(m.get("how") or "")
-        if how not in ("done", "not_needed") or not ref:
+        if how not in ("done", "not_needed", "wrong") or not ref:
             return {"ok": False, "error": "Unknown choice."}
         mem = self._memory()
         ended = mem.end_todo(ref, how)
         self._todo_refresh()
         if not ended:
             return {"ok": False, "error": "That’s already off your list."}
-        can_undo = ref.startswith("todo:") and callable(getattr(mem, "reopen_todo", None))
+        if callable(getattr(mem, "reopen_item", None)):
+            can_undo = ref.split(":")[0] in ("todo", "commit", "loop")
+        else:
+            can_undo = ref.startswith("todo:") and callable(getattr(mem, "reopen_todo", None))
         return {"ref": ended, "how": how, "undo": can_undo,
                 **({"until": time.time() + self.TODO_UNDO_S} if can_undo else {})}
 
     def a_todo_reopen(self, m: dict[str, Any]) -> dict[str, Any]:
-        """The Undo of a Done or Not needed on a to-do you added: memory's ``reopen_todo``; it is open again, as it was."""
-        fn = getattr(self._memory(), "reopen_todo", None)
-        back = fn(str(m.get("ref") or "")) if callable(fn) else None
+        """The Undo of a Done, Not needed or Not mine (memory's ``reopen_item``, within its 10 minutes; an older
+        memory: ``reopen_todo``), and with ``any`` a row of Recently done put back or a promise memory closed itself
+        reopened (Not done yet): open again, as it was."""
+        mem, ref = self._memory(), str(m.get("ref") or "")
+        fn = getattr(mem, "reopen_item", None)
+        if callable(fn):
+            back = fn(ref, any_age=bool(m.get("any")))
+        else:
+            old = getattr(mem, "reopen_todo", None)
+            back = old(ref) if callable(old) else None
         self._todo_refresh()
         if not back:
-            return {"ok": False, "error": "Too late to put it back (10 minutes)."}
+            return {"ok": False, "error": "I can’t put that back any more." if m.get("any") else "Too late to put it back (10 minutes)."}
         return {"ref": back}
 
+    #: The model client the add field's due words are read with (one small call per add), made on first use.
+    _due_client: Any = None
+
+    def _due_reader(self) -> Any:
+        if self._due_client is None:
+            try:
+                from yuki.agent.failover import make_client
+
+                WebWindow._due_client = make_client()
+            except Exception:  # noqa: BLE001 - no client: the words go in whole, with no due
+                return None
+        return self._due_client
+
     def a_todo_add(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Add from the window: your words as the to-do (memory's ``add_todo``, as the voice adds one), with the due
-        day and time from the page's own date and time fields (machine values ``YYYY-MM-DD`` and ``HH:MM``, checked
-        here; nothing is read out of the words)."""
+        """Add from the window: your words as the to-do (memory's ``add_todo``, as the voice adds one). With the page's
+        own date and time fields (machine values ``YYYY-MM-DD`` and ``HH:MM``, checked here) they are the due; without
+        them (the Work page's one field, "send Jonas the slides by Monday"), memory reads the due from your words with
+        one small model call (``add_todo_words``; offline, the words go in whole with no due). Returns the id, the due
+        it took and the words it kept."""
         from datetime import datetime
 
         text = " ".join(str(m.get("text") or "").split())
@@ -1475,9 +1609,68 @@ class WebWindow:
                     due = f"{day} {clock}"
         except ValueError:
             return {"ok": False, "error": "That date isn’t one I can read. Pick it again."}
-        ref = self._memory().add_todo(text, due)
+        mem = self._memory()
+        if due is None and m.get("words") and callable(getattr(mem, "add_todo_words", None)):
+            ref, due = mem.add_todo_words(text, self._due_reader())
+        else:
+            ref = mem.add_todo(text, due)
         self._todo_refresh()
-        return {"ref": ref}
+        return {"ref": ref, "due": due}
+
+    # -- the Work page (report 68) -----------------------------------------------------------------------------------
+
+    def a_work_mark(self, m: dict[str, Any]) -> dict[str, Any]:
+        """A Work row's mark, at once, no model: No reply needed on a chat (``no_reply``), a promise moved to your list
+        (``listed``), or none (their Undo)."""
+        key, mark = str(m.get("key") or ""), m.get("mark")
+        if mark not in (None, "no_reply", "listed"):
+            return {"ok": False, "error": "Unknown choice."}
+        ok = self._memory_op("work_mark")(key, mark)
+        self.refresh("work")
+        if mark == "listed" or mark is None:
+            self.refresh("home")
+        return {} if ok else {"ok": False, "error": "That changed since you opened it. I’ll show it again."}
+
+    def a_work_open_chat(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Needs your reply's Open chat: the chat's app brought forward (its window that shows the chat when one does;
+        a web chat with no window open, its address), and the row marked opened until your reply is captured. Types,
+        clicks and sends nothing."""
+        key = str(m.get("key") or "")
+        place = self._memory_op("work_chat")(key)
+        if not place:
+            return {"ok": False, "error": "I can’t find that chat any more."}
+        ok, how = bring_forward(place)
+        app = str(place.get("app") or "the app")
+        if not ok:
+            return {"ok": False, "error": f"{app} isn’t open, so I couldn’t bring the chat forward."}
+        self._memory_op("work_mark")(key, "opened")
+        self.refresh("work")
+        return {"app": app, "how": how}
+
+    def a_work_continue(self, m: dict[str, Any]) -> dict[str, Any]:
+        """A "Worked on today" row: the Continue run at once (the thread's windows and pages, read again here from
+        memory's ``thread_continue``; the page sends only the thread's id), handed to Yuki as your request. It
+        reopens what you had and types, clicks and sends nothing."""
+        cont = self._memory_op("thread_continue")(str(m.get("ref") or ""))
+        if not cont:
+            return {"ok": False, "error": "I can’t find that work any more."}
+        return {**self._tray("submit", text=continue_request(cont)), "title": cont.get("title") or ""}
+
+    def a_work_nudge(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Waiting on's Draft a nudge: memory's draft for that loop (read again here by its id; the page sends no
+        words) put in the ask bar **unsent**, marked as a nudge from Work. Only your own Send runs it, with the send
+        countdown like any message."""
+        ref = str(m.get("ref") or "")
+        kind, _, number = ref.partition(":")
+        board = self._memory_op("work_board")() or {}
+        loop = (board.get("loops") or {}).get(int(number)) if kind == "loop" and number.isdigit() else None
+        draft = " ".join(str((loop or {}).get("draft") or "").split())
+        if not draft:
+            return {"ok": False, "error": "I have no draft for that yet."}
+        who = " ".join(str((loop or {}).get("who") or "").split())
+        self._grant_foreground()
+        r = self._tray("askbar", text=draft, note=f"a nudge for {who} · from Work → Waiting on" if who else "from Work → Waiting on")
+        return {**r, "text": draft} if r.get("ok", True) else r
 
     def a_cancel_correction(self, m: dict[str, Any]) -> dict[str, Any]:
         """The Undo of a Correct while it waits (memory's ``cancel_correction``); once the pass started it is too late

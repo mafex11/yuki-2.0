@@ -155,7 +155,7 @@ async function main() {
 
     // the countdowns in the window: where to go, what to press
     const CASES = [
-      { name: 'Work: Done on a to-do', page: 'work', press: '.todo[data-cref] [data-do="todo-end"][data-how="done"]' },
+      { name: 'Work: Done on a to-do', page: 'work', press: '.wli[data-cref] [data-do="todo-end"][data-how="done"]' },
       { name: 'Me: Right on a fact to review', page: 'me', press: '.rv[data-resolve] [data-do="resolve"][data-verdict="right"]' },
       { name: 'Me: Right on a misheard entry', page: 'me', press: '[data-resolve][data-op="heard"] [data-do="resolve"]' }
     ];

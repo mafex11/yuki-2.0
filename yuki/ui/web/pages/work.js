@@ -1,13 +1,17 @@
-/* Work: your to-do list (open ones due first, with Done / Not needed / Correct, Add, the ones done lately folded) and
-   today's sessions (a short title; opened, the summary and the time per app), under the week's hours; and the Day
-   tab: the day as a dot skyline you can scrub (the readout follows the cursor; arrow keys move it), today's totals,
-   the week by hour, sessions and calls. Threads of work are not shown (the 4 Oct decision: memory keeps them for
-   Yuki's own use). Everything drawn is measured by memory's timeline or is memory's list; nothing here guesses what
-   an app is (full screen is a measured signal, not a game detector). */
+/* Work (the page the user approved on 4 Oct, docs/research/revamp-2026-10-02/68-build-appWork.md): the week's hours in
+   the head with how many things are due tomorrow; Today across the top (focus against your usual by now, the longest
+   stretch, what you worked on, what's coming up); then two balanced columns: Your list and Waiting on on the left,
+   Needs your reply and You said you'd on the right. Every row is one line and a short meta line; its keys show over
+   the end of the line on hover or keyboard focus. Done, Not needed, They did it, No reply needed, Add to list and Not
+   mine settle the row in place with Undo and a dot drain, then it leaves. And the Day tab: the day as a dot skyline
+   you can scrub, today's totals, the week by hour, sessions and calls (unchanged).
+   Every button goes to Python (Yk.act) with machine fields; nothing here reads what a message says, nothing is sent
+   from here (a nudge is a draft put in the ask bar), and Open chat only brings a chat forward. */
 (function () {
   'use strict';
-  const Y = window.Yk, { h, key, fmt } = Y;
-  const tabs = (sub) => Y.seg([['', 'Work'], ['day', 'Day']], 'sub', sub === 'day' ? 'day' : '');
+  const Y = window.Yk, { h, ic, key, fmt } = Y;
+  const isDay = (sub) => sub === 'day' || String(sub || '').startsWith('day/');
+  const tabs = (sub) => Y.seg([['', 'Work'], ['day', 'Day']], 'sub', isDay(sub) ? 'day' : '');
 
   /* the week bars (the 3 Oct item 16): a bar is your hours at the PC that day, its outlined top the part that was
      full screen, today brightest and labelled; hovering or focusing a day shows its readout and brightens its
@@ -48,54 +52,230 @@
   document.addEventListener('focusin', (e) => { const b = e.target.closest && e.target.closest('[data-wk]'); if (b) wkHover(+b.dataset.wk); });
   document.addEventListener('focusout', (e) => { if (e.target.closest && e.target.closest('[data-wk]')) wkHover(null); });
 
-  /* ---------- Work: the to-do list and today's sessions ---------- */
-  const OPEN_SHOWN = 8;   // open to-dos drawn at once; the rest fold under them (the two columns stay about level)
-  function addLine(T) {
-    if (!(T.can || {}).add) return null;
-    return h('div', { class: 'td-add', data: { k: 'add' } },
-      h('input', { class: 'td-in', data: { enter: 'todo-add' }, attrs: { 'aria-label': 'A new to-do', placeholder: 'Add a to-do, then Enter', autocomplete: 'off', maxlength: 300 } }),
-      h('input', { class: 'td-day', attrs: { type: 'date', 'aria-label': 'Due day, if it has one', title: 'Due day, if it has one' } }),
-      key('Add', { cls: 'xs', data: { do: 'todo-add' } }));
+  /* ---------- Work: Today, Your list, Waiting on, Needs your reply, You said you'd ---------- */
+  const SHOWN = 6;   // a long list shows its first 6 rows by position; the rest fold behind "Show N more"
+  const W = () => (Y.S.work = Y.S.work || { more: {}, doneOpen: false, adding: [], seen: null, arrived: new Set(), opened: new Set(), listed: new Map(), flash: null });
+  const workData = () => Y.D.pages.work || {};
+  const nowS = () => Date.now() / 1000;
+  const acts = (...keys) => h('div', { class: 'wacts' }, keys);
+  const av = (name) => h('span', { class: 'wav', aria: { hidden: 'true' }, text: (String(name || '?').trim().charAt(0) || '?').toUpperCase() });
+  const wempty = (text) => h('div', { class: 'wempty', text });
+  /* how long ago, as people say it: "12 min", "1 hour", "3 hours", "yesterday", "4 days" (counted on the page) */
+  function ageWords(at) {
+    if (!at) return '';
+    const s = nowS() - at;
+    if (s < 3600) return `${Math.max(1, Math.round(s / 60))} min`;
+    const d = new Date(at * 1000), t = new Date(), y = new Date(t); y.setDate(t.getDate() - 1);
+    if (d.toDateString() === t.toDateString()) { const hh = Math.floor(s / 3600); return hh === 1 ? '1 hour' : `${hh} hours`; }
+    if (d.toDateString() === y.toDateString()) return 'yesterday';
+    const days = Math.max(2, Math.round((new Date(t.toDateString()) - new Date(d.toDateString())) / 86400000));
+    return `${days} days`;
   }
-  /* a to-do done lately (memory keeps 14 days of them): what it was, quietly; one you ended here a moment ago keeps
-     its Undo for the rest of memory's 10 minutes (review F5: the drain's 5 s is not the only chance) */
-  function doneRow(t) {
-    const until = Y.todoUndoUntil(t.ref);
-    const row = h('div', { class: 'todo done', data: { k: 'done:' + t.ref, dref: until ? t.ref : null } }, h('i', { class: 'td-dot on', aria: { hidden: 'true' } }),
-      h('div', { class: 'td-b' }, h('div', { class: 'td-t', text: t.title || t.text, title: t.title ? t.text : '' }), t.from ? h('div', { class: 'td-m' }, h('span', { text: t.from })) : null),
-      until ? h('div', { class: 'td-acts' }, key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen-done' }, title: 'Put it back on your list' }),
-        h('span', { class: 'until', data: { until }, text: `${Math.max(1, Math.round((until * 1000 - Date.now()) / 60000))} min left` })) : null);   // counted down by the ticker
-    row.__t = t;
-    return row;
+  /* how long you have waited: one dot per day (a half-lit one for hours), then the words */
+  function ageDots(at) {
+    const days = at ? Math.floor((nowS() - at) / 86400) : 0;
+    return h('span', { class: 'wage', title: at ? `since ${fmt.natWhen(at)}` : '' },
+      h('span', { class: 'adots', aria: { hidden: 'true' } }, [0, 1, 2].map((i) => h('i', { class: i < days ? 'on' : (!days && !i ? 'half' : '') }))),
+      h('span', { text: days >= 1 ? (days === 1 ? '1 day' : `${days} days`) : ageWords(at) }));
   }
-  function todoBlock(d) {
-    const T = d.todos;
-    if (!T) return Y.k(Y.sec('To-dos', null, Y.empty('Reading your list…')), 'todos');   // a snapshot from before the list
-    const open = Y.todosOpen(T), allDone = (T.done || []).filter((t) => !open.some((o) => o.ref === t.ref));
-    const undoNow = allDone.filter((t) => Y.todoUndoUntil(t.ref)), done = allDone.filter((t) => !Y.todoUndoUntil(t.ref));   // ended here: in view, with Undo
-    const row = (t) => Y.todoRow(t, d, 'work', true);
-    const first = open.slice(0, OPEN_SHOWN), rest = open.slice(OPEN_SHOWN);
-    const body = [addLine(T),
-      open.length ? h('div', { class: 'todos' }, first.map(row)) : Y.empty('Nothing on your list. Ask me to keep a to-do, or add one here.'),
-      rest.length ? Y.fold('todos-more', h('span', { class: 'tx', text: `${rest.length} more` }), null, h('div', { class: 'todos' }, rest.map(row)), { cls: 'tdfold' }) : null,
-      undoNow.length ? h('div', { class: 'todos td-just', data: { k: 'just' } }, undoNow.map(doneRow)) : null,
-      done.length ? Y.fold('todos-done', h('span', { class: 'tx', text: 'Done lately' }), h('span', { text: String(done.length) }), h('div', { class: 'todos' }, done.map(doneRow)), { cls: 'tdfold' }) : null];
-    return Y.k(Y.sec('To-dos', open.length, body, Y.rightLabel('due first'), 'todosec'), 'todos');
+  /* settle a row in place: what happened, Undo and a short dot drain, then it leaves; `send` goes to memory at once
+     (its promise), `undo` takes it back, `strike` keeps the title struck through beside the words. The row is held
+     through redraws (app.js holdsHands: __res) and keyboard focus moves to Undo, back to the same key after Undo, and
+     on to the next row once it goes. */
+  const SETTLE_MS = 5000;
+  function settle(row, words, o) {
+    if (!row || row.__res) return;
+    const ae = document.activeElement, hadFocus = !!ae && row.contains(ae), fDo = hadFocus && ae.dataset ? ae.dataset.do || '' : '';
+    const res = { kids: Array.from(row.childNodes), cls: row.className };
+    row.__res = res;
+    res.p = (o.send ? o.send() : Promise.resolve({ ok: true })).then((r) => {
+      if (!r.ok && row.__res === res) { back(row); Y.toast(r.error || 'Couldn’t change it. Memory didn’t answer.', true); }
+      return r;
+    });
+    row.classList.add('settling');
+    if (o.strike) row.classList.add('isdone');
+    const mark = o.strike && row.querySelector('.ck') ? row.querySelector('.ck').cloneNode(true) : h('span', { class: 'ckd' }, ic(o.icon || 'check'));
+    if (mark.tagName === 'BUTTON') mark.disabled = true;
+    const title = o.strike ? (row.querySelector('.wt') || {}).textContent || '' : '';
+    row.replaceChildren(mark, h('div', { class: 'confirm res wsettle' }, o.strike ? h('span', { class: 'wt', text: title }) : null, h('span', { text: words }),
+      o.undo === false ? null : key('Undo', { cls: 'xs ghost', data: { do: 'work-undo' } }), h('i', { class: 'res-drain', aria: { hidden: 'true' } })));
+    Y.pop(row.lastElementChild);
+    if (hadFocus) { const u = row.querySelector('[data-do="work-undo"]'); if (u) u.focus({ preventScroll: true }); }
+    res.undo = () => {
+      clearTimeout(res.timer);
+      res.p.then((first) => (first && first.ok && o.undo ? o.undo() : { ok: true })).then((r) => {
+        if (!r.ok) { Y.toast(r.error || 'Couldn’t put it back.', true); return; }
+        back(row);
+        if (o.after) o.after(true);
+        if (fDo) { const b = row.querySelector(`[data-do="${fDo}"]`); if (b) b.focus({ preventScroll: true }); }
+        Y.renderMain();
+      });
+    };
+    res.timer = setTimeout(() => {
+      if (row.__res !== res) return;
+      row.__res = null; row.__leaving = true;
+      focusNear(row);
+      Y.leave(row);
+      setTimeout(() => { if (o.after) o.after(false); Y.renderMain(); }, 460);
+    }, SETTLE_MS);
   }
-  function work(d, S) {
-    const T = d.todos, open = T ? Y.todosOpen(T) : [];
-    const w = d.week || {}, tot = w.totals || {};
-    const sess = (d.sessions || []).slice().reverse();
-    const meta = [T ? h('span', null, h('b', { text: open.length }), open.length === 1 ? ' to-do open' : ' to-dos open') : null,
-      h('span', null, h('b', { text: sess.length }), sess.length === 1 ? ' session today' : ' sessions today'),
-      tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
-    const sessions = Y.k(Y.sec('Sessions today', sess.length, sess.length ? sess.map((s) => sessionRow(s, d, 'work')) : Y.empty(d.sessions ? 'No sessions yet today.' : 'Reading your day…'),
-      Y.rightLabel('latest first')), 'sessions');
-    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'),
-      h('div', { class: 'grid2 wk-grid', data: { k: 'grid' } }, h('div', { class: 'col', data: { k: 'left' } }, todoBlock(d)),
-        h('div', { class: 'col', data: { k: 'right' } }, sessions))];
+  function back(row) {
+    const res = row.__res; if (!res) return;
+    clearTimeout(res.timer); row.__res = null;
+    row.className = res.cls; row.replaceChildren(...res.kids);
+  }
+  /* a row about to leave while it holds keyboard focus hands it to the next row (or the one above) */
+  function focusNear(row) {
+    if (!row.contains(document.activeElement)) return;
+    const ok = (r) => r && r.classList && r.classList.contains('wrow') && !r.__leaving && r.offsetParent;
+    let r = row.nextElementSibling; while (r && !ok(r)) r = r.nextElementSibling;
+    if (!r) { r = row.previousElementSibling; while (r && !ok(r)) r = r.previousElementSibling; }
+    const f = r ? r.querySelector('button') : null;
+    if (f) f.focus({ preventScroll: true });
+  }
+  Y.actions['work-undo'] = (t) => { const row = t.closest('.wrow'); if (row && row.__res && row.__res.undo) { t.disabled = true; row.__res.undo(); } };
+
+  /* ---- Today: four clearings across the top (the same figures as the Day tab) ---- */
+  function todayStrip(T) {
+    if (!T) return null;
+    const focus = T.focus || 0, usual = T.usual;
+    // one dot per 10 minutes; past 4 hours a dot stands for more (whole tens of minutes), so the meter stays one line
+    const unit = 10 * Math.max(1, Math.ceil(Math.max(focus, usual || 0) / 240));
+    const all = Math.max(1, Math.round(Math.max(focus, usual || 0) / unit)), lit = Math.min(all, Math.round(focus / unit));
+    const uAt = usual != null ? Math.min(all, Math.max(1, Math.round(usual / unit))) - 1 : -1;
+    const meter = h('span', { class: 'fmeter', attrs: { role: 'img', 'aria-label': `${fmt.dur(focus)} so far${usual != null ? `; your usual by now is ${fmt.dur(usual)}` : ''}` } },
+      Array.from({ length: all }, (_, i) => h('i', { class: (i < lit ? 'on' : '') + (i === uAt ? ' u' : '') })));
+    const L = T.longest;
+    const worked = (T.worked || []).map(([title, min, ref]) => h('button', { class: 'tw', data: { do: 'work-continue', ref },
+      attrs: { type: 'button', title: 'Pick it up: I reopen the windows you had. I type and send nothing.', 'aria-label': `Pick up ${title}, ${fmt.dur(min)} today` } },
+    h('span', { text: title }), h('span', { class: 'mono', text: fmt.dur(min) }), ic('chev')));
+    const coming = (T.coming || []).map(([when, title]) => h('div', { class: 'tc' }, h('span', { class: 'mono', text: when }), h('span', { text: title, title })));
+    return h('div', { class: 'wk-today', data: { k: 'today' } },
+      Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Focus today' }), h('a', { class: 'golink', attrs: { href: '#work/day' } }, 'Your day', ic('chev'))),
+        h('div', { class: 'big', title: 'Time at the PC today, not full screen (the Day tab’s Active)' }, h('span', { class: 'doto', text: fmt.dur(focus) })), meter,
+        h('div', { class: 'sm', text: usual != null ? `Your usual by now is about ${fmt.dur(usual)}` : 'No usual yet: I need a few more days at the PC.' })),
+      Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Longest stretch' })),
+        L ? [h('div', { class: 'big' }, h('span', { class: 'doto', text: fmt.dur(L.min) })), h('div', { class: 'sm', text: `${L.app}${L.title ? ', on ' + L.title : ''}, from ${L.from}` })]
+          : h('div', { class: 'sm', text: 'No stretch in one app yet today.' })),
+      Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Worked on today' })),
+        worked.length ? h('div', { class: 'twl' }, worked) : h('div', { class: 'sm', text: 'Nothing I could tie to your work yet today.' })),
+      Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Coming up' })),
+        coming.length ? [h('div', { class: 'twl' }, coming), T.coming_seen ? h('div', { class: 'sm t3 mono tseen', text: T.coming_seen }) : null]
+          : h('div', { class: 'sm', text: 'Nothing coming up that I’ve seen on your screen.' })));
   }
 
+  /* ---- Your list (the to-do list, shared with Home: Y.todoRow's work look, Y.todosOpen) ---- */
+  const madeHere = (ref) => W().listed.has(ref);
+  function listItems(d) {
+    const T = d.todos || {}, w = W();
+    const open = Y.todosOpen(T).slice();
+    // a promise you just moved here shows at once, before memory's next build has it (and once it has, it's that row)
+    for (const [ref, view] of w.listed) if (!open.some((t) => t.ref === ref)) open.unshift(view);
+    // just added first (the last ten minutes, newest first), then the list's own order (late first, then by due)
+    const fresh = open.filter((t) => t.since && nowS() - t.since < 600 && (t.source === 'user' || madeHere(t.ref))).sort((a, b) => b.since - a.since);
+    return fresh.concat(open.filter((t) => !fresh.includes(t)));
+  }
+  function addLine(T) {
+    if (!(T.can || {}).add) return null;
+    return h('label', { class: 'wadd', data: { k: 'add' } }, ic('plus'),
+      h('input', { class: 'wl-in', data: { enter: 'work-add' }, attrs: { 'aria-label': 'Add to your list', placeholder: 'Add to your list… “send Sam the deck by Monday”', autocomplete: 'off', maxlength: 300 } }),
+      h('span', { class: 'hint', text: 'or say “Yuki, add…”' }));
+  }
+  function addingRow(a) {
+    return h('div', { class: 'wrow wli adding', data: { k: 'adding:' + a.id } }, h('span', { class: 'ck' }, h('i', { class: 'box' })),
+      h('div', { class: 'wtx' }, h('div', { class: 'wt', text: a.text }), h('div', { class: 'wm' }, h('span', { text: 'adding it…' }))), h('span'));
+  }
+  function doneRow(t) {
+    return h('div', { class: 'wrow wdone', data: { k: 'done:' + t.ref } }, h('span', { class: 'ckd' }, ic(t.status === 'dropped' ? 'dash' : 'check')),
+      h('div', { class: 'wtx' }, h('div', { class: 'wt', text: t.title || t.text, title: t.text }), t.meta ? h('div', { class: 'wm' }, h('span', { text: t.meta })) : null),
+      t.back && (workData().todos.can || {}).reopen ? acts(key('Put it back', { cls: 'xs ghost', data: { do: 'work-back', ref: t.ref } })) : h('span'));
+  }
+  function listBlock(d) {
+    const T = d.todos, w = W();
+    if (!T) return Y.k(Y.sec('Your list', null, wempty('Reading your list…'), null, 'wsec wk-list'), 'list');
+    const items = listItems(d);
+    for (const t of items) if (!(w.seen && w.seen.has(t.ref)) && t.since && nowS() - t.since < 120) w.arrived.add(t.ref);   // said to me: slides in once
+    w.seen = new Set(items.map((t) => t.ref).concat(w.seen ? Array.from(w.seen) : []));
+    const open = !!w.more.list, extra = Math.max(0, items.length - SHOWN);
+    const rows = items.map((t, i) => {
+      const r = Y.todoRow(t, d, 'work', true);
+      if (i >= SHOWN) r.classList.add('more');
+      if (w.arrived.has(t.ref)) r.classList.add('arriving');
+      return r;
+    });
+    const adding = w.adding.filter((a) => !items.some((t) => t.ref === a.ref)).map(addingRow);
+    const done = (T.done || []).filter((t) => !items.some((o) => o.ref === t.ref));
+    const body = [addLine(T),
+      h('div', { class: 'wrows' + (open ? ' open' : ''), data: { k: 'rows' } }, adding, rows.length || adding.length ? rows : wempty('Nothing on your list. Add one above, or say “Yuki, add … to my list”.')),
+      h('div', { class: 'wfoot', data: { k: 'foot' } },
+        extra ? key(open ? 'Show fewer' : `Show ${extra} more`, { cls: 'xs ghost', data: { do: 'work-more', which: 'list' } }) : h('span'),
+        done.length ? h('button', { class: 'wfold-b', data: { do: 'work-donefold' }, attrs: { type: 'button', 'aria-expanded': String(w.doneOpen) } }, ic('chev'), 'Recently done ', h('span', { class: 'doto', text: String(done.length) })) : h('span')),
+      w.doneOpen && done.length ? h('div', { class: 'wdone-l', data: { k: 'done' } }, done.map(doneRow)) : null];
+    return Y.k(Y.sec('Your list', items.length, body, Y.rightLabel('just added first, then by when it’s due'), 'wsec wk-list'), 'list');
+  }
+
+  /* ---- Waiting on: what others owe you ---- */
+  function waitRow(o) {
+    return h('div', { class: 'wrow ww', data: { k: 'wait:' + o.ref, wref: o.ref } }, av(o.who),
+      h('div', { class: 'wtx' }, h('div', { class: 'wt' }, h('b', { text: o.who }), ' ', h('span', { class: 't2', text: 'to ' + o.what })),
+        h('div', { class: 'wm' }, o.where ? h('span', { text: o.where }) : null, o.day ? h('span', { text: o.day }) : null)),
+      ageDots(o.since),
+      acts(o.draft ? key('Draft a nudge', { cls: 'xs', icon: 'edit', data: { do: 'work-nudge' }, title: 'A draft in the ask bar. Nothing is sent until you press Enter.' }) : null,
+        key('They did it', { cls: 'xs ghost', data: { do: 'work-gotit' } })));
+  }
+  function waitBlock(d) {
+    const list = d.waiting || [];
+    return Y.k(Y.sec('Waiting on', list.length, h('div', { class: 'wrows', data: { k: 'rows' } }, list.length ? list.map(waitRow) : wempty('Nobody owes you anything right now.')),
+      Y.rightLabel('a nudge is only a draft'), 'wsec wk-wait'), 'wait');
+  }
+
+  /* ---- Needs your reply: chats where the other person spoke last ---- */
+  function replyRow(n, i) {
+    const opened = n.opened || W().opened.has(n.key);
+    return h('div', { class: 'wrow wr' + (opened ? ' opened' : '') + (i >= SHOWN ? ' more' : ''), data: { k: 'reply:' + n.key, rkey: n.key } },
+      h('button', { class: 'wr-hit', data: { do: 'work-open' }, attrs: { type: 'button', 'aria-label': `Open ${n.who}’s chat in ${n.app}` } }, av(n.who),
+        h('span', { class: 'wtx' }, h('span', { class: 'wt' }, h('b', { text: n.who }), ' ', h('span', { class: 't2', text: `“${n.msg}”` })),
+          h('span', { class: 'wm' }, h('span', { text: [n.app, n.place].filter(Boolean).join(' · ') }), opened ? h('span', { class: 'op', text: 'opened · I’ll clear it once you reply' }) : null)),
+        h('span', { class: 'wago', text: ageWords(n.at) })),
+      acts(key('Open chat', { cls: 'xs', data: { do: 'work-open' } }, ), key('No reply needed', { cls: 'xs ghost', data: { do: 'work-noreply' } })));
+  }
+  function replyBlock(d) {
+    const R = d.replies || {}, all = R.items || [], w = W(), open = !!w.more.reply, extra = Math.max(0, all.length - SHOWN);
+    const body = [h('div', { class: 'wrows' + (open ? ' open' : ''), data: { k: 'rows' } }, all.length ? all.map(replyRow)
+      : wempty(R.ready ? 'You’re caught up. Nobody is waiting on an answer.' : 'I haven’t read your chats for this yet. Who’s waiting on you shows here.')),
+    extra ? h('div', { class: 'wfoot', data: { k: 'foot' } }, key(open ? 'Show fewer' : `Show ${extra} more`, { cls: 'xs ghost', data: { do: 'work-more', which: 'reply' } })) : null];
+    return Y.k(Y.sec('Needs your reply', all.length, body, Y.rightLabel('newest first'), 'wsec wk-reply'), 'reply');
+  }
+
+  /* ---- You said you'd: promises you made in chats and calls ---- */
+  function saidRow(p) {
+    if (p.closed) {
+      return h('div', { class: 'wrow wclosed', data: { k: 'said:' + p.ref, sref: p.ref } }, h('span', { class: 'ckd' }, ic('check')),
+        h('div', { class: 'wtx' }, h('div', { class: 'wt', text: p.title }), h('div', { class: 'wm' }, h('span', { text: p.closed }))),
+        acts(key('Not done yet', { cls: 'xs ghost', data: { do: 'work-notyet' } })));
+    }
+    const said = p.quote ? `you said “${p.quote}”` : p.who ? `you promised ${p.who}` : '';
+    return h('div', { class: 'wrow wp' + (p.over ? ' late' : ''), data: { k: 'said:' + p.ref, sref: p.ref } }, h('span', { class: 'wq' }, ic('chat')),
+      h('div', { class: 'wtx' }, h('div', { class: 'wt', text: p.title, title: p.title }),
+        h('div', { class: 'wm', title: said }, p.due ? h('span', { class: 'due', text: p.due }) : null, h('span', { text: [p.where, p.day].filter(Boolean).join(', ') }), said ? h('span', { class: 'said', text: said }) : null)),
+      acts(key('Add to list', { cls: 'xs', data: { do: 'work-list' } }), key('Done', { cls: 'xs ghost', data: { do: 'work-said', how: 'done' } }),
+        key('Not mine', { cls: 'xs ghost', data: { do: 'work-said', how: 'wrong' } })));
+  }
+  function saidBlock(d) {
+    const list = (d.said || []).filter((p) => !W().listed.has(p.ref));
+    return Y.k(Y.sec('You said you’d', list.filter((p) => !p.closed).length, h('div', { class: 'wrows', data: { k: 'rows' } },
+      list.length ? list.map(saidRow) : wempty('No promises open. I close them when I see them done.')), Y.rightLabel('from your chats and calls'), 'wsec wk-said'), 'said');
+  }
+
+  function work(d, S) {
+    const w = d.week || {}, tot = w.totals || {};
+    const due = d.todos ? listItems(d).filter((t) => t.tomorrow).length : 0;
+    const meta = [h('span', { data: { wkdue: '' }, attrs: { hidden: due ? null : true } }, h('b', { text: due }), ' due tomorrow'),
+      tot.pc != null ? h('span', null, 'this week: ', h('b', { text: fmt.dur(tot.pc) }), ' at the PC', tot.f ? [', ', h('b', { text: fmt.dur(tot.f) }), ' full screen'] : null) : null];
+    return [Y.k(Y.head('Work', meta, weekFig(w), tabs(S.sub), 'ph-wk'), 'head'), todayStrip(d.today),
+      h('div', { class: 'wk-grid', data: { k: 'grid' } }, h('div', { class: 'col', data: { k: 'left' } }, listBlock(d), waitBlock(d)),
+        h('div', { class: 'col', data: { k: 'right' } }, replyBlock(d), saidBlock(d)))];
+  }
   /* ---------- the day ---------- */
   const LEGEND = [['', 6, 'at the PC'], ['str', 9, 'full screen'], ['mid', 3, 'away, PC on'], ['', 3, 'call'], ['live', 3, 'live call'], ['off', 3, 'PC off or not recorded']];
   function day(d, S) {
@@ -215,46 +395,141 @@
     return prevKeys ? prevKeys(e, a) : false;
   };
 
-  /* ---------- the list's own actions (Done / Not needed / Undo / Correct are the rows', pages/home.js and ui.js) ----------
-     Add: your words as a to-do, with an optional due day from the date field (a machine value; nothing is read out
-     of the words); memory adds it as the voice does and the list refreshes from memory. */
-  const workData = () => Y.D.pages.work || {};
-  Y.actions['todo-add'] = (t) => {
-    const box = t.closest('.td-add'), inp = box && box.querySelector('.td-in'), day = box && box.querySelector('.td-day');
+  /* ---------- the Work page's own actions (Done / Not needed / Undo / Correct on Your list are the rows', pages/home.js
+     and ui.js) ---------- */
+  const rowOf = (t, attr) => t.closest(`[data-${attr}]`);
+  /* Add: your words as a to-do; memory reads a due date from them ("by Monday" becomes "due Monday") and the list
+     refreshes from memory. The row shows at once, "adding it…", until memory's list has it. */
+  Y.actions['work-add'] = (t) => {
+    const box = t.closest('.wadd'), inp = box && box.querySelector('.wl-in');
     if (!inp || inp.disabled) return;
     const text = inp.value.replace(/\s+/g, ' ').trim();
     if (!text) { inp.focus(); return; }
-    inp.disabled = true;
-    Y.act('todo_add', { text, day: day ? day.value : '' }).then((r) => {
-      inp.disabled = false;
-      if (!r.ok) { Y.toast(r.error || 'Couldn’t add it. Memory didn’t answer.', true); inp.focus(); return; }
-      inp.value = ''; if (day) day.value = '';
-      Y.toast('Added to your list.');
+    const w = W(), a = { id: Date.now(), text, ref: null };
+    w.adding.unshift(a); inp.value = '';
+    Y.renderMain();
+    Y.act('todo_add', { text, words: true }).then((r) => {
+      if (!r.ok) { w.adding = w.adding.filter((x) => x !== a); Y.toast(r.error || 'Couldn’t add it. Memory didn’t answer.', true); Y.renderMain(); return; }
+      a.ref = r.ref; w.arrived.add(r.ref);
+      setTimeout(() => { w.adding = w.adding.filter((x) => x !== a); Y.renderMain(); }, 15000);   // memory's build has it by then
+      Y.toast(r.due ? 'Added to your list, with its due date.' : 'Added to your list.');
+    });
+  };
+  Y.actions['work-more'] = (t) => { const w = W(), k = t.dataset.which; w.more[k] = !w.more[k]; Y.renderMain(); };
+  Y.actions['work-donefold'] = () => { const w = W(); w.doneOpen = !w.doneOpen; Y.renderMain(); };
+  /* Put it back (Recently done): open again where it belongs; the list unfolds if that is past the first rows */
+  Y.actions['work-back'] = (t) => {
+    const ref = t.dataset.ref; t.disabled = true;
+    Y.act('todo_reopen', { ref, any: true }).then((r) => {
+      if (!r.ok) { t.disabled = false; Y.toast(r.error || 'I can’t put that back any more.', true); return; }
+      const view = (workData().todos.done || []).find((x) => x.ref === ref);
+      if (view && Y.todoReopened) Y.todoReopened(ref, view);
+      const w = W(); w.arrived.add(ref);
+      const at = listItems(workData()).findIndex((x) => x.ref === ref);
+      if (at >= SHOWN) w.more.list = true;
+      Y.toast('Back on your list.');
+      Y.renderMain();
+    });
+  };
+  /* Waiting on */
+  Y.actions['work-nudge'] = (t) => {
+    const row = rowOf(t, 'wref'); if (!row) return;
+    t.disabled = true;
+    Y.act('work_nudge', { ref: row.dataset.wref }).then((r) => {
+      t.disabled = false;
+      Y.toast(r.ok ? 'In the ask bar, not sent. Nothing is sent until you press Enter.' : (r.error || 'Yuki isn’t running, so the ask bar can’t open.'), !r.ok);
+    });
+  };
+  Y.actions['work-gotit'] = (t) => {
+    const row = rowOf(t, 'wref'); if (!row) return;
+    const ref = row.dataset.wref;
+    settle(row, 'Good. Off your waiting list.', { send: () => Y.act('todo_end', { ref, how: 'done' }), undo: () => Y.act('todo_reopen', { ref }) });
+  };
+  /* Needs your reply: a click brings that chat forward (it clears itself once your reply is captured) */
+  Y.actions['work-open'] = (t) => {
+    const row = rowOf(t, 'rkey'); if (!row) return;
+    const key0 = row.dataset.rkey, n = ((workData().replies || {}).items || []).find((x) => x.key === key0) || {};
+    Y.act('work_open_chat', { key: key0 }).then((r) => {
+      if (!r.ok) { Y.toast(r.error || 'I couldn’t bring that chat forward.', true); return; }
+      W().opened.add(key0);
+      Y.toast(r.how === 'chat' ? `Brought ${r.app} forward on your chat with ${n.who}.` : r.how === 'page' ? `Opened your chat with ${n.who}.` : `Brought ${r.app} forward. Your chat with ${n.who} is in it.`);
+      Y.renderMain();
+    });
+  };
+  Y.actions['work-noreply'] = (t) => {
+    const row = rowOf(t, 'rkey'); if (!row) return;
+    const k = row.dataset.rkey;
+    settle(row, 'Cleared. No reply needed.', { icon: 'dash', send: () => Y.act('work_mark', { key: k, mark: 'no_reply' }), undo: () => Y.act('work_mark', { key: k, mark: null }) });
+  };
+  /* You said you'd: Add to list shows it in Your list at once (and it leaves here); Done; Not mine */
+  Y.actions['work-list'] = (t) => {
+    const row = rowOf(t, 'sref'); if (!row) return;
+    const ref = row.dataset.sref, p = (workData().said || []).find((x) => x.ref === ref); if (!p) return;
+    const w = W();
+    const view = { ref, text: p.text, title: p.title, due: p.due, over: p.over, due_at: p.due_at, all_day: p.all_day, since: nowS(), tomorrow: !!p.tomorrow,
+      meta: p.quote ? `you said “${p.quote}”` : (p.who ? `you promised ${p.who}` : 'you said you’d'), source: 'moved', status: 'open', undo: true };
+    settle(row, 'Added to your list.', { icon: 'todo',
+      send: () => { w.listed.set(ref, view); w.arrived.add(ref); Y.renderMain(); return Y.act('work_mark', { key: ref, mark: 'listed' }); },
+      undo: () => Y.act('work_mark', { key: ref, mark: null }).then((r) => { if (r.ok) { w.listed.delete(ref); w.arrived.delete(ref); } return r; }),
+      after: (undone) => { if (!undone) setTimeout(() => { w.listed.delete(ref); Y.renderMain(); }, 20000); } });
+  };
+  Y.actions['work-said'] = (t) => {
+    const row = rowOf(t, 'sref'); if (!row) return;
+    const ref = row.dataset.sref, how = t.dataset.how;
+    settle(row, how === 'done' ? 'Marked done. I’ll stop tracking it.' : 'Not yours. I won’t count it as a promise.', { icon: how === 'done' ? 'check' : 'dash',
+      send: () => Y.act('todo_end', { ref, how }), undo: () => Y.act('todo_reopen', { ref }) });
+  };
+  Y.actions['work-notyet'] = (t) => {
+    const row = rowOf(t, 'sref'); if (!row) return;
+    t.disabled = true;
+    Y.act('todo_reopen', { ref: row.dataset.sref, any: true }).then((r) => {
+      if (!r.ok) { t.disabled = false; Y.toast(r.error || 'I can’t reopen that.', true); return; }
+      Y.toast('Reopened. It stays open until you mark it done.');
+    });
+  };
+  /* Worked on today: the Continue run at once (reopens the windows you had; types and sends nothing) */
+  Y.actions['work-continue'] = (t) => {
+    t.disabled = true;
+    Y.act('work_continue', { ref: t.dataset.ref }).then((r) => {
+      t.disabled = false;
+      Y.toast(r.ok ? `Picking up ${r.title || 'that'}: I’m reopening the windows you had. I type and send nothing.` : (r.error || 'Yuki isn’t running, so I can’t pick it up.'), !r.ok);
     });
   };
 
-  /* Home's Now tile opens #work/at:<moment>: the session holding that moment (else the latest before it) opens and
-     comes into view, once per visit (a visit is one navigation, S.navs: the tile clicked again after going Home
-     focuses it again; the data's own re-renders within the visit don't); "see all" (#work/todos) brings the list */
+  /* the Day tab at a moment (Home's Now tile opens #work/day/at:<moment>): the session holding it (else the latest
+     before it) opens and comes into view, once per visit (a visit is one navigation, S.navs) */
   let atNav = -1;
   function focusSession(main, S) {
     if (atNav === S.navs) return;
-    const at = Number(S.sub.slice(3)), list = workData().sessions;
+    const at = Number(S.sub.split('at:')[1]), list = (Y.D.pages.day || {}).sessions;
     if (!list) return;   // the data isn't here yet: the mount after it arrives
     atNav = S.navs;
-    if (!list.length) { Y.focusBlock(main.querySelector('[data-k="sessions"]'), 'work-at'); return; }
+    if (!list.length) { Y.focusBlock(main.querySelector('[data-k="sessions"]'), 'day-at'); return; }
     const s = list.find((x) => x.start_at <= at && at <= x.end_at) || list.filter((x) => x.start_at <= at).slice(-1)[0] || list[list.length - 1];
     const k = sessKey(s);
     if (!Y.S.open.has('f:' + k)) { Y.S.open.add('f:' + k); Y.renderMain(); }
-    Y.focusBlock(main.querySelector(`[data-k="${CSS.escape('f:' + k)}"]`), 'work-at', 'center');
+    Y.focusBlock(main.querySelector(`[data-k="${CSS.escape('f:' + k)}"]`), 'day-at', 'center');
+  }
+  /* an item said to me ("Yuki, add …") slides into Your list once, with a mint flash */
+  function arrive(main) {
+    const w = W();
+    main.querySelectorAll('.wk-list .wrow.arriving').forEach((r) => {
+      const ref = r.dataset.cref || (r.dataset.k || '').replace(/^todo:/, '');
+      w.arrived.delete(ref); w.slid = (w.slid || 0) + 1;
+      r.classList.remove('arriving');
+      if (window.Lattice.Motion.reduced || !r.animate) return;
+      const hh = r.offsetHeight;
+      r.animate([{ height: '0px', minHeight: '0px', paddingTop: '0px', paddingBottom: '0px', opacity: 0 }, { height: hh + 'px', minHeight: hh + 'px', opacity: 1 }], { duration: 420, easing: Y.EASE });
+      const tt = r.querySelector('.wt'); if (tt) tt.animate([{ background: 'rgba(111,235,196,.18)' }, { background: 'rgba(111,235,196,0)' }], { duration: 1800, delay: 300, easing: Y.EASE });
+    });
   }
 
   Y.pages.work = {
-    build: (d, S, D) => (S.sub === 'day' ? day(d, S) : work(d, S)),
+    build: (d, S, D) => (isDay(S.sub) ? day(D.pages.day || d, S) : work(d, S)),
     mount: (main, S, D) => {
-      if (S.sub === 'todos') Y.focusBlock(main.querySelector('[data-k="todos"]'), 'work-todos');
-      else if (S.sub.startsWith('at:')) focusSession(main, S);
-      if (S.sub !== 'day') return;
+      if (S.sub === 'todos') Y.focusBlock(main.querySelector('[data-k="list"]'), 'work-todos');
+      if (!isDay(S.sub)) { arrive(main); return; }
+      if (S.sub.includes('at:')) focusSession(main, S);
       const d = D.pages.day; if (!d) return;
       setTimeout(() => setHover(S.scrub != null ? S.scrub : (d.today && d.now_min != null ? Math.max(0, d.now_min - 30) : 720), null), 30);   // the design: 30 ms after mount
     }

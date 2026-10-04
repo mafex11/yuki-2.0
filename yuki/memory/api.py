@@ -3383,6 +3383,153 @@ class MemoryClient:
             return None
         return f"todo:{int(number)}" if ok else None
 
+    def reopen_item(self, ref: str, *, any_age: bool = False) -> str | None:
+        """Put one ended item of the list back, open as it was (the Work page's Undo, Put it back and Not done yet).
+
+        * ``todo:N`` a to-do the user added, ended as done or not needed: within :data:`REOPEN_WITHIN_S`, or at any
+          age with ``any_age`` (Put it back from Recently done);
+        * ``commit:N`` a commitment ended as done, not needed or not theirs: by the user within
+          :data:`REOPEN_WITHIN_S`; with ``any_age``, one memory closed itself (the to-do check saw it done: Not done
+          yet) or one done at any age (Put it back). It is active again, its end note cleared;
+        * ``loop:N`` an open loop the user ended within :data:`REOPEN_WITHIN_S`: open again, its portrait fact current
+          again and the correction that closed it ended (history kept: nothing is deleted).
+
+        Returns the id, or ``None`` (not ended, too late, or a kind that can't be put back). Never raises."""
+        prefix, _, number = str(ref or "").strip().strip("[]").partition(":")
+        if not number.strip().isdigit():
+            return None
+        n, now = int(number), time.time()
+        since = now - self.REOPEN_WITHIN_S
+        try:
+            if prefix == "todo":
+                ok = self.store._write(lambda conn: conn.execute(
+                    "UPDATE todos SET status='open', done_at=NULL, updated_at=? WHERE id=? AND status IN ('done','dropped')"
+                    " AND (? OR done_at >= ?)", (now, n, int(bool(any_age)), since)).rowcount == 1)
+            elif prefix == "commit":
+                rows = self.store._query("SELECT status, expired_at, end_note_ciphertext FROM conversation_facts"
+                                         " WHERE id=? AND kind='commitment'", (n,))
+                if not rows or rows[0]["status"] not in ("done", "dropped", "wrong"):
+                    return None
+                from yuki.memory.nudges import END_NOTES   # the notes the user's own end writes (the rest: memory's)
+
+                note = self.store._dec(rows[0]["end_note_ciphertext"]) or ""
+                by_user = note in {n for n, _c in END_NOTES.values()}
+                recent = float(rows[0]["expired_at"] or 0.0) >= since
+                if not ((by_user and recent) or (any_age and (not by_user or rows[0]["status"] == "done"))):
+                    return None
+                ok = self.store._write(lambda conn: conn.execute(
+                    "UPDATE conversation_facts SET status='active', valid_to=NULL, expired_at=NULL, superseded_by=NULL,"
+                    " end_note_ciphertext=NULL WHERE id=? AND kind='commitment' AND status IN ('done','dropped','wrong')",
+                    (n,)).rowcount == 1)
+            elif prefix == "loop":
+                def op(conn: Any) -> bool:
+                    row = conn.execute("SELECT portrait_fact_id, resolved_at FROM open_loops WHERE id=? AND status='done'"
+                                       " AND resolved_at >= ?", (n, since)).fetchone()
+                    if row is None:
+                        return False
+                    at = float(row["resolved_at"])
+                    conn.execute("UPDATE open_loops SET status='open', resolved_at=NULL, updated_at=? WHERE id=?", (now, n))
+                    if row["portrait_fact_id"] is not None:   # ended with it by complete_open_loop: current again
+                        conn.execute("UPDATE portrait_facts SET valid_to=NULL, expired_at=NULL WHERE id=? AND"
+                                     " superseded_by IS NULL AND abs(valid_to - ?) < 1.0", (int(row["portrait_fact_id"]), at))
+                    # the user's "this is done" correction end_item wrote at the same moment: ended, not deleted
+                    conn.execute("UPDATE portrait_facts SET valid_to=?, expired_at=? WHERE kind='correction' AND"
+                                 " origin='user' AND valid_to IS NULL AND abs(valid_from - ?) < 1.0", (now, now, at))
+                    return True
+                ok = self.store._write(op)
+            else:
+                return None
+        except Exception:
+            return None
+        return f"{prefix}:{n}" if ok else None
+
+    def set_due(self, ref: str, due: str | None) -> str | None:
+        """Move an open to-do's or commitment's due date (the user's correction "it's due Monday", read by
+        :func:`yuki.memory.workboard.read_correction`): ``due`` ``"YYYY-MM-DD"`` (that day, no time),
+        ``"YYYY-MM-DD HH:MM"``, or ``None`` (no date). Returns the id, or ``None`` (not open, not one of those, a date
+        it can't read). Never raises."""
+        prefix, _, number = str(ref or "").strip().strip("[]").partition(":")
+        if prefix not in ("todo", "commit") or not number.strip().isdigit():
+            return None
+        due_at, all_day = None, False
+        if due:
+            try:
+                raw = str(due).strip()
+                if len(raw) == 10:
+                    due_at, all_day = datetime.strptime(raw, "%Y-%m-%d").timestamp(), True
+                else:
+                    due_at = datetime.strptime(raw, "%Y-%m-%d %H:%M").timestamp()
+            except ValueError:
+                return None
+        n, now = int(number), time.time()
+        try:
+            if prefix == "todo":
+                ok = self.store._write(lambda conn: conn.execute(
+                    "UPDATE todos SET due_at=?, due_all_day=?, updated_at=? WHERE id=? AND status='open'",
+                    (due_at, int(all_day), now, n)).rowcount == 1)
+            else:   # a commitment's day is its midnight (nudges reads a midnight due as a day)
+                ok = self.store._write(lambda conn: conn.execute(
+                    "UPDATE conversation_facts SET due_at=? WHERE id=? AND kind='commitment' AND status='active'",
+                    (due_at, n)).rowcount == 1)
+        except Exception:
+            return None
+        return f"{prefix}:{n}" if ok else None
+
+    # -- the Work page (yuki.memory.workboard) ---------------------------------------------------------------------
+
+    def work_board(self, now: float | None = None) -> dict:
+        """The Work page's judged parts (:func:`yuki.memory.workboard.board`): the chats waiting on the user's reply,
+        who owes what in the open loops, the meetings ahead, what the user moved to their list. Reads only; never
+        raises (``{}`` when memory can't say)."""
+        from yuki.memory.workboard import board
+
+        try:
+            return board(self.store, now)
+        except Exception:
+            return {}
+
+    def work_kept(self, now: float | None = None) -> list[dict]:
+        """The user's promises memory saw kept lately (:func:`yuki.memory.workboard.kept_promises`), newest first."""
+        from yuki.memory.workboard import kept_promises
+
+        try:
+            return kept_promises(self.store, now)
+        except Exception:
+            return []
+
+    def work_threads_for(self, spans: Any) -> list[dict | None]:
+        """The thread of work each ``(start, end)`` stretch belongs to (:func:`yuki.memory.workboard.session_threads`):
+        ``{"ref", "title"}`` or ``None`` per stretch. The Work page's "Worked on today"."""
+        from yuki.memory.workboard import session_threads
+
+        try:
+            return session_threads(self.store, [(float(a), float(b)) for a, b in spans])
+        except Exception:
+            return [None for _ in spans]
+
+    def work_mark(self, key: str, mark: str | None) -> bool:
+        """The user's mark on a Work row (:func:`yuki.memory.workboard.set_mark`): ``no_reply`` / ``opened`` on a chat,
+        ``listed`` on a commitment or loop moved to their list; ``None`` takes it back."""
+        from yuki.memory.workboard import set_mark
+
+        return set_mark(self.store, key, mark)
+
+    def work_chat(self, key: str) -> dict | None:
+        """Where a Needs-your-reply chat is (``chat:<id>``), to bring it forward: its app, process, name, address."""
+        from yuki.memory.workboard import chat_place
+
+        prefix, _, number = str(key or "").partition(":")
+        return chat_place(self.store, int(number)) if prefix == "chat" and number.isdigit() else None
+
+    def add_todo_words(self, words: str, client: Any = None) -> tuple[str, str | None]:
+        """Add a to-do from the words the user typed, a due date read from them (``"by Monday"``: one small model
+        call, :func:`yuki.memory.workboard.read_due`; without a client or on a failure, the words whole and no due).
+        Returns ``(id, due)``."""
+        from yuki.memory.workboard import read_due
+
+        text, due = read_due(client, words)
+        return self.add_todo(text, due), due
+
     def aliases(self) -> list[dict]:
         """Names the user corrected: ``[{"heard": "Barun", "name": "Varun", "why", "since"}]``, oldest first."""
         try:
@@ -4234,7 +4381,12 @@ _STAMP_SQL: dict[str, str] = {
     "work_threads": "SELECT max(id), max(updated_at) FROM work_threads",
     "portraits": "SELECT max(id) FROM portraits",
     "portrait_facts": "SELECT max(id), max(valid_to), max(expired_at) FROM portrait_facts",
-    "conversation_facts": "SELECT max(id), max(valid_to), max(expired_at) FROM conversation_facts",
+    # how many are active too: a commitment put back (Undo, Not done yet) clears its valid_to and moves no max
+    "conversation_facts": "SELECT max(id), max(valid_to), max(expired_at), sum(status = 'active') FROM conversation_facts",
+    # the Work page (migration 36): the judged chats, loops and meetings, and the user's marks
+    "work_items": "SELECT max(id), max(updated_at) FROM work_items",
+    # Needs your reply clears when your reply is captured (a newer message in that chat)
+    "messages": "SELECT max(id) FROM messages",
     "playbooks": "SELECT max(id), max(updated_at) FROM playbooks",
     "standing_requests": "SELECT max(id), max(updated_at) FROM standing_requests",
     "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",

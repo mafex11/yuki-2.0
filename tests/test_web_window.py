@@ -1257,6 +1257,9 @@ def test_page_stamps_move_on_each_write_and_stay_cheap(tmp_path):
             cols = [c for c in m.store._query(f"PRAGMA table_info({table})")
                     if (c[3] and c[4] is None and not c[5]) or c[1] == "updated_at"]
             values = [1.0 if str(c[2]).upper() in ("REAL", "INTEGER") else "x" for c in cols]
+            if table == "messages":   # its capture thread must exist (a foreign key; the Work page, report 68)
+                tid = m.store.upsert_thread("Invented", "an invented chat", None)
+                values = [tid if c[1] == "thread_id" else v for c, v in zip(cols, values)]
             m.store._write(lambda c: c.execute(f"INSERT INTO {table} ({', '.join(x[1] for x in cols)}) VALUES "
                                                f"({', '.join('?' for _ in cols)})", values))
 

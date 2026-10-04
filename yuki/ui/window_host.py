@@ -846,9 +846,12 @@ class WindowHost(QObject):
         return {"result": result or {"ok": False, "why": "error"}}
 
     def _op_askbar(self, req: dict[str, Any]) -> dict[str, Any]:
-        """``askbar(text)``: open the ask bar, with ``text`` in it **unsent** (Work's Continue puts a plan there;
-        nothing runs until the user presses Enter). The window granted the foreground before asking."""
+        """``askbar(text, note?)``: open the ask bar, with ``text`` in it **unsent** (Work's Draft a nudge puts a
+        message there; nothing runs until the user presses Enter, then it is their own request, with the send
+        countdown like any message). ``note``: where it came from, shown on the ask bar's "In the ask bar · not sent"
+        card ("a nudge for Riya · from Work → Waiting on"). The window granted the foreground before asking."""
         text = str(req.get("text") or "").strip()
+        note = " ".join(str(req.get("note") or "").split())[:120]
 
         def show() -> None:
             overlay = self.ui.overlay
@@ -858,6 +861,9 @@ class WindowHost(QObject):
                 cursor = overlay.input.textCursor()
                 cursor.movePosition(cursor.MoveOperation.End)
                 overlay.input.setTextCursor(cursor)
+                unsent = getattr(overlay, "show_unsent", None)
+                if note and unsent is not None:   # the Intent card: in the ask bar, not sent, and from where
+                    unsent(note)
         self._on_gui(show)
         self._log("window_op", op="askbar", chars=len(text))
         return {}

@@ -328,6 +328,22 @@ class TodoMemory:
             item("todo:33", "Copy the September phone photos to the external drive", "user", since=2 * D),
             item("todo:34", "Test the planner on the old laptop", "user", since=4 * D),
             item("todo:35", "Add the train tickets for the 24th to the budget", "user", since=22 * M),
+            # the Work page (report 68): one said to me a moment ago (it slides in), loops someone owes you, one you
+            # promised, one asked of you, and promises you made on a call and to me
+            item("todo:36", "Charge the bike lights before the ride", "user", due=self._day(NOW + 1 * D), since=40),
+            item("loop:13", "Dev said he would send the bed measurements for the planner", "loop", since=2 * D,
+                 title="Bed measurements from Dev", evidence="Dev on Signal on 2026-10-01"),
+            item("loop:14", "Ana said she would book the community hall for the seed swap", "loop", since=26 * H,
+                 title="Hall booking from Ana", evidence="Ana in Allotment Club, #seed-swap on 2026-10-02"),
+            item("loop:15", "Noor is waiting for the drum loop you promised for the new song", "loop", since=9 * H,
+                 title="Drum loop for Noor", evidence="promised to Noor on Signal on 2026-10-03"),
+            item("loop:16", "Riya asked for a dark mode in the planner", "loop", since=3 * D,
+                 title="Dark mode for Riya", evidence="asked by Riya in Signal on 2026-09-30"),
+            item("commit:47", "Send Dev the planner build to try", "chat", since=3 * H, title="Send Dev the planner build",
+                 evidence="said on 2026-10-03: \"I'll send Dev the build tonight\""),
+            item("commit:48", "Print the seed-swap flyers", "call", since=2 * D, due=self._day(NOW + 2 * D),
+                 title="Print the seed-swap flyers",
+                 evidence="said in a call on 2026-10-01: \"I can print the flyers\""),
         ]
         if include_done:
             rows += [item("todo:27", "Measure the balcony beds", "user", status="done", since=2 * D),
@@ -335,6 +351,33 @@ class TodoMemory:
                           since=1 * D, title="Community hall Sunday hours"),
                      item("todo:25", "Call the landlord about the lease", "user", status="done", since=5 * D)]
         return rows
+
+
+def work_board() -> dict:
+    """An invented judged board (memory's ``work_board`` shape): who owes what in the open loops, with a nudge draft
+    for the ones you wait on."""
+    return {"loops": {
+        13: {"kind": "waiting", "who": "Dev", "what": "send the bed measurements", "where": "Signal",
+             "draft": "message Dev on Signal: hey, any luck with the bed measurements?"},
+        14: {"kind": "waiting", "who": "Ana", "what": "book the community hall", "where": "Allotment Club, #seed-swap",
+             "draft": "message Ana on Mumble: did the hall booking go through?"},
+        15: {"kind": "promised", "who": "Noor", "what": "Send Noor the drum loop", "where": "Signal"},
+        16: {"kind": "asked", "who": "Riya", "what": "Add a dark mode to the planner", "where": "Signal"},
+        12: {"kind": "asked", "who": "Riya", "what": "Send Riya the climbing photos", "where": "Signal"}},
+        "listed": [], "ready": True}
+
+
+def work_replies() -> list[dict]:
+    """Invented chats waiting on your reply, newest first (seven: past six they fold)."""
+    rows = [("chat:61", "Riya", "did you get the photos from the gym?", "Signal", "your DM", 55 * M),
+            ("chat:62", "Noor", "can you do 7:30 instead of 7 on Wednesday?", "Signal", "your DM", 2 * H),
+            ("chat:63", "Dev", "which chart library did you pick in the end?", "Element", "your DM", 3 * H),
+            ("chat:64", "Ana", "@Sam are you bringing the seed labels?", "Mumble", "#seed-swap", 5 * H),
+            ("chat:65", "Mum", "are you coming for lunch on Sunday?", "WhatsApp", "Family", 1 * D + 2 * H),
+            ("chat:66", "Kai", "want to climb on Thursday?", "Signal", "your DM", 2 * D),
+            ("chat:67", "Lee", "did the invoice go out?", "Slack", "your DM", 4 * D)]
+    return [{"key": k, "who": who, "msg": msg, "app": app, "place": place, "at": ago(age), "opened": False}
+            for k, who, msg, app, place, age in rows]
 
 
 def day_name(days_ago: int) -> str:
@@ -474,12 +517,26 @@ def build() -> dict:
     midnight = NOW - (21 * 60 + 52) * M
     for s in day["sessions"]:
         s["start_at"], s["end_at"] = round(midnight + s["a"] * M, 1), round(midnight + s["b"] * M, 1)
-    # Work (the 4 Oct decision: no threads in the window): the whole to-do list and today's sessions, under the week
-    open_todos, done_todos = W.todo_lists(TodoMemory(), NOW, include_done=True)
-    can = {"end": True, "undo": True, "correct": True, "add": True}
+    # Work (the page approved on 4 Oct, report 68): memory's merged list split by the real web_data.work_columns over an
+    # invented board (who owes what in the open loops), the chats waiting on a reply, and Today as work_today sends it
+    rows = TodoMemory().todos(include_done=True)
+    open_todos, done_todos = W.todo_lists(None, NOW, include_done=True, rows=rows)
+    can = {"end": True, "undo": True, "correct": True, "add": True, "mark": True, "reopen": True}
+    cols = W.work_columns(rows, work_board(), [{"ref": "commit:43", "text": "Send Riya the planner link",
+                                                "title": "Send Riya the planner link", "closed_at": ago(50 * M),
+                                                "since": ago(5 * H)}], NOW)
     work = {
-        "todos": {"open": open_todos, "done": done_todos, "n": len(open_todos), "can": can},
-        "sessions": [dict(s) for s in day["sessions"]], "pending": {}, "can": {"correct": True}, "next_at": None,
+        "todos": {"open": cols["list"], "done": cols["done"], "n": len(cols["list"]), "can": can},
+        "waiting": cols["waiting"], "said": cols["said"],
+        "replies": {"items": work_replies(), "ready": True},
+        "today": {"focus": 306, "usual": 340,
+                  "longest": {"min": 52, "app": "VS Code", "title": "Bed sizes screen", "at": ago(11 * H + 40 * M),
+                              "from": "10:12 AM"},
+                  "worked": [["Garden planner", 196, "thread:7"], ["October budget", 66, "thread:9"],
+                             ["Rust exercises", 38, "thread:11"]],
+                  "coming": [["tomorrow 11 AM", "Seed-swap planning on Mumble"], ["Wednesday 7 PM", "Band practice"]],
+                  "coming_seen": "seen on your screen in Firefox"},
+        "pending": {}, "can": {"correct": True}, "next_at": None,
         "week": {"days": [{"dow": d, "today": i == 6, "pc": pc, "a": a, "f": f} for i, (d, pc, a, f) in enumerate(
             [("Sun", 210, 90, 40), ("Mon", 520, 360, 80), ("Tue", 470, 330, 0), ("Wed", 560, 380, 90), ("Thu", 430, 300, 0),
              ("Fri", 610, 360, 150), ("Sat", 452, 230, 114)])],
@@ -683,7 +740,11 @@ def build() -> dict:
         # Correct from your words and its Undo (the feedback round 3); the to-do list's Done / Not needed, Undo, Add
         "correct_item": {"ok": True, "correction_id": 91, "ref": "fact:21"}, "cancel_correction": {"ok": True},
         "todo_end": {"ok": True, "ref": "todo:31", "how": "done", "undo": True, "until": ago(-10 * M)},
-        "todo_reopen": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40"},
+        "todo_reopen": {"ok": True, "ref": "todo:31"}, "todo_add": {"ok": True, "ref": "todo:40", "due": None},
+        # the Work page (report 68): a row's mark, Open chat, a Worked-on-today row, Draft a nudge
+        "work_mark": {"ok": True}, "work_open_chat": {"ok": True, "app": "Signal", "how": "app"},
+        "work_continue": {"ok": True, "title": "Garden planner"},
+        "work_nudge": {"ok": True, "text": "message Dev on Signal: hey, any luck with the bed measurements?"},
         # Settings → AI (report 67): canned answers (the page keeps what it shows when a reply carries no "ai")
         "ai_role": {"ok": True}, "ai_key": {"ok": True, "key": "saved", "key_words": "Saved on this PC, encrypted"},
         "ai_custom": {"ok": True},

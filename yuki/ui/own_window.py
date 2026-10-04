@@ -24,13 +24,13 @@ LEGACY: tuple[str, ...] = ("today", "yuki", "status")
 #: is answered by reading that data and placing it here, never by guessing (the 4 Oct live test: "where is my to-do
 #: list?" got "inside the Work tab thread card", a place that never existed), with the worked example of that case.
 #: Keep it short: the thinker's tool block has a measured budget (tests/test_d_brain.py).
-PAGE_WORDS = ("home: needs them, offers, Your list (open to-dos), running; todos: Home at Your list; work: every "
-              "to-do, today's sessions; me: people, routines, facts, misheard; playbook: lessons, rules; activity: "
+PAGE_WORDS = ("home: needs them, offers, Your list (open to-dos), running; todos: Home at Your list; work: to-dos, "
+              "replies owed, waits, today; me: people, routines, facts, misheard; playbook: lessons, rules; activity: "
               "what you did, calls; chat; settings. Asked about it, read the data and place it here, never guess "
               "(where's my list: todo list, then todos, say where).")
 #: Where the window opened, said in the report the model answers from (``todos``: the words it should say).
 PLACES = {"home": "Home", "todos": "Home, at the user's to-do list (under Your list; every to-do is also on Work)",
-          "work": "Work (every to-do, today's sessions)", "me": "Me", "playbook": "Playbook", "activity": "Activity",
+          "work": "Work (every to-do, replies you owe, who you wait on, today)", "me": "Me", "playbook": "Playbook", "activity": "Activity",
           "chat": "the chat", "settings": "Settings"}
 #: The new names for the Qt window (``yuki.ui.window``, the fallback without WebView2), which knows only its own.
 QT_PAGES = {"home": "today", "todos": "today", "work": "today", "playbook": "yuki", "activity": "status"}
