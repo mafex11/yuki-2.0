@@ -300,7 +300,8 @@ class _Context:
         return list(self._messages)
 
 
-def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = False) -> Any:
+def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = False, solo: set[str] | None = None,
+                  user_speaking: bool = False, during: Any = None) -> Any:
     from yuki.voice.pipeline import Conversation
 
     queued: list[Any] = []
@@ -310,6 +311,8 @@ def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = Fa
 
     class Tool:
         async def handle(self, params: Any) -> None:
+            if during is not None:
+                during(params)   # what happens while the look runs (the user goes on talking, ...)
             if by_code:
                 from pipecat.frames.frames import FunctionCallResultProperties
 
@@ -317,8 +320,9 @@ def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = Fa
             else:
                 await params.result_callback(report)
 
-    conv = SimpleNamespace(_llm=SimpleNamespace(_yuki_spoke=spoke, queue_frame=queue_frame), quick_memory=Tool(),
-                           log=_Log(), session="s1", observer=SimpleNamespace(bot_speaking=True), queued=queued)
+    llm = SimpleNamespace(_yuki_spoke=spoke, _yuki_solo=set(spoke) if solo is None else solo, queue_frame=queue_frame)
+    conv = SimpleNamespace(_llm=llm, quick_memory=Tool(), log=_Log(), session="s1",
+                           observer=SimpleNamespace(bot_speaking=True, user_speaking=user_speaking), queued=queued)
     conv._answer_look_now = lambda params, result: Conversation._answer_look_now(conv, params, result)
     return conv
 
@@ -383,3 +387,106 @@ def test_the_conversation_registers_the_look_with_its_answer_now_handler() -> No
     source = inspect.getsource(pipeline.Conversation)
     assert 'register_function(QUICK_MEMORY["name"], self._quick_memory_call' in source
     assert pipeline.ANSWER_WHILE_SPEAKING == frozenset({"quick_memory"})
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# review fixes: a look is answered at once only when it is alone in its reply and the user has not gone on (LV-1, LV-2)
+# ---------------------------------------------------------------------------------------------------------------------
+
+_HISTORY = [{"role": "user", "content": "What's on my list?"}]
+_REPORT = {"list": "2 open: - Buy printer ink - Call the plumber", "how_to_handle_it": "Tell them."}
+
+
+def test_a_look_beside_another_call_in_its_reply_settles_as_before() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    # LV-1: "What's on my list, and what did I say about Tara?" -> two looks in one reply after "Let me look.":
+    # Pipecat answers once, after the last report, with both; neither starts a run of its own on a half copy
+    conv = _conversation({"toolu_7", "toolu_8"}, _REPORT, solo=set())
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(_HISTORY)))))
+    assert settled[0][1] is None and not conv.queued
+
+
+def test_a_look_whose_report_comes_back_while_the_user_speaks_settles_as_before() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    # LV-2: the user goes on ("...the work one") before the report is back: no run over them; their turn answers
+    conv = _conversation({"toolu_7"}, _REPORT, user_speaking=True)
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(_HISTORY)))))
+    assert settled[0][1] is None and not conv.queued
+    kind, facts = conv.log.events[-1]
+    assert kind == "quick_memory" and facts["op"] == "answer_later" and facts["user_speaking"] is True
+
+
+@pytest.mark.parametrize("role", ["user", "developer"])
+def test_a_look_after_which_the_user_said_more_settles_as_before(role: str) -> None:
+    from yuki.voice.pipeline import Conversation
+
+    history = list(_HISTORY)
+    context = _Context(history)
+    # the user finished a new turn while the look ran: the copy would be built before their words
+    conv = _conversation({"toolu_7"}, _REPORT,
+                         during=lambda params: history.append({"role": role, "content": "The work one."}))
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, context)))
+    assert settled[0][1] is None and not conv.queued
+    assert conv.log.events[-1][1]["newer"] is True
+
+
+def test_yukis_own_words_after_the_call_do_not_count_as_the_user_saying_more() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    history = list(_HISTORY)
+    conv = _conversation({"toolu_7"}, _REPORT,
+                         during=lambda params: history.append({"role": "assistant", "content": "Let me look."}))
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(history))))
+    assert settled[0][1].run_llm is False and len(conv.queued) == 1
+
+
+def test_the_talker_marks_only_a_lone_call_as_alone_in_its_reply() -> None:
+    from yuki.voice.mouth import MouthMemory
+    from yuki.voice.pipeline import _layered_service
+
+    class Gate:
+        is_speculating = False
+
+    class Base:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            self._speculation_gate = Gate()
+
+        async def run_function_calls(self, calls: Any) -> None:
+            pass
+
+    hooks = SimpleNamespace(speculation=lambda *a: None, would_hold=lambda name: False, calls_made=lambda ids: None)
+    llm = _layered_service(Base, MouthMemory(), hooks)()
+
+    def call(cid: str) -> Any:
+        return SimpleNamespace(function_name="quick_memory", tool_call_id=cid)
+
+    async def main() -> None:
+        await llm.run_function_calls([call("toolu_1")])
+        await llm.run_function_calls([call("toolu_2"), call("toolu_3")])
+
+    asyncio.run(main())
+    assert llm._yuki_solo == {"toolu_1"}
+
+
+def test_a_look_flagged_after_its_replys_end_does_not_unpause_the_next_reply() -> None:
+    from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame
+
+    tts = _tts()
+
+    async def run() -> None:
+        # a speculative reply: the gate releases its end, then its held look is started from a task
+        await tts.process_frame(LLMFullResponseStartFrame(), None)
+        await tts.process_frame(LLMFullResponseEndFrame(), None)
+        await tts.process_frame(_started("quick_memory"), None)
+        # the next reply (the look's answer) pauses as usual
+        await tts.process_frame(LLMFullResponseStartFrame(), None)
+        await tts.process_frame(LLMFullResponseEndFrame(), None)
+
+    asyncio.run(run())
+    assert tts.paused == 2

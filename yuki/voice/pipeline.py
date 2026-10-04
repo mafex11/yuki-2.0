@@ -776,6 +776,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             super().__init__(*args, **kwargs)
             #: Tool call ids of replies that said words before calling (see ``chronological``).
             self._yuki_spoke: set[str] = set()
+            #: Tool call ids that were the only call of their reply (leftVoice review LV-1: Pipecat answers a reply's
+            #: calls once, after the last; only a lone look may be answered at once on its own copy).
+            self._yuki_solo: set[str] = set()
             #: Tool call ids whose say_first was spoken while the call was still being written (v3.5).
             self._yuki_early: set[str] = set()
             #: Tool calls of a speculative reply (eager end of turn), run when the turn is confirmed.
@@ -815,6 +818,10 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if len(self._yuki_hold) > 64:
                 for old in list(self._yuki_hold)[:32]:
                     del self._yuki_hold[old]
+            if function_calls and len(function_calls) == 1:
+                if len(self._yuki_solo) > 64:
+                    self._yuki_solo.clear()   # ids of long-settled calls; a live one is re-added just below
+                self._yuki_solo.add(str(getattr(function_calls[0], "tool_call_id", function_calls[0])))
             if self._yuki_words is not None:
                 # The reply is complete: its words are said, unless a call it makes will be held until the
                 # user answers (then nothing of it was said or done, and the call's report says so).
@@ -1286,9 +1293,15 @@ def _clause_tts(base: type, *, strip_marks: bool = False) -> type:
             await super()._maybe_pause_frame_processing()
 
         async def process_frame(self, frame: Any, direction: Any) -> None:
-            from pipecat.frames.frames import FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame
+            from pipecat.frames.frames import (
+                FunctionCallsStartedFrame, InterruptionFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
+            )
 
-            if isinstance(frame, FunctionCallsStartedFrame):
+            if isinstance(frame, LLMFullResponseStartFrame):
+                # A new reply: a look flagged after the last reply's end (a speculative reply's held calls run once
+                # the turn is confirmed, after its end has passed) is not this reply's (review fixes).
+                self._yuki_answer_next = False
+            elif isinstance(frame, FunctionCallsStartedFrame):
                 # leftVoice: Pipecat pauses this service's frames after a reply that had words until they have played
                 # ("to avoid audio overlapping"), and the tool's result waits in that queue: with "Let me look."
                 # before a quick_memory call the answer's run started only when the line ended (+1.0-1.2 s,
@@ -2425,6 +2438,15 @@ def _last_role(context: Any) -> str | None:
         if isinstance(message, dict) and message.get("role") in ("user", "assistant", "developer", "tool"):
             return str(message.get("role"))
     return None
+
+
+def _said_count(context: Any) -> int | None:
+    """How many user and developer messages the talker's context holds (a newer one means the user said more)."""
+    try:
+        messages = context.get_messages()
+    except Exception:  # noqa: BLE001
+        return None
+    return sum(1 for m in messages or [] if isinstance(m, dict) and m.get("role") in ("user", "developer"))
 
 
 def _last_user_text(context: Any) -> str:
@@ -3782,16 +3804,34 @@ class Conversation:
         holds the call and its report (:meth:`_answer_look_now`); its words queue behind the lead in the voice. A reply
         that called it with no words first waits behind nothing, so it settles as before; so does a clean add, said by
         code with no run at all. Plumbing: when the run starts, never what anyone said.
+
+        Review fixes (LV-1, LV-2): only a look that was the only call of its reply is answered this way (Pipecat answers
+        a reply's several calls once, after the last, with every report), and only when, as the report comes back, the
+        user is not speaking and has said nothing since the call (no user or developer message newer than it). Else the
+        report settles as on main and Pipecat's aggregator decides, so Yuki never talks over the user or answers twice.
         """
         llm = getattr(self, "_llm", None)
         call_id = str(getattr(params, "tool_call_id", "") or "")
         spoke = bool(call_id) and llm is not None and call_id in getattr(llm, "_yuki_spoke", ())
-        if spoke:
+        solo = spoke and call_id in getattr(llm, "_yuki_solo", ())
+        if solo:
             original = params.result_callback
+            context = getattr(params, "context", None)
+            said = _said_count(context)
 
             async def settle(result: Any, *, properties: Any = None) -> None:
                 if properties is not None and getattr(properties, "run_llm", None) is False:
                     await original(result, properties=properties)   # said by code (a clean add): no run at all
+                    return
+                user_speaking = bool(getattr(self.observer, "user_speaking", False))
+                newer = _said_count(context) != said
+                if user_speaking or newer:
+                    # The user is talking, or has said more since the call: as on main, the report just goes in and
+                    # their own turn (or Pipecat, once they stop) answers with it.
+                    if self.log is not None:
+                        self.log.event("quick_memory", session=self.session, op="answer_later", call=call_id,
+                                       user_speaking=user_speaking, newer=newer)
+                    await original(result, properties=properties)
                     return
                 from pipecat.frames.frames import FunctionCallResultProperties
 
