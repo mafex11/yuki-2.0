@@ -683,7 +683,8 @@ def test_home_is_the_inbox_built_from_memory(tmp_path):
     assert d["needs"] == [{"kind": "question", "ref": "question:4", "at_label": label, "title": "Is the call at 10?",
                            "why": "It moved once."}]
     assert [o["card"] for o in d["offers"]] == ["41"] and d["offers"][0]["label"] == "Add to list"
-    assert d["now"]["front"]["app"] == "VS Code" and d["now"]["call"]["recording"] is True
+    # "In front" became the current work thread (4 Oct); this stand-in has no threads of work, so no tile
+    assert "front" not in d["now"] and d["now"]["thread"] is None and d["now"]["call"]["recording"] is True
     assert [r["kind"] for r in d["running"]] == ["call", "waiting"] and "2 calls" in d["running"][1]["title"]
     kinds = {a["kind"]: a for a in d["away"]}
     assert kinds["card"]["changed"][0]["undo"]["card"] == "39"                   # ran 7 min ago: Undo still open
@@ -740,9 +741,11 @@ def test_the_drawer_gets_every_step_with_its_time_and_the_runs():
 
 
 def test_continue_puts_a_plan_from_memorys_own_fields_in_the_ask_bar():
+    # an older memory (no thread_continue): the same concrete shape memory's ask has, never "where I left off" (W1)
     text = web_window.plan_text({"title": "Garden planner", "state": "Half built.", "open": ["Write the schedule", "Test"]})
-    assert text.startswith("Pick up “Garden planner” where I left off") and "Half built." in text and "Next: Write the schedule" in text
-    assert web_window.plan_text({"title": "X"}).count(":") == 1
+    assert text == "Help me continue Garden planner. Where it stands: Half built. Next: Write the schedule"
+    assert web_window.plan_text({"title": "X"}) == "Help me continue X."
+    assert "left off" not in text
 
 
 def test_shift_times_moves_only_times():

@@ -16,8 +16,23 @@
   function nowStrip(n) {
     if (!n) return null;
     const tiles = [];
-    if (n.front) tiles.push(Y.clearing('div', '', Y.label(`In front${n.front.since_at ? ' · since ' + fmt.natTime(n.front.since_at) : ''}`, null, 'front'),
-      h('div', { class: 'big' }, h('span', { text: n.front.app || 'An app' })), h('div', { class: 'sm', text: n.front.title || '' })));
+    // the thread of work you are on (the 4 Oct decision: it replaced "In front"): "On <thread> in <app> · <time>"
+    // and its next step; a click opens it on Work with its Continue
+    if (n.thread) {
+      // while its app is in front the minutes run on the page from since_at (the ticker's data-durfrom, once a
+      // minute); else the stretch's fixed length
+      const t = n.thread, live = !!(t.in_front && t.since_at);
+      const mins = live ? (Date.now() / 1000 - t.since_at) / 60 : (t.min || 0);
+      const dur = live || mins >= 1 ? fmt.dur(mins) : '';
+      const durEl = live ? h('span', { data: { durfrom: t.since_at }, text: dur }) : dur;
+      const head = t.app ? 'In ' + t.app : '';
+      const where = [t.app ? 'in ' + t.app : '', live ? '' : dur].filter(Boolean).join(' · ');   // no figure that goes stale
+      tiles.push(h('button', { class: 'clear nowthread', data: { clear: '', do: 'thread-go', ref: t.ref },
+        attrs: { type: 'button', 'aria-label': `On ${t.title}${where ? ' ' + where : ''}. Open it on Work.` } },
+      Y.label(head && dur ? [head, ' · ', durEl] : head || (dur ? durEl : 'Your work now'), null, 'front'),
+      h('div', { class: 'big' }, h('span', { text: t.title })),
+      h('div', { class: 'sm', text: t.next ? 'Next: ' + t.next : (t.shown || '') })));
+    }
     if (n.playing) tiles.push(Y.clearing('div', '', Y.label(`Playing · ${n.playing.status || ''}`, null, 'music'),
       h('div', { class: 'big' }, h('span', { text: n.playing.title || 'Something' })), h('div', { class: 'sm', text: [n.playing.artist, n.playing.app].filter(Boolean).join(' · ') })));
     if (n.call) {
@@ -133,7 +148,7 @@
       h('div', { class: 'grid2', data: { k: 'grid' } },
         h('div', { class: 'col', data: { k: 'left' } },
           Y.k(Y.sec('Needs you', needs.length, needsB), 'needs'),
-          Y.k(Y.sec('Offers', offers.length, offersB, Y.rightLabel('cards only · never a run')), 'offers')),
+          Y.k(Y.sec('Offers', offers.length, offersB), 'offers')),
         h('div', { class: 'col', data: { k: 'right' } },
           Y.k(Y.sec('Running', runningN, runB), 'running'),
           Y.k(Y.sec('Since you were away', away.length, awayB), 'away'),
@@ -201,6 +216,7 @@
   A['answer-typed'] = (t) => answered(t, t.value.trim());
   A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
+  A['thread-go'] = (t) => Y.go('work', t.dataset.ref || '');
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
   /* Learned proposals (practice memory, E13): Save keeps it, Edit is your words (memory re-distills the next
      version from them), No drops it; a question is answered in your words or skipped. Python maps the choice onto

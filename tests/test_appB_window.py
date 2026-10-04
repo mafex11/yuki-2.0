@@ -132,7 +132,7 @@ def test_me_shows_memorys_words_one_summary_per_person_and_each_fact_once():
     assert me["routines"][0]["week"] == [False, False, False, True, False, True, True]
     assert [r["ref"] for r in me["not_routines"]] == ["fact:34"]
     assert groups["about"]["facts"][0]["joke"] is True and me["rules"][0]["prov"].startswith("You told me")
-    assert me["can"] == {"pin": True, "review": True, "heard": True}
+    assert me["can"] == {"pin": True, "review": True, "heard": True, "correct": False}   # no correct_item: older memory
 
 
 def test_maybe_misheard_says_where_it_was_heard_in_one_format():
@@ -140,7 +140,7 @@ def test_maybe_misheard_says_where_it_was_heard_in_one_format():
     m = me["misheard"]
     assert m["total"] == 6 and m["direct"] is True
     call, unknown_src, page, chat, call_no_id = m["items"]
-    assert call["quote"] == "the hair loom swap"
+    assert "quote" not in call and call["text"] == "The user said a word."   # the raw transcript never reaches the page (W6)
     assert call["prov"] == "Heard in Mumble, #seed-swap voice (Allotment Club), yesterday, 9:52 PM, with Noor and maybe Dev"
     # review F1: only a chat with me is "you said it to me"; read off the screen is "Seen in"; no source claims neither
     assert unknown_src["prov"] == "Noted while Firefox was open, today, 8:52 PM"
@@ -275,7 +275,9 @@ def test_a_session_opens_to_its_whole_title_and_the_time_in_every_app():
     d = W.build_day(_DayMemory(day0), day, now=day0 + 22 * H, week=[],
                     people=[{"name": "Noor", "ids": ["noor", "noor.plays"]}])
     s = d["sessions"][0]
-    assert s["title"].endswith("…") and s["full"].startswith("Garden planner: you finished") and not s["full"].endswith("…")
+    # no title written yet (an episode before migration 35): the app is the title, never the narrative cut with "…"
+    # (the 4 Oct item W2); opened, the first sentence whole
+    assert s["title"] == "VS Code" and s["full"].startswith("Garden planner: you finished") and not s["full"].endswith("…")
     assert [a[0] for a in s["apps"]] == ["VS Code", "Firefox", "Notes"]
     assert d["first"] == "10 AM" and d["last"] == "12:12 PM"                          # 12-hour outside time columns
     c = d["calls"][0]
@@ -361,7 +363,7 @@ def test_the_fixture_has_the_new_shapes_and_no_third_person_or_route_refs():
     assert all(p.get("summary") for p in me["people"]) and me["review"]["items"] and me["misheard"]["items"]
     assert {g["key"] for g in me["groups"]} >= {"work", "people", "interests", "prefs", "about"}
     assert act["groups"] and not any("undo" in r for r in act["rows"])
-    assert any(s.get("full") for s in data["pages"]["day"]["sessions"])
+    assert any(s.get("summary") for s in data["pages"]["day"]["sessions"])
     assert all(k in data["replies"] for k in ("pin", "resolve_heard", "review_mark", "thread_days", "chat_day", "day_answer"))
 
 

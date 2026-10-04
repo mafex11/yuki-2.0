@@ -202,6 +202,58 @@ def front_now(memory: Any, now: float) -> dict[str, Any] | None:
     return None
 
 
+#: Home's "current work thread" tile (the 4 Oct decision "In front -> current work thread"): a thread you touched
+#: within this long is the one you are on; touches further apart than the gap end its current stretch.
+CURRENT_THREAD_S = 90 * 60.0
+CURRENT_GAP_S = 30 * 60.0
+
+
+def current_thread(memory: Any, now: float, front: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The thread of work you are on now, for Home's tile "On <title> in <app> · <duration>" with its next step:
+    the open thread memory's journal last saw you touch (``latest_work_events``, content-free), within
+    :data:`CURRENT_THREAD_S`. ``app`` is the app of that touch; ``since_at`` the start of its current stretch (the
+    thread's touches no further apart than :data:`CURRENT_GAP_S`); the stretch runs to now while that app is still
+    the one in front (``front``; ``min`` is then None and the page counts from ``since_at``), else to the last touch
+    (``min``, fixed). ``None`` when no open thread was touched lately. Reads only;
+    the measured times are plumbing, nothing here judges what the work is."""
+    store = getattr(memory, "store", None)
+    latest = getattr(store, "latest_work_events", None)
+    if not callable(latest):
+        return None
+    events = _safe(lambda: latest(since=now - CURRENT_THREAD_S - 6 * 3600, limit=200), []) or []
+    if not events or float(events[0].get("at") or 0) < now - CURRENT_THREAD_S:
+        return None
+    # the newest touch on a thread that is still open (one you just closed, or one memory saw end, gives way to the
+    # open one you touched before it); the threads touched lately are among the most recently touched open ones (a
+    # short read: Home builds often)
+    rows = _safe(lambda: memory.threads(statuses=("active", "blocked"), limit=8), []) or []
+    open_rows = {r.get("id"): r for r in rows}
+    hit = next((e for e in events if float(e.get("at") or 0) >= now - CURRENT_THREAD_S
+                and e.get("work_thread_id") in open_rows), None)
+    if hit is None:
+        return None
+    tid = hit.get("work_thread_id")
+    t = open_rows[tid]
+    mine = [e for e in events if e.get("work_thread_id") == tid]   # newest first
+    last = float(mine[0].get("at") or now)
+    start = last
+    for e in mine[1:]:
+        at = float(e.get("at") or 0)
+        if start - at > CURRENT_GAP_S:
+            break
+        start = at
+    app = str(mine[0].get("app") or "").strip()
+    # while that app is still in front the stretch runs to now; it starts at the thread's own first touch, never at
+    # when the app came to the front (the app may have held other threads before this one)
+    in_front = bool(front and app and str(front.get("app") or "").casefold() == app.casefold())
+    # in front: the page counts the minutes from since_at itself (its minute ticker), so the data stays the same from
+    # one minute to the next and the tile never shows a stale figure; else the stretch's fixed length
+    return {"ref": t.get("ref"), "title": t.get("title") or "", "app": app, "since_at": start,
+            "min": None if in_front else max(0, round((last - start) / 60)), "in_front": in_front,
+            "next": " ".join(str(t.get("next") or "").split()) or None,
+            "shown": " ".join(str(t.get("shown") or "").split()) or None}
+
+
 #: ``GlobalSystemMediaTransportControlsSessionPlaybackStatus`` values worth showing.
 _PLAYBACK = {4: "playing", 5: "paused"}
 
@@ -325,7 +377,9 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
     call = call_view(call_status) if call_status is not None else call_now(memory)
     waiting = (call_status.get("waiting") if call_status is not None else _safe(memory.call_audio_waiting, {})) or {}
     now_call, running = home_call(call, waiting)
-    now_strip = {"front": front_now(memory, now), "playing": None, "call": now_call}
+    front = front_now(memory, now)
+    # "In front" became the current work thread (the 4 Oct decision); the app in front only times its stretch
+    now_strip = {"thread": current_thread(memory, now, front), "playing": None, "call": now_call}
     needs = [question_item(q) for q in (_safe(lambda: memory.questions(statuses=("open",), limit=12), []) or [])]
     cards = _safe(lambda: memory.recent_nudges(hours=24 * INBOX_DAYS), []) or []
     cards = sorted(cards, key=lambda n: epoch_of(n.get("shown_at")) or epoch_of(n.get("at")) or 0, reverse=True)
@@ -864,32 +918,40 @@ def review_view(q: dict[str, Any], facts_by_ref: dict[str, dict[str, Any]]) -> d
 
 def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[Any],
                   now: float | None = None, lookup: dict[str, str] | None = None) -> dict[str, Any]:
-    """"Maybe misheard" (memory's ``misheard()``: unanswered uncertain entries of the last week, newest first): the
-    words as heard (the entry's own quote when memory kept it, else its text) and where they were heard, in the one
-    format (:func:`heard_line`). An older memory: the Qt view's uncertain entries (``fallback``)."""
+    """"Maybe misheard" (memory's ``misheard()``: real mishearings of the last week, newest first; the feedback round
+    3, W6): what was heard and Yuki's guess (``heard``, ``guess``, ``why`` who or what makes it fit, ``guess_is_name``),
+    the entry said in English (``text``: memory's ``shown`` when written, else its text with only formats changed) and
+    where it was heard, in the one format (:func:`heard_line`). The raw transcript (``source.quote``) is provenance
+    and never reaches the page. An item with ``heard`` and ``guess`` takes ``guess_right`` (Yes = Yuki's guess is
+    right; only a memory that writes guesses has them); ``correct``: True when memory takes ``correct_item`` ("It
+    was…" in your words). An older memory: the Qt view's uncertain entries (``fallback``)."""
     from yuki.ui.window.data import natural, plain
 
     fn = getattr(memory, "misheard", None)
     got = _safe(fn, None) if callable(fn) else None
     if not isinstance(got, dict):
-        items = [{"ref": i.ref, "text": i.text, "quote": "", "prov": heard_line(i.title, None, i.since, now=now)} for i in fallback]
-        return {"items": items, "total": len(items), "direct": False}
+        items = [{"ref": i.ref, "text": i.text, "prov": heard_line(i.title, None, i.since, now=now)} for i in fallback]
+        return {"items": items, "total": len(items), "direct": False, "correct": False}
     items = []
     for m in got.get("items") or []:
         if not isinstance(m, dict) or not m.get("ref"):
             continue
         src = m.get("source") if isinstance(m.get("source"), dict) else {}
-        quote = " ".join(str(src.get("quote") or "").split())
         cid = _call_id(m.get("call"))
         call = calls.get(cid) if cid is not None else None
         if cid is not None and call is None:   # memory's own label for it (its digest's place) and who was on it
             call = {"label": m.get("heard_in") or "", "app": m.get("app") or "",
                     "people": call_people(m.get("people") or [], lookup or {})}
-        items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))), "quote": quote,
+        heard, guess = " ".join(str(m.get("heard") or "").split()), " ".join(str(m.get("guess") or "").split())
+        text = " ".join(str(m.get("shown") or "").split()) or plain(natural(str(m.get("text") or "")))
+        items.append({"ref": str(m["ref"]), "text": text,
+                      **({"heard": heard, "guess": guess, "guess_is_name": bool(m.get("guess_is_name")),
+                          "why": " ".join(str(m.get("why") or "").split()) or None} if heard and guess else {}),
                       "prov": heard_line(str(m.get("app") or ""), call, m.get("at"),
                                          channel_known=bool(m.get("channel_known", True)), now=now,
                                          kind=str(src.get("kind") or ""), where=str(src.get("where") or ""))})
-    return {"items": items, "total": int(got.get("total") or len(items)), "direct": callable(getattr(memory, "resolve_heard", None))}
+    return {"items": items, "total": int(got.get("total") or len(items)), "direct": callable(getattr(memory, "resolve_heard", None)),
+            "correct": callable(getattr(memory, "correct_item", None))}
 
 
 def read_pending(path: Path, db: str) -> dict[str, dict[str, Any]]:
@@ -902,6 +964,29 @@ def read_pending(path: Path, db: str) -> dict[str, dict[str, Any]]:
         return {}
     return {str(k): {"kind": v.get("kind"), "words": v.get("words") or "", "late": bool(v.get("late"))}
             for k, v in (raw.get("items") or {}).items() if isinstance(v, dict)}
+
+
+#: How long a correction that landed says "Fixed" on its row.
+FIXED_SHOWN_S = 10 * 60.0
+
+
+def pending_view(pending: dict[str, Any] | None, prefixes: tuple[str, ...] | None = None,
+                 now: float | None = None) -> dict[str, dict[str, Any]]:
+    """The corrections a page shows on their rows (the feedback round 3, W3): ``{ref: {"kind", "words", "state",
+    "cid", "at"}}`` for the refs starting with one of ``prefixes`` (all with None). ``state``: ``fixing`` (sent, the
+    correction pass has not landed: "Got it, fixing it"), ``fixed`` (landed within :data:`FIXED_SHOWN_S`; the row
+    already shows the corrected text) or ``failed``; ``cid`` is the correction's id, for its Undo while it waits."""
+    now = time.time() if now is None else now
+    out: dict[str, dict[str, Any]] = {}
+    for ref, p in (pending or {}).items():
+        if not isinstance(p, dict) or (prefixes and not str(ref).startswith(prefixes)):
+            continue
+        state = str(p.get("state") or "fixing")
+        if state != "fixing" and now - float(p.get("done_at") or 0) > FIXED_SHOWN_S:
+            continue
+        out[str(ref)] = {"kind": p.get("kind") or "correct", "words": p.get("words") or "", "state": state,
+                         "cid": p.get("fid"), "at": p.get("at"), "late": bool(p.get("late"))}
+    return out
 
 
 def rule_json(r: dict[str, Any]) -> dict[str, Any]:
@@ -960,9 +1045,10 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
     total = sum(len(g["facts"]) for g in groups) + len(rules) + len(routines) + len(not_routines) + len(in_review)
     return {"source": source, "people": persons, "groups": groups, "rules": rules, "routines": routines,
             "not_routines": not_routines, "review": review, "total": total,
-            "misheard": misheard_view(memory, calls, fallback, now, lookup), "pending": pending or {},
+            "misheard": misheard_view(memory, calls, fallback, now, lookup), "pending": pending_view(pending, None, now),
             "can": {"pin": callable(getattr(memory, "pin_fact", None)), "review": callable(rq),
-                    "heard": callable(getattr(memory, "resolve_heard", None))}}
+                    "heard": callable(getattr(memory, "resolve_heard", None)),
+                    "correct": callable(getattr(memory, "correct_item", None))}}
 
 
 # -- Work and the Day ----------------------------------------------------------------------------------------------
@@ -998,28 +1084,69 @@ def thread_involves(t: dict[str, Any]) -> tuple[list[str], list[str]]:
     return people, things
 
 
-def build_work(memory: Any, *, week: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Threads of work (memory's ``threads``), most recently touched first, with their checklists, the people and
-    the apps they involve, their open goal; and the week figure."""
+#: Work's "Closed" fold: threads you (or memory) closed or dismissed within this long, at most this many.
+CLOSED_SHOWN_DAYS = 14
+CLOSED_SHOWN = 8
+
+
+def closed_threads(memory: Any) -> list[dict[str, Any]]:
+    """The threads closed as done or dismissed, as ``{"ref", "title", "status", "closed_at", "closed_by",
+    "last_seen"}``, newest closed first. Every closed one is read, not the most recently touched few: a thread you
+    dismiss may not have been touched for weeks, and it must still reach the fold (and its Reopen). The store's
+    plain rows (no checklists or typed names to work out); a memory without a store gets ``threads``' read."""
+    rows = _safe(lambda: memory.store.work_threads(("done", "dismissed")), None)
+    if rows is None:
+        out = _safe(lambda: memory.threads(statuses=("done", "dismissed"), limit=CLOSED_SHOWN * 3), []) or []
+    else:
+        out = [{"ref": f"thread:{t.id}", "title": t.title, "status": t.status, "closed_at": getattr(t, "closed_at", None),
+                "closed_by": getattr(t, "closed_by", None), "last_seen": t.last_seen} for t in rows]
+    return sorted(out, key=lambda t: -(epoch_of(t.get("closed_at")) or epoch_of(t.get("last_seen")) or 0))
+
+
+def build_work(memory: Any, *, week: dict[str, Any] | None = None, pending: dict[str, Any] | None = None,
+               now: float | None = None) -> dict[str, Any]:
+    """Threads of work (memory's ``threads``; the feedback round 3, W1): the open ones (active first, then paused,
+    most recently touched first), each with its title, where it stands (``state``: memory's card, said to you), the
+    next step (``next``; memory's, or None until written), its checklist, the people and the apps it involves and
+    its open goal; ``closed``: the ones closed as done or dismissed lately (newest first, for the Reopen fold);
+    ``pending``: corrections sent on a thread and not landed yet; ``can``: which of close / Continue / correct this
+    memory takes; and the week figure."""
     from yuki.ui.window.data import natural
 
-    rows = _safe(lambda: memory.threads(statuses=("active", "paused", "done"), limit=24), []) or []
+    now = time.time() if now is None else now
+    rows = _safe(lambda: memory.threads(statuses=("active", "blocked", "paused"), limit=24), []) or []
     goals = thread_goals(memory)
-    threads = []
-    for t in rows:
+
+    def view(t: dict[str, Any]) -> dict[str, Any]:
         people, things = thread_involves(t)
         goal = goals.get(f"W{t.get('id')}") if t.get("id") is not None else None
-        threads.append({"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
-                        # where it stands, said to you (memory's shown form, migration 33); until it is written, the
-                        # state with only its date and time formats changed
-                        "state": " ".join(str(t.get("shown") or "").split()) or natural(" ".join(str(t.get("state") or "").split())),
-                        "open": [str(x) for x in t.get("open") or []],
-                        "involves": [str(x) for x in t.get("involves") or []], "people": people, "apps": things,
-                        "last_at": epoch_of(t.get("last_seen")), "checks": thread_checks(t),
-                        "goal": goal["text"] if goal else None})
-    order = {"active": 0, "blocked": 0, "paused": 1, "done": 2}
+        return {"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
+                # where it stands, said to you (memory's card, migrations 33 and 35); until it is written, the state
+                # with only its date and time formats changed
+                "state": " ".join(str(t.get("shown") or "").split()) or natural(" ".join(str(t.get("state") or "").split())),
+                "next": " ".join(str(t.get("next") or "").split()) or None,
+                "open": [str(x) for x in t.get("open") or []],
+                "involves": [str(x) for x in t.get("involves") or []], "people": people, "apps": things,
+                "last_at": epoch_of(t.get("last_seen")), "checks": thread_checks(t),
+                "goal": goal["text"] if goal else None}
+    threads = [view(t) for t in rows]
+    order = {"active": 0, "blocked": 0, "paused": 1}
     threads.sort(key=lambda t: (order.get(t["status"], 1), -(t["last_at"] or 0)))
-    return {"threads": threads, "week": week if week is not None else week_figure(memory)}
+    closed = []
+    can_close = callable(getattr(memory, "close_thread", None))
+    if can_close:   # only a memory that can reopen them shows them (an older one has no dismissed threads)
+        for t in closed_threads(memory):
+            at = epoch_of(t.get("closed_at")) or epoch_of(t.get("last_seen")) or 0
+            if at < now - CLOSED_SHOWN_DAYS * 86400:
+                continue
+            closed.append({"ref": t.get("ref"), "title": t.get("title") or "", "status": t.get("status") or "",
+                           "closed_at": at, "by_you": t.get("closed_by") == "user"})
+        closed.sort(key=lambda c: -(c["closed_at"] or 0))
+        closed = closed[:CLOSED_SHOWN]
+    return {"threads": threads, "closed": closed, "week": week if week is not None else week_figure(memory),
+            "pending": pending_view(pending, ("thread:",), now),
+            "can": {"close": can_close, "cont": callable(getattr(memory, "thread_continue", None)),
+                    "correct": callable(getattr(memory, "correct_item", None))}}
 
 
 def week_figure(memory: Any, now: float | None = None) -> dict[str, Any]:
@@ -1109,9 +1236,11 @@ def call_where(c: dict[str, Any], default: str | None = None) -> str:
 
 
 def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
-              week: list[dict[str, Any]] | None = None, people: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """The Day tab: the day in slices (the skyline), today's totals, sessions (each opens to its whole title and the
-    time in every app), calls (where, who, the gists said to you), and the week by hour."""
+              week: list[dict[str, Any]] | None = None, people: list[dict[str, Any]] | None = None,
+              pending: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The Day tab: the day in slices (the skyline), today's totals, sessions (a short title each; opened, the
+    summary and the time in every app; ``ref`` for Correct), calls (where, who, the gists said to you), the week by
+    hour, and the corrections sent on a session and not landed yet (``pending``)."""
     from yuki.ui.window.data import build_day as qt_build_day
 
     now = time.time() if now is None else now
@@ -1165,18 +1294,24 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
     from yuki.ui.window.data import nat_time, natural
 
     lanes = {ln.key: ln.label for ln in v.lanes}
+    labels = session_labels(memory, v.sessions, since)
     sessions = []
     for s in v.sessions:
         fs = sum(seg.present_s for seg in v.segments if seg.fullscreen and seg.state == "present"
                  and seg.start < s.end and seg.end > s.start)
-        full = natural(getattr(s, "title_full", "") or s.title)
-        # the row shows the title and its first apps; opening it shows the whole title and the time in every app
-        # (the 3 Oct ask D: "clicking on each session should show the time spent per app and the entire session title")
+        app = lanes.get(s.lane, s.lane)
+        lab = labels.get(id(s))
+        # the feedback round 3, W2: the row is the session's short distinct title (memory's, never its summary cut
+        # short), opened its one- or two-sentence summary and the time in every app. Until memory has written them:
+        # the app as the title and the narrative's first sentence, whole, as the detail
+        if lab is not None and lab["title"]:
+            extra = {"title": lab["title"], "ref": lab["ref"], **({"summary": lab["summary"]} if lab["summary"] else {})}
+        else:   # still correctable: the ref of its longest episode (correct_item takes any current one)
+            extra = {"title": app, "full": natural(getattr(s, "title_full", "") or s.title),
+                     **({"ref": lab["ref"]} if lab is not None and lab.get("ref") else {})}
         sessions.append({"a": int((s.start - since) // 60), "b": int((s.end - since) // 60), "start": hm(s.start),
-                         "end": hm(s.end), "title": natural(s.title), "app": lanes.get(s.lane, s.lane),
-                         "mode": "full" if fs > s.present_s / 2 else "active",
-                         "apps": [[name, round(secs / 60)] for name, secs in s.apps if secs >= 30],
-                         **({"full": full} if full != natural(s.title) else {})})
+                         "end": hm(s.end), "app": app, "mode": "full" if fs > s.present_s / 2 else "active",
+                         "apps": [[name, round(secs / 60)] for name, secs in s.apps if secs >= 30], **extra})
     calls_rows = _safe(lambda: memory.calls_in(since=since, until=since + 86400, limit=30), []) or []
     lookup = name_lookup(people)
     calls = []
@@ -1210,7 +1345,38 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
             "now_min": int((now - since) // 60) if is_today else None,
             "off": [{"from": nat_time(s), "to": nat_time(e)} for s, e in offs if e - s >= 600],
             "buckets": buckets, "sessions": sessions, "calls": calls, "totals": totals,
-            "week_hours": week if week is not None else week_days(memory, now)}
+            "week_hours": week if week is not None else week_days(memory, now),
+            "pending": pending_view(pending, ("episode:",), now),
+            "can": {"correct": callable(getattr(memory, "correct_item", None))}}
+
+
+def session_labels(memory: Any, sessions: list[Any], since: float) -> dict[int, dict[str, Any]]:
+    """Each Day session's label from memory's episodes (migration 35, the feedback round 3, W2): ``{id(session):
+    {"title", "summary", "ref"}}`` from the longest titled episode inside it (an episode belongs to the session
+    holding most of it; a session joins neighbouring episodes led by the same app, as its title already did). A
+    session with no titled episode yet gets ``{"title": None, "summary": None, "ref"}`` from its longest episode, so
+    it can still be corrected (the page keeps the app as its title); one with no episode is left out. Reads only
+    (``episodes``), no model."""
+    eps = []
+    for e in _safe(lambda: memory.episodes(since, since + 86400.0, limit=200), []) or []:
+        if not isinstance(e, dict):
+            continue
+        title = " ".join(str(e.get("title") or "").split()) or None
+        s, u = epoch_of(e.get("start")), epoch_of(e.get("end"))
+        if s is not None and u is not None and u > s:
+            eps.append((s, u, title, " ".join(str(e.get("summary") or "").split()) or None, e.get("ref")))
+    out: dict[int, dict[str, Any]] = {}
+    for sess in sessions:
+        inside = [e for e in eps if min(e[1], sess.end) - max(e[0], sess.start) > (e[1] - e[0]) / 2]
+        titled = [e for e in inside if e[2]]
+        if titled:
+            s, u, title, summary, ref = max(titled, key=lambda e: e[1] - e[0])
+            out[id(sess)] = {"title": title, "summary": summary, "ref": ref}
+        elif inside:
+            ref = max(inside, key=lambda e: e[1] - e[0])[4]
+            if ref:
+                out[id(sess)] = {"title": None, "summary": None, "ref": ref}
+    return out
 
 
 def longest_focus(v: Any) -> tuple[float, str, float]:
@@ -1886,7 +2052,7 @@ def runs_of(model: Any, now: float | None = None) -> list[dict[str, Any]]:
 #: read the timeline, so it is in their stamps (review F3): a revisit after STALE_S, or the open page's slow fallback,
 #: rebuilds them while you are at the PC; the hash still skips a build that shows nothing new.
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
-    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls"),
+    "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", "work_threads"),
     "work": ("work_threads", "goals", "timeline"),
     "day": ("timeline", "calls"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),

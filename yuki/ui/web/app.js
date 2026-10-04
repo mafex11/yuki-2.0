@@ -271,7 +271,7 @@
      else is patched in place or swapped. Scroll, focus, typed text, open folds and the field's figures (when their
      data did not change) all survive. */
   const FIELDS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
-  const TICKER = ['from', 'since', 'clock', 'rel', 'until', 'nowmin'];   // text the ticker owns (tick below)
+  const TICKER = ['from', 'since', 'clock', 'rel', 'until', 'nowmin', 'durfrom'];   // text the ticker owns (tick below)
   const FIG_PROPS = ['__week', '__sky'];                                  // figure data the field reads (field.js)
   const RETIRE_MS = 4000;    // a confirmation row an action left stays this long, then new data may replace it
   const PRESS_MS = 6000;     // the item you pressed is held this long (its reply may still morph it)
@@ -433,6 +433,8 @@
     // the minute's own changes, with no message from the host (42 §6.3): "x min ago", an Undo's minutes left, the
     // Day's now marker; an Undo whose window closed is patched away
     document.querySelectorAll('[data-rel]').forEach((el) => { const v = fmt.rel(Number(el.dataset.rel)); if (el.textContent !== v) el.textContent = v; });
+    // Home's thread tile: how long you've been on it, "1h 05m", while its app is in front
+    document.querySelectorAll('[data-durfrom]').forEach((el) => { const v = fmt.dur((now - Number(el.dataset.durfrom)) / 60); if (el.textContent !== v) el.textContent = v; });
     let closed = false;
     document.querySelectorAll('#main [data-until]').forEach((el) => {
       const left = Number(el.dataset.until) - now;

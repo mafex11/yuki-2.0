@@ -1,11 +1,13 @@
 /* Me (the 3 Oct design): the people Yuki knows (each with one summary, key facts, how you reach them: the routes
    table, the contact rhythm, the "Usually" line), your portrait (a "To review" queue of at most 5 a day, search, topic
    groups of one-line headlines with the detail on click, each fact shown once), Routines (title, days seen in the last
-   7, how sure I am; detail on click; the one-day observations under "Not routines") and Maybe misheard (where it was
-   heard, in one format). Every entry says where it came from and has Correct / Forget (10 s to undo, nothing is sent
-   before) / Not mine / Pin (its own flag: Pin <-> Unpin). Right / Wrong on To review and Maybe misheard resolve at
-   once (a 5 s Undo, no "updating"). Words come from memory's shown forms; nothing here rewrites them. What you
-   resolve, pin or forget is kept by id for the session, so a redraw never brings it back. */
+   7, how sure I am; detail on click; the one-day observations under "Not routines") and Maybe misheard (what I heard
+   and my guess, 'Heard "hey meant", probably Hemanth', with why; where it was heard, in one format). Every entry says
+   where it came from and has Correct (you say what's wrong in a few words; the 4 Oct item W3, ui.js) / Forget (10 s
+   to undo, nothing is sent before) / Not mine / Pin (its own flag: Pin <-> Unpin). Right / Wrong on To review and
+   Yes / No on Maybe misheard resolve at once (a 5 s Undo, no "updating"); "It was…" is Correct in your words. Words
+   come from memory's shown forms; nothing here rewrites them. What you resolve, pin or forget is kept by id for the
+   session, so a redraw never brings it back. */
 (function () {
   'use strict';
   const Y = window.Yk, { h, ic, key, fmt } = Y;
@@ -19,15 +21,17 @@
   const factActs = (pinned, o) => {
     const opts = o || {};
     return h('div', { class: 'acts' + (opts.inline ? ' inline' : '') },
-      opts.noCorrect ? null : key('Correct', { cls: 'xs', data: { do: 'correct' } }),
+      opts.noCorrect ? null : Y.correctKey(opts.rule ? 'Say it again' : 'Correct'),
       key('Forget', { cls: 'xs ghost', data: { do: 'forget' } }),
       opts.noNotMine ? null : key('Not mine', { cls: 'xs ghost', data: { do: 'notmine' } }),
       opts.noPin ? null : pinKey(pinned));
   };
+  /* a change you asked for, on its row: a correction in your words says "Got it, fixing it" then "Fixed" (ui.js
+     fixLine); Forget and Not mine say they are being applied */
   function pendingMeta(p) {
     if (!p) return null;
-    const words = { correct: `You corrected this${p.words ? ': “' + p.words + '”' : ''}. I’m updating it.`, forget: 'Forgetting it. I’m updating.',
-      notmine: 'Marked not yours. I’m updating.' }[p.kind] || 'I’m updating it.';
+    if (!p.kind || p.kind === 'correct') return Y.fixLine(p);
+    const words = { forget: 'Forgetting it. I’m updating.', notmine: 'Marked not yours. I’m updating.' }[p.kind] || 'I’m updating it.';
     return h('span', { class: 'corrected', text: words });
   }
   const pinMark = () => h('span', { class: 'pinmark', title: 'pinned' }, ic('pin'));
@@ -42,23 +46,24 @@
     const p = (d.pending || {})[f.ref];
     const pinned = isPinned(f.ref, f.pinned);
     const notmine = p && p.kind === 'notmine';
-    const head = h('span', { class: 'tx' + (f.joke ? ' joke' : '') }, (p && p.kind === 'correct' && p.words) || f.h);
+    const head = h('span', { class: 'tx' + (f.joke ? ' joke' : '') }, f.h);
     const meta = [o.group ? h('span', { class: 'gtag', text: o.group }) : null, f.joke ? h('span', { class: 'flag', text: 'joke' }) : null,
       f.unsure ? h('span', { class: 'flag', text: 'not sure' }) : null, pinMark()];
     const body = [f.d ? h('div', { class: 'd', text: f.d }) : null,
       h('div', { class: 'meta2' }, pendingMeta(p), f.prov ? h('span', { text: f.prov }) : null, f.you ? h('span', { text: 'you told me' }) : null),
       factActs(pinned, { inline: true, noPin: !(d.can || {}).pin })];
     return Y.fold(f.ref, head, meta, body, { cls: [pinned ? 'pinned' : '', notmine ? 'notmine' : '', p && p.kind === 'forget' ? 'forgetting' : ''].filter(Boolean).join(' '),
-      data: { fact: '', ref: f.ref, kind: f.kind || 'fact', title: f.subject || f.h || '', text: f.d || f.h || '' } });
+      data: { fact: '', ref: f.ref, cref: f.ref, cpage: 'me', kind: f.kind || 'fact', title: f.subject || f.h || '', text: f.d || f.h || '' } });
   }
   /* a person's fact lives on their page: here it is a link there, never the detail again */
   const personLink = (f) => h('button', { class: 'fx-link', data: { person: f.person, k: 'pl:' + f.ref }, attrs: { type: 'button' } },
     h('span', { class: 'tx', text: f.h }), h('span', { class: 'fx-meta' }, isPinned(f.ref, f.pinned) ? pinMark() : null, h('span', { text: 'on their page' })), ic('chev'));
   function ruleRow(r, d) {
     const p = (d.pending || {})[r.ref];
-    return Y.fold(r.ref, h('span', { class: 'tx' }, (p && p.words) || r.text), h('span', { class: 'gtag', text: r.kind === 'rule' ? 'your rule' : 'your preference' }),
-      [h('div', { class: 'meta2' }, pendingMeta(p), h('span', { text: r.prov || '' })), factActs(false, { inline: true, noNotMine: true, noPin: true })],
-      { data: { fact: '', ref: r.ref, kind: 'rule', text: r.text || '' } });
+    // your rules are your own words: "Say it again" puts the rule in new words (never the old text to edit)
+    return Y.fold(r.ref, h('span', { class: 'tx' }, r.text), h('span', { class: 'gtag', text: r.kind === 'rule' ? 'your rule' : 'your preference' }),
+      [h('div', { class: 'meta2' }, p && p.kind !== 'correct' ? pendingMeta(p) : null, h('span', { text: r.prov || '' })), factActs(false, { inline: true, noNotMine: true, noPin: true, rule: true })],
+      { data: { fact: '', ref: r.ref, cref: r.ref, cpage: 'me', kind: 'rule', text: r.text || '' } });
   }
 
   /* ---------- your portrait: To review, search, topic groups ---------- */
@@ -66,11 +71,16 @@
     const R = d.review;
     if (!R) return null;
     const list = (R.items || []).filter((r) => !resolved.has(r.ref));
-    const rows = list.map((r) => h('div', { class: 'rv', data: { fact: '', resolve: '', op: 'review', ref: r.ref, k: 'rv:' + r.ref } },
-      h('div', { class: 'rv-h' }, h('span', { text: r.h }), r.d ? h('span', { class: 'rv-d', text: r.d }) : null),
-      h('div', { class: 'meta2' }, r.flag ? h('span', { class: 'flag' + (r.flag === 'new' ? ' new' : ''), text: r.flag }) : null, r.prov ? h('span', { text: r.prov }) : null),
-      h('div', { class: 'acts inline' }, key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' } }),
-        key('Wrong', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' } }), key('Not mine', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'notmine' } }))));
+    const canFix = !!(d.can || {}).correct;
+    const rows = list.map((r) => {
+      const p = (d.pending || {})[r.ref];
+      return h('div', { class: 'rv', data: { fact: '', resolve: '', op: 'review', ref: r.ref, cref: r.ref, cpage: 'me', k: 'rv:' + r.ref, title: r.h || '', text: r.d || r.h || '' } },
+        h('div', { class: 'rv-h' }, h('span', { text: r.h }), r.d ? h('span', { class: 'rv-d', text: r.d }) : null),
+        h('div', { class: 'meta2' }, r.flag ? h('span', { class: 'flag' + (r.flag === 'new' ? ' new' : ''), text: r.flag }) : null, r.prov ? h('span', { text: r.prov }) : null, pendingMeta(p)),
+        h('div', { class: 'acts inline' }, key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' } }),
+          key('Wrong', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' } }), key('Not mine', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'notmine' } }),
+          canFix && !Y.fixing(p) ? Y.correctKey() : null));
+    });
     const done = R.left <= 0 && !list.length ? 'All reviewed for today. The next few come tomorrow.'
       : 'Nothing to review right now. I’ll put new or unsure facts here, at most 5 a day.';
     return h('div', { class: 'review', data: { review: '', k: 'review' } },
@@ -130,23 +140,23 @@
   function routineRow(r, d) {
     const p = (d.pending || {})[r.ref];
     const pinned = isPinned(r.ref, r.pinned), n = (r.week || []).filter(Boolean).length;
-    const head = h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: (p && p.kind === 'correct' && p.words) || r.h }),
+    const head = h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: r.h }),
       r.when ? h('span', { class: 'rt-w', text: ' · ' + r.when }) : null);   /* title · when (measured from its evidence) */
     const meta = [r.week ? wkDots(r.week) : null, r.conf_word ? confMeter(r.conf_word) : null, pinMark()];
     const body = [r.d ? h('div', { class: 'd', text: r.d }) : null,
       h('div', { class: 'meta2' }, pendingMeta(p), h('span', { class: 'rt-sure', text: `${cap(r.conf_word || 'still learning')} · seen ${n} of the last 7 days` }), r.prov ? h('span', { text: r.prov }) : null),
       factActs(pinned, { inline: true, noPin: !(d.can || {}).pin })];
     return Y.fold(r.ref, head, meta, body, { cls: 'rt' + (pinned ? ' pinned' : '') + (p && p.kind === 'notmine' ? ' notmine' : ''),
-      data: { fact: '', ref: r.ref, kind: 'routine', title: r.h || '', text: r.d || r.h || '' } });
+      data: { fact: '', ref: r.ref, cref: r.ref, cpage: 'me', kind: 'routine', title: r.h || '', text: r.d || r.h || '' } });
   }
   function routines(d) {
     const R = d.routines || [], N = d.not_routines || [];
     const legend = h('div', { class: 'rt-key' }, h('span', null, h('span', { class: 'wkdots' }, h('i', { class: 'on' }), h('i', { class: 'on' }), h('i')), 'days I saw it, last 7'),
       h('span', null, h('span', { class: 'conf' }, h('i', { class: 'on' }), h('i', { class: 'on' }), h('i')), 'how sure I am'), h('span', { class: 't3', text: 'click one for the detail' }));
     const notRt = N.map((r) => Y.fold(r.ref, h('span', { class: 'tx' }, h('b', { class: 'rt-t', text: r.h })), null,
-      [r.d ? h('div', { class: 'd', text: r.d }) : null, h('div', { class: 'meta2' }, r.days_seen ? h('span', { text: `seen on ${fmt.plural(r.days_seen, 'day')}` }) : null,
+      [r.d ? h('div', { class: 'd', text: r.d }) : null, h('div', { class: 'meta2' }, pendingMeta((d.pending || {})[r.ref]), r.days_seen ? h('span', { text: `seen on ${fmt.plural(r.days_seen, 'day')}` }) : null,
         r.prov ? h('span', { text: r.prov }) : null), factActs(isPinned(r.ref, r.pinned), { inline: true, noPin: !(d.can || {}).pin })],
-      { cls: 'rt notrt', data: { fact: '', ref: r.ref, kind: 'behaviour', title: r.h || '', text: r.d || r.h || '' } }));
+      { cls: 'rt notrt', data: { fact: '', ref: r.ref, cref: r.ref, cpage: 'me', kind: 'behaviour', title: r.h || '', text: r.d || r.h || '' } }));
     const body = h('div', { class: 'rts' }, R.length ? [legend, R.map((r) => routineRow(r, d))] : Y.empty('No routines yet. They come from what you do most days.'),
       N.length ? [h('div', { class: 'label notrt-h', text: 'Not routines: what you’ve been doing lately' }),
         // what they are and how I use them, in one plain line (the 4 Oct item W4)
@@ -155,16 +165,26 @@
     return Y.sec('Routines', R.length, body, Y.rightLabel('your preferences and rules are in your portrait'));
   }
 
-  /* ---------- Maybe misheard ---------- */
+  /* ---------- Maybe misheard (the 4 Oct item W6): what I heard and my guess, never a raw transcript line ---------- */
+  const guessWords = (m) => (m.guess_is_name ? m.guess : `“${m.guess}”`);
+  function misheardRow(m, M, d) {
+    const p = (d.pending || {})[m.ref], guessed = !!(m.heard && m.guess);
+    const acts = Y.fixing(p) || (p && p.kind === 'forget') ? null : guessed && M.direct
+      ? [key('Yes', { cls: 'xs', data: { do: 'resolve', verdict: 'guess_right' }, title: `Yes, it was ${m.guess}` }),
+        key('No', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' }, title: 'No, drop it' })]
+      : M.direct ? [key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' }, title: 'It was right as I heard it' }),
+        key('Wrong', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' } })]
+        : [key('Wrong', { cls: 'xs ghost', data: { do: 'forget' } })];
+    return h('div', { class: 'fact mh', data: { fact: '', resolve: '', op: 'heard', ref: m.ref, cref: m.ref, cpage: 'me', kind: 'journal', text: m.text || '', k: 'mh:' + m.ref,
+      cask: 'What was it?', cph: guessed ? `what you said instead of “${m.heard}”` : 'the words or the name you said' } },
+    guessed ? h('div', { class: 'tx mh-g' }, 'Heard ', h('b', { text: `“${m.heard}”` }), ', probably ', h('b', { text: guessWords(m) })) : h('div', { class: 'tx', text: m.text }),
+    guessed && m.why ? h('div', { class: 'mh-why', text: m.why }) : null,
+    h('div', { class: 'meta2' }, pendingMeta(p), h('span', { text: m.prov || '' }), h('span', { text: 'maybe misheard' })),
+    acts ? h('div', { class: 'acts inline' }, acts, M.correct ? Y.correctKey('It was…', 'Tell me what was said') : null) : null);
+  }
   function misheard(d) {
     const M = d.misheard || {}, list = (M.items || []).filter((m) => !resolved.has(m.ref));
-    const direct = !!M.direct;
-    const rows = list.map((m) => h('div', { class: 'fact mh', data: { fact: '', resolve: '', op: 'heard', ref: m.ref, kind: 'journal', text: m.text || '', k: 'mh:' + m.ref } },
-      h('div', { class: 'tx', text: m.quote ? `“${m.quote}”` : m.text }),
-      h('div', { class: 'meta2' }, h('span', { text: m.prov || '' }), h('span', { text: 'maybe misheard' })),
-      h('div', { class: 'acts inline' }, direct
-        ? [key('Right', { cls: 'xs', data: { do: 'resolve', verdict: 'right' } }), key('Wrong', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'wrong' } })]
-        : key('Wrong', { cls: 'xs ghost', data: { do: 'forget' } }))));
+    const rows = list.map((m) => misheardRow(m, M, d));
     const more = (M.total || 0) > (M.items || []).length ? h('div', { class: 'label', text: `${M.total - M.items.length} more after these` }) : null;
     return Y.sec('Maybe misheard', list.length, [rows, more,
       h('div', { class: 'mh-done', attrs: { hidden: list.length ? true : null } }, ic('check'), h('span', { text: 'Nothing to check. I’ll ask when I’m not sure of a word.' }))], null, 'mhsec');
@@ -217,7 +237,8 @@
         (det.aliases || p.aliases || []).length ? h('div', { class: 'aka', text: 'aka ' + (det.aliases || p.aliases).join(', ') }) : null),
       sm ? factActs(pinned, { noPin: !(d.can || {}).pin }) : null),
       // one summary (the relation is the people list's line, never repeated here: the 3 Oct feedback item 4)
-      sm && (sm.text || sm.headline) ? h('div', { class: 'note tx', text: (pf && pf.kind === 'correct' && pf.words) || sm.text || sm.headline }) : null,
+      sm && (sm.text || sm.headline) ? h('div', { class: 'note tx', text: sm.text || sm.headline }) : null,
+      sm ? h('div', { class: 'fixslot' }) : null,
       facts.length ? h('div', { class: 'kf' }, Y.label('Key facts'),
         h('ul', { class: 'kfacts' + (kOpen ? ' open' : '') }, facts.map((f, i) => {
           const flag = reviewFlag(f.ref, d);
@@ -232,7 +253,10 @@
       h('div', { class: 'usually' }, h('span', { class: 'label', text: 'Usually' }),
         h('span', { text: usual || (d.source === 'index' ? 'No chat seen on this PC yet. I won’t guess one.' : 'I learn how you reach people from the chats I see on this PC.') })),
       (p.open || []).length ? h('div', { class: 'usually' }, h('span', { class: 'label', text: 'Open' }), h('span', { class: 't2', text: p.open.join(' · ') })) : null);
-    if (sm) { el.dataset.fact = ''; el.dataset.ref = sm.ref; el.dataset.kind = 'person'; el.dataset.title = p.name; el.dataset.text = sm.text || sm.headline || ''; }
+    if (sm) {
+      el.dataset.fact = ''; el.dataset.ref = sm.ref; el.dataset.cref = sm.ref; el.dataset.cpage = 'me'; el.dataset.kind = 'person';
+      el.dataset.title = p.name; el.dataset.text = sm.text || sm.headline || '';
+    }
     return el;
   }
 
@@ -273,36 +297,7 @@
       return r;
     });
   }
-  /* Correct: the row opens and the editor sits in its detail (outside the header button, so typing never folds it);
-     Save keeps the row open with "You corrected this, just now" */
-  A.correct = (t) => {
-    const row = rowOf(t); if (!row || row.classList.contains('editing')) return;
-    const fx = row.classList.contains('fx');
-    const old = fx ? (row.querySelector('.fx-h .tx') || {}).textContent || '' : ((row.querySelector('.note, .tx') || {}).textContent || '');
-    row.classList.add('editing');
-    if (fx && !row.classList.contains('open')) { row.classList.add('open'); Y.S.open.add('f:' + row.dataset.fold); }
-    const inp = h('input', { class: 'fact-in', data: { enter: 'fact-save', escape: 'fact-cancel', old: old.trim() }, attrs: { 'aria-label': 'Say what’s true, in your words', value: (row.dataset.text || old).trim() } });
-    const ed = h('div', { class: 'fx-edit' }, h('div', { class: 'label' }, ic('edit'), 'Say it your way'), h('div', { class: 'fx-edit-r one' }, inp),
-      h('div', { class: 'acts inline' }, key('Save', { cls: 'xs pri', data: { do: 'fact-save' } }), key('Cancel', { cls: 'xs ghost', data: { do: 'fact-cancel' } })));
-    const host = row.querySelector(':scope > .fx-d') || row;
-    if (host === row) { const n = row.querySelector('.note, .tx'); if (n) n.after(ed); else row.append(ed); } else host.prepend(ed);
-    Y.pop(ed); inp.focus(); inp.select(); Y.remeasure();
-  };
-  function factDone(row, cancel) {
-    if (!row) return;
-    const ed = row.querySelector('.fx-edit'); const inp = ed && ed.querySelector('input'); if (!inp) return;
-    const words = inp.value.trim(), old = (row.dataset.text || inp.dataset.old || '').trim();
-    ed.remove(); row.classList.remove('editing'); Y.remeasure();
-    if (cancel || !words || words === old) return;
-    send(row, 'correct', words).then((r) => {
-      if (!r || !r.ok) return;
-      const tx = row.querySelector('.fx-h .tx, .note');
-      if (tx) { tx.textContent = words; if (!window.Lattice.Motion.reduced) tx.animate([{ background: 'rgba(111,235,196,.14)' }, { background: 'transparent' }], { duration: 900 }); }
-      const m = row.querySelector('.meta2'); if (m) { let c = m.querySelector('.corrected'); if (!c) { c = h('span', { class: 'corrected' }); m.prepend(c); } c.textContent = 'You corrected this, just now'; }
-    });
-  }
-  A['fact-save'] = (t) => factDone(rowOf(t), false);
-  A['fact-cancel'] = (t) => factDone(rowOf(t), true);
+  /* Correct is the shared one (ui.js): a small "What's wrong?" line, your words to memory's correct_item */
   /* Forget: a 10 s countdown with Undo; nothing reaches memory until it runs out */
   A.forget = (t) => {
     const row = rowOf(t); if (!row || row.__forget) return;
@@ -372,7 +367,7 @@
   /* Right / Wrong / Not mine at once: the row turns into "Got it" with Undo and a 5 s drain, then leaves; the count
      drops; an answer that fails puts the row back. Undo after memory started on it is too late: it stays removed. */
   const WORDS = { review: { right: 'Got it. I’ll keep it as right.', wrong: 'Got it. I’ve dropped it.', notmine: 'Got it. Not yours; I’ll stop using it.' },
-    heard: { right: 'Got it. I’ll take it as you said it.', wrong: 'Got it. I’ve dropped it.' } };
+    heard: { right: 'Got it. I’ll take it as you said it.', wrong: 'Got it. I’ve dropped it.', guess_right: 'Got it, fixing my notes to say it right.' } };
   function countIn(row, delta) {
     const box = row.closest('[data-review]') || row.closest('section');
     const c = box && box.querySelector('.label .doto');
