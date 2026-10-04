@@ -482,6 +482,8 @@ LIST_CLIPS = [
     ("l_plumber", "What did I tell you earlier about the plumber?"),
     ("l_add", "Add the car insurance renewal to my to-do list."), ("l_time", "What time is it?"),
     ("l_totals", "I told you about the total list, right? What were the totals?"),
+    # second review LVV-1: an add with more asked in the same breath (both parts must be answered)
+    ("l_add_ask", "Add call mom to my list, and what time is it?"),
 ]
 
 

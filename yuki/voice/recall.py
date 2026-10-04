@@ -71,18 +71,18 @@ SEARCH_EMBED_WAIT_S = 0.4
 QUICK_MEMORY: dict[str, Any] = {
     "name": "quick_memory",
     "description": (
-        "Your quick look into memory, after a few words in the same reply (\"Let me look.\"); its report says what "
-        "to say. todos: their to-do "
-        "list. add_todos: put items on it when they ask, one each, their words. today: today's talk with you. "
-        "search: memory for query."
+        "Look into memory, after a few words in the same reply (\"Let me look.\"). todos: their to-dos. add_todos: put "
+        "items on it when they ask, one each, their words. today: today's chat. search: memory for query."
     ),
     "properties": {
         "action": {"type": "string", "enum": ["todos", "add_todos", "today", "search"]},
         "items": {"type": "array", "items": {"type": "object", "properties": {
             "text": {"type": "string"},
-            "due": {"type": "string", "description": "Only if they gave one: YYYY-MM-DD or YYYY-MM-DD HH:MM"}},
+            "due": {"type": "string", "description": "If given: YYYY-MM-DD[ HH:MM]"}},
             "required": ["text"]}},
         "query": {"type": "string"},
+        # second review LVV-1: the rest of a request an add is part of (a clean add alone ends the turn by code)
+        "then": {"type": "string", "description": "With add_todos: the rest of what they asked, else \"\""},
     },
     "required": ["action"],
 }
@@ -97,10 +97,16 @@ ADDED_NOTE = ("Saved and checked: nothing more to do. Say: \"Added {n}, they're 
               "they ask.")
 #: leftVoice: a clean add (every item saved, with its due when it had one) is confirmed by code, in these words, the
 #: moment memory has it: no second talker run (its first token alone is ~1.2-1.5 s). Formatting: a count and the place.
+#: Only when the add is the whole request: alone in its reply, with nothing left in its ``then`` (second review LVV-1).
 ADDED_ONE_LINE = "Added it, it's on Home under Your list."
 ADDED_LINE = "Added {n}, they're on Home under Your list."
 ADDED_SAID_NOTE = ("Said aloud just now in your voice, word for word: your own words to them, already heard. Saved and "
                    "checked: nothing more to do. Never say it again; if they ask, answer from it.")
+#: Second review LVV-1: the same words asked for more than the add ("add call mom, and what time is it?"; a clean add
+#: said by code used to end the turn, and the rest was never answered). The talker says the add and does the rest, as
+#: fx2's open hands do with their own ``then``.
+ADDED_THEN_NOTE = (" Then, in the same reply, do what else they asked unless your words before the call already did: "
+                   "{then} (this report holds only what was just added; anything more needs its own look).")
 #: An item kept without the due it was given (memory could not read the due): the talker says so, not code.
 NO_TIME_MARK = " (saved without its time: it could not be read)"
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
@@ -389,10 +395,14 @@ class QuickMemory:
     ``memory`` is :class:`~yuki.agent.memory.MemoryAccess`. ``log`` (the voice log) gets one content-free event per
     use: the action, whether it worked, how long it took and how many items."""
 
-    def __init__(self, memory: Any, *, log: Any = None, session: str | None = None) -> None:
+    def __init__(self, memory: Any, *, log: Any = None, session: str | None = None,
+                 alone: Any = None) -> None:
         self.memory = memory
         self.log = log
         self.session = session
+        #: ``alone(tool_call_id)``: the call was the only one of its reply (the talker service's ``_yuki_solo``);
+        #: ``None`` takes every call as alone.
+        self.alone = alone
 
     async def handle(self, params: Any) -> None:
         args = params.arguments if isinstance(params.arguments, dict) else {}
@@ -403,13 +413,20 @@ class QuickMemory:
             payload = {"failed": f"memory could not be read ({type(exc).__name__})",
                        "how_to_handle_it": NOTHING_NOTE.format(where="memory")}
             facts = {"ok": False}
-        line = added_line(payload) if str(args.get("action") or "").strip() == "add_todos" else None
+        adding = str(args.get("action") or "").strip() == "add_todos"
+        rest = " ".join(str(args.get("then") or "").split())[:200] if adding else ""
+        line = added_line(payload) if adding else None
         push = getattr(getattr(params, "llm", None), "push_frame", None)
-        said = bool(line and callable(push))
+        # Second review LVV-1: said by code only when the add is the whole request. A reply with another call beside it
+        # is answered once, after its last report, by Pipecat; settling this one with no run starved that answer when
+        # the other call came back first. And what else the same words asked (``then``) is the talker's to do.
+        alone = self.alone is None or self.alone(str(getattr(params, "tool_call_id", "") or ""))
+        said = bool(line and callable(push) and alone and not rest)
         if self.log is not None:
             self.log.event("quick_memory", session=self.session, op=str(args.get("action") or ""),
                            ms=round((time.monotonic() - started) * 1000), call=getattr(params, "tool_call_id", None),
-                           **facts, **({"said_by": "code"} if said else {}))
+                           **facts, **({"said_by": "code"} if said else {}),
+                           **({"then": True} if rest else {}), **({} if alone else {"alone": False}))
         if said:
             # leftVoice: a clean add is confirmed by code in Yuki's voice, as a hand's done line is: the talker is not
             # run again for it (that second run was ~1.5 s of silence before "Added ..."); its words go into the
@@ -420,6 +437,9 @@ class QuickMemory:
             await params.result_callback({**payload, "said": line, "how_to_handle_it": ADDED_SAID_NOTE},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
+        if rest and isinstance(payload.get("how_to_handle_it"), str):
+            payload = {**payload, "then": rest, "how_to_handle_it": payload["how_to_handle_it"]
+                       + ADDED_THEN_NOTE.format(then=rest)}
         await params.result_callback(payload)
 
     def run(self, args: dict[str, Any], *, now: float | None = None) -> tuple[dict[str, Any], dict[str, Any]]:

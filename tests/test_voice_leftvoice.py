@@ -44,8 +44,10 @@ def test_the_look_comes_after_a_few_words_and_every_other_call_stays_alone() -> 
     assert '"Yep, pausing it." + media_key' in MOUTH_PROMPT
     # what the Earlier block holds is answered from it, with no look
     assert "answer from the Earlier block when it holds it" in " ".join(MOUTH_PROMPT.split())
-    # the schema is unchanged (no say_first field: its tokens were the reason vfix4 left this open)
-    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query"] and QUICK_MEMORY["required"] == ["action"]
+    # no say_first field (its tokens were the reason vfix4 left this open); one short optional field, then, for the
+    # rest of a request an add is part of (second review LVV-1), paid for by shorter wording: still vfix4's 700
+    assert list(QUICK_MEMORY["properties"]) == ["action", "items", "query", "then"]
+    assert QUICK_MEMORY["required"] == ["action"]
     assert len(json.dumps(QUICK_MEMORY)) <= 700
 
 
@@ -300,6 +302,10 @@ class _Context:
         return list(self._messages)
 
 
+_HISTORY = [{"role": "user", "content": "What's on my list?"}]
+_REPORT = {"list": "2 open: - Buy printer ink - Call the plumber", "how_to_handle_it": "Tell them."}
+
+
 def _conversation(spoke: set[str], report: dict[str, Any], *, by_code: bool = False, solo: set[str] | None = None,
                   user_speaking: bool = False, during: Any = None) -> Any:
     from yuki.voice.pipeline import Conversation
@@ -372,7 +378,7 @@ def test_a_look_with_no_lead_and_a_clean_add_settle_as_before() -> None:
     settled: list[Any] = []
     asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context([]))))
     assert settled[0][1] is None and not conv.queued
-    # a clean add said by code after a lead: no run at all
+    # a report settled with no run at all stays so
     conv = _conversation({"toolu_7"}, {"added": 1, "said": "Added it."}, by_code=True)
     settled = []
     asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context([]))))
@@ -393,8 +399,6 @@ def test_the_conversation_registers_the_look_with_its_answer_now_handler() -> No
 # review fixes: a look is answered at once only when it is alone in its reply and the user has not gone on (LV-1, LV-2)
 # ---------------------------------------------------------------------------------------------------------------------
 
-_HISTORY = [{"role": "user", "content": "What's on my list?"}]
-_REPORT = {"list": "2 open: - Buy printer ink - Call the plumber", "how_to_handle_it": "Tell them."}
 
 
 def test_a_look_beside_another_call_in_its_reply_settles_as_before() -> None:
@@ -490,3 +494,261 @@ def test_a_look_flagged_after_its_replys_end_does_not_unpause_the_next_reply() -
 
     asyncio.run(run())
     assert tts.paused == 2
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# second review: the live conversation, not the run's frozen copy, says whether the user went on (LVC-1); the answer
+# stays in the turn its lead belongs to (LVC-2); an add ends the turn only when it is the whole request (LVV-1)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _live() -> Any:
+    from pipecat.processors.aggregators.llm_context import LLMContext
+
+    return LLMContext(messages=[{"role": "user", "content": "Yuki."}, {"role": "assistant", "content": "Yeah?"}])
+
+
+def _provisional(shared: Any, text: str) -> Any:
+    """The context an eager end of turn runs on, made by Pipecat's own ``_run_speculative_inference``."""
+    from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregator
+
+    pushed: list[Any] = []
+
+    async def push_frame(frame: Any, direction: Any = None) -> None:
+        pushed.append(frame)
+
+    agg = SimpleNamespace(_context=shared, role="user", push_frame=push_frame)
+    asyncio.run(LLMUserAggregator._run_speculative_inference(agg, SimpleNamespace(text=text)))
+    (frame,) = pushed
+    assert frame.context is not shared and frame.speculation is True
+    return frame.context
+
+
+def _eager_conversation(shared: Any, report: dict[str, Any], *, during: Any = None) -> Any:
+    conv = _conversation({"toolu_7"}, report, user_speaking=False, during=during)
+    conv._llm_context = shared
+    return conv
+
+
+def test_on_an_eager_turn_the_user_going_on_is_seen_in_the_live_conversation() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    shared = _live()
+    provisional = _provisional(shared, "What's on my list?")
+
+    def goes_on(params: Any) -> None:
+        # the eager turn is committed, then the user finishes a new one, while the read is slow
+        shared.add_message({"role": "user", "content": "What's on my list?"})
+        shared.add_message({"role": "user", "content": "Actually, the work one."})
+
+    conv = _eager_conversation(shared, _REPORT, during=goes_on)
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, provisional)))
+    assert settled[0][1] is None and not conv.queued          # main's way: their own turn answers, once
+    assert conv.log.events[-1][1]["op"] == "answer_later" and conv.log.events[-1][1]["newer"] is True
+
+
+def test_an_eager_turns_own_commit_is_not_the_user_going_on() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    shared = _live()
+    provisional = _provisional(shared, "What's on my list?")
+    # the confirmed turn is written to the conversation just after its held call starts: still the same turn
+    conv = _eager_conversation(shared, _REPORT,
+                               during=lambda params: shared.add_message({"role": "user", "content": "What's on my list?"}))
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, provisional)))
+    assert settled[0][1].run_llm is False and len(conv.queued) == 1
+    assert conv.queued[0].context.get_messages()[2] == {"role": "user", "content": "What's on my list?"}
+
+
+def test_a_look_made_by_the_answer_now_run_sees_the_user_going_on() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    shared = _live()
+    shared.add_message({"role": "user", "content": "What's on my list?"})
+    # the answer-now run's own copy (frozen): it says "Let me search." and looks again
+    copy = _Context(shared.get_messages() + [
+        {"role": "assistant", "tool_calls": [{"id": "toolu_6", "type": "function",
+                                              "function": {"name": "quick_memory", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "toolu_6", "content": "{}"}])
+    conv = _eager_conversation(shared, _REPORT,
+                               during=lambda params: shared.add_message({"role": "user", "content": "Never mind."}))
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, copy)))
+    assert settled[0][1] is None and not conv.queued
+    # with nothing said since, a chained look on a fresh copy is answered at once as before
+    fresh = _live()
+    fresh.add_message({"role": "user", "content": "What's on my list?"})
+    conv = _eager_conversation(fresh, _REPORT)
+    settled = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, copy)))
+    assert settled[0][1].run_llm is False and len(conv.queued) == 1
+
+
+def _observer(tmp_path: Path) -> Any:
+    from yuki.config import Settings
+    from yuki.voice.pipeline import TurnObserver
+
+    return TurnObserver(settings=Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv"), log=None,
+                        memory=None, session="s1", speech_end=lambda: None, on_state=lambda *a: None,
+                        tts_provider="deepgram", activity=lambda: None)
+
+
+def test_the_answer_now_run_stays_in_the_users_turn_until_its_lead_is_heard(tmp_path: Path) -> None:
+    from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame
+
+    from yuki.voice.pipeline import Conversation
+
+    obs = _observer(tmp_path)
+    user_turn = obs._open("user")
+    obs.on_frame(LLMFullResponseStartFrame())
+    obs.on_frame(LLMFullResponseEndFrame())   # "Let me look." + the look: the lead is still on its way to the speaker
+    conv = _conversation({"toolu_7"}, _REPORT)
+    conv.observer = obs
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(_HISTORY)))))
+    assert len(conv.queued) == 1
+    obs.on_frame(LLMFullResponseStartFrame())  # the answer's run starts before the lead's first audio
+    assert obs.turn is user_turn and user_turn.trigger == "user"
+    # a later run of its own (a result, a progress line) is still a turn of its own
+    obs.on_frame(LLMFullResponseEndFrame())
+    obs.on_frame(LLMFullResponseStartFrame())
+    assert obs.turn is not user_turn and obs.turn.trigger == "result"
+
+
+def test_an_add_with_more_asked_in_the_same_words_goes_to_the_talker() -> None:
+    from yuki.voice.recall import ADDED_THEN_NOTE
+
+    # LVV-1 (a): "Add call mom to my list, and what time is it?" -> one add whose then holds the rest: no code line
+    # (it ended the turn, and the time was never given); the talker says the add and does the rest
+    log = _Log()
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}],
+                                       "then": "  what time is it "})
+    asyncio.run(QuickMemory(_Memory(), log=log).handle(params))
+    assert not pushed and settled[0][1] is None
+    report = settled[0][0]
+    assert report["then"] == "what time is it" and "said" not in report
+    assert report["how_to_handle_it"].endswith(ADDED_THEN_NOTE.format(then="what time is it"))
+    assert log.events[-1][1]["then"] is True and "said_by" not in log.events[-1][1]
+    assert "mom" not in repr(log.events) and "time is it" not in repr(log.events)   # content-free
+    # an empty then is a whole request: said by code as before
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}], "then": ""})
+    asyncio.run(QuickMemory(_Memory()).handle(params))
+    assert pushed and settled[0][1].run_llm is False
+    # a read's then is ignored (it is for adds)
+    params, pushed, settled = _params({"action": "todos", "then": "what time is it"})
+    asyncio.run(QuickMemory(_Memory()).handle(params))
+    assert "then" not in settled[0][0]
+
+
+def test_an_add_beside_another_call_in_its_reply_goes_to_the_talker() -> None:
+    # LVV-1 (b): an add with any other call in its reply is answered once, after the last report, by Pipecat
+    alone: list[str] = []
+    tool = QuickMemory(_Memory(), alone=lambda cid: (alone.append(cid), False)[1])
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}]})
+    asyncio.run(tool.handle(params))
+    assert alone == ["toolu_9"] and not pushed and settled[0][1] is None and "said" not in settled[0][0]
+    tool = QuickMemory(_Memory(), alone=lambda cid: True)
+    params, pushed, settled = _params({"action": "add_todos", "items": [{"text": "Call mom"}]})
+    asyncio.run(tool.handle(params))
+    assert pushed and settled[0][1].run_llm is False
+
+
+def test_the_conversation_tells_the_tool_which_calls_were_alone_in_their_reply() -> None:
+    import inspect
+
+    from yuki.voice import pipeline
+
+    source = inspect.getsource(pipeline.Conversation)
+    assert 'alone=lambda call_id: call_id in getattr(self._llm, "_yuki_solo", ())' in source
+    assert "then" in QUICK_MEMORY["properties"] and QUICK_MEMORY["required"] == ["action"]
+
+
+@pytest.mark.parametrize("add_first", [False, True])
+def test_an_add_and_a_read_in_one_reply_still_get_one_answer(add_first: bool) -> None:
+    # LVV-1 (b): "add call mom, and then read me the list" -> add_todos and todos in one reply. Pipecat 1.11 runs the
+    # talker once, after the last report of the group; the add settled with run_llm=False starved that run when the
+    # read came back first (a write is usually slower)
+    from pipecat.frames.frames import (
+        FunctionCallFromLLM, FunctionCallInProgressFrame, FunctionCallResultFrame, FunctionCallsStartedFrame,
+    )
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
+
+    agg = LLMAssistantAggregator(LLMContext(messages=[{"role": "user", "content": "Add call mom, then read the list."}]))
+    runs: list[Any] = []
+
+    async def push_context_frame(direction: Any = None) -> None:
+        runs.append(direction)
+
+    agg.push_context_frame = push_context_frame
+    agg.has_queued_frame = lambda cls: False
+    calls = {"add": {"action": "add_todos", "items": [{"text": "Call mom"}]}, "read": {"action": "todos"}}
+    reports: dict[str, tuple[Any, Any]] = {}
+    for cid, args in calls.items():
+        params, _pushed, settled = _params(args)
+        params.tool_call_id = cid
+        asyncio.run(QuickMemory(_Memory(), alone=lambda call_id: False).handle(params))   # two calls in one reply
+        reports[cid] = settled[0]
+    assert "said" not in reports["add"][0] and reports["add"][1] is None
+
+    async def main() -> None:
+        await agg._handle_function_calls_started(FunctionCallsStartedFrame(function_calls=[
+            FunctionCallFromLLM(function_name="quick_memory", tool_call_id=cid, arguments=args, context=None)
+            for cid, args in calls.items()]))
+        for cid, args in calls.items():
+            await agg._handle_function_call_in_progress(FunctionCallInProgressFrame(
+                function_name="quick_memory", tool_call_id=cid, arguments=args, cancel_on_interruption=False,
+                group_id="g1"))
+        for cid in (["add", "read"] if add_first else ["read", "add"]):
+            result, properties = reports[cid]
+            await agg._handle_function_call_result(FunctionCallResultFrame(
+                function_name="quick_memory", tool_call_id=cid, arguments=calls[cid], result=result,
+                properties=properties))
+
+    asyncio.run(main())
+    assert len(runs) == 1
+
+
+def test_the_answer_now_copy_holds_the_replys_own_words_before_the_call() -> None:
+    # offline 4 Oct (second review): "Add call mom to my list, and what time is it?" -> "It's 22:51. Adding call mom to
+    # your list now." + the add with then; the answer's copy lacked those words and gave the time a second time
+    from yuki.voice.pipeline import Conversation
+
+    conv = _conversation({"toolu_7"}, _REPORT)
+    # the turn's words so far: an earlier run's, then this reply's (the newest run starts at reply_from)
+    conv.observer.turn = SimpleNamespace(reply=["Hm.", "It's 22:51.", " Adding call mom  now."], reply_from=1)
+    settled: list[Any] = []
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params(settled, _Context(list(_HISTORY)))))
+    messages = conv.queued[0].context.get_messages()
+    assert messages[1] == {"role": "assistant", "content": "It's 22:51. Adding call mom now."}
+    assert messages[2]["tool_calls"][0]["id"] == "toolu_7" and messages[3]["role"] == "tool" and len(messages) == 4
+    assert conv.observer.look_now_turn is conv.observer.turn
+    # words the conversation already holds since the user spoke are not written twice
+    conv = _conversation({"toolu_7"}, _REPORT)
+    conv.observer.turn = SimpleNamespace(reply=["Let me look."], reply_from=0)
+    held = [*_HISTORY, {"role": "assistant", "content": "Let me look."}]
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params([], _Context(held))))
+    assert [m.get("content") for m in conv.queued[0].context.get_messages()].count("Let me look.") == 1
+    # the same words in an earlier exchange do not count
+    conv = _conversation({"toolu_7"}, _REPORT)
+    conv.observer.turn = SimpleNamespace(reply=["Let me look."], reply_from=0)
+    old = [{"role": "user", "content": "Tara?"}, {"role": "assistant", "content": "Let me look."}, *_HISTORY]
+    asyncio.run(Conversation._quick_memory_call(conv, _look_params([], _Context(old))))
+    assert [m.get("content") for m in conv.queued[0].context.get_messages()].count("Let me look.") == 2
+
+
+def test_each_mouth_run_marks_where_its_words_start_in_the_turn(tmp_path: Path) -> None:
+    from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame
+
+    obs = _observer(tmp_path)
+    turn = obs._open("user")
+    obs.on_frame(LLMFullResponseStartFrame())
+    obs.on_frame(LLMTextFrame(text="Let me look."))
+    obs.on_frame(LLMFullResponseEndFrame())
+    assert turn.reply_from == 0
+    obs.look_now_turn = turn
+    obs.on_frame(LLMFullResponseStartFrame())   # the answer-now run, in the same turn
+    obs.on_frame(LLMTextFrame(text="Two things."))
+    assert obs.turn is turn and turn.reply_from == 1 and "".join(turn.reply[turn.reply_from:]) == "Two things."

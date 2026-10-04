@@ -864,6 +864,11 @@ def test_embedder_pipe_serves_only_the_key_holder_and_never_blocks(tmp_path: Pat
         slow.delay = 0.0
         stranger = EmbedClient(FieldCipher(b"z" * 32), db, local=lambda: Emb())
         assert stranger.embed(["x"], 1.0) is not None and stranger.last_source == "local"
+        # multiprocessing's handshake tells the stranger "no" before the server's thread counts the refusal: wait a
+        # moment for the count (leftVoice second review LVV-2: a race in this test, on main too)
+        deadline = _t.monotonic() + 2.0
+        while server.stats["refused"] < 1 and _t.monotonic() < deadline:
+            _t.sleep(0.01)
         assert server.stats["refused"] >= 1
     finally:
         server.stop()
