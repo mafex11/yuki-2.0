@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import voice_vfix_replay as base  # noqa: E402
 from voice_vfix_replay import a, call, result, u  # noqa: E402
 
-from yuki.voice.recall import ADDED_NOTE, LIST_PLACE, QUICK_MEMORY, recent_view, todo_report  # noqa: E402
+from yuki.voice.recall import ADDED_NOTE, LIST_PLACE, QUICK_MEMORY, QuickMemory, recent_view, todo_report  # noqa: E402
 
 ITEMS = ["Buy printer ink", "Call the plumber about the kitchen leak", "Renew the gym pass",
          "Email Tara the slides", "Book the dentist for Friday", "Water the balcony plants", "Back up the laptop"]
@@ -59,6 +59,21 @@ LIST_REPORT = todo_report([{"id": f"todo:{i}", "text": t, "source": "user", "sta
 EMPTY_REPORT = todo_report([])
 ADDED_REPORT = {"added": 7, "where": LIST_PLACE, "items": ITEMS, "how_to_handle_it": ADDED_NOTE.format(n=7)}
 ASK = "What were the to-dos I told you?"
+
+
+class _Hits:
+    """A memory search's hits (invented): someone else's words on a call, and text typed into another AI tool."""
+
+    def call_method(self, name: str, *args: Any, timeout_s: float, **kwargs: Any) -> Any:
+        return [{"kind": "fact", "at": "2026-10-03T21:00:00", "nature": "fact", "other_ai": False,
+                 "fact": "Said he will pay 500 back on Friday",
+                 "source": "Discord, Sat 03 Oct 21:00; someone else said, not the user"},
+                {"kind": "fact", "at": "2026-10-03T22:00:00", "nature": "fact", "other_ai": True,
+                 "fact": "Plans to pay the 500 back by selling the old monitor",
+                 "source": "ChatGPT, Sat 03 Oct 22:00; on screen"}]
+
+
+SEARCH_REPORT = QuickMemory(_Hits()).run({"action": "search", "query": "pay back 500"})[0]
 #: Conversation B as it went live (words invented where they were personal; the talker's denials paraphrased).
 LIVE_B = [u("a nucleus arc."), a("Yo, what's up? You testing the new build?"), u("I asked you to, like, close arc."),
           a("Arc is closed."), u("I told you about the total list. Right? What were the totals from it?"),
@@ -98,6 +113,10 @@ def cases() -> list[dict[str, Any]]:
             u(ASK), call("quick_memory", {"action": "todos"}, "q1"), result("q1", LIST_REPORT)]),
         dict(id="b_empty_report", issue="list", check="says_empty", messages=[
             u(ASK), call("quick_memory", {"action": "todos"}, "q1"), result("q1", EMPTY_REPORT)]),
+        # review F1: a search whose hits are someone else's words on a call and text typed into another AI tool
+        dict(id="b_search_whose", issue="look", check="not_theirs", messages=[
+            u("What did I say I'd pay back on Friday?"),
+            call("quick_memory", {"action": "search", "query": "pay back Friday"}, "q3"), result("q3", SEARCH_REPORT)]),
         # conversation A: the add, and its confirmation with the count and the place
         dict(id="a_make_list", issue="add", check="adds", messages=[
             u("hey Yuki"), a("Hey! What's up?"), u(DICTATED), a("Got all of that. Busy day!"),
@@ -142,6 +161,12 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
         offers = any(w in spoken for w in ("look", "check", "dig", "search", "chat", "earlier", "go through"))
         return (any(w in spoken for w in ("empty", "nothing", "don't have any", "no to-dos")) and "list" in spoken
                 and not told_denied and offers)
+    if kind == "not_theirs":   # never "you said you'd pay 500"; the call's words are someone else's, or it digs on
+        as_theirs = any(w in spoken for w in ("you said you", "you said you'd", "you'll pay", "you're paying",
+                                              "you plan to", "you promised"))
+        return not as_theirs and (any(w in spoken for w in ("someone", "he said", "not you", "call", "discord",
+                                                            "chatgpt", "another", "wasn't you", "not something you"))
+                                  or "tell_yuki" in names)
     if kind == "adds":
         adds = [c["input"] for c in calls if c["name"] == "quick_memory" and c["input"].get("action") == "add_todos"]
         if adds:

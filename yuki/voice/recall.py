@@ -91,9 +91,9 @@ TODOS_NOTE = ("Their list, read now. Tell them in a few words: how many, then th
 EMPTY_LIST_NOTE = ("Their list has nothing open, read now. Say plainly you looked at their list and it is empty; never "
                    "that they did not tell you. When they say they told you something, say the list is empty and offer "
                    "to look through today's chat for it (quick_memory today) or dig further (a hand-over).")
-ADDED_NOTE = ("Saved and checked: nothing more to do. Tell them in a few words how many you added and where they are: "
-              "in your window, on Home under Your list (\"Added {n}, they're on Home under Your list.\"). Never read "
-              "them back unless they ask.")
+ADDED_NOTE = ("Saved and checked: nothing more to do. Say: \"Added {n}, they're on Home under Your list.\" (that, or as "
+              "short in your words, always with how many and where: Home, Your list). Never read them back unless "
+              "they ask.")
 NOT_SAVED_NOTE = ("Not saved: {why}. Say plainly that it did not save{part}, and offer to try again. Never say it is "
                   "on their list.")
 MAYBE_SAVED_NOTE = ("Memory was too slow to answer, so {n} of them may or may not have saved. Say so plainly; before "
@@ -103,7 +103,8 @@ FOUND_NOTE = ("For you, not to read out: answer what they asked from it in a few
 NOTHING_NOTE = ("Nothing found in {where}. Say that plainly, naming where you looked, and offer to dig further "
                 "(a hand-over); never that they did not tell you.")
 WHOSE_NOTE = ("A hit marked as another AI tool's text, or whose from line says someone else said it, is never theirs: "
-              "never give it as their own words or plans.")
+              "never give it as their own words or plans. When none is theirs, say what you found and whose it is "
+              "(\"someone on your Discord call said that, not you\"), and offer to dig further.")
 
 
 class _OutOfTime(Exception):
