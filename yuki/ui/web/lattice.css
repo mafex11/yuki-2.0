@@ -893,6 +893,8 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
 .td-acts { display: flex; gap: 6px; align-items: center; opacity: .55; transition: opacity .15s; }
 .todo:hover .td-acts, .todo:focus-within .td-acts { opacity: 1; }
 .todo.editing .td-acts { display: none; }
+.td-just { border-top: 1px solid var(--hair); }
+.td-just .until { font: 500 11px/1 var(--f-mono); color: var(--text-3); white-space: nowrap; }
 .td-more { display: inline-block; margin-top: 8px; font: 500 11px/1.4 var(--f-mono); color: var(--text-2); }
 .td-all { text-decoration: none; }
 .td-all:hover { color: var(--text); }

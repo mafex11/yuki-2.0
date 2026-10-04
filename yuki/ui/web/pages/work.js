@@ -57,18 +57,28 @@
       h('input', { class: 'td-day', attrs: { type: 'date', 'aria-label': 'Due day, if it has one', title: 'Due day, if it has one' } }),
       key('Add', { cls: 'xs', data: { do: 'todo-add' } }));
   }
-  /* a to-do done lately (memory keeps 14 days of them): what it was, quietly */
-  const doneRow = (t) => h('div', { class: 'todo done', data: { k: 'done:' + t.ref } }, h('i', { class: 'td-dot on', aria: { hidden: 'true' } }),
-    h('div', { class: 'td-b' }, h('div', { class: 'td-t', text: t.title || t.text, title: t.title ? t.text : '' }), t.from ? h('div', { class: 'td-m' }, h('span', { text: t.from })) : null));
+  /* a to-do done lately (memory keeps 14 days of them): what it was, quietly; one you ended here a moment ago keeps
+     its Undo for the rest of memory's 10 minutes (review F5: the drain's 5 s is not the only chance) */
+  function doneRow(t) {
+    const until = Y.todoUndoUntil(t.ref);
+    const row = h('div', { class: 'todo done', data: { k: 'done:' + t.ref, dref: until ? t.ref : null } }, h('i', { class: 'td-dot on', aria: { hidden: 'true' } }),
+      h('div', { class: 'td-b' }, h('div', { class: 'td-t', text: t.title || t.text, title: t.title ? t.text : '' }), t.from ? h('div', { class: 'td-m' }, h('span', { text: t.from })) : null),
+      until ? h('div', { class: 'td-acts' }, key('Undo', { cls: 'xs ghost', data: { do: 'todo-reopen-done' }, title: 'Put it back on your list' }),
+        h('span', { class: 'until', data: { until }, text: `${Math.max(1, Math.round((until * 1000 - Date.now()) / 60000))} min left` })) : null);   // counted down by the ticker
+    row.__t = t;
+    return row;
+  }
   function todoBlock(d) {
     const T = d.todos;
     if (!T) return Y.k(Y.sec('To-dos', null, Y.empty('Reading your list…')), 'todos');   // a snapshot from before the list
-    const open = Y.todosOpen(T), done = T.done || [];
+    const open = Y.todosOpen(T), allDone = (T.done || []).filter((t) => !open.some((o) => o.ref === t.ref));
+    const undoNow = allDone.filter((t) => Y.todoUndoUntil(t.ref)), done = allDone.filter((t) => !Y.todoUndoUntil(t.ref));   // ended here: in view, with Undo
     const row = (t) => Y.todoRow(t, d, 'work', true);
     const first = open.slice(0, OPEN_SHOWN), rest = open.slice(OPEN_SHOWN);
     const body = [addLine(T),
       open.length ? h('div', { class: 'todos' }, first.map(row)) : Y.empty('Nothing on your list. Ask me to keep a to-do, or add one here.'),
       rest.length ? Y.fold('todos-more', h('span', { class: 'tx', text: `${rest.length} more` }), null, h('div', { class: 'todos' }, rest.map(row)), { cls: 'tdfold' }) : null,
+      undoNow.length ? h('div', { class: 'todos td-just', data: { k: 'just' } }, undoNow.map(doneRow)) : null,
       done.length ? Y.fold('todos-done', h('span', { class: 'tx', text: 'Done lately' }), h('span', { text: String(done.length) }), h('div', { class: 'todos' }, done.map(doneRow)), { cls: 'tdfold' }) : null];
     return Y.k(Y.sec('To-dos', open.length, body, Y.rightLabel('due first'), 'todosec'), 'todos');
   }

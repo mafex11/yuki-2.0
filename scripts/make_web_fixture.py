@@ -379,8 +379,8 @@ def build() -> dict:
     home = {
         "now": {
             # what you are doing now (the 4 Oct decision: it replaced the current-thread tile): the current session's
-            # title and summary, the app in front since when
-            "session": {"app": "VS Code", "since_at": ago(42 * M), "title": "Watering schedule screen",
+            # title and summary, the app in front since when, the moment Work opens at
+            "session": {"app": "VS Code", "since_at": ago(42 * M), "at": round(ago(42 * M), 1), "title": "Watering schedule screen",
                         "summary": "You started on the garden planner’s watering schedule screen.", "ref": "episode:315"},
             "playing": {"status": "paused", "title": "Rain Study No. 4", "artist": "The Lo-Fi Trio", "app": "Music"},
             "call": now_call,

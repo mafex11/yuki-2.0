@@ -186,54 +186,84 @@ def call_view(cs: dict[str, Any]) -> dict[str, Any] | None:
 # -- Home --------------------------------------------------------------------------------------------------------
 
 
+#: Home's Now tile shows only what is happening now (review F1): the timeline's newest row reaches this close to now
+#: (the recorder writes the open stretch every 30 s, ``timeline.FLUSH_EVERY_S``; longer silence is the PC asleep,
+#: memory paused or the session locked) ...
+NOW_FRESH_S = 120.0
+#: ... and the time without input after your last stretch at the PC is under this (a few minutes reading still counts
+#: as now; longer, you have left). A power row (off, asleep) after it always ends it.
+NOW_AWAY_S = 5 * 60.0
+#: Away from the PC this long starts a new session (``timeline.BREAK_S``, the Day tab's breaks).
+NOW_BREAK_S = 10 * 60.0
+
+
 def front_now(memory: Any, now: float) -> dict[str, Any] | None:
-    """The app in front: the timeline's latest stretch at the PC (app, window title, since when)."""
-    rows = _safe(lambda: memory.day_timeline(now - 3 * 3600, now), []) or []
-    for r in reversed(rows):
-        if r.get("state") == "present" and (r.get("app") or r.get("process")):
-            start = float(r.get("start") or now)
-            # earlier rows of the same app run on into this one: since when it has been in front
-            for prev in reversed(rows[:rows.index(r)]):
-                if prev.get("state") == "present" and prev.get("app") == r.get("app") and float(prev.get("end") or 0) >= start - 60:
-                    start = float(prev.get("start") or start)
-                else:
-                    break
-            title = "" if r.get("withheld") else (r.get("title") or "")
-            return {"app": r.get("app") or r.get("process") or "", "title": " ".join(title.split()), "since_at": start}
-    return None
-
-
-#: Home's "Now" tile (the 4 Oct decision: threads left the window): what you are doing right now. An episode (memory's
-#: titled stretch of the day, written as its window closes) counts as the current one when it ended this recently.
-NOW_EPISODE_S = 45 * 60.0
+    """The app in front now: the timeline's latest stretch at the PC (app, window title, since when it has been in
+    front: ``since_at``) and since when you have been at the PC without a break (``session_at``: the current
+    session's start, within the 3 hours read). ``None`` unless that stretch is current (:data:`NOW_FRESH_S`,
+    :data:`NOW_AWAY_S`; no power row after it) or when the app was withheld. Times are compared, nothing more."""
+    rows = [r for r in (_safe(lambda: memory.day_timeline(now - 3 * 3600, now), []) or []) if isinstance(r, dict)]
+    if not rows or now - max(float(r.get("end") or 0) for r in rows) > NOW_FRESH_S:
+        return None   # nothing recorded lately: asleep, paused, locked
+    at = None
+    for i in range(len(rows) - 1, -1, -1):
+        state = rows[i].get("state")
+        if state == "present":
+            at = i
+            break
+        if state != "away":
+            return None   # the PC went off or to sleep after your last stretch at it
+    if at is None:
+        return None
+    r = rows[at]
+    if now - float(r.get("end") or 0) > NOW_AWAY_S or not (r.get("app") or r.get("process")):
+        return None   # away since, or an app memory records without its name
+    start = float(r.get("start") or now)
+    # earlier rows of the same app run on into this one: since when it has been in front
+    for prev in reversed(rows[:at]):
+        if prev.get("state") == "present" and prev.get("app") == r.get("app") and float(prev.get("end") or 0) >= start - 60:
+            start = float(prev.get("start") or start)
+        else:
+            break
+    session = start
+    for prev in reversed(rows[:at]):
+        if prev.get("state") != "present":
+            continue   # away a while or the PC asleep: the gap between stretches at the PC decides
+        if float(prev.get("end") or 0) < session - NOW_BREAK_S:
+            break
+        session = min(session, float(prev.get("start") or session))
+    title = "" if r.get("withheld") else (r.get("title") or "")
+    return {"app": r.get("app") or r.get("process") or "", "title": " ".join(title.split()), "since_at": start,
+            "session_at": session}
 
 
 def now_session(memory: Any, now: float, front: dict[str, Any] | None) -> dict[str, Any] | None:
-    """What you are doing right now, for Home's Now tile: the app in front (``front``: the timeline's latest stretch
-    at the PC) since when (``since_at``: the page counts the minutes itself, so the data stays the same from one minute
-    to the next), titled by the current session: the newest titled episode that ended within :data:`NOW_EPISODE_S`
-    and while that app was already in front (``title``, ``summary``; the finer one when two end together), else the
-    window's own title, else nothing (the page shows the app). ``None`` while nothing is in front. Reads only (one
-    short episodes read); times are compared, nothing judges what the work is."""
+    """What you are doing right now, for Home's Now tile: the app in front (``front``: :func:`front_now`) since when
+    (``since_at``: the page counts the minutes itself, so the data stays the same from one minute to the next),
+    titled by the current session (review F2): the newest titled episode overlapping the time since the session
+    began (``session_at``), the open one memory still rewrites included (``title``, ``summary``, ``ref``; the finer
+    one when two end together); else no title (the page shows the app; never the raw window title). ``at``: where
+    Work opens for it (the moment the app came to the front, inside the session holding now). ``None`` while nothing
+    is in front now. Reads only (one short episodes read); times are compared, nothing judges what the work is."""
     if not front or not front.get("app"):
         return None
     since = float(front.get("since_at") or now)
+    began = min(since, float(front.get("session_at") or since))
     best: tuple[float, float, dict[str, Any]] | None = None
-    for e in _safe(lambda: memory.episodes(now - NOW_EPISODE_S - 6 * 3600, now + 60, limit=24), []) or []:
+    for e in _safe(lambda: memory.episodes(began - 3600, now + 60, limit=24), []) or []:
         if not isinstance(e, dict):
             continue
         title = " ".join(str(e.get("title") or "").split())
         s, u = epoch_of(e.get("start")), epoch_of(e.get("end"))
-        if not title or s is None or u is None or u < now - NOW_EPISODE_S or u <= since:
-            continue   # untitled, too old, or over before this app came to the front (another stretch's)
+        if not title or s is None or u is None or u <= began or s >= now:
+            continue   # untitled, or over before this session began (another session's)
         rank = (u, -(u - s))
         if best is None or rank > best[:2]:
             best = (rank[0], rank[1], e)
     ep = best[2] if best else None
-    window = " ".join(str(front.get("title") or "").split())
-    return {"app": str(front.get("app") or ""), "since_at": since,
-            "title": " ".join(str(ep.get("title") or "").split()) if ep else (window or None),
-            "summary": " ".join(str(ep.get("summary") or "").split()) or None if ep else None,
+    return {"app": str(front.get("app") or ""), "since_at": since, "at": round(since, 1),
+            "title": " ".join(str(ep.get("title") or "").split()) if ep else None,
+            "summary": (" ".join(str(ep.get("summary") or "").split()) or None) if ep else None,
             "ref": ep.get("ref") if ep else None}
 
 

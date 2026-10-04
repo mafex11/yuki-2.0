@@ -18,12 +18,13 @@
     const tiles = [];
     // Now: what you are doing right now (the 4 Oct decision: threads left the window): the current session's title,
     // the app in front and how long (the minutes run on the page from since_at: the ticker's data-durfrom, so no
-    // figure goes stale); a click opens Work at that session
+    // figure goes stale); a click opens Work at that session (data-at: the moment the app came to the front). With no
+    // session title yet the app is the title (never the raw window title)
     if (n.session) {
       const t = n.session, title = t.title || t.app || 'At the PC';
       const durEl = t.since_at ? h('span', { data: { durfrom: t.since_at }, text: fmt.dur((Date.now() / 1000 - t.since_at) / 60) }) : null;
       const inApp = t.title && t.app ? t.app : '';
-      tiles.push(h('button', { class: 'clear nowsess', data: { clear: '', do: 'now-go' },
+      tiles.push(h('button', { class: 'clear nowsess', data: { clear: '', do: 'now-go', at: t.at || t.since_at || null },
         attrs: { type: 'button', 'aria-label': `Now: ${title}${inApp ? ' in ' + inApp : ''}. Open today’s sessions on Work.` } },
       Y.label(['Now', inApp ? ' · in ' + inApp : '', durEl ? [' · ', durEl] : null], null, 'front'),
       h('div', { class: 'big' }, h('span', { text: title })),
@@ -123,15 +124,38 @@
      memory's merged to-do list, the same one Yuki reads when you ask what is on it. A row: the round tick (Done), the
      words, when it is due in natural words and where it came from, then Not needed and Correct (the shared "What's
      wrong?" line, ui.js). Done / Not needed go to memory at once; the row says so for 5 s, with Undo while memory can
-     put it back (a to-do you added, within 10 minutes), then leaves. Nothing here decides anything. */
+     put it back (a to-do you added, within 10 minutes), then leaves; for the rest of those 10 minutes its Undo is on
+     Work's row of it, under the open ones (review F5). Nothing here decides anything. */
   const END_WORDS = { done: 'Done. It’s off your list.', not_needed: 'Not needed. It’s off your list.' };
   const ending = new Map();   // ref -> how, ended here and not yet out of the data (or undone)
-  /* the open to-dos still to draw: the ones ended here leave at once, whatever an older patch still says */
+  const undoable = new Map();   // ref -> until (epoch s): ended here, memory can still put it back
+  /* ref -> { view, seen }: put back here (Undo), drawn as open until data newer than the Undo (not one of `seen`,
+     the data the page held then) has it again; the data that dropped it can arrive after the Undo (review F3) */
+  const reopening = new Map();
+  const REOPEN_HOLD_MS = 60000;   // memory answered: the rebuild that has it again comes within seconds
+  const dueKey = (t) => [t.due_at == null ? 1 : 0, t.due_at || 0, -(t.since || 0)];   // the list's order (Python's todo_lists)
+  const byDue = (a, b) => { const x = dueKey(a), y = dueKey(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2]; };
+  /* the open to-dos still to draw: the ones ended here leave at once, whatever an older patch still says; the ones
+     put back here are there at once */
   Y.todosOpen = (T) => {
     const open = (T && T.open) || [];
     for (const ref of Array.from(ending.keys())) if (!open.some((t) => t.ref === ref)) ending.delete(ref);   // the data caught up
-    return open.filter((t) => !ending.has(t.ref));
+    const out = open.filter((t) => !ending.has(t.ref));
+    let added = false;
+    for (const [ref, r] of Array.from(reopening)) {
+      const has = open.some((t) => t.ref === ref);
+      if ((has && !r.seen.has(T)) || Date.now() - r.at > REOPEN_HOLD_MS) { reopening.delete(ref); continue; }
+      if (!has) { out.push(r.view); added = true; }
+    }
+    return added ? out.sort(byDue) : out;
   };
+  /* until when a to-do ended here can still be put back (Work's row of it), or null */
+  Y.todoUndoUntil = (ref) => { const u = undoable.get(ref); if (u && u * 1000 > Date.now()) return u; undoable.delete(ref); return null; };
+  function reopened(ref, view) {
+    undoable.delete(ref);
+    const P = Y.D.pages || {};
+    reopening.set(ref, { view: Object.assign({}, view, { status: 'open' }), at: Date.now(), seen: new Set([(P.home || {}).todos, (P.work || {}).todos]) });
+  }
   function todoMeta(t, full) {
     const bits = [t.due ? h('span', { class: 'td-due' + (t.over ? ' over' : ''), text: t.due }) : null,
       t.from ? h('span', { text: t.from }) : null, full && t.added ? h('span', { text: 'added ' + t.added }) : null].filter(Boolean);
@@ -142,7 +166,7 @@
   Y.todoRow = (t, d, page, full) => {
     const can = (d.todos || {}).can || {}, p = (d.pending || {})[t.ref];
     const words = t.title || t.text;   // memory's few-word title when it has one (Home and Work); Work adds the whole
-    return h('div', { class: 'todo' + (t.over ? ' over' : ''),
+    const row = h('div', { class: 'todo' + (t.over ? ' over' : ''),
       data: { k: 'todo:' + t.ref, cref: t.ref, cpage: page, kind: 'todo', title: t.title || '', text: t.text, undo: t.undo ? '1' : null } },
     can.end ? h('button', { class: 'td-tick', data: { do: 'todo-end', how: 'done' }, attrs: { type: 'button', 'aria-label': 'Done: ' + t.text }, title: 'Done' }, ic('check'))
       : h('i', { class: 'td-dot', aria: { hidden: 'true' } }),
@@ -156,6 +180,8 @@
     h('div', { class: 'td-acts' },
       can.end ? key('Not needed', { cls: 'xs ghost', data: { do: 'todo-end', how: 'not_needed' }, title: 'You don’t need it any more: it leaves your list' }) : null,
       can.correct && !Y.fixing(p) ? Y.correctKey() : null));
+    row.__t = t;   // its view, for an Undo that puts it back before the data has it again
+    return row;
   };
   /* Home's "Your list": the open to-dos, due first, a few lines; the rest on Work (see all) */
   function yourList(d) {
@@ -195,6 +221,7 @@
     row.__res = res; ending.set(ref, how);
     res.p = Y.act('todo_end', { ref, how }).then((r) => {
       if (!r.ok && row.__res === res) { putBack(row); Y.toast(r.error || 'Couldn’t change it. Memory didn’t answer.', true); }
+      if (r.ok && r.undo) undoable.set(ref, r.until || Date.now() / 1000 + 600);   // Work's row keeps its Undo
       return r;
     });
     row.classList.add('resolved');
@@ -211,9 +238,20 @@
     const row = t.closest('[data-cref]'), res = row && row.__res; if (!res) return;
     clearTimeout(res.timer); t.disabled = true;
     res.p.then((first) => (first && first.ok ? Y.act('todo_reopen', { ref: row.dataset.cref }) : { ok: true })).then((r) => {
-      if (r.ok) { putBack(row); Y.renderMain(); return; }
+      if (r.ok) { reopened(row.dataset.cref, row.__t || {}); putBack(row); Y.renderMain(); return; }
       Y.toast(r.error || 'Couldn’t put it back.', true);
       row.__res = null; row.__leaving = true; Y.leave(row);
+    });
+  };
+  /* Work's row of a to-do ended here, while memory can put it back (the rest of its 10 minutes) */
+  Y.actions['todo-reopen-done'] = (t) => {
+    const row = t.closest('[data-dref]'); if (!row) return;
+    const ref = row.dataset.dref, view = row.__t || {};
+    t.disabled = true;
+    Y.act('todo_reopen', { ref }).then((r) => {
+      if (r.ok) reopened(ref, view);
+      else { undoable.delete(ref); Y.toast(r.error || 'Couldn’t put it back.', true); }
+      Y.renderMain();
     });
   };
 
@@ -311,8 +349,8 @@
   A['answer-typed'] = (t) => answered(t, t.value.trim());
   A['skip-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: false }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'Skipped. I may ask another time.' : (r.error || 'Couldn’t skip it.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
   A['never-q'] = (t) => { const box = boxOf(t); Y.act('skip_question', { ref: box.dataset.ref, never: true }).then((r) => Y.morph(box, h('div', null, Y.confirmRow(r.ok ? 'I won’t ask about that again.' : (r.error || 'Couldn’t send that.'))), r.ok ? { fade: 1500, fadeEl: box } : null)); };
-  /* the Now tile: Work, at the session holding this moment (its row opens and comes into view) */
-  A['now-go'] = () => Y.go('work', 'at:' + Math.round(Date.now() / 1000));
+  /* the Now tile: Work, at the session holding the tile's moment (its row opens and comes into view) */
+  A['now-go'] = (t) => Y.go('work', 'at:' + Math.round(Number(t.dataset.at) || Date.now() / 1000));
   A['stop-call'] = (t) => { t.disabled = true; Y.act('stop_call').then((r) => Y.toast(r.ok ? 'Stopped remembering this call.' : (r.error || 'Couldn’t stop it.'), !r.ok)); };
   /* Learned proposals (practice memory, E13): Save keeps it, Edit is your words (memory re-distills the next
      version from them), No drops it; a question is answered in your words or skipped. Python maps the choice onto

@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "yuki" / "ui" / "web"
 #: A fixed local moment: Sunday 4 Oct 2026, 10:00.
 NOW = datetime(2026, 10, 4, 10, 0).timestamp()
-M, H, D = 60.0, 3600.0, 86400.0
+S, M, H, D = 1.0, 60.0, 3600.0, 86400.0
 
 
 @pytest.fixture()
@@ -183,19 +183,65 @@ def _ep(start, end, title, summary=None, ref="episode:1"):
 
 
 def test_the_now_tile_is_the_app_in_front_titled_by_the_current_session():
-    front = {"app": "VS Code", "title": "beds.ts", "since_at": NOW - 40 * M}
+    front = {"app": "VS Code", "title": "beds.ts", "since_at": NOW - 40 * M, "session_at": NOW - 40 * M}
     mem = _Eps([_ep(NOW - 3 * H, NOW - 2 * H, "Morning forum", ref="episode:1"),
                 _ep(NOW - 50 * M, NOW - 5 * M, "Watering schedule screen", "You started the schedule.", "episode:2"),
                 _ep(NOW - 70 * M, NOW - 5 * M, "A longer window over it", ref="episode:3")])
     t = W.now_session(mem, NOW, front)
-    # the newest that ended while the app was in front; of two ending together, the finer one
-    assert t == {"app": "VS Code", "since_at": NOW - 40 * M, "title": "Watering schedule screen",
+    # the newest titled episode inside the session; of two ending together, the finer one; Work opens at since_at
+    assert t == {"app": "VS Code", "since_at": NOW - 40 * M, "at": round(NOW - 40 * M, 1), "title": "Watering schedule screen",
                  "summary": "You started the schedule.", "ref": "episode:2"}
-    # the app came to the front after that episode ended: not this stretch's; the window's own title instead
-    late = W.now_session(mem, NOW, {"app": "Discord", "title": "general", "since_at": NOW - 2 * M})
-    assert late["title"] == "general" and late["ref"] is None and late["app"] == "Discord"
+    # review F2: the open episode memory still rewrites (non-final, ended at its last write) titles it too, and an
+    # app switch inside the session keeps the session's title
+    open_ep = _Eps([dict(_ep(NOW - 55 * M, NOW - 30 * M, "Garden planner beds", ref="episode:7"), final=False)])
+    sw = W.now_session(open_ep, NOW, {"app": "Discord", "title": "general", "since_at": NOW - 2 * M, "session_at": NOW - 50 * M})
+    assert sw["title"] == "Garden planner beds" and sw["ref"] == "episode:7" and sw["at"] == round(NOW - 2 * M, 1)
+    # nothing titled in this session (the last one ended before it began): no title, never the raw window title
+    late = W.now_session(mem, NOW, {"app": "Discord", "title": "general", "since_at": NOW - 2 * M, "session_at": NOW - 2 * M})
+    assert late["title"] is None and late["ref"] is None and late["app"] == "Discord"
     assert W.now_session(_Eps([]), NOW, {"app": "Firefox", "title": "", "since_at": NOW})["title"] is None
     assert W.now_session(mem, NOW, None) is None                                          # nothing in front: no tile
+
+
+class _Tl:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def day_timeline(self, since, until=None):
+        return self.rows
+
+
+def _row(start, end, state="present", app="Firefox", title="A page"):
+    return {"start": start, "end": end, "state": state, "app": app, "process": app.lower() if app else "", "title": title,
+            "withheld": False}
+
+
+def test_now_is_only_what_is_current():
+    """review F1: the last stretch at the PC is "now" only while it is current; after an away stretch, the PC asleep
+    or a silent timeline (paused, locked), Home shows no Now tile (it would count on from an old moment)."""
+    live = W.front_now(_Tl([_row(NOW - 3 * H, NOW - 3 * H + 30 * M, app="Calc"), _row(NOW - 2 * H + 5 * M, NOW - 40 * M, app="VS Code"),
+                            _row(NOW - 40 * M, NOW - 30 * M, app="Firefox"), _row(NOW - 30 * M, NOW - 20 * S, app="Firefox", title="Other")]), NOW)
+    # Firefox since its first row of the run; the session since the stretch before (a 5-minute gap is no break) and
+    # not the one before an hour away
+    assert live == {"app": "Firefox", "title": "Other", "since_at": NOW - 40 * M, "session_at": NOW - 2 * H + 5 * M}
+    # the reviewer's case: Chrome 10:00-10:30, away 10:30-12:30, now 12:31
+    assert W.front_now(_Tl([_row(NOW - 151 * M, NOW - 121 * M, app="Chrome"), _row(NOW - 121 * M, NOW - M, state="away", app="Chrome")]), NOW) is None
+    # the real-DB shape: the newest row is away and ended 41 minutes ago
+    assert W.front_now(_Tl([_row(NOW - 80 * M, NOW - 54 * M), _row(NOW - 54 * M, NOW - 41 * M, state="away")]), NOW) is None
+    # a minute or two without input (reading) is still now; the PC asleep after the stretch is not
+    assert W.front_now(_Tl([_row(NOW - 20 * M, NOW - 2 * M), _row(NOW - 2 * M, NOW - 10 * S, state="away")]), NOW)["since_at"] == NOW - 20 * M
+    assert W.front_now(_Tl([_row(NOW - 20 * M, NOW - 3 * M), _row(NOW - 3 * M, NOW - 10 * S, state="asleep", app="")]), NOW) is None
+    # the open stretch is written every 30 s: a timeline silent for minutes is not now
+    assert W.front_now(_Tl([_row(NOW - 20 * M, NOW - 5 * M)]), NOW) is None
+    assert W.front_now(_Tl([]), NOW) is None
+
+
+def test_home_shows_no_now_tile_after_you_left(store):
+    class _Mem(MemoryClient):
+        def day_timeline(self, since, until=None):
+            return [_row(NOW - 150 * M, NOW - 120 * M, app="Chrome"), _row(NOW - 120 * M, NOW - 60 * S, state="away", app="Chrome")]
+
+    assert W.build_home(_Mem(store), requests_csv=None, now=NOW)["now"]["session"] is None
 
 
 def test_home_has_no_thread_tile_and_goals_carry_no_thread(store):
