@@ -1917,7 +1917,9 @@ def build_resume_message(
     # an item whose reminder went out in the last hour is on their screen already: not said twice
     reminded = {n.ref for n in store.nudges(now - 3600.0, now + 1.0, kinds=("reminder",)) if n.ref}
     parts += _todo_lines([i for i in items if i.ref not in reminded and i.ref not in due_refs], now, safe)
-    parts += deadline_lines(store, items, now, safe)
+    # the same "not said twice" in DEADLINES (review F3): a reminded item is left out; a DUE NOW one is marked
+    parts += deadline_lines(store, [i for i in items if i.ref not in reminded], now, safe,
+                            notes={ref: "in DUE NOW above: said there, once" for ref in due_refs})
     parts.append("RECENT MESSAGES (last 24 h, oldest first):")
     recent = [n for n in store.nudges(now - 86400.0, now + 1.0, limit=6)
               if not (n.kind == "reminder" and n.ref in reminded)][-4:]

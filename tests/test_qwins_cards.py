@@ -16,6 +16,7 @@ from yuki.memory.cardrules import (
     DEADLINE_RULE,
     deadline_lines,
     deadline_status,
+    event_status,
     with_card_rules,
 )
 from yuki.memory.nudges import FULLSCREEN_HOLD_S, GAME_ALIVE_S, NudgeConfig, _todo_lines, observe, todo_items
@@ -93,9 +94,52 @@ def test_deadlines_gather_every_dated_item_soonest_first(store):
     lines = deadline_lines(store, todo_items(store, now=NOW), NOW, safe)
     assert lines[0] == "DEADLINES:" and len(lines) == 4
     assert "Send the brochure proofs (overdue since Wednesday 30 September; stated Monday 28 September)" in lines[1]
-    assert lines[2].startswith("- [event:e1] Dentist appointment (due tomorrow, Monday 5 October, 11 AM")
+    assert lines[2].startswith("- [event:e1] Dentist appointment (tomorrow, Monday 5 October, 11 AM")
     assert "Ship the invoice export (due in 2 days, Tuesday 6 October, 6 PM" in lines[3]
     assert not any("ferns" in line or "Old fair" in line for line in lines)
+
+
+@pytest.mark.parametrize("at, all_day, words", [
+    (datetime(2026, 10, 2, 19, 0).timestamp(), False, "was on Friday 2 October, 7 PM"),     # review F2: never overdue
+    (datetime(2026, 10, 4, 20, 0).timestamp(), False, "earlier today, Sunday 4 October, 8 PM"),
+    (datetime(2026, 10, 4, 0, 0).timestamp(), True, "today, Sunday 4 October"),
+    (datetime(2026, 10, 5, 19, 0).timestamp(), False, "tomorrow, Monday 5 October, 7 PM"),
+    (datetime(2026, 10, 7, 0, 0).timestamp(), True, "in 3 days, Wednesday 7 October"),
+])
+def test_an_event_is_never_due_or_overdue(at, all_day, words):
+    assert event_status(at, NOW, all_day=all_day) == words
+
+
+def test_a_past_event_in_deadlines_says_it_was_on(store):
+    from yuki.memory.presence import EVENTS_STATE
+
+    events = [{"id": "e3", "what": "Dinner with Priya", "at": NOW - 2 * 86400, "all_day": False}]
+    store.set_nudge_state(EVENTS_STATE, store.cipher.encrypt(json.dumps(events)))
+    lines = deadline_lines(store, [], NOW, safe)
+    assert lines[1].startswith("- [event:e3] Dinner with Priya (was on Friday 2 October")
+    assert "overdue" not in lines[1] and "due" not in lines[1].replace("Dinner", "")
+    assert "never due or overdue" in DEADLINE_RULE and "was on" in DEADLINE_RULE
+
+
+def test_the_welcome_back_does_not_bring_a_reminded_deadline_back(store):
+    # review F3: TO-DOS and RECENT MESSAGES leave out what was reminded in the last hour; DEADLINES does too, and an
+    # item folded into DUE NOW is marked there as said once
+    from yuki.memory.nudges import ResumeGap, build_resume_message
+    from yuki.memory.store import NewNudge, NudgeCheckin
+
+    store.add_todo("Send the invoice", due_at=datetime(2026, 10, 4, 0, 0).timestamp(), all_day=True)
+    store.add_todo("Book the bike service", due_at=datetime(2026, 10, 6, 0, 0).timestamp(), all_day=True)
+    store.add_todo("Renew the library card", due_at=datetime(2026, 10, 9, 0, 0).timestamp(), all_day=True)
+    items = todo_items(store, now=NOW)
+    invoice, bike, card = (next(i for i in items if word in i.text) for word in ("invoice", "bike", "library"))
+    store.record_checkin(NudgeCheckin(at=NOW - 1200, trigger="due", outcome="nudge"),
+                         NewNudge(kind="reminder", text="Send the invoice today.", trigger="due", ref=invoice.ref))
+    gap = ResumeGap("resume:x", [], 0.0, None, NOW - 60, False, True, False)
+    data = build_resume_message(store, observe(store, NOW, CFG), gap, items, CFG, nonce="N", due=[(bike, "remind")])
+    deadlines = data[data.index("DEADLINES:"):data.index("RECENT MESSAGES")]
+    assert "Send the invoice" not in deadlines
+    assert "Book the bike service (due in 2 days, Tuesday 6 October; in DUE NOW above: said there, once" in deadlines
+    assert "Renew the library card (due in 5 days" in deadlines and card.ref in deadlines
 
 
 def test_no_deadline_says_none(store):
