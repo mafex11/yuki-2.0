@@ -227,6 +227,12 @@ def _now_line(value: Any) -> str:
     return text if len(text) <= NOW_CHARS else text[: NOW_CHARS - 1].rstrip() + "…"
 
 
+def _keeps_no_cache(client: Any) -> bool:
+    """The agent's client goes to an AI that keeps no prompt cache (Settings → AI, report 67): no warm-up for it."""
+    caching = getattr(client, "prompt_caching", None)
+    return callable(caching) and caching() == "none"
+
+
 def _acts_only(tool_input: Any) -> dict[str, Any]:
     """A kept step's input without the brain's notes about it (``what``, ``risk``...): what the call did."""
     from yuki.agent.loopguard import NOTE_FIELDS
@@ -716,8 +722,10 @@ class Agent:
         def warm() -> None:
             self._warm_activity()
             warmed = self._warm_model()
-            if warmed and self.authorizer is not None and not self.reader:
-                self.authorizer.warm()   # revamp D: the judge's own cached prompt, before the first judged call
+            # revamp D: the judge's own cached prompt, before the first judged call. The judge always runs on Claude
+            # (leftMem), so it is warmed too when Doing things is on an AI that keeps no prompt cache (review L2).
+            if (warmed or _keeps_no_cache(self.client)) and self.authorizer is not None and not self.reader:
+                self.authorizer.warm()
             self._warm_memory()
             self._warm_shell()
             self._warm_apps()
@@ -799,8 +807,7 @@ class Agent:
         all (no network yet: worth retrying), None on any other failure.
         """
         started = time.perf_counter()
-        caching = getattr(self.client, "prompt_caching", None)   # Settings → AI (report 67)
-        if callable(caching) and caching() == "none":
+        if _keeps_no_cache(self.client):   # Settings → AI (report 67)
             self.logger.log("model_prewarm", skipped="the chosen AI for doing things keeps no prompt cache")
             return None
         try:

@@ -210,6 +210,35 @@ def test_thinker_on_openrouter_judge_priced_as_claude(ai_dir: Path, tmp_path: Pa
                                                                                "cache_write_tokens": 0}), rel=1e-6)
 
 
+def test_judge_priced_as_claude_after_agent_routed_call_asked_same_model(ai_dir: Path, tmp_path: Path,
+                                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review L1: the agent runs on the judge's own model id (Haiku) and Doing things is on Ollama. The agent's last
+    routed call left its note on the agent's thread, where the judge's whole verdicts are costed: they are still priced
+    as Claude on Bedrock (never Ollama's 0), and the agent's own note is left as it was."""
+    from yuki.agent.providers.pricing import note_routed, routed_name
+
+    with FakeOpenAI([]) as server:
+        monkeypatch.setitem(PROVIDERS, "ollama", dataclasses.replace(PROVIDERS["ollama"], base_url=server.url + "/v1"))
+        _route("thinker", "ollama", "llama3.2:3b")
+        bedrock = _Bedrock()
+        auth = _authorizer(tmp_path, _agent_client(bedrock))
+        s = Settings()
+        assert s.judge_model == HAIKU
+        note_routed(s.judge_model, "ollama:llama3.2:3b")   # the agent's last model call, on this (the agent's) thread
+        try:
+            usage = {"input_tokens": 900, "output_tokens": 40, "cache_read_tokens": 0, "cache_write_tokens": 0}
+            assert s.estimate_cost(s.judge_model, usage) == 0.0   # what main's lookup would have priced it at
+            v = auth.check("type_text", _SEND, words=_WORDS, target=_TARGET)
+            assert routed_name(s.judge_model) == "ollama:llama3.2:3b"   # the agent's note is put back
+        finally:
+            note_routed(None, None)
+        posts = server.posts()
+    assert posts == [] and len(bedrock.sent) == 2 and v.model is None
+    claude = s.estimate_cost(s.judge_model, usage)
+    assert claude and claude > 0
+    assert auth.cost_usd == pytest.approx(2 * claude, rel=1e-6) and auth.unpriced == set()
+
+
 def test_judge_warm_up_and_forced_hand_check_use_bedrock_too(ai_dir: Path, tmp_path: Path) -> None:
     """The warm-up writes the judge's own Claude cache; the voice hands' forced check (hands._judge_client is the
     authorizer's model_client) goes through the same pinned client."""
@@ -361,3 +390,30 @@ def test_judge_lock_is_per_authorizer_thread_safe(ai_dir: Path, tmp_path: Path) 
     for t in threads:
         t.join()
     assert len({id(v) for v in views}) == 1
+
+
+@pytest.mark.parametrize(("caching", "warmed", "judge_warmed"), [
+    ("none", None, True),         # Doing things on an AI with no cache: the judge (on Claude) is warmed anyway
+    ("explicit", True, True),     # the default path, as on main
+    ("explicit", None, False),    # the thinker's warm-up failed for another reason: as on main, no judge warm-up
+    ("explicit", False, False),   # Bedrock not reachable yet: as on main
+])
+def test_judge_warmed_when_thinker_keeps_no_cache(caching: str, warmed: bool | None, judge_warmed: bool) -> None:
+    """Review L2: the judge's warm-up no longer follows the thinker's when the thinker's AI keeps no prompt cache."""
+    from yuki.agent import loop
+    from yuki.agent.loop import Agent
+
+    seen: list[str] = []
+    agent = SimpleNamespace(
+        client=SimpleNamespace(prompt_caching=lambda: caching),
+        authorizer=SimpleNamespace(warm=lambda: seen.append("judge")),
+        reader=False,
+        _warm_activity=lambda: None, _warm_model=lambda: warmed, _warm_memory=lambda: None,
+        _warm_shell=lambda: None, _warm_apps=lambda: None)
+    retry = loop.PREWARM_RETRY_S
+    loop.PREWARM_RETRY_S = ()
+    try:
+        Agent._start_prewarm(agent).join(5.0)
+    finally:
+        loop.PREWARM_RETRY_S = retry
+    assert seen == (["judge"] if judge_warmed else [])

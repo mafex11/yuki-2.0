@@ -1293,7 +1293,17 @@ class Authorizer:
         if not v.usage or not callable(estimate):
             return
         try:   # the model that answered when Settings → AI moved it (its returned amount if it gave one)
-            cost = v.returned_usd if v.returned_usd is not None else estimate(v.model or model, v.usage)
+            if v.returned_usd is not None:
+                cost = v.returned_usd
+            elif v.model is not None:
+                cost = estimate(v.model, v.usage)
+            else:
+                # The default (Claude) path answered, on the judge's own thread. Priced here on the caller's thread,
+                # whose last routed call may have asked for this same model id: price it as Claude (review L1).
+                from yuki.agent.providers.pricing import unrouted
+
+                with unrouted():
+                    cost = estimate(model, v.usage)
         except Exception:  # noqa: BLE001
             cost = None
         if cost is not None:
