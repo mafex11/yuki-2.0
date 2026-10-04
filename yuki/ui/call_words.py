@@ -157,7 +157,7 @@ def kept(status: Any) -> dict[str, Any]:
     if waits and sentence:
         sentence += " Your mic waits for headphones."
     quiet = stall_words(status)
-    if quiet and line:   # recording, but nothing new kept for a while (memory measured it): said, never hidden
+    if quiet and line:   # recording, but the mic brings no sound (memory measured it): said, never hidden
         line, short_line = f"{line} · {quiet}", f"{short_line or line} · {quiet}"
         sentence = f"{sentence} {_cap(quiet)}.".strip()
         short = quiet   # the narrow pill's fallback words: the rec dot says recording, the words say what is wrong
@@ -171,14 +171,18 @@ def kept(status: Any) -> dict[str, Any]:
 
 
 def stall_words(status: Any) -> str:
-    """``"nothing new kept for 12 min"`` when memory says a row records but kept no new piece of the call for a while
-    (``call_status()["stall"]``, measured by the call worker); ``""`` otherwise."""
+    """``"no sound from your mic for 12 min"`` when memory says a row records but its microphone brought no audio at
+    all for a while (``call_status()["stall"]`` with reason ``no_audio``, a dead capture, measured by the call worker);
+    ``""`` otherwise. A row that hears only silence (``no_speech``: a quiet voice channel, a muted user) is normal and
+    shows nothing (review F4)."""
     stall = _d(_d(status).get("stall"))
+    if stall.get("reason") != "no_audio":
+        return ""
     try:
         minutes = int(stall.get("minutes") or 0)
     except (TypeError, ValueError):
         return ""
-    return f"nothing new kept for {minutes} min" if minutes > 0 else ""
+    return f"no sound from your mic for {minutes} min" if minutes > 0 else ""
 
 
 def remembering_title(status: Any) -> str:

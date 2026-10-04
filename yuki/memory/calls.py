@@ -2104,6 +2104,10 @@ class CallWorker:
         if self.after is not None:
             self._close_after(now, reason)
         self._sync_watch(False, now)
+        # nothing records now: no stall stays behind in what the UI and the doctor read (review F5; a suspended row
+        # is open on purpose)
+        self._stall = None
+        self._note_tracks()
 
     def _suspend(self, r: _Active, now: float) -> None:
         """The service stops while row ``r`` goes on: its microphone and app track stop (each spools its last

@@ -452,11 +452,6 @@ def check_call_recording(db: Path | None = None, *, now: float | None = None, da
         marks = ",".join("?" * len(CALL_OPEN_STATUSES))
         open_rows = conn.execute(f"SELECT id, app, kind, detected_at, last_alive_at FROM calls WHERE status IN ({marks})"
                                  " AND ended_at IS NULL", CALL_OPEN_STATUSES).fetchall()
-        if isinstance(stall, dict) and stall.get("call_id") in {r["id"] for r in open_rows}:
-            what = ("the microphone sends no sound" if stall.get("reason") == "no_audio"
-                    else "nothing new was kept")
-            problems.append(f"the {stall.get('app') or 'call'} recording shows on, but {what} for "
-                            f"{int(stall.get('minutes') or 0)} min")
         running = True
         try:
             from yuki.memory.api import service_running
@@ -464,6 +459,13 @@ def check_call_recording(db: Path | None = None, *, now: float | None = None, da
             running = service_running(db)
         except Exception:
             running = True
+        # only a dead capture (no audio at all) is a problem: a row that hears only silence (a quiet voice channel,
+        # "no_speech") is normal (review F4); and only while the service runs, as a stopped service leaves its rows
+        # open on purpose with their last flag (review F5)
+        if (running and isinstance(stall, dict) and stall.get("reason") == "no_audio"
+                and stall.get("call_id") in {r["id"] for r in open_rows}):
+            problems.append(f"the {stall.get('app') or 'call'} recording shows on, but the microphone sends no sound "
+                            f"for {int(stall.get('minutes') or 0)} min")
         for r in open_rows if running else []:
             seen = r["last_alive_at"] if r["last_alive_at"] is not None else r["detected_at"]
             if now - float(seen) > 600.0:

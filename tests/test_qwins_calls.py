@@ -157,19 +157,24 @@ def test_call_status_carries_the_stall_and_the_island_says_it(store):
     call_id = store.start_call(app="Discord", process="discord", via="screen", at=now - 1800, status="recording",
                                consent="always", consent_by="pref", hold_since=now - 1810)
     stall = {"call_id": call_id, "app": "Discord", "kind": "call", "since": now - 720, "minutes": 12,
-             "reason": "no_speech"}
-    store.set_nudge_state(TRACKS_STATE, json.dumps({
-        "rows": [call_id], "mic": {"state": "recording", "call_id": call_id, "reason": None},
-        "tracks": [{"call_id": call_id, "app": "Discord", "process": "discord", "track_kind": "call",
-                    "state": "recording", "reason": None}], "stall": stall}))
+             "reason": "no_audio"}
+    state = {"rows": [call_id], "mic": {"state": "recording", "call_id": call_id, "reason": None},
+             "tracks": [{"call_id": call_id, "app": "Discord", "process": "discord", "track_kind": "call",
+                         "state": "recording", "reason": None}], "stall": stall}
+    store.set_nudge_state(TRACKS_STATE, json.dumps(state))
     status = MemoryClient(store).call_status()
     assert status["stall"]["minutes"] == 12
     view = live_view(status)
-    assert view["line"].endswith("nothing new kept for 12 min")
-    assert view["short_words"] == "nothing new kept for 12 min"
-    assert "Nothing new kept for 12 min." in view["sentence"]
+    assert view["line"].endswith("no sound from your mic for 12 min")
+    assert view["short_words"] == "no sound from your mic for 12 min"
+    assert "No sound from your mic for 12 min." in view["sentence"]
+    # review F4: a quiet voice channel (audio arrives, nobody speaks) is normal: the island says nothing about it
+    state["stall"] = dict(stall, reason="no_speech")
+    store.set_nudge_state(TRACKS_STATE, json.dumps(state))
+    quiet = live_view(MemoryClient(store).call_status())
+    assert "min" not in quiet["line"] and "mic" not in quiet["sentence"].replace("Your mic", "")
     store.set_nudge_state(TRACKS_STATE, json.dumps({"rows": [call_id], "stall": None}))
-    assert "nothing new" not in live_view(MemoryClient(store).call_status())["line"]
+    assert "no sound" not in live_view(MemoryClient(store).call_status())["line"]
 
 
 def test_a_stall_for_another_row_is_not_shown(store):
@@ -226,6 +231,44 @@ def test_doctor_flags_a_silent_loss_a_live_stall_and_a_stuck_row(doctor_db):
     assert "VALORANT voice chat from" in c.detail and "still marked open" in c.detail
     assert "1 recorded call in the last 7 days kept nothing" in c.detail and "Discord, 59 min" in c.detail
     assert "Zoom" not in c.detail                                # two minutes is under the stall time
+
+
+def test_doctor_leaves_a_quiet_voice_channel_alone(doctor_db):
+    # review F4: "no_speech" (silence arrives, nothing kept) is a quiet channel, not a broken microphone
+    from yuki.core.doctor import OK, check_call_recording
+
+    now = time.time()
+    live = doctor_db.start_call(app="Discord", process="discord", via="screen", at=now - 3000, status="recording")
+    doctor_db.update_call(live, last_alive_at=now - 5)
+    doctor_db.set_nudge_state(TRACKS_STATE, json.dumps({"stall": {"call_id": live, "app": "Discord", "minutes": 47,
+                                                                  "reason": "no_speech"}}))
+    c = check_call_recording(doctor_db.path, now=now)
+    assert c.status == OK and "47" not in c.detail
+
+
+def test_doctor_reads_no_live_stall_while_the_service_is_stopped(doctor_db, monkeypatch):
+    # review F5: a stopped service leaves its rows open on purpose; the last flag is not a live stall
+    import yuki.memory.api as api
+    from yuki.core.doctor import OK, check_call_recording
+
+    monkeypatch.setattr(api, "service_running", lambda db: False)
+    now = time.time()
+    live = doctor_db.start_call(app="Discord", process="discord", via="screen", at=now - 3000, status="recording")
+    doctor_db.update_call(live, last_alive_at=now - 900)
+    doctor_db.set_nudge_state(TRACKS_STATE, json.dumps({"stall": {"call_id": live, "app": "Discord", "minutes": 12,
+                                                                  "reason": "no_audio"}}))
+    assert check_call_recording(doctor_db.path, now=now).status == OK
+
+
+def test_a_service_stop_clears_the_stall_it_leaves_behind(store, sim):
+    # review F5: close("service_stop") suspends the rows and writes "no stall" for the UI and the doctor
+    w, _stubs, t0 = discord_call(store, sim)
+    w._stall = {"call_id": w.active.call_id, "app": "Discord", "kind": "call", "since": t0, "minutes": 12,
+                "reason": "no_audio"}
+    w._note_tracks()
+    assert json.loads(store.nudge_state(TRACKS_STATE))["stall"] is not None
+    w.close("service_stop", now=t0 + 30)
+    assert w._stall is None and json.loads(store.nudge_state(TRACKS_STATE))["stall"] is None
 
 
 def test_doctor_dates_are_natural():
