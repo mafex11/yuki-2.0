@@ -112,7 +112,11 @@ def run_pytest(targets: list[str], *, timeout_s: float, python: str, env: dict[s
     fd, junit = tempfile.mkstemp(prefix="sweep-", suffix=".xml")
     os.close(fd)
     junit_path = Path(junit)
-    cmd = [python, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider", f"--junitxml={junit_path}"]
+    # each process its own temp root: pytest keeps only the newest few of its shared numbered temp folders, so
+    # processes running side by side deleted each other's (a test's tmp_path vanished mid-test: a false flake)
+    basetemp = Path(tempfile.mkdtemp(prefix="sweep-bt-"))
+    cmd = [python, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider", f"--junitxml={junit_path}",
+           f"--basetemp={basetemp / 't'}"]
     started = time.monotonic()
     try:
         proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8",
@@ -127,6 +131,9 @@ def run_pytest(targets: list[str], *, timeout_s: float, python: str, env: dict[s
         junit_path.unlink()
     except OSError:
         pass
+    import shutil
+
+    shutil.rmtree(basetemp, ignore_errors=True)
     outcome = Outcome(code, seconds, timed_out, tail="\n".join(out.strip().splitlines()[-3:]))
     if counts is not None:
         outcome.passed, outcome.failed, outcome.skipped, outcome.failed_ids = counts

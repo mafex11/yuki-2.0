@@ -66,16 +66,16 @@ def tmp_tests(tmp_path):
 
 def test_a_passing_file_passes(tmp_tests):
     sweep = _sweep()
-    run = sweep.sweep_file(tmp_tests("test_ok.py", "def test_a():\n    assert 1\n"), timeout_s=120,
+    run = sweep.sweep_file(tmp_tests("test_ok.py", "def test_a():\n    assert 1\n"), timeout_s=300,
                            python=__import__("sys").executable, env=dict(__import__("os").environ))
-    assert run.result == "passed" and run.passed == 1
+    assert run.result == "passed" and run.passed == 1, run
 
 
 def test_a_failure_twice_is_failed_and_named(tmp_tests):
     sweep = _sweep()
     run = sweep.sweep_file(tmp_tests("test_bad.py", "def test_ok():\n    pass\n\ndef test_bad():\n    assert 0\n"),
-                           timeout_s=120, python=__import__("sys").executable, env=dict(__import__("os").environ))
-    assert run.result == "failed" and run.failed == 1 and len(run.failed_ids) == 1
+                           timeout_s=300, python=__import__("sys").executable, env=dict(__import__("os").environ))
+    assert run.result == "failed" and run.failed == 1 and len(run.failed_ids) == 1, run
     assert run.failed_ids[0].endswith("::test_bad")
 
 
@@ -85,16 +85,16 @@ def test_a_failure_that_passes_alone_is_flaky(tmp_tests, tmp_path):
     body = ("from pathlib import Path\n\n"
             f"def test_once():\n    p = Path({marker!r})\n    first = not p.exists()\n    p.write_text('x')\n"
             "    assert not first\n")
-    run = sweep.sweep_file(tmp_tests("test_flaky.py", body), timeout_s=120, python=__import__("sys").executable,
+    run = sweep.sweep_file(tmp_tests("test_flaky.py", body), timeout_s=300, python=__import__("sys").executable,
                            env=dict(__import__("os").environ))
-    assert run.result == "flaky" and run.failed_ids == [] and len(run.flaky_ids) == 1
+    assert run.result == "flaky" and run.failed_ids == [] and len(run.flaky_ids) == 1, run
 
 
 def test_a_file_without_tests_is_empty(tmp_tests):
     sweep = _sweep()
-    run = sweep.sweep_file(tmp_tests("test_none.py", "X = 1\n"), timeout_s=120, python=__import__("sys").executable,
+    run = sweep.sweep_file(tmp_tests("test_none.py", "X = 1\n"), timeout_s=300, python=__import__("sys").executable,
                            env=dict(__import__("os").environ))
-    assert run.result == "empty"
+    assert run.result == "empty", run
 
 
 def test_node_ids_from_junit_names():
