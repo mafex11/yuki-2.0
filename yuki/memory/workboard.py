@@ -444,7 +444,9 @@ def board(store: Store, now: float | None = None) -> dict[str, Any]:
       A candidate chat (its newest message not the user's) shows with its latest verdict; one the user marked No
       reply needed shows again only when a newer message is judged to need a reply; Open chat's mark shows as
       ``opened`` until a newer message.
-    * ``loops``: ``{loop id: {"kind", "who", "what", "where", "draft"}}`` for the open loops judged.
+    * ``loops``: ``{loop id: {"kind", "who", "what", "where", "draft", "basis"}}`` for the open loops judged (``draft``
+      and ``basis`` on a waiting one: the request built in code from the loop's own person and app; "offered" or
+      "asked"). One chat captured as two threads (the same app and quoted message) shows once.
     * ``meetings``: ``[{"at", "all_day", "title", "seen" (the apps it was seen in)}]``, still ahead, soonest first.
     * ``listed``: the refs the user moved to their list (``commit:<id>``, ``loop:<id>``).
     * ``ready``: whether a check has run at all (else the page says it is still reading).
