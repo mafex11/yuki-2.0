@@ -287,6 +287,47 @@ _EFFECT_FACTS = ("foreground_changed", "focus_changed", "foreground_title_change
                  "window_state_changed")   # v3.14b: normal / maximized / full screen, before -> after
 
 
+#: appOpen review F6: how long a run trace waits for its openings' watches at most (the watch's own 180 s, and slack).
+WATCH_JOIN_S = 200.0
+
+
+def with_watch_steps(run: dict[str, Any], watching: list[tuple[int, dict[str, Any]]], *,
+                     join_s: float = WATCH_JOIN_S) -> dict[str, Any]:
+    """The run trace with each opening's watch (appOpen review F6) as a step right after the last launch_app it
+    watched: verified when the app's own window came up, not when it did not, "could not tell" when the watch was
+    stopped or did not end. Waits for the watches (bounded by ``join_s``); returns a new run dict."""
+    deadline = time.monotonic() + max(0.0, float(join_s))
+    last: dict[int, tuple[int, dict[str, Any]]] = {}
+    for index, entry in watching:
+        if id(entry) not in last or index > last[id(entry)][0]:
+            last[id(entry)] = (index, entry)
+    steps = list(run.get("steps") or [])
+    ended = float(run.get("ended_at") or time.time())
+    for index, entry in sorted(last.values(), key=lambda x: -x[0]):
+        thread = entry.get("thread")
+        if isinstance(thread, threading.Thread):
+            thread.join(max(0.0, deadline - time.monotonic()))
+        result = entry.get("result") if isinstance(entry.get("result"), dict) else {
+            "verified": None, "summary": "the watch did not end in time"}
+        verdict = result.get("verified") if isinstance(result.get("verified"), bool) else None
+        at = float(entry.get("ended") or time.time())
+        ended = max(ended, at)
+        base = steps[index] if 0 <= index < len(steps) else {}
+        name = str(entry.get("name") or "")
+        query = (base.get("input") or {}).get("query") if isinstance(base.get("input"), dict) else None
+        steps.insert(index + 1, {
+            "tool": "launch_app", "kind": "action",
+            "app": str(result.get("process_name") or "") or None if verdict is True else None,
+            "target": f"{base.get('target') or 'app ' + repr(name)}, watched",
+            "input": {"query": query or name, "watch": True}, "ok": verdict is not False, "verdict": verdict,
+            "why": ("its own window showed" if verdict is True else "its own window did not show"
+                    if verdict is False else "the watch stopped before it could tell"),
+            "expected": False, "result": " ".join(str(result.get("summary") or "").split())[:400],
+            "ms": round((at - float(entry.get("began") or at)) * 1000.0, 1), "sig": None, "playbook": None,
+            "at": at, "cost_usd": None})
+    return {**run, "steps": steps, "ended_at": ended}
+
+
 def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
     """Whether an action's own report verifies that it took effect: ``(True | False | None, why)``.
 
@@ -1339,6 +1380,8 @@ class Agent:
         #: touched (never meaning: no lesson may carry them), the words the user added mid-run, the playbooks shown.
         self._trace: list[dict[str, Any]] = []
         self._trace_numbers: set[int] = set()
+        #: appOpen review F6: the openings of this request still starting through a launcher (trace index, watch).
+        self._launch_watch_steps: list[tuple[int, dict[str, Any]]] = []
         self._call_costs: dict[int, float] = {}
         self._steer_texts: list[str] = []
         #: vfix3 review F6: know-how sent with the action it describes, kept when the request ends well.
@@ -1833,9 +1876,57 @@ class Agent:
                     "at": time.time()}
             if control:
                 step["control"] = control
+            launcher = details.get("launcher") if name == "launch_app" else None
+            if isinstance(launcher, dict):
+                # appOpen review F1: which launcher took it and when, so practice memory tells a game this launch
+                # started from the user's own doing; review F6: a game still starting gets the voice hand's light watch
+                step["input"] = {**acting, **{k: launcher[k] for k in ("handed_to", "handed_at") if launcher.get(k)}}
+                if details.get("starting"):
+                    self._watch_launch(launcher, len(trace))
             trace.append(step)
         except Exception as exc:  # noqa: BLE001 - the trace never breaks a request
             self.logger.log("trace_step_failed", tool=name, error=f"{type(exc).__name__}: {exc}")
+
+    def _watch_launch(self, launcher: dict[str, Any], index: int) -> None:
+        """appOpen review F6: a launch_app the launcher is still starting (a game) gets the same light, bounded watch
+        as the voice hand's (``backend.watch_launch``: one window list a second, at most 180 s, never acting), on its
+        own thread; its verdict joins this request's run trace as a step after the opening (:func:`with_watch_steps`),
+        so the thinker's opening gets a real verdict too. One watch per entry: a second launch_app of the same game
+        while it starts shares it. A backend without a watch (tests, stubs) keeps the opening as it was."""
+        backend = getattr(getattr(self, "dispatcher", None), "backend", None)
+        watch = getattr(backend, "watch_launch", None) if backend is not None else None
+        if not callable(watch):
+            return
+        key = str(launcher.get("appid") or launcher.get("name") or "").lower()
+        watches: dict[str, dict[str, Any]] = self.__dict__.setdefault("_launch_watches", {})
+        entry = watches.get(key)
+        if entry is None or entry.get("ended") is not None:
+            entry = {"name": str(launcher.get("name") or ""), "began": time.time(), "ended": None, "result": None}
+            logger = getattr(self, "logger", None)
+
+            def run() -> None:
+                try:
+                    result = watch(launcher)
+                except Exception as exc:  # noqa: BLE001 - a watch that failed says so
+                    result = {"verified": None, "summary": f"the watch failed: {type(exc).__name__}"}
+                entry["result"] = result if isinstance(result, dict) else {"verified": None, "summary": str(result)}
+                entry["ended"] = time.time()
+                if logger is not None:
+                    try:
+                        logger.log("launch_watch", verified=entry["result"].get("verified"),
+                                   waited_s=round(entry["ended"] - entry["began"], 1),
+                                   in_front=bool(entry["result"].get("in_front")),
+                                   fullscreen=bool(entry["result"].get("fullscreen")))
+                    except Exception:  # noqa: BLE001 - the log never breaks a watch
+                        pass
+
+            entry["thread"] = threading.Thread(target=run, name="yuki-launch-watch", daemon=True)
+            watches[key] = entry
+            entry["thread"].start()
+        steps = getattr(self, "_launch_watch_steps", None)
+        if steps is None:
+            steps = self._launch_watch_steps = []
+        steps.append((index, entry))
 
     def _record_surfaced(self, *, reply: str, at: float) -> None:
         """After the reply is out: which brief lines and memories this reply was written from, to memory's personal-ness
@@ -1893,6 +1984,21 @@ class Agent:
                 logger.log("run_trace_logged", **{k: v for k, v in report.items() if k != "result"},
                            learn=(report.get("result") or {}).get("learn"))
 
+            watching = list(getattr(self, "_launch_watch_steps", None) or [])
+            if watching:
+                # appOpen review F6: an opening still starting is kept with its watch's verdict (at most ~3 min later,
+                # off the request: the reply is out already)
+                self._launch_watch_steps = []
+
+                def after_watch() -> None:
+                    try:
+                        record(with_watch_steps(run, watching), on_done=done)
+                    except Exception as exc:  # noqa: BLE001 - memory never breaks a request
+                        logger.log("run_trace_failed", error=f"{type(exc).__name__}: {exc}")
+
+                threading.Thread(target=after_watch, name="yuki-run-after-watch", daemon=True).start()
+                self.logger.log("run_trace_held", watches=len(watching), steps=len(steps))
+                return
             queued = record(run, on_done=done)
             self.logger.log("run_trace_queued", queued=queued, steps=len(steps), injected=run["injected"],
                             cited=sorted({str(s.get("playbook")) for s in steps if s.get("playbook")}))

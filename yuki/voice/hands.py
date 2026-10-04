@@ -1602,9 +1602,12 @@ class Hands:
             return
         verdict = watch.get("verified")
         shown_app = str(watch.get("process_name") or "") or None
+        launcher = facts.get("launcher") if isinstance(facts.get("launcher"), dict) else {}
+        # review F1: which launcher took it and when, so the learner tells a game this launch started from the user's
+        handed = {k: launcher[k] for k in ("handed_to", "handed_at") if launcher.get(k)}
         steps = [
             {"tool": "launch_app", "kind": "action", "app": None, "target": f'app "{args.get("name")}"',
-             "input": {"name": args.get("name")}, "ok": True, "verdict": None,
+             "input": {"name": args.get("name"), **handed}, "ok": True, "verdict": None,
              "why": "still starting: no window of it yet when the hand returned", "result": str(report or "")[:600],
              "ms": float(ms or 0.0), "at": started_at},
             {"tool": "launch_app", "kind": "action", "app": shown_app if verdict is True else None,

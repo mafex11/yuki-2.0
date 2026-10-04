@@ -611,7 +611,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 #: its report (:mod:`yuki.agent.finish`), not by the model: about 40 output tokens less per finishing call. The line
 #: travels to the voice in this same field of the ``tool_call`` event (a string there, so voice v3.17's
 #: verified-result path reads it unchanged). A string sent here by an older habit counts as ``finish_words``.
-#: appOpen: the longest a launch_app call waits for a game its launcher is still starting (the thinker asks with wait_s).
+#: appOpen: the longest a launch_app call waits for a game its launcher is still starting, when a caller passes wait_s.
+#: The dispatcher accepts it; it is kept out of launch_app's schema (the brain prompt's size budget), so the thinker
+#: does not ask for it - its opening is confirmed by the light watch instead (``Agent._watch_launch``).
 LAUNCH_WAIT_MAX_S = 60
 
 FINISHES_FIELD = "finishes_with"

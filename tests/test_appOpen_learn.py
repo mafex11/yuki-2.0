@@ -234,3 +234,138 @@ def test_memory_access_hands_launch_the_learned_programs_quickly_and_never_raise
     assert access.learned_launch_images("Starfall") == ["starfall-win64-shipping"]
     assert access.learned_launch_images("STARFALL") == ["starfall-win64-shipping"] and access.asked == 1  # cached
     assert Access(RuntimeError("memory is down")).learned_launch_images("Starfall") == []
+
+
+# -- review fixes (5 Oct): Yuki's own slow launch is Yuki's, a verified opening is not doubted, the program belongs to
+# -- the entry -------------------------------------------------------------------------------------------------------
+
+SHELL = r"C:\Windows\SystemApps\Fake.Shell\searchhost.exe"
+
+
+@pytest.fixture(autouse=True)
+def shell(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shell's program lives in the Windows folder; nothing real is read."""
+    monkeypatch.setattr(L, "_running_exe", lambda key: SHELL if key == "searchhost" else "")
+    L._shell_cache.clear()
+
+
+def _game_from(store: Any, *, chain_at: float, window_at: float, start_row_at: float | None = None) -> None:
+    """The game's window at ``window_at`` (full screen, 2 min), its launch chain under the launcher started at
+    ``chain_at``; with ``start_row_at`` the user opened Start themselves then."""
+    lineage.clear()
+    lineage.add({"at": window_at, "image": "starfall-win64-shipping.exe", "exe": GAME, "started": chain_at + 5.0,
+                 "parents": [{"image": "starfall.exe", "exe": BOOT, "started": chain_at},
+                             {"image": "fakelauncher.exe", "exe": CARRIER, "started": NOW - 86400.0}],
+                 "by_yuki": False})
+    rows = [(window_at, 120.0, "starfall-win64-shipping", "Starfall", "STARFALL", True)]
+    if start_row_at is not None:
+        rows.insert(0, (start_row_at, 2.0, "searchhost", "Search", "Start", False))
+    for start, active, process, app, title, full in rows:
+        store.save_timeline(TimelineRow(id=None, started_at=start, ended_at=start + active, state="present",
+                                        process=process, app=app, title=title, active_s=active, fullscreen=full))
+
+
+def _voice_opening(*, handed: bool = True, verdict: bool | None = None) -> dict[str, Any]:
+    run = opening_run(watched=verdict)
+    if handed:
+        run["steps"][0]["input"] = {"name": "Starfall", "handed_to": "fakelauncher.exe", "handed_at": NOW + 0.2}
+    if verdict is None:
+        run["steps"][1].update(ok=True, why="the watch stopped before it could tell",
+                               result="stopped watching for Starfall's window after 30 s")
+    return run
+
+
+def _thinker_opening(*, handed: bool) -> dict[str, Any]:
+    inp: dict[str, Any] = {"query": "Starfall"}
+    if handed:
+        inp.update(handed_to="fakelauncher.exe", handed_at=NOW + 0.2)
+    steps = [{"tool": "launch_app", "kind": "action", "app": None, "target": "", "input": inp, "ok": True,
+              "verdict": None, "why": "it is still starting through its launcher: no window of the app itself yet",
+              "result": "started 'Starfall' the way the Start menu does: Fake Launcher took it; after 8 s it is "
+                        "still starting", "ms": 8000.0, "at": NOW + 8.0}]
+    return {"source": "agent", "session_id": "S5", "request_id": "voice-9", "lane": "voice", "at": NOW,
+            "ended_at": NOW + 9.0, "words": WORDS, "reply": "It's starting.", "outcome": "final", "steps": steps,
+            "wall_s": 9.0}
+
+
+@pytest.mark.parametrize("make", [
+    lambda: _voice_opening(handed=True),             # the voice watch was stopped (a second "open it")
+    lambda: _thinker_opening(handed=True),           # the thinker: launch_app said "starting", no watch verdict
+    lambda: _thinker_opening(handed=False),          # an opening kept without the hand-off facts: within 180 s
+], ids=["voice-watch-stopped", "thinker-handed", "thinker-plain"])
+def test_review_f1_a_game_yukis_own_launch_started_late_is_never_learned_as_the_users_fix(store, make):
+    run = make()
+    worker = Worker(store)
+    P.record_run(store, run)
+    end = float(run["ended_at"])
+    worker.answers += [{"outcome": "failed", "cause": "not confirmed", "operations": [], "used": []}] * 2
+    L.Learner(worker).run_once(now=end + L.FOLLOWUP_S + 1)
+    calls = len(worker.calls)
+    _game_from(store, chain_at=NOW + 3.0, window_at=NOW + 100.0)    # only the game, from Yuki's own launch
+    head = P.run_header(store, P.run_key(run["source"], "S5", run["request_id"]))
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=end + L.CONTEXT_S + 5)
+    assert len(items) == 1 and items[0]["yuki"] and not items[0]["worked"]
+    assert "started by Yuki's own launch" in items[0]["yuki_why"]
+    assert "started by Yuki's own launch" in L._user_item_line(items[0], lambda v, n: str(v)[:n])
+    assert L.Learner(worker).run_once(now=end + L.CONTEXT_S + 5) == []
+    assert len(worker.calls) == calls                                # no demonstration pass, no post-mortem
+    assert P.live(store, ["procedure"]) == []
+    assert P.run_header(store, head.run_key).signals[L.RECHECK_KEY]["result"] == "nothing new"
+
+
+def test_review_f1_the_user_taking_over_through_start_is_still_the_users_own_fix(store):
+    worker = Worker(store)
+    P.record_run(store, _voice_opening(handed=True, verdict=False))
+    worker.answers.append({"outcome": "failed", "cause": "the game never came up", "operations": [PIT], "used": []})
+    L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
+    _game_from(store, chain_at=NOW + 327.0, window_at=NOW + 330.0, start_row_at=NOW + 250.0)
+    worker.answers.append({**DEMO, "from_user": ["u1", "u2"]})
+    res = L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
+    assert len(res) == 1 and res[0].outcome == "shown"
+    assert "Yuki's own effect" not in worker.calls[-1]["user"].split("[u2]")[1].split("\n")[0]
+
+
+def test_review_f1_a_chain_yuki_started_before_the_user_went_to_start_stays_yukis(store):
+    run = _voice_opening(handed=True, verdict=False)
+    P.record_run(store, run)
+    _game_from(store, chain_at=NOW + 3.0, window_at=NOW + 100.0, start_row_at=NOW + 30.0)
+    head = P.run_header(store, P.run_key("hand", "S5", run["request_id"]))
+    items = L.user_next(store, head, P.run_steps(store, head.run_key), now=END + L.CONTEXT_S)
+    assert [it["yuki"] for it in items] == [False, True]             # Start is the user's; the game is Yuki's launch
+
+
+def test_review_f3_a_verified_opening_is_not_doubted_and_never_takes_the_users_way(store):
+    two = [P.RunStep(step=n, at=NOW, tool="launch_app", kind="action", app=None, target="", input="{}", ok=True,
+                     verdict=v, why="", result="", ms=1.0, cost_usd=None, cited=[]) for n, v in ((1, None), (2, True))]
+    assert not L.doubtful_open(two)                                  # the watch verified it
+    assert L.doubtful_open(two[:1]) and L.doubtful_open([two[1], two[0]])
+    worker = Worker(store, answers=[{"outcome": "worked", "operations": [], "used": []}] * 3)
+    P.record_run(store, _voice_opening(handed=True, verdict=True))
+    L.Learner(worker).run_once(now=END + L.FOLLOWUP_S + 1)
+    calls = len(worker.calls)
+    _game_from(store, chain_at=NOW + 327.0, window_at=NOW + 330.0, start_row_at=NOW + 250.0)
+    L.Learner(worker).run_once(now=END + L.CONTEXT_S + 5)
+    assert len(worker.calls) == calls                                # no extra post-mortem for a verified opening
+    # a pass that still cites the user's items on a verified run: the way is refused
+    ctx = L.Ctx(mode="postmortem", verified=True, user_items={"u1": {"label": "u1", "worked": True, "yuki": False,
+                                                                   "image": "starfall-win64-shipping.exe",
+                                                                   "entries": [{"name": "Starfall"}]}})
+    checked = L.check({"outcome": "failed", "operations": [{**SHOWN, "from_user": ["u1"]}], "used": []}, ctx)
+    L.keep_ways_from_success(checked, ctx, success=False)
+    assert not any(o.get("demonstrated") for o in checked.ops)
+    assert any("the run itself worked" in r for r in checked.rejected)
+
+
+@pytest.mark.parametrize("item, why", [
+    ({"image": "moonfall-win64-shipping.exe", "exe": r"C:\Games\Moonfall\bin\moonfall-win64-shipping.exe"},
+     "named for another Start entry ('Moonfall')"),
+    ({"image": "fakelauncher.exe", "exe": CARRIER}, "hands its arguments to"),
+])
+def test_review_f4_the_program_learned_must_belong_to_the_entry(item, why):
+    entries = [{"name": "Starfall", "arguments": "--launch-product=starfall", "program": "fakelauncher.exe"},
+               {"name": "Moonfall", "arguments": "--launch-product=moonfall", "program": "fakelauncher.exe"},
+               {"name": "Fake Launcher", "arguments": "", "program": "fakelauncher.exe"}]
+    ctx = L.Ctx(mode="postmortem", user_items={"u4": {"label": "u4", "worked": True, "yuki": False, "entries": entries,
+                                                      **item}})
+    checked = L.check({"outcome": "failed", "operations": [{**SHOWN, "from_user": ["u4"]}], "used": []}, ctx)
+    assert checked.ops == [] and any(why in r for r in checked.rejected)
