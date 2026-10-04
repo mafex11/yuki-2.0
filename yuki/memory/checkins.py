@@ -82,6 +82,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from yuki.memory import offers as offers_mod
+from yuki.memory.cardrules import DEADLINE_RULE, deadline_lines, with_card_rules
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted
 from yuki.memory.personality import nature_mark, usable
 from yuki.memory.store import (
@@ -282,6 +283,9 @@ to Yuki or to an AI.
 Call write_checkin exactly once."""
 
 #: The offer field of a check-in: null or a typed todo_add (yuki.memory.offers checks it like every card's).
+#: Deadlines only from DEADLINES (yuki.memory.cardrules, report 76; the relay rule is item 4 above).
+CHECKIN_PROMPT = with_card_rules(CHECKIN_PROMPT, DEADLINE_RULE)
+
 CHECKIN_TOOL: dict[str, Any] = {
     "name": "write_checkin",
     "description": "Record the check-in you show the user now, or none. Call exactly once.",
@@ -1572,6 +1576,7 @@ class CheckinWorker:
         parts += shown or ["(none beyond the moment's)"]
         parts += ["", "TO-DOS (open):"]
         parts += _todo_lines(items, now, safe)
+        parts += deadline_lines(self.store, items, now, safe)
         parts += ["ABOUT THE USER (your brief on them, written nightly; else portrait facts):"]
         parts += _about_lines(self.store, CHECKIN_ABOUT_KINDS, safe)
         parts += ["", "RECENT CHECK-INS AND QUESTIONS (last 7 days, oldest first, with what the user did):"]
