@@ -466,7 +466,13 @@ def test_the_pause_catches_the_next_action_reads_the_screen_again_and_goes_on(tm
 def test_a_takeover_during_an_action_waits_after_it_and_the_breaker_does_not_count_it(tmp_path: Path):
     desk = _desk()
     watches = Watches()
-    brain = Brain([_response(_press(0, "playpause"), _press(1, "nexttrack")), _response(_done())])
+    seen: dict[str, str] = {}
+
+    def after(params: dict) -> SimpleNamespace:
+        seen["text"] = _texts(params)
+        return _response(_done(1))
+
+    brain = Brain([_response(_press(0, "playpause"), _press(1, "nexttrack"), _done()), after])
     agent = _agent(brain, tmp_path, desk, watches=watches)
 
     def on_event(a: Any, ev: Any) -> None:
@@ -476,9 +482,10 @@ def test_a_takeover_during_an_action_waits_after_it_and_the_breaker_does_not_cou
             threading.Timer(0.05, a.resume).start()
 
     events = _drive(agent, "play, then next", on_event)
-    assert _presses(desk) == ["playpause"]        # the second action of that response never ran
+    assert _presses(desk) == ["playpause"]        # the rest of that response (a key and its done) never ran
     assert any(isinstance(e, Paused) and e.state == "resumed" for e in events)
     assert agent._breaker.trips == [] and isinstance(events[-1], Final)
+    assert "earlier tool in this turn failed" not in seen["text"] and seen["text"].count("so you were paused") >= 2
 
 
 def test_words_given_with_the_resume_reach_the_brain_as_the_users(tmp_path: Path):
@@ -692,6 +699,8 @@ def test_the_island_opens_paused_and_resume_goes_out(qapp):
         assert isl.state == "working"
         isl.set_paused(5, True, "keys")
         assert isl.state == "paused" and isl.current_spec().body == "paused"
+        assert not isl.window.k_resume.isHidden() and not isl.window.k_pstop.isHidden()
+        assert isl.window.ln1.text() == "You took over · paused"
         isl.window.k_resume.clicked.emit()
         assert resumed == [5]
         isl.toggle_card()                                            # the chevron: the run card says it is paused
@@ -701,7 +710,7 @@ def test_the_island_opens_paused_and_resume_goes_out(qapp):
         isl.window.run.k_resume.clicked.emit()
         assert resumed == [5, 5]
         isl.set_paused(5, False)
-        assert isl.state == "working" and not isl.window.run.paused
+        assert isl.state == "working" and not isl.window.run.paused and isl.window.k_resume.isHidden()
         isl.set_paused(5, True)
         isl.window.k_pstop.clicked.emit()
         assert stopped == [5] and isl.state == "working"              # "Stopping…" until it ends

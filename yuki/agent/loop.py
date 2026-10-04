@@ -2647,6 +2647,11 @@ class Agent:
 
         # done is honoured only when everything before it succeeded -- which
         # includes a call skipped for being cut off at the output limit.
+        if turn.stop_after and self._paused.is_set():
+            # appTakeover: the rest of a response the pause caught is not run either, and is no failure of its own
+            turn.gated.add(tool_id)
+            turn.record(tool_id, self._skip(tool_id, name, PAUSED_SKIP))
+            return
         if turn.stop_after or (name == "done" and turn.failed):
             turn.record(
                 tool_id, self._skip(tool_id, name, "Not run: an earlier tool in this turn failed.")

@@ -1601,6 +1601,8 @@ class IslandWindow(QWidget):
         self.caption.setVisible(spec.body == "caption")
         for w in (self.k_answer, self.k_qstop):
             w.setVisible(spec.body == "choices")
+        for w in (self.k_resume, self.k_pstop):
+            w.setVisible(spec.body == "paused")
         self.run.setVisible(spec.body == "run")
         self.send.setVisible(spec.body == "send")
         pitch =3 if spec.mini else COMPACT_PITCH if spec.compact else 8
