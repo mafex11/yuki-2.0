@@ -67,6 +67,10 @@ LIVE_B = [u("a nucleus arc."), a("Yo, what's up? You testing the new build?"), u
           a("I'm drawing a blank on that one. Can you run me through it again?")]
 DENIALS = ("don't have", "do not have", "no record", "drawing a blank", "not on record", "didn't tell", "did not tell",
            "haven't told", "not saved", "nothing saved", "don't remember", "can't recall", "no idea")
+#: An empty list said as "you never told me" (the empty report's check: "your list is empty" itself is fine).
+TOLD_DENIALS = ("didn't tell", "did not tell", "haven't told", "have not told", "never told", "haven't given",
+                "didn't give", "haven't said", "didn't say", "no record", "drawing a blank", "don't remember",
+                "haven't mentioned", "didn't mention")
 
 
 def cases() -> list[dict[str, Any]]:
@@ -133,8 +137,11 @@ def check(case: dict[str, Any], row: dict[str, Any]) -> bool:
             "tell_yuki" in names and not denied)
     if kind == "says_items":
         return _items_said(spoken) >= 2 and "todo:" not in spoken and not denied
-    if kind == "says_empty":
-        return any(w in spoken for w in ("empty", "nothing", "don't have any", "no to-dos")) and "list" in spoken
+    if kind == "says_empty":   # the list is empty, never "you didn't tell me" (review F2), and a further look offered
+        told_denied = any(d in spoken for d in TOLD_DENIALS)
+        offers = any(w in spoken for w in ("look", "check", "dig", "search", "chat", "earlier", "go through"))
+        return (any(w in spoken for w in ("empty", "nothing", "don't have any", "no to-dos")) and "list" in spoken
+                and not told_denied and offers)
     if kind == "adds":
         adds = [c["input"] for c in calls if c["name"] == "quick_memory" and c["input"].get("action") == "add_todos"]
         if adds:
