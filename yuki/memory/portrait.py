@@ -138,6 +138,7 @@ from yuki.memory.brief import BRIEF_FIELD_SCHEMA, BRIEF_RENDER_RULES, brief_inpu
 from yuki.memory.questions import embed_questions, known_text, question_from_item, question_item_schema, vet_new
 from yuki.memory.store import (
     AUDIT_FLAG,
+    CALL_OPEN_STATUSES,
     CORRECTION_KIND,
     PORTRAIT_KINDS,
     REFRESH_FLAG,
@@ -3325,6 +3326,10 @@ class PortraitWorker:
 # ---------------------------------------------------------------------------
 
 
+#: How far back an open call row holds the scheduled runs back (:meth:`PortraitScheduler.busy`).
+BUSY_CALL_WINDOW_S = 12 * 3600.0
+
+
 class PortraitScheduler:
     """When to run the portrait worker; one daemon thread in ``yuki-memory``.
 
@@ -3342,8 +3347,11 @@ class PortraitScheduler:
        (or first) run since -> ``weekly`` run; then the nightly slot (the latest
        ``nightly_hour``) without a journal run since -> ``nightly`` run. A due slot
        runs at the first moment the user has been idle ``idle_s`` (no
-       keyboard/mouse input), or straight away on the first check after the
-       service starts (the slot was missed while it was not running).
+       keyboard/mouse input) and no call, game voice, meeting or full-screen app
+       is going on (:meth:`busy`). A slot missed while the service was not running
+       waits for that moment too: it used to run straight away at start, which on
+       5 Oct meant ten Sonnet calls at 02:39 right after an install, while the
+       transcriber had the graphics card.
     After every successful run that read the journal, a portrait audit
     (:meth:`PortraitWorker.audit`: the facts new evidence touches; every fact after a
     weekly or first run). An ``audit_portrait`` flag file asks for one now ("all" in
@@ -3364,6 +3372,7 @@ class PortraitScheduler:
         db_path: str | Path | None,
         log: Callable[..., Any] | None = None,
         idle_fn: Callable[[], float] | None = None,
+        live_fn: Callable[[], dict[str, Any]] | None = None,
         clock: Callable[[], float] = time.time,
         nightly_hour: int = 22,
         idle_s: float = 600.0,
@@ -3396,6 +3405,9 @@ class PortraitScheduler:
 
             idle_fn = user_idle_s
         self.idle_fn = idle_fn
+        #: The recorder's live stretch (``{"fullscreen": bool, "meeting": bool}``, the service passes the
+        #: timeline's); ``None``: only the store's open call rows hold the scheduled runs back.
+        self.live_fn = live_fn
         self.clock = clock
         self.nightly_hour = int(nightly_hour)
         self.idle_s = float(idle_s)
@@ -3455,7 +3467,6 @@ class PortraitScheduler:
             if count >= self.first_min_facts:
                 return "first", f"no portrait yet, {count} journal facts"
             return None, f"waiting for {self.first_min_facts} journal facts ({count})"
-        idle = self.idle_fn()
         for kind, slot, kinds in (
             ("weekly", self.weekly_slot(now), ("weekly", "first")),
             ("nightly", self.nightly_slot(now), JOURNAL_RUN_KINDS),
@@ -3463,12 +3474,37 @@ class PortraitScheduler:
             last = self.store.last_portrait_run_at(kinds)
             if last is not None and last >= slot:
                 continue
-            if self._startup:
-                return kind, f"missed slot {_local(slot, '%Y-%m-%d %H:%M')}, running at start"
+            missed = "missed " if self._startup else ""
+            busy = self.busy()
+            if busy:
+                return None, f"{kind} due since {_local(slot, '%Y-%m-%d %H:%M')}, waiting: {busy}"
+            idle = self.idle_fn()
             if idle >= self.idle_s:
-                return kind, f"slot {_local(slot, '%Y-%m-%d %H:%M')}, user idle {idle:.0f} s"
+                return kind, f"{missed}slot {_local(slot, '%Y-%m-%d %H:%M')}, user idle {idle:.0f} s"
             return None, f"{kind} due since {_local(slot, '%Y-%m-%d %H:%M')}, waiting for idle ({idle:.0f} s)"
         return None, "nothing due"
+
+    def busy(self) -> str | None:
+        """What holds the scheduled (nightly, weekly) runs back now, in plain words, or ``None``: a call or a game's
+        voice chat with an open row (``yuki.memory.calls``), a meeting or a full-screen app in front (``live_fn``).
+        Idle input alone is not enough: a call or a match leaves the keyboard alone for minutes. A row still open
+        :data:`BUSY_CALL_WINDOW_S` after it began is left out (a row stuck open must not hold the night back for
+        good; the doctor flags those). Content-free."""
+        try:
+            if self.store.calls(statuses=CALL_OPEN_STATUSES, since=self.clock() - BUSY_CALL_WINDOW_S, limit=1):
+                return "a call is going on"
+        except Exception:   # a store without calls (an older schema): nothing to hold on
+            pass
+        if self.live_fn is not None:
+            try:
+                live = self.live_fn() or {}
+            except Exception:
+                live = {}
+            if live.get("meeting"):
+                return "a meeting is in front"
+            if live.get("fullscreen"):
+                return "a full-screen app is in front"
+        return None
 
     # -- loop --------------------------------------------------------------
 

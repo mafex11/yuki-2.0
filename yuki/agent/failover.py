@@ -156,6 +156,9 @@ class FailoverClient:
         self.regionless = regionless
         self.role = role
         self.settings = settings
+        #: Read timeout the routed clients (Settings → AI) take instead of ``settings.model_timeout_s``
+        #: (``None``: theirs); :meth:`from_settings` sets it for the memory passes.
+        self.read_timeout_s: float | None = None
         #: (route, key file stamp, custom address, requested model) -> the routed client of that route
         self._routed: dict[tuple[Any, ...], FailoverClient] = {}
         self.region = region
@@ -178,17 +181,20 @@ class FailoverClient:
 
     @classmethod
     def from_settings(cls, settings: Any, *, log: Callable[..., Any] | None = None,
-                      factory: Callable[[str], Any] | None = None, role: str | None = "thinker") -> "FailoverClient":
+                      factory: Callable[[str], Any] | None = None, role: str | None = "thinker",
+                      read_timeout_s: float | None = None) -> "FailoverClient":
         """The client for ``settings`` (region, chains, retries, timeouts), SDK retries off (these are ours).
 
         ``role``: whose calls these are (the agent's: ``thinker``, the default), for Settings → AI.
+        ``read_timeout_s``: seconds without a byte before a call counts as timed out (default
+        ``settings.model_timeout_s``); the memory passes pass their own (:func:`make_client`).
         """
         import os
 
         region = getattr(settings, "aws_region", None) or os.environ.get("AWS_REGION", "ap-south-1")
         backend = getattr(settings, "model_backend", None) or "bedrock"
+        read = float(read_timeout_s if read_timeout_s is not None else getattr(settings, "model_timeout_s", 90.0))
         if factory is None:
-            read = float(getattr(settings, "model_timeout_s", 90.0))
             connect = float(getattr(settings, "model_connect_timeout_s", 10.0))
 
             def factory(r: str) -> Any:
@@ -199,13 +205,15 @@ class FailoverClient:
                 return sync_client(r, backend=backend, max_retries=0,
                                    timeout=anthropic.Timeout(read, connect=connect, write=30.0, pool=10.0))
 
-        return cls(
+        client = cls(
             region, factory, regionless=backend == "anthropic",
             fallbacks=getattr(settings, "model_fallbacks", None) or {},
             retries=getattr(settings, "model_retries", 2), base_s=getattr(settings, "model_retry_base_s", 0.6),
             max_s=getattr(settings, "model_retry_max_s", 4.0), sticky_s=getattr(settings, "failover_sticky_s", 300.0),
             log=log, role=role, settings=settings,
         )
+        client.read_timeout_s = read if read_timeout_s is not None else None
+        return client
 
     # -- plumbing --------------------------------------------------------------------------
 
@@ -400,9 +408,10 @@ class FailoverClient:
         if client is not None:
             return client
         settings = self.settings
+        read_timeout_s = self.read_timeout_s
 
         def factory(place: str) -> Any:
-            return sync_provider_client(place.lstrip("@"), settings)
+            return sync_provider_client(place.lstrip("@"), settings, timeout=read_timeout_s)
 
         fallbacks = {}
         if backup is not None and backup_model:
@@ -566,9 +575,16 @@ def make_client(settings: Any = None, *, log: Callable[..., Any] | None = None,
     The one-line change for any worker that builds ``anthropic.AnthropicBedrock(aws_region=...)``
     itself (the memory workers): ``self._client = make_client(settings, log=self._log)``. ``role``: whose calls
     these are for Settings → AI (the memory passes, ``memory``, by default).
+
+    The memory passes' calls get ``settings.memory_model_timeout_s`` as their read timeout instead of the agent's
+    ``model_timeout_s``: they stream long thinking that sends no bytes for minutes (see the setting).
     """
     if settings is None:
         from yuki.config import Settings
 
         settings = Settings()
-    return FailoverClient.from_settings(settings, log=log, role=role)
+    read = None
+    if role == "memory":
+        value = getattr(settings, "memory_model_timeout_s", None)
+        read = float(value) if value else None
+    return FailoverClient.from_settings(settings, log=log, role=role, read_timeout_s=read)

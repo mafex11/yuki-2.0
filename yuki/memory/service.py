@@ -523,9 +523,15 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory.portrait import PortraitScheduler, PortraitWorker
                 from yuki.memory.watcher import user_idle_s
 
+                def portrait_live() -> dict[str, Any]:
+                    # the recorder's open stretch: the nightly run waits out a meeting or a full-screen game
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen"))}
+
                 portrait = PortraitScheduler(
                     store, PortraitWorker(store, embedder=get_embedder()), db_path=db_path, log=log,
-                    idle_fn=user_idle_s,
+                    idle_fn=user_idle_s, live_fn=portrait_live,
                 )
                 portrait_thread = threading.Thread(
                     target=_guarded(portrait.run, log, "portrait"), args=(stop,), name="yuki-memory-portrait",
