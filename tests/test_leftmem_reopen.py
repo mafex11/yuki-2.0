@@ -266,3 +266,59 @@ def test_migration_adds_the_column_to_an_existing_database(tmp_path: Path):
         assert "reopened_at" in cols
     finally:
         s.close()
+
+
+# -- the conversation extractor (second review R1) ---------------------------------------------------------------------
+
+
+def _extract_ops(store: Store, ops: list[dict[str, Any]], turn_ids: list[int]):
+    from yuki.memory.conversations import ConversationWorker
+
+    worker = ConversationWorker(store, log_dir=Path(tempfile.gettempdir()))
+    turns = store.turns_by_ids(turn_ids)
+    return worker.validate(ops, turns, store.conversation_facts(), worker.cards_for(turns))
+
+
+def _op(op: str, item: int, n: int, end_as: str = "", text: str = "") -> dict[str, Any]:
+    return {"op": op, "item": item, "kind": "commitment" if op == "UPDATE" else "", "subject": "", "text": text,
+            "quote": "", "due": "", "end_as": end_as, "card": 0, "exchanges": [n], "reason": "r", "owner": "user"}
+
+
+def test_the_extractor_never_closes_a_reopened_one_on_an_exchange_from_before(store):
+    """A done-sounding exchange still waiting for extraction when the user pressed Not done yet (a failed batch is
+    retried later) no longer closes, revokes or rewrites the promise; one dated after the put-back still does."""
+    c = store.add_conversation_fact("commitment", "The user will send Mira the slides", owner="user", at=T0,
+                                    origin="model")
+    old_t = store.add_turn("s", 4, T0 + 3600, "sent Mira the slides", "Nice.", [], "final")
+    store.flush_turns()
+    store.end_conversation_fact(c, "done", at=T0 + 3600, note="done, by Yuki's to-do check (T1): sent")
+    _not_done_yet(store, c)
+    new_t = store.add_turn("s", 5, BACK + 300, "ok now I really sent Mira the slides", "Nice.", [], "final")
+    store.flush_turns()
+    for op in (_op("INVALIDATE", c, 1, "done"), _op("INVALIDATE", c, 1, "revoked"),
+               _op("UPDATE", c, 1, text="The user sent Mira the slides")):
+        changes, records = _extract_ops(store, [op], [old_t, new_t])
+        assert changes == [] and records[0].status == "rejected: the cited exchanges are older than when the user put it back"
+    changes, records = _extract_ops(store, [_op("INVALIDATE", c, 2, "done")], [old_t, new_t])
+    assert [(ch.op, ch.end_as) for ch in changes] == [("INVALIDATE", "done")] and changes[0].at == BACK + 300
+
+
+def test_the_extractor_closes_one_never_put_back_as_before(store):
+    c = store.add_conversation_fact("commitment", "The user will send Mira the slides", owner="user", at=T0,
+                                    origin="model")
+    t = store.add_turn("s", 4, T0 + 3600, "sent Mira the slides", "Nice.", [], "final")
+    store.flush_turns()
+    changes, _records = _extract_ops(store, [_op("INVALIDATE", c, 1, "done")], [t])
+    assert [(ch.op, ch.end_as) for ch in changes] == [("INVALIDATE", "done")]
+
+
+def test_the_extractor_prompt_shows_the_put_back(store):
+    from yuki.memory.conversations import EXTRACT_SYSTEM_PROMPT, ConversationWorker
+
+    c = store.add_conversation_fact("commitment", "The user will send Mira the slides", owner="user", at=T0,
+                                    origin="model")
+    store.end_conversation_fact(c, "done", at=T0 + 3600, note="done")
+    _not_done_yet(store, c)
+    line = ConversationWorker._item_line(store.conversation_fact(c), lambda v, n: str(v or "")[:n])
+    assert f", put back by the user {datetime.fromtimestamp(BACK):%Y-%m-%d %H:%M}" in line
+    assert '"put back by the user"' in EXTRACT_SYSTEM_PROMPT

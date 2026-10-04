@@ -233,6 +233,16 @@ def _keeps_no_cache(client: Any) -> bool:
     return callable(caching) and caching() == "none"
 
 
+def _routed(client: Any) -> bool:
+    """The agent's client goes to another AI than Claude on Bedrock (Settings → AI routes Doing things elsewhere: its
+    prompt cache is ``auto`` or ``none``, not Claude's ``explicit``). Never raises; False when it cannot tell."""
+    caching = getattr(client, "prompt_caching", None)
+    try:
+        return callable(caching) and caching() != "explicit"
+    except Exception:
+        return False
+
+
 def _acts_only(tool_input: Any) -> dict[str, Any]:
     """A kept step's input without the brain's notes about it (``what``, ``risk``...): what the call did."""
     from yuki.agent.loopguard import NOTE_FIELDS
@@ -723,19 +733,24 @@ class Agent:
             self._warm_activity()
             warmed = self._warm_model()
             # revamp D: the judge's own cached prompt, before the first judged call. The judge always runs on Claude
-            # (leftMem), so it is warmed too when Doing things is on an AI that keeps no prompt cache (review L2).
-            if (warmed or _keeps_no_cache(self.client)) and self.authorizer is not None and not self.reader:
-                self.authorizer.warm()
+            # (leftMem), so when Doing things is routed to another AI it is warmed whatever that AI's warm-up gave
+            # (no cache kept, an outage, a bad key: review L2 and second review J1); on Claude, as on main, only after
+            # the thinker's warm-up reached it.
+            routed = _routed(self.client)
+            judge = self.authorizer is not None and not self.reader
+            judge_warm = bool(judge and (warmed or routed) and self.authorizer.warm() is not None)
             self._warm_memory()
             self._warm_shell()
             self._warm_apps()
             # Started at logon (or after a wake) the network may not be up yet: when Bedrock
-            # could not be reached at all, try the warm-up again a few times, quietly.
+            # could not be reached at all, try the warm-up again a few times, quietly (the judge too, until warm).
             for delay in PREWARM_RETRY_S:
                 if warmed is not False:
                     break
                 threading.Event().wait(delay)
                 warmed = self._warm_model()
+                if judge and not judge_warm and (warmed or routed):
+                    judge_warm = self.authorizer.warm() is not None
 
         thread = threading.Thread(target=warm, name="yuki-prewarm", daemon=True)
         thread.start()

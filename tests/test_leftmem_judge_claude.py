@@ -397,6 +397,9 @@ def test_judge_lock_is_per_authorizer_thread_safe(ai_dir: Path, tmp_path: Path) 
     ("explicit", True, True),     # the default path, as on main
     ("explicit", None, False),    # the thinker's warm-up failed for another reason: as on main, no judge warm-up
     ("explicit", False, False),   # Bedrock not reachable yet: as on main
+    ("auto", False, True),        # second review J1: Doing things routed to an AI that is down: judge still warmed
+    ("auto", None, True),         # ... or whose key is wrong
+    ("auto", True, True),
 ])
 def test_judge_warmed_when_thinker_keeps_no_cache(caching: str, warmed: bool | None, judge_warmed: bool) -> None:
     """Review L2: the judge's warm-up no longer follows the thinker's when the thinker's AI keeps no prompt cache."""
@@ -417,3 +420,44 @@ def test_judge_warmed_when_thinker_keeps_no_cache(caching: str, warmed: bool | N
     finally:
         loop.PREWARM_RETRY_S = retry
     assert seen == (["judge"] if judge_warmed else [])
+
+
+def _prewarm(caching: str, warms: list[bool | None], judge_answers: list[Any], retries: tuple[float, ...]) -> list[str]:
+    """Run the agent's warm-up on a stand-in; returns the order of thinker ("model") and judge warm-ups."""
+    from yuki.agent import loop
+    from yuki.agent.loop import Agent
+
+    seen: list[str] = []
+    warms, judge_answers = list(warms), list(judge_answers)
+
+    def model() -> bool | None:
+        seen.append("model")
+        return warms.pop(0)
+
+    def judge() -> Any:
+        seen.append("judge")
+        return judge_answers.pop(0)
+
+    agent = SimpleNamespace(
+        client=SimpleNamespace(prompt_caching=lambda: caching), authorizer=SimpleNamespace(warm=judge), reader=False,
+        _warm_activity=lambda: None, _warm_model=model, _warm_memory=lambda: None,
+        _warm_shell=lambda: None, _warm_apps=lambda: None)
+    retry = loop.PREWARM_RETRY_S
+    loop.PREWARM_RETRY_S = retries
+    try:
+        Agent._start_prewarm(agent).join(5.0)
+    finally:
+        loop.PREWARM_RETRY_S = retry
+    return seen
+
+
+def test_judge_warmed_after_the_retry_reaches_bedrock() -> None:
+    """Second review J1: at logon Bedrock is not up yet; once the retry reaches it the judge is warmed too."""
+    assert _prewarm("explicit", [False, True], [{"input_tokens": 1}], (0.0, 0.0)) == ["model", "model", "judge"]
+
+
+def test_routed_judge_warm_retried_until_it_lands_never_twice() -> None:
+    """Routed thinker and Bedrock both down at logon: the judge's warm-up is retried with the thinker's, and once warm
+    it is not sent again."""
+    seen = _prewarm("auto", [False, False, False, False], [None, {"input_tokens": 1}], (0.0, 0.0, 0.0))
+    assert seen == ["model", "judge", "model", "judge", "model", "model"]
