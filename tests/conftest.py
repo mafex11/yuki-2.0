@@ -75,8 +75,9 @@ def _temp_memory_dir(tmp_path_factory: pytest.TempPathFactory):
 # ``time.time``, ``time.localtime``/``gmtime``/``strftime`` without a time, and ``datetime.now``/``today`` and
 # ``date.today`` in every loaded ``yuki`` and ``test_*`` module (their ``datetime``/``date`` names are swapped for
 # subclasses that read the pinned clock). ``time.monotonic`` and ``perf_counter`` are left alone, so timeouts and waits
-# behave. Pick the time with ``@pytest.mark.clock("00:30")`` (default noon). ``YUKI_TEST_CLOCK=HH:MM`` pins every test
-# of the run (``scripts/sweep.py --clock 00:30``): how the after-midnight failures are found.
+# behave. Pick the time with ``@pytest.mark.clock("00:30")`` (default noon, on :data:`PINNED_DAY`). ``YUKI_TEST_CLOCK=HH:MM``
+# pins every test of the run to that time of the real today (``scripts/sweep.py --clock 00:30``): how the after-midnight
+# failures are found. Today, not a fixed day: a test whose data is dated "now-ish" by the real clock must keep its order.
 
 import datetime as _dt
 import sys as _sys
@@ -106,9 +107,9 @@ _REAL_DATETIME = _dt.datetime
 _REAL_DATE = _dt.date
 
 
-def _pin(monkeypatch: pytest.MonkeyPatch, hhmm: str) -> PinnedClock:
+def _pin(monkeypatch: pytest.MonkeyPatch, hhmm: str, day: _dt.date | None = None) -> PinnedClock:
     hour, minute = (int(x) for x in hhmm.split(":"))
-    start = _REAL_DATETIME.combine(PINNED_DAY, _dt.time(hour, minute)).timestamp()
+    start = _REAL_DATETIME.combine(day or PINNED_DAY, _dt.time(hour, minute)).timestamp()
     clock = PinnedClock(start, _REAL_MONOTONIC())
 
     class PinnedDatetime(_REAL_DATETIME):
@@ -163,7 +164,7 @@ def _clock_for_the_run(request: pytest.FixtureRequest, monkeypatch: pytest.Monke
     """``YUKI_TEST_CLOCK=HH:MM`` (the sweep's ``--clock``) pins every test that does not pin its own."""
     pinned = os.environ.get("YUKI_TEST_CLOCK", "").strip()
     if pinned and "pinned_clock" not in request.fixturenames:
-        _pin(monkeypatch, pinned)
+        _pin(monkeypatch, pinned, _REAL_DATE.fromtimestamp(_REAL_TIME()))
     yield
 
 
