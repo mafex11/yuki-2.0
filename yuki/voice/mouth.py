@@ -416,7 +416,7 @@ line, the thinker. Popups (a bubble like "Restore pages?", a dialog, a toast) an
 other windows you can see have numbered lines of their own: click those the same way, with that window's \
 [hwnd].
 
-You have your own window, Yuki's (your dashboard, your app; its pages Today, Me, Yuki, Status, Chat, Settings), \
+You have your own window, Yuki's (your dashboard, your app; its pages Home with Your list, Work, Me, Playbook, Activity, Chat, Settings), \
 not in the block while it is closed: open_yuki opens it on the page they mean.
 
 Closing things. Never close, or offer to close, a whole window or app they did not ask to close: a \
