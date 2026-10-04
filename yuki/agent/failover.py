@@ -22,6 +22,13 @@ Every retry and failover is logged (``log(event_type, **fields)``): ``model_retr
 The target a call actually used is :meth:`FailoverClient.last_model` (per thread), so its cost
 is priced with the right model.
 
+Settings → AI (report 67): a client built for a role (``from_settings`` -> ``thinker``, ``make_client`` ->
+``memory``) checks ``yuki.agent.providers.config.route(role)`` on every call (one ``stat`` of ``ai.json``). On
+``default`` nothing below changes. A role moved to another provider (OpenAI, Gemini, OpenRouter, Ollama, DeepSeek,
+another OpenAI-compatible service, or Anthropic with the user's key) is served by a client of this same class whose
+places are ``@<provider>``: the same retries and backoff on that provider, then the user's backup if one is set;
+``last_model`` is then ``provider:model``.
+
 Usage::
 
     client = FailoverClient.from_settings(settings, log=logger.log)

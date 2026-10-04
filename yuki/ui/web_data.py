@@ -2004,7 +2004,7 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
 def _ai_page() -> dict[str, Any]:
     from yuki.agent.providers.summary import page
 
-    return page(ask=False)
+    return page()
 
 
 def call_knobs(privacy: dict[str, Any] | None) -> dict[str, bool]:

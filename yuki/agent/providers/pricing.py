@@ -107,14 +107,18 @@ def cost(name: str, tokens: dict[str, int], pricing: dict[str, dict[str, float]]
 
 
 def price_words(name: str, pricing: dict[str, dict[str, float]] | None = None) -> str:
-    """The price in plain words for the Settings page: ``Free``, ``$0.25 in, $2.00 out per million words``, or
+    """The price in plain words for the Settings page: ``Free``, ``$0.25 in, $2.00 out (per million tokens)``, or
     ``Price not known``."""
     table = rates(name, pricing)
     if table is None:
         return "Price not known"
+    return table_words(table)
+
+
+def table_words(table: dict[str, float]) -> str:
     if not any(float(table.get(k) or 0) for k in ("input", "output")):
         return "Free"
-    return f"${float(table.get('input') or 0):.2f} in, ${float(table.get('output') or 0):.2f} out per million tokens"
+    return f"${float(table.get('input') or 0):.2f} in, ${float(table.get('output') or 0):.2f} out (per million tokens)"
 
 
 def usage_cost_fields(usage: Any) -> float | None:

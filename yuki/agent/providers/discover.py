@@ -234,13 +234,13 @@ def fit_for(role: str, info: ModelInfo | None) -> str:
 
 def describe(info: ModelInfo, provider_id: str) -> dict[str, Any]:
     """One model as the Settings page shows it."""
-    from yuki.agent.providers.pricing import is_free, price_words
+    from yuki.agent.providers.pricing import is_free, price_words, table_words
 
     out = {k: v for k, v in asdict(info).items() if k in ("id", "label", "tools", "small", "images", "free")}
     out["label"] = info.label or info.id
     out["free"] = bool(info.free) or is_free(provider_id, info.id)
     if provider_id == "openrouter" and info.price is not None:
-        out["price"] = "Free" if out["free"] else price_words_from(info.price)
+        out["price"] = "Free" if out["free"] else table_words(info.price)
     else:
         out["price"] = price_words(f"{provider_id}:{info.id}")
     if info.params_b is not None:
@@ -248,8 +248,19 @@ def describe(info: ModelInfo, provider_id: str) -> dict[str, Any]:
     return out
 
 
-def price_words_from(price: dict[str, float]) -> str:
-    return f"${float(price.get('input') or 0):.2f} in, ${float(price.get('output') or 0):.2f} out (per million tokens)"
+def known_list(provider_id: str) -> list[ModelInfo]:
+    """The models already known for ``provider_id`` without asking anyone: the list read earlier in this process,
+    else the catalog's suggestions."""
+    with _lock:
+        hit = _lists.get(provider_id)
+    if hit is not None and hit[1] is not None:
+        return list(hit[1])
+    return list(MODELS.get(provider_id, ()))
+
+
+def free_first(models: list[ModelInfo]) -> list[ModelInfo]:
+    """Free models first, then the rest, each in the service's own order."""
+    return [m for m in models if m.free] + [m for m in models if not m.free]
 
 
 def test(provider_id: str, model: str = "", *, transport: Any = None, settings: Any = None) -> tuple[bool, str]:

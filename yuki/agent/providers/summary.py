@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from yuki.agent.providers.catalog import MODELS, PROVIDERS, ROLE_HINTS, ROLE_WORDS, ROLES
+from yuki.agent.providers.catalog import PROVIDERS, ROLE_HINTS, ROLE_WORDS, ROLES
 
 #: Shown under each saved key.
 SAVED_WORDS = "Saved on this PC, encrypted"
@@ -62,12 +62,14 @@ def roles_state() -> list[dict[str, Any]]:
     return [role_line(role) for role in ROLES]
 
 
-def providers_state(*, ask: bool = False) -> list[dict[str, Any]]:
-    """Each provider's key status and models. ``ask``: ask the services for their model lists (network, off the UI
-    thread); otherwise only what is already known (the catalog, lists read earlier in this process)."""
+def providers_state() -> list[dict[str, Any]]:
+    """Each provider's key status and the models already known (no network: the page asks with ``models_reply``).
+    OpenRouter's few hundred models are not all carried in the page: its free ones and the ones a job uses."""
     from yuki.agent.providers import config, discover
     from yuki.agent.providers.keys import env_names, key_source
 
+    chosen = {(r["provider"], r["model"]) for r in roles_state()} | {
+        (r["backup_provider"], r["backup_model"]) for r in roles_state()}
     out = []
     for pid, info in PROVIDERS.items():
         if pid == "default":
@@ -78,32 +80,38 @@ def providers_state(*, ask: bool = False) -> list[dict[str, Any]]:
         entry["key_words"] = _KEY_WORDS[entry["key"]]
         if pid == "custom":
             entry["base_url"] = config.current()["custom"]["base_url"]
-        models = discover.list_models(pid) if ask else _known_models(pid)
-        if pid == "ollama":
-            entry["running"] = models is not None if ask else None
-            if ask and models is None:
-                entry["status"] = "Ollama isn't running"
-            elif ask:
-                entry["status"] = f"{len(models)} model{'s' if len(models) != 1 else ''} on this PC" if models \
-                    else "Ollama is running but has no models yet"
+        models = discover.known_list(pid)
+        if pid == "openrouter":
+            models = [m for m in discover.free_first(models) if m.free or (pid, m.id) in chosen]
         entry["models"] = discover.describe_list(pid, models) or []
         out.append(entry)
     return out
 
 
-def _known_models(provider_id: str) -> list[Any]:
+def ollama_words(models: list[Any] | None) -> str:
+    if models is None:
+        return "Ollama isn't running"
+    if not models:
+        return "Ollama is running but has no models yet"
+    return f"{len(models)} model{'s' if len(models) != 1 else ''} on this PC"
+
+
+def models_reply(provider_id: str, *, refresh: bool = False) -> dict[str, Any]:
+    """The window's ``ai_models`` answer: a service's models as the page lists them (free ones first), asked of the
+    service itself (network, or the local Ollama; run off the UI thread)."""
     from yuki.agent.providers import discover
 
-    with discover._lock:
-        hit = discover._lists.get(provider_id)
-    if hit is not None and hit[1] is not None:
-        return hit[1]
-    return list(MODELS.get(provider_id, ()))
+    models = discover.list_models(provider_id, refresh=refresh)
+    out: dict[str, Any] = {"models": discover.describe_list(provider_id, discover.free_first(models or [])) or []}
+    if provider_id == "ollama":
+        out["running"] = models is not None
+        out["status"] = ollama_words(models)
+    return out
 
 
-def page(*, ask: bool = False) -> dict[str, Any]:
-    """The AI section's data."""
-    return {"roles": roles_state(), "providers": providers_state(ask=ask), "apply": APPLY_WORDS,
+def page() -> dict[str, Any]:
+    """The AI section's data (no network)."""
+    return {"roles": roles_state(), "providers": providers_state(), "apply": APPLY_WORDS,
             "choices": [{"id": pid, "label": _provider_words(pid)} for pid in PROVIDERS]}
 
 
@@ -197,5 +205,5 @@ def openrouter_price(model: str) -> dict[str, float] | None:
     return cached_price("openrouter", model)
 
 
-__all__ = ["APPLY_WORDS", "SAVED_WORDS", "doctor_lines", "openrouter_price", "page", "providers_state", "role_line",
-           "roles_state", "set_custom", "set_key", "set_role"]
+__all__ = ["APPLY_WORDS", "SAVED_WORDS", "doctor_lines", "models_reply", "ollama_words", "openrouter_price", "page",
+           "providers_state", "role_line", "roles_state", "set_custom", "set_key", "set_role"]

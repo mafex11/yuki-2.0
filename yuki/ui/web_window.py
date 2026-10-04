@@ -1858,17 +1858,9 @@ class WebWindow:
 
     def a_ai_models(self, m: dict[str, Any]) -> dict[str, Any]:
         """A service's models (network or the local Ollama, on this action's own thread)."""
-        from yuki.agent.providers import discover
+        from yuki.agent.providers import summary
 
-        provider = str(m.get("provider") or "")
-        models = discover.list_models(provider, refresh=bool(m.get("refresh")))
-        out: dict[str, Any] = {"models": discover.describe_list(provider, models) or []}
-        if provider == "ollama":
-            out["running"] = models is not None
-            out["status"] = ("Ollama isn't running" if models is None else
-                             f"{len(models)} model{'s' if len(models) != 1 else ''} on this PC" if models
-                             else "Ollama is running but has no models yet")
-        return out
+        return summary.models_reply(str(m.get("provider") or ""), refresh=bool(m.get("refresh")))
 
     def a_ai_test(self, m: dict[str, Any]) -> dict[str, Any]:
         from yuki.agent.providers import discover
