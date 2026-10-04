@@ -64,6 +64,9 @@ def cases() -> list[dict[str, Any]]:
         dict(id="list_reply", issue="list", check="says_items", messages=[
             u(ASK_LIST), *_lead_call({"action": "todos"}, "q1", "Let me look."), result("q1", v4.LIST_REPORT)]),
         dict(id="totals_look", issue="list", check="answers_or_looks", messages=[u(TOTALS)]),
+        # the list was made in the last hour, so the Earlier block holds it: answering from it is fastest
+        dict(id="view_ask", issue="view", check="answers_or_looks", recent=v4._view(), messages=[u(v4.ASK)]),
+        dict(id="view_list", issue="view", check="answers_or_looks", recent=v4._view(), messages=[u(ASK_LIST)]),
         dict(id="plumber_look", issue="today", check="looks", messages=[u(PLUMBER)]),
         dict(id="plumber_reply", issue="today", check="plumber", messages=[
             u(PLUMBER), *_lead_call({"action": "today"}, "q4", "Let me check."), result("q4", TODAY_REPORT)]),
