@@ -39,7 +39,7 @@ from PySide6.QtCore import QObject, Signal
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
     APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE,
-    brain_request, result_payload, waiting_payload,
+    brain_request, outcome_fields, result_payload, waiting_payload,
 )
 from yuki.voice.narrator import RANKS, Item, asks, condense, ends_sentence, machine_text, sentences
 from yuki.voice.progress import JobLog, step_of
@@ -122,6 +122,9 @@ class Job:
     #: at once, by code (v3.6).
     finishing: str | None = None
     finished_by_action: str | None = None
+    #: honest (87): the request's one outcome verdict (``yuki.agent.finish.outcome_verdict``), from the runtime's
+    #: ``outcome`` signal just before its closing words: below likely, its words are never said as written.
+    verdict: dict[str, Any] | None = None
     #: The tell_yuki call this job was started for early (the mouth's reply had just begun it; v3.6).
     early_call: str | None = None
     #: How many user turns the conversation had when this was handed over (v3.9): a result that arrives
@@ -172,6 +175,7 @@ class Job:
             **({"paused": "they took over the keyboard or mouse; it waits for them"} if self.paused
                and self.state == RUNNING else {}),
             **({"outcome": self.outcome} if self.outcome and self.state not in OPEN_STATES else {}),
+            **(_checked(self.verdict) if self.outcome and self.state == DONE else {}),
         }
 
     def brief(self, limit: int = 90) -> str:
@@ -408,7 +412,7 @@ class VoiceBridge(QObject):
             ("failed", self._on_failed), ("withdrawn", self._on_withdrawn), ("lane_done", self._on_lane_done),
             ("handed_off", self._on_handed_off), ("steer_unread", self._on_steer_unread),
             ("partial", self._on_partial), ("resumed", self._on_resumed), ("send_pending", self._on_send_pending),
-            ("paused_changed", self._on_paused_changed),
+            ("paused_changed", self._on_paused_changed), ("outcome", self._on_outcome),
         ):
             signal = getattr(runtime, name, None)
             if signal is not None:
@@ -612,6 +616,10 @@ class VoiceBridge(QObject):
                 what = "withdrawn for a newer request" + (
                     f" (its list still had: {'; '.join(left)}; say so if they did not mean to drop it)" if left else "")
             outcome = condense(j.outcome or "", max_sentences=1, max_chars=120)[0] if j.state == DONE else ""
+            held = self._held_verdict(j, "done") if j.state == DONE else None
+            if held is not None:
+                # honest (87): its words are the thinker's claim; the check's level is what the talker may repeat
+                what += f", {str(held.get('label') or '').lower()} ({held.get('seen') or 'nothing showed it'})"
             parts.append(f'task {j.job_id} "{j.brief()}" {what} {round(now - (j.finished_at or now))} s ago'
                          + (f': "{outcome}"' if outcome else ""))
         return "; ".join(parts) or None
@@ -745,9 +753,11 @@ class VoiceBridge(QObject):
                 # The task was finishing: start the addition as its own task, quietly
                 # (gradient-bang's task_closing path). This call carries its outcome.
                 prev = target.outcome or (target.closing[1] if target.closing else "")
+                held = self._held_verdict(target, "done")   # honest (87): its words at their checked level
+                graded = f" ({held.get('label')}: {held.get('seen')})" if held is not None else ""
                 text = brain_request(request, heard, context="; ".join(x for x in (
                     context, f'this adds to the request just before it ("{target.request}"), which had just '
-                             f'finished{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
+                             f'finished{graded}{": " + condense(prev, max_sentences=2, max_chars=300)[0] if prev else ""}')
                     if x), done_before=done_before, corrects=corrects, said=said, tabs=tabs, app_named=app_named)
         job = self._new_job(request)
         job.acked = self._acked(params, args)
@@ -889,13 +899,18 @@ class VoiceBridge(QObject):
                 # alone is ~1.6 s), no rewording. Longer results, questions, failures, late outcomes and "nothing was
                 # done" still go to the talker, which says them once, merged with whatever it is saying. The narrator
                 # releases a final with only a short gap, the moment the user may be spoken to.
+                held = self._held_verdict(job, kind)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
-                                and payload.strip() == job.finished_by_action)
+                                and payload.strip() == job.finished_by_action) and held is None
                 head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
                 job.rest = rest
                 delivered = loop.create_future()
                 nothing = self._nothing_done(job) if kind == "done" else False
-                lines = self._by_code(job, kind, head, rest, late=late, verified=verified, nothing_done=nothing)
+                lines = None if held is not None else self._by_code(job, kind, head, rest, late=late,
+                                                                    verified=verified, nothing_done=nothing)
+                if held is not None:
+                    self._log("bridge", op="outcome_held", job_id=job.job_id, level=held.get("level"),
+                              said_by="talker")
                 push = getattr(getattr(params, "llm", None), "push_frame", None)
                 if lines is not None and push is None and self.speak_result is None and self.speak is None:
                     lines = None   # nothing here can put words into the voice (a bare stand-in): the talker says it
@@ -926,12 +941,12 @@ class VoiceBridge(QObject):
                         self._outcome_said(job)
                     if not stale:
                         # v3.16: owed until heard, late or not (only the stale rule lets it go): the ledger says it
-                        # by code if the run that should say it is silent.
-                        self._owe(job, kind, head)
+                        # by code if the run that should say it is silent (honest: below likely, the verdict's line)
+                        self._owe(job, kind, self._owed_words(job, kind, head))
                     self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                     await params.result_callback(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                                 request=job.request, late=late, verified=verified,
-                                                                nothing_done=nothing),
+                                                                nothing_done=nothing, outcome=job.verdict),
                                                  properties=FunctionCallResultProperties(run_llm=run_llm))
                     if not delivered.done():
                         delivered.set_result(stale)
@@ -1288,9 +1303,14 @@ class VoiceBridge(QObject):
             return
         head, rest = condense(job.rest, max_sentences=self._max_sentences, max_chars=self._max_chars)
         job.rest = rest
-        self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest))
-        await params.result_callback({"more": head, "more_available": bool(rest),
-                                      "how_to_say_it": SPOKEN_NOTE + (" Still more after this." if rest else "")})
+        # second review V2-5: the rest of a done held below likely keeps its level and its note, as its first part did
+        held = self._held_verdict(job, "done") if job.state == DONE else None
+        graded, graded_note = outcome_fields(held) if held is not None else ({}, "")
+        self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest),
+                  **({"level": held.get("level")} if held is not None else {}))
+        await params.result_callback({"more": head, **graded, "more_available": bool(rest),
+                                      "how_to_say_it": (graded_note or SPOKEN_NOTE)
+                                      + (" Still more after this." if rest else "")})
 
     async def stay_quiet(self, params: Any) -> None:
         """Pipecat handler for ``stay_quiet``: the mouth chose to say nothing; settled without a turn."""
@@ -1847,6 +1867,44 @@ class VoiceBridge(QObject):
         self._changed()
         self._job_event(job, WAITING, question)
 
+    def _on_outcome(self, lane: str, job_id: int, verdict: dict) -> None:
+        """honest (87): the request's outcome verdict, kept on its job: its words are said at that level, never more."""
+        job = self._job(job_id)
+        if job is None or not isinstance(verdict, dict):
+            return
+        job.verdict = dict(verdict)
+        if job.log is not None and verdict.get("label"):
+            job.log.add("checked", f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "))
+        if verdict.get("acted") and verdict.get("label"):
+            # review (items not done): the thinker's steps reach the shared action ledger as "not verified" one by one
+            # (a step's level is not on its event); the request's one verdict closes them, so the talker's desktop
+            # block and the next hand-off read the checked level, never only the step marks
+            level = str(verdict.get("level") or "")
+            self.actions.add("the thinker", f'the request "{job.brief()}", as a whole',
+                             f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "),
+                             ok=level != "failed", verified=True if level == "verified" else False if level == "failed"
+                             else None)
+        self._log("bridge", op="outcome", job_id=job_id, level=verdict.get("level"), acted=verdict.get("acted"),
+                  send=verdict.get("send"))
+
+    def _held_verdict(self, job: Job, kind: str) -> dict[str, Any] | None:
+        """honest (87): the verdict of a done whose words may not be said as written (below likely), else ``None``."""
+        from yuki.agent.finish import sayable
+
+        if kind != "done" or sayable(job.verdict):
+            return None
+        return job.verdict
+
+    def _owed_words(self, job: Job, kind: str, head: str) -> str:
+        """What the owed ledger says by code if the talker's run for a result is not heard: the thinker's words, or for
+        an outcome below likely the verdict's own fixed line (``I tried to send it, but I couldn't confirm it went.``),
+        never the thinker's claim (honest, report 87)."""
+        held = self._held_verdict(job, kind)
+        line = " ".join(str((held or {}).get("line") or "").split())
+        if held is None or not line:
+            return head
+        return f"{head} {line}" if not held.get("acted") else line   # an unread answer keeps its words, marked
+
     def _on_finished(self, lane: str, job_id: int, text: str) -> None:
         job = self._job(job_id)
         if job is not None:
@@ -2344,12 +2402,17 @@ class VoiceBridge(QObject):
                 # Like a tell_yuki call's own result: a short or verified one said by code (C1, v3.17), anything else
                 # by the talker, once.
                 late = self._moved_on(job)
+                held = self._held_verdict(job, kind)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
-                                and payload.strip() == job.finished_by_action)
+                                and payload.strip() == job.finished_by_action) and held is None
                 head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
                 job.rest = rest
                 nothing = self._nothing_done(job) if kind == "done" else False
-                lines = self._by_code(job, kind, head, rest, late=late, verified=verified, nothing_done=nothing)
+                lines = None if held is not None else self._by_code(job, kind, head, rest, late=late,
+                                                                    verified=verified, nothing_done=nothing)
+                if held is not None:
+                    self._log("bridge", op="outcome_held", job_id=job.job_id, level=held.get("level"),
+                              said_by="talker")
                 if lines is not None and self.speak_result is None and self.speak is None:
                     lines = None   # no voice to say it by code: the talker says it
                 if lines is not None:
@@ -2369,11 +2432,11 @@ class VoiceBridge(QObject):
                         if run_llm and not stale:
                             self._outcome_said(job)
                         if not stale:
-                            self._owe(job, kind, head)   # v3.16: owed until heard
+                            self._owe(job, kind, self._owed_words(job, kind, head))   # v3.16: owed until heard
                         self._waiting_run = None   # this run says the outcome: never "stale" (waiting_reply_stale)
                         await announce(result_payload(kind, head, more=bool(rest), held_back=stale,
                                                       request=job.request, late=late, verified=verified,
-                                                      nothing_done=nothing),
+                                                      nothing_done=nothing, outcome=job.verdict),
                                        run_llm and not stale)
                 item_kind = "final"
             else:
@@ -2425,6 +2488,18 @@ def _memory_words(request: str, heard: Any) -> str | None:
         return memory_words(request, heard) or None
     except Exception:  # noqa: BLE001 - a hint for memory only
         return None
+
+
+def _checked(verdict: dict[str, Any] | None) -> dict[str, Any]:
+    """honest (87): a finished job's outcome level for the talker's task view, when it is below likely (its words are
+    then the thinker's claim, never what was seen): ``{"checked": "not confirmed: <what the check saw>"}``."""
+    from yuki.agent.finish import sayable
+
+    if sayable(verdict):
+        return {}
+    label = str((verdict or {}).get("label") or "").lower()
+    seen = " ".join(str((verdict or {}).get("seen") or "").split())
+    return {"checked": f"{label}: {seen}" if seen else label}
 
 
 def _tasks_left(tasks: list[dict[str, Any]] | None) -> list[str]:

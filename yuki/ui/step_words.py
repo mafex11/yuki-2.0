@@ -612,6 +612,15 @@ def changes_state(name: str, tool_input: dict[str, Any] | None) -> bool:
     return False
 
 
+def effect_key(name: str, tool_input: dict[str, Any] | None) -> str:
+    """A step's machine key for matching a run trace's verified steps to the card's rows (second review V2-4): the tool,
+    its fixed ``action`` and the app its input names (casefolded, without ``.exe``). Plumbing, never words."""
+    args = tool_input if isinstance(tool_input, dict) else {}
+    app = " ".join(str(args.get("app") or "").split()).casefold()
+    app = app[:-4] if app.endswith(".exe") else app
+    return f"{name}|{' '.join(str(args.get('action') or '').split()).casefold()}|{app}"
+
+
 def is_effect(name: str, tool_input: dict[str, Any] | None) -> bool:
     """A step whose result the user cares about after the run: the agent marked it as sending, closing or deleting
     for certain (``_about``: ``sends`` / ``changes``, from the tool's fixed traits), the brain declared its effect
@@ -672,7 +681,78 @@ def failed_row(name: str, tool_input: dict[str, Any] | None) -> str:
     return f"Didn’t finish {running[:1].lower() + running[1:]}"
 
 
-def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+#: honest (87): the card's header for a run that ended done, by its outcome verdict's level (``yuki.agent.finish``).
+LEVEL_HEADS: dict[str, tuple[str, str]] = {"unverified": ("dash", "Not confirmed"), "failed": ("x", "Didn’t work")}
+
+
+#: honest review F7: the title of a run below likely when no step names what it tried.
+ATTEMPTED_TITLE = "Tried what you asked"
+
+
+def attempted(steps: list[dict[str, Any]], verdict: dict[str, Any] | None) -> str:
+    """honest review F7: the one line for a run that ended done below likely (the card's title, the strip's final word
+    and the window's line), in the running words of what it tried ("Sending Ana the message", "Quitting Slack"),
+    never the brain's past-tense claim: an unconfirmed send's own step, else the step the verdict turned on (its
+    ``what``), else the last effect, else :data:`ATTEMPTED_TITLE`. Machine fields only."""
+    verdict = verdict if isinstance(verdict, dict) else {}
+    if verdict.get("send") == "unconfirmed":
+        sends = [st for st in steps if _about(st.get("input") or {}).get("sends")]
+        if sends:
+            return describe_step(str(sends[-1].get("name") or ""), sends[-1].get("input") or {}, limit=ACHIEVED_CHARS)
+    step = " ".join(str(verdict.get("step") or "").split())
+    if step:
+        return describe_step("", {WHAT: step}, limit=ACHIEVED_CHARS)
+    effects = [st for st in steps if str(st.get("name") or "") != "done"
+               and is_effect(str(st.get("name") or ""), st.get("input"))]
+    if effects:
+        return describe_step(str(effects[-1].get("name") or ""), effects[-1].get("input") or {}, limit=ACHIEVED_CHARS)
+    return ATTEMPTED_TITLE
+
+
+def final_line(steps: list[dict[str, Any]], verdict: dict[str, Any] | None) -> str:
+    """The one line a run that ended done is shown with: what it achieved (:func:`achievement`), or below likely what
+    it tried (:func:`attempted`)."""
+    level = str((verdict or {}).get("level") or "") if isinstance(verdict, dict) else ""
+    return attempted(steps, verdict) if level in LEVEL_HEADS and verdict.get("acted") else achievement(steps)
+
+
+def _sentence_case(text: str) -> str:
+    text = " ".join(str(text or "").split())
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def level_row(verdict: dict[str, Any] | None) -> dict[str, str] | None:
+    """honest (87): the done card's first row, the run's outcome level and what its check saw ("Checked on screen: the
+    message shows in the chat"; "Not confirmed: the message did not show up in the chat"; "Didn’t work: closing
+    Slack"), or ``None`` (no verdict, or an answer with nothing done)."""
+    if not isinstance(verdict, dict) or not verdict.get("acted") or not verdict.get("label"):
+        return None
+    level = str(verdict.get("level") or "")
+    label = str(verdict["label"])
+    if level == "failed":
+        step = " ".join(str(verdict.get("step") or "").split())
+        what = step[:1].lower() + step[1:] if step else str(verdict.get("seen") or "")
+        return {"text": f"{label}: {what}" if what else label, "icon": "dash"}
+    seen = " ".join(str(verdict.get("seen") or "").split())
+    return {"text": f"{label}: {seen}" if seen else label, "icon": "check" if level in ("verified", "likely")
+            else "dash"}
+
+
+def graded_reply(text: str, verdict: dict[str, Any] | None) -> str:
+    """honest (87): a reply shown as written beside its run's outcome level when that is below likely (the reply is
+    the thinker's claim; the level is what was checked): ``"<reply>\\n\\nNot confirmed: <what the check saw>."``."""
+    if not isinstance(verdict, dict) or verdict.get("level") not in ("unverified", "failed"):
+        return text
+    row = level_row(verdict)
+    if row is None:
+        seen = " ".join(str(verdict.get("seen") or "").split())
+        row = {"text": f"Not checked: {seen}" if seen else "Not checked"}
+    line = _sentence_case(row["text"]).rstrip(".") + "."
+    return f"{text}\n\n{line}" if (text or "").strip() else line
+
+
+def return_view(outcome: str, text: str, steps: list[dict[str, Any]],
+                verdict: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the return card says about a run that acted, from how it ended and its steps.
 
     Args:
@@ -689,6 +769,17 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
         word. No row carries an undo of any kind (the user, 3 Oct 19:10: "dont show the undo options in this card").
     """
     icon, head = OUTCOME_HEADS.get(outcome, OUTCOME_HEADS["done"])
+    level = str((verdict or {}).get("level") or "") if isinstance(verdict, dict) else ""
+    if outcome == "done" and level in LEVEL_HEADS:
+        # honest (87): a run that ended with words its checks do not back is headed by the checked level
+        icon, head = LEVEL_HEADS[level]
+        if level == "failed" and (verdict or {}).get("partial"):
+            head = "Partly done"
+    unconfirmed_send = isinstance(verdict, dict) and verdict.get("send") == "unconfirmed"
+    # second review V2-4: below likely, a step that ran is drawn with a check only when its own check showed it (the
+    # verdict's ``checked`` keys); the rest the level row speaks for, never a check mark
+    below = outcome == "done" and level in LEVEL_HEADS and bool((verdict or {}).get("acted"))
+    checked = set((verdict or {}).get("checked") or []) if below else set()
     rows: list[dict[str, str]] = []
     sent_ok = sent_missed = False
     for st in steps:
@@ -698,6 +789,10 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
             sent_ok = sent_ok or ok is True
             sent_missed = sent_missed or ok is not True
         if not is_effect(name, args):
+            continue
+        if about.get("sends") and unconfirmed_send:
+            continue   # pressed, never seen in the chat: the level row says so, never a check mark
+        if ok is True and below and effect_key(name, args) not in checked:
             continue
         if ok is True:
             row = {"text": describe_step(name, args, done=True), "icon": "check"}
@@ -719,8 +814,13 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
     elif outcome == "handed":
         title = " ".join(str(text or "").split()) or "Handed back. You have the controls."
     else:
-        title = achievement(steps) or FINISHED_TITLE
+        title = final_line(steps, verdict) or FINISHED_TITLE   # review F7: below likely, what it tried
         rows = [r for r in rows if r["text"] != title]
+        graded = level_row(verdict)
+        if graded is not None:
+            rows.insert(0, graded)   # honest (87): what was achieved, with its level, first
+            # a level below likely is news the strip's final word does not carry: the card comes for it
+            worth = worth or level in LEVEL_HEADS
     return {"icon": icon, "head": head, "title": title, "rows": rows[:RETURN_ROWS],
             "more": max(0, len(rows) - RETURN_ROWS), "worth": worth}
 

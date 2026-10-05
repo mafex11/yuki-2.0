@@ -83,10 +83,15 @@ class AskUser:
 
 @dataclass(frozen=True)
 class Final:
-    """The agent's closing message for this request."""
+    """The agent's closing message for this request.
+
+    ``outcome``: the request's one outcome verdict (``yuki.agent.finish.outcome_verdict``: level, what was seen, the
+    send's confirmation, the line said by code below ``likely``), or ``None`` (a stand-in agent). The voice, the done
+    card, the island and the window repeat its level and never say more than it."""
 
     text: str
     kind: Literal["final"] = "final"
+    outcome: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

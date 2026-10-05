@@ -568,7 +568,14 @@ class ChatModel:
         key = f"achieved:{job}"
         if any(s.key == key for s in item.steps):
             return
-        item.steps.append(Step(key, "say", "achieved", text, at, ended=at, ok=True,
+        # honest (87): the line carries the run's checked level (``level`` / ``label`` / ``seen`` of its outcome
+        # verdict): its mark and result say how far it was checked, never a check mark for what nothing showed
+        level = str(ev.get("level") or "")
+        label = " ".join(str(ev.get("label") or "").split())
+        seen = " ".join(str(ev.get("seen") or "").split())
+        ok = None if level == "unverified" else False if level == "failed" else True
+        result = f"{label}: {seen}" if label and seen else label
+        item.steps.append(Step(key, "say", "achieved", text, at, ended=at, ok=ok, result=result,
                                depth=1 if job in self._voice_job else 0, job=job))
         self._changed(item)
 
