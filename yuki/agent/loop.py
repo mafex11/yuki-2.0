@@ -670,6 +670,9 @@ class Agent:
         #: told to the surfaces (``resumed`` / ``ended``); :meth:`_close_pause` adds only what is missing.
         self._pause_end_logged = False
         self._pause_end_told = False
+        #: small8 review F2: the request has reached its end (its reply, a stop, an error): no new pause starts, so a
+        #: takeover watch that fires in the last moments cannot leave a "paused" with no end on record.
+        self._pause_closing = False
         self._pause_quiet_until = 0.0
         self._resume_asked = False
         self._watch: Any = None
@@ -1119,8 +1122,9 @@ class Agent:
         stop typing is not sent). Safe from any thread. ``False`` when nothing is acting, it is stopping, or it is
         already paused."""
         with self._pause_lock:
-            if self._acting_token is None or self._cancelled.is_set() or self._paused.is_set():
-                return False
+            if (self._acting_token is None or self._cancelled.is_set() or self._paused.is_set()
+                    or self._pause_closing):
+                return False   # small8 review F2: nor once the request reached its end
             if self._awaiting_answer or self._send_open is not None or time.monotonic() < self._pause_quiet_until:
                 # Yuki asked something, or a send counts down on the island: the user's hand is on Yuki's card (the
                 # answer, Stop, a chip), not taking over; and for a moment after, while that hand moves on
@@ -1249,9 +1253,11 @@ class Agent:
         ``closed`` (the runtime's paused job, the island, the voice; unless already told), so nothing goes on showing a
         paused request and the next request is never read as paused. Live, a run whose last press had landed finished
         with its reply 11 s into a mouse takeover, no record closed the pause, and the next request was taken as
-        paused. Safe to call when not paused (nothing happens). Never raises."""
+        paused. Safe to call when not paused (only no new pause starts after it in this request: review F2). Never
+        raises."""
         try:
             with self._pause_lock:
+                self._pause_closing = True   # review F2: from here no new pause starts in this request
                 if not self._paused.is_set():
                     return
                 self._paused.clear()
@@ -1408,6 +1414,7 @@ class Agent:
         self._pause_wake.clear()
         self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
         self._pause_end_logged = self._pause_end_told = False
+        self._pause_closing = False
         self._pause_quiet_until, self._resume_asked = 0.0, False
         stale = self.take_steers()
         self._pending_answer = None
@@ -1572,7 +1579,9 @@ class Agent:
         finally:
             if drive is not None:
                 drive.close()
-            # small8: whatever ended it (a stop, an error), a pause still open ends with the request
+            # small8: whatever ended it (a stop, an error), a pause still open ends with the request; the watch stops
+            # first (review F2), and no pause starts after the close
+            self._watch_off()
             self._close_pause("finished" if outcome == "final" else "cancelled" if self._cancelled.is_set()
                               else "ended")
             self._acting_done()

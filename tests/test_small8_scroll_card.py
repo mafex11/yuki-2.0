@@ -195,6 +195,41 @@ def test_nothing_reached_the_screen_or_a_refused_effect_is_never_set_aside() -> 
         assert v["level"] == "failed" and v["refused"] == 0
 
 
+def test_review_f1_a_refused_attempt_after_only_a_focus_or_an_opening_stays_failed() -> None:
+    """A focus (or an opening), then the very step asked for refused: nothing of it happened, whatever the claim, and
+    the claim check still sees "done" below likely (it asks once)."""
+    from yuki.agent.finish import claim_gap
+
+    cases = [[_act("focus_window"), _act("scroll", ok=False, verdict_=False, refused=True, input={"dy": -5})],
+             [_act("launch_app"), _act("type_text", ok=False, verdict_=False, refused=True, input={"text": "notes"})],
+             [_act("focus_window"), _act("press", ok=False, verdict_=False, refused=True, input={"key": "pagedown"})]]
+    for run in cases:
+        for claims in ("done", "checked", "answer", "tried"):
+            v = outcome_verdict(run, claims=claims)
+            assert v["level"] == "failed" and v["refused"] == 0 and v["label"] == "Didn’t work", (run[1]["tool"], claims)
+    assert claim_gap("done", outcome_verdict(cases[0], claims="done")) is not None
+
+
+def test_review_f1_a_refused_content_step_needs_the_same_kind_to_have_worked_before_it() -> None:
+    # a click worked, then the typing was refused: the text was never typed
+    typed = [_act("click", input={"element": 3}), _act("type_text", ok=False, verdict_=False, refused=True)]
+    assert outcome_verdict(typed, claims="done")["level"] == "failed"
+    # a scroll worked, then another scroll was refused: the view was reached by the first
+    scrolled = [_act("scroll"), _act("scroll", ok=False, verdict_=False, refused=True, input={"dy": 3})]
+    assert outcome_verdict(scrolled, claims="done")["level"] == LIKELY
+    # keys are one kind: a Page Down that worked covers a refused hotkey
+    keys = [_act("press", input={"key": "pagedown"}), _act("hotkey", ok=False, verdict_=False, refused=True)]
+    assert outcome_verdict(keys, claims="done")["level"] == LIKELY
+
+
+def test_review_f1_a_refused_step_in_another_or_an_unknown_app_or_before_the_work_stays_failed() -> None:
+    other_app = [_act("scroll"), _act("click", ok=False, verdict_=False, refused=True, app="browser")]
+    unknown = [_act("scroll"), _act("click", ok=False, verdict_=False, refused=True, app="")]
+    before = [_act("click", ok=False, verdict_=False, refused=True), _act("scroll")]
+    for run in (other_app, unknown, before):
+        assert outcome_verdict(run, claims="done")["level"] == "failed"
+
+
 def test_a_refused_step_a_later_retry_put_right_is_not_counted() -> None:
     run = [_act("click", ok=False, verdict_=False, refused=True, control="button|Play"),
            _act("click", control="button|Play")]
@@ -240,7 +275,10 @@ def test_the_agent_marks_a_refused_step_and_grades_by_the_dones_claim(tmp_path: 
             return _response(_use("done", i, message="Playing now; the extra click didn't go through.",
                                   about=[], states=[], achieved="Started the music", claims=claims))
 
-        brain = Brain([_response(_use("press", 0, key="playpause", expect_hwnd=ChatPlayerDesk.PLAYER)),
+        # the player in front, so the refused click is in the app where the press worked (review F1: a refused step
+        # in another app, or after only a focus, is never set aside)
+        brain = Brain([_response(_use("focus_window", 5, hwnd=ChatPlayerDesk.PLAYER)),
+                       _response(_use("press", 0, key="playpause", expect_hwnd=ChatPlayerDesk.PLAYER)),
                        _response(_use("click", 1, button="left")),   # neither an element nor x and y: refused
                        done(2), done(3), done(4)])
         agent = _agent(brain, tmp_path / claims, _desk())

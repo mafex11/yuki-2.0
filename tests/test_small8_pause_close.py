@@ -137,6 +137,99 @@ def test_a_stop_while_held_paused_is_told_closed_once_and_logged_stopped_once(tm
     assert [r["state"] for r in _takeover_records(tmp_path)] == ["paused", "stopped"]
 
 
+def _one_press(h: Any) -> Any:
+    return h.Brain([h._response(h._press(0, "playpause")), h._response(h._done(1, "Pressed it."))])
+
+
+def test_review_f2_input_in_the_last_moments_of_a_run_starts_no_pause(tmp_path: Path) -> None:
+    """A run with no takeover finishes while its watch still polls; the user's mouse moves between the end's close and
+    the watch's stop (the reviewer's gap): no pause starts, so nothing is left on "paused"."""
+    h = _helpers()
+    watches = h.Watches()
+    agent = h._agent(_one_press(h), tmp_path, h._desk(), watches=watches)
+    told: list[tuple] = []
+    agent.on_pause = lambda state, why, s: told.append((state, why))
+    late: list[bool] = []
+    real_done = agent._acting_done
+
+    def acting_done() -> None:
+        for w in watches.made:                 # a callback already in flight when the watch stopped
+            late.append(w.on("mouse"))
+        real_done()
+
+    agent._acting_done = acting_done
+    events = list(agent.run("press play"))
+    assert isinstance(events[-1], Final)
+    assert late and not any(late)              # refused: the request had reached its end
+    assert told == [] and _takeover_records(tmp_path) == []
+    assert not agent._paused.is_set()
+
+
+def test_review_f2_the_watch_stops_before_the_run_end_closes_the_pause(tmp_path: Path) -> None:
+    h = _helpers()
+    watches = h.Watches()
+    agent = h._agent(_one_press(h), tmp_path, h._desk(), watches=watches)
+    seen: list[bool] = []
+    real_close = agent._close_pause
+
+    def close(how: str) -> None:
+        seen.append(all(w.stopped for w in watches.made))
+        real_close(how)
+
+    agent._close_pause = close
+    list(agent.run("press play"))
+    assert seen and seen[-1] is True           # the run's own end: no watch running when the pause is closed
+
+
+def test_review_f2_a_takeover_after_the_done_close_but_before_the_end_starts_no_pause(tmp_path: Path) -> None:
+    h = _helpers()
+    watches = h.Watches()
+    agent = h._agent(_one_press(h), tmp_path, h._desk(), watches=watches)
+    told: list[tuple] = []
+    agent.on_pause = lambda state, why, s: told.append((state, why))
+    for ev in agent.run("press play"):
+        if isinstance(ev, Final):
+            # the reply is out, the run's end not yet: a takeover now is not a pause of this request
+            assert agent.pause("mouse") is False
+    assert told == [] and _takeover_records(tmp_path) == []
+
+
+def test_review_f2_the_next_request_can_pause_again(tmp_path: Path) -> None:
+    h = _helpers()
+    watches = h.Watches()
+    agent = h._agent(h.Brain([h._response(h._press(0, "playpause")), h._response(h._done(1, "Pressed it.")),
+                              h._response(h._press(2, "playpause")), h._response(h._done(3, "Pressed it."))]),
+                     tmp_path, h._desk(), watches=watches)
+    list(agent.run("press play"))
+    assert agent._pause_closing is True
+    paused: list[bool] = []
+    for ev in agent.run("press play again"):
+        if getattr(ev, "name", None) == "press" and getattr(ev, "ok", False) and not paused:
+            paused.append(agent.pause("mouse"))
+            agent.resume(by="test")
+    assert paused == [True]
+
+
+def test_review_f3_the_live_takeover_checker_ends_an_episode_on_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    spec = importlib.util.spec_from_file_location("small8_takeover", ROOT / "scripts" / "live" / "takeover.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    worker = [{"_ts": 100.0, "type": "takeover", "state": "paused", "why": "mouse"},
+              {"_ts": 101.0, "type": "tool_result", "name": "press"},          # an action in flight finishing
+              {"_ts": 111.0, "type": "takeover", "state": "closed", "how": "finished", "why": "mouse", "seconds": 11.0},
+              {"_ts": 120.0, "type": "tool_result", "name": "press"},          # the next request's actions
+              {"_ts": 121.0, "type": "say"}]
+    monkeypatch.setattr(mod, "session_records", lambda since, until, which="*": worker if which == "worker" else [])
+    monkeypatch.setattr(mod, "pokes", lambda since, until: [])
+    monkeypatch.setattr(mod.sys, "argv", ["takeover.py", "--since", "45m"])
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.strip().startswith("pause "))
+    assert "acts_while_paused=1 says_while_paused=0 -> closed how=finished" in line and "after_s=11.0" in line
+
+
 def test_closing_when_not_paused_does_nothing(tmp_path: Path) -> None:
     h = _helpers()
     agent = h._agent(h.Brain([]), tmp_path, h._desk(), watches=h.Watches())

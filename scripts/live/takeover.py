@@ -54,8 +54,11 @@ def main() -> int:
                              "by": None, "words": None, "view": False, "seconds": None})
         elif t == "takeover" and st == "resume_asked" and episodes:
             episodes[-1].update(by=r.get("by"), words=r.get("words"))
-        elif t == "takeover" and st in ("resumed", "stopped", "ended") and episodes and episodes[-1]["end"] is None:
-            episodes[-1].update(end=r["_ts"], end_state=st, seconds=r.get("seconds"), end_why=r.get("why"))
+        elif (t == "takeover" and st in ("resumed", "stopped", "ended", "closed") and episodes
+              and episodes[-1]["end"] is None):
+            # small8: "closed" = the request ended (its reply, a stop) while still paused; "how" says which
+            episodes[-1].update(end=r["_ts"], end_state=st, seconds=r.get("seconds"), end_why=r.get("why"),
+                                end_how=r.get("how"))
             paused_at = None
         elif paused_at is not None and t == "tool_result":
             episodes[-1]["acts"] += 1
@@ -67,7 +70,8 @@ def main() -> int:
         poke = any(0 <= e["at"] - float(p.get("ts") or 0) <= 3.0 for p in poked)
         e["poked"] = poke
         print(f"   pause {hhmm(e['at'])} why={e['why']} poked={poke} acts_while_paused={e['acts']} "
-              f"says_while_paused={e['says']} -> {e['end_state']} by={e['by']} words={e['words']} "
+              f"says_while_paused={e['says']} -> {e['end_state']} how={e.get('end_how')} by={e['by']} "
+              f"words={e['words']} "
               f"after_s={e['seconds']} resume_view={e['view']}")
     ev = collections.Counter(str(r.get("event")) for r in ui if str(r.get("event", "")).startswith(
         ("takeover", "submit", "cancel", "strip_stop", "steer", "stop", "keep_scrolling", "send_")))

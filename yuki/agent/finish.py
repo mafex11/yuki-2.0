@@ -332,8 +332,39 @@ def _part_done(still: list[int], actions: list[dict[str, Any]], levels: list[str
 #: small8: the ``seen`` of a request held at likely because a step of it was refused before it ran (plain words).
 SEEN_REFUSED = "one step couldn't run, so not all of it was checked"
 
+#: small8 review F1: the tools whose effect is the content or the view itself (what was typed, the keys' effect, where
+#: the view went, a slider's value), by kind (``press`` and ``hotkey`` are both keys). A refused one of these is set
+#: aside only when the same kind of step did work earlier in the same app: then what it aimed at was reached that way.
+#: Fixed schema tool names, plumbing.
+_CONTENT_KINDS = {"type_text": "type", "press": "keys", "hotkey": "keys", "scroll": "scroll", "set_slider": "slider"}
 
-def _set_aside_refused(still: list[int], actions: list[dict[str, Any]], claims: str | None) -> list[int]:
+
+def _reached_before(index: int, actions: list[dict[str, Any]], levels: list[str]) -> bool:
+    """small8 review F1: whether something of the request already worked in the app a refused step was for, before
+    it: an earlier step in the same known app that ran and was not shown to fail (verified, likely, or not confirmed:
+    that step's own level still bounds the request while it stays open), that did more than bring the window to front
+    or open the app (:func:`readies`), and, for a refused step of a content kind (:data:`_CONTENT_KINDS`), one of that
+    same kind. The live shape: a verified scroll, then refused clicks that only tried to put the caret by a line
+    number. Never: a focus or an opening before a refused scroll, press or typing (that refused step was the attempt
+    itself); an unknown app."""
+    step = actions[index]
+    app = _app(step)
+    if app is None:
+        return False
+    kind = _CONTENT_KINDS.get(str(step.get("tool") or ""))
+    for j in range(index):
+        done = actions[j]
+        tool = str(done.get("tool") or "")
+        if (levels[j] == FAILED or done.get("refused") or _app(done) != app
+                or readies(tool, done.get("input"))):
+            continue
+        if kind is None or _CONTENT_KINDS.get(tool) == kind:
+            return True
+    return False
+
+
+def _set_aside_refused(still: list[int], actions: list[dict[str, Any]], levels: list[str],
+                       claims: str | None) -> list[int]:
     """small8 (report 73, release 7): the open steps that were refused before anything was sent (the trace's
     ``refused``: a guard's "not clicked: nothing you can click is at ...", the loop breaker, a bad argument) and that
     the brain's own closing claim says did not matter: it classes its message as done, checked or an answer, not as
@@ -343,8 +374,10 @@ def _set_aside_refused(still: list[int], actions: list[dict[str, Any]], claims: 
 
     Never set aside: anything when the claim is ``tried`` or unknown, or every action was refused (nothing reached the
     screen); a refused step that is itself an effect the user asks for (a send, a close, a volume or window change:
-    :func:`yuki.ui.step_words.is_effect`), whatever the claim. The request is then held at ``likely`` at most, never
-    ``verified``: what was refused did not happen."""
+    :func:`yuki.ui.step_words.is_effect`), whatever the claim; a refused step when nothing of the request worked
+    before it in that app (:func:`_reached_before`, review F1: a focus, then a refused scroll, is a scroll that never
+    happened, and stays failed for the claim check to ask about). The request is then held at ``likely`` at most,
+    never ``verified``: what was refused did not happen."""
     if claims not in (CLAIM_DONE, CLAIM_CHECKED, CLAIM_ANSWER):
         return []
     if all(s.get("refused") for s in actions):
@@ -352,7 +385,8 @@ def _set_aside_refused(still: list[int], actions: list[dict[str, Any]], claims: 
     from yuki.ui.step_words import is_effect
 
     return [i for i in still if actions[i].get("refused") and not actions[i].get("send")
-            and not is_effect(str(actions[i].get("tool") or ""), actions[i].get("input"))]
+            and not is_effect(str(actions[i].get("tool") or ""), actions[i].get("input"))
+            and _reached_before(i, actions, levels)]
 
 
 def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] | tuple[str, ...] = (),
@@ -383,7 +417,7 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
                    if finished_by_action else None)
     still = [i for i, lv in enumerate(levels)
              if lv != VERIFIED and not _resolved(i, actions, levels, finished_at=finished_at)]
-    aside = _set_aside_refused(still, actions, claims)
+    aside = _set_aside_refused(still, actions, levels, claims)
     still = [i for i in still if i not in aside]
     # review F2: the request's send is unconfirmed while any send is still open, not only the last one
     sends = [i for i, s in enumerate(actions) if s.get("send")]
