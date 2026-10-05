@@ -614,8 +614,14 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory.review import ReviewScheduler, ReviewWorker
                 from yuki.memory.watcher import session_locked, user_idle_s
 
+                def review_live() -> dict[str, Any]:
+                    # the recorder's open stretch: the weekly review waits out a meeting or a full-screen game
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen"))}
+
                 review = ReviewScheduler(store, ReviewWorker(store, log=log), db_path=db_path, privacy=privacy,
-                                         log=log, idle_fn=user_idle_s, locked_fn=session_locked)
+                                         log=log, idle_fn=user_idle_s, locked_fn=session_locked, live_fn=review_live)
                 review_thread = threading.Thread(
                     target=_guarded(review.run, log, "review"), args=(stop,), name="yuki-memory-review",
                     daemon=True,

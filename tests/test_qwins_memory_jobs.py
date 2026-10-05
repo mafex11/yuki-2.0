@@ -58,6 +58,20 @@ def test_the_agent_keeps_the_short_read_timeout(monkeypatch):
     assert make_client(settings, role="thinker").read_timeout_s is None
 
 
+def test_a_memory_call_the_user_waits_on_keeps_the_short_read_timeout(monkeypatch):
+    # review (item 1): the window's to-do due words are a memory call the user waits on, not a background pass
+    from pathlib import Path
+
+    from yuki.agent.failover import make_client
+    from yuki.config import Settings
+
+    settings = Settings()
+    read = _captured_read_timeout(monkeypatch, lambda: make_client(settings, waited_on=True))
+    assert read == settings.model_timeout_s and make_client(settings, waited_on=True).read_timeout_s is None
+    src = (Path(__file__).resolve().parents[1] / "yuki" / "ui" / "web_window.py").read_text(encoding="utf-8")
+    assert "make_client(waited_on=True)" in src
+
+
 def test_routed_memory_client_is_built_with_the_memory_timeout(monkeypatch):
     from yuki.agent import failover
     from yuki.agent.providers import client as provider_client
@@ -149,3 +163,39 @@ def test_a_broken_live_reading_does_not_stop_the_night(store):
         raise RuntimeError("no recorder")
 
     assert _sched(store, idle=9999.0, live=broken).due(T0)[0] == "weekly"
+
+
+# -- the weekly review's missed slot waits the same way (review: item 1, other catch-ups) ----------------------------
+
+RNOW = datetime(2026, 9, 28, 9, 0).timestamp()   # a Monday morning: Sunday 20:00's review was missed
+
+
+def _review(store, *, idle, live=None):
+    from yuki.memory.nudges import NudgeConfig
+    from yuki.memory.review import ReviewConfig, ReviewScheduler
+
+    return ReviewScheduler(store, SimpleNamespace(), db_path=store.path, config=ReviewConfig(),
+                           nudge_config=NudgeConfig(), idle_fn=lambda: idle, live_fn=live, clock=lambda: RNOW,
+                           signal=lambda: None)
+
+
+def test_a_missed_weekly_review_no_longer_runs_at_start_while_the_user_is_active(store):
+    ok, reason = _review(store, idle=5.0).due(RNOW)
+    assert ok is False and "waiting for idle" in reason
+
+
+def test_a_missed_weekly_review_runs_once_the_user_is_idle(store):
+    ok, reason = _review(store, idle=9999.0).due(RNOW)
+    assert ok is True and reason.startswith("missed slot")
+
+
+@pytest.mark.parametrize("live, word", [({"fullscreen": True}, "full-screen"), ({"meeting": True}, "meeting")])
+def test_a_game_or_meeting_holds_the_weekly_review_back(store, live, word):
+    ok, reason = _review(store, idle=9999.0, live=lambda: live).due(RNOW)
+    assert ok is False and word in reason
+
+
+def test_a_call_holds_the_weekly_review_back(store):
+    store.start_call(app="Discord", process="discord.exe", via="test", at=RNOW - 600, status="recording")
+    ok, reason = _review(store, idle=9999.0).due(RNOW)
+    assert ok is False and "call" in reason

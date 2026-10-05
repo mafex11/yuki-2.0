@@ -1307,9 +1307,11 @@ class ReviewScheduler:
     2. Deliver the latest undelivered review's teaser when the user is present (see :meth:`deliver`).
     3. ``paused`` flag or ``[review] enabled = false`` -> nothing scheduled.
     4. The weekly slot (the latest ``weekday`` at ``at``) without a review since -> run at the first
-       moment the user has been idle ``idle_min``, or at once on the first check after the service
-       starts (the slot was missed while it was not running), up to ``catch_up_h`` after the slot.
-       A failed run is retried no sooner than ``retry_min`` later.
+       moment the user has been idle ``idle_min`` and no call, game voice, meeting or full-screen app is
+       going on (``yuki.memory.portrait.scheduled_busy``), up to ``catch_up_h`` after the slot. A slot missed
+       while the service was not running waits for that moment too (report 76: it used to run at once at
+       start, right after an install, whatever the user was doing). A failed run is retried no sooner than
+       ``retry_min`` later.
     """
 
     def __init__(
@@ -1327,6 +1329,7 @@ class ReviewScheduler:
         clock: Callable[[], float] = time.time,
         check_every_s: float = 30.0,
         signal: Callable[[], Any] | None = None,
+        live_fn: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         from yuki.memory.nudges import NudgeConfig, signal_nudge
         from yuki.memory.timeline import PrivacySection
@@ -1347,6 +1350,8 @@ class ReviewScheduler:
             idle_fn = user_idle_s
         self.idle_fn = idle_fn
         self.locked_fn = locked_fn
+        #: ``{"meeting", "fullscreen"}`` now (the recorder's open stretch); with the open call rows, what holds the run
+        self.live_fn = live_fn
         self.clock = clock
         self.check_every_s = float(check_every_s)
         self._signal = signal or signal_nudge
@@ -1401,11 +1406,15 @@ class ReviewScheduler:
         failed = [r for r in done if r.outcome in ("error", "running")]
         if failed and now - max(r.at for r in failed) < config.retry_min * 60.0:
             return False, "failed recently, waiting to retry"
-        if self._startup:
-            return True, f"missed slot {datetime.fromtimestamp(slot):%Y-%m-%d %H:%M}, running at start"
+        from yuki.memory.portrait import scheduled_busy
+
+        busy = scheduled_busy(self.store, self.live_fn, now)
+        if busy:
+            return False, f"due since {datetime.fromtimestamp(slot):%Y-%m-%d %H:%M}, waiting: {busy}"
         idle = self.idle_fn()
         if idle >= config.idle_min * 60.0:
-            return True, f"slot {datetime.fromtimestamp(slot):%Y-%m-%d %H:%M}, user idle {idle:.0f} s"
+            missed = "missed " if self._startup else ""
+            return True, f"{missed}slot {datetime.fromtimestamp(slot):%Y-%m-%d %H:%M}, user idle {idle:.0f} s"
         return False, f"due since {datetime.fromtimestamp(slot):%Y-%m-%d %H:%M}, waiting for idle ({idle:.0f} s)"
 
     # -- delivery ------------------------------------------------------------------

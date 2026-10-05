@@ -1621,7 +1621,7 @@ class WebWindow:
             try:
                 from yuki.agent.failover import make_client
 
-                WebWindow._due_client = make_client()
+                WebWindow._due_client = make_client(waited_on=True)   # you wait on it: the agent's timeout
             except Exception:  # noqa: BLE001 - no client: the words go in whole, with no due
                 return None
         return self._due_client

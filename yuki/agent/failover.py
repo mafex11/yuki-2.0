@@ -569,7 +569,7 @@ class _FailoverStream:
 
 
 def make_client(settings: Any = None, *, log: Callable[..., Any] | None = None,
-                role: str | None = "memory") -> FailoverClient:
+                role: str | None = "memory", waited_on: bool = False) -> FailoverClient:
     """A failover Bedrock client for ``settings`` (default :class:`yuki.config.Settings`).
 
     The one-line change for any worker that builds ``anthropic.AnthropicBedrock(aws_region=...)``
@@ -577,14 +577,15 @@ def make_client(settings: Any = None, *, log: Callable[..., Any] | None = None,
     these are for Settings → AI (the memory passes, ``memory``, by default).
 
     The memory passes' calls get ``settings.memory_model_timeout_s`` as their read timeout instead of the agent's
-    ``model_timeout_s``: they stream long thinking that sends no bytes for minutes (see the setting).
+    ``model_timeout_s``: they stream long thinking that sends no bytes for minutes (see the setting). ``waited_on``:
+    a call the user waits on (the window's to-do due words) keeps ``model_timeout_s``: nobody waits five minutes.
     """
     if settings is None:
         from yuki.config import Settings
 
         settings = Settings()
     read = None
-    if role == "memory":
+    if role == "memory" and not waited_on:
         value = getattr(settings, "memory_model_timeout_s", None)
         read = float(value) if value else None
     return FailoverClient.from_settings(settings, log=log, role=role, read_timeout_s=read)

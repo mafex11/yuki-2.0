@@ -3349,6 +3349,29 @@ class PortraitWorker:
 BUSY_CALL_WINDOW_S = 12 * 3600.0
 
 
+def scheduled_busy(store: Store, live_fn: Callable[[], dict[str, Any]] | None, now: float) -> str | None:
+    """What holds a scheduled background run (the portrait's nightly and weekly, the weekly review) back now, in plain
+    words, or ``None``: a call or a game's voice chat with an open row (``yuki.memory.calls``), a meeting or a
+    full-screen app in front (``live_fn``). Idle input alone is not enough: a call or a match leaves the keyboard
+    alone for minutes. A row still open :data:`BUSY_CALL_WINDOW_S` after it began is left out (a row stuck open must
+    not hold the night back for good; the doctor flags those). Content-free."""
+    try:
+        if store.calls(statuses=CALL_OPEN_STATUSES, since=now - BUSY_CALL_WINDOW_S, limit=1):
+            return "a call is going on"
+    except Exception:   # a store without calls (an older schema): nothing to hold on
+        pass
+    if live_fn is not None:
+        try:
+            live = live_fn() or {}
+        except Exception:
+            live = {}
+        if live.get("meeting"):
+            return "a meeting is in front"
+        if live.get("fullscreen"):
+            return "a full-screen app is in front"
+    return None
+
+
 class PortraitScheduler:
     """When to run the portrait worker; one daemon thread in ``yuki-memory``.
 
@@ -3508,22 +3531,8 @@ class PortraitScheduler:
         voice chat with an open row (``yuki.memory.calls``), a meeting or a full-screen app in front (``live_fn``).
         Idle input alone is not enough: a call or a match leaves the keyboard alone for minutes. A row still open
         :data:`BUSY_CALL_WINDOW_S` after it began is left out (a row stuck open must not hold the night back for
-        good; the doctor flags those). Content-free."""
-        try:
-            if self.store.calls(statuses=CALL_OPEN_STATUSES, since=self.clock() - BUSY_CALL_WINDOW_S, limit=1):
-                return "a call is going on"
-        except Exception:   # a store without calls (an older schema): nothing to hold on
-            pass
-        if self.live_fn is not None:
-            try:
-                live = self.live_fn() or {}
-            except Exception:
-                live = {}
-            if live.get("meeting"):
-                return "a meeting is in front"
-            if live.get("fullscreen"):
-                return "a full-screen app is in front"
-        return None
+        good; the doctor flags those). Content-free (:func:`scheduled_busy`)."""
+        return scheduled_busy(self.store, self.live_fn, self.clock())
 
     # -- loop --------------------------------------------------------------
 
