@@ -420,7 +420,16 @@ class _PresenceSampler:
         self._lock = threading.Lock()
         self._real_tick: int | None = None
         self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
         self._failed = False
+
+    def stop(self) -> None:
+        """Stops the poller (the Raw Input reader answers now); the next question starts it again."""
+        with self._lock:
+            stop, self._stop = self._stop, threading.Event()
+            self._thread = None
+            self._real_tick = None
+        stop.set()
 
     def idle_s(self) -> float:
         raw = raw_idle_s()
@@ -429,7 +438,8 @@ class _PresenceSampler:
         if self._thread is None:
             with self._lock:
                 if self._thread is None:
-                    self._thread = threading.Thread(target=self._run, name="yuki-presence", daemon=True)
+                    self._thread = threading.Thread(target=self._run, args=(self._stop,), name="yuki-presence",
+                                                    daemon=True)
                     self._thread.start()
         with self._lock:
             real = self._real_tick
@@ -437,14 +447,14 @@ class _PresenceSampler:
             return raw
         return max(raw, ((_kernel32.GetTickCount() - real) & 0xFFFFFFFF) / 1000.0)
 
-    def _run(self) -> None:
+    def _run(self, stop: threading.Event) -> None:
         try:
             info = _LASTINPUTINFO(cbSize=ctypes.sizeof(_LASTINPUTINFO))
             pt = wintypes.POINT()
             positions: deque[tuple[float, int, int]] = deque()
             resets: deque[float] = deque()
             last_tick: int | None = None
-            while True:
+            while not stop.is_set():
                 now = time.monotonic()
                 have_pos = bool(_user32.GetCursorPos(ctypes.byref(pt)))
                 if have_pos:
@@ -467,12 +477,13 @@ class _PresenceSampler:
                             with self._lock:
                                 self._real_tick = tick
                     last_tick = tick
-                time.sleep(self.PERIOD_S)
+                stop.wait(self.PERIOD_S)
         except Exception:
             self._failed = True
 
 
-_presence = Presence(raw_idle=raw_idle_s, fallback=_PresenceSampler().idle_s)
+_sampler = _PresenceSampler()
+_presence = Presence(raw_idle=raw_idle_s, fallback=_sampler.idle_s, fallback_stop=_sampler.stop)
 
 
 def user_idle_s() -> float:
@@ -1918,9 +1929,11 @@ class Watcher:
         if self._locked or self._paused or self._pending is not None or self._busy is not None or not self._fg:
             return
         idle = user_idle_s() > self.settings.idle_limit_s
-        if idle != self._idle:
+        answering = _presence.answering()
+        if idle != self._idle or answering != getattr(self, "_presence_answering", answering):
             self._idle = idle
             self._log("watcher_state", idle=idle, presence=presence_facts())
+        self._presence_answering = answering
         if idle:
             return
         self._submit(self._fg, "backstop", now)

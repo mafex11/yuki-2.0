@@ -36,7 +36,16 @@ registration is one per process: never run both readers in one process (the memo
 
 Semantics kept for the callers: :meth:`Presence.idle_s` is seconds since the user's last real input, never less than
 Windows' own idle time (``GetLastInputInfo``: no input of any kind for that long means no real input either). If Raw
-Input is unavailable (no desktop), ``fallback`` answers (the old sampler) and the reason is in :meth:`Presence.facts`.
+Input is unavailable (no desktop), ``fallback`` answers (the old sampler) and the reason is in :meth:`Presence.facts`;
+if the reader only finishes starting after :data:`START_WAIT_S`, it takes over then (``late_start`` in the facts).
+
+The one thing Raw Input cannot hear (review F1, 5 Oct): input to a window of a higher-integrity process (an elevated
+terminal, Task Manager, a tool or game run as administrator) while this process is not elevated: Windows' UIPI keeps
+it from the reader, though ``GetLastInputInfo`` (session-wide) still sees it. So when Windows saw input newer than the
+reader's last and the window in front is such a process (:class:`_FrontIntegrity`: its token's integrity level above
+this process's, or it cannot be asked), Windows' idle time answers, and that input stays credited after the window
+leaves the front (``answering: idle_timer`` and ``unheard_front`` in the facts). The cost: with the vibrating mouse and
+an elevated window left in front, the user reads as present, the old behaviour, for as long as it stays in front.
 """
 
 from __future__ import annotations
@@ -84,6 +93,113 @@ _WHEELS = 0x0400 | 0x0800
 _SM_CXSCREEN, _SM_CYSCREEN, _SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 0, 1, 78, 79
 _WM_TIMER = 0x0113
 _REST_TIMER = 1
+
+
+class _FrontIntegrity:
+    """Whether the window in front belongs to a process at a higher integrity level than this one.
+
+    Windows' UIPI gives a process none of a higher-integrity window's input through Raw Input: while the user types in
+    an elevated window (an admin terminal, Task Manager, a game or tool run as administrator) the reader hears nothing,
+    though ``GetLastInputInfo`` (session-wide) still sees it. A process that cannot be asked (access denied, a
+    protected process) counts as higher; no window in front, or one of this process's own, does not. The answer is
+    kept per foreground window, so asking costs two calls while the same window stays in front.
+    """
+
+    _TOKEN_QUERY = 0x0008
+    _QUERY_LIMITED = 0x1000          # PROCESS_QUERY_LIMITED_INFORMATION
+    _TOKEN_INTEGRITY_LEVEL = 25
+
+    def __init__(self) -> None:
+        self._api: Any = None
+        self._own: int | None = None
+        self._own_pid = 0
+        self._key: tuple[int, int] | None = None
+        self._answer = False
+
+    def _setup(self) -> Any:
+        from ctypes import wintypes as W
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        user32.GetForegroundWindow.restype = W.HWND
+        user32.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
+        user32.GetWindowThreadProcessId.restype = W.DWORD
+        kernel32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
+        kernel32.OpenProcess.restype = W.HANDLE
+        kernel32.GetCurrentProcess.restype = W.HANDLE
+        kernel32.CloseHandle.argtypes = [W.HANDLE]
+        advapi32.OpenProcessToken.argtypes = [W.HANDLE, W.DWORD, ctypes.POINTER(W.HANDLE)]
+        advapi32.OpenProcessToken.restype = W.BOOL
+        advapi32.GetTokenInformation.argtypes = [W.HANDLE, ctypes.c_int, ctypes.c_void_p, W.DWORD,
+                                                 ctypes.POINTER(W.DWORD)]
+        advapi32.GetTokenInformation.restype = W.BOOL
+        advapi32.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+        advapi32.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+        advapi32.GetSidSubAuthority.argtypes = [ctypes.c_void_p, W.DWORD]
+        advapi32.GetSidSubAuthority.restype = ctypes.POINTER(W.DWORD)
+        self._own_pid = int(kernel32.GetCurrentProcessId())
+        return W, user32, kernel32, advapi32
+
+    def _level(self, process: Any) -> int | None:
+        """The integrity level (the label's RID: 0x2000 medium, 0x3000 high, 0x4000 system) of a process handle."""
+        W, _user32, kernel32, advapi32 = self._api
+        token = W.HANDLE()
+        if not advapi32.OpenProcessToken(process, self._TOKEN_QUERY, ctypes.byref(token)):
+            return None
+        try:
+            buf = (ctypes.c_byte * 128)()
+            size = W.DWORD(0)
+            if not advapi32.GetTokenInformation(token, self._TOKEN_INTEGRITY_LEVEL, buf, ctypes.sizeof(buf),
+                                                ctypes.byref(size)):
+                return None
+            sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]   # TOKEN_MANDATORY_LABEL.Label.Sid
+            count = advapi32.GetSidSubAuthorityCount(sid)[0]
+            if not count:
+                return None
+            return int(advapi32.GetSidSubAuthority(sid, count - 1)[0])
+        finally:
+            kernel32.CloseHandle(token)
+
+    def own_level(self) -> int | None:
+        """This process's integrity level."""
+        if self._api is None:
+            self._api = self._setup()
+        if self._own is None:
+            self._own = self._level(self._api[2].GetCurrentProcess())
+        return self._own
+
+    def pid_higher(self, pid: int) -> bool:
+        """Whether process ``pid`` runs above this process's integrity level (or cannot be asked)."""
+        own = self.own_level()
+        W, _user32, kernel32, _advapi32 = self._api
+        if pid == self._own_pid:
+            return False
+        process = kernel32.OpenProcess(self._QUERY_LIMITED, False, int(pid))
+        if not process:
+            return True                           # access denied: a protected or higher process
+        try:
+            level = self._level(process)
+        finally:
+            kernel32.CloseHandle(process)
+        if level is None or own is None:
+            return True
+        return level > own
+
+    def __call__(self) -> bool:
+        if self._api is None:
+            self._api = self._setup()
+        W, user32, _kernel32, _advapi32 = self._api
+        hwnd = int(user32.GetForegroundWindow() or 0)
+        if not hwnd:
+            return False
+        pid = W.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        key = (hwnd, int(pid.value))
+        if key != self._key:
+            self._answer = bool(pid.value) and self.pid_higher(int(pid.value))
+            self._key = key
+        return self._answer
 
 
 def _settings_move_px() -> int:
@@ -429,27 +545,39 @@ class Presence:
         reader: Starts the facts' feed: ``start() -> bool``, ``error``, ``running`` (default: :class:`_RawReader`).
         move_px: The user's takeover distance, read on start and every :data:`SETTINGS_EVERY_S`.
         clock: The facts' clock (``time.monotonic``).
+        front_unheard: Whether the window in front is one Raw Input cannot hear (a higher-integrity process: UIPI);
+            asked only when Windows saw input newer than the reader's last (default: :class:`_FrontIntegrity`).
+        fallback_stop: Stops the fallback's own work once the reader answers (the old sampler's 10 Hz thread).
 
     Attributes:
         source: ``"raw_input"`` once listening, ``"fallback"`` when it could not, ``""`` before the first question.
         error: Why Raw Input is unavailable.
+        unheard: Whether the last answer came from Windows' idle time because the window in front could not be heard.
     """
 
     def __init__(self, *, raw_idle: Callable[[], float], fallback: Callable[[], float],
                  monitor: PresenceInput | None = None, reader: Any = None,
-                 move_px: Callable[[], int] = _settings_move_px, clock: Callable[[], float] = time.monotonic) -> None:
+                 move_px: Callable[[], int] = _settings_move_px, clock: Callable[[], float] = time.monotonic,
+                 front_unheard: Callable[[], bool] | None = None,
+                 fallback_stop: Callable[[], None] | None = None) -> None:
         self._raw_idle = raw_idle
         self._fallback = fallback
+        self._fallback_stop = fallback_stop
         self.monitor = monitor or PresenceInput(now=clock)
         self._reader = reader
         self._move_px = move_px
         self._clock = clock
+        self._front_unheard = front_unheard if front_unheard is not None else _FrontIntegrity()
         self._lock = threading.Lock()
         self.source = ""
         self.error = ""
         self._baseline = 0.0       # the start, less Windows' idle time then: no real input known before it
         self._unlock_at = 0.0
         self._settings_at = 0.0
+        self._unheard_at = 0.0     # the latest input Windows saw while an unheard window was in front
+        self.unheard = False
+        self._unheard_switches = 0
+        self._late_start = False
 
     def _raw(self) -> float:
         try:
@@ -467,7 +595,15 @@ class Presence:
                     self.source, self.error = "fallback", self._reader.error or "the input reader stopped"
             return False
         if self.source == "fallback":
-            return False
+            reader = self._reader
+            if reader is None or not getattr(reader, "running", False):
+                return False
+            with self._lock:   # the reader finished starting after start() gave up waiting: it answers from now on
+                if self.source == "fallback" and reader.running:
+                    self._baseline = self._clock() - self._raw()
+                    self.source, self.error, self._late_start = "raw_input", "", True
+                    self._stop_fallback()
+            return self.source == "raw_input"
         with self._lock:
             if self.source == "":
                 try:
@@ -489,10 +625,26 @@ class Presence:
         """When the user's last real input came (the clock's time), ``None`` when Raw Input is unavailable."""
         if not self._ensure():
             return None
-        return max(self.monitor.latest(), self._baseline, self._unlock_at)
+        return max(self.monitor.latest(), self._baseline, self._unlock_at, self._unheard_at)
+
+    def _stop_fallback(self) -> None:
+        if self._fallback_stop is not None:
+            try:
+                self._fallback_stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _unheard_front(self) -> bool:
+        try:
+            return bool(self._front_unheard())
+        except Exception:  # noqa: BLE001 - cannot tell: the reader's answer
+            return False
 
     def idle_s(self) -> float:
-        """Seconds since the user's last real input, never less than Windows' idle time."""
+        """Seconds since the user's last real input, never less than Windows' idle time.
+
+        While a window Raw Input cannot hear is in front (a higher-integrity process, see :class:`_FrontIntegrity`),
+        Windows' idle time answers instead, and that input stays credited after the window leaves the front."""
         last = self.last_input_at()
         if last is None:
             return float(self._fallback())
@@ -503,7 +655,19 @@ class Presence:
                 self.monitor.move_px = int(self._move_px())
             except Exception:  # noqa: BLE001 - keep the last one
                 pass
-        return max(self._raw(), now - last)
+        raw = self._raw()
+        heard = now - last
+        if raw < heard:                         # Windows saw input the reader did not: jitter, or an unheard window
+            if self._unheard_front():
+                self._unheard_at = max(self._unheard_at, now - raw)
+                if not self.unheard:
+                    self.unheard = True
+                    self._unheard_switches += 1
+                return raw
+            self.unheard = False
+        elif self.unheard and (self.monitor.latest() > self._unheard_at or not self._unheard_front()):
+            self.unheard = False                # the reader hears the user again, or the window left the front
+        return max(raw, heard)
 
     def note_unlock(self) -> None:
         """The session was unlocked: the user is at the PC."""
@@ -518,7 +682,18 @@ class Presence:
             out["counts"] = dict(self.monitor.counts)
             out["max_travel"] = round(self.monitor.max_travel, 1)
             out["move_px"] = self.monitor.move_px
+            out["answering"] = "idle_timer" if self.unheard else "raw_input"
+            if self._unheard_switches:
+                out["unheard_front"] = self._unheard_switches
+            if self._late_start:
+                out["late_start"] = True
         return out
+
+    def answering(self) -> str:
+        """What answers right now: ``raw_input``, ``idle_timer`` (an unheard window in front), ``fallback``."""
+        if self.source == "raw_input":
+            return "idle_timer" if self.unheard else "raw_input"
+        return self.source or "not_started"
 
 
 __all__ = ["DEFAULT_MOVE_PX", "KINDS", "MOVE_WINDOW_S", "Presence", "PresenceInput", "SETTINGS_EVERY_S"]

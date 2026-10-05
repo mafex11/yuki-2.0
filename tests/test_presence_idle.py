@@ -59,10 +59,11 @@ def jitter(monitor: PresenceInput, start: float, end: float, *, rate: float = 23
 
 
 def presence(clock: Clock, *, raw: float = 0.0, reader: FakeReader | None = None, move_px: int = 40,
-             fallback=lambda: -1.0) -> Presence:
-    """Windows' own idle time held at ``raw`` (the jitter keeps it at ~0)."""
-    p = Presence(raw_idle=lambda: raw, fallback=fallback, reader=reader or FakeReader(), move_px=lambda: move_px,
-                 clock=clock)
+             fallback=lambda: -1.0, front_unheard=lambda: False, fallback_stop=None) -> Presence:
+    """Windows' own idle time held at ``raw`` (the jitter keeps it at ~0); the window in front heard (never this
+    PC's real foreground window)."""
+    p = Presence(raw_idle=raw if callable(raw) else (lambda: raw), fallback=fallback, reader=reader or FakeReader(),
+                 move_px=lambda: move_px, clock=clock, front_unheard=front_unheard, fallback_stop=fallback_stop)
     p.monitor.now = clock
     return p
 
@@ -235,7 +236,7 @@ def test_the_takeover_distance_follows_the_users_setting():
     clock = Clock()
     setting = {"px": 40}
     p = Presence(raw_idle=lambda: 0.0, fallback=lambda: 0.0, reader=FakeReader(), move_px=lambda: setting["px"],
-                 clock=clock)
+                 clock=clock, front_unheard=lambda: False)
     p.idle_s()
     assert p.monitor.move_px == 40
     setting["px"] = 120
@@ -255,7 +256,185 @@ def test_facts_are_counts_only():
     p.monitor.relative(1, 0, at=T0)
     facts = p.facts()
     assert facts["source"] == "raw_input" and facts["counts"] == {"keys": 1, "moves": 1}
-    assert set(facts) == {"source", "counts", "max_travel", "move_px"}
+    assert set(facts) == {"source", "counts", "max_travel", "move_px", "answering"}
+    assert facts["answering"] == "raw_input"
+
+
+# -- review fixes (5 Oct): an unheard elevated window in front, a reader that starts late ------------------------------
+
+
+class Raw:
+    """Windows' idle time: seconds since the last input of any kind the clock saw (the jitter keeps it near 0)."""
+
+    def __init__(self, clock: Clock, at: float) -> None:
+        self.clock, self.at = clock, at
+
+    def __call__(self) -> float:
+        return self.clock.t - self.at
+
+
+def test_typing_in_an_elevated_window_keeps_the_user_present():
+    # UIPI: the reader hears nothing while an admin window is in front, but Windows' idle timer still sees the typing
+    clock = Clock()
+    raw = Raw(clock, T0)
+    front = {"elevated": False}
+    asked = []
+
+    def unheard():
+        asked.append(clock.t)
+        return front["elevated"]
+
+    p = presence(clock, raw=raw, front_unheard=unheard)
+    p.idle_s()
+    front["elevated"] = True
+    for k in range(1, 601):                                  # ten minutes of typing the reader never hears
+        clock.t = T0 + k
+        raw.at = clock.t - 0.2
+        assert p.idle_s() == pytest.approx(0.2)
+    facts = p.facts()
+    assert facts["answering"] == "idle_timer" and facts["unheard_front"] == 1 and p.answering() == "idle_timer"
+    # the user leaves the elevated window for a normal one and walks away; the mouse vibrates (Windows' timer ~0)
+    front["elevated"] = False
+    for k in range(1, 121):
+        clock.t = T0 + 600 + k
+        raw.at = clock.t - 0.05
+        p.idle_s()
+    assert p.idle_s() == pytest.approx(120.2, abs=0.1)       # counted from the last typing, never from the start
+    assert p.facts()["answering"] == "raw_input" and p.facts()["unheard_front"] == 1
+
+
+def test_an_elevated_window_left_in_front_with_nobody_there_grows_idle_without_jitter():
+    clock = Clock()
+    raw = Raw(clock, T0)
+    p = presence(clock, raw=raw, front_unheard=lambda: True)
+    p.idle_s()
+    raw.at = T0 + 10                                         # the last key in the admin window
+    clock.t = T0 + 400
+    assert p.idle_s() == pytest.approx(390.0)
+    clock.t = T0 + 700
+    assert p.idle_s() == pytest.approx(690.0)
+
+
+def test_the_window_in_front_is_asked_only_when_windows_saw_input_the_reader_did_not():
+    clock = Clock()
+    raw = Raw(clock, T0 - 50)
+    asked = []
+    p = presence(clock, raw=raw, front_unheard=lambda: asked.append(1) or True)
+    p.idle_s()
+    clock.t = T0 + 30
+    p.monitor.key_down(at=T0 + 30)                           # the reader heard the latest input itself
+    raw.at = T0 + 30
+    assert p.idle_s() == 0.0 and asked == []
+    clock.t = T0 + 90                                        # nothing at all since: no question either
+    assert p.idle_s() == pytest.approx(60.0) and asked == []
+
+
+def test_a_real_key_after_an_unheard_window_hands_back_to_the_reader():
+    clock = Clock()
+    raw = Raw(clock, T0)
+    front = {"elevated": True}
+    p = presence(clock, raw=raw, front_unheard=lambda: front["elevated"])
+    p.idle_s()
+    clock.t, raw.at = T0 + 100, T0 + 99
+    assert p.idle_s() == pytest.approx(1.0) and p.unheard
+    front["elevated"] = False
+    clock.t = raw.at = T0 + 150
+    p.monitor.key_down(at=T0 + 150)
+    assert p.idle_s() == 0.0 and not p.unheard
+
+
+def test_a_failing_front_check_keeps_the_readers_answer():
+    clock = Clock()
+
+    def broken():
+        raise OSError("no desktop")
+
+    p = presence(clock, raw=0.0, front_unheard=broken)
+    p.idle_s()
+    jitter(p.monitor, T0, T0 + 200)
+    clock.t = T0 + 200
+    assert p.idle_s() == pytest.approx(200.0)
+
+
+class LateReader(FakeReader):
+    """start() gives up waiting (the service busy starting), the thread finishes starting a moment later."""
+
+    def start(self) -> bool:
+        self.starts += 1
+        return False
+
+
+def test_a_reader_that_finishes_starting_late_takes_over():
+    clock = Clock()
+    stops = []
+    reader = LateReader()
+    p = presence(clock, raw=Raw(clock, T0 - 5), reader=reader, fallback=lambda: 0.0,
+                 fallback_stop=lambda: stops.append(clock.t))
+    assert p.idle_s() == 0.0 and p.source == "fallback"      # the old sampler, held at ~0 by the jitter
+    assert p.facts()["error"] == "the input reader did not start"
+    clock.t = T0 + 2
+    reader.running = True                                    # its thread got there after all
+    jitter(p.monitor, T0 + 2, T0 + 300)
+    clock.t = T0 + 300
+    assert p.idle_s() == pytest.approx(305.0)                # from Windows' idle time at the takeover, not ~0
+    facts = p.facts()
+    assert p.source == "raw_input" and facts["late_start"] is True and "error" not in facts
+    assert stops == [T0 + 300] and reader.starts == 1        # the poller stopped once; never started again
+
+
+def test_a_reader_that_stopped_is_not_taken_back():
+    clock = Clock()
+    reader = FakeReader()
+    p = presence(clock, reader=reader, fallback=lambda: 3.0)
+    p.idle_s()
+    reader.running = False
+    assert p.idle_s() == 3.0
+    for _ in range(3):
+        assert p.idle_s() == 3.0 and p.source == "fallback"
+
+
+def test_the_old_samplers_poller_stops_and_starts_again(monkeypatch):
+    from yuki.memory import watcher
+
+    monkeypatch.setattr(watcher, "raw_idle_s", lambda: 1.0)
+    runs = []
+
+    def fake_run(self, stop):
+        runs.append(stop)
+        stop.wait(5.0)
+
+    monkeypatch.setattr(watcher._PresenceSampler, "_run", fake_run)
+    s = watcher._PresenceSampler()
+    s.idle_s()
+    first = s._thread
+    s.stop()
+    first.join(1.0)
+    assert not first.is_alive() and runs[0].is_set()
+    s.idle_s()
+    assert s._thread is not first and len(runs) == 2 and not runs[1].is_set()
+    s.stop()
+
+
+@pytest.mark.skipif(not hasattr(__import__("ctypes"), "windll"), reason="Windows only")
+def test_front_integrity_reads_real_levels_read_only():
+    import os
+    import subprocess
+    import sys
+
+    from yuki.memory.userpresence import _FrontIntegrity
+
+    f = _FrontIntegrity()
+    own = f.own_level()
+    assert own is not None and own >= 0x2000                 # medium or above
+    assert f.pid_higher(os.getpid()) is False
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        assert f.pid_higher(child.pid) is False              # same user, same level
+    finally:
+        child.kill()
+        child.wait()
+    if own < 0x4000:
+        assert f.pid_higher(4) is True                       # the System process: above us, or cannot be asked
 
 
 def test_watcher_user_idle_s_is_the_jitter_proof_signal(monkeypatch):
