@@ -402,6 +402,24 @@ TAKEOVER_QUIET_S = 0.8
 _MOUSE_VKS = frozenset({1, 2, 4, 5, 6})
 
 
+#: When (monotonic) the process's keyboard hook last saw a key go down (percFix), 0.0 before any. The tray's own
+#: low-level keyboard hook (``yuki.ui.hotkey.ChordHookThread``, there for the Alt+Shift chord) stamps it on every key
+#: down; it only counts, it never keeps which key. Live 5 Oct a 50 ms Shift tap never paused a run: polled every
+#: 0.1 s, ``GetAsyncKeyState``'s "held" bit missed it and its "pressed since" bit is shared with every other program
+#: that asks, so a real fast keystroke could go unseen. The hook sees every key down as it happens.
+_KEY_DOWN_AT = [0.0]
+
+
+def note_key_down(at: float | None = None) -> None:
+    """A key went down now (or at ``at``, monotonic): called from the keyboard hook. One store, no lock (a float)."""
+    _KEY_DOWN_AT[0] = time.monotonic() if at is None else float(at)
+
+
+def key_down_at() -> float:
+    """When the keyboard hook last saw a key go down (monotonic; 0.0: never, or no hook in this process)."""
+    return _KEY_DOWN_AT[0]
+
+
 def key_states(vks: tuple[int, ...] = _REAL_INPUT_VKS) -> tuple[frozenset[int], frozenset[int]] | None:
     """``(down, tapped)``: the keys and mouse buttons held down now (``GetAsyncKeyState``'s high bit), and those pressed
     and let go since the last look (its low bit, the key no longer down); ``None`` when Windows cannot say. Every key
@@ -537,9 +555,12 @@ class TakeoverWatch:
                  cursor: Callable[[], tuple[int, int] | None] = cursor_at,
                  span: Callable[[], tuple[float, float | None]] = own_input_span,
                  ours: Callable[[str, tuple[int, int] | None], bool] = yuki_has_it,
-                 now: Callable[[], float] = time.monotonic) -> None:
+                 now: Callable[[], float] = time.monotonic,
+                 pressed: Callable[[], float] = key_down_at) -> None:
         self.move_px, self.window_s, self.quiet_s = float(move_px), float(window_s), float(quiet_s)
         self.age, self.keys, self.cursor, self.span, self.ours, self.now = age, keys, cursor, span, ours, now
+        self.pressed = pressed
+        self._pressed_seen = 0.0
         self.armed = False
         self.polls = 0
         self.max_travel = 0.0
@@ -591,6 +612,19 @@ class TakeoverWatch:
                     self._down = down
                     if fresh and not first:
                         found = "click" if fresh & _MOUSE_VKS else "keys"
+        # percFix: a key down the keyboard hook saw since the last look counts however short it was (a 50 ms tap went
+        # unseen by the polled key states); one inside Yuki's own input moment is Yuki's
+        try:
+            pressed_at = float(self.pressed() or 0.0)
+        except Exception:  # noqa: BLE001
+            pressed_at = 0.0
+        if pressed_at > self._pressed_seen:
+            if not first:
+                if own or self._was_own(pressed_at, t):
+                    self._skip("own")
+                elif found is None:
+                    found = "keys"
+            self._pressed_seen = pressed_at
         if last is not None:
             self._last_input = last if self._last_input is None else max(self._last_input, last)
         where = self.cursor()

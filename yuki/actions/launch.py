@@ -2505,6 +2505,8 @@ def _launch_verdict(ok: bool, details: dict) -> bool | None:
     page = details.get("page_verified")
     if page is not None:
         return bool(page) and bool(details.get("foreground", True))
+    if details.get("page_targets"):
+        return None   # percFix: handed an address and no page could be read: the window alone is not the page
     if not details.get("hwnd") or not details.get("foreground"):
         return None
     identity = details.get("identity") if isinstance(details.get("identity"), dict) else {}
@@ -3222,8 +3224,36 @@ def _fullscreen(hwnd: int, name: str, details: dict, finish) -> ActionResult:  #
     now = "maximized, not full screen" if _is_zoomed(hwnd) else "not full screen"
     return finish(False, f"{name}: pressed F11, still {now} after {_FULLSCREEN_WAIT_S:g} s (this app may use its "
                          f"own full-screen command)", details)
-#: Bound on the wait for a window asked to close to go away (it may ask to save first).
-_CLOSE_WAIT_S = 2.0
+#: Bound on the wait for a window asked to close to go away (percFix: 2 s was too short for a browser saving its
+#: session; a window that asks something first ends the wait at once, see :func:`_asks_before_closing`).
+_CLOSE_WAIT_S = 8.0
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """DWM keeps the window but no longer shows it (a closing app's window can sit cloaked until it is destroyed)."""
+    try:
+        from yuki.perception.windows import is_cloaked
+
+        return bool(is_cloaked(hwnd))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _asks_before_closing(hwnd: int) -> bool:
+    """Whether a window asked to close shows it is asking something: it is disabled (a modal dialog of its own owns
+    the input), or another visible window of the same process is in front. Window facts only."""
+    try:
+        if not win32gui.IsWindowEnabled(hwnd):
+            return True
+        front = int(_user32.GetForegroundWindow() or 0)
+        if not front or front == hwnd:
+            return False
+        import win32process
+
+        return (win32process.GetWindowThreadProcessId(front)[1] == win32process.GetWindowThreadProcessId(hwnd)[1]
+                and bool(win32gui.IsWindowVisible(front)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def window_action(hwnd: int, action: str) -> ActionResult:
@@ -3236,7 +3266,7 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     to save) and waits up to :data:`_CLOSE_WAIT_S` for the window to go. ``ok``
     is True only when the new state was observed, so the summary is the effect,
     not the request: "Discord.exe "..." is now minimized", or "... asked to close;
-    still open after 2.0 s (it may be asking something)".
+    it is asking something first" (a dialog of its own in front), or "still open after 8 s".
     """
     started = time.perf_counter()
 
@@ -3270,14 +3300,29 @@ def window_action(hwnd: int, action: str) -> ActionResult:
     if action == "fullscreen":
         return _fullscreen(hwnd, name, details, finish)
     if action == "close":
+        was_cloaked = _is_cloaked(hwnd)
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        # percFix: live 5 Oct Arc took longer than 2 s to close and was reported "still open" (it had closed a few
+        # seconds later). The wait is longer now, and it ends at once on what "it is asking something" looks like:
+        # the window disabled behind a dialog of its own (a modal save prompt), or another of its process's windows
+        # come to the front.
         deadline = time.monotonic() + _CLOSE_WAIT_S
+        asking = False
         while time.monotonic() < deadline:
-            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            if (not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
+                    or (not was_cloaked and _is_cloaked(hwnd))):
                 return finish(True, f"{name} is closed", details)
+            asking = _asks_before_closing(hwnd)
+            if asking:
+                break
             time.sleep(_POLL_S)
-        return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s (it may be asking "
-                             f"something, e.g. to save)", details)
+        waited = round(time.monotonic() - (deadline - _CLOSE_WAIT_S), 1)
+        details["close_waited_s"] = waited
+        if asking:
+            details["asking"] = True
+            return finish(False, f"{name}: asked to close; it is asking something first (a dialog of its own is in "
+                                 f"front)", details)
+        return finish(False, f"{name}: asked to close, still open after {_CLOSE_WAIT_S:g} s", details)
 
     def reached() -> bool:
         iconic, zoomed = bool(win32gui.IsIconic(hwnd)), bool(_is_zoomed(hwnd))

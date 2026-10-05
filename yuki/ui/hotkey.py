@@ -464,6 +464,10 @@ class ChordHookThread(_MessageLoopThread):
         self._tainted = False
         self._masked = False
         self._mask_now = False
+        try:   # percFix: the takeover watch counts key downs from here (a fast tap included); one store per key down
+            from yuki.actions.leases import note_key_down
+        except Exception:  # noqa: BLE001
+            note_key_down = None
 
         def on_key(n_code: int, w_param: int, l_param: int) -> int:
             action: str | None = None
@@ -473,6 +477,8 @@ class ChordHookThread(_MessageLoopThread):
                     # Our own injected keys (the mask tap, the focus unlock) are
                     # not the user's typing: they must not taint or end a chord.
                     if (event.dwExtraInfo or 0) != INJECT_MARK:
+                        if note_key_down is not None and int(w_param) in _KEY_DOWN:
+                            note_key_down()
                         action = self._observe(int(event.vkCode), int(w_param))
                         if self._mask_now:
                             self._mask_now = False

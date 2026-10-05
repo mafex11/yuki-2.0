@@ -313,12 +313,24 @@ class ChatModel:
             self._add(Item(self._new_id("u"), "user", at, text=text, source=str(ev.get("source") or "text")))
         if isinstance(job, int):
             old = self._by_id.get(self._job_item.get(job, ""))
-            if old is not None and old.status == "question":
-                old.status = "done"
-                old.ended_at = at
-                self._changed(old)
             if job in self._voice_job:
+                if old is not None and old.status == "question":
+                    old.status = "done"
+                    old.ended_at = at
+                    self._changed(old)
                 return   # a voice job's steps stay under the voice response that started it
+            if old is not None:
+                # percFix: the work goes on in a new bubble below the answer, so the old one is finished here - a
+                # question's, and a run paused by a takeover and resumed with typed words alike. Live 5 Oct both stayed
+                # "running" in the tray's `now` long after the run ended: the paused one kept its status, and the
+                # question's ask step kept spinning (its result arrives for the new bubble, never this one).
+                if old.status in ("question", "running", "pending", "streaming"):
+                    old.status = "done"
+                    old.ended_at = at
+                for step in old.steps:
+                    if step.running:
+                        step.ended, step.ok = at, None
+                self._changed(old)
             item = self._add(Item(self._new_id("a"), "assistant", at, source=old.source if old else "text",
                                   status="running", jobs=[job]))
             self._job_item[job] = item.id

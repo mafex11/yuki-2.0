@@ -50,6 +50,7 @@ BOUNDS_SLACK = 24
 #: gave up (and may have clicked with the mouse instead) never acts a second time.
 ACT_MARGIN_S = 0.3
 _UIA_RUNTIME_ID = 30000
+_UIA_TOGGLE_STATE = 30086
 _TREE_SCOPE_SUBTREE = 7
 
 
@@ -162,6 +163,22 @@ def _title(hwnd: int) -> str | None:
         return None
 
 
+def _watch(automation: Any, element: Any, property_ids: tuple[int, ...]) -> Any:
+    """The element's own property-changed events while a pattern acts (percFix), ``None`` when it gives none."""
+    try:
+        from yuki.perception.events import ElementWatch
+
+        watch = ElementWatch(automation, element, property_ids)
+    except Exception:  # noqa: BLE001
+        return None
+    return watch if watch.live else None
+
+
+def _budget_left(stop_at: float) -> float:
+    """How long the job may still wait for an effect: up to :data:`WATCH_S`, never past its budget."""
+    return max(0.0, min(WATCH_S, stop_at + ACT_MARGIN_S - 0.1 - time.monotonic()))
+
+
 def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str | None = None, dy: int = 0,
                    dx: int = 0) -> ActionResult | None:
     """Act on a read element through its pattern; ``None`` when that cannot be done (the caller falls back).
@@ -260,10 +277,20 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
             elif label == "toggle":
                 pattern = target.GetCurrentPattern(_PATTERN_TOGGLE).QueryInterface(module.IUIAutomationTogglePattern)
                 before = int(pattern.CurrentToggleState)
-                shared["acting"] = True
-                pattern.Toggle()
-                shared["done"] = "Toggle"
-                after = int(pattern.CurrentToggleState)
+                watch = _watch(automation, target, (_UIA_TOGGLE_STATE,))
+                try:
+                    shared["acting"] = True
+                    pattern.Toggle()
+                    shared["done"] = "Toggle"
+                    after = int(pattern.CurrentToggleState)
+                    # percFix: Chromium and CEF report the new state a moment after Toggle returns (live 5 Oct:
+                    # "its state did not change" for a Lyrics toggle that had worked); wait for its own event,
+                    # within the budget, never a timed poll
+                    if after == before and watch is not None and watch.wait(_budget_left(stop_at)):
+                        after = int(pattern.CurrentToggleState)
+                finally:
+                    if watch is not None:
+                        watch.close()
                 shared["toggle"] = (before, after)
             elif label == "select":
                 pattern = target.GetCurrentPattern(_PATTERN_SELECTION_ITEM).QueryInterface(
@@ -322,8 +349,14 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
     summary = f"{how} on {name} through UI Automation (the mouse and keyboard were not used)"
     if label == "toggle":
         before, after = shared.get("toggle", (None, None))
-        details["verified"] = before is not None and after is not None and before != after
-        summary += "; its state changed" if details["verified"] else "; its state did not change"
+        changed = before is not None and after is not None and before != after
+        if changed:
+            details["verified"] = True
+            summary += "; its state changed"
+        else:
+            # percFix: not "did not change": an app can show the new state later than the pattern call returns (or
+            # draw the control again); the read of the window after it decides
+            summary += "; its state did not read as changed right away"
     elif label == "select":
         details["verified"] = bool(shared.get("selected"))
         summary += "; it reads selected" if details["verified"] else "; it does not read selected"
