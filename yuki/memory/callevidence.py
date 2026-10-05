@@ -638,6 +638,9 @@ class CallEvidence:
         calling site (the module docstring): by the user's ``[meetings]`` word, else by the verdict on the
         shipped list's entry it falls under (that list judged once, as a whole, never per visit); a site the user
         blocked themselves never counts. One verdict per host, kept. Returns how many hosts were decided."""
+        with self._lock:
+            if not self._sites:
+                return 0   # no unread page seen: nothing to read, not even the privacy file's stamp
         meetings = self._meeting_rules()
         with self._lock:
             if meetings is not self._meetings_used:   # the user changed [meetings]: decide every site again
