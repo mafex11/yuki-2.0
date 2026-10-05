@@ -45,6 +45,7 @@ def requests(path: Path) -> Iterator[dict[str, Any]]:
     closing message (``final``) or by the finishing action (``by_action``)."""
     current: dict[str, Any] | None = None
     pending_send: str | None = None
+    calls: dict[str, dict[str, Any]] = {}   # the latest call of each tool not graded yet (its compared fields)
     for event in _events(path):
         kind = event.get("type")
         if kind == "user_message":
@@ -52,18 +53,25 @@ def requests(path: Path) -> Iterator[dict[str, Any]]:
                 yield current
             current = {"steps": [], "unbacked": [], "final": False, "by_action": False}
             pending_send = None
+            calls: dict[str, dict[str, Any]] = {}
             continue
         if current is None:
             continue
-        if kind == "send_confirmation":
+        if kind == "tool_call" and isinstance(event.get("input"), dict):
+            # review: the fields the verdict compares (the app an input names, a window's operation), nothing else
+            calls[str(event.get("name"))] = {k: event["input"][k] for k in ("app", "action") if k in event["input"]}
+        elif kind == "send_confirmation":
             # logged just before the send's own action_verdict
             pending_send = "confirmed" if event.get("confirmed") else "unconfirmed"
         elif kind == "action_verdict":
             why = str(event.get("why") or "")
             step = {"kind": "action", "tool": event.get("tool"), "ok": why != "it failed",
-                    "verdict": event.get("verified"), "why": why, "app": event.get("target")}
+                    "verdict": event.get("verified"), "why": why, "app": event.get("target"),
+                    "input": calls.pop(str(event.get("tool")), {}), "call": event.get("turn")}
             if pending_send:
-                step["send"], pending_send = pending_send, None
+                # the window number stands in for the chat too (the logs keep no message fingerprint): a retry is
+                # matched by its window, as the live trace matches it by its window's title
+                step["send"], step["window"], pending_send = pending_send, event.get("target"), None
             current["steps"].append(step)
         elif kind == "claim_accepted":
             current["unbacked"].append("a claim the check could not back")

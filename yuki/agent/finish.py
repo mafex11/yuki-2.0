@@ -165,9 +165,10 @@ def _seen(step: dict[str, Any], level: str) -> str:
 
 
 def _app(step: dict[str, Any]) -> str | None:
-    """The app a step acted in, comparable across steps: its window's process, else the app its input names (the
-    mixer's level names its app, not a window), casefolded without ``.exe``; ``None`` unknown. Plumbing."""
-    raw = str(step.get("app") or (step.get("input") or {}).get("app") or "").strip().casefold()
+    """The app a step acted in, comparable across steps: the app its input names (the mixer's level names its app;
+    the trace's ``app`` for it is only the window in front), else its window's process, casefolded without ``.exe``;
+    ``None`` unknown. Plumbing."""
+    raw = str((step.get("input") or {}).get("app") or step.get("app") or "").strip().casefold()
     raw = raw[:-4] if raw.endswith(".exe") else raw
     return raw or None
 
