@@ -655,6 +655,27 @@ async function inPage(F) {
     tsel().value = '24'; tsel().dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
     check('TK1 a save that fails puts the choice back', tsel().value === '160', tsel().value);
   }
+  // ---- report 78 C0: Settings -> Record how I work: off and locked until your go-ahead; the leave-out list ----
+  {
+    const rc = () => main().querySelector('[data-k="record"]');
+    const ro = () => main().querySelector('[data-k="record-out"]');
+    const rtog = () => rc() && rc().querySelector('.tog[data-do="record-on"]');
+    check('RC1 Record how I work is shown off, cannot be turned on, and says it waits for your go-ahead', !!rtog() && rtog().disabled
+      && rtog().getAttribute('aria-checked') === 'false' && rc().textContent.includes('Record how I work') && rc().textContent.includes('go-ahead')
+      && rc().textContent.includes('Never the letters you type'), rc() && rc().textContent.slice(0, 120));
+    rtog().click(); await sleep(150);
+    check('RC1 a press on the locked switch sends nothing and stays off', acts('record_actions').length === 0 && rtog().getAttribute('aria-checked') === 'false');
+    const chips = () => Array.from(ro().querySelectorAll('[data-do="leave-out-drop"]')).map((b) => b.dataset.app);
+    const add = () => ro().querySelector('select[data-change="leave-out-add"]');
+    check('RC1 the leave-out list shows the apps left out and offers the others', chips().join('|') === 'Banking app' && !!add()
+      && Array.from(add().options).map((o) => o.value).includes('Notes'), `${chips().join('|')}`);
+    REPLY.record_leave_out = (m) => ({ ok: true, leave_out: m.out ? ['Banking app', m.app] : ['Banking app'].filter((a) => a !== m.app) });
+    add().value = 'Notes'; add().dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
+    check('RC1 adding an app is saved through Python and shown as a chip', acts('record_leave_out').some((m) => m.app === 'Notes' && m.out === true)
+      && chips().join('|') === 'Banking app|Notes' && !Array.from(add().options).map((o) => o.value).includes('Notes'), chips().join('|'));
+    ro().querySelector('[data-do="leave-out-drop"][data-app="Notes"]').click(); await sleep(250);
+    check('RC1 a chip removes it again', acts('record_leave_out').some((m) => m.app === 'Notes' && m.out === false) && chips().join('|') === 'Banking app', chips().join('|'));
+  }
 
   // ---- appWin1 (4 Oct round 3): W2 session titles, W6 misheard guesses, W3 Correct in your words, English only
   // (W1's threads and Home's current-thread tile left the window with appTodo, 4 Oct) ----

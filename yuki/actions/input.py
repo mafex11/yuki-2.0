@@ -1,7 +1,7 @@
 """Synthetic mouse and keyboard input.
 
-Mouse events are sent with ``SetCursorPos`` + ``mouse_event`` at the cursor's
-current position rather than through pyautogui's absolute path: pyautogui
+Mouse events are sent with ``SetCursorPos`` + a mouse ``SendInput`` record at the
+cursor's current position rather than through pyautogui's absolute path: pyautogui
 normalises absolute coordinates against the *primary* monitor
 (``65536 * x // width``) and clamps scroll coordinates to it, so every click on
 a secondary monitor lands in the wrong place.  Text is typed with ``SendInput``
@@ -57,6 +57,13 @@ deadline, because "focus did not move" is a real answer and not worth waiting ou
 The waits after keyboard input (focus moving, a new window showing, a cleared
 field reading empty) and the page watch after any input (the page differing from
 before and titled) are condition polls with deadlines in the same way.
+
+Every event Yuki injects carries Yuki's stamp, :data:`yuki.core.inputtag.YUKI_INPUT_TAG`, in ``dwExtraInfo``
+(report 78, C0): typed text, chords and single keys, clicks and the wheel all go through :func:`_send_each` or
+:func:`_send_text`, which build tagged ``SendInput`` records. pyautogui's ``press``/``hotkey`` (``keybd_event`` with
+no extra info) and bare ``mouse_event`` are no longer used to send anything; pyautogui stays for its key names
+and their virtual-key table, so a key goes out exactly as before, only stamped. A later capture phase reads the
+stamp back to tell Yuki's input from the user's (dictation, Deskflow and macro tools stay the user's).
 """
 
 from __future__ import annotations
@@ -69,12 +76,14 @@ import unicodedata
 from collections.abc import Callable
 
 import pyautogui
+import pyautogui._pyautogui_win as _pyautogui_win   # its key-name -> virtual-key table (keyboardMapping)
 import win32clipboard
 import win32con
 import win32gui
 import win32process
 
 from yuki.actions import ActionResult
+from yuki.core.inputtag import YUKI_INPUT_TAG
 from yuki.perception.windows import (
     accepts_input,
     cursor_position,
@@ -104,6 +113,7 @@ _WHEEL_DELTA = 120
 #: the better transport, and long text is exactly what clipboard paste is for.
 _PASTE_THRESHOLD_CHARS = 50
 
+_INPUT_MOUSE = 0
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
@@ -189,16 +199,81 @@ _kernel32.GlobalFree.restype = ctypes.c_void_p
 
 
 def _key_event(vk: int, scan: int, *, up: bool, unicode: bool = False) -> _Input:
-    """One keyboard INPUT record."""
+    """One keyboard INPUT record, stamped with Yuki's tag."""
     flags = _KEYEVENTF_UNICODE if unicode else 0
     if up:
         flags |= _KEYEVENTF_KEYUP
     return _Input(
         type=_INPUT_KEYBOARD,
         union=_InputUnion(
-            ki=_KeyBdInput(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=None)
+            ki=_KeyBdInput(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=YUKI_INPUT_TAG)
         ),
     )
+
+
+def _mouse_record(flags: int, data: int = 0) -> _Input:
+    """One mouse INPUT record at the cursor's current position (no move), stamped with Yuki's tag.
+
+    ``data``: the wheel's signed delta for ``MOUSEEVENTF_WHEEL``/``HWHEEL``; carried in the unsigned ``mouseData``
+    as its two's complement, the way Windows reads it back as a signed value.
+    """
+    return _Input(
+        type=_INPUT_MOUSE,
+        union=_InputUnion(
+            mi=_MouseInput(dx=0, dy=0, mouseData=int(data) & 0xFFFFFFFF, dwFlags=flags, time=0,
+                           dwExtraInfo=YUKI_INPUT_TAG)
+        ),
+    )
+
+
+def _send_each(records: list[_Input]) -> int:
+    """Send each record in its own ``SendInput`` call, in order; how many Windows accepted.
+
+    One call per record keeps the timing of the ``keybd_event`` / ``mouse_event`` calls this replaces (each was one
+    event), so an app sees the same sequence it always did. Every record here comes from :func:`_key_event` or
+    :func:`_mouse_record`, so every one carries Yuki's tag.
+    """
+    accepted = 0
+    for record in records:
+        accepted += int(_user32.SendInput(1, ctypes.byref(record), ctypes.sizeof(_Input)))
+    return accepted
+
+
+def _send_mouse(flags: int, data: int = 0) -> int:
+    """One tagged mouse event at the cursor (a button edge, or a wheel notch run with ``data``); 1 when accepted."""
+    return _send_each([_mouse_record(flags, data)])
+
+
+def _named_key_records(key: str, *, up: bool) -> list[_Input]:
+    """pyautogui's ``_keyDown`` / ``_keyUp`` for one key name, as tagged records (nothing for an unmapped name).
+
+    The same virtual keys, modifiers and order as pyautogui's ``keybd_event`` calls (scan code 0, no extended flag):
+    the modifiers the key's table entry needs go down, the key goes down (or up), then those modifiers go up.
+    """
+    if len(key) > 1:
+        key = key.lower()
+    code = _pyautogui_win.keyboardMapping.get(key)
+    if code is None:
+        return []
+    shift = pyautogui.isShiftCharacter(key)
+    mods, vk = divmod(int(code), 0x100)
+    before = [m for on, m in ((mods & 4, _VK_MENU), (mods & 2, _VK_CONTROL), (mods & 1 or shift, _VK_SHIFT)) if on]
+    after = [m for on, m in ((mods & 1 or shift, _VK_SHIFT), (mods & 2, _VK_CONTROL), (mods & 4, _VK_MENU)) if on]
+    return ([_key_event(m, 0, up=False) for m in before] + [_key_event(vk, 0, up=up)]
+            + [_key_event(m, 0, up=True) for m in after])
+
+
+def _send_chord(*keys: str) -> int:
+    """``pyautogui.hotkey(*keys)``, stamped: each key down in order, then each up in reverse; events accepted."""
+    records = [r for k in keys for r in _named_key_records(k, up=False)]
+    records += [r for k in reversed(keys) for r in _named_key_records(k, up=True)]
+    return _send_each(records)
+
+
+def _send_presses(key: str, times: int = 1) -> int:
+    """``pyautogui.press(key, presses=times, interval=0)``, stamped: down then up, ``times`` times; events accepted."""
+    once = _named_key_records(key, up=False) + _named_key_records(key, up=True)
+    return _send_each(once * max(1, int(times)))
 
 
 def _char_events(char: str) -> list[_Input]:
@@ -1563,8 +1638,8 @@ def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, 
     if refusal:
         details["cleared"] = False
         return refusal, ""
-    pyautogui.hotkey("ctrl", "a")
-    pyautogui.press("delete")
+    _send_chord("ctrl", "a")
+    _send_presses("delete")
     if not known or not getattr(focus, "has_value", False):
         details["cleared"] = None
         return None, (
@@ -1914,8 +1989,8 @@ def click(
     down, up = _MOUSEEVENTF[button]
     _move(x, y)
     for _ in range(clicks):
-        _user32.mouse_event(down, 0, 0, 0, 0)
-        _user32.mouse_event(up, 0, 0, 0, 0)
+        _send_mouse(down)
+        _send_mouse(up)
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     details["cursor"] = cursor_position()
     outcome = _report_effects(
@@ -2330,7 +2405,7 @@ def type_text(
         if press_enter:
             into, facts = _input_target(_focus_state())
             details.update(facts)
-            pyautogui.press("enter")
+            _send_presses("enter")
             return _result(
                 True,
                 summary(cleared, f"pressed enter (no text) in {into}", appeared(_POPUP_WATCH_S)),
@@ -2365,7 +2440,7 @@ def type_text(
         if refusal:
             _restore_clipboard(previous)
             return _result(False, refusal, details, started)
-        pyautogui.hotkey("ctrl", "v")
+        _send_chord("ctrl", "v")
         consumed = _wait_clipboard_released(
             time.monotonic() + _CLIPBOARD_HANDOFF_S
         )
@@ -2469,7 +2544,7 @@ def type_text(
                 details,
                 started,
             )
-        pyautogui.press("enter")
+        _send_presses("enter")
     # Where it landed, for the log and for a caller checking its work.  Read after
     # the keystrokes, not before: Enter may well have moved the focus on.
     details.update(_where_focus_is()[1])
@@ -2521,7 +2596,7 @@ def _accept_suggestion(state: object, expect_hwnd: int | None, details: dict) ->
     chosen = getattr(state, "selected", -1)
     key = "enter" if chosen >= 0 or not items else "tab"
     before_text, before_parts = _field_text(state), getattr(state, "parts", 0)
-    pyautogui.press(key)
+    _send_presses(key)
     deadline = time.monotonic() + _SUGGESTION_ACCEPT_S
     after = _read_field()
     while (after is None or getattr(after, "popup", False)) and time.monotonic() < deadline:
@@ -2608,7 +2683,7 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
-    pyautogui.hotkey(*resolved)
+    _send_chord(*resolved)
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
         before,
@@ -2662,7 +2737,7 @@ def press(
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
-    pyautogui.press(normalized, presses=times, interval=0)
+    _send_presses(normalized, times)
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
         before,

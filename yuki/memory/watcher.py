@@ -551,6 +551,9 @@ class ProcessFacts:
     exe: str
     app_name: str  # the app's own name (yuki.core.appnames: "Google Chrome", "WhatsApp" for WhatsApp.Root.exe)
     is_own: bool  # a Yuki process: this one, or one run by Yuki's interpreter
+    #: Runs above Yuki (as administrator, like Task Manager): Windows keeps its UI out of reach, so its windows are
+    #: reported ``elevated`` instead of read empty (report 78 C0; :func:`yuki.core.elevation.runs_above_us`).
+    elevated: bool = False
 
 
 def _under(path: str, root: Path) -> bool:
@@ -594,7 +597,13 @@ class _ProcessCache:
                 pass
             own = any(p and (_under(p, _VENV_ROOT) or _under(p, _PROJECT_ROOT) or _under(p, _APP_ROOT))
                       for p in chain)
-        facts = ProcessFacts(pid, name, exe, _appnames.name_for_exe(exe, pid=pid, image=name), own)
+        try:
+            from yuki.core.elevation import runs_above_us
+
+            elevated = not own and runs_above_us(pid)
+        except Exception:  # noqa: BLE001 - unknown: read it as before
+            elevated = False
+        facts = ProcessFacts(pid, name, exe, _appnames.name_for_exe(exe, pid=pid, image=name), own, elevated)
         if len(self._facts) > 512:
             self._facts.clear()
         self._facts[pid] = (created, facts)
@@ -2013,6 +2022,8 @@ class Watcher:
                 self.now.block(hwnd, app=facts.app_name, process=facts.process_name, reason=reason, at=time.time(),
                                foreground=False)
             return done("skipped", reason)
+        if facts.elevated:
+            return done("skipped", "elevated")   # as for the window in front: Windows keeps its UI from us
         if job.app_data_only:
             result.opaque = True
             self._follow_opaque(hwnd, facts, title, foreground=False)
@@ -2211,6 +2222,9 @@ class Watcher:
             if self._hwnd:
                 _user32.PostMessageW(self._hwnd, WM_APP_REFRESH, 0, 0)
             return done("skipped", "fullscreen")
+        if facts.elevated:
+            # runs as administrator (Task Manager): Windows keeps its UI from us, so a read only comes back empty
+            return done("skipped", "elevated")
         blocked_as = self._bg_blocked.get(hwnd)
         if (request.trigger in BLOCKED_SKIP_TRIGGERS and blocked_as is not None and blocked_as[0] == window_title):
             # Its last read was a blocked site or a sign-in page (known only after reading), and it still shows
