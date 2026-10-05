@@ -870,6 +870,7 @@ def apply(store: Store, linked: Linked, *, run_id: int | None, now: float, rebui
 def _invalidate(store: Store) -> None:
     with _CACHE_LOCK:
         _CACHE.pop(_db_key(store), None)
+        _CACHE.pop(_db_key(store) + "|learned", None)
 
 
 @dataclass
