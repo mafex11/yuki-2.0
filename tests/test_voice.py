@@ -68,7 +68,8 @@ def _agent(client: FakeClient, tmp: Path) -> Agent:
 def test_say_yields_event_and_run_continues(tmp_path: Path) -> None:
     client = FakeClient([
         _response(_block("tool_use", id="t1", name="say", input={"text": "Found three invoices."}),
-                  _block("tool_use", id="t2", name="run_powershell", input={"command": "ls"})),
+                  _block("tool_use", id="t2", name="run_powershell",
+                                                  input={"command": "ls", "risk": {"reversible": True, "user_asked": True}})),
         _response(_block("tool_use", id="t3", name="done", input={"message": "Total is 48,200."})),
     ])
     events = list(_agent(client, tmp_path).run("add up my invoices"))
@@ -706,7 +707,7 @@ def test_finishing_mark_needs_a_verified_report(tmp_path: Path) -> None:
         _response(_block("tool_use", id="t1", name="hotkey",
                          input={"keys": ["f11"], FINISHES_FIELD: "It's full screen."})),
         _response(_block("tool_use", id="t2", name="done", input={"message": "It's maximized, not full screen.",
-                                                                  "about": []})),
+                                                                  "about": [], "claims": "tried"})),
     ])
     events = list(_agent(client, tmp_path).run("make it full screen"))
     assert events[-1].text == "It's maximized, not full screen." and len(client.calls) == 2

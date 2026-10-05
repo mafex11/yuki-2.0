@@ -72,7 +72,8 @@ def test_unverified_action_escalates_the_next_call_and_holds_its_finish(tmp_path
     client = FakeClient([
         _response(_block("tool_use", id="t1", name="hotkey",
                          input={"keys": ["win", "up"], "finishes_with": "It's full screen."})),
-        _response(_block("tool_use", id="t2", name="done", input={"message": "It's maximized.", "about": []})),
+        _response(_block("tool_use", id="t2", name="done", input={"message": "It's maximized.", "about": [],
+                                                                  "claims": "tried"})),   # fix6: its class
     ])
     events = list(_agent(client, tmp_path).run("make it full screen", effort="low", thinking=False,
                                                escalate=("medium", True)))
