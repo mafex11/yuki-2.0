@@ -61,7 +61,9 @@ SEARCH_UP = 2
 #: The whole job's budget (s: the keys path, up to MAX_PRESSES with a read-back after each batch and the input gate's
 #: wait before each, takes longer than one SetValue), and how long a set value is watched for its read-back.
 BUDGET_S = 9.0
-SETTLE_S = 0.4
+#: percFix: the bound on a set value's read-back when the slider gives no change events (polled every POLL_S, ending
+#: as soon as it reads moved to the target). Live 5 Oct 0.4 s was too short for Spotify: it read the old value.
+SETTLE_S = 1.5
 #: percFix: how long a set value's own change event is waited for before the read-back stands (s), and after each
 #: batch of keys.
 VALUE_WAIT_S = 2.0

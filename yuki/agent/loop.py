@@ -350,6 +350,8 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
     if isinstance(own, bool) and change is not None and change.get("verified") is own and change.get("why"):
         # report 58: the window read before and after the action, compared (yuki.perception.outcome)
         return own, str(change["why"])
+    if own is None and change is not None and change.get("undecided"):
+        return None, str(change.get("why") or "")   # percFix: the window's account could not decide (a click on nothing)
     if name == "launch_app" and isinstance(own, bool):
         # appOpen F2: launch_app's own verdict is the app's own window in front (never a launcher's window)
         return own, ("the app's own window is in front" if own else

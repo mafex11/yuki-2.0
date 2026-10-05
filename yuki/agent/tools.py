@@ -2722,7 +2722,18 @@ class Dispatcher:
             # never "nothing changed"
             lines = ["nothing changed inside this window itself; what changed is in the facts above (the window in "
                      "front, the focus, a new window)"]
+        undecided = False
+        if details.get("point_on_nothing") and final is True and not (any(e is True for e in effects)
+                                                                     or details.get("new_windows")):
+            # percFix: a raw click on a point with no control under it (in the read just before it, the pointer
+            # already there) is never verified by what changed in the window: live 5 Oct a click on an empty margin
+            # was "verified" by things that change on their own. Unverified, with the account below
+            final, verified, undecided = None, None, True
+            why = ("nothing you can click was at that point, so what changed in the window may be its own movement, "
+                   "not the click")
         record = {"verified": verified, "why": why, "lines": lines[:8], **(diag or {})}
+        if undecided:
+            record["undecided"] = True
         if change is not None:
             record["counts"] = dict(change.counts)
         details["screen_change"] = record
@@ -2749,6 +2760,8 @@ class Dispatcher:
             # the account goes to the model with the result; the one-line summary (run trace, cards) stays as it was,
             # so what was on screen is not copied into practice memory's traces
             said = "What changed: " + "; ".join(lines[:OUTCOME_LINES]) + "."
+            if undecided:
+                said += f" Not taken as the click's effect: {why}."
             if outcome.content and outcome.content[0].get("type") == "text":
                 outcome.content[0]["text"] = f"{outcome.content[0]['text']}\n{said}"
             else:

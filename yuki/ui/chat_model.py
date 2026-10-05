@@ -331,9 +331,13 @@ class ChatModel:
                     if step.running:
                         step.ended, step.ok = at, None
                 self._changed(old)
+            # a request set aside on its question carries on under a new id (``resumed``, sent just before this
+            # answer): that id goes on below the answer too, or its end would never reach the new bubble
+            jobs = [job] + ([j for j in old.jobs if j != job and self._job_item.get(j) == old.id] if old else [])
             item = self._add(Item(self._new_id("a"), "assistant", at, source=old.source if old else "text",
-                                  status="running", jobs=[job]))
-            self._job_item[job] = item.id
+                                  status="running", jobs=jobs))
+            for j in jobs:
+                self._job_item[j] = item.id
 
     def _on_started(self, ev: dict[str, Any], at: float) -> None:
         job = ev.get("job")
