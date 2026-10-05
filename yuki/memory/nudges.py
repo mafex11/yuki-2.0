@@ -2287,7 +2287,7 @@ class NudgeWorker:
             gate = view.gate
             if gate is None and self._meeting_held(now, view, config):
                 gate = "meeting"
-            if gate == "fullscreen" and view.at_pc_since is not None \
+            if gate in ("fullscreen", "game") and view.at_pc_since is not None \
                     and now - view.at_pc_since >= config.break_consider_min * 60.0:
                 self._calm_pending = True   # a long stretch in a game: look at the first calm moment after it
         self._note_gate(gate)

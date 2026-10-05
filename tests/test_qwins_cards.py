@@ -183,6 +183,22 @@ def test_a_live_game_voice_session_holds_the_cards(store):
     assert observe(store, NOW, CFG).gate == "game"
 
 
+def test_a_long_game_with_voice_sets_up_the_break_look_after_it(store):
+    # review F8: a windowed game with recorded voice gates as "game"; like a full-screen one, a long stretch in it
+    # arms the look at the first calm moment after it (the coach prompt's TRIGGER calm)
+    from yuki.memory.nudges import NudgeWorker
+
+    present(store, NOW - 2 * 3600, NOW, "VALORANT")
+    row = store.start_call(app="VALORANT", process="valorant", via="game", at=NOW - 7000, status="recording",
+                           kind="game")
+    store.update_call(row, last_alive_at=NOW - 30)
+    w = NudgeWorker(store, config=CFG, client=None, log_dir=Path(tempfile.gettempdir()) / "yuki-qwins-tests",
+                    locked_fn=lambda: False, media_fn=lambda: [], event_name="Local\\YukiNudgeReadyQwinsTest",
+                    render_fn=lambda: [], clock=lambda: NOW)
+    assert observe(store, NOW, CFG).gate == "game" and not w._calm_pending
+    assert w.tick(NOW) == [] and w._calm_pending
+
+
 def test_a_stuck_game_row_holds_nothing(store):
     present(store, NOW - 1800, NOW, "Discord")
     row = store.start_call(app="VALORANT", process="valorant", via="game", at=NOW - 7200, status="recording",
