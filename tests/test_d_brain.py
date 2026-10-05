@@ -816,28 +816,50 @@ def test_pattern_choice_follows_the_reads_own_pattern_list() -> None:
     assert usable({"patterns": (), "is_scrollable": True}, "scroll") == "scroll"
 
 
+class _Sig:
+    """A stub input monitor (``yuki.actions.userinput``): the user's real input times by kind, listening since 0."""
+
+    running = True
+
+    def __init__(self, started_at: float = -60.0, **times: float) -> None:
+        self.started_at = started_at
+        self.times = dict(times)
+
+    def last(self, kind: str) -> float:
+        value = self.times.get(kind, 0.0)
+        return float(value() if callable(value) else value)
+
+    def latest(self, kinds=("keys", "click", "wheel", "mouse")):
+        best = max(((self.last(k), k) for k in kinds), default=(0.0, None))
+        return best if best[0] else (0.0, None)
+
+
+#: Where the pretend clock of the gate tests starts (monotonic seconds; 0.0 means "never" to the input monitor).
+T0 = 10.0
+
+
 def _clocked_gate(**kw: Any) -> tuple[Any, dict[str, float]]:
     """An input gate on a pretend clock, with pretend key and cursor reads (V8: never the real keyboard in a test)."""
     from yuki.actions.leases import InputGate
 
-    clock = {"t": 0.0}
+    clock = {"t": T0}
     kw.setdefault("held", lambda: False)
     kw.setdefault("cursor", lambda: (500, 500))
+    kw.setdefault("signal", None)
     gate = InputGate(sleep=lambda s: clock.__setitem__("t", clock["t"] + s), now=lambda: clock["t"], **kw)
     return gate, clock
 
 
+def _typing_until(gate: Any, clock: dict[str, float], until: float) -> None:
+    """They type until ``until`` s into the wait (the input monitor sees a key on every look), then stop."""
+    sig = _Sig(keys=lambda: min(clock["t"], T0 + until))
+    gate.age, gate.signal = (lambda: max(0.0, clock["t"] - (T0 + until))), sig
+
+
 def test_input_waits_while_they_type_and_says_nothing_under_three_seconds() -> None:
-    # V8: they type for ~1 s (a new input on every look, the cursor still), then stop: Yuki waits, silently
-    state = {"last": 0.0}
+    # V8: they type for ~1 s (a key on every look), then stop: Yuki waits, silently
     gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.1)
-
-    def age() -> float:
-        if clock["t"] < 1.0:
-            state["last"] = clock["t"]   # still typing
-        return clock["t"] - state["last"]
-
-    gate.age = age
+    _typing_until(gate, clock, 1.0)
     said: list[str] = []
     result = gate.wait(notify=said.append)
     assert result["waited"] and result["ok"] and result["real"] and said == []
@@ -845,15 +867,8 @@ def test_input_waits_while_they_type_and_says_nothing_under_three_seconds() -> N
 
 
 def test_input_wait_says_one_line_only_past_three_seconds() -> None:
-    state = {"last": 0.0}
     gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.1)
-
-    def age() -> float:
-        if clock["t"] < 4.0:
-            state["last"] = clock["t"]   # typing on for 4 s
-        return clock["t"] - state["last"]
-
-    gate.age = age
+    _typing_until(gate, clock, 4.0)   # typing on for 4 s
     said: list[str] = []
     result = gate.wait(notify=said.append)
     assert result["ok"] and len(said) == 1 and "wait a moment" in said[0]
@@ -869,22 +884,27 @@ def test_mouse_moves_alone_never_hold_yuki_back() -> None:
     assert result["ok"] and result["real"] is False and result["ms"] <= 300 and said == []
 
 
-def test_a_keystroke_just_before_the_wait_counts_while_the_cursor_stays_still() -> None:
-    # Review F3: the user typed or clicked 0.3 s before Yuki's action and nothing since, the cursor still. That input
-    # made the gate look; its kind is not known, so it counts: Yuki waits until 0.8 s after it (main's quiet), never
-    # going ahead 0.25 s into a typing pause.
-    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05)
-    gate.age = lambda: 0.3 + clock["t"]   # the last input stays where it was
+def test_a_keystroke_just_before_the_wait_counts() -> None:
+    # Review F3: the user typed 0.3 s before Yuki's action and nothing since. The input monitor saw the key: Yuki waits
+    # until 0.8 s after it (main's quiet), never going ahead 0.25 s into a typing pause.
+    gate, clock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05, signal=_Sig(keys=T0 - 0.3))
+    gate.age = lambda: 0.3 + clock["t"] - T0   # the last input stays where it was
     said: list[str] = []
     result = gate.wait(notify=said.append)
-    assert result["ok"] and result["real"] is True and said == []
+    assert result["ok"] and result["real"] is True and result["kind"] == "keys" and said == []
     assert 450 <= result["ms"] <= 600            # 0.8 s after the keystroke, not 0.25 s into the wait
-    # the same with the cursor moving during the look: that input was the mouse, Yuki goes ahead
-    moving, mclock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05,
-                                   cursor=lambda: (int(mclock["t"] * 1000), 300))
-    moving.age = lambda: 0.3 + mclock["t"]
-    result = moving.wait()
-    assert result["ok"] and result["real"] is False and result["ms"] <= 300
+    # hotInput: the same recent input with no key, button or wheel measured (a twitching mouse sensor moves the input
+    # clock 20-30 times a second, mostly without moving the cursor): no wait at all
+    jitter, jclock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05, signal=_Sig())
+    jitter.age = lambda: 0.03
+    result = jitter.wait()
+    assert result == {"waited": False, "ok": True, "ms": 0, "real": False}
+    # with no input monitor listening, a key's kind cannot be known from the input clock: the keys and buttons are
+    # watched for a moment (probe_s), and with none pressed Yuki goes ahead
+    blind, bclock = _clocked_gate(recent_s=1.0, quiet_s=0.8, max_s=12.0, poll_s=0.05)
+    blind.age = lambda: 0.3 + bclock["t"] - T0
+    result = blind.wait()
+    assert result["ok"] and result["real"] is False and 250 <= result["ms"] <= 300
 
 
 def test_real_input_counts_a_press_since_the_last_look_but_not_one_before_the_first() -> None:

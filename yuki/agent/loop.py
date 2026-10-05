@@ -177,7 +177,8 @@ PAUSED_SKIP = ("Not run: the user took over the keyboard or mouse before this ra
 #: moving away, and the screen is read again first.
 RESUME_GRACE_S = 1.5
 #: How the user took over, in plain words (the model's note and the log).
-TAKEOVER_WORDS = {"keys": "typed on the keyboard", "click": "clicked", "mouse": "moved the mouse"}
+TAKEOVER_WORDS = {"keys": "typed on the keyboard", "click": "clicked", "mouse": "moved the mouse",
+                  "wheel": "turned the mouse wheel"}
 
 
 def written_tool_call(text: str, tools: Iterable[str]) -> str | None:
@@ -655,6 +656,8 @@ class Agent:
         self._pause_quiet_until = 0.0
         self._resume_asked = False
         self._watch: Any = None
+        #: hotInput: whether this request holds the process's input monitor (:mod:`yuki.actions.userinput`).
+        self._input_held = False
         self._pending_answer: str | None = None
         self._awaiting_answer = False
         self._prewarm_thread: threading.Thread | None = None
@@ -1455,6 +1458,9 @@ class Agent:
         reply = ""
         drive: Iterator[AgentEvent] | None = None
         try:
+            # hotInput: the user's input monitor, held inside the try whose finally gives it back (taken before it,
+            # a raise in between - the judge's begin_request, a model name - kept it running until the next request)
+            self._input_on()
             query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
             self._note_request_words(request, query, user_words)   # whose words each is, for the judge
             fresh = pack is not None and pack.age_s <= float(getattr(self.settings, "pack_max_age_s", 20.0))
@@ -1516,6 +1522,7 @@ class Agent:
             if drive is not None:
                 drive.close()
             self._acting_done()
+            self._input_off()
             self.logger.usage_total()
             self._summarize(
                 request, outcome=outcome, started_at=started_at, model=model, effort=effort
@@ -4077,6 +4084,43 @@ class Agent:
                     probe_s=float(getattr(self.settings, "input_yield_probe_s", 0.25)),
                     notify_after_s=float(getattr(self.settings, "input_yield_notify_s", 3.0)))
         except Exception:  # noqa: BLE001 - the hands work without it
+            pass
+
+    def _input_on(self) -> None:
+        """hotInput: on the real desktop, the process's input monitor listens while this request runs (from its start,
+        so by the first action it knows whether the user was just typing): the input gate and the takeover watch read
+        the user's real keys, buttons, wheel and big mouse moves from it, never ``GetLastInputInfo`` alone (a twitching
+        mouse sensor keeps that under 0.3 s: report 73, release 6). Stub desks get none. Never raises."""
+        if self._input_held:
+            return
+        try:
+            from yuki.agent.tools import _LazyRealBackend
+
+            if not isinstance(getattr(self.dispatcher, "backend", None), _LazyRealBackend):
+                return
+            from yuki.actions import userinput
+
+            self._input_held = True
+            if not userinput.acquire():
+                self.logger.log("user_input", state="unavailable", error=userinput.shared().error or None)
+        except Exception as exc:  # noqa: BLE001 - the gate and the watch fall back to polled keys
+            self.logger.log("user_input", state="failed", error=f"{type(exc).__name__}: {exc}")
+
+    def _input_off(self) -> None:
+        """The request ended: give the input monitor back (the last holder stops it), logging its counts. Never
+        raises."""
+        if not self._input_held:
+            return
+        self._input_held = False
+        try:
+            from yuki.actions import userinput
+
+            monitor = userinput.shared()
+            facts = monitor.facts()
+            userinput.release()
+            self.logger.log("user_input", state="released", running=facts["running"], counts=facts["counts"],
+                            max_travel=facts["max_travel"], move_px=facts["move_px"])
+        except Exception:  # noqa: BLE001
             pass
 
     def _note_words(self, text: str | None, *, how: str, question: str | None = None) -> None:
