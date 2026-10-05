@@ -347,6 +347,13 @@ game_mic_grace_s = 3
 # joined call (judged by a small model from the window's control names; a
 # lobby, a video page or a text chat is not a call).  The card still asks
 # every time; "Never for <app>" is remembered.
+# A meeting site this file keeps unread ([web] above: meet.google.com,
+# zoom.us, Teams' meeting paths) is never read, so its screen cannot be
+# judged: a browser holding the microphone while it shows such a page counts
+# by the page's site alone (never its title, address path or content).  Which
+# blocked sites are meeting services is judged once from the shipped list,
+# never from a page you visited; a site you block yourself counts only if you
+# also list it in [meetings] always_sites.
 # Your own additions (empty by default): apps that are a call whenever they
 # hold the microphone, sound or not.  Process names of desktop apps, or
 # package family names of Store apps.
