@@ -3161,6 +3161,11 @@ class MemoryClient:
             if not out["cancelled"]:
                 out["error"] = TOO_LATE_TO_UNDO
                 return out
+            try:   # report 88: the alias the Right taught goes with it
+                self.store.end_aliases([a["id"] for a in self.store.aliases()
+                                        if a.get("correction_id") == int(correction_id)])
+            except Exception:
+                pass
         try:
             done = self.store.resolve_journal(jid, verdict)
         except Exception as exc:
@@ -3183,7 +3188,24 @@ class MemoryClient:
                 self.rerender_portrait()   # wakes the service for the pass
             except Exception:
                 pass
+            if guess.get("meant_name") and out["correction_id"]:
+                # report 88: one answer teaches - the heard form is that person's alias at once (the people index,
+                # keyterms and the talker read it from the next lookup); the pass still rewords the entry
+                from yuki.memory.misheard import KnownNames, learn_name_fixes
+
+                right = KnownNames.of(self.store).name_of(guess["meant"]) or str(guess["meant"])
+                learned = learn_name_fixes(self.store, [{"heard": guess["heard"], "name": right, "how": "confirmed",
+                                                         "at": time.time()}],
+                                           source="the misheard list", correction_id=out["correction_id"])
+                out["alias"] = bool(learned)
         return out
+
+    def name_forms(self, name: str = "Yuki") -> list[str]:
+        """The heard forms memory learned for ``name`` (default Yuki's own: how speech recognition wrote it), newest
+        first (``name_aliases``; :func:`yuki.memory.misheard.name_forms`). For the voice's fast path. Never raises."""
+        from yuki.memory.misheard import name_forms
+
+        return name_forms(self.store, name)
 
     def portrait_facts_with_evidence(self, evidence_per_fact: int = 6) -> list[dict]:
         """The current portrait facts, each with the journal entries it rests on (newest first).

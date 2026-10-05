@@ -8714,6 +8714,16 @@ class Store:
 
         return self._write(op)
 
+    def end_aliases(self, alias_ids: Sequence[int], *, at: float | None = None) -> int:
+        """End live aliases by id (an Undo of the answer that taught them); returns how many ended."""
+        ids = [int(i) for i in alias_ids if i is not None]
+        if not ids:
+            return 0
+        now = float(at) if at is not None else time.time()
+        marks = ",".join("?" * len(ids))
+        return self._write(lambda conn: conn.execute(
+            f"UPDATE name_aliases SET ended_at=? WHERE ended_at IS NULL AND id IN ({marks})", (now, *ids)).rowcount)
+
     def aliases(self, *, include_ended: bool = False) -> list[dict[str, Any]]:
         """Name aliases, oldest first: ``{id, heard, name, why, correction_id, at, ended_at}``."""
         sql = "SELECT * FROM name_aliases" + ("" if include_ended else " WHERE ended_at IS NULL") + " ORDER BY id"

@@ -1645,6 +1645,8 @@ class ConversationWorker:
             knowhow_ids = self._save_knowhow(knowhow)
             if not items_only and not knowhow:
                 knowhow_ids += self._knowhow_pass(session_id, [t for t in turns if t.id not in elsewhere])
+            if not items_only:   # report 88: a name the user corrected once is learned now
+                self._names_pass(session_id, turns, context, elsewhere)
             results = iter(written)
             for rec in records:
                 if rec.status != "applied":
@@ -1751,6 +1753,38 @@ class ConversationWorker:
                 self._log("conversation_error", purpose="knowhow", session_id=session_id,
                           error=f"{type(exc).__name__}: {exc}", cost_usd=call.cost_usd)
         return saved
+
+    def _names_pass(self, session_id: str, turns: Sequence[ConversationTurn], context: Sequence[ConversationTurn],
+                    elsewhere: set[int]) -> list[dict[str, Any]]:
+        """Report 88 (learn from one correction): when the batch has words heard through speech recognition, one small
+        call (:data:`yuki.memory.misheard.NAMES_TOOL`) says which misheard names the exchanges settled (the user
+        corrected or confirmed one; Yuki's own name heard as a sound-alike); each becomes a name alias at once and the
+        correction pass rewords memory text that carries the heard form (:func:`yuki.memory.misheard.learn_name_fixes`).
+        Logged, never raises; returns what was learned."""
+        from yuki.memory import misheard as _m
+
+        if not any(t.id not in elsewhere and _m.heard_by_speech(t) for t in turns):
+            return []
+        call = ConversationCall(at=time.time(), purpose="names", model=self.model, session_id=session_id,
+                                turn_count=len(turns))
+        try:
+            known = _m.KnownNames.of(self.store, self.user_names())
+            tool_input, response, _request = self._call("names", _m.names_system(),
+                                                        _m.names_message(context, turns, known), _m.NAMES_TOOL, call)
+            fixes, rejected = _m.name_fixes_from(tool_input.get("name_fixes"), turns, context, known=known,
+                                                 elsewhere=elsewhere)
+            learned = _m.learn_name_fixes(self.store, fixes, source="a conversation with Yuki") if fixes else []
+            if any(x.get("correction_id") for x in learned):
+                request_render(self.store.path)   # wakes the service for the correction pass
+            self._log("conversation_names", session_id=session_id, turn_ids=[t.id for t in turns], model=self.model,
+                      cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1), found=len(fixes),
+                      learned=len(learned), hows=[x["how"] for x in learned], rejected=rejected,
+                      response_ciphertext=self._seal(response.content))
+            return learned
+        except Exception as exc:
+            self._log("conversation_error", purpose="names", session_id=session_id,
+                      error=f"{type(exc).__name__}: {exc}", cost_usd=call.cost_usd)
+            return []
 
     def _save_knowhow(self, items: Sequence[dict[str, Any]]) -> list[int]:
         """Store validated know-how (origin ``conversation``); a restatement supersedes the entry it restates."""

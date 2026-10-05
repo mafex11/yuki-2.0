@@ -38,7 +38,8 @@ Usage::
 Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_directory``, ``prefer_route``)::
 
     Linker(worker).run(kind="refresh" | "rebuild", dry_run=False, now=None) -> LinkResult
-    people(store) -> list[Contact]                      # live contacts with their routes (cached by a stamp)
+    people(store, learned=True) -> list[Contact]        # live contacts with their routes (cached by a stamp); with
+                                                        # the heard forms learned since the last rebuild (aliases)
     resolve(store, ref, near_thread=None) -> list[Contact]
     rank_routes(store, contact, now=None, near_thread=None) -> Ranking
     card(store, contact, now=None, near_thread=None, samples=STYLE_SAMPLES) -> dict
@@ -338,7 +339,7 @@ def gather(store: Store, *, now: float | None = None, settings_names: Sequence[s
         aliases = []
     return Candidates(threads=threads, facts=facts, aliases=aliases, calls=call_people_seen(store),
                       user_names=_user_names(store, settings_names),
-                      existing=people(store) if with_existing else [])
+                      existing=people(store, learned=False) if with_existing else [])
 
 
 def call_people_seen(store: Store, limit: int = MAX_CALL_PEOPLE) -> dict[str, dict[str, Any]]:
@@ -1076,7 +1077,9 @@ def _stamp(store: Store) -> tuple[Any, ...]:
         " (SELECT max(coalesce(ended_at, updated_at)) FROM contacts),"
         " (SELECT max(coalesce(ended_at, updated_at)) FROM contact_routes),"
         " (SELECT count(*) FROM contact_routes WHERE ended_at IS NULL),"
-        " (SELECT max(coalesce(ended_at, created_at)) FROM contact_prefs)")
+        " (SELECT max(coalesce(ended_at, created_at)) FROM contact_prefs),"
+        " (SELECT max(coalesce(ended_at, created_at)) FROM name_aliases),"
+        " (SELECT count(*) FROM name_aliases WHERE ended_at IS NULL)")
     return tuple(rows[0]) if rows else ()
 
 
@@ -1110,8 +1113,27 @@ def all_routes(store: Store) -> list[Route]:
     return out
 
 
-def people(store: Store) -> list[Contact]:
-    """The live contacts with their routes (decrypted), cached until the tables change. Never raises (``[]``)."""
+def people(store: Store, *, learned: bool = True) -> list[Contact]:
+    """The live contacts with their routes (decrypted), cached until the tables change. Never raises (``[]``).
+
+    ``learned`` (report 88): each person also carries the heard forms memory learned for their name since the index
+    was last built (:func:`with_learned`: ``name_aliases``, written the moment the user corrected or confirmed a
+    mishearing), so the resolver, the frame and the talker's directory know them at once. The rebuild reads the
+    index without them (``False``): the aliases are its input, never something it should copy back."""
+    if learned:
+        key = _db_key(store) + "|learned"
+        try:
+            stamp = _stamp(store)
+        except Exception:
+            return []
+        with _CACHE_LOCK:
+            hit = _CACHE.get(key)
+            if hit is not None and hit[0] == stamp:
+                return [_copy(c) for c in hit[1]]
+        found = with_learned(store, people(store, learned=False))
+        with _CACHE_LOCK:
+            _CACHE[key] = (stamp, found)
+        return [_copy(c) for c in found]
     key = _db_key(store)
     try:
         stamp = _stamp(store)
@@ -1149,6 +1171,43 @@ def _copy(c: Contact) -> Contact:
                    tone=c.tone, fact_ids=list(c.fact_ids),
                    routes=[Route(**{k: (list(v) if isinstance(v, list) else v) for k, v in r.__dict__.items()})
                            for r in c.routes])
+
+
+def with_learned(store: Store, found: list[Contact]) -> list[Contact]:
+    """``found`` with each live name alias (``store.aliases()``: a heard form and the right name) added to the one
+    person whose name or own alias is that name, as a heard form (``{"name": heard, "how": "heard", "learned": id}``),
+    newest first before the heard forms the index already had. Scoped and checked on data, never words: an alias
+    whose name fits nobody or several people is left out, and so is one whose heard form is someone's own name or
+    alias (it would send that person's name to another). Never raises (``found`` as it was)."""
+    try:
+        aliases = store.aliases()
+    except Exception:
+        return found
+    if not aliases or not found:
+        return found
+    owners: dict[str, set[int]] = {}
+    for c in found:
+        for n in [c.name] + [a["name"] for a in c.aliases if a.get("how") != "heard"]:
+            k = " ".join(tokens(n))
+            if k:
+                owners.setdefault(k, set()).add(c.id)
+    by_id = {c.id: c for c in found}
+    new: dict[int, list[dict[str, Any]]] = {}
+    for a in reversed(aliases):   # newest first
+        target = owners.get(" ".join(tokens(a.get("name"))), set())
+        heard_key = " ".join(tokens(a.get("heard")))
+        if len(target) != 1 or not heard_key or heard_key in owners:
+            continue
+        c = by_id[next(iter(target))]
+        if any(" ".join(tokens(x["name"])) == heard_key for x in [*c.aliases, *new.get(c.id, [])]):
+            continue
+        new.setdefault(c.id, []).append({"name": " ".join(str(a["heard"]).split()), "how": "heard",
+                                         "learned": a.get("id")})
+    for cid, extra in new.items():
+        c = by_id[cid]
+        own = [a for a in c.aliases if a.get("how") != "heard"]
+        c.aliases = own + extra + [a for a in c.aliases if a.get("how") == "heard"]
+    return found
 
 
 def places(store: Store) -> list[Route]:
