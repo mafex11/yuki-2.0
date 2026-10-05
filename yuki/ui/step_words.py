@@ -672,7 +672,47 @@ def failed_row(name: str, tool_input: dict[str, Any] | None) -> str:
     return f"Didn’t finish {running[:1].lower() + running[1:]}"
 
 
-def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+#: honest (87): the card's header for a run that ended done, by its outcome verdict's level (``yuki.agent.finish``).
+LEVEL_HEADS: dict[str, tuple[str, str]] = {"unverified": ("dash", "Not confirmed"), "failed": ("x", "Didn’t work")}
+
+
+def _sentence_case(text: str) -> str:
+    text = " ".join(str(text or "").split())
+    return text[:1].upper() + text[1:] if text else ""
+
+
+def level_row(verdict: dict[str, Any] | None) -> dict[str, str] | None:
+    """honest (87): the done card's first row, the run's outcome level and what its check saw ("Checked on screen: the
+    message shows in the chat"; "Not confirmed: the message did not show up in the chat"; "Didn’t work: closing
+    Slack"), or ``None`` (no verdict, or an answer with nothing done)."""
+    if not isinstance(verdict, dict) or not verdict.get("acted") or not verdict.get("label"):
+        return None
+    level = str(verdict.get("level") or "")
+    label = str(verdict["label"])
+    if level == "failed":
+        step = " ".join(str(verdict.get("step") or "").split())
+        what = step[:1].lower() + step[1:] if step else str(verdict.get("seen") or "")
+        return {"text": f"{label}: {what}" if what else label, "icon": "dash"}
+    seen = " ".join(str(verdict.get("seen") or "").split())
+    return {"text": f"{label}: {seen}" if seen else label, "icon": "check" if level in ("verified", "likely")
+            else "dash"}
+
+
+def graded_reply(text: str, verdict: dict[str, Any] | None) -> str:
+    """honest (87): a reply shown as written beside its run's outcome level when that is below likely (the reply is
+    the thinker's claim; the level is what was checked): ``"<reply>\\n\\nNot confirmed: <what the check saw>."``."""
+    if not isinstance(verdict, dict) or verdict.get("level") not in ("unverified", "failed"):
+        return text
+    row = level_row(verdict)
+    if row is None:
+        seen = " ".join(str(verdict.get("seen") or "").split())
+        row = {"text": f"Not checked: {seen}" if seen else "Not checked"}
+    line = _sentence_case(row["text"]).rstrip(".") + "."
+    return f"{text}\n\n{line}" if (text or "").strip() else line
+
+
+def return_view(outcome: str, text: str, steps: list[dict[str, Any]],
+                verdict: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the return card says about a run that acted, from how it ended and its steps.
 
     Args:
@@ -689,6 +729,13 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
         word. No row carries an undo of any kind (the user, 3 Oct 19:10: "dont show the undo options in this card").
     """
     icon, head = OUTCOME_HEADS.get(outcome, OUTCOME_HEADS["done"])
+    level = str((verdict or {}).get("level") or "") if isinstance(verdict, dict) else ""
+    if outcome == "done" and level in LEVEL_HEADS:
+        # honest (87): a run that ended with words its checks do not back is headed by the checked level
+        icon, head = LEVEL_HEADS[level]
+        if level == "failed" and (verdict or {}).get("partial"):
+            head = "Partly done"
+    unconfirmed_send = isinstance(verdict, dict) and verdict.get("send") == "unconfirmed"
     rows: list[dict[str, str]] = []
     sent_ok = sent_missed = False
     for st in steps:
@@ -699,6 +746,8 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
             sent_missed = sent_missed or ok is not True
         if not is_effect(name, args):
             continue
+        if about.get("sends") and unconfirmed_send:
+            continue   # pressed, never seen in the chat: the level row says so, never a check mark
         if ok is True:
             row = {"text": describe_step(name, args, done=True), "icon": "check"}
         elif about.get("sends"):
@@ -721,6 +770,11 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]]) -> dict[st
     else:
         title = achievement(steps) or FINISHED_TITLE
         rows = [r for r in rows if r["text"] != title]
+        graded = level_row(verdict)
+        if graded is not None:
+            rows.insert(0, graded)   # honest (87): what was achieved, with its level, first
+            # a level below likely is news the strip's final word does not carry: the card comes for it
+            worth = worth or level in LEVEL_HEADS
     return {"icon": icon, "head": head, "title": title, "rows": rows[:RETURN_ROWS],
             "more": max(0, len(rows) - RETURN_ROWS), "worth": worth}
 

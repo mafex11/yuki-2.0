@@ -44,7 +44,8 @@
   function stepRow(s) {
     const bad = s.ok === false;
     return h('div', { class: 'st' + (bad ? ' bad' : '') + (s.running ? ' run' : '') + (s.depth ? ' d1' : '') },
-      s.running ? h('span', { class: 'spin' }, ic('retry')) : bad ? ic('x') : ic('check'),
+      // honest (87): a finished line with a result its checks did not confirm (ok null: "Not confirmed: …") gets a dash
+      s.running ? h('span', { class: 'spin' }, ic('retry')) : bad ? ic('x') : s.ok === null && s.result ? ic('dash') : ic('check'),
       h('span', null, s.label || '', s.result ? h('small', { text: s.result }) : null),
       // a time only for a step of a second or more, never milliseconds (the 3 Oct item 14)
       s.running && s.started ? h('span', { class: 'ms', data: { since: s.started }, text: fmt.secs(Date.now() / 1000 - s.started) })
