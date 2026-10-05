@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
 
-from yuki.memory.store import PortraitRunStats
+from yuki.memory.store import NAME_FORM_WHY, PortraitRunStats
 
 #: The provenance keys a misheard entry carries (inside the journal row's encrypted ``source``).
 SOURCE_KEYS: tuple[str, ...] = ("heard", "meant", "meant_why", "meant_name")
@@ -239,6 +239,33 @@ def heard_by_speech(turn: Any) -> bool:
     return VOICE_HEARD_MARK.split(".")[0] in note
 
 
+#: How far back a typed batch looks for spoken exchanges it may be correcting (report 76: the same mishearing was
+#: sorted out 6 hours before it came back).
+SPOKEN_LOOKBACK_H = 12.0
+#: Most spoken exchanges from other conversations given to a typed batch as context.
+SPOKEN_CONTEXT = 4
+
+
+def spoken_before(store: Any, turns: Sequence[Any], session_id: Any = None) -> list[Any]:
+    """For a batch with no spoken words (a typed message may correct a name heard in an earlier voice conversation):
+    the last :data:`SPOKEN_CONTEXT` exchanges said to Yuki through speech recognition in the
+    :data:`SPOKEN_LOOKBACK_H` hours before it, from other conversations, oldest first. ``[]`` when there are none (then
+    no names call is made). Never raises."""
+    from yuki.memory.conversations import OTHERS
+
+    if not turns:
+        return []
+    until = min(float(getattr(t, "at", 0.0) or 0.0) for t in turns)
+    try:
+        rows = store.turns_between(until - SPOKEN_LOOKBACK_H * 3600.0, until)
+    except Exception:
+        return []
+    mine = {getattr(t, "id", None) for t in turns}
+    keep = [t for t in rows if t.id not in mine and t.session_id != session_id
+            and getattr(t, "addressed", None) != OTHERS and heard_by_speech(t)]
+    return keep[-SPOKEN_CONTEXT:]
+
+
 def names_message(context: Sequence[Any], turns: Sequence[Any], known: KnownNames) -> str:
     """The exchanges for the names call, in the conversation worker's own exchange format, fenced as data."""
     from yuki.memory.conversations import ConversationWorker
@@ -314,6 +341,22 @@ class KnownNames:
         return self.canonical.get(_key(words))
 
 
+def check_name_pair(heard: Any, name: Any, known: KnownNames) -> tuple[str | None, str | None]:
+    """``(right name as memory spells it, None)`` when ``heard`` -> ``name`` may be learned as an alias, else
+    ``(None, why not)``. The one check every path that writes a learned alias runs (the live and backfill names pass,
+    the misheard list's Right, the correction pass): a few different words each; the name is one memory knows; the
+    heard words are not themselves a name memory knows (that would send one person's name to another)."""
+    hk, nk = _key(heard), _key(name)
+    if not hk or not nk or hk == nk or max(len(hk.split()), len(nk.split())) > NAME_FIX_MAX_WORDS:
+        return None, "the heard words and the name must be a few different words"
+    right = known.name_of(name)
+    if right is None:
+        return None, "not a name memory knows"
+    if known.name_of(heard) is not None:
+        return None, "the heard words are a name memory knows"
+    return right, None
+
+
 def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (), *, known: KnownNames,
                     elsewhere: Sequence[int] = ()) -> tuple[list[dict[str, Any]], list[str]]:
     """``(fixes, rejected)``: the model's ``name_fixes`` checked against the exchanges and memory's names (plumbing).
@@ -369,12 +412,9 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
                 for t in history):
             rejected.append(f"[{n}]: the name is not in the exchanges")
             continue
-        right = known.name_of(name)
+        right, why_not = check_name_pair(heard, name, known)
         if right is None:
-            rejected.append(f"[{n}]: not a name memory knows")
-            continue
-        if known.name_of(heard) is not None:
-            rejected.append(f"[{n}]: the heard words are a name memory knows")
+            rejected.append(f"[{n}]: {why_not}")
             continue
         if (hk, _key(right)) in seen or len(out) >= MAX_NAME_FIXES:
             continue
@@ -390,51 +430,155 @@ def fix_words(fix: dict[str, Any]) -> str:
     return right_words({"heard": fix["heard"], "meant": fix["name"], "meant_name": True})
 
 
+#: Where an alias the exchanges settled (the model's reading of them, live or in the backfill) says so in its ``why``.
+#: The user's own answers (the misheard list's Right, the correction pass) never carry it: :func:`learn_name_fixes`
+#: never lets a reading replace one of those.
+JUDGED_WHY = "the exchanges settled it"
+
+
+def judged(alias: dict[str, Any]) -> bool:
+    """Whether a name alias came from the model's reading of the exchanges (plumbing on :func:`learn_name_fixes`'s own
+    ``why`` format), not from the user's own answer."""
+    why = str(alias.get("why") or "")
+    return JUDGED_WHY in why or why.startswith(NAME_FORM_WHY)
+
+
 def learn_name_fixes(store: Any, fixes: Sequence[dict[str, Any]], *, source: str = "a conversation",
-                     ripple: bool = True, correction_id: int | None = None,
-                     now: float | None = None) -> list[dict[str, Any]]:
+                     ripple: bool = True, correction_id: int | None = None, by_user: bool = False,
+                     now: float | None = None, skipped: list[str] | None = None) -> list[dict[str, Any]]:
     """Write each fix as a name alias at once (``store.add_alias``; the people index, keyterms and the talker read it
     from the next lookup) and, with ``ripple``, queue the correction pass with :func:`fix_words` so memory text that
     carries the heard form is reworded where its context shows it (a fix by "called" never queues one: the user said
-    no words about it). A heard form already learned for the same name is left as it is. Returns, per fix written,
-    ``{"heard", "name", "how", "alias_id", "correction_id"}``. Never raises (a failed fix is left out)."""
+    no words about it). A heard form of Yuki's own name is written as a name form (:data:`NAME_FORM_WHY`: the wake
+    word's and the fast path's only). A heard form already learned for the same name is left as it is.
+
+    A heard form already learned for ANOTHER name (review F1): ``by_user`` (the user's own answer, now) replaces it;
+    the model's reading (``by_user`` False) never replaces one newer than the exchange it read (a delayed batch, the
+    backfill's old judgement) nor one the user's own correction taught - it is left out (``skipped`` gets one
+    content-free line). Returns, per fix written, ``{"heard", "name", "how", "alias_id", "correction_id",
+    "replaced"}`` (``replaced``: the ids of the aliases it ended, brought back by :func:`undo_learned`). Never raises
+    (a failed fix is left out)."""
     now = time.time() if now is None else float(now)
     try:
-        live = {(_key(a["heard"]), _key(a["name"])) for a in store.aliases()}
+        rows = store.aliases(name_forms=True)
     except Exception:
-        live = set()
+        rows = []
+    live: dict[str, list[dict[str, Any]]] = {}
+    for a in rows:
+        live.setdefault(_key(a["heard"]), []).append(a)
     out: list[dict[str, Any]] = []
     for fix in fixes:
-        pair = (_key(fix.get("heard")), _key(fix.get("name")))
-        if not all(pair) or pair in live:
+        hk, nk = _key(fix.get("heard")), _key(fix.get("name"))
+        if not hk or not nk or any(_key(a["name"]) == nk for a in live.get(hk, [])):
+            continue
+        at = float(fix.get("at") or now)
+        others = live.get(hk, [])
+        if others and not by_user and any(float(a.get("at") or 0.0) > at or not judged(a) for a in others):
+            if skipped is not None:
+                skipped.append("a newer alias or the user's own correction already has these heard words")
             continue
         how = str(fix.get("how") or "")
-        day = datetime.fromtimestamp(float(fix.get("at") or now)).strftime("%Y-%m-%d")
-        why = (f"speech recognition heard Yuki's name so ({source}, {day})" if how == "called" else
-               f"speech recognition heard it so; the user {how} it ({source}, {day})")
+        day = datetime.fromtimestamp(at).strftime("%Y-%m-%d")
+        if nk == _key(WAKE_NAME):
+            why = f"{NAME_FORM_WHY} ({source}, {day}; the user {how} it)"
+        elif by_user:
+            why = f"speech recognition heard it so; the user {how} it ({source}, {day})"
+        else:
+            why = f"speech recognition heard it so; {JUDGED_WHY}: the user {how} it ({source}, {day})"
         try:
             cid = correction_id
             if ripple and how != "called" and cid is None:
                 from yuki.memory import secret_filter
 
                 text = f'About "what Yuki heard", the user said in their own words: "{fix_words(fix)}"'
-                cid = store.add_correction(secret_filter.redact_text(text), at=float(fix.get("at") or now))
+                cid = store.add_correction(secret_filter.redact_text(text), at=at)
             alias_id = store.add_alias(fix["heard"], fix["name"], why=why, correction_id=cid, at=now)
         except Exception:
             continue
         if alias_id is None:
             continue
-        live.add(pair)
+        replaced = [int(a["id"]) for a in others]
+        live[hk] = [{"id": alias_id, "heard": fix["heard"], "name": fix["name"], "why": why, "at": now}]
         out.append({"heard": fix["heard"], "name": fix["name"], "how": how, "alias_id": alias_id,
-                    "correction_id": cid})
+                    "correction_id": cid, "replaced": replaced})
     return out
+
+
+def undo_learned(store: Any, learned: Sequence[dict[str, Any]], *, now: float | None = None) -> dict[str, int]:
+    """Take learned aliases back (an Undo): each ends, and the alias it replaced comes back (``replaced``, else the
+    one with the same heard words that ended the moment it was written). ``{"aliases_ended", "aliases_restored"}``.
+    Never raises."""
+    ids = [int(x["alias_id"]) for x in learned if x.get("alias_id") is not None]
+    if not ids:
+        return {"aliases_ended": 0, "aliases_restored": 0}
+    back: list[int] = []
+    try:
+        rows = {int(a["id"]): a for a in store.aliases(include_ended=True, name_forms=True)}
+    except Exception:
+        rows = {}
+    for x in learned:
+        if x.get("alias_id") is None:
+            continue
+        if x.get("replaced") is not None:
+            back += [int(i) for i in x["replaced"]]
+            continue
+        mine = rows.get(int(x["alias_id"]))
+        if mine is not None:   # an answer from before ``replaced`` was kept: the same heard words, ended as it began
+            back += [i for i, a in rows.items() if i < mine["id"] and a.get("ended_at") == mine["at"]
+                     and _key(a["heard"]) == _key(mine["heard"])]
+    try:
+        ended = store.end_aliases(ids, at=now)
+    except Exception:
+        ended = 0
+    try:
+        restored = store.reopen_aliases(back) if back else 0
+    except Exception:
+        restored = 0
+    return {"aliases_ended": int(ended or 0), "aliases_restored": int(restored or 0)}
+
+
+def stated_aliases(store: Any, aliases: Sequence[dict[str, Any]], words: Any) -> list[dict[str, Any]]:
+    """The correction pass's found aliases (``[{"heard", "name", "why"}]``) that the user's own words of one
+    correction state themselves - both the heard words and the name stand in them ("it's Tarun, not the run") - and
+    that pass :func:`check_name_pair`, the name as memory spells it. One typed correction (the Me page's Correct, a
+    chat message) teaches the alias with no rewrite needed (items not done, report 88 review). Never raises."""
+    from yuki.memory.contacts import span_in
+
+    try:
+        known = KnownNames.of(store)
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for a in aliases:
+        if not (span_in(a.get("heard"), words) and span_in(a.get("name"), words)):
+            continue
+        right, _why_not = check_name_pair(a.get("heard"), a.get("name"), known)
+        if right is not None:
+            out.append(dict(a, name=right))
+    return out
+
+
+def keep_alias(store: Any, heard: str, name: str, *, why: str | None, correction_id: int | None,
+               at: float) -> int | None:
+    """``store.add_alias`` for the correction pass: a heard form already live for the same name is left as it is (a
+    Right on the misheard list learned it at once), and a heard form of Yuki's own name is a name form
+    (:data:`NAME_FORM_WHY`). Returns the new alias id, or None."""
+    try:
+        rows = store.aliases(name_forms=True)
+    except Exception:
+        rows = []
+    if any(_key(a["heard"]) == _key(heard) and _key(a["name"]) == _key(name) for a in rows):
+        return None
+    if _key(name) == _key(WAKE_NAME):
+        why = f"{NAME_FORM_WHY} (the user's correction{': ' + why if why else ''})"
+    return store.add_alias(heard, name, why=why, correction_id=correction_id, at=at)
 
 
 def name_forms(store: Any, name: str = WAKE_NAME) -> list[str]:
     """The heard forms memory learned for ``name`` (default Yuki's own: how speech recognition writes it), newest
-    first. Data from ``name_aliases``; never raises."""
+    first. Data from ``name_aliases`` (with the name forms other readers never see); never raises."""
     try:
-        rows = store.aliases()
+        rows = store.aliases(name_forms=True)
     except Exception:
         return []
     want = _key(name)
@@ -687,11 +831,13 @@ class NamesResult:
     found: int = 0
     written: int = 0
     rejected: list[str] = field(default_factory=list)
+    #: Fixes left out because a newer alias or the user's own correction already has their heard words (review F1).
+    skipped: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
     error: str | None = None
     #: The fixes found (the plan): ``[{"heard", "name", "how", "why", "turn_id", "at"}]``.
     decisions: list[dict[str, Any]] = field(default_factory=list)
-    #: Per fix written: ``{"heard", "name", "how", "alias_id", "correction_id"}`` (what ``--undo-names`` takes back).
+    #: Per fix written: ``{"heard", "name", "how", "alias_id", "correction_id", "replaced"}`` (what ``--undo-names`` takes back).
     learned: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -742,7 +888,12 @@ class NamesPass:
                         away = [t.id for t in turns if getattr(t, "addressed", None) == OTHERS]
                         if not any(t.id not in away and getattr(t, "addressed", None) != OTHERS and heard_by_speech(t)
                                    for t in [*context, *turns]):
-                            continue   # typed words have no mishearing (the live pass reads the same batches)
+                            # typed words have no mishearing; a typed fix of an earlier voice conversation reads
+                            # that one as context (the live pass reads the same batches)
+                            spoken = spoken_before(store, turns, turns[0].session_id)
+                            if not spoken:
+                                continue
+                            context = sorted([*spoken, *context], key=lambda t: float(t.at or 0.0))
                         raw = worker._call(purpose="names", run_id=None, system=names_system(),
                                            user=names_message(context, turns, known), tool=NAMES_TOOL, effort="low",
                                            max_tokens=2_000, stats=stats, model=self.model, forced=True)
@@ -754,7 +905,8 @@ class NamesPass:
                 result.decisions = found
                 result.found = len(found)
                 if not dry_run and found:
-                    result.learned = learn_name_fixes(store, found, source="past conversations", now=now)
+                    result.learned = learn_name_fixes(store, found, source="past conversations", now=now,
+                                                      skipped=result.skipped)
                     result.written = len(result.learned)
                     if any(x.get("correction_id") for x in result.learned):
                         from yuki.memory.store import request_render
@@ -765,13 +917,14 @@ class NamesPass:
             result.cost_usd = stats.cost_usd
             worker._log("names_pass", reason=reason, dry_run=dry_run, ok=result.ok, turns=result.turns,
                         windows=result.windows, calls=result.calls, found=result.found, written=result.written,
-                        rejected=len(result.rejected), cost_usd=round(result.cost_usd, 6), error=result.error,
+                        rejected=len(result.rejected), skipped=len(result.skipped), cost_usd=round(result.cost_usd, 6), error=result.error,
                         decisions_ciphertext=worker._seal(result.decisions))
         return result
 
     def undo(self, learned: Sequence[dict[str, Any]], *, now: float | None = None) -> dict[str, Any]:
-        """Take an applied backfill back: its aliases end and its correction passes are cancelled while they wait."""
-        ended = self.store.end_aliases([x.get("alias_id") for x in learned], at=now)
+        """Take an applied backfill back: its aliases end (each alias one replaced comes back) and its correction
+        passes are cancelled while they wait."""
+        out: dict[str, Any] = dict(undo_learned(self.store, learned, now=now))
         cancelled = 0
         for x in learned:
             if x.get("correction_id"):
@@ -779,26 +932,33 @@ class NamesPass:
                     cancelled += bool(self.store.cancel_correction(int(x["correction_id"])))
                 except Exception:
                     pass
-        return {"aliases_ended": ended, "corrections_cancelled": cancelled}
+        out["corrections_cancelled"] = cancelled
+        return out
 
 
-def would_resolve(store: Any, aliases: Sequence[dict[str, Any]], *, days: float = DAYS,
-                  now: float | None = None) -> dict[str, int]:
-    """Counts only (the verification on a DB copy): of the user's words in the last ``days``, how many hold a heard
-    form of ``aliases`` (``[{"heard", "name"}]``) that the people resolver now takes to a person, and how many open
-    with a heard form of Yuki's own name (the fast path would take them as the name). Never raises."""
+def would_resolve(store: Any, probe: Sequence[dict[str, Any]], aliases: Sequence[dict[str, Any]], *,
+                  days: float = DAYS, now: float | None = None) -> dict[str, int]:
+    """Counts only (the verification on a DB copy), like for like (review F5): the same past turns - the user's
+    words of the last ``days`` that hold a heard form of ``probe`` (``[{"heard", "name"}]``, the fixes a pass found) -
+    counted against the aliases memory would read (``aliases``: today's for "before", today's plus the found ones for
+    "after"). ``person_turns``: turns holding a person's heard form; ``person_resolved``: of those, turns where the
+    people resolver takes it to that person. ``yuki_turns``: turns opening with a heard form of Yuki's own name (not
+    the name as written); ``yuki_resolved``: of those, turns the fast path takes as the name. Never raises."""
     from yuki.memory import contacts as _c
     from yuki.memory.conversations import own_words
     from yuki.voice.fastpath import name_opens, with_name
 
     now = time.time() if now is None else float(now)
-    out = {"turns": 0, "person_turns": 0, "person_resolved": 0, "yuki_turns": 0}
+    out = {"turns": 0, "person_turns": 0, "person_resolved": 0, "yuki_turns": 0, "yuki_resolved": 0}
     try:
         turns = store.turns_between(now - float(days) * 86400.0, now)
     except Exception:
         return out
-    yuki_forms = [a["heard"] for a in aliases if _key(a.get("name")) == _key(WAKE_NAME)]
-    people = [a for a in aliases if _key(a.get("name")) != _key(WAKE_NAME)]
+    wake = _key(WAKE_NAME)
+    probe_yuki = [a["heard"] for a in probe if _key(a.get("name")) == wake]
+    probe_people = [a for a in probe if _key(a.get("name")) != wake]
+    yuki_forms = [a["heard"] for a in aliases if _key(a.get("name")) == wake]
+    people = [a for a in aliases if _key(a.get("name")) != wake]
 
     class _Rows:   # the people index as it would read with these aliases learned (with_learned's own rules)
         @staticmethod
@@ -814,13 +974,15 @@ def would_resolve(store: Any, aliases: Sequence[dict[str, Any]], *, days: float 
     out["turns"] = len(turns)
     for t in turns:
         words = own_words(t.user_text)
-        hits = [a for a in people if _c.span_in(a["heard"], words)]
+        hits = [a for a in probe_people if _c.span_in(a["heard"], words)]
         if hits:
             out["person_turns"] += 1
             if any((_key(a["name"]), _key(a["heard"])) in known for a in hits):
                 out["person_resolved"] += 1
-        if yuki_forms and not name_opens(words) and name_opens(with_name(words, yuki_forms)[0]):
+        if probe_yuki and not name_opens(words) and name_opens(with_name(words, probe_yuki)[0]):
             out["yuki_turns"] += 1
+            if yuki_forms and name_opens(with_name(words, yuki_forms)[0]):
+                out["yuki_resolved"] += 1
     return out
 
 
@@ -845,6 +1007,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.apply and args.dry_run:
         parser.error("--apply writes the saved plan; leave out --dry-run")
+    if args.names and not args.undo_names and not (args.dry_run or args.apply):
+        # review F3: a names run that writes must be a reviewed plan, so its undo file is always saved
+        parser.error("--names needs --dry-run (find and save a plan) or --apply FILE (write a saved plan)")
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
@@ -898,14 +1063,18 @@ def _names_main(args: Any, store: Any, worker: Any) -> int:
     saved = str(save_plan(store, NAMES_PASS, r.decisions, args.save)) if args.dry_run and r.ok else None
     undo = (str(save_plan(store, NAMES_PASS + "-undo", r.learned, Path(args.apply).with_suffix(".undo.json")))
             if args.apply and r.learned else None)
-    before = would_resolve(store, store.aliases(), days=args.days)
-    after = would_resolve(store, [*store.aliases(), *r.decisions], days=args.days) if args.dry_run else before
+    # like for like (review F5): the turns holding the found heard forms, against today's aliases and with them added
+    current = store.aliases(name_forms=True)
+    mine = {int(x["alias_id"]) for x in r.learned}
+    today = [a for a in current if int(a["id"]) not in mine]
+    before = would_resolve(store, r.decisions, today, days=args.days)
+    after = would_resolve(store, r.decisions, [*today, *r.decisions] if args.dry_run else current, days=args.days)
     hows: dict[str, int] = {}
     for d in r.decisions:
         hows[d["how"]] = hows.get(d["how"], 0) + 1
     print(json.dumps({"ok": r.ok, "turns": r.turns, "windows": r.windows, "calls": r.calls, "found": r.found,
                       "found_by_how": hows, "yuki_forms": sum(_key(d["name"]) == _key(WAKE_NAME) for d in r.decisions),
-                      "written": r.written, "rejected": len(r.rejected), "cost_usd": round(r.cost_usd, 4),
+                      "written": r.written, "rejected": len(r.rejected), "skipped": len(r.skipped), "cost_usd": round(r.cost_usd, 4),
                       "error": r.error, "plan_saved": saved, "undo_saved": undo,
                       "resolve_before": before, "resolve_after": after,
                       "decisions": r.decisions if args.show else None,

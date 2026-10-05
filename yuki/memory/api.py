@@ -3161,9 +3161,11 @@ class MemoryClient:
             if not out["cancelled"]:
                 out["error"] = TOO_LATE_TO_UNDO
                 return out
-            try:   # report 88: the alias the Right taught goes with it
-                self.store.end_aliases([a["id"] for a in self.store.aliases()
-                                        if a.get("correction_id") == int(correction_id)])
+            try:   # report 88: the alias the Right taught goes with it, and the one it replaced comes back (F1)
+                from yuki.memory.misheard import undo_learned
+
+                undo_learned(self.store, [{"alias_id": a["id"]} for a in self.store.aliases(name_forms=True)
+                                          if a.get("correction_id") == int(correction_id)])
             except Exception:
                 pass
         try:
@@ -3191,12 +3193,15 @@ class MemoryClient:
             if guess.get("meant_name") and out["correction_id"]:
                 # report 88: one answer teaches - the heard form is that person's alias at once (the people index,
                 # keyterms and the talker read it from the next lookup); the pass still rewords the entry
-                from yuki.memory.misheard import KnownNames, learn_name_fixes
+                # (review F2: the same check as the names pass - a known name, not itself someone's name, a few
+                # words; otherwise the correction pass learns it once a rewrite carries it, as before)
+                from yuki.memory.misheard import KnownNames, check_name_pair, learn_name_fixes
 
-                right = KnownNames.of(self.store).name_of(guess["meant"]) or str(guess["meant"])
+                right, _why_not = check_name_pair(guess.get("heard"), guess.get("meant"), KnownNames.of(self.store))
                 learned = learn_name_fixes(self.store, [{"heard": guess["heard"], "name": right, "how": "confirmed",
                                                          "at": time.time()}],
-                                           source="the misheard list", correction_id=out["correction_id"])
+                                           source="the misheard list", correction_id=out["correction_id"],
+                                           by_user=True) if right else []
                 out["alias"] = bool(learned)
         return out
 
@@ -3650,7 +3655,10 @@ class MemoryClient:
             base = terms_from_facts(self.store.portrait_facts(NAME_KINDS, include_corrections=False), (), limit)
         except Exception:
             base = []
-        heard = {a["heard"].casefold() for a in self.aliases()}
+        try:   # every heard form, Yuki's own name's too ("UK"), is kept out
+            heard = {a["heard"].casefold() for a in self.store.aliases(name_forms=True)}
+        except Exception:
+            heard = set()
         resource_terms = [t for r in self.user_resources() if r["confirmed"] for t in r["keyterms"]]
         out: list[str] = []
         for name in [a["name"] for a in self.aliases()] + resource_terms + base:

@@ -167,8 +167,21 @@ def test_a_fix_is_an_alias_at_once_and_queues_the_correction_pass_with_the_users
 
 def test_a_call_by_name_teaches_the_alias_but_never_speaks_for_the_user(store):
     out = M.learn_name_fixes(store, [{"heard": "Yoki", "name": "Yuki", "how": "called", "at": NOW}], now=NOW)
-    assert out[0]["correction_id"] is None and store.aliases()[0]["name"] == "Yuki"
+    assert out[0]["correction_id"] is None and store.aliases(name_forms=True)[0]["name"] == "Yuki"
     assert store._query("SELECT count(*) FROM correction_passes")[0][0] == 0
+
+
+def test_a_form_of_yukis_name_is_for_the_wake_side_only_never_the_general_alias_readers(store):
+    """Review F4: "UK" learned for Yuki must not reach call digests, the correction prompt, questions or contacts."""
+    from yuki.memory.api import MemoryClient
+
+    M.learn_name_fixes(store, [{"heard": "UK", "name": "Yuki", "how": "called", "at": NOW},
+                               {"heard": "you key", "name": "Yuki", "how": "corrected", "at": NOW}], now=NOW)
+    store.add_alias("the run", "Tarun", at=NOW + 1)
+    assert [a["heard"] for a in store.aliases()] == ["the run"]   # what every general reader gets
+    assert M.name_forms(store) == ["you key", "UK"] and MemoryClient(store).name_forms() == ["you key", "UK"]
+    assert [a["heard"] for a in MemoryClient(store).aliases()] == ["the run"]
+    assert "UK" not in MemoryClient(store).speech_names(10)
 
 
 def test_a_heard_form_already_learned_is_left_alone(store):
@@ -176,6 +189,38 @@ def test_a_heard_form_already_learned_is_left_alone(store):
     assert M.learn_name_fixes(store, [fix], now=NOW)
     assert M.learn_name_fixes(store, [dict(fix, heard="The  Run")], now=NOW + 1) == []
     assert len(store.aliases()) == 1
+
+
+def test_an_old_reading_never_replaces_a_newer_alias_or_the_users_own_correction(store):
+    """Review F1: the backfill's 7-day-old judgement must not end the alias a typed correction made yesterday."""
+    store.add_alias("the run", "Tarun", why="the user's correction", correction_id=7, at=NOW - 86400)
+    skipped: list[str] = []
+    old = {"heard": "the run", "name": "Arun", "how": "corrected", "at": NOW - 7 * 86400}
+    assert M.learn_name_fixes(store, [old], now=NOW, skipped=skipped) == [] and len(skipped) == 1
+    # even a reading newer than it leaves the user's own correction alone
+    assert M.learn_name_fixes(store, [dict(old, at=NOW)], now=NOW, skipped=skipped) == []
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("the run", "Tarun")]
+    # and a newer alias of any kind is never replaced by an older reading
+    store.add_alias("sea ra", "Sierra", at=NOW)
+    assert M.learn_name_fixes(store, [{"heard": "sea ra", "name": "Ciara", "how": "confirmed", "at": NOW - 60}],
+                              now=NOW + 1, skipped=skipped) == []
+    assert store._query("SELECT count(*) FROM correction_passes")[0][0] == 0
+
+
+def test_a_newer_reading_replaces_an_older_reading_and_undo_brings_the_old_one_back(store):
+    [first] = M.learn_name_fixes(store, [{"heard": "the run", "name": "Tarun", "how": "corrected", "at": NOW}],
+                                 now=NOW)
+    [second] = M.learn_name_fixes(store, [{"heard": "the run", "name": "Arun", "how": "corrected", "at": NOW + 50}],
+                                  now=NOW + 60)
+    assert second["replaced"] == [first["alias_id"]]
+    assert [a["name"] for a in store.aliases()] == ["Arun"]
+    assert M.undo_learned(store, [second], now=NOW + 70) == {"aliases_ended": 1, "aliases_restored": 1}
+    assert [(a["id"], a["name"]) for a in store.aliases()] == [(first["alias_id"], "Tarun")]
+    # without ``replaced`` (an older payload) the alias that ended as it began is found the same way
+    [third] = M.learn_name_fixes(store, [{"heard": "the run", "name": "Arun", "how": "corrected", "at": NOW + 80}],
+                                 now=NOW + 90)
+    assert M.undo_learned(store, [{"alias_id": third["alias_id"]}])["aliases_restored"] == 1
+    assert [a["name"] for a in store.aliases()] == ["Tarun"]
 
 
 def test_name_forms_lists_the_learned_sound_alikes_of_yukis_name_newest_first(store):
@@ -431,6 +476,113 @@ def test_right_on_a_misheard_name_guess_writes_the_alias_at_once_and_undo_takes_
     assert undone["ok"] and C.resolve(store, "sea ra") == [] and store.aliases() == []
 
 
+def test_right_replaces_an_older_alias_of_the_heard_words_and_undo_brings_it_back(store):
+    """Review F1, the window's side: Undo of a Right must leave the heard words with the alias they had."""
+    from yuki.memory.api import MemoryClient
+
+    _contact(store, "Ciara")
+    _contact(store, "Sierra")
+    store.add_alias("sea ra", "Sierra", at=NOW)
+    client = MemoryClient(store)
+    row = _journal_misheard(store, "sea ra", "Ciara")
+    got = client.resolve_heard(f"journal:{row}", "guess_right")
+    assert got["alias"] and [a["name"] for a in store.aliases()] == ["Ciara"]
+    assert client.resolve_heard(f"journal:{row}", "undo", correction_id=got["correction_id"])["ok"]
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("sea ra", "Sierra")]
+
+
+@pytest.mark.parametrize("heard, meant", [("Arun", "Tarun"),            # someone else's name
+                                          ("sea ra", "Zorblat"),         # a name memory does not know
+                                          ("call sea ra on discord now please", "Ciara")])   # not a few words
+def test_right_on_a_guess_the_names_checks_reject_writes_no_alias_at_once(store, heard, meant):
+    """Review F2: the misheard list's Right runs the same check as the names pass."""
+    from yuki.memory.api import MemoryClient
+
+    for name in ("Tarun", "Arun", "Ciara"):
+        _contact(store, name)
+    row = _journal_misheard(store, heard, meant)
+    got = MemoryClient(store).resolve_heard(f"journal:{row}", "guess_right")
+    assert got["ok"] and got["correction_id"] and got["alias"] is False and store.aliases() == []
+
+
+def test_check_name_pair_is_the_one_check(store):
+    known = _known("Tarun", "Arun")
+    assert M.check_name_pair("the run", "tarun", known) == ("Tarun", None)
+    assert M.check_name_pair("arun", "Tarun", known)[1] == "the heard words are a name memory knows"
+    assert M.check_name_pair("the run", "Zorblat", known)[1] == "not a name memory knows"
+    assert M.check_name_pair("tarun", "Tarun", known)[0] is None
+
+
+# -- typed corrections: the live names pass and the correction pass ---------------------------------------------------
+
+
+def test_a_typed_correction_of_an_earlier_voice_conversation_is_learned_after_its_batch(store):
+    _contact(store, "Tarun")
+    store.add_turn("v", "voice-v-1", NOW - 3600, "call the run on discord", "Calling Arun.", [], "voice",
+                   addressed="yuki")
+    ids = [store.add_turn("t", "worker-1", NOW, "it's tarun, not the run", "Got it, Tarun.", [], "done")]
+    store.flush_turns()
+    purposes: list[str] = []
+    seen: list[str] = []
+    worker = _worker(store, {"name_fixes": [_fix("the run", "Tarun", "corrected", 1)]}, purposes)
+    inner = worker._call
+
+    def spy(purpose, system, user, tool, call, model=None):
+        if purpose == "names":
+            seen.append(user)
+        return inner(purpose, system, user, tool, call, model)
+
+    worker._call = spy
+    assert worker.extract("t", store.turns_by_ids(ids)).ok
+    assert "names" in purposes and "EARLIER IN THIS CONVERSATION" in seen[0] and "call the run" in seen[0]
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("the run", "Tarun")]
+
+
+def test_spoken_before_reads_only_recent_spoken_words_said_to_yuki_elsewhere(store):
+    store.add_turn("v", "voice-v-1", NOW - 13 * 3600, "too old", "", [], "voice", addressed="yuki")
+    store.add_turn("v", "voice-v-2", NOW - 600, "call the run", "", [], "voice", addressed="yuki")
+    store.add_turn("v", "voice-v-3", NOW - 500, "hey the run", "", [], "voice", addressed="others")
+    store.add_turn("w", "worker-9", NOW - 400, "typed elsewhere", "", [], "done")
+    ids = [store.add_turn("t", "worker-1", NOW, "it's tarun", "", [], "done")]
+    store.flush_turns()
+    got = M.spoken_before(store, store.turns_by_ids(ids), "t")
+    assert [t.user_text for t in got] == ["call the run"]
+
+
+def test_a_typed_correction_teaches_the_alias_it_states_even_with_nothing_to_reword(store):
+    """Items not done: the Me page's Correct and a typed correction learned the alias only once a rewrite carried it."""
+    from yuki.memory.corrections import CorrectionApplier
+
+    _contact(store, "Tarun")
+    _contact(store, "Arun")
+    applier = CorrectionApplier(SimpleNamespace(store=store))
+    cid = store.add_correction('About "Discord", the user said in their own words: "it\'s Tarun, not the run"', at=NOW)
+    correction = store.portrait_fact(cid)
+    found = [{"heard": "the run", "name": "tarun", "why": "w"}, {"heard": "Arun", "name": "Tarun", "why": "w"},
+             {"heard": "the walk", "name": "Tarun", "why": "w"}]
+    taught = applier.taught_aliases(found, [], correction)
+    assert [(a["heard"], a["name"]) for a in taught] == [("the run", "Tarun")]   # the stated one, as memory spells it
+    assert M.keep_alias(store, "the run", "Tarun", why="w", correction_id=cid, at=NOW)
+    assert M.keep_alias(store, "the run", "Tarun", why="w", correction_id=cid, at=NOW + 1) is None   # already live
+    assert len(store.aliases()) == 1
+
+
+def test_the_call_transcription_hint_leads_with_the_names_the_user_corrected(store):
+    from yuki.memory.calls import vocabulary_hint
+    from yuki.memory.transcribe import corrected_names
+
+    def tokens(text: str) -> int:   # a stub tokenizer: 1 token per 2 letters
+        return sum(max(1, len(w) // 2) for w in text.replace(",", " ").split())
+
+    store.add_alias("the run", "Tarun", at=NOW)
+    M.learn_name_fixes(store, [{"heard": "UK", "name": "Yuki", "how": "called", "at": NOW}], now=NOW)
+    assert corrected_names(store) == ["Tarun"]
+    subjects = ["Corvana", "corvana", "Varun", "varun"]
+    assert vocabulary_hint(subjects, tokens, 40).split(", ") == ["Corvana", "Varun"]
+    assert vocabulary_hint(subjects, tokens, 40, first=corrected_names(store)).split(", ") == [
+        "Tarun", "Corvana", "Varun"]
+
+
 def _journal_misheard(store: Store, heard: str, meant: str) -> int:
     """One uncertain call-side journal entry with a mishearing and Yuki's guess (the misheard list's shape)."""
     from yuki.memory.store import NewFact
@@ -481,31 +633,65 @@ def test_the_names_backfill_plans_on_a_dry_run_and_applies_exactly_that(store):
     for n, (words, reply) in enumerate([("call the run", "Calling Arun."), ("no, I said tarun", "Calling Tarun."),
                                         ("ask the run about dinner", "Asked.")], start=1):
         store.add_turn("old", f"voice-old-{n}", NOW - 3600 + n, words, reply, [], "voice", addressed="yuki")
-    store.add_turn("typed", "worker-1", NOW - 3000, "rename the invented file", "Done.", [], "done")
+    # typed with no spoken words in the hours before it: never read
+    store.add_turn("typed", "worker-1", NOW - 20 * 3600, "rename the invented file", "Done.", [], "done")
     store.flush_turns()
     stub = _PortraitStub(store, [{"name_fixes": [_fix("the run", "Tarun", "corrected", 2)]}])
     p = M.NamesPass(stub)
     dry = p.run(days=1, dry_run=True, now=NOW)
     assert dry.ok and dry.found == 1 and dry.written == 0 and store.aliases() == []
     assert len(stub.calls) == 1, "the typed-only session is never read"
-    before = M.would_resolve(store, store.aliases(), days=1, now=NOW)
-    after = M.would_resolve(store, [*store.aliases(), *dry.decisions], days=1, now=NOW)
-    assert (before["person_resolved"], after["person_turns"], after["person_resolved"]) == (0, 2, 2)
     applied = p.run(days=1, plan=dry.decisions, now=NOW)
     assert applied.written == 1 and len(stub.calls) == 1, "applying the plan makes no model call"
     assert C.resolve(store, "the run")[0].name == "Tarun"
     undone = p.undo(applied.learned)
-    assert undone == {"aliases_ended": 1, "corrections_cancelled": 1} and store.aliases() == []
+    assert undone == {"aliases_ended": 1, "aliases_restored": 0, "corrections_cancelled": 1}
+    assert store.aliases() == []
 
 
-def test_would_resolve_counts_turns_opening_with_a_learned_form_of_yukis_name(store):
-    for n, words in enumerate(["UK, open chrome.", "I lived in the UK", "Yuki, pause"], start=1):
+def test_the_backfill_never_applies_an_old_reading_over_a_newer_correction_and_undo_restores(store):
+    """Review F1, the reviewer's case: yesterday's typed correction stands against a 7-day-old reading."""
+    _contact(store, "Tarun")
+    _contact(store, "Arun")
+    store.add_turn("old", "voice-old-1", NOW - 7 * 86400, "call the run", "Calling Tarun.", [], "voice",
+                   addressed="yuki")
+    store.add_turn("old", "voice-old-2", NOW - 7 * 86400 + 5, "no, arun", "Calling Arun.", [], "voice",
+                   addressed="yuki")
+    store.flush_turns()
+    store.add_alias("the run", "Tarun", why="the user's correction", correction_id=3, at=NOW - 86400)
+    stub = _PortraitStub(store, [{"name_fixes": [_fix("the run", "Arun", "corrected", 2)]}])
+    r = M.NamesPass(stub).run(days=8, now=NOW)
+    assert r.found == 1 and r.written == 0 and len(r.skipped) == 1
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("the run", "Tarun")]
+    assert stub.logged[-1][1]["skipped"] == 1
+
+
+def test_would_resolve_counts_the_same_turns_before_and_after(store):
+    """Review F5: like for like - the turns holding the found heard forms, against today's aliases and with them."""
+    _contact(store, "Tarun")
+    for n, words in enumerate(["call the run", "ask the run about dinner", "UK, open chrome.", "I lived in the UK",
+                               "Yuki, pause", "message nor"], start=1):
         store.add_turn("y", f"voice-y-{n}", NOW - 60 + n, words, "", [], "voice", addressed="yuki")
     store.flush_turns()
-    assert M.would_resolve(store, [{"heard": "UK", "name": "Yuki"}], days=1, now=NOW)["yuki_turns"] == 1
+    store.add_alias("nor", "Noor", at=NOW - 3600)   # an alias already there: never counted, it is not found now
+    found = [{"heard": "the run", "name": "Tarun"}, {"heard": "UK", "name": "Yuki"}]
+    before = M.would_resolve(store, found, store.aliases(name_forms=True), days=1, now=NOW)
+    after = M.would_resolve(store, found, [*store.aliases(name_forms=True), *found], days=1, now=NOW)
+    assert {k: before[k] for k in ("person_turns", "person_resolved", "yuki_turns", "yuki_resolved")} == {
+        "person_turns": 2, "person_resolved": 0, "yuki_turns": 1, "yuki_resolved": 0}
+    assert {k: after[k] for k in ("person_turns", "person_resolved", "yuki_turns", "yuki_resolved")} == {
+        "person_turns": 2, "person_resolved": 2, "yuki_turns": 1, "yuki_resolved": 1}
 
 
 def test_the_cli_refuses_a_missing_database(tmp_path, capsys):
     with pytest.raises(SystemExit):
         M.main(["--names", "--dry-run", "--db", str(tmp_path / "nope.db")])
     assert not (tmp_path / "nope.db").exists()
+
+
+def test_the_names_cli_never_writes_without_a_reviewed_plan(tmp_path, capsys):
+    """Review F3: --names alone would write with no undo file; it must be --dry-run or --apply."""
+    Store.open(tmp_path / "memory.db").close()
+    with pytest.raises(SystemExit):
+        M.main(["--names", "--db", str(tmp_path / "memory.db")])
+    assert "--dry-run" in capsys.readouterr().err

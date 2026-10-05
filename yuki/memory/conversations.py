@@ -1766,7 +1766,12 @@ class ConversationWorker:
 
         if not any(t.id not in elsewhere and getattr(t, "addressed", None) != OTHERS and _m.heard_by_speech(t)
                    for t in [*context, *turns]):
-            return []   # typed words have no mishearing (a typed fix of a spoken one has the spoken one before it)
+            # typed words have no mishearing, but a typed message may correct a name heard in a voice conversation
+            # earlier: those spoken exchanges are its context; with none, no call
+            spoken = _m.spoken_before(self.store, turns, session_id)
+            if not spoken:
+                return []
+            context = sorted([*spoken, *context], key=lambda t: float(getattr(t, "at", 0.0) or 0.0))
         call = ConversationCall(at=time.time(), purpose="names", model=self.model, session_id=session_id,
                                 turn_count=len(turns))
         try:
