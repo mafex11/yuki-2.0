@@ -978,7 +978,12 @@ def _state_control(get: object) -> bool:
         return False
 
 
-def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> bool:
+#: Where the off-screen flag is not trusted (a covered window read by geometry), only a box at most this many px wide
+#: or tall is "no box" for :func:`_hidden_in_place`: a visually hidden web control clipped to 1 px, or to nothing.
+_HIDDEN_BOX_PX = 2
+
+
+def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None, *, trusted: bool = True) -> bool:
     """A state control the app hides in place behind its own drawing (report 58, root cause 1).
 
     Seen on 3-4 Oct in every Spotify read: the volume and progress sliders are
@@ -997,6 +1002,12 @@ def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> boo
     its own full size (Spotify's two "Resize main navigation" range inputs
     were left out as "hidden" that way); off-screen while its box overlaps the
     visible area is what "kept out of sight by the app" is.
+
+    ``trusted`` (review F2): whether the read trusts the off-screen flag.  A
+    window other windows cover reports everything off-screen and is read by
+    geometry alone; there the flag says nothing about one control, so only the
+    1-2 px box inside ``area`` counts (every checkbox, switch and slider of a
+    covered page would be "hidden" otherwise).
     """
     if not _state_control(get):
         return False
@@ -1009,6 +1020,9 @@ def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> boo
         return True
     if not offscreen:
         return False
+    if not trusted:
+        small = bounds[2] - bounds[0] <= _HIDDEN_BOX_PX or bounds[3] - bounds[1] <= _HIDDEN_BOX_PX
+        return small and (area is None or _contains(area, bounds))
     return area is None or _overlap(area, bounds) is not None
 
 
@@ -1879,7 +1893,8 @@ class _ViewportPass:
         for child in children[:_UNREAD_LOOKED]:
             try:
                 get = child.GetCachedPropertyValue  # type: ignore[attr-defined]
-                if _as_bool(get(_P_IS_OFFSCREEN)) and not _hidden_in_place(get, self._hidden_area()):
+                if _as_bool(get(_P_IS_OFFSCREEN)) and not _hidden_in_place(get, self._hidden_area(),
+                                                                           trusted=self.trust_offscreen):
                     continue
                 walker.note_left_out(depth, None, _role_name(get(_P_CONTROL_TYPE)), _as_text(get(_P_NAME)),
                                      unread=True)
@@ -1901,7 +1916,8 @@ class _ViewportPass:
             walker.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
-        if _hidden_in_place(get, self._hidden_area()) and not self._in_unlisted_page(element):
+        if (_hidden_in_place(get, self._hidden_area(), trusted=self.trust_offscreen)
+                and not self._in_unlisted_page(element)):
             # A slider or switch the page hides in place: kept for its state, nothing below it read.
             runtime_id = _runtime_id(get)
             if runtime_id is not None:
@@ -2803,7 +2819,7 @@ class _ViewportPass:
             area = self._area_under(parent_id)
             if area is None and self.viewport is not None:
                 continue   # its container is scrolled out of view itself
-            hidden = _hidden_in_place(get, area)
+            hidden = _hidden_in_place(get, area, trusted=self.trust_offscreen)
             offscreen = _as_bool(get(_P_IS_OFFSCREEN))
             if offscreen and not hidden:
                 continue   # scrolled away, not hidden: the read's off-screen notes cover it

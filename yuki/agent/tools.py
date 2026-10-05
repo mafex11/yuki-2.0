@@ -2528,19 +2528,24 @@ class Dispatcher:
             return
 
     def _read_again_until(self, hwnd: int, after: list[Any] | None, after_partial: bool,
-                          settled: Callable[[list[Any] | None], bool], deadline: float
-                          ) -> tuple[list[Any] | None, bool, int]:
+                          settled: Callable[[list[Any] | None], bool], deadline: float,
+                          generation: int | None = None) -> tuple[list[Any] | None, bool, int]:
         """percFix: while the read after an action does not show what it expects of its target (``settled``), wait
         for the window's next event (never past ``deadline``) and read it again: the way a person looks once more
         when something moves, never a timed poll. Without events nothing is waited for. Returns the last read, its
-        partial flag and how many extra reads were taken."""
+        partial flag and how many extra reads were taken.
+
+        ``generation``: the window's event generation taken just *before* ``after`` was read (review F3). An event
+        that lands while a read is running is newer than that, so it is not waited for again: the window is read once
+        more at once. Each re-read takes its generation before it reads, the same way."""
         hub = self._hub()
         extra = 0
         while not settled(after) and hub is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            generation = self._generation(hwnd)
+            if generation is None:
+                generation = self._generation(hwnd)
             if generation is None:
                 break
             try:
@@ -2550,6 +2555,7 @@ class Dispatcher:
                                                                                     - time.monotonic())))
             except Exception:  # noqa: BLE001
                 break
+            generation = self._generation(hwnd)
             newer, newer_partial = self._observe(hwnd)
             extra += 1
             if newer is None:
@@ -2595,7 +2601,8 @@ class Dispatcher:
                    before_hook: Callable[[list[Any] | None], ToolOutcome | None] | None = None,
                    after_hook: Callable[..., ToolOutcome] | None = None,
                    prepare: Callable[[], None] | None = None,
-                   settled: Callable[[list[Any] | None], bool] | None = None) -> ToolOutcome:
+                   settled: Callable[[list[Any] | None], bool] | None = None,
+                   point: tuple[int, int] | None = None) -> ToolOutcome:
         """Run ``act`` between two reads of ``hwnd`` and say what it changed there (report 58).
 
         The account (:mod:`yuki.perception.outcome`) goes into the result as "What changed: ..." and its verdict
@@ -2612,7 +2619,9 @@ class Dispatcher:
         pointer alone does is not taken for the click's effect); ``settled`` says whether a read after the action
         shows what the action expects of its target (a toggle in the state asked for): until it does, the first
         event is waited for longer and the window is read again on each new event, up to
-        :data:`OUTCOME_TARGET_WAIT_S` (an app that takes a second or more to show it is not "contradicted").
+        :data:`OUTCOME_TARGET_WAIT_S` (an app that takes a second or more to show it is not "contradicted");
+        ``settled(None)`` says whether the control itself already confirmed it (then no long wait). ``point``: for a
+        scroll, the point it was made at (the content under it is what must have been replaced, review F1).
         """
         if not hwnd or not self.verify_outcomes:
             return self._hooked(act, before_hook, after_hook)
@@ -2655,15 +2664,20 @@ class Dispatcher:
         after: list[Any] | None = None
         try:
             waited = time.monotonic()
+            # the long first wait only while the control has not already said it reached the state asked for
+            # (review F4: a toggle confirmed by its own pattern does not wait 3 s for a window event)
             self._settled_after(hwnd, generation,
-                                first_s=OUTCOME_TARGET_WAIT_S if settled is not None else OUTCOME_FIRST_EVENT_S)
+                                first_s=(OUTCOME_TARGET_WAIT_S if settled is not None and not settled(None)
+                                         else OUTCOME_FIRST_EVENT_S))
             settle_ms = round((time.monotonic() - waited) * 1000.0, 1)
             read_started = time.monotonic()
+            read_generation = self._generation(hwnd)
             after, after_partial = self._observe(hwnd)
             rereads = 0
             if settled is not None and after is not None:
                 after, after_partial, rereads = self._read_again_until(hwnd, after, after_partial, settled,
-                                                                       acted_at + OUTCOME_TARGET_WAIT_S)
+                                                                       acted_at + OUTCOME_TARGET_WAIT_S,
+                                                                       read_generation)
             # content-free facts for the log: what the bracket cost and whether events spared the read before
             diag = {"before_read": "fresh" if fresh else "current by events", "events": generation is not None,
                     "before_ms": prepared_ms, "settle_ms": settle_ms,
@@ -2681,7 +2695,8 @@ class Dispatcher:
 
             busy = {fact(e, "id") for e in before if tuple(fact(e, "runtime_id") or ()) in busy_rids}
             change = diff(before, after, target=target, reference=reference if fresh else None, busy=busy,
-                          before_partial=before_partial, after_partial=after_partial, scroll=name == "scroll")
+                          before_partial=before_partial, after_partial=after_partial, scroll=name == "scroll",
+                          point=point if name == "scroll" else None)
             if after_hook is not None:
                 outcome = after_hook(outcome, after, change)
             opaque = bool((self._observed.get(hwnd) or (None, 0.0, False))[2])
@@ -4172,7 +4187,7 @@ class Dispatcher:
             )
 
         # report 58: a scroll is judged by the window's content moving, not by one point under it
-        first = self._bracketed("scroll", window, act)
+        first = self._bracketed("scroll", window, act, point=(int(x), int(y)))
         return self._continue_scrolling(tool_input, first, x, y, guard)
 
     def _continue_scrolling(self, tool_input: dict[str, Any], first: ToolOutcome, x: int, y: int,

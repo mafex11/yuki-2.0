@@ -172,6 +172,32 @@ def _scrollers_of(element_id: int, by_id: dict[int, Any]) -> int:
     return -1
 
 
+def _holds(element: Any, point: tuple[int, int]) -> bool:
+    """Whether an element's box contains a screen point."""
+    box = fact(element, "bounds")
+    if not box:
+        return False
+    return int(box[0]) <= int(point[0]) < int(box[2]) and int(box[1]) <= int(point[1]) < int(box[3])
+
+
+def _replaced_in_view(scroller: int, container: Any, still: list[int], left: list[int], a: dict[int, Any],
+                      b: dict[int, Any], point: tuple[int, int] | None) -> bool:
+    """For a scroll (review F1): whether the items a scrolling container showed were replaced, rather than one or two
+    changing on their own while the rest stayed put. Replaced: nothing in it stayed where it was in both reads; or,
+    knowing the scroll's point, the container is the one under it, what was under the point went, and nothing that
+    stayed in place is under it (a fixed header or side bar of the page may stay; the content under the point may
+    not). A page at its end whose hover label went and a badge came is not a scroll."""
+    if point is not None and container is not None and fact(container, "bounds") and not _holds(container, point):
+        return False
+    if not still:
+        return True
+    if point is None:
+        return False
+    if any(_holds(a[i], point) for i in still):
+        return False
+    return any(_holds(b[i], point) for i in left)
+
+
 #: A scroll position change smaller than this (percent of the way) is rounding, not movement.
 SCROLL_MIN_PERCENT = 0.5
 
@@ -194,7 +220,8 @@ def _scroll_changes(element_before: Any, element_after: Any) -> list[tuple[str, 
 
 def diff(before: list[Any], after: list[Any], *, target: int | None = None,
          reference: list[Any] | None = None, busy: set[int] | None = None,
-         before_partial: bool = False, after_partial: bool = False, scroll: bool = False) -> Change:
+         before_partial: bool = False, after_partial: bool = False, scroll: bool = False,
+         point: tuple[int, int] | None = None) -> Change:
     """Compare two reads of one window whose ids are carried (the same id is the same element).
 
     Args:
@@ -207,6 +234,8 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         before_partial / after_partial: that read stopped at its limit (its cap) before the end of the window.  An
             element the other read has past the last element both reads share (in that read's tree order) lies
             beyond the limit: it is not counted as appeared or gone (report 58 review, F5).
+        scroll: the action was a scroll (items replaced in a scrolling container can be its movement).
+        point: for a scroll, the screen point it was made at (the content under it is what must have been replaced).
     """
     b = {fact(e, "id"): e for e in before}
     a = {fact(e, "id"): e for e in after}
@@ -264,6 +293,9 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
     change.gone = _roots(gone, b) if gone else []
     # movement inside scrolling containers (or the window when none scrolls)
     shifts: dict[int, list[tuple[int, int]]] = {}
+    # per scrolling container, the elements in both reads that stayed where they were (review F1: a scroll judged by
+    # items replaced needs none of these where it scrolled)
+    still: dict[int, list[int]] = {}
     for i in common:
         if i in noisy or fact(a[i], "hidden"):
             continue
@@ -272,6 +304,8 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
             continue
         dy, dx = int(b1[1]) - int(b0[1]), int(b1[0]) - int(b0[0])
         shifts.setdefault(_scrollers_of(i, a), []).append((dy, dx))
+        if max(abs(dy), abs(dx)) < MOVE_MIN_PX:
+            still.setdefault(_scrollers_of(i, a), []).append(i)
     for scroller, pairs in shifts.items():
         if len(pairs) < 3:
             continue
@@ -309,6 +343,10 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
             if not (came and left) and scroller not in position:
                 continue
             container = a.get(scroller) or b.get(scroller)
+            if scroller not in position and not _replaced_in_view(scroller, container, still.get(scroller, []),
+                                                                  [i for i in gone if _scrollers_of(i, b) == scroller],
+                                                                  a, b, point):
+                continue
             if scroller in position:
                 change.scroll_items[scroller] = (came, left)
             else:
