@@ -132,8 +132,10 @@ def step_level(step: dict[str, Any]) -> str:
     if send in (SEND_UNCONFIRMED, SEND_UNCHECKED):
         return UNVERIFIED if step.get("ok") is not False else FAILED
     level = _CLASS_LEVEL[classify(step.get("ok") is not False, step.get("verdict"), str(step.get("why") or ""))]
-    if level == UNVERIFIED and step.get("confirmed"):
-        return LIKELY   # backed afterwards by something independent (a later verified step in the same window)
+    if level == UNVERIFIED and step.get("confirmed") and not step.get("confirmed_by_ready"):
+        # backed afterwards by something independent (a later verified step in the same window); second review V2-7:
+        # never by a step that only brought that window to front or opened it (``confirmed_by_ready``)
+        return LIKELY
     if level == UNVERIFIED and step.get("tool") in EXIT_STATUS_TOOLS:
         return LIKELY   # a command's own report is its exit status: it ran without an error, a weak check
     return level
@@ -154,7 +156,7 @@ def _seen(step: dict[str, Any], level: str) -> str:
             return _SEEN_WINDOW.get(str((step.get("input") or {}).get("action") or ""), "the window reads back that way")
         return _SEEN_TOOL.get(tool, "the window changed after it")
     if level == LIKELY:
-        if step.get("confirmed"):
+        if step.get("confirmed") and not step.get("confirmed_by_ready"):
             return "a later step showed it worked"
         if tool in EXIT_STATUS_TOOLS:
             return "the command ran without an error"
@@ -173,30 +175,124 @@ def _app(step: dict[str, Any]) -> str | None:
     return raw or None
 
 
-def _same_chat(step: dict[str, Any], other: dict[str, Any]) -> bool:
-    """Whether a later send is a retry of an earlier one (review F2): the same known app and the same message (its
-    text's fingerprint, ``send_sig``), or with no text known for the earlier one, the same window by its title."""
+def readies(name: str, tool_input: dict[str, Any] | None) -> bool:
+    """A step whose effect is only a window brought to front or an app opened (``focus_window``, ``launch_app``, a
+    ``window_action`` focus): getting there, never another step's effect (second review V2-1, V2-7). Machine fields
+    only (the tool's name and its fixed ``action``)."""
+    if name in ("focus_window", "launch_app"):
+        return True
+    return name == "window_action" and str((tool_input or {}).get("action") or "") == "focus"
+
+
+def _number(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+
+def _squashed(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return "+".join(_squashed(v) for v in value)
+    return " ".join(str(value).split()).casefold() if value is not None and value != "" else ""
+
+
+#: The input fields that name what a step aims at, per tool that takes no element (a retry aims at the same): fixed
+#: schema fields, plumbing.
+_AIM_FIELDS = {"window_action": ("action",), "tab": ("action", "tab"), "hotkey": ("keys",), "press": ("key",),
+               "open_url": ("url",), "launch_app": ("query",), "run_powershell": ("command",),
+               "write_clipboard": ("text",), "focus_window": ()}
+#: Tools that aim at an element of the window: a retry is the same element (its role and name).
+_ELEMENT_TOOLS = frozenset({"click", "type_text", "hover", "scroll", "set_slider"})
+
+
+def _element(step: dict[str, Any]) -> str:
+    """The element a step aimed at: the loop's ``control`` (role|name), else the role and name its ``target`` starts
+    with (``button "Send", window "..."``); ``""`` unknown."""
+    control = _squashed(step.get("control"))
+    if control.strip("|"):
+        return control
+    head = str(step.get("target") or "").split(", window ", 1)[0].strip()
+    return "" if not head or head.startswith("window ") else _squashed(head)
+
+
+def _aim(step: dict[str, Any]) -> tuple[str, ...] | None:
+    """What a step aims at (second review V2-1): its tool and the operation or element it is for, or ``None`` when that
+    is not known (then no other step counts as its retry)."""
+    tool = str(step.get("tool") or "")
+    args = step.get("input") or {}
+    if tool in _ELEMENT_TOOLS:
+        element = _element(step)
+        if element:
+            return (tool, element)
+        if tool == "type_text" and _squashed(args.get("text")):
+            return (tool, "text", _squashed(args.get("text")))   # typed into the focused field: the same text again
+        if tool == "scroll":
+            # at a point, no element named: the same way again (the signs of its fixed dy / dx fields)
+            signs = tuple("+" if _number(args.get(k)) > 0 else "-" if _number(args.get(k)) < 0 else "0"
+                          for k in ("dy", "dx"))
+            return None if signs == ("0", "0") else (tool, *signs)
+        return None
+    if tool == "app_volume":
+        return (tool, "mute" if isinstance(args.get("mute"), bool) else "level")   # its app is compared by _app
+    if tool in _AIM_FIELDS:
+        fields = tuple(_squashed(args.get(k)) for k in _AIM_FIELDS[tool])
+        return None if fields and not any(fields) else (tool, *fields)
+    return None
+
+
+def _aims_same(step: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether ``other`` is a retry of ``step``: the same known app and the same aim (the same tool and the same
+    operation or element). A focus is never a retry of a close; an unknown app is never the same app."""
     app = _app(step)
     if app is None or _app(other) != app:
+        return False
+    aim = _aim(step)
+    return aim is not None and aim == _aim(other)
+
+
+def _chat(step: dict[str, Any]) -> str | None:
+    """Which chat a send went to, as far as its window's title tells: the title when it names more than the app
+    (``Ana - Discord``), else ``None`` (second review V2-2, V2-3: WhatsApp's title is only ``WhatsApp``, and an unread
+    count ``(3) WhatsApp`` names no chat either). Character tests on the title and the process name, plumbing."""
+    title = " ".join(str(step.get("window") or "").split()).casefold()
+    if not title:
+        return None
+    rest = title
+    app = _app(step) or ""
+    for part in {app, app_name(app).casefold(), *app.replace("-", ".").split(".")}:
+        if len(part) >= 3:
+            rest = rest.replace(part, " ")
+    return title if any(ch.isalpha() for ch in rest) else None
+
+
+def _same_chat(step: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether a later send is a retry of an earlier one (review F2, second review V2-2/V2-3): the same known app, the
+    same chat by a window title that names it (:func:`_chat`), and with a text known for both, the same message (its
+    fingerprint, ``send_sig``). The same text to two chats of one app, or any send in an app whose title never names
+    the chat, stays open."""
+    app = _app(step)
+    if app is None or _app(other) != app:
+        return False
+    chat = _chat(step)
+    if chat is None or chat != _chat(other):
         return False
     sig, other_sig = step.get("send_sig"), other.get("send_sig")
     if sig and other_sig:
         return sig == other_sig
-    window, other_window = step.get("window"), other.get("window")
-    return bool(window) and window == other_window
+    return not sig   # no text known for the earlier one: the chat is all there is to match
 
 
 def _resolved(index: int, actions: list[dict[str, Any]], levels: list[str], *, finished_at: int | None) -> bool:
     """Whether a later step put an earlier non-verified one right. Facts of the trace only, and only a later step
-    toward the same effect (review F1-F3): never an unrelated verified step, never a step in another known app.
+    toward the same effect (review F1-F3, second review V2-1/V2-6): never an unrelated verified step, never a step in
+    another or an unknown app.
 
     * a send: only a later confirmed send of the same message in the same chat (:func:`_same_chat`);
-    * any other step: a later try of the same tool in the same app (the retry's own level stands for it), or the
-      verified action the brain marked as completing the request (``finished_at``: its index) when it acted in the same
-      app, or came in the same response (every call of that response succeeded, or the loop would not finish on it).
-      The slider-then-mixer case (a player's slider failed, then the mixer level for that app, marked finishing) is
-      the same app by the mixer's own ``app`` field. A step's own later confirmation (``confirmed``: a later verified
-      step in the same window) makes it ``likely`` in :func:`step_level`, never ``verified``."""
+    * any other step: a later try at the same aim in the same app (:func:`_aims_same`; the retry's own level stands
+      for it), or the verified action the brain marked as completing the request (``finished_at``: its index) when it
+      acted in the same app (and is not a mere focus or opening, unless the step was one too), or came in the same
+      response while the step is already ``likely`` (a weak check by nature). The slider-then-mixer case (a player's
+      slider failed, then the mixer level for that app, marked finishing) is the same app by the mixer's own ``app``
+      field. A step's own later confirmation (``confirmed``) makes it ``likely`` in :func:`step_level`, never
+      ``verified``."""
     step = actions[index]
     later = range(index + 1, len(actions))
     if step.get("send"):
@@ -204,11 +300,13 @@ def _resolved(index: int, actions: list[dict[str, Any]], levels: list[str], *, f
     app = _app(step)
     if finished_at is not None and finished_at > index:
         done = actions[finished_at]
+        same_app = app is not None and _app(done) == app and (
+            not readies(str(done.get("tool") or ""), done.get("input"))
+            or readies(str(step.get("tool") or ""), step.get("input")))
         same_response = step.get("call") is not None and step.get("call") == done.get("call")
-        if (app is not None and _app(done) == app) or (same_response and levels[index] != FAILED):
+        if same_app or (same_response and levels[index] == LIKELY):
             return True
-    return any(not actions[j].get("send") and actions[j].get("tool") == step.get("tool") and _app(actions[j]) == app
-               for j in later)
+    return any(not actions[j].get("send") and _aims_same(step, actions[j]) for j in later)
 
 
 def _part_done(still: list[int], actions: list[dict[str, Any]], levels: list[str]) -> bool:
@@ -280,8 +378,15 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
         line = ""
     # the deciding step in the brain's own plain words for it (its ``what``, as the window shows the step)
     step = " ".join(str((actions[decider].get("input") or {}).get("what") or "").split())[:80]
+    # second review V2-4: the effects whose own check showed them, by machine key (below likely the done card draws a
+    # check mark only for these)
+    from yuki.ui.step_words import effect_key
+
+    checked = sorted({effect_key(str(actions[i].get("tool") or ""), actions[i].get("input"))
+                      for i, lv in enumerate(levels) if lv == VERIFIED})
     return {"level": level, "label": LEVEL_LABELS[level], "acted": True, "seen": seen, "send": send,
-            "partial": partial, "line": line, "step": step, "steps": len(actions), "open": len(still)}
+            "partial": partial, "line": line, "step": step, "steps": len(actions), "open": len(still),
+            "checked": checked}
 
 
 def sayable(verdict: dict[str, Any] | None) -> bool:
@@ -470,4 +575,4 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
 __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
            "LEARNED_UNVERIFIABLE", "LEVELS", "LEVEL_LABELS", "LIKELY", "PAGE_SCROLL_UNVERIFIABLE", "SAYABLE",
            "SEND_CONFIRMED", "SEND_UNCHECKED", "SEND_UNCONFIRMED", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
-           "is_expected", "noop_line", "outcome_verdict", "sayable", "similar", "step_level"]
+           "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level"]

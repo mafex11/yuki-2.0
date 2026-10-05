@@ -28,6 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from yuki.agent.finish import SAYABLE, outcome_verdict  # noqa: E402
 
+#: The input fields the verdict compares (the app an input names, a window's or tab's operation, the keys, the address
+#: or app asked for, a mute, a scroll's direction): what a retry aims at (second review V2-1). Kept in memory only,
+#: never printed.
+_COMPARED = ("app", "action", "tab", "key", "keys", "url", "query", "mute", "dy", "dx")
+
 
 def _events(path: Path) -> Iterator[dict[str, Any]]:
     with path.open(encoding="utf-8", errors="replace") as fh:
@@ -59,7 +64,7 @@ def requests(path: Path) -> Iterator[dict[str, Any]]:
             continue
         if kind == "tool_call" and isinstance(event.get("input"), dict):
             # review: the fields the verdict compares (the app an input names, a window's operation), nothing else
-            calls[str(event.get("name"))] = {k: event["input"][k] for k in ("app", "action") if k in event["input"]}
+            calls[str(event.get("name"))] = {k: event["input"][k] for k in _COMPARED if k in event["input"]}
         elif kind == "send_confirmation":
             # logged just before the send's own action_verdict
             pending_send = "confirmed" if event.get("confirmed") else "unconfirmed"

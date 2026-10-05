@@ -1820,18 +1820,29 @@ class Agent:
             return confirmed
         return 0
 
-    def _mark_confirmations(self, hwnd: int | None, verdict: tuple[bool | None, str]) -> None:
+    def _mark_confirmations(self, hwnd: int | None, verdict: tuple[bool | None, str], name: str = "",
+                            tool_input: dict[str, Any] | None = None) -> None:
         """An unverifiable step stays open until something independent backs it in this request: a later verified step
         in the same window (or a send seen in its chat) marks it confirmed in the run trace (practice memory then
-        learns the control as expected-unverifiable)."""
+        learns the control as expected-unverifiable). Second review V2-7: a later step that only brought that window
+        to front or opened it (``finish.readies``) marks it too, as before, but tagged ``confirmed_by_ready``, and the
+        step stays open for a later step with an effect of its own; the outcome verdict does not count such a mark."""
         trace = getattr(self, "_trace", None)
         if trace is None or not hwnd:
             return
         if verdict[0] is True:
+            ready_only = finish_gate.readies(name, tool_input)
             keep = []
             for index, window in self._unconfirmed:
                 if window == hwnd and index < len(trace):
-                    trace[index]["confirmed"] = True
+                    if ready_only:
+                        if not trace[index].get("confirmed"):
+                            trace[index]["confirmed_by_ready"] = True
+                        trace[index]["confirmed"] = True
+                        keep.append((index, window))
+                    else:
+                        trace[index]["confirmed"] = True
+                        trace[index].pop("confirmed_by_ready", None)
                 else:
                     keep.append((index, window))
             self._unconfirmed = keep
@@ -3328,7 +3339,7 @@ class Agent:
                              outcome=outcome, control=target.get("control") if acts else None, send=send_state,
                              send_sig=send_sig)
             if acts and verdict is not None and outcome.ok:
-                self._mark_confirmations(target.get("hwnd"), verdict)
+                self._mark_confirmations(target.get("hwnd"), verdict, name, tool_input)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload, about=step_words)
         if outcome.ok and finish_line:
             # N1: an action whose report says nothing moved finishes with that, never with the line written before it

@@ -612,6 +612,15 @@ def changes_state(name: str, tool_input: dict[str, Any] | None) -> bool:
     return False
 
 
+def effect_key(name: str, tool_input: dict[str, Any] | None) -> str:
+    """A step's machine key for matching a run trace's verified steps to the card's rows (second review V2-4): the tool,
+    its fixed ``action`` and the app its input names (casefolded, without ``.exe``). Plumbing, never words."""
+    args = tool_input if isinstance(tool_input, dict) else {}
+    app = " ".join(str(args.get("app") or "").split()).casefold()
+    app = app[:-4] if app.endswith(".exe") else app
+    return f"{name}|{' '.join(str(args.get('action') or '').split()).casefold()}|{app}"
+
+
 def is_effect(name: str, tool_input: dict[str, Any] | None) -> bool:
     """A step whose result the user cares about after the run: the agent marked it as sending, closing or deleting
     for certain (``_about``: ``sends`` / ``changes``, from the tool's fixed traits), the brain declared its effect
@@ -767,6 +776,10 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]],
         if level == "failed" and (verdict or {}).get("partial"):
             head = "Partly done"
     unconfirmed_send = isinstance(verdict, dict) and verdict.get("send") == "unconfirmed"
+    # second review V2-4: below likely, a step that ran is drawn with a check only when its own check showed it (the
+    # verdict's ``checked`` keys); the rest the level row speaks for, never a check mark
+    below = outcome == "done" and level in LEVEL_HEADS and bool((verdict or {}).get("acted"))
+    checked = set((verdict or {}).get("checked") or []) if below else set()
     rows: list[dict[str, str]] = []
     sent_ok = sent_missed = False
     for st in steps:
@@ -779,6 +792,8 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]],
             continue
         if about.get("sends") and unconfirmed_send:
             continue   # pressed, never seen in the chat: the level row says so, never a check mark
+        if ok is True and below and effect_key(name, args) not in checked:
+            continue
         if ok is True:
             row = {"text": describe_step(name, args, done=True), "icon": "check"}
         elif about.get("sends"):

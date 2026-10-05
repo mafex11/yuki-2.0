@@ -39,7 +39,7 @@ from PySide6.QtCore import QObject, Signal
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
     APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE,
-    brain_request, result_payload, waiting_payload,
+    brain_request, outcome_fields, result_payload, waiting_payload,
 )
 from yuki.voice.narrator import RANKS, Item, asks, condense, ends_sentence, machine_text, sentences
 from yuki.voice.progress import JobLog, step_of
@@ -1303,9 +1303,14 @@ class VoiceBridge(QObject):
             return
         head, rest = condense(job.rest, max_sentences=self._max_sentences, max_chars=self._max_chars)
         job.rest = rest
-        self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest))
-        await params.result_callback({"more": head, "more_available": bool(rest),
-                                      "how_to_say_it": SPOKEN_NOTE + (" Still more after this." if rest else "")})
+        # second review V2-5: the rest of a done held below likely keeps its level and its note, as its first part did
+        held = self._held_verdict(job, "done") if job.state == DONE else None
+        graded, graded_note = outcome_fields(held) if held is not None else ({}, "")
+        self._log("bridge", op="more", found=True, job_id=job.job_id, spoken_chars=len(head), rest_chars=len(rest),
+                  **({"level": held.get("level")} if held is not None else {}))
+        await params.result_callback({"more": head, **graded, "more_available": bool(rest),
+                                      "how_to_say_it": (graded_note or SPOKEN_NOTE)
+                                      + (" Still more after this." if rest else "")})
 
     async def stay_quiet(self, params: Any) -> None:
         """Pipecat handler for ``stay_quiet``: the mouth chose to say nothing; settled without a turn."""

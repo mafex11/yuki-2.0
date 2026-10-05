@@ -59,7 +59,13 @@ def test_the_live_whatsapp_send_the_check_never_saw_is_not_confirmed() -> None:
     assert not sayable(v)
     # a later verified click in the same app never puts an unseen send right; only a confirmed send does
     assert outcome_verdict(steps + [_act("click", app="WhatsApp")])["level"] == "unverified"
-    seen = outcome_verdict(steps + [_act("press", app="WhatsApp", send="confirmed", send_sig="5a1e")])   # the same one
+    # second review V2-2: WhatsApp's title never names the chat, so even the same text seen later may be another chat's
+    again = outcome_verdict(steps + [_act("press", app="WhatsApp", send="confirmed", send_sig="5a1e")])
+    assert (again["level"], again["send"]) == ("unverified", "unconfirmed")
+    # in an app whose title names the chat, the same message seen in the same chat puts it right
+    chat = [{**s, "app": "Discord", "window": "Ana - Discord"} for s in steps]
+    seen = outcome_verdict(chat + [_act("press", app="Discord", send="confirmed", send_sig="5a1e",
+                                        window="Ana - Discord")])
     assert (seen["level"], seen["send"], seen["seen"]) == ("verified", "confirmed", "the message shows in the chat")
 
 
@@ -106,9 +112,10 @@ def test_a_key_with_nothing_watched_is_not_confirmed_and_a_retry_that_verified_p
     assert backed["level"] == "likely"
     # a later verified step in another app does not put it right
     assert outcome_verdict([key, _act("launch_app", app="Spotify")])["level"] == "unverified"
-    # a retry of the same tool in the same app stands for it, whatever its own level
-    retry = outcome_verdict([_act("window_action", ok=False, verdict=False, why="it failed", app="Slack"),
-                             _act("window_action", verdict=None, why="x", app="Slack")])
+    # a retry (the same operation in the same app) stands for it, whatever its own level
+    first = {**_act("window_action", ok=False, verdict=False, why="it failed", app="Slack"), "input": {"action": "close"}}
+    retry = outcome_verdict([first, {**_act("window_action", verdict=None, why="x", app="Slack"),
+                                     "input": {"action": "close"}}])
     assert retry["level"] == "unverified"
 
 
@@ -133,10 +140,14 @@ def test_review_f1_a_finishing_action_in_another_app_never_puts_a_failed_step_ri
     v = outcome_verdict([warp, spotify], finished_by_action=True)
     assert (v["level"], v["partial"], v["step"]) == ("failed", True, "Making Warp full screen")
     assert not sayable(v)
-    # a step of the finishing response itself that ran but could not be checked is covered by it
-    same = outcome_verdict([_act("press", verdict=None, why="x", app="Spotify.exe", call=3),
+    # a step of the finishing response itself whose check is weak by nature is covered by it; second review V2-6: one
+    # in another app that nothing checked is not
+    same = outcome_verdict([_act("type_text", verdict=None, why=EXPECTED_UNVERIFIABLE, app="Spotify.exe", call=3),
                             _act("launch_app", app="Slack.exe", call=3)], finished_by_action=True)
     assert same["level"] == "verified"
+    blind = outcome_verdict([_act("press", verdict=None, why="x", app="Spotify.exe", call=3),
+                             _act("launch_app", app="Slack.exe", call=3)], finished_by_action=True)
+    assert (blind["level"], blind["open"]) == ("unverified", 1)
     # never a contradicted one, even in the same response
     assert outcome_verdict([_act("press", verdict=False, why="x", app="Notepad.exe", call=3),
                             _act("launch_app", app="Slack.exe", call=3)], finished_by_action=True)["level"] == "failed"
@@ -154,7 +165,9 @@ def test_review_f2_a_confirmed_send_puts_right_only_the_same_message_in_the_same
     # another message in the same app does not put it right either; the same message sent again does
     other = _act("press", app="WhatsApp.Root.exe", send="confirmed", send_sig="cccc")
     assert outcome_verdict([ana, other])["level"] == "unverified"
-    again = outcome_verdict([ana, _act("press", app="WhatsApp.Root.exe", send="confirmed", send_sig="aaaa")])
+    named = {**ana, "app": "Slack.exe", "window": "Ana (DM) - Acme - Slack"}
+    again = outcome_verdict([named, {**other, "app": "Slack.exe", "send_sig": "aaaa",
+                                     "window": "Ana (DM) - Acme - Slack"}])
     assert (again["level"], again["send"]) == ("verified", "confirmed")
     # no text known for the first: only a confirmed send in the same chat window (by its title) puts it right
     blind = _act("press", why="x", app="Discord.exe", send="unchecked", window="Ana - Discord")
@@ -194,6 +207,138 @@ def test_review_f4_a_focus_before_a_failed_close_is_not_a_part_done() -> None:
     shrink["input"] = {"action": "minimize"}
     assert outcome_verdict([shrink, close])["partial"] is True
     assert outcome_verdict([_act("launch_app", app="Spotify.exe"), close])["partial"] is True
+
+
+def _window(action: str, **kw: Any) -> dict[str, Any]:
+    step = _act("window_action", **kw)
+    step["input"] = {"action": action, **({"what": kw["what"]} if kw.get("what") else {})}
+    return step
+
+
+def test_second_review_v2_1_a_retry_aims_at_the_same_effect_not_just_the_same_tool() -> None:
+    close = _window("close", verdict=False, why="the window is still there", app="slack.exe", what="Quitting Slack")
+    # a contradicted close, then a verified window_action focus of Slack: a focus is never a retry of a close
+    v = outcome_verdict([close, _window("focus", app="slack.exe")])
+    assert (v["level"], v["open"], v["line"]) == ("failed", 1, LINE_FAILED) and not sayable(v)
+    # nor when the focus is the action the brain marked as finishing
+    assert outcome_verdict([close, _window("focus", app="slack.exe")], finished_by_action=True)["level"] == "failed"
+    # a failed click on one control, then a verified click on another in the same app
+    submit = _act("click", ok=False, verdict=False, why="it failed", app="chrome.exe", control="Button|Submit")
+    banner = _act("click", app="chrome.exe", control="Button|Close the cookie banner")
+    assert outcome_verdict([submit, banner])["level"] == "failed"
+    # the same control again does stand for it (its role and name from the trace's target when no control is kept)
+    again = _act("click", app="chrome.exe", target='Button "Submit", window "Form - Chrome"')
+    assert outcome_verdict([{**submit, "control": None, "target": again["target"]}, again])["level"] == "verified"
+    assert outcome_verdict([submit, {**banner, "control": "Button|Submit"}])["level"] == "verified"
+    # a likely typing into one field is not made verified by a verified typing into another
+    typed = _act("type_text", verdict=None, why=EXPECTED_UNVERIFIABLE, app="discord.exe", control="Edit|Search")
+    other = _act("type_text", app="discord.exe", control="Edit|Message @Ana")
+    assert outcome_verdict([typed, other])["level"] == "likely"
+    # an unknown app is never the same app
+    blind = _act("click", ok=False, verdict=False, why="it failed", app=None, control="Button|Submit")
+    assert outcome_verdict([blind, {**blind, "ok": True, "verdict": True, "why": ""}])["level"] == "failed"
+    # keys: a different key is not a retry; the same key is
+    f11 = {**_act("press", ok=False, verdict=False, why="it failed", app="warp.exe"), "input": {"key": "f11"}}
+    assert outcome_verdict([f11, {**_act("press", app="warp.exe"), "input": {"key": "escape"}}])["level"] == "failed"
+    assert outcome_verdict([f11, {**_act("press", app="warp.exe"), "input": {"key": "F11"}}])["level"] == "verified"
+    # a scroll at a point (no element): the same way again is a retry, the other way is not
+    down = {**_act("scroll", ok=False, verdict=False, why="it failed", app="arc.exe"), "input": {"dy": -3}}
+    assert outcome_verdict([down, {**_act("scroll", app="arc.exe"), "input": {"dy": -5}}])["level"] == "verified"
+    assert outcome_verdict([down, {**_act("scroll", app="arc.exe"), "input": {"dy": 3}}])["level"] == "failed"
+
+
+def test_second_review_v2_2_and_3_the_same_text_to_two_chats_or_a_blind_send_stays_open() -> None:
+    ana = _act("press", verdict=None, why="not confirmed", app="WhatsApp.exe", send="unconfirmed",
+               send_sig="abc123abc123", window="WhatsApp", what="Sending Ana the message")
+    bob = _act("press", app="WhatsApp.exe", send="confirmed", send_sig="abc123abc123", window="WhatsApp")
+    v = outcome_verdict([ana, bob])
+    assert (v["level"], v["send"], v["open"]) == ("unverified", "unconfirmed", 1)
+    # Discord names the channel: the same text in two channels is two messages
+    general = {**ana, "app": "Discord.exe", "window": "#general | Acme - Discord"}
+    random = {**bob, "app": "Discord.exe", "window": "#random | Acme - Discord"}
+    assert outcome_verdict([general, random])["send"] == "unconfirmed"
+    # V2-3: Enter with no text known in WhatsApp, then another message confirmed there: still open
+    blind = _act("press", why="x", app="WhatsApp.exe", send="unchecked", window="WhatsApp")
+    later = {**bob, "send_sig": "ffff00001111"}
+    assert outcome_verdict([blind, later])["level"] == "unverified"
+    assert outcome_verdict([{**blind, "window": "(3) WhatsApp"}, {**later, "window": "(3) WhatsApp"}])["level"] == \
+        "unverified"
+
+
+def test_second_review_v2_4_the_card_never_checks_a_step_the_verdict_did_not_see() -> None:
+    from yuki.ui.step_words import label_input, return_view
+
+    close = _window("close", verdict=False, why="the window is still there", app="slack.exe", what="Quitting Slack")
+    calls = [{"name": "window_action", "ok": True, "input": label_input({"action": "close", "what": "Quitting Slack",
+                                                                          "_about": {"app": "Slack"}})}]
+    view = return_view("done", "Closed Slack.", calls, verdict=outcome_verdict([close]))
+    assert view["head"] == "Didn’t work" and not any(r["icon"] == "check" for r in view["rows"])
+    full = _window("fullscreen", verdict=None, why="x", app="warp.exe")
+    calls = [{"name": "window_action", "ok": True, "input": {"action": "fullscreen", "_about": {"app": "Warp"}}}]
+    unv = return_view("done", "Warp's full screen.", calls, verdict=outcome_verdict([full]))
+    assert unv["head"] == "Not confirmed" and not any(r["icon"] == "check" for r in unv["rows"])
+    # a change whose own check showed it keeps its check beside the one that did not work
+    shrink = _window("minimize", app="discord.exe")
+    calls = [{"name": "window_action", "ok": True, "input": {"action": "minimize", "_about": {"app": "Discord"}}},
+             {"name": "window_action", "ok": True, "input": {"action": "close", "_about": {"app": "Slack"}}}]
+    mixed = return_view("done", "Done.", calls, verdict=outcome_verdict([shrink, close]))
+    checks = [r["text"] for r in mixed["rows"] if r["icon"] == "check"]
+    assert mixed["head"] == "Partly done" and len(checks) == 1 and "Slack" not in checks[0]
+    # at verified, as before
+    ok = return_view("done", "Done.", calls, verdict=outcome_verdict([shrink, {**close, "verdict": True}]))
+    assert ok["head"] == "Done" and [r["icon"] for r in ok["rows"]].count("check") >= 2
+
+
+def test_second_review_v2_5_the_rest_of_a_held_result_keeps_its_level() -> None:
+    from test_voice_v39 import Params, _settle
+
+    async def main() -> Any:
+        rt, bridge = _voice_bridge()
+        bridge.speak_result = None
+        bridge._max_sentences = 1
+        params = Params("tell ana and bob")
+        task = asyncio.create_task(bridge.tell_yuki(params))
+        await _settle()
+        await _end(rt, rt.submitted[0][0], "I wrote to them. I sent it to Ana and she has it now. I also told Bob.",
+                   UNSEEN_SEND)
+        await asyncio.wait_for(task, 1)
+        more = Params("")
+        await bridge.more_of_result(more)
+        return params.results[-1][0], more.results[-1][0]
+
+    first, rest = asyncio.run(main())
+    assert first["outcome"] == "not confirmed" and first["more_available"] is True
+    assert rest["more"] and rest["outcome"] == "not confirmed"
+    assert rest["checked"] == "the message did not show up in the chat"
+    assert "couldn't confirm it went" in rest["how_to_say_it"]
+
+
+def test_second_review_v2_6_a_finishing_action_leaves_an_unchecked_step_in_another_app_open() -> None:
+    key = {**_act("press", verdict=None, why="x", app="warp.exe", call=4), "input": {"key": "f11"}}
+    v = outcome_verdict([key, _act("launch_app", app="spotify.exe", call=4)], finished_by_action=True)
+    assert (v["level"], v["open"]) == ("unverified", 1) and not sayable(v)
+
+
+def test_second_review_v2_7_a_focus_never_backs_an_unchecked_step() -> None:
+    from yuki.agent.loop import Agent
+
+    trace = [{"kind": "action", "tool": "press", "ok": True, "verdict": None, "why": "x", "app": "warp.exe",
+              "input": {"key": "f11"}},
+             {"kind": "action", "tool": "focus_window", "ok": True, "verdict": True, "why": "", "app": "warp.exe",
+              "input": {"hwnd": 100}}]
+    agent = SimpleNamespace(_trace=trace[:1], _unconfirmed=[])
+    Agent._mark_confirmations(agent, 100, (None, "x"), "press", {"key": "f11"})
+    agent._trace.append(trace[1])
+    Agent._mark_confirmations(agent, 100, (True, ""), "focus_window", {"hwnd": 100})
+    assert trace[0]["confirmed"] and trace[0]["confirmed_by_ready"]   # practice memory still sees it backed
+    v = outcome_verdict(agent._trace)
+    assert v["level"] == "unverified" and not sayable(v)
+    # a later step with an effect of its own in that window still backs it (it stayed open for one)
+    agent._trace.append({"kind": "action", "tool": "window_action", "ok": True, "verdict": True, "why": "",
+                         "app": "warp.exe", "input": {"action": "maximize"}})
+    Agent._mark_confirmations(agent, 100, (True, ""), "window_action", {"action": "maximize"})
+    assert "confirmed_by_ready" not in trace[0] and agent._unconfirmed == []
+    assert outcome_verdict(agent._trace)["level"] == "likely"
 
 
 def test_weak_checks_by_nature_are_likely_and_say_why() -> None:
