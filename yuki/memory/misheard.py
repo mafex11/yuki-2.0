@@ -837,7 +837,8 @@ class NamesResult:
     error: str | None = None
     #: The fixes found (the plan): ``[{"heard", "name", "how", "why", "turn_id", "at"}]``.
     decisions: list[dict[str, Any]] = field(default_factory=list)
-    #: Per fix written: ``{"heard", "name", "how", "alias_id", "correction_id", "replaced"}`` (what ``--undo-names`` takes back).
+    #: Per fix written: ``{"heard", "name", "how", "alias_id", "correction_id", "replaced"}`` (what ``--undo-names``
+    #: takes back).
     learned: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -917,7 +918,8 @@ class NamesPass:
             result.cost_usd = stats.cost_usd
             worker._log("names_pass", reason=reason, dry_run=dry_run, ok=result.ok, turns=result.turns,
                         windows=result.windows, calls=result.calls, found=result.found, written=result.written,
-                        rejected=len(result.rejected), skipped=len(result.skipped), cost_usd=round(result.cost_usd, 6), error=result.error,
+                        rejected=len(result.rejected), skipped=len(result.skipped),
+                        cost_usd=round(result.cost_usd, 6), error=result.error,
                         decisions_ciphertext=worker._seal(result.decisions))
         return result
 
@@ -1074,7 +1076,8 @@ def _names_main(args: Any, store: Any, worker: Any) -> int:
         hows[d["how"]] = hows.get(d["how"], 0) + 1
     print(json.dumps({"ok": r.ok, "turns": r.turns, "windows": r.windows, "calls": r.calls, "found": r.found,
                       "found_by_how": hows, "yuki_forms": sum(_key(d["name"]) == _key(WAKE_NAME) for d in r.decisions),
-                      "written": r.written, "rejected": len(r.rejected), "skipped": len(r.skipped), "cost_usd": round(r.cost_usd, 4),
+                      "written": r.written, "rejected": len(r.rejected), "skipped": len(r.skipped),
+                      "cost_usd": round(r.cost_usd, 4),
                       "error": r.error, "plan_saved": saved, "undo_saved": undo,
                       "resolve_before": before, "resolve_after": after,
                       "decisions": r.decisions if args.show else None,
