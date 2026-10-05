@@ -614,7 +614,7 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["text", "nature", "importance", "source", "content_date", "milestone",
-                                 "other_ai", "user_said", "sensitive"],
+                                 "other_ai", "user_said", "sensitive", "sensitive_shown"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -689,6 +689,14 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                                 "USER): sexuality, health, money, credentials or legal; \"none\" for nearly all."
                             ),
                         },
+                        "sensitive_shown": {
+                            "type": "string",
+                            "description": (
+                                "Only when sensitive is not none: the fact said to the user in one short plain "
+                                "second-person sentence, as Yuki would ask them about it (\"You checked your "
+                                "Northbank holdings on Saturday morning.\"); else \"\"."
+                            ),
+                        },
                     },
                 },
             },
@@ -730,7 +738,7 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
                            ["properties"].items() if k not in ("content_date", "milestone", "other_ai",
-                                                               "user_said")},
+                                                               "user_said", "sensitive_shown")},
                         "user_said": {
                             "type": "boolean",
                             "description": (
@@ -1519,6 +1527,9 @@ class JournalWorker:
             questions = ([] if call_side else
                          self._parse_questions(response, thread, sources, fact_sources, tool=tool["name"]))
             work_ops, work_rejected = self.parse_work(response, tool["name"], offered, thread, sources, fact_sources)
+            # review F8: a thread of work or a question resting only on held (sensitive) facts is left out with them
+            work_ops, work_held = _admission.unheld_links(facts, work_ops)
+            questions, questions_held = _admission.unheld_links(facts, questions)
             embed_error = self._embed_batch(facts, work_ops, offered)
             work_notes = _work.dedupe_starts(work_ops, self.store)
             work_ops = _work.live_ops(work_ops)
@@ -1543,6 +1554,8 @@ class JournalWorker:
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
                 tainted=sum(1 for f in facts if f.tainted), not_users_words=not_users_words or None,
+                held={"sensitive": sum(1 for f in facts if f.held), "work_left_out": work_held,
+                      "questions_left_out": questions_held} if any(f.held for f in facts) else None,
                 open_requests=len(open_requests), requests_fired=fired,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
                 sources=len(sources), commands=sum(1 for x in sources if x.command is not None),
@@ -1710,9 +1723,18 @@ class JournalWorker:
                                                  names=self.user_names(), model=self.model)
             if judged.exception is not None and unreachable(judged.exception):
                 raise judged.exception   # no network: the whole batch waits and is read again (no attempt spent)
+            last_try = max((int(getattr(c, "attempts", 0) or 0) for c in captures), default=0) + 1 >= self.max_attempts
+            if judged.exception is not None and not last_try:
+                # review F3: an unjudged call would hold every claim, the user's own plans too, with no line a card
+                # could show; the batch is read again (one attempt spent) - only the last attempt stores unjudged
+                raise RuntimeError(f"admission judge failed: {judged.error}") from judged.exception
             admission = _admission.admit_call_facts(facts, judge_items, judged)
             if judged.error:
                 admission["judge_error"] = judged.error
+                admission["held_unjudged"] = sum(1 for v, f in zip(judged.verdicts, facts) if v is None and f.held)
+            # review F8: a to-do thread or a question resting only on held facts would carry them out anyway
+            work_ops, admission["work_left_out"] = _admission.unheld_links(facts, work_ops)
+            questions, admission["questions_left_out"] = _admission.unheld_links(facts, questions)
             requests += judged.requests
             responses += judged.responses
             for k in totals:
@@ -2217,6 +2239,9 @@ class JournalWorker:
                 # plain fact (report 76 item 5; the "Maybe misheard" list asks when it carries a guess)
                 nature = "uncertain"
             sensitive = _admission.sensitive_kind(item.get("sensitive"))
+            shown = " ".join(str(item.get("sensitive_shown") or "").split())
+            if sensitive != "none" and 0 < len(shown) <= _admission.SHOWN_MAX_CHARS:
+                source[_admission.SHOWN_KEY] = shown   # how the window's "Waiting for your yes" says it to the user
             facts.append(
                 NewFact(at=content_date(item.get("content_date"), sources[index].at) or sources[index].at,
                         thread_id=thread.id, app=thread.app, host=thread.host,

@@ -7,9 +7,12 @@ account) were stored until the user removed them himself. Since 3 Oct a call rec
 are in the transcript too. The fix is at admission, so memory stays clean without the user as its cleaner:
 
 * **Structure** (code, on metadata only, never words): a fact citing a line someone else said (``who`` "others") is
-  never admitted on its own - it waits for the user's Keep (:func:`route`); a fact resting on a line the recogniser
-  itself marked UNCLEAR is ``uncertain`` (possibly misheard: never used as a fact, listed under "Maybe misheard" when it
-  has a guess), done in the journal (:func:`yuki.memory.journal.JournalWorker._parse_facts`).
+  never admitted on its own, whatever its label - it waits for the user's Keep, or stays out when the judge drops it
+  (:func:`route`); a fact resting on a line the recogniser itself marked UNCLEAR is ``uncertain``
+  (:func:`yuki.memory.journal.JournalWorker._parse_facts`) and an uncertain fact is held, not stored - unless it
+  carries the journal's misheard guess, which the "Maybe misheard" list asks the user about.
+* **Links** (:func:`unheld_links`): a work op or a question of the same batch resting only on held facts is left
+  out, so a held fact never reaches the workboard or a question through the words around it.
 * **Sensitive** (model judgement, :data:`SENSITIVE_GUIDANCE`, worked examples): the journal's own model marks every fact
   (screen and call) that states something personal and sensitive about the user (sexuality, health, their own money
   accounts, where their passwords or seed phrases are, legal trouble); such a fact is held until the user's explicit yes
@@ -22,7 +25,10 @@ are in the transcript too. The fix is at admission, so memory stays clean withou
   keeping, but a call cannot settle it: a claim about their life, anything resting on someone else's words, anything
   with banter around it - it waits for a Keep) or ``drop`` (read in context it was not meant as true: a joke, a tease,
   a boast, a hypothetical, a misheard line - kept out), plus its sensitivity and the short second-person line a card
-  shows. When the call fails, every claim waits (nothing unjudged goes in).
+  shows. When the model cannot be reached, the batch is read again later (no attempt spent); when the judge fails
+  otherwise and the batch has attempts left, the batch fails and is read again (review F3); only on its last attempt
+  are the facts stored unjudged, every claim waiting (nothing unjudged goes in), listed in the window's "Waiting for
+  your yes" and counted in the journal's log (``admission.held_unjudged``).
 
 **Held facts.** A held fact is written like any other (with its vector and provenance) and, in the same transaction,
 superseded by a ``hold:<reason>`` batch (:meth:`yuki.memory.store.Store._hold_journal`), so no journal reader - search,
@@ -33,9 +39,16 @@ after :data:`HOLD_DAYS`: the default for no answer is that only what was admitte
 by the user - stays.
 
 **The user's answer** (:func:`resolve_held`, no model): ``keep`` - a new journal row with the held one's time, thread,
-nature, provenance and vector (the portrait reads it as new, like a correction's rewrite); ``joke`` - the same as
-``humor`` (a bit of theirs, never a fact); ``not_true`` - it stays out, answered; ``undo`` - either is taken back. A
-diary line each (pass ``keep``).
+nature (``uncertain`` becomes ``fact``: the user says it is true), provenance marked :data:`CONFIRMED_KEY` (the
+portrait's bar takes it as the user's own word) and vector (the portrait reads it as new, like a correction's
+rewrite); ``joke`` - the same as ``humor`` (a bit of theirs, never a fact), except on someone else's line, where it
+stays out like ``not_true``; ``not_true`` - it stays out, answered; ``undo`` - either is taken back. A diary line
+each (pass ``keep``). A re-journal of the same captures carries an answer over to the new batch's fact on the same
+line (:meth:`yuki.memory.store.Store._hold_journal`).
+
+**Where held facts are offered**: the call's recap card (at most :data:`RECAP_KEEP_MAX` lines with the judge's
+second-person line) and the window's Me page, "Waiting for your yes" (every unanswered call and sensitive hold of
+the last :data:`HOLD_DAYS`, the private surface for a sensitive fact's explicit yes).
 
 **The recap card** (:func:`recap_items`, :func:`recap_text`; the presence ``recap`` channel): after a call, at most one
 card, never spoken, never during a game or a call (the card worker's gates): "From your call with Tara: 3 things I'd
@@ -51,11 +64,12 @@ Examples in the prompts use invented people, places and numbers.
 Public API::
 
     SENSITIVE_KINDS, SENSITIVE_GUIDANCE, CALL_ADMISSION_PROMPT, ADMIT_TOOL, VERDICTS, ANSWERS
-    HOLD_CALL, HOLD_SENSITIVE, HOLD_DROP, HOLD_DAYS
+    HOLD_CALL, HOLD_SENSITIVE, HOLD_DROP, HOLD_DAYS, SHOWN_KEY, CONFIRMED_KEY
     sensitive_kind(value) -> str
     JudgeItem(text, nature, line, around, call_app);  item_from_source(fact, sources, index) -> JudgeItem
     judge_call_facts(client, items, *, settings, names, model) -> JudgeResult
-    route(who, nature, verdict, sensitive) -> held reason | None
+    route(who, nature, verdict, sensitive, *, listed=False) -> held reason | None
+    unheld_links(facts, work_ops_or_questions) -> (kept, left_out)
     admit_call_facts(facts, items, result) -> dict (content-free counts)   # sets NewFact.held / source["keep_shown"]
     held_facts(store, *, since=None, reasons=None, call_ids=None, now=None) -> list[HeldFact]
     resolve_held(store, journal_id, answer, *, now=None) -> dict | None
@@ -90,6 +104,9 @@ RECAP_KEEP_MAX = 3
 #: The provenance key of the short second-person line a card shows for a held fact.
 SHOWN_KEY = "keep_shown"
 SHOWN_MAX_CHARS = 140
+#: The provenance key a Keep sets on the kept copy: the user confirmed it themself (the portrait's bar for sensitive
+#: facts takes such a row as the user's own word).
+CONFIRMED_KEY = "confirmed_by_user"
 
 #: What kind of personal sensitive fact a fact is (``none`` for nearly all).
 SENSITIVE_KINDS: tuple[str, ...] = ("none", "sexuality", "health", "money", "credentials", "legal")
@@ -394,26 +411,39 @@ def judge_call_facts(client: Any, items: Sequence[JudgeItem], *, settings: Any =
 # ---------------------------------------------------------------------------
 
 
-def route(who: str, nature: str, verdict: Verdict | None, sensitive: str = "none") -> str | None:
+def route(who: str, nature: str, verdict: Verdict | None, sensitive: str = "none", *,
+          listed: bool = False) -> str | None:
     """Where one call fact goes: ``None`` (into memory now) or the reason it is held (:data:`HOLD_REASONS`).
 
-    ``who``: whose line it rests on (``user`` | ``others`` | ``game``); ``nature``: the journal's label; ``verdict``:
-    the judge's (``None`` when it gave none); ``sensitive``: the journal's own mark (either mark holds it).
+    ``who``: whose line it rests on (``user`` | ``others`` | ``game``); ``nature``: the journal's label (a fact on a
+    line the recogniser marked UNCLEAR is already ``uncertain``); ``verdict``: the judge's (``None`` when it gave
+    none); ``sensitive``: the journal's own mark (either mark holds it); ``listed``: the fact carries the journal's
+    misheard guess, so the "Maybe misheard" list asks the user about it (:func:`yuki.memory.misheard.is_listed`).
 
     * Sensitive (the journal's mark or the judge's) is held for the user's explicit yes, whatever else holds.
-    * A joke the journal already labelled (``humor``) or a line it marked possibly misheard (``uncertain``) is never a
-      fact anyway (every reader treats it so); it goes in with that label.
+    * Someone else's words never go in on their own, whatever their label: the judge's ``drop`` keeps them out, else
+      they wait for a Keep (review F2: a friend's tease on an UNCLEAR line is no "uncertain" fact about the user).
+    * A joke of the user's own the journal labelled (``humor``) goes in as a joke (never a fact; the portrait reads it
+      as their humour).
+    * A possibly misheard line with the journal's guess goes in as ``uncertain``: the "Maybe misheard" list is the
+      surface that asks the user about it.
     * The judge's ``drop`` keeps it out.
-    * Someone else's words are never admitted on their own: they wait for a Keep (``ask`` or not).
+    * Any other ``uncertain`` fact (the recogniser was unsure of the line, or the journal could not tell what was
+      meant) is held, not stored: it waits for a Keep (the brief: misheard lines are held).
     * The user's own line: ``admit`` goes in; ``ask`` - and no verdict at all (the judge failed) - waits.
     """
     if sensitive_kind(sensitive) != "none" or (verdict is not None and verdict.sensitive != "none"):
         return HOLD_SENSITIVE
-    if nature in ("humor", "uncertain"):
-        return None
-    if verdict is not None and verdict.verdict == "drop":
-        return HOLD_DROP
+    dropped = verdict is not None and verdict.verdict == "drop"
     if who != "user":
+        return HOLD_DROP if dropped else HOLD_CALL
+    if nature == "humor":
+        return None
+    if nature == "uncertain" and listed:
+        return None
+    if dropped:
+        return HOLD_DROP
+    if nature == "uncertain":
         return HOLD_CALL
     if verdict is not None and verdict.verdict == "admit":
         return None
@@ -423,10 +453,13 @@ def route(who: str, nature: str, verdict: Verdict | None, sensitive: str = "none
 def admit_call_facts(facts: Sequence[Any], items: Sequence[JudgeItem], result: JudgeResult) -> dict[str, int]:
     """Set each call fact's ``held`` (and its card line, :data:`SHOWN_KEY` in its provenance) from :func:`route`.
     ``facts`` (NewFact), ``items`` and ``result.verdicts`` are aligned. Returns content-free counts for the log."""
+    from yuki.memory.misheard import is_listed
+
     counts: Counter[str] = Counter()
     for fact, item, verdict in zip(facts, items, result.verdicts):
         reason = route(item.who, str(getattr(fact, "nature", "fact") or "fact"), verdict,
-                       str(getattr(fact, "sensitive", "none") or "none"))
+                       str(getattr(fact, "sensitive", "none") or "none"),
+                       listed=is_listed(getattr(fact, "source", None) or {}))
         fact.held = reason
         if verdict is not None and verdict.shown and reason is not None:
             source = dict(getattr(fact, "source", None) or {})
@@ -435,6 +468,20 @@ def admit_call_facts(facts: Sequence[Any], items: Sequence[JudgeItem], result: J
         counts[f"verdict_{verdict.verdict}" if verdict is not None else "verdict_none"] += 1
         counts[f"held_{reason}" if reason else "admitted"] += 1
     return dict(counts)
+
+
+def unheld_links(facts: Sequence[Any], linked: Sequence[Any]) -> tuple[list[Any], int]:
+    """Work ops or questions of one journal batch (anything with ``fact_indexes``) that rest on at least one fact
+    going into memory now, and how many were left out (review F8): one whose facts are all held - sensitive, a joke
+    taken literally, a claim waiting for a Keep - would carry them onto the workboard or into a question through the
+    words the model wrote around them. One citing no fact at all stays (it rests on nothing held)."""
+    kept: list[Any] = []
+    for item in linked:
+        idx = [i for i in getattr(item, "fact_indexes", None) or [] if 0 <= i < len(facts)]
+        if idx and all(getattr(facts[i], "held", None) for i in idx):
+            continue
+        kept.append(item)
+    return kept, len(linked) - len(kept)
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +577,15 @@ def resolve_held(store: Any, journal_id: int, answer: str, *, now: float | None 
         text = store.cipher.decrypt(row["fact_ciphertext"])
         new_id: int | None = None
         nature = str(row["nature"] or "fact")
+        try:
+            source = json.loads(store._dec(row["source_ciphertext"]) or "{}") if row["source_ciphertext"] else {}
+        except (TypeError, ValueError):
+            source = {}
+        source = source if isinstance(source, dict) else {}
+        said = answer
+        if answer == "joke" and source.get("who") == "others":
+            # review F5: a joke is the user's own humour; someone else's line answered "It's a joke" stays out
+            said = "not_true"
         if answer == "undo":
             if row["reviewed_at"] is None:
                 return None
@@ -544,8 +600,12 @@ def resolve_held(store: Any, journal_id: int, answer: str, *, now: float | None 
         else:
             if row["reviewed_at"] is not None:
                 return None
-            if answer in ("keep", "joke"):
-                nature = "humor" if answer == "joke" else nature
+            if said in ("keep", "joke"):
+                # Keep: the user says it is true (a possibly misheard line kept is a fact now); It's a joke: theirs
+                nature = "humor" if said == "joke" else ("fact" if nature == "uncertain" else nature)
+                # review F6: the kept copy says the user confirmed it, so the portrait's bar for sensitive facts
+                # (only what the user told Yuki) can take it
+                kept_source = {**source, CONFIRMED_KEY: True} if said == "keep" else source
                 batch = store._insert_batch(conn, ModelCall(at=now, thread_id=row["thread_id"], model="user:keep",
                                                             cost_usd=0.0), 0, 1)
                 cur = conn.execute(
@@ -553,22 +613,26 @@ def resolve_held(store: Any, journal_id: int, answer: str, *, now: float | None 
                     " by_yuki, nature, milestone, source_ciphertext, tainted, attention, work_thread_id, reviewed_at)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (row["at"], row["thread_id"], row["app"], row["host"], row["fact_ciphertext"], row["importance"],
-                     batch, now, row["by_yuki"], nature, row["milestone"], row["source_ciphertext"], row["tainted"],
-                     row["attention"], row["work_thread_id"], now))
+                     batch, now, row["by_yuki"], nature, row["milestone"],
+                     store.cipher.encrypt(json.dumps(kept_source, ensure_ascii=False)) if kept_source else None,
+                     row["tainted"], row["attention"], row["work_thread_id"], now))
                 new_id = int(cur.lastrowid)
                 vec = conn.execute("SELECT model, dim, vec_ciphertext FROM journal_vec WHERE journal_id=?",
                                    (int(journal_id),)).fetchone()
                 if vec is not None:
                     conn.execute("INSERT OR REPLACE INTO journal_vec(journal_id, model, dim, vec_ciphertext)"
                                  " VALUES (?,?,?,?)", (new_id, vec["model"], vec["dim"], vec["vec_ciphertext"]))
-                line = "kept it as a joke" if answer == "joke" else "kept it"
+                line = "kept it as a joke" if said == "joke" else "kept it"
+            elif answer == "joke":
+                line = "said someone else's line was a joke; it stays out"
             else:
                 line = "said it isn't true; it stays out"
             conn.execute("UPDATE journal SET reviewed_at=? WHERE id=?", (now, int(journal_id)))
-        store._insert_diary(conn, None, now, {"pass": DIARY_PASS, "action": answer, "fact_ids": [int(journal_id)],
+        store._insert_diary(conn, None, now, {"pass": DIARY_PASS, "action": said, "fact_ids": [int(journal_id)],
                                               "new_fact_ids": [new_id] if new_id else [],
                                               "text": f"The user {line} for held J{int(journal_id)}."})
-        return {"id": int(journal_id), "answer": answer, "new_id": new_id, "nature": nature, "text": text}
+        return {"id": int(journal_id), "answer": said, "new_id": new_id, "nature": nature if new_id else None,
+                "text": text}
 
     out = store._write(op)
     try:
@@ -587,12 +651,15 @@ def recap_items(store: Any, call_ids: Sequence[int], *, now: float | None = None
                 limit: int = RECAP_KEEP_MAX) -> list[dict[str, Any]]:
     """The lines of a call's recap card: the call's unanswered :data:`HOLD_CALL` facts (never sensitive, never
     dropped ones) that have the judge's short second-person line (a card never shows the journal's "The user ..."
-    wording), the most important first, at most ``limit``: ``{"ref": "journal:N", "text": the card's line}``."""
+    wording), the most important first, at most ``limit``: ``{"ref": "journal:N", "text": the card's line, "who":
+    whose line it rests on}`` (``others``: the card offers no "It's a joke", review F5). The rest stay on the window's
+    "Waiting for your yes" list (:meth:`yuki.memory.api.MemoryClient.held_facts`) until they lapse."""
     if not call_ids:
         return []
     held = [h for h in held_facts(store, reasons=(HOLD_CALL,), call_ids=call_ids, now=now) if h.source.get(SHOWN_KEY)]
     held.sort(key=lambda h: (-h.importance, h.at, h.id))
-    return [{"ref": f"journal:{h.id}", "text": h.shown} for h in held[:max(0, int(limit))]]
+    return [{"ref": f"journal:{h.id}", "text": h.shown, "who": "others" if h.source.get("who") == "others" else "user"}
+            for h in held[:max(0, int(limit))]]
 
 
 def _names(people: Sequence[str]) -> str:
@@ -712,10 +779,15 @@ def _forget_corrections(store: Any, since: float) -> list[dict[str, Any]]:
 def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = None, settings: Any = None,
             now: float | None = None) -> dict[str, Any]:
     """What these rules would have done to the last ``days`` (counts only): of the user's "forget it" corrections,
-    how many would have been kept out (every journal fact behind it held or dropped, or never a fact: uncertain or
-    a labelled joke); of ``good`` call facts nobody corrected that the portrait uses, and of as many screen facts,
-    how many would wrongly be held or dropped. One judge call per call (or per :data:`JUDGE_BATCH` facts), a few
-    sensitivity calls for screen facts. Read only on the database; never writes."""
+    how many would have been kept out - only where the rules change the outcome: every journal fact behind it held
+    (waiting, dropped or sensitive) instead of stored. A fact the rules still store as before - a labelled joke, a
+    misheard line with the journal's guess (the "Maybe misheard" list), or an admitted fact - leaves the correction
+    as it was: it is counted ``unchanged`` (already a joke or uncertain when he corrected it, and stored with the same
+    label again) or ``admitted`` (review F1: those were counted as kept out before). Of ``good`` call facts nobody
+    corrected that the portrait uses, and of as many screen facts, how many would wrongly be held or dropped. One
+    judge call per call (or per :data:`JUDGE_BATCH` facts), a few sensitivity calls for screen facts. Read only on
+    the database; never writes."""
+    from yuki.memory.misheard import is_listed
     import random
 
     now = time.time() if now is None else float(now)
@@ -731,8 +803,9 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
     cache: dict[int, tuple[str, list[dict[str, Any]]]] = {}
 
     def outcome(es: Sequence[Any], detail: Counter[str] | None = None) -> dict[int, str]:
-        """``{journal id: admitted | held_<reason> | not_a_fact}`` for each entry, as the rules would route it;
-        ``detail`` counts the call facts by whose line, nature, verdict and sensitivity (content-free)."""
+        """``{journal id: admitted | held_<reason> | unchanged}`` for each entry, as the rules would route it
+        (``unchanged``: stored again with the joke or uncertain label it already had); ``detail`` counts the call
+        facts by whose line, nature, verdict and sensitivity (content-free)."""
         res: dict[int, str] = {}
         calls = [e for e in es if (e.source or {}).get("kind") == "call"]
         others = [e for e in es if (e.source or {}).get("kind") != "call"]
@@ -742,15 +815,15 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
                 it.nature = "uncertain"
         verdicts = judge_call_facts(client, items, settings=settings, names=names).verdicts if items else []
         for e, it, v in zip(calls, items, verdicts):
-            reason = route(it.who, it.nature, v)
+            reason = route(it.who, it.nature, v, listed=is_listed(e.source or {}))
             if detail is not None:
                 detail[f"{it.who}/{it.nature}/{v.verdict if v else 'none'}/{v.sensitive if v else '-'}"] += 1
             res[e.id] = (f"held_{reason}" if reason else
-                         "not_a_fact" if it.nature in ("humor", "uncertain") else "admitted")
+                         "unchanged" if e.nature in ("humor", "uncertain") else "admitted")
         if others:   # screen facts: only the sensitivity mark holds them (the journal gives it at the source)
             for e, kind in zip(others, judge_sensitive(client, [e.fact for e in others], settings=settings)):
                 res[e.id] = "held_sensitive" if kind != "none" else (
-                    "not_a_fact" if e.nature in ("humor", "uncertain") else "admitted")
+                    "unchanged" if e.nature in ("humor", "uncertain") else "admitted")
         return res
 
     corrected_detail: Counter[str] = Counter()
@@ -770,11 +843,13 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
             per["no_journal_evidence"] += 1
             kept_out_with_bar += sensitive_fact
             continue
-        out_all = all(s != "admitted" for s in states)
+        # kept out only where the rules change the outcome: every fact behind it held instead of stored
+        out_all = all(str(s).startswith("held_") for s in states)
         kept_out += out_all
         kept_out_with_bar += out_all or sensitive_fact
         kinds = {(entries[j].source or {}).get("kind") == "call" for j in c["journal_ids"] if j in entries}
-        per[("call" if True in kinds else "screen") + ("_kept_out" if out_all else "_admitted")] += 1
+        verdict = ("_kept_out" if out_all else "_admitted" if "admitted" in states else "_unchanged")
+        per[("call" if True in kinds else "screen") + verdict] += 1
     fact_states = Counter(got.values())
     by_kind = Counter(("call" if (entries[j].source or {}).get("kind") == "call" else "screen", s)
                       for j, s in got.items())

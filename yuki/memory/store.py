@@ -3767,22 +3767,59 @@ class Store:
             return 0
         conn.execute("UPDATE journal_batches SET supersedes=? WHERE id=?", (json.dumps(old), batch_id))
         self._forget_withdrawn()
-        # facts of the replaced batches still held back (yuki.memory.admission) are replaced too: no longer offered
+        # facts of the replaced batches still held back (yuki.memory.admission) and not answered are replaced too: no
+        # longer offered. An answered one stays with its hold batch (its Undo still works) and its answer is carried
+        # to the new batch's fact on the same line (_hold_journal; review F7)
         conn.execute(
-            "UPDATE journal SET superseded_by=? WHERE batch_id IN (%s) AND superseded_by IN"
+            "UPDATE journal SET superseded_by=? WHERE batch_id IN (%s) AND reviewed_at IS NULL AND superseded_by IN"
             " (SELECT id FROM journal_batches WHERE model LIKE 'hold:%%')" % ",".join("?" * len(old)),
             (batch_id, *old))
         return conn.execute(
             "UPDATE journal SET superseded_at=?, superseded_by=? WHERE batch_id IN (%s) AND superseded_at IS NULL"
             % ",".join("?" * len(old)), (time.time(), batch_id, *old)).rowcount
 
+    @staticmethod
+    def _line_key(source: Any) -> tuple[str, float, str] | None:
+        """The call line a fact rests on, from its provenance alone (the call, the line's time, whose line): how a
+        re-journal's fact meets the earlier fact on the same line (metadata, never words). ``None`` off a call."""
+        if not isinstance(source, dict) or source.get("kind") != "call" or source.get("at") is None:
+            return None
+        try:
+            at = round(float(source["at"]), 1)
+        except (TypeError, ValueError):
+            return None
+        return (str(source.get("call") or ""), at, "others" if source.get("who") == "others" else "user")
+
     def _hold_journal(self, conn: sqlite3.Connection, facts: Sequence[NewFact], journal_ids: Sequence[int],
-                      thread_id: int | None) -> int:
+                      thread_id: int | None, supersedes: Sequence[int] = ()) -> int:
         """Admission (yuki.memory.admission): the facts held back until the user's yes are superseded at once by one
-        ``hold:<reason>`` batch per reason (no tokens, no cost), in the caller's transaction. Returns how many."""
+        ``hold:<reason>`` batch per reason (no tokens, no cost), in the caller's transaction. Returns how many.
+
+        A re-journal (``supersedes``): a new fact on the same call line as a held fact of the replaced batches the user
+        already answered carries that answer (review F7) - it is held under the same reason and marked answered, so
+        a Not true is not admitted again and a Keep (whose kept copy stays) is not stored twice."""
+        answered: dict[tuple[str, float, str], tuple[str, float]] = {}
+        old = sorted({int(b) for b in supersedes if b is not None})
+        if old:
+            for r in conn.execute(
+                    "SELECT j.source_ciphertext, j.reviewed_at, b.model FROM journal j JOIN journal_batches b"
+                    " ON b.id = j.superseded_by WHERE j.batch_id IN (%s) AND j.reviewed_at IS NOT NULL"
+                    " AND b.model LIKE 'hold:%%'" % ",".join("?" * len(old)), old).fetchall():
+                try:
+                    src = json.loads(self._dec(r["source_ciphertext"]) or "{}") if r["source_ciphertext"] else {}
+                except (TypeError, ValueError):
+                    src = {}
+                key = self._line_key(src)
+                if key is not None:
+                    answered[key] = (str(r["model"])[len("hold:"):], float(r["reviewed_at"]))
         held: dict[str, list[int]] = {}
+        carried: list[tuple[float, int]] = []
         for fact, jid in zip(facts, journal_ids):
             reason = getattr(fact, "held", None)
+            prior = answered.get(self._line_key(getattr(fact, "source", None))) if answered else None
+            if prior is not None:
+                reason = reason or prior[0]
+                carried.append((prior[1], int(jid)))
             if reason:
                 held.setdefault(str(reason), []).append(int(jid))
         now = time.time()
@@ -3791,6 +3828,8 @@ class Store:
                                                        cost_usd=0.0), 0, 0)
             conn.executemany("UPDATE journal SET superseded_at=?, superseded_by=? WHERE id=?",
                              [(now, batch, i) for i in ids])
+        if carried:
+            conn.executemany("UPDATE journal SET reviewed_at=? WHERE id=?", carried)
         return sum(len(v) for v in held.values())
 
     def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
@@ -3810,7 +3849,7 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
-            self._hold_journal(conn, facts, journal_ids, call.thread_id)
+            self._hold_journal(conn, facts, journal_ids, call.thread_id, supersedes)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
@@ -8099,7 +8138,7 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
-            self._hold_journal(conn, facts, journal_ids, call.thread_id)
+            self._hold_journal(conn, facts, journal_ids, call.thread_id, supersedes)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
