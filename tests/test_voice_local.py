@@ -484,7 +484,7 @@ def test_settings_offers_local_speech_in_plain_words_and_says_how_it_stands(_mod
                                                    root=[_models_in_temp])["local"]["text"]
     (_models_in_temp / "status.json").write_text(json.dumps({"models": {"piper": {"state": "paused"}}}),
                                                  encoding="utf-8")
-    assert "waits while you're in a game or a call" in local_speech_view(
+    assert "waits while you're in a game, a call or a full-screen window" in local_speech_view(
         {"tts_provider": "local"}, root=[_models_in_temp])["local"]["text"]
     for text in (view["local"]["text"], *[c["note"] for c in cloud["stt_choices"]]):
         assert "Parakeet" not in text and "sherpa" not in text   # no model or tool names in what the user reads

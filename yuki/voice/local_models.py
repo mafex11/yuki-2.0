@@ -157,6 +157,8 @@ STT_PROVIDERS = ("deepgram", "local")
 LOCAL = "local"
 #: The cloud voices ``tts_provider`` may name (``yuki.voice.session.PROVIDERS`` adds ``local``).
 CLOUD_VOICES = ("gemini", "elevenlabs", "deepgram")
+#: voice.json key holding the cloud voice id (``tts_voice``) while a voice on this PC is chosen (review F5).
+CLOUD_VOICE_KEY = "cloud_tts_voice"
 
 
 def is_local_voice(value: Any) -> bool:
@@ -189,25 +191,36 @@ def voice_pref_changes(prefs: dict[str, Any], changes: dict[str, Any]) -> dict[s
     """``prefs`` (voice.json) with the window's voice choices applied, the local ones translated.
 
     ``tts_provider`` may be ``local:<family:name>`` (Settings' one Voice list): that is ``tts_provider: local`` and
-    ``tts_voice: <family:name>``. Moving to a cloud voice drops a local ``tts_voice`` (it is not a cloud voice id), and
-    ``stt_provider`` is kept only when it is one of :data:`STT_PROVIDERS` (``deepgram`` is the default: not stored)."""
+    ``tts_voice: <family:name>``; a cloud voice id saved in ``tts_voice`` then (the user's ElevenLabs voice) is kept
+    aside in :data:`CLOUD_VOICE_KEY` and put back when a cloud voice is chosen again. Moving to a cloud voice drops a
+    local ``tts_voice`` (it is not a cloud voice id), and ``stt_provider`` is kept only when it is one of
+    :data:`STT_PROVIDERS` (``deepgram`` is the default: not stored)."""
     out = dict(prefs)
+
+    def to_local(voice: str) -> None:
+        saved = str(out.get("tts_voice") or "").strip()
+        if saved and not is_local_voice(saved):
+            out[CLOUD_VOICE_KEY] = saved
+        out["tts_provider"] = LOCAL
+        out["tts_voice"] = voice
+
     if "tts_provider" in changes:
         value = str(changes.get("tts_provider") or "").strip()
         if value.lower().startswith(LOCAL + ":"):
-            out["tts_provider"] = LOCAL
-            out["tts_voice"] = parse_voice(value[len(LOCAL) + 1:]).key
+            to_local(parse_voice(value[len(LOCAL) + 1:]).key)
         else:
             provider = value.lower()
             if provider in CLOUD_VOICES:
                 out["tts_provider"] = provider
             elif provider == LOCAL:
-                out["tts_provider"] = LOCAL
-                out["tts_voice"] = parse_voice(out.get("tts_voice")).key
+                to_local(parse_voice(out.get("tts_voice")).key)
             else:
                 out.pop("tts_provider", None)
             if provider != LOCAL and is_local_voice(out.get("tts_voice")):
                 out.pop("tts_voice", None)
+                kept = str(out.pop(CLOUD_VOICE_KEY, "") or "").strip()
+                if kept:
+                    out["tts_voice"] = kept
     if "stt_provider" in changes:
         value = str(changes.get("stt_provider") or "").strip().lower()
         if value == LOCAL:
@@ -364,19 +377,45 @@ class Downloader:
     def start(self, keys: list[str], *, allowed: Callable[[], bool] = lambda: True, root: Any = None,
               log: Any = None, opener: Callable[..., Any] | None = None) -> bool:
         """Download and install the missing ones of ``keys`` in the background. ``False``: nothing to do, one is
-        already running, or ``allowed()`` says not now. ``allowed`` is asked again between chunks."""
+        already running, ``allowed()`` says not now (the models are marked ``paused``, so the resume hooks see them), or
+        each missing one failed its checksum recently (:meth:`backing_off`). ``allowed`` is asked again between
+        chunks."""
         missing = [k for k in keys if k in CATALOG and not installed(k, root)]
-        if not missing or self.running:
+        if self.running:
+            return False
+        saved = read_status(root)
+        missing = [k for k in missing if not self.backing_off(saved.get(k))]
+        if not missing:
             return False
         try:
-            if not allowed():
-                return False
+            go = bool(allowed())
         except Exception:  # noqa: BLE001 - not sure: not now
+            go = False
+        if not go:
+            for key in missing:
+                if (self._status.get(key) or {}).get("state") != "paused":
+                    part = roots(root)[0] / f"{CATALOG[key].archive}.part"
+                    self._set(root, key, state="paused", done=part.stat().st_size if part.is_file() else 0,
+                              total=CATALOG[key].archive_mb * 1_000_000)
             return False
         self._thread = threading.Thread(target=self._run, args=(missing, allowed, root, log, opener),
                                         name="yuki-voice-models", daemon=True)
         self._thread.start()
         return True
+
+    #: After a download that failed its checksum, the next try waits this long (s): 1 h, then 6 h, then a day each.
+    BACKOFF_S = (3600.0, 6 * 3600.0, 24 * 3600.0)
+
+    @staticmethod
+    def backing_off(row: Any, now: float | None = None) -> bool:
+        """Whether a model's saved status says its last download failed its checksum and the wait is not over (a
+        network failure is retried at the next standby as before)."""
+        if not isinstance(row, dict) or row.get("state") != "error":
+            return False
+        try:
+            return float(row.get("retry_after") or 0) > (time.time() if now is None else now)
+        except (TypeError, ValueError):
+            return False
 
     def join(self, timeout: float | None = None) -> None:
         thread = self._thread
@@ -433,7 +472,12 @@ class Downloader:
         except OSError:
             pass
         if problem:
-            self._set(root, spec.key, state="error", error=problem, total=spec.archive_mb * 1_000_000)
+            # The same bad copy would come again at once: wait longer after each failed check (status.json keeps it).
+            before = read_status(root).get(spec.key) or {}
+            failures = int(before.get("failures") or 0) + 1 if before.get("state") == "error" else 1
+            wait = self.BACKOFF_S[min(failures, len(self.BACKOFF_S)) - 1]
+            self._set(root, spec.key, state="error", error=problem, total=spec.archive_mb * 1_000_000,
+                      failures=failures, retry_after=round(time.time() + wait))
             return "error"
         self._set(root, spec.key, state="ready")
         return "ready"
@@ -604,16 +648,22 @@ class LocalSpeech:
     def configure(self, *, root: Any = None, threads: int | None = None, keep_loaded: bool | None = None,
                   unload_s: float | None = None, hotword_score: float | None = None, log: Any = None,
                   busy: Callable[[], bool] | None = None) -> "LocalSpeech":
-        """Settings for the next loads, and the threads started (call it off every event loop)."""
+        """Settings for the next loads, and the threads started (call it off every event loop). Turning
+        ``keep_loaded`` off while nothing holds the models starts the quiet timer, as a conversation's end would."""
+        let_go = False
         with self._lock:
             if root is not None:
                 self.root = root
             if threads is not None:
                 self.threads = max(1, int(threads))
-            if keep_loaded is not None:
-                self.keep_loaded = bool(keep_loaded)
             if unload_s is not None:
                 self.unload_s = max(0.0, float(unload_s))
+            if keep_loaded is not None:
+                was, self.keep_loaded = self.keep_loaded, bool(keep_loaded)
+                if was and not self.keep_loaded and not self._holds and self._unload_at is None and (
+                        self._stt is not None or self._tts):
+                    self._unload_at = time.monotonic() + self.unload_s
+                    let_go = True
             if hotword_score is not None:
                 self.hotword_score = max(0.0, min(self.HOTWORD_SCORE_MAX, float(hotword_score)))
             if log is not None:
@@ -624,8 +674,14 @@ class LocalSpeech:
                 self._thread = threading.Thread(target=self._run, name="yuki-voice-local", daemon=True)
                 self._thread.start()
                 threading.Thread(target=self._run_voice, name="yuki-voice-local-tts", daemon=True).start()
-                self.decode_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-stt"))
-                self.synth_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-tts"))
+                # Decoding and synthesis (the per-turn heavy work) run below normal too, like the loads.
+                self.decode_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-stt",
+                                                             initializer=_below_normal_thread))
+                self.synth_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-tts",
+                                                            initializer=_below_normal_thread))
+        if let_go:
+            self._event("unload_timer", s=self.unload_s, why="keep_loaded_off")
+            self._jobs.put(lambda: None)   # the worker wakes to wait for the new deadline
         return self
 
     @property

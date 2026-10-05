@@ -2334,10 +2334,12 @@ def local_speech_view(prefs: dict[str, Any], root: Any = None) -> dict[str, Any]
         whole = sum(int(r.get("total") or 0) for r in rows if r.get("state") in ("downloading", "installing")) or 1
         text = f"Downloading, {round(100 * done / whole)}% of this part. Until it's done I use the cloud."
     elif "paused" in states:
-        text = "The download waits while you're in a game or a call, then carries on. Until then I use the cloud."
+        text = "The download waits while you're in a game, a call or a full-screen window, then carries on. Until then I use the cloud."
     elif "error" in states:
         why = next((r.get("error") for r in rows if r.get("state") == "error"), "") or "it failed"
-        text = f"Couldn't download the models ({why}). I try again next time. Until then I use the cloud."
+        later = max((float(r.get("retry_after") or 0) for r in rows if lm.Downloader.backing_off(r)), default=0.0)
+        again = f"I try again from {day_words(later)}" if later else "I try again next time"
+        text = f"Couldn't download the models ({why}). {again}. Until then I use the cloud."
     else:
         text = f"About {total_mb} MB to download, when you're not in a game or a call. Until then I use the cloud."
     out["local"] = {"text": text, "keep_loaded": bool(prefs.get("local_keep_loaded", False)),

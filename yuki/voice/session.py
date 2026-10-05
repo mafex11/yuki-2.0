@@ -1145,18 +1145,28 @@ class VoiceSession(QObject):
             self._apply_wake()
             if changed:
                 self._emit_listening()
-        resume = getattr(self, "_resume_local_download", None)   # vLocal (a test's stand-in session has none)
-        if callable(resume):
-            resume()
+        for hook in ("_resume_local_download", "_local_busy_changed"):   # vLocal (a test's stand-in has none)
+            fn = getattr(self, hook, None)
+            if callable(fn):
+                fn()
+
+    def on_front_changed(self) -> None:
+        """The window in front changed, or changed its size (the island's WinEvent watch): a download paused by a
+        full-screen window may go on, and a standby whose speech-on-this-PC choice no longer fits a game starting or
+        ending is built again. Cheap: nothing is read unless a download is paused or a standby runs speech on this PC
+        (then one Win32 look)."""
+        self._resume_local_download()
+        self._local_busy_changed()
 
     def _resume_local_download(self) -> None:
-        """vLocal: a download of the speech models that stopped for a game or a call goes on once both are over."""
+        """vLocal: a download of the speech models that stopped for a game, a call or a full-screen window goes on once
+        none is on (a call-status change, or the window in front changing)."""
         import sys
 
         lm = sys.modules.get("yuki.voice.local_models")   # never imported when local speech was never chosen
-        if lm is None or lm.downloader().running or not self._pc_free():
+        if lm is None or lm.downloader().running:
             return
-        if any(row.get("state") == "paused" for row in lm.downloader().status().values()):
+        if any(row.get("state") == "paused" for row in lm.downloader().status().values()) and self._pc_free():
             self.local_models_wanted()
 
     def owns(self, job_id: int) -> bool:
@@ -1297,12 +1307,48 @@ class VoiceSession(QObject):
                 self.log.event("local_models", op="download_start", models=keys)
         return keys
 
-    def _local_setup(self, settings: Settings) -> None:
+    def _local_choice(self, settings: Settings, facts: dict[str, Any]) -> str | None:
+        """What a standby chose for speech on this PC (review F3): ``"busy_cloud"`` (local chosen, but a game or a call
+        sent it to the cloud), ``"local"`` (it runs on this PC), ``None`` (local not chosen, or not ready anyway)."""
+        if facts.get("local_busy"):
+            return "busy_cloud"
+        if "local" in (facts.get("stt_provider"), facts.get("tts_provider")):
+            return "local"
+        return None
+
+    def _local_busy_changed(self) -> None:
+        """A game or a call started or ended (call status, the window in front): a standby whose speech-on-this-PC
+        choice no longer fits is built again. Cloud for a game, and back on this PC after it; a local standby whose
+        models are not loaded goes to the cloud when a game starts (its wake would load about 1 GB mid-game)."""
+        built = getattr(self, "_standby_local", None)
+        if built is None or self.in_conversation or self._standby_conv is None:
+            return
+        busy = not self._pc_free()
+        if built == "busy_cloud" and busy:
+            return
+        if built == "local":
+            if not busy:
+                return
+            import sys
+
+            lm = sys.modules.get("yuki.voice.local_models")
+            settings = (getattr(self._standby_conv, "_standby_meta", {}) or {}).get("settings") or self.settings
+            needed = lm.wanted(settings.voice_stt_provider, settings.voice_tts_provider,
+                               settings.voice_tts_voice) if lm is not None else []
+            loaded = lm.engine().loaded() if lm is not None else {}
+            if all(loaded.get(k) for k in needed if k != lm.FALLBACK_VOICE.family):
+                return   # already loaded: nothing heavy to load at the wake
+        self._standby_local = None
+        self.log.event("local_models", op="standby_rebuild", busy=busy, was=built)
+        self.rebuild_standby()
+
+    def _local_setup(self, settings: Settings, *, busy: bool = False) -> None:
         """Before a conversation is built (its own thread, never an event loop): the speech models on this PC.
 
-        Local chosen: the engine's threads exist, VAD and Smart Turn load (once), the big models load ahead only with
-        "keep loaded" and no game or call on (else at the wake), and missing models download in the background. Local
-        not chosen: anything still loaded from before is let go. Nothing at all when local was never used."""
+        Local chosen: the engine's threads exist, VAD and Smart Turn load (once; not while a game or a call is on),
+        the big models load ahead only with "keep loaded" and no game or call on (else at the wake), and missing models
+        download in the background. Local not chosen: anything still loaded from before is let go. Nothing at all
+        when local was never used."""
         from yuki.voice import local_models as lm
 
         stt_local = settings.voice_stt_provider == "local"
@@ -1317,7 +1363,7 @@ class VoiceSession(QObject):
             eng.unload(everything=True)
         self.local_models_wanted()
         root = str(getattr(settings, "voice_local_models_dir", "") or "") or None
-        if stt_local and lm.installed("parakeet", root):
+        if stt_local and lm.installed("parakeet", root) and (not busy or eng.loaded().get("parakeet")):
             eng.turn_models()
         if settings.voice_local_keep_loaded:
             family = lm.parse_voice(settings.voice_tts_voice).family if tts_local else None
@@ -1625,8 +1671,10 @@ class VoiceSession(QObject):
             _background(load_aec, "yuki-voice-aec")
         try:
             mic = self._ensure_mic()
-            self._local_setup(settings)   # vLocal
-            facts = preflight(settings, need_headphones=False)
+            busy = not self._pc_free()   # vLocal: a game or a call (speech on this PC only if already loaded)
+            self._local_setup(settings, busy=busy)
+            facts = preflight(settings, need_headphones=False, busy=busy)
+            self._standby_local = self._local_choice(settings, facts)
             if facts.get("tts_voice"):
                 settings = replace(settings, voice_tts_voice=facts["tts_voice"])
             if facts.get("stt_provider", settings.voice_stt_provider) != settings.voice_stt_provider:
@@ -1911,8 +1959,9 @@ class VoiceSession(QObject):
             mark("listening")  # what is said from here on (and since the name) is kept for speech recognition
             if self._output_note(out_facts):
                 self._thread_state.emit("note", self._output_note(out_facts))
-            self._local_setup(settings)   # vLocal
-            facts = preflight(settings)
+            busy = not self._pc_free()   # vLocal: a game or a call (speech on this PC only if already loaded)
+            self._local_setup(settings, busy=busy)
+            facts = preflight(settings, busy=busy)
             mark("preflight")
             if facts.get("tts_voice"):
                 # The chosen voice was refused (e.g. needs a paid plan): this conversation only.

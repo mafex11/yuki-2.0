@@ -302,40 +302,67 @@ def stt_provider(settings: Any) -> str:
     return "local" if value == "local" else "deepgram"
 
 
-def local_fallbacks(settings: Any, facts: dict[str, Any]) -> None:
-    """vLocal: speech on this PC that cannot run yet (its models not downloaded, or one failed to load this run) runs
-    in the cloud for this conversation, with a note saying so: Yuki is never deaf or silent because of the setting."""
+#: vLocal: what the pill says when a game or a call is on and the models on this PC are not loaded (review F3).
+LOCAL_BUSY_NOTE = "You're in a game or a call, so I'm using the cloud this time; speech on this PC would slow it down"
+
+
+def local_fallbacks(settings: Any, facts: dict[str, Any], *, busy: bool = False) -> None:
+    """vLocal: speech on this PC that cannot run yet runs in the cloud for this conversation, with a note saying so:
+    Yuki is never deaf or silent because of the setting.
+
+    * Not downloaded (the chosen voice's own model, not just the plain fallback voice): the cloud. The plain voice
+      speaks only for a chosen voice that is downloaded but fails to load this run.
+    * Failed to load this run (recognition, or both the voice and the plain voice): the cloud.
+    * ``busy`` (a game or a call is on) and the model is not loaded already: the cloud, when the cloud can work (a
+      Deepgram key); loading about 1 GB and decoding on this PC would slow the game (``facts["local_busy"]``)."""
+    stt_local, tts_local = facts.get("stt_provider") == "local", facts.get("tts_provider") == "local"
+    if not (stt_local or tts_local):
+        return
     from yuki.voice import local_models as lm
 
     root = str(getattr(settings, "voice_local_models_dir", "") or "") or None
-    broken = lm.engine().broken
+    eng = lm.engine()
+    broken = eng.broken
+    loaded = eng.loaded() if busy else {}
+    cloud_ok = bool(get_key(DEEPGRAM))
 
     def ready(key: str) -> bool:
         return lm.installed(key, root) and key not in broken
 
-    if facts.get("stt_provider") == "local" and not ready("parakeet"):
-        facts["stt_provider"] = "deepgram"
-        facts["stt_note"] = ("Speech recognition on this PC isn't downloaded yet; using the cloud for now"
-                             if "parakeet" not in broken else
-                             "Speech recognition on this PC couldn't start; using the cloud for now")
-    if facts.get("tts_provider") == "local":
+    if stt_local:
+        if not ready("parakeet"):
+            facts["stt_provider"] = "deepgram"
+            facts["stt_note"] = ("Speech recognition on this PC isn't downloaded yet; using the cloud for now"
+                                 if "parakeet" not in broken else
+                                 "Speech recognition on this PC couldn't start; using the cloud for now")
+        elif busy and cloud_ok and not loaded.get("parakeet"):
+            facts["stt_provider"], facts["stt_note"], facts["local_busy"] = "deepgram", LOCAL_BUSY_NOTE, True
+    if tts_local:
         voice = lm.parse_voice(getattr(settings, "voice_tts_voice", ""))
-        if not (ready(voice.family) or ready(lm.FALLBACK_VOICE.family)):
-            fallback = str(getattr(settings, "voice_tts_fallback", "") or "deepgram")
-            facts["tts_provider"] = fallback if fallback != "local" else "deepgram"
+        fallback = str(getattr(settings, "voice_tts_fallback", "") or "deepgram")
+        cloud = fallback if fallback != "local" else "deepgram"
+        if not lm.installed(voice.family, root):
+            facts["tts_provider"] = cloud
             facts["tts_note"] = "The voice on this PC isn't downloaded yet; using the cloud voice for now"
+        elif voice.family in broken and not ready(lm.FALLBACK_VOICE.family):
+            facts["tts_provider"] = cloud
+            facts["tts_note"] = "The voice on this PC couldn't start; using the cloud voice for now"
+        elif busy and cloud_ok and not loaded.get(voice.family):
+            facts["tts_provider"], facts["local_busy"] = cloud, True
+            facts.setdefault("tts_note", LOCAL_BUSY_NOTE)
 
 
-def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, Any]:
+def preflight(settings: Settings, *, need_headphones: bool = True, busy: bool = False) -> dict[str, Any]:
     """Check what a conversation needs before opening anything. Raises :class:`VoiceUnavailable`.
 
     Returns facts for the log, including ``tts_provider``: the configured one,
     or ``voice_tts_fallback`` (with ``tts_note`` saying why) when the configured
     one cannot speak. Speakers are no reason to refuse any more (the echo guard,
     docs/VOICE.md §11) unless ``voice_require_headphones`` asks for the v3.3 rule.
+    ``busy``: a game or a call is on (speech on this PC then runs only if already loaded, :func:`local_fallbacks`).
     """
     facts: dict[str, Any] = {"tts_provider": settings.voice_tts_provider, "stt_provider": stt_provider(settings)}
-    local_fallbacks(settings, facts)
+    local_fallbacks(settings, facts, busy=busy)
     if (facts["stt_provider"] != "local" or facts["tts_provider"] == "deepgram") and not get_key(DEEPGRAM):
         raise VoiceUnavailable("Voice needs DEEPGRAM_API_KEY (a Windows user environment variable).")
     if settings.voice_tts_provider == "gemini":
