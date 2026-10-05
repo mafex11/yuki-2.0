@@ -192,6 +192,12 @@ OPAQUE_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "title"})
 #: Triggers a window whose last read was privacy-skipped (a blocked site) is not read again for, while its
 #: title is the same ("title" and "page" always read: it may have left the site).
 BLOCKED_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "refresh"})
+#: Privacy reasons of a page on a site the privacy file names (its sign-in, payment and meeting sites, whole or
+#: by path): the page's host alone - never its title, path or content - goes to call detection, in this process
+#: only, so a call on a meeting site that is never read can still be noticed (2026-10-05: a Google Meet call in
+#: the Zen browser). Call detection decides from the privacy file's own lists which hosts are meeting sites and
+#: never sends a visited host anywhere (yuki.memory.callevidence).
+SITE_ONLY_REASONS = frozenset({"blocked_host", "blocked_path"})
 #: Popups whose own element is one of these UIA control types (a fixed machine vocabulary) are shown in Now
 #: but never stored: a tooltip or a menu is what is on screen, not something that happened.
 NOW_ONLY_POPUPS = frozenset({"ToolTip", "Menu", "MenuBar"})
@@ -973,6 +979,9 @@ class Watcher:
         self._store_ref: Any = None
         #: Windows whose last read was privacy-skipped after reading (a blocked site): (title, why).
         self._bg_blocked: dict[int, tuple[str, str]] = {}
+        #: ... and of those on a site the privacy file names (:data:`SITE_ONLY_REASONS`): (app key, exe, host, why),
+        #: in memory only, so a skip without a read still tells call detection which site the window shows.
+        self._blocked_site: dict[int, tuple[str, str, str, str]] = {}
         #: The window in front: its content events since its last read (first, last) and the adaptive gap.
         self._fg_content: tuple[float, float] | None = None
         self._fg_content_gap: dict[int, float] = {}
@@ -1027,7 +1036,9 @@ class Watcher:
         self._acting_last: tuple[Any, float] = (None, 0.0)
         #: ``(screen)``: called on the worker thread after each extraction of a window that passed the privacy
         #: gates, with ``{"process", "exe", "hwnd", "at", "host", "title", "controls"}`` (the visible control
-        #: names), for call detection (:class:`yuki.memory.callevidence.CallEvidence`). Must not block.
+        #: names), for call detection (:class:`yuki.memory.callevidence.CallEvidence`). Must not block. A page on
+        #: a site the privacy file names (:data:`SITE_ONLY_REASONS`) is handed as ``{"process", "exe", "hwnd",
+        #: "at", "host", "blocked"}`` only (no title, no controls), also when a skip did not read it again.
         self.on_screen: Callable[[dict[str, Any]], None] | None = None
         #: A retry waiting for the window to settle (hook thread):
         #: ``(hwnd, deadline, content pid when armed)``.
@@ -2020,6 +2031,7 @@ class Watcher:
         blocked_as = self._bg_blocked.get(hwnd)
         if blocked_as is not None and blocked_as[0] == title and job.reason != "refresh":
             # its last read was a blocked site or a sign-in page, and it shows the same title: not read again
+            self._tell_site_again(hwnd)   # still on that site: its host only, for call detection
             return done("skipped", f"{blocked_as[1]}_before")
         if _uia_threads_alive() > self.settings.uia_backlog:
             return done("skipped", "uia_backlog")
@@ -2036,6 +2048,10 @@ class Watcher:
             # A popup hosted by another process (a notification toast shown by the shell) that names an app the
             # user blocked: nothing of it is kept (their own list, matched exactly, fails safe).
             return done("skipped", "blocked_app_named")
+        if extraction.profile != "error":
+            blocked = rules.check_url(extraction.url or "")
+            if blocked:   # a blocked site on screen: for a site the privacy file names, its host for call detection
+                self._tell_site(hwnd, facts, extraction.url, blocked)
         opaque = False if job.popup else self._measure_opaque(hwnd, extraction, result)
         if opaque:
             self._follow_opaque(hwnd, facts, title, foreground=False)
@@ -2214,6 +2230,7 @@ class Watcher:
             # Its last read was a blocked site or a sign-in page (known only after reading), and it still shows
             # the same title: a meeting page in front was read again on every focus change (0.5-2 s each).
             result.app = facts.app_name
+            self._tell_site_again(hwnd)   # still on that site: its host only, for call detection
             return done("skipped", f"{blocked_as[1]}_before")
         opaque_at = self._opaque.get(hwnd)
         if (request.trigger in OPAQUE_SKIP_TRIGGERS and opaque_at is not None
@@ -2263,6 +2280,8 @@ class Watcher:
             self._bg_blocked[hwnd] = (title, reason)
         else:
             self._bg_blocked.pop(hwnd, None)
+        if not (outcome == "skipped" and reason in SITE_ONLY_REASONS):
+            self._blocked_site.pop(hwnd, None)
 
     # -- opaque windows and the app's own data --------------------------------------------
 
@@ -2369,13 +2388,50 @@ class Watcher:
         if hook is None or extraction.profile == "error":
             return
         try:
-            if rules.check_url(extraction.url or "") or extraction.stats.get("password_fields"):
-                return   # a blocked site or a sign-in page: nothing of it leaves the watcher
+            blocked = rules.check_url(extraction.url or "")
+            if blocked:
+                # a blocked site: nothing of it leaves the watcher but, for a site the privacy file names, its host
+                self._tell_site(hwnd, facts, extraction.url, blocked)
+                return
+            if extraction.stats.get("password_fields"):
+                return   # a sign-in page: nothing of it leaves the watcher
             from yuki.memory.store import app_key, url_host
 
             hook({"process": app_key(facts.process_name) or "", "exe": facts.exe, "hwnd": int(hwnd),
                   "at": time.time(), "host": url_host(extraction.url), "title": extraction.title or "",
                   "controls": list(extraction.controls or [])})
+        except Exception as exc:  # noqa: BLE001 - call detection never breaks capture
+            self._log_error("on_screen", exc)
+
+    def _tell_site(self, hwnd: int, facts: ProcessFacts, url: str | None, reason: str) -> None:
+        """A read page the privacy rules skipped: when the reason is a site the privacy file names
+        (:data:`SITE_ONLY_REASONS`), hand ``on_screen`` its app, host and time - nothing else - and remember them
+        for the skips that do not read the window again (:meth:`_tell_site_again`). Never raises, never blocks."""
+        if self.on_screen is None or reason not in SITE_ONLY_REASONS:
+            return
+        try:
+            from yuki.memory.store import app_key, url_host
+
+            host = url_host(url)
+            if not host:
+                return
+            if len(self._blocked_site) > 256:
+                self._blocked_site.clear()
+            self._blocked_site[hwnd] = (app_key(facts.process_name) or "", facts.exe, host, reason)
+            self._tell_site_again(hwnd)
+        except Exception as exc:  # noqa: BLE001 - call detection never breaks capture
+            self._log_error("on_screen", exc)
+
+    def _tell_site_again(self, hwnd: int) -> None:
+        """The window still shows the site its last read was skipped for (same title, not read again): tell
+        ``on_screen`` it was seen now (app, host, time only). Never raises."""
+        hook = self.on_screen
+        site = self._blocked_site.get(hwnd)
+        if hook is None or site is None:
+            return
+        key, exe, host, reason = site
+        try:
+            hook({"process": key, "exe": exe, "hwnd": int(hwnd), "at": time.time(), "host": host, "blocked": reason})
         except Exception as exc:  # noqa: BLE001 - call detection never breaks capture
             self._log_error("on_screen", exc)
 

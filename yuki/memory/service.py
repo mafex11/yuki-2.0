@@ -408,7 +408,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.callevidence import CallEvidence
 
-                call_evidence = CallEvidence(log=log)
+                call_evidence = CallEvidence(log=log, privacy=watcher.privacy)   # [meetings] always/never_sites
                 watcher.on_screen = call_evidence.seen
             except Exception as exc:  # calls then need the user's own [calls] apps
                 log("error", where="call_evidence", error=f"{type(exc).__name__}: {exc}")
