@@ -1425,6 +1425,8 @@ class Agent:
         #: N10: the request's kept list (``tasks``), and how often a done was held for what is still on it.
         self._tasks: list[dict[str, Any]] = []
         self._tasks_held = 0
+        #: fix6 review: a plain-text reply (no done, so no claims class) after steps ran was sent back once for done.
+        self._plain_held = False
         self._typed: dict[int, str] = {}
         self._files_read = False
         self._unconfirmed: list[tuple[int, int | None]] = []
@@ -2510,6 +2512,16 @@ class Agent:
                     f"dropped in tasks with those words and say so in done; when all is done, mark it done in tasks "
                     f"alongside done.")
                 continue
+            if text and not self._plain_held and (getattr(self, "_trace", None) or []):
+                # fix6 review (item 1): a plain-text reply classes nothing, so the claim check cannot weigh it; after
+                # steps ran it could claim one that never ran ("opened it and closed it, confirmed"). Sent back once
+                # for done, whose claims class the check holds to the run (a reply with no steps is a plain answer)
+                self._plain_held = True
+                self.logger.log("plain_held", steps=len(self._trace), text_chars=len(text))
+                self.context.add_note(
+                    f"{CHECK_LABEL}: your reply above was not sent: finish with done (its claims no stronger than "
+                    f"your steps showed), not plain text.")
+                continue
             if text:
                 verdict = self._outcome_verdict()
                 self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
@@ -2583,12 +2595,18 @@ class Agent:
         self._claim_rounds += 1
         self.logger.log("claim_held", gaps=gaps, about=turn.done_about, message=turn.finished[0])
         turn.finished.clear()
-        held.append(({"type": "text", "text": (
-            f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
-            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows, its claims no "
-            f"stronger than your steps showed. A done that no step backs reaches them as not confirmed, so word it as "
-            f"what you tried.")},
-            "a claim about the screen had no evidence"))
+        if gaps == [self._claim_gap(turn.done_claims)]:
+            # review F3: only its claims class is past the run: the gap itself says what clears it (a look only
+            # where a look can), never "look first" where looking cannot raise the result
+            text = (f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Then finish with done, its claims no "
+                    f"stronger than your steps showed. A done whose claims stay past them reaches them as not "
+                    f"confirmed.")
+        else:
+            text = (f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
+                    f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows, its claims "
+                    f"no stronger than your steps showed. A done that no step backs reaches them as not confirmed, so "
+                    f"word it as what you tried.")
+        held.append(({"type": "text", "text": text}, "a claim about the screen had no evidence"))
         return held
 
     def _outcome_verdict(self) -> dict[str, Any] | None:
@@ -2633,7 +2651,7 @@ class Agent:
         except Exception:  # noqa: BLE001 - the check never breaks a request
             return None
         read = any(s.get("kind") in ("read", "memory") and s.get("ok") for s in trace if isinstance(s, dict))
-        return finish_gate.claim_gap(claims, verdict, read=read)
+        return finish_gate.claim_gap(claims, verdict, read=read, looked_back=finish_gate.read_back(trace))
 
     def _honest_final(self, text: str, verdict: dict[str, Any] | None) -> str:
         """fix6: the closing text obeys the outcome verdict (:func:`yuki.agent.finish.honest_text`): below likely the
@@ -3081,13 +3099,15 @@ class Agent:
                     self.logger.log("situation_gate", tool=name, what=need, checks=len(checks),
                                     hwnd=target.get("hwnd"))
             if held_text is None:
-                # Revamp D (S3): a pending send to a person, or the request's first action on a close call, gets one
+                # Revamp D (S3): a pending send to a person, or the first harmful call on a close call, gets one
                 # second look before it runs; its verdict (the model's) can hold the call.
                 signal = None
                 if judged is not None and judged.sends:
                     signal = ("send", "a message to a person is about to be sent")
-                elif (self._learning.get("actions", 0) == 0 and _close_call(self._frame)
-                      and _close_call_matters(name, tool_input, target)):
+                elif _close_call(self._frame) and _close_call_matters(name, tool_input, target):
+                    # fix6 review F2: the first call that could do lasting harm on a close call, whatever its index
+                    # (a selecting click or a focus before a close or delete no longer hides the close from it);
+                    # once per request (``_consult_due``)
                     signal = ("close_call", "the task frame calls two candidates a close call")
                 if signal is not None and not self._paused.is_set() and self._consult_due(signal[0]):
                     advice = self._consult(signal[0], signal[1],

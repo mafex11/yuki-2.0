@@ -4038,7 +4038,6 @@ class Dispatcher:
             return False, self._live_element(hwnd, element)
 
         def before(read: list[Any] | None) -> ToolOutcome | None:
-            nonlocal learned
             _from_bracket, live = in_read(read)
             if live is None:
                 raise ToolError(f"not clicked: {label} is not in a fresh read of its window: it may be hidden until "
@@ -4060,14 +4059,30 @@ class Dispatcher:
                                                                "window_state": shown_before, "toggle_to": want}})
                     return self._labelled(outcome, label)
                 return None
-            if learned is None and _renamed_same_state(element, live):
-                # the thinker read it under another name with the same on/off: its state is in its name
-                learned = self._learn_toggle(hwnd, element, live, "name")
             if learned == "name" and now == want:
                 raise ToolError(f"not clicked: {label}'s own on/off reads the same in both its states (its name "
                                 f"changes, its on/off does not), so whether it is already {want} cannot be read from "
                                 f"it. Judge by what it switches: for a full-screen control give full_screen or "
                                 f"not_full_screen; otherwise read the window first")
+            if learned is None and now == want and _renamed_same_state(element, live):
+                # review F6: renamed since the thinker's read with the same on/off. For this call only (a passive
+                # difference between two reads is no evidence that its on/off never moves: a like button's name
+                # carries a live count), so nothing is learned; a fresh read makes the names agree again
+                raise ToolError(f"not clicked: {label}'s name changed since your read while its on/off stayed {now}, "
+                                f"so whether it is already {want} is not clear from it. Read the window again and "
+                                f"click from that read; for a full-screen control give full_screen or not_full_screen")
+            if now == want and shown_before == "fullscreen":
+                # review F4: the window itself measures full screen, and a full-screen control's own on/off can read
+                # the same in both views (Spotify's "Exit full screen", off either way): "already" from it is not
+                # verified while the window is full screen. Said as the measured fact; judged by the window on ask
+                text = (f"{label} reads {want} (read live just now): not clicked, nothing changed; but the window "
+                        f"itself is full screen (measured from Windows: its size against the monitor), so its own "
+                        f"on/off does not confirm it. If this control switches full screen, give toggle_to full_screen "
+                        f"or not_full_screen to judge it by the window")
+                outcome = ToolOutcome(name="click", ok=True, summary=text, content=[{"type": "text", "text": text}],
+                                      payload={"details": {"noop": True, "state": now, "toggle_unconfirmed": True,
+                                                           "window_state": shown_before, "toggle_to": want}})
+                return self._labelled(outcome, label)
             if now == want:
                 outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just "
                                                                      f"now): not clicked, nothing changed",
@@ -4808,13 +4823,18 @@ class Dispatcher:
         outcome = self._from_action("window_action", act(hwnd, action))
         payload = outcome.payload if isinstance(outcome.payload, dict) else {}
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-        if action == "restore" and outcome.ok and details.get("window_state_after") == "fullscreen":
+        was_min = bool(details.get("was_minimized")) or details.get("window_state_before") == "minimized"
+        if (action == "restore" and outcome.ok and details.get("window_state_after") == "fullscreen"
+                and not was_min):
             # fix6 (report 73): "restored" means neither minimized nor maximized, which an app's own full screen also
-            # is; measured from Windows the window still covers its monitor, so it was not put back to normal
+            # is; measured from Windows the window still covers its monitor, so it was not put back to normal. Review
+            # F5: a minimized window brought back to its own full screen (a borderless game) was restored as asked
             note = ("; but the window still covers its whole monitor with no title bar (measured from Windows): it "
                     "is still full screen. Restore does not leave an app's own full screen: its own full-screen "
                     "control or key does")
             outcome.ok = False
+            if "ok" in payload:
+                payload = {**payload, "ok": False}
             outcome.summary += note
             if outcome.content and outcome.content[0].get("type") == "text":
                 outcome.content[0]["text"] += note
