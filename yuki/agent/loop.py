@@ -402,6 +402,13 @@ def action_verdict(name: str, outcome: ToolOutcome) -> tuple[bool | None, str]:
         facts = [details.get(k) for k in _EFFECT_FACTS if k in details]
         if any(f is True for f in facts) or details.get("new_windows"):
             return True, "something visibly changed after it"
+        if change is not None and change.get("verified") is None and change.get("why"):
+            # small8 (report 73, release 7): the window was read before and after and that read could not tell (its
+            # content is drawn where it cannot be read, or only things that change on their own changed, such as a
+            # status bar's line number): focus, title and page staying the same cannot say the effect did not happen
+            # (Page Down in a page or a document moves only what is inside). Live, 7 of 8 Page Ups that moved the
+            # view were "contradicted" this way, and the done card said "Didn't work"
+            return None, str(change["why"])
         if facts and all(f is False for f in facts):
             return False, "focus, window, its state and page were watched and nothing changed"
         return None, "nothing its report watched could show the effect"
@@ -1917,6 +1924,10 @@ class Agent:
                     "at": time.time()}
             if control:
                 step["control"] = control
+            if kind == "action" and ok is False and (payload.get("refused") is True or why == "refused before it ran"):
+                # small8: refused before anything was sent (a guard, the loop breaker, a bad argument): nothing of it
+                # reached the screen (yuki.agent.finish._set_aside_refused)
+                step["refused"] = True
             if isinstance(payload.get("saved"), bool):
                 # second review V1/V2: whether a memory write was kept, from its own result (not saved: memory down)
                 step["saved"] = payload["saved"]
@@ -2539,8 +2550,8 @@ class Agent:
                     f"your steps showed), not plain text.")
                 continue
             if text:
-                verdict = self._outcome_verdict()
                 self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
+                verdict = self._outcome_verdict()
                 text = self._with_list_left(self._honest_final(text, verdict))
                 self.logger.final(text)
                 yield Final(text, outcome=verdict)
@@ -2630,9 +2641,12 @@ class Agent:
         trace and the closing message's unbacked claims, logged (counts and levels only) and carried on its ``Final``.
         Never raises: ``None`` when it cannot be made."""
         try:
+            by_action = bool(getattr(self, "_finished_by_action", False))
             verdict = finish_gate.outcome_verdict(getattr(self, "_trace", None) or [],
                                                   unbacked=list(getattr(self, "_unbacked", None) or []),
-                                                  finished_by_action=bool(getattr(self, "_finished_by_action", False)))
+                                                  finished_by_action=by_action,
+                                                  # small8: the done's own claim (none for a finishing action)
+                                                  claims=None if by_action else getattr(self, "_done_claims", None))
         except Exception as exc:  # noqa: BLE001 - the verdict never breaks a request
             self.logger.log("outcome_verdict_failed", error=f"{type(exc).__name__}: {exc}")
             return None
@@ -2663,7 +2677,7 @@ class Agent:
         trace = getattr(self, "_trace", None) or []
         try:
             verdict = finish_gate.outcome_verdict(trace, finished_by_action=bool(getattr(self, "_finished_by_action",
-                                                                                          False)))
+                                                                                          False)), claims=claims)
         except Exception:  # noqa: BLE001 - the check never breaks a request
             return None
         read = any(s.get("kind") in ("read", "memory") and s.get("ok") for s in trace if isinstance(s, dict))

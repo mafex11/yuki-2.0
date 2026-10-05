@@ -154,6 +154,11 @@ _P_AUTOMATION_ID = 30011
 #: full-screen scroll has no lasting element to see move, but its position moved).
 _P_SCROLL_H_PERCENT = 30053
 _P_SCROLL_V_PERCENT = 30055
+#: How much of the content the view shows (Scroll pattern, percent): unchanged while the position moves, the view went
+#: over the same content; changed, the content itself grew or shrank (small8: tells a document scrolled by keys from a
+#: feed that loaded more, report 73 release 7).
+_P_SCROLL_H_VIEW_SIZE = 30054
+_P_SCROLL_V_VIEW_SIZE = 30056
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -192,7 +197,7 @@ _CACHED_PROPERTIES = (
 _OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET,
                         _P_IS_RANGE_VALUE_AVAILABLE, _P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_IS_READONLY,
                         _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM, _P_AUTOMATION_ID, _P_SCROLL_H_PERCENT,
-                        _P_SCROLL_V_PERCENT)
+                        _P_SCROLL_V_PERCENT, _P_SCROLL_H_VIEW_SIZE, _P_SCROLL_V_VIEW_SIZE)
 
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_CHILDREN = 2
@@ -530,13 +535,19 @@ class UIElement:
     #: A scrolling element's position, ``(horizontal, vertical)`` percent of the way (-1 on an axis it does not
     #: scroll), else ``None`` (percFix: what a scroll's outcome is judged by).
     scroll: tuple[float, float] | None = None
+    #: How much of its content a scrolling element's view shows, ``(horizontal, vertical)`` percent (-1 on an axis it
+    #: does not report), else ``None`` (small8: the same view size before and after is the view moving over the same
+    #: content, never content that grew past the view).
+    scroll_view: tuple[float, float] | None = None
 
 
-def _scroll_position(get: object) -> tuple[float, float] | None:
-    """A scrolling element's ``(horizontal, vertical)`` scroll percent, ``None`` when the provider gives neither as a
-    number (an optional property: an older UI Automation reads as absent)."""
+def _scroll_position(get: object, props: tuple[int, int] = (_P_SCROLL_H_PERCENT, _P_SCROLL_V_PERCENT)
+                     ) -> tuple[float, float] | None:
+    """A scrolling element's ``(horizontal, vertical)`` scroll percent (or, with the view size properties, how much of
+    the content its view shows), ``None`` when the provider gives neither as a number (an optional property: an older
+    UI Automation reads as absent)."""
     out: list[float] = []
-    for prop in (_P_SCROLL_H_PERCENT, _P_SCROLL_V_PERCENT):
+    for prop in props:
         try:
             value = get(prop)  # type: ignore[operator]
         except Exception:
@@ -1358,6 +1369,8 @@ class _CachedWalker:
                 hidden=hidden,
                 range=_range_numbers(get) if ranged is not None else None,
                 scroll=_scroll_position(get) if is_scrollable else None,
+                scroll_view=(_scroll_position(get, (_P_SCROLL_H_VIEW_SIZE, _P_SCROLL_V_VIEW_SIZE))
+                             if is_scrollable else None),
             )
         )
         if hidden:
