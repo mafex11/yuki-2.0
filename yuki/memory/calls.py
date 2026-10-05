@@ -1555,6 +1555,8 @@ class CallLife:
     * **Without the microphone** the call lives on for ``release_grace_s`` unless the screen already says it
       is over, or while an in-call frame shown *after* the app let go is at most ``screen_alive_s`` old (Meet
       drops the microphone on mute, its page still shows the meeting). Not alive for ``end_grace_s``: it ends.
+      A call started by a site sighting (a meeting page the privacy rules keep unread,
+      :attr:`yuki.memory.callevidence.Life.site`) has no in-call frame: the worker passes none.
 
     Args:
         cfg: The ``[calls]`` numbers.
@@ -2318,8 +2320,12 @@ class CallWorker:
         life = self._life(act)
         if act.life is None:   # a call begun before CallLife existed in this object (tests that build _Active)
             act.life = CallLife(cfg, now=act.detected_at, hold_since=h.since if h is not None else None)
+        # a sighting of a calling site whose page is never read (a blocked Meet tab) starts a call but cannot say
+        # the user is still in it once the app let go (a muted meeting and a "You left" page look the same from the
+        # host): such a call lives by the microphone hold alone (callevidence, 2026-10-05)
         step = act.life.observe(now, held=act.held, hold_since=h.since if h is not None else None,
-                                positive_at=life.positive_at, negatives=life.negatives)
+                                positive_at=None if getattr(life, "site", False) else life.positive_at,
+                                negatives=life.negatives)
         if step.regrab is not None:
             self._log("call_regrab", call_id=act.call_id, app=act.app, regrabs=act.life.regrabs, **step.regrab)
             try:

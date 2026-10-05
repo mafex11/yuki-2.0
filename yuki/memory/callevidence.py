@@ -40,9 +40,25 @@ Those frames were half drawn: 0, 0, 18, 21, 21 and 22 controls against at least 
   window that stays in front), and the call worker's :class:`yuki.memory.calls.CallLife` ends a call whose
   microphone is still held only on a persistent run of them (:meth:`life`), never on one.
 
+**A meeting site the privacy rules keep unread** (2026-10-05, ``docs/research/revamp-2026-10-02/84-build-meetFix.md``):
+live, the user sat in a Google Meet call in the Zen browser and no call was ever seen, because the privacy file
+blocks ``meet.google.com`` and ``zoom.us`` (and Teams' meeting paths): the watcher never reads those pages, so
+no screen of the call ever reached the judge. A blocked page's content stays unread; the watcher hands over
+only its **site identity** (:meth:`seen` with ``blocked``: the app, the page's host, when; never a title, a path
+or a control). For an app that holds the microphone, each such host is judged once by the same small model from
+the host alone (``judge_site``, worked examples, cached per host): is it a voice or video calling service? A
+sighting of a calling site during the hold is site evidence: it **starts** a call (``fresh`` / ``stale`` like a
+screen; a lobby holds the microphone too, so a false start costs at most the Ask card, which still decides any
+recording, and the standing answer is the service's, never the browser's). It never keeps a call alive after
+the app lets go of the microphone (:attr:`Life.site`): a host cannot tell a muted meeting from a "You left the
+meeting" page, so such a call ends by the microphone hold alone (:class:`yuki.memory.calls.CallLife`). A
+browser holding the microphone for a video site is still no call: that page is read and judged as a screen.
+
 Logs are content-free (``call_evidence_judged`` / ``call_evidence_applied`` for a cached verdict: app, the
-verdict, the frame's control count, whether it was healthy, the site's median, ms, cost): never a control
-name. Nothing here decides from words in code: the model judges the screen.
+verdict, the frame's control count, whether it was healthy, the site's median, ms, cost;
+``call_evidence_site``: app, whether the site is a calling service, its product name, ms, cost): never a
+control name, never a blocked page's host. Nothing here decides from words in code: the model judges the screen
+and the site.
 """
 
 from __future__ import annotations
@@ -84,6 +100,11 @@ HEALTH_RATIO = 0.5
 HEALTH_WINDOW = 20
 #: Reliable negative sights kept per site (the call worker needs a few, spanning minutes).
 MAX_NEGATIVES = 32
+
+#: Site verdicts kept (by host).
+SITE_CACHE = 128
+#: Blocked-site sightings kept (per app and host).
+MAX_SITES = 256
 
 #: The judge's three answers.
 IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
@@ -181,6 +202,50 @@ The user's own name or tile never counts in others; a call whose screen does not
 
 Answer with the judge_screen tool only."""
 
+SITE_TOOL: dict[str, Any] = {
+    "name": "judge_site",
+    "description": "Say whether this web site is a voice or video calling service.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "calling": {
+                "type": "boolean",
+                "description": "true when the site is a voice or video calling or meeting service: a page of it "
+                               "that uses the microphone is a call or a meeting, or its waiting room. false for "
+                               "any other site (sign-in, bank, payment, shop, video, mail, documents).",
+            },
+            "service": {
+                "type": "string",
+                "description": "When calling: the product's common name (Google Meet, Zoom, Microsoft Teams). "
+                               "Otherwise empty.",
+            },
+        },
+        "required": ["calling", "service"],
+    },
+}
+
+SITE_PROMPT = """\
+A browser on the user's PC is using the microphone while it shows a page of a site whose content is kept \
+private: you get only the site's web address host, nothing of the page. Say whether that site is a voice or \
+video calling service - a site whose pages use the microphone for calls or meetings (or the waiting room \
+before one) - or any other kind of site (signing in, banking, payments, shopping, video, mail, documents), \
+which has no calls of its own.
+
+Examples:
+- meet.google.com -> calling, Google Meet
+- zoom.us -> calling, Zoom
+- app.zoom.us -> calling, Zoom
+- teams.microsoft.com -> calling, Microsoft Teams
+- teams.live.com -> calling, Microsoft Teams
+- whereby.com -> calling, Whereby
+- accounts.google.com -> not calling (signing in)
+- login.microsoftonline.com -> not calling (signing in)
+- paypal.com -> not calling (payments)
+- netbanking.examplebank.com -> not calling (a bank)
+- bitwarden.com -> not calling (a password manager)
+
+Answer with the judge_site tool only."""
+
 
 @dataclass
 class Screen:
@@ -222,6 +287,9 @@ class Life:
     #: Control count of the site's latest frame, and the median of its recent in-call frames (for the log).
     last_controls: int | None = None
     median_controls: float | None = None
+    #: The newest positive is a sighting of a calling site whose page is never read (the module docstring): it
+    #: cannot say the user is still in the call once the app lets go of the microphone.
+    site: bool = False
 
 
 def _digest(title: str, host: str | None, controls: Iterable[str]) -> str:
@@ -238,12 +306,22 @@ class CallEvidence:
         log: ``log(type, **fields)`` (content-free), or None.
         fresh_s: How long an in-call screen stays fresh evidence (``[calls] evidence_fresh_s``).
         client: A model client (tests); default ``yuki.agent.failover.make_client(settings)``.
+        site_fn: ``(host) -> (calling, service)`` for a blocked page's site; default: the model (Haiku, forced
+            tool ``judge_site``, the host only). Tests pass a stub.
     """
 
     def __init__(self, *, judge_fn: Callable[[Screen], Verdict] | None = None, settings: Any = None,
                  log: Callable[..., Any] | None = None, fresh_s: float = FRESH_S, client: Any = None,
-                 model: str | None = None, rejudge_s: float = REJUDGE_S) -> None:
+                 model: str | None = None, rejudge_s: float = REJUDGE_S,
+                 site_fn: Callable[[str], tuple[bool, str]] | None = None) -> None:
         self._judge_fn = judge_fn
+        self._site_fn = site_fn
+        #: Sightings of blocked pages per (app key, host): the last capture time (the host only, never content).
+        self._sites: dict[tuple[str, str], float] = {}
+        #: Sites whose host has no verdict yet, per (app key, host).
+        self._site_pending: set[tuple[str, str]] = set()
+        #: Per host: ``(a calling service, its product name)``.
+        self._site_verdicts: OrderedDict[str, tuple[bool, str]] = OrderedDict()
         self._settings = settings
         self._log_fn = log
         self.fresh_s = float(fresh_s)
@@ -272,18 +350,26 @@ class CallEvidence:
         self.rejudge_s = float(rejudge_s)
         #: When the model last judged a screen of each (app key, host) (monotonic).
         self._judged_at: dict[tuple[str, str | None], float] = {}
-        self.counters = {"seen": 0, "judged": 0, "cached": 0, "errors": 0}
+        self.counters = {"seen": 0, "judged": 0, "cached": 0, "errors": 0, "sites_seen": 0, "sites_judged": 0}
         self.cost_usd = 0.0
 
     # -- input (the watcher's worker thread) -------------------------------------------------
 
     def seen(self, screen: dict[str, Any]) -> None:
-        """A window was extracted: keep it as its app's (and site's) latest screen. Cheap; never raises."""
+        """A window was extracted: keep it as its app's (and site's) latest screen. Cheap; never raises.
+
+        ``blocked`` set (a privacy reason): a page the privacy rules keep unread; only its app, host and time
+        are kept (a site sighting, see the module docstring), whatever else the dict carries.
+        """
         try:
             key = str(screen.get("process") or "").strip().casefold()
             if not key:
                 return
             host = (str(screen.get("host") or "").strip().casefold() or None)
+            if screen.get("blocked"):
+                if host:
+                    self._seen_site(key, host, str(screen.get("exe") or ""), float(screen.get("at") or time.time()))
+                return
             controls = tuple(str(c) for c in (screen.get("controls") or [])[:MAX_CONTROLS] if str(c).strip())
             title = str(screen.get("title") or "")
             shot = Screen(key=key, host=host, hwnd=int(screen.get("hwnd") or 0), exe=str(screen.get("exe") or ""),
@@ -311,6 +397,31 @@ class CallEvidence:
                 for old in sorted(self._screens, key=lambda w: self._screens[w].at)[:256]:
                     self._screens.pop(old, None)
                     self._pending.discard(old)
+
+    def _seen_site(self, key: str, host: str, exe: str, at: float) -> None:
+        """A sighting of a page the privacy rules keep unread: its app, host and time only."""
+        where = (key, host)
+        with self._lock:
+            self.counters["sites_seen"] += 1
+            if exe:
+                self._exes[key] = exe
+            if at > self._sites.get(where, float("-inf")):
+                self._sites[where] = at
+            if host not in self._site_verdicts:
+                self._site_pending.add(where)
+            if len(self._sites) > MAX_SITES:   # bounded: forget the oldest sightings
+                for old in sorted(self._sites, key=self._sites.__getitem__)[: MAX_SITES // 2]:
+                    self._sites.pop(old, None)
+                    self._site_pending.discard(old)
+
+    def _site_hits(self, holder: Any) -> list[tuple[float, str, str]]:
+        """``(last sighting, host, service)`` of the calling sites an app showed (under the lock)."""
+        out = []
+        for (k, h), at in self._sites.items():
+            verdict = self._site_verdicts.get(h)
+            if verdict is not None and verdict[0] and self._matches(holder, k):
+                out.append((at, h, verdict[1]))
+        return out
 
     def _add_negative(self, where: tuple[str, str | None], at: float) -> None:
         """One more reliable not-in-call sight of a site (under the lock); only a newer one counts."""
@@ -414,7 +525,74 @@ class CallEvidence:
                 self._log("call_evidence_judged", applied=not superseded, ms=ms, cost_usd=round(cost, 6), **fields)
             if not superseded:
                 applied += 1
-        return applied
+        return applied + self._judge_sites(holders)
+
+    def _judge_sites(self, holders: list[Any]) -> int:
+        """Judge, from the host alone, the sites of unread pages these apps showed (the microphone holders now);
+        one verdict per host, kept. Returns how many hosts were judged."""
+        with self._lock:
+            todo = sorted({w[1] for w in self._site_pending
+                           if w[1] not in self._site_verdicts and any(self._matches(h, w[0]) for h in holders)})
+        judged = 0
+        for host in todo:
+            started = time.perf_counter()
+            cost = 0.0
+            try:
+                if self._site_fn is not None:
+                    calling, service = self._site_fn(host)
+                else:
+                    calling, service, cost = self._model_site(host)
+            except Exception as exc:  # noqa: BLE001 - judged again on the next pass
+                with self._lock:
+                    self.counters["errors"] += 1
+                self._log("call_evidence_error", where="site", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+                continue
+            calling = bool(calling)
+            service = " ".join(str(service or "").split())[:40] if calling else ""
+            with self._lock:
+                self._site_verdicts[host] = (calling, service)
+                while len(self._site_verdicts) > SITE_CACHE:
+                    self._site_verdicts.popitem(last=False)
+                apps = sorted({w[0] for w in self._site_pending if w[1] == host})
+                self._site_pending = {w for w in self._site_pending if w[1] != host}
+                self.counters["sites_judged"] += 1
+                self.cost_usd += cost
+            judged += 1
+            self._log("call_evidence_site", apps=apps, calling=calling, service=service or None,
+                      ms=round((time.perf_counter() - started) * 1000), cost_usd=round(cost, 6))
+        return judged
+
+    def _model_site(self, host: str) -> tuple[bool, str, float]:
+        """``(calling, service, cost)`` for a host, from the model (the host only: nothing of the page)."""
+        from yuki.log.requests import usage_tokens
+
+        settings, model = self._model_client()
+        response = self._client.messages.create(
+            model=model, max_tokens=60, system=SITE_PROMPT, tools=[SITE_TOOL],
+            tool_choice={"type": "tool", "name": SITE_TOOL["name"]},
+            messages=[{"role": "user", "content": f"host: {host}"}])
+        block = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
+        data = getattr(block, "input", None) or {}
+        try:
+            cost = float(settings.estimate_cost(model, usage_tokens(response.usage)) or 0.0)
+        except Exception:  # noqa: BLE001
+            cost = 0.0
+        return data.get("calling") is True, str(data.get("service") or ""), cost
+
+    def _model_client(self) -> tuple[Any, str]:
+        """``(settings, model)``, creating the settings and the client once."""
+        from yuki.memory.journal import HAIKU_MODEL
+
+        settings = self._settings
+        if settings is None:
+            from yuki.config import Settings
+
+            settings = self._settings = Settings()
+        if self._client is None:
+            from yuki.agent.failover import make_client
+
+            self._client = make_client(settings)
+        return settings, self._model or HAIKU_MODEL
 
     def _verdict(self, shot: Screen) -> tuple[Verdict, bool, int, float] | None:
         """``(verdict, from the cache, ms, cost)`` for a screen, or None when the model failed (judged again on
@@ -449,18 +627,8 @@ class CallEvidence:
 
     def _model_verdict(self, shot: Screen) -> tuple[Verdict, float]:
         from yuki.log.requests import usage_tokens
-        from yuki.memory.journal import HAIKU_MODEL
 
-        settings = self._settings
-        if settings is None:
-            from yuki.config import Settings
-
-            settings = self._settings = Settings()
-        if self._client is None:
-            from yuki.agent.failover import make_client
-
-            self._client = make_client(settings)
-        model = self._model or HAIKU_MODEL
+        settings, model = self._model_client()
         lines = [f"title: {json.dumps(shot.title, ensure_ascii=False)}",
                  f"host: {shot.host or '(an app window, no web page)'}",
                  "controls, in on-screen order: " + " / ".join(json.dumps(c, ensure_ascii=False)
@@ -500,13 +668,17 @@ class CallEvidence:
         newest counted frame was in a call, captured during this hold, starts one. ``service`` is the call's
         product name from the verdict ("" when unknown). A call already going on is kept by
         :meth:`life` (no "newer than the hold" test: a re-grab of the microphone is the same call).
+        A sighting of a calling site whose page is never read, during this hold, counts the same way
+        (``service`` from the site verdict, else its host).
         """
         if not holder:
             return None, ""
         now = time.time() if now is None else float(now)
+        floor = float(mic_since) - HOLD_TOLERANCE_S
         with self._lock:
             found = [(at, service) for (k, h), (at, service, _o) in self._evidence.items()
-                     if self._matches(holder, k) and self._live((k, h)) and at >= float(mic_since) - HOLD_TOLERANCE_S]
+                     if self._matches(holder, k) and self._live((k, h)) and at >= floor]
+            found += [(at, service or host) for at, host, service in self._site_hits(holder) if at >= floor]
         if not found:
             return None, ""
         at, service = max(found)
@@ -514,11 +686,16 @@ class CallEvidence:
 
     def life(self, holder: Any) -> Life:
         """What the screen says about an app's call that is going on (key or ``Holder``): the newest in-call
-        frame of its site and the reliable not-in-call sights since (:class:`Life`; empty without one)."""
+        frame of its site and the reliable not-in-call sights since (:class:`Life`; empty without one). When the
+        newest positive is a sighting of a calling site whose page is never read, :attr:`Life.site` is set."""
         if not holder:
             return Life()
         with self._lock:
             sites = [(at, w) for w, (at, _s, _o) in self._evidence.items() if self._matches(holder, w[0])]
+            blocked = self._site_hits(holder)
+            newest_site = max(blocked) if blocked else None
+            if newest_site is not None and (not sites or newest_site[0] > max(s[0] for s in sites)):
+                return Life(positive_at=newest_site[0], host=newest_site[1], site=True)
             if not sites:
                 return Life()
             at, where = max(sites, key=lambda s: s[0])
@@ -531,10 +708,11 @@ class CallEvidence:
         """``(app key, capture time)`` of the newest window the watcher handed over (the one in front, as last
         read), or ``(None, None)``; content-free, for the call log."""
         with self._lock:
-            if not self._screens:
+            seen = [(s.at, s.key) for s in self._screens.values()] + [(at, w[0]) for w, at in self._sites.items()]
+            if not seen:
                 return None, None
-            shot = max(self._screens.values(), key=lambda s: s.at)
-            return shot.key, shot.at
+            at, key = max(seen)
+            return key, at
 
     def host_of(self, holder: Any) -> str | None:
         """The site of the newest live in-call evidence of an app (key or ``Holder``; None: an app window, or
@@ -544,6 +722,7 @@ class CallEvidence:
         with self._lock:
             found = [(at, h or "") for (k, h), (at, _s, _o) in self._evidence.items()
                      if self._matches(holder, k) and self._live((k, h))]
+            found += [(at, host) for at, host, _service in self._site_hits(holder)]
         return (max(found)[1] or None) if found else None
 
     def others_of(self, holder: Any) -> int | None:
@@ -562,10 +741,14 @@ class CallEvidence:
             for where in [w for w in self._evidence if w[0] == key.casefold()]:
                 self._evidence.pop(where, None)
                 self._negs.pop(where, None)
+            for where in [w for w in self._sites if w[0] == key.casefold()]:
+                self._sites.pop(where, None)
+                self._site_pending.discard(where)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {**self.counters, "screens": len(self._screens), "evidence": len(self._evidence),
+                    "sites": len(self._sites), "calling_sites": sum(1 for v in self._site_verdicts.values() if v[0]),
                     "contradicted": sum(1 for w in self._evidence if self._negs.get(w)),
                     "cost_usd": round(self.cost_usd, 5)}
 
@@ -577,5 +760,5 @@ class CallEvidence:
                 pass
 
 
-__all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "FRESH_S", "HEALTH_RATIO",
-           "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]
+__all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "SITE_PROMPT", "SITE_TOOL",
+           "FRESH_S", "HEALTH_RATIO", "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]
