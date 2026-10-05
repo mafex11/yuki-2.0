@@ -21,11 +21,26 @@ real mishearings: the words as heard AND Yuki's best guess of what was meant, wi
   real mishearing gets its heard words, guess, why and an English line said to the user (``shown``); the rest stay
   uncertain (never used as facts) and drop off the list. Reversible (``--undo RUN_ID``: the provenance put back).
 
+* **One correction teaches** (report 88; report 76 item 4: a friend's name heard as two English words was corrected
+  three times and never learned). After each batch of exchanges with spoken words, the conversation worker asks one
+  small question (:data:`NAMES_TOOL`, worked examples in :data:`NAME_FIX_GUIDANCE`): which misheard names did the
+  exchanges settle - the user corrected one, confirmed Yuki's guess, or called Yuki by a sound-alike. The answer is
+  checked against the exchanges and memory's names (:func:`name_fixes_from`) and written at once
+  (:func:`learn_name_fixes`): a name alias (the people index carries it as that person's heard form from the next
+  lookup, :func:`yuki.memory.contacts.with_learned`; speech recognition's terms lead with the right name; the
+  talker's directory says "heard as"), and the correction pass queued with the user's fix so memory text that still
+  carries the heard form is reworded where its context shows it. Right on a guess of a name in the list does the
+  same at once (Undo ends the alias). Yuki's own learned forms (:func:`name_forms`) let the voice's fast path take
+  "UK" opening a sentence as the name. Backfill over past exchanges: ``--names``.
+
 Usage (dry run on a copy first; counts only unless ``--show``)::
 
     python -m yuki.memory.misheard --dry-run [--save FILE] [--show] [--days 7] [--db PATH]
     python -m yuki.memory.misheard --apply FILE [--db PATH]
     python -m yuki.memory.misheard --undo RUN_ID [--db PATH]
+    python -m yuki.memory.misheard --names --dry-run [--save FILE] [--days 7] [--db PATH]   # + would-resolve counts
+    python -m yuki.memory.misheard --names --apply FILE [--db PATH]                         # writes FILE.undo.json
+    python -m yuki.memory.misheard --undo-names FILE.undo.json [--db PATH]
 """
 
 from __future__ import annotations
@@ -151,10 +166,12 @@ NAME_FIX_ITEM: dict[str, Any] = {
         "heard": {"type": "string", "description": (
             "The words speech recognition wrote for the name, copied exactly from the user's words (any script, "
             "a few words, never the whole sentence).")},
-        "name": {"type": "string", "description": "The right name, as the user or Yuki wrote it once it was sorted out."},
+        "name": {"type": "string",
+                 "description": "The right name, as the user or Yuki wrote it once it was sorted out."},
         "how": {"type": "string", "enum": list(NAME_FIX_HOWS), "description": (
             "corrected: the user said the name was wrong and gave the right one; confirmed: Yuki asked with its guess "
-            "and the user said yes; called: the heard words were the user calling Yuki by name (Yuki's own name only).")},
+            "and the user said yes; called: the heard words were the user calling Yuki by name (Yuki's own name "
+            "only).")},
         "exchange": {"type": "integer", "description": (
             "Number [n] of the NEW exchange that settles it (the correction, the yes, or the call by name).")},
         "why": {"type": "string", "description": "A few words: what in the exchanges shows it."},
@@ -704,8 +721,8 @@ class NamesPass:
 
     def run(self, *, days: float = DAYS, dry_run: bool = False, plan: Sequence[dict[str, Any]] | None = None,
             now: float | None = None, reason: str = "") -> NamesResult:
-        """Find the settled mishearings of the last ``days`` (``dry_run``: write nothing); ``plan``: an earlier dry run's
-        fixes, written as they are with no model call. Never raises."""
+        """Find the settled mishearings of the last ``days`` (``dry_run``: write nothing); ``plan``: an earlier dry
+        run's fixes, written as they are with no model call. Never raises."""
         from yuki.memory.conversations import OTHERS
 
         now = time.time() if now is None else float(now)

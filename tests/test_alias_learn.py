@@ -58,7 +58,8 @@ def _contact(store: Store, name: str, aliases: tuple[str, ...] = ()) -> int:
 
 
 def _turn(n: int, words: str, reply: str = "", *, voice: bool = True, addressed: str | None = "yuki") -> Any:
-    return SimpleNamespace(id=1000 + n, at=NOW + n, session_id="s", request_id=f"voice-s-{n}" if voice else f"worker-{n}",
+    return SimpleNamespace(id=1000 + n, at=NOW + n, session_id="s",
+                           request_id=f"voice-s-{n}" if voice else f"worker-{n}",
                            user_text=words, reply_text=reply, actions=[], outcome="voice" if voice else "done",
                            addressed=addressed, envelope=None)
 
