@@ -193,8 +193,10 @@ OPAQUE_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "title"})
 #: title is the same ("title" and "page" always read: it may have left the site).
 BLOCKED_SKIP_TRIGGERS = frozenset({"backstop", "content", "focus", "refresh"})
 #: Privacy reasons of a page on a site the privacy file names (its sign-in, payment and meeting sites, whole or
-#: by path): the page's host alone - never its title, path or content - goes to call detection, so a call on a
-#: meeting site that is never read can still be noticed (2026-10-05: a Google Meet call in the Zen browser).
+#: by path): the page's host alone - never its title, path or content - goes to call detection, in this process
+#: only, so a call on a meeting site that is never read can still be noticed (2026-10-05: a Google Meet call in
+#: the Zen browser). Call detection decides from the privacy file's own lists which hosts are meeting sites and
+#: never sends a visited host anywhere (yuki.memory.callevidence).
 SITE_ONLY_REASONS = frozenset({"blocked_host", "blocked_path"})
 #: Popups whose own element is one of these UIA control types (a fixed machine vocabulary) are shown in Now
 #: but never stored: a tooltip or a menu is what is on screen, not something that happened.

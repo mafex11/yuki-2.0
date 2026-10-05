@@ -1555,8 +1555,12 @@ class CallLife:
     * **Without the microphone** the call lives on for ``release_grace_s`` unless the screen already says it
       is over, or while an in-call frame shown *after* the app let go is at most ``screen_alive_s`` old (Meet
       drops the microphone on mute, its page still shows the meeting). Not alive for ``end_grace_s``: it ends.
-      A call started by a site sighting (a meeting page the privacy rules keep unread,
-      :attr:`yuki.memory.callevidence.Life.site`) has no in-call frame: the worker passes none.
+    * **A call started by a site sighting** (a meeting page the privacy rules keep unread,
+      :attr:`yuki.memory.callevidence.Life.site`; ``site_at`` is that sighting, ``positive_at`` is None) has no
+      in-call frame. Held, it also ends once the app's newest frame is another page judged not in a call
+      (``away_at``) and the site was last seen at least ``screen_alive_s`` ago (one glance at a meeting page
+      during a long unrelated hold). Let go, it lives on while the app still plays ``sound`` and the site was
+      seen within ``screen_alive_s`` (Meet releases the microphone on mute while the others talk).
 
     Args:
         cfg: The ``[calls]`` numbers.
@@ -1581,9 +1585,11 @@ class CallLife:
                 and float(negatives[-1]) - float(negatives[0]) >= self.cfg.neg_span_s)
 
     def observe(self, now: float, *, held: bool, hold_since: float | None, positive_at: float | None,
-                negatives: Sequence[float] = ()) -> LifeStep:
+                negatives: Sequence[float] = (), site_at: float | None = None, away_at: float | None = None,
+                sound: bool = False) -> LifeStep:
         """One poll: does the call go on? ``negatives``: capture times of the reliable not-in-call sights of the
-        call's site since its newest in-call frame ``positive_at``."""
+        call's site since its newest in-call frame ``positive_at`` (or its site sighting ``site_at``); ``away_at``
+        and ``sound``: see the class docstring (site calls only)."""
         cfg = self.cfg
         negs = sorted(float(t) for t in negatives)
         if held:
@@ -1598,6 +1604,11 @@ class CallLife:
             self.last_held_at = now
             if self.contradicted(negs):
                 return LifeStep(False, end="screen_contradicts", regrab=regrab)
+            if (site_at is not None and away_at is not None and away_at > site_at
+                    and now - site_at >= cfg.screen_alive_s):
+                # a site call whose app has shown only other pages (not in a call) since the site was last seen,
+                # for screen_alive_s: the glance at the meeting page was not this hold's call
+                return LifeStep(False, end="screen_contradicts", regrab=regrab)
             self.alive_at = now
             return LifeStep(True, regrab=regrab, by="hold")
         let_go = self.last_held_at if self.last_held_at is not None else self.alive_at
@@ -1609,6 +1620,10 @@ class CallLife:
             # an in-call frame captured after the last poll that saw the microphone held (the same clock): the
             # screen still showed the call once the app had let go (Meet's page while muted)
             by = "screen"
+        elif site_at is not None and sound and not negs and now - site_at <= cfg.screen_alive_s:
+            # a site call (its page never read) whose app still plays sound: muted in the meeting while the
+            # others talk (Meet releases the microphone on mute)
+            by = "site_sound"
         if by is not None:
             self.alive_at = now
             return LifeStep(True, by=by)
@@ -2320,12 +2335,18 @@ class CallWorker:
         life = self._life(act)
         if act.life is None:   # a call begun before CallLife existed in this object (tests that build _Active)
             act.life = CallLife(cfg, now=act.detected_at, hold_since=h.since if h is not None else None)
-        # a sighting of a calling site whose page is never read (a blocked Meet tab) starts a call but cannot say
-        # the user is still in it once the app let go (a muted meeting and a "You left" page look the same from the
-        # host): such a call lives by the microphone hold alone (callevidence, 2026-10-05)
+        # a sighting of a calling site whose page is never read (a blocked Meet tab) has no in-call frame: its own
+        # rules (CallLife; callevidence, 2026-10-05): after the app lets go it lives on only while the app still
+        # plays sound (muted, the others talking), read only then (the render sessions, cached)
+        site = bool(getattr(life, "site", False))
+        sound = False
+        if (site and not act.held and act.holder is not None and life.positive_at is not None
+                and now - life.positive_at <= cfg.screen_alive_s):
+            sound = self._plays(act.holder)
         step = act.life.observe(now, held=act.held, hold_since=h.since if h is not None else None,
-                                positive_at=None if getattr(life, "site", False) else life.positive_at,
-                                negatives=life.negatives)
+                                positive_at=None if site else life.positive_at, negatives=life.negatives,
+                                site_at=life.positive_at if site else None,
+                                away_at=getattr(life, "away_at", None) if site else None, sound=sound)
         if step.regrab is not None:
             self._log("call_regrab", call_id=act.call_id, app=act.app, regrabs=act.life.regrabs, **step.regrab)
             try:
@@ -2333,6 +2354,12 @@ class CallWorker:
             except Exception as exc:
                 self._log("error", where="calls.regrab", error=f"{type(exc).__name__}: {exc}")
         if not step.alive:
+            if site and act.held and step.end == "screen_contradicts" and self.evidence is not None:
+                # the hold goes on but the site's sighting was not its call: it must not start the next row
+                try:
+                    self.evidence.forget(act.key)
+                except Exception as exc:
+                    self._log("error", where="calls.forget", error=f"{type(exc).__name__}: {exc}")
             self._end(act, step.end or "call_ended", now, life=life)
             return False
         if step.by != act.alive_by:
@@ -2405,6 +2432,14 @@ class CallWorker:
             g.alive_by = step.by
         g.last_seen = now
         return True
+
+    def _plays(self, holder: Holder) -> bool:
+        """Whether the call's app has an active output stream now (Core Audio render sessions, state only; the
+        shared signals' cache). False when it cannot be read."""
+        try:
+            return bool(self.signals.playing([holder]))
+        except Exception:
+            return False
 
     def _life(self, act: _Active) -> Any:
         """What the screen says about the open call (:meth:`CallEvidence.life`); empty without evidence."""

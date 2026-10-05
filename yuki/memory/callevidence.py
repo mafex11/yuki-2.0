@@ -45,20 +45,35 @@ live, the user sat in a Google Meet call in the Zen browser and no call was ever
 blocks ``meet.google.com`` and ``zoom.us`` (and Teams' meeting paths): the watcher never reads those pages, so
 no screen of the call ever reached the judge. A blocked page's content stays unread; the watcher hands over
 only its **site identity** (:meth:`seen` with ``blocked``: the app, the page's host, when; never a title, a path
-or a control). For an app that holds the microphone, each such host is judged once by the same small model from
-the host alone (``judge_site``, worked examples, cached per host): is it a voice or video calling service? A
-sighting of a calling site during the hold is site evidence: it **starts** a call (``fresh`` / ``stale`` like a
+or a control), and it stays in this process. Which of those sites are calling services is decided from the
+privacy file itself, never from a visit:
+
+* the **shipped** list of blocked sites (``privacy_default.toml`` ``[web] blocked_host_suffixes`` and the hosts of
+  ``blocked_host_paths``; public data, the same for every user) is judged **once, as a whole**, by the same small
+  model (``judge_sites``, worked examples) the first time a site sighting of a microphone holder needs it: which
+  entries are voice or video calling services. No request ever names a page the user visited (review F1 of
+  2026-10-05: an earlier version of this change sent each visited blocked host, a bank or a sign-in site too);
+* the user's own ``[meetings] always_sites`` are calling sites by their word (named by ``[meetings.names]``), and
+  ``never_sites`` never are;
+* a blocked site the user added themselves (not in the shipped list, not in ``always_sites``) never counts and is
+  never sent anywhere.
+
+A sighting of a calling site during the hold is site evidence: it **starts** a call (``fresh`` / ``stale`` like a
 screen; a lobby holds the microphone too, so a false start costs at most the Ask card, which still decides any
-recording, and the standing answer is the service's, never the browser's). It never keeps a call alive after
-the app lets go of the microphone (:attr:`Life.site`): a host cannot tell a muted meeting from a "You left the
-meeting" page, so such a call ends by the microphone hold alone (:class:`yuki.memory.calls.CallLife`). A
-browser holding the microphone for a video site is still no call: that page is read and judged as a screen.
+recording, and the standing answer is the service's, never the browser's), unless a newer readable screen of the
+same app and site was judged not in a call (Teams' readable pre-join lobby after its blocked join link). A site
+call's life (:attr:`Life.site`, :class:`yuki.memory.calls.CallLife`): while the app holds the microphone it goes
+on, unless readable screens of the same site persistently say otherwise, or the app's newest frame is another page
+judged not in a call and the site has not been seen for ``screen_alive_s`` (one glance at a meeting page during a
+long unrelated hold, review F4); once the app lets go (Meet releases the microphone on mute) it goes on while the
+app still plays sound and the site was seen within ``screen_alive_s`` (review F3), else it ends by the release
+grace. A browser holding the microphone for a video site is still no call: that page is read and judged as a screen.
 
 Logs are content-free (``call_evidence_judged`` / ``call_evidence_applied`` for a cached verdict: app, the
 verdict, the frame's control count, whether it was healthy, the site's median, ms, cost;
-``call_evidence_site``: app, whether the site is a calling service, its product name, ms, cost): never a
-control name, never a blocked page's host. Nothing here decides from words in code: the model judges the screen
-and the site.
+``call_evidence_sites``: the shipped list's size, how many are calling services, their product names, ms, cost;
+``call_evidence_site``: apps, whether the site counts, its product name, by what): never a control name, never a
+blocked page's host. Nothing here decides from words in code: the model judges the screen and the site list.
 """
 
 from __future__ import annotations
@@ -105,6 +120,8 @@ MAX_NEGATIVES = 32
 SITE_CACHE = 128
 #: Blocked-site sightings kept (per app and host).
 MAX_SITES = 256
+#: A failed judgement of the shipped site list is tried again after this long (s).
+SITES_RETRY_S = 60.0
 
 #: The judge's three answers.
 IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
@@ -202,39 +219,50 @@ The user's own name or tile never counts in others; a call whose screen does not
 
 Answer with the judge_screen tool only."""
 
-SITE_TOOL: dict[str, Any] = {
-    "name": "judge_site",
-    "description": "Say whether this web site is a voice or video calling service.",
+SITES_TOOL: dict[str, Any] = {
+    "name": "judge_sites",
+    "description": "Say, for each web site in the list, whether it is a voice or video calling service.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "calling": {
-                "type": "boolean",
-                "description": "true when the site is a voice or video calling or meeting service: a page of it "
-                               "that uses the microphone is a call or a meeting, or its waiting room. false for "
-                               "any other site (sign-in, bank, payment, shop, video, mail, documents).",
-            },
-            "service": {
-                "type": "string",
-                "description": "When calling: the product's common name (Google Meet, Zoom, Microsoft Teams). "
-                               "Otherwise empty.",
+            "sites": {
+                "type": "array",
+                "description": "One item per site of the list, in its order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string", "description": "The site exactly as listed."},
+                        "calling": {
+                            "type": "boolean",
+                            "description": "true when the site is a voice or video calling or meeting service: a "
+                                           "page of it that uses the microphone is a call or a meeting, or its "
+                                           "waiting room. false for any other site (sign-in, password manager, "
+                                           "bank, payment, shop, video, mail, documents).",
+                        },
+                        "service": {
+                            "type": "string",
+                            "description": "When calling: the product's common name (Google Meet, Zoom, Microsoft "
+                                           "Teams). Otherwise empty.",
+                        },
+                    },
+                    "required": ["host", "calling", "service"],
+                },
             },
         },
-        "required": ["calling", "service"],
+        "required": ["sites"],
     },
 }
 
-SITE_PROMPT = """\
-A browser on the user's PC is using the microphone while it shows a page of a site whose content is kept \
-private: you get only the site's web address host, nothing of the page. Say whether that site is a voice or \
-video calling service - a site whose pages use the microphone for calls or meetings (or the waiting room \
-before one) - or any other kind of site (signing in, banking, payments, shopping, video, mail, documents), \
-which has no calls of its own.
+SITES_PROMPT = """\
+You get a list of web sites (address hosts; a site also covers its subdomains) that a privacy setting keeps \
+unread. Nothing of any page is given, and nobody visited them for this question: it is the setting's own list. \
+Say for each whether it is a voice or video calling service - a site whose pages use the microphone for calls or \
+meetings (or the waiting room before one) - or any other kind of site (signing in, password managers, banking, \
+payments, shopping, video, mail, documents), which has no calls of its own.
 
 Examples:
 - meet.google.com -> calling, Google Meet
 - zoom.us -> calling, Zoom
-- app.zoom.us -> calling, Zoom
 - teams.microsoft.com -> calling, Microsoft Teams
 - teams.live.com -> calling, Microsoft Teams
 - whereby.com -> calling, Whereby
@@ -244,7 +272,29 @@ Examples:
 - netbanking.examplebank.com -> not calling (a bank)
 - bitwarden.com -> not calling (a password manager)
 
-Answer with the judge_site tool only."""
+Answer with the judge_sites tool only, one item for every site of the list."""
+
+
+def shipped_site_entries() -> tuple[str, ...]:
+    """The blocked sites of the packaged privacy file (``[web] blocked_host_suffixes`` and the hosts of
+    ``blocked_host_paths``), sorted: public data, the same for every user. () when unreadable."""
+    global _SHIPPED
+    if _SHIPPED is None:
+        try:
+            from yuki.memory.privacy import DEFAULT_PATH, PrivacyRules
+
+            rules = PrivacyRules.load(DEFAULT_PATH)
+            _SHIPPED = tuple(sorted(set(rules.blocked_host_suffixes) | set(rules.blocked_host_paths)))
+        except Exception:  # noqa: BLE001 - no shipped list: no site counts but the user's always_sites
+            _SHIPPED = ()
+    return _SHIPPED
+
+
+_SHIPPED: tuple[str, ...] | None = None
+
+
+def _host_matches(host: str, entry: str) -> bool:
+    return host == entry or host.endswith("." + entry)
 
 
 @dataclass
@@ -287,9 +337,12 @@ class Life:
     #: Control count of the site's latest frame, and the median of its recent in-call frames (for the log).
     last_controls: int | None = None
     median_controls: float | None = None
-    #: The newest positive is a sighting of a calling site whose page is never read (the module docstring): it
-    #: cannot say the user is still in the call once the app lets go of the microphone.
+    #: The newest positive is a sighting of a calling site whose page is never read (the module docstring);
+    #: ``negatives`` are then the reliable not-in-call sights of readable pages of the same site since it.
     site: bool = False
+    #: For a site call: capture time of the app's newest frame when that is another page, judged reliably not in
+    #: a call, captured after the sighting (the browser shows something else now); None otherwise.
+    away_at: float | None = None
 
 
 def _digest(title: str, host: str | None, controls: Iterable[str]) -> str:
@@ -306,21 +359,36 @@ class CallEvidence:
         log: ``log(type, **fields)`` (content-free), or None.
         fresh_s: How long an in-call screen stays fresh evidence (``[calls] evidence_fresh_s``).
         client: A model client (tests); default ``yuki.agent.failover.make_client(settings)``.
-        site_fn: ``(host) -> (calling, service)`` for a blocked page's site; default: the model (Haiku, forced
-            tool ``judge_site``, the host only). Tests pass a stub.
+        sites_fn: ``(entries) -> {entry: (calling, service)}`` for the shipped list of blocked sites (see the
+            module docstring); default: the model (Haiku, forced tool ``judge_sites``, the list only). Tests pass a
+            stub.
+        privacy: The service's :class:`yuki.memory.privacy.PrivacyConfig` (its ``[meetings]`` table: the user's
+            ``always_sites``, ``never_sites`` and ``names``); None: the packaged defaults.
+        entries: The shipped list of blocked sites (tests); default :func:`shipped_site_entries`.
     """
 
     def __init__(self, *, judge_fn: Callable[[Screen], Verdict] | None = None, settings: Any = None,
                  log: Callable[..., Any] | None = None, fresh_s: float = FRESH_S, client: Any = None,
                  model: str | None = None, rejudge_s: float = REJUDGE_S,
-                 site_fn: Callable[[str], tuple[bool, str]] | None = None) -> None:
+                 sites_fn: Callable[[tuple[str, ...]], dict[str, tuple[bool, str]]] | None = None,
+                 privacy: Any = None, entries: Iterable[str] | None = None) -> None:
         self._judge_fn = judge_fn
-        self._site_fn = site_fn
-        #: Sightings of blocked pages per (app key, host): the last capture time (the host only, never content).
+        self._sites_fn = sites_fn
+        self._privacy = privacy
+        self._entries = tuple(sorted({str(e).strip().casefold() for e in entries if str(e).strip()})) \
+            if entries is not None else None
+        #: The privacy file's [meetings] table (built on first use), and the value the site verdicts were made with.
+        self._meetings: Any = None
+        self._meetings_used: Any = None
+        #: The shipped list's verdicts per entry (None: not judged yet), and when judging it last failed (monotonic).
+        self._entry_verdicts: dict[str, tuple[bool, str]] | None = None
+        self._entries_failed_at = float("-inf")
+        #: Sightings of blocked pages per (app key, host): the last capture time (the host only, never content; in
+        #: this process only).
         self._sites: dict[tuple[str, str], float] = {}
         #: Sites whose host has no verdict yet, per (app key, host).
         self._site_pending: set[tuple[str, str]] = set()
-        #: Per host: ``(a calling service, its product name)``.
+        #: Per host: ``(a calling site, its product name)``.
         self._site_verdicts: OrderedDict[str, tuple[bool, str]] = OrderedDict()
         self._settings = settings
         self._log_fn = log
@@ -414,14 +482,34 @@ class CallEvidence:
                     self._sites.pop(old, None)
                     self._site_pending.discard(old)
 
-    def _site_hits(self, holder: Any) -> list[tuple[float, str, str]]:
-        """``(last sighting, host, service)`` of the calling sites an app showed (under the lock)."""
+    def _site_hits(self, holder: Any) -> list[tuple[float, str, str, tuple[float, ...]]]:
+        """``(last sighting, host, service, negatives)`` of the calling sites an app showed (under the lock).
+
+        ``negatives``: the reliable not-in-call sights of readable pages of the same app and site captured after
+        the sighting (no in-call frame of it since; review F2): such a hit can no longer start a call, and a call
+        it started ends on a persistent run of them, like a screen's."""
         out = []
         for (k, h), at in self._sites.items():
             verdict = self._site_verdicts.get(h)
             if verdict is not None and verdict[0] and self._matches(holder, k):
-                out.append((at, h, verdict[1]))
+                out.append((at, h, verdict[1], tuple(t for t in self._negs.get((k, h), ()) if t > at)))
         return out
+
+    def _away_at(self, holder: Any, site_at: float, site_host: str) -> float | None:
+        """Capture time of the app's newest frame when it is a readable page of another site, judged reliably not
+        in a call (its verdict applied to that very screen), captured after the site sighting; else None
+        (under the lock). A newer sighting of any unread page is not "away": nothing is known of it."""
+        shots = [s for w, s in self._screens.items() if self._matches(holder, w[0])]
+        if not shots:
+            return None
+        newest = max(shots, key=lambda s: s.at)
+        where = (newest.key, newest.host)
+        unread = [at for (k, _h), at in self._sites.items() if self._matches(holder, k)]
+        if (newest.host == site_host or newest.at <= site_at or (unread and max(unread) > newest.at)
+                or self._applied.get(where) != newest.digest or self._kind.get(where) != "neg"):
+            return None
+        negs = self._negs.get(where)
+        return max(newest.at, negs[-1]) if negs else newest.at
 
     def _add_negative(self, where: tuple[str, str | None], at: float) -> None:
         """One more reliable not-in-call sight of a site (under the lock); only a newer one counts."""
@@ -527,27 +615,54 @@ class CallEvidence:
                 applied += 1
         return applied + self._judge_sites(holders)
 
+    def _meeting_rules(self) -> Any:
+        """The privacy file's ``[meetings]`` table (:class:`yuki.memory.timeline.MeetingRules`: the user's
+        ``always_sites``, ``never_sites``, ``names``), re-read when the file changes; None when unreadable."""
+        try:
+            if self._meetings is None:
+                from yuki.memory.timeline import MeetingRules, PrivacySection
+
+                self._meetings = PrivacySection(self._privacy, "meetings", MeetingRules.from_dict)
+            return self._meetings.get()
+        except Exception:  # noqa: BLE001 - then only the shipped list counts
+            return None
+
+    def _entry_of(self, host: str) -> str | None:
+        """The most specific entry of the shipped list of blocked sites that ``host`` falls under, or None."""
+        entries = self._entries if self._entries is not None else shipped_site_entries()
+        found = [e for e in entries if _host_matches(host, e)]
+        return max(found, key=len) if found else None
+
     def _judge_sites(self, holders: list[Any]) -> int:
-        """Judge, from the host alone, the sites of unread pages these apps showed (the microphone holders now);
-        one verdict per host, kept. Returns how many hosts were judged."""
+        """Decide, for the sites of unread pages these apps showed (the microphone holders now), whether each is a
+        calling site (the module docstring): by the user's ``[meetings]`` word, else by the verdict on the
+        shipped list's entry it falls under (that list judged once, as a whole, never per visit); a site the user
+        blocked themselves never counts. One verdict per host, kept. Returns how many hosts were decided."""
+        meetings = self._meeting_rules()
         with self._lock:
+            if meetings is not self._meetings_used:   # the user changed [meetings]: decide every site again
+                self._meetings_used = meetings
+                self._site_verdicts.clear()
+                self._site_pending |= set(self._sites)
             todo = sorted({w[1] for w in self._site_pending
                            if w[1] not in self._site_verdicts and any(self._matches(h, w[0]) for h in holders)})
-        judged = 0
+        decided = 0
         for host in todo:
-            started = time.perf_counter()
-            cost = 0.0
-            try:
-                if self._site_fn is not None:
-                    calling, service = self._site_fn(host)
-                else:
-                    calling, service, cost = self._model_site(host)
-            except Exception as exc:  # noqa: BLE001 - judged again on the next pass
-                with self._lock:
-                    self.counters["errors"] += 1
-                self._log("call_evidence_error", where="site", error=f"{type(exc).__name__}: {str(exc)[:200]}")
-                continue
-            calling = bool(calling)
+            calling, service, by = False, "", "unlisted"
+            if meetings is not None and meetings.never("", host):
+                by = "never_sites"
+            elif meetings is not None and meetings.match_url(f"https://{host}/"):
+                calling, service, by = True, meetings.match_url(f"https://{host}/"), "always_sites"
+            else:
+                entry = self._entry_of(host)
+                if entry is not None:
+                    verdicts = self._entry_verdicts if self._entry_verdicts is not None else self._judge_entries()
+                    if verdicts is None:
+                        break   # the list could not be judged now: these sites wait for a later pass
+                    calling, service = verdicts.get(entry, (False, ""))
+                    by = "shipped_list"
+                    if calling and meetings is not None:
+                        service = meetings.name_for(host, meetings.name_for(entry, service or entry))
             service = " ".join(str(service or "").split())[:40] if calling else ""
             with self._lock:
                 self._site_verdicts[host] = (calling, service)
@@ -556,28 +671,66 @@ class CallEvidence:
                 apps = sorted({w[0] for w in self._site_pending if w[1] == host})
                 self._site_pending = {w for w in self._site_pending if w[1] != host}
                 self.counters["sites_judged"] += 1
-                self.cost_usd += cost
-            judged += 1
-            self._log("call_evidence_site", apps=apps, calling=calling, service=service or None,
-                      ms=round((time.perf_counter() - started) * 1000), cost_usd=round(cost, 6))
-        return judged
+            decided += 1
+            self._log("call_evidence_site", apps=apps, calling=calling, service=service or None, by=by)
+        return decided
 
-    def _model_site(self, host: str) -> tuple[bool, str, float]:
-        """``(calling, service, cost)`` for a host, from the model (the host only: nothing of the page)."""
+    def _judge_entries(self) -> dict[str, tuple[bool, str]] | None:
+        """Judge the whole shipped list of blocked sites once (``sites_fn`` or the model); None when that failed
+        (tried again after :data:`SITES_RETRY_S`). Never names a page the user visited."""
+        if time.monotonic() - self._entries_failed_at < SITES_RETRY_S:
+            return None
+        entries = self._entries if self._entries is not None else shipped_site_entries()
+        started = time.perf_counter()
+        cost = 0.0
+        try:
+            if self._sites_fn is not None:
+                got = self._sites_fn(entries)
+            else:
+                got, cost = self._model_sites(entries)
+        except Exception as exc:  # noqa: BLE001
+            self._entries_failed_at = time.monotonic()
+            with self._lock:
+                self.counters["errors"] += 1
+            self._log("call_evidence_error", where="sites", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            return None
+        verdicts = {}
+        for entry in entries:
+            calling, service = (got or {}).get(entry, (False, ""))
+            calling = calling is True
+            verdicts[entry] = (calling, " ".join(str(service or "").split())[:40] if calling else "")
+        with self._lock:
+            self._entry_verdicts = verdicts
+            self.cost_usd += cost
+        services = sorted({s for c, s in verdicts.values() if c and s})
+        self._log("call_evidence_sites", entries=len(entries), calling=sum(1 for c, _s in verdicts.values() if c),
+                  services=services, ms=round((time.perf_counter() - started) * 1000), cost_usd=round(cost, 6))
+        return verdicts
+
+    def _model_sites(self, entries: tuple[str, ...]) -> tuple[dict[str, tuple[bool, str]], float]:
+        """``({entry: (calling, service)}, cost)`` for the shipped list, from the model (the list only)."""
         from yuki.log.requests import usage_tokens
 
+        if not entries:
+            return {}, 0.0
         settings, model = self._model_client()
         response = self._client.messages.create(
-            model=model, max_tokens=60, system=SITE_PROMPT, tools=[SITE_TOOL],
-            tool_choice={"type": "tool", "name": SITE_TOOL["name"]},
-            messages=[{"role": "user", "content": f"host: {host}"}])
+            model=model, max_tokens=60 + 40 * len(entries), system=SITES_PROMPT, tools=[SITES_TOOL],
+            tool_choice={"type": "tool", "name": SITES_TOOL["name"]},
+            messages=[{"role": "user", "content": "sites:\n" + "\n".join(entries)}])
         block = next((b for b in response.content if getattr(b, "type", None) == "tool_use"), None)
         data = getattr(block, "input", None) or {}
+        out: dict[str, tuple[bool, str]] = {}
+        for item in data.get("sites") or []:
+            if isinstance(item, dict):
+                host = str(item.get("host") or "").strip().casefold()
+                if host in entries:
+                    out[host] = (item.get("calling") is True, str(item.get("service") or ""))
         try:
             cost = float(settings.estimate_cost(model, usage_tokens(response.usage)) or 0.0)
         except Exception:  # noqa: BLE001
             cost = 0.0
-        return data.get("calling") is True, str(data.get("service") or ""), cost
+        return out, cost
 
     def _model_client(self) -> tuple[Any, str]:
         """``(settings, model)``, creating the settings and the client once."""
@@ -678,7 +831,8 @@ class CallEvidence:
         with self._lock:
             found = [(at, service) for (k, h), (at, service, _o) in self._evidence.items()
                      if self._matches(holder, k) and self._live((k, h)) and at >= floor]
-            found += [(at, service or host) for at, host, service in self._site_hits(holder) if at >= floor]
+            found += [(at, service or host) for at, host, service, negs in self._site_hits(holder)
+                      if at >= floor and not negs]
         if not found:
             return None, ""
         at, service = max(found)
@@ -687,15 +841,18 @@ class CallEvidence:
     def life(self, holder: Any) -> Life:
         """What the screen says about an app's call that is going on (key or ``Holder``): the newest in-call
         frame of its site and the reliable not-in-call sights since (:class:`Life`; empty without one). When the
-        newest positive is a sighting of a calling site whose page is never read, :attr:`Life.site` is set."""
+        newest positive is a sighting of a calling site whose page is never read, :attr:`Life.site` is set, with
+        the readable negatives of the same site since it and :attr:`Life.away_at`."""
         if not holder:
             return Life()
         with self._lock:
             sites = [(at, w) for w, (at, _s, _o) in self._evidence.items() if self._matches(holder, w[0])]
             blocked = self._site_hits(holder)
-            newest_site = max(blocked) if blocked else None
+            newest_site = max(blocked, key=lambda b: b[0]) if blocked else None
             if newest_site is not None and (not sites or newest_site[0] > max(s[0] for s in sites)):
-                return Life(positive_at=newest_site[0], host=newest_site[1], site=True)
+                site_at, site_host, _service, negs = newest_site
+                return Life(positive_at=site_at, negatives=negs, host=site_host, site=True,
+                            away_at=self._away_at(holder, site_at, site_host))
             if not sites:
                 return Life()
             at, where = max(sites, key=lambda s: s[0])
@@ -722,7 +879,7 @@ class CallEvidence:
         with self._lock:
             found = [(at, h or "") for (k, h), (at, _s, _o) in self._evidence.items()
                      if self._matches(holder, k) and self._live((k, h))]
-            found += [(at, host) for at, host, _service in self._site_hits(holder)]
+            found += [(at, host) for at, host, _service, negs in self._site_hits(holder) if not negs]
         return (max(found)[1] or None) if found else None
 
     def others_of(self, holder: Any) -> int | None:
@@ -760,5 +917,5 @@ class CallEvidence:
                 pass
 
 
-__all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "SITE_PROMPT", "SITE_TOOL",
-           "FRESH_S", "HEALTH_RATIO", "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]
+__all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "SITES_PROMPT", "SITES_TOOL",
+           "shipped_site_entries", "FRESH_S", "HEALTH_RATIO", "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]
