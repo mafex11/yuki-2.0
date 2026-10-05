@@ -6432,6 +6432,19 @@ class Store:
                         question: tuple[int, str] | None) -> tuple[int, int | None]:
         """:meth:`record_checkin`'s writes, inside the caller's transaction."""
         c = checkin
+        dropped = False
+        if nudge is not None and nudge.text:
+            # Yuki's own internal words never reach a card (report 76; yuki.core.ownwords: the sentences that carry
+            # one go). A card with nothing left is not written, and its look is accounted as held back, its question
+            # left open to ask again (review F6), never as sent
+            from yuki.core.ownwords import strip_internal
+
+            clean = strip_internal(nudge.text)
+            if clean != nudge.text:
+                nudge = replace(nudge, text=clean) if clean else None
+                if nudge is None:
+                    dropped = True
+                    c.outcome = "suppressed:internal_words"
         cur = conn.execute(
             "INSERT INTO nudge_checkins(at, trigger, outcome, model, input_chars, input_tokens, output_tokens,"
             " cache_write_tokens, cache_read_tokens, cost_usd, latency_ms, stop_reason, error, reason_ciphertext)"
@@ -6442,14 +6455,6 @@ class Store:
         )
         checkin_id = int(cur.lastrowid)
         nudge_id = None
-        if nudge is not None and nudge.text:
-            # Yuki's own internal words never reach a card (report 76; yuki.core.ownwords: the sentences that carry
-            # one go, and a card with nothing left is not written)
-            from yuki.core.ownwords import strip_internal
-
-            clean = strip_internal(nudge.text)
-            if clean != nudge.text:
-                nudge = replace(nudge, text=clean) if clean else None
         if nudge is not None:
             cur = conn.execute(
                 "INSERT INTO nudges(at, kind, trigger, text_ciphertext, reason_ciphertext, inputs_ciphertext,"
@@ -6465,6 +6470,8 @@ class Store:
             _take_card_context()   # a look that ended in none: its noted context goes with it
         if question is not None:
             qid, status = question
+            if dropped and status == "asked":
+                status = "open"   # never shown: not asked
             conn.execute(
                 "UPDATE questions SET status=?, nudge_id=coalesce(?, nudge_id),"
                 " asked_at=CASE WHEN ?='asked' THEN ? ELSE asked_at END, updated_at=?"
@@ -7213,14 +7220,20 @@ class Store:
 
     def record_checkin_question(self, checkin: NudgeCheckin, nudge: NewNudge, question: NewQuestion, *,
                                 moment: str, goal: dict[str, Any] | None = None
-                                ) -> tuple[int, int | None, int, int | None]:
+                                ) -> tuple[int, int | None, int | None, int | None]:
         """One transaction for a check-in Yuki asks: its goal (``goal``: ``{"id": n}`` for one it is about, or
         ``{"new": {scope, text, source, day, work_thread_id, source_ref, evidence, words}}`` for one memory shows
         that has no row yet - stored ``unknown`` -, with ``next_checkin_at``), the question (origin ``checkin``,
         status ``asked``, never deduped: a goal is checked on again), the card (kind ``question``, ``ref`` its
-        question) and the check-in's accounting. Returns ``(checkin_id, nudge_id, question_id, goal_id)``."""
+        question) and the check-in's accounting. Returns ``(checkin_id, nudge_id, question_id, goal_id)``. A card that
+        carries nothing but Yuki's internal words (yuki.core.ownwords) is never shown, so nothing is asked: only the
+        accounting is written, as held back (review F6), and ``(checkin_id, None, None, None)`` comes back."""
         if nudge.kind != "question":
             raise ValueError("a check-in's card is a question card")
+        from yuki.core.ownwords import strip_internal
+
+        if nudge.text and not strip_internal(nudge.text).strip():
+            return (*self._write(lambda conn: self._record_checkin(conn, checkin, nudge, None)), None, None)
 
         def op(conn: sqlite3.Connection) -> tuple[int, int | None, int, int | None]:
             at = float(checkin.at)

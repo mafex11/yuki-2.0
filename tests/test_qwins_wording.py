@@ -157,6 +157,37 @@ def test_a_card_never_carries_an_internal_word(store):
     assert none is None and len(store.nudges()) == 1
 
 
+def test_a_dropped_question_card_is_not_asked(store):
+    # review F6: a card left empty by the vocabulary check is never shown, so its question stays open (asked again
+    # later) and its look is accounted as held back, never as a card sent
+    from yuki.memory.store import NewNudge, NewQuestion, NudgeCheckin
+
+    (qid, _how), = store.add_questions([NewQuestion(at=900.0, kind="person", subject="Ravi", question="Who is Ravi?",
+                                                    evidence="they message Ravi most evenings", reason="names",
+                                                    importance=6, origin="journal")])
+    checkin = NudgeCheckin(at=1000.0, trigger="question", outcome="nudge")
+    _cid, nid = store.record_checkin(checkin, NewNudge(kind="question", text="The thinker can pull that up.",
+                                                       trigger="question", ref=f"question:{qid}"),
+                                     question=(qid, "asked"))
+    assert nid is None and checkin.outcome == "suppressed:internal_words"
+    row = store._conn.execute("SELECT status, asked_at, nudge_id FROM questions WHERE id=?", (qid,)).fetchone()
+    assert (row["status"], row["asked_at"], row["nudge_id"]) == ("open", None, None)
+    assert store._conn.execute("SELECT outcome FROM nudge_checkins ORDER BY id DESC").fetchone()[0] \
+        == "suppressed:internal_words"
+
+
+def test_a_dropped_check_in_card_asks_nothing(store):
+    from yuki.memory.store import NewNudge, NewQuestion, NudgeCheckin
+
+    checkin = NudgeCheckin(at=1000.0, trigger="checkin_evening", outcome="question")
+    question = NewQuestion(at=1000.0, kind="fact", subject="the invoice export", question="Did the export land?",
+                           evidence="worked on it", reason="goal", importance=5, origin="checkin")
+    out = store.record_checkin_question(checkin, NewNudge(kind="question", text="Did tell_yuki finish it?"),
+                                        question, moment="evening")
+    assert out[1:] == (None, None, None) and checkin.outcome == "suppressed:internal_words"
+    assert store.checkin_questions() == [] and store.nudges() == []
+
+
 # -- "you're typing or clicking" only on measured input ---------------------------------------------------------------
 
 
