@@ -340,6 +340,16 @@ class Settings:
             threads never hold it back; in-process when that cannot start.
         voice_standby: Keep the next conversation built and connected, dormant, while listening for the name
             (v3.11): speech recognition's socket open with no audio sent, the caches warm; the name wakes it at once.
+        voice_stt_provider: ``deepgram`` (Flux, the default) or ``local`` (Parakeet on this PC with Silero VAD and
+            Smart Turn: private and offline, English only, ~1 s slower to first audio here; report 67b and 86).
+            ``voice.json`` ``stt_provider`` wins. ``voice_tts_provider`` may be ``local`` too (``voice.json``
+            ``tts_voice`` names the voice: ``supertonic:F1``, ``kokoro:af_heart``; yuki.voice.local_models).
+        voice_local_keep_loaded: Keep the speech models on this PC loaded all the time (no load at each wake, ~1 GB
+            held); off: loaded at the wake, unloaded ``voice_local_unload_s`` after the last conversation.
+            ``voice.json`` ``local_keep_loaded`` wins.
+        voice_local_threads / voice_local_hotword_score: Threads per local model (67b: 2; more did not help) and how
+            strongly memory's names are boosted in local recognition (67b: 2.0; capped at 3.0, where names repeat).
+        voice_local_models_dir: Where the local models are (``""``: ``%LOCALAPPDATA%\\Yuki\\voice\\models``).
         voice_cache_refresh_s: While dormant (and the user is at the PC), the talker's and thinker's prompt caches
             (their stable layers are kept an hour) are read again this often.
         voice_screen_terms: At most this many names on the screen in front (its list items, chats, tabs,
@@ -515,6 +525,12 @@ class Settings:
     voice_standby: bool = True
     voice_wake_process: bool = True
     voice_cache_refresh_s: float = 3000.0
+    voice_stt_provider: str = "deepgram"
+    voice_local_keep_loaded: bool = False
+    voice_local_unload_s: float = 300.0
+    voice_local_threads: int = 2
+    voice_local_hotword_score: float = 2.0
+    voice_local_models_dir: str = ""
     voice_speech_guard: bool = True
     voice_speech_guard_timeout_s: float = 2.5
     # v3.16: "marker" by the offline eval (docs/research/revamp-2026-10-02/21-build-A1-A2.md): 220 replies, 0 unmarked,

@@ -340,6 +340,10 @@ class YukiUi(QObject):
             listening_changed.connect(lambda state: self.island.update(listening=str(state or "on")))
         self.island.update(listening=str(getattr(self.voice, "listening_state", "on") or "on"))
         self.calls.changed.connect(self.voice.on_call_status)
+        # vLocal: a speech-model download paused by a full-screen window goes on when the window in front changes
+        # (the island's existing WinEvent watch; nothing is read unless a download is paused).
+        self.island.watch.changed.connect(lambda _hwnd: self.voice.on_front_changed())
+        self.island.watch.reshaped.connect(lambda _hwnd: self.voice.on_front_changed())
         runtime_signals.said.connect(self._on_said)
         # The Yuki window (its own process) and the live chat thread the overlay shows (docs/UI-window.md).
         self.window_host = WindowHost(self)
