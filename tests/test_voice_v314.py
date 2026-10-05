@@ -77,7 +77,8 @@ def test_unverified_action_escalates_the_next_call_and_holds_its_finish(tmp_path
     ])
     events = list(_agent(client, tmp_path).run("make it full screen", effort="low", thinking=False,
                                                escalate=("medium", True)))
-    assert isinstance(events[-1], Final) and events[-1].text == "It's maximized."
+    assert isinstance(events[-1], Final) and events[-1].text == ("I tried, but I couldn't confirm it worked. "
+                                                                  "It's maximized.")   # fix6 review: line first
     first, second = client.calls
     assert first["thinking"] == {"type": "disabled"} and first["output_config"]["effort"] == "low"
     assert second["thinking"]["type"] == "adaptive" and second["output_config"]["effort"] == "medium"

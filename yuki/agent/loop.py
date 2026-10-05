@@ -2512,7 +2512,9 @@ class Agent:
                     f"dropped in tasks with those words and say so in done; when all is done, mark it done in tasks "
                     f"alongside done.")
                 continue
-            if text and not self._plain_held and (getattr(self, "_trace", None) or []):
+            if text and not self._plain_held and any(
+                    isinstance(s, dict) and s.get("kind") in ("action", "read", "memory")
+                    for s in (getattr(self, "_trace", None) or [])):
                 # fix6 review (item 1): a plain-text reply classes nothing, so the claim check cannot weigh it; after
                 # steps ran it could claim one that never ran ("opened it and closed it, confirmed"). Sent back once
                 # for done, whose claims class the check holds to the run (a reply with no steps is a plain answer)
