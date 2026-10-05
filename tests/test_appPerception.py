@@ -40,7 +40,7 @@ def test_spotify_volume_slider_hidden_in_its_label_is_read_with_its_numbers(monk
     assert tree.hidden_controls == 2   # the volume and the progress inputs
     text = T.format_window_tree(tree)
     line = next(ln for ln in text.splitlines() if '"Change volume"' in ln and "Slider" in ln)
-    assert "[hidden]" in line and 'value="0.62 (range 0-1)"' in line and "@(" not in line
+    assert "[hidden]" in line and 'value="0.62 (62%, range 0-1)"' in line and "@(" not in line
     assert "[hidden] = a control the app keeps out of sight" in text.splitlines()[0]
 
 

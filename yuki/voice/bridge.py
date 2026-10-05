@@ -1899,11 +1899,17 @@ class VoiceBridge(QObject):
         """What the owed ledger says by code if the talker's run for a result is not heard: the thinker's words, or for
         an outcome below likely the verdict's own fixed line (``I tried to send it, but I couldn't confirm it went.``),
         never the thinker's claim (honest, report 87)."""
+        from yuki.agent.finish import LINE_NOT_CHECKED, LINE_NOTHING_DONE
+
         held = self._held_verdict(job, kind)
         line = " ".join(str((held or {}).get("line") or "").split())
         if held is None or not line:
             return head
-        return f"{head} {line}" if not held.get("acted") else line   # an unread answer keeps its words, marked
+        if held.get("acted"):
+            return line
+        if head.strip() in (LINE_NOTHING_DONE, LINE_NOT_CHECKED):
+            return head   # fix6: the thinker's claim was already replaced by its own fixed line
+        return f"{head} {line}"   # an unread answer keeps its words, marked
 
     def _on_finished(self, lane: str, job_id: int, text: str) -> None:
         job = self._job(job_id)

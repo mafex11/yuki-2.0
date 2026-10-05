@@ -380,7 +380,8 @@ def test_the_agent_ends_with_the_verdict_on_its_final(tmp_path: Path) -> None:
     ], judge=sends)
     agent = _agent(client, tmp_path, memory=_send_memory([]))
     final = _run(agent, "tell sam on my way")[-1]
-    assert isinstance(final, Final) and final.text == "Sent."                # the brain's words, unchanged
+    # fix6: below likely the user gets the verdict's line, never the brain's unbacked "Sent."
+    assert isinstance(final, Final) and final.text == LINE_SEND_UNCONFIRMED
     assert (final.outcome["level"], final.outcome["send"]) == ("unverified", "unconfirmed")
     assert final.outcome["line"] == LINE_SEND_UNCONFIRMED
     step = [s for s in agent._trace if s.get("send")][-1]

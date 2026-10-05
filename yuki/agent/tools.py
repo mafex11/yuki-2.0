@@ -252,9 +252,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "clicks": {"type": "integer", "description": "2 for a double click."},
                 "expect_hwnd": _GUARD,
                 # N4 (report 47): a toggle (a read with on/off) is clicked only toward the state they want
-                "toggle_to": {"type": "string", "enum": ["on", "off"],
+                "toggle_to": {"type": "string", "enum": ["on", "off", "full_screen", "not_full_screen"],
                               "description": "A toggle (on/off in the read): the state they want; read live first, "
-                                             "clicked only if not there, read back."},
+                                             "clicked only if not there, read back. A full-screen control: "
+                                             "full_screen or not_full_screen, judged by the window."},
             },
         ),
     },
@@ -619,8 +620,8 @@ LAUNCH_WAIT_MAX_S = 60
 FINISHES_FIELD = "finishes_with"
 FINISHES_SCHEMA: dict[str, Any] = {
     "type": "boolean",
-    "description": "true when this call alone completes what they asked: it ends the request with a line made from "
-                   "its verified report (no done).",
+    "description": "true when this call alone completes what they asked: its verified report ends the request (no "
+                   "done).",
 }
 #: The text field kept beside it: the outcome in the brain's own words, only when the report cannot name it the way the
 #: user asked (a key, a click).
@@ -929,8 +930,7 @@ STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 NOW_FIELD = "now"
 NOW_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "description": "Optional, shown to them live: what you check or do and why, plain words, at most 12, no tool "
-                   "names or ids",
+    "description": "Optional, shown live: what you do and why, at most 12 plain words, no tool names or ids",
 }
 #: The actions, the situation check and the reads a step usually waits on (the rarer reads go without it).
 NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(ACTION_TOOL_NAMES + (
@@ -1002,7 +1002,22 @@ STATES_SCHEMA: dict[str, Any] = {
                    "own player volume. [] for none.",
 }
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][STATES_FIELD] = STATES_SCHEMA
-TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD]
+#: fix6 (report 73, release 6: two replies said "checked" / "confirmed" below that level, one claimed a queue opened and
+#: closed when no action ran): the brain classes its own message; the loop holds a class its steps do not back
+#: (``yuki.agent.finish.claim_gap``) and, below likely, the user gets the verdict's line unless it is ``tried``
+#: (``finish.honest_text``). Judgement with worked examples, never a reading of the words.
+CLAIMS_FIELD = "claims"
+CLAIMS_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["checked", "done", "tried", "answer"],
+    "description": "What your message claims. checked: you saw or confirmed the result (\"It's at 30% now, read back\"); "
+                   "done: it got done (\"Closed Slack\"); tried: what you tried and that it failed or could not be "
+                   "confirmed (\"I clicked Queue but couldn't see it open\"); answer: only what you found, nothing "
+                   "done. Never past what your steps showed.",
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][CLAIMS_FIELD] = CLAIMS_SCHEMA
+TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD,
+                                                     CLAIMS_FIELD]
 
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})
@@ -1200,6 +1215,45 @@ def _own_toggle_state(via: Any) -> str | None:
     if not isinstance(own, dict) or own.get("before") == own.get("after"):
         return None
     return {0: "off", 1: "on"}.get(own.get("after"))
+
+
+#: fix6: ``click``'s ``toggle_to`` values for a control that switches its window's full screen: judged by the window
+#: (measured from Windows), never by the control's own on/off.
+SCREEN_WANTS: tuple[str, str] = ("full_screen", "not_full_screen")
+
+
+def _toggle_keys(element: Any) -> list[tuple]:
+    """fix6: what identifies a toggle across its two states: its RuntimeId, and its role with its name (a toggle
+    whose state is in its name is known by either name it had). Facts of the read only."""
+    if element is None:
+        return []
+    keys: list[tuple] = []
+    rid = _field(element, "runtime_id")
+    if rid:
+        keys.append(("rid", tuple(rid)))
+    name = " ".join(str(_field(element, "name") or "").split())
+    if name:
+        keys.append(("name", str(_field(element, "role") or ""), name))
+    return keys
+
+
+def _renamed_same_state(was: Any, now: Any) -> bool:
+    """fix6: the same toggle (the same RuntimeId) under another name with the same on/off in both reads: its state
+    shows in its name, not in its on/off (Spotify's "Enter full screen" / "Exit full screen", off in both). Facts of
+    the reads (ids, names, states); the names are compared, never read for meaning."""
+    if was is None or now is None:
+        return False
+    rid0, rid1 = _field(was, "runtime_id"), _field(now, "runtime_id")
+    if not rid0 or not rid1 or list(rid0) != list(rid1):
+        return False
+    if " ".join(str(_field(was, "name") or "").split()) == " ".join(str(_field(now, "name") or "").split()):
+        return False
+
+    def state(e: Any) -> str | None:
+        states = [str(s) for s in (_field(e, "states") or ())]
+        return "on" if "on" in states else "off" if "off" in states else None
+
+    return state(was) is not None and state(was) == state(now)
 
 
 def _without_point_verdict(text: str) -> str:
@@ -1519,6 +1573,8 @@ class Backend(Protocol):
     def read_clipboard(self) -> Any: ...  # pragma: no cover - protocol only
     def write_clipboard(self, text: str) -> Any: ...  # pragma: no cover - protocol only
     def window_at(self, x: int, y: int) -> int: ...  # pragma: no cover - protocol only
+    # Optional too (fix6): how a window is shown, measured (minimized / fullscreen / maximized / normal).
+    def window_state(self, hwnd: int) -> str | None: ...  # pragma: no cover - protocol only
 
 
 #: The tool input fields that name a window (``look_at_window``'s ``hwnd``, an action's ``expect_hwnd`` guard).
@@ -1746,6 +1802,13 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.actions.clipboard").write_clipboard(text)
+
+    def window_state(self, hwnd: int) -> str | None:
+        """:func:`yuki.perception.windows.window_state`: how a window is shown, measured from Windows (minimized,
+        fullscreen: it covers its whole monitor with no caption, maximized, normal), ``None`` when gone. Read-only."""
+        import importlib
+
+        return importlib.import_module("yuki.perception.windows").window_state(int(hwnd))
 
     def window_at(self, x: int, y: int) -> int:
         """The top-level window at a screen point (``WindowFromPoint``, its root), 0 for none. Read-only."""
@@ -1982,6 +2045,11 @@ class Dispatcher:
         #: hwnd -> facts of the latest read of it given to the model (read number, rectangle, title, opaque,
         #: whether Yuki has acted on it since): what a click at raw x,y is checked against.
         self._read_facts: dict[int, dict[str, Any]] = {}
+        #: fix6 (report 73, release 6): toggles whose own on/off does not follow what they switch, learned from a
+        #: click this session: ``(hwnd, key) -> "full_screen"`` (a click flipped the window's full screen while its
+        #: state read the same) or ``"name"`` (its name changed, its state did not). ``key`` is its RuntimeId, else
+        #: its role and a name it had. Never "already" from such a toggle's own state.
+        self._untracked_toggles: dict[tuple[int, tuple], str] = {}
         #: What each window was (process, title, place) as the overviews showed it: a call on one that vanished goes
         #: to the one that took its place (:meth:`_follow_vanished`).
         self._windows_seen: dict[int, dict[str, Any]] = {}
@@ -3883,6 +3951,49 @@ class Dispatcher:
             return None
         return min(same, key=lambda e: sum(abs(int(a) - int(b)) for a, b in zip(e["bounds"], want)))
 
+    def _window_shown(self, hwnd: int | None) -> str | None:
+        """fix6: how a window is shown, measured from Windows (``fullscreen``: it covers its monitor with no caption;
+        ``maximized``, ``normal``, ``minimized``), or ``None`` when the backend cannot say. A few Win32 calls."""
+        measure = getattr(self.backend, "window_state", None)
+        if not hwnd or not callable(measure):
+            return None
+        try:
+            shown = measure(int(hwnd))
+        except Exception:  # noqa: BLE001
+            return None
+        return str(shown) if shown else None
+
+    #: fix6: how long a full-screen control's window is watched for its full screen to switch after the click (s),
+    #: and how often it is measured meanwhile (a few Win32 calls; only while that click's result is pending).
+    SCREEN_WAIT_S = 1.5
+    SCREEN_POLL_S = 0.05
+
+    def _await_window(self, hwnd: int, done: Callable[[str | None], bool]) -> str | None:
+        """fix6: the window's shown state once ``done`` says so, else the last measure after :attr:`SCREEN_WAIT_S`.
+        Windows sends no event for a window's own full screen switch that this process listens to, so it is measured
+        for a bounded moment (as a window action's own full-screen check does)."""
+        deadline = time.monotonic() + self.SCREEN_WAIT_S
+        shown = self._window_shown(hwnd)
+        while not done(shown) and time.monotonic() < deadline:
+            time.sleep(self.SCREEN_POLL_S)
+            shown = self._window_shown(hwnd)
+        return shown
+
+    def _untracked_toggle(self, hwnd: int, element: Any) -> str | None:
+        """fix6: what this session learned about a toggle whose own on/off does not follow what it switches
+        (``full_screen`` or ``name``), or ``None``."""
+        found = [self._untracked_toggles.get((int(hwnd), key)) for key in _toggle_keys(element)]
+        return "full_screen" if "full_screen" in found else "name" if "name" in found else None
+
+    def _learn_toggle(self, hwnd: int, element: Any, now: Any, how: str) -> str:
+        """fix6: remember (this session) that a toggle's own on/off does not show its state, under every key it had in
+        both reads (its RuntimeId, its role and either name). ``full_screen`` is never downgraded to ``name``."""
+        for key in _toggle_keys(element) + _toggle_keys(now):
+            slot = (int(hwnd), key)
+            if self._untracked_toggles.get(slot) != "full_screen":
+                self._untracked_toggles[slot] = how
+        return how
+
     def _click_toggle(self, tool_input: dict[str, Any], toggle: tuple[int, dict[str, Any], str], *, button: str,
                       guard: int | None, label: str, x: int, y: int) -> ToolOutcome:
         """N4: read the toggle's live state, click only when it is not the wanted one, read it back. Live 3 Oct
@@ -3893,16 +4004,31 @@ class Dispatcher:
         (or when the window cannot be read twice) it reads the toggle alone, as before."""
         hwnd, element, read_state = toggle
         want = tool_input.get("toggle_to")
-        if want not in ("on", "off"):
+        if want not in ("on", "off", *SCREEN_WANTS):
             raise ToolError(f"not clicked: {label} is a toggle (it was {read_state} in the read): give toggle_to, on "
                             f"or off, the state they want; it is clicked only when it is not there already")
         element_id = tool_input.get("element")
         element_id = element_id if isinstance(element_id, int) and not isinstance(element_id, bool) else None
         held: dict[str, Any] = {}
+        # fix6 (report 73, release 6): Spotify's "Enter/Exit full screen" reads off in both views, so "already off"
+        # from its own state was a false verified. A full-screen control is judged by the window itself (its size
+        # against the monitor, from Windows): asked as full_screen / not_full_screen, or learned this session from a
+        # click that flipped the window's full screen while the control's own state read the same.
+        learned = self._untracked_toggle(hwnd, element)
+        screen_want = want if want in SCREEN_WANTS else (
+            ("full_screen" if want == "on" else "not_full_screen") if learned == "full_screen" else None)
+        shown_before = self._window_shown(hwnd)
+        held["screen_before"] = shown_before
 
         def state_of(found: Any) -> str | None:
             states = [str(s) for s in (_field(found, "states") or ())]
             return "on" if "on" in states else "off" if "off" in states else None
+
+        def screen_reached(shown: str | None) -> bool | None:
+            """Whether the window shows the full screen asked for (``None``: it cannot be measured)."""
+            if shown is None or screen_want is None:
+                return None
+            return (shown == "fullscreen") == (screen_want == "full_screen")
 
         def in_read(read: list[Any] | None) -> tuple[bool, Any]:
             """``(read, the toggle in it)``: from the bracket's read (by its carried id, its RuntimeId, else the
@@ -3919,6 +4045,44 @@ class Dispatcher:
                                 f"it from that read")
             held["was"] = live
             now = held["now"] = state_of(live)
+            if screen_want is not None:
+                reached = screen_reached(shown_before)
+                if reached is None:
+                    raise ToolError(f"not clicked: whether the window is full screen cannot be measured here, so "
+                                    f"{label} cannot be judged by it; give toggle_to on or off")
+                if reached:
+                    words = "full screen" if screen_want == "full_screen" else "not full screen"
+                    text = (f"the window is already {words} (measured from Windows: its size against the monitor): "
+                            f"{label} not clicked, nothing changed")
+                    outcome = ToolOutcome(name="click", ok=True, summary=text, content=[{"type": "text", "text": text}],
+                                          payload={"details": {"verified": True, "noop": True, "state": now,
+                                                               "window_state": shown_before, "toggle_to": want}})
+                    return self._labelled(outcome, label)
+                return None
+            if learned == "name" and now == want:
+                raise ToolError(f"not clicked: {label}'s own on/off reads the same in both its states (its name "
+                                f"changes, its on/off does not), so whether it is already {want} cannot be read from "
+                                f"it. Judge by what it switches: for a full-screen control give full_screen or "
+                                f"not_full_screen; otherwise read the window first")
+            if learned is None and now == want and _renamed_same_state(element, live):
+                # review F6: renamed since the thinker's read with the same on/off. For this call only (a passive
+                # difference between two reads is no evidence that its on/off never moves: a like button's name
+                # carries a live count), so nothing is learned; a fresh read makes the names agree again
+                raise ToolError(f"not clicked: {label}'s name changed since your read while its on/off stayed {now}, "
+                                f"so whether it is already {want} is not clear from it. Read the window again and "
+                                f"click from that read; for a full-screen control give full_screen or not_full_screen")
+            if now == want and shown_before == "fullscreen":
+                # review F4: the window itself measures full screen, and a full-screen control's own on/off can read
+                # the same in both views (Spotify's "Exit full screen", off either way): "already" from it is not
+                # verified while the window is full screen. Said as the measured fact; judged by the window on ask
+                text = (f"{label} reads {want} (read live just now): not clicked, nothing changed; but the window "
+                        f"itself is full screen (measured from Windows: its size against the monitor), so its own "
+                        f"on/off does not confirm it. If this control switches full screen, give toggle_to full_screen "
+                        f"or not_full_screen to judge it by the window")
+                outcome = ToolOutcome(name="click", ok=True, summary=text, content=[{"type": "text", "text": text}],
+                                      payload={"details": {"noop": True, "state": now, "toggle_unconfirmed": True,
+                                                           "window_state": shown_before, "toggle_to": want}})
+                return self._labelled(outcome, label)
             if now == want:
                 outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just "
                                                                      f"now): not clicked, nothing changed",
@@ -3944,11 +4108,15 @@ class Dispatcher:
             """percFix: the read after the click shows the toggle in the state asked for, or the control itself
             already said so right after the pattern call (until then the bracket reads the window again on its next
             event, bounded)."""
+            if screen_want is not None:
+                return screen_reached(self._window_shown(hwnd)) is True
             if held.get("own") == want:
                 return True
             return read is not None and state_of(_toggle_in(read, element_id, held.get("was"))) == want
 
         def after(via: ToolOutcome, read: list[Any] | None, change: Any = None) -> ToolOutcome:
+            if screen_want is not None:
+                return screen_after(via, read)
             _from_bracket, found = in_read(read)
             state = None if found is None else state_of(found)
             # percFix: the toggle's own state is the verdict. When it still reads the old state (or was drawn again
@@ -3976,6 +4144,34 @@ class Dispatcher:
                 note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
                 if via.ok:
                     note += f" (wanted {want}): do not click it again from this read; read the window first"
+            shown_after = self._window_shown(hwnd) if via.ok else shown_before
+
+            def flips(shown: str | None) -> bool:
+                return (shown_before is not None and shown is not None
+                        and (shown_before == "fullscreen") != (shown == "fullscreen"))
+
+            if (via.ok and verified is not True and shown_before == "fullscreen" and not flips(shown_after)
+                    and _renamed_same_state(held.get("was"), found)):
+                # renamed with the same on/off: a control whose state is in its name; a full-screen switch can take
+                # a moment longer than the window's tree to show on the window itself (bounded). Second review V4:
+                # only when the window was full screen before the click (leaving it); otherwise one measure, so a
+                # Show/Hide or Mute/Unmute toggle never waits for a switch that is not coming
+                shown_after = self._await_window(hwnd, flips) or shown_after
+            flipped = flips(shown_after)
+            if verified is not True and via.ok and state is not None and state == held.get("now") and flipped:
+                # fix6: its own on/off did not move, the window's full screen did: the window is the verdict, and
+                # this control is judged by it from now on (never "already" from its own state)
+                self._learn_toggle(hwnd, element, found, "full_screen")
+                now_full = shown_after == "fullscreen"
+                verified = now_full == (want == "on")
+                note = (f"; its own on/off still reads {state}, but the window itself is "
+                        f"{'now full screen' if now_full else 'no longer full screen'} (measured from Windows: its size "
+                        f"against the monitor): this control switches full screen, so judge it by the window "
+                        f"(toggle_to full_screen or not_full_screen)")
+            elif verified is not True and via.ok and _renamed_same_state(held.get("was"), found):
+                # fix6: renamed by the click while its on/off read the same: its state is in its name
+                self._learn_toggle(hwnd, element, found, "name")
+                note += "; its name changed but its on/off did not, so its on/off does not show its state"
             via.summary += note
             if via.content and via.content[0].get("type") == "text":
                 via.content[0]["text"] += note
@@ -3983,6 +4179,44 @@ class Dispatcher:
                 details = (dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict)
                            else {})
                 details.update(verified=verified, state_before=held.get("now"), state_after=state, toggle_to=want)
+                if flipped:
+                    details.update(window_state_before=shown_before, window_state_after=shown_after)
+                if verified is None:
+                    details.pop("verified", None)
+                    details["toggle_unconfirmed"] = True
+                via.payload = {**via.payload, "details": details}
+            return self._labelled(via, label)
+
+        def screen_after(via: ToolOutcome, read: list[Any] | None) -> ToolOutcome:
+            """fix6: a full-screen control's verdict from the window itself, measured from Windows (its size against
+            the monitor, no caption), waited for a moment (bounded) after the click; never its own on/off."""
+            shown = self._window_shown(hwnd)
+            if via.ok and screen_reached(shown) is False:
+                shown = self._await_window(hwnd, lambda s: screen_reached(s) is True) or shown
+            reached = screen_reached(shown)
+            words = ("full screen" if shown == "fullscreen" else
+                     f"not full screen ({shown})" if shown else "")
+            if reached:
+                verified: bool | None = True
+                note = f"; the window is now {words} (measured from Windows: its size against the monitor)"
+                _from_bracket, found = in_read(read)
+                if found is not None and state_of(found) == held.get("now"):
+                    self._learn_toggle(hwnd, element, found, "full_screen")
+            elif reached is None:
+                verified = None
+                note = "; whether the window is full screen could not be measured after it"
+            else:
+                verified = False
+                note = (f"; the window is still {words} (measured from Windows): it did not switch" if via.ok
+                        else "")
+            via.summary += note
+            if via.content and via.content[0].get("type") == "text":
+                via.content[0]["text"] += note
+            if isinstance(via.payload, dict):
+                details = (dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict)
+                           else {})
+                details.update(verified=verified, toggle_to=want, window_state_before=shown_before,
+                               window_state_after=shown, window_state_changed=shown != shown_before)
                 if verified is None:
                     details.pop("verified", None)
                     details["toggle_unconfirmed"] = True
@@ -4588,7 +4822,26 @@ class Dispatcher:
         act = getattr(self.backend, "window_action", None)
         if not callable(act):
             raise ToolError("this backend cannot act on whole windows")
-        return self._from_action("window_action", act(hwnd, action))
+        outcome = self._from_action("window_action", act(hwnd, action))
+        payload = outcome.payload if isinstance(outcome.payload, dict) else {}
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        was_min = bool(details.get("was_minimized")) or details.get("window_state_before") == "minimized"
+        if (action == "restore" and outcome.ok and details.get("window_state_after") == "fullscreen"
+                and not was_min):
+            # fix6 (report 73): "restored" means neither minimized nor maximized, which an app's own full screen also
+            # is; measured from Windows the window still covers its monitor, so it was not put back to normal. Review
+            # F5: a minimized window brought back to its own full screen (a borderless game) was restored as asked
+            note = ("; but the window still covers its whole monitor with no title bar (measured from Windows): it "
+                    "is still full screen. Restore does not leave an app's own full screen: its own full-screen "
+                    "control or key does")
+            outcome.ok = False
+            if "ok" in payload:
+                payload = {**payload, "ok": False}
+            outcome.summary += note
+            if outcome.content and outcome.content[0].get("type") == "text":
+                outcome.content[0]["text"] += note
+            outcome.payload = {**payload, "details": {**details, "verified": False, "still_fullscreen": True}}
+        return outcome
 
     # -- control tools -----------------------------------------------------
 

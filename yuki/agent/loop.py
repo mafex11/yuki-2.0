@@ -63,6 +63,7 @@ from yuki.agent.memory import (
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
     ABOUT_FIELD,
+    CLAIMS_FIELD,
     STATES_FIELD,
     ALL_TOOL_NAMES,
     ACTION_TOOL_NAMES,
@@ -75,6 +76,7 @@ from yuki.agent.tools import (
     NOW_FIELD,
     PLAYBOOK_FIELD,
     RISK_FIELD,
+    SCREEN_WANTS,
     STEP_ABOUT_FIELD,
     STEP_FIELD,
     WHAT_FIELD,
@@ -456,6 +458,9 @@ class _Turn:
     done_about: list[int] | None = None
     #: N3: the states the ``done`` of this response tells, each with the step it says showed it (``states``).
     done_states: list[dict[str, Any]] = field(default_factory=list)
+    #: fix6: what the ``done`` of this response claims, as the brain classes it (``claims``: checked, done, tried,
+    #: answer; ``None``: none given).
+    done_claims: str | None = None
     #: The user answered a question in this response (``ask_user`` or a risk confirmation).
     asked: bool = False
     #: ``(tool, why)`` of actions this response ran whose own report shows the effect did not happen (revamp D, S2):
@@ -1408,6 +1413,8 @@ class Agent:
         #: honest (87): the claims of the closing message the claim check could not back after asking once (its gaps):
         #: the outcome verdict is no stronger than "not confirmed" while one stands.
         self._unbacked: list[str] = []
+        #: fix6: what the accepted done's message claims, as the brain classed it (``claims``); ``None``: none given.
+        self._done_claims: str | None = None
         self._last_verdict: dict[str, Any] | None = None
         self._finished_by_action = False
         #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
@@ -1422,6 +1429,8 @@ class Agent:
         #: N10: the request's kept list (``tasks``), and how often a done was held for what is still on it.
         self._tasks: list[dict[str, Any]] = []
         self._tasks_held = 0
+        #: fix6 review: a plain-text reply (no done, so no claims class) after steps ran was sent back once for done.
+        self._plain_held = False
         self._typed: dict[int, str] = {}
         self._files_read = False
         self._unconfirmed: list[tuple[int, int | None]] = []
@@ -1873,8 +1882,8 @@ class Agent:
             if kind is None:
                 kind = ("action" if name in ACTION_TOOL_NAMES else "memory" if name in MEMORY_TOOLS
                         else "ask" if name == "ask_user" else "read" if name in PERCEPTION_TOOLS else "control")
-            hwnd = (_view_target(name, tool_input, details)[0] if kind == "action"
-                    else _as_hwnd(tool_input.get("hwnd")))
+            hwnd, chosen = (_view_target(name, tool_input, details) if kind == "action"
+                            else (_as_hwnd(tool_input.get("hwnd")), ""))
             window = self._window_of(hwnd)
             app = str((window or {}).get("process_name") or "") or None
             if app is None and kind == "action":
@@ -1908,6 +1917,12 @@ class Agent:
                     "at": time.time()}
             if control:
                 step["control"] = control
+            if isinstance(payload.get("saved"), bool):
+                # second review V1/V2: whether a memory write was kept, from its own result (not saved: memory down)
+                step["saved"] = payload["saved"]
+            if kind == "action" and _windowless(name, chosen):
+                # second review V6: no window of its own (a shell command): its app is only the window in front
+                step["windowless"] = True
             if send:
                 step["send"] = send   # honest (87): confirmed | unconfirmed | unchecked in memory's capture of the chat
                 if send_sig:
@@ -2453,9 +2468,12 @@ class Agent:
                     window_view=view,
                 )
                 if turn.finished:
-                    final = self._with_list_left(turn.finished[0])
+                    verdict = self._outcome_verdict()
+                    if self._finished_by_action:
+                        self._done_claims = None   # its line is written by code from the verified report
+                    final = self._with_list_left(self._honest_final(turn.finished[0], verdict))
                     self.logger.final(final)
-                    yield Final(final, outcome=self._outcome_verdict())
+                    yield Final(final, outcome=verdict)
                     return
                 continue
 
@@ -2508,10 +2526,24 @@ class Agent:
                     f"dropped in tasks with those words and say so in done; when all is done, mark it done in tasks "
                     f"alongside done.")
                 continue
+            if text and not self._plain_held and any(
+                    isinstance(s, dict) and s.get("kind") in ("action", "read", "memory")
+                    for s in (getattr(self, "_trace", None) or [])):
+                # fix6 review (item 1): a plain-text reply classes nothing, so the claim check cannot weigh it; after
+                # steps ran it could claim one that never ran ("opened it and closed it, confirmed"). Sent back once
+                # for done, whose claims class the check holds to the run (a reply with no steps is a plain answer)
+                self._plain_held = True
+                self.logger.log("plain_held", steps=len(self._trace), text_chars=len(text))
+                self.context.add_note(
+                    f"{CHECK_LABEL}: your reply above was not sent: finish with done (its claims no stronger than "
+                    f"your steps showed), not plain text.")
+                continue
             if text:
-                text = self._with_list_left(text)
+                verdict = self._outcome_verdict()
+                self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
+                text = self._with_list_left(self._honest_final(text, verdict))
                 self.logger.final(text)
-                yield Final(text, outcome=self._outcome_verdict())
+                yield Final(text, outcome=verdict)
             else:
                 message = f"The model stopped with nothing to say (stop_reason={stop_reason})."
                 self.logger.error(message)
@@ -2569,19 +2601,28 @@ class Agent:
                 self.logger.log("claim_accepted", why="asked once already this request", about=turn.done_about)
             if turn.finished and not turn.failed:
                 self._unbacked = gaps   # honest (87): what the done says that nothing backs caps the verdict
+                self._done_claims = turn.done_claims
             return held
         gaps = self._claim_gaps(turn)
         if not gaps:
             self._unbacked = []
+            self._done_claims = turn.done_claims
             return held
         self._claim_rounds += 1
         self.logger.log("claim_held", gaps=gaps, about=turn.done_about, message=turn.finished[0])
         turn.finished.clear()
-        held.append(({"type": "text", "text": (
-            f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
-            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows. A done that no "
-            f"step backs reaches them as not confirmed, so word it as what you tried.")},
-            "a claim about the screen had no evidence"))
+        if gaps == [self._claim_gap(turn.done_claims)]:
+            # review F3: only its claims class is past the run: the gap itself says what clears it (a look only
+            # where a look can), never "look first" where looking cannot raise the result
+            text = (f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Then finish with done, its claims no "
+                    f"stronger than your steps showed. A done whose claims stay past them reaches them as not "
+                    f"confirmed.")
+        else:
+            text = (f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
+                    f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows, its claims "
+                    f"no stronger than your steps showed. A done that no step backs reaches them as not confirmed, so "
+                    f"word it as what you tried.")
+        held.append(({"type": "text", "text": text}, "a claim about the screen had no evidence"))
         return held
 
     def _outcome_verdict(self) -> dict[str, Any] | None:
@@ -2608,7 +2649,41 @@ class Agent:
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
                  f"verified result" for hwnd in (turn.done_about or []) if hwnd not in self._evidence]
         gaps += self._state_gaps(turn.done_states)
+        claimed = self._claim_gap(turn.done_claims)
+        if claimed:
+            gaps.append(claimed)
         return gaps
+
+    def _claim_gap(self, claims: str | None) -> str | None:
+        """fix6 (report 73, release 6): what the done's own class of its message (``claims``) says beyond this
+        request's run so far: a claim of something done when no action ran, "checked" above the level, "done" below
+        likely (:func:`yuki.agent.finish.claim_gap`). Facts of the run trace only, never the words."""
+        if claims is None:
+            return None
+        trace = getattr(self, "_trace", None) or []
+        try:
+            verdict = finish_gate.outcome_verdict(trace, finished_by_action=bool(getattr(self, "_finished_by_action",
+                                                                                          False)))
+        except Exception:  # noqa: BLE001 - the check never breaks a request
+            return None
+        read = any(s.get("kind") in ("read", "memory") and s.get("ok") for s in trace if isinstance(s, dict))
+        return finish_gate.claim_gap(claims, verdict, read=read, looked_back=finish_gate.read_back(trace),
+                                     windowless=finish_gate.last_windowless(trace))
+
+    def _honest_final(self, text: str, verdict: dict[str, Any] | None) -> str:
+        """fix6: the closing text obeys the outcome verdict (:func:`yuki.agent.finish.honest_text`): below likely the
+        user gets the verdict's own line unless the done classed its words as what was tried and nothing in them was
+        left unbacked. Logged without words."""
+        claims = getattr(self, "_done_claims", None)
+        out, why = finish_gate.honest_text(text, verdict, claims)
+        if why is not None and out != text and isinstance(verdict, dict) and (text or "").strip():
+            # second review V3: the card and the window get the line alone; the brain's own words stay on the verdict
+            # (``words``) for the expanded run, never as the reply
+            verdict["words"] = " ".join(str(text).split())
+        if why is not None and out != text:
+            self.logger.log("final_held", why=why, level=(verdict or {}).get("level"), claims=claims,
+                            text_chars=len(text or ""))
+        return out
 
     def _state_gaps(self, states: list[dict[str, Any]]) -> list[str]:
         """N3 (report 47): the states a done tells (``states``) that no step of this request showed: the step it names
@@ -3045,12 +3120,15 @@ class Agent:
                     self.logger.log("situation_gate", tool=name, what=need, checks=len(checks),
                                     hwnd=target.get("hwnd"))
             if held_text is None:
-                # Revamp D (S3): a pending send to a person, or the request's first action on a close call, gets one
+                # Revamp D (S3): a pending send to a person, or the first harmful call on a close call, gets one
                 # second look before it runs; its verdict (the model's) can hold the call.
                 signal = None
                 if judged is not None and judged.sends:
                     signal = ("send", "a message to a person is about to be sent")
-                elif self._learning.get("actions", 0) == 0 and _close_call(self._frame):
+                elif _close_call(self._frame) and _close_call_matters(name, tool_input, target):
+                    # fix6 review F2: the first call that could do lasting harm on a close call, whatever its index
+                    # (a selecting click or a focus before a close or delete no longer hides the close from it);
+                    # once per request (``_consult_due``)
                     signal = ("close_call", "the task frame calls two candidates a close call")
                 if signal is not None and not self._paused.is_set() and self._consult_due(signal[0]):
                     advice = self._consult(signal[0], signal[1],
@@ -3228,6 +3306,7 @@ class Agent:
             turn.done_about = [h for h in (_as_hwnd(v) for v in about) if h] if isinstance(about, list) else []
             states = tool_input.get(STATES_FIELD)
             turn.done_states = [s for s in states if isinstance(s, dict)][:8] if isinstance(states, list) else []
+            turn.done_claims = finish_gate.claim(tool_input.get(CLAIMS_FIELD))
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
@@ -5087,6 +5166,55 @@ class Agent:
         self._evidence[hwnd] = "looked"   # the next call sees it read after the actions (v3.14)
         self._last_view_text = view.text   # revamp D: the window acted on, for a second look's summary
         return (hwnd, text, True) if changes else (hwnd, text)
+
+
+def _close_call_matters(name: str, tool_input: dict[str, Any] | None, target: dict[str, Any] | None) -> bool:
+    """fix6 (report 73, release 6: every Spotify volume change took 4-5 s, of which the slider itself 0.8-1.3 s; the
+    rest was this second look, 3.0 and 4.1 s, on a close call between two things in the frame): whether picking the
+    wrong one of two close candidates could do lasting harm with this call, so it waits for a second look. True when
+    the call can destroy or reach something (its fixed traits and its target's role, as the judge sees them) or puts
+    text of the brain's somewhere (its ``text`` input). A level, a scroll, a hover, a window state or a tab shown take
+    no candidate's content, report their own effect and are undone the same way: they go at once. Traits and input
+    fields only, never words."""
+    target = target or {}
+    args = tool_input or {}
+    if name == "click" and args.get("toggle_to") in SCREEN_WANTS:
+        # second review V5: a full-screen control is judged by the window and undone by the same click
+        return False
+    if name in ("press", "hotkey") and _view_only_keys(args):
+        return False
+    try:
+        traits = call_traits(name, args, role=target.get("role"), typed_pending=bool(target.get("typed_pending")))
+    except Exception:  # noqa: BLE001 - when in doubt, the second look runs as before
+        return True
+    return bool(traits.destroys or traits.reaches or str(args.get("text") or "").strip())
+
+
+#: Second review V5: keys that only move a view or a level and type nothing (media and volume keys, page and arrow
+#: movement): pressed alone they go at once on a close call, like a scroll or a slider. A fixed key vocabulary.
+VIEW_ONLY_KEYS: frozenset[str] = frozenset({"playpause", "nexttrack", "prevtrack", "stop", "volumeup", "volumedown",
+                                            "volumemute", "pageup", "pagedown", "up", "down", "left", "right", "home",
+                                            "end"})
+
+
+def _view_only_keys(args: dict[str, Any]) -> bool:
+    """A ``press`` of one :data:`VIEW_ONLY_KEYS` key, or a ``hotkey`` of that key alone (case, ``_``, ``-`` and spaces
+    folded, as the backend folds key names: ``volume_down`` is ``volumedown``)."""
+    keys = [args.get("key")] if "key" in args else args.get("keys")
+    if not isinstance(keys, list) or len(keys) != 1 or not isinstance(keys[0], str):
+        return False
+    return "".join(ch for ch in keys[0].casefold() if ch not in "_- ") in VIEW_ONLY_KEYS
+
+
+def _windowless(name: str, chosen: str) -> bool:
+    """Second review V6: an action with no window of its own: its tool takes no window (no ``expect_hwnd``, ``hwnd``
+    or ``element``) and its result named none, so its trace step's app is only the window that was in front. A schema
+    fact and how the window was chosen, never words."""
+    from yuki.agent.tools import TOOLS_BY_NAME
+
+    props = ((TOOLS_BY_NAME.get(name) or {}).get("input_schema") or {}).get("properties") or {}
+    return chosen in ("the window in front after the action", "the foreground window") and not any(
+        k in props for k in ("expect_hwnd", "hwnd", "element"))
 
 
 def _close_call(frame: Any) -> bool:
