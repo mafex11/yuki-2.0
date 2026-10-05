@@ -2263,6 +2263,8 @@ class CallWorker:
         self._note_holders(now)
         act = self.active
         if act is not None and not self._goes_on(cfg, act, now):
+            if act.held:   # ended by the screen while its app holds the microphone: not begun again from this
+                cands = [c for c in cands if c[0] != act.key]   # poll's candidates (read before it ended)
             self.active = act = None
         if act is None and cands:
             key, via, service, name = cands[0]
