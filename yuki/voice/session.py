@@ -1145,7 +1145,9 @@ class VoiceSession(QObject):
             self._apply_wake()
             if changed:
                 self._emit_listening()
-        self._resume_local_download()
+        resume = getattr(self, "_resume_local_download", None)   # vLocal (a test's stand-in session has none)
+        if callable(resume):
+            resume()
 
     def _resume_local_download(self) -> None:
         """vLocal: a download of the speech models that stopped for a game or a call goes on once both are over."""

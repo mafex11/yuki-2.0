@@ -2299,9 +2299,10 @@ VOICE_PROVIDERS = [{"key": "gemini", "label": "Gemini, Leda", "note": "The defau
 #: vLocal: speech recognition's choices (voice.json ``stt_provider``; the cloud is the default).
 STT_CHOICES = [{"key": "deepgram", "label": "Cloud (fastest)", "note": "Understands English and Hindi"},
                {"key": "local", "label": "On this PC (private, slower)",
-                "note": "English only. What you say never leaves this PC, and replies start about a second later"}]
+                "note": "English only. What you say never leaves this PC, and spoken replies start about half a second "
+                        "later"}]
 #: vLocal: what each voice on this PC is like, in plain words (67b's measurements on this PC).
-LOCAL_VOICE_NOTES = {"supertonic": "Private. Starts speaking about a second later than the cloud voices",
+LOCAL_VOICE_NOTES = {"supertonic": "Private. Starts speaking about half a second later than the cloud voices",
                      "kokoro": "Private and the most natural of these, but about two seconds slower to start"}
 
 
@@ -2325,8 +2326,9 @@ def local_speech_view(prefs: dict[str, Any], root: Any = None) -> dict[str, Any]
     states = {r.get("state") for r in rows}
     total_mb = round(sum(lm.CATALOG[k].archive_mb for k in keys if (status.get(k) or {}).get("state") != "ready"))
     if states == {"ready"}:
-        text = ("Ready. Replies start about 1 to 1.5 seconds later than with the cloud, and talking uses about "
-                "1 GB more memory while the models are loaded.")
+        text = ("Ready. Spoken replies start about half a second later than with the cloud, and the first one after "
+                "a quiet spell a few seconds later while the models load (unless they stay loaded). They use about "
+                "1 GB of memory while loaded.")
     elif "downloading" in states or "installing" in states:
         done = sum(int(r.get("done") or 0) for r in rows if r.get("state") in ("downloading", "installing"))
         whole = sum(int(r.get("total") or 0) for r in rows if r.get("state") in ("downloading", "installing")) or 1
