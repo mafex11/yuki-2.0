@@ -105,6 +105,10 @@ LINE_FAILED = "That didn't work."
 #: Said after an answer that tells the screen's state without having read it (nothing was done).
 LINE_UNREAD = "I haven't checked that on screen, though."
 
+#: Tools whose report is a command's exit status (no screen to check): one that ran without an error is ``likely``
+#: (replayed 5 Oct: a request that read a fact with a command and answered it was otherwise graded "not confirmed").
+EXIT_STATUS_TOOLS = frozenset({"run_powershell"})
+
 #: What a verified step's own check saw, per tool operation (plain words: cards, the talker's ``checked``).
 _SEEN_WINDOW = {"close": "its window is gone", "minimize": "its window is minimized",
                 "maximize": "its window is maximized", "fullscreen": "its window is full screen",
@@ -125,6 +129,8 @@ def step_level(step: dict[str, Any]) -> str:
     level = _CLASS_LEVEL[classify(step.get("ok") is not False, step.get("verdict"), str(step.get("why") or ""))]
     if level == UNVERIFIED and step.get("confirmed"):
         return LIKELY   # backed afterwards by something independent (a later verified step in the same window)
+    if level == UNVERIFIED and step.get("tool") in EXIT_STATUS_TOOLS:
+        return LIKELY   # a command's own report is its exit status: it ran without an error, a weak check
     return level
 
 
@@ -141,33 +147,41 @@ def _seen(step: dict[str, Any], level: str) -> str:
             return _SEEN_WINDOW.get(str((step.get("input") or {}).get("action") or ""), "the window reads back that way")
         return _SEEN_TOOL.get(tool, "the window changed after it")
     if level == LIKELY:
-        return ("a later step showed it worked" if step.get("confirmed")
-                else "it can't be read back from here, which is normal for it")
+        if step.get("confirmed"):
+            return "a later step showed it worked"
+        if tool in EXIT_STATUS_TOOLS:
+            return "the command ran without an error"
+        return "it can't be read back from here, which is normal for it"
     if level == UNVERIFIED:
         return "nothing on screen showed whether it worked"
     return "it failed" if step.get("ok") is False else "the screen showed it didn't happen"
 
 
-def _resolved(index: int, actions: list[dict[str, Any]], levels: list[str]) -> bool:
+def _resolved(index: int, actions: list[dict[str, Any]], levels: list[str], *, finished_at: int | None) -> bool:
     """Whether a later step put an earlier non-verified one right: a send only by a later confirmed send; any other
-    step by a later verified step in the same app, or by a later try of the same tool in the same app (the retry's own
-    level stands for it). Facts of the trace only."""
+    step by a later verified step in the same app (or where either app is not known), by a later try of the same tool
+    in the same app (the retry's own level stands for it), or by the verified action the brain marked as completing the
+    request (``finished_at``: its index). Facts of the trace only."""
     step = actions[index]
     later = range(index + 1, len(actions))
     if step.get("send"):
         return any(actions[j].get("send") == "confirmed" for j in later)
+    if finished_at is not None and finished_at > index:
+        return True
     app = step.get("app")
     for j in later:
         other = actions[j]
-        if other.get("send") or other.get("app") != app:
+        if other.get("send"):
             continue
-        if other.get("tool") == step.get("tool") or (app is not None and levels[j] == VERIFIED):
+        same = other.get("app") == app
+        if (same and other.get("tool") == step.get("tool")) or (
+                levels[j] == VERIFIED and (same or app is None or other.get("app") is None)):
             return True
     return False
 
 
-def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] | tuple[str, ...] = ()
-                    ) -> dict[str, Any]:
+def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] | tuple[str, ...] = (),
+                    finished_by_action: bool = False) -> dict[str, Any]:
     """The request's one outcome verdict from its run trace (``yuki.agent.loop.Agent._trace``), used by the thinker's
     log, the voice, the done card, the island and the window's run. Data only: the steps' measured verdicts, a send's
     confirmation in memory's capture of the chat, and the claims of the closing message the claim check could not back
@@ -188,7 +202,12 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
                 "send": None, "partial": False, "line": LINE_UNREAD if unbacked else "", "step": "", "steps": 0,
                 "open": 0}
     levels = [step_level(s) for s in actions]
-    still = [i for i, lv in enumerate(levels) if lv != VERIFIED and not _resolved(i, actions, levels)]
+    # the request ended on the action the brain marked as completing it, and that action verified (the loop finishes
+    # only then): the last verified action
+    finished_at = (max((i for i, lv in enumerate(levels) if lv == VERIFIED), default=None)
+                   if finished_by_action else None)
+    still = [i for i, lv in enumerate(levels)
+             if lv != VERIFIED and not _resolved(i, actions, levels, finished_at=finished_at)]
     if still:
         decider = min(still, key=lambda i: (_RANK[levels[i]], -i))   # the weakest; the latest of equals
         level = levels[decider]

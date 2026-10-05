@@ -804,10 +804,10 @@ class YukiUi(QObject):
     def _on_outcome(self, lane_name: str, request_id: int, verdict: dict) -> None:
         """honest (87): the request's outcome verdict, kept for its settle (the strip, the card, the window)."""
         if isinstance(verdict, dict):
-            self._outcomes[request_id] = dict(verdict)
-            del_keys = list(self._outcomes)[:-16]   # only the newest few wait for their settle
-            for key in del_keys:
-                self._outcomes.pop(key, None)
+            store = self.__dict__.setdefault("_outcomes", {})
+            store[request_id] = dict(verdict)
+            for key in list(store)[:-16]:   # only the newest few wait for their settle
+                store.pop(key, None)
 
     def _on_finished(self, lane_name: str, request_id: int, text: str) -> None:
         self._settle(lane_name, request_id, text, tone="reply")

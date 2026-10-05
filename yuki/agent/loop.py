@@ -1406,6 +1406,7 @@ class Agent:
         #: the outcome verdict is no stronger than "not confirmed" while one stands.
         self._unbacked: list[str] = []
         self._last_verdict: dict[str, Any] | None = None
+        self._finished_by_action = False
         #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
         self._situation_checks: list[situation_check.CheckRecord] = []
         #: appPT: the questions the user answered in this request (``ask_user``: question, answer). A send whose exact
@@ -2376,6 +2377,7 @@ class Agent:
                     # succeeded and that action's own report verified its effect: that is its done, with no
                     # extra round trip.
                     turn.finished.append(turn.finishing[-1][0])
+                    self._finished_by_action = True   # honest (87): the outcome verdict ends on that verified action
                     self.logger.log("finished_by_action", message=turn.finishing[-1][0])
                 reason = self._step_signal(turn, breaker_blocks)
                 if reason is None and held and not (turn.finishing and finish_gate.is_expected(turn.finishing[-1][2])):
@@ -2417,6 +2419,7 @@ class Agent:
                     )})
                     self.logger.log("steer", held_final=turn.finished[0])
                     turn.finished.clear()
+                    self._finished_by_action = False
                 if resumed_after is not None:
                     view = self._resume_view()
                 else:
@@ -2564,7 +2567,8 @@ class Agent:
         Never raises: ``None`` when it cannot be made."""
         try:
             verdict = finish_gate.outcome_verdict(getattr(self, "_trace", None) or [],
-                                                  unbacked=list(getattr(self, "_unbacked", None) or []))
+                                                  unbacked=list(getattr(self, "_unbacked", None) or []),
+                                                  finished_by_action=bool(getattr(self, "_finished_by_action", False)))
         except Exception as exc:  # noqa: BLE001 - the verdict never breaks a request
             self.logger.log("outcome_verdict_failed", error=f"{type(exc).__name__}: {exc}")
             return None
