@@ -168,3 +168,36 @@ def test_only_exactly_one_turns_the_words_on(monkeypatch, value):
 def test_the_desktop_agents_log_content_free():
     src = (Path(__file__).resolve().parents[1] / "yuki" / "ui" / "runtime.py").read_text(encoding="utf-8")
     assert src.count("content=content_kept()") == 2   # the worker's and the front desk's session logs
+
+
+def test_the_window_takes_a_requests_words_from_memory(tmp_path, monkeypatch):
+    # review F7: requests.csv keeps no words now; Home's "while you were away" and Activity's request rows take them
+    # from memory's exchanges (matched by start time), so each row is still told apart; no match -> "A request"
+    from datetime import datetime
+
+    from test_web_window import _Memory
+    from yuki.ui import web_data
+
+    monkeypatch.delenv(LOG_CONTENT_ENV, raising=False)
+    now = time.time()
+    path = tmp_path / "requests.csv"
+    started = [now - 1200.6, now - 600.2, now - 300.0]
+    for at in started:   # the agent stamps the row with the request's start, to the second
+        append_request_row(path, {"timestamp": datetime.fromtimestamp(at).isoformat(timespec="seconds"),
+                                  "session": "s", "lane": "worker", "request": SECRET_WORDS, "wall_s": 3.0,
+                                  "outcome": "final"})
+    assert SECRET_WORDS not in path.read_text(encoding="utf-8")
+
+    class _WithTurns(_Memory):
+        def turns_on(self, day, limit=200):
+            return [{"at": started[0], "user": "open my budget sheet"}, {"at": started[1], "user": "pause the music"},
+                    {"at": now - 4000, "user": "an older one"}]
+
+    home = web_data.build_home(_WithTurns(), requests_csv=path, now=now)
+    titles = sorted(a["title"] for a in home["away"] if a["kind"] == "request")
+    assert titles == ["A request", "“open my budget sheet”", "“pause the music”"]
+    activity = web_data.build_activity(_WithTurns(), requests_csv=path, now=now)
+    rows = {r["what"]: r for r in activity["rows"] if r["kind"] == "request"}
+    assert "“pause the music”" in rows and "pause the music" in rows["“pause the music”"]["wrong_text"]
+    assert rows["A request"]["wrong_text"] == ""
+    assert web_data.request_words_from_memory(object(), [{"at": now, "what": ""}]) == [{"at": now, "what": ""}]
