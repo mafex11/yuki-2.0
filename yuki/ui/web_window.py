@@ -141,7 +141,7 @@ ASKED = frozenset({"want", "action"})
 #: Messages held while the window can't be seen (minimised, hidden, covered by a full-screen app); one catch-up on show.
 HOLD_KINDS = frozenset({"data", "live", "chat"})
 #: The tray's state fields the Settings page shows (a change in any of them rebuilds Settings if it is open).
-SETTINGS_STATE = ("wake", "mic", "speaker", "hotkeys", "devices", "tts_voice")
+SETTINGS_STATE = ("wake", "mic", "speaker", "hotkeys", "devices", "tts_voice", "local_models")
 #: What is playing (the Now strip) is read again at most this often, after a Home build.
 MEDIA_S = 60.0
 #: While yuki-ui is not answering, look for it again this often.
@@ -1975,7 +1975,7 @@ class WebWindow:
         policy.set_app_act(str(m.get("app") or ""), bool(m.get("act")), self.policy_path)
         return {}
 
-    VOICE_KEYS = ("wake", "mic", "speaker", "end_tone", "tts_provider")
+    VOICE_KEYS = ("wake", "mic", "speaker", "end_tone", "tts_provider", "stt_provider", "local_keep_loaded")
 
     def a_voice(self, m: dict[str, Any]) -> dict[str, Any]:
         changes = {k: m[k] for k in self.VOICE_KEYS if k in m}
@@ -1990,7 +1990,17 @@ class WebWindow:
             return {"ok": bool(reply.get("ok")), **({"error": reply["error"]} if reply.get("error") else {})}
         from yuki.ui.window import settings_io
 
-        settings_io.write_voice_prefs(changes)   # used when Yuki next starts
+        speech = {k: changes.pop(k) for k in ("tts_provider", "stt_provider", "local_keep_loaded") if k in changes}
+        if speech:   # vLocal: "local:<voice>" is tts_provider local + tts_voice; the defaults are not stored
+            from yuki.voice.local_models import voice_pref_changes
+
+            import json
+
+            path = settings_io.voice_prefs_path()
+            prefs = settings_io.write_voice_prefs({}, path)   # what voice.json holds now
+            path.write_text(json.dumps(voice_pref_changes(prefs, speech), indent=1), encoding="utf-8")
+        if changes:
+            settings_io.write_voice_prefs(changes)   # used when Yuki next starts
         return {"offline": True}
 
     def _privacy(self, key: str, value: Any) -> dict[str, Any]:

@@ -2296,6 +2296,57 @@ VOICE_PROVIDERS = [{"key": "gemini", "label": "Gemini, Leda", "note": "The defau
                    {"key": "elevenlabs", "label": "ElevenLabs", "note": "Uses your ElevenLabs voice id"}]
 
 
+#: vLocal: speech recognition's choices (voice.json ``stt_provider``; the cloud is the default).
+STT_CHOICES = [{"key": "deepgram", "label": "Cloud (fastest)", "note": "Understands English and Hindi"},
+               {"key": "local", "label": "On this PC (private, slower)",
+                "note": "English only. What you say never leaves this PC, and spoken replies start about half a second "
+                        "later. A pause of a second or more mid-sentence can end what you're saying"}]
+#: vLocal: what each voice on this PC is like, in plain words (67b's measurements on this PC).
+LOCAL_VOICE_NOTES = {"supertonic": "Private. Starts speaking about half a second later than the cloud voices",
+                     "kokoro": "Private and the most natural of these, but about two seconds slower to start"}
+
+
+def local_speech_view(prefs: dict[str, Any], root: Any = None) -> dict[str, Any]:
+    """Settings → Voice, vLocal: the voice list with the voices on this PC, speech recognition's choice, and how the
+    models on this PC stand (from their own files and the download's status file; nothing is computed or fetched)."""
+    from yuki.voice import local_models as lm
+
+    stt = "local" if str(prefs.get("stt_provider") or "").lower() == "local" else "deepgram"
+    tts = str(prefs.get("tts_provider") or "gemini").lower()
+    voice = lm.parse_voice(prefs.get("tts_voice")).key if tts == "local" else ""
+    providers = VOICE_PROVIDERS + [{"key": f"local:{v.key}", "label": v.label, "note": LOCAL_VOICE_NOTES[v.family]}
+                                   for v in lm.VOICES.values()]
+    out: dict[str, Any] = {"provider": f"local:{voice}" if voice else tts, "providers": providers,
+                           "stt": stt, "stt_choices": STT_CHOICES}
+    keys = lm.wanted(stt, tts, voice)
+    if not keys:
+        return out
+    status = lm.read_status(root)
+    rows = [status.get(k) or {"state": "missing"} for k in keys]
+    states = {r.get("state") for r in rows}
+    total_mb = round(sum(lm.CATALOG[k].archive_mb for k in keys if (status.get(k) or {}).get("state") != "ready"))
+    if states == {"ready"}:
+        text = ("Ready. Spoken replies start about half a second later than with the cloud, and the first one after "
+                "a quiet spell a few seconds later while the models load (unless they stay loaded). They use about "
+                "1 GB of memory while loaded.")
+    elif "downloading" in states or "installing" in states:
+        done = sum(int(r.get("done") or 0) for r in rows if r.get("state") in ("downloading", "installing"))
+        whole = sum(int(r.get("total") or 0) for r in rows if r.get("state") in ("downloading", "installing")) or 1
+        text = f"Downloading, {round(100 * done / whole)}% of this part. Until it's done I use the cloud."
+    elif "paused" in states:
+        text = "The download waits while you're in a game, a call or a full-screen window, then carries on. Until then I use the cloud."
+    elif "error" in states:
+        why = next((r.get("error") for r in rows if r.get("state") == "error"), "") or "it failed"
+        later = max((float(r.get("retry_after") or 0) for r in rows if lm.Downloader.backing_off(r)), default=0.0)
+        again = f"I try again from {day_words(later)}" if later else "I try again next time"
+        text = f"Couldn't download the models ({why}). {again}. Until then I use the cloud."
+    else:
+        text = f"About {total_mb} MB to download, when you're not in a game or a call. Until then I use the cloud."
+    out["local"] = {"text": text, "keep_loaded": bool(prefs.get("local_keep_loaded", False)),
+                    "ready": states == {"ready"}}
+    return out
+
+
 def takeover_view(px: Any) -> dict[str, Any]:
     """Settings → While I work: how far the mouse must move while Yuki works for Yuki to pause (``ui.json``
     ``takeover_move_px``, read by the takeover watch each time a task starts acting). ``px``: the saved distance; the
@@ -2374,8 +2425,8 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                   "mic": live.get("mic") if "mic" in live else prefs.get("mic_device") or "",
                   "speaker": live.get("speaker") if "speaker" in live else prefs.get("speaker_device") or "",
                   "end_tone": bool(prefs.get("end_tone", True)),
-                  "provider": str(prefs.get("tts_provider") or "gemini").lower(), "providers": VOICE_PROVIDERS,
-                  "devices": devices, "hotkey": ""},
+                  "devices": devices, "hotkey": "", **_safe(lambda: local_speech_view(prefs), {
+                      "provider": str(prefs.get("tts_provider") or "gemini").lower(), "providers": VOICE_PROVIDERS})},
         "offers": {"enabled": str(nudges.get("offers", "yuki_only")) != "off"},
         "coach": {"enabled": bool(nudges.get("enabled", True)), "questions": bool(nudges.get("questions_enabled", True)),
                   "quiet_start": str(nudges.get("quiet_start", "00:30")), "quiet_end": str(nudges.get("quiet_end", "08:00")),

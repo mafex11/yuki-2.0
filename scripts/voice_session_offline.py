@@ -63,8 +63,17 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     variant = args.echo if scenario == "echo" else ("headphones" if args.headphones else "speakers")
     tmp = Path(tempfile.mkdtemp(prefix=f"yuki-v34-{scenario}-"))
     echo_pref = {"aec": "auto", "half": "half", "none": "full"}.get(args.echo, "auto")
-    settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider="deepgram",
-                        voice_tts_voice="aura-2-thalia-en", voice_grounding=False, voice_idle_s=args.idle,
+    # vLocal: speech on this PC (--stt local / --tts local, models read from --models; the first folder is the run's own)
+    import os
+
+    local_dirs = os.pathsep.join([str(tmp / "models"), *[str(m) for m in (getattr(args, "models", None) or [])]])
+    tts_local = getattr(args, "tts", "deepgram") == "local"
+    settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv",
+                        voice_tts_provider="local" if tts_local else "deepgram",
+                        voice_tts_voice=args.tts_voice if tts_local else "aura-2-thalia-en",
+                        voice_stt_provider=getattr(args, "stt", "deepgram"), voice_local_models_dir=local_dirs,
+                        voice_local_keep_loaded=bool(getattr(args, "keep_loaded", False)),
+                        voice_grounding=False, voice_idle_s=args.idle,
                         voice_idle_max_s=max(args.idle, 12.0), voice_call_idle_s=args.call_idle,
                         voice_echo=echo_pref, voice_tts_cache_dir=str(tmp / "tts-cache"),
                         **({"voice_eager_eot_threshold": args.eager_eot} if getattr(args, "eager_eot", None) else {}),
@@ -283,6 +292,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                                              {"id": 2, "app": "VALORANT", "kind": "game", "status": "recording"}]})
     session.wake_enabled = True
     io_seen = install_io_audit() if getattr(args, "audit_io", False) else None
+    usage = _Usage()   # vLocal: this process's CPU and memory over the run (every 0.1 s)
     t_start = time.monotonic()
     session.start()
     if args.prewarm:
@@ -307,6 +317,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         app.processEvents()
         time.sleep(0.05)
     session.shutdown()
+    usage.stop()
     if service is not None:
         service.kill()
     t0 = timeline.t0
@@ -324,6 +335,9 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
         "mic_levels": mic.stats.levels() if mic else None,
         "brain_requests": getattr(runtime, "requests", []),
         "desk_calls": [c[0] for c in desk.calls],
+        "speech": {"stt": settings.voice_stt_provider, "tts": settings.voice_tts_provider,
+                   "voice": settings.voice_tts_voice},
+        "usage": usage.facts([(t, on) for t, on in convs]),
     }
     if scenario == "latency" and mic is not None:
         rows = []
@@ -354,6 +368,7 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 acks = [e["t"] for e in timeline.events if e["kind"] == "ack" and e["t"] > said_end - 0.2]
                 audio = [e["t"] for e in timeline.events if e["kind"] == "audio_start" and e["t"] > said_end - 0.2]
                 row["request_end_to_ack_ms"] = round((acks[0] - said_end) * 1000) if acks else None
+                row["request_end_to_reply_audio_ms"] = round((audio[0] - said_end) * 1000) if audio else None
                 sounds = acks[:1] + audio[:1]
                 row["request_end_to_first_sound_ms"] = round((min(sounds) - said_end) * 1000) if sounds else None
                 row["heard"] = [e["text"] for e in timeline.events if e["kind"] == "user"
@@ -454,6 +469,54 @@ def game_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[s
     return rows
 
 
+class _Usage:
+    """vLocal: this process's memory (RSS) and CPU time, sampled every 0.1 s on a thread of its own (measurement)."""
+
+    def __init__(self) -> None:
+        import psutil
+
+        self._p = psutil.Process()
+        self.samples: list[tuple[float, float, float]] = []   # (monotonic, rss MB, cpu seconds so far)
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="usage", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._done.wait(0.1):
+            try:
+                t = self._p.cpu_times()
+                self.samples.append((time.monotonic(), self._p.memory_info().rss / 1_048_576, t.user + t.system))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def stop(self) -> None:
+        self._done.set()
+        self._thread.join(2)
+
+    def facts(self, convs: list[tuple[float, bool]]) -> dict[str, Any]:
+        """Peak and start memory, CPU seconds over the run and while conversations were on (cores used on average)."""
+        if len(self.samples) < 2:
+            return {}
+        spans, start = [], None
+        for t, on in convs:
+            if on and start is None:
+                start = t
+            elif not on and start is not None:
+                spans.append((start, t))
+                start = None
+
+        def cpu_between(a: float, b: float) -> float:
+            inside = [s for s in self.samples if a <= s[0] <= b]
+            return inside[-1][2] - inside[0][2] if len(inside) >= 2 else 0.0
+
+        talk_s = sum(b - a for a, b in spans)
+        talk_cpu = sum(cpu_between(a, b) for a, b in spans)
+        rss = [s[1] for s in self.samples]
+        return {"rss_start_mb": round(rss[0]), "rss_peak_mb": round(max(rss)), "rss_end_mb": round(rss[-1]),
+                "cpu_s": round(self.samples[-1][2] - self.samples[0][2], 1), "talk_s": round(talk_s, 1),
+                "talk_cpu_s": round(talk_cpu, 1), "talk_cores": round(talk_cpu / talk_s, 2) if talk_s else None}
+
+
 def ask_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[str, Any]], t0: float,
              end_of: Any) -> list[dict[str, Any]]:
     """leftVoice: per ask (each line after the name), from the end of its speech: the first audio Yuki played, the
@@ -550,6 +613,8 @@ def summary(report: dict[str, Any]) -> str:
     for t, s, d in report["states"]:
         if s in ("error", "note"):
             lines.append(f"{t:7.2f}  pill {s}: {d}")
+    if report.get("speech"):
+        lines.append("speech: " + json.dumps(report["speech"]) + "  usage: " + json.dumps(report.get("usage")))
     if report.get("latency"):
         lines.append("latency: " + json.dumps(report["latency"]))
     if report.get("endings") is not None:
@@ -600,6 +665,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="lists: the clips to ask, each after the name in a conversation of its own")
     ap.add_argument("--one-breath", dest="one_breath", action="store_true",
                     help="latency: \"Yuki, pause the music.\" in one breath instead of the name, a pause, the words")
+    # vLocal (report 86): the same cases with speech on this PC, measured side by side with the cloud
+    ap.add_argument("--stt", default="deepgram", choices=("deepgram", "local"), help="speech recognition")
+    ap.add_argument("--tts", default="deepgram", choices=("deepgram", "local"), help="Yuki's voice (Aura or local)")
+    ap.add_argument("--tts-voice", dest="tts_voice", default="supertonic:F1", help="--tts local: family:name")
+    ap.add_argument("--models", type=Path, action="append", default=[],
+                    help="--stt/--tts local: a folder with the models (read only; repeat for more)")
+    ap.add_argument("--keep-loaded", dest="keep_loaded", action="store_true",
+                    help="local: the models load ahead (keep loaded) instead of at the wake")
     args = ap.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
     report = run(args.scenario, args)
