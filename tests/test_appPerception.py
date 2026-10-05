@@ -459,7 +459,10 @@ def test_a_reread_cut_short_never_replaces_a_whole_read_in_the_view_after_action
         monkeypatch: pytest.MonkeyPatch) -> None:
     desk = _TruncatingDesk(monkeypatch)
     d = _dispatcher(desk, verify=False)
-    view = d.window_view(7001, settle=True, quiet_s=0.05, cap_s=0.4)
+    # cap 60 s, not 0.4: the second (cut-short) read must happen inside the cap, and on a loaded PC the first read
+    # alone took 0.6-7.7 s (the view then ended "still changing" after one read); the cut-short re-read ends the
+    # loop at once, so the larger cap costs nothing
+    view = d.window_view(7001, settle=True, quiet_s=0.05, cap_s=60.0)
     assert "cut short" in view.reason and "Lyrics" in view.text and view.reads == 2
 
 
@@ -485,28 +488,55 @@ class _FakeSource:
 def test_the_event_hub_counts_waits_quietly_and_lets_idle_windows_go() -> None:
     from yuki.perception.events import EventHub
 
-    source = _FakeSource()
-    hub = EventHub(lambda: source, idle_s=0.3)
+    class StepClock:
+        """Monotonic time, or (``frozen`` set) a clock that moves only when the ticking thread moves it."""
+
+        frozen: float | None = None
+
+        def __call__(self) -> float:
+            return time.monotonic() if self.frozen is None else self.frozen
+
+    source, clock = _FakeSource(), StepClock()
+    # idle 30 s while counting and waiting, 0.3 s only for the letting-go part at the end: with 0.3 s throughout,
+    # the steps before it took about 0.3 s themselves, and on a loaded PC the window was let go mid-wait (wait_quiet
+    # then answered "not quiet" after 0.12-0.17 s, or the first wait found no window at all)
+    hub = EventHub(lambda: source, idle_s=30.0, clock=clock)
     try:
         assert hub.watch(11, wait_s=1.0) and hub.generation(11) == 0
         source.sinks[11]("property", 30086, (42, 7))
         source.sinks[11]("structure", 0, None)
         assert hub.generation(11) == 2 and hub.busy_since(11, 0.0) == {(42, 7)}
         assert hub.wait_change(11, 1, 0.5) and not hub.wait_change(11, 2, 0.05)
-        quiet, waited = hub.wait_quiet(11, quiet_s=0.05, cap_s=1.0)
-        assert quiet and waited < 0.5
+        quiet, waited = hub.wait_quiet(11, quiet_s=0.05, cap_s=3.0)
+        # quiet (it is checked before the cap); no upper bound on waited: a loaded PC took 0.63 s for 0.05 s
+        assert quiet and waited >= 0.04
+
+        # A window that keeps changing, on a clock that moves only with its events (10 ms of clock per event): the
+        # gap between events is 10 ms of the hub's time however late a loaded PC runs this thread (with real time,
+        # the whole process was off the CPU for 1-3 s at a time and the hub rightly saw a quiet window)
+        ticked, stop = threading.Event(), threading.Event()
 
         def ticking() -> None:
-            for _ in range(20):
-                source.sinks.get(11, lambda *a: None)("property", 30005, None)
-                time.sleep(0.02)
+            while not stop.is_set():
+                clock.frozen += 0.01
+                source.sinks[11]("property", 30005, None)
+                ticked.set()
+                time.sleep(0.01)
 
+        clock.frozen = time.monotonic()
         thread = threading.Thread(target=ticking)
         thread.start()
-        quiet, waited = hub.wait_quiet(11, quiet_s=0.1, cap_s=0.2)
-        thread.join()
-        assert not quiet and waited >= 0.19
-        deadline = time.monotonic() + 3.0
+        try:
+            assert ticked.wait(5.0)
+            quiet, waited = hub.wait_quiet(11, quiet_s=0.1, cap_s=0.2)
+        finally:
+            stop.set()
+            thread.join()
+            clock.frozen = None                # real time again (never behind: each 10 ms step slept 10 ms)
+        assert not quiet and waited >= 0.19    # (not 0.2: a large monotonic clock rounds the difference)
+        hub.idle_s = 0.3
+        hub.watch(11)                          # touched now: let go 0.3 s from here
+        deadline = time.monotonic() + 15.0     # a condition poll: 3 s was not always enough on a loaded PC
         while 11 not in source.unsubscribed and time.monotonic() < deadline:
             time.sleep(0.02)
         assert source.unsubscribed == [11] and hub.generation(11) is None
@@ -530,8 +560,12 @@ def test_an_event_source_that_fails_leaves_reads_to_stand_in() -> None:
 
 def test_with_events_the_read_before_an_action_is_skipped_while_nothing_happened(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.agent.tools as tools
     from yuki.perception.events import EventHub
 
+    # the reuse age limit (2 s, real time) is not under test here: a loaded PC took longer than that between the
+    # look and the click, and the click read again (3 reads, not 2)
+    monkeypatch.setattr(tools, "REUSE_MAX_S", 60.0)
     source = _FakeSource()
     hub = EventHub(lambda: source)
     try:
@@ -650,8 +684,10 @@ def test_a_read_stopped_by_its_cap_does_not_make_the_rest_gone() -> None:
 
 def test_the_view_after_actions_reuses_the_after_read_while_the_events_show_no_change(
         monkeypatch: pytest.MonkeyPatch) -> None:
+    import yuki.agent.tools as tools
     from yuki.perception.events import EventHub
 
+    monkeypatch.setattr(tools, "REUSE_MAX_S", 60.0)   # the age limit is not under test (2 s: a loaded PC passed it)
     source = _FakeSource()
     hub = EventHub(lambda: source)
     try:
