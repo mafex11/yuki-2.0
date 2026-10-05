@@ -39,13 +39,6 @@ from yuki.core.inputtag import is_yuki_input
 #: The kinds of real input, and what each is.
 KEYS, CLICK, WHEEL, MOUSE = "keys", "click", "wheel", "mouse"
 KINDS = (KEYS, CLICK, WHEEL, MOUSE)
-#: presence (5 Oct): the mouse itself travelled the takeover distance within the window, read from its own reports (a
-#: relative mouse's raw counts, summed: their net travel) rather than the cursor. Yuki's ``SetCursorPos`` jumps send no
-#: report, so another process (the memory service, which cannot see Yuki's input moments) never mistakes one for the
-#: user's hand, and a game that holds the cursor still (turning in Valorant) still counts. A twitching sensor's 0-1
-#: count back-and-forth never sums that far. Absolute devices (pen, remote desktop) have no counts: their cursor travel
-#: (:data:`MOUSE`) stands in. Not in :data:`KINDS`: the input gate and the takeover watch read the cursor, as before.
-DEVICE = "device"
 #: The window the cursor's travel is measured over (s): the takeover watch's own (``leases.TAKEOVER_WINDOW_S``).
 MOVE_WINDOW_S = 0.3
 #: How long :func:`acquire` waits for the reader to be listening (s).
@@ -75,9 +68,6 @@ class UserInputMonitor:
         own_now: Whether one of Yuki's own input moments runs or just ended (``leases.own_input_now``).
         own_span: Yuki's latest input span (``leases.own_input_span``): a new one starts the travel measure again.
         now: The clock.
-        track_cursor: Whether a relative mouse's moves also measure the cursor's travel (:data:`MOUSE`, Yuki's own
-            input moments left out). ``False`` (the memory service's presence) keeps only :data:`DEVICE` for them,
-            which costs a few additions per report, no cursor read and no trail scan (a 1000 Hz gaming mouse).
 
     Attributes:
         running: Whether the reader is listening (Raw Input registered), or a test feeds it.
@@ -85,31 +75,24 @@ class UserInputMonitor:
         counts: Events by kind, counts only (``keys``, ``click``, ``wheel``, ``moves``, ``mouse``: moves that went
             far, ``own``: Yuki's own, left out).
         max_travel: The farthest the cursor got within the window without counting (px): what the jitter looked like.
-        max_device_travel: The same for the mouse's own net travel (counts), :data:`DEVICE`.
     """
 
     def __init__(self, *, move_px: int | None = None, window_s: float = MOVE_WINDOW_S,
                  own_now: Callable[[float], bool] | None = None,
                  own_span: Callable[[], tuple[float, float | None]] | None = None,
-                 now: Callable[[], float] = time.monotonic, track_cursor: bool = True) -> None:
+                 now: Callable[[], float] = time.monotonic) -> None:
         self.move_px = move_px
         self.window_s = float(window_s)
         self._own_now = own_now
         self._own_span = own_span
         self.now = now
-        self.track_cursor = bool(track_cursor)
         self.running = False
         self.started_at = 0.0
         self.error = ""
         self.counts: dict[str, int] = {}
         self.max_travel = 0.0
-        self.max_device_travel = 0.0
-        self._last: dict[str, float] = {kind: 0.0 for kind in (*KINDS, DEVICE)}
+        self._last: dict[str, float] = {kind: 0.0 for kind in KINDS}
         self._trail: deque[tuple[float, int, int]] = deque()
-        #: The mouse's own reports within the window (time, dx, dy) and their running sum.
-        self._counts_trail: deque[tuple[float, int, int]] = deque()
-        self._sum_x = 0
-        self._sum_y = 0
         self._span_seen = 0.0
         self._users = 0
         self._lock = threading.Lock()
@@ -140,7 +123,7 @@ class UserInputMonitor:
     def facts(self) -> dict[str, Any]:
         """Counts and numbers only, for a log line."""
         return {"running": self.running, "counts": dict(self.counts), "max_travel": round(self.max_travel, 1),
-                "max_device_travel": round(self.max_device_travel, 1), "move_px": self._move_px()}
+                "move_px": self._move_px()}
 
     # -- intake (the reader's thread) ----------------------------------------------------------------------------------
 
@@ -186,48 +169,15 @@ class UserInputMonitor:
         own_now = self._own_now or (lambda at: leases.own_input_now(at, span=lambda: span))
         return fresh or bool(own_now(t))
 
-    def _device_travel(self, t: float, dx: int, dy: int) -> None:
-        """A relative mouse report of ``(dx, dy)`` counts: stamps :data:`DEVICE` once their net sum within the window
-        reaches the takeover distance (then starts the sum again)."""
-        trail = self._counts_trail
-        while trail and t - trail[0][0] > self.window_s:
-            _t, ox, oy = trail.popleft()
-            self._sum_x -= ox
-            self._sum_y -= oy
-        trail.append((t, dx, dy))
-        self._sum_x += dx
-        self._sum_y += dy
-        travel = math.hypot(self._sum_x, self._sum_y)
-        if travel >= self._move_px():
-            self._last[DEVICE] = t
-            self._count(DEVICE)
-            trail.clear()
-            self._sum_x = self._sum_y = 0
-        elif travel > self.max_device_travel:
-            self.max_device_travel = travel
-
-    def _clear_device(self) -> None:
-        self._counts_trail.clear()
-        self._sum_x = self._sum_y = 0
-
-    def move(self, where: tuple[int, int] | None, at: float | None = None, extra: int | None = 0,
-             delta: tuple[int, int] | None = None) -> bool:
+    def move(self, where: tuple[int, int] | None, at: float | None = None, extra: int | None = 0) -> bool:
         """The mouse moved and the cursor is now at ``where`` (screen px; ``None``: unknown). Returns whether the
-        cursor has now travelled the takeover distance within the window (the user moving the mouse).
-
-        ``delta``: a relative mouse's own report (counts), for :data:`DEVICE`; ``None`` for an absolute device (pen,
-        remote desktop), whose cursor travel then stands in for :data:`DEVICE`."""
+        cursor has now travelled the takeover distance within the window (the user moving the mouse)."""
         t = self.now() if at is None else float(at)
         self._count("moves")
         if is_yuki_input(extra):
             self._count("own")
             self._trail.clear()
-            self._clear_device()
             return False
-        if delta is not None:
-            self._device_travel(t, int(delta[0]), int(delta[1]))
-            if not self.track_cursor:
-                return False
         if self._own(t):
             self._trail.clear()
             return False
@@ -242,8 +192,6 @@ class UserInputMonitor:
         if travel >= self._move_px():
             self._last[MOUSE] = t
             self._count(MOUSE)
-            if delta is None:
-                self._last[DEVICE] = t
             return True
         if travel > self.max_travel:
             self.max_travel = travel
@@ -276,10 +224,8 @@ class UserInputMonitor:
         self.error = ""
         self.move_px = None         # the user's setting, read again for this stretch
         self._trail.clear()
-        self._clear_device()
         self.counts = {}            # counts per listening stretch (the facts' times are kept: they are only times)
         self.max_travel = 0.0
-        self.max_device_travel = 0.0
         self._thread = threading.Thread(target=self._run, args=(self._gen,), name="yuki-user-input", daemon=True)
         self._thread.start()
 
@@ -395,14 +341,9 @@ class _RawReader:
                     monitor.button_down(t, extra)
                 if flags & _WHEELS:
                     monitor.wheel(t, extra)
-                absolute = bool(m.usFlags & 0x01)                   # MOUSE_MOVE_ABSOLUTE: coordinates, not counts
-                if m.lLastX or m.lLastY or absolute:                # a move
-                    delta = None if absolute else (int(m.lLastX), int(m.lLastY))
-                    if absolute or monitor.track_cursor:
-                        where = (point.x, point.y) if user32.GetCursorPos(ctypes.byref(point)) else None
-                    else:
-                        where = None                                # presence reads the counts only
-                    monitor.move(where, t, extra, delta)
+                if m.lLastX or m.lLastY or (m.usFlags & 0x01):     # a move (MOUSE_MOVE_ABSOLUTE included)
+                    where = (point.x, point.y) if user32.GetCursorPos(ctypes.byref(point)) else None
+                    monitor.move(where, t, extra)
             elif kind == _RIM_TYPEKEYBOARD:
                 k = buf.data.keyboard
                 if int(k.Message) in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
@@ -482,5 +423,5 @@ def release() -> None:
     _SHARED.release()
 
 
-__all__ = ["CLICK", "DEVICE", "KEYS", "KINDS", "MOUSE", "MOVE_WINDOW_S", "UserInputMonitor", "WHEEL", "acquire", "release",
+__all__ = ["CLICK", "KEYS", "KINDS", "MOUSE", "MOVE_WINDOW_S", "UserInputMonitor", "WHEEL", "acquire", "release",
            "running", "shared"]
