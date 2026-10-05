@@ -633,6 +633,8 @@ def is_effect(name: str, tool_input: dict[str, Any] | None) -> bool:
         return True
     if name == "todo":
         return str(args.get("action") or "") in TODO_WRITES
+    if name == "watch_for":
+        return str(args.get("action") or "add") != "list"   # second review V2: listing the watches is a read
     return name in KEEPING_TOOLS
 
 

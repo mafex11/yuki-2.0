@@ -710,8 +710,9 @@ def test_finishing_mark_needs_a_verified_report(tmp_path: Path) -> None:
                                                                   "about": [], "claims": "tried"})),
     ])
     events = list(_agent(client, tmp_path).run("make it full screen"))
-    # fix6 review: below likely the verdict's line leads
-    assert events[-1].text == "I tried, but I couldn't confirm it worked. It's maximized, not full screen."
+    # fix6 second review V3: below likely the verdict's line alone; the words ride on the verdict
+    assert events[-1].text == "I tried, but I couldn't confirm it worked."
+    assert events[-1].outcome["words"] == "It's maximized, not full screen."
     assert len(client.calls) == 2
 
 

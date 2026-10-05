@@ -63,15 +63,17 @@ def test_the_claim_check_catches_actions_that_never_ran_and_words_above_the_leve
     assert claim_gap("tried", FAILED) is None and claim_gap(None, FAILED) is None
 
 
-def test_below_likely_the_user_gets_the_verdicts_line_unless_the_words_are_what_was_tried() -> None:
+def test_below_likely_the_user_gets_the_verdicts_line_alone_even_for_what_was_tried() -> None:
     assert honest_text("Closed it, confirmed.", VERIFIED, "checked") == ("Closed it, confirmed.", None)
     assert honest_text("Sent.", UNSEEN, "done") == (LINE_SEND_UNCONFIRMED, "below_likely")
     assert honest_text("Sent.", UNSEEN, None) == (LINE_SEND_UNCONFIRMED, "below_likely")      # plain text, no class
     assert honest_text("It worked.", FAILED, "checked") == (LINE_FAILED, "below_likely")
     tried = "I clicked Queue, but I couldn't see it open."
-    assert honest_text(tried, FAILED, "tried") == (f"{LINE_FAILED} {tried}", "below_likely_tried")
+    # second review V3: a "tried" class never puts its words after the line (flat success words get it too)
+    assert honest_text(tried, FAILED, "tried") == (LINE_FAILED, "below_likely_tried")
+    assert honest_text("Shuffle's on now.", UNSEEN, "tried") == (LINE_SEND_UNCONFIRMED, "below_likely_tried")
     unbacked = outcome_verdict([_act("click", verdict=None, why="could not tell")], unbacked=["a state unseen"])
-    assert honest_text(tried, unbacked, "tried") == (LINE_UNVERIFIED, "below_likely")          # it tells unseen states
+    assert honest_text(tried, unbacked, "tried") == (LINE_UNVERIFIED, "below_likely_tried")
     # nothing done: a claim of something done or checked becomes its own fixed line; an unread answer keeps its words
     run19 = outcome_verdict([], unbacked=["it says you did something, but no action ran in this request"])
     assert honest_text("Opened the queue and closed it, confirmed.", run19, "done") == (LINE_NOTHING_DONE,
@@ -121,7 +123,7 @@ def test_an_unseen_send_claimed_as_done_is_held_then_said_as_the_verdicts_line(t
     final = _run(agent, "tell sam on my way")[-1]
     assert isinstance(final, Final) and final.text == LINE_SEND_UNCONFIRMED
     assert final.outcome["level"] == "unverified"
-    # the same request worded as what was tried keeps its words after the verdict's line (review: the line leads)
+    # the same request worded as what was tried: the line alone; the words ride on the verdict for the expanded run
     tried = {**done, "message": "I sent it to Sam, but I couldn't confirm it arrived.", "claims": "tried"}
     client = Client(_brain(_block("tool_use", id="t0", name="check_situation",
                                   input={"action": "send the message", "hwnd": CHROME}),
@@ -130,7 +132,8 @@ def test_an_unseen_send_claimed_as_done_is_held_then_said_as_the_verdicts_line(t
                            _block("tool_use", id="t2", name="done", input=tried)), judge=sends)
     agent = _agent(client, tmp_path, memory=_send_memory([]))
     final = _run(agent, "tell sam on my way")[-1]
-    assert final.text == f"{LINE_SEND_UNCONFIRMED} {tried['message']}" and final.outcome["level"] == "unverified"
+    assert final.text == LINE_SEND_UNCONFIRMED and final.outcome["level"] == "unverified"
+    assert final.outcome["words"] == tried["message"]
 
 
 def test_a_verified_request_keeps_its_words_and_is_not_held(tmp_path: Path) -> None:
@@ -621,3 +624,169 @@ def test_a_plain_text_reply_after_steps_is_sent_back_once_for_done(tmp_path: Pat
     client = Client([_response_text("Hi.")])
     final = _run(_agent(client, tmp_path, judge=False), "hello")[-1]
     assert isinstance(final, Final) and final.text == "Hi." and len(client.brain_calls) == 1
+
+
+# -- second review (5 Oct): V1-V6 -------------------------------------------------------------------------------------
+
+
+def _saving_memory(saved: bool) -> Any:
+    """Memory whose every write answers with its own ``saved`` (False: memory down, nothing kept)."""
+    from yuki.agent.memory import MemoryAccess
+    from yuki.agent.tools import ToolOutcome
+
+    class Memory(MemoryAccess):
+        def __init__(self) -> None:
+            super().__init__(open_client=lambda: (_ for _ in ()).throw(RuntimeError("x")))
+            self.ran: list[str] = []
+
+        @property
+        def installed(self) -> bool:
+            return True
+
+        def run_tool(self, name: str, tool_input: dict[str, Any], *, request: str | None = None) -> Any:
+            self.ran.append(name)
+            text = "Kept." if saved else "Not saved: memory is not available right now."
+            return ToolOutcome(name=name, ok=True, summary=text, content=[{"type": "text", "text": text}],
+                               payload={"saved": saved})
+
+        def call_method(self, name: str, *args: Any, timeout_s: float, **kwargs: Any) -> Any:
+            return None
+
+        def context(self, **kw: Any) -> Any:
+            raise RuntimeError("no memory context in this test")
+
+    return Memory()
+
+
+def test_v1_v2_a_write_counts_by_its_own_saved_flag_not_a_tool_list() -> None:
+    from yuki.agent.finish import did_other
+
+    answered = {"kind": "memory", "tool": "answer_question", "ok": True, "saved": True,
+                "input": {"question": "q:12", "answer": "a developer at Corvana"}}
+    route = {"kind": "memory", "tool": "about", "ok": True, "saved": True, "input": {"name": "Ana",
+                                                                                       "prefer_route": "discord"}}
+    looked_up = {"kind": "memory", "tool": "about", "ok": True, "input": {"name": "Ana"}}
+    unsaved = {"kind": "memory", "tool": "todo", "ok": True, "saved": False, "input": {"action": "add"}}
+    watches = {"kind": "memory", "tool": "watch_for", "ok": True, "input": {"action": "list"}}
+    assert did_other([answered]) and did_other([route])
+    assert not did_other([looked_up]) and not did_other([unsaved]) and not did_other([watches])
+    assert "did anything" in claim_gap("done", outcome_verdict([unsaved]))
+    assert claim_gap("done", outcome_verdict([answered])) is None
+
+
+@pytest.mark.parametrize("tool,tool_input", [
+    ("answer_question", {"question": "q:12", "answer": "a developer at Corvana", "outcome": "answered"}),
+    ("about", {"name": "Ana", "prefer_route": "discord", "words": "message Ana on discord"}),
+])
+def test_v1_a_saved_answer_or_route_keeps_its_words_and_runs_once(tmp_path: Path, tool: str,
+                                                                   tool_input: dict[str, Any]) -> None:
+    from test_d_brain import Client, _agent, _block, _run
+    from yuki.log.events import Final
+
+    done = {"message": "Noted.", "about": [], "states": [], "achieved": "Kept it", "claims": "done"}
+    client = Client(_brain(_block("tool_use", id="t1", name=tool, input=tool_input),
+                           _block("tool_use", id="t2", name="done", input=done),
+                           _block("tool_use", id="t3", name=tool, input=tool_input),
+                           _block("tool_use", id="t4", name="done", input=done)))
+    memory = _saving_memory(True)
+    final = _run(_agent(client, tmp_path, judge=False, memory=memory), "message Ana on discord from now on")[-1]
+    assert isinstance(final, Final) and final.text == "Noted."
+    assert memory.ran.count(tool) == 1 and len(client.brain_calls) == 2
+
+
+def test_v2_a_write_memory_did_not_keep_backs_no_done_claim(tmp_path: Path) -> None:
+    from test_d_brain import Client, _agent, _block, _run
+    from yuki.log.events import Final
+
+    done = {"message": "Added buy milk to your list.", "about": [], "states": [], "achieved": "Added buy milk",
+            "claims": "done"}
+    client = Client(_brain(_block("tool_use", id="t1", name="todo", input={"action": "add", "text": "buy milk"}),
+                           _block("tool_use", id="t2", name="done", input=done),
+                           _block("tool_use", id="t3", name="done", input=done)))
+    final = _run(_agent(client, tmp_path, judge=False, memory=_saving_memory(False)), "add buy milk")[-1]
+    assert isinstance(final, Final) and final.text == LINE_NOTHING_DONE
+
+
+def test_v3_tried_with_no_action_is_nothing_done() -> None:
+    assert "tried something" in claim_gap("tried", ANSWER)
+    run = outcome_verdict([], unbacked=["it says you tried something, but nothing in this request did anything"])
+    assert honest_text("I tried to pause Spotify.", run, "tried") == (LINE_NOTHING_DONE, "nothing_done")
+    added = outcome_verdict([{"kind": "memory", "tool": "todo", "ok": True, "saved": True, "input": {}}])
+    assert claim_gap("tried", added) is None
+
+
+def test_v3_tried_with_no_action_is_held_then_said_as_nothing_done(tmp_path: Path) -> None:
+    from test_d_brain import Client, _agent, _block, _run
+    from yuki.log.events import Final
+
+    done = {"message": "I tried to pause Spotify.", "about": [], "states": [], "achieved": "Tried",
+            "claims": "tried"}
+    client = Client(_brain(_block("tool_use", id="t1", name="done", input=done),
+                           _block("tool_use", id="t2", name="done", input=done)))
+    final = _run(_agent(client, tmp_path, judge=False), "pause spotify")[-1]
+    assert isinstance(final, Final) and final.text == LINE_NOTHING_DONE and len(client.brain_calls) == 2
+
+
+def test_v4_a_name_toggle_in_a_window_that_is_not_full_screen_never_waits_for_one() -> None:
+    from yuki.agent.tools import Dispatcher
+    from yuki.voice.offline import ChatPlayerDesk
+
+    class Desk(ChatPlayerDesk):
+        def window_state(self, hwnd: int) -> str | None:
+            return "normal"
+
+        def get_window_tree(self, hwnd: int, **kw: Any) -> dict[str, Any]:
+            tree = super().get_window_tree(hwnd, **kw)
+            for e in tree["elements"]:
+                if e["name"] in ("Lyrics", "Show lyrics", "Hide lyrics"):
+                    e.update(name="Hide lyrics" if self.toggles["Lyrics"] else "Show lyrics", states=["off"],
+                             runtime_id=(42, 7, 2))
+            return tree
+
+        def click(self, x: int, y: int, **kwargs: Any) -> Any:
+            result = super().click(x, y, **kwargs)
+            if self.clicks and self.clicks[-1] in ("Show lyrics", "Hide lyrics"):
+                self.toggles["Lyrics"] = not self.toggles["Lyrics"]
+            return result
+
+    desk = Desk()
+    d = Dispatcher(desk)
+    clicked = 0
+    for _ in range(2):
+        d.dispatch("look_at_window", {"hwnd": desk.PLAYER})
+        ids = {e["name"]: e["id"] for e in desk.get_window_tree(desk.PLAYER)["elements"]}
+        name = "Hide lyrics" if "Hide lyrics" in ids else "Show lyrics"
+        started = time.monotonic()
+        out = d.dispatch("click", {"element": ids[name], "expect_hwnd": desk.PLAYER, "toggle_to": "on"})
+        clicked += int(bool(out.ok and not (out.payload or {}).get("details", {}).get("noop")))
+        assert time.monotonic() - started < Dispatcher.SCREEN_WAIT_S - 0.5
+    assert clicked >= 1
+
+
+def test_v5_full_screen_clicks_and_view_keys_go_at_once_on_a_close_call() -> None:
+    from yuki.agent.loop import _close_call_matters
+
+    assert not _close_call_matters("click", {"element": 3, "toggle_to": "full_screen"}, {"role": "Button"})
+    assert not _close_call_matters("click", {"element": 3, "toggle_to": "not_full_screen"}, {"role": "Button"})
+    assert not _close_call_matters("press", {"key": "volume_down"}, {})
+    assert not _close_call_matters("press", {"key": "pagedown", "times": 3}, {})
+    assert not _close_call_matters("hotkey", {"keys": ["volumedown"]}, {})
+    assert _close_call_matters("click", {"element": 3, "toggle_to": "on"}, {"role": "Button"})
+    assert _close_call_matters("press", {"key": "enter"}, {})
+    assert _close_call_matters("hotkey", {"keys": ["alt", "f4"]}, {})
+
+
+def test_v6_a_shell_command_has_no_window_to_read_back() -> None:
+    from yuki.agent.finish import last_windowless, read_back
+    from yuki.agent.loop import _windowless
+
+    assert _windowless("run_powershell", "the foreground window")
+    assert _windowless("run_powershell", "the window in front after the action")
+    assert not _windowless("run_powershell", "the window the action reported")
+    assert not _windowless("press", "the foreground window") and not _windowless("click", "the foreground window")
+    shell = _act("run_powershell", verdict=None, why=EXPECTED_UNVERIFIABLE, app="Discord", windowless=True)
+    front = {"kind": "read", "tool": "look_at_window", "ok": True, "app": "Discord", "input": {}}
+    v = outcome_verdict([shell, front])
+    assert v["level"] == "likely" and not read_back([shell, front]) and last_windowless([shell, front])
+    gap = claim_gap("checked", v, read=True, looked_back=False, windowless=True)
+    assert gap and "read the window back" not in gap and "its output" in gap

@@ -76,6 +76,7 @@ from yuki.agent.tools import (
     NOW_FIELD,
     PLAYBOOK_FIELD,
     RISK_FIELD,
+    SCREEN_WANTS,
     STEP_ABOUT_FIELD,
     STEP_FIELD,
     WHAT_FIELD,
@@ -1874,8 +1875,8 @@ class Agent:
             if kind is None:
                 kind = ("action" if name in ACTION_TOOL_NAMES else "memory" if name in MEMORY_TOOLS
                         else "ask" if name == "ask_user" else "read" if name in PERCEPTION_TOOLS else "control")
-            hwnd = (_view_target(name, tool_input, details)[0] if kind == "action"
-                    else _as_hwnd(tool_input.get("hwnd")))
+            hwnd, chosen = (_view_target(name, tool_input, details) if kind == "action"
+                            else (_as_hwnd(tool_input.get("hwnd")), ""))
             window = self._window_of(hwnd)
             app = str((window or {}).get("process_name") or "") or None
             if app is None and kind == "action":
@@ -1909,6 +1910,12 @@ class Agent:
                     "at": time.time()}
             if control:
                 step["control"] = control
+            if isinstance(payload.get("saved"), bool):
+                # second review V1/V2: whether a memory write was kept, from its own result (not saved: memory down)
+                step["saved"] = payload["saved"]
+            if kind == "action" and _windowless(name, chosen):
+                # second review V6: no window of its own (a shell command): its app is only the window in front
+                step["windowless"] = True
             if send:
                 step["send"] = send   # honest (87): confirmed | unconfirmed | unchecked in memory's capture of the chat
                 if send_sig:
@@ -2653,7 +2660,8 @@ class Agent:
         except Exception:  # noqa: BLE001 - the check never breaks a request
             return None
         read = any(s.get("kind") in ("read", "memory") and s.get("ok") for s in trace if isinstance(s, dict))
-        return finish_gate.claim_gap(claims, verdict, read=read, looked_back=finish_gate.read_back(trace))
+        return finish_gate.claim_gap(claims, verdict, read=read, looked_back=finish_gate.read_back(trace),
+                                     windowless=finish_gate.last_windowless(trace))
 
     def _honest_final(self, text: str, verdict: dict[str, Any] | None) -> str:
         """fix6: the closing text obeys the outcome verdict (:func:`yuki.agent.finish.honest_text`): below likely the
@@ -2661,6 +2669,10 @@ class Agent:
         left unbacked. Logged without words."""
         claims = getattr(self, "_done_claims", None)
         out, why = finish_gate.honest_text(text, verdict, claims)
+        if why is not None and out != text and isinstance(verdict, dict) and (text or "").strip():
+            # second review V3: the card and the window get the line alone; the brain's own words stay on the verdict
+            # (``words``) for the expanded run, never as the reply
+            verdict["words"] = " ".join(str(text).split())
         if why is not None and out != text:
             self.logger.log("final_held", why=why, level=(verdict or {}).get("level"), claims=claims,
                             text_chars=len(text or ""))
@@ -5121,12 +5133,44 @@ def _close_call_matters(name: str, tool_input: dict[str, Any] | None, target: di
     no candidate's content, report their own effect and are undone the same way: they go at once. Traits and input
     fields only, never words."""
     target = target or {}
+    args = tool_input or {}
+    if name == "click" and args.get("toggle_to") in SCREEN_WANTS:
+        # second review V5: a full-screen control is judged by the window and undone by the same click
+        return False
+    if name in ("press", "hotkey") and _view_only_keys(args):
+        return False
     try:
-        traits = call_traits(name, tool_input or {}, role=target.get("role"),
-                             typed_pending=bool(target.get("typed_pending")))
+        traits = call_traits(name, args, role=target.get("role"), typed_pending=bool(target.get("typed_pending")))
     except Exception:  # noqa: BLE001 - when in doubt, the second look runs as before
         return True
-    return bool(traits.destroys or traits.reaches or str((tool_input or {}).get("text") or "").strip())
+    return bool(traits.destroys or traits.reaches or str(args.get("text") or "").strip())
+
+
+#: Second review V5: keys that only move a view or a level and type nothing (media and volume keys, page and arrow
+#: movement): pressed alone they go at once on a close call, like a scroll or a slider. A fixed key vocabulary.
+VIEW_ONLY_KEYS: frozenset[str] = frozenset({"playpause", "nexttrack", "prevtrack", "stop", "volumeup", "volumedown",
+                                            "volumemute", "pageup", "pagedown", "up", "down", "left", "right", "home",
+                                            "end"})
+
+
+def _view_only_keys(args: dict[str, Any]) -> bool:
+    """A ``press`` of one :data:`VIEW_ONLY_KEYS` key, or a ``hotkey`` of that key alone (case, ``_``, ``-`` and spaces
+    folded, as the backend folds key names: ``volume_down`` is ``volumedown``)."""
+    keys = [args.get("key")] if "key" in args else args.get("keys")
+    if not isinstance(keys, list) or len(keys) != 1 or not isinstance(keys[0], str):
+        return False
+    return "".join(ch for ch in keys[0].casefold() if ch not in "_- ") in VIEW_ONLY_KEYS
+
+
+def _windowless(name: str, chosen: str) -> bool:
+    """Second review V6: an action with no window of its own: its tool takes no window (no ``expect_hwnd``, ``hwnd``
+    or ``element``) and its result named none, so its trace step's app is only the window that was in front. A schema
+    fact and how the window was chosen, never words."""
+    from yuki.agent.tools import TOOLS_BY_NAME
+
+    props = ((TOOLS_BY_NAME.get(name) or {}).get("input_schema") or {}).get("properties") or {}
+    return chosen in ("the window in front after the action", "the foreground window") and not any(
+        k in props for k in ("expect_hwnd", "hwnd", "element"))
 
 
 def _close_call(frame: Any) -> bool:

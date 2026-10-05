@@ -394,16 +394,27 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
 _OTHER_EFFECT_TOOLS = frozenset({"open_yuki"})
 
 
-def did_other(steps: list[dict[str, Any]] | None) -> bool:
-    """fix6 review F1: a step that is not an on-screen action succeeded and changed something (a to-do added or ticked,
-    a rule or know-how kept, a memory corrected, a watch set, Yuki's window opened: ``yuki.ui.step_words.is_effect``
-    on its tool and fixed fields). A closing message that says it got done is then backed by that step's own result,
-    never "nothing was done". Machine fields only."""
+def _changed(step: dict[str, Any]) -> bool:
+    """Whether one successful step that is not an on-screen action changed something. Second review V1/V2: a memory
+    write's own result says whether it was kept (its payload's ``saved``, carried on the trace step by the loop): a
+    write memory could not keep (memory down, nothing to cancel) changed nothing, and every write counts (an answer to
+    a getting-to-know-you question, a route kept for a person), not only the ones a tool-name list knows. A step whose
+    result carries no ``saved`` (a read, an older stand-in) falls back to ``yuki.ui.step_words.is_effect``."""
+    saved = step.get("saved")
+    if isinstance(saved, bool):
+        return saved
     from yuki.ui.step_words import is_effect
 
-    return any(isinstance(s, dict) and s.get("kind") != "action" and s.get("ok") is True
-               and (str(s.get("tool") or "") in _OTHER_EFFECT_TOOLS
-                    or is_effect(str(s.get("tool") or ""), s.get("input")))
+    tool = str(step.get("tool") or "")
+    return tool in _OTHER_EFFECT_TOOLS or is_effect(tool, step.get("input"))
+
+
+def did_other(steps: list[dict[str, Any]] | None) -> bool:
+    """fix6 review F1: a step that is not an on-screen action succeeded and changed something (a to-do added or ticked,
+    a rule or know-how kept, a memory corrected, a watch set, a question answered, a route kept, Yuki's window opened:
+    :func:`_changed`). A closing message that says it got done is then backed by that step's own result, never
+    "nothing was done". Machine fields only."""
+    return any(isinstance(s, dict) and s.get("kind") != "action" and s.get("ok") is True and _changed(s)
                for s in (steps or []))
 
 
@@ -413,7 +424,9 @@ def read_back(steps: list[dict[str, Any]] | None) -> bool:
     effect (a ``likely`` step). Trace facts only."""
     steps = [s for s in (steps or []) if isinstance(s, dict)]
     last = max((i for i, s in enumerate(steps) if s.get("kind") == "action"), default=None)
-    if last is None:
+    if last is None or steps[last].get("windowless"):
+        # second review V6: an action with no window of its own (a shell command, a media key) has nothing to read
+        # back; its step's app is only the window that was in front, so reading that is not a read-back
         return False
     app = steps[last].get("app")
     return any(s.get("kind") == "read" and s.get("ok") is True and s.get("app") == app for s in steps[last + 1:])
@@ -436,6 +449,13 @@ LINE_NOTHING_DONE = "I haven't done that: nothing was done on screen for it."
 LINE_NOT_CHECKED = "I haven't checked that on screen."
 
 
+def last_windowless(steps: list[dict[str, Any]] | None) -> bool:
+    """Second review V6: the request's last action has no window of its own (a shell command, a media key: the loop
+    marks its trace step ``windowless``). Trace facts only."""
+    actions = [s for s in (steps or []) if isinstance(s, dict) and s.get("kind") == "action"]
+    return bool(actions and actions[-1].get("windowless"))
+
+
 def claim(value: Any) -> str | None:
     """A ``done``'s declared claim (:data:`CLAIMS`), or ``None`` when it gave none or something else."""
     word = " ".join(str(value or "").split()).casefold()
@@ -443,15 +463,17 @@ def claim(value: Any) -> str | None:
 
 
 def claim_gap(claims: str | None, verdict: dict[str, Any] | None, *, read: bool = False,
-              looked_back: bool = False) -> str | None:
+              looked_back: bool = False, windowless: bool = False) -> str | None:
     """What a closing message claims beyond what this request's steps showed, in words for the brain, or ``None``.
 
     ``claims``: the brain's own class of its message (:func:`claim`); ``verdict``: :func:`outcome_verdict` of the run
     so far (with no unbacked claims); ``read``: a read of the screen or memory ran in this request; ``looked_back``: the
-    window the last action acted in was read after it (:func:`read_back`). Facts only:
+    window the last action acted in was read after it (:func:`read_back`); ``windowless``: that action has no window
+    of its own (a shell command: :func:`last_windowless`), so the gap never asks to read one back. Facts only:
 
-    * nothing was done (no action, and no other step that changed something: ``did``) and it says something got done
-      (or was checked, with nothing read either);
+    * nothing was done (no action, and no other step that changed something: ``did``) and it says something got done,
+      or that something was tried (second review V3: with no action nothing was tried), or that it was checked with
+      nothing read either;
     * it says checked or confirmed while no step's own check showed it (the level is below verified), unless the
       result is likely and the window was read back after the action (review F3: a read never raises the level, so a
       read-back is what "checked" can rest on there);
@@ -465,17 +487,19 @@ def claim_gap(claims: str | None, verdict: dict[str, Any] | None, *, read: bool 
     seen = " ".join(str(verdict.get("seen") or "").split())
     because = f" ({seen})" if seen else ""
     if not verdict.get("acted"):
-        if claims == CLAIM_DONE and not verdict.get("did"):
+        if claims in (CLAIM_DONE, CLAIM_TRIED) and not verdict.get("did"):
             # review F1: never "do it now" blindly: nothing at all changed in this request, so nothing would repeat
-            return ("it says you did something, but nothing in this request did anything (no step ran that changes "
-                    "something): say plainly that it was not done, or, if they asked for it, do it first and then "
-                    "finish")
+            return (f"it says you {'did' if claims == CLAIM_DONE else 'tried'} something, but nothing in this request "
+                    f"did anything (no step ran that changes something): say plainly that it was not done, or, if "
+                    f"they asked for it, do it first and then finish")
         if claims == CLAIM_CHECKED and not read:
             return ("it says you checked something, but nothing was read in this request: look first and say what "
                     "it shows, or say plainly that you have not checked")
         return None
     if claims == CLAIM_CHECKED and level != VERIFIED and not (level == LIKELY and looked_back):
-        fix = ("read the window back now and say what it shows, or say what you did without checked or confirmed"
+        fix = ("say what you did and what its output showed, without checked or confirmed" if level == LIKELY
+               and windowless else
+               "read the window back now and say what it shows, or say what you did without checked or confirmed"
                if level == LIKELY else "say what you did and what the check showed, never checked or confirmed")
         return (f"it says you checked or confirmed it, but no step's own check showed it: the result is "
                 f"\"{str(verdict.get('label') or level).lower()}\"{because}; {fix}")
@@ -489,17 +513,18 @@ def honest_text(text: str, verdict: dict[str, Any] | None, claims: str | None) -
     """The closing text the user gets, obeying the request's outcome level: ``(text, why replaced or None)``.
 
     At ``likely`` or stronger, or an answer with nothing done and nothing unbacked, the brain's words stand. Below
-    likely the user always gets the verdict's own fixed line first (review: a mislabelled class never stands alone):
-    the brain's words follow it only when it classed them as what was tried (``tried``) and the claim check backed
-    everything they tell (no ``unbacked``); otherwise the line alone, never an unbacked claim. With nothing done: a
-    message that claims something got done becomes :data:`LINE_NOTHING_DONE` (unless another step changed something,
+    likely the user gets the verdict's own fixed line alone (second review V3: the brain labels flat success words
+    "tried" too, so "I tried, but I couldn't confirm it worked. Shuffle's on now." put a false claim right after the
+    line; the done card's level row already says what the check saw, and the brain's words ride on the verdict as
+    ``words`` for the expanded run: :meth:`yuki.agent.loop.Agent._honest_final`). With nothing done: a message that
+    claims something got done or was tried becomes :data:`LINE_NOTHING_DONE` (unless another step changed something,
     ``did``: a to-do added), one that claims a check becomes :data:`LINE_NOT_CHECKED`; any other unread answer keeps
     its words (the surfaces add "not checked" after them). Fixed sentences over measured facts and the brain's own
     class; the words are never read."""
     if not isinstance(verdict, dict) or verdict.get("level") in SAYABLE or not verdict.get("level"):
         return text, None
     if not verdict.get("acted"):
-        if claims == CLAIM_DONE and not verdict.get("did"):
+        if claims in (CLAIM_DONE, CLAIM_TRIED) and not verdict.get("did"):
             return LINE_NOTHING_DONE, "nothing_done"
         if claims == CLAIM_CHECKED:
             return LINE_NOT_CHECKED, "not_checked"
@@ -507,10 +532,7 @@ def honest_text(text: str, verdict: dict[str, Any] | None, claims: str | None) -
     line = " ".join(str(verdict.get("line") or "").split())
     if not line:
         return text, None
-    words = " ".join(str(text or "").split())
-    if claims == CLAIM_TRIED and not verdict.get("unbacked") and words:
-        return f"{line} {words}", "below_likely_tried"
-    return line, "below_likely"
+    return line, "below_likely_tried" if claims == CLAIM_TRIED else "below_likely"
 
 
 def sayable(verdict: dict[str, Any] | None) -> bool:
@@ -701,4 +723,4 @@ __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILE
            "SEND_CONFIRMED", "SEND_UNCHECKED", "SEND_UNCONFIRMED", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
            "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
            "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "did_other", "honest_text",
-           "read_back"]
+           "last_windowless", "read_back"]
