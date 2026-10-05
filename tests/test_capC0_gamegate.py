@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -186,14 +187,23 @@ def test_a_game_already_running_at_start_holds_from_the_first_look() -> None:
 
 def test_a_new_game_seen_full_screen_drawing_like_one_is_learned_and_remembered() -> None:
     store = _Store()
-    gate, clock, log, _ = _gate(procs=[(30, "Fieldrunner.exe")], fullscreen={4}, gpu={30: 61.0}, store=store)
+    gate, clock, log, _ = _gate(procs=[(30, "Fieldrunner.exe"), (12, "Discord.exe")], fullscreen={4},
+                                gpu={30: 61.0}, store=store)
     assert not gate.on_foreground(4, 30).hold
+    clock.t += G.CHECK_AFTER_S[0]
+    d = gate.on_check()                                            # one stretch: a candidate, not yet a game
+    assert not d.hold and gate.next_check_in() is None and not log.of("game_gate_learned")
+    assert log.of("game_gate_evidence") == [{"app": "fieldrunner", "gpu_share": 61.0, "stretches": 1, "step": 1}]
+    assert gate.stats()["candidates"] == 1 and gate.stats()["learned"] == 0
+    gate.on_foreground(5, 12)
+    gate.on_foreground(4, 30)                                      # a second, separate stretch
     clock.t += G.CHECK_AFTER_S[0]
     d = gate.on_check()
     assert d.hold and d.sources == ("learned",) and gate.next_check_in() is None
-    assert log.of("game_gate_learned") == [{"game": "fieldrunner", "gpu_share": 61.0}]
+    assert log.of("game_gate_learned") == [{"game": "fieldrunner", "gpu_share": 61.0, "stretches": 2}]
     kept = json.loads(store.rows[G.LEARNED_STATE])
-    assert kept["fieldrunner"]["gpu_share"] == 61.0 and set(kept) == {"fieldrunner"}
+    assert kept["fieldrunner"]["gpu_share"] == 61.0 and kept["fieldrunner"]["stretches"] == 2
+    assert set(kept) == {"fieldrunner"}
     again, *_ = _gate(procs=[(31, "Fieldrunner.exe"), (12, "Discord.exe")], store=store)
     assert again.on_foreground(5, 12).hold                          # remembered, and windowed or behind counts
 
@@ -209,6 +219,123 @@ def test_a_full_screen_app_left_before_its_check_is_not_judged() -> None:
 def test_the_game_voice_session_holds_without_a_window_change() -> None:
     gate, *_ = _gate(procs=[(12, "Discord.exe")], session=True)
     assert gate.holds()
+
+
+def _live_gate(**state: Any):
+    """A gate whose readings can change between events (``state`` is read at each call)."""
+    clock, log = _Clock(), _Log()
+    s = {"procs": {}, "fullscreen": set(), "gpu": {}, "d3d": False, "session": False, **state}
+    gate = GameGate(log=log, game_session_fn=lambda: s["session"], fullscreen_fn=lambda hwnd: hwnd in s["fullscreen"],
+                    d3d_fn=lambda: s["d3d"], gpu_fn=lambda pids: s["gpu"].get(list(pids)[0]),
+                    scan_fn=lambda: list(s["procs"].items()), image_fn=lambda pid: s["procs"].get(pid, ""),
+                    own_fn=lambda pid: False, clock=clock)
+    return gate, clock, log, s
+
+
+def test_d3d_exclusive_full_screen_holds_at_once_without_a_window_change() -> None:
+    """Review fix: a game not on the list goes exclusive full screen with no foreground event."""
+    gate, clock, log, s = _live_gate(procs={40: "Skyrider.exe", 12: "Discord.exe"})
+    gate.on_foreground(5, 40)
+    assert not gate.holds()
+    s["d3d"] = True
+    clock.t += G.D3D_FRESH_S                                      # the cached reading has aged out
+    assert gate.holds()                                           # read live, no event needed
+    assert not log.of("game_gate")                                # ...and logged at the next beat
+    d = gate.beat()
+    assert d is not None and d.hold and log.of("game_gate")[-1]["trigger"] == "d3d"
+    assert log.of("game_gate")[-1]["reasons"] == ["d3d_fullscreen"]
+    s["d3d"] = False
+    clock.t += 1.0
+    assert gate.beat() is None                                    # not due yet: no work between beats
+    clock.t += G.BEAT_EVERY_S
+    assert not gate.beat().hold and log.of("game_gate")[-1]["trigger"] == "d3d"
+
+
+def test_a_game_voice_session_opening_and_closing_is_logged_by_the_beat() -> None:
+    """Review fix: the voice session changes without a window change; the beat logs it as ``game_voice``."""
+    gate, clock, log, s = _live_gate(procs={12: "Discord.exe"})
+    gate.on_foreground(5, 12)
+    s["session"] = True
+    assert gate.holds()
+    clock.t += G.BEAT_EVERY_S
+    gate.beat()
+    assert log.of("game_gate") == [{"trigger": "game_voice", "hold": True, "reasons": ["game_voice"], "games": [],
+                                    "front": "", "front_fullscreen": False, "sources": []}]
+    s["session"] = False
+    clock.t += G.BEAT_EVERY_S
+    gate.beat()
+    assert log.of("game_gate")[-1]["trigger"] == "game_voice" and log.of("game_gate")[-1]["hold"] is False
+    assert not gate.holds()
+
+
+def test_the_gate_fails_closed() -> None:
+    """Review fix: no gate holds, and a started gate whose thread died holds whatever its last decision was."""
+    assert G.gate_holds(None) is True
+    gate, *_ = _live_gate(procs={12: "Discord.exe"})
+    gate.on_foreground(5, 12)
+    assert G.gate_holds(gate) is False
+    dead = threading.Thread(target=lambda: None)
+    dead.start()
+    dead.join()
+    gate._thread = dead                                           # as if the thread raised and exited
+    assert not gate.alive and gate.holds() and G.gate_holds(gate)
+
+
+def test_a_learned_program_measured_low_is_corrected_and_forgotten() -> None:
+    """Review fix: a music app's GPU-heavy visualiser twice makes it a learned game; later low stretches take it out
+    again, and the program is forgotten from the stored evidence at zero."""
+    store = _Store()
+    gate, clock, log, images = _gate(procs=[(11, FL), (12, "Discord.exe")], fullscreen={1}, gpu={11: 40.0},
+                                     store=store)
+
+    def stretch(share: float) -> None:
+        gate._gpu_fn = lambda pids: share
+        gate.on_foreground(5, 12)
+        gate.on_foreground(1, 11)
+        for after in G.CHECK_AFTER_S:
+            if gate.next_check_in() is None:
+                break
+            clock.t += after
+            gate.on_check()
+
+    stretch(40.0)
+    stretch(40.0)
+    assert gate.holds() and log.of("game_gate_learned")[0]["game"] == "fl64"
+    stretch(2.0)                                                   # evidence 2 -> 1: not a game any more
+    assert not gate.holds() and log.of("game_gate_unlearned") == [{"app": "fl64", "gpu_share": 2.0, "stretches": 1}]
+    assert json.loads(store.rows[G.LEARNED_STATE])["fl64"]["stretches"] == 1
+    stretch(2.0)                                                   # 1 -> 0: forgotten
+    assert json.loads(store.rows[G.LEARNED_STATE]) == {} and gate.stats()["candidates"] == 0
+    assert not gate.holds()
+
+
+def test_evidence_is_capped_and_one_low_stretch_does_not_drop_a_well_known_game() -> None:
+    gate, clock, log, _ = _gate(procs=[(30, "Fieldrunner.exe"), (12, "Discord.exe")], fullscreen={4})
+
+    def stretch(share: float) -> None:
+        gate._gpu_fn = lambda pids: share
+        gate.on_foreground(5, 12)
+        gate.on_foreground(4, 30)
+        for after in G.CHECK_AFTER_S:
+            if gate.next_check_in() is None:
+                break
+            clock.t += after
+            gate.on_check()
+
+    for _ in range(6):
+        stretch(70.0)
+    assert G.stretches(gate._evidence["fieldrunner"]) == G.EVIDENCE_CAP
+    stretch(4.0)                                                   # a lobby screen: 3 -> 2, still a game
+    assert gate.holds() and not log.of("game_gate_unlearned")
+
+
+def test_listed_games_are_never_measured_and_old_entries_start_as_candidates() -> None:
+    store = _Store()
+    store.rows[G.LEARNED_STATE] = json.dumps({"fieldrunner": {"first_seen": 1.0, "gpu_share": 50.0}})
+    gate, clock, _log, _ = _gate(procs=[(20, VALORANT), (30, "Fieldrunner.exe")], fullscreen={2}, store=store)
+    gate.on_foreground(2, 20)
+    assert gate.next_check_in() is None                           # on the fixed list: nothing to measure
+    assert gate.decision().games == ("valorant-win64-shipping",)  # the old one-stretch entry is a candidate only
 
 
 def test_a_game_without_a_wait_handle_is_dropped_at_the_next_window_switch() -> None:
@@ -259,6 +386,7 @@ def test_the_thread_starts_listens_and_wakes_when_a_game_exits(tmp_path: Path) -
         assert not gate.holds() and log.of("game_gate")[-1]["trigger"] == "game_exit"
         gate.stop()
         assert not gate.alive and log.of("game_gate_stop")
+        assert gate.holds()                                       # a stopped gate fails closed
     finally:
         if child.poll() is None:
             child.kill()
