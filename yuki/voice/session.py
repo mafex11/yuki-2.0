@@ -530,7 +530,8 @@ class VoiceSession(QObject):
         self._wake_strict = via == "wake" and bool(self._wake_game or self._call_focus() or self._after_goodbye())
         keep_from = None
         if self._wake_strict and name_end:
-            # the name itself and no more: replaying the whole pre-roll made the first answer ~0.5 s later offline
+            # the name itself and no more than the pre-roll (each replayed second delays the first answer: offline the
+            # kept name cost ~0.3-0.4 s on the first words after a wake in a game)
             keep_from = name_end - NAME_KEEP_S
             if wake_at is not None:
                 keep_from = max(keep_from, wake_at - WAKE_PREROLL_S)
