@@ -125,6 +125,126 @@ def check_embed_pipe() -> Check:
     return Check("Memory search (embedder)", OK, f"the embedder pipe is up ({ms:.0f} ms)")
 
 
+CAPTURE_CHECK = "Screen reading"
+
+#: Reads that kept the window's text (``health.outcome``).
+_KEPT = frozenset({"captured", "unchanged", "no_new_text", "deduplicated"})
+
+#: The watcher's reason codes (``health.reason``, content-free) grouped under one plain phrase each. A code's
+#: ``:detail`` (``no_text:terminal``) and ``_before`` ending (the same blocked page seen again) fold into its group.
+#: Formatting only: which words a count is shown with, never what Yuki does.
+_REASON_GROUPS: dict[str, tuple[str, ...]] = {
+    "a full-screen app was in front": ("fullscreen",),
+    "you paused memory": ("paused", "user", "pause"),
+    "the PC was locked": ("locked", "session"),
+    "the window runs as administrator, which Windows keeps out of reach": ("elevated",),
+    "the app draws its own screen, with no text to read": ("opaque",),
+    "the window showed no text": ("no_text", "masked", "no_complete_message"),
+    "the window didn't answer in time": ("window_busy",),
+    "too many reads were waiting": ("uia_backlog",),
+    "a password was on screen": ("password_focused", "password_field"),
+    "a private app or window": ("blocked_app", "user_blocked_app", "blocked_window", "private_window",
+                                "blocked_app_named"),
+    "a blocked site": ("blocked_scheme", "hostless_url", "credentials_in_url", "unparsable_url", "blocked_host",
+                       "adult_host", "user_blocked_domain", "blocked_path"),
+    "the window changed or closed first": ("not_foreground", "window_gone", "in_front", "not_on_screen", "covered",
+                                           "not_user_window"),
+    "Yuki's own windows": ("own_window",),
+    "a menu or tooltip, kept only for the moment": ("now_only",),
+    "the text ran past the time or size limit": ("truncated",),
+    "something went wrong": ("extract_error", "store_error", "unexpected", "store_unavailable"),
+}
+_REASON_WORDS = {code: words for words, codes in _REASON_GROUPS.items() for code in codes}
+#: Groups shown without the app that had most of them (it says nothing there, or the app's name is the wrong one:
+#: Yuki's own windows carry the name of the browser engine they are drawn with).
+_NO_APP = frozenset({"you paused memory", "the PC was locked", "the window changed or closed first",
+                     "Yuki's own windows"})
+
+
+def _reason_words(code: str | None) -> str:
+    base = (code or "").split(":", 1)[0]
+    base = base[: -len("_before")] if base.endswith("_before") else base
+    return _REASON_WORDS.get(base, "reasons not named here")
+
+
+def _count_phrase(rows: list[tuple[str, str, int]], limit: int = 5) -> str:
+    """``"full screen 300, no text 80 (mostly Warp)"``: the top reasons by count, each with its main app when one
+    app has most of them. ``rows``: (reason words, app, count)."""
+    by_reason: dict[str, dict[str, int]] = {}
+    for words, app, n in rows:
+        apps = by_reason.setdefault(words, {})
+        apps[app] = apps.get(app, 0) + n
+    ranked = sorted(by_reason.items(), key=lambda kv: -sum(kv[1].values()))
+    parts = []
+    for words, apps in ranked[:limit]:
+        total = sum(apps.values())
+        app, top = max(apps.items(), key=lambda kv: kv[1])
+        mostly = f", mostly {app}" if app and top * 2 > total and words not in _NO_APP else ""
+        parts.append(f"{words} ({total:,}{mostly})")
+    rest = sum(sum(apps.values()) for _w, apps in ranked[limit:])
+    if rest:
+        parts.append(f"the rest ({rest:,})")
+    return "; ".join(parts)
+
+
+def check_capture_health(db: Path | None = None, *, now: float | None = None, hours: float = 24.0) -> Check:
+    """Why Yuki's reads of your windows came back empty, were skipped or were cut short (report 78 C0): the memory
+    service's content-free health rows of the last ``hours``, counted by outcome and reason code, in plain words.
+    Counts and app names only; read-only."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(CAPTURE_CHECK, SKIP, "no memory database yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        rows = conn.execute("SELECT outcome, reason, coalesce(app, ''), count(*) FROM health WHERE at >= ?"
+                            " GROUP BY outcome, reason, app", (now - hours * 3600.0,)).fetchall()
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, WARN, f"could not read the reads ({type(exc).__name__})")
+    finally:
+        conn.close()
+    kept = short = 0
+    empty: list[tuple[str, str, int]] = []
+    skipped: list[tuple[str, str, int]] = []
+    failed: list[tuple[str, str, int]] = []
+    for outcome, reason, app, n in rows:
+        n = int(n)
+        if outcome in _KEPT:
+            kept += n
+            short += n if reason == "truncated" else 0
+        elif outcome == "empty":
+            empty.append((_reason_words(reason), app, n))
+        elif outcome == "failed":
+            failed.append((_reason_words(reason), app, n))
+        else:   # skipped, or paused (full screen, locked, your pause)
+            skipped.append((_reason_words(reason), app, n))
+    total = kept + sum(r[2] for r in empty + skipped + failed)
+    span = f"the last {hours:g} hours" if hours != 24 else "the last day"
+    if not total:
+        return Check(CAPTURE_CHECK, OK, f"no reads of your windows in {span}")
+    lines = [f"In {span}, {total:,} reads: {kept:,} kept text"
+             + (f" ({short:,} of them cut short: the text ran past the time or size limit)" if short else "")]
+    n_empty, n_skipped, n_failed = (sum(r[2] for r in group) for group in (empty, skipped, failed))
+    if n_empty:
+        lines.append(f"{n_empty:,} came back empty: {_count_phrase(empty)}")
+    if n_skipped:
+        lines.append(f"{n_skipped:,} were skipped: {_count_phrase(skipped)}")
+    if n_failed:
+        lines.append(f"{n_failed:,} failed: {_count_phrase(failed)}")
+    detail = ". ".join(lines) + "."
+    if n_failed >= 10 and n_failed * 20 >= total:
+        return Check(CAPTURE_CHECK, WARN, detail,
+                     "If this keeps happening, send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    return Check(CAPTURE_CHECK, OK, detail)
+
+
 # -- models and keys ----------------------------------------------------------------------------
 
 
@@ -598,6 +718,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
     checks: list[tuple[str, Callable[[], Check]]] = [
         ("Memory service", check_memory_service),
         ("Memory search (embedder)", check_embed_pipe),
+        (CAPTURE_CHECK, check_capture_health),
         (MODELS_CHECK, lambda: check_models(settings)),
         (AI_ROLES_CHECK, lambda: check_ai_roles(offline)),
         ("Speech to text (Deepgram)", check_deepgram),
