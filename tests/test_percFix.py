@@ -57,7 +57,7 @@ def test_a_slider_whose_label_is_kept_off_screen_is_found_by_the_sweep_and_place
     assert all(e.parent < e.id for e in tree.elements if e.parent >= 0)
     assert slider.id > bar.id and all(tree.elements[i].depth > bar.depth for i in range(bar.id + 1, slider.id))
     line = next(ln for ln in T.format_window_tree(tree).splitlines() if '"Change volume"' in ln and "Slider" in ln)
-    assert "[hidden]" in line and "0.4 (range 0-1)" in line
+    assert "[hidden]" in line and "0.4 (40%, range 0-1)" in line
 
 
 def test_the_sweep_leaves_out_a_slider_of_a_page_the_read_does_not_list(monkeypatch: pytest.MonkeyPatch) -> None:

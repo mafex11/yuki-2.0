@@ -68,6 +68,9 @@ SETTLE_S = 1.5
 #: batch of keys.
 VALUE_WAIT_S = 2.0
 KEY_WAIT_S = 0.6
+#: fix6: the longest single wait for a set value's change event before it is read again anyway (s): an app that sets
+#: the value without raising the event is read within this, not at the end of VALUE_WAIT_S.
+EVENT_SLICE_S = 0.25
 POLL_S = 0.05
 #: Keys: presses per batch, the most presses in all, and how close (share of the range) counts as reached.
 KEYS_PER_BATCH = 5
@@ -194,8 +197,9 @@ def _drive_moves(slider: Slider, details: dict[str, Any], *, value: float, want:
                     details["settled_off_target"] = True
                     break
                 if live:
-                    # read again either way: the value may have come without its event
-                    watch.wait(min(remaining, STABLE_S) if moved else remaining)
+                    # read again either way: the value may have come without its event. fix6: never the whole bound in
+                    # one wait (a value that arrived with no event was read only when VALUE_WAIT_S ran out, 2 s)
+                    watch.wait(min(remaining, STABLE_S if moved else EVENT_SLICE_S))
                 else:
                     sleep(POLL_S)
                 level = slider.read()[0]

@@ -3086,7 +3086,8 @@ class Agent:
                 signal = None
                 if judged is not None and judged.sends:
                     signal = ("send", "a message to a person is about to be sent")
-                elif self._learning.get("actions", 0) == 0 and _close_call(self._frame):
+                elif (self._learning.get("actions", 0) == 0 and _close_call(self._frame)
+                      and _close_call_matters(name, tool_input, target)):
                     signal = ("close_call", "the task frame calls two candidates a close call")
                 if signal is not None and not self._paused.is_set() and self._consult_due(signal[0]):
                     advice = self._consult(signal[0], signal[1],
@@ -5087,6 +5088,23 @@ class Agent:
         self._evidence[hwnd] = "looked"   # the next call sees it read after the actions (v3.14)
         self._last_view_text = view.text   # revamp D: the window acted on, for a second look's summary
         return (hwnd, text, True) if changes else (hwnd, text)
+
+
+def _close_call_matters(name: str, tool_input: dict[str, Any] | None, target: dict[str, Any] | None) -> bool:
+    """fix6 (report 73, release 6: every Spotify volume change took 4-5 s, of which the slider itself 0.8-1.3 s; the
+    rest was this second look, 3.0 and 4.1 s, on a close call between two things in the frame): whether picking the
+    wrong one of two close candidates could do lasting harm with this call, so it waits for a second look. True when
+    the call can destroy or reach something (its fixed traits and its target's role, as the judge sees them) or puts
+    text of the brain's somewhere (its ``text`` input). A level, a scroll, a hover, a window state or a tab shown take
+    no candidate's content, report their own effect and are undone the same way: they go at once. Traits and input
+    fields only, never words."""
+    target = target or {}
+    try:
+        traits = call_traits(name, tool_input or {}, role=target.get("role"),
+                             typed_pending=bool(target.get("typed_pending")))
+    except Exception:  # noqa: BLE001 - when in doubt, the second look runs as before
+        return True
+    return bool(traits.destroys or traits.reaches or str((tool_input or {}).get("text") or "").strip())
 
 
 def _close_call(frame: Any) -> bool:

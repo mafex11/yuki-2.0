@@ -88,6 +88,7 @@ reads only that (a page-only pass, nothing inside the pages) and
 from __future__ import annotations
 
 import dataclasses
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -960,9 +961,47 @@ def _range_numbers(get: object) -> tuple[float, float, float] | None:
     return (float(value), float(low), float(high))
 
 
-def _slider_value(get: object) -> str | None:
-    """A slider's RangeValue as a read shows it ("37 (range 0-100)"), or ``None`` without one. An optional property:
-    an older UI Automation, or a provider without it, reads as absent (its "not supported" sentinel is no number)."""
+def _percent_words(value: float, low: float, high: float) -> str:
+    """``value`` as a percent of its range, as a read says it ("40%", "33.3%"); deterministic number formatting."""
+    share = max(0.0, min(100.0, (value - low) * 100.0 / (high - low))) if high > low else 0.0
+    return f"{round(share, 1):g}%"
+
+
+def _plain_number(text: str) -> float | None:
+    """The number a value text is when it is only a number (optionally with a percent sign: "40", "40%", "0.4"),
+    else ``None`` ("0:00", "Volume 40", "medium"). Number parsing only."""
+    words = " ".join(str(text or "").split())
+    if words.endswith("%"):
+        words = words[:-1].strip()
+    try:
+        number = float(words)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _is_level(text: str, numbers: tuple[float, float, float]) -> bool:
+    """fix6 (report 73, release 6): whether a slider's Value text states its RangeValue level: it is that number, or
+    that number as a percent of the range. Spotify's volume input reports "0:00" as its text while its level is 0.4 of
+    0-1, so its text hides the level."""
+    number = _plain_number(text)
+    if number is None:
+        return False
+    value, low, high = numbers
+    if abs(number - value) <= max(1e-9, abs(high - low) * 0.005):
+        return True
+    share = (value - low) * 100.0 / (high - low) if high > low else None
+    return share is not None and abs(number - share) <= 0.5
+
+
+def _slider_value(get: object, text: str | None = None) -> str | None:
+    """A slider's RangeValue as a read shows it ("37 (range 0-100)", "0.4 (40%, range 0-1)"), or ``None`` without one.
+    An optional property: an older UI Automation, or a provider without it, reads as absent (its "not supported"
+    sentinel is no number).
+
+    fix6: with a Value ``text`` that does not state the level (:func:`_is_level`: Spotify's volume says "0:00"), the
+    level comes first as a percent and the text after it ("40% (0.4, range 0-1; its text: "0:00")"); a text that is
+    the level is returned as it is."""
     try:
         if not _as_bool(get(_P_IS_RANGE_VALUE_AVAILABLE)):  # type: ignore[operator]
             return None
@@ -971,9 +1010,16 @@ def _slider_value(get: object) -> str | None:
         return None
     numbers = _range_numbers(get)
     if numbers is None:
-        return "slider"
+        return text or "slider"
     value, low, high = numbers
-    return f"{value:g} (range {low:g}-{high:g}{', read-only' if read_only else ''})"
+    flag = ", read-only" if read_only else ""
+    if text:
+        if _is_level(text, numbers):
+            return text
+        shown = text if len(text) <= 60 else text[:59] + "…"
+        return f"{_percent_words(value, low, high)} ({value:g}, range {low:g}-{high:g}{flag}; its text: \"{shown}\")"
+    share = "" if (low, high) == (0.0, 100.0) or high <= low else f"{_percent_words(value, low, high)}, "
+    return f"{value:g} ({share}range {low:g}-{high:g}{flag})"
 
 
 def _state_control(get: object) -> bool:
@@ -1257,11 +1303,11 @@ class _CachedWalker:
         patterns = tuple(
             label for label, property_id in _PATTERN_ORDER if _as_bool(get(property_id))
         ) + (("value",) if editable else ())
-        ranged = _slider_value(get)
+        ranged = _slider_value(get, value)
         if ranged is not None:
             patterns += ("range",)
-            if value is None:
-                value = ranged
+            # fix6: a Value text that is not the level (Spotify's volume says "0:00") no longer hides its numbers
+            value = ranged
         is_interactive = enabled and (
             bool(patterns)
             or _as_bool(get(_P_IS_KEYBOARD_FOCUSABLE))
