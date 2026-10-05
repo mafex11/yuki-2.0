@@ -311,6 +311,7 @@ def run(args: argparse.Namespace) -> int:
     transcriber = None
     transcriber_thread: threading.Thread | None = None
     screen_recall = None
+    game_gate = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -407,7 +408,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.callevidence import CallEvidence
 
-                call_evidence = CallEvidence(log=log)
+                call_evidence = CallEvidence(log=log, privacy=watcher.privacy)   # [meetings] always/never_sites
                 watcher.on_screen = call_evidence.seen
             except Exception as exc:  # calls then need the user's own [calls] apps
                 log("error", where="call_evidence", error=f"{type(exc).__name__}: {exc}")
@@ -684,9 +685,27 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     log("error", where="calldigest_start", error=f"{type(exc).__name__}: {exc}")
 
+        # The hard game gate (report 78 §4.5, phase C0): knows when a game runs; logs its decisions only (nothing
+        # obeys it yet). Its own event-driven thread; a failure here never stops memory. A later capture phase asks
+        # gamegate.gate_holds(game_gate): a gate that failed to start (None) holds.
+        try:
+            from yuki.memory.gamegate import GameGate
+
+            def game_voice_open() -> bool:
+                c = calls
+                return c is not None and (getattr(c, "game", None) is not None
+                                          or getattr(c, "_gaming", None) is not None)
+
+            game_gate = GameGate(store=store, privacy_path=privacy.path, log=log,
+                                 game_session_fn=game_voice_open).start()
+        except Exception as exc:
+            log("error", where="game_gate_start", error=f"{type(exc).__name__}: {exc}")
+            game_gate = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
+        game_gate_dead = False
         privacy_error = privacy.last_error
         wall_seen = time.time()
         while not stop.is_set():
@@ -704,6 +723,17 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="watcher", error="hook thread exited")
                 code = 2
                 break
+            if game_gate is not None:
+                # Piggyback (no loop of its own): D3D full screen and the game voice session show no window event.
+                # A dead gate thread is kept, not dropped: it then holds (fails closed), logged once.
+                if game_gate.alive:
+                    try:
+                        game_gate.beat()
+                    except Exception as exc:
+                        log("error", where="game_gate_beat", error=type(exc).__name__)
+                elif not game_gate_dead:
+                    game_gate_dead = True
+                    log("error", where="game_gate", error="game gate thread exited; it holds from now")
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
@@ -751,7 +781,8 @@ def run(args: argparse.Namespace) -> int:
                 log("stats", **meter.reading(), watcher=watcher.stats(),
                     timeline=timeline.stats() if timeline is not None else None,
                     warp=warp.stats() if warp is not None else None,
-                    screen_recall=screen_recall.stats() if screen_recall is not None else None)
+                    screen_recall=screen_recall.stats() if screen_recall is not None else None,
+                    game_gate=game_gate.stats() if game_gate is not None else None)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
@@ -806,6 +837,8 @@ def run(args: argparse.Namespace) -> int:
             calls.stop()   # closes the microphone, spools what is left (encrypted)
         if transcriber is not None:
             transcriber.stop()   # a running batch is asked to stop after its chunk
+        if game_gate is not None:
+            game_gate.stop()
         if watcher is not None:
             watcher.stop()
         if timeline is not None:

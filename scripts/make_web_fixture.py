@@ -710,6 +710,8 @@ def build() -> dict:
         "call_knobs": W.call_knobs({}),
         "appearance": {"accent": "green", "reduce_motion": False, "accents": [{"key": "green", "label": "Mint"}, {"key": "orange", "label": "Orange"}]},
         "takeover": W.takeover_view(40),
+        # Record how I work (report 78 C0): off and locked; one app already left out
+        "record": W.record_view({"trace": {"leave_out": ["Banking app"]}}, ["VS Code", "Firefox", "Signal", "Calc", "Thunderbird", "Notes"]),
         "usage": {"mb": 312, "cpu": 0.4},
         "ai": ai_settings(),
     }

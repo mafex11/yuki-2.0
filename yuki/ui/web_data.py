@@ -2313,6 +2313,26 @@ def takeover_view(px: Any) -> dict[str, Any]:
     return {"px": px, "label": U.TAKEOVER_MOVE_LABEL, "hint": U.TAKEOVER_MOVE_HINT, "choices": choices}
 
 
+def record_view(privacy: dict[str, Any] | None, apps: list[str]) -> dict[str, Any]:
+    """Settings → Privacy and pause → Record how I work (report 78 C0): the switch, always shown off and locked
+    (nothing records yet; it waits for the user's go-ahead), and the apps to leave out (the privacy file's
+    ``[trace] leave_out``), with the apps seen this week offered to add. ``apps``: their names, as App access shows
+    them."""
+    from yuki.ui import ui_settings as U
+
+    trace = (privacy or {}).get("trace") if isinstance((privacy or {}).get("trace"), dict) else {}
+    out: list[str] = []
+    for value in trace.get("leave_out", []) if isinstance(trace.get("leave_out"), list) else []:
+        name = " ".join(str(value).split())
+        if name and name.casefold() not in {o.casefold() for o in out}:
+            out.append(name)
+    left = {o.casefold() for o in out}
+    choices = [a for a in apps if a and a.casefold() not in left]
+    return {"on": False, "locked": True, "label": U.RECORD_LABEL, "hint": U.RECORD_HINT, "waiting": U.RECORD_WAITING,
+            "leave_out": out, "choices": choices, "leave_out_label": U.RECORD_LEAVE_OUT_LABEL,
+            "leave_out_hint": U.RECORD_LEAVE_OUT_HINT}
+
+
 def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: dict[str, Any] | None = None,
                    policy_path: Path | None = None, ui_path: Path | None = None) -> dict[str, Any]:
     """Settings: the autonomy policy, app access (look: the privacy blocklist; act: the policy's per-app switch),
@@ -2373,6 +2393,8 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                                    for k, v in T.ACCENTS.items()]},
         # While I work: how far the mouse must move for me to pause (the takeover watch reads it as a task starts)
         "takeover": takeover_view(ui.takeover_move_px),
+        # Record how I work (report 78 C0): off and locked until the user's go-ahead; the leave-out list is ready
+        "record": record_view(privacy, [a["app"] for a in apps if a.get("look")]),
         "usage": yuki_usage(),
         # Settings → AI (report 67): each job's service and model, each service's key status (never a key); no
         # network here (the page asks for model lists with the ai_models action, off the UI thread)

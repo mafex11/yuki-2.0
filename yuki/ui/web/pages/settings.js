@@ -153,6 +153,21 @@
     return [srow(tk.label, pick(opts, String(tk.px), { change: 'takeover-move' }, tk.label), tk.hint)];
   }
 
+  /* Record how I work (report 78 C0): the switch is shown off and locked (it waits for your go-ahead; nothing
+     records yet), then the apps to leave out: each a chip that removes it, and a pick of the apps seen this week.
+     The words come from Python (ui_settings.RECORD_*); the list is the privacy file's [trace] leave_out */
+  function recordRows(rc) {
+    const chips = (rc.leave_out || []).map((a) => key(a + ' ×', { cls: 'xs', data: { do: 'leave-out-drop', app: a } }));
+    const add = (rc.choices || []).length
+      ? pick([['', 'Add an app…']].concat(rc.choices.map((a) => [a, a])), '', { change: 'leave-out-add' }, rc.leave_out_label)
+      : null;
+    return [
+      h('div', { class: 'srow record-h', data: { k: 'record' } }, h('span', null, rc.label, h('small', { text: rc.hint }), h('small', { class: 'record-wait', text: rc.waiting })),
+        h('span', { class: 'ctl' }, tog(!!rc.on, { do: 'record-on' }, rc.label, !!rc.locked))),
+      h('div', { class: 'srow record-h', data: { k: 'record-out' } }, h('span', null, rc.leave_out_label, h('small', { text: rc.leave_out_hint })),
+        h('span', { class: 'ctl' }, chips.length ? chips : h('span', { class: 'v', text: 'None' }), add))];
+  }
+
   function build(d, S, D) {
     const A = d.autonomy || { levels: [], kinds: [] }, v = d.voice || {}, pr = d.privacy || {}, ap = d.appearance || {}, co = d.coach || {};
     const live = D.shell.connected;
@@ -184,7 +199,8 @@
         h('span', { class: 'ctl' }, pr.paused ? key('Resume', { cls: 'xs pri', data: { do: 'pause', on: '0' } }) : key('Pause', { cls: 'xs', data: { do: 'pause', on: '1' } }))),
       srow('Private browser windows', 'never looked at'),
       pr.blocked_sites != null ? srow('Blocked sites', fmt.plural(pr.blocked_sites, 'site')) : null,
-      pr.seen_min != null ? srow('Seen today', `${Math.round(pr.seen_min)} min across ${fmt.plural(pr.seen_apps || 0, 'app')}`, 'Counts only, see Activity → Saw') : null];
+      pr.seen_min != null ? srow('Seen today', `${Math.round(pr.seen_min)} min across ${fmt.plural(pr.seen_apps || 0, 'app')}`, 'Counts only, see Activity → Saw') : null,
+      ...(d.record ? recordRows(d.record) : [])];
     /* what a recorded call keeps, said from the privacy file's [calls] knobs (read only here: record_others,
        game_voice); then the per-app answers, then when it becomes text */
     const kn = d.call_knobs || { record_others: true, game_voice: true };
@@ -282,6 +298,20 @@
     });
   }
   A['quiet-on'] = (t) => { const on = flip(t); quietSave(t, { on }, () => flip(t)); };
+  /* Record how I work: the switch is locked (disabled); a press that gets through is refused by Python with why */
+  A['record-on'] = (t) => { save(t, 'record_actions', { on: true }, null, null).then(() => { t.setAttribute('aria-checked', 'false'); }); };
+  function leaveOut(t, app, out) {
+    const rc = settings().record || {};
+    save(t, 'record_leave_out', { app, out }, out ? `${app} will be left out.` : `${app} is no longer left out.`).then((r) => {
+      if (!r.ok) return;
+      const kept = Array.isArray(r.leave_out) ? r.leave_out
+        : (out ? (rc.leave_out || []).concat([app]) : (rc.leave_out || []).filter((a) => a !== app));   // a canned reply: what you asked
+      rc.choices = (rc.choices || []).concat(out ? [] : [app]).filter((a) => !kept.includes(a));
+      rc.leave_out = kept;
+      Y.renderMain();
+    });
+  }
+  A['leave-out-drop'] = (t) => leaveOut(t, t.dataset.app, false);
   A.pause = (t) => { const on = t.dataset.on === '1'; save(t, 'pause', { paused: on }, on ? 'Memory paused.' : 'Remembering again.').then((r) => { if (r.ok) { settings().privacy.paused = on; Y.renderMain(); } }); };
   A.accent = (t) => { const name = t.dataset.accent; save(t, 'accent', { accent: name }).then((r) => { if (r.ok) { settings().appearance.accent = name; Y.applyAppearance(Object.assign({}, Y.D.appearance, { accent: name })); Y.render(false); } }); };
   A.motion = (t) => { const on = t.dataset.on === '1'; save(t, 'motion', { reduce: on }).then((r) => { if (r.ok) { settings().appearance.reduce_motion = on; Y.applyAppearance(Object.assign({}, Y.D.appearance, { reduce_motion: on })); Y.render(false); } }); };
@@ -414,6 +444,7 @@
         Y.toast(`Saved: ${c ? c.words.toLowerCase() : 'your own setting'}. I use it from my next task.`);
       });
     }
+    if (t.dataset.change === 'leave-out-add' && v) leaveOut(t, v, true);
     if (t.dataset.change === 'quiet-time') {
       const co = settings().coach || {}, was = co[t.dataset.which === 'start' ? 'quiet_start' : 'quiet_end'];
       quietSave(t, { [t.dataset.which]: t.value }, () => { t.value = was; });

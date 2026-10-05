@@ -452,12 +452,13 @@ def _marker(element: Any) -> Callable[[], int | None]:
 
 def _wheel_sender(dy: int, dx: int) -> Callable[[], None]:
     def send() -> None:
-        from yuki.actions.input import _MOUSEEVENTF_HWHEEL, _MOUSEEVENTF_WHEEL, _WHEEL_DELTA, _user32
+        # stamped with Yuki's input tag like every event Yuki sends (report 78 C0: yuki.core.inputtag)
+        from yuki.actions.input import _MOUSEEVENTF_HWHEEL, _MOUSEEVENTF_WHEEL, _WHEEL_DELTA, _send_mouse
 
         if dy:
-            _user32.mouse_event(_MOUSEEVENTF_WHEEL, 0, 0, int(dy) * _WHEEL_DELTA, 0)
+            _send_mouse(_MOUSEEVENTF_WHEEL, int(dy) * _WHEEL_DELTA)
         if dx:
-            _user32.mouse_event(_MOUSEEVENTF_HWHEEL, 0, 0, int(dx) * _WHEEL_DELTA, 0)
+            _send_mouse(_MOUSEEVENTF_HWHEEL, int(dx) * _WHEEL_DELTA)
     return send
 
 
