@@ -121,6 +121,9 @@ class WindowHost(QObject):
                                                                         voice.wake_enabled and not voice.quiet)),
                                                    "wake_state": voice.listening_state, "quiet_until": until}))
         voice.devices_changed.connect(lambda text: self.live({"devices": text}))
+        local_models = getattr(voice, "local_models_changed", None)
+        if local_models is not None:   # vLocal: the speech models' download, for Settings (about once a second)
+            local_models.connect(lambda status: self.live({"local_models": status}))
 
     # -- the thread ------------------------------------------------------------------------------
 
@@ -404,16 +407,18 @@ class WindowHost(QObject):
                     v.set_tts_voice(str(req["tts_voice"] or ""))
                 if "end_tone" in req and callable(getattr(v, "set_end_tone", None)):
                     v.set_end_tone(bool(req["end_tone"]))
-                if "tts_provider" in req:   # read when the next conversation starts (voice.json, the voice's prefs)
-                    from yuki.voice.session import PROVIDERS, load_prefs, save_prefs
+                speech = {k: req[k] for k in ("tts_provider", "stt_provider", "local_keep_loaded") if k in req}
+                if speech:   # read when the next conversation is built (voice.json, the voice's prefs)
+                    from yuki.voice.local_models import voice_pref_changes
+                    from yuki.voice.session import load_prefs, save_prefs
 
-                    provider = str(req["tts_provider"] or "").strip().lower()
                     prefs = load_prefs()
-                    if provider in PROVIDERS:
-                        prefs["tts_provider"] = provider
-                    else:
-                        prefs.pop("tts_provider", None)
-                    save_prefs(prefs)
+                    changed = voice_pref_changes(prefs, speech)
+                    if changed != prefs:
+                        save_prefs(changed)
+                        v.rebuild_standby()          # vLocal: the waiting conversation is built again with them
+                    if callable(getattr(v, "local_models_wanted", None)):
+                        v.local_models_wanted()      # vLocal: missing models download when no game or call is on
                 return self.state()
             return {"state": self._on_gui(apply)}
         if op == "voice_toggle":

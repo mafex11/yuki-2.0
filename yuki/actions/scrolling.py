@@ -28,6 +28,7 @@ Plumbing only: nothing here looks at what an element is called.
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
 import time
 from ctypes import wintypes
@@ -647,6 +648,16 @@ def step_result(result: Any) -> StepResult:
                       still=bool(first.get("still")), gone=details.get("refused") == "foreground")
 
 
+def _call(fn: Callable[[], Any] | None) -> None:
+    """Call ``fn`` when there is one; a failure never stops the scroll."""
+    if fn is None:
+        return
+    try:
+        fn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class ContinuousScroll:
     """A window's page scrolled on in steps until something stops it (V7).
 
@@ -699,15 +710,21 @@ class ContinuousScroll:
 
     def _watch(self) -> None:
         """The user's take-over, looked at every tick for as long as it runs, steps included (review F4: looked at only
-        between steps, a click during the 1-2 s of a step was gone by the next look)."""
-        while not self._stop.is_set():
-            try:
-                if self.took_over is not None and self.took_over():
-                    self._end("user_input")
-                    return
-            except Exception:  # noqa: BLE001 - a broken read never stops the scroll by itself
-                pass
-            self._stop.wait(TICK_S)
+        between steps, a click during the 1-2 s of a step was gone by the next look). A watch with ``open`` / ``close``
+        (:class:`InputWatch`) holds what it reads for the scroll's whole life."""
+        watch = self.took_over
+        _call(getattr(watch, "open", None))
+        try:
+            while not self._stop.is_set():
+                try:
+                    if watch is not None and watch():
+                        self._end("user_input")
+                        return
+                except Exception:  # noqa: BLE001 - a broken read never stops the scroll by itself
+                    pass
+                self._stop.wait(TICK_S)
+        finally:
+            _call(getattr(watch, "close", None))
 
     def stop(self, why: str = "stop", wait_s: float = 2.0) -> dict[str, Any]:
         """Stop it (``why``: voice / stop / replaced / ended); returns the report."""
@@ -912,24 +929,35 @@ def continuous_state() -> str | None:
 class InputWatch:
     """The user's input while a continuous scroll runs (review F4), looked at on the scroll's watch thread every tick.
 
-    Called, it says whether they took over: a key or a mouse button went down (or was pressed since the last look),
-    or other input came with the cursor still (:class:`yuki.actions.leases.RealInput`; Yuki's own wheel moment is left
-    out). :meth:`moving`: they moved the cursor within :data:`MOUSE_STILL_S` (Yuki's own cursor jump left out), so the
-    next step waits and never jumps the cursor under their hand. Measured facts only; no hook.
+    Called, it says whether they took over: a key, a mouse button or the wheel (:class:`yuki.actions.leases.RealInput`:
+    the input monitor's facts while it listens, a key or button pressed since the last look; Yuki's own input left
+    out). The wheel, the clicks and the big moves come from the input monitor (Raw Input), which runs only while
+    someone holds it: :meth:`open` holds it for the scroll's life (the scroll's watch thread calls it), so a voice
+    fast-path scroll, which runs outside any agent request, and an agent's scroll that outlives its request are still
+    stopped by the wheel (the independent check of hotInput). :meth:`moving`: the cursor travelled the user's takeover distance within :data:`MOUSE_STILL_S` (the monitor's
+    big move, or the cursor that far from its last look; Yuki's own cursor jump left out), so the next step waits and
+    never jumps the cursor under their hand. hotInput: a twitching mouse sensor (1 px, 20-30 times a second) is neither:
+    before, any input with the cursor still was a take-over and any 1 px move was "moving" (report 73, release 6).
+    Measured facts only; no hook.
 
     Args:
         real: The input reader (tests pass one on stubs).
         own_now: Whether one of Yuki's own input moments is running or just ended
             (:func:`yuki.actions.leases.own_input_now`).
+        move_px: The travel that counts as the user moving the mouse (px; the user's setting in :func:`input_watch`).
     """
 
     def __init__(self, real: Any = None, *, own_now: Callable[[float], bool] | None = None,
-                 now: Callable[[], float] = time.monotonic) -> None:
-        from yuki.actions.leases import RealInput, own_input_now
+                 now: Callable[[], float] = time.monotonic, move_px: int | None = None) -> None:
+        from yuki.actions.leases import TAKEOVER_MOVE_PX, RealInput, own_input_now
 
-        self.real = real if real is not None else RealInput()
+        #: Whether :meth:`open` holds the process's input monitor (only for the real reader, never a test's stub).
+        self._monitor = real is None
+        self._held = False
+        self.real = real if real is not None else RealInput(kinds=("keys", "click", "wheel"))
         self.own_now = own_now or own_input_now
         self.now = now
+        self.move_px = float(TAKEOVER_MOVE_PX if move_px is None else move_px)
         self.moved_at: float | None = None
         self.real.poll()   # the baseline: input before now does not count
         self.real.last_real = None
@@ -940,14 +968,41 @@ class InputWatch:
         last = self.real.poll()
         after = self.real.cursor_seen
         t = self.now()
-        if before is not None and after is not None and after != before and not self.own_now(t):
+        if (before is not None and after is not None and math.dist(before, after) >= self.move_px
+                and not self.own_now(t)):
             self.moved_at = t
+        sig = getattr(self.real, "source", None)
+        if sig is not None:
+            big = float(sig.last("mouse") or 0.0)
+            if big > self.since and (self.moved_at is None or big > self.moved_at):
+                self.moved_at = big
         return last is not None and last > self.since
 
     def moving(self) -> bool:
         return self.moved_at is not None and self.now() - self.moved_at < MOUSE_STILL_S
 
+    def open(self) -> bool:
+        """Hold the input monitor while the scroll runs (counted with the agent's own hold; :meth:`close` gives it
+        back). Returns whether it is listening. Input from before the watch began still never counts."""
+        if not self._monitor or self._held:
+            return self._held
+        from yuki.actions import userinput
+
+        self._held = True
+        return bool(userinput.acquire())
+
+    def close(self) -> None:
+        """Give the input monitor back (once)."""
+        if self._held:
+            self._held = False
+            from yuki.actions import userinput
+
+            userinput.release()
+
 
 def input_watch() -> InputWatch:
-    """A "they took over" signal from now on (:class:`InputWatch`; its ``moving`` is the mouse-moving hold)."""
-    return InputWatch()
+    """A "they took over" signal from now on (:class:`InputWatch`; its ``moving`` is the mouse-moving hold), with the
+    user's takeover distance."""
+    from yuki.actions.leases import takeover_move_px
+
+    return InputWatch(move_px=takeover_move_px())

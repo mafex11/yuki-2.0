@@ -16,8 +16,9 @@ Two threads:
   after the first event.  Waiting is ``MsgWaitForMultipleObjectsEx`` with the
   next deadline as its timeout: it wakes on the next event or the deadline,
   never on a fixed sleep.  A slow adaptive **backstop** re-reads the foreground
-  window every 45-90 s while the user is active (``GetLastInputInfo``), and
-  never while they are idle.
+  window every 45-90 s while the user is active (:func:`user_idle_s`: their
+  real keys, clicks, wheel and mouse travel, :mod:`yuki.memory.userpresence`),
+  and never while they are idle.
 * the **capture worker** does the reading - a structured UIA read turned into
   messages (chats, mail) or clean main text by :func:`yuki.memory.extract.extract`
   - privacy gating (:mod:`yuki.memory.privacy`: the page URL, masked lines and
@@ -57,6 +58,7 @@ from yuki.memory import secret_filter
 from yuki.memory.extract import Extraction, extract
 from yuki.memory.extract.uia import content_pid
 from yuki.memory.privacy import PrivacyConfig, PrivacyRules
+from yuki.memory.userpresence import Presence
 from yuki.perception import visibility as _visibility
 from yuki.perception.windows import is_user_window
 
@@ -390,6 +392,11 @@ def raw_idle_s() -> float:
 class _PresenceSampler:
     """Tells a person's input from a drifting mouse, from the idle timer and the cursor.
 
+    presence (5 Oct): only the fallback now, when Raw Input is unavailable
+    (:mod:`yuki.memory.userpresence`). Its :attr:`BURST` rule cannot tell a
+    vibrating sensor (20-30 resets a second, 0-1 px each) from typing, so with
+    such a mouse it never lets the user go idle.
+
     Some mice report a one-count move every few seconds with nobody touching
     them, which resets the system idle timer forever. Measured on this PC
     (2026-09-24, G402): with hands off, a reset every ~4 s, each moving the
@@ -413,7 +420,16 @@ class _PresenceSampler:
         self._lock = threading.Lock()
         self._real_tick: int | None = None
         self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
         self._failed = False
+
+    def stop(self) -> None:
+        """Stops the poller (the Raw Input reader answers now); the next question starts it again."""
+        with self._lock:
+            stop, self._stop = self._stop, threading.Event()
+            self._thread = None
+            self._real_tick = None
+        stop.set()
 
     def idle_s(self) -> float:
         raw = raw_idle_s()
@@ -422,7 +438,8 @@ class _PresenceSampler:
         if self._thread is None:
             with self._lock:
                 if self._thread is None:
-                    self._thread = threading.Thread(target=self._run, name="yuki-presence", daemon=True)
+                    self._thread = threading.Thread(target=self._run, args=(self._stop,), name="yuki-presence",
+                                                    daemon=True)
                     self._thread.start()
         with self._lock:
             real = self._real_tick
@@ -430,14 +447,14 @@ class _PresenceSampler:
             return raw
         return max(raw, ((_kernel32.GetTickCount() - real) & 0xFFFFFFFF) / 1000.0)
 
-    def _run(self) -> None:
+    def _run(self, stop: threading.Event) -> None:
         try:
             info = _LASTINPUTINFO(cbSize=ctypes.sizeof(_LASTINPUTINFO))
             pt = wintypes.POINT()
             positions: deque[tuple[float, int, int]] = deque()
             resets: deque[float] = deque()
             last_tick: int | None = None
-            while True:
+            while not stop.is_set():
                 now = time.monotonic()
                 have_pos = bool(_user32.GetCursorPos(ctypes.byref(pt)))
                 if have_pos:
@@ -460,20 +477,27 @@ class _PresenceSampler:
                             with self._lock:
                                 self._real_tick = tick
                     last_tick = tick
-                time.sleep(self.PERIOD_S)
+                stop.wait(self.PERIOD_S)
         except Exception:
             self._failed = True
 
 
-_presence = _PresenceSampler()
+_sampler = _PresenceSampler()
+_presence = Presence(raw_idle=raw_idle_s, fallback=_sampler.idle_s, fallback_stop=_sampler.stop)
 
 
 def user_idle_s() -> float:
-    """Seconds since the user's last real input, a drifting mouse's reports left out.
+    """Seconds since the user's last real input: a key, a mouse button, the wheel, the mouse travelling the takeover
+    distance, an unlock; a vibrating or drifting mouse's reports and Yuki's own input left out.
 
-    See :class:`_PresenceSampler`; falls back to :func:`raw_idle_s` if sampling fails.
+    See :mod:`yuki.memory.userpresence`; falls back to :class:`_PresenceSampler` if Raw Input is unavailable.
     """
     return _presence.idle_s()
+
+
+def presence_facts() -> dict[str, Any]:
+    """Where :func:`user_idle_s` comes from and its counts (numbers only), for a log line."""
+    return _presence.facts()
 
 
 def notification_state() -> int:
@@ -1339,6 +1363,7 @@ class Watcher:
                 if wparam == WTS_SESSION_LOCK:
                     self._set_locked(True)
                 elif wparam == WTS_SESSION_UNLOCK:
+                    _presence.note_unlock()     # the user is back: their password went to the secure desktop
                     self._set_locked(False)
                 return 0
             if msg == WM_APP_PAUSE:
@@ -1904,9 +1929,11 @@ class Watcher:
         if self._locked or self._paused or self._pending is not None or self._busy is not None or not self._fg:
             return
         idle = user_idle_s() > self.settings.idle_limit_s
-        if idle != self._idle:
+        answering = _presence.answering()
+        if idle != self._idle or answering != getattr(self, "_presence_answering", answering):
             self._idle = idle
-            self._log("watcher_state", idle=idle)
+            self._log("watcher_state", idle=idle, presence=presence_facts())
+        self._presence_answering = answering
         if idle:
             return
         self._submit(self._fg, "backstop", now)

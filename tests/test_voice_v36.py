@@ -196,6 +196,10 @@ def test_conversation_replays_only_what_came_after_the_name(tmp_path: Path) -> N
     from yuki.voice.session import WAKE_PREROLL_S
 
     session = _session(tmp_path)
+    # this PC's own state (a game in front, a call on, a recent goodbye) makes the wake strict (vGame): keep it out
+    session._game_now = lambda: None
+    session._call_focus = lambda: False
+    session._after_goodbye = lambda: False
     seen: list[tuple] = []
 
     class _Thread:

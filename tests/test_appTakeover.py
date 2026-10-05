@@ -45,10 +45,30 @@ from yuki.voice.offline import ChatPlayerDesk
 # -- 1. the watch, on stub input sources ------------------------------------------------------------------------------
 
 
+class Sig:
+    """A stub input monitor (``yuki.actions.userinput``): the user's real input times by kind."""
+
+    running = True
+    started_at = 1.0
+
+    def __init__(self, **times: float) -> None:
+        self.times = dict(times)
+
+    def last(self, kind: str) -> float:
+        return self.times.get(kind, 0.0)
+
+    def latest(self, kinds=("keys", "click", "wheel", "mouse")):
+        best = max(((self.times.get(k, 0.0), k) for k in kinds), default=(0.0, None))
+        return best if best[0] else (0.0, None)
+
+
 class Desk:
-    """Stub input sources on a stub clock: the cursor, the keys, ``GetLastInputInfo`` and Yuki's own input span."""
+    """Stub input sources on a stub clock: the cursor, the keys, ``GetLastInputInfo``, Yuki's own input span, the
+    keyboard hook's last key and the input monitor (``None``: not listening)."""
 
     def __init__(self) -> None:
+        self.pressed_at = 0.0
+        self.signal: Any = None
         self.t = 1000.0
         self.pos: tuple[int, int] | None = (500, 500)
         self.down: frozenset[int] = frozenset()
@@ -61,7 +81,7 @@ class Desk:
     def watch(self, move_px: int = 40) -> TakeoverWatch:
         return TakeoverWatch(move_px=move_px, age=lambda: self.t - self.last_input, keys=self.keys,
                              cursor=lambda: self.pos, span=lambda: self.span, ours=lambda kind, where: self.yuki_windows,
-                             now=lambda: self.t)
+                             now=lambda: self.t, pressed=lambda: self.pressed_at, signal=self.signal)
 
     def keys(self) -> tuple[frozenset[int], frozenset[int]]:
         self.key_reads += 1
@@ -995,7 +1015,7 @@ def test_f3_typing_already_going_on_when_the_watch_starts_is_not_a_takeover():
     """The user types in a chat (or holds game keys) as the request reaches its first action: the next keystrokes are
     the baseline. Once they have been still for the quiet gap, a key counts again."""
     d = Desk()
-    d.last_input = d.t - 0.05                 # a key 50 ms before the watch
+    d.last_input = d.pressed_at = d.t - 0.05  # a key 50 ms before the watch (the keyboard hook saw it go down)
     w = d.watch()
     assert d.step(w) is None and not w.armed
     for _ in range(6):                        # they keep typing: never a pause
@@ -1012,6 +1032,7 @@ def test_f3_typing_already_going_on_when_the_watch_starts_is_not_a_takeover():
 def test_f3_a_mouse_moving_when_the_watch_starts_counts_only_after_a_still_moment():
     d = Desk()
     d.last_input = d.t - 0.02
+    d.signal = Sig(mouse=d.t - 0.02)          # the input monitor saw the hand moving the mouse just before
     w = d.watch()
     d.step(w)
     for x in (560, 640, 720, 800):            # the hand was already moving

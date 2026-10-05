@@ -21,8 +21,11 @@ Two parts:
     perception's page-only pass (:func:`yuki.perception.tree._read_pages`: the
     window frame and its Document elements, nothing inside the page) on a
     worker thread of its own, bounded to :data:`PAGE_PROBE_S`;
-  - ``present`` vs ``away``: present while the last keyboard/mouse input
-    (``GetLastInputInfo``, system idle time - no hooks, no input monitoring)
+  - ``present`` vs ``away``: present while the user's last real input
+    (:func:`yuki.memory.watcher.user_idle_s`: a key, a click, the wheel, the
+    mouse travelling the takeover distance, read through Raw Input as counts
+    and times only; a vibrating sensor's tiny moves and Yuki's own input left
+    out, :mod:`yuki.memory.userpresence`)
     is under :data:`AWAY_AFTER_S` old, or while the app in front plays media;
     otherwise ``away``. Time while the app in front plays media is
     ``passive`` (watching or listening) whatever the input says: the idle
@@ -1262,8 +1265,10 @@ class TimelineRecorder:
             now = time.time()
             self._acc_at = now
             self._input_at = now - self._w.user_idle_s()
+            presence = getattr(self._w, "presence_facts", None)
             self._log("timeline_start", away_after_s=AWAY_AFTER_S, media_every_s=MEDIA_EVERY_S,
-                      flush_every_s=FLUSH_EVERY_S, paused=self._paused)
+                      flush_every_s=FLUSH_EVERY_S, paused=self._paused,
+                      presence=presence() if callable(presence) else None)
             self._foreground(self._root(int(u.GetForegroundWindow() or 0)), now)
         except BaseException as exc:
             self._start_error = exc
