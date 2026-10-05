@@ -619,8 +619,8 @@ LAUNCH_WAIT_MAX_S = 60
 FINISHES_FIELD = "finishes_with"
 FINISHES_SCHEMA: dict[str, Any] = {
     "type": "boolean",
-    "description": "true when this call alone completes what they asked: it ends the request with a line made from "
-                   "its verified report (no done).",
+    "description": "true when this call alone completes what they asked: its verified report ends the request (no "
+                   "done).",
 }
 #: The text field kept beside it: the outcome in the brain's own words, only when the report cannot name it the way the
 #: user asked (a key, a click).
@@ -929,8 +929,7 @@ STEP_SCHEMA: dict[str, Any] = STEP_SCHEMA_VOICE
 NOW_FIELD = "now"
 NOW_SCHEMA: dict[str, Any] = {
     "type": "string",
-    "description": "Optional, shown to them live: what you check or do and why, plain words, at most 12, no tool "
-                   "names or ids",
+    "description": "Optional, shown live: what you do and why, at most 12 plain words, no tool names or ids",
 }
 #: The actions, the situation check and the reads a step usually waits on (the rarer reads go without it).
 NOW_TOOLS: tuple[str, ...] = tuple(dict.fromkeys(ACTION_TOOL_NAMES + (
@@ -1002,7 +1001,22 @@ STATES_SCHEMA: dict[str, Any] = {
                    "own player volume. [] for none.",
 }
 TOOLS_BY_NAME["done"]["input_schema"]["properties"][STATES_FIELD] = STATES_SCHEMA
-TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD]
+#: fix6 (report 73, release 6: two replies said "checked" / "confirmed" below that level, one claimed a queue opened and
+#: closed when no action ran): the brain classes its own message; the loop holds a class its steps do not back
+#: (``yuki.agent.finish.claim_gap``) and, below likely, the user gets the verdict's line unless it is ``tried``
+#: (``finish.honest_text``). Judgement with worked examples, never a reading of the words.
+CLAIMS_FIELD = "claims"
+CLAIMS_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["checked", "done", "tried", "answer"],
+    "description": "What your message claims. checked: you saw or confirmed the result (\"It's at 30% now, read back\"); "
+                   "done: it got done (\"Closed Slack\"); tried: what you tried and that it failed or could not be "
+                   "confirmed (\"I clicked Queue but couldn't see it open\"); answer: only what you found, nothing "
+                   "done. Never past what your steps showed.",
+}
+TOOLS_BY_NAME["done"]["input_schema"]["properties"][CLAIMS_FIELD] = CLAIMS_SCHEMA
+TOOLS_BY_NAME["done"]["input_schema"]["required"] = ["message", ABOUT_FIELD, ACHIEVED_FIELD, STATES_FIELD,
+                                                     CLAIMS_FIELD]
 
 #: Tools the agent loop runs itself (not the dispatcher, not memory): the helper team.
 AGENT_TOOLS: frozenset[str] = frozenset({"spawn_helpers"})

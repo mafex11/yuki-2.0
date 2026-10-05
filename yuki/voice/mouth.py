@@ -1263,19 +1263,21 @@ NOTHING_DONE_NOTE = (
 OUTCOME_NOTES = {
     "unverified": (
         "Not confirmed: it was tried, but nothing showed that it worked ({checked}). Say in a few words of your own what "
-        "was tried and that you couldn't confirm it, and never that it worked, is done, sent, closed or open, whatever "
-        "the result's words say. E.g. result \"Sent it to Ana.\", checked \"the message did not show up in the chat\": "
+        "was tried and that you couldn't confirm it, and never that it worked, is done, sent, closed or open, or that "
+        "you checked or confirmed it, whatever the result's words say. E.g. result \"Sent it to Ana.\", checked \"the message did not show up in the chat\": "
         "\"I tried to send it to Ana, but I couldn't confirm it went.\" Result \"Warp's full screen now.\": \"I tried to "
         "make Warp full screen, but I couldn't check that it worked.\""),
     "failed": (
         "It did not work ({checked}; the step: {step}). Say plainly in a few words what did not work; say that another "
-        "part worked only when the result says so. Never that it is done. E.g. result \"Closed Slack.\": \"Closing "
+        "part worked only when the result says so. Never that it is done, checked or confirmed. E.g. result \"Closed Slack.\": \"Closing "
         "Slack didn't work, it's still open.\" Result \"Opened Spotify and paused YouTube.\", step \"Pausing YouTube\": "
         "\"Spotify's open, but pausing YouTube didn't work.\""),
     # an answer that tells the screen's state without having read it (nothing was done)
     "unread": (
-        "Not checked: what it says about the screen was not read just now. Say it as what you think, not as seen, in a "
-        "few words: e.g. result \"The video's paused.\": \"I think it's paused, but I haven't checked.\""),
+        "Not checked: what it says about the screen was not read just now, and nothing was done. Say it as what you "
+        "think, not as seen, in a few words, never that you did, checked or confirmed anything: e.g. result \"The "
+        "video's paused.\": \"I think it's paused, but I haven't checked.\" Result \"Opened the queue and closed it, "
+        "confirmed.\": \"I haven't actually done that yet.\""),
 }
 #: What the result's ``outcome`` field says per level (plain words, the same everywhere).
 OUTCOME_WORDS = {"unverified": "not confirmed", "failed": "did not work", "unread": "not checked"}

@@ -347,7 +347,7 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
         return {"level": level, "label": LEVEL_LABELS[level], "acted": False,
                 "seen": "what the reply says about the screen was not read in this request" if unbacked else "",
                 "send": None, "partial": False, "line": LINE_UNREAD if unbacked else "", "step": "", "steps": 0,
-                "open": 0}
+                "open": 0, "unbacked": len(unbacked)}
     levels = [step_level(s) for s in actions]
     # the request ended on the action the brain marked as completing it, and that action verified (the loop finishes
     # only then): the last verified action
@@ -386,7 +386,90 @@ def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] |
                       for i, lv in enumerate(levels) if lv == VERIFIED})
     return {"level": level, "label": LEVEL_LABELS[level], "acted": True, "seen": seen, "send": send,
             "partial": partial, "line": line, "step": step, "steps": len(actions), "open": len(still),
-            "checked": checked}
+            "checked": checked, "unbacked": len(unbacked)}
+
+
+# ---------------------------------------------------------------------------
+# What the closing message claims (fix6, report 73 release 6: "honest wording")
+# ---------------------------------------------------------------------------
+
+#: What a ``done`` message claims, as the brain itself classes it (``done.claims``; judgement with worked examples in
+#: its schema, never a reading of the words here): ``checked`` (it says the result was seen or confirmed), ``done``
+#: (it says something got done), ``tried`` (what was tried, and that it failed or could not be confirmed), ``answer``
+#: (only what was found; nothing done). Strongest first.
+CLAIM_CHECKED, CLAIM_DONE, CLAIM_TRIED, CLAIM_ANSWER = "checked", "done", "tried", "answer"
+CLAIMS = (CLAIM_CHECKED, CLAIM_DONE, CLAIM_TRIED, CLAIM_ANSWER)
+
+#: Said in place of a closing message that claims something got done (or was checked) when no action ran in the
+#: request (live 5 Oct run 19: no action, yet "I opened and closed the queue, confirmed").
+LINE_NOTHING_DONE = "I haven't done that: nothing was done on screen for it."
+LINE_NOT_CHECKED = "I haven't checked that on screen."
+
+
+def claim(value: Any) -> str | None:
+    """A ``done``'s declared claim (:data:`CLAIMS`), or ``None`` when it gave none or something else."""
+    word = " ".join(str(value or "").split()).casefold()
+    return word if word in CLAIMS else None
+
+
+def claim_gap(claims: str | None, verdict: dict[str, Any] | None, *, read: bool = False) -> str | None:
+    """What a closing message claims beyond what this request's steps showed, in words for the brain, or ``None``.
+
+    ``claims``: the brain's own class of its message (:func:`claim`); ``verdict``: :func:`outcome_verdict` of the run
+    so far (with no unbacked claims); ``read``: a read of the screen or memory ran in this request. Facts only:
+
+    * nothing was done and it says something got done (or was checked, with nothing read either);
+    * it says checked or confirmed while no step's own check showed it (the level is below verified);
+    * it says it got done while the level is below likely (not confirmed, or it did not work).
+
+    ``None`` claims (none declared, an older brain) are not checked here; the closing text obeys the level anyway
+    (:func:`honest_text`)."""
+    if claims is None or not isinstance(verdict, dict):
+        return None
+    level = str(verdict.get("level") or "")
+    seen = " ".join(str(verdict.get("seen") or "").split())
+    because = f" ({seen})" if seen else ""
+    if not verdict.get("acted"):
+        if claims == CLAIM_DONE:
+            return ("it says you did something, but no action ran in this request: do it now, or say plainly that it "
+                    "was not done")
+        if claims == CLAIM_CHECKED and not read:
+            return ("it says you checked something, but nothing was read in this request: look first, or say plainly "
+                    "that you have not checked")
+        return None
+    if claims == CLAIM_CHECKED and level != VERIFIED:
+        return (f"it says you checked or confirmed it, but no step's own check showed it: the result is "
+                f"\"{str(verdict.get('label') or level).lower()}\"{because}; say what you did and what the check "
+                f"showed, never checked or confirmed")
+    if claims == CLAIM_DONE and level in (UNVERIFIED, FAILED):
+        return (f"it says it got done, but the result is \"{str(verdict.get('label') or level).lower()}\"{because}; "
+                f"say what you tried and that it {'did not work' if level == FAILED else 'could not be confirmed'}")
+    return None
+
+
+def honest_text(text: str, verdict: dict[str, Any] | None, claims: str | None) -> tuple[str, str | None]:
+    """The closing text the user gets, obeying the request's outcome level: ``(text, why replaced or None)``.
+
+    At ``likely`` or stronger, or an answer with nothing done and nothing unbacked, the brain's words stand. Below
+    likely they stand only when the brain classed them as what was tried (``tried``) and the claim check backed
+    everything they tell (no ``unbacked``); otherwise the user gets the verdict's own fixed line, never an unbacked
+    claim. With nothing done: a message that claims something got done becomes :data:`LINE_NOTHING_DONE`, one that
+    claims a check becomes :data:`LINE_NOT_CHECKED`; any other unread answer keeps its words (the surfaces add "not
+    checked" after them). Fixed sentences over measured facts and the brain's own class; the words are never read."""
+    if not isinstance(verdict, dict) or verdict.get("level") in SAYABLE or not verdict.get("level"):
+        return text, None
+    if not verdict.get("acted"):
+        if claims == CLAIM_DONE:
+            return LINE_NOTHING_DONE, "nothing_done"
+        if claims == CLAIM_CHECKED:
+            return LINE_NOT_CHECKED, "not_checked"
+        return text, None
+    if claims == CLAIM_TRIED and not verdict.get("unbacked"):
+        return text, None
+    line = " ".join(str(verdict.get("line") or "").split())
+    if not line:
+        return text, None
+    return line, "below_likely"
 
 
 def sayable(verdict: dict[str, Any] | None) -> bool:
@@ -575,4 +658,5 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
 __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
            "LEARNED_UNVERIFIABLE", "LEVELS", "LEVEL_LABELS", "LIKELY", "PAGE_SCROLL_UNVERIFIABLE", "SAYABLE",
            "SEND_CONFIRMED", "SEND_UNCHECKED", "SEND_UNCONFIRMED", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
-           "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level"]
+           "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
+           "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "honest_text"]

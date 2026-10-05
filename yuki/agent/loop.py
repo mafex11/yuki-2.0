@@ -63,6 +63,7 @@ from yuki.agent.memory import (
 from yuki.agent.prompt import profile_text, rules_text, system_blocks
 from yuki.agent.tools import (
     ABOUT_FIELD,
+    CLAIMS_FIELD,
     STATES_FIELD,
     ALL_TOOL_NAMES,
     ACTION_TOOL_NAMES,
@@ -455,6 +456,9 @@ class _Turn:
     done_about: list[int] | None = None
     #: N3: the states the ``done`` of this response tells, each with the step it says showed it (``states``).
     done_states: list[dict[str, Any]] = field(default_factory=list)
+    #: fix6: what the ``done`` of this response claims, as the brain classes it (``claims``: checked, done, tried,
+    #: answer; ``None``: none given).
+    done_claims: str | None = None
     #: The user answered a question in this response (``ask_user`` or a risk confirmation).
     asked: bool = False
     #: ``(tool, why)`` of actions this response ran whose own report shows the effect did not happen (revamp D, S2):
@@ -1405,6 +1409,8 @@ class Agent:
         #: honest (87): the claims of the closing message the claim check could not back after asking once (its gaps):
         #: the outcome verdict is no stronger than "not confirmed" while one stands.
         self._unbacked: list[str] = []
+        #: fix6: what the accepted done's message claims, as the brain classed it (``claims``); ``None``: none given.
+        self._done_claims: str | None = None
         self._last_verdict: dict[str, Any] | None = None
         self._finished_by_action = False
         #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
@@ -2446,9 +2452,12 @@ class Agent:
                     window_view=view,
                 )
                 if turn.finished:
-                    final = self._with_list_left(turn.finished[0])
+                    verdict = self._outcome_verdict()
+                    if self._finished_by_action:
+                        self._done_claims = None   # its line is written by code from the verified report
+                    final = self._with_list_left(self._honest_final(turn.finished[0], verdict))
                     self.logger.final(final)
-                    yield Final(final, outcome=self._outcome_verdict())
+                    yield Final(final, outcome=verdict)
                     return
                 continue
 
@@ -2502,9 +2511,11 @@ class Agent:
                     f"alongside done.")
                 continue
             if text:
-                text = self._with_list_left(text)
+                verdict = self._outcome_verdict()
+                self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
+                text = self._with_list_left(self._honest_final(text, verdict))
                 self.logger.final(text)
-                yield Final(text, outcome=self._outcome_verdict())
+                yield Final(text, outcome=verdict)
             else:
                 message = f"The model stopped with nothing to say (stop_reason={stop_reason})."
                 self.logger.error(message)
@@ -2562,18 +2573,21 @@ class Agent:
                 self.logger.log("claim_accepted", why="asked once already this request", about=turn.done_about)
             if turn.finished and not turn.failed:
                 self._unbacked = gaps   # honest (87): what the done says that nothing backs caps the verdict
+                self._done_claims = turn.done_claims
             return held
         gaps = self._claim_gaps(turn)
         if not gaps:
             self._unbacked = []
+            self._done_claims = turn.done_claims
             return held
         self._claim_rounds += 1
         self.logger.log("claim_held", gaps=gaps, about=turn.done_about, message=turn.finished[0])
         turn.finished.clear()
         held.append(({"type": "text", "text": (
             f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
-            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows. A done that no "
-            f"step backs reaches them as not confirmed, so word it as what you tried.")},
+            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows, its claims no "
+            f"stronger than your steps showed. A done that no step backs reaches them as not confirmed, so word it as "
+            f"what you tried.")},
             "a claim about the screen had no evidence"))
         return held
 
@@ -2601,7 +2615,36 @@ class Agent:
         gaps += [f"it says how window {hwnd} is now, but this request has neither read it nor acted on it with a "
                  f"verified result" for hwnd in (turn.done_about or []) if hwnd not in self._evidence]
         gaps += self._state_gaps(turn.done_states)
+        claimed = self._claim_gap(turn.done_claims)
+        if claimed:
+            gaps.append(claimed)
         return gaps
+
+    def _claim_gap(self, claims: str | None) -> str | None:
+        """fix6 (report 73, release 6): what the done's own class of its message (``claims``) says beyond this
+        request's run so far: a claim of something done when no action ran, "checked" above the level, "done" below
+        likely (:func:`yuki.agent.finish.claim_gap`). Facts of the run trace only, never the words."""
+        if claims is None:
+            return None
+        trace = getattr(self, "_trace", None) or []
+        try:
+            verdict = finish_gate.outcome_verdict(trace, finished_by_action=bool(getattr(self, "_finished_by_action",
+                                                                                          False)))
+        except Exception:  # noqa: BLE001 - the check never breaks a request
+            return None
+        read = any(s.get("kind") in ("read", "memory") and s.get("ok") for s in trace if isinstance(s, dict))
+        return finish_gate.claim_gap(claims, verdict, read=read)
+
+    def _honest_final(self, text: str, verdict: dict[str, Any] | None) -> str:
+        """fix6: the closing text obeys the outcome verdict (:func:`yuki.agent.finish.honest_text`): below likely the
+        user gets the verdict's own line unless the done classed its words as what was tried and nothing in them was
+        left unbacked. Logged without words."""
+        claims = getattr(self, "_done_claims", None)
+        out, why = finish_gate.honest_text(text, verdict, claims)
+        if why is not None and out != text:
+            self.logger.log("final_held", why=why, level=(verdict or {}).get("level"), claims=claims,
+                            text_chars=len(text or ""))
+        return out
 
     def _state_gaps(self, states: list[dict[str, Any]]) -> list[str]:
         """N3 (report 47): the states a done tells (``states``) that no step of this request showed: the step it names
@@ -3221,6 +3264,7 @@ class Agent:
             turn.done_about = [h for h in (_as_hwnd(v) for v in about) if h] if isinstance(about, list) else []
             states = tool_input.get(STATES_FIELD)
             turn.done_states = [s for s in states if isinstance(s, dict)][:8] if isinstance(states, list) else []
+            turn.done_claims = finish_gate.claim(tool_input.get(CLAIMS_FIELD))
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
