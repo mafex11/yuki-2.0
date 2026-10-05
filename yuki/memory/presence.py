@@ -387,7 +387,10 @@ spelling, an expansion or a guess of your own. When lines disagree, a later corr
 over an earlier line ("Hollis, not NIST": say Hollis).
 - recap: the user's own words and plans ("you said you'd ...", "you told Sam you'd send the link") - what \
 someone asked of them only as the reason for their plan; never what anyone else said they would do, never \
-an amount of money.
+an amount of money. Never anything personal and sensitive about the user, even in their own words: their \
+sexuality, a health matter (therapy, medication, a diagnosis), their money accounts, where their passwords or \
+seed phrases are, legal trouble - a card on the corner of their screen is not the place; with nothing else \
+to say: none.
 - plans: one short line naming the plan, who it is with and when, then the reminder question ("Tomorrow's the \
 setup call you set with Sam before his restart on the 12th - want a reminder at 8 pm?"); never an amount.
 - followup: a question, like a friend asking how it went.

@@ -137,9 +137,27 @@ def test_route_keeps_jokes_others_words_and_sensitive_facts_out_of_memory():
     assert A.route("others", "fact", V("drop", "none", "")) == A.HOLD_DROP
     assert A.route("user", "fact", None) == A.HOLD_CALL                                  # unjudged: waits
     assert A.route("user", "humor", V("drop", "none", "")) is None                       # a labelled joke stays a joke
-    assert A.route("user", "uncertain", None) is None                                    # never a fact anyway
     assert A.route("user", "fact", V("admit", "money", "")) == A.HOLD_SENSITIVE          # the judge's mark
     assert A.route("user", "humor", None, "sexuality") == A.HOLD_SENSITIVE               # the journal's mark
+    # possibly misheard (review F2): held, not stored - unless the "Maybe misheard" list asks about it (its guess)
+    assert A.route("user", "uncertain", V("admit", "none", "")) == A.HOLD_CALL
+    assert A.route("user", "uncertain", None) == A.HOLD_CALL
+    assert A.route("user", "uncertain", V("drop", "none", "")) == A.HOLD_DROP
+    assert A.route("user", "uncertain", V("ask", "none", ""), listed=True) is None
+    # someone else's words never go in, whatever the label; the judge's drop wins over the label (review F2)
+    assert A.route("others", "uncertain", V("drop", "none", "")) == A.HOLD_DROP
+    assert A.route("others", "uncertain", V("ask", "none", "")) == A.HOLD_CALL
+    assert A.route("others", "uncertain", V("ask", "none", ""), listed=True) == A.HOLD_CALL
+    assert A.route("others", "humor", None) == A.HOLD_CALL
+    assert A.route("game", "fact", V("admit", "none", "")) == A.HOLD_CALL
+
+
+def test_held_links_keep_work_and_questions_off_held_facts():
+    facts = [SimpleNamespace(held=None), SimpleNamespace(held=A.HOLD_SENSITIVE), SimpleNamespace(held=A.HOLD_DROP)]
+    ops = [SimpleNamespace(fact_indexes=[1]), SimpleNamespace(fact_indexes=[1, 2]), SimpleNamespace(fact_indexes=[0, 1]),
+           SimpleNamespace(fact_indexes=[])]
+    kept, left = A.unheld_links(facts, ops)
+    assert kept == [ops[2], ops[3]] and left == 2
 
 
 def test_the_judges_answer_is_checked():
@@ -175,13 +193,14 @@ def test_a_calls_plans_go_in_and_claims_jokes_others_words_and_sensitive_facts_w
     [result], client = journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]})
     assert result.ok and [r["tools"][0]["name"] for r in client.requests] == ["record_call_side", "admit_call_facts"]
     visible = {e.fact: e.nature for e in store.journal_between()}
-    assert visible == {"The user will send the hostel link after dinner.": "fact",
-                       "The user bought generic prices.": "uncertain"}   # UNCLEAR: possibly misheard, never a fact
-    held = {h.fact: h.reason for h in A.held_facts(store, now=T0 + 3600)}
-    assert held == {"The user has five girlfriends.": A.HOLD_DROP,
-                    "The user has been to Japan four times.": A.HOLD_CALL,
-                    "Someone on the call said the trek starts at 6 AM on 11 October.": A.HOLD_CALL,
-                    "The user said they started therapy in September.": A.HOLD_SENSITIVE}
+    assert visible == {"The user will send the hostel link after dinner.": "fact"}
+    held = {h.fact: (h.reason, h.nature) for h in A.held_facts(store, now=T0 + 3600)}
+    assert held == {"The user has five girlfriends.": (A.HOLD_DROP, "fact"),
+                    "The user has been to Japan four times.": (A.HOLD_CALL, "fact"),
+                    "Someone on the call said the trek starts at 6 AM on 11 October.": (A.HOLD_CALL, "fact"),
+                    # UNCLEAR: possibly misheard - held, not stored (review F2)
+                    "The user bought generic prices.": (A.HOLD_CALL, "uncertain"),
+                    "The user said they started therapy in September.": (A.HOLD_SENSITIVE, "fact")}
     japan = next(h for h in A.held_facts(store, now=T0 + 3600) if "Japan" in h.fact)
     assert japan.shown == "You've been to Japan four times." and japan.call_id == cid
     # the judge's request carried the line each fact rests on; the judge's cost counts toward the batch
@@ -190,13 +209,41 @@ def test_a_calls_plans_go_in_and_claims_jokes_others_words_and_sensitive_facts_w
     assert result.usage["input_tokens"] == 2000
 
 
-def test_when_the_judge_fails_every_claim_waits(store):
+def test_a_friends_tease_on_an_unclear_line_never_becomes_an_uncertain_fact_about_the_user(store):
+    # review F2: the judge's drop and the others rule come before the uncertain label
+    call_with(store, [line(T0 + 10, "he's literally addicted to energy drinks", "others", unclear=True),
+                      line(T0 + 14, "shut up man")])
+    tease = {"text": "The user drinks a lot of energy drinks.", "nature": "fact", "importance": 4, "source": 1,
+             "user_said": False, "involves_user": True, "sensitive": "none"}
+    [result], _client = journal(store, {"record_call_side": [{"facts": [tease], "commitments": [], "questions": []}],
+                                        "admit_call_facts": [{"verdicts": [verdict(1, "drop")]}]})
+    assert result.ok and store.journal_between() == []
+    assert [(h.fact, h.reason) for h in A.held_facts(store, now=T0 + 3600)] == \
+        [("The user drinks a lot of energy drinks.", A.HOLD_DROP)]
+
+
+def test_when_the_judge_fails_the_batch_is_read_again_and_only_the_last_attempt_stores_unjudged(store):
+    # review F3: an unjudged call holds even the user's own plans with no line a card can show - so try again first
     call_with(store, SCENE)
-    [result], _client = journal(store, {"record_call_side": [CALL_ANSWER],
-                                        "admit_call_facts": [RuntimeError("timeout")]})
-    assert result.ok
-    assert [e.fact for e in store.journal_between()] == ["The user bought generic prices."]   # uncertain anyway
-    assert len(A.held_facts(store, now=T0 + 3600)) == 5
+    answers = {"record_call_side": [CALL_ANSWER], "admit_call_facts": [RuntimeError("overloaded")]}
+    [first], _client = journal(store, answers)
+    assert not first.ok and "admission judge failed" in (first.error or "")
+    assert store.journal_between() == [] and A.held_facts(store, now=T0 + 3600) == []
+    [pending] = store.pending_captures()
+    assert pending.attempts == 1                     # one attempt spent; read again on the next round
+    [second], _client = journal(store, answers)
+    assert not second.ok
+    [third], _client = journal(store, answers)       # the last attempt: stored, every claim waiting
+    assert third.ok and store.journal_between() == []
+    held = A.held_facts(store, now=T0 + 3600)
+    assert len(held) == 6 and not any(h.source.get(A.SHOWN_KEY) for h in held)
+
+
+def test_after_one_failed_judge_the_next_round_admits_the_plans(store):
+    call_with(store, SCENE)
+    journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [RuntimeError("overloaded")]})
+    [again], _client = journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]})
+    assert again.ok and [e.fact for e in store.journal_between()] == ["The user will send the hostel link after dinner."]
 
 
 def test_when_the_judge_cannot_reach_the_model_the_batch_is_read_again_later(store):
@@ -215,17 +262,29 @@ def test_a_screen_fact_marked_sensitive_waits_for_the_users_yes(store):
 
     tid = store.upsert_thread("Google Chrome", "Northbank - Holdings", None, kind="page")
     store.add_capture(tid, T0, "foreground", "Holdings 12 funds", "Holdings 12 funds", kind="page")
+    store.add_capture(tid, T0 + 30, "foreground", "Relay docs: setup", "Relay docs: setup", kind="page")
 
-    def sfact(text: str, sensitive: str) -> dict:
-        return {"text": text, "nature": "fact", "importance": 5, "source": 1, "content_date": "", "milestone": False,
-                "other_ai": False, "user_said": "no", "sensitive": sensitive}
+    def sfact(text: str, sensitive: str, source: int = 1, shown: str = "") -> dict:
+        return {"text": text, "nature": "fact", "importance": 5, "source": source, "content_date": "",
+                "milestone": False, "other_ai": False, "user_said": "no", "sensitive": sensitive,
+                "sensitive_shown": shown}
 
-    answer = {"facts": [sfact("The user checked the holdings in their Northbank brokerage account.", "money"),
-                        sfact("The user had Google Chrome open.", "none")], "questions": [], "work": []}
+    def work(title: str, source: int) -> dict:
+        return {"thread": 0, "action": "starts", "title": title, "state": "Started.", "open_items": [],
+                "entities": [], "sources": [source]}
+
+    answer = {"facts": [sfact("The user checked the holdings in their Northbank brokerage account.", "money",
+                              shown="You checked your Northbank holdings."),
+                        sfact("The user read the Relay setup docs.", "none", 2, shown="ignored when not sensitive")],
+              "questions": [],
+              # review F8: a thread resting only on the held fact is left out with it
+              "work": [work("Northbank investments", 1), work("Relay setup", 2)]}
     [result], _client = journal(store, {"record_facts": [answer]})
-    assert result.ok and [e.fact for e in store.journal_between()] == ["The user had Google Chrome open."]
+    assert result.ok and [e.fact for e in store.journal_between()] == ["The user read the Relay setup docs."]
     [held] = A.held_facts(store, now=T0 + 60)
-    assert held.reason == A.HOLD_SENSITIVE
+    assert held.reason == A.HOLD_SENSITIVE and held.shown == "You checked your Northbank holdings."
+    assert A.SHOWN_KEY not in (store.journal_between()[0].source or {})
+    assert [t.title for t in store.work_threads(("active", "paused", "done"))] == ["Relay setup"]
     for tool in (RECORD_FACTS_TOOL, RECORD_CALL_SIDE_TOOL):
         item = tool["input_schema"]["properties"]["facts"]["items"]
         assert "sensitive" in item["required"] and item["properties"]["sensitive"]["enum"][0] == "none"
@@ -237,8 +296,10 @@ def test_a_screen_fact_marked_sensitive_waits_for_the_users_yes(store):
 
 
 def held_fact(store: Store, text: str, reason: str | None, *, at: float = T0, call: int = 5, importance: int = 5,
-              shown: str = "", nature: str = "fact") -> int:
+              shown: str = "", nature: str = "fact", who: str = "user") -> int:
     source = {"kind": "call", "by": "the user", "where": "Discord call", "at": at, "call": f"call:{call}"}
+    if who == "others":
+        source.update(who="others", by="someone on the call")
     if shown:
         source[A.SHOWN_KEY] = shown
     fact = NewFact(at=at, thread_id=None, app="Discord", host=None, fact=text, importance=importance,
@@ -269,6 +330,50 @@ def test_keep_joke_not_true_and_undo(store):
     assert A.resolve_held(store, 999_999, "keep") is None
     diary = store.changelog(pass_=A.DIARY_PASS)
     assert len(diary) == 4 and all("held J" in d["text"] for d in diary)
+
+
+def test_its_a_joke_on_someone_elses_line_stays_out_and_keep_marks_the_users_yes(store):
+    from yuki.memory.portrait import PortraitWorker
+
+    theirs = held_fact(store, "Someone on the call said the trek starts at 6 AM.", A.HOLD_CALL, who="others")
+    misheard = held_fact(store, "The user bought generic prices.", A.HOLD_CALL, nature="uncertain")
+    j = A.resolve_held(store, theirs, "joke", now=T0 + 100)   # review F5: a joke is the user's own humour only
+    assert j["answer"] == "not_true" and j["new_id"] is None and store.journal_between() == []
+    assert A.resolve_held(store, theirs, "undo", now=T0 + 110)["answer"] == "undo"   # nothing kept to take back
+    k = A.resolve_held(store, misheard, "keep", now=T0 + 120)
+    [kept] = store.journal_between()
+    assert kept.id == k["new_id"] and kept.nature == "fact"    # a misheard line he keeps is a fact now
+    assert kept.source[A.CONFIRMED_KEY] is True                # review F6: the portrait sees his yes
+    line_text = PortraitWorker._journal_line(kept, lambda v, cap: str(v or "")[:cap])
+    assert "[THE USER CONFIRMED THIS]" in line_text
+    from yuki.memory.portrait import ADMISSION_BAR
+    assert "THE USER CONFIRMED THIS" in ADMISSION_BAR
+
+
+def test_a_rejournal_keeps_the_users_answers(store):
+    # review F7: an answered held fact stays answered; the re-journal's fact on the same line carries the answer
+    call_with(store, SCENE)
+    journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]})
+    held = {h.fact: h for h in A.held_facts(store, now=T0 + 3600)}
+    japan, trek = held["The user has been to Japan four times."], \
+        held["Someone on the call said the trek starts at 6 AM on 11 October."]
+    A.resolve_held(store, japan.id, "not_true", now=T0 + 3700)
+    kept = A.resolve_held(store, trek.id, "keep", now=T0 + 3700)
+    from yuki.memory.journal import JournalWorker
+
+    admit_all = {"verdicts": [verdict(n, "admit") for n in range(1, 7)]}   # this time the judge would admit them
+    [(capture, batch)] = store.journaled_captures(thread_kind="my_call_side")
+    JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER], "admit_call_facts": [admit_all]}),
+                  embedder=StubEmbedder(), log_dir=Path(tempfile.mkdtemp())).rejournal(capture.thread_id, [capture],
+                                                                                        [batch])
+    current = [e.fact for e in store.journal_between()]
+    assert "The user has been to Japan four times." not in current               # Not true is not admitted again
+    assert current.count("Someone on the call said the trek starts at 6 AM on 11 October.") == 1   # Keep: once
+    assert kept["new_id"] in {e.id for e in store.journal_between()}
+    assert A.resolve_held(store, japan.id, "undo", now=T0 + 3800)["answer"] == "undo"   # its Undo still works
+    unanswered = {h.fact for h in A.held_facts(store, now=T0 + 3900)}
+    assert "The user has been to Japan four times." in unanswered and len(
+        [h for h in A.held_facts(store, now=T0 + 3900) if "Japan" in h.fact]) == 1
 
 
 def test_a_held_fact_lapses_after_the_hold_days_and_a_rejournal_replaces_it(store):
@@ -324,7 +429,7 @@ def test_a_call_recap_with_waiting_lines_is_a_keep_card_written_without_a_model(
     presence = PresenceWorker(worker)
     [call] = [c for c in store.calls(since=T0 - 60) if c.id == cid]
     look = presence._recap_look(f"recap:call:{cid}", [call], T0 + 3600)
-    assert look.meta["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times."}]
+    assert look.meta["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times.", "who": "user"}]
     out = presence.observe(T0 + 3600, NudgeConfig(), None, [], look)
     assert out["nudge_id"] and client.requests == []                    # no model call writes it
     mem = MemoryClient(store)
@@ -332,7 +437,7 @@ def test_a_call_recap_with_waiting_lines_is_a_keep_card_written_without_a_model(
         [mem._nudge_dict(store.nudge(out["nudge_id"]))]
     assert card["trigger"] == "recap" and card["kind"] == "notice"
     assert card["head"] == "From your Discord call: 1 thing I'd keep"
-    assert card["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times."}]
+    assert card["keep"] == [{"ref": f"journal:{jid}", "text": "You've been to Japan four times.", "who": "user"}]
     assert mem.recap_keep(out["nudge_id"], "journal:999999", "keep")["why"] == "not_on_card"
     assert mem.recap_keep(out["nudge_id"], f"journal:{jid}", "maybe")["why"] == "bad_answer"
     got = mem.recap_keep(out["nudge_id"], f"journal:{jid}", "keep")
@@ -340,6 +445,16 @@ def test_a_call_recap_with_waiting_lines_is_a_keep_card_written_without_a_model(
     assert mem.recap_keep(out["nudge_id"], f"journal:{jid}", "keep")["why"] == "already"
     assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
     assert presence._keep_look(f"recap:call:{cid}", [call], T0 + 3700) is None   # nothing waits any more
+
+
+def test_sensitive_matters_stay_off_the_recap_card_and_out_of_the_call_digest():
+    # review F4: when nothing waits, the old model-written recap reads the digest - neither carries the matter
+    from yuki.memory.calldigest import system_prompt as digest_prompt
+    from yuki.memory.presence import NOTICE_WRITER_PROMPT
+
+    assert "THE USER'S SENSITIVE MATTERS" in digest_prompt(["Sam"])
+    recap_rule = NOTICE_WRITER_PROMPT[NOTICE_WRITER_PROMPT.index("- recap: the user's own words"):]
+    assert "Never anything personal and sensitive about the user" in recap_rule.split("\n- plans:")[0]
 
 
 def test_held_facts_for_a_private_surface_never_list_dropped_ones(store):

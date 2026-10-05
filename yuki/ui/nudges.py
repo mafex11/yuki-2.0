@@ -477,7 +477,8 @@ class KeepRows(QWidget):
         self.rows: dict[str, dict[str, Any]] = {}
 
     def set_items(self, items: list[dict[str, Any]]) -> None:
-        """One row per line (``{"ref", "text"}``), all unanswered."""
+        """One row per line (``{"ref", "text", "who"}``), all unanswered; a line resting on someone else's words
+        (``who`` others) has no "It's a joke"."""
         from yuki.ui import lattice as L
 
         while self._col.count():
@@ -500,6 +501,8 @@ class KeepRows(QWidget):
             keys_row.setSpacing(6)
             keys = []
             for answer, label in KEEP_ANSWERS:
+                if answer == "joke" and item.get("who") == "others":
+                    continue   # a joke is the user's own humour; someone else's line is Keep or Not true (review F5)
                 key = L.Key(label, variant="pri" if answer == "keep" else "", size="xs", parent=box)
                 key.clicked.connect(lambda _c=False, r=ref, a=answer: self.answered.emit(r, a))
                 keys_row.addWidget(key)

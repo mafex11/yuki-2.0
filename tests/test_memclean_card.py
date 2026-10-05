@@ -25,8 +25,9 @@ KEEP = {"id": 41, "kind": "notice", "trigger": "recap", "at": None,
         "text": "From your call with Tara: 2 things I'd keep\n- You've been to Japan four times.\n- Someone on the "
                 "call said the trek starts at 6 AM on 11 October.",
         "head": "From your call with Tara: 2 things I'd keep",
-        "keep": [{"ref": "journal:7", "text": "You've been to Japan four times."},
-                 {"ref": "journal:8", "text": "Someone on the call said the trek starts at 6 AM on 11 October."}]}
+        "keep": [{"ref": "journal:7", "text": "You've been to Japan four times.", "who": "user"},
+                 {"ref": "journal:8", "text": "Someone on the call said the trek starts at 6 AM on 11 October.",
+                  "who": "others"}]}
 
 
 class Memory:
@@ -65,6 +66,8 @@ def test_a_keep_list_card_shows_each_line_with_its_three_answers(qapp):
     row = card.keep_rows.rows["journal:7"]
     assert [k.text() for k in row["keys"]] == [label for _a, label in KEEP_ANSWERS] == ["Keep", "Not true",
                                                                                         "It's a joke"]
+    # review F5: someone else's line is Keep or Not true - a joke is only ever the user's own
+    assert [k.text() for k in card.keep_rows.rows["journal:8"]["keys"]] == ["Keep", "Not true"]
     assert card.reply_button.isHidden() and not card.dismiss_button.isHidden()   # Dismiss / Less like this stay
     card.set_nudge({**KEEP, "keep": None, "head": None})   # an ordinary recap: no rows, Reply as before
     assert card.keep_rows.isHidden() and not card.reply_button.isHidden()
@@ -87,7 +90,7 @@ def test_a_press_is_answered_by_memory_and_the_row_says_so_with_undo(qapp):
     assert ("recap_keep", 41, "journal:7", "keep") in memory.calls and memory.acks == [(41, "accepted")]
     assert rows["journal:7"]["state"].text() == "Kept." and not rows["journal:7"]["undo"].isHidden()
     assert all(k.isHidden() for k in rows["journal:7"]["keys"])
-    rows["journal:8"]["keys"][2].click()           # It's a joke, but memory has an answer already
+    rows["journal:8"]["keys"][1].click()           # Not true, but memory has an answer already
     _settle(qapp, ctl)
     assert rows["journal:8"]["state"].text() == "Already answered." and rows["journal:8"]["undo"].isHidden()
     assert memory.acks == [(41, "accepted")]       # the card is acknowledged once

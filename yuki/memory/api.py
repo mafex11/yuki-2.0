@@ -2062,7 +2062,8 @@ class MemoryClient:
         moment = inputs.get("moment") if isinstance(inputs, dict) and n.trigger == "checkin" else None
         # a call's keep list (report 76 item 5, yuki.memory.admission): its lines, each answered with recap_keep
         keep = inputs.get("keep") if isinstance(inputs, dict) and n.trigger == "recap" else None
-        keep = [{"ref": str(k.get("ref")), "text": str(k.get("text") or "")} for k in keep or []
+        keep = [{"ref": str(k.get("ref")), "text": str(k.get("text") or ""),
+                 "who": "others" if k.get("who") == "others" else "user"} for k in keep or []
                 if isinstance(k, dict) and k.get("ref")] or None
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
                 "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None),
@@ -2133,24 +2134,31 @@ class MemoryClient:
 
     def held_facts(self, reasons: Any = None, days: float | None = None) -> list[dict]:
         """Facts memory is holding back until the user says yes (yuki.memory.admission), newest first: ``{"ref",
-        "text" (said to the user), "fact", "reason" (call | sensitive), "at" ISO, "call"}``. Dropped ones (judged not
-        meant) are never listed. For a private surface (the window); a sensitive one never goes on a corner card.
-        Answer with :meth:`resolve_held`. Read only, never raises."""
+        "text" (said to the user), "fact", "reason" (call | sensitive), "at" ISO, "call", "who" (user | others: whose
+        line, for a call), "kind" (call | page | message | ...: where it came from), "where", "shown" (``text`` is
+        Yuki's second-person line, not the stored "The user ..." sentence)}``. Dropped ones (judged not meant) are
+        never listed. For a private surface (the window's "Waiting for your yes"); a sensitive one never goes on a
+        corner card. Answer with :meth:`resolve_held`. Read only, never raises."""
         from yuki.memory import admission
 
         try:
             wanted = tuple(reasons) if reasons else (admission.HOLD_CALL, admission.HOLD_SENSITIVE)
             since = None if days is None else time.time() - float(days) * 86400.0
             return [{"ref": f"journal:{h.id}", "text": h.shown, "fact": h.fact, "reason": h.reason, "at": _iso(h.at),
-                     "call": f"call:{h.call_id}" if h.call_id is not None else None}
+                     "call": f"call:{h.call_id}" if h.call_id is not None else None,
+                     "who": "others" if h.source.get("who") == "others" else "user",
+                     "kind": str(h.source.get("kind") or ""), "where": str(h.source.get("where") or ""),
+                     "app": h.app,
+                     "shown": bool(h.source.get(admission.SHOWN_KEY))}
                     for h in admission.held_facts(self.store, since=since, reasons=wanted)
                     if h.reason != admission.HOLD_DROP]
         except Exception:
             return []
 
-    def resolve_held(self, ref: Any, answer: str) -> dict:
+    def resolve_held(self, ref: Any, answer: str, *, correction_id: int | None = None) -> dict:
         """The user's explicit answer to a held fact from a private surface (the window): as :meth:`recap_keep`,
-        without a card (``keep`` here is the explicit yes a sensitive fact needs)."""
+        without a card (``keep`` here is the explicit yes a sensitive fact needs). ``correction_id`` is accepted and
+        ignored (the window's answer path passes one; nothing here queues a correction pass)."""
         from yuki.memory import admission
 
         answer = str(answer or "").strip().lower()

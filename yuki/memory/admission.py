@@ -501,6 +501,7 @@ class HeldFact:
     reason: str
     source: dict[str, Any]
     reviewed_at: float | None = None
+    app: str = ""
 
     @property
     def shown(self) -> str:
@@ -537,7 +538,8 @@ def held_facts(store: Any, *, since: float | None = None, reasons: Sequence[str]
         held = HeldFact(id=int(r["id"]), at=float(r["at"]), fact=store.cipher.decrypt(r["fact_ciphertext"]),
                         nature=str(r["nature"] or "fact"), importance=int(r["importance"] or 1), reason=reason,
                         source=source if isinstance(source, dict) else {},
-                        reviewed_at=r["reviewed_at"] if "reviewed_at" in r.keys() else None)
+                        reviewed_at=r["reviewed_at"] if "reviewed_at" in r.keys() else None,
+                        app=str(r["app"] or ""))
         if wanted_calls is not None and held.call_id not in wanted_calls:
             continue
         out.append(held)
