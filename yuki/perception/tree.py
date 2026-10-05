@@ -87,6 +87,7 @@ reads only that (a page-only pass, nothing inside the pages) and
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 import time
 from collections.abc import Callable
@@ -147,6 +148,11 @@ _P_RANGE_VALUE_MAXIMUM = 30050
 #: The app's own name for a control (a web page's ``id``, a XAML ``x:Name``): part of an element's identity across
 #: reads when the provider gives no RuntimeId (appPerception, report 58).
 _P_AUTOMATION_ID = 30011
+#: Where a scrolling element stands (Scroll pattern, percent of the way; -1 when it does not scroll that way): the
+#: scroll position the outcome of a scroll is judged by (percFix: a page whose every visible item was replaced by a
+#: full-screen scroll has no lasting element to see move, but its position moved).
+_P_SCROLL_H_PERCENT = 30053
+_P_SCROLL_V_PERCENT = 30055
 _PATTERN_TEXT = 10014
 _TEXT_ENDPOINT_START = 0
 _TEXT_ENDPOINT_END = 1
@@ -184,7 +190,8 @@ _CACHED_PROPERTIES = (
 #: without one simply reads it as absent).
 _OPTIONAL_PROPERTIES = (_P_HELP_TEXT, _P_FULL_DESCRIPTION, _P_POSITION_IN_SET, _P_SIZE_OF_SET,
                         _P_IS_RANGE_VALUE_AVAILABLE, _P_RANGE_VALUE_VALUE, _P_RANGE_VALUE_IS_READONLY,
-                        _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM, _P_AUTOMATION_ID)
+                        _P_RANGE_VALUE_MINIMUM, _P_RANGE_VALUE_MAXIMUM, _P_AUTOMATION_ID, _P_SCROLL_H_PERCENT,
+                        _P_SCROLL_V_PERCENT)
 
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_CHILDREN = 2
@@ -519,6 +526,23 @@ class UIElement:
     hidden: bool = False
     #: A slider's ``(value, minimum, maximum)`` (RangeValue), else ``None``.
     range: tuple[float, float, float] | None = None
+    #: A scrolling element's position, ``(horizontal, vertical)`` percent of the way (-1 on an axis it does not
+    #: scroll), else ``None`` (percFix: what a scroll's outcome is judged by).
+    scroll: tuple[float, float] | None = None
+
+
+def _scroll_position(get: object) -> tuple[float, float] | None:
+    """A scrolling element's ``(horizontal, vertical)`` scroll percent, ``None`` when the provider gives neither as a
+    number (an optional property: an older UI Automation reads as absent)."""
+    out: list[float] = []
+    for prop in (_P_SCROLL_H_PERCENT, _P_SCROLL_V_PERCENT):
+        try:
+            value = get(prop)  # type: ignore[operator]
+        except Exception:
+            value = None
+        out.append(round(float(value), 2) if isinstance(value, (int, float)) and not isinstance(value, bool)
+                   else -1.0)
+    return (out[0], out[1]) if any(v >= 0 for v in out) else None
 
 
 #: The pattern flags :class:`UIElement` reports, in the order they are listed:
@@ -867,6 +891,15 @@ def _automation_id(get: object) -> str:
 
 #: Hidden-in-place controls (:func:`_hidden_in_place`) one read keeps, at most.
 _MAX_HIDDEN = 40
+#: The slider sweep (:meth:`_ViewportPass._sweep_sliders`): skipped when less than this is left of a read's budget (s);
+#: sliders looked at, at most; control-view levels climbed to a listed ancestor, at most; and how long a window found
+#: with no slider at all is not searched again (s).
+_SWEEP_MARGIN_S = 0.3
+_SWEEP_MAX = 24
+_SWEEP_CLIMB = 12
+_NO_SLIDERS_S = 30.0
+#: Windows whose last sweep found no slider, with when (monotonic).
+_no_sliders: dict[int, float] = {}
 #: Unread children (cap or clock) looked at per level for their names; the rest are only counted.
 _UNREAD_LOOKED = 40
 #: Names of left-out children kept per parent (:attr:`WindowTree.left_out`), and how much of each.
@@ -936,11 +969,6 @@ def _slider_value(get: object) -> str | None:
     return f"{value:g} (range {low:g}-{high:g}{', read-only' if read_only else ''})"
 
 
-#: A box at most this many px wide or tall is "no box" for :func:`_hidden_in_place`: a visually hidden web control is
-#: clipped to 1 px (``clip: rect(0 0 0 0); width: 1px; height: 1px``), or to nothing.
-_HIDDEN_BOX_PX = 2
-
-
 def _state_control(get: object) -> bool:
     """Whether an element carries a state the reader must not lose: a RangeValue (a slider) or a Toggle (a checkbox,
     a switch, a pressed button)."""
@@ -958,11 +986,17 @@ def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> boo
     reports them off-screen (or with no box at all) while the label sits in
     plain view; a switch's checkbox is hidden the same way.  True when the
     element has a RangeValue or Toggle pattern and either no box, or reports
-    off-screen with a box of at most :data:`_HIDDEN_BOX_PX` lying inside
-    ``area`` (the visible part of the window, or of the scrolling container it
-    is in).  A list row scrolled out of view has a full-size box outside
-    ``area``, so it is never taken for one.  Facts about patterns and
-    rectangles only.
+    off-screen with a box that lies at least partly inside ``area`` (the
+    visible part of the window, narrowed to the scrolling container it is in).
+    A list row scrolled out of view has its box outside ``area``, so it is
+    never taken for one.  Facts about patterns and rectangles only.
+
+    percFix (live 5 Oct, 0 of 8 Spotify reads listed the volume): the first
+    rule also wanted the box to be 1-2 px.  Chromium reports an element's
+    *unclipped* box, so an input clipped away inside a 1 px label still has
+    its own full size (Spotify's two "Resize main navigation" range inputs
+    were left out as "hidden" that way); off-screen while its box overlaps the
+    visible area is what "kept out of sight by the app" is.
     """
     if not _state_control(get):
         return False
@@ -975,8 +1009,7 @@ def _hidden_in_place(get: object, area: tuple[int, int, int, int] | None) -> boo
         return True
     if not offscreen:
         return False
-    small = bounds[2] - bounds[0] <= _HIDDEN_BOX_PX or bounds[3] - bounds[1] <= _HIDDEN_BOX_PX
-    return small and (area is None or _contains(area, bounds))
+    return area is None or _overlap(area, bounds) is not None
 
 
 def _states(get: object) -> tuple[str, ...]:
@@ -1257,6 +1290,7 @@ class _CachedWalker:
                 automation_id=_automation_id(get),
                 hidden=hidden,
                 range=_range_numbers(get) if ranged is not None else None,
+                scroll=_scroll_position(get) if is_scrollable else None,
             )
         )
         if hidden:
@@ -1697,6 +1731,10 @@ class _ViewportPass:
         frame = _window_rect(hwnd)
         self.viewport = _overlap(frame, virtual_screen_bounds()) if frame else None
         self.walker.viewport = self.viewport
+        #: The visible part of the scrolling container the walk is in (the viewport narrowed by every scrolling
+        #: ancestor): a state control reported off-screen with its box inside it is hidden in place, one outside it
+        #: is scrolled away (:func:`_hidden_in_place`, percFix).
+        self.scroll_clip = self.viewport
         self.rects: dict[int, tuple[int, int, int, int]] = {}
         for handle in handles:
             rect = _window_rect(handle)
@@ -1839,7 +1877,7 @@ class _ViewportPass:
         for child in children[:_UNREAD_LOOKED]:
             try:
                 get = child.GetCachedPropertyValue  # type: ignore[attr-defined]
-                if _as_bool(get(_P_IS_OFFSCREEN)) and not _hidden_in_place(get, self.clip or self.viewport):
+                if _as_bool(get(_P_IS_OFFSCREEN)) and not _hidden_in_place(get, self._hidden_area()):
                     continue
                 walker.note_left_out(depth, None, _role_name(get(_P_CONTROL_TYPE)), _as_text(get(_P_NAME)),
                                      unread=True)
@@ -1861,7 +1899,7 @@ class _ViewportPass:
             walker.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
-        if _hidden_in_place(get, self.clip or self.viewport):
+        if _hidden_in_place(get, self._hidden_area()):
             # A slider or switch the page hides in place: kept for its state, nothing below it read.
             runtime_id = _runtime_id(get)
             if runtime_id is not None:
@@ -1989,6 +2027,25 @@ class _ViewportPass:
             return self.clip
         return (_overlap(bounds, self.clip) if self.clip else None) or bounds
 
+    def _child_scroll_clip(self, get: object) -> tuple[int, int, int, int] | None:
+        """:attr:`scroll_clip` for the children of an element: narrowed to its box when it scrolls (what lies outside
+        a scrolling container's box is scrolled away, not hidden in place)."""
+        scrolls = _as_bool(get(_P_IS_SCROLL_AVAILABLE)) and (  # type: ignore[operator]
+            _as_bool(get(_P_SCROLL_VERTICALLY_SCROLLABLE))  # type: ignore[operator]
+            or _as_bool(get(_P_SCROLL_HORIZONTALLY_SCROLLABLE))  # type: ignore[operator]
+        )
+        if not scrolls:
+            return self.scroll_clip
+        bounds = _rect(get(_P_BOUNDING_RECT))  # type: ignore[operator]
+        if bounds is None:
+            return self.scroll_clip
+        return (_overlap(bounds, self.scroll_clip) if self.scroll_clip else bounds) or bounds
+
+    def _hidden_area(self) -> tuple[int, int, int, int] | None:
+        """Where a state control reported off-screen counts as hidden in place: the visible part of the scrolling
+        container it is in (geometry-only reads: :attr:`clip`, which is narrowed the same way)."""
+        return self.scroll_clip if self.trust_offscreen else (self.clip or self.viewport)
+
     def _count(self, get: object) -> None:
         self.nodes_seen += 1
         try:
@@ -2037,7 +2094,9 @@ class _ViewportPass:
         and "list my Chrome tabs" had no tabs to list).
         """
         saved = self.clip
+        saved_scroll = self.scroll_clip
         self.clip = self._child_clip(get)
+        self.scroll_clip = self._child_scroll_clip(get)
         walker = self.walker
         saved_cap = walker.max_elements
         page = not self.stop_at_documents and _page_facts(get) is not None
@@ -2056,6 +2115,7 @@ class _ViewportPass:
                 walk()
         finally:
             self.clip = saved
+            self.scroll_clip = saved_scroll
             walker.max_elements = saved_cap
 
     def _mark(self) -> dict:
@@ -2659,8 +2719,114 @@ class _ViewportPass:
             or (self.cancel is not None and self.cancel.is_set())
             or time.monotonic() >= self.deadline
         )
+        if not stopped and not walker.truncated:
+            self._sweep_sliders(live_root)
         walker.complete = not stopped
         return walker
+
+    def _sweep_sliders(self, live_root: object) -> int:
+        """Look once for the window's sliders the walk did not list (percFix), and list them where they belong.
+
+        Live 5 Oct, 0 of 8 Spotify reads listed the volume slider, though a direct UI Automation search found it
+        every time (``set_slider`` found it by name and moved it). The walk never met it: it is not in the filtered
+        batch of the player bar, nor in its left-out notes. The search that does find it is the one ``set_slider``
+        uses: every RangeValue element under the window (one ``FindAll``, 30-75 ms on the Chromium and Electron
+        windows measured on this desktop, since UI Automation evaluates the condition in the app's own process).
+        Each one found that the read lacks is placed under its nearest listed ancestor (found by climbing the
+        control view), marked hidden when the app keeps it out of sight (off-screen, its box in the visible part of
+        its scrolling container, or no box), else listed as it is. One with no listed ancestor (a background tab's,
+        a covered page's) is left out. A window with no slider at all is not searched again for
+        :data:`_NO_SLIDERS_S`. Returns how many were added. Facts about patterns, RuntimeIds and boxes only.
+        """
+        walker = self.walker
+        if walker.part is not None or self.stop_at_documents or not walker.elements:
+            return 0
+        if time.monotonic() >= self.deadline - _SWEEP_MARGIN_S:
+            return 0
+        now = time.monotonic()
+        with _fresh_lock:
+            if now - _no_sliders.get(self.hwnd, -_NO_SLIDERS_S) < _NO_SLIDERS_S:
+                return 0
+        automation = self.automation
+        try:
+            request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT, mode=_AUTOMATION_ELEMENT_MODE_FULL)
+            condition = automation.CreatePropertyCondition(_P_IS_RANGE_VALUE_AVAILABLE, True)  # type: ignore[attr-defined]
+            found = live_root.FindAllBuildCache(_TREE_SCOPE_DESCENDANTS, condition, request)  # type: ignore[attr-defined]
+            count = int(found.Length) if found else 0
+            sliders = [found.GetElement(i) for i in range(min(count, _SWEEP_MAX))]
+        except Exception:
+            return 0
+        walker.fetches += 1
+        with _fresh_lock:
+            if sliders:
+                _no_sliders.pop(self.hwnd, None)
+            else:
+                _no_sliders[self.hwnd] = now
+                if len(_no_sliders) > 256:
+                    for stale in [h for h, at in _no_sliders.items() if now - at >= _NO_SLIDERS_S]:
+                        _no_sliders.pop(stale, None)
+        by_rid = {e.runtime_id: e.id for e in walker.elements if e.runtime_id}
+        added: list[int] = []
+        try:
+            walker_view = automation.ControlViewWalker  # type: ignore[attr-defined]
+        except Exception:
+            return 0
+        for element in sliders:
+            if time.monotonic() >= self.deadline - _SWEEP_MARGIN_S / 2:
+                break
+            get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
+            runtime_id = _runtime_id(get)
+            if runtime_id is None or runtime_id in by_rid or ("rid", runtime_id) in walker.seen:
+                continue
+            parent_id, levels = -1, 0
+            current = element
+            try:
+                while levels < _SWEEP_CLIMB:
+                    current = walker_view.GetParentElementBuildCache(current, request)
+                    if not current:
+                        break
+                    levels += 1
+                    above = _runtime_id(current.GetCachedPropertyValue)
+                    if above is not None and above in by_rid:
+                        parent_id = by_rid[above]
+                        break
+            except Exception:
+                continue
+            if parent_id < 0:
+                continue   # not under anything the read lists: another page's, or a covered part
+            parent = walker.elements[parent_id]
+            area = self._area_under(parent_id)
+            if area is None and self.viewport is not None:
+                continue   # its container is scrolled out of view itself
+            hidden = _hidden_in_place(get, area)
+            offscreen = _as_bool(get(_P_IS_OFFSCREEN))
+            if offscreen and not hidden:
+                continue   # scrolled away, not hidden: the read's off-screen notes cover it
+            walker._lineage = [[parent.depth, parent_id, 0]]
+            before = len(walker.elements)
+            walker._add(element, parent.depth + levels, hidden=hidden)
+            if len(walker.elements) > before:
+                added.append(len(walker.elements) - 1)
+                by_rid[runtime_id] = len(walker.elements) - 1
+        walker._lineage = []
+        if added:
+            _place_added(walker, added)
+        return len(added)
+
+    def _area_under(self, element_id: int) -> tuple[int, int, int, int] | None:
+        """The visible part of the scrolling container listed element ``element_id`` sits in (itself included): the
+        viewport narrowed by every scrolling element on its line of listed ancestors."""
+        area = self.viewport
+        elements = self.walker.elements
+        current, hops = element_id, 0
+        while 0 <= current < len(elements) and hops < 64:
+            element = elements[current]
+            if element.is_scrollable and element.bounds is not None:
+                area = _overlap(element.bounds, area) if area else element.bounds
+                if area is None:
+                    return None
+            current, hops = element.parent, hops + 1
+        return area
 
 
 def _runtime_id(get: object) -> tuple[int, ...] | None:
@@ -3442,6 +3608,44 @@ def get_window_tree(
         part=bool(part),
         part_missing=part_missing,
     )
+
+
+def _place_added(walker: _CachedWalker, added: list[int]) -> None:
+    """Move elements appended after the walk (``added``: their ids, each with its parent set) to just after their
+    parent's subtree, so the list stays in tree order (a child after its parent, inside its run of descendants), and
+    renumber every id, parent and left-out note to match."""
+    elements = walker.elements
+    extra = set(added)
+    base = [e for e in elements if e.id not in extra]
+    children: dict[int, list[UIElement]] = {}
+    for element_id in added:
+        children.setdefault(elements[element_id].parent, []).append(elements[element_id])
+    # the end of each parent's run of descendants in the base order (descendants follow their ancestor, deeper)
+    order: list[UIElement] = []
+    pending: list[tuple[int, int]] = []   # (depth, parent id) whose additions wait for its subtree to end
+
+    def flush(depth: int) -> None:
+        while pending and pending[-1][0] >= depth:
+            _d, parent = pending.pop()
+            order.extend(children.pop(parent, []))
+
+    for element in base:
+        flush(element.depth)
+        order.append(element)
+        if element.id in children:
+            pending.append((element.depth, element.id))
+    flush(-1)
+    for rest in children.values():   # a parent not in the base (cannot happen): kept at the end
+        order.extend(rest)
+    mapping = {element.id: index for index, element in enumerate(order)}
+    walker.elements = [
+        dataclasses.replace(element, id=mapping[element.id],
+                            parent=mapping.get(element.parent, -1) if element.parent >= 0 else -1)
+        for element in order
+    ]
+    walker.left_out = {mapping.get(parent, parent) if parent >= 0 else parent:
+                       {**entry, "parent": mapping.get(parent, parent) if parent >= 0 else parent}
+                       for parent, entry in walker.left_out.items()}
 
 
 def _left_out_list(left_out: dict[int, dict], count: int) -> list[dict]:

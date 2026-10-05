@@ -174,6 +174,14 @@ class Cached:
     def FindFirstBuildCache(self, scope: int, condition: Any, request: Request) -> Any:
         return None
 
+    def FindAllBuildCache(self, scope: int, condition: Any, request: Request) -> Any:
+        """Every descendant (and the element itself with the element scope bit) in the request's view that meets
+        ``condition``, as UI Automation's ``FindAll`` gives them (percFix: the slider sweep)."""
+        view = request.TreeFilter
+        found = [n for n in self.node.walk() if (n is not self.node or scope & 1) and matches(n, view)
+                 and matches(n, condition)]
+        return _Array([Cached(n, request, depth_left=0, automation=self.automation) for n in found])
+
     @property
     def CachedBoundingRectangle(self) -> Any:
         raise AttributeError
@@ -188,6 +196,15 @@ class Automation:
     def __init__(self, roots: dict[int, Node]) -> None:
         self.roots = roots
         self.fetches = 0
+        self.parents: dict[int, Node] = {}
+        for root in roots.values():
+            for node in root.walk():
+                for child in node.children:
+                    self.parents[id(child)] = node
+
+    @property
+    def ControlViewWalker(self) -> "_Walker":
+        return _Walker(self)
 
     def CreateCacheRequest(self) -> Request:
         return Request()
@@ -220,6 +237,19 @@ class Automation:
         return Cached(node, request, depth_left=depth, automation=self)
 
 
+class _Walker:
+    """The control view's tree walker: an element's nearest ancestor that is a control element."""
+
+    def __init__(self, automation: "Automation") -> None:
+        self.automation = automation
+
+    def GetParentElementBuildCache(self, element: Cached, request: Request) -> Any:
+        node = self.automation.parents.get(id(element.node))
+        while node is not None and not node.control:
+            node = self.automation.parents.get(id(node))
+        return Cached(node, request, depth_left=0, automation=self.automation) if node is not None else None
+
+
 class Live(Cached):
     def __init__(self, node: Node, automation: Automation) -> None:
         super().__init__(node, Request(), depth_left=0, automation=automation)
@@ -237,6 +267,8 @@ def read(root: Node, *, hwnd: int = 7001, viewport: tuple[int, int, int, int] | 
     monkeypatch.setattr(T, "virtual_screen_bounds", lambda: (-10_000, -10_000, 10_000, 10_000))
     monkeypatch.setattr(T, "_child_window_at", lambda h, x, y: h)
     automation = Automation({hwnd: root})
+    T._no_sliders.clear()   # the slider sweep's memo is per window handle; every read here is a new window
+
     def start(walker: Any) -> None:
         walker.part = tuple(part) if part else None
 

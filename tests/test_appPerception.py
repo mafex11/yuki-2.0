@@ -72,10 +72,15 @@ def test_toggle_states_are_in_the_read(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_an_auto_hidden_player_bar_is_said_to_be_kept_out_of_sight(monkeypatch: pytest.MonkeyPatch) -> None:
+    # percFix: a state control off-screen with its box in the visible area is hidden in place whatever its size
+    # (Chromium reports unclipped boxes), so the bar's toggles are listed, hidden, with their states
     tree = read(player_window(bar_offscreen=True), monkeypatch=monkeypatch)
-    assert not any(e.name == "Lyrics" for e in tree.elements)
+    lyrics = _by_name(tree, "Lyrics")
+    assert lyrics.hidden and "off" in lyrics.states
+    assert not any(e.name == "Mute" for e in tree.elements)
     text = T.format_window_tree(tree)
-    assert 'kept out of sight by the app: Button "Lyrics", Button "Queue"' in text
+    line = next(ln for ln in text.splitlines() if '"Lyrics"' in ln)
+    assert "[off hidden]" in line
 
 
 def test_a_long_chat_says_how_many_messages_are_above_the_view(monkeypatch: pytest.MonkeyPatch) -> None:
