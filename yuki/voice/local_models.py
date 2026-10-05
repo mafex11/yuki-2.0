@@ -460,6 +460,8 @@ class Downloader:
     def _one(self, spec: ModelSpec, allowed: Callable[[], bool], root: Any, opener: Any) -> str:
         base = roots(root)[0]
         base.mkdir(parents=True, exist_ok=True)
+        before = read_status(root).get(spec.key) or {}   # read before this try's progress rows replace it
+        failed_before = int(before.get("failures") or 0) if before.get("state") == "error" else 0
         part = base / f"{spec.archive}.part"
         archive = self._fetch(spec, part, allowed, root, opener)
         if archive is None:
@@ -473,8 +475,7 @@ class Downloader:
             pass
         if problem:
             # The same bad copy would come again at once: wait longer after each failed check (status.json keeps it).
-            before = read_status(root).get(spec.key) or {}
-            failures = int(before.get("failures") or 0) + 1 if before.get("state") == "error" else 1
+            failures = failed_before + 1
             wait = self.BACKOFF_S[min(failures, len(self.BACKOFF_S)) - 1]
             self._set(root, spec.key, state="error", error=problem, total=spec.archive_mb * 1_000_000,
                       failures=failures, retry_after=round(time.time() + wait))

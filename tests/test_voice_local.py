@@ -12,6 +12,7 @@ import asyncio
 import bz2
 import hashlib
 import io
+import json
 import tarfile
 import time
 from concurrent.futures import Future
@@ -90,6 +91,14 @@ def test_the_windows_voice_choices_are_written_as_voice_json_keys() -> None:
     assert back == {"wake": True, "tts_provider": "elevenlabs"}
     # a cloud voice id the user set by hand stays
     assert voice_pref_changes({"tts_voice": "abc123"}, {"tts_provider": "deepgram"})["tts_voice"] == "abc123"
+    # review F5: trying a voice on this PC keeps the ElevenLabs voice id aside, and going back puts it back
+    tried = voice_pref_changes({"tts_provider": "elevenlabs", "tts_voice": "inventedVoiceId42"},
+                               {"tts_provider": "local:supertonic:F1"})
+    assert tried == {"tts_provider": "local", "tts_voice": "supertonic:F1", "cloud_tts_voice": "inventedVoiceId42"}
+    again = voice_pref_changes(tried, {"tts_provider": "local:kokoro:af_heart"})   # another local voice: still kept
+    assert again["cloud_tts_voice"] == "inventedVoiceId42" and again["tts_voice"] == "kokoro:af_heart"
+    assert voice_pref_changes(again, {"tts_provider": "elevenlabs"}) == {"tts_provider": "elevenlabs",
+                                                                         "tts_voice": "inventedVoiceId42"}
     assert voice_pref_changes({}, {"local_keep_loaded": True}) == {"local_keep_loaded": True}
     assert voice_pref_changes({"local_keep_loaded": True}, {"local_keep_loaded": False}) == {}
     assert voice_pref_changes({}, {"tts_provider": "nonsense"}) == {}
@@ -286,6 +295,19 @@ def test_models_are_let_go_after_the_quiet_time_unless_held_or_kept() -> None:
     kept.release()
     time.sleep(0.4)
     assert kept.loaded()["parakeet"]
+    # review F2: turning "keep it loaded" off with no conversation on lets them go after the quiet time
+    kept.configure(keep_loaded=False, unload_s=0.2)
+    deadline = time.monotonic() + 3
+    while kept.loaded()["parakeet"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not kept.loaded()["parakeet"]
+    # ... but not while a conversation holds them (its end starts the timer as usual)
+    held = LocalSpeech().configure(unload_s=0.1, keep_loaded=True)
+    held._stt = done
+    held.hold()
+    held.configure(keep_loaded=False)
+    time.sleep(0.4)
+    assert held.loaded()["parakeet"] and held._unload_at is None
 
 
 def test_nothing_is_loaded_ahead_during_a_game_or_a_call() -> None:
@@ -447,6 +469,11 @@ def test_a_conversation_set_to_local_builds_the_local_services(monkeypatch: pyte
     stt, _llm, tts = conv._services()
     assert isinstance(stt, ParakeetSTTService) and isinstance(tts, SherpaTTSService)
     assert tts.voice.key == "kokoro:af_bella" and "Zorbin" in stt._hotwords
+    # review F1: Parakeet's hotwords are the alias builder's one list (the same Flux gets), never a separate one
+    from yuki.voice.keyterms import vocabulary
+    from yuki.voice.local_stt import hotword_text
+
+    assert stt._hotwords == hotword_text(vocabulary(settings.user_names, ["Zorbin"], settings.voice_keyterms_max))
     strategies = stt.recommended_user_turn_strategies(enable_interruptions=True)
     assert type(strategies).__name__ == "ExternalUserTurnStrategies"
     assert not fresh.loaded()["parakeet"]        # nothing heavy is loaded by building it (only at the wake)
@@ -454,9 +481,10 @@ def test_a_conversation_set_to_local_builds_the_local_services(monkeypatch: pyte
     cloud = Conversation(settings=Settings(voice_hands=False, voice_tts_provider="deepgram", voice_fast_ack=False,
                                            voice_speech_guard=False, voice_tts_voice="supertonic:F1"),
                          bridge=bridge, transport=SimpleNamespace(), memory=None, mouth_memory=MouthMemory(), log=Log(),
-                         speech_end=lambda: None, on_state=lambda s, d: None, session="t2")
+                         speech_end=lambda: None, on_state=lambda s, d: None, session="t2", keyterms=["Zorbin"])
     stt2, _llm2, tts2 = cloud._services()
     assert type(stt2).__name__ == "DeepgramFluxSTTService"
+    assert list(stt2._settings.keyterm) == vocabulary(settings.user_names, ["Zorbin"], settings.voice_keyterms_max)
     assert tts2._settings.voice == "aura-2-thalia-en"   # a local voice name is never sent to the cloud
 
 
@@ -589,3 +617,182 @@ def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: 
 
     heard = asyncio.run(main())
     assert len(heard) == 1 and heard[0].text.split()[0].strip(",").lower() == "well"
+
+
+# -- review fixes (report 86 "Review fixes") ---------------------------------------------------------------------
+
+
+def test_decoding_and_synthesis_run_below_normal_priority() -> None:
+    """Review F4: the per-turn heavy work (each decode, each render) is below normal, like the loads."""
+    import ctypes
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("thread priority is a Windows check")
+    from yuki.voice.local_models import LocalSpeech
+
+    def priority() -> int:
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentThread.restype = ctypes.c_void_p
+        return int(k32.GetThreadPriority(ctypes.c_void_p(k32.GetCurrentThread())))
+
+    eng = LocalSpeech().configure()
+    assert eng.decode_pool.submit(priority).result(5) == -1
+    assert eng.synth_pool.submit(priority).result(5) == -1
+
+
+def test_a_chosen_voice_that_is_not_downloaded_uses_the_cloud_not_the_plain_voice(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F6: only Supertonic and the plain voice are here and Kokoro is chosen: the cloud voice with a note until
+    Kokoro arrives. The plain voice speaks only for a downloaded voice that fails to load."""
+    from yuki.voice import local_models as lm
+    from yuki.voice import pipeline
+
+    here = {"supertonic", "piper"}
+    monkeypatch.setattr(lm, "installed", lambda key, root=None: key in here)
+    monkeypatch.setattr(lm, "_engine", lm.LocalSpeech())
+    facts = {"stt_provider": "deepgram", "tts_provider": "local"}
+    pipeline.local_fallbacks(Settings(voice_tts_provider="local", voice_tts_voice="kokoro:af_heart"), facts)
+    assert facts["tts_provider"] == "deepgram" and "isn't downloaded" in facts["tts_note"]
+    lm.engine().broken["supertonic"] = "RuntimeError"           # downloaded but broken: the plain voice speaks
+    facts = {"stt_provider": "deepgram", "tts_provider": "local"}
+    pipeline.local_fallbacks(Settings(voice_tts_provider="local", voice_tts_voice="supertonic:F1"), facts)
+    assert facts == {"stt_provider": "deepgram", "tts_provider": "local"}
+    lm.engine().broken["piper"] = "RuntimeError"                # and the plain voice too: the cloud
+    pipeline.local_fallbacks(Settings(voice_tts_provider="local", voice_tts_voice="supertonic:F1"), facts)
+    assert facts["tts_provider"] == "deepgram" and "couldn't start" in facts["tts_note"]
+
+
+def test_a_game_or_a_call_uses_the_cloud_unless_the_models_are_already_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F3: nothing heavy during a game or a call. Local chosen and downloaded, a game on: the cloud this time
+    (with a note), unless the models are loaded already; without a Deepgram key it stays on this PC (never deaf)."""
+    from yuki.voice import local_models as lm
+    from yuki.voice import pipeline
+
+    monkeypatch.setattr(lm, "installed", lambda key, root=None: True)
+    eng = lm.LocalSpeech()
+    monkeypatch.setattr(lm, "_engine", eng)
+    monkeypatch.setattr(pipeline, "get_key", lambda name: "k")
+    settings = Settings(voice_stt_provider="local", voice_tts_provider="local", voice_tts_voice="supertonic:F1")
+
+    def facts(busy: bool) -> dict[str, Any]:
+        out = {"stt_provider": "local", "tts_provider": "local"}
+        pipeline.local_fallbacks(settings, out, busy=busy)
+        return out
+
+    assert facts(False) == {"stt_provider": "local", "tts_provider": "local"}
+    in_game = facts(True)
+    assert in_game["stt_provider"] == "deepgram" and in_game["tts_provider"] == "deepgram" and in_game["local_busy"]
+    assert in_game["stt_note"] == pipeline.LOCAL_BUSY_NOTE and "game or a call" in in_game["tts_note"]
+    done: Future = Future()
+    done.set_result(object())
+    eng._stt, eng._tts = done, {"supertonic": done}           # loaded already (a conversation a minute ago)
+    assert facts(True) == {"stt_provider": "local", "tts_provider": "local"}
+    eng._stt, eng._tts = None, {}
+    monkeypatch.setattr(pipeline, "get_key", lambda name: None)  # no cloud key: stays on this PC
+    assert facts(True) == {"stt_provider": "local", "tts_provider": "local"}
+
+
+def test_a_local_standby_is_rebuilt_when_a_game_starts_and_again_after_it(tmp_path: Path,
+                                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F3: a standby built on this PC (models not loaded) would load about 1 GB at a wake in a game: when a game
+    starts it is built again (for the cloud), and once the game is over built again on this PC."""
+    from yuki.voice import local_models as lm
+
+    monkeypatch.setattr(lm, "_engine", lm.LocalSpeech())
+    session = _session(tmp_path, {"stt_provider": "local"})
+    rebuilt: list[str] = []
+    session.rebuild_standby = lambda: rebuilt.append("x")
+    session._standby_conv = SimpleNamespace(_standby_meta={"settings": Settings(voice_stt_provider="local")})
+    session._standby_local = "local"
+    session.fullscreen_probe = lambda: False
+    session.on_front_changed()
+    assert rebuilt == []                                      # nothing changed
+    session.fullscreen_probe = lambda: True                   # a full-screen game comes in front
+    session.on_front_changed()
+    assert rebuilt == ["x"] and session._standby_local is None
+    session._standby_local = "busy_cloud"                     # the new standby went to the cloud for the game
+    session.on_front_changed()
+    assert rebuilt == ["x"]
+    session.fullscreen_probe = lambda: False                  # the game is over
+    session.on_call_status({})
+    assert rebuilt == ["x", "x"]
+    assert session._local_choice(Settings(), {"stt_provider": "deepgram", "tts_provider": "gemini"}) is None
+    assert session._local_choice(Settings(), {"stt_provider": "local", "tts_provider": "gemini"}) == "local"
+    assert session._local_choice(Settings(), {"stt_provider": "deepgram", "local_busy": True}) == "busy_cloud"
+
+
+def test_a_download_refused_for_a_full_screen_window_is_paused_and_resumes_when_the_front_changes(
+        tmp_path: Path, _models_in_temp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F7: refused at the start (a full-screen window) it is marked paused, and the window in front changing
+    (not only a call status) lets it go on."""
+    from yuki.voice import local_models as lm
+
+    monkeypatch.setenv("YUKI_VOICE_MODELS", str(_models_in_temp))   # nothing downloaded
+    spec, blob = _fake_model(_models_in_temp)
+    from dataclasses import replace
+
+    monkeypatch.setitem(lm.CATALOG, "parakeet", replace(spec, key="parakeet"))   # what local recognition wants, small
+    dl = lm.Downloader()
+    monkeypatch.setattr(lm, "downloader", lambda: dl)
+    real_start = dl.start
+    monkeypatch.setattr(dl, "start", lambda keys, **k: real_start(
+        keys, **{**k, "opener": lambda request, timeout=0: _Response(blob)}))
+    session = _session(tmp_path, {"stt_provider": "local"})
+    session.fullscreen_probe = lambda: True
+    session.local_models_wanted()
+    assert dl.status()["parakeet"]["state"] == "paused" and lm.read_status()["parakeet"]["state"] == "paused"
+    session.on_front_changed()                                  # still full screen: still waiting
+    assert not dl.running and dl.status()["parakeet"]["state"] == "paused"
+    session.fullscreen_probe = lambda: False
+    session.on_front_changed()                                  # the video ended
+    dl.join(10)
+    assert dl.status()["parakeet"]["state"] == "ready"
+
+
+def test_a_checksum_failure_waits_longer_each_time_before_downloading_again(_models_in_temp: Path,
+                                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review F8: a bad copy is not downloaded again after every conversation: an hour, then six, then a day. A
+    network failure is retried as before; Settings says when the next try is."""
+    from dataclasses import replace
+
+    from yuki.ui.web_data import local_speech_view
+    from yuki.voice import local_models as lm
+
+    monkeypatch.setenv("YUKI_VOICE_MODELS", str(_models_in_temp))
+    spec, blob = _fake_model(_models_in_temp)
+    bad = replace(spec, files=(replace(spec.files[0], sha256="0" * 64), *spec.files[1:]))
+    monkeypatch.setitem(lm.CATALOG, "fake", bad)
+    fetched: list[int] = []
+
+    def opener(request: Any, timeout: float = 0) -> _Response:
+        fetched.append(1)
+        return _Response(blob)
+
+    dl = lm.Downloader()
+    started = time.time()
+    assert dl.start(["fake"], opener=opener)
+    dl.join(10)
+    row = lm.read_status()["fake"]
+    assert row["state"] == "error" and row["failures"] == 1
+    assert 3500 < row["retry_after"] - started < 3700
+    assert not lm.Downloader().start(["fake"], opener=opener)   # a new run (the next standby) waits too
+    assert len(fetched) == 1
+    # the wait is over: tried again, failed again, waits six hours
+    status = json.loads(lm.status_path().read_text(encoding="utf-8"))
+    status["models"]["fake"]["retry_after"] = time.time() - 1
+    lm.status_path().write_text(json.dumps(status), encoding="utf-8")
+    dl2 = lm.Downloader()
+    assert dl2.start(["fake"], opener=opener)
+    dl2.join(10)
+    row = lm.read_status()["fake"]
+    assert row["failures"] == 2 and 6 * 3600 - 100 < row["retry_after"] - time.time() < 6 * 3600 + 100
+    assert len(fetched) == 2
+    # a network failure is no checksum failure: no wait
+    assert not lm.Downloader.backing_off({"state": "error", "error": "couldn't reach the download (network?)"})
+    # Settings says when
+    lm.status_path().write_text(json.dumps({"models": {"piper": {
+        "state": "error", "error": "model.onnx failed its checksum", "failures": 1,
+        "retry_after": time.time() + 3600}}}), encoding="utf-8")
+    text = local_speech_view({"tts_provider": "local"}, root=[_models_in_temp])["local"]["text"]
+    assert "I try again from " in text and "next time" not in text
