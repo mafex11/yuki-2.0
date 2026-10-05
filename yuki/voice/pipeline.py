@@ -295,6 +295,36 @@ def elevenlabs_quota(refresh: bool = False) -> tuple[int, int] | None:
     return max(0, limit - used), limit
 
 
+def stt_provider(settings: Any) -> str:
+    """Speech recognition in force: ``"local"`` (Parakeet on this PC, vLocal) or ``"deepgram"`` (Flux, the default)."""
+    value = str(getattr(settings, "voice_stt_provider", "deepgram") or "deepgram").strip().lower()
+    return "local" if value == "local" else "deepgram"
+
+
+def local_fallbacks(settings: Any, facts: dict[str, Any]) -> None:
+    """vLocal: speech on this PC that cannot run yet (its models not downloaded, or one failed to load this run) runs
+    in the cloud for this conversation, with a note saying so: Yuki is never deaf or silent because of the setting."""
+    from yuki.voice import local_models as lm
+
+    root = str(getattr(settings, "voice_local_models_dir", "") or "") or None
+    broken = lm.engine().broken
+
+    def ready(key: str) -> bool:
+        return lm.installed(key, root) and key not in broken
+
+    if facts.get("stt_provider") == "local" and not ready("parakeet"):
+        facts["stt_provider"] = "deepgram"
+        facts["stt_note"] = ("Speech recognition on this PC isn't downloaded yet; using the cloud for now"
+                             if "parakeet" not in broken else
+                             "Speech recognition on this PC couldn't start; using the cloud for now")
+    if facts.get("tts_provider") == "local":
+        voice = lm.parse_voice(getattr(settings, "voice_tts_voice", ""))
+        if not (ready(voice.family) or ready(lm.FALLBACK_VOICE.family)):
+            fallback = str(getattr(settings, "voice_tts_fallback", "") or "deepgram")
+            facts["tts_provider"] = fallback if fallback != "local" else "deepgram"
+            facts["tts_note"] = "The voice on this PC isn't downloaded yet; using the cloud voice for now"
+
+
 def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, Any]:
     """Check what a conversation needs before opening anything. Raises :class:`VoiceUnavailable`.
 
@@ -303,8 +333,9 @@ def preflight(settings: Settings, *, need_headphones: bool = True) -> dict[str, 
     one cannot speak. Speakers are no reason to refuse any more (the echo guard,
     docs/VOICE.md §11) unless ``voice_require_headphones`` asks for the v3.3 rule.
     """
-    facts: dict[str, Any] = {"tts_provider": settings.voice_tts_provider}
-    if not get_key(DEEPGRAM):
+    facts: dict[str, Any] = {"tts_provider": settings.voice_tts_provider, "stt_provider": stt_provider(settings)}
+    local_fallbacks(settings, facts)
+    if (facts["stt_provider"] != "local" or facts["tts_provider"] == "deepgram") and not get_key(DEEPGRAM):
         raise VoiceUnavailable("Voice needs DEEPGRAM_API_KEY (a Windows user environment variable).")
     if settings.voice_tts_provider == "gemini":
         from yuki.voice.gemini_tts import gemini_status
@@ -3436,6 +3467,10 @@ class Conversation:
         if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
         tts = getattr(self, "_tts", None)
+        for service in (getattr(self, "_stt", None), tts):
+            load = getattr(service, "load_now", None)   # vLocal: the models on this PC load now (their own thread)
+            if callable(load):
+                load()
         warm = getattr(tts, "warm_now", None) or getattr(tts, "_maybe_warm", None)
         if callable(warm) and self.woken_at is not None:   # built awake, the voice warms itself as it starts
             try:
@@ -3508,6 +3543,16 @@ class Conversation:
 
     # -- building ----------------------------------------------------------------
 
+    def _local_engine(self) -> Any:
+        """vLocal: this process's speech models on this PC (configured by the session off every loop; a conversation
+        built without a session configures it here)."""
+        from yuki.voice import local_models
+
+        eng = local_models.engine()
+        if not eng.started:
+            local_models.configure_from(self.settings, log=self.log)
+        return eng
+
     def _services(self) -> tuple[Any, Any, Any]:
         import pipecat.services.llm_service as llm_service_module
         from pipecat.processors.aggregators import async_tool_messages
@@ -3524,16 +3569,24 @@ class Conversation:
         # conversation moved on to. Here the narrator gate decides that, and a
         # stale result arrives marked held_back; the note defers to the payload.
         async_tool_messages._FINAL_DESCRIPTION = FINAL_DESCRIPTION
-        hints = [Language(code) for code in s.voice_stt_languages] if s.voice_stt_model.endswith("multi") else None
-        stt = DeepgramFluxSTTService(
-            api_key=get_key(DEEPGRAM) or "",
-            enable_eager_end_of_turn=s.voice_eager_eot_threshold is not None,
-            settings=DeepgramFluxSTTService.Settings(
-                model=s.voice_stt_model, language_hints=hints, eot_threshold=s.voice_eot_threshold,
-                eager_eot_threshold=s.voice_eager_eot_threshold, eot_timeout_ms=s.voice_eot_timeout_ms,
-                keyterm=keyterm_list(["Yuki", *s.user_names], self.keyterms, s.voice_keyterms_max),
-            ),
-        )
+        if stt_provider(s) == "local":
+            # vLocal: Parakeet on this PC, with its own end of turn (Silero VAD + Smart Turn), shaped like Flux
+            from yuki.voice.local_stt import ParakeetSTTService
+
+            stt = ParakeetSTTService(engine=self._local_engine(), log=self.log, session=self.session,
+                                     hotwords=keyterm_list(["Yuki", *s.user_names], self.keyterms,
+                                                           s.voice_keyterms_max))
+        else:
+            hints = [Language(code) for code in s.voice_stt_languages] if s.voice_stt_model.endswith("multi") else None
+            stt = DeepgramFluxSTTService(
+                api_key=get_key(DEEPGRAM) or "",
+                enable_eager_end_of_turn=s.voice_eager_eot_threshold is not None,
+                settings=DeepgramFluxSTTService.Settings(
+                    model=s.voice_stt_model, language_hints=hints, eot_threshold=s.voice_eot_threshold,
+                    eager_eot_threshold=s.voice_eager_eot_threshold, eot_timeout_ms=s.voice_eot_timeout_ms,
+                    keyterm=keyterm_list(["Yuki", *s.user_names], self.keyterms, s.voice_keyterms_max),
+                ),
+            )
         obs = self.observer
 
         async def on_update(_service: Any, transcript: str) -> None:
@@ -3552,7 +3605,8 @@ class Conversation:
 
         stt.add_event_handler("on_connected", on_connected)
         stt.add_event_handler("on_update", on_update)
-        stt.add_event_handler("on_eager_end_of_turn", on_eager)
+        if stt_provider(s) != "local":
+            stt.add_event_handler("on_eager_end_of_turn", on_eager)
         stt.add_event_handler("on_end_of_turn", on_eot)
         # Settings → AI: the talker's calls go to the client it wraps while "Voice replies" is on Claude (as before),
         # else to the chosen provider and model (yuki.agent.providers.client.AsyncRoleClient)
@@ -3599,9 +3653,19 @@ class Conversation:
                                                 str(call_id)))
             llm.register_function(QUICK_MEMORY["name"], self._quick_memory_call, cancel_on_interruption=False,
                                   timeout_secs=20)
+        from yuki.voice.local_models import DEFAULT_VOICE as LOCAL_DEFAULT_VOICE, is_local_voice
+
         provider = self.tts_provider
         voice = (s.voice_tts_voice if provider == s.voice_tts_provider else "") or DEFAULT_VOICES.get(provider, "")
-        if provider == "gemini":
+        if (provider == "local") != is_local_voice(voice):   # vLocal: a voice on this PC is never a cloud voice id
+            voice = LOCAL_DEFAULT_VOICE if provider == "local" else DEFAULT_VOICES.get(provider, "")
+        if provider == "local":
+            # vLocal: Supertonic or Kokoro on this PC (Piper if it cannot load); marks stripped, clause-first
+            from yuki.voice.local_tts import SherpaTTSService
+
+            tts = _clause_tts(SherpaTTSService, strip_marks=True)(engine=self._local_engine(), voice=voice,
+                                                                 log=self.log, session=self.session)
+        elif provider == "gemini":
             from yuki.voice.gemini_tts import service_class
 
             log = self.log
@@ -3662,7 +3726,7 @@ class Conversation:
             ack_cache = TTSCache(Path(s.voice_tts_cache_dir) if getattr(s, "voice_tts_cache_dir", "") else None)
             self.ack = AckVoice(provider=provider, voice=voice,
                                 model=s.voice_tts_model if provider == "elevenlabs" else "", cache=ack_cache,
-                                log=self.log)
+                                log=self.log, render=getattr(tts, "render_pcm", None))   # vLocal: rendered here
             _ack_workers().submit(self.ack.load)
         if getattr(s, "voice_speech_guard", True) and callable(getattr(tts, "set_guard", None)):
             # Every line passes one cheap check before it is heard (v3.10): only what a person says to the user.
@@ -3997,6 +4061,11 @@ class Conversation:
         terms = keyterm_list(memory_terms, list(names), self.KEYTERMS_TOTAL_MAX)
         stt = getattr(self, "_stt", None)
         if stt is None or self.worker is None or terms == getattr(self, "_terms_sent", None):
+            return
+        if callable(getattr(stt, "set_hotwords", None)):   # vLocal: Parakeet takes them per decoded segment
+            stt.set_hotwords(terms)
+            self._terms_sent = terms
+            self.log.event("keyterms", op="screen", terms=len(terms), screen=len(names))
             return
         try:
             from pipecat.frames.frames import STTUpdateSettingsFrame

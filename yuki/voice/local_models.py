@@ -425,7 +425,8 @@ class Downloader:
         archive = self._fetch(spec, part, allowed, root, opener)
         if archive is None:
             return "paused"
-        self._set(root, spec.key, state="installing", done=part.stat().st_size, total=part.stat().st_size)
+        size = archive.stat().st_size
+        self._set(root, spec.key, state="installing", done=size, total=size)
         problem = install_archive(spec, archive, base)
         try:
             archive.unlink()
@@ -749,9 +750,9 @@ class LocalSpeech:
                 model=str(d / "model.onnx"), voices=str(d / "voices.bin"), tokens=str(d / "tokens.txt"),
                 data_dir=str(d / "espeak-ng-data"), lexicon=str(d / "lexicon-us-en.txt"), lang="en-us")
         elif family == "piper":
+            onnx = next(f.path for f in CATALOG[family].files if f.path.endswith(".onnx"))
             mc.vits = sherpa_onnx.OfflineTtsVitsModelConfig(
-                model=str(d / "en_US-ljspeech-medium.onnx"), tokens=str(d / "tokens.txt"),
-                data_dir=str(d / "espeak-ng-data"))
+                model=str(d / onnx), tokens=str(d / "tokens.txt"), data_dir=str(d / "espeak-ng-data"))
         else:
             raise ValueError(f"unknown voice family {family}")
         tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(model=mc, max_num_sentences=1))

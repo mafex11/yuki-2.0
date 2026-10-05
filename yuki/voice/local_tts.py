@@ -86,7 +86,7 @@ class SherpaTTSService(TTSService):
         self._log = log
         self._session = session
         self._held = False
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._fell_back = False
         self._first_ms: list[float] = []
 
@@ -113,7 +113,7 @@ class SherpaTTSService(TTSService):
         self._let_go()
 
     def _let_go(self) -> None:
-        self._stop.set()
+        self._halt.set()
         if self._held:
             self._held = False
             self._engine.release()
@@ -147,7 +147,7 @@ class SherpaTTSService(TTSService):
 
     async def run_tts(self, text: str, context_id: str) -> Any:
         """Each clause of ``text`` rendered and sent as soon as it is ready."""
-        self._stop.clear()
+        self._halt.clear()
         started = time.perf_counter()
         first = True
         try:
@@ -158,7 +158,7 @@ class SherpaTTSService(TTSService):
                 yield ErrorFrame(error=f"the voice on this PC could not load: {type(exc).__name__}")
                 return
             loop = asyncio.get_running_loop()
-            stop = self._stop
+            stop = self._halt
             gen = _generation(voice.family, voice.sid)
 
             def render(piece: str) -> tuple[Any, int]:
@@ -178,7 +178,7 @@ class SherpaTTSService(TTSService):
                     await self.stop_ttfb_metrics()
                 yield TTSAudioRawFrame(audio=pcm, sample_rate=self.sample_rate, num_channels=1, context_id=context_id)
         except (asyncio.CancelledError, GeneratorExit):
-            self._stop.set()   # an interruption: the clause being rendered stops at its next sentence, no more follow
+            self._halt.set()   # an interruption: the clause being rendered stops at its next sentence, no more follow
             raise
         finally:
             await self.stop_ttfb_metrics()
