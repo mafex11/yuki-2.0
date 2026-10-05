@@ -56,6 +56,11 @@ def test_without_the_fixture_the_clock_is_real():
 
 @pytest.fixture()
 def tmp_tests(tmp_path):
+    # the temp files' own pytest.ini makes tmp_path the inner run's rootdir: without one, pytest took the common
+    # ancestor of the file and the worktree (the home folder) and walked it while collecting, and a file vanishing
+    # there meanwhile (other processes' temp and lock files: a busy PC) failed the run with FileNotFoundError
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+
     def write(name: str, body: str) -> str:
         path = tmp_path / name
         path.write_text(body, encoding="utf-8")
