@@ -271,6 +271,8 @@ class JudgeResult:
     responses: list[Any] = field(default_factory=list)
     error: str | None = None
     latency_ms: float = 0.0
+    #: The last exception, for the caller's retry decision (the model could not be reached at all).
+    exception: BaseException | None = None
 
 
 def item_from_source(fact: Any, sources: Sequence[Any], index: int) -> JudgeItem:
@@ -382,6 +384,7 @@ def judge_call_facts(client: Any, items: Sequence[JudgeItem], *, settings: Any =
                 result.verdicts[start + i] = v
         except Exception as exc:   # this chunk stays unjudged: its claims are held
             result.error = f"{type(exc).__name__}: {exc}"
+            result.exception = exc
     result.latency_ms = (time.perf_counter() - t0) * 1000
     return result
 

@@ -199,6 +199,17 @@ def test_when_the_judge_fails_every_claim_waits(store):
     assert len(A.held_facts(store, now=T0 + 3600)) == 5
 
 
+def test_when_the_judge_cannot_reach_the_model_the_batch_is_read_again_later(store):
+    import anthropic
+    import httpx
+
+    call_with(store, SCENE)
+    down = anthropic.APIConnectionError(request=httpx.Request("POST", "https://bedrock.invalid"))
+    [result], _client = journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [down]})
+    assert not result.ok and store.journal_between() == [] and A.held_facts(store, now=T0 + 3600) == []
+    assert store.pending_captures()   # still waiting; no attempt spent on a network blip
+
+
 def test_a_screen_fact_marked_sensitive_waits_for_the_users_yes(store):
     from yuki.memory.journal import RECORD_CALL_SIDE_TOOL, RECORD_FACTS_TOOL, system_prompt
 

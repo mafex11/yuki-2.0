@@ -1708,6 +1708,8 @@ class JournalWorker:
             # literally stay out. A failed look holds every claim (nothing unjudged goes in).
             judged = _admission.judge_call_facts(self.client, judge_items, settings=self.settings,
                                                  names=self.user_names(), model=self.model)
+            if judged.exception is not None and unreachable(judged.exception):
+                raise judged.exception   # no network: the whole batch waits and is read again (no attempt spent)
             admission = _admission.admit_call_facts(facts, judge_items, judged)
             if judged.error:
                 admission["judge_error"] = judged.error
