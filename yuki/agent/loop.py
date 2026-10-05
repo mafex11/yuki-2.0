@@ -3486,18 +3486,31 @@ class Agent:
             return ""
 
         def keep(client: Any) -> Any:
+            from yuki.memory import misheard
+
             found = client.contact(name)
             if not isinstance(found, dict) or not found.get("found"):
                 return None
-            return client.store.add_alias(heard, str(found.get("name") or name),
-                                          why=f"speech recognition heard it so; the user confirmed it was "
-                                              f"{found.get('name') or name} (voice, {time.strftime('%Y-%m-%d')})")
+            right = str(found.get("name") or name)
+            # second review V2-5: the one check every learned alias passes (the heard words neither are nor hold a
+            # name memory knows); the person the people index just found is a name it knows
+            known = misheard.KnownNames.of(client.store)
+            known.canonical.setdefault(misheard._key(right), right)
+            ok, why_not = misheard.check_name_pair(heard, right, known)
+            if ok is None:
+                return {"why_not": why_not}
+            return misheard.write_alias(client.store, heard, right,
+                                        why=f"speech recognition heard it so; the user confirmed it was "
+                                            f"{right} (voice, {time.strftime('%Y-%m-%d')})")[0]
 
         try:
             row = call("add_alias", keep, timeout_s=2.0)
         except Exception as exc:  # noqa: BLE001 - memory never breaks a request
             self.logger.log("heard_alias", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
             return "The misheard form could not be kept (memory did not answer)."
+        if isinstance(row, dict):
+            self.logger.log("heard_alias", ok=False, chars=len(heard), why=str(row.get("why_not") or ""))
+            return f"Not kept as a misheard form: {row.get('why_not')} (\"{heard}\" is not a mishearing of {name})."
         self.logger.log("heard_alias", ok=bool(row), chars=len(heard))
         return (f"Kept: \"{heard}\" is how speech recognition hears {name}; it resolves to them from now on."
                 if row else f"Not kept: memory's people index has no one called {name}.")

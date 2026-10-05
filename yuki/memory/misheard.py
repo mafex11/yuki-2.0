@@ -55,6 +55,7 @@ from datetime import datetime
 from typing import Any, Sequence
 
 from yuki.memory.store import NAME_FORM_WHY, PortraitRunStats
+from yuki.memory.store import WAKE_NAME as STORE_WAKE_NAME
 
 #: The provenance keys a misheard entry carries (inside the journal row's encrypted ``source``).
 SOURCE_KEYS: tuple[str, ...] = ("heard", "meant", "meant_why", "meant_name")
@@ -149,7 +150,7 @@ def right_words(source: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 #: Yuki's own name: the one name that may be learned from the user calling her (``how`` "called").
-WAKE_NAME = "Yuki"
+WAKE_NAME = STORE_WAKE_NAME
 #: How the exchange shows the heard words were the name.
 NAME_FIX_HOWS: tuple[str, ...] = ("corrected", "confirmed", "called")
 #: A heard form or a name is a few words (a name, not a sentence): a measure of the model's output, not a word list.
@@ -344,8 +345,11 @@ class KnownNames:
 def check_name_pair(heard: Any, name: Any, known: KnownNames) -> tuple[str | None, str | None]:
     """``(right name as memory spells it, None)`` when ``heard`` -> ``name`` may be learned as an alias, else
     ``(None, why not)``. The one check every path that writes a learned alias runs (the live and backfill names pass,
-    the misheard list's Right, the correction pass): a few different words each; the name is one memory knows; the
-    heard words are not themselves a name memory knows (that would send one person's name to another)."""
+    the misheard list's Right, the correction pass, the thinker's ``heard_as``): a few different words each; the name
+    is one memory knows; the heard words neither are nor hold a name memory knows (that would send one person's name
+    to another: "Arun ji" or "call Arun" -> Tarun, second review V2-4)."""
+    from yuki.memory.contacts import span_in
+
     hk, nk = _key(heard), _key(name)
     if not hk or not nk or hk == nk or max(len(hk.split()), len(nk.split())) > NAME_FIX_MAX_WORDS:
         return None, "the heard words and the name must be a few different words"
@@ -354,6 +358,8 @@ def check_name_pair(heard: Any, name: Any, known: KnownNames) -> tuple[str | Non
         return None, "not a name memory knows"
     if known.name_of(heard) is not None:
         return None, "the heard words are a name memory knows"
+    if any(span_in(k, hk) for k in known.canonical):
+        return None, "the heard words hold a name memory knows"
     return right, None
 
 
@@ -362,9 +368,11 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
     """``(fixes, rejected)``: the model's ``name_fixes`` checked against the exchanges and memory's names (plumbing).
 
     Kept: a NEW exchange said to Yuki is cited; the heard form is a few words standing as one run in the user's own
-    words of that exchange or one before it in this conversation (``context``); the name is in the exchanges (the
-    user's words or Yuki's) and is a name memory knows (:class:`KnownNames`; returned as memory spells it); the heard
-    form is not itself a name memory knows (it would send one person's name to another); "called" only for Yuki's
+    words of an exchange before it in this conversation (``context`` included: the correction or the yes follows the
+    mishearing); for "corrected", the name is not what Yuki itself answered those words with (that was the guess the
+    user turned down); the name is in the exchanges (the user's words or Yuki's) and is a name memory knows
+    (:class:`KnownNames`; returned as memory spells it); the heard form neither is nor holds a name memory knows
+    (:func:`check_name_pair`: it would send one person's name to another); "called" only for Yuki's
     own name, with the heard form in the cited exchange itself (Yuki's name need not be written anywhere: the
     recogniser wrote the sound-alike). Each fix: ``{"heard", "name", "how", "why", "turn_id", "at"}``."""
     from yuki.memory.contacts import span_in
@@ -402,10 +410,18 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
         if how == "called" and nk != _key(WAKE_NAME):
             rejected.append(f"[{n}]: called is only for Yuki's own name")
             continue
-        # where the heard words must stand: a call by name is that exchange itself; a fix may follow them
-        upto = [turn] if how == "called" else history[: len(context) + n]
-        if not any(span_in(heard, own_words(getattr(t, "user_text", ""))) for t in upto):
-            rejected.append(f"[{n}]: the heard words are not in what the user said")
+        # where the heard words must stand: a call by name is that exchange itself; a correction or a yes settles
+        # words said BEFORE it (second review V2-1: the exchange that holds them is the mishearing, not its settling)
+        upto = [turn] if how == "called" else history[: len(context) + n - 1]
+        holding = [t for t in upto if span_in(heard, own_words(getattr(t, "user_text", "")))]
+        if not holding:
+            rejected.append(f"[{n}]: the heard words are not in what the user said before the exchange that settles it"
+                            if how != "called" else f"[{n}]: the heard words are not in what the user said")
+            continue
+        # a correction turns Yuki's guess down: a name Yuki itself answered the heard words with is that guess
+        # ("call Arun" / "Calling Tarun." / "no, call Meera": Tarun is never Arun's right name)
+        if how == "corrected" and any(span_in(name, getattr(t, "reply_text", "") or "") for t in holding):
+            rejected.append(f"[{n}]: the name is Yuki's own guess for the heard words, which the user turned down")
             continue
         if how != "called" and not any(
                 span_in(name, f"{own_words(getattr(t, 'user_text', ''))} {getattr(t, 'reply_text', '') or ''}")
@@ -428,6 +444,32 @@ def fix_words(fix: dict[str, Any]) -> str:
     """A learned fix in the correction pass's fixed format (its "user's own words"), so memory text still carrying the
     heard form is reworded through the existing pass (never by hand)."""
     return right_words({"heard": fix["heard"], "meant": fix["name"], "meant_name": True})
+
+
+def write_alias(store: Any, heard: str, name: str, *, why: str | None, correction_id: int | None = None,
+                at: float | None = None, live: Sequence[dict[str, Any]] | None = None) -> tuple[int | None, list[int]]:
+    """``store.add_alias`` with the other live aliases of the same heard words ending with it: the same words case and
+    punctuation aside (:func:`_key`, the key the resolver and these passes read by), where ``store.add_alias`` alone
+    ends only the same spelling ("sea ra" over "Sea-ra" left both live, second review V2-3). ``live``: the live
+    aliases to look in (default: all of them). Returns ``(new alias id or None, the ids actually ended)``; raises what
+    ``store.add_alias`` raises."""
+    now = time.time() if at is None else float(at)
+    hk = _key(heard)
+    if live is None:
+        try:
+            live = store.aliases(name_forms=True)
+        except Exception:
+            live = []
+    twins = [int(a["id"]) for a in live if _key(a.get("heard")) == hk and a.get("ended_at") is None]
+    alias_id = store.add_alias(heard, name, why=why, correction_id=correction_id, at=now)
+    if alias_id is None or not twins:
+        return alias_id, []
+    try:
+        store.end_aliases([i for i in twins if i != alias_id], at=now)
+        rows = {int(a["id"]): a for a in store.aliases(include_ended=True, name_forms=True)}
+    except Exception:
+        rows = {}
+    return alias_id, [i for i in twins if i != alias_id and rows.get(i, {}).get("ended_at") is not None]
 
 
 #: Where an alias the exchanges settled (the model's reading of them, live or in the backfill) says so in its ``why``.
@@ -492,12 +534,12 @@ def learn_name_fixes(store: Any, fixes: Sequence[dict[str, Any]], *, source: str
 
                 text = f'About "what Yuki heard", the user said in their own words: "{fix_words(fix)}"'
                 cid = store.add_correction(secret_filter.redact_text(text), at=at)
-            alias_id = store.add_alias(fix["heard"], fix["name"], why=why, correction_id=cid, at=now)
+            alias_id, replaced = write_alias(store, fix["heard"], fix["name"], why=why, correction_id=cid, at=now,
+                                             live=others)
         except Exception:
             continue
         if alias_id is None:
             continue
-        replaced = [int(a["id"]) for a in others]
         live[hk] = [{"id": alias_id, "heard": fix["heard"], "name": fix["name"], "why": why, "at": now}]
         out.append({"heard": fix["heard"], "name": fix["name"], "how": how, "alias_id": alias_id,
                     "correction_id": cid, "replaced": replaced})
@@ -571,7 +613,7 @@ def keep_alias(store: Any, heard: str, name: str, *, why: str | None, correction
         return None
     if _key(name) == _key(WAKE_NAME):
         why = f"{NAME_FORM_WHY} (the user's correction{': ' + why if why else ''})"
-    return store.add_alias(heard, name, why=why, correction_id=correction_id, at=at)
+    return write_alias(store, heard, name, why=why, correction_id=correction_id, at=at, live=rows)[0]
 
 
 def name_forms(store: Any, name: str = WAKE_NAME) -> list[str]:

@@ -100,7 +100,7 @@ def test_yukis_own_name_called_by_a_sound_alike_is_kept_without_the_name_written
 @pytest.mark.parametrize("item, why", [
     (_fix("the walk", "Tarun", "corrected", 1), "the heard words are not in what the user said"),
     (_fix("the run", "Zorblat", "corrected", 1), "the name is not in the exchanges"),
-    (_fix("arun", "Tarun", "corrected", 1), "the heard words are a name memory knows"),   # Yuki's guess, not heard
+    (_fix("arun", "Tarun", "corrected", 1), "before the exchange that settles it"),   # Yuki's guess, not heard
     (_fix("the run", "Tarun", "called", 1), "called is only for Yuki's own name"),
     (_fix("the run", "Tarun", "corrected", 9), "not a new exchange said to Yuki"),
     (_fix("the run on discord please now", "Tarun", "corrected", 1), "a few different words"),
@@ -695,3 +695,93 @@ def test_the_names_cli_never_writes_without_a_reviewed_plan(tmp_path, capsys):
     with pytest.raises(SystemExit):
         M.main(["--names", "--db", str(tmp_path / "memory.db")])
     assert "--dry-run" in capsys.readouterr().err
+
+
+# -- second review (V2-1 .. V2-5) --------------------------------------------------------------------------------------
+
+
+def test_v2_1_a_refused_guess_is_never_learned_as_the_name_of_what_was_heard():
+    """"call Arun" / "Calling Tarun." / "no not Tarun, call Meera instead": Arun (a friend memory does not know yet) is
+    never Tarun. The model cited the exchange holding the heard words, and Tarun was Yuki's own guess."""
+    turns = [_turn(1, "call Arun on discord", "Calling Tarun."), _turn(2, "no not Tarun, call Meera instead",
+                                                                      "Calling Meera.")]
+    known = _known("Tarun", "Meera")
+    for item in (_fix("Arun", "Tarun", "corrected", 1), _fix("Arun", "Tarun", "confirmed", 1)):
+        fixes, rejected = M.name_fixes_from([item], turns, known=known)
+        assert fixes == [] and "before the exchange that settles it" in rejected[0]
+    fixes, rejected = M.name_fixes_from([_fix("Arun", "Tarun", "corrected", 2)], turns, known=known)
+    assert fixes == [] and "Yuki's own guess" in rejected[0]
+    # the controls: a real correction and a real yes are still kept
+    context = [_turn(0, "call the run on discord", "Calling Arun.")]
+    fixed, _ = M.name_fixes_from([_fix("the run", "Tarun", "corrected", 1)],
+                                 [_turn(1, "no, I said Tarun", "Calling Tarun.")], context, known=_known("Tarun"))
+    assert [f["name"] for f in fixed] == ["Tarun"]
+    yes, _ = M.name_fixes_from([_fix("sea ra", "Ciara", "confirmed", 2)],
+                               [_turn(1, "message sea ra", "Ciara, right?"), _turn(2, "yeah")], known=_known("Ciara"))
+    assert [f["name"] for f in yes] == ["Ciara"]
+
+
+def test_v2_2_an_unmarked_alias_of_yukis_name_is_a_name_form_by_its_data(store):
+    """An alias of Yuki's name typed before the name forms had their mark stays off every general reader."""
+    from yuki.memory.api import MemoryClient
+
+    store.add_alias("you key", "Yuki", why="the user's correction", at=NOW)
+    store.add_alias("Yoki", "yuki.", at=NOW + 1)
+    store.add_alias("the run", "Tarun", at=NOW + 2)
+    assert [a["heard"] for a in store.aliases()] == ["the run"]
+    assert [a["heard"] for a in MemoryClient(store).aliases()] == ["the run"]
+    assert M.name_forms(store) == ["Yoki", "you key"]
+
+
+def test_v2_3_a_users_answer_ends_the_alias_of_the_same_words_spelled_otherwise(store):
+    for name in ("Tarun", "Arun", "Ciara", "Sierra"):
+        _contact(store, name)
+    [old] = M.learn_name_fixes(store, [{"heard": "Sea-ra", "name": "Ciara", "how": "confirmed", "at": NOW}], now=NOW)
+    [new] = M.learn_name_fixes(store, [{"heard": "sea ra", "name": "Sierra", "how": "corrected", "at": NOW + 50}],
+                               by_user=True, now=NOW + 60)
+    assert new["replaced"] == [old["alias_id"]]
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("sea ra", "Sierra")]
+    assert [c.name for c in C.resolve(store, "sea ra")] == ["Sierra"]
+    assert M.undo_learned(store, [new], now=NOW + 70) == {"aliases_ended": 1, "aliases_restored": 1}
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("Sea-ra", "Ciara")]
+    # the correction pass's writer ends it the same way
+    M.keep_alias(store, "SEA RA!", "Sierra", why="w", correction_id=None, at=NOW + 80)
+    assert [(a["heard"], a["name"]) for a in store.aliases()] == [("SEA RA!", "Sierra")]
+
+
+@pytest.mark.parametrize("heard", ["call Arun", "Arun ji"])
+def test_v2_4_heard_words_holding_a_known_name_never_point_to_another_person(store, heard):
+    assert M.check_name_pair(heard, "Tarun", _known("Tarun", "Arun")) == (
+        None, "the heard words hold a name memory knows")
+    for name in ("Tarun", "Arun"):
+        _contact(store, name)
+    assert M.learn_name_fixes(store, [{"heard": heard, "name": "Tarun", "how": "corrected", "at": NOW}],
+                              now=NOW) != []   # the writer trusts its callers; every caller runs the check first
+    row = _journal_misheard(store, heard, "Tarun")
+    store.end_aliases([a["id"] for a in store.aliases()])
+    from yuki.memory.api import MemoryClient
+
+    assert MemoryClient(store).resolve_heard(f"journal:{row}", "guess_right")["alias"] is False
+    assert store.aliases() == []
+
+
+def test_v2_5_the_thinkers_heard_as_runs_the_same_check(store):
+    """Agent._learn_heard: "message Arun the notes" then "yes" never makes Arun a heard form of Tarun."""
+    from yuki.agent.loop import Agent
+    from yuki.memory.api import MemoryClient
+
+    for name in ("Tarun", "Arun"):
+        _contact(store, name)
+    client = MemoryClient(store)
+    logged: list[dict[str, Any]] = []
+    stub = SimpleNamespace(
+        _user_words=[{"how": "heard", "text": "message Arun the notes", "request": 1},
+                     {"how": "answer", "text": "yes", "request": 1}],
+        memory=SimpleNamespace(call=lambda _n, fn, timeout_s=0: fn(client)),
+        logger=SimpleNamespace(log=lambda event, **kw: logged.append(dict(kw, event=event))))
+    line = Agent._learn_heard(stub, {"heard_as": "Arun", "name": "Tarun"})
+    assert line.startswith("Not kept") and "name memory knows" in line and store.aliases() == []
+    stub._user_words[0]["text"] = "message the run the notes"
+    line = Agent._learn_heard(stub, {"heard_as": "the run", "name": "Tarun"})
+    assert line.startswith("Kept") and [(a["heard"], a["name"]) for a in store.aliases()] == [("the run", "Tarun")]
+    assert [x["ok"] for x in logged] == [False, True]
