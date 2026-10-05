@@ -118,7 +118,9 @@ def test_a_full_logger_is_unchanged(tmp_path):
 
 def test_content_free_record_without_the_heavy_fields_keeps_numbers():
     out = content_free({"type": "takeover", "state": "paused", "why": "keys", "n": 2, "error": "OSError: no such"})
-    assert out["state"] == "paused" and out["n"] == 2 and out["why_chars"] == 4
+    # hotInput: a code word in an enum field (a why, a level, a verdict) is kept; a sentence there is still its length
+    assert out["state"] == "paused" and out["n"] == 2 and out["why"] == "keys"
+    assert content_free({"type": "x", "why": SECRET_WORDS})["why_chars"] == len(SECRET_WORDS)
     assert out["error_kind"] == "OSError" and "error" not in out
 
 

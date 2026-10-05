@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -270,6 +271,104 @@ ID_FIELDS: frozenset[str] = frozenset({
 })
 
 
+#: String fields a content-free log keeps when the value is a code word, not prose: levels, verdicts, outcome kinds,
+#: reasons and states Yuki's own code names (hotInput, report 73: with ``outcome_verdict.level`` stored as its length,
+#: the diagnostics could not see a single level or verdict). A value that is not a code word (:func:`_code_word`) is
+#: still only its length, so a reason written as a sentence, or a name, never reaches the file. Never a field that
+#: holds the user's own words (a todo's ``by``: "dropped: their words, exactly").
+ENUM_FIELDS: frozenset[str] = frozenset({
+    "level", "verdict", "verdict_class", "why", "reason", "status", "tone", "send", "step_level",
+    "result_kind", "pattern", "patterns", "control_type", "button", "direction", "how", "source", "lease",
+    "process", "process_name", "exe", "window_state", "trigger", "phase", "stage", "decision", "cause", "class",
+})
+#: The fields a content-free log keeps inside a tool's input, a tool's result and a perception payload: the model
+#: writes a tool's input, so only fields whose values are a fixed vocabulary (a button, a direction, a pattern, a
+#: role, a state); never ``name``, ``title``, ``text``, ``path`` or ``app``, and never the free-form ones (``why``,
+#: ``reason``, ``source``, ``decision``, ``by``): there a single word can be a person's name or the user's words.
+NESTED_FIELDS: frozenset[str] = frozenset({
+    "level", "verdict", "verdict_class", "status", "send", "step_level", "result_kind", "pattern", "patterns",
+    "control_type", "button", "direction", "how", "lease", "window_state", "phase", "stage", "class",
+    "kind", "state", "mode", "via", "role", "roles", "hidden_roles", "flags", "op", "tool", "lane", "outcome",
+    "type", "error_kind",
+})
+#: A code word is what Yuki's code writes: lower case, digits and ``_ . : + -`` (``read_back_on``, ``keys``,
+#: ``verified``). A capitalised word is a name until shown otherwise, so it is kept only where the vocabulary is
+#: known (:data:`_ROLE_WORDS` for roles and control types, a ``.exe`` for a process).
+_CODE_WORD = re.compile(r"[a-z][a-z0-9_.:+\-]{0,47}")
+#: Field names kept inside a nested value: plain lower-case names (a dict keyed by titles or people's names is left
+#: out and counted, ``other_keys``).
+_FIELD_NAME = re.compile(r"[a-z_][a-z0-9_]{0,47}")
+_EXE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,59}\.exe", re.IGNORECASE)
+#: The UIA control-type names (yuki/perception/tree.py ``_ROLE_NAMES``) and Yuki's own role words built on them.
+_ROLE_WORDS: frozenset[str] = frozenset({
+    "Button", "Calendar", "CheckBox", "ComboBox", "Edit", "Hyperlink", "Image", "ListItem", "List", "Menu",
+    "MenuBar", "MenuItem", "ProgressBar", "RadioButton", "ScrollBar", "Slider", "Spinner", "StatusBar", "Tab",
+    "TabItem", "Text", "ToolBar", "ToolTip", "Tree", "TreeItem", "Custom", "Group", "Thumb", "DataGrid", "DataItem",
+    "Document", "SplitButton", "Window", "Pane", "Header", "HeaderItem", "Table", "TitleBar", "Separator",
+    "SemanticZoom", "AppBar", "Link",
+})
+_ROLE_FIELDS = frozenset({"role", "roles", "hidden_roles", "control_type"})
+_EXE_FIELDS = frozenset({"process", "process_name", "exe"})
+#: Inside a nested value, lists longer than this keep only their length, and nesting deeper than this its size.
+NESTED_LIST_MAX = 20
+NESTED_DEPTH_MAX = 4
+
+
+def _code_word(value: str, key: str = "") -> bool:
+    """Whether a string is one code word (``verified``, ``read_back_off``), not prose or a name; under a role field a
+    UIA role name (``Slider``), under a process field an exe name (``Spotify.exe``)."""
+    if _CODE_WORD.fullmatch(value):
+        return True
+    if key in _ROLE_FIELDS:
+        return value in _ROLE_WORDS
+    if key in _EXE_FIELDS:
+        return bool(_EXE.fullmatch(value))
+    return False
+
+
+def _code_words(value: Any, key: str = "") -> bool:
+    """Whether ``value`` is a short list of code words (a control's patterns, the roles left hidden)."""
+    return (isinstance(value, (list, tuple)) and len(value) <= NESTED_LIST_MAX
+            and all(isinstance(v, str) and _code_word(v, key) for v in value))
+
+
+def _shape(value: Any, depth: int = 0) -> Any:
+    """A tool's input or result, or a perception payload, without its words: numbers, booleans and ``None`` as they
+    are, code words in :data:`NESTED_FIELDS` as they are, every other string its length (``<field>_chars``), field
+    names that are not plain names (a dict keyed by titles) left out and counted, long lists their length."""
+    if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return len(value)
+    if depth >= NESTED_DEPTH_MAX:
+        return {"chars": len(json.dumps(value, ensure_ascii=False, default=str))}
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        dropped = 0
+        for key, v in value.items():
+            key = str(key)
+            if not _FIELD_NAME.fullmatch(key):
+                dropped += 1
+                continue
+            if isinstance(v, str):
+                if key in NESTED_FIELDS and _code_word(v, key):
+                    out[key] = v
+                else:
+                    out[f"{key}_chars"] = len(v)
+            elif key in NESTED_FIELDS and _code_words(v, key):
+                out[key] = list(v)
+            else:
+                out[key] = _shape(v, depth + 1)
+        if dropped:
+            out["other_keys"] = dropped
+        return out
+    if isinstance(value, (list, tuple)):
+        if len(value) > NESTED_LIST_MAX:
+            return {"count": len(value)}
+        return [_shape(v, depth + 1) for v in value]
+    return {"chars": len(json.dumps(value, ensure_ascii=False, default=str))}
+
+
 def _error_kind(text: str) -> str:
     """``"ReadTimeout"`` from ``"ReadTimeout: The read operation timed out"``: the exception's type, not its message."""
     head = text.split(":", 1)[0].strip()
@@ -290,11 +389,12 @@ def _trace_frames(text: str) -> str:
 
 
 def _counts_only(value: Any) -> Any:
-    """``value`` with every string that is not an id replaced by its length (see :data:`ID_FIELDS`)."""
+    """``value`` with every string that is not an id (:data:`ID_FIELDS`) or a code word in :data:`ENUM_FIELDS`
+    replaced by its length."""
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, v in value.items():
-            if isinstance(v, str) and key not in ID_FIELDS:
+            if isinstance(v, str) and key not in ID_FIELDS and not (key in ENUM_FIELDS and _code_word(v, key)):
                 if key == "traceback":
                     out[key] = _trace_frames(v)
                 elif key == "error":
@@ -302,6 +402,8 @@ def _counts_only(value: Any) -> Any:
                     out["error_chars"] = len(v)
                 else:
                     out[f"{key}_chars"] = len(v)
+            elif key in ENUM_FIELDS and _code_words(v, key):
+                out[key] = list(v)
             else:
                 out[key] = _counts_only(v)
         return out
@@ -345,7 +447,9 @@ def content_free(record: dict[str, Any]) -> dict[str, Any]:
             value = rec.pop(key)
             heavy[f"{key}_chars"] = len(json.dumps(value, ensure_ascii=False, default=str))
             if key == "input" and isinstance(value, dict):
-                heavy["input_keys"] = sorted(str(k) for k in value)
+                heavy["input_keys"] = sorted(str(k) for k in value if _FIELD_NAME.fullmatch(str(k)))
+            # hotInput: the non-word facts inside (verified, flags, counts, hidden roles, a level) stay readable
+            heavy[f"{key}_shape"] = _shape(value)
     out = _counts_only(rec)
     out.update(heavy)
     return out
