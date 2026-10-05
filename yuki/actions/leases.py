@@ -9,11 +9,13 @@ kinds of lease keep them from colliding without making everything wait for every
   Toggle, a SelectionItem.Select, a Value.SetValue, a ScrollPattern scroll, a tab select). It needs no input lease, so
   a pattern action on one window proceeds while a typing job holds the input lease for another.
 
-**Yielding to the user**: before global input, :class:`InputGate` asks Windows when the keyboard or mouse was last used
-(``GetLastInputInfo``: a time, not an input hook) and leaves out Yuki's own synthetic input (the time of its last
-``SendInput`` is kept here, :func:`note_own_input`). Used within ``recent_s``: it says one line through ``notify`` and
-waits until ``quiet_s`` pass with no input from the user, at most ``max_s``; past that nothing is sent and the caller is
-told. Numbers, measured on the clock, never on what was typed.
+**Yielding to the user**: before global input, :class:`InputGate` waits until ``quiet_s`` pass with no real input from
+the user (a key, a mouse button, the wheel, the cursor travelling their takeover distance: the input monitor,
+:mod:`yuki.actions.userinput`, and keys or buttons held down now), at most ``max_s``; past that nothing is sent and the
+caller is told. Yuki's own input is left out (its tagged ``SendInput`` records, and the span of its input actions,
+:func:`note_own_input`). ``GetLastInputInfo`` only lets it go at once when nothing at all came lately; it never holds
+Yuki back (hotInput: a twitching mouse sensor keeps it under 0.3 s). Numbers, measured on the clock, never on what was
+typed.
 """
 
 from __future__ import annotations
@@ -251,21 +253,67 @@ def cursor_at() -> tuple[int, int] | None:
         return None
 
 
+#: ``signal`` default: the process's input monitor (:mod:`yuki.actions.userinput`) whenever it is listening.
+SHARED_SIGNAL: Any = object()
+
+
+def _signal_now(signal: Any) -> Any:
+    """The input monitor to read on this look: ``signal`` itself when it is listening, the process's monitor when
+    ``signal`` is :data:`SHARED_SIGNAL` and it listens, else ``None`` (no monitor: polled keys only)."""
+    if signal is SHARED_SIGNAL:
+        try:
+            from yuki.actions import userinput
+
+            return userinput.running()
+        except Exception:  # noqa: BLE001
+            return None
+    return signal if signal is not None and getattr(signal, "running", False) else None
+
+
+#: The real-input kinds the input monitor keeps (:mod:`yuki.actions.userinput`): a key, a mouse button, the wheel, the
+#: cursor travelling the user's takeover distance.
+ALL_KINDS: tuple[str, ...] = ("keys", "click", "wheel", "mouse")
+
+
 class RealInput:
-    """When the user last really used the PC: a key or a mouse button (V8, 3 Oct). ``GetLastInputInfo`` also counts
-    every mouse move (and input another machine sends through a shared mouse), so live Yuki said twice "you're using the
-    keyboard or mouse" while the user touched nothing. Polled while Yuki waits to act (no hook): an input that came
-    while the cursor stayed where it was (a key, a click, the wheel) or while a key or button was down (or went down
-    since the last look) counts; one that came with the cursor moving and nothing pressed is the mouse moving, and does
-    not. The first look is a baseline (what was pressed before it does not count). Measured facts only."""
+    """When the user last really used the PC: a key, a mouse button, the wheel, or (``kinds`` with ``mouse``) the
+    cursor travelling the user's takeover distance. Read on every look.
+
+    hotInput (report 73, release 6): ``GetLastInputInfo`` cannot tell a key from a mouse move, and this user's mouse
+    sensor twitches 20-30 times a second, mostly without moving the cursor at all. The old rule ("input that came while
+    the cursor stayed still was a key or a click") took every twitch for a keystroke, so the input gate held every
+    action for 12 s. Now only measured facts count:
+
+    * the input monitor's key, button, wheel and big-move times (:mod:`yuki.actions.userinput`, Raw Input, Yuki's own
+      tagged input left out) while it is listening;
+    * a key or a mouse button held down now, or pressed since the last look (``held``, ``GetAsyncKeyState``), after the
+      first look (a baseline: what was pressed before it does not count).
+
+    ``GetLastInputInfo`` (``age``) is never a reason to wait; it is kept for the callers that use it to look closer.
+
+    Args:
+        history: The first look takes the monitor's facts from before the watch began (the input gate: a key 0.3 s
+            before Yuki's action counts); ``False``: they are the baseline (a continuous scroll's watch).
+        kinds: The monitor's kinds that count.
+        signal: The input monitor (:data:`SHARED_SIGNAL`: the process's; ``None``: none; tests pass a stub).
+
+    Attributes:
+        last_real: When real input was last seen (monotonic), ``None``: not yet.
+        kind: What it was (``keys``, ``click``, ``wheel``, ``mouse``; ``press``: a polled key or button).
+        source: The monitor read on the latest look (``None``: polled keys only).
+    """
 
     def __init__(self, *, age: Callable[[], float | None] = user_input_age_s,
                  held: Callable[[], bool | None] = key_or_button_down,
                  cursor: Callable[[], tuple[int, int] | None] = cursor_at,
-                 now: Callable[[], float] = time.monotonic) -> None:
+                 now: Callable[[], float] = time.monotonic, signal: Any = SHARED_SIGNAL, history: bool = False,
+                 kinds: tuple[str, ...] = ALL_KINDS) -> None:
         self.age, self.held, self.cursor, self.now = age, held, cursor, now
-        self.last_real: float | None = None   # when real input was last seen (monotonic), None: not yet
-        self._last_input: float | None = None
+        self.signal, self.history, self.kinds = signal, bool(history), tuple(kinds)
+        self.last_real: float | None = None
+        self.kind: str | None = None
+        self.source: Any = None
+        self._seen = 0.0
         self._cursor: tuple[int, int] | None = None
         #: The cursor was seen at two different places on two looks in a row (the mouse moved while watched).
         self.cursor_moved = False
@@ -276,47 +324,59 @@ class RealInput:
         """Where the cursor was on the latest look (``None``: not looked yet, or unknown)."""
         return self._cursor
 
+    def _real(self, at: float, kind: str | None) -> None:
+        if self.last_real is None or at >= self.last_real:
+            self.last_real, self.kind = at, kind
+
     def poll(self) -> float | None:
         """Look once; returns :attr:`last_real`."""
         t = self.now()
-        seconds = self.age()
-        last = None if seconds is None or seconds == float("inf") else t - seconds
-        where = self.cursor()
+        sig = self.source = _signal_now(self.signal)
+        if sig is not None:
+            at, kind = sig.latest(self.kinds)
+            if at > self._seen:
+                if self.polls or self.history:
+                    self._real(at, kind)
+                self._seen = at
         down = self.held()
         if down and self.polls:
-            self.last_real = t
-        elif last is not None and self._last_input is not None and last > self._last_input + 0.005:
-            # new input since the last look: real unless the cursor moved with it
-            if where is not None and self._cursor is not None and where == self._cursor:
-                self.last_real = max(self.last_real or 0.0, last)
+            self._real(t, "press")
+        where = self.cursor()
         if where is not None and self._cursor is not None and where != self._cursor:
             self.cursor_moved = True
-        if last is not None:
-            self._last_input = last if self._last_input is None else max(self._last_input, last)
         self._cursor = where
         self.polls += 1
         return self.last_real
 
 
 #: The line said when Yuki has waited this long for the user to stop typing or clicking (V8: before, it was said at
-#: the start of every wait, mouse moves included; now the wait is silent unless it goes on).
+#: the start of every wait, mouse moves included; now the wait is silent unless it goes on). Only after a key or a
+#: mouse button was measured (hotInput: never for the mouse moving or the wheel).
 INPUT_WAIT_LINE = "You're typing or clicking, so I'll wait a moment before I do it."
+#: The kinds of real input the line is said for.
+_LINE_KINDS = frozenset({"keys", "click", "press"})
+#: Why nothing was sent, by the kind of input the user kept up (for the brain; measured, never guessed).
+_KEPT_UP = {"keys": "kept typing", "click": "kept clicking", "press": "kept typing or clicking",
+            "wheel": "kept turning the mouse wheel", "mouse": "kept moving the mouse"}
 
 
 class InputGate:
-    """Wait for the user to stop typing or clicking before global input; silent unless the wait goes on (V8).
+    """Wait for the user to stop using the PC before global input; silent unless the wait goes on (V8).
+
+    hotInput: what holds Yuki back is measured real input only (:class:`RealInput`: a key, a mouse button, the wheel,
+    or the cursor travelling the user's takeover distance; Yuki's own tagged input left out), never ``GetLastInputInfo``
+    alone: a twitching mouse sensor keeps that under 0.3 s all day.
 
     Args:
-        recent_s: Input this recent (any kind, ``GetLastInputInfo``) makes the gate look closer.
-        quiet_s: How long they must be still (no key, no click) before Yuki's input goes in.
+        recent_s: No input of any kind for this long (``GetLastInputInfo``): nothing to wait for, Yuki goes at once.
+        quiet_s: How long after the user's latest real input Yuki's input goes in.
         max_s: The longest wait; then the action is not sent.
-        age: Seconds since the user's last input (:func:`user_input_age_s`; tests pass a stub).
-        probe_s: How long the gate watches recent input to tell a key or click from the mouse moving. With no real
-            input seen in that time and the cursor seen moving, the input that made it look was the mouse: Yuki goes
-            ahead. With the cursor still the whole time, that input was a key, a click or the wheel, and Yuki waits
-            until ``quiet_s`` after it (review F3: it went ahead 0.25 s after a keystroke, inside a typing pause).
+        age: Seconds since the last input of any kind (:func:`user_input_age_s`; tests pass a stub).
+        probe_s: With no input monitor listening (or one that just started), how long the gate watches the keys and
+            buttons before it goes: the monitor knows the time before the wait, a fresh poll does not.
         notify_after_s: The one notice is said only when the wait has lasted this long (~3 s).
         held, cursor: The key-or-button and cursor reads (:class:`RealInput`; tests pass stubs).
+        signal: The input monitor (:data:`SHARED_SIGNAL`: the process's, while it listens; tests pass a stub).
     """
 
     def __init__(self, *, recent_s: float = 1.0, quiet_s: float = 0.8, max_s: float = 12.0,
@@ -324,44 +384,51 @@ class InputGate:
                  sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
                  probe_s: float = 0.25, notify_after_s: float = 3.0,
                  held: Callable[[], bool | None] = key_or_button_down,
-                 cursor: Callable[[], tuple[int, int] | None] = cursor_at) -> None:
+                 cursor: Callable[[], tuple[int, int] | None] = cursor_at, signal: Any = SHARED_SIGNAL) -> None:
         self.recent_s, self.quiet_s, self.max_s = float(recent_s), float(quiet_s), float(max_s)
         self.age, self.poll_s, self.sleep, self.now = age, float(poll_s), sleep, now
         self.probe_s, self.notify_after_s = float(probe_s), float(notify_after_s)
-        self.held, self.cursor = held, cursor
+        self.held, self.cursor, self.signal = held, cursor, signal
 
     def wait(self, *, notify: Callable[[str], None] | None = None,
              cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
-        """``{"waited": bool, "ok": bool, "ms", "why"?, "real"?}``: ``ok`` False means the user kept typing or clicking
-        past ``max_s`` (or the request was cancelled): send nothing. ``real``: whether a key or click was seen."""
+        """``{"waited": bool, "ok": bool, "ms", "why"?, "real"?, "kind"?}``: ``ok`` False means the user kept using
+        the PC past ``max_s`` (or the request was cancelled): send nothing. ``real``: whether real input held Yuki back;
+        ``kind``: what it was."""
         first = self.age()
-        if first is None or first >= self.recent_s:
+        if first is not None and first >= self.recent_s:
             return {"waited": False, "ok": True, "ms": 0.0}
         started = self.now()
-        trigger = started - float(first)   # the input that made the gate look: its kind is not known yet
-        watch = RealInput(age=self.age, held=self.held, cursor=self.cursor, now=self.now)
+        watch = RealInput(age=self.age, held=self.held, cursor=self.cursor, now=self.now, signal=self.signal,
+                          history=True)
         notified = False
+        held_back = False
         while True:
             if cancelled is not None and cancelled():
                 return {"waited": True, "ok": False, "ms": round((self.now() - started) * 1000), "why": "cancelled",
-                        "real": watch.last_real is not None}
+                        "real": held_back, "kind": watch.kind}
             last_real = watch.poll()
             t = self.now()
             ms = round((t - started) * 1000)
-            if last_real is None and t - started >= self.probe_s:
-                if watch.cursor_moved:
-                    return {"waited": ms > 0, "ok": True, "ms": ms, "real": False}   # only the mouse moved: go ahead
-                # the cursor stayed still while watched (or cannot be read): the input that made the gate look was a
-                # key, a click or the wheel, never told apart from the mouse moving, so it counts
-                last_real = watch.last_real = trigger
-            if last_real is not None and t - last_real >= self.quiet_s:
-                return {"waited": True, "ok": True, "ms": ms, "real": True}
+            sig = watch.source
+            # how long input has been watched: the monitor knows the time since it started, a poll only this wait
+            since = float(getattr(sig, "started_at", 0.0) or 0.0) if sig is not None else 0.0
+            watched = t - (since if since else started)
+            quiet = last_real is None or t - last_real >= self.quiet_s
+            if quiet and watched >= self.probe_s:
+                out: dict[str, Any] = {"waited": ms > 0, "ok": True, "ms": ms, "real": held_back}
+                if held_back:
+                    out["kind"] = watch.kind
+                return out
+            if not quiet:
+                held_back = True
             if t - started >= self.max_s:
-                return {"waited": True, "ok": False, "ms": ms, "real": last_real is not None,
-                        "why": f"the user kept typing or clicking for {self.max_s:g} s"}
-            # the line says "you're typing or clicking": only when a key or a click was measured within ``quiet_s``
-            # (report 76: 15 false waits before V8), never on the input that made the gate look, whose kind is unknown
-            measured = watch.last_real is not None and watch.last_real > trigger and t - watch.last_real <= self.quiet_s
+                kept = _KEPT_UP.get(str(watch.kind), "kept using the keyboard or mouse")
+                return {"waited": True, "ok": False, "ms": ms, "real": held_back, "kind": watch.kind,
+                        "why": f"the user {kept} for {self.max_s:g} s"}
+            # the line says "you're typing or clicking": only when a key or a mouse button was measured within
+            # ``quiet_s`` (report 76: 15 false waits before V8; hotInput: never for the mouse moving or the wheel)
+            measured = (not quiet) and watch.kind in _LINE_KINDS
             if notify is not None and not notified and measured and t - started >= self.notify_after_s:
                 notified = True
                 try:
@@ -378,10 +445,12 @@ class InputGate:
 # The user, 4 Oct: "when it's working and I start typing with my keyboard or I suddenly move my mouse then it should
 # think that I have taken over ... and it should stop temporarily ... not a very small vibration, a big movement,
 # because my mouse sensor is bad and sometimes vibrates on its own." While a request acts, :class:`TakeoverThread`
-# looks a few times a second (``GetLastInputInfo``, ``GetCursorPos``, and ``GetAsyncKeyState`` only when some input
-# came since the last look: no hook, nothing at all while no request acts) for a key or a mouse button going down, or
-# the cursor travelling far. Yuki's own input moments are left out (its own span, and any span that began since the
-# last look: its keys and its cursor jumps are never the user's). Numbers on the clock and in pixels only.
+# looks a few times a second for a key or a mouse button going down, the wheel turning, or the cursor travelling far:
+# the input monitor's facts (:mod:`yuki.actions.userinput`, Raw Input, the same ones the input gate reads) while it
+# listens, plus ``GetCursorPos`` and ``GetAsyncKeyState`` (asked only when ``GetLastInputInfo`` shows some input came
+# since the last look; that clock is a hint of when to look, never a fact about the user: hotInput, report 73). Yuki's
+# own input moments are left out (its tagged input, its own span, and any span that began since the last look: its
+# keys and its cursor jumps are never the user's). Numbers on the clock and in pixels only.
 
 #: How far (screen pixels) the cursor must travel within :data:`TAKEOVER_WINDOW_S` to count as the user moving the
 #: mouse, by default. A sensor that twitches by itself moves the cursor a few pixels back and forth (it never gets far
@@ -394,9 +463,10 @@ TAKEOVER_MOVE_MAX_PX = 400
 TAKEOVER_WINDOW_S = 0.3
 TAKEOVER_POLL_S = 0.1
 #: Input already going on when the watch began (typing in a chat, keys held in a game as the request starts) is the
-#: baseline, not a takeover: keys, clicks and movement count only once the user has been still this long (s) since the
-#: watch began, or their last input was Yuki's own. The input gate's own "stopped typing" gap (``InputGate.quiet_s``),
-#: measured on the clock (review F3).
+#: baseline, not a takeover: keys, clicks and movement count only once the user's real input (a key, a button, the
+#: wheel, a big move; never a twitch of the sensor) has been still this long (s). The input gate's own "stopped
+#: typing" gap (``InputGate.quiet_s``), measured on the clock (review F3). hotInput: it was measured on
+#: ``GetLastInputInfo``, which a twitching sensor keeps under 0.3 s, so the watch never armed (report 73, release 6).
 TAKEOVER_QUIET_S = 0.8
 #: The mouse buttons among :data:`_REAL_INPUT_VKS` (a button going down is a click; any other key is typing).
 _MOUSE_VKS = frozenset({1, 2, 4, 5, 6})
@@ -531,8 +601,8 @@ def takeover_move_px(value: Any = None) -> int:
 class TakeoverWatch:
     """Whether the user took over the keyboard or mouse since the watch began: one :meth:`poll` per look.
 
-    * **keys** / **click**: a key or a mouse button went down since the last look (or was pressed and let go between
-      two looks), not held from before the watch began;
+    * **keys** / **click** / **wheel**: a key or a mouse button went down since the last look (or was pressed and let
+      go between two looks), or the wheel turned (the input monitor), not held from before the watch began;
     * **mouse**: the cursor travelled at least ``move_px`` from where it was within the last ``window_s`` seconds, and
       it is still that far on the next look (a twitching sensor's back-and-forth, or a one-look jump that comes straight
       back, never counts);
@@ -540,18 +610,20 @@ class TakeoverWatch:
       when one began since the previous look: its keys are consumed and not counted, and the cursor's places from
       before are forgotten (Yuki moves the cursor itself; review vfix2 for scroll); input that went to Yuki itself
       (:func:`yuki_has_it`);
-    * not counted yet: input that was already going on when the watch began (the user typing elsewhere, keys held in a
-      game): nothing counts until the user has been still for ``quiet_s`` since, or their last input was Yuki's own
-      (review F3: the next keystroke of typing that began before the request paused it).
+    * not counted yet: real input that was already going on when the watch began (the user typing elsewhere, keys
+      held in a game): nothing counts until their real input has been still for ``quiet_s`` (review F3: the next
+      keystroke of typing that began before the request paused it). Mouse jitter is no real input: it never holds the
+      watch back (hotInput).
 
     ``GetAsyncKeyState`` is asked only when ``GetLastInputInfo`` shows new input since the last look (or around one of
-    Yuki's own moments): an idle desk costs two calls a look. Every source is a parameter (tests pass stubs).
+    Yuki's own moments): an idle desk costs two calls a look. Every source is a parameter (tests pass stubs);
+    ``signal`` is the input monitor (:data:`SHARED_SIGNAL`: the process's, while it listens; ``None``: none).
 
     Attributes:
         polls: Looks so far.
         max_travel: The farthest the cursor travelled in one window without counting (px): what jitter looked like.
         ignored: Why input was not counted, by reason (``own``, ``yuki``, ``busy``: going on since before the watch).
-        armed: Whether the user's input counts yet (they were still for ``quiet_s`` since the watch began).
+        armed: Whether the user's input counts yet (their real input was still for ``quiet_s``).
     """
 
     def __init__(self, *, move_px: int = TAKEOVER_MOVE_PX, window_s: float = TAKEOVER_WINDOW_S,
@@ -562,11 +634,15 @@ class TakeoverWatch:
                  span: Callable[[], tuple[float, float | None]] = own_input_span,
                  ours: Callable[[str, tuple[int, int] | None], bool] = yuki_has_it,
                  now: Callable[[], float] = time.monotonic,
-                 pressed: Callable[[], float] = key_down_at) -> None:
+                 pressed: Callable[[], float] = key_down_at, signal: Any = SHARED_SIGNAL) -> None:
         self.move_px, self.window_s, self.quiet_s = float(move_px), float(window_s), float(quiet_s)
         self.age, self.keys, self.cursor, self.span, self.ours, self.now = age, keys, cursor, span, ours, now
         self.pressed = pressed
+        self.signal = signal
         self._pressed_seen = 0.0
+        #: When the user's latest real input came (monotonic; 0.0: none known): the watch arms ``quiet_s`` after it.
+        self.activity = 0.0
+        self._sig_seen: dict[str, float] = {}
         self.armed = False
         self.polls = 0
         self.max_travel = 0.0
@@ -602,8 +678,23 @@ class TakeoverWatch:
         last = None if seconds is None or seconds == float("inf") else t - float(seconds)
         came = last is not None and (self._last_input is None or last > self._last_input + 0.005)
         first = self.polls == 0
-        if not self.armed and not own and (last is None or t - last >= self.quiet_s or self._was_own(last, t)):
-            self.armed = True   # still since the watch began (or the last input was Yuki's): from here, input counts
+        sig = _signal_now(self.signal)
+        try:
+            pressed_at = float(self.pressed() or 0.0)
+        except Exception:  # noqa: BLE001
+            pressed_at = 0.0
+        if sig is not None:
+            # the monitor's keys join the keyboard hook's: one key path, checked the same way below
+            pressed_at = max(pressed_at, float(sig.last("keys") or 0.0))
+        if first:
+            # real input from before the watch (the hook's and the monitor's own times): typing going on is the baseline
+            times = [pressed_at]
+            if sig is not None:
+                times += [float(sig.last(kind) or 0.0) for kind in ("click", "wheel", "mouse")]
+            before = [at for at in times if at and not self._was_own(at, t)]
+            self.activity = max([self.activity, *before])
+        if not self.armed and not own and t - self.activity >= self.quiet_s:
+            self.armed = True   # the user's real input has been still for the quiet gap: from here, input counts
         found: str | None = None
         if first or came or own:
             states = self.keys()
@@ -618,12 +709,8 @@ class TakeoverWatch:
                     self._down = down
                     if fresh and not first:
                         found = "click" if fresh & _MOUSE_VKS else "keys"
-        # percFix: a key down the keyboard hook saw since the last look counts however short it was (a 50 ms tap went
-        # unseen by the polled key states); one inside Yuki's own input moment is Yuki's
-        try:
-            pressed_at = float(self.pressed() or 0.0)
-        except Exception:  # noqa: BLE001
-            pressed_at = 0.0
+        # percFix: a key down the keyboard hook (or the input monitor) saw since the last look counts however short it
+        # was (a 50 ms tap went unseen by the polled key states); one inside Yuki's own input moment is Yuki's
         if pressed_at > self._pressed_seen:
             if first:
                 self._pressed_seen = pressed_at
@@ -639,6 +726,20 @@ class TakeoverWatch:
                 self._skip("unseen")
                 self._pressed_seen = pressed_at
             # else: the last-input time may not have caught up yet: looked at again next time
+        if sig is not None:
+            # hotInput: a mouse button, the wheel, or the cursor travelling the takeover distance, as the monitor saw
+            # them (between looks too: a quick click a poll misses); Yuki's own tagged input never reaches these
+            for kind in ("click", "wheel", "mouse"):
+                at = float(sig.last(kind) or 0.0)
+                if at <= self._sig_seen.get(kind, 0.0):
+                    continue
+                self._sig_seen[kind] = at
+                if first:
+                    continue
+                if own or self._was_own(at, t):
+                    self._skip("own")
+                    continue
+                found = found or kind
         if last is not None:
             self._last_input = last if self._last_input is None else max(self._last_input, last)
         where = self.cursor()
@@ -664,8 +765,10 @@ class TakeoverWatch:
         self._prev_t = t
         self.polls += 1
         if found is not None and not self.armed:
-            # going on since before the watch began (typing elsewhere, a game's keys): the baseline, not a takeover
+            # going on since before the watch began (typing elsewhere, a game's keys): the baseline, not a takeover;
+            # the quiet gap starts again from it
             self._skip("busy")
+            self.activity = max(self.activity, t)
             self._far = None
             return None
         if found is not None and self.ours(found, where):
