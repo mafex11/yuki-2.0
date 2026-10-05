@@ -77,6 +77,12 @@ class Change:
     #: view and others leaving it, with none left in both reads to measure a shift by (a scroll of a screenful or
     #: more): ``[(container, came_into_view, left_view)]``.
     turnover: list[tuple[Any, int, int]] = field(default_factory=list)
+    #: Scroll positions that changed but are no evidence the content moved (second review V4): ``[(container, axis,
+    #: before, after, why)]``, ``why`` ``"grew"`` (the position changed while the elements in view stayed put: content
+    #: added or removed past the view, as an infinite feed loads more) or ``"elsewhere"`` (for a scroll made at a
+    #: known point: a container on another axis, or one not under the point, such as a carousel scrolling itself).
+    #: Said, but neither evidence nor the content moving.
+    scroll_aside: list[tuple[Any, str, float, float, str]] = field(default_factory=list)
     #: For a scroll: per container in :attr:`scrolled`, how many elements came into view and left it there.
     scroll_items: dict[int, tuple[int, int]] = field(default_factory=dict)
     title: tuple[str, str] | None = None
@@ -89,7 +95,7 @@ class Change:
     @property
     def any(self) -> bool:
         return bool(self.target_changes or self.appeared or self.gone or self.changed or self.moved or self.title
-                    or self.page or self.scrolled or self.turnover)
+                    or self.page or self.scrolled or self.turnover or self.scroll_aside)
 
     @property
     def evidence(self) -> bool:
@@ -214,19 +220,27 @@ def _free_share(point: tuple[int, int], boxes: list[tuple], area: tuple, axes: s
     return best
 
 
+#: For a scroll judged by items replaced with nothing in the container left in place (second review V4): at least this
+#: many must have come into view and as many left it (one slide of a fading carousel swapped is not a scroll).
+TURNOVER_MIN_ITEMS = 2
+
+
 def _replaced_in_view(scroller: int, container: Any, still: list[int], left: list[int], a: dict[int, Any],
-                      b: dict[int, Any], point: tuple[int, int] | None, view: Any = None, axes: str = "v") -> bool:
+                      b: dict[int, Any], point: tuple[int, int] | None, view: Any = None, axes: str = "v",
+                      came: int = 0) -> bool:
     """For a scroll (review F1): whether the items a scrolling container showed were replaced, rather than one or two
     changing on their own while the rest stayed put. Replaced: nothing in it stayed where it was in both reads; or,
     knowing the scroll's point, the container is the one under it, what was under the point went, and a line through
     the point crosses nothing left in place for at least :data:`TURNOVER_SPAN_SHARE` of the container's visible
     extent (a fixed header or side bar may stay; the tiles next to the point may not). A page at its end whose hover
-    label went and a badge came, or one tile swapped among tiles that stayed, is not a scroll."""
+    label went and a badge came, or one tile swapped among tiles that stayed, is not a scroll; nor is one slide of a
+    fading carousel swapped for another with nothing else in its container (second review V4: with nothing left in
+    place, at least :data:`TURNOVER_MIN_ITEMS` must have come and gone)."""
     box = fact(container, "bounds") if container is not None else None
     if point is not None and box and not _holds(container, point):
         return False
     if not still:
-        return True
+        return came >= TURNOVER_MIN_ITEMS and len(left) >= TURNOVER_MIN_ITEMS
     if point is None or not box:
         return False
     if not any(_holds(b[i], point) for i in left):
@@ -260,6 +274,25 @@ def _scroll_changes(element_before: Any, element_after: Any) -> list[tuple[str, 
         if b >= 0 and a >= 0 and abs(a - b) >= SCROLL_MIN_PERCENT:
             out.append((axis, b, a))
     return out
+
+
+def _set_scroll_aside(change: Change, shifts: dict[int, list[tuple[int, int]]], *, scroll: bool,
+                      point: tuple[int, int] | None, axes: str) -> None:
+    """Move from :attr:`Change.scrolled` to :attr:`Change.scroll_aside` the position changes that are no evidence the
+    content moved (second review V4): one whose elements in view all but stayed put (its content grew or shrank past
+    the view: an infinite feed loading more moves 100% to 85% with the view where it was), and, for a scroll made at a
+    known point, one on another axis or whose box does not hold the point (a carousel elsewhere scrolling itself)."""
+    keep: list[tuple[Any, str, float, float]] = []
+    for container, axis, s0, s1 in change.scrolled:
+        pairs = shifts.get(fact(container, "id"), [])
+        stayed = sum(1 for dy, dx in pairs if max(abs(dy), abs(dx)) < MOVE_MIN_PX)
+        if len(pairs) >= 3 and stayed >= MOVE_SHARE * len(pairs):
+            change.scroll_aside.append((container, axis, s0, s1, "grew"))
+        elif scroll and point is not None and (axis not in axes or not _holds(container, point)):
+            change.scroll_aside.append((container, axis, s0, s1, "elsewhere"))
+        else:
+            keep.append((container, axis, s0, s1))
+    change.scrolled = keep
 
 
 def diff(before: list[Any], after: list[Any], *, target: int | None = None,
@@ -351,6 +384,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         shifts.setdefault(_scrollers_of(i, a), []).append((dy, dx))
         if max(abs(dy), abs(dx)) < MOVE_MIN_PX:
             still.setdefault(_scrollers_of(i, a), []).append(i)
+    _set_scroll_aside(change, shifts, scroll=scroll, point=point, axes=axes)
     for scroller, pairs in shifts.items():
         if len(pairs) < 3:
             continue
@@ -391,7 +425,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
             if scroller not in position and not _replaced_in_view(scroller, container, still.get(scroller, []),
                                                                   [i for i in gone if _scrollers_of(i, b) == scroller],
                                                                   a, b, point, after[0] if after else None,
-                                                                  axes):
+                                                                  axes, came):
                 continue
             if scroller in position:
                 change.scroll_items[scroller] = (came, left)
@@ -411,6 +445,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         change.page = (p0[1] if p0 else "", p1[1] if p1 else "")
     change.counts = {"appeared": len(appeared), "gone": len(gone), "changed": len(change.changed),
                      "weak": change.weak, "moved": len(change.moved), "scrolled": len(change.scrolled),
+                     "scroll_aside": len(change.scroll_aside),
                      "turnover": len(change.turnover), "ignored": change.ignored,
                      "past_limit": past_limit, "before": len(before), "after": len(after)}
     return change
@@ -507,6 +542,14 @@ def describe(change: Change, *, target_label: str = "") -> list[str]:
         counts = [c for c in counts if c]
         lines.append(f"{label(container)} scrolled {way} from {s0:.0f}% to {s1:.0f}% of the way"
                      + (f": {', '.join(counts)}" if counts else ""))
+    for container, axis, s0, s1, why in change.scroll_aside:
+        if why == "grew":
+            lines.append(f"{label(container)} now reports {s1:.0f}% of the way (was {s0:.0f}%) while what was in view "
+                         f"stayed where it was: its content grew or shrank, the view did not move")
+        else:
+            way = ("down" if s1 > s0 else "up") if axis == "v" else ("right" if s1 > s0 else "left")
+            lines.append(f"{label(container)}, away from where the scroll was made, scrolled {way} from {s0:.0f}% to "
+                         f"{s1:.0f}% of the way")
     for container, came, left in change.turnover:
         lines.append(f"the content of {label(container)} scrolled on: {came} element(s) came into view, {left} left "
                      f"it")
@@ -542,7 +585,8 @@ def verdict(change: Change | None, *, opaque: bool = False, readable: bool = Tru
         return None, "the window could not be read before and after"
     if change.any and not change.evidence:
         # report 58 review (F1): a clock tick or a progress value is no proof the action did anything
-        return None, "only things that change on their own changed (a read-only text or a progress value)"
+        return None, ("only things that change on their own changed (a read-only text, a progress value, or a scroll "
+                      "position that is not the content moving)")
     if change.any:
         # the reason is kept in the run trace: the target's own change (a control the thinker acted on), else counts
         # only, so nothing the window showed is copied into it

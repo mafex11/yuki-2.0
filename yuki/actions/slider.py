@@ -80,6 +80,9 @@ TIE_PX = 2.0
 #: How long a bar is given to appear after the pointer moved over it, and how long a set value is watched again (s).
 REVEAL_S = 0.4
 HOLD_S = 0.5
+#: How long a set value must hold one level off the target before the read-back stops waiting for more (s): a
+#: slider that snaps SetValue to a coarser step (second review V8).
+STABLE_S = 0.15
 #: A learned shortcut: presses at most, and the wait for its effect before each read-back (s).
 MAX_SHORTCUT_PRESSES = 12
 SHORTCUT_WAIT_S = 0.15
@@ -178,27 +181,41 @@ def _drive_moves(slider: Slider, details: dict[str, Any], *, value: float, want:
             # moment: Chromium and CEF deliver the new value a little later than SetValue returns
             deadline = time.monotonic() + (VALUE_WAIT_S if live else settle_s)
             after = slider.read()[0]
+            level_since = time.monotonic()   # when the value was first read at its current level
             while not there(after):
-                remaining = deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = deadline - now
                 if remaining <= 0:
                     break
+                moved = abs(after - value) > 1e-9
+                if moved and now - level_since >= STABLE_S:
+                    # second review V8: it took a level off the target (snapped to a coarser step) and holds it;
+                    # waiting out the rest of the bound will not bring it nearer
+                    details["settled_off_target"] = True
+                    break
                 if live:
-                    got = watch.wait(remaining)
-                    after = slider.read()[0]   # read again either way: the value may have come without its event
-                    if not got:
-                        break
-                    continue
-                sleep(POLL_S)
-                after = slider.read()[0]
+                    # read again either way: the value may have come without its event
+                    watch.wait(min(remaining, STABLE_S) if moved else remaining)
+                else:
+                    sleep(POLL_S)
+                level = slider.read()[0]
+                if abs(level - after) > 1e-9:
+                    after, level_since = level, time.monotonic()
             if live:
                 details["read_back"] = "on its change event" if there(after) else "no change event in time"
             if there(after) and hold_s > 0:
                 # a controlled web input can take the value and be put back by its app a moment later
                 if live:
-                    if watch.wait(hold_s):
+                    # second review V2: the whole hold, read again on every change event and at its end. A change
+                    # event SetValue itself raised may still be pending, so one early wake-up is not "it held"
+                    end = time.monotonic() + hold_s
+                    again = after
+                    while there(again):
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        watch.wait(remaining)
                         again = slider.read()[0]
-                    else:
-                        again = after
                 else:
                     sleep(hold_s)
                     again = slider.read()[0]

@@ -1083,6 +1083,14 @@ OUTCOME_TARGET_WAIT_S = 3.0
 #: the pointer alone does - a hover card, a video preview ending - so the click's account holds only what the click
 #: did (live 5 Oct a click on an empty margin was "verified" by a video preview the pointer's move had closed).
 HOVER_SETTLE_S = 1.0
+#: The hover's first event is waited for at most this long (s; second review V5: the move usually raises none, and the
+#: hover effects that matter - a preview ending, a card opening - raise one at once, so the full 0.6 s of an action's
+#: first event was a fixed cost on every raw click). A window that had an event this recently before the move (s) is
+#: busy on its own (a playing video): its quiet would not come before the cap, so it is given a shorter one (s), time
+#: for a preview the pointer ended to go.
+HOVER_FIRST_EVENT_S = 0.2
+HOVER_BUSY_S = 0.25
+HOVER_BUSY_CAP_S = 0.4
 
 
 def _toggle_in(read: list[Any], element_id: int | None, was: Any = None) -> Any:
@@ -1157,6 +1165,27 @@ def _on_a_control(read: list[Any], x: int, y: int) -> bool:
         if area(b) > CONTAINER_SHARE * whole or not _field(e, "is_interactive"):
             continue
         if int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3]):
+            return True
+    return False
+
+
+#: Roles of a surface a click opens (second review V6), and how far from the click's point (px) its box may lie and
+#: still be the click's: a menu or dialog appearing there is the click's effect even when the pointer's arrival had
+#: taken away the control that was at the point.
+_OPENED_ROLES = frozenset({"Menu", "Dialog", "Window"})
+_OPENED_NEAR_PX = 300
+
+
+def _surface_opened_near(change: Any, x: int, y: int) -> bool:
+    """Whether a menu, dialog or window appeared in ``change`` with its box within :data:`_OPENED_NEAR_PX` of point
+    (x, y) (second review V6). Facts about roles and boxes only."""
+    for element, _size in getattr(change, "appeared", None) or ():
+        box = _field(element, "bounds")
+        if _field(element, "role") not in _OPENED_ROLES or not box or len(box) != 4:
+            continue
+        dx = max(int(box[0]) - x, 0, x - int(box[2]))
+        dy = max(int(box[1]) - y, 0, y - int(box[3]))
+        if max(dx, dy) <= _OPENED_NEAR_PX:
             return True
     return False
 
@@ -2578,6 +2607,15 @@ class Dispatcher:
         except Exception:  # noqa: BLE001 - not known: move it
             pass
         generation = self._generation(int(hwnd)) if hwnd else None
+        busy = False
+        if generation is not None:
+            try:
+                hub = self._hub()
+                activity = hub.activity(int(hwnd)) if hub is not None else None
+                last_at = float(getattr(activity, "last_at", 0.0) or 0.0)
+                busy = bool(last_at) and hub.clock() - last_at < HOVER_BUSY_S
+            except Exception:  # noqa: BLE001 - not known: treat as quiet
+                busy = False
         try:
             self._before_input("click")
             moved = point_at(int(x), int(y), expect_hwnd=guard)
@@ -2591,8 +2629,8 @@ class Dispatcher:
         if hub is None or generation is None:
             return
         try:
-            if hub.wait_change(int(hwnd), generation, OUTCOME_FIRST_EVENT_S):
-                hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=HOVER_SETTLE_S)
+            if hub.wait_change(int(hwnd), generation, HOVER_FIRST_EVENT_S):
+                hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=HOVER_BUSY_CAP_S if busy else HOVER_SETTLE_S)
         except Exception:  # noqa: BLE001
             return
 
@@ -3734,7 +3772,8 @@ class Dispatcher:
             return None
 
         def after(outcome: ToolOutcome, read: list[Any] | None, change: Any = None) -> ToolOutcome:
-            if point.get("on_control") is False and isinstance(outcome.payload, dict):
+            if (point.get("on_control") is False and isinstance(outcome.payload, dict)
+                    and not _surface_opened_near(change, x, y)):
                 details = dict(outcome.payload.get("details") or {})
                 details["point_on_nothing"] = True
                 outcome.payload = {**outcome.payload, "details": details}

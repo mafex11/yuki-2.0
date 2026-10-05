@@ -113,6 +113,12 @@ _VK_MENU = 0x12
 _MAPVK_VK_TO_VSC = 0
 
 
+#: Stamped in ``dwExtraInfo`` on every key Yuki sends (second review V7), the same mark as
+#: :data:`yuki.ui.focus.INJECT_MARK` ("YUKI" in ASCII; not imported, so the actions need nothing of the UI): the
+#: tray's keyboard hook leaves such keys out, so Yuki's own typing never stamps a takeover nor plays a chord.
+INJECT_MARK = 0x594B5549
+
+
 class _KeyBdInput(ctypes.Structure):
     _fields_ = [
         ("wVk", ctypes.c_ushort),
@@ -196,7 +202,7 @@ def _key_event(vk: int, scan: int, *, up: bool, unicode: bool = False) -> _Input
     return _Input(
         type=_INPUT_KEYBOARD,
         union=_InputUnion(
-            ki=_KeyBdInput(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=None)
+            ki=_KeyBdInput(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=INJECT_MARK)
         ),
     )
 

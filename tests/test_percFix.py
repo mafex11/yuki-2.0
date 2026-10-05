@@ -992,3 +992,348 @@ def test_f5_with_the_guard_on_a_control_that_leaves_as_the_pointer_comes_makes_t
     assert desk.pointed == [(300, 865)] and desk.clicks == [(300, 865)]
     assert out.ok and details["point_on_nothing"] is True and "verified" not in details
     assert action_verdict("click", out)[0] is None
+
+
+
+# ---------------------------------------------------------------------------
+# Second review fixes (report 83, "Second review")
+# ---------------------------------------------------------------------------
+
+
+def _with_background_tab(window: Node) -> Node:
+    """The live Zen case (V1): a background tab's page under the browser's content pane, reported off-screen, its
+    checkboxes and a toggle with boxes inside the view (Chromium keeps a hidden tab's layout)."""
+    pane = next(n for n in window.walk() if n.role == "Pane")
+    tab = Node("Document", "Background tab", (105, 121, 1507, 951), value="https://example.com/settings",
+               offscreen=True)
+    tab.add(Node("Group", "Settings list", (300, 300, 900, 600), offscreen=True).add(
+        *[Node("CheckBox", f"Option {i}", (310, 310 + 40 * i, 600, 340 + 40 * i), toggle=0, offscreen=True)
+          for i in range(5)],
+        Node("Button", "Background switch", (700, 310, 760, 340), toggle=1, offscreen=True)))
+    pane.add(tab)
+    return window
+
+
+def test_v1_a_background_tabs_checkboxes_are_not_listed_as_hidden_controls_of_the_front_page(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # the fake now refuses to climb from a cached-only element, as real UI Automation does ("Invalid pointer")
+    window = _with_background_tab(player_window(volume=0.4))
+    slider = _node(window, "Change volume", "Slider")
+    slider.bounds, slider.offscreen = (1376, 918, 1416, 942), True   # the front page's own hidden-in-place input
+    tree = read(window, monkeypatch=monkeypatch)
+    assert not any(e.name.startswith("Option ") or e.name == "Background switch" for e in tree.elements)
+    found = _by_name(tree, "Change volume", "Slider")
+    assert found.hidden and found.range == (0.4, 0.0, 1.0)
+
+
+def test_v1_the_fake_refuses_to_climb_from_a_cached_only_element() -> None:
+    from _fake_uia import Automation, Request
+
+    root = player_window()
+    automation = Automation({1: root})
+    request = Request()
+    cached = automation.build(root.children[0], request)   # AutomationElementMode NONE
+    with pytest.raises(OSError):
+        automation.ControlViewWalker.GetParentElementBuildCache(cached, request)
+
+
+def test_v1_when_the_pages_under_a_batch_cannot_be_asked_a_hidden_control_is_left_out(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from _fake_uia import Cached
+
+    def refuses(self: Any, scope: int, condition: Any, request: Any) -> Any:
+        raise OSError(-2147467259, "E_FAIL")
+
+    monkeypatch.setattr(Cached, "FindAllBuildCache", refuses)
+    tree = read(_with_background_tab(player_window()), monkeypatch=monkeypatch)
+    assert not any(e.name.startswith("Option ") or e.name == "Background switch" for e in tree.elements)
+
+
+def test_v3_a_window_whose_sliders_are_all_listed_is_not_swept_again_until_its_pages_change(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    from _fake_uia import Automation, Cached
+
+    window = player_window(slider_box="full")
+    first = read(window, monkeypatch=monkeypatch)
+    assert any(e.name == "Change volume" and e.role == "Slider" and not e.hidden for e in first.elements)
+    assert 7001 in T._no_sliders   # swept once, nothing to add
+    calls: list[int] = []
+    original = Cached.FindAllBuildCache
+
+    def counted(self: Any, scope: int, condition: Any, request: Any) -> Any:
+        if condition == ("prop", T._P_IS_RANGE_VALUE_AVAILABLE, True):   # the sweep's search (not the V1 lookup)
+            calls.append(1)
+        return original(self, scope, condition, request)
+
+    monkeypatch.setattr(Cached, "FindAllBuildCache", counted)
+    T._collect_pass(Automation({7001: window}), 7001, [], 400, time.monotonic() + 5.0)
+    assert calls == []
+    # a navigation: the page Document is new, so the sweep runs again
+    doc = next(n for n in window.walk() if n.role == "Document")
+    doc.rid = (42, 999_999)
+    T._collect_pass(Automation({7001: window}), 7001, [], 400, time.monotonic() + 5.0)
+    assert calls
+
+
+def _point_feed(first: int, *, position: float, carousel: float | None = None,
+                fade: int | None = None) -> list[dict[str, Any]]:
+    """A page whose Document scrolls (tiles at x 0-800), with a horizontal carousel scroller at the right (x 820-1200)
+    or a fading one-slide carousel under the point."""
+    root, pane, *items = _feed(first, position=position)
+    root["bounds"] = (0, 0, 1200, 600)
+    out = [root, pane, *items]
+    if carousel is not None:
+        out.append({"id": 60, "role": "List", "name": "Carousel", "parent": 0, "depth": 1,
+                    "bounds": (820, 0, 1200, 200), "center": (1010, 100), "states": (), "value": None,
+                    "is_interactive": True, "is_scrollable": True, "scroll": (carousel, -1.0)})
+    if fade is not None:
+        out.append({"id": 70, "role": "Group", "name": "Hero", "parent": 0, "depth": 1, "bounds": (820, 300, 1200,
+                    560), "center": (1010, 430), "states": (), "value": None, "is_interactive": False,
+                    "is_scrollable": True})
+        out.append({**_item(700 + fade, f"Slide {fade}", 70, 400), "bounds": (830, 400, 1190, 440),
+                    "center": (1010, 420)})
+    return out
+
+
+def test_v4_a_carousel_elsewhere_scrolling_itself_is_not_the_scroll_moving_the_content() -> None:
+    before = _point_feed(0, position=100.0, carousel=10.0)
+    after = _point_feed(0, position=100.0, carousel=40.0)
+    change = diff(before, after, scroll=True, point=(400, 300), axes="v")
+    assert not change.content_moved and change.scroll_aside and change.scroll_aside[0][4] == "elsewhere"
+    assert verdict(change)[0] is None
+    assert any("away from where the scroll was made" in ln for ln in describe(change))
+    # the same carousel scrolled by a horizontal scroll made over it is the scroll
+    over = diff(before, after, scroll=True, point=(1000, 100), axes="h")
+    assert over.content_moved and over.scrolled
+
+
+def test_v4_one_fading_slide_swapped_under_the_point_is_not_a_scroll() -> None:
+    before = _point_feed(0, position=100.0, fade=1)
+    after = _point_feed(0, position=100.0, fade=2)
+    change = diff(before, after, scroll=True, point=(1000, 420), axes="v")
+    assert not change.turnover and not change.content_moved
+
+
+def test_v4_a_feed_that_loaded_more_at_its_end_did_not_move_the_view() -> None:
+    before = _feed(0, position=100.0)
+    after = _feed(0, position=85.0)   # the same items in place; the page grew below the view
+    change = diff(before, after, scroll=True, point=(400, 300), axes="v")
+    assert not change.content_moved and change.scroll_aside[0][4] == "grew"
+    assert any("its content grew or shrank, the view did not move" in ln for ln in describe(change))
+    assert not any("scrolled up" in ln for ln in describe(change))
+    # a real scroll still moves: the items shift and the position goes on
+    real = diff(_feed(0, position=10.0), _feed(3, position=20.0), scroll=True, point=(400, 300), axes="v")
+    assert real.content_moved
+
+
+class _TimedSlider:
+    """A slider over real time (V2/V8): SetValue applies at once (snapped to ``snap`` when given) and raises a change
+    event; the app puts the old value back ``revert_after`` s later (another event)."""
+
+    def __init__(self, value: float = 0.5, *, snap: float | None = None, revert_after: float | None = None,
+                 events: bool = True) -> None:
+        import threading
+
+        self.value, self.snap, self.revert_after, self.events = value, snap, revert_after, events
+        self.event = threading.Event()
+        self.timers: list[Any] = []
+
+    def read(self) -> tuple[float, float, float, bool, float]:
+        return self.value, 0.0, 1.0, False, 0.01
+
+    def set(self, value: float) -> None:
+        import threading
+
+        old = self.value
+        self.value = round(round(value / self.snap) * self.snap, 4) if self.snap else value
+        self.event.set()
+        if self.revert_after is not None:
+            def back() -> None:
+                self.value = old
+                self.event.set()
+            timer = threading.Timer(self.revert_after, back)
+            timer.start()
+            self.timers.append(timer)
+
+    def focus(self) -> None:
+        pass
+
+    def watch(self) -> Any:
+        slider = self
+
+        class Watch:
+            live = slider.events
+
+            def wait(self, timeout_s: float) -> bool:
+                got = slider.event.wait(max(0.0, timeout_s))
+                slider.event.clear()
+                return got
+
+            def close(self) -> None:
+                pass
+
+        return Watch()
+
+
+def test_v2_a_value_the_app_puts_back_during_the_hold_is_caught_with_events() -> None:
+    from yuki.actions.slider import drive
+
+    s = _TimedSlider(revert_after=0.15)
+    ok, _summary, details = drive(s, by=-30, hold_s=0.4)
+    for timer in s.timers:
+        timer.join()
+    assert not ok and details["verified"] is False and details.get("reverted") is True
+    assert details["after"] == pytest.approx(0.5)
+
+
+def test_v2_a_value_that_holds_is_verified_after_the_whole_hold() -> None:
+    import time
+
+    from yuki.actions.slider import drive
+
+    s = _TimedSlider()
+    started = time.monotonic()
+    ok, _summary, details = drive(s, by=-30, hold_s=0.3)
+    assert ok and details["verified"] is True and time.monotonic() - started >= 0.29
+
+
+@pytest.mark.parametrize("events", [True, False])
+def test_v8_a_slider_that_snaps_off_target_stops_waiting_once_it_holds_its_level(events: bool) -> None:
+    import time
+
+    from yuki.actions.slider import drive
+
+    s = _TimedSlider(snap=0.1, events=events)
+    started = time.monotonic()
+    ok, _summary, details = drive(s, to=33, hold_s=0.0)
+    elapsed = time.monotonic() - started
+    assert not ok and details["after"] == pytest.approx(0.3) and details.get("settled_off_target") is True
+    assert elapsed < 0.8, elapsed
+
+
+class _HoverHub:
+    def __init__(self, *, busy: bool) -> None:
+        import time
+
+        self.now = time.monotonic()
+        self.last_at = self.now - (0.05 if busy else 30.0)
+        self.firsts: list[float] = []
+        self.caps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def watch(self, hwnd: int) -> None:
+        return None
+
+    def generation(self, hwnd: int) -> int:
+        return 5
+
+    def activity(self, hwnd: int) -> Any:
+        return SimpleNamespace(last_at=self.last_at)
+
+    def wait_change(self, hwnd: int, since: int, timeout_s: float) -> bool:
+        self.firsts.append(timeout_s)
+        return True
+
+    def wait_quiet(self, hwnd: int, *, quiet_s: float, cap_s: float) -> tuple[bool, float]:
+        self.caps.append(cap_s)
+        return False, cap_s
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_v5_the_hover_before_a_raw_click_waits_briefly(monkeypatch: pytest.MonkeyPatch, busy: bool) -> None:
+    from yuki.agent import tools as tools_mod
+    from yuki.agent.tools import Dispatcher
+
+    pointed: list[tuple[int, int]] = []
+    backend = SimpleNamespace(point_at=lambda x, y, expect_hwnd=None: pointed.append((x, y)) or {"ok": True})
+    d = Dispatcher(backend=backend)
+    hub = _HoverHub(busy=busy)
+    d.events, d.use_events = hub, True
+    d._before_input = lambda name: None
+    monkeypatch.setattr("yuki.perception.windows.cursor_position", lambda: (0, 0))
+    d._hover_first(7001, 300, 400, 7001)
+    assert pointed == [(300, 400)]
+    assert hub.firsts == [tools_mod.HOVER_FIRST_EVENT_S] and tools_mod.HOVER_FIRST_EVENT_S <= 0.2
+    assert hub.caps == [tools_mod.HOVER_BUSY_CAP_S if busy else tools_mod.HOVER_SETTLE_S]
+    assert tools_mod.HOVER_BUSY_CAP_S < tools_mod.HOVER_SETTLE_S
+
+
+def test_v6_a_click_that_opened_a_menu_is_verified_though_the_hover_replaced_the_control(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.agent.loop import action_verdict
+
+    window = player_window()
+    library = next(n for n in window.walk() if n.name == "Your Library")
+    card = Node("Button", "Show card", (153, 850, 461, 880), invoke=True)
+    library.add(card)
+    desk = _PointerDesk(monkeypatch, window)
+
+    def preview(x: int, y: int) -> None:
+        if card in library.children:   # the hover swaps the card for a preview that is not clickable
+            library.children.remove(card)
+            library.add(Node("Group", "Preview", (153, 850, 461, 880)))
+
+    def opens(x: int, y: int) -> None:
+        library.add(Node("Menu", "Card menu", (300, 600, 500, 845)).add(
+            Node("MenuItem", "Save", (305, 605, 495, 630), invoke=True)))
+
+    desk.on_point, desk.on_click = preview, opens
+    d = _guarded(desk, monkeypatch)
+    d.dispatch("look_at_window", {"hwnd": 7001})
+    out = d.dispatch("click", {"x": 300, "y": 865, "expect_hwnd": 7001})
+    details = out.payload["details"]
+    assert out.ok and "point_on_nothing" not in details and details["verified"] is True
+    assert action_verdict("click", out)[0] is True
+
+
+def test_v7_a_key_the_hook_saw_that_the_pc_never_took_as_input_is_not_a_takeover() -> None:
+    # Deskflow's hook swallowed it (typed onto another screen): GetLastInputInfo never moved
+    state = {"t": 1000.0, "last": 900.0, "span": (0.0, 0.0), "pressed": 0.0}
+    w = _watch(state)
+    assert w.poll() is None
+    state["t"] += 1.0
+    assert w.poll() is None
+    state["pressed"] = state["t"] + 0.03
+    for _ in range(5):
+        state["t"] += 0.1
+        assert w.poll() is None
+    assert w.ignored.get("unseen") == 1
+
+
+def test_v7_a_hook_key_whose_last_input_shows_a_moment_later_still_counts() -> None:
+    state = {"t": 1000.0, "last": 900.0, "span": (0.0, 0.0), "pressed": 0.0}
+    w = _watch(state)
+    w.poll()
+    state["t"] += 1.0
+    w.poll()
+    state["pressed"] = state["t"] + 0.03
+    state["t"] += 0.1
+    assert w.poll() is None          # the last-input time has not caught up yet
+    state["last"] = state["pressed"] + 0.001
+    state["t"] += 0.1
+    assert w.poll() == "keys"
+
+
+def test_v7_yukis_own_keys_carry_the_mark_the_hook_leaves_out() -> None:
+    from yuki.actions import input as I
+    from yuki.ui.focus import INJECT_MARK
+
+    assert I.INJECT_MARK == INJECT_MARK
+    event = I._key_event(0x41, 0, up=False)
+    assert event.union.ki.dwExtraInfo == INJECT_MARK
+
+
+def test_v7_the_hook_stamps_the_events_own_time() -> None:
+    import ctypes
+    import time
+
+    from yuki.ui.hotkey import _event_moment
+
+    tick = int(ctypes.windll.kernel32.GetTickCount()) & 0xFFFFFFFF
+    at = _event_moment((tick - 200) & 0xFFFFFFFF)
+    assert time.monotonic() - at == pytest.approx(0.2, abs=0.05)
+    assert abs(time.monotonic() - _event_moment((tick - 60_000) & 0xFFFFFFFF)) < 0.05   # far off: now

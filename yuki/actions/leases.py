@@ -410,6 +410,12 @@ _MOUSE_VKS = frozenset({1, 2, 4, 5, 6})
 _KEY_DOWN_AT = [0.0]
 
 
+#: A key the hook saw counts only with the PC's last-input time at or after it (less this slack, s: the two clocks
+#: tick apart), and is looked at for this long (s) for that to show before it is dropped (second review V7).
+HOOK_INPUT_MATCH_S = 0.05
+HOOK_INPUT_WAIT_S = 0.3
+
+
 def note_key_down(at: float | None = None) -> None:
     """A key went down now (or at ``at``, monotonic): called from the keyboard hook. One store, no lock (a float)."""
     _KEY_DOWN_AT[0] = time.monotonic() if at is None else float(at)
@@ -619,12 +625,20 @@ class TakeoverWatch:
         except Exception:  # noqa: BLE001
             pressed_at = 0.0
         if pressed_at > self._pressed_seen:
-            if not first:
-                if own or self._was_own(pressed_at, t):
-                    self._skip("own")
-                elif found is None:
-                    found = "keys"
-            self._pressed_seen = pressed_at
+            if first:
+                self._pressed_seen = pressed_at
+            elif own or self._was_own(pressed_at, t):
+                self._skip("own")
+                self._pressed_seen = pressed_at
+            elif came and last is not None and last >= pressed_at - HOOK_INPUT_MATCH_S:
+                # second review V7: only a key the PC took as input (its last-input time moved with it); a key another
+                # program's hook swallowed (Deskflow sending it to another screen) never moves it
+                found = found or "keys"
+                self._pressed_seen = pressed_at
+            elif t - pressed_at > HOOK_INPUT_WAIT_S:
+                self._skip("unseen")
+                self._pressed_seen = pressed_at
+            # else: the last-input time may not have caught up yet: looked at again next time
         if last is not None:
             self._last_input = last if self._last_input is None else max(self._last_input, last)
         where = self.cursor()

@@ -893,13 +893,20 @@ def _automation_id(get: object) -> str:
 _MAX_HIDDEN = 40
 #: The slider sweep (:meth:`_ViewportPass._sweep_sliders`): skipped when less than this is left of a read's budget (s);
 #: sliders looked at, at most; control-view levels climbed to a listed ancestor, at most; and how long a window found
-#: with no slider at all is not searched again (s).
+#: whose sweep had nothing to add is not searched again while its listed sliders stay the same (s).
 _SWEEP_MARGIN_S = 0.3
 _SWEEP_MAX = 24
 _SWEEP_CLIMB = 12
 _NO_SLIDERS_S = 30.0
-#: Windows whose last sweep found no slider, with when (monotonic).
-_no_sliders: dict[int, float] = {}
+#: Off-screen page Documents under one batch asked for their state controls (:meth:`_ViewportPass._in_unlisted_page`),
+#: at most (more: not known, so the batch's hidden controls are left out); and the mark of a batch not asked yet.
+_UNLISTED_PAGES = 16
+_UNASKED = object()
+#: Windows whose last sweep had nothing to add (no slider, or every one already listed or not this window's), with
+#: when (monotonic) and the RuntimeIds of the sliders and page Documents the walk listed then: the next read of the
+#: window skips the sweep while its walk lists exactly those (second review V3: a Chrome or Discord read paid
+#: 40-140 ms on every read for nothing).
+_no_sliders: dict[int, tuple[float, frozenset]] = {}
 #: Unread children (cap or clock) looked at per level for their names; the rest are only counted.
 _UNREAD_LOOKED = 40
 #: Names of left-out children kept per parent (:attr:`WindowTree.left_out`), and how much of each.
@@ -1751,6 +1758,10 @@ class _ViewportPass:
         self.scroll_clip = self.viewport
         #: The cache request for climbing to a hidden control's ancestors (:meth:`_in_unlisted_page`), made once.
         self._parent_request: object | None = None
+        #: The filtered subtree batches the walk is reading now, innermost last, each as ``[live element, what
+        #: :meth:`_state_in_offscreen_pages` found under it or _UNASKED]``: an element of such a batch is cached only
+        #: (AutomationElementMode NONE), and real UI Automation will not climb from it.
+        self._batch_live: list[list[object]] = []
         self.rects: dict[int, tuple[int, int, int, int]] = {}
         for handle in handles:
             rect = _window_rect(handle)
@@ -1917,7 +1928,7 @@ class _ViewportPass:
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
         if (_hidden_in_place(get, self._hidden_area(), trusted=self.trust_offscreen)
-                and not self._in_unlisted_page(element)):
+                and not self._in_unlisted_page(element, live=live)):
             # A slider or switch the page hides in place: kept for its state, nothing below it read.
             runtime_id = _runtime_id(get)
             if runtime_id is not None:
@@ -1998,7 +2009,11 @@ class _ViewportPass:
         if self._whole_subtree(get):
             holder = self._fetch(element, self._request("subtree"))
             if holder is not None:
-                self._walk_children(holder, depth, live=False)
+                self._batch_live.append([element, _UNASKED])
+                try:
+                    self._walk_children(holder, depth, live=False)
+                finally:
+                    self._batch_live.pop()
         else:
             holder = self._fetch(element, self._request("level"))
             if holder is not None:
@@ -2762,8 +2777,13 @@ class _ViewportPass:
         if time.monotonic() >= self.deadline - _SWEEP_MARGIN_S:
             return 0
         now = time.monotonic()
+        # the window's shape as far as sliders go: the sliders the walk listed and the pages it read (a tab switch or
+        # a navigation brings new page RuntimeIds, so the sweep runs again)
+        listed = frozenset((e.role == "Document", e.runtime_id) for e in walker.elements
+                           if e.runtime_id and (e.range is not None or e.role == "Document"))
         with _fresh_lock:
-            if now - _no_sliders.get(self.hwnd, -_NO_SLIDERS_S) < _NO_SLIDERS_S:
+            memo = _no_sliders.get(self.hwnd)
+            if memo is not None and now - memo[0] < _NO_SLIDERS_S and memo[1] == listed:
                 return 0
         automation = self.automation
         try:
@@ -2776,21 +2796,17 @@ class _ViewportPass:
             return 0
         walker.fetches += 1
         with _fresh_lock:
-            if sliders:
-                _no_sliders.pop(self.hwnd, None)
-            else:
-                _no_sliders[self.hwnd] = now
-                if len(_no_sliders) > 256:
-                    for stale in [h for h, at in _no_sliders.items() if now - at >= _NO_SLIDERS_S]:
-                        _no_sliders.pop(stale, None)
+            _no_sliders.pop(self.hwnd, None)
         by_rid = {e.runtime_id: e.id for e in walker.elements if e.runtime_id}
         added: list[int] = []
         try:
             walker_view = automation.ControlViewWalker  # type: ignore[attr-defined]
         except Exception:
             return 0
+        looked_at_all = count <= _SWEEP_MAX
         for element in sliders:
             if time.monotonic() >= self.deadline - _SWEEP_MARGIN_S / 2:
+                looked_at_all = False
                 break
             get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
             runtime_id = _runtime_id(get)
@@ -2812,6 +2828,7 @@ class _ViewportPass:
                     if above_get(_P_CONTROL_TYPE) == _DOCUMENT_CONTROL_TYPE:
                         break   # inside a page the read does not list (a background tab's, a covered one): not here
             except Exception:
+                looked_at_all = False
                 continue
             if parent_id < 0:
                 continue   # not under anything the read lists: another page's, or a covered part
@@ -2832,15 +2849,35 @@ class _ViewportPass:
         walker._lineage = []
         if added:
             _place_added(walker, added)
+        elif looked_at_all:
+            with _fresh_lock:
+                _no_sliders[self.hwnd] = (now, listed)
+                if len(_no_sliders) > 256:
+                    for stale in [h for h, (at, _ids) in _no_sliders.items() if now - at >= _NO_SLIDERS_S]:
+                        _no_sliders.pop(stale, None)
         return len(added)
 
-    def _in_unlisted_page(self, element: object) -> bool:
+    def _in_unlisted_page(self, element: object, *, live: bool = True) -> bool:
         """Whether a state control the read is about to keep as hidden in place lies inside a page the walk did not
         read (percFix): its line of control-view ancestors meets a Document the walk never visited before it meets an
         element it did. The reader's filter lifts a hidden control out of an off-screen subtree to the nearest element
-        read, so a covered page's slider would otherwise be listed as this window's. A few cross-process calls, only
-        for hidden controls (at most :data:`_MAX_HIDDEN` a read); unknown (no walker, an error) is False."""
+        read, so a covered page's slider, or a background tab's checkboxes, would otherwise be listed as this
+        window's. Only for hidden controls (at most :data:`_MAX_HIDDEN` a read).
+
+        An element of a filtered subtree batch (``live`` False) is cached only, and real UI Automation refuses to
+        climb from it ("Invalid pointer", second review V1). For those the batch's own live element is asked once
+        for the off-screen Documents under it and the state controls under each (``FindAll``, evaluated in the
+        app's process), and the control is in an unlisted page when a Document holding it was not visited. Unknown
+        (an error, nothing to ask) fails closed: True, so the control is not listed as this window's."""
         try:
+            if not live:
+                runtime_id = _runtime_id(element.GetCachedPropertyValue)  # type: ignore[attr-defined]
+                if runtime_id is None or not self._batch_live:
+                    return True
+                state = self._state_in_offscreen_pages(self._batch_live[-1])  # type: ignore[assignment]
+                if state is None:
+                    return True
+                return any(doc not in self.visited for doc in state.get(runtime_id, ()))
             if self._parent_request is None:
                 self._parent_request = _build_cache_request(self.automation, _TREE_SCOPE_ELEMENT,
                                                             mode=_AUTOMATION_ELEMENT_MODE_FULL)
@@ -2857,8 +2894,49 @@ class _ViewportPass:
                 if get(_P_CONTROL_TYPE) == _DOCUMENT_CONTROL_TYPE:
                     return True
         except Exception:
-            return False
+            return True
         return False
+
+    def _state_in_offscreen_pages(self, batch: list[object]) -> dict[tuple[int, ...], set[tuple[int, ...]]] | None:
+        """The state controls (RangeValue or Toggle) under each off-screen page Document below the batch's live
+        element, by RuntimeId, with the RuntimeIds of the Documents holding them; ``None`` when UI Automation would
+        not say. Asked once per batch (:meth:`_in_unlisted_page`), kept in ``batch[1]``."""
+        if batch[1] is not _UNASKED:
+            return batch[1]  # type: ignore[return-value]
+        batch_live = batch[0]
+        out: dict[tuple[int, ...], set[tuple[int, ...]]] | None = {}
+        automation = self.automation
+        try:
+            if self._parent_request is None:
+                self._parent_request = _build_cache_request(automation, _TREE_SCOPE_ELEMENT,
+                                                            mode=_AUTOMATION_ELEMENT_MODE_FULL)
+            condition = automation.CreatePropertyCondition  # type: ignore[attr-defined]
+            pages = automation.CreateAndCondition(  # type: ignore[attr-defined]
+                condition(_P_CONTROL_TYPE, _DOCUMENT_CONTROL_TYPE), condition(_P_IS_OFFSCREEN, True))
+            state = automation.CreateOrCondition(  # type: ignore[attr-defined]
+                condition(_P_IS_RANGE_VALUE_AVAILABLE, True), condition(_P_IS_TOGGLE_AVAILABLE, True))
+            found = batch_live.FindAllBuildCache(  # type: ignore[attr-defined]
+                _TREE_SCOPE_DESCENDANTS, pages, self._parent_request)
+            self.walker.fetches += 1
+            pages_found = int(found.Length) if found else 0
+            if pages_found > _UNLISTED_PAGES:
+                # not known: the batch's hidden controls are left out (the slider sweep still adds its sliders)
+                raise RuntimeError("too many off-screen pages to ask")
+            for i in range(pages_found):
+                doc = found.GetElement(i)
+                doc_id = _runtime_id(doc.GetCachedPropertyValue)
+                if doc_id is None:
+                    continue
+                controls = doc.FindAllBuildCache(_TREE_SCOPE_DESCENDANTS, state, self._parent_request)
+                self.walker.fetches += 1
+                for j in range(int(controls.Length) if controls else 0):
+                    control_id = _runtime_id(controls.GetElement(j).GetCachedPropertyValue)
+                    if control_id is not None:
+                        out.setdefault(control_id, set()).add(doc_id)
+        except Exception:
+            out = None
+        batch[1] = out
+        return out
 
     def _area_under(self, element_id: int) -> tuple[int, int, int, int] | None:
         """The visible part of the scrolling container listed element ``element_id`` sits in (itself included): the

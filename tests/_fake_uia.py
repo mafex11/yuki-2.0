@@ -244,6 +244,10 @@ class _Walker:
         self.automation = automation
 
     def GetParentElementBuildCache(self, element: Cached, request: Request) -> Any:
+        if element.request.AutomationElementMode == T._AUTOMATION_ELEMENT_MODE_NONE:
+            # as real UI Automation does (second review V1): an element fetched cached-only has no live reference to
+            # climb from, and the call fails with E_POINTER ("Invalid pointer")
+            raise OSError(-2147467261, "Invalid pointer")
         node = self.automation.parents.get(id(element.node))
         while node is not None and not node.control:
             node = self.automation.parents.get(id(node))
@@ -252,7 +256,9 @@ class _Walker:
 
 class Live(Cached):
     def __init__(self, node: Node, automation: Automation) -> None:
-        super().__init__(node, Request(), depth_left=0, automation=automation)
+        request = Request()
+        request.AutomationElementMode = T._AUTOMATION_ELEMENT_MODE_FULL
+        super().__init__(node, request, depth_left=0, automation=automation)
 
 
 def read(root: Node, *, hwnd: int = 7001, viewport: tuple[int, int, int, int] | None = None,

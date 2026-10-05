@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import time
 from ctypes import wintypes
 
 from typing import TYPE_CHECKING
@@ -144,6 +145,17 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
         ("time", wintypes.DWORD),
         ("dwExtraInfo", ctypes.c_void_p),
     ]
+
+
+def _event_moment(event_ms: int) -> float:
+    """The monotonic moment of a hook event from its own ``time`` field (``GetTickCount`` ms), not the moment the
+    callback ran (second review V7: a busy process runs it late). Off by more than a few seconds: now."""
+    now = time.monotonic()
+    try:
+        late = ((int(ctypes.windll.kernel32.GetTickCount()) - int(event_ms)) & 0xFFFFFFFF) / 1000.0
+    except Exception:  # noqa: BLE001
+        return now
+    return now - late if 0.0 <= late <= 5.0 else now
 
 
 class HotkeyError(ValueError):
@@ -478,7 +490,7 @@ class ChordHookThread(_MessageLoopThread):
                     # not the user's typing: they must not taint or end a chord.
                     if (event.dwExtraInfo or 0) != INJECT_MARK:
                         if note_key_down is not None and int(w_param) in _KEY_DOWN:
-                            note_key_down()
+                            note_key_down(_event_moment(int(event.time)))
                         action = self._observe(int(event.vkCode), int(w_param))
                         if self._mask_now:
                             self._mask_now = False
