@@ -1757,8 +1757,8 @@ class VoiceBridge(QObject):
         self._changed()
 
     def _on_paused_changed(self, lane: str, job_id: int, state: str, why: str) -> None:
-        """appTakeover: the job paused because the user took over (``paused``), goes on (``resumed``), or ended
-        unresumed (``ended``). Nothing is said for any of them (Yuki never speaks first): a step or "still on it" line
+        """appTakeover: the job paused because the user took over (``paused``), goes on (``resumed``), ended
+        unresumed (``ended``), or ended while still paused (``closed``, small8). Nothing is said for any of them (Yuki never speaks first): a step or "still on it" line
         still waiting is dropped, none comes while it is paused, and an unresumed end is quiet."""
         job = self._job(job_id)
         if job is None:
@@ -1773,6 +1773,10 @@ class VoiceBridge(QObject):
             job.paused = False
             if job.log is not None:
                 job.log.add("resumed", "it read the screen again and goes on")
+        elif state == "closed":
+            # small8: the request ended while still paused (it finished anyway, or was stopped): no longer paused; its
+            # end is told as it really happened (its reply, or the stop), never as "nobody went on with it"
+            job.paused = False
         else:
             job.paused, job.paused_out = False, True
             job.superseded = True                 # nothing of its end is spoken

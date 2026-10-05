@@ -543,8 +543,8 @@ class WindowHost(QObject):
 
     def _op_now(self, req: dict[str, Any]) -> dict[str, Any]:
         """``now``: the live task trace, from the chat thread (:class:`ChatModel`): every response still running,
-        with its steps (label, running/ok, seconds), elapsed time and step count, and which request each lane
-        drives."""
+        with its steps (label, running/ok, seconds), elapsed time and step count, which request each lane drives, and
+        the request paused for the user's takeover (``paused``: its id, else ``None``)."""
         def build() -> dict[str, Any]:
             at = time.time()
             runs = []
@@ -563,7 +563,11 @@ class WindowHost(QObject):
                     "writing_s": round(tail[0], 1) if tail else None,
                 })
             rt = self.ui.runtime
-            return {"at": at, "runs": runs, "lanes": dict(rt.running_ids()), "worker_busy": bool(rt.worker_busy)}
+            # small8: the request paused for the user's takeover now (its id), else None: read from the runtime, so a
+            # request that ended (finished or stopped) while paused is never shown paused
+            paused_id = getattr(rt, "paused_id", None)
+            return {"at": at, "runs": runs, "lanes": dict(rt.running_ids()), "worker_busy": bool(rt.worker_busy),
+                    "paused": paused_id() if callable(paused_id) else None}
         return {"now": self._on_gui(build)}
 
     def _find_card(self, card: Any) -> dict[str, Any] | None:

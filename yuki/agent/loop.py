@@ -648,8 +648,9 @@ class Agent:
         #: (the default: the CLI, evals, tests, a caller's agent) never pauses. The desktop runtime's worker sets it.
         self.takeover: Any = None
         #: Told at once of every pause state (``on_pause(state, why, seconds)``: ``paused`` from the watch's thread the
-        #: moment the user takes over, ``resumed`` / ``ended`` from the request's thread), so the island shows it while
-        #: the request is still in a model call. Never raises into the request.
+        #: moment the user takes over, ``resumed`` / ``ended`` from the request's thread, and ``closed`` when the request
+        #: ends while still paused: finished anyway, or stopped; small8), so the island shows it while the request is
+        #: still in a model call. Never raises into the request.
         self.on_pause: Any = None
         #: Whether a takeover may pause the request now (``takeover_ok() -> bool``; ``None``: always). The desktop sets
         #: it to "no full screen in front": in a full-screen game or video the island is hidden, so a pause could not
@@ -665,6 +666,10 @@ class Agent:
         self._paused_s = 0.0
         self._pauses = 0
         self._stopped_paused = False
+        #: small8: the pause now set already has its end on record (``resumed`` / ``ended`` / ``stopped`` logged) and
+        #: told to the surfaces (``resumed`` / ``ended``); :meth:`_close_pause` adds only what is missing.
+        self._pause_end_logged = False
+        self._pause_end_told = False
         self._pause_quiet_until = 0.0
         self._resume_asked = False
         self._watch: Any = None
@@ -1130,6 +1135,7 @@ class Agent:
             self._pause_why, self._pause_at = str(why or ""), time.monotonic()
             self._pauses += 1
             self._resume_asked = False
+            self._pause_end_logged = self._pause_end_told = False
             self._paused.set()
             self._pause_wake.clear()
         self.logger.log("takeover", state="paused", why=self._pause_why, n=self._pauses)
@@ -1216,22 +1222,50 @@ class Agent:
         if timed_out:
             self.logger.log("takeover", state="ended", why=why, seconds=round(took, 1))
             self._stopped_paused = True
+            self._pause_end_logged = self._pause_end_told = True
             self._tell_pause("ended", why, round(took, 1))
             yield Paused("ended", why, round(took, 1))
             self.cancel()
             return False
         if self._cancelled.is_set():
             self._stopped_paused = True
+            self._pause_end_logged = True
             self.logger.log("takeover", state="stopped", why=why, seconds=round(took, 1))
             return False
         with self._pause_lock:
             self._paused.clear()
             self._resume_asked = False
+            self._pause_end_logged = self._pause_end_told = True
         self.logger.log("takeover", state="resumed", why=why, seconds=round(took, 1))
         self._tell_pause("resumed", why, round(took, 1))
         yield Paused("resumed", why, round(took, 1))
         self._watch_on(grace_s=RESUME_GRACE_S)
         return True
+
+    def _close_pause(self, how: str) -> None:
+        """small8 (report 73, release 7): the request ends (``how``: ``finished`` with its reply, ``cancelled``, or
+        ``ended`` otherwise) while still paused for the user's takeover: the pause ends with it, everywhere. One
+        ``takeover`` record ``closed`` goes to the log (unless its end is already there) and the surfaces are told
+        ``closed`` (the runtime's paused job, the island, the voice; unless already told), so nothing goes on showing a
+        paused request and the next request is never read as paused. Live, a run whose last press had landed finished
+        with its reply 11 s into a mouse takeover, no record closed the pause, and the next request was taken as
+        paused. Safe to call when not paused (nothing happens). Never raises."""
+        try:
+            with self._pause_lock:
+                if not self._paused.is_set():
+                    return
+                self._paused.clear()
+                self._resume_asked = False
+                logged, told = self._pause_end_logged, self._pause_end_told
+                self._pause_end_logged = self._pause_end_told = True
+                why, since = self._pause_why, self._pause_at
+            seconds = round(max(0.0, time.monotonic() - since), 1) if since else 0.0
+            if not logged:
+                self.logger.log("takeover", state="closed", how=how, why=why, seconds=seconds)
+            if not told:
+                self._tell_pause("closed", why, seconds)
+        except Exception:  # noqa: BLE001 - presentation and the log only: the request's end goes on
+            pass
 
     def _resume_note(self, seconds: float) -> str:
         """What the model is told when the request goes on after the user took over."""
@@ -1373,6 +1407,7 @@ class Agent:
         self._paused.clear()
         self._pause_wake.clear()
         self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
+        self._pause_end_logged = self._pause_end_told = False
         self._pause_quiet_until, self._resume_asked = 0.0, False
         stale = self.take_steers()
         self._pending_answer = None
@@ -1537,6 +1572,9 @@ class Agent:
         finally:
             if drive is not None:
                 drive.close()
+            # small8: whatever ended it (a stop, an error), a pause still open ends with the request
+            self._close_pause("finished" if outcome == "final" else "cancelled" if self._cancelled.is_set()
+                              else "ended")
             self._acting_done()
             self._input_off()
             self.logger.usage_total()
@@ -2483,6 +2521,7 @@ class Agent:
                     if self._finished_by_action:
                         self._done_claims = None   # its line is written by code from the verified report
                     final = self._with_list_left(self._honest_final(turn.finished[0], verdict))
+                    self._close_pause("finished")   # small8: a done while paused ends the pause before the reply
                     self.logger.final(final)
                     yield Final(final, outcome=verdict)
                     return
@@ -2553,6 +2592,7 @@ class Agent:
                 self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
                 verdict = self._outcome_verdict()
                 text = self._with_list_left(self._honest_final(text, verdict))
+                self._close_pause("finished")
                 self.logger.final(text)
                 yield Final(text, outcome=verdict)
             else:

@@ -53,7 +53,9 @@ def brief_now(c) -> dict:
                      "tools": [s.get("name") for s in r.get("steps") or [] if s.get("kind") in ("tool", "hand", "helper")
                                and isinstance(s.get("name"), str) and len(s.get("name")) < 40][-8:],
                      "running": [s.get("name") for s in r.get("steps") or [] if s.get("running")][-2:]})
-    return {"lanes": n.get("lanes"), "worker_busy": n.get("worker_busy"), "runs": runs}
+    # small8: the paused request from the runtime itself (a tray from before it has no "paused": the log is read)
+    return {"lanes": n.get("lanes"), "worker_busy": n.get("worker_busy"), "runs": runs,
+            **({"paused": n.get("paused")} if "paused" in n else {})}
 
 
 def paused_now() -> bool:
@@ -94,7 +96,8 @@ def main() -> int:
             while True:
                 now = brief_now(c)
                 waiting = [r for r in now["runs"] if r["question"] or r["status"] == "question"]
-                if now["worker_busy"] and paused_now():
+                paused = (now["paused"] is not None) if "paused" in now else paused_now()
+                if now["worker_busy"] and paused:
                     print(f"paused for the user's takeover after {time.time() - started:.0f}s")
                     return 4
                 if waiting:
