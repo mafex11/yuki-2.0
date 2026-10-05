@@ -1122,6 +1122,20 @@ def _toggle_in(read: list[Any], element_id: int | None, was: Any = None) -> Any:
     return best if best_share >= _SAME_PLACE_SHARE else None
 
 
+def _box_area(b: Any) -> int:
+    """The area of a ``(left, top, right, bottom)`` box, 0 for anything else."""
+    if not b or len(b) != 4:
+        return 0
+    return max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+
+
+def _container_share() -> float:
+    """:data:`yuki.agent.situation.CONTAINER_SHARE`: a box larger than this share of the window is a container."""
+    from yuki.agent.situation import CONTAINER_SHARE
+
+    return float(CONTAINER_SHARE)
+
+
 #: How much of the larger of two boxes they must share to be one control drawn again in place (:func:`_toggle_in`).
 _SAME_PLACE_SHARE = 0.6
 
@@ -3735,7 +3749,18 @@ class Dispatcher:
                                 f"the click no longer has it); read the window again")
             return x, y
         centre = current.get("center") or ()
-        if current.get("hidden") or len(centre) < 2:
+        if current.get("hidden"):
+            # percFix: a control the app keeps out of sight stands at the box of what hides it (a switch's label). When
+            # that is a container covering much of the window (the whole bar it sits in is hidden too, as in a
+            # full-size view), the mouse would land on whatever is drawn there: nothing is sent
+            box = current.get("bounds") or ()
+            areas = [_box_area(_field(e, "bounds")) for e in model.latest.values()]
+            if len(box) == 4 and _box_area(box) > _container_share() * max(areas or [1]):
+                raise ToolError(f"not clicked: element [{element_id}] is kept out of sight by the app and has no place "
+                                f"of its own on screen to click. Hover where it appears, read the window again, then "
+                                f"click it from that read")
+            return x, y
+        if len(centre) < 2:
             return x, y
         return int(centre[0]), int(centre[1])
 

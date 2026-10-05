@@ -60,6 +60,18 @@ def test_a_slider_whose_label_is_kept_off_screen_is_found_by_the_sweep_and_place
     assert "[hidden]" in line and "0.4 (range 0-1)" in line
 
 
+def test_the_sweep_leaves_out_a_slider_of_a_page_the_read_does_not_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    window = player_window()
+    pane = next(n for n in window.walk() if n.role == "Pane")
+    covered = Node("Document", "Covered page", (105, 121, 1507, 951), offscreen=True)
+    covered.add(Node("Group", "Covered player", (111, 890, 1501, 945), offscreen=True).add(
+        Node("Slider", "Covered volume", (1374, 925, 1418, 935), range=(0.9, 0.0, 1.0), offscreen=True)))
+    pane.add(covered)
+    tree = read(window, monkeypatch=monkeypatch)
+    assert not any(e.name == "Covered volume" for e in tree.elements)
+    assert any(e.name == "Change volume" and e.role == "Slider" for e in tree.elements)
+
+
 def test_the_sweep_does_not_search_again_a_window_with_no_slider(monkeypatch: pytest.MonkeyPatch) -> None:
     root = Node("Window", "Notes", (0, 0, 800, 600))
     root.add(Node("Button", "Save", (10, 10, 80, 40), invoke=True))
@@ -298,6 +310,23 @@ def test_a_toggle_that_did_nothing_is_still_contradicted(monkeypatch: pytest.Mon
     text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
     out = d.dispatch("click", {"element": _id_of(text, "Lyrics"), "expect_hwnd": 7001, "toggle_to": "on"})
     assert out.payload["details"]["verified"] is False and action_verdict("click", out)[0] is False
+
+
+def test_a_toggle_hidden_with_its_whole_bar_is_never_clicked_by_the_mouse_at_the_containers_place(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # a full-size view hides the player bar: its toggles are listed hidden (with their states), standing at the box
+    # of the window-sized group that holds them; the mouse would land on whatever the view draws there
+    desk = _Desk(monkeypatch, player_window(bar_offscreen=True))
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    out = d.dispatch("click", {"element": _id_of(text, "Lyrics"), "expect_hwnd": 7001, "toggle_to": "on"})
+    assert not out.ok and "kept out of sight" in out.summary and desk.clicks == []
+    # through its Toggle pattern it is fine: no pointer needed
+    desk = _PatternDesk(monkeypatch, player_window(bar_offscreen=True))
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    out = d.dispatch("click", {"element": _id_of(text, "Lyrics"), "expect_hwnd": 7001, "toggle_to": "on"})
+    assert out.ok and desk.acted == ["click"] and desk.clicks == []
 
 
 def test_the_toggle_found_again_by_place_ignores_a_different_control_or_a_small_overlap() -> None:

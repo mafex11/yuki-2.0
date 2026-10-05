@@ -1735,6 +1735,8 @@ class _ViewportPass:
         #: ancestor): a state control reported off-screen with its box inside it is hidden in place, one outside it
         #: is scrolled away (:func:`_hidden_in_place`, percFix).
         self.scroll_clip = self.viewport
+        #: The cache request for climbing to a hidden control's ancestors (:meth:`_in_unlisted_page`), made once.
+        self._parent_request: object | None = None
         self.rects: dict[int, tuple[int, int, int, int]] = {}
         for handle in handles:
             rect = _window_rect(handle)
@@ -1899,7 +1901,7 @@ class _ViewportPass:
             walker.stop("depth")
             return
         get = element.GetCachedPropertyValue  # type: ignore[attr-defined]
-        if _hidden_in_place(get, self._hidden_area()):
+        if _hidden_in_place(get, self._hidden_area()) and not self._in_unlisted_page(element):
             # A slider or switch the page hides in place: kept for its state, nothing below it read.
             runtime_id = _runtime_id(get)
             if runtime_id is not None:
@@ -2786,10 +2788,13 @@ class _ViewportPass:
                     if not current:
                         break
                     levels += 1
-                    above = _runtime_id(current.GetCachedPropertyValue)
+                    above_get = current.GetCachedPropertyValue
+                    above = _runtime_id(above_get)
                     if above is not None and above in by_rid:
                         parent_id = by_rid[above]
                         break
+                    if above_get(_P_CONTROL_TYPE) == _DOCUMENT_CONTROL_TYPE:
+                        break   # inside a page the read does not list (a background tab's, a covered one): not here
             except Exception:
                 continue
             if parent_id < 0:
@@ -2812,6 +2817,32 @@ class _ViewportPass:
         if added:
             _place_added(walker, added)
         return len(added)
+
+    def _in_unlisted_page(self, element: object) -> bool:
+        """Whether a state control the read is about to keep as hidden in place lies inside a page the walk did not
+        read (percFix): its line of control-view ancestors meets a Document the walk never visited before it meets an
+        element it did. The reader's filter lifts a hidden control out of an off-screen subtree to the nearest element
+        read, so a covered page's slider would otherwise be listed as this window's. A few cross-process calls, only
+        for hidden controls (at most :data:`_MAX_HIDDEN` a read); unknown (no walker, an error) is False."""
+        try:
+            if self._parent_request is None:
+                self._parent_request = _build_cache_request(self.automation, _TREE_SCOPE_ELEMENT,
+                                                            mode=_AUTOMATION_ELEMENT_MODE_FULL)
+            walker_view = self.automation.ControlViewWalker  # type: ignore[attr-defined]
+            current = element
+            for _ in range(_SWEEP_CLIMB):
+                current = walker_view.GetParentElementBuildCache(current, self._parent_request)
+                if not current:
+                    return False
+                get = current.GetCachedPropertyValue
+                runtime_id = _runtime_id(get)
+                if runtime_id is not None and runtime_id in self.visited:
+                    return False
+                if get(_P_CONTROL_TYPE) == _DOCUMENT_CONTROL_TYPE:
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _area_under(self, element_id: int) -> tuple[int, int, int, int] | None:
         """The visible part of the scrolling container listed element ``element_id`` sits in (itself included): the
