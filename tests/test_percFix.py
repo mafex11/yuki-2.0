@@ -742,3 +742,253 @@ def test_the_launch_verdict_with_an_address_and_no_page_read_is_unverified() -> 
 
     own = {"hwnd": 5, "foreground": True, "identity": {"names": ["browser.exe"]}}
     assert _launch_verdict(True, {**own, "page_targets": ["https://www.example.com"]}) is None
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (report 83, "Review fixes")
+# ---------------------------------------------------------------------------
+
+
+def _feed_under_a_bar(first: int, *, extra: list[dict[str, Any]] | None = None,
+                      drop: int | None = None) -> list[dict[str, Any]]:
+    """A page whose Document scrolls: a search bar that stays put at the top, video tiles below it."""
+    root, pane, *items = _feed(first, position=None)
+    tiles = [{**t, "bounds": (0, t["bounds"][1] + 100, 800, t["bounds"][3] + 100),
+              "center": (400, t["center"][1] + 100)} for t in items if t["id"] != drop]
+    bar = _item(50, "Search", 1, 20, role="Edit")
+    bar["bounds"], bar["center"] = (200, 20, 600, 60), (400, 40)
+    return [root, pane, bar, *tiles, *(extra or [])]
+
+
+def test_f1_a_scroll_that_did_nothing_while_one_item_swapped_on_its_own_is_not_the_content_moving() -> None:
+    # review F1: the page is at its end, the scroll does nothing, a hover label goes and a badge comes: 9 of 10 items
+    # stayed in place, so nothing was replaced by scrolling
+    before = _feed(0, position=None)
+    after = [e for e in before if e["id"] != 105] + [_item(300, "New badge", 1, 480)]
+    for point in (None, (400, 300), (400, 220)):
+        change = diff(before, after, scroll=True, point=point)
+        assert not change.turnover and not change.content_moved, point
+        assert not verdict(change)[1].startswith("the window changed: its content moved"), point
+
+
+def test_f1_a_screenful_scroll_under_a_bar_that_stays_is_judged_by_what_was_under_the_point() -> None:
+    # the live YouTube case with its fixed search bar: every tile replaced, the bar left in both reads
+    before, after = _feed_under_a_bar(0), _feed_under_a_bar(20)
+    change = diff(before, after, scroll=True, point=(400, 300))   # over the tiles
+    assert change.turnover and change.content_moved
+    # without the point, an item left in place says nothing was replaced
+    assert not diff(before, after, scroll=True).turnover
+    # with the point on the bar that stayed, the content under it did not move
+    assert not diff(before, after, scroll=True, point=(400, 40)).turnover
+    # a point outside the scrolling container is not a scroll of it
+    assert not diff(before, after, scroll=True, point=(900, 300)).turnover
+
+
+def test_f1_one_tile_under_the_point_swapped_while_the_rest_stayed_is_not_a_scroll() -> None:
+    # tile 105 (y 300-340) went and another came at its place, but the tiles around it stayed where they were
+    before = _feed_under_a_bar(0)
+    after = _feed_under_a_bar(0, drop=105, extra=[_item(301, "Ad", 1, 300)])
+    change = diff(before, after, scroll=True, point=(400, 320))
+    assert not change.turnover and not change.content_moved
+
+
+def _covered_settings_page() -> Node:
+    window = Node("Window", "Settings - Browser", (0, 0, 1200, 800))
+    pane = Node("Pane", "", (0, 80, 1200, 800), offscreen=True)
+    page = Node("Document", "Settings", (0, 80, 1200, 800), value="https://example.com/settings", offscreen=True)
+    page.add(Node("CheckBox", "Send reports", (20, 100, 200, 130), toggle=0, offscreen=True),
+             Node("Button", "Dark mode", (20, 140, 200, 170), toggle=1, offscreen=True).add(
+                 Node("Text", "Dark mode label", (25, 145, 190, 165), offscreen=True)),
+             Node("Slider", "Text size", (20, 180, 300, 210), range=(12.0, 8.0, 32.0), offscreen=True),
+             Node("Button", "Save", (20, 220, 100, 250), invoke=True, offscreen=True))
+    pane.add(page)
+    window.add(pane)
+    return window
+
+
+def test_f2_a_covered_window_read_by_geometry_lists_its_switches_and_sliders_as_shown(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # review F2: a window other windows cover reports everything off-screen; its state controls are not "hidden"
+    tree = read(_covered_settings_page(), monkeypatch=monkeypatch)
+    for name in ("Send reports", "Dark mode", "Text size", "Save"):
+        assert not _by_name(tree, name).hidden, name
+    assert any(e.name == "Dark mode label" for e in tree.elements)
+    assert _by_name(tree, "Text size").range == (12.0, 8.0, 32.0)
+
+
+def test_f2_the_small_box_rule_still_holds_where_the_off_screen_flag_is_not_trusted() -> None:
+    def getter(box: tuple[int, int, int, int] | None, offscreen: bool = True) -> Any:
+        values = {T._P_IS_RANGE_VALUE_AVAILABLE: True, T._P_IS_TOGGLE_AVAILABLE: False,
+                  T._P_IS_OFFSCREEN: offscreen, T._P_BOUNDING_RECT: box}
+        return lambda prop: values.get(prop)
+
+    area = (0, 0, 1000, 800)
+    full = (20, 180, 280, 30)    # the raw property: left, top, width, height
+    tiny = (100, 100, 1, 1)
+    assert T._hidden_in_place(getter(full), area) is True                       # trusted: any size counts
+    assert T._hidden_in_place(getter(full), area, trusted=False) is False       # covered window: not hidden
+    assert T._hidden_in_place(getter(tiny), area, trusted=False) is True        # a 1 px input is hidden anywhere
+    assert T._hidden_in_place(getter(None), area, trusted=False) is True        # no box at all
+    assert T._hidden_in_place(getter(full, False), area, trusted=False) is False
+
+
+class _Hub:
+    """A fake event hub: a generation counter the test moves; nothing waits for real."""
+
+    def __init__(self) -> None:
+        self.gen = 0
+        self.waits: list[tuple[int, float]] = []
+
+    def watch(self, hwnd: int) -> None:
+        return None
+
+    def generation(self, hwnd: int) -> int:
+        return self.gen
+
+    def wait_change(self, hwnd: int, since: int, timeout_s: float) -> bool:
+        self.waits.append((since, timeout_s))
+        return self.gen > since
+
+    def wait_quiet(self, hwnd: int, *, quiet_s: float, cap_s: float) -> tuple[bool, float]:
+        return True, 0.0
+
+    def busy_since(self, hwnd: int, since: float) -> list[Any]:
+        return []
+
+
+def _hub_dispatcher(hub: _Hub, reads: list[Any], *, bump_on_read: bool = False) -> Any:
+    from yuki.agent.tools import Dispatcher
+
+    d = Dispatcher(backend=SimpleNamespace())
+    d.verify_outcomes = True
+    d.events = hub
+    d.use_events = True
+    taken: list[Any] = []
+
+    def observe(hwnd: int) -> tuple[Any, bool]:
+        taken.append(reads[len(taken)])
+        if bump_on_read:
+            hub.gen += 1   # the window's event lands while this read runs
+        return taken[-1], False
+
+    d._observe = observe
+    return d
+
+
+def test_f3_an_event_that_landed_during_the_read_after_is_not_waited_for_again() -> None:
+    import time
+
+    hub = _Hub()
+    d = _hub_dispatcher(hub, ["on"])
+    read_generation = hub.gen      # taken before the after-read
+    hub.gen += 1                   # the toggle's event arrives while that read runs: it still shows "off"
+    after, _partial, extra = d._read_again_until(7001, "off", False, lambda r: r == "on",
+                                                 time.monotonic() + 3.0, read_generation)
+    assert after == "on" and extra == 1 and hub.waits[0][0] == read_generation
+
+
+def test_f3_each_re_read_takes_its_generation_before_it_reads() -> None:
+    import time
+
+    hub = _Hub()
+    hub.gen = 1
+    d = _hub_dispatcher(hub, ["off", "on"], bump_on_read=True)
+    after, _partial, extra = d._read_again_until(7001, "off", False, lambda r: r == "on",
+                                                 time.monotonic() + 3.0, 0)
+    # the first re-read still showed "off" while an event landed during it: read again at once, not a later event
+    assert after == "on" and extra == 2 and [w[0] for w in hub.waits] == [0, 1]
+
+
+def test_f4_a_toggle_its_own_pattern_confirmed_does_not_wait_long_for_a_window_event(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.agent import tools as tools_mod
+
+    firsts: list[float] = []
+
+    def recording(d: Any) -> None:
+        original = d._settled_after
+
+        def recorded(hwnd: int, generation: Any, *, first_s: float = tools_mod.OUTCOME_FIRST_EVENT_S) -> None:
+            firsts.append(first_s)
+            return original(hwnd, generation, first_s=first_s)
+
+        d._settled_after = recorded
+
+    desk = _PatternDesk(monkeypatch, player_window(lyrics_on=False))
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    recording(d)
+    out = d.dispatch("click", {"element": _id_of(text, "Lyrics"), "expect_hwnd": 7001, "toggle_to": "on"})
+    assert out.payload["details"]["verified"] is True
+    assert firsts == [tools_mod.OUTCOME_FIRST_EVENT_S]
+    # a mouse-clicked toggle (no state of its own yet) still gets the long first wait
+    desk = _Desk(monkeypatch, player_window(lyrics_on=False))
+    d = _dispatcher(desk)
+    text = d.dispatch("look_at_window", {"hwnd": 7001}).content[0]["text"]
+    firsts.clear()
+    recording(d)
+    d.dispatch("click", {"element": _id_of(text, "Lyrics"), "expect_hwnd": 7001, "toggle_to": "on"})
+    assert firsts == [tools_mod.OUTCOME_TARGET_WAIT_S]
+
+
+def _guarded(desk: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A dispatcher with the production raw-click guard on, its window facts stubbed (no real window is asked)."""
+    from yuki.agent import tools as tools_mod
+
+    d = _dispatcher(desk)
+    d.guard_raw_clicks = True
+    d._pointed_window = lambda x, y: 7001
+    monkeypatch.setattr(tools_mod, "_window_title_now", lambda h: None)
+    monkeypatch.setattr(tools_mod, "_window_rect_now", lambda h: None)
+    monkeypatch.setattr("yuki.perception.tree.measured_opaque", lambda h: False)
+    monkeypatch.setattr("yuki.perception.windows.cursor_position", lambda: (0, 0))
+    return d
+
+
+class _PointerDesk(_Desk):
+    """A desk that can bring the pointer to a point (``on_point`` runs as it arrives)."""
+
+    def point_at(self, x: int, y: int, *, expect_hwnd: int | None = None) -> Any:
+        self.pointed.append((x, y))
+        if self.on_point is not None:
+            self.on_point(x, y)
+        return ActionResult(ok=True, summary=f"pointer at ({x},{y})", details={})
+
+
+def test_f5_with_the_guard_on_a_click_on_an_empty_margin_is_refused_before_anything_moves(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    desk = _PointerDesk(monkeypatch, player_window())
+    d = _guarded(desk, monkeypatch)
+    d.dispatch("look_at_window", {"hwnd": 7001})
+    out = d.dispatch("click", {"x": 300, "y": 870, "expect_hwnd": 7001})   # in the library, below the playlists
+    assert not out.ok and "nothing you can click is at (300,870)" in out.summary
+    assert desk.clicks == [] and desk.pointed == []
+
+
+def test_f5_with_the_guard_on_a_control_that_leaves_as_the_pointer_comes_makes_the_click_unverified(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    # the latest read had a card at the point (the guard lets the click through); the pointer arriving closes it, so
+    # the read just before the click has nothing there: what changes after is not taken as the click's effect
+    from yuki.agent.loop import action_verdict
+
+    window = player_window()
+    library = next(n for n in window.walk() if n.name == "Your Library")
+    card = Node("Button", "Show card", (153, 850, 461, 880), invoke=True)
+    library.add(card)
+    desk = _PointerDesk(monkeypatch, window)
+
+    def closes(x: int, y: int) -> None:
+        if card in library.children:
+            library.children.remove(card)
+
+    def churn(x: int, y: int) -> None:
+        library.children.pop(0)   # something else in the window goes on its own as the click lands
+
+    desk.on_point, desk.on_click = closes, churn
+    d = _guarded(desk, monkeypatch)
+    d.dispatch("look_at_window", {"hwnd": 7001})
+    out = d.dispatch("click", {"x": 300, "y": 865, "expect_hwnd": 7001})
+    details = out.payload["details"]
+    assert desk.pointed == [(300, 865)] and desk.clicks == [(300, 865)]
+    assert out.ok and details["point_on_nothing"] is True and "verified" not in details
+    assert action_verdict("click", out)[0] is None

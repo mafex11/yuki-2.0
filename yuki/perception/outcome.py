@@ -180,22 +180,66 @@ def _holds(element: Any, point: tuple[int, int]) -> bool:
     return int(box[0]) <= int(point[0]) < int(box[2]) and int(box[1]) <= int(point[1]) < int(box[3])
 
 
+#: For a scroll judged by items replaced (review F1): the stretch through the scroll's point that nothing left in
+#: place crosses must be at least this share of the scrolling container's visible extent (a fixed header or side bar
+#: may stay; tiles above and below the point staying mean nothing scrolled).
+TURNOVER_SPAN_SHARE = 0.5
+
+
+def _free_share(point: tuple[int, int], boxes: list[tuple], area: tuple, axes: str = "v") -> float:
+    """The share of ``area`` that a line through ``point`` along the scroll's axis covers without meeting any of
+    ``boxes`` (0 when one of them holds the point); the larger of the two when ``axes`` is ``"vh"``. A vertical scroll
+    is measured along the vertical line: a list's rows lie across any horizontal one, so that would say nothing."""
+    px, py = int(point[0]), int(point[1])
+    best = 0.0
+    lines = [(1, 0, int(area[1]), int(area[3]))] if "v" in axes else []
+    lines += [(0, 1, int(area[0]), int(area[2]))] if "h" in axes else []
+    for along, across, low, high in lines:
+        # along=1: the vertical line at x (boxes crossing it limit it above and below the point); along=0: horizontal
+        start, end = low, high
+        at = py if along else px
+        line = px if along else py
+        for box in boxes:
+            if not (int(box[across]) <= line < int(box[across + 2])):
+                continue
+            near, far = int(box[along]), int(box[along + 2])
+            if near <= at < far:
+                return 0.0
+            if far <= at:
+                start = max(start, far)
+            else:
+                end = min(end, near)
+        if high > low:
+            best = max(best, (end - start) / (high - low))
+    return best
+
+
 def _replaced_in_view(scroller: int, container: Any, still: list[int], left: list[int], a: dict[int, Any],
-                      b: dict[int, Any], point: tuple[int, int] | None) -> bool:
+                      b: dict[int, Any], point: tuple[int, int] | None, view: Any = None, axes: str = "v") -> bool:
     """For a scroll (review F1): whether the items a scrolling container showed were replaced, rather than one or two
     changing on their own while the rest stayed put. Replaced: nothing in it stayed where it was in both reads; or,
-    knowing the scroll's point, the container is the one under it, what was under the point went, and nothing that
-    stayed in place is under it (a fixed header or side bar of the page may stay; the content under the point may
-    not). A page at its end whose hover label went and a badge came is not a scroll."""
-    if point is not None and container is not None and fact(container, "bounds") and not _holds(container, point):
+    knowing the scroll's point, the container is the one under it, what was under the point went, and a line through
+    the point crosses nothing left in place for at least :data:`TURNOVER_SPAN_SHARE` of the container's visible
+    extent (a fixed header or side bar may stay; the tiles next to the point may not). A page at its end whose hover
+    label went and a badge came, or one tile swapped among tiles that stayed, is not a scroll."""
+    box = fact(container, "bounds") if container is not None else None
+    if point is not None and box and not _holds(container, point):
         return False
     if not still:
         return True
-    if point is None:
+    if point is None or not box:
         return False
-    if any(_holds(a[i], point) for i in still):
+    if not any(_holds(b[i], point) for i in left):
         return False
-    return any(_holds(b[i], point) for i in left)
+    area = tuple(box)
+    window = fact(view, "bounds") if view is not None else None
+    if window:
+        # the container's part inside the window (a page's Document may report its whole length)
+        area = (max(area[0], window[0]), max(area[1], window[1]), min(area[2], window[2]), min(area[3], window[3]))
+        if area[2] <= area[0] or area[3] <= area[1]:
+            return False
+    boxes = [fact(a[i], "bounds") for i in still if fact(a[i], "bounds")]
+    return _free_share(point, boxes, area, axes) >= TURNOVER_SPAN_SHARE
 
 
 #: A scroll position change smaller than this (percent of the way) is rounding, not movement.
@@ -221,7 +265,7 @@ def _scroll_changes(element_before: Any, element_after: Any) -> list[tuple[str, 
 def diff(before: list[Any], after: list[Any], *, target: int | None = None,
          reference: list[Any] | None = None, busy: set[int] | None = None,
          before_partial: bool = False, after_partial: bool = False, scroll: bool = False,
-         point: tuple[int, int] | None = None) -> Change:
+         point: tuple[int, int] | None = None, axes: str = "v") -> Change:
     """Compare two reads of one window whose ids are carried (the same id is the same element).
 
     Args:
@@ -236,6 +280,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
             beyond the limit: it is not counted as appeared or gone (report 58 review, F5).
         scroll: the action was a scroll (items replaced in a scrolling container can be its movement).
         point: for a scroll, the screen point it was made at (the content under it is what must have been replaced).
+        axes: for a scroll, its direction: ``"v"`` (up/down), ``"h"`` (left/right) or ``"vh"``.
     """
     b = {fact(e, "id"): e for e in before}
     a = {fact(e, "id"): e for e in after}
@@ -345,7 +390,8 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
             container = a.get(scroller) or b.get(scroller)
             if scroller not in position and not _replaced_in_view(scroller, container, still.get(scroller, []),
                                                                   [i for i in gone if _scrollers_of(i, b) == scroller],
-                                                                  a, b, point):
+                                                                  a, b, point, after[0] if after else None,
+                                                                  axes):
                 continue
             if scroller in position:
                 change.scroll_items[scroller] = (came, left)
