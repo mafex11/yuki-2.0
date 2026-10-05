@@ -2699,40 +2699,46 @@ def launch_app(
 
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
-    launched_pid: int | None = None
-    if plan is None:
-        # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
-        # for both packaged apps (AppUserModelID) and desktop shortcuts.
-        result = run_powershell(
-            f"Start-Process -FilePath {_quote('shell:AppsFolder\\' + chosen['appid'])}",
-            timeout_s=start_budget,
-        )
-        details["launched"] = result.ok
-        details["launch_stderr"] = result.details.get("stderr", "")
-        failure = result.details.get("stderr") or result.summary
-    elif "command" in plan:
-        # Start-Process on a desktop program file or on an App Execution Alias.
-        result = run_powershell(plan["command"], timeout_s=start_budget)
-        details["launched"] = result.ok
-        details["launch_stderr"] = result.details.get("stderr", "")
-        stdout = str(result.details.get("stdout") or "").strip()
-        last_line = stdout.splitlines()[-1].strip() if stdout else ""
-        details["pid"] = int(last_line) if last_line.isdigit() else None
-        launched_pid = details["pid"]
-        failure = result.details.get("stderr") or result.summary
-    else:
-        pid, error = _activate_packaged(
-            plan["aumid"], plan["arguments"], start_budget, uris=plan.get("uris")
-        )
-        details["launched"] = pid is not None
-        details["pid"] = pid
-        launched_pid = pid
-        if error:
-            details["launch_error"] = error
-        failure = (
-            f"activating the packaged app {plan['aumid']!r} with arguments "
-            f"({plan['via']}) failed: {error}"
-        )
+    def hand_over(into: dict) -> tuple[int | None, str]:
+        """Start the app with its arguments (writes ``launched`` and the start's facts into ``into``): ``(pid,
+        failure)``. percFix: also used once more to hand the address again (see below)."""
+        launched_pid: int | None = None
+        if plan is None:
+            # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
+            # for both packaged apps (AppUserModelID) and desktop shortcuts.
+            result = run_powershell(
+                f"Start-Process -FilePath {_quote('shell:AppsFolder\\' + chosen['appid'])}",
+                timeout_s=start_budget,
+            )
+            into["launched"] = result.ok
+            into["launch_stderr"] = result.details.get("stderr", "")
+            failure = result.details.get("stderr") or result.summary
+        elif "command" in plan:
+            # Start-Process on a desktop program file or on an App Execution Alias.
+            result = run_powershell(plan["command"], timeout_s=start_budget)
+            into["launched"] = result.ok
+            into["launch_stderr"] = result.details.get("stderr", "")
+            stdout = str(result.details.get("stdout") or "").strip()
+            last_line = stdout.splitlines()[-1].strip() if stdout else ""
+            into["pid"] = int(last_line) if last_line.isdigit() else None
+            launched_pid = into["pid"]
+            failure = result.details.get("stderr") or result.summary
+        else:
+            pid, error = _activate_packaged(
+                plan["aumid"], plan["arguments"], start_budget, uris=plan.get("uris")
+            )
+            into["launched"] = pid is not None
+            into["pid"] = pid
+            launched_pid = pid
+            if error:
+                into["launch_error"] = error
+            failure = (
+                f"activating the packaged app {plan['aumid']!r} with arguments "
+                f"({plan['via']}) failed: {error}"
+            )
+        return launched_pid, failure
+
+    launched_pid, failure = hand_over(details)
     mark("start")
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
@@ -2773,6 +2779,29 @@ def launch_app(
                 ),
                 details,
             )
+        if (page_wait is not None and page_wait.windows and not page_wait.seen and not already_running
+                and identity.running_pids()):
+            # percFix (live 5 Oct): Arc started cold with an address came up on its own new-tab view and never
+            # showed the page - the address handed to it at its start was dropped - and the agent spent 111 s and
+            # 11 model calls typing it in. Its windows are up and show no page at all, and the app runs now: the
+            # address is handed once more, to the running app, and the page waited for again.
+            again: dict = {}
+            handed_again = time.monotonic()
+            _again_pid, again_failure = hand_over(again)
+            details["handed_again"] = {"launched": bool(again.get("launched"))}
+            if not again.get("launched"):
+                details["handed_again"]["error"] = str(again_failure)[:160]
+            else:
+                page_wait = _await_page(identity, page_targets, before,
+                                        handed_again + content_timeout_s - time.monotonic())
+                mark("page_again")
+                details["page_check_again"] = _page_details(page_wait)
+                if page_wait is not None and page_wait.matched is not None:
+                    details["waited_ms"] = round((time.monotonic() - handed_off) * 1000.0, 1)
+                    opened = _page_opened(chosen["name"], page_wait, before, details,
+                                          handed_again + content_timeout_s, page_targets, identity)
+                    return finish(True, f"{opened} (the address was handed again once {chosen['name']} was "
+                                        f"running: its first start showed no page)", details)
         details["page_verified"] = False if page_wait is not None and page_wait.seen else None
         page_miss = _page_miss(chosen["name"], page_targets, page_wait)
         # The address is not on screen.  What did change, if anything, is
@@ -3227,6 +3256,8 @@ def _fullscreen(hwnd: int, name: str, details: dict, finish) -> ActionResult:  #
 #: Bound on the wait for a window asked to close to go away (percFix: 2 s was too short for a browser saving its
 #: session; a window that asks something first ends the wait at once, see :func:`_asks_before_closing`).
 _CLOSE_WAIT_S = 8.0
+#: How long a window asked to close must keep showing it is asking something before the wait ends on it (s).
+_ASKING_HOLD_S = 0.8
 
 
 def _is_cloaked(hwnd: int) -> bool:
@@ -3241,17 +3272,16 @@ def _is_cloaked(hwnd: int) -> bool:
 
 def _asks_before_closing(hwnd: int) -> bool:
     """Whether a window asked to close shows it is asking something: it is disabled (a modal dialog of its own owns
-    the input), or another visible window of the same process is in front. Window facts only."""
+    the input), or the window in front is owned by it (its own dialog). Another window of the same app coming to the
+    front is not that: closing one of two browser windows brings the other forward. Window facts only."""
     try:
         if not win32gui.IsWindowEnabled(hwnd):
             return True
         front = int(_user32.GetForegroundWindow() or 0)
         if not front or front == hwnd:
             return False
-        import win32process
-
-        return (win32process.GetWindowThreadProcessId(front)[1] == win32process.GetWindowThreadProcessId(hwnd)[1]
-                and bool(win32gui.IsWindowVisible(front)))
+        return int(win32gui.GetWindow(front, win32con.GW_OWNER) or 0) == int(hwnd) and bool(
+            win32gui.IsWindowVisible(front))
     except Exception:  # noqa: BLE001
         return False
 
@@ -3304,17 +3334,22 @@ def window_action(hwnd: int, action: str) -> ActionResult:
         win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         # percFix: live 5 Oct Arc took longer than 2 s to close and was reported "still open" (it had closed a few
         # seconds later). The wait is longer now, and it ends at once on what "it is asking something" looks like:
-        # the window disabled behind a dialog of its own (a modal save prompt), or another of its process's windows
-        # come to the front.
+        # the window disabled behind a dialog of its own (a modal save prompt), or a window it owns in front, for
+        # :data:`_ASKING_HOLD_S` on end (an app can disable its window for a moment while it shuts down).
         deadline = time.monotonic() + _CLOSE_WAIT_S
         asking = False
+        asking_since: float | None = None
         while time.monotonic() < deadline:
             if (not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
                     or (not was_cloaked and _is_cloaked(hwnd))):
                 return finish(True, f"{name} is closed", details)
-            asking = _asks_before_closing(hwnd)
-            if asking:
-                break
+            if _asks_before_closing(hwnd):
+                asking_since = asking_since if asking_since is not None else time.monotonic()
+                asking = time.monotonic() - asking_since >= _ASKING_HOLD_S
+                if asking:
+                    break
+            else:
+                asking_since, asking = None, False
             time.sleep(_POLL_S)
         waited = round(time.monotonic() - (deadline - _CLOSE_WAIT_S), 1)
         details["close_waited_s"] = waited
