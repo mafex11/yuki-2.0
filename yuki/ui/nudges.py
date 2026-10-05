@@ -51,7 +51,7 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QEnterEvent, QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
 
 from yuki.agent.memory import TRAY_TIMEOUT_S, MemoryAccess, MemoryUnavailable
 from yuki.ui.lattice_cards import LatticeCard
@@ -118,6 +118,12 @@ EXPANDED_LINGER_MS = 45_000
 SUGGESTION_MARK = "[Yuki's own suggestion"
 #: A question card's buttons: answer it (opens the overlay), not now, don't ask about this.
 QUESTION_BUTTONS: tuple[str, str, str] = ("Answer", "Skip", "Don't ask")
+#: A call's keep list (report 76 item 5, ``yuki.memory.admission``): each line's answers, as the card names them, and
+#: what the line says once answered (memory's ``recap_keep``).
+KEEP_ANSWERS: tuple[tuple[str, str], ...] = (("keep", "Keep"), ("not_true", "Not true"), ("joke", "It's a joke"))
+KEEP_DONE: dict[str, str] = {"keep": "Kept.", "not_true": "Left out.", "joke": "Kept as a joke."}
+#: A keep list stays up this much longer than its text alone (a few things to decide).
+KEEP_LINGER_EXTRA_MS = 15_000
 
 #: ``QUERY_USER_NOTIFICATION_STATE`` values, and the ones that mean "not now".
 NOTIFICATION_STATES: dict[int, str] = {
@@ -451,6 +457,92 @@ OFFER_ICONS: dict[str, str] = {"todo_add": "todo", "bring_back": "window", "draf
                                "ask": "key"}
 
 
+class KeepRows(QWidget):
+    """A call's keep list on its card: each line Yuki would keep, with Keep / Not true / It's a joke; once answered,
+    what became of it ("Kept.") and Undo. Nothing here decides anything: memory answers each press
+    (``recap_keep``), and the card says what it said.
+
+    Signals:
+        answered: ``(ref, answer)`` -- ``keep`` | ``not_true`` | ``joke`` | ``undo`` on the line ``ref``.
+    """
+
+    answered = Signal(str, str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._col = QVBoxLayout(self)
+        self._col.setContentsMargins(0, 0, 0, 0)
+        self._col.setSpacing(12)
+        #: ref -> {"keys": [Key], "state": Para, "undo": Key, "answer": str | None}
+        self.rows: dict[str, dict[str, Any]] = {}
+
+    def set_items(self, items: list[dict[str, Any]]) -> None:
+        """One row per line (``{"ref", "text"}``), all unanswered."""
+        from yuki.ui import lattice as L
+
+        while self._col.count():
+            got = self._col.takeAt(0)
+            w = got.widget() if got is not None else None
+            if w is not None:
+                w.deleteLater()
+        self.rows = {}
+        for item in items:
+            ref = str(item.get("ref") or "")
+            if not ref:
+                continue
+            box = QWidget(self)
+            col = QVBoxLayout(box)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(6)
+            col.addWidget(L.Para(_squash(item.get("text")), font=L.ui_font(14), line_height=1.4, parent=box))
+            keys_row = QHBoxLayout()
+            keys_row.setContentsMargins(0, 0, 0, 0)
+            keys_row.setSpacing(6)
+            keys = []
+            for answer, label in KEEP_ANSWERS:
+                key = L.Key(label, variant="pri" if answer == "keep" else "", size="xs", parent=box)
+                key.clicked.connect(lambda _c=False, r=ref, a=answer: self.answered.emit(r, a))
+                keys_row.addWidget(key)
+                keys.append(key)
+            state = L.Para("", font=L.ui_font(12.5), color=L.TEXT2, line_height=1.3, parent=box, max_lines=1)
+            state.hide()
+            keys_row.addWidget(state, 1)
+            undo = L.Key("Undo", variant="ghost", size="xs", parent=box)
+            undo.clicked.connect(lambda _c=False, r=ref: self.answered.emit(r, "undo"))
+            undo.hide()
+            keys_row.addStretch(1)
+            keys_row.addWidget(undo)
+            col.addLayout(keys_row)
+            self._col.addWidget(box)
+            self.rows[ref] = {"keys": keys, "state": state, "undo": undo, "answer": None}
+
+    def busy(self, ref: str) -> None:
+        """A press is on its way to memory: the row's keys wait."""
+        for key in (self.rows.get(ref) or {}).get("keys") or []:
+            key.setEnabled(False)
+
+    def show_answer(self, ref: str, answer: str, ok: bool, why: str = "") -> None:
+        """Memory's answer for one row: what became of the line, with Undo; an Undo brings the keys back. A refused
+        press says why in plain words ("Already answered." when memory has an answer for it from elsewhere)."""
+        row = self.rows.get(ref)
+        if row is None:
+            return
+        done = ok and answer in KEEP_DONE
+        already = not ok and why == "already" and answer != "undo"
+        for key in row["keys"]:
+            key.setEnabled(True)
+            key.setVisible(not done and not already)
+        row["state"].set_text(KEEP_DONE.get(answer, "") if done else "Already answered." if already else
+                              "" if ok else "That didn't save.")
+        row["state"].setVisible(bool(row["state"].text()))
+        row["undo"].setVisible(done)
+        row["undo"].setEnabled(True)
+        row["answer"] = answer if done else "already" if already else None
+
+    def all_answered(self) -> bool:
+        return bool(self.rows) and all(r["answer"] for r in self.rows.values())
+
+
 class NudgeCard(LatticeCard):
     """One card, bottom right, in the Lattice design (the offer, question, break and notice cards): a mono header
     (its kind's dot icon, the kind and the time) with a close key, the text, then by kind:
@@ -490,6 +582,8 @@ class NudgeCard(LatticeCard):
     accepted = Signal(object)
     less = Signal(object)
     undo = Signal(object)
+    #: ``(nudge, ref, answer)``: a line of a call's keep list answered (Keep / Not true / It's a joke / Undo).
+    keep_answered = Signal(object, str, str)
 
     def __init__(self, *, linger_ms: int | None = None) -> None:
         super().__init__(icon="dot")
@@ -510,6 +604,13 @@ class NudgeCard(LatticeCard):
         self.when.hide()
         self.body = L.Para("", font=L.ui_font(15), line_height=1.45, parent=self)
         self.content.addWidget(self.body)
+        #: A call's keep list (report 76 item 5): its lines, each with Keep / Not true / It's a joke.
+        self.keep_gap = QWidget(self)
+        self.keep_gap.setFixedHeight(12)
+        self.content.addWidget(self.keep_gap)
+        self.keep_rows = KeepRows(self)
+        self.content.addWidget(self.keep_rows)
+        self.keep_rows.answered.connect(self._on_keep)
         #: What a check-in that carries an offer rests on (its Will / Won't take the detail's place).
         self.rest_gap = QWidget(self)
         self.rest_gap.setFixedHeight(6)
@@ -664,6 +765,12 @@ class NudgeCard(LatticeCard):
             self.detail.setVisible(offer)
             self._detail_gap.setFixedHeight(12)
         self._detail_gap.setVisible(not self.detail.isHidden())
+        keep = [k for k in nudge.get("keep") or [] if isinstance(k, dict)] if not question else []
+        if keep:   # the head line; the lines themselves are rows with their keys
+            self.body.set_text(_squash(nudge.get("head")) or text)
+        self.keep_rows.set_items(keep)
+        self.keep_rows.setVisible(bool(keep))
+        self.keep_gap.setVisible(bool(keep))
         self.rest.setVisible(bool(self.rest.text()))
         self.rest_gap.setVisible(bool(self.rest.text()))
         do = str((card_offer(nudge) or {}).get("do") or "")
@@ -673,7 +780,7 @@ class NudgeCard(LatticeCard):
         self.do_button.setVisible(offer or brk)
         self.reply_button.set_parts(QUESTION_BUTTONS[0] if question else "Reply",
                                     variant="pri" if question and not offer else "")
-        self.reply_button.setVisible((question or not offer) and not brk)
+        self.reply_button.setVisible((question or not offer) and not brk and not keep)
         self.later_button.setVisible(brk)
         self.answer_input.setVisible(question)
         self.acts.setStretch(self._stretch_at, 0 if question else 1)   # the answer field takes the row
@@ -697,7 +804,7 @@ class NudgeCard(LatticeCard):
             self.dismiss_button.set_parts("Dismiss")
             self._foot([self.dismiss_button] + ([self.less_button] if kind in LESS_KINDS else []))
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
-            linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0))
+            linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0) + (KEEP_LINGER_EXTRA_MS if keep else 0))
         self._fit_height()
 
     def _fit_height(self, animate: bool = False) -> None:
@@ -889,6 +996,25 @@ class NudgeCard(LatticeCard):
         self.show_running()   # the card stays: the result shows here (typed offers answer at once)
         self.accepted.emit(nudge)
 
+    def _on_keep(self, ref: str, answer: str) -> None:
+        """A line of the keep list answered: the row waits for memory (:meth:`show_keep_answer`); the card's own
+        outcome is recorded once (the controller acknowledges it ``accepted``), so fading later records nothing."""
+        nudge = self.nudge
+        if nudge is None:
+            return
+        self._acted = True
+        self.keep_rows.busy(ref)
+        if self._linger.isActive():
+            self._linger.start(self.linger_ms)
+        self.keep_answered.emit(nudge, ref, answer)
+
+    def show_keep_answer(self, ref: str, answer: str, ok: bool, why: str = "") -> None:
+        """Memory's answer to one line: said on its row; once every line is answered the card goes soon after."""
+        self.keep_rows.show_answer(ref, answer, ok, why)
+        self._fit_height(animate=True)
+        if self.keep_rows.all_answered() and not self._paused:
+            self._linger.start(self._fixed_linger if self._fixed_linger is not None else RESULT_LINGER_MS)
+
     def _on_undo(self) -> None:
         if self.nudge is not None:
             self.undo_button.setEnabled(False)
@@ -972,6 +1098,8 @@ class NudgeController(QObject):
     #: ``(nudge, result, via)`` / ``(nudge, result)``: memory's answer to a press / an Undo, back on the GUI thread.
     _acted = Signal(object, object, str)
     _undone = Signal(object, object)
+    #: ``(nudge, ref, answer, result)``: memory's answer to a line of a keep list, back on the GUI thread.
+    _kept = Signal(object, str, str, object)
 
     def __init__(
         self,
@@ -1020,6 +1148,10 @@ class NudgeController(QObject):
             answered.connect(self._on_answered)
         self.card.less.connect(self._on_less)
         self.card.undo.connect(self.undo_offer)
+        keep_answered = getattr(self.card, "keep_answered", None)
+        if keep_answered is not None:
+            keep_answered.connect(self.keep_answer)
+        self._kept.connect(self._on_kept)
         self._acted.connect(self._on_acted)
         self._undone.connect(self._on_undone)
         self.card.faded_out.connect(self.try_show)
@@ -1342,6 +1474,39 @@ class NudgeController(QObject):
         else:
             self._show_result(stored, result)
         self.offer_state.emit(stored, state)
+
+    def keep_answer(self, nudge: dict[str, Any], ref: str, answer: str, via: str = "card") -> threading.Thread:
+        """One line of a call's keep list answered (Keep / Not true / It's a joke / Undo): the card is acknowledged
+        ``accepted`` once, and memory records the answer by code (``recap_keep``: no model, never the agent), off the
+        GUI thread; the answer comes back to :meth:`_on_kept`."""
+        stored = self.record_delivery(nudge, via)
+        if not stored.get("_keep_acked"):
+            stored["_keep_acked"] = True
+            self.ack(stored, "accepted")
+        self.ui_log.event("nudge_keep", id=nudge.get("id"), via=via, answer=answer)
+        nudge_id = stored.get("id")
+
+        def work() -> None:
+            try:
+                result = self.memory.call_method("recap_keep", nudge_id, ref, answer, timeout_s=TRAY_TIMEOUT_S)
+            except Exception as exc:  # never take the UI down
+                result = {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+            self._kept.emit(stored, ref, answer, result if isinstance(result, dict) else {"ok": False})
+
+        thread = threading.Thread(target=work, name="yuki-ui-keep", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
+
+    def _on_kept(self, stored: dict[str, Any], ref: str, answer: str, result: dict[str, Any]) -> None:
+        ok = bool(result.get("ok"))
+        stored.setdefault("_keep_answers", {})[ref] = answer if ok else None
+        self.ui_log.event("nudge_keep_result", id=stored.get("id"), answer=answer, ok=ok, why=result.get("why"),
+                          error=result.get("error"))
+        if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
+            show = getattr(self.card, "show_keep_answer", None)
+            if show is not None:
+                show(ref, answer, ok, str(result.get("why") or ""))
 
     def _show_result(self, stored: dict[str, Any], result: dict[str, Any]) -> None:
         if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):

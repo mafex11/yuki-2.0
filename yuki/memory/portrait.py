@@ -286,6 +286,11 @@ it. A fact that mixes lasting points (their tools, preferences, how they work) w
 as written; rewritten to its lasting points alone, it passes. Numbers are fine where they describe the \
 person's own habits across days (a behaviour or routine pattern), never where they are a tool's meters \
 on one day.
+Personal and sensitive things about the user - their sexuality, a health condition, their own money accounts and \
+what they hold, where their passwords or seed phrases are kept, legal trouble - are a portrait fact only when the \
+user told Yuki themselves (a USER CORRECTION, their answer to Yuki's question, what they said to Yuki); a page, a \
+chat or a call is never enough for these, however plain (report 76: the user had to remove such facts by hand). \
+Their work on such topics (a payments product, a health app) is ordinary work.
 Worked examples (invented):
 - FAILS: "The user's harness rotates across four Claude accounts on Mac and PC. On the evening of \
 2026-08-14, with 15 parallel agents running, the four accounts' combined quota fell to 160% of 400% by \
