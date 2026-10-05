@@ -12,8 +12,10 @@ Two things here, both deliberately small and logged:
   like a hotkey, not a judgement. A turn whose words are only those phrases (with the few filler words in
   :data:`FILLER_WORDS` around them: the name, "okay", "dude", "please") ends the conversation on its final transcript,
   with no model call. Anything longer or different goes to the talker as before (the model judges "turn yourself off for
-  two hours", "tell him to go away"). Closing when the words were for someone else costs nothing (say the name to talk
-  again); staying open is what hurt. A few phrases mean "stop *that*" when something is running (a task, a scroll):
+  two hours", "tell him to go away"). Closing when the words were for someone else costs little (say the name to talk
+  again); staying open is what hurt. A match is provisional (second review R1/G1): it ends the conversation only after
+  a short grace with no resumed speech, since "Stop... the music" and "Nothing... actually open Spotify" begin with
+  these words and must reach the talker whole. A few phrases mean "stop *that*" when something is running (a task, a scroll):
   :data:`WHEN_IDLE_ONLY` are a dismissal only when nothing is.
 * **The instant acknowledgement** (:class:`AckVoice`): a short line in Yuki's own voice ("Mm-hm.", or "Yeah?" to the
   name alone), rendered once by the voice's own service and kept on disk, played the moment a turn said to Yuki by name
@@ -45,6 +47,9 @@ WHEN_IDLE_ONLY = frozenset({"stop", "stop it", "cancel", "never mind", "nevermin
 #: Of those, the ones that also confirm an answer ("The report from yesterday?" "That's it."): a dismissal only when
 #: Yuki's last line was not a question and nothing runs (review F3, 5 Oct); otherwise the talker decides.
 WHEN_NOT_ASKED = frozenset({"that's it", "thats it", "that's all", "thats all"})
+#: Of those, the ones that mean something else in a call (second review R9, 5 Oct): "stop listening" there is go_quiet
+#: for the rest of the call (the wake word off, CALL_LAYER), which only the talker does; a plain end left the wake on.
+IN_CALL_TALKERS = frozenset({"stop listening"})
 #: Words that may stand around a dismissal without changing it ("okay okay go away", "dude, shut up", "Yuki, bye").
 #: Not "yes"/"yeah": "Yeah, that's it." confirms (review F3); "no" stays ("No, that's all." answers "anything else").
 FILLER_WORDS = frozenset({
@@ -68,12 +73,13 @@ def words(text: str) -> list[str]:
     return "".join(ch if (ch.isalnum() or ch == "'") else " " for ch in text).split()
 
 
-def dismissal(text: str, *, busy: bool = False, asked: bool = False) -> str | None:
+def dismissal(text: str, *, busy: bool = False, asked: bool = False, call: bool = False) -> str | None:
     """The dismiss phrase ``text`` consists of (with fillers around it), or ``None`` when it is anything else.
 
     ``busy``: something is running (a voice task, a scroll, a hand): :data:`WHEN_IDLE_ONLY` and :data:`WHEN_NOT_ASKED`
     phrases are then not a dismissal. ``asked``: Yuki's last line was a question: :data:`WHEN_NOT_ASKED` phrases are
-    then an answer, not a dismissal. Every word must belong to the vocabulary; at least one must be a dismiss phrase.
+    then an answer, not a dismissal. ``call``: a call is on: :data:`IN_CALL_TALKERS` phrases are the talker's (the
+    whole turn goes to it). Every word must belong to the vocabulary; at least one must be a dismiss phrase.
     A transcript written as a question ("So that's it?") is never a command.
     """
     if (text or "").rstrip().endswith("?"):
@@ -87,6 +93,8 @@ def dismissal(text: str, *, busy: bool = False, asked: bool = False) -> str | No
         for k in range(min(_LONGEST, len(tokens) - i), 0, -1):
             phrase = " ".join(tokens[i:i + k])
             if phrase in DISMISS_PHRASES:
+                if call and phrase in IN_CALL_TALKERS:
+                    return None   # R9: in a call "stop listening" is go_quiet for the call, the talker's
                 # a phrase that is not a dismissal now ("that's all" answering her question) is neutral: another
                 # phrase in the same words may still be one ("That's all for now. Bye.")
                 if not (busy and phrase in WHEN_IDLE_ONLY) and not ((busy or asked) and phrase in WHEN_NOT_ASKED):
@@ -99,6 +107,28 @@ def dismissal(text: str, *, busy: bool = False, asked: bool = False) -> str | No
         else:
             return None
     return found
+
+
+def vocabulary_only(text: str) -> bool:
+    """Whether every word of ``text`` belongs to the dismiss vocabulary or its fillers ("Yuki, no", "Okay, turn off"):
+    words that may still become a dismissal, so the eager acknowledgement waits for more (second review R4)."""
+    tokens = words(text)
+    i = 0
+    while i < len(tokens):
+        for k in range(min(_LONGEST, len(tokens) - i), 0, -1):
+            if " ".join(tokens[i:i + k]) in DISMISS_PHRASES | FILLER_WORDS:
+                i += k
+                break
+        else:
+            return False
+    return bool(tokens)
+
+
+def said_in(phrase: str, line: str) -> bool:
+    """Whether the words of ``phrase`` stand together in ``line`` (both as :func:`words`): Yuki's own line holding the
+    dismiss words, so a transcript of them may be her echo (second review G2)."""
+    need, have = words(phrase), words(line)
+    return bool(need) and any(have[i:i + len(need)] == need for i in range(len(have) - len(need) + 1))
 
 
 def bare_name(text: str) -> bool:
@@ -243,5 +273,5 @@ class AckVoice:
             return response.read()
 
 
-__all__ = ["DISMISS_PHRASES", "WHEN_IDLE_ONLY", "WHEN_NOT_ASKED", "FILLER_WORDS", "ACK_LINES", "AckVoice", "dismissal",
-           "bare_name", "name_opens", "words", "trim", "scale"]
+__all__ = ["DISMISS_PHRASES", "WHEN_IDLE_ONLY", "WHEN_NOT_ASKED", "IN_CALL_TALKERS", "FILLER_WORDS", "ACK_LINES", "AckVoice", "dismissal",
+           "bare_name", "name_opens", "vocabulary_only", "said_in", "words", "trim", "scale"]

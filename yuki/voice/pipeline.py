@@ -2587,8 +2587,15 @@ def fast_path_processor(conversation: Any) -> Any:
     It sees each transcript before the user aggregator does: a final one the fast path takes (a dismissal, the name
     alone) never reaches the talker; an eager one that is a dismissal starts no speculative talker call. Every other
     frame passes untouched. The turn observer saw the transcript already (observers see a frame as it is pushed here),
-    so the turn is logged as usual."""
-    from pipecat.frames.frames import EagerTranscriptionFrame, TranscriptionFrame
+    so the turn is logged as usual.
+
+    Second review R1/G1: a dismissal is provisional (``Conversation._dismiss_pending``). Its final transcript is held
+    here; Flux withdrawing the eager end of turn (``EagerEndOfTurnCancelFrame``), a new start of turn or words that are
+    not a dismissal withdraw it, and the held words then go on to the talker, after the frame that withdrew it (so the
+    aggregator takes them into the turn they belong to)."""
+    from pipecat.frames.frames import (
+        EagerEndOfTurnCancelFrame, EagerTranscriptionFrame, ProposedUserStartedSpeakingFrame, TranscriptionFrame,
+    )
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     class FastPath(FrameProcessor):
@@ -2598,12 +2605,26 @@ def fast_path_processor(conversation: Any) -> Any:
                                                                              EagerTranscriptionFrame)):
                 try:
                     taken = conversation._fast_turn(frame.text or "",
-                                                    final=not isinstance(frame, EagerTranscriptionFrame))
+                                                    final=not isinstance(frame, EagerTranscriptionFrame), frame=frame)
                 except Exception as exc:  # noqa: BLE001 - the talker then, as before
                     taken = False
                     conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                for held in conversation._fast_released():
+                    await self.push_frame(held, direction)   # the withdrawn dismissal's words, before the new ones
                 if taken:
                     return
+                await self.push_frame(frame, direction)
+                return
+            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (EagerEndOfTurnCancelFrame,
+                                                                             ProposedUserStartedSpeakingFrame)):
+                try:
+                    conversation._fast_resumed(type(frame).__name__)
+                except Exception as exc:  # noqa: BLE001
+                    conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+                await self.push_frame(frame, direction)
+                for held in conversation._fast_released():
+                    await self.push_frame(held, direction)
+                return
             await self.push_frame(frame, direction)
 
     return FastPath(name="yuki-fast-path")
@@ -2744,8 +2765,17 @@ class Conversation:
         self._names: deque[float] = deque(maxlen=16)
         #: Until when the next turn counts as said to Yuki: the user said the name alone and was answered "Yeah?".
         self._name_carry_until = 0.0
-        #: When the acknowledgement played on the eager end of turn of the words being finished (monotonic), else None.
+        #: When the acknowledgement played on the eager end of turn of the words being finished (monotonic), else None,
+        #: and the start of speech of those words: one acknowledgement per utterance (second review R2).
         self._eager_ack_at: float | None = None
+        self._eager_ack_start: float | None = None
+        #: Second review R1/G1: a dismissal heard but not acted on yet (``phrase``, ``busy``, ``text``, ``start``,
+        #: ``at``, ``end``, ``final``, ``frames``): it ends the conversation after :attr:`DISMISS_GRACE_S` with no
+        #: resumed speech (:meth:`_dismiss_tick`), else it is withdrawn and its words go to the talker.
+        self._dismiss_pending: dict[str, Any] | None = None
+        #: Held transcript frames of a withdrawn dismissal, for the fast path processor to pass on.
+        self._released: list[Any] = []
+        self._dismiss_task: Any = None
         #: The instant acknowledgement lines in this conversation's voice (:class:`yuki.voice.fastpath.AckVoice`).
         self.ack: Any = None
         #: ``(pcm, kind)``: play a short clip of Yuki's voice now (24 kHz int16 mono) on the conversation's output,
@@ -2866,14 +2896,17 @@ class Conversation:
         except Exception:  # noqa: BLE001 - when unsure, "stop" is the talker's
             return True
 
-    def _fast_turn(self, text: str, *, final: bool) -> bool:
+    def _fast_turn(self, text: str, *, final: bool, frame: Any = None) -> bool:
         """vGame: the fast path on a transcript before the talker (``FastPath``). ``True``: the frame is taken.
 
-        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation at once with no model call, already on
-        Flux's eager end of turn (~0.15 s before the final words; if they were going on, closing costs nothing: the name
-        opens it again). The name alone, said to Yuki, is answered "Yeah?" at once and the next turn counts as said to
-        her. A turn said to her by name gets the instant "Mm-hm" and goes on to the talker as before."""
-        from yuki.voice.fastpath import bare_name, dismissal
+        A dismissal (:func:`yuki.voice.fastpath.dismissal`) ends the conversation with no model call. Second review
+        R1/G1: the match is provisional: it is held (:attr:`_dismiss_pending`) and acted on after a short grace with no
+        resumed speech (:meth:`_dismiss_tick`); "Stop... the music" and "Nothing... actually open Spotify" start with
+        dismiss words, and Flux's eager end of turn (or a split final) fires at that pause. Words that are not a
+        dismissal withdraw it and reach the talker whole (a held final with them). The name alone, said to Yuki, is
+        answered "Yeah?" at once and the next turn counts as said to her. A turn said to her by name gets the instant
+        "Mm-hm" and goes on to the talker as before."""
+        from yuki.voice.fastpath import bare_name, dismissal, vocabulary_only
 
         if self._stop.is_set():
             return self.reason == "user_asked"   # after a dismissal nothing more reaches the talker
@@ -2884,30 +2917,45 @@ class Conversation:
         busy = False
         if getattr(s, "voice_fast_dismiss", True):
             busy = self._busy_for_dismiss()
-            phrase = dismissal(text, busy=busy, asked=self._asked_last())
+            phrase = dismissal(text, busy=busy, asked=self._asked_last(), call=bool(self.call_app))
+            if phrase is not None and self._her_own_words(phrase):
+                # G2: the words are in what Yuki is saying or just said (her echo on speakers): the talker judges them
+                self.log.event("fast_path", op="dismiss_echo", session=self.session, phrase=phrase, eager=not final)
+                phrase = None
+        start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
         if phrase is not None:
-            self._fast_dismiss(phrase, busy, eager=not final, text=text)
+            self._hold_dismissal(phrase, busy, text, start=start, final=final, frame=frame)
             return True
+        if self._dismiss_pending is not None:
+            self._withdraw_dismissal("words", text=text)   # words that are not a dismissal: all of it to the talker
         named, how = self._named_turn(text, final=final)
+        prev = self._utterance
+        if not named and prev is not None and prev[0] == start and prev[1]:
+            # R8: an earlier (eager) transcript of these same words had the name (Flux often drops it from the final)
+            named, how = True, prev[2]
         # review F4: the talker call and the router answering these words read this, not the observer's open turn
-        self._utterance = (float(getattr(self.observer, "_user_started_at", 0.0) or 0.0), named, how)
+        self._utterance = (start, named, how)
         if not final:
             # the acknowledgement already on the eager end of turn (~0.15 s sooner); a premature one is a backchannel
             if not named or not getattr(s, "voice_fast_ack", True) or not text.strip():
                 return False
             if bare_name(text):
                 return True   # the name alone is answered on its final words: no speculative talker reply to it
-            if self._eager_ack_at is not None and time.monotonic() - self._eager_ack_at < self.EAGER_ACK_S:
-                return False   # review F7: once per utterance ("open... uh... Spotify": eager, resumed, eager again)
+            if self._eager_ack_at is not None and self._eager_ack_start == start:
+                return False   # review F7 / R2: once per utterance ("open... uh... Spotify": eager, resumed, eager)
+            if vocabulary_only(text):
+                return False   # R4: "Yuki, no..." may still become "go away": no "Mm-hm" before the end tone
             self._ack("request", how, eager=True)
             return False
+        # R2/R8: the eager acknowledgement belongs to this utterance only; cleared on every final transcript
+        eager_ack, ack_start = self._eager_ack_at, self._eager_ack_start
+        self._eager_ack_at = self._eager_ack_start = None
         turn = self.observer.turn
         if turn is not None and turn.trigger == "user" and named:
             turn.named = True
         if not named or not getattr(s, "voice_fast_ack", True):
             return False
-        eager_ack, self._eager_ack_at = self._eager_ack_at, None
-        if eager_ack is not None and time.monotonic() - eager_ack < self.EAGER_ACK_S and not bare_name(text):
+        if eager_ack is not None and ack_start == start and not bare_name(text):
             if turn is not None and turn.trigger == "user":
                 turn.ack_at = eager_ack   # acknowledged on its eager words already
             return False
@@ -2919,22 +2967,130 @@ class Conversation:
         self._ack("request", how)
         return False
 
-    def _fast_dismiss(self, phrase: str, busy: bool, eager: bool = False, text: str = "") -> None:
+    #: Second review R1/G1: a dismissal is acted on this long after it was heard, when no speech resumed (s). Measured
+    #: (review probe, real Flux): eager end of turn -> TurnResumed / EndOfTurn 0.2-0.6 s; a pause inside "Stop. The
+    #: music" ~0.6 s.
+    DISMISS_GRACE_S = 0.8
+    #: The microphone voiced after the dismiss words keeps it waiting (Flux's own word on a resumed turn comes ~0.3-1 s
+    #: into speech) until this long after the match at most; then sound that recognition never made a turn of is noise.
+    DISMISS_MAX_WAIT_S = 2.5
+    #: Voiced sound newer than this (s) is speech going on.
+    DISMISS_QUIET_S = 0.45
+    #: Yuki's line counts as just said this long after she stopped (s): her echo on speakers comes back late.
+    ECHO_AFTER_S = 1.5
+
+    def _her_own_words(self, phrase: str) -> bool:
+        """G2: the dismiss words stand in Yuki's line while she speaks, a line is on its way, or she just stopped."""
+        from yuki.voice.fastpath import said_in
+
+        obs = self.observer
+        now = time.monotonic()
+        last_stop = float(getattr(obs, "last_bot_stop", 0.0) or 0.0)
+        if not (obs.bot_speaking or obs.speech_pending or (last_stop and now - last_stop < self.ECHO_AFTER_S)):
+            return False
+        said = getattr(obs, "last_said", None) or {}
+        lines = [str(said.get("written") or ""), str(said.get("heard") or "")]
+        turn = obs.turn
+        if turn is not None:
+            lines.append(strip_tags("".join(turn.reply)))
+        return any(said_in(phrase, line) for line in lines if line)
+
+    def _hold_dismissal(self, phrase: str, busy: bool, text: str, *, start: float, final: bool, frame: Any) -> None:
+        pending = self._dismiss_pending
+        now = time.monotonic()
+        if pending is None:
+            end, _how = self.observer._end_of_speech(now)
+            pending = self._dismiss_pending = {"phrase": phrase, "busy": busy, "text": text, "start": start, "at": now,
+                                               "end": end if end is not None else now - 0.3, "final": False,
+                                               "frames": []}
+            self.log.event("fast_path", op="dismiss_held", session=self.session, phrase=phrase, eager=not final)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None   # (tests drive _dismiss_tick themselves)
+            if loop is not None:
+                self._dismiss_task = loop.create_task(self._dismiss_watch())
+        else:
+            pending.update(phrase=phrase, busy=busy)
+        pending["text"] = text
+        if final:
+            pending["final"] = True
+            if frame is not None:
+                pending["frames"].append(frame)
+
+    def _withdraw_dismissal(self, why: str, text: str = "") -> None:
+        pending, self._dismiss_pending = self._dismiss_pending, None
+        if pending is None:
+            return
+        self._released.extend(pending["frames"])
+        self.log.event("fast_path", op="dismiss_withdrawn", session=self.session, phrase=pending["phrase"], by=why,
+                       held_ms=round((time.monotonic() - pending["at"]) * 1000), released=len(pending["frames"]),
+                       words=len(text.split()))
+
+    def _fast_resumed(self, frame_name: str) -> None:
+        """Flux withdrew its eager end of turn or a new turn started: a held dismissal was the start of more words."""
+        if self._dismiss_pending is not None and not self._stop.is_set():
+            self._withdraw_dismissal("resumed" if "Cancel" in frame_name else "start_of_turn")
+
+    def _fast_released(self) -> list[Any]:
+        released, self._released = self._released, []
+        return released
+
+    def _voiced_after(self, pending: dict[str, Any], now: float) -> bool:
+        """The microphone heard voice after the dismiss words, and recently (speech going on, not a long noise)."""
+        if self._voice_activity is None:
+            return False
+        try:
+            since, last = self._voice_activity()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(last and last > pending["end"] + 0.15 and now - last < self.DISMISS_QUIET_S
+                    and (last - since) < self.SOUND_MAX_STRETCH_S)
+
+    def _dismiss_tick(self, now: float | None = None) -> bool:
+        """Act on a held dismissal once its grace passed with no voice after it. ``True``: nothing is held any more."""
+        pending = self._dismiss_pending
+        if pending is None or self._stop.is_set():
+            self._dismiss_pending = None
+            return True
+        now = time.monotonic() if now is None else now
+        waited = now - pending["at"]
+        if waited < self.DISMISS_GRACE_S:
+            return False
+        if waited < self.DISMISS_MAX_WAIT_S and self._voiced_after(pending, now):
+            return False
+        self._dismiss_pending = None
+        self._fast_dismiss(pending["phrase"], pending["busy"], eager=not pending["final"], text=pending["text"],
+                           held_ms=round(waited * 1000))
+        return True
+
+    async def _dismiss_watch(self) -> None:
+        while not self._dismiss_tick():
+            await asyncio.sleep(0.04)
+
+    def _fast_dismiss(self, phrase: str, busy: bool, eager: bool = False, text: str = "", held_ms: int = 0) -> None:
         obs = self.observer
         turn = obs.turn
         if eager:
-            # the final transcript has not come yet, so its turn is not open: the dismissal opens it now with the eager
-            # words (logged as usual, said to Yuki); a final transcript after it only updates them (TurnObserver)
-            now = time.monotonic()
-            turn = obs._open("user")
-            turn.user_text = text
-            turn.transcript_at = now
-            turn.speech_end, turn.eos_source = obs._end_of_speech(now)
-            obs.user_turns += 1
+            start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
+            if (turn is not None and turn.trigger == "user" and turn.transcript_at is not None
+                    and turn.transcript_at >= start and not turn.counted):
+                pass   # G3: the observer opened it from the final words already (milliseconds apart): the same turn
+            else:
+                # the final transcript has not come: the dismissal opens the turn with the eager words (logged as
+                # usual, said to Yuki); a final transcript after it only updates them (TurnObserver)
+                now = time.monotonic()
+                turn = obs._open("user")
+                turn.user_text = text
+                turn.transcript_at = now
+                turn.speech_end, turn.eos_source = obs._end_of_speech(now)
+                obs.user_turns += 1
+                # R3: the chat thread shows what they said, as for a final transcript
+                obs.chat({"type": "user_utterance", "text": text, "ts": time.time(), "turn_id": obs.turn_id()})
         obs.fast_handled("dismiss")
         now = time.monotonic()
         self.log.event("fast_path", op="dismiss", session=self.session, phrase=phrase, busy=busy, eager=eager,
-                       call_mode=bool(self.call_app), game=bool(self.game_app),
+                       call_mode=bool(self.call_app), game=bool(self.game_app), held_ms=held_ms,
                        eos_to_end_ms=round((now - turn.speech_end) * 1000) if turn is not None and turn.speech_end
                        else None)
         if self.on_dismissed is not None:
@@ -2944,9 +3100,6 @@ class Conversation:
                 pass
         self.log.event("session", state="end_asked", session=self.session, waited_ms=0, fast=True)
         self._set_stop("user_asked")
-
-    #: An acknowledgement played on the eager end of turn covers the final words that come within this long (s).
-    EAGER_ACK_S = 4.0
 
     def _ack(self, kind: str, how: str, *, eager: bool = False) -> None:
         """Play the instant acknowledgement (``"request"``: "Mm-hm.", ``"name"``: "Yeah?") unless Yuki is speaking.
@@ -2975,6 +3128,7 @@ class Conversation:
             return
         if eager:
             self._eager_ack_at = now
+            self._eager_ack_start = float(getattr(obs, "_user_started_at", 0.0) or 0.0)
         elif turn is not None and turn.trigger == "user":
             turn.ack_at = now
         end, _how = obs._end_of_speech(now) if eager else ((turn.speech_end if turn is not None else None), "")

@@ -75,11 +75,13 @@ def _conversation(tmp_path: Path, *, call: bool = False, jobs: int = 0, **over: 
     return conv, log, sounds, tones, dismissed
 
 
-def _open_turn(conv: Any, text: str, *, started_ago: float = 1.5) -> Any:
-    """What the turn observer does with a final transcript (it sees the frame before the fast path does)."""
+def _open_turn(conv: Any, text: str, *, started_ago: float = 1.5, same_utterance: bool = False) -> Any:
+    """What the turn observer does with a final transcript (it sees the frame before the fast path does).
+    ``same_utterance``: the final words of an utterance whose eager words came already (its start of speech kept)."""
     obs = conv.observer
     now = time.monotonic()
-    obs._user_started_at = now - started_ago
+    if not same_utterance:
+        obs._user_started_at = now - started_ago
     turn = obs._open("user")
     turn.user_text = text
     turn.transcript_at = now
@@ -179,6 +181,8 @@ def test_go_away_ends_on_the_transcript_with_no_model_call_and_is_never_for_othe
     conv, log, sounds, _tones, dismissed = _conversation(tmp_path, call=True)
     turn = _open_turn(conv, "Go away, dude.")
     assert conv._fast_turn("Go away, dude.", final=True) is True
+    assert not conv._stop.is_set() and dismissed == []   # held for its grace (second review R1/G1)
+    assert conv._dismiss_tick(time.monotonic() + conv.DISMISS_GRACE_S) is True
     assert conv.reason == "user_asked" and conv._stop.is_set() and dismissed == [True]
     assert turn.fast == "dismiss" and not conv.observer.for_others(turn, "")
     assert log.of("fast_path", op="dismiss")[0]["phrase"] == "go away"
@@ -186,15 +190,17 @@ def test_go_away_ends_on_the_transcript_with_no_model_call_and_is_never_for_othe
     assert sounds == []   # no acknowledgement on a dismissal
 
 
-def test_an_eager_dismissal_ends_at_once_and_the_final_words_make_no_second_turn(tmp_path: Path) -> None:
-    """Flux's eager end of turn comes ~0.15 s before the final words: a dismissal ends there (closing when they were
-    going on costs nothing). Its turn is opened then, and the final transcript only updates its words."""
+def test_an_eager_dismissal_ends_after_its_grace_and_the_final_words_make_no_second_turn(tmp_path: Path) -> None:
+    """Flux's eager end of turn comes ~0.15 s before the final words: a dismissal heard there ends after its grace
+    when nothing more came (second review R1/G1). Its turn is opened then, and the final transcript only updates its
+    words."""
     from pipecat.frames.frames import TranscriptionFrame
 
     conv, log, _sounds, _tones, dismissed = _conversation(tmp_path)
     obs = conv.observer
     obs._user_started_at = time.monotonic() - 1.0
     assert conv._fast_turn("Shut up", final=False) is True
+    assert not conv._stop.is_set() and conv._dismiss_tick(time.monotonic() + 1.0)
     assert conv._stop.is_set() and conv.reason == "user_asked" and dismissed == [True]
     turn = obs.turn
     assert turn.fast == "dismiss" and turn.user_text == "Shut up" and obs.user_turns == 1
@@ -220,7 +226,7 @@ def test_the_acknowledgement_plays_on_the_eager_end_of_turn_once(tmp_path: Path)
     conv.observer._user_started_at = time.monotonic() - 1.0
     assert conv._fast_turn("Open Spotify", final=False) is False
     assert sounds == [("request", 4800)] and log.of("fast_path", op="ack", eager=True)
-    turn = _open_turn(conv, "Open Spotify.")
+    turn = _open_turn(conv, "Open Spotify.", same_utterance=True)
     assert conv._fast_turn("Open Spotify.", final=True) is False
     assert len(sounds) == 1 and turn.ack_at is not None and turn.named
     # the second utterance of the conversation is not "the first words after the name"
@@ -685,7 +691,8 @@ def test_thats_it_answering_her_question_goes_to_the_talker(tmp_path: Path) -> N
     _open_turn(conv, "That's it.")
     assert conv._fast_turn("That's it.", final=True) is False and dismissed == []
     conv.observer.last_said = {"written": "Paused.", "heard": "Paused."}
-    assert conv._fast_turn("That's it.", final=True) is True and dismissed == [True]
+    assert conv._fast_turn("That's it.", final=True) is True and conv._dismiss_tick(time.monotonic() + 1.0)
+    assert dismissed == [True]
 
 
 def test_named_follows_the_words_a_speculative_call_answers_not_the_last_turn(tmp_path: Path) -> None:
@@ -722,7 +729,7 @@ def test_the_eager_acknowledgement_plays_once_per_utterance(tmp_path: Path) -> N
     conv._fast_turn("Open", final=False)
     conv._fast_turn("Open uh Spotify", final=False)
     assert len(sounds) == 1
-    turn = _open_turn(conv, "Open, uh, Spotify.")
+    turn = _open_turn(conv, "Open, uh, Spotify.", same_utterance=True)
     conv._fast_turn(turn.user_text, final=True)
     assert len(sounds) == 1 and turn.ack_at is not None
 
@@ -765,3 +772,259 @@ def test_the_pill_leaves_thinking_when_the_name_alone_is_answered(tmp_path: Path
     obs.set_state("thinking")
     assert conv._fast_turn("Yuki?", final=True) is True
     assert obs.state != "thinking"
+
+
+# -- second review (5 Oct): a dismissal is provisional, echo, "stop listening" in a call, named per utterance ----------
+
+@pytest.mark.parametrize("eager, final", [
+    ("Yuki, turn off", "Yuki, turn off the lights in the bedroom."),
+    ("Cancel", "Cancel my five o'clock meeting."),
+    ("Yuki, stop", "Yuki, stop the music."),
+    ("Nothing", "Nothing... wait, open Discord."),
+    ("Turn off.", "Turn off the bedroom lights."),
+])
+def test_a_dismissal_on_the_first_words_of_a_command_is_withdrawn_and_the_command_reaches_the_talker(
+        tmp_path: Path, eager: str, final: str) -> None:
+    """R1: Flux fired EagerEndOfTurn on the dismiss-phrase prefix in 6 of 8 real runs; the command was swallowed."""
+    conv, log, _sounds, _tones, dismissed = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    assert conv._fast_turn(eager, final=False) is True          # held: no speculative talker call on it
+    assert not conv._stop.is_set() and log.of("fast_path", op="dismiss_held")
+    conv._fast_resumed("EagerEndOfTurnCancelFrame")              # TurnResumed
+    assert conv._dismiss_pending is None and log.of("fast_path", op="dismiss_withdrawn", by="resumed")
+    turn = _open_turn(conv, final, same_utterance=True)
+    assert conv._fast_turn(final, final=True) is False           # the whole command goes to the talker
+    assert conv._dismiss_tick(time.monotonic() + 5) is True
+    assert not conv._stop.is_set() and dismissed == [] and conv.reason == "running" and turn.fast is None
+    # with no TurnResumed in between, the final words that are not a dismissal withdraw it too
+    conv2, log2, _s2, _t2, dismissed2 = _conversation(tmp_path)
+    conv2.observer._user_started_at = time.monotonic() - 1.0
+    assert conv2._fast_turn(eager, final=False) is True
+    _open_turn(conv2, final, same_utterance=True)
+    assert conv2._fast_turn(final, final=True) is False and conv2._dismiss_pending is None
+    assert log2.of("fast_path", op="dismiss_withdrawn", by="words") and dismissed2 == []
+
+
+def test_a_split_final_dismissal_is_held_and_released_to_the_talker_when_they_go_on(tmp_path: Path) -> None:
+    """G1: "That's all. Thanks." [pause] "Now open Spotify." Flux split the finals; on main both reached the talker."""
+    conv, log, _s, _t, dismissed = _conversation(tmp_path)
+    first = _open_turn(conv, "That's all. Thanks.")
+    held = object()
+    assert conv._fast_turn("That's all. Thanks.", final=True, frame=held) is True
+    assert conv._fast_released() == [] and not conv._stop.is_set()
+    conv._fast_resumed("ProposedUserStartedSpeakingFrame")       # they started again before the grace ran out
+    assert conv._fast_released() == [held] and conv._fast_released() == []
+    assert log.of("fast_path", op="dismiss_withdrawn", by="start_of_turn", released=1)
+    second = _open_turn(conv, "Now open Spotify.")
+    assert conv._fast_turn("Now open Spotify.", final=True) is False
+    conv._dismiss_tick(time.monotonic() + 5)
+    assert not conv._stop.is_set() and dismissed == [] and first.fast is None and second.fast is None
+
+
+def test_a_held_dismissal_waits_while_the_microphone_hears_them_then_ends(tmp_path: Path) -> None:
+    """G1: voice after the dismiss words keeps it waiting for Flux's own word; noise never holds it for ever."""
+    conv, _log, _s, _t, dismissed = _conversation(tmp_path)
+    clock = {"since": 0.0, "last": 0.0}
+    conv._voice_activity = lambda: (clock["since"], clock["last"])
+    _open_turn(conv, "Stop.")
+    assert conv._fast_turn("Stop.", final=True) is True
+    at = conv._dismiss_pending["at"]
+    clock["since"], clock["last"] = at + 0.3, at + 0.7          # they went on talking
+    assert conv._dismiss_tick(at + conv.DISMISS_GRACE_S + 0.01) is False and dismissed == []
+    clock["last"] = at + conv.DISMISS_MAX_WAIT_S - 0.1           # still sound, but no turn from recognition: noise
+    assert conv._dismiss_tick(at + conv.DISMISS_MAX_WAIT_S + 0.01) is True and dismissed == [True]
+    # silence after the words: it ends at the grace
+    quiet, _l, _s2, _t2, dismissed2 = _conversation(tmp_path)
+    quiet._voice_activity = lambda: (0.0, 0.0)
+    _open_turn(quiet, "Go away.")
+    quiet._fast_turn("Go away.", final=True)
+    a = quiet._dismiss_pending["at"]
+    assert quiet._dismiss_tick(a + 0.3) is False and quiet._dismiss_tick(a + quiet.DISMISS_GRACE_S) is True
+    assert dismissed2 == [True] and quiet.reason == "user_asked"
+
+
+def _run_processor(proc: Any, frames: list[Any], wait_s: float) -> list[Any]:
+    """Frames through the fast path processor (its base class stubbed: no pipeline here); what it pushed on."""
+    import asyncio
+
+    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+    pushed: list[Any] = []
+
+    async def push(frame: Any, direction: Any = FrameDirection.DOWNSTREAM) -> None:
+        pushed.append(frame)
+
+    async def nothing(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def run() -> None:
+        orig = FrameProcessor.process_frame
+        FrameProcessor.process_frame = nothing
+        proc.push_frame = push
+        try:
+            for frame in frames:
+                await proc.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(wait_s)
+        finally:
+            FrameProcessor.process_frame = orig
+
+    asyncio.run(run())
+    return pushed
+
+
+def test_the_fast_path_processor_holds_and_releases_in_order(tmp_path: Path) -> None:
+    """R1/G1 in the processor: a held final transcript is passed on after the frame that withdrew it."""
+    from pipecat.frames.frames import ProposedUserStartedSpeakingFrame, TranscriptionFrame
+
+    from yuki.voice.pipeline import fast_path_processor
+
+    conv, _log, _s, _t, dismissed = _conversation(tmp_path)
+    stop = TranscriptionFrame(text="Stop.", user_id="u", timestamp="0")
+    start = ProposedUserStartedSpeakingFrame()
+    more = TranscriptionFrame(text="The music, I mean.", user_id="u", timestamp="0")
+    pushed = _run_processor(fast_path_processor(conv), [stop, start, more], conv.DISMISS_GRACE_S + 0.2)
+    assert pushed == [start, stop, more] and dismissed == [] and not conv._stop.is_set()
+    # a dismissal alone ends on the loop's own watch after the grace
+    conv2, _l2, _s2, _t2, dismissed2 = _conversation(tmp_path)
+    away = TranscriptionFrame(text="Go away.", user_id="u", timestamp="0")
+    pushed2 = _run_processor(fast_path_processor(conv2), [away], conv2.DISMISS_GRACE_S + 0.3)
+    assert pushed2 == [] and dismissed2 == [True] and conv2.reason == "user_asked"
+
+
+def test_yukis_own_words_echoed_back_never_end_the_conversation(tmp_path: Path) -> None:
+    """G2: on speakers her "Nothing, I'm good..." came back as the user's "Nothing." and ended it mid-reply."""
+    conv, log, _s, _t, _dismissed = _conversation(tmp_path)
+    obs = conv.observer
+    obs.bot_speaking = True
+    obs.last_said = {"written": "Nothing, I'm good. Just here. What's up with you?", "heard": "Nothing, I'm good."}
+    assert conv._fast_turn("Nothing.", final=False) is False and conv._dismiss_pending is None
+    assert log.of("fast_path", op="dismiss_echo", phrase="nothing")
+    # just after she stopped, too
+    obs.bot_speaking = False
+    obs.last_bot_stop = time.monotonic() - 0.5
+    assert conv._fast_turn("Nothing.", final=False) is False
+    # a barge-in in words that are not hers is held as before
+    obs.bot_speaking = True
+    assert conv._fast_turn("Shut up.", final=False) is True and conv._dismiss_pending is not None
+    # and her old line long after she stopped is no echo
+    other, _l, _s2, _t2, _d2 = _conversation(tmp_path)
+    other.observer.last_said = {"written": "Nothing much.", "heard": "Nothing much."}
+    other.observer.last_bot_stop = time.monotonic() - 10
+    assert other._fast_turn("Nothing.", final=False) is True
+
+
+def test_stop_listening_in_a_call_is_the_talkers_go_quiet(tmp_path: Path) -> None:
+    """R9: in a call "stop listening" means go_quiet(this_call=true): the wake word off for the call (CALL_LAYER)."""
+    from yuki.voice.fastpath import dismissal
+
+    for words in ("Yuki, stop listening.", "Stop listening.", "Okay Yuki, stop listening now."):
+        assert dismissal(words, call=True) is None and dismissal(words) == "stop listening"
+        conv, _log, _s, _t, _dismissed = _conversation(tmp_path, call=True)
+        _open_turn(conv, words)
+        assert conv._fast_turn(words, final=True) is False and conv._dismiss_pending is None
+    assert dismissal("Go away.", call=True) == "go away"
+
+
+@pytest.mark.parametrize("eagers, final", [
+    (["Yuki, open Discord.", "Open Discord."], "Open Discord."),
+    (["Yuki"], "pause the music."),
+])
+def test_the_name_in_an_eager_transcript_keeps_the_final_words_named(tmp_path: Path, eagers: list[str],
+                                                                      final: str) -> None:
+    """R8: Flux wrote the name in an eager transcript and dropped it from the final (2 of 16 real runs)."""
+    from yuki.voice.pipeline import _Hooks
+
+    conv, _log, sounds, _t, _d = _conversation(tmp_path, call=True)
+    conv.name_check = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    for words in eagers:
+        conv._fast_turn(words, final=False)
+    turn = _open_turn(conv, final, same_utterance=True)
+    assert conv._fast_turn(final, final=True) is False
+    assert turn.named and _Hooks(conv).named() is True
+    assert len(sounds) == 1 and conv._eager_ack_at is None
+    # the next utterance, not named, is not carried by it
+    nxt = _open_turn(conv, "nah he's lurking")
+    conv._fast_turn(nxt.user_text, final=True)
+    assert not nxt.named
+
+
+def test_an_eager_acknowledgement_is_cleared_by_any_final_words(tmp_path: Path) -> None:
+    """R8: a stale eager ack suppressed the next named turn's own "Mm-hm" and lent it its time."""
+    conv, _log, sounds, _t, _d = _conversation(tmp_path)
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    conv._eager_ack_at, conv._eager_ack_start = time.monotonic() - 0.5, conv.observer._user_started_at
+    _open_turn(conv, "lol nice")                                   # a final not named
+    conv._fast_turn("lol nice", final=True)
+    assert conv._eager_ack_at is None and conv._eager_ack_start is None
+    named = _open_turn(conv, "Yuki, open Chrome.")
+    conv._names.append(time.monotonic() - 0.5)
+    conv._fast_turn(named.user_text, final=True)
+    assert sounds == [("request", 4800)] and named.ack_at is not None
+
+
+def test_one_acknowledgement_per_utterance_however_long_it_runs(tmp_path: Path) -> None:
+    """R2: the 4 s window let a long request with pauses get a second and third "Mm-hm"."""
+    conv, _log, sounds, _t, _d = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    conv._fast_turn("write to Rohan", final=False)
+    conv._fast_resumed("EagerEndOfTurnCancelFrame")
+    conv._eager_ack_at -= 4.3                                      # 4.3 s later, the same utterance
+    conv._fast_turn("write to Rohan that I'll be late because the", final=False)
+    conv._eager_ack_at -= 4.3
+    turn = _open_turn(conv, "Write to Rohan that I'll be late because the meeting ran over.", same_utterance=True)
+    conv._fast_turn(turn.user_text, final=True)
+    assert len(sounds) == 1 and turn.ack_at is not None
+
+
+def test_no_acknowledgement_on_words_that_may_become_a_dismissal(tmp_path: Path) -> None:
+    """R4: "Yuki, no... go away" played "Mm-hm" and then the end tone."""
+    from yuki.voice.fastpath import vocabulary_only
+
+    assert vocabulary_only("Yuki, no") and vocabulary_only("okay turn off") and not vocabulary_only("Yuki, open")
+    conv, _log, sounds, _t, dismissed = _conversation(tmp_path)
+    conv.woken_by_name = True
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    assert conv._fast_turn("Yuki, no", final=False) is False and sounds == []
+    _open_turn(conv, "Yuki, no, go away.", same_utterance=True)
+    assert conv._fast_turn("Yuki, no, go away.", final=True) is True
+    assert conv._dismiss_tick(time.monotonic() + 1) and dismissed == [True] and sounds == []
+
+
+def test_an_eager_dismissal_shows_the_users_words_in_the_chat(tmp_path: Path) -> None:
+    """R3: ended on its eager words, the voice thread got turn_closed and no user line."""
+    from pipecat.frames.frames import TranscriptionFrame
+
+    conv, _log, _s, _t, _d = _conversation(tmp_path)
+    events: list[dict[str, Any]] = []
+    conv.observer.on_chat = events.append
+    conv.observer._user_started_at = time.monotonic() - 1.0
+    conv._fast_turn("Go away", final=False)
+    conv._dismiss_tick(time.monotonic() + 1)
+    conv.observer.on_frame(TranscriptionFrame(text="Go away.", user_id="u", timestamp="0"))
+    users = [e for e in events if e["type"] == "user_utterance"]
+    assert len(users) == 1 and users[0]["text"] == "Go away"
+
+
+def test_eager_and_final_milliseconds_apart_make_one_turn(tmp_path: Path) -> None:
+    """G3: the observer opened the turn from the final words before the fast path saw the eager ones: one turn."""
+    from pipecat.frames.frames import TranscriptionFrame
+
+    conv, _log, _s, _t, _d = _conversation(tmp_path)
+    obs = conv.observer
+    obs._user_started_at = time.monotonic() - 1.0
+    obs.on_frame(TranscriptionFrame(text="That's all. Thanks.", user_id="u", timestamp="0"))
+    first = obs.turn
+    assert obs.user_turns == 1
+    conv._fast_turn("That's all. Thanks.", final=False)
+    conv._dismiss_tick(time.monotonic() + 1)
+    assert obs.user_turns == 1 and obs.turn is first and first.fast == "dismiss"
+
+
+def test_the_focus_guide_says_cant_alone_and_never_names_the_game() -> None:
+    """G4: "what's the weather?" in a match got an offer, or the private note said aloud."""
+    from yuki.voice.mouth import FOCUS_GUIDE
+
+    assert "(\"Can't do that.\"), never silence" in FOCUS_GUIDE and "no word about the game or the call" in FOCUS_GUIDE
