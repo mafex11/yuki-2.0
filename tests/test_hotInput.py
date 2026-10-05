@@ -397,5 +397,53 @@ def test_the_run_takes_and_gives_back_the_monitor():
     assert lines[end - 1] == "self._acting_done()"
 
 
+# -- content-free logs keep the non-word facts ------------------------------------------------------------------------
+
+
+def test_content_free_logs_keep_levels_verdicts_tool_names_and_flags_but_no_words(tmp_path):
+    import json
+
+    from yuki.log.events import SessionLogger
+
+    words = "send Mirela the plum invoice"          # invented
+    title = "Inbox - Quentin Vale - Plumtree Mail"
+    log = SessionLogger(tmp_path, session_id="t-worker", quiet=True, content=False)
+    log.log("outcome_verdict", level="verified", acted=True, send="confirmed", partial=False, steps=3, open=[])
+    log.log("action_verdict", tool="click", verified=True, why="read_back_on", target=1234,
+            verdict_class="verified")
+    log.log("action_verdict", tool="click", verified=None, why=f"3 went away near {title}", target=1234,
+            verdict_class="unverified")
+    log.tool_call("click", {"element": "e12", "button": "left", "label": "Mirela"}, tool_use_id="tu_1")
+    log.tool_call("type_text", {"text": words}, tool_use_id="tu_2")
+    log.tool_result("click", ok=True, summary=f"Clicked {title}", elapsed_ms=40.0, tool_use_id="tu_1",
+                    result={"verified": True, "via": "pattern", "kind": "action", "name": "Mirela",
+                            "details": {"flags": ["toggled", "focus_moved"], "count": 2, "title": title,
+                                        "by_title": {title: 1}}})
+    log.perception("window_view", size_chars=900, elapsed_ms=12.0,
+                   payload={"hwnd": 77, "summary": title, "n": 324, "left_hidden": 13,
+                            "hidden_roles": ["Slider", "Button"], "names": ["Quentin", "Plumtree"]})
+    log.close()
+    text = log.path.read_text(encoding="utf-8")
+    for word in ("Mirela", "plum", "Quentin", "Plumtree", "went away"):
+        assert word not in text
+    recs = [json.loads(line) for line in text.splitlines()]
+    verdict = next(r for r in recs if r["type"] == "outcome_verdict")
+    assert verdict["level"] == "verified" and verdict["send"] == "confirmed" and verdict["acted"] is True
+    actions = [r for r in recs if r["type"] == "action_verdict"]
+    assert actions[0]["why"] == "read_back_on" and actions[0]["verdict_class"] == "verified"
+    assert actions[1]["why_chars"] > 0 and actions[1]["verdict_class"] == "unverified"
+    calls = [r for r in recs if r["type"] == "tool_call"]
+    assert calls[0]["name"] == "click" and calls[0]["input_shape"]["button"] == "left"
+    assert calls[0]["input_shape"]["label_chars"] == 6 and calls[1]["input_shape"] == {"text_chars": len(words)}
+    res = next(r for r in recs if r["type"] == "tool_result")["result_shape"]
+    assert res["verified"] is True and res["via"] == "pattern" and res["name_chars"] == 6
+    assert res["details"]["flags"] == ["toggled", "focus_moved"] and res["details"]["count"] == 2
+    assert res["details"]["by_title"] == {"other_keys": 1}
+    view = next(r for r in recs if r["type"] == "perception")
+    assert view["kind"] == "window_view" and view["payload_shape"]["n"] == 324
+    assert view["payload_shape"]["left_hidden"] == 13 and view["payload_shape"]["names"] == [7, 8]
+    assert view["payload_shape"]["hidden_roles"] == ["Slider", "Button"]
+
+
 if __name__ == "__main__":   # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
