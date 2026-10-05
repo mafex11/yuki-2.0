@@ -355,7 +355,8 @@ def test_f1_the_title_is_what_was_achieved_never_just_done() -> None:
 
     assert ACHIEVED_FIELD == ACHIEVED and ACHIEVED in LABEL_KEYS
     # vfix2 (report 47, N3) adds "states": each state the message tells, with the step that showed it
-    assert TOOLS_BY_NAME["done"]["input_schema"]["required"] == ["message", "about", "achieved", "states"]
+    # fix6 (report 73, release 6) adds "claims": the brain's own class of its message, checked by the claim check
+    assert TOOLS_BY_NAME["done"]["input_schema"]["required"] == ["message", "about", "achieved", "states", "claims"]
     closed = {"name": "run_powershell", "ok": True, "input": {"what": "close Slack", "_about": {"changes": True}}}
     # the reply is "Done." and the brain said nothing better: the step's own done words
     assert return_view("done", "Done.", [closed])["title"] == "Closed Slack"

@@ -4130,8 +4130,17 @@ class Dispatcher:
                 if via.ok:
                     note += f" (wanted {want}): do not click it again from this read; read the window first"
             shown_after = self._window_shown(hwnd) if via.ok else shown_before
-            flipped = (shown_before is not None and shown_after is not None
-                       and (shown_before == "fullscreen") != (shown_after == "fullscreen"))
+
+            def flips(shown: str | None) -> bool:
+                return (shown_before is not None and shown is not None
+                        and (shown_before == "fullscreen") != (shown == "fullscreen"))
+
+            if (via.ok and verified is not True and shown_before is not None and not flips(shown_after)
+                    and _renamed_same_state(held.get("was"), found)):
+                # renamed with the same on/off: a control whose state is in its name; a full-screen switch can take
+                # a moment longer than the window's tree to show on the window itself (bounded)
+                shown_after = self._await_window(hwnd, flips) or shown_after
+            flipped = flips(shown_after)
             if verified is not True and via.ok and state is not None and state == held.get("now") and flipped:
                 # fix6: its own on/off did not move, the window's full screen did: the window is the verdict, and
                 # this control is judged by it from now on (never "already" from its own state)
