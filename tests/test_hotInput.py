@@ -232,7 +232,7 @@ def test_no_monitor_and_no_key_pressed_goes_after_a_short_look():
     assert result["ok"] and result["real"] is False and result["ms"] <= 300
 
 
-def test_the_dispatcher_types_presses_and_scrolls_under_jitter():
+def test_the_dispatcher_types_presses_scrolls_and_clicks_under_jitter():
     from yuki.voice.offline import StubDesktop
     from yuki.agent.tools import Dispatcher
 
@@ -244,10 +244,11 @@ def test_the_dispatcher_types_presses_and_scrolls_under_jitter():
     d = Dispatcher(desk)
     d.input_gate = gate(clock, m, jitter.age, max_s=12.0)
     for name, args in (("type_text", {"text": "hello"}), ("press", {"key": "enter"}),
-                       ("scroll", {"direction": "down", "amount": 3})):
+                       ("scroll", {"direction": "down", "amount": 3}), ("click", {"x": 400, "y": 300})):
         out = d.dispatch(name, args)
         assert "Not sent" not in out.summary, (name, out.summary)
     assert any(c[0] == "type_text" for c in desk.calls) and any(c[0] == "press" for c in desk.calls)
+    assert any(c[0] == "click" for c in desk.calls)          # a raw click by coordinates (live: 0/3 landed)
 
 
 # -- the takeover watch -----------------------------------------------------------------------------------------------
