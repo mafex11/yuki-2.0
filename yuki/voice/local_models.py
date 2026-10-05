@@ -289,6 +289,31 @@ def _present(spec: ModelSpec, folder: Path) -> bool:
         return False
 
 
+#: Files up to this size are checked against their checksum before every load (the config and token files: a few ms
+#: in all). The big weights are checked once, when installed; damaged weights make sherpa-onnx raise, not exit.
+SMALL_FILE_MAX = 2_000_000
+_small_ok: dict[tuple[str, int, int], str] = {}
+
+
+def check_small_files(spec: ModelSpec, folder: Path) -> str | None:
+    """``None`` when the model's small files match their checksums, else which one doesn't (plain words). A file
+    already checked at the same size and modification time is not read again (once per run)."""
+    for f in spec.files:
+        if f.tree or f.size > SMALL_FILE_MAX:
+            continue
+        path = folder / f.path
+        try:
+            st = path.stat()
+            key = (str(path), st.st_size, st.st_mtime_ns)
+            if _small_ok.get(key) != f.sha256:
+                if sha256_file(path) != f.sha256:
+                    return f"{f.path} failed its checksum"
+                _small_ok[key] = f.sha256
+        except OSError:
+            return f"{f.path} is missing"
+    return None
+
+
 def sha256_file(path: Path, *, stop: Callable[[], bool] | None = None) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -785,6 +810,11 @@ class LocalSpeech:
         folder = model_dir(key, self.root)
         if folder is None:
             raise FileNotFoundError(f"{CATALOG[key].label} isn't downloaded")
+        damaged = check_small_files(CATALOG[key], folder)
+        if damaged:
+            # second review V2-3: a damaged config file (tts.json zero-filled at its right size) makes sherpa-onnx exit
+            # the whole process natively instead of raising; checked first, it is a load failure like any other
+            raise RuntimeError(f"{CATALOG[key].label} is damaged: {damaged}")
         return folder
 
     def _load_recognizer(self) -> Any:
@@ -950,4 +980,4 @@ def configure_from(settings: Any, *, log: Any = None, busy: Callable[[], bool] |
 __all__ = ["CATALOG", "VOICES", "DEFAULT_VOICE", "FALLBACK_VOICE", "STT_PROVIDERS", "LOCAL", "ModelFile", "ModelSpec",
            "Voice", "is_local_voice", "parse_voice", "wanted", "voice_pref_changes", "roots", "model_dir", "installed",
            "verify", "tree_digest", "read_status", "Downloader", "downloader", "install_archive", "LocalSpeech",
-           "engine", "configure_from", "default_root"]
+           "engine", "configure_from", "default_root", "check_small_files"]

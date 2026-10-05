@@ -2300,7 +2300,7 @@ VOICE_PROVIDERS = [{"key": "gemini", "label": "Gemini, Leda", "note": "The defau
 STT_CHOICES = [{"key": "deepgram", "label": "Cloud (fastest)", "note": "Understands English and Hindi"},
                {"key": "local", "label": "On this PC (private, slower)",
                 "note": "English only. What you say never leaves this PC, and spoken replies start about half a second "
-                        "later"}]
+                        "later. A pause of a second or more mid-sentence can end what you're saying"}]
 #: vLocal: what each voice on this PC is like, in plain words (67b's measurements on this PC).
 LOCAL_VOICE_NOTES = {"supertonic": "Private. Starts speaking about half a second later than the cloud voices",
                      "kokoro": "Private and the most natural of these, but about two seconds slower to start"}

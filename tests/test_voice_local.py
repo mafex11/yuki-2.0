@@ -416,8 +416,8 @@ def test_the_local_voice_speaks_at_the_output_rate_and_falls_back_to_the_plain_v
     from yuki.voice.local_models import LocalSpeech, ModelFile, ModelSpec
     from yuki.voice.local_tts import SherpaTTSService
 
-    if HFC.exists():   # the lab has another Piper voice: stand it in for the fallback (only sizes are checked)
-        files = tuple(ModelFile(p.name, p.stat().st_size, "") for p in HFC.iterdir()
+    if HFC.exists():   # the lab has another Piper voice: stand it in for the fallback (its own checksums)
+        files = tuple(ModelFile(p.name, p.stat().st_size, lm.sha256_file(p)) for p in HFC.iterdir()
                       if p.is_file() and p.suffix in (".onnx", ".txt"))
         monkeypatch.setitem(lm.CATALOG, "piper", ModelSpec("piper", "Fallback", "x", HFC.name, "tts-models",
                                                            (*files, ModelFile("espeak-ng-data", 0, "", tree=True)), 1))
@@ -796,3 +796,179 @@ def test_a_checksum_failure_waits_longer_each_time_before_downloading_again(_mod
         "retry_after": time.time() + 3600}}}), encoding="utf-8")
     text = local_speech_view({"tts_provider": "local"}, root=[_models_in_temp])["local"]["text"]
     assert "I try again from " in text and "next time" not in text
+
+
+# -- second review (report 86 "Second review") ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("facts,said", [
+    ({"stt_provider": "deepgram", "tts_provider": "deepgram", "local_busy": True,
+      "stt_note": "LOCAL_BUSY", "tts_note": "LOCAL_BUSY"}, "LOCAL_BUSY"),
+    ({"stt_provider": "deepgram", "stt_note": "Speech recognition on this PC isn't downloaded yet"},
+     "Speech recognition on this PC isn't downloaded yet"),
+    ({"tts_provider": "deepgram", "tts_note": "The voice on this PC couldn't start"},
+     "The voice on this PC couldn't start"),
+    ({"stt_provider": "local", "tts_provider": "local"}, None),
+])
+def test_a_woken_standby_says_on_the_pill_why_it_uses_the_cloud(facts: dict[str, Any], said: str | None,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    """V2-1: the standby (the default path) chose the cloud for a game or a call, a model not downloaded or one that
+    couldn't start: at the wake the pill says so, as a cold start does, and the session start log has the notes."""
+    from yuki.voice import audio, echo
+    from yuki.voice.pipeline import LOCAL_BUSY_NOTE
+    from yuki.voice.session import VoiceSession
+
+    facts = {k: (LOCAL_BUSY_NOTE if v == "LOCAL_BUSY" else v) for k, v in facts.items()}
+    said = LOCAL_BUSY_NOTE if said == "LOCAL_BUSY" else said
+    monkeypatch.setattr(audio, "headphones_check", lambda *_a, **_k: (True, {"device": "Headphones"}))
+    monkeypatch.setattr(echo, "tone", lambda *_a, **_k: b"")
+    states: list[tuple[str, str]] = []
+    log = Log()
+    mic = SimpleNamespace(device_used="Mic", set_echo=lambda _g: None)
+    speaker = SimpleNamespace(write=lambda *_a, **_k: None, close=lambda: None)
+    output = SimpleNamespace(set_speaker=lambda _s: None)
+    stops: list[str] = []
+    s = SimpleNamespace(settings=Settings(), log=log, call_app=None, speaker_used=None, _speaker=None, _guard=None,
+                        last_timings=None)
+    s._thread_state = SimpleNamespace(emit=lambda state, detail: states.append((state, detail)))
+    s.devices_changed = SimpleNamespace(emit=lambda _t: None)
+    s.devices_text = lambda: ""
+    s._ensure_mic = lambda: mic
+    s._resolve = lambda kind, quiet=False: None
+    s._open_output = lambda _chosen: (speaker, {"device": "Headphones", "found": True})
+    s._output_note = lambda _f: ""
+    s._echo_guard = lambda *_a: None
+    s.notice = lambda _t: None
+    conversation = SimpleNamespace(session="s1", request_stop=stops.append, _standby_meta={
+        "settings": Settings(voice_wake_chime=False), "facts": facts, "mouth_memory": None, "keyterms": {}})
+    VoiceSession._open_for_wake(s, conversation, output, "wake", time.monotonic(), time.monotonic())
+    assert not stops
+    notes = [d for st, d in states if st == "note"]
+    assert notes == ([said] if said else [])
+    start = [f for k, f in log.events if k == "session" and f.get("state") == "start"]
+    assert len(start) == 1 and start[0]["standby"]
+    assert start[0]["local_busy"] is bool(facts.get("local_busy"))
+    assert start[0]["stt_note"] == facts.get("stt_note") and start[0]["tts_note"] == facts.get("tts_note")
+
+
+def test_a_model_with_a_damaged_config_file_fails_to_load_instead_of_ending_the_process(tmp_path: Path) -> None:
+    """V2-3: every file at its size counts as installed, but a zero-filled tts.json made sherpa-onnx exit the whole
+    process natively. The small files are checked against the catalogue first: a load failure, remembered as broken
+    (the plain voice or the cloud takes over), and sherpa-onnx is never handed the damaged copy."""
+    from yuki.voice import local_models as lm
+
+    spec = lm.CATALOG["supertonic"]
+    folder = tmp_path / spec.folder
+    folder.mkdir()
+    for f in spec.files:
+        with open(folder / f.path, "wb") as fh:
+            fh.truncate(f.size)   # the right size, all zeros
+    assert lm.installed("supertonic", [tmp_path])
+    assert lm.check_small_files(spec, folder) == "tts.json failed its checksum"
+    eng = lm.LocalSpeech().configure(root=[tmp_path])
+    with pytest.raises(RuntimeError, match="damaged"):
+        eng.tts("supertonic").result(30)
+    assert "supertonic" in eng.broken
+    lab = LAB / spec.folder
+    if lab.is_dir():   # an intact copy passes (and is not read again at the same size and time)
+        assert lm.check_small_files(spec, lab) is None and lm.check_small_files(spec, lab) is None
+
+
+def test_when_no_voice_on_this_pc_can_speak_the_conversation_ends_saying_so(tmp_path: Path) -> None:
+    """V2-4: the chosen voice fails to load and the plain voice isn't downloaded yet: a fatal error (the session's
+    notice says the next conversation uses the cloud voice), not a conversation of silent replies."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from pipecat.frames.frames import (
+        ErrorFrame, LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, TTSAudioRawFrame,
+    )
+    from pipecat.pipeline.worker import PipelineParams
+    from pipecat.tests.utils import SleepFrame, run_test
+
+    from yuki.voice.local_tts import NO_VOICE_ERROR, SherpaTTSService
+
+    def failed(family: str) -> Future:
+        fut: Future = Future()
+        fut.set_exception(RuntimeError(f"{family} could not load") if family != "piper"
+                          else FileNotFoundError("Fallback voice isn't downloaded"))
+        return fut
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    eng = SimpleNamespace(tts=failed, hold=lambda: None, release=lambda: None, loaded=lambda: {}, synth_pool=pool)
+    log = Log()
+
+    async def main() -> tuple[list[Any], list[Any]]:
+        tts = SherpaTTSService(engine=eng, voice="supertonic:F1", log=log, session="t")
+        frames = [SleepFrame(0.2), LLMFullResponseStartFrame(), LLMTextFrame("Okay, I paused the music."),
+                  LLMFullResponseEndFrame(), SleepFrame(1.0)]
+        return await run_test(tts, frames_to_send=frames, pipeline_params=PipelineParams(audio_out_sample_rate=24_000))
+
+    down, up = asyncio.run(main())
+    pool.shutdown()
+    errors = [f for f in [*down, *up] if isinstance(f, ErrorFrame)]
+    assert errors and all(f.fatal and f.error == NO_VOICE_ERROR for f in errors)
+    assert not any(isinstance(f, TTSAudioRawFrame) for f in down)
+    ops = [f["op"] for k, f in log.events if k == "local_tts"]
+    assert "fallback" in ops and "no_voice" in ops
+
+
+def test_smart_turns_done_ends_the_turn_only_after_the_quiet_hold() -> None:
+    """V2-2: Smart Turn judged at the VAD's 0.2 s stop called fragments done and cut sentences at a pause. Its "done"
+    now counts once the user has been quiet COMPLETE_HOLD_S; speech resuming before that (or starting to: the VAD's
+    unconfirmed "starting") keeps the same turn going."""
+    from pipecat.audio.turn.base_turn_analyzer import EndOfTurnState
+
+    from yuki.voice.local_stt import ParakeetSTTService
+
+    eng = SimpleNamespace(hold=lambda: None, release=lambda: None, loaded=lambda: {})
+
+    def service() -> tuple[Any, list[tuple[str, float]]]:
+        stt = ParakeetSTTService(engine=eng)
+        ended: list[tuple[str, float]] = []
+
+        async def verdict() -> tuple[Any, None]:
+            return EndOfTurnState.COMPLETE, None
+
+        async def push(frame: Any, *_a: Any) -> None:
+            ended.append((type(frame).__name__, time.monotonic()))
+
+        async def broadcast(cls: Any, **_k: Any) -> None:
+            ended.append((cls.__name__, time.monotonic()))
+
+        async def handler(*_a: Any) -> None:
+            return None
+
+        stt._turn = SimpleNamespace(analyze_end_of_turn=verdict, clear=lambda: None)
+        stt.push_frame, stt.broadcast_frame, stt._call_event_handler = push, broadcast, handler
+        stt._in_turn, stt._texts = True, ["remind me to"]
+        return stt, ended
+
+    async def quiet() -> tuple[float, list[tuple[str, float]]]:
+        stt, ended = service()
+        stt._speech_end_at = start = time.monotonic()
+        await stt._judge(stt._epoch)
+        return start, ended
+
+    start, ended = asyncio.run(quiet())
+    names = [n for n, _ in ended]
+    assert names == ["TranscriptionFrame", "ProposedUserStoppedSpeakingFrame"]
+    assert ended[0][1] - start >= ParakeetSTTService.COMPLETE_HOLD_S - 0.02
+
+    async def resumed(starting_only: bool) -> tuple[Any, list[tuple[str, float]]]:
+        stt, ended = service()
+        stt._speech_end_at = time.monotonic()
+        judge = asyncio.create_task(stt._judge(stt._epoch))
+        await asyncio.sleep(ParakeetSTTService.COMPLETE_HOLD_S - 0.1)
+        if starting_only:
+            stt._vad_starting = True               # speech heard again, not confirmed yet ...
+            await asyncio.sleep(0.2)
+            stt._epoch += 1                        # ... then confirmed: _speech_started bumps the epoch
+            stt._vad_starting = False
+        else:
+            stt._epoch += 1                        # speech resumed within the hold
+        await judge
+        return stt, ended
+
+    for starting_only in (False, True):
+        stt, ended = asyncio.run(resumed(starting_only))
+        assert ended == [] and stt._in_turn and stt._texts == ["remind me to"]

@@ -13,7 +13,8 @@ How a turn goes:
 * Each stretch of speech is a segment. When the VAD says it stopped, the segment is decoded at once (Parakeet Unified
   EN 0.6B int8, offline mode, modified beam search with the names memory holds as hotwords) and, alongside, Smart
   Turn v3 judges from the sound whether the user is done. Done: once every segment is decoded, the words go out as one
-  ``TranscriptionFrame`` and the turn ends (``ProposedUserStoppedSpeakingFrame``). Not done: the turn stays open; more
+  ``TranscriptionFrame`` and the turn ends (``ProposedUserStoppedSpeakingFrame``), once the user has been quiet 1.2 s
+  (second review V2-2: a "done" at the 0.2 s stop cut sentences at a pause). Not done: the turn stays open; more
   speech adds a segment, and Smart Turn's own silence limit ends it after 3 s of quiet. Speech that resumes before the
   last segment is decoded keeps the same turn going (Flux's "turn resumed").
 * The partial words after each segment go to the ``on_update`` handlers (the grounding lookup and the desktop read
@@ -94,6 +95,15 @@ class ParakeetSTTService(SegmentedSTTService):
 
     #: Silence appended to a segment before it is decoded (s): the model hears the last word end.
     TRAILING_SILENCE_S = 0.3
+    #: Smart Turn's "done" ends the turn only after this much quiet since the speech ended (s; second review V2-2):
+    #: judged at the VAD's 0.2 s stop it cut the user off at a pause inside a sentence. Most of it passes while the
+    #: last words are decoded anyway (the turn's end waited 0.7-1.4 s for the decode before). Measured on the lab's
+    #: synth clips (report 86, "Second review"): a 0.6 s pause inside a sentence split 3-4 of 5 turns before, 0 of 5
+    #: now; whole sentences end at a median 1.2 s as before. A pause of a second or more still ends the turn.
+    COMPLETE_HOLD_S = 1.2
+    #: Speech that may be starting again (the VAD's "starting", before its 0.2 s confirm) holds the end this much
+    #: longer at most (s): the words resuming a sentence are not cut off by a decision made in their first 0.2 s.
+    RESUME_GRACE_S = 0.3
 
     def __init__(self, *, engine: LocalSpeech, hotwords: list[str] | None = None, log: Any = None,
                  session: str = "", should_interrupt: bool = True, **kwargs: Any) -> None:
@@ -110,6 +120,7 @@ class ParakeetSTTService(SegmentedSTTService):
         self._held = False
         # the turn
         self._vad_speaking = False
+        self._vad_starting = False  # the VAD hears speech that is not confirmed yet
         self._in_turn = False
         self._texts: list[str] = []
         self._epoch = 0            # bumped when speech resumes or a turn ends: a judgement about older audio is void
@@ -205,6 +216,7 @@ class ParakeetSTTService(SegmentedSTTService):
         from pipecat.audio.vad.vad_analyzer import VADState
 
         state = await self._vad.analyze_audio(frame.audio)
+        self._vad_starting = state == VADState.STARTING
         if state == VADState.SPEAKING and not self._vad_speaking:
             await self._speech_started()
         elif state == VADState.QUIET and self._vad_speaking:
@@ -254,8 +266,18 @@ class ParakeetSTTService(SegmentedSTTService):
             if self._log is not None:
                 self._log.event("local_stt", op="smart_turn", error=type(exc).__name__)
             return
-        if state == EndOfTurnState.COMPLETE:
-            await self._commit(epoch, "smart_turn")
+        if state != EndOfTurnState.COMPLETE:
+            return
+        # V2-2: "done" counts once the user has been quiet COMPLETE_HOLD_S (speech resuming in the meantime bumps the
+        # epoch: the same turn goes on), and not while the VAD hears speech that may be starting again.
+        if self._speech_end_at is not None:
+            wait = self.COMPLETE_HOLD_S - (time.monotonic() - self._speech_end_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+        grace = time.monotonic() + self.RESUME_GRACE_S
+        while self._vad_starting and epoch == self._epoch and time.monotonic() < grace:
+            await asyncio.sleep(0.02)
+        await self._commit(epoch, "smart_turn")
 
     async def _commit(self, epoch: int, why: str) -> None:
         """End the turn: wait for its segments, then one transcript and the proposed end (unless speech resumed)."""

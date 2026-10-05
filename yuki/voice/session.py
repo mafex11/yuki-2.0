@@ -1677,8 +1677,11 @@ class VoiceSession(QObject):
             self._standby_local = self._local_choice(settings, facts)
             if facts.get("tts_voice"):
                 settings = replace(settings, voice_tts_voice=facts["tts_voice"])
+                self.log.event("voice_id", state="refused_fallback", note=facts.get("tts_note"), standby=True)
             if facts.get("stt_provider", settings.voice_stt_provider) != settings.voice_stt_provider:
                 settings = replace(settings, voice_stt_provider=facts["stt_provider"])   # vLocal: not ready yet
+                self.log.event("local_models", op="stt_fallback", note=facts.get("stt_note"),
+                               local_busy=bool(facts.get("local_busy")), standby=True)
             mouth_memory = fetch_memory(self.memory)
             try:
                 keyterms, keyterm_facts = keyterms_job.result(timeout=3.0)
@@ -1815,9 +1818,13 @@ class VoiceSession(QObject):
                                  name="yuki-voice-chime", daemon=True).start()
             if self._output_note(out_facts):
                 self._thread_state.emit("note", self._output_note(out_facts))
+            facts = meta.get("facts") or {}
+            if _start_note(facts):
+                # second review V2-1: the standby chose the cloud (a game or a call, not downloaded, couldn't start) or
+                # another voice; said on the pill as a cold start does (it is already listening: a note, not a state)
+                self._thread_state.emit("note", _start_note(facts))
             timings["listening"] = round((time.monotonic() - started) * 1000)
             self.last_timings = timings
-            facts = meta.get("facts") or {}
             memory = meta.get("mouth_memory")
             self.log.event("session", state="start", session=conversation.session, via=via, standby=True,
                            mic=mic.device_used, output=out_facts.get("device"), output_found=out_facts.get("found"),
@@ -1825,6 +1832,8 @@ class VoiceSession(QObject):
                            echo_why=why, call_mode=bool(self.call_app), stt=self.settings.voice_stt_model,
                            stt_provider=settings.voice_stt_provider,
                            mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
+                           tts_note=facts.get("tts_note"), stt_note=facts.get("stt_note"),
+                           local_busy=bool(facts.get("local_busy")),
                            memory=memory.facts() if memory is not None else None, keyterms=meta.get("keyterms"),
                            timings_ms=dict(timings))
         except Exception as exc:  # noqa: BLE001 - the conversation goes on without a voice; said in the pill
@@ -2011,8 +2020,8 @@ class VoiceSession(QObject):
             listener = self._listener
             conversation.after_goodbye = via == "wake" and self._after_goodbye()
             conversation.woken_by_name, conversation.name_check = self._wake_evidence(via, listener)
-            if facts.get("tts_note") or facts.get("stt_note"):
-                self._thread_state.emit("starting", facts.get("tts_note") or facts["stt_note"])
+            if _start_note(facts):
+                self._thread_state.emit("starting", _start_note(facts))
             self._conversation = conversation
             if self.call_app != call_app:  # the call started or ended while this was starting
                 conversation.set_call(self.call_app, self.call_evidence)
@@ -2027,7 +2036,8 @@ class VoiceSession(QObject):
                            headphones=heard, echo=mode, echo_why=why, call_mode=bool(call_app),
                            stt=self.settings.voice_stt_model, stt_provider=settings.voice_stt_provider,
                            mouth=self.settings.voice_mouth_model, tts=facts.get("tts_provider"),
-                           tts_note=facts.get("tts_note"),
+                           tts_note=facts.get("tts_note"), stt_note=facts.get("stt_note"),
+                           local_busy=bool(facts.get("local_busy")),
                            tts_model=(settings.voice_gemini_model if facts.get("tts_provider") == "gemini"
                                       else self.settings.voice_tts_model),
                            tts_voice_set=bool(settings.voice_tts_voice),
@@ -2224,6 +2234,12 @@ def _prewarm(settings: Settings, log: Any) -> dict[str, Any]:
     if log is not None:
         log.event("prewarm", **facts)
     return facts
+
+
+def _start_note(facts: dict[str, Any]) -> str:
+    """What the pill says when a conversation starts on another voice or recognition than chosen (preflight's notes:
+    the voice's, else recognition's; both say the same in a game or a call). Cold start and woken standby alike."""
+    return str(facts.get("tts_note") or facts.get("stt_note") or "")
 
 
 def _plain_error(text: str) -> str:

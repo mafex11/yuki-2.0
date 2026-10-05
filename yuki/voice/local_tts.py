@@ -73,6 +73,10 @@ def to_pcm(samples: Any, rate: int, out_rate: int) -> bytes:
     return (np.clip(audio, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
+#: The conversation's end when no voice on this PC can speak (the session's notice shows it: plain words, no "connect").
+NO_VOICE_ERROR = "the voice on this PC couldn't start; the next conversation uses the cloud voice"
+
+
 class SherpaTTSService(TTSService):
     """A voice on this PC (Supertonic, Kokoro, Piper) for the Pipecat pipeline. See the module docstring."""
 
@@ -154,8 +158,14 @@ class SherpaTTSService(TTSService):
             await self.start_tts_usage_metrics(text)
             try:
                 tts, voice = await self._model()
-            except Exception as exc:  # noqa: BLE001 - no voice at all on this PC: the reply plays nothing
-                yield ErrorFrame(error=f"the voice on this PC could not load: {type(exc).__name__}")
+            except Exception as exc:  # noqa: BLE001 - no voice at all on this PC
+                # second review V2-4: neither the chosen voice nor the plain one loads (Piper is fetched after the
+                # voice): every reply would be silent. The conversation ends, saying so; the next one starts on the
+                # cloud voice (preflight sees the voice broken) with its "couldn't start" note.
+                if self._log is not None:
+                    self._log.event("local_tts", op="no_voice", session=self._session, voice=self._voice.key,
+                                    error=f"{type(exc).__name__}: {str(exc)[:120]}")
+                yield ErrorFrame(error=NO_VOICE_ERROR, fatal=True)
                 return
             loop = asyncio.get_running_loop()
             stop = self._halt
@@ -184,4 +194,4 @@ class SherpaTTSService(TTSService):
             await self.stop_ttfb_metrics()
 
 
-__all__ = ["SherpaTTSService", "clauses", "to_pcm"]
+__all__ = ["SherpaTTSService", "clauses", "to_pcm", "NO_VOICE_ERROR"]
