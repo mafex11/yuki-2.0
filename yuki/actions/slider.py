@@ -52,6 +52,7 @@ _UIA_NAME = 30005
 _UIA_HELP_TEXT = 30013
 _UIA_NATIVE_WINDOW_HANDLE = 30020
 _UIA_VALUE_VALUE = 30045
+_UIA_RANGE_VALUE_VALUE = 30047
 _UIA_FULL_DESCRIPTION = 30159
 _TREE_SCOPE_ELEMENT = 1
 _TREE_SCOPE_SUBTREE = 7
@@ -61,6 +62,10 @@ SEARCH_UP = 2
 #: wait before each, takes longer than one SetValue), and how long a set value is watched for its read-back.
 BUDGET_S = 9.0
 SETTLE_S = 0.4
+#: percFix: how long a set value's own change event is waited for before the read-back stands (s), and after each
+#: batch of keys.
+VALUE_WAIT_S = 2.0
+KEY_WAIT_S = 0.6
 POLL_S = 0.05
 #: Keys: presses per batch, the most presses in all, and how close (share of the range) counts as reached.
 KEYS_PER_BATCH = 5
@@ -126,31 +131,79 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
         end = " (its end)" if want in (low, high) else ""
         return True, (f"{name} is already at {details['before_percent']:g}% of its range{end}: nothing to move, "
                       f"nothing was changed"), details
-    after = value
+
+    def there(level: float) -> bool:
+        """At the target, and moved toward it (percFix: live 5 Oct a step of 0.1 was also the tolerance, so a value
+        that had not moved yet, 0.40 against a target of 0.30, counted as reached and was reported verified)."""
+        return abs(level - want) <= tolerance and (level - value) * (want - value) > 0
+
     if stopped is not None and stopped():
         # review F5: the caller's answer ("nothing was dragged or clicked") has gone back; nothing is set after it
         details.update(stopped=True, after=round(value, 4), after_percent=details["before_percent"])
         return False, f"{name} was not changed: the time for it ran out first", details
+    watcher = getattr(slider, "watch", None)
+    watch = None
+    try:
+        watch = watcher() if callable(watcher) else None
+    except Exception:  # noqa: BLE001 - read without events then
+        watch = None
+    live = watch is not None and getattr(watch, "live", False)
+    try:
+        return _drive_moves(slider, details, value=value, want=want, low=low, high=high, small=small,
+                            read_only=read_only, tolerance=tolerance, there=there, watch=watch if live else None,
+                            press=press, name=name, sleep=sleep, settle_s=settle_s, stopped=stopped, hold_s=hold_s)
+    finally:
+        if watch is not None:
+            try:
+                watch.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _drive_moves(slider: Slider, details: dict[str, Any], *, value: float, want: float, low: float, high: float,
+                 small: float, read_only: bool, tolerance: float, there: Callable[[float], bool], watch: Any,
+                 press: Callable[[str, int], Any] | None, name: str, sleep: Callable[[float], None],
+                 settle_s: float, stopped: Callable[[], bool] | None, hold_s: float) -> tuple[bool, str, dict[str, Any]]:
+    """:func:`drive` once the target is known: the value, else the keys, then the verdict. ``watch``: the slider's
+    own change events (percFix), ``None`` when it gives none (then the read-back waits ``settle_s``, polled)."""
+    live = watch is not None
+    after = value
     if not read_only:
         try:
             slider.set(want)
             details["via"] = "RangeValue"
-            deadline = time.monotonic() + settle_s
-            while True:
-                after = slider.read()[0]
-                if abs(after - want) <= tolerance or time.monotonic() >= deadline:
+            # percFix: read back when the slider says its value changed (its own event, bounded), not after a fixed
+            # moment: Chromium and CEF deliver the new value a little later than SetValue returns
+            deadline = time.monotonic() + (VALUE_WAIT_S if live else settle_s)
+            after = slider.read()[0]
+            while not there(after):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     break
-                sleep(POLL_S)
-            if abs(after - want) <= tolerance and hold_s > 0:
+                if live:
+                    if not watch.wait(remaining):
+                        break
+                else:
+                    sleep(POLL_S)
+                after = slider.read()[0]
+            if live:
+                details["read_back"] = "on its change event" if there(after) else "no change event in time"
+            if there(after) and hold_s > 0:
                 # a controlled web input can take the value and be put back by its app a moment later
-                sleep(hold_s)
-                again = slider.read()[0]
-                if abs(again - after) > tolerance:
+                if live:
+                    if watch.wait(hold_s):
+                        again = slider.read()[0]
+                    else:
+                        again = after
+                else:
+                    sleep(hold_s)
+                    again = slider.read()[0]
+                if not there(again):
                     details["reverted"] = True
                     after = again
         except Exception as exc:  # noqa: BLE001 - the keys then
             details["set_error"] = f"{type(exc).__name__}: {exc}"[:160]
-    if abs(after - want) > tolerance and press is not None:
+    if not there(after) and press is not None:
         details["via"] = "keys"
         try:
             slider.focus()
@@ -172,7 +225,10 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
                 details["keys_error"] = f"{type(exc).__name__}: {exc}"[:160]
                 break
             presses += need
-            sleep(POLL_S)
+            if live:
+                watch.wait(KEY_WAIT_S)   # percFix: the level a key set arrives on its own event, a moment later
+            else:
+                sleep(POLL_S)
             after = slider.read()[0]
             if abs(after - before_batch) < 1e-9:
                 details["keys_stuck"] = True
@@ -181,7 +237,9 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
                 break   # one press past it: close enough within a step
         details["presses"] = presses
     details.update(after=round(after, 4), after_percent=round(percent(after, low, high), 1))
-    reached = abs(after - want) <= max(tolerance, abs(small) if small else 0.0)
+    # percFix: never "reached" without having moved toward the target (a key step as wide as the asked move made a
+    # level that had not moved count as reached)
+    reached = abs(after - want) <= max(tolerance, abs(small) if small else 0.0) and (after - value) * (want - value) > 0
     details["verified"] = bool(reached)
     how = {"RangeValue": "its UI Automation value", "keys": "its own arrow keys"}.get(details.get("via"), "nothing")
     moved = f"{details['before_percent']:g}% -> {details['after_percent']:g}% of its range"
@@ -205,9 +263,19 @@ def drive(slider: Slider, *, to: float | None = None, by: float | None = None,
 class _LiveSlider:
     """A RangeValue element, read and set on the UI Automation thread that found it."""
 
-    def __init__(self, element: Any, pattern: Any) -> None:
+    def __init__(self, element: Any, pattern: Any, automation: Any = None) -> None:
         self.element = element
         self.pattern = pattern
+        self.automation = automation
+
+    def watch(self) -> Any:
+        """percFix: the slider's own value-changed events (:class:`yuki.perception.events.ElementWatch`), made before
+        it is set so the change cannot be missed; ``None`` without an automation object."""
+        if self.automation is None:
+            return None
+        from yuki.perception.events import ElementWatch
+
+        return ElementWatch(self.automation, self.element, (_UIA_RANGE_VALUE_VALUE,))
 
     def read(self) -> tuple[float, float, float, bool, float]:
         p = self.pattern
@@ -620,7 +688,7 @@ class _UiaTree:
         module = _uia_core()
         pattern = node.ref.GetCurrentPattern(_PATTERN_RANGE_VALUE).QueryInterface(
             module.IUIAutomationRangeValuePattern)
-        return _LiveSlider(node.ref, pattern)
+        return _LiveSlider(node.ref, pattern, self.automation)
 
     def shown(self, node: Node) -> list[tuple[str, tuple[int, int, int, int] | None]]:
         out: list[tuple[str, tuple[int, int, int, int] | None]] = []

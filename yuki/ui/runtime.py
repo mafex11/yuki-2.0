@@ -136,7 +136,7 @@ class HandsBlockedBackend:
         self.attempted = []
 
     def __getattr__(self, name: str) -> Any:
-        if name in ACTION_TOOL_NAMES:
+        if name in ACTION_TOOL_NAMES or name == "point_at":   # percFix: the pointer move before a click is a hand too
 
             def blocked(*args: Any, **kwargs: Any) -> BlockedAction:
                 del args, kwargs

@@ -495,17 +495,20 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
                                    started + budget_s * 0.5)
             shared["page_marker"] = inner is not None
             watched = inner
-        elif not page and at_point is not None and window_sized(at_point, hwnd or _root_of(x, y)):
+        elif not page and at_point is not None:
             # report 58: on Chromium/CEF the point answers with the renderer's whole pane (13:30 on 3 Oct: "nothing
-            # under the point moved: it did not scroll" while the page scrolled). A window-sized surface never moves,
-            # so it can show no scroll: watch inside the page below it, or nothing
+            # under the point moved: it did not scroll" while the page scrolled). percFix (5 Oct, YouTube in Arc,
+            # 2 of 4 scrolls "did not scroll" while the page moved): the browser's own content host there is not
+            # window-sized (the sidebar is beside it) but never moves either. Any element that holds a page is a
+            # surface, not content: watch inside the page below it; a window-sized one with no page, nothing
             below = page_below(automation, at_point)
-            shared["surface"] = True
             if below is not None:
+                shared["surface"] = True
                 page = True
                 watched = marker_in_page(automation, below, x, y, started + budget_s * 0.5)
                 shared["page_marker"] = watched is not None
-            else:
+            elif window_sized(at_point, hwnd or _root_of(x, y)):
+                shared["surface"] = True
                 watched = None
         shared["page"] = page
 
@@ -548,6 +551,11 @@ def scroll_at(x: int, y: int, *, dy: int = 0, dx: int = 0, hwnd: int | None = No
     return outcome, facts
 
 
+#: The end of a wheel scroll's summary when the one element watched under the point did not move. The dispatcher
+#: (``yuki.agent.tools``) drops it when its before/after reads of the window show the content did move (percFix).
+POINT_STILL = ", but nothing under the point moved: it did not scroll"
+
+
 def describe(outcome: Outcome, *, direction: str, notches: int, x: int, y: int) -> tuple[bool, str]:
     """``(ok, summary)`` for an :class:`Outcome`: ok only when it did not provably fail."""
     who = outcome.target
@@ -568,7 +576,7 @@ def describe(outcome: Outcome, *, direction: str, notches: int, x: int, y: int) 
         if outcome.moved:
             return True, f"{sent}; the content moved"
         if outcome.moved is False:
-            return False, f"{sent}, but nothing under the point moved: it did not scroll"
+            return False, f"{sent}{POINT_STILL}"
         return True, f"{sent}; {outcome.note or 'whether it moved is not known'}"
     return False, outcome.note or "nothing scrollable was found"
 

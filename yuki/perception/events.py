@@ -425,6 +425,70 @@ class UiaSource:
                 continue
 
 
+class ElementWatch:
+    """percFix: one element's property-changed events, for the moment an action waits on its own effect (a slider's
+    value after ``SetValue``, a toggle's state after ``Toggle``). Made on the action's own UI Automation thread (MTA)
+    before it acts, so the event cannot be missed; :meth:`wait` blocks on a threading event, never a timed poll;
+    :meth:`close` removes the handler. A provider that cannot subscribe gives a watch whose :meth:`wait` returns
+    False at once (the caller reads once and goes by that).
+
+    Live 5 Oct ``set_slider`` read the volume back 0.4 s after setting it, saw the old value (Chromium and CEF
+    deliver a value change a moment later) and reported 40% -> 40% while the slider had moved to 30%.
+    """
+
+    def __init__(self, automation: Any, element: Any, property_ids: tuple[int, ...]) -> None:
+        import ctypes
+
+        self.automation = automation
+        self.element = element
+        self.changes = 0
+        self._event = threading.Event()
+        self._handler: Any = None
+        try:
+            from yuki.perception.tree import _uia_core
+
+            _structure, property_cls, _automation = handler_classes(_uia_core())
+
+            def sink(_kind: str, _what: int, _rid: tuple | None) -> None:
+                self.changes += 1
+                self._event.set()
+
+            handler = property_cls(sink)
+            ids = (ctypes.c_int * len(property_ids))(*property_ids)
+            automation.AddPropertyChangedEventHandlerNativeArray(element, _TREE_SCOPE_ELEMENT, None, handler, ids,
+                                                                 len(property_ids))
+            self._handler = handler
+        except Exception:  # noqa: BLE001 - no events from this provider: wait() says so at once
+            self._handler = None
+
+    @property
+    def live(self) -> bool:
+        return self._handler is not None
+
+    def wait(self, timeout_s: float) -> bool:
+        """Wait up to ``timeout_s`` for a change event since the last :meth:`wait`; whether one came."""
+        if self._handler is None:
+            return False
+        got = self._event.wait(max(0.0, timeout_s))
+        self._event.clear()
+        return got
+
+    def close(self) -> None:
+        handler, self._handler = self._handler, None
+        if handler is None:
+            return
+        try:
+            self.automation.RemovePropertyChangedEventHandler(self.element, handler)
+        except Exception:  # noqa: BLE001 - the element may be gone
+            pass
+
+    def __enter__(self) -> "ElementWatch":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+
 _SHARED: EventHub | None = None
 _SHARED_LOCK = threading.Lock()
 

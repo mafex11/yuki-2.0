@@ -406,7 +406,7 @@ def test_a_wheel_scroll_the_point_called_failed_is_a_scroll_when_the_page_moved(
     d = _dispatcher(desk)
     d.dispatch("look_at_window", {"hwnd": 7001})
     out = d.dispatch("scroll", {"x": 960, "y": 600, "dy": -10, "expect_hwnd": 7001})
-    assert out.ok and "but the window's content did move" in out.summary
+    assert out.ok and "the window's content did move" in out.summary
     assert "moved up by about 600 px" in out.content[0]["text"]
     assert action_verdict("scroll", out)[0] is True
 

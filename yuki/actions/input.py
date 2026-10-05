@@ -2745,7 +2745,24 @@ def scroll(
 # focus a field and then types holds it throughout.
 from yuki.actions.leases import leased as _leased  # noqa: E402
 
+def point_at(x: int, y: int, *, expect_hwnd: int | None = None) -> ActionResult:
+    """Put the pointer on (x, y) and nothing else (percFix): the move a mouse click makes, taken before the click so
+    that what the pointer alone does (a hover card opening, a video preview ending) is in the window before the
+    click and is not taken for the click's effect. Refused like a click: outside the desktop, or ``expect_hwnd``
+    not in front."""
+    started = time.perf_counter()
+    details = {"x": x, "y": y, "expect_hwnd": expect_hwnd}
+    if not _in_screen_bounds(x, y):
+        return _result(False, f"({x},{y}) is outside the desktop {virtual_screen_bounds()}", details, started)
+    refusal = _foreground_mismatch(expect_hwnd)
+    if refusal:
+        return _result(False, refusal, details, started)
+    _move(int(x), int(y))
+    return _result(True, f"pointer at ({x},{y})", details, started)
+
+
 click = _leased(click)
+point_at = _leased(point_at)
 type_text = _leased(type_text)
 hotkey = _leased(hotkey)
 press = _leased(press)

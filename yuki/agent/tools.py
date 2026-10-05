@@ -1073,6 +1073,67 @@ REFERENCE_FRESH_S = 6.0
 #: A read stays current by the window's events for at most this long (s): past it the window is read again
 #: (report 58 review, F4: a provider may move content without any event Yuki subscribes to).
 REUSE_MAX_S = 2.0
+#: percFix: an action that expects its target to change (a toggle asked for a state) waits up to this long (s) after
+#: acting for the window's events and reads it again on each new event until the target reads as asked. Live 5 Oct
+#: Spotify's Lyrics toggle showed nothing for over a second after it was pressed (no event within 0.6 s, the read
+#: after it unchanged), and the view opened a few seconds later; the read 1.4 s after the click called it
+#: "contradicted".
+OUTCOME_TARGET_WAIT_S = 3.0
+#: percFix: a mouse click at a raw point first brings the pointer there and waits (on the events, bounded) for what
+#: the pointer alone does - a hover card, a video preview ending - so the click's account holds only what the click
+#: did (live 5 Oct a click on an empty margin was "verified" by a video preview the pointer's move had closed).
+HOVER_SETTLE_S = 1.0
+
+
+def _toggle_in(read: list[Any], element_id: int | None, was: Any = None) -> Any:
+    """The toggle a click acted on, in a read after it (percFix): by its carried id; else by the RuntimeId it had
+    just before the click; else the control the app drew again in its place - the same role with a Toggle pattern,
+    its box over most of the old one (live 5 Oct T3 Code drew "Toggle right panel" anew under a longer name, and the
+    read-back said "not in the window now" while the panel had closed). ``None`` when there is none. Facts about ids,
+    roles, patterns and boxes; never names."""
+    if element_id is not None:
+        same = next((e for e in read if _field(e, "id") == element_id), None)
+        if same is not None:
+            return same
+    if was is None:
+        return None
+    rid = _field(was, "runtime_id")
+    if rid:
+        same = next((e for e in read if _field(e, "runtime_id") and list(_field(e, "runtime_id")) == list(rid)), None)
+        if same is not None:
+            return same
+    old = _field(was, "bounds")
+    if not old or len(old) != 4 or _field(was, "hidden"):
+        return None
+
+    def area(b: Any) -> int:
+        return max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+
+    best, best_share = None, 0.0
+    for e in read:
+        box = _field(e, "bounds")
+        if (_field(e, "role") != _field(was, "role") or "toggle" not in (_field(e, "patterns") or ())
+                or not box or len(box) != 4 or _field(e, "hidden")):
+            continue
+        overlap = area((max(old[0], box[0]), max(old[1], box[1]), min(old[2], box[2]), min(old[3], box[3])))
+        share = overlap / max(1, max(area(old), area(box)))
+        if share > best_share:
+            best, best_share = e, share
+    return best if best_share >= _SAME_PLACE_SHARE else None
+
+
+#: How much of the larger of two boxes they must share to be one control drawn again in place (:func:`_toggle_in`).
+_SAME_PLACE_SHARE = 0.6
+
+
+def _without_point_verdict(text: str) -> str:
+    """A wheel scroll's summary without its single-point "it did not scroll" ending (percFix: said only when the
+    window's reads show its content did move, so the point's verdict was wrong)."""
+    try:
+        from yuki.actions.scrolling import POINT_STILL
+    except Exception:  # noqa: BLE001
+        return text
+    return text.replace(POINT_STILL, "", 1)
 
 
 def effective_screenshot_policy(policy: str | None = None) -> str:
@@ -1553,6 +1614,13 @@ class _LazyRealBackend:
         import importlib
 
         return importlib.import_module("yuki.actions.hover").hover(x, y, expect_hwnd=expect_hwnd, label=label)
+
+    def point_at(self, x: int, y: int, *, expect_hwnd: int | None = None) -> Any:
+        """:func:`yuki.actions.input.point_at`: the pointer onto a point, nothing else (the move a click makes, taken
+        first so the click's account holds only the click's effect)."""
+        import importlib
+
+        return importlib.import_module("yuki.actions.input").point_at(x, y, expect_hwnd=expect_hwnd)
 
     def app_volume(self, app: str, *, level: float | None = None, change: float | None = None,
                    mute: bool | None = None) -> Any:
@@ -2400,22 +2468,87 @@ class Dispatcher:
         elements, partial = self._observe(hwnd)
         return elements, True, partial
 
-    def _settled_after(self, hwnd: int, generation: int | None) -> None:
+    def _settled_after(self, hwnd: int, generation: int | None, *, first_s: float = OUTCOME_FIRST_EVENT_S) -> None:
         """Wait for the action's effect to show and the window to go quiet, on its events (bounded); without events
-        return at once."""
+        return at once. ``first_s``: how long the first event is waited for."""
         hub = self._hub()
         if hub is None or generation is None:
             return
         try:
-            hub.wait_change(int(hwnd), generation, OUTCOME_FIRST_EVENT_S)
+            hub.wait_change(int(hwnd), generation, first_s)
             hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=OUTCOME_CAP_S)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _read_again_until(self, hwnd: int, after: list[Any] | None, after_partial: bool,
+                          settled: Callable[[list[Any] | None], bool], deadline: float
+                          ) -> tuple[list[Any] | None, bool, int]:
+        """percFix: while the read after an action does not show what it expects of its target (``settled``), wait
+        for the window's next event (never past ``deadline``) and read it again: the way a person looks once more
+        when something moves, never a timed poll. Without events nothing is waited for. Returns the last read, its
+        partial flag and how many extra reads were taken."""
+        hub = self._hub()
+        extra = 0
+        while not settled(after) and hub is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            generation = self._generation(hwnd)
+            if generation is None:
+                break
+            try:
+                if not hub.wait_change(int(hwnd), generation, remaining):
+                    break   # nothing more happened in the window: the read stands
+                hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=max(0.0, min(OUTCOME_CAP_S, deadline
+                                                                                    - time.monotonic())))
+            except Exception:  # noqa: BLE001
+                break
+            newer, newer_partial = self._observe(hwnd)
+            extra += 1
+            if newer is None:
+                break
+            after, after_partial = newer, newer_partial
+        return after, after_partial, extra
+
+    def _hover_first(self, hwnd: int | None, x: int, y: int, guard: int | None) -> None:
+        """percFix: before a mouse click at a raw point, bring the pointer there and let the window show what the
+        pointer alone does (on its events, bounded by :data:`HOVER_SETTLE_S`), so the read before the click already
+        has it. Nothing is clicked; a pointer already there costs nothing."""
+        point_at = getattr(self.backend, "point_at", None)
+        if not callable(point_at):
+            return
+        try:
+            from yuki.perception.windows import cursor_position
+
+            if tuple(cursor_position()) == (int(x), int(y)):
+                return
+        except Exception:  # noqa: BLE001 - not known: move it
+            pass
+        generation = self._generation(int(hwnd)) if hwnd else None
+        try:
+            self._before_input("click")
+            moved = point_at(int(x), int(y), expect_hwnd=guard)
+        except ToolError:
+            raise
+        except Exception:  # noqa: BLE001 - the click goes on without it
+            return
+        if not getattr(moved, "ok", isinstance(moved, dict) and moved.get("ok")):
+            return
+        hub = self._hub()
+        if hub is None or generation is None:
+            return
+        try:
+            if hub.wait_change(int(hwnd), generation, OUTCOME_FIRST_EVENT_S):
+                hub.wait_quiet(int(hwnd), quiet_s=OUTCOME_QUIET_S, cap_s=HOVER_SETTLE_S)
         except Exception:  # noqa: BLE001
             return
 
     def _bracketed(self, name: str, hwnd: int | None, act: Callable[[], ToolOutcome], *, target: int | None = None,
                    target_label: str = "",
                    before_hook: Callable[[list[Any] | None], ToolOutcome | None] | None = None,
-                   after_hook: Callable[[ToolOutcome, list[Any] | None], ToolOutcome] | None = None) -> ToolOutcome:
+                   after_hook: Callable[..., ToolOutcome] | None = None,
+                   prepare: Callable[[], None] | None = None,
+                   settled: Callable[[list[Any] | None], bool] | None = None) -> ToolOutcome:
         """Run ``act`` between two reads of ``hwnd`` and say what it changed there (report 58).
 
         The account (:mod:`yuki.perception.outcome`) goes into the result as "What changed: ..." and its verdict
@@ -2425,12 +2558,19 @@ class Dispatcher:
         moving is a scroll that worked, whatever a single point under it said.
 
         ``before_hook`` is given the read before the action (``None`` when there is none) and may return an outcome
-        that stands instead of acting; ``after_hook`` is given the action's outcome and the read after it (``None``
-        when there is none) and returns the outcome to report (report 58 review, F3: a toggle reads its own state
-        from these same two reads, so its side effects are in the account too).
+        that stands instead of acting; ``after_hook`` is given the action's outcome, the read after it and the
+        change between the two reads (``None`` when there is none) and returns the outcome to report (report 58
+        review, F3: a toggle reads its own state from these same two reads, so its side effects are in the account
+        too). percFix: ``prepare`` runs before the read before the action (a raw click's pointer move, so what the
+        pointer alone does is not taken for the click's effect); ``settled`` says whether a read after the action
+        shows what the action expects of its target (a toggle in the state asked for): until it does, the first
+        event is waited for longer and the window is read again on each new event, up to
+        :data:`OUTCOME_TARGET_WAIT_S` (an app that takes a second or more to show it is not "contradicted").
         """
         if not hwnd or not self.verify_outcomes:
             return self._hooked(act, before_hook, after_hook)
+        if prepare is not None:
+            prepare()
         prepare_started = time.monotonic()
         before: list[Any] | None = None
         fresh = before_partial = False
@@ -2462,35 +2602,47 @@ class Dispatcher:
                 return instead
         prepared_ms = round((time.monotonic() - prepare_started) * 1000.0, 1)
         outcome = act()
+        acted_at = time.monotonic()
         if not outcome.ok and name != "scroll":
             return after_hook(outcome, None) if after_hook is not None else outcome
         after: list[Any] | None = None
         try:
             waited = time.monotonic()
-            self._settled_after(hwnd, generation)
+            self._settled_after(hwnd, generation,
+                                first_s=OUTCOME_TARGET_WAIT_S if settled is not None else OUTCOME_FIRST_EVENT_S)
             settle_ms = round((time.monotonic() - waited) * 1000.0, 1)
             read_started = time.monotonic()
             after, after_partial = self._observe(hwnd)
-            if after_hook is not None:
-                outcome = after_hook(outcome, after)
+            rereads = 0
+            if settled is not None and after is not None:
+                after, after_partial, rereads = self._read_again_until(hwnd, after, after_partial, settled,
+                                                                       acted_at + OUTCOME_TARGET_WAIT_S)
             # content-free facts for the log: what the bracket cost and whether events spared the read before
             diag = {"before_read": "fresh" if fresh else "current by events", "events": generation is not None,
                     "before_ms": prepared_ms, "settle_ms": settle_ms,
                     "after_read_ms": round((time.monotonic() - read_started) * 1000.0, 1)}
+            if rereads:
+                diag["rereads"] = rereads
             if before_partial or after_partial:
                 diag["partial"] = True
             if after is None:
+                if after_hook is not None:
+                    outcome = after_hook(outcome, None)
                 return self._with_change(outcome, None, [], None, "the window could not be read after it", diag)
             from yuki.perception.model import fact
             from yuki.perception.outcome import describe, diff, verdict
 
             busy = {fact(e, "id") for e in before if tuple(fact(e, "runtime_id") or ()) in busy_rids}
             change = diff(before, after, target=target, reference=reference if fresh else None, busy=busy,
-                          before_partial=before_partial, after_partial=after_partial)
+                          before_partial=before_partial, after_partial=after_partial, scroll=name == "scroll")
+            if after_hook is not None:
+                outcome = after_hook(outcome, after, change)
             opaque = bool((self._observed.get(hwnd) or (None, 0.0, False))[2])
             verified, why = verdict(change, opaque=opaque)
             lines = describe(change, target_label=target_label)
             return self._with_change(outcome, verified, lines, change, why, diag)
+        except ToolError:
+            raise
         except Exception as exc:  # noqa: BLE001 - the action's own report stands
             if isinstance(outcome.payload, dict):
                 outcome.payload = {**outcome.payload, "screen_change_error": f"{type(exc).__name__}: {exc}"}
@@ -2518,10 +2670,10 @@ class Dispatcher:
         effects = [details.get(k) for k in ("foreground_changed", "focus_changed", "foreground_title_changed",
                                             "page_changed", "window_state_changed")]
         own = details.get("verified")
-        if details.get("toggle_to") and isinstance(own, bool):
-            # a toggle's own read-back of its state is the verdict (did it reach the state asked for); what else
-            # changed is the account
-            final: bool | None = own
+        if details.get("toggle_to"):
+            # a toggle's own read-back of its state is the verdict (did it reach the state asked for; percFix: None
+            # when it still reads the old state but the window did change); what else changed is the account
+            final: bool | None = own if isinstance(own, bool) else None
         elif details.get("readback") == "missing" or details.get("enter_withheld"):
             final = own if isinstance(own, bool) else None   # the text did not arrive: no send to see
             if details.get("readback") == "missing":
@@ -2545,12 +2697,17 @@ class Dispatcher:
             details["verified"] = final
         else:
             details.pop("verified", None)
-        if outcome.name == "scroll" and verified is True and change is not None and change.moved:
+        if outcome.name == "scroll" and change is not None and getattr(change, "content_moved", change.moved):
+            # percFix: a scroll is judged by the window's content (its scroll position, items moving together, or
+            # the items in view replaced as it scrolled), never by one point under it
             details["verified"] = True
             details.pop("unverifiable", None)
             if not outcome.ok:
                 outcome.ok = True
-                outcome.summary = f"{outcome.summary}; but the window's content did move"
+                said = "the window's content did move"
+                outcome.summary = f"{_without_point_verdict(outcome.summary)}; {said}"
+                if outcome.content and outcome.content[0].get("type") == "text":
+                    outcome.content[0]["text"] = f"{_without_point_verdict(outcome.content[0]['text'])}; {said}"
         if nested:
             outcome.payload = {**outer, "type_text": {**payload, "details": details}}
         else:
@@ -3485,8 +3642,12 @@ class Dispatcher:
                 self._mark_acted(guard or target or self._pointed_window(x, y), "click")
             return outcome
 
+        # percFix: a click at a raw point goes by the mouse; the pointer is brought there first and the window let
+        # settle, so the read before the click already shows what the pointer alone did
+        prepare = (lambda: self._hover_first(window, x, y, guard)) if not label else None
         return self._bracketed("click", window, act, target=element_id if isinstance(element_id, int) else None,
-                               target_label=self._short_label(found[1]) if found is not None else "")
+                               target_label=self._short_label(found[1]) if found is not None else "",
+                               prepare=prepare)
 
     def _aim(self, hwnd: int | None, element_id: Any, x: int, y: int) -> tuple[int, int]:
         """Where a click on element ``element_id`` lands now (report 58 review, F4): its centre in the screen
@@ -3598,9 +3759,10 @@ class Dispatcher:
             return "on" if "on" in states else "off" if "off" in states else None
 
         def in_read(read: list[Any] | None) -> tuple[bool, Any]:
-            """``(read, the toggle in it)``: from the bracket's read by its carried id, else a live read of its own."""
+            """``(read, the toggle in it)``: from the bracket's read (by its carried id, its RuntimeId, else the
+            control the app drew again in its place), else a live read of its own."""
             if read is not None and element_id is not None:
-                return True, next((e for e in read if _field(e, "id") == element_id), None)
+                return True, _toggle_in(read, element_id, held.get("was"))
             return False, self._live_element(hwnd, element)
 
         def before(read: list[Any] | None) -> ToolOutcome | None:
@@ -3609,6 +3771,7 @@ class Dispatcher:
                 raise ToolError(f"not clicked: {label} is not in a fresh read of its window: it may be hidden until "
                                 f"the pointer comes near it, or gone. Hover where it appears, read again, and click "
                                 f"it from that read")
+            held["was"] = live
             now = held["now"] = state_of(live)
             if now == want:
                 outcome = ToolOutcome(name="click", ok=True, summary=f"{label} is already {want} (read live just "
@@ -3630,13 +3793,33 @@ class Dispatcher:
                 self._mark_acted(hwnd, "click")
             return via
 
-        def after(via: ToolOutcome, read: list[Any] | None) -> ToolOutcome:
+        def settled(read: list[Any] | None) -> bool:
+            """percFix: the read after the click shows the toggle in the state asked for (until then the bracket
+            reads the window again on its next event, bounded)."""
+            return read is not None and state_of(_toggle_in(read, element_id, held.get("was"))) == want
+
+        def after(via: ToolOutcome, read: list[Any] | None, change: Any = None) -> ToolOutcome:
             _from_bracket, found = in_read(read)
             state = None if found is None else state_of(found)
-            verified = state == want
-            note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
-            if via.ok and not verified:
-                note += f" (wanted {want}): do not click it again from this read; read the window first"
+            # percFix: the toggle's own state is the verdict. When it still reads the old state (or was drawn again
+            # without one) but the window did change - something appeared or went, it was renamed - that is not a
+            # failure the click can be blamed for: unverified, and the account says what changed. Only a toggle
+            # that reads the old state in a window where nothing changed, after the wait, is "did not take".
+            moved_on = bool(change is not None and getattr(change, "evidence", False))
+            if state == want:
+                verified: bool | None = True
+                note = f"; read back: now {state}"
+            elif moved_on:
+                verified = None
+                note = ((f"; read back: still {state} (wanted {want})" if state else
+                         "; read back: its new state is not shown")
+                        + ", though the window did change (below): it may have taken effect in a way its own state "
+                          "does not show. Read the window before clicking it again")
+            else:
+                verified = False
+                note = (f"; read back: now {state}" if state else "; read back: it is not in the window now")
+                if via.ok:
+                    note += f" (wanted {want}): do not click it again from this read; read the window first"
             via.summary += note
             if via.content and via.content[0].get("type") == "text":
                 via.content[0]["text"] += note
@@ -3644,11 +3827,15 @@ class Dispatcher:
                 details = (dict(via.payload.get("details") or {}) if isinstance(via.payload.get("details"), dict)
                            else {})
                 details.update(verified=verified, state_before=held.get("now"), state_after=state, toggle_to=want)
+                if verified is None:
+                    details.pop("verified", None)
+                    details["toggle_unconfirmed"] = True
                 via.payload = {**via.payload, "details": details}
             return self._labelled(via, label)
 
         return self._bracketed("click", hwnd, act, target=element_id,
-                               target_label=self._short_label(element), before_hook=before, after_hook=after)
+                               target_label=self._short_label(element), before_hook=before, after_hook=after,
+                               settled=settled)
 
     def _pointed_window(self, x: int, y: int) -> int | None:
         locate = getattr(self.backend, "window_at", None)

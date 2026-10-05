@@ -70,6 +70,15 @@ class Change:
     partial: bool = False
     #: Containers whose content moved: ``[(container, dy, dx, came_into_view, left_view)]``.
     moved: list[tuple[Any, int, int, int, int]] = field(default_factory=list)
+    #: Scrolling containers whose own scroll position changed (percFix): ``[(container, axis, before, after)]``,
+    #: axis ``"v"`` or ``"h"``, percent of the way.
+    scrolled: list[tuple[Any, str, float, float]] = field(default_factory=list)
+    #: For a scroll (``diff(scroll=True)``): scrolling containers whose visible items were replaced, some coming into
+    #: view and others leaving it, with none left in both reads to measure a shift by (a scroll of a screenful or
+    #: more): ``[(container, came_into_view, left_view)]``.
+    turnover: list[tuple[Any, int, int]] = field(default_factory=list)
+    #: For a scroll: per container in :attr:`scrolled`, how many elements came into view and left it there.
+    scroll_items: dict[int, tuple[int, int]] = field(default_factory=dict)
     title: tuple[str, str] | None = None
     page: tuple[str, str] | None = None
     #: Elements left out because they were already changing before the action.
@@ -80,20 +89,26 @@ class Change:
     @property
     def any(self) -> bool:
         return bool(self.target_changes or self.appeared or self.gone or self.changed or self.moved or self.title
-                    or self.page)
+                    or self.page or self.scrolled or self.turnover)
 
     @property
     def evidence(self) -> bool:
         """Whether something changed that an action makes and the window does not change on its own: the target,
         what appeared or went, movement, the title or page, or a state, value or name of an interactive element."""
         return bool(self.target_changes or self.appeared or self.gone or self.moved or self.title or self.page
-                    or len(self.changed) > self.weak)
+                    or self.scrolled or self.turnover or len(self.changed) > self.weak)
+
+    @property
+    def content_moved(self) -> bool:
+        """Whether the window's content moved (percFix: what a scroll is judged by): elements shifted together, a
+        scrolling container's position changed, or its visible items were replaced as it scrolled."""
+        return bool(self.moved or self.scrolled or self.turnover)
 
 
 def _shown(element: Any) -> tuple:
     """What a reader sees of an element besides its id and box."""
     return (fact(element, "role"), fact(element, "name") or "", fact(element, "value"),
-            tuple(fact(element, "states") or ()), bool(fact(element, "hidden")))
+            tuple(fact(element, "states") or ()), bool(fact(element, "hidden")), tuple(fact(element, "scroll") or ()))
 
 
 def _differences(before: Any, after: Any) -> list[tuple[str, Any, Any]]:
@@ -157,9 +172,29 @@ def _scrollers_of(element_id: int, by_id: dict[int, Any]) -> int:
     return -1
 
 
+#: A scroll position change smaller than this (percent of the way) is rounding, not movement.
+SCROLL_MIN_PERCENT = 0.5
+
+
+def _scroll_changes(element_before: Any, element_after: Any) -> list[tuple[str, float, float]]:
+    """``[(axis, before, after)]`` for a scrolling element whose own position moved between two reads."""
+    s0, s1 = fact(element_before, "scroll"), fact(element_after, "scroll")
+    if not s0 or not s1:
+        return []
+    out = []
+    for axis, b, a in (("h", s0[0], s1[0]), ("v", s0[1], s1[1])):
+        try:
+            b, a = float(b), float(a)
+        except (TypeError, ValueError):
+            continue
+        if b >= 0 and a >= 0 and abs(a - b) >= SCROLL_MIN_PERCENT:
+            out.append((axis, b, a))
+    return out
+
+
 def diff(before: list[Any], after: list[Any], *, target: int | None = None,
          reference: list[Any] | None = None, busy: set[int] | None = None,
-         before_partial: bool = False, after_partial: bool = False) -> Change:
+         before_partial: bool = False, after_partial: bool = False, scroll: bool = False) -> Change:
     """Compare two reads of one window whose ids are carried (the same id is the same element).
 
     Args:
@@ -188,6 +223,11 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         else:
             change.target_changes = _differences(b[target], a[target])
     common = [i for i in a if i in b]
+    for i in common:
+        if i in noisy:
+            continue
+        for axis, s0, s1 in _scroll_changes(b[i], a[i]):
+            change.scrolled.append((a[i], axis, s0, s1))
     for i in common:
         if i == target:
             continue
@@ -249,6 +289,32 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         # what came into view or left it there is part of the movement, counted with it, not listed apart
         change.appeared = [(e, n) for e, n in change.appeared if _scrollers_of(fact(e, "id"), a) != scroller]
         change.gone = [(e, n) for e, n in change.gone if _scrollers_of(fact(e, "id"), b) != scroller]
+    if scroll:
+        # percFix: a scroll of a screenful or more replaces every item in view, so nothing is left in both reads to
+        # measure a shift by (live 5 Oct on YouTube: "82 appeared, 31 went away", no movement, "did not scroll");
+        # items coming into view and others leaving inside one scrolling container, or its own position moving, is
+        # the scroll
+        moved_ids = {fact(m[0], "id") for m in change.moved if m[0] is not None}
+        position = {fact(s[0], "id") for s in change.scrolled}
+        came_in: dict[int, int] = {}
+        left_out: dict[int, int] = {}
+        for i in appeared:
+            came_in[_scrollers_of(i, a)] = came_in.get(_scrollers_of(i, a), 0) + 1
+        for i in gone:
+            left_out[_scrollers_of(i, b)] = left_out.get(_scrollers_of(i, b), 0) + 1
+        for scroller in sorted(set(came_in) | set(left_out), key=lambda s: -(came_in.get(s, 0) + left_out.get(s, 0))):
+            if scroller < 0 or scroller in moved_ids:
+                continue
+            came, left = came_in.get(scroller, 0), left_out.get(scroller, 0)
+            if not (came and left) and scroller not in position:
+                continue
+            container = a.get(scroller) or b.get(scroller)
+            if scroller in position:
+                change.scroll_items[scroller] = (came, left)
+            else:
+                change.turnover.append((container, came, left))
+            change.appeared = [(e, n) for e, n in change.appeared if _scrollers_of(fact(e, "id"), a) != scroller]
+            change.gone = [(e, n) for e, n in change.gone if _scrollers_of(fact(e, "id"), b) != scroller]
     t0 = fact(before[0], "name") if before else ""
     t1 = fact(after[0], "name") if after else ""
     if before and after and fact(before[0], "depth", 0) == 0 and t0 != t1:
@@ -260,7 +326,8 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
     elif p0 != p1 and (p0 or p1):
         change.page = (p0[1] if p0 else "", p1[1] if p1 else "")
     change.counts = {"appeared": len(appeared), "gone": len(gone), "changed": len(change.changed),
-                     "weak": change.weak, "moved": len(change.moved), "ignored": change.ignored,
+                     "weak": change.weak, "moved": len(change.moved), "scrolled": len(change.scrolled),
+                     "turnover": len(change.turnover), "ignored": change.ignored,
                      "past_limit": past_limit, "before": len(before), "after": len(after)}
     return change
 
@@ -349,6 +416,16 @@ def describe(change: Change, *, target_label: str = "") -> list[str]:
             counts.append(f"{left} left it")
         lines.append(f"the content of {label(container)} moved {' and '.join(way)}"
                      + (f": {', '.join(counts)}" if counts else ""))
+    for container, axis, s0, s1 in change.scrolled:
+        way = ("down" if s1 > s0 else "up") if axis == "v" else ("right" if s1 > s0 else "left")
+        came, left = change.scroll_items.get(fact(container, "id"), (0, 0))
+        counts = [f"{came} element(s) came into view" if came else "", f"{left} left it" if left else ""]
+        counts = [c for c in counts if c]
+        lines.append(f"{label(container)} scrolled {way} from {s0:.0f}% to {s1:.0f}% of the way"
+                     + (f": {', '.join(counts)}" if counts else ""))
+    for container, came, left in change.turnover:
+        lines.append(f"the content of {label(container)} scrolled on: {came} element(s) came into view, {left} left "
+                     f"it")
     for element, size in change.appeared[:NAMED_CHANGES]:
         inside = f" with {size - 1} element(s) inside" if size > 1 else ""
         lines.append(f"{label(element)} appeared{inside}")
@@ -390,7 +467,7 @@ def verdict(change: Change | None, *, opaque: bool = False, readable: bool = Tru
         parts = [f"{n} {what}" for n, what in ((sum(s for _e, s in change.appeared), "appeared"),
                                                (sum(s for _e, s in change.gone), "went away"),
                                                (len(change.changed), "changed")) if n]
-        if change.moved:
+        if change.content_moved:
             parts.insert(0, "its content moved")
         if change.page or change.title:
             parts.insert(0, "its page or title changed")
