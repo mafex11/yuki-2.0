@@ -1756,15 +1756,17 @@ class ConversationWorker:
 
     def _names_pass(self, session_id: str, turns: Sequence[ConversationTurn], context: Sequence[ConversationTurn],
                     elsewhere: set[int]) -> list[dict[str, Any]]:
-        """Report 88 (learn from one correction): when the batch has words heard through speech recognition, one small
+        """Report 88 (learn from one correction): when the batch or the exchanges before it have words heard through
+        speech recognition, one small
         call (:data:`yuki.memory.misheard.NAMES_TOOL`) says which misheard names the exchanges settled (the user
         corrected or confirmed one; Yuki's own name heard as a sound-alike); each becomes a name alias at once and the
         correction pass rewords memory text that carries the heard form (:func:`yuki.memory.misheard.learn_name_fixes`).
         Logged, never raises; returns what was learned."""
         from yuki.memory import misheard as _m
 
-        if not any(t.id not in elsewhere and _m.heard_by_speech(t) for t in turns):
-            return []
+        if not any(t.id not in elsewhere and getattr(t, "addressed", None) != OTHERS and _m.heard_by_speech(t)
+                   for t in [*context, *turns]):
+            return []   # typed words have no mishearing (a typed fix of a spoken one has the spoken one before it)
         call = ConversationCall(at=time.time(), purpose="names", model=self.model, session_id=session_id,
                                 turn_count=len(turns))
         try:

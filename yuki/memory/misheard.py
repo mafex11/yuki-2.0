@@ -305,7 +305,8 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
     words of that exchange or one before it in this conversation (``context``); the name is in the exchanges (the
     user's words or Yuki's) and is a name memory knows (:class:`KnownNames`; returned as memory spells it); the heard
     form is not itself a name memory knows (it would send one person's name to another); "called" only for Yuki's
-    own name. Each fix: ``{"heard", "name", "how", "why", "turn_id", "at"}``."""
+    own name, with the heard form in the cited exchange itself (Yuki's name need not be written anywhere: the
+    recogniser wrote the sound-alike). Each fix: ``{"heard", "name", "how", "why", "turn_id", "at"}``."""
     from yuki.memory.contacts import span_in
     from yuki.memory.conversations import own_words
 
@@ -335,15 +336,20 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
             rejected.append(f"[{n}]: no heard words, name or how")
             continue
         hk, nk = _key(heard), _key(name)
-        if not hk or not nk or hk == nk or len(hk.split()) > NAME_FIX_MAX_WORDS or len(nk.split()) > NAME_FIX_MAX_WORDS:
+        if not hk or not nk or hk == nk or max(len(hk.split()), len(nk.split())) > NAME_FIX_MAX_WORDS:
             rejected.append(f"[{n}]: the heard words and the name must be a few different words")
             continue
-        upto = history[: len(context) + n]
+        if how == "called" and nk != _key(WAKE_NAME):
+            rejected.append(f"[{n}]: called is only for Yuki's own name")
+            continue
+        # where the heard words must stand: a call by name is that exchange itself; a fix may follow them
+        upto = [turn] if how == "called" else history[: len(context) + n]
         if not any(span_in(heard, own_words(getattr(t, "user_text", ""))) for t in upto):
             rejected.append(f"[{n}]: the heard words are not in what the user said")
             continue
-        if not any(span_in(name, f"{own_words(getattr(t, 'user_text', ''))} {getattr(t, 'reply_text', '') or ''}")
-                   for t in history):
+        if how != "called" and not any(
+                span_in(name, f"{own_words(getattr(t, 'user_text', ''))} {getattr(t, 'reply_text', '') or ''}")
+                for t in history):
             rejected.append(f"[{n}]: the name is not in the exchanges")
             continue
         right = known.name_of(name)
@@ -352,9 +358,6 @@ def name_fixes_from(raw: Any, turns: Sequence[Any], context: Sequence[Any] = (),
             continue
         if known.name_of(heard) is not None:
             rejected.append(f"[{n}]: the heard words are a name memory knows")
-            continue
-        if how == "called" and _key(right) != _key(WAKE_NAME):
-            rejected.append(f"[{n}]: called is only for Yuki's own name")
             continue
         if (hk, _key(right)) in seen or len(out) >= MAX_NAME_FIXES:
             continue
@@ -720,7 +723,8 @@ class NamesPass:
                         result.windows += 1
                         result.turns += len(turns)
                         away = [t.id for t in turns if getattr(t, "addressed", None) == OTHERS]
-                        if not any(t.id not in away and heard_by_speech(t) for t in turns):
+                        if not any(t.id not in away and getattr(t, "addressed", None) != OTHERS and heard_by_speech(t)
+                                   for t in [*context, *turns]):
                             continue   # typed words have no mishearing (the live pass reads the same batches)
                         raw = worker._call(purpose="names", run_id=None, system=names_system(),
                                            user=names_message(context, turns, known), tool=NAMES_TOOL, effort="low",
