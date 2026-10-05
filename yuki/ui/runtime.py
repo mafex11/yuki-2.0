@@ -245,7 +245,8 @@ class Lane(QThread):
 
     def _on_pause(self, state: str, why: str, seconds: float = 0.0) -> None:
         """The agent's pause state changed (any thread): the island, the run card and the voice are told through
-        ``paused_changed``; a pause nobody resumed in time ends as a stop (``cancelled`` with ``by`` ``paused``)."""
+        ``paused_changed``; a pause nobody resumed in time ends as a stop (``cancelled`` with ``by`` ``paused``); a
+        request that ended while paused (``closed``, small8) is no longer the paused job."""
         job_id = self.current_id
         if job_id is None:
             return
@@ -701,8 +702,10 @@ class AgentRuntime(QObject):
     #: going | stopped | swapped, who, where, app, text, seconds, who_alts, where_alts, typed, from_memory, window).
     send_pending = Signal(str, int, dict)
     #: appTakeover: ``(lane, id, state, why)``: the request paused because the user took over the keyboard or mouse
-    #: (``paused``; why: keys | click | mouse), goes on (``resumed``: it read the screen again), or ended unresumed
-    #: (``ended``: a stop follows). Sent the moment it happens, from any thread (Qt queues it to the GUI thread).
+    #: (``paused``; why: keys | click | mouse), goes on (``resumed``: it read the screen again), ended unresumed
+    #: (``ended``: a stop follows), or the request ended while still paused (``closed``, small8: it finished anyway,
+    #: or it was stopped; nothing shows it paused any more). Sent the moment it happens, from any thread (Qt queues it
+    #: to the GUI thread).
     paused_changed = Signal(str, int, str, str)
     #: honest (87): ``(lane, id, verdict)``: the request's one outcome verdict (``yuki.agent.finish.outcome_verdict``:
     #: level verified | likely | unverified | failed | answer, what was seen, the send's confirmation, the line said by

@@ -276,17 +276,43 @@ def _scroll_changes(element_before: Any, element_after: Any) -> list[tuple[str, 
     return out
 
 
+#: Two view sizes (percent of the content the view shows) this close are the same content: a provider's own rounding.
+VIEW_SIZE_SLACK = 0.01
+
+
+def _same_content(before: Any, after: Any, axis: str) -> bool:
+    """Whether a scrolling element's view showed the same share of its content in both reads on ``axis`` (its Scroll
+    pattern's view size, known and equal): its position then moved over the same content, the view moved; content
+    that grew or shrank past the view changes the view size too. ``False`` when either read does not report it."""
+    v0, v1 = fact(before, "scroll_view"), fact(after, "scroll_view")
+    if not v0 or not v1:
+        return False
+    index = 0 if axis == "h" else 1
+    try:
+        b, a = float(v0[index]), float(v1[index])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return 0 < b < 100 and 0 < a < 100 and abs(a - b) <= VIEW_SIZE_SLACK
+
+
 def _set_scroll_aside(change: Change, shifts: dict[int, list[tuple[int, int]]], *, scroll: bool,
-                      point: tuple[int, int] | None, axes: str) -> None:
+                      point: tuple[int, int] | None, axes: str, before: dict[int, Any] | None = None) -> None:
     """Move from :attr:`Change.scrolled` to :attr:`Change.scroll_aside` the position changes that are no evidence the
     content moved (second review V4): one whose elements in view all but stayed put (its content grew or shrank past
     the view: an infinite feed loading more moves 100% to 85% with the view where it was), and, for a scroll made at a
-    known point, one on another axis or whose box does not hold the point (a carousel elsewhere scrolling itself)."""
+    known point, one on another axis or whose box does not hold the point (a carousel elsewhere scrolling itself).
+
+    small8 (report 73, release 7): a container whose view shows the same share of its content in both reads
+    (:func:`_same_content`) moved its view, whatever stayed put inside it: a text document's lines are no elements, so
+    the only elements under it (its own scroll bar's buttons) never move, and Page Down in Notepad, which moved the
+    view from line 30 to 186, was set aside as "grew" and called "nothing changed"."""
     keep: list[tuple[Any, str, float, float]] = []
     for container, axis, s0, s1 in change.scrolled:
-        pairs = shifts.get(fact(container, "id"), [])
+        cid = fact(container, "id")
+        pairs = shifts.get(cid, [])
         stayed = sum(1 for dy, dx in pairs if max(abs(dy), abs(dx)) < MOVE_MIN_PX)
-        if len(pairs) >= 3 and stayed >= MOVE_SHARE * len(pairs):
+        same = before is not None and cid in before and _same_content(before[cid], container, axis)
+        if not same and len(pairs) >= 3 and stayed >= MOVE_SHARE * len(pairs):
             change.scroll_aside.append((container, axis, s0, s1, "grew"))
         elif scroll and point is not None and (axis not in axes or not _holds(container, point)):
             change.scroll_aside.append((container, axis, s0, s1, "elsewhere"))
@@ -384,7 +410,7 @@ def diff(before: list[Any], after: list[Any], *, target: int | None = None,
         shifts.setdefault(_scrollers_of(i, a), []).append((dy, dx))
         if max(abs(dy), abs(dx)) < MOVE_MIN_PX:
             still.setdefault(_scrollers_of(i, a), []).append(i)
-    _set_scroll_aside(change, shifts, scroll=scroll, point=point, axes=axes)
+    _set_scroll_aside(change, shifts, scroll=scroll, point=point, axes=axes, before=b)
     for scroller, pairs in shifts.items():
         if len(pairs) < 3:
             continue

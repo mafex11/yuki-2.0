@@ -2190,12 +2190,14 @@ class Dispatcher:
         try:
             outcome = handler(tool_input)
         except ToolError as exc:
+            # small8: a ToolError is a refusal before anything was sent (a bad argument, a guard: "not clicked: nothing
+            # you can click is at ..."), so the run's outcome can tell it from an action that ran and failed
             outcome = ToolOutcome(
                 name=name,
                 ok=False,
                 summary=str(exc),
                 content=[{"type": "text", "text": str(exc)}],
-                payload={"error": str(exc)},
+                payload={"error": str(exc), "refused": True},
             )
         except Exception as exc:  # backend blew up; tell the model plainly
             message = f"{type(exc).__name__}: {exc}"
