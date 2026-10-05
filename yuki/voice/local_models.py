@@ -780,7 +780,11 @@ class LocalSpeech:
         from pipecat.audio.vad.silero import SileroVADAnalyzer
         from pipecat.audio.vad.vad_analyzer import VADParams
 
-        vad = SileroVADAnalyzer(sample_rate=16_000, params=VADParams(stop_secs=self.VAD_STOP_S))
+        # No volume gate (Pipecat's default needs 0.6): its rolling loudness reads 0 until its window has filled and then
+        # ramps up, and a standby's analyzer hears nothing until the wake, so the words right after the name (often
+        # the whole request) went by unheard (offline 5 Oct: the first wake heard nothing, the second everything).
+        # Silero's own confidence decides.
+        vad = SileroVADAnalyzer(sample_rate=16_000, params=VADParams(stop_secs=self.VAD_STOP_S, min_volume=0.0))
         vad.set_sample_rate(16_000)
         turn = LocalSmartTurnAnalyzerV3(cpu_count=min(2, self.threads), sample_rate=16_000,
                                         params=SmartTurnParams(stop_secs=self.TURN_SILENCE_S))

@@ -488,3 +488,104 @@ def test_settings_offers_local_speech_in_plain_words_and_says_how_it_stands(_mod
         {"tts_provider": "local"}, root=[_models_in_temp])["local"]["text"]
     for text in (view["local"]["text"], *[c["note"] for c in cloud["stt_choices"]]):
         assert "Parakeet" not in text and "sherpa" not in text   # no model or tool names in what the user reads
+
+
+# -- the session: downloads wait for a game or a call; local off lets everything go --------------------------------
+
+
+def _session(tmp_path: Path, prefs: dict[str, Any]) -> Any:
+    import json
+
+    from PySide6.QtCore import QCoreApplication, QObject, Signal
+
+    from yuki.voice.session import VoiceSession
+
+    QCoreApplication.instance() or QCoreApplication([])
+
+    class Runtime(QObject):
+        started = Signal(str, int, str)
+        tool_called = Signal(str, int, str, dict)
+        said = Signal(str, int, str)
+        asked = Signal(str, int, str)
+        finished = Signal(str, int, str)
+        failed = Signal(str, int, str)
+        lane_done = Signal(str, int, str, bool, list)
+        handed_off = Signal(int, int, int)
+        steer_unread = Signal(str, int, list)
+
+    (tmp_path / "voice.json").write_text(json.dumps(prefs), encoding="utf-8")
+    settings = Settings(log_dir=tmp_path / "sessions", requests_csv=tmp_path / "r.csv")
+    return VoiceSession(settings, Runtime(), None, prefs_path=tmp_path / "voice.json")
+
+
+def test_missing_models_download_only_when_no_game_or_call_is_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                                 _models_in_temp: Path) -> None:
+    from yuki.voice import local_models as lm
+
+    monkeypatch.setenv("YUKI_VOICE_MODELS", str(_models_in_temp))   # nothing downloaded
+    started: list[tuple[list[str], bool]] = []
+
+    class Stub:
+        on_change = None
+        running = False
+
+        def start(self, keys: list[str], *, allowed: Any, root: Any = None, log: Any = None) -> bool:
+            started.append((keys, allowed()))
+            return bool(allowed())
+
+        def status(self) -> dict[str, Any]:
+            return {"parakeet": {"state": "paused"}}
+
+    monkeypatch.setattr(lm, "downloader", lambda: Stub())
+    session = _session(tmp_path, {"stt_provider": "local"})
+    session.fullscreen_probe = lambda: True          # a game in front
+    assert session.local_models_wanted() == ["parakeet"]
+    assert started == [(["parakeet"], False)]         # asked, and refused: not during a game
+    session.fullscreen_probe = lambda: False
+    session.on_call_status({})                        # nothing on any more: the paused download carries on
+    assert started[-1] == (["parakeet"], True)
+    session.call_active = True                        # a call: no
+    assert not session._pc_free()
+
+
+def test_turning_local_speech_off_lets_the_loaded_models_go(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.voice import local_models as lm
+
+    fresh = lm.LocalSpeech().configure()
+    done: Future = Future()
+    done.set_result(object())
+    fresh._stt, fresh._turn = done, done
+    monkeypatch.setattr(lm, "_engine", fresh)
+    session = _session(tmp_path, {})
+    from yuki.voice.session import conversation_settings, load_prefs
+
+    session._local_setup(conversation_settings(session.settings, load_prefs(tmp_path / "voice.json")))
+    assert not any(fresh.loaded().values())
+
+
+@needs_lab
+def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: Path) -> None:
+    """A few quiet words at once, while both models still load (a cold wake), make one turn. The volume-gate loss of
+    5 Oct (report 86 §3) showed only in the offline session harness; this keeps the plain case covered."""
+    import soundfile as sf
+    from pipecat.frames.frames import TranscriptionFrame
+    from pipecat.tests.utils import SleepFrame, run_test
+
+    from yuki.voice.local_models import LocalSpeech
+    from yuki.voice.local_stt import ParakeetSTTService
+
+    pcm, _rate = sf.read(str(PARAKEET_WAV), dtype="int16")
+    first = (pcm[: int(16_000 * 1.3)] * 0.25).astype(np.int16)   # the first words only, as quiet as a room mic
+    eng = LocalSpeech().configure(root=[tmp_path, LAB])
+
+    async def main() -> list[Any]:
+        stt = ParakeetSTTService(engine=eng)
+        stt.load_now()                 # as at a cold wake: both models load while the words come in
+        eng.tts("supertonic")
+        frames = [SleepFrame(0.5), *_audio_frames(first), *_audio_frames(np.zeros(16_000 * 4, dtype=np.int16)),
+                  SleepFrame(3.0)]
+        down, _ = await run_test(stt, frames_to_send=frames, start_timeout=20)
+        return [f for f in down if isinstance(f, TranscriptionFrame)]
+
+    heard = asyncio.run(main())
+    assert len(heard) == 1 and heard[0].text.split()[0].strip(",").lower() == "well"

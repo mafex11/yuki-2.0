@@ -234,6 +234,9 @@ class ParakeetSTTService(SegmentedSTTService):
         await self.emit_stt_usage_metrics()
         self._pending += 1
         self._decoded.clear()
+        if self._log is not None:   # content-free: how long each stretch of speech was
+            self._log.event("local_stt", op="segment", session=self._session, ms=round(len(pcm) / 32),
+                            loaded=bool(self._engine.loaded().get("parakeet")))
         await self._segment_queue.put(pcm)
         self.create_task(self._judge(self._epoch))
 
