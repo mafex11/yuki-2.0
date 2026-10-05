@@ -18,6 +18,14 @@ Usage::
         latency  "Yuki." then "Pause the music.", twice (cold, then warm): the wake word to listening
         endings  vfix: "shut up", "go away", "bye bye" and a mistaken wake, each after the name: every one ends the
                  conversation at once and leaves the wake word on (clips: voice_clips.py --set vfix)
+        game     vGame: in a Discord call with VALORANT in front: "Yuki, turn it up a bit" (instant "Mm-hm"), talk to the
+                 team (the conversation ends at once, silently, and more talk does not wake it), the name, a pause and
+                 a request, then "go away" (ends on the transcript, no model call). Clips: a folder whose manifest has
+                 the v34 clips and vfix's e_goaway (vGame: --clips of a merged manifest)
+        named_end  vGame review: "Yuki, turn it up a bit", "Yuki, stop." (the name in the dismissal's breath: it ends and
+                 never starts again), "Yuki, go away." on a wake, then right after that goodbye "Yuki." + a pause +
+                 "Pause the music." (answered and acted on). In a game and a call; --plain for neither. Clips: the v34
+                 ones plus g_stop and g_goaway in the v34 user's voice. --ack-room: "Mm-hm" plays into the room too
 
 Each run writes ``<out>/<scenario>-<variant>.json`` (the timeline: what was heard, said, called and
 done, the states, the session's timings) and prints a summary.
@@ -58,7 +66,9 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "requests.csv", voice_tts_provider="deepgram",
                         voice_tts_voice="aura-2-thalia-en", voice_grounding=False, voice_idle_s=args.idle,
                         voice_idle_max_s=max(args.idle, 12.0), voice_call_idle_s=args.call_idle,
-                        voice_echo=echo_pref, **({"voice_standby": False} if getattr(args, "no_standby", False)
+                        voice_echo=echo_pref, voice_tts_cache_dir=str(tmp / "tts-cache"),
+                        **({"voice_eager_eot_threshold": args.eager_eot} if getattr(args, "eager_eot", None) else {}),
+                        **({"voice_standby": False} if getattr(args, "no_standby", False)
                                                   and "voice_standby" in Settings.__dataclass_fields__ else {}))
     manifest = {c["name"]: c for c in json.loads((args.clips / "manifest.json").read_text(encoding="utf-8"))}
 
@@ -92,6 +102,20 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     session = VoiceSession(settings, runtime, memory, prefs_path=tmp / "voice.json")
     session.bridge = VoiceBridge(runtime, session.log, settings=settings, hands_backend=desk, foreground=lambda: None)
     session.play_tone = lambda *a: timeline.add("notice_tone")
+    # vGame: the instant acknowledgement is recorded on the timeline (the room hears Yuki's replies, not this clip);
+    # no real window is ever looked at: a game is in front only in the "game" scenario
+    focus_scene = scenario == "game" or (scenario == "named_end" and not getattr(args, "plain", False))
+
+    def play_ack(pcm: bytes, kind: str) -> None:
+        timeline.add("ack", line=kind, ms=round(len(pcm) / 48))
+        speaker = session._speaker if getattr(args, "ack_room", False) else None
+        if speaker is not None:
+            # review F6: --ack-room plays it into the room like the app does (Yuki's voice: the echo guard's gate on),
+            # so on speakers the mic hears it back
+            threading.Thread(target=lambda: speaker.write(pcm, gate=True), daemon=True).start()
+
+    session.play_sound = play_ack
+    session.fullscreen_probe = (lambda: {"hwnd": 1, "pid": 1, "exe": "game.exe"}) if focus_scene else (lambda: None)
     session.extra_observers = (timeline.observer(),)
     room = Room(echo_db=args.echo_db)
     # On headphones nothing Yuki plays reaches the mic: the speaker plays into a room of its own.
@@ -193,6 +217,24 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                  ("k_name", 1.0, standby_again(1.5)), ("e_mistake", 0.35, None)]
         script = [(clip(n), after, wait) for n, after, wait in lines]
         names = [n for n, _a, _w in lines]
+    elif scenario == "game":
+        # vGame: a match with friends on Discord. The team talk after the first request is judged not for Yuki and ends
+        # the conversation at once; the second line of it finds no conversation (and must not wake one); the name, a
+        # pause and a request; then "go away" ends on its transcript.
+        first = prewarmed() if args.prewarm else None
+        lines = [("k_turnup", 1.0, first), ("k_clutch", 1.0, settled(0.8)), ("k_insane", 2.5, no_conversation(1.0)),
+                 ("k_name", 1.5, standby_again(1.5)), ("k_pause_cmd", 1.4, None), ("e_goaway", 1.0, settled(0.8))]
+        script = [(clip(n), after, wait) for n, after, wait in lines]
+        names = [n for n, _a, _w in lines]
+    elif scenario == "named_end":
+        # vGame review F1/F2: the name in the same breath as the dismissal ("Yuki, stop." mid-conversation; "Yuki, go
+        # away." on a wake) must end it and never start it again (the spotter's late hit); then right after that
+        # goodbye, the name alone, a pause and a request is answered and acted on. In a game and a call unless --plain.
+        first = prewarmed() if args.prewarm else None
+        lines = [("k_turnup", 1.0, first), ("g_stop", 1.0, settled(0.8)), ("g_goaway", 1.0, standby_again(4.0)),
+                 ("k_name", 1.0, standby_again(4.0)), ("k_pause_cmd", 1.4, None)]
+        script = [(clip(n), after, wait) for n, after, wait in lines]
+        names = [n for n, _a, _w in lines]
     elif scenario == "lists":
         # leftVoice (report 65's "what's on my list" silence): each ask in a conversation of its own, after the name
         # (clips: voice_clips.py --set lists); with --fake-memory the quick memory tool reads an invented list
@@ -235,6 +277,10 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
     session.conversation_changed.connect(on_conversation)
     if scenario in ("call", "call2"):
         session.on_call_status({"call": {"app": "Discord", "status": "recording"}})
+    elif focus_scene:
+        session.on_call_status({"call": {"app": "Discord", "status": "recording"},
+                                "sessions": [{"id": 1, "app": "Discord", "kind": "call", "status": "recording"},
+                                             {"id": 2, "app": "VALORANT", "kind": "game", "status": "recording"}]})
     session.wake_enabled = True
     io_seen = install_io_audit() if getattr(args, "audit_io", False) else None
     t_start = time.monotonic()
@@ -304,6 +350,12 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
                 acted = [e["t"] for e in timeline.events if e["kind"] == "action" and e["t"] > said_end - 0.2]
                 row["request_end_to_transcript_ms"] = round((heard_t[0] - said_end) * 1000) if heard_t else None
                 row["request_end_to_action_ms"] = round((acted[0] - said_end) * 1000) if acted else None
+                # vGame: the instant acknowledgement, and the first sound of any kind (it, or Yuki's reply)
+                acks = [e["t"] for e in timeline.events if e["kind"] == "ack" and e["t"] > said_end - 0.2]
+                audio = [e["t"] for e in timeline.events if e["kind"] == "audio_start" and e["t"] > said_end - 0.2]
+                row["request_end_to_ack_ms"] = round((acks[0] - said_end) * 1000) if acks else None
+                sounds = acks[:1] + audio[:1]
+                row["request_end_to_first_sound_ms"] = round((min(sounds) - said_end) * 1000) if sounds else None
                 row["heard"] = [e["text"] for e in timeline.events if e["kind"] == "user"
                                 and said_end - 3 < e["t"] < said_end + 15]
                 del nxt
@@ -320,11 +372,17 @@ def run(scenario: str, args: argparse.Namespace) -> dict[str, Any]:
             upto = end if end is not None else said_end + 30
             said = [e["text"] for e in timeline.events if e["kind"] == "yuki" and said_end < e["t"] <= upto]
             tools = [e["name"] for e in timeline.events if e["kind"] == "mouth_tool" and said_end - 0.5 < e["t"] <= upto]
+            cue = next((e["t"] for e in timeline.events if e["kind"] == "notice_tone" and e["t"] > said_end), None)
             rows.append({"line": name, "ended": end is not None,
                          "speech_end_to_conversation_end_ms": round((end - said_end) * 1000) if end else None,
+                         "speech_end_to_end_cue_ms": (round((cue - said_end) * 1000)
+                                                      if cue is not None and (end is None or cue <= end + 1.5) else None),
                          "yuki_said_after": said, "tools": tools})
         report["endings"] = rows
         report["quiet_after"] = bool(getattr(session, "quiet", False))
+    if scenario in ("game", "named_end") and mic is not None:
+        report["game"] = game_rows(names, mic.lines, timeline.events, t0, lambda n: speech_end_offset(clip(n)),
+                                   [(t - t0, on) for t, on in convs], [h - t0 for _a, h in wakes])
     if scenario == "lists" and mic is not None:
         report["asks"] = ask_rows(names, mic.lines, timeline.events, t0,
                                   lambda n: speech_end_offset(clip(n)))
@@ -359,6 +417,41 @@ def fake_memory(folder: Path) -> Path:
     finally:
         client.close()
     return folder
+
+
+def game_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[str, Any]], t0: float, end_of: Any,
+              convs: list[tuple[float, bool]], wakes: list[float]) -> list[dict[str, Any]]:
+    """vGame: per line of the game scenario, from the end of its speech: whether a conversation was on, the instant
+    acknowledgement, the first audio, the talker's tool, Yuki's words, and when the conversation ended after it."""
+    rows = []
+    for i, name in enumerate(names):
+        if i >= len(lines):
+            break
+        said_end = lines[i]["started_at"] + end_of(name) - t0
+        nxt = lines[i + 1]["started_at"] - t0 if i + 1 < len(lines) else said_end + 30
+
+        def first(kind: str) -> Any:
+            return next((e for e in events if e["kind"] == kind and said_end - 0.3 < e["t"] < nxt), None)
+
+        def ms(t: Any) -> Any:
+            return round((t - said_end) * 1000) if t is not None else None
+
+        on = [t for t, up in convs if up and t < said_end]
+        off = [t for t, up in convs if not up and t < said_end]
+        live = bool(on) and (not off or on[-1] > off[-1])
+        ended = next((t for t, up in convs if not up and said_end - 0.3 < t < nxt), None)
+        ack, audio, tool = first("ack"), first("audio_start"), first("mouth_tool")
+        # review F1: a conversation started again after this line's end (a late name hit after a dismissal)
+        restarted = [t for t, up in convs if up and ended is not None and ended < t < nxt]
+        cue = first("notice_tone")
+        rows.append({"line": name, "conversation_on": live, "wake_after": any(said_end - 2 < w < nxt for w in wakes),
+                     "restarted_after_end": len(restarted), "end_cue_ms": ms(cue["t"]) if cue else None,
+                     "ack_ms": ms(ack["t"]) if ack else None, "ack_kind": ack.get("line") if ack else None,
+                     "first_audio_ms": ms(audio["t"]) if audio else None, "tool": tool["name"] if tool else None,
+                     "tool_ms": ms(tool["t"]) if tool else None,
+                     "said": [e["text"] for e in events if e["kind"] in ("yuki", "yuki_code") and said_end < e["t"] < nxt],
+                     "conversation_end_ms": ms(ended)})
+    return rows
 
 
 def ask_rows(names: list[str], lines: list[dict[str, Any]], events: list[dict[str, Any]], t0: float,
@@ -465,6 +558,8 @@ def summary(report: dict[str, Any]) -> str:
         lines.append(f"quiet time after (go_quiet): {report.get('quiet_after')}")
     for row in report.get("asks") or []:
         lines.append("ask: " + json.dumps(row, ensure_ascii=False))
+    for row in report.get("game") or []:
+        lines.append("game: " + json.dumps(row, ensure_ascii=False))
     lines.append("session timings: " + json.dumps(report["session_timings_ms"]))
     lines.append(f"mic levels: {report['mic_levels']}")
     if report.get("loop_io") is not None:
@@ -476,7 +571,12 @@ def summary(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency", "endings", "lists"))
+    ap.add_argument("scenario", choices=("echo", "call", "call2", "latency", "endings", "lists", "game", "named_end"))
+    ap.add_argument("--ack-room", dest="ack_room", action="store_true",
+                    help="vGame review F6: the instant acknowledgement plays into the room (on speakers the mic hears it)")
+    ap.add_argument("--plain", action="store_true", help="named_end: no game and no call (plain mode)")
+    ap.add_argument("--eager-eot", dest="eager_eot", type=float, default=None,
+                    help="vGame review: Flux's eager end-of-turn threshold for this run (the setting's default else)")
     ap.add_argument("--clips", type=Path, required=True, help="the folder with manifest.json of the v34 clips")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--echo", default="aec", choices=("aec", "half", "none"))

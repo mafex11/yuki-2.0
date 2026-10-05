@@ -196,7 +196,7 @@ class WakeSpotter:
             keyword = (result.keyword or "").strip()
             if keyword:
                 times = list(result.timestamps or [])
-                end = self._wall(times[-1], at, samples.size) if times else None
+                end = self._plausible(self._wall(times[-1], at, samples.size) if times else None, at, samples.size)
                 if keyword == self.WAKE:
                     heard = keyword
                     self.name_end = end
@@ -227,6 +227,28 @@ class WakeSpotter:
             return None if self._t0 is None else self._t0 + token_s + NAME_END_OFFSET_S
         stream_now = self._fed / RATE   # the stream's own time at the end of this batch
         return at + size / RATE - (stream_now - token_s) + NAME_END_OFFSET_S
+
+    #: How long after the name ends the spotter hears it (s, the batch's end; measured 5 Oct on "Yuki." after 0-12 s
+    #: of other speech, five batch phases each, 50 hits: 0.34-0.70, p50 0.48). A name end further from the hit than
+    #: this window is not the name's: see :meth:`_plausible`.
+    HIT_LAG_S = (0.2, 0.9)
+
+    def _plausible(self, end: float | None, at: float | None, size: int) -> float | None:
+        """``end`` when it fits the hit (:data:`HIT_LAG_S`), else ``None`` (not known; counted in :attr:`retimed`).
+
+        The model's token times count from where its decoder last restarted inside the stream (it restarts by itself
+        on a pause, and that point is not exposed), not from the stream's first sample: measured 5 Oct, "Yuki." after 5
+        s of other speech in one stream put the name's end 3.5 s early, after 15 s 11.9 s early. Live 4-5 Oct the
+        session saw 2-40 s (``name_end_ignored``). Only a fresh stream's times are exact. An end that cannot be the
+        name's is reported as unknown: the session then replays from just before the batch that heard the name, with
+        the name in it (and still treats the first words as said to Yuki)."""
+        if end is None or at is None:
+            return end
+        lag = (at + size / RATE) - (end - NAME_END_OFFSET_S)
+        if self.HIT_LAG_S[0] <= lag <= self.HIT_LAG_S[1]:
+            return end
+        self.retimed = getattr(self, "retimed", 0) + 1
+        return None
 
     def reset(self) -> None:
         self._stream = self._kws.create_stream()

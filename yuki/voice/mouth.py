@@ -610,6 +610,28 @@ Good: a close report says the video tab "Wasureranneyo - YouTube" was closed by 
 say_when_done="It's back.") alone
 Bad: the same, you: open_url with the video's address, or a search for it (a stale or different video)"""
 
+#: vGame (5 Oct): while a full-screen game is in front or a call is on, Yuki stays out of the way. Rides in the volatile
+#: block on those turns only (the cached prompt is at its measured cap). Report 76: 37 dismissals in 4 days, replies in
+#: Hindi to talk not meant for it during a match, chit-chat questions after "nothing", follow-ups he never wanted.
+FOCUS_GUIDE = """\
+Private, never to be said: they are {where} right now, so you stay out of the way.
+- When a note here says they said your name (the transcript often leaves it out), when your name is in their words, \
+or when they are the next step of what they just asked you, the words are for you, questions too: do it at once, \
+answer, or say in a few words that you can't. Anything else, in any language, gets stay_quiet alone: talk to friends \
+or teammates, callouts, reactions, questions that fit the others, a stray word.
+- Never a follow-up question, an offer, small talk or a question back. Replies are a few words, in English \
+("Paused.", "Done.", "Twenty past nine.").
+- Asked something you can't do or know: three words that say so ("Can't do that."), never silence; no offer, \
+no reason, no word about the game or the call.
+- Told to go, in any words ("go away", "shut up", "not you", "I said go away"): end_conversation(say_first="") alone. \
+That is always said to you, in a call too.
+Good: they said your name, then "turn it up a bit" -> media_key(key="volumeup", times=3, say_when_done="Louder.") alone
+Good: they said your name, then "what time is it?" -> "Twenty to five."
+Good: "push B, I'm rotating" -> stay_quiet
+Good: "dude I just said go away" -> end_conversation(say_first="") alone
+Bad: "Yuki, open Discord" -> "Sure! Want me to join a voice channel too?" (an offer and a question)
+Good: the same -> open_app(say_first="", name="Discord", ..., say_when_done="Opened.") alone"""
+
 
 # ---------------------------------------------------------------------------
 # The speech channel (v3.16, ``Settings.voice_speech_channel = "marker"``)
@@ -1559,6 +1581,13 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     if call:
         text += (f"\n[Private, never to be said: a voice call on {call} (the call note). Decide silently whom these "
                  f"words were for; if not for you, stay_quiet alone.]")
+    focus = state.get("focus") if isinstance(state.get("focus"), dict) else None
+    if focus:
+        # vGame: a full-screen game in front or a call on (measured states, set by the conversation)
+        game, on_call = focus.get("game"), bool(focus.get("call"))
+        where = ((f"in a game ({game})" if isinstance(game, str) and game else "in a full-screen game or video")
+                 + (" and on a voice call" if on_call else "")) if game else "on a voice call"
+        text += "\n[" + FOCUS_GUIDE.format(where=where) + "]"
     if state.get("dictating"):
         # N7 (report 47): measured while they spoke, text went into another app's field (typing or dictation)
         text += (f"\n[Private, never to be said: while they spoke, the text in {state['dictating']} changed: they "
@@ -1566,9 +1595,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  f"name in them (\"tell Yuki's pipeline to...\"): stay_quiet alone, no words. Only words that plainly "
                  f"turn to you and ask you something now get an answer.]")
     elif named:
-        text += ("\n[They said your name, Yuki, right before these words (it woke you; the name itself is not in "
-                 "the transcript): these words are said to you, in a call too. Do what they ask or answer them; "
-                 "stay_quiet is final, so only if they plainly talk about you to someone else.]")
+        text += ("\n[They said your name, Yuki, right before these words or in them (heard by the wake word; the "
+                 "transcript may leave it out): these words are said to you, in a call too. Do what they ask or "
+                 "answer them; stay_quiet is final, so only if they plainly talk about you to someone else.]")
     if heard:
         text += (f"\n[Speech recognition on their latest words (the Speech line; private, never mentioned to them): "
                  f"{heard}. They may have been misheard. {RECOGNITION_GUIDE.strip()}]")

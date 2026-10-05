@@ -228,13 +228,21 @@ class SpeakerOutput(BaseOutputTransport):
         await super().start(frame)
         await self.set_transport_ready(frame)
 
+    #: vGame: Yuki's voice at this gain (dB; 0: as made). The conversation sets it lower in a game or a call.
+    gain_db: float = 0.0
+
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         speaker = self._speaker
         if speaker is None:
             return True   # dormant: nothing is ever said before the wake, but never fail the pipeline on it
         if self._executor is None:
             self._start_writer()
-        return await self.get_event_loop().run_in_executor(self._executor, self._write, speaker, frame.audio)
+        pcm = frame.audio
+        if self.gain_db:
+            from yuki.voice.fastpath import scale
+
+            pcm = scale(pcm, self.gain_db)
+        return await self.get_event_loop().run_in_executor(self._executor, self._write, speaker, pcm)
 
     def _write(self, speaker: Speaker, pcm: bytes) -> bool:
         """One blocking write on the writer thread; failures counted, and the speaker reopened once at the third."""

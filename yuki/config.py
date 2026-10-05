@@ -365,8 +365,20 @@ class Settings:
         voice_prefetch_results: The sentences of the thinker's done message are fetched by the voice as each one is
             written (v3.17, C2; Gemini only), so a result said by code plays the moment it is accepted.
         voice_router: A small model call decides, from the user's words alone, whether the turn needs the thinker,
-            and starts it ~1 s after they stop instead of when the talker begins its hand-off (v3.17, E3a). Off by
-            default (docs/research/revamp-2026-10-02/26-build-voice-speed.md).
+            and starts it ~1 s after they stop instead of when the talker begins its hand-off (v3.17, E3a). On since
+            vGame (5 Oct: the user asked for the thinker to start at once); in a game or a call only on words said to
+            Yuki by name (docs/research/revamp-2026-10-02/26-build-voice-speed.md, 79-build-vGame.md).
+        voice_fast_dismiss / voice_fast_ack: vGame (79-build-vGame.md). A turn that is only the user's words for "go
+            away" (``yuki.voice.fastpath.DISMISS_PHRASES``) ends the conversation on its final transcript, with no
+            model call; a turn said to Yuki by name gets an instant "Mm-hm" in her voice ("Yeah?" to the name alone).
+        voice_focus_mode: vGame. While a full-screen game is in front or a call is on: replies short and quieter, no
+            follow-ups or small talk, no step lines, a rescued sound-alike never wakes it, and
+            ``voice_focus_close_on_quiet``: a turn the talker judged not for Yuki ends the conversation at once,
+            silently. ``voice_focus_reply_words`` caps a spoken reply there.
+        voice_name_while_talking: vGame. The wake word keeps listening during a conversation; a turn it hears the
+            name in is said to Yuki (measured evidence for the acknowledgement, the router and the talker).
+        voice_stt_warm: vGame. Half a second of silence goes to speech recognition when a standby connects, so the
+            first words after the wake come back ~0.5 s sooner (measured).
         voice_router_model: The router's model (empty: the talker's model).
         voice_router_adopt_s: A thinker the router started is withdrawn, unseen, if the talker has not handed the
             turn over within this many seconds of its start (or chose another way).
@@ -514,10 +526,18 @@ class Settings:
     # v3.17 voice speed (docs/research/revamp-2026-10-02/26-build-voice-speed.md)
     voice_results_by_code: bool = True
     voice_prefetch_results: bool = True
-    voice_router: bool = False
+    voice_router: bool = True
     voice_router_model: str = ""
     voice_router_adopt_s: float = 2.5
     voice_reply_words_cap: int = 45
+    # vGame (docs/research/revamp-2026-10-02/79-build-vGame.md)
+    voice_fast_dismiss: bool = True
+    voice_fast_ack: bool = True
+    voice_focus_mode: bool = True
+    voice_focus_close_on_quiet: bool = True
+    voice_focus_reply_words: int = 18
+    voice_name_while_talking: bool = True
+    voice_stt_warm: bool = True
     voice_qos: bool = True
     voice_mmcss: bool = True
     # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md)
