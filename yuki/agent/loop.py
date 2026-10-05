@@ -1358,7 +1358,6 @@ class Agent:
         self._cancelled.clear()
         self.cancel_reason = CANCELLED
         self._watch_off()
-        self._input_on()
         self._paused.clear()
         self._pause_wake.clear()
         self._pauses, self._paused_s, self._stopped_paused, self._pause_why = 0, 0.0, False, ""
@@ -1459,6 +1458,9 @@ class Agent:
         reply = ""
         drive: Iterator[AgentEvent] | None = None
         try:
+            # hotInput: the user's input monitor, held inside the try whose finally gives it back (taken before it,
+            # a raise in between - the judge's begin_request, a model name - kept it running until the next request)
+            self._input_on()
             query = " ".join(str(memory_query or "").split()) or memory_query_of(request)
             self._note_request_words(request, query, user_words)   # whose words each is, for the judge
             fresh = pack is not None and pack.age_s <= float(getattr(self.settings, "pack_max_age_s", 20.0))

@@ -100,6 +100,10 @@ class UserInputMonitor:
         self._thread_id = 0
         self._gen = 0
         self._ready = threading.Event()
+        #: Raw Input registration is one per process: the stretch whose reader holds it, and a lock so an old reader's
+        #: removal never lands after a new reader registered (a release straight followed by an acquire).
+        self._registered_gen = 0
+        self._reg_lock = threading.Lock()
 
     # -- facts ---------------------------------------------------------------------------------------------------------
 
@@ -248,7 +252,9 @@ class UserInputMonitor:
         finally:
             if gen == self._gen:
                 self.running = False
-            self._ready.set()
+                # only the current stretch's reader wakes acquire(): an old reader leaving after a new stretch began
+                # would wake it before the new reader listens (a false "unavailable")
+                self._ready.set()
 
 
 class _RawReader:
@@ -367,8 +373,10 @@ class _RawReader:
         devices = (RAWINPUTDEVICE * 2)(RAWINPUTDEVICE(0x01, 0x02, _RIDEV_INPUTSINK, hwnd),   # mouse
                                        RAWINPUTDEVICE(0x01, 0x06, _RIDEV_INPUTSINK, hwnd))   # keyboard
         try:
-            if not user32.RegisterRawInputDevices(devices, 2, ctypes.sizeof(RAWINPUTDEVICE)):
-                raise OSError(f"RegisterRawInputDevices failed ({ctypes.get_last_error()})")
+            with monitor._reg_lock:
+                if not user32.RegisterRawInputDevices(devices, 2, ctypes.sizeof(RAWINPUTDEVICE)):
+                    raise OSError(f"RegisterRawInputDevices failed ({ctypes.get_last_error()})")
+                monitor._registered_gen = self.gen
             with monitor._lock:
                 if not monitor._current(self.gen):
                     return          # stopped while it was starting
@@ -383,9 +391,12 @@ class _RawReader:
                     break
                 user32.DispatchMessageW(ctypes.byref(msg))
         finally:
-            remove = (RAWINPUTDEVICE * 2)(RAWINPUTDEVICE(0x01, 0x02, _RIDEV_REMOVE, None),
-                                          RAWINPUTDEVICE(0x01, 0x06, _RIDEV_REMOVE, None))
-            user32.RegisterRawInputDevices(remove, 2, ctypes.sizeof(RAWINPUTDEVICE))
+            with monitor._reg_lock:
+                if monitor._registered_gen == self.gen:     # a newer reader's registration is never taken away
+                    remove = (RAWINPUTDEVICE * 2)(RAWINPUTDEVICE(0x01, 0x02, _RIDEV_REMOVE, None),
+                                                  RAWINPUTDEVICE(0x01, 0x06, _RIDEV_REMOVE, None))
+                    user32.RegisterRawInputDevices(remove, 2, ctypes.sizeof(RAWINPUTDEVICE))
+                    monitor._registered_gen = 0
             user32.DestroyWindow(hwnd)
             user32.UnregisterClassW(name, instance)
 

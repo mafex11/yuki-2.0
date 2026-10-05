@@ -149,6 +149,64 @@ def test_the_monitor_runs_only_while_held():
     assert m._users == 0
 
 
+
+def test_an_old_reader_leaving_never_wakes_a_new_stretchs_acquire(monkeypatch):
+    """The check: a release straight followed by an acquire returned False while the new reader was still starting,
+    because the old reader's ``finally`` set ``_ready``. Only the current stretch's reader wakes it now."""
+    class Reader:
+        def __init__(self, monitor: Any, gen: int) -> None:
+            pass
+
+        def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(userinput, "_RawReader", Reader)
+    m = UserInputMonitor()
+    m._gen = 5                                    # a new stretch (gen 5) began; the old reader (gen 4) leaves now
+    m._ready.clear()
+    m._run(4)
+    assert not m._ready.is_set()
+    m._run(5)                                     # the current stretch's reader ending (failed to start) does wake it
+    assert m._ready.is_set()
+
+
+def test_a_continuous_scroll_holds_the_monitor_for_its_life(monkeypatch):
+    """The check: the wheel is read only from the monitor, which ran only during an agent request, so a voice
+    fast-path scroll (or an agent's scroll outliving its request) could not be stopped by the wheel. The scroll's
+    watch now holds the monitor from its first look to its end."""
+    import threading
+
+    from yuki.actions import scrolling
+    from yuki.actions.scrolling import ContinuousScroll, InputWatch, StepResult
+
+    calls: list[str] = []
+    monkeypatch.setattr(userinput, "acquire", lambda: calls.append("acquire") or True)
+    monkeypatch.setattr(userinput, "release", lambda: calls.append("release"))
+    watch = InputWatch()                          # the real reader (polled keys stubbed below), not a test's stub
+    watch.real.held = lambda: False
+    watch.real.cursor = lambda: (500, 500)
+    watch.real.signal = None
+    assert calls == []                            # nothing held until the scroll's watch starts
+    stepped = threading.Event()
+
+    def step() -> StepResult:
+        stepped.set()
+        return StepResult(ok=True, moved=True, at_end=False, percent=None, report="")
+
+    monkeypatch.setattr(scrolling, "PACES", {**scrolling.PACES, "normal": (0.01, 4)})
+    scroll = ContinuousScroll(step, where="a page", took_over=watch, moving=watch.moving)
+    scroll.start()
+    assert stepped.wait(2.0)
+    assert calls == ["acquire"]
+    scroll.stop("stop")
+    scroll._watcher.join(2.0)
+    assert calls == ["acquire", "release"]
+    watch.close()                                 # given back once only
+    assert calls == ["acquire", "release"]
+    stub = InputWatch(watch.real)                 # a test's own reader never touches the process's monitor
+    assert stub.open() is False and calls == ["acquire", "release"]
+
+
 # -- the input gate ---------------------------------------------------------------------------------------------------
 
 
@@ -393,9 +451,13 @@ def test_the_run_takes_and_gives_back_the_monitor():
     src = (Path(__file__).resolve().parents[1] / "yuki" / "agent" / "loop.py").read_text(encoding="utf-8")
     lines = [line.strip() for line in src.splitlines()]
     start = lines.index("self._input_on()")
-    assert lines[start - 1] == "self._watch_off()" and lines[start - 3] == "self._cancelled.clear()"
     end = lines.index("self._input_off()")
-    assert lines[end - 1] == "self._acting_done()"
+    # the first thing inside the try whose finally gives it back (the check: taken before the try, a raise in
+    # between kept it held until the next request)
+    assert lines[start - 3] == "try:" and lines[start - 4] == "drive: Iterator[AgentEvent] | None = None"
+    assert lines[end - 1] == "self._acting_done()" and "finally:" in lines[start:end]
+    run_start = max(i for i in range(start) if lines[i].startswith("def run("))
+    assert "self._input_on()" not in lines[run_start:start - 3]
 
 
 # -- content-free logs keep the non-word facts ------------------------------------------------------------------------
@@ -444,6 +506,37 @@ def test_content_free_logs_keep_levels_verdicts_tool_names_and_flags_but_no_word
     assert view["kind"] == "window_view" and view["payload_shape"]["n"] == 324
     assert view["payload_shape"]["left_hidden"] == 13 and view["payload_shape"]["names"] == [7, 8]
     assert view["payload_shape"]["hidden_roles"] == ["Slider", "Button"]
+
+
+
+def test_content_free_logs_drop_a_single_word_of_content_names_and_name_keys():
+    """The independent check: a one-word piece of content got through (a todo's ``by``, hand_over's ``why``, a
+    result keyed by a name, a model-written ``app``, a capitalised ``reason``). Invented data."""
+    from yuki.log.events import content_free
+
+    rec = content_free({
+        "type": "tool_call", "name": "todo", "reason": "Quentin", "source": "Plumtree", "decision": "Mirela",
+        "why": "read_back_on", "process": "Spotify.exe", "control_type": "Slider",
+        "input": {"items": [{"what": "call Mirela", "state": "dropped", "by": "nevermind"}], "why": "Mirela",
+                  "app": "Quentin", "pattern": "Plumtree", "patterns": ["toggle", "Quentin"], "button": "left",
+                  "role": "Slider", "Quentin": 1},
+        "result": {"by_name": {"Quentin": 2, "plumtree vale": 1}, "kind": "action", "role": "Quentin",
+                   "process": "Quentin", "exe": "Spotify.exe"},
+    })
+    text = str(rec)
+    for word in ("Quentin", "Plumtree", "Mirela", "nevermind"):
+        assert word not in text, word
+    assert rec["why"] == "read_back_on" and rec["process"] == "Spotify.exe" and rec["control_type"] == "Slider"
+    assert rec["reason_chars"] == 7 and rec["source_chars"] == 8 and rec["decision_chars"] == 6
+    shape = rec["input_shape"]
+    assert shape["items"] == [{"what_chars": 11, "state": "dropped", "by_chars": 9}]
+    assert shape["why_chars"] == 6 and shape["app_chars"] == 7 and shape["pattern_chars"] == 8
+    assert shape["patterns"] == [6, 7] and shape["button"] == "left" and shape["role"] == "Slider"
+    assert shape["other_keys"] == 1 and rec["input_keys"] == ["app", "button", "items", "pattern", "patterns",
+                                                               "role", "why"]
+    res = rec["result_shape"]
+    assert res["by_name"] == {"other_keys": 2} and res["kind"] == "action" and res["role_chars"] == 7
+    assert res["process_chars"] == 7 and "exe" not in res and res["exe_chars"] == 11
 
 
 if __name__ == "__main__":   # pragma: no cover
