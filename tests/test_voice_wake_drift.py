@@ -15,7 +15,13 @@ def _session(tmp: Path) -> Any:
     from yuki.voice.session import VoiceSession
 
     settings = Settings(log_dir=tmp / "sessions", requests_csv=tmp / "r.csv", voice_wake=False)
-    return VoiceSession(settings, QObject(), None, prefs_path=tmp / "voice.json")
+    session = VoiceSession(settings, QObject(), None, prefs_path=tmp / "voice.json")
+    # this PC's own state (a full-screen window or game in front, a call, a recent goodbye) makes the wake strict
+    # (vGame) and changes where listening starts: keep it out of the test
+    session._game_now = lambda: None
+    session._call_focus = lambda: False
+    session._after_goodbye = lambda: False
+    return session
 
 
 def _starts(session: Any, *calls: dict) -> list[tuple]:
