@@ -1808,7 +1808,8 @@ class VoiceSession(QObject):
                        seconds=round(time.monotonic() - started, 1), turns=obs.totals["turns"],
                        for_others=obs.totals.get("for_others", 0), mouth_cost_usd=round(obs.totals["mouth_cost_usd"], 5),
                        tts_chars=obs.totals["tts_chars"],
-                       stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
+                       stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min
+                                            * (getattr(settings, "voice_stt_provider", "") != "local"), 5),
                        timings_ms=timings, standby=True, **_stop_facts(conversation))
         self._last_end = {"reason": reason, "exchanges": int(getattr(obs, "exchanges", 0) or 0)}
         self._thread_done.emit(reason, error)
@@ -2010,7 +2011,8 @@ class VoiceSession(QObject):
                            for_others=obs.totals.get("for_others", 0) if obs else 0,
                            mouth_cost_usd=round(obs.totals["mouth_cost_usd"], 5) if obs else 0,
                            tts_chars=obs.totals["tts_chars"] if obs else 0,
-                           stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min, 5),
+                           stt_cost_usd=round((time.monotonic() - started) / 60 * self.settings.voice_usd_per_stt_min
+                                            * (getattr(settings, "voice_stt_provider", "") != "local"), 5),
                            timings_ms=dict(timings), **_stop_facts(self._conversation))
             self._last_end = {"reason": reason, "exchanges": int(getattr(obs, "exchanges", 0) or 0) if obs else 0}
             self._thread_done.emit(reason, error)

@@ -17,10 +17,10 @@ Three parts:
   moved into place in one rename. Progress goes to ``status.json`` beside the models (the window's Settings reads it)
   and to an ``on_change`` callback.
 * **The loaded models** (:class:`LocalSpeech`, one per process, :func:`engine`): Parakeet (speech recognition), the
-  chosen voice, Silero VAD and Smart Turn. The big two load at the wake (or stay loaded: ``keep_loaded``) on one
-  below-normal thread of their own, started off every event loop; they are unloaded ``unload_s`` after the last
-  conversation let them go. VAD and Smart Turn (about 85 MB) load once when the standby is built and stay while local
-  recognition is chosen.
+  chosen voice, Silero VAD and Smart Turn. The big two load at the wake (or stay loaded: ``keep_loaded``) side by
+  side on two below-normal threads of their own, started off every event loop; they are unloaded ``unload_s`` after
+  the last conversation let them go. VAD and Smart Turn (about 85 MB) load once when the standby is built and stay
+  while local recognition is chosen.
 
 Plumbing only: what the user chose decides; nothing here judges words.
 """
@@ -560,7 +560,7 @@ def _rss_mb() -> float | None:
 
 
 class LocalSpeech:
-    """The speech models of this process: loaded on one below-normal thread, unloaded when no conversation holds them.
+    """The speech models of this process: loaded on below-normal threads, unloaded when no conversation holds them.
 
     ``configure`` (off every loop) starts its threads; :meth:`recognizer` and :meth:`tts` return futures (the voice
     loop awaits them with ``asyncio.wrap_future``); :meth:`hold` and :meth:`release` count the conversations using
@@ -577,6 +577,9 @@ class LocalSpeech:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._jobs: queue.SimpleQueue[Callable[[], Any]] = queue.SimpleQueue()
+        #: The voice loads on a second thread, alongside recognition (both are needed right after a wake: one after
+        #: the other, a cold wake waited 5.2 s for Parakeet and then 2.3 s more for Supertonic, offline 5 Oct).
+        self._voice_jobs: queue.SimpleQueue[Callable[[], Any]] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self.root: Any = None
         self.threads = 2
@@ -620,6 +623,7 @@ class LocalSpeech:
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run, name="yuki-voice-local", daemon=True)
                 self._thread.start()
+                threading.Thread(target=self._run_voice, name="yuki-voice-local-tts", daemon=True).start()
                 self.decode_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-stt"))
                 self.synth_pool = _prime(ThreadPoolExecutor(max_workers=1, thread_name_prefix="yuki-voice-tts"))
         return self
@@ -653,7 +657,16 @@ class LocalSpeech:
             except Exception:  # noqa: BLE001 - each job reports into its own future
                 pass
 
-    def _submit(self, fn: Callable[[], Any]) -> Future:
+    def _run_voice(self) -> None:
+        _below_normal_thread()
+        while True:
+            job = self._voice_jobs.get()
+            try:
+                job()
+            except Exception:  # noqa: BLE001 - each job reports into its own future
+                pass
+
+    def _submit(self, fn: Callable[[], Any], *, voice: bool = False) -> Future:
         future: Future = Future()
 
         def run() -> None:
@@ -664,7 +677,7 @@ class LocalSpeech:
             except BaseException as exc:  # noqa: BLE001 - handed to whoever waits
                 future.set_exception(exc)
 
-        self._jobs.put(run)
+        (self._voice_jobs if voice else self._jobs).put(run)
         return future
 
     # -- the models ------------------------------------------------------------------------------------------------
@@ -681,7 +694,8 @@ class LocalSpeech:
         with self._lock:
             fut = self._tts.get(family)
             if fut is None or (fut.done() and fut.exception() is not None):
-                fut = self._tts[family] = self._submit(lambda: self._timed(family, lambda: self._load_tts(family)))
+                fut = self._tts[family] = self._submit(lambda: self._timed(family, lambda: self._load_tts(family)),
+                                                       voice=True)
             return fut
 
     def turn_models(self) -> Future:

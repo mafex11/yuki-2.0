@@ -182,11 +182,15 @@
     const devs = v.devices || {};
     const devOpts = (kind) => [['', 'System default' + (devs['default_' + kind] ? ` (${devs['default_' + kind]})` : '')]].concat((devs[kind] || []).map((n) => [n, n]));
     const withCur = (opts, cur) => (cur && !opts.some(([k]) => k === cur) ? opts.concat([[cur, cur + ' (not connected)']]) : opts);
+    const noteOf = (list, k) => { const c = (list || []).find((x) => x.key === k); return c ? (c.note || null) : null; };
     const voice = [
       srow('Listening for “Yuki”', tog(v.wake, { do: 'voice-wake' }, 'Listen for Yuki'), v.hotkey ? `Also ${v.hotkey}` : null),
       srow('Microphone', pick(withCur(devOpts('capture'), v.mic), v.mic || '', { change: 'voice-mic' }, 'Microphone')),
       srow('Speaker', pick(withCur(devOpts('render'), v.speaker), v.speaker || '', { change: 'voice-speaker' }, 'Speaker'), 'Falls back to the default if it drops'),
-      srow('Voice', pick((v.providers || []).map((p) => [p.key, p.label]), v.provider || '', { change: 'voice-provider' }, 'Voice'), (v.providers || []).find((p) => p.key === v.provider) ? (v.providers.find((p) => p.key === v.provider).note || null) : null),
+      srow('Speech recognition', pick((v.stt_choices || []).map((c) => [c.key, c.label]), v.stt || 'deepgram', { change: 'voice-stt' }, 'Speech recognition'), noteOf(v.stt_choices, v.stt || 'deepgram')),
+      srow('Voice', pick((v.providers || []).map((p) => [p.key, p.label]), v.provider || '', { change: 'voice-provider' }, 'Voice'), noteOf(v.providers, v.provider)),
+      ...(v.local ? [srow('Speech on this PC', '', v.local.text),
+        srow('Keep it loaded', tog(v.local.keep_loaded, { do: 'voice-keep' }, 'Keep speech on this PC loaded'), 'Starts faster after you say “Yuki”, but holds about 1 GB of memory all the time')] : []),
       srow('End tone', tog(v.end_tone, { do: 'voice-tone' }, 'End tone'), 'A soft tone when a conversation ends on its own'),
       srow('In a call', 'quiet until you say “Yuki”', 'What a recorded call keeps: see Calls')];
     const offers = [
@@ -267,6 +271,7 @@
   A['app-look'] = (t) => { const on = flip(t); save(t, 'app_look', { app: t.dataset.app, look: on }, on ? `I may look at ${t.dataset.app} again.` : `I won’t look at ${t.dataset.app}.`, () => flip(t)); };
   A['app-act'] = (t) => { const on = flip(t); save(t, 'app_act', { app: t.dataset.app, act: on }, on ? `I may click and type in ${t.dataset.app}.` : `I won’t click or type in ${t.dataset.app}.`, () => flip(t)); };
   A['voice-wake'] = (t) => { const on = flip(t); save(t, 'voice', { wake: on }, (r) => (on ? 'Listening for “Yuki”.' : 'Stopped listening for “Yuki”.') + (r.offline ? ' (used when Yuki next starts)' : ''), () => flip(t)); };
+  A['voice-keep'] = (t) => { const on = flip(t); save(t, 'voice', { local_keep_loaded: on }, on ? 'Speech on this PC stays loaded.' : 'Speech on this PC loads when you talk.', () => flip(t)); };
   A['voice-tone'] = (t) => { const on = flip(t); save(t, 'voice', { end_tone: on }, on ? 'End tone on.' : 'End tone off.', () => flip(t)); };
   A.offers = (t) => { const on = flip(t); save(t, 'offers', { enabled: on }, on ? 'Offers on. Cards can carry one named button.' : 'Offers off. Cards only talk now.', () => flip(t)); };
   A.coach = (t) => { const on = flip(t); save(t, 'coach', { enabled: on }, on ? 'Check-ins on.' : 'Check-ins off.', () => flip(t)); };
@@ -435,6 +440,7 @@
     if (t.dataset.change === 'voice-mic') save(t, 'voice', { mic: v }, `Microphone: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-speaker') save(t, 'voice', { speaker: v }, `Speaker: ${v || 'System default'}.`);
     if (t.dataset.change === 'voice-provider') save(t, 'voice', { tts_provider: v }, 'Voice saved. The next conversation uses it.');
+    if (t.dataset.change === 'voice-stt') save(t, 'voice', { stt_provider: v }, v === 'local' ? 'Speech recognition on this PC. The next conversation uses it.' : 'Speech recognition in the cloud. The next conversation uses it.');
     if (t.dataset.change === 'takeover-move') {
       const tk = settings().takeover || {}, was = tk.px, px = Number(t.value);
       save(t, 'takeover_move', { px }, null, () => { t.value = String(was); }).then((r) => {

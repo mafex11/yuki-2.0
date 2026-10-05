@@ -458,3 +458,33 @@ def test_a_conversation_set_to_local_builds_the_local_services(monkeypatch: pyte
     stt2, _llm2, tts2 = cloud._services()
     assert type(stt2).__name__ == "DeepgramFluxSTTService"
     assert tts2._settings.voice == "aura-2-thalia-en"   # a local voice name is never sent to the cloud
+
+
+# -- Settings -----------------------------------------------------------------------------------------------------
+
+
+def test_settings_offers_local_speech_in_plain_words_and_says_how_it_stands(_models_in_temp: Path) -> None:
+    import json
+
+    from yuki.ui.web_data import local_speech_view
+
+    cloud = local_speech_view({})
+    assert cloud["stt"] == "deepgram" and cloud["provider"] == "gemini" and "local" not in cloud
+    assert [c["label"] for c in cloud["stt_choices"]] == ["Cloud (fastest)", "On this PC (private, slower)"]
+    keys = [p["key"] for p in cloud["providers"]]
+    assert keys[:3] == ["gemini", "deepgram", "elevenlabs"] and "local:supertonic:F1" in keys
+    # chosen, with nothing downloaded yet (only the temp folder: the lab is not a root here)
+    view = local_speech_view({"stt_provider": "local", "tts_provider": "local", "tts_voice": "kokoro:af_heart"},
+                             root=[_models_in_temp])
+    assert view["provider"] == "local:kokoro:af_heart" and view["stt"] == "local"
+    assert view["local"]["text"].startswith("About 1034 MB to download") and not view["local"]["ready"]
+    (_models_in_temp / "status.json").write_text(json.dumps({"models": {
+        "kokoro": {"state": "downloading", "done": 165_000_000, "total": 330_000_000}}}), encoding="utf-8")
+    assert "Downloading, 50%" in local_speech_view({"tts_provider": "local", "tts_voice": "kokoro:af_heart"},
+                                                   root=[_models_in_temp])["local"]["text"]
+    (_models_in_temp / "status.json").write_text(json.dumps({"models": {"piper": {"state": "paused"}}}),
+                                                 encoding="utf-8")
+    assert "waits while you're in a game or a call" in local_speech_view(
+        {"tts_provider": "local"}, root=[_models_in_temp])["local"]["text"]
+    for text in (view["local"]["text"], *[c["note"] for c in cloud["stt_choices"]]):
+        assert "Parakeet" not in text and "sherpa" not in text   # no model or tool names in what the user reads
