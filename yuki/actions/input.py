@@ -1,7 +1,7 @@
 """Synthetic mouse and keyboard input.
 
-Mouse events are sent with ``SetCursorPos`` + ``mouse_event`` at the cursor's
-current position rather than through pyautogui's absolute path: pyautogui
+Mouse events are sent with ``SetCursorPos`` + a mouse ``SendInput`` record at the
+cursor's current position rather than through pyautogui's absolute path: pyautogui
 normalises absolute coordinates against the *primary* monitor
 (``65536 * x // width``) and clamps scroll coordinates to it, so every click on
 a secondary monitor lands in the wrong place.  Text is typed with ``SendInput``
