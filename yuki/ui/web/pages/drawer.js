@@ -70,6 +70,8 @@
       h('span', { class: 's' + (m.wait ? ' wait' : ''), text: m.state })))) : null;
     return h('div', { class: 'y', data: { k: it.id } }, h('span', { class: 'who', text: 'yuki' }),
       text ? h('span', { class: 'tx' + (it.status === 'failed' ? ' failed' : it.status === 'interrupted' ? ' dim' : ''), text }) : h('span', { class: 'tx dim', text: it.question || '' }),
+      // honest (87, review F5): a run that ended below likely shows its checked level under the reply, with a dash
+      it.outcome && it.outcome.text ? h('div', { class: 'meta' }, it.outcome.ok === false ? ic('x') : ic('dash'), ' ', it.outcome.text) : null,
       liveLine, addedEl, fold, !steps.length && it.meta && !it.running ? h('div', { class: 'meta', text: it.meta }) : null,
       it.status === 'interrupted' ? h('div', { class: 'meta', text: 'interrupted' }) : null);
   }

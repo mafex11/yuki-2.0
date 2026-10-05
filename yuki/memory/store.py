@@ -714,6 +714,22 @@ PORTRAIT_KINDS: tuple[str, ...] = (
     "work", "interest", "person", "routine", "behaviour", "preference", "personality", "open_loop",
 )
 CORRECTION_KIND = "correction"
+#: How a name alias of Yuki's OWN name starts its ``why`` (report 88: "UK" heard for Yuki). Such a form is for the
+#: wake word and the voice's fast path only (``Store.aliases(name_forms=True)``); every other reader of the aliases
+#: (call digests, the correction pass, questions, the people index) never sees it, so the country UK stays the country.
+NAME_FORM_WHY = "speech recognition heard Yuki's name so"
+#: Yuki's own name, as a name alias's ``name`` (second review V2-2: an alias of Yuki's name written before the name
+#: forms had their ``why`` mark, e.g. a typed correction, is a name form by its data all the same).
+WAKE_NAME = "Yuki"
+
+
+def is_name_form(alias: dict[str, Any]) -> bool:
+    """Whether a name alias is a heard form of Yuki's own name: its ``why`` carries :data:`NAME_FORM_WHY`, or its
+    ``name`` is Yuki's (case and punctuation aside). Data, never words of the heard form."""
+    if str(alias.get("why") or "").startswith(NAME_FORM_WHY):
+        return True
+    words = "".join(ch if ch.isalnum() else " " for ch in str(alias.get("name") or "").casefold()).split()
+    return words == [WAKE_NAME.casefold()]
 #: What a journal item is (migration 14; yuki.memory.personality): told as true, how the user is,
 #: an anecdote they told, a joke or bit (never a fact), possibly misheard or ambiguous (never a fact).
 JOURNAL_NATURES: tuple[str, ...] = ("fact", "trait", "story", "humor", "uncertain")
@@ -8714,13 +8730,42 @@ class Store:
 
         return self._write(op)
 
-    def aliases(self, *, include_ended: bool = False) -> list[dict[str, Any]]:
-        """Name aliases, oldest first: ``{id, heard, name, why, correction_id, at, ended_at}``."""
+    def end_aliases(self, alias_ids: Sequence[int], *, at: float | None = None) -> int:
+        """End live aliases by id (an Undo of the answer that taught them); returns how many ended."""
+        ids = [int(i) for i in alias_ids if i is not None]
+        if not ids:
+            return 0
+        now = float(at) if at is not None else time.time()
+        marks = ",".join("?" * len(ids))
+        return self._write(lambda conn: conn.execute(
+            f"UPDATE name_aliases SET ended_at=? WHERE ended_at IS NULL AND id IN ({marks})", (now, *ids)).rowcount)
+
+    def reopen_aliases(self, alias_ids: Sequence[int]) -> int:
+        """Bring back ended aliases by id (an Undo of the alias that replaced them); one whose heard form has a live
+        alias again stays ended. Returns how many came back."""
+        ids = [int(i) for i in alias_ids if i is not None]
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for i in ids:
+                n += conn.execute(
+                    "UPDATE name_aliases SET ended_at=NULL WHERE id=? AND ended_at IS NOT NULL AND NOT EXISTS"
+                    " (SELECT 1 FROM name_aliases b WHERE b.heard_key=name_aliases.heard_key AND b.ended_at IS NULL)",
+                    (i,)).rowcount
+            return n
+
+        return self._write(op) if ids else 0
+
+    def aliases(self, *, include_ended: bool = False, name_forms: bool = False) -> list[dict[str, Any]]:
+        """Name aliases, oldest first: ``{id, heard, name, why, correction_id, at, ended_at}``. The heard forms of
+        Yuki's own name (:func:`is_name_form`: the ``why`` mark, or Yuki's name as the alias's name) only with
+        ``name_forms`` (the wake word's and the fast path's readers)."""
         sql = "SELECT * FROM name_aliases" + ("" if include_ended else " WHERE ended_at IS NULL") + " ORDER BY id"
-        return [{"id": r["id"], "heard": self.cipher.decrypt(r["heard_ciphertext"]),
+        rows = [{"id": r["id"], "heard": self.cipher.decrypt(r["heard_ciphertext"]),
                  "name": self.cipher.decrypt(r["name_ciphertext"]), "why": self._dec(r["why_ciphertext"]),
                  "correction_id": r["correction_id"], "at": r["created_at"], "ended_at": r["ended_at"]}
                 for r in self._query(sql)]
+        return rows if name_forms else [r for r in rows if not is_name_form(r)]
 
     def supersede_journal_facts(self, call: ModelCall, items: Sequence[tuple[int, str | None, np.ndarray | None]],
                                 *, embed_model: str | None = None) -> list[tuple[int, int | None]]:

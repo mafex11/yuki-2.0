@@ -40,6 +40,7 @@ from typing import Any, Callable
 from yuki.config import Settings
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
+from yuki.voice.keyterms import vocabulary
 from yuki.voice.hands import HAND_TOOLS
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
@@ -2762,8 +2763,8 @@ class Conversation:
         # (v3.6: live 04:46:47 "yucky" was flagged as close to Yuki, the mouth asked about it and held the
         # action; a word like the name is the user calling her, and the wake word's timing keeps the name
         # itself out of what recognition hears).
-        self.observer.keyterms = [t for t in keyterm_list(["Yuki", *settings.user_names], self.keyterms,
-                                                          settings.voice_keyterms_max)
+        self.observer.keyterms = [t for t in vocabulary(settings.user_names, self.keyterms,
+                                                        settings.voice_keyterms_max)
                                   if t.casefold() != WAKE_NAME.casefold()]
         self.worker: Any = None
         #: The spoken-line check (yuki.voice.speechguard, v3.10), made with the services.
@@ -2950,12 +2951,18 @@ class Conversation:
         dismissal withdraw it and reach the talker whole (a held final with them). The name alone, said to Yuki, is
         answered "Yeah?" at once and the next turn counts as said to her. A turn said to her by name gets the instant
         "Mm-hm" and goes on to the talker as before."""
-        from yuki.voice.fastpath import bare_name, dismissal, vocabulary_only
+        from yuki.voice.fastpath import bare_name, dismissal, vocabulary_only, with_name
+        from yuki.voice.keyterms import name_forms
 
         if self._stop.is_set():
             return self.reason == "user_asked"   # after a dismissal nothing more reaches the talker
         if self.dormant:
             return False
+        # report 88: how recognition wrote the name before (memory's learned forms, "UK" for Yuki) counts as the name
+        # where it opens what was said; for these checks only (the talker gets the words as heard)
+        heard, (text, form) = text, with_name(text, name_forms())
+        if form is not None and final:
+            self.log.event("fast_path", op="name_form", session=self.session, words=len(form.split()))
         s = self.settings
         phrase = None
         busy = False
@@ -2968,7 +2975,7 @@ class Conversation:
                 phrase = None
         start = float(getattr(self.observer, "_user_started_at", 0.0) or 0.0)
         if phrase is not None:
-            self._hold_dismissal(phrase, busy, text, start=start, final=final, frame=frame)
+            self._hold_dismissal(phrase, busy, heard, start=start, final=final, frame=frame)
             return True
         if self._dismiss_pending is not None:
             self._withdraw_dismissal("words", text=text)   # words that are not a dismissal: all of it to the talker
@@ -3569,13 +3576,14 @@ class Conversation:
         # conversation moved on to. Here the narrator gate decides that, and a
         # stale result arrives marked held_back; the note defers to the payload.
         async_tool_messages._FINAL_DESCRIPTION = FINAL_DESCRIPTION
+        # One list for every recogniser (yuki.voice.keyterms.vocabulary): Yuki's name, the user's names, memory's names
+        # (a correction's right name first), never a heard form; Flux's keyterms and Parakeet's hotwords alike.
+        terms = vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max)
         if stt_provider(s) == "local":
             # vLocal: Parakeet on this PC, with its own end of turn (Silero VAD + Smart Turn), shaped like Flux
             from yuki.voice.local_stt import ParakeetSTTService
 
-            stt = ParakeetSTTService(engine=self._local_engine(), log=self.log, session=self.session,
-                                     hotwords=keyterm_list(["Yuki", *s.user_names], self.keyterms,
-                                                           s.voice_keyterms_max))
+            stt = ParakeetSTTService(engine=self._local_engine(), log=self.log, session=self.session, hotwords=terms)
         else:
             hints = [Language(code) for code in s.voice_stt_languages] if s.voice_stt_model.endswith("multi") else None
             stt = DeepgramFluxSTTService(
@@ -3584,7 +3592,7 @@ class Conversation:
                 settings=DeepgramFluxSTTService.Settings(
                     model=s.voice_stt_model, language_hints=hints, eot_threshold=s.voice_eot_threshold,
                     eager_eot_threshold=s.voice_eager_eot_threshold, eot_timeout_ms=s.voice_eot_timeout_ms,
-                    keyterm=keyterm_list(["Yuki", *s.user_names], self.keyterms, s.voice_keyterms_max),
+                    keyterm=terms,
                 ),
             )
         obs = self.observer
@@ -4057,7 +4065,7 @@ class Conversation:
         """New names on the screen: the Speech line's near names and recognition's keyterms (memory names first)."""
         self.observer.screen_terms = list(names)
         s = self.settings
-        memory_terms = keyterm_list(["Yuki", *s.user_names], self.keyterms, s.voice_keyterms_max)
+        memory_terms = vocabulary(s.user_names, self.keyterms, s.voice_keyterms_max)
         terms = keyterm_list(memory_terms, list(names), self.KEYTERMS_TOTAL_MAX)
         stt = getattr(self, "_stt", None)
         if stt is None or self.worker is None or terms == getattr(self, "_terms_sent", None):

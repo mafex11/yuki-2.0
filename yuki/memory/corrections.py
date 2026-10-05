@@ -530,6 +530,22 @@ class CorrectionApplier:
                 out.append({"heard": heard, "name": name, "why": " ".join(str(a.get("why") or "").split())[:160]})
         return out
 
+    def taught_aliases(self, aliases: Sequence[dict[str, str]], changes: Sequence[dict[str, Any]],
+                       correction: Any) -> list[dict[str, str]]:
+        """The aliases this correction teaches: those a rewrite carried out (:meth:`confirmed_aliases`), and (report
+        88: one correction teaches) those the user's own words state themselves, heard words and name both, checked
+        like every learned alias (:func:`yuki.memory.misheard.stated_aliases`) - a typed correction teaches the alias
+        even when no memory item needed rewording."""
+        from yuki.memory.misheard import _key, stated_aliases
+
+        out = list(self.confirmed_aliases(aliases, changes))
+        have = {_key(a["heard"]) for a in out}
+        for a in stated_aliases(self.store, aliases, own_words(correction.text) or ""):
+            if _key(a["heard"]) not in have:
+                have.add(_key(a["heard"]))
+                out.append(a)
+        return out
+
     @staticmethod
     def confirmed_aliases(aliases: Sequence[dict[str, str]], changes: Sequence[dict[str, Any]]) -> list[dict[str, str]]:
         """Aliases the judge's own rewrites carried out: some applied rewrite had the wrong form and now has the
@@ -703,7 +719,8 @@ class CorrectionApplier:
                     result.changes = [{"surface": SURFACE_NAMES[e["cand"].surface], "ref": e["cand"].ref, "op": e["op"],
                                        "old": e["cand"].text, "new": e["text"], "reason": e["reason"],
                                        "held": f"{e['cand'].subject} {e['cand'].text}".strip()} for e in edits]
-                    result.aliases = self.confirmed_aliases(result.aliases, [dict(c, ok=True) for c in result.changes])
+                    result.aliases = self.taught_aliases(result.aliases, [dict(c, ok=True) for c in result.changes],
+                                                         correction)
                 else:
                     result.changes = self._apply(correction, edits, run_id, stats, now)
                     if target is not None and target.surface == "J":
@@ -714,9 +731,11 @@ class CorrectionApplier:
                                     store.resolve_journal(int(c["new_id"]), "right", now=now)
                                 except Exception:
                                     pass
-                    result.aliases = self.confirmed_aliases(result.aliases, result.changes)
+                    result.aliases = self.taught_aliases(result.aliases, result.changes, correction)
+                    from yuki.memory.misheard import keep_alias
+
                     for a in result.aliases:
-                        store.add_alias(a["heard"], a["name"], why=a["why"], correction_id=correction.id, at=now)
+                        keep_alias(store, a["heard"], a["name"], why=a["why"], correction_id=correction.id, at=now)
                     portrait_changed = portrait_changed or any(c["surface"] == "portrait" and c["ok"]
                                                                for c in result.changes)
                     if portrait_changed:

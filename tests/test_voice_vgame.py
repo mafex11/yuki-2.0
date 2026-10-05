@@ -840,7 +840,8 @@ def test_a_held_dismissal_waits_while_the_microphone_hears_them_then_ends(tmp_pa
     _open_turn(quiet, "Go away.")
     quiet._fast_turn("Go away.", final=True)
     a = quiet._dismiss_pending["at"]
-    assert quiet._dismiss_tick(a + 0.3) is False and quiet._dismiss_tick(a + quiet.DISMISS_GRACE_S) is True
+    # + 0.01: a large monotonic clock rounds a + 0.8 - a below 0.8 (the test failed once the PC had been up a while)
+    assert quiet._dismiss_tick(a + 0.3) is False and quiet._dismiss_tick(a + quiet.DISMISS_GRACE_S + 0.01) is True
     assert dismissed2 == [True] and quiet.reason == "user_asked"
 
 

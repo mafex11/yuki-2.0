@@ -66,7 +66,8 @@ from yuki.ui.island import PAUSED_NOTE, PAUSE_STOP_LINE, RESUMED_NOTE, Island, o
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import describe_summary, describe_tool
-from yuki.ui.step_words import FAILED_TITLE, achievement, clock, label_input, return_view, took_words
+from yuki.ui.step_words import (FAILED_TITLE, clock, final_line, graded_reply, label_input, return_view,
+                                took_words)
 from yuki.ui.uilog import UiLog
 from yuki.ui.window_host import WindowHost
 from yuki.voice.session import VoiceSession
@@ -294,6 +295,11 @@ class YukiUi(QObject):
         runtime_signals.started.connect(self._on_started)
         runtime_signals.tool_called.connect(self._on_tool_called)
         runtime_signals.asked.connect(self._on_asked)
+        #: honest (87): each request's outcome verdict, from the runtime's ``outcome`` signal (just before finished)
+        self._outcomes: dict[int, dict] = {}
+        outcome_signal = getattr(runtime_signals, "outcome", None)
+        if outcome_signal is not None:
+            outcome_signal.connect(self._on_outcome)
         runtime_signals.finished.connect(self._on_finished)
         runtime_signals.failed.connect(self._on_failed)
         withdrawn = getattr(runtime_signals, "withdrawn", None)
@@ -795,6 +801,14 @@ class YukiUi(QObject):
         if state in ("error", "off", "starting", "note"):
             self.ui_log.event("voice", state=state, detail=detail)
 
+    def _on_outcome(self, lane_name: str, request_id: int, verdict: dict) -> None:
+        """honest (87): the request's outcome verdict, kept for its settle (the strip, the card, the window)."""
+        if isinstance(verdict, dict):
+            store = self.__dict__.setdefault("_outcomes", {})
+            store[request_id] = dict(verdict)
+            for key in list(store)[:-16]:   # only the newest few wait for their settle
+                store.pop(key, None)
+
     def _on_finished(self, lane_name: str, request_id: int, text: str) -> None:
         self._settle(lane_name, request_id, text, tone="reply")
 
@@ -841,24 +855,30 @@ class YukiUi(QObject):
         outcome = "handed" if handed else "stopped" if tone == "stopped" else "failed" if tone == "error" else "done"
         self._ask_outcome(request_id, stopped=stopped, failed=tone == "error")
         shown = self._end_run(request_id)
+        # honest (87): the request's outcome verdict; a run that ended done is shown at its checked level everywhere
+        verdict = getattr(self, "_outcomes", {}).pop(request_id, None) if outcome == "done" else None
+        level = str((verdict or {}).get("level") or "")
         # A run that acted ends on one plain line, the same on the strip, the thread and the return card: what it
         # achieved (never the reply or a bare "Done"), or the plain reason it did not finish (never the loop's error
         # text, which stays in the log).
         final = text
         if acted and outcome == "done":
-            line = achievement(list((run or {}).get("calls") or []))
+            line = final_line(list((run or {}).get("calls") or []), verdict)   # review F7: below likely, what it tried
             final = line or text
             host = getattr(self, "window_host", None)
             if line and callable(getattr(host, "emit", None)):
-                host.emit({"type": "achieved", "job": request_id, "text": line})
+                host.emit({"type": "achieved", "job": request_id, "text": line,
+                           **({"level": level, "label": str(verdict.get("label") or ""),
+                               "seen": str(verdict.get("seen") or "")} if verdict and verdict.get("acted") else {})})
         elif acted and outcome == "failed":
             final = FAILED_TITLE
+        body = graded_reply(text, verdict) if outcome == "done" else text
         card = self.cards.pop(request_id, None)
         if card is not None:
-            card.set_body(text, tone="error" if tone == "error" else "reply")
+            card.set_body(body, tone="error" if tone == "error" else "reply")
         if self.overlay.isVisible() and not self.overlay.closing:
             if card is None:
-                card = self.overlay.add_card("", text, tone="error" if tone == "error" else "reply")
+                card = self.overlay.add_card("", body, tone="error" if tone == "error" else "reply")
             self.overlay.expand_input()
             self._settled[request_id] = card
             if shown and self.strip.run_id is None:
@@ -868,7 +888,14 @@ class YukiUi(QObject):
             # over it for a moment, then that run comes back
             other = self.strip.run_id if self.strip.run_id not in (None, request_id) else None
             self.nudges.make_way()
-            self.strip.show_final(final, tone="error" if tone == "error" else "final", outcome=outcome)
+            final_tone = "error" if tone == "error" else "final"
+            if acted and level:
+                try:   # honest (87): the island's done flash says the checked level (a strip without it: as before)
+                    self.strip.show_final(final, tone=final_tone, outcome=outcome, level=level)
+                except TypeError:
+                    self.strip.show_final(final, tone=final_tone, outcome=outcome)
+            else:
+                self.strip.show_final(final, tone=final_tone, outcome=outcome)
             self._settled[request_id] = None
             if other is not None:
                 QTimer.singleShot(FINAL_SWITCH_MS, lambda rid=other: self._strip_run(rid)
@@ -876,9 +903,9 @@ class YukiUi(QObject):
         self.ui_log.event("settle", id=request_id, lane=lane_name, tone=tone, text=text, by=stopped_by,
                           shown=final if final != text else None,
                           steps=run["steps"] if run else None,
-                          wall_s=round(time.monotonic() - run["started"], 1) if run else None)
+                          wall_s=round(time.monotonic() - run["started"], 1) if run else None, level=level or None)
         if acted and getattr(self, "island", None) is not None:
-            self._queue_return_card(request_id, text, outcome, run, by=stopped_by)
+            self._queue_return_card(request_id, text, outcome, run, by=stopped_by, verdict=verdict)
         self.nudges.try_show()
 
     def _ask_outcome(self, request_id: int, *, stopped: bool, failed: bool) -> None:
@@ -1336,7 +1363,7 @@ class YukiUi(QObject):
         self.overlay.input.setTextCursor(cursor)
 
     def _queue_return_card(self, request_id: int, text: str, outcome: str, run: dict | None, *,
-                           by: str | None = None) -> None:
+                           by: str | None = None, verdict: dict | None = None) -> None:
         """A run that acted ended: the return card says how it really ended (done, stopped, didn't finish, handed
         back) and what it changed that the user cares about, in plain words (:func:`yuki.ui.step_words.return_view`:
         effects as rows, the opening steps folded into one line, no undo of any kind). **Learned** only for a run that
@@ -1346,7 +1373,7 @@ class YukiUi(QObject):
         :data:`LEARNED_WAIT_S`, :meth:`_wait_for_learning`). Nothing to tell beyond the strip's final word, no card -
         unless the run ended done and its success taught a way: then the card comes for the Learned box (``quiet``:
         shown only with it)."""
-        view = return_view(outcome, text, list((run or {}).get("calls") or []))
+        view = return_view(outcome, text, list((run or {}).get("calls") or []), verdict=verdict)
         if not view["worth"] and outcome != "done":
             return
         took = time.monotonic() - run["started"] if run else 0.0

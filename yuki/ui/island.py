@@ -225,6 +225,9 @@ class FinalInfo:
     run: RunInfo | None = None
     ended: float = 0.0                       # time.monotonic() when it ended (the run card's time)
     cost: str = ""                           # the run's cost, once the summary came ("33¢")
+    #: honest (87): a done run's outcome level (verified | likely | unverified | failed; "" unknown): below likely the
+    #: flash never shows the done chip
+    level: str = ""
 
 
 @dataclass
@@ -410,7 +413,7 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         face = {"listening": "woke" if i.voice == "starting" else "listening", "call-notice": "quiet-in-call"}.get(
             state, state)
         if state == "done-flash":
-            face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
+            face = _done_face(i.final)
         # the halo belongs to the open island: the pill never carries it
         return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=step_of(run),
                     title=_notice_title(i) if state == "call-notice" else compact_word(state, i))
@@ -484,9 +487,13 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
     if state == "done-flash":
         f = i.final or FinalInfo("Done.")
         if expanded and f.run is not None:
-            return Spec(state, face="done-flash" if f.outcome == "done" else "handed", exp=True, width=RUN_W,
+            return Spec(state, face=_done_face(f), exp=True, width=RUN_W,
                         line=f.text, sub=f.meta or _final_sub(f), rec=rec, body="run", keys=("chev",))
         keys = ("chev",) if f.run is not None else ()   # the finished run's card opens from here
+        if f.outcome == "done" and f.level in LEVEL_CHIPS:
+            # honest (87): ended with words its checks do not back: never the done chip
+            return Spec(state, face="handed", line=f.text, sub=f.meta or _final_sub(f), chip=LEVEL_CHIPS[f.level],
+                        keys=keys)
         if f.outcome == "done":   # the design's done flash carries its chip only (no rec chip)
             return Spec(state, face="done-flash", line=f.text, sub=f.meta or _final_sub(f), chip="done", keys=keys)
         return Spec(state, face="handed", line=f.text, sub=f.meta or _final_sub(f), chip=f.outcome, keys=keys)
@@ -521,10 +528,25 @@ NOTICE_ROOM = COMPACT_MAX_W - (1 + COMPACT_PAD + FACE_W * COMPACT_PITCH + COMPAC
                                + COMPACT_PAD_R + 1)
 
 
+#: honest (87): the done flash's chip for a run whose outcome level is below likely, and its sub line's word.
+LEVEL_CHIPS = {"unverified": "unconfirmed", "failed": "failed"}
+LEVEL_WORDS = {"unverified": "Not confirmed", "failed": "Didn't work"}
+
+
+def _done_face(f: FinalInfo | None) -> str:
+    """The end's face: the stamped done check only for a run that ended done at likely or better (honest review F6:
+    the pill and the open run card too, not only the flash); below likely, or not done, the plain hand-back face."""
+    if f is None:
+        return "done-flash"
+    return "done-flash" if f.outcome == "done" and f.level not in LEVEL_CHIPS else "handed"
+
+
 def _final_sub(f: FinalInfo) -> str:
     """The end word's sub line (the design's run card heads: "Nothing was sent · 0:44", "You have the controls")."""
     word = {"done": "Done", "stopped": "Stopped by you", "failed": "It didn't finish",
             "handed": "You have the controls"}.get(f.outcome, "")
+    if f.outcome == "done" and f.level in LEVEL_WORDS:
+        word = LEVEL_WORDS[f.level]
     if f.run is not None and f.ended:
         return f"{word} · {elapsed(f.ended - f.run.started)}"
     return word
@@ -1593,7 +1615,8 @@ class IslandWindow(QWidget):
         for w in (self.rec, self.chip, self.k_stop, self.k_chev, self.k_retry, self.k_settings):
             w.setVisible(w in items)
         if spec.chip:
-            icon = {"done": "check", "stopped": "stop", "failed": "x", "handed": "hand"}.get(spec.chip, "check")
+            icon = {"done": "check", "stopped": "stop", "failed": "x", "handed": "hand",
+                    "unconfirmed": "dash"}.get(spec.chip, "check")
             self.chip.icon_name = icon
             self.chip.set_text(spec.chip)
         self.k_chev.icon_name = "chev"
@@ -2370,6 +2393,8 @@ class Island(QObject):
             summary = ("; ".join(did) or "Nothing yet", "What was left of the request")
         note = {"handed": "You have the mouse and keys", "stopped": "Nothing else ran", "failed": "It stopped there",
                 "done": ""}.get(mode, "")
+        if mode == "done" and final is not None and final.level in LEVEL_WORDS:
+            note = LEVEL_WORDS[final.level]   # honest (87): the run's checked level, never a plain done
         self.window.run.set_card(mode=mode, title=title, touch=touch, count=count, cost=cost,
                                  asked=asked if self._needs_say(asked) else "", steps=steps, steers=run.steers,
                                  summary=summary, foot_note=note,
@@ -2764,7 +2789,7 @@ class IslandStrip(QObject):
         else:
             self.island.update(transient=text)
 
-    def show_final(self, text: str, *, tone: str = "final", outcome: str | None = None) -> None:
+    def show_final(self, text: str, *, tone: str = "final", outcome: str | None = None, level: str = "") -> None:
         was = self.isVisible()
         run = self.island.inputs.run
         if run is not None:
@@ -2776,7 +2801,7 @@ class IslandStrip(QObject):
         kind = outcome or ("failed" if tone == "error" else "done")
         isl = self.island
         isl.last_final = (" ".join(str(text or "").split()), kind, time.time())
-        isl.update(final=FinalInfo(text, kind, "", ended, ended=time.monotonic()), transient="")
+        isl.update(final=FinalInfo(text, kind, "", ended, ended=time.monotonic(), level=level or ""), transient="")
         isl._final_timer.start(DONE_MS)
         self._ended = None
         self._changed(was)

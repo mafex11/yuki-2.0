@@ -1256,9 +1256,50 @@ NOTHING_DONE_NOTE = (
 )
 
 
+#: honest (87): travels with a result whose request's outcome verdict is below "likely" (``yuki.agent.finish.
+#: outcome_verdict``): the talker repeats the verdict's level and never says more than it, whatever the thinker's words
+#: say. Judgement stays with the talker (which words, what to name); the level is data. ``{checked}``: what the check
+#: saw or could not see; ``{step}``: the deciding step in the thinker's words.
+OUTCOME_NOTES = {
+    "unverified": (
+        "Not confirmed: it was tried, but nothing showed that it worked ({checked}). Say in a few words of your own what "
+        "was tried and that you couldn't confirm it, and never that it worked, is done, sent, closed or open, whatever "
+        "the result's words say. E.g. result \"Sent it to Ana.\", checked \"the message did not show up in the chat\": "
+        "\"I tried to send it to Ana, but I couldn't confirm it went.\" Result \"Warp's full screen now.\": \"I tried to "
+        "make Warp full screen, but I couldn't check that it worked.\""),
+    "failed": (
+        "It did not work ({checked}; the step: {step}). Say plainly in a few words what did not work; say that another "
+        "part worked only when the result says so. Never that it is done. E.g. result \"Closed Slack.\": \"Closing "
+        "Slack didn't work, it's still open.\" Result \"Opened Spotify and paused YouTube.\", step \"Pausing YouTube\": "
+        "\"Spotify's open, but pausing YouTube didn't work.\""),
+    # an answer that tells the screen's state without having read it (nothing was done)
+    "unread": (
+        "Not checked: what it says about the screen was not read just now. Say it as what you think, not as seen, in a "
+        "few words: e.g. result \"The video's paused.\": \"I think it's paused, but I haven't checked.\""),
+}
+#: What the result's ``outcome`` field says per level (plain words, the same everywhere).
+OUTCOME_WORDS = {"unverified": "not confirmed", "failed": "did not work", "unread": "not checked"}
+
+
+def outcome_fields(verdict: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+    """``(fields, note)`` a spoken result carries for its request's outcome verdict: ``{"outcome", "checked"}`` and the
+    level's note (:data:`OUTCOME_NOTES`) when the verdict is below likely, else ``({}, "")``."""
+    level = verdict.get("level") if isinstance(verdict, dict) else None
+    if level not in ("unverified", "failed"):
+        return {}, ""
+    if level == "unverified" and not verdict.get("acted"):
+        level = "unread"
+    checked = " ".join(str(verdict.get("seen") or "").split()) or "nothing showed it"
+    step = " ".join(str(verdict.get("step") or "").split()) or "not named"
+    fields: dict[str, Any] = {"outcome": OUTCOME_WORDS[level], "checked": checked}
+    if verdict.get("partial"):
+        fields["partly"] = "another part of it did work"
+    return fields, OUTCOME_NOTES[level].format(checked=checked, step=step)
+
+
 def result_payload(kind: str, text: str, *, more: bool = False, held_back: bool = False,
                    request: str | None = None, late: bool = False, verified: bool = False,
-                   nothing_done: bool = False) -> dict[str, Any]:
+                   nothing_done: bool = False, outcome: dict[str, Any] | None = None) -> dict[str, Any]:
     """What a ``tell_yuki`` final result says to the mouth (``kind`` is ``done`` or ``failed``).
 
     ``result``, not ``done``: the word must not tell the mouth it worked; the brain's own
@@ -1274,16 +1315,28 @@ def result_payload(kind: str, text: str, *, more: bool = False, held_back: bool 
     request asked for something to be done (the talker handed it over with ``acts``, or a hand of its own was tried)
     and no action ran in its job: the talker says so or asks (offline 29 Sept a misheard "Ok on WhatsApp" was
     answered "Got it." with nothing done). Decided from the job's own record, never from the words.
+    ``outcome`` (honest, report 87): the request's outcome verdict; below likely, the result carries its level and what
+    was checked (:func:`outcome_fields`) and the talker says it at that level, never stronger (late or not, and when
+    asked about a result held back too); a verified mark never stands beside it.
     """
     about = {"for_request": request if len(request) <= 200 else request[:199] + "…"} if request else {}
+    graded, graded_note = outcome_fields(outcome) if kind == "done" else ({}, "")
     if held_back:
-        return {"held_back": text, **about, "failed": kind != "done", "how_to_handle_it": HELD_BACK_NOTE}
+        return {"held_back": text, **about, **graded, "failed": kind != "done",
+                "how_to_handle_it": HELD_BACK_NOTE + (" " + graded_note if graded_note else "")}
     if late:
-        return {"result" if kind == "done" else "failed": text, **about, "late": True, "more_available": more,
-                "how_to_say_it": LATE_NOTE + (MORE_NOTE if more else "")}
+        return {"result" if kind == "done" else "failed": text, **about, **graded, "late": True,
+                "more_available": more,
+                "how_to_say_it": LATE_NOTE + (" " + graded_note if graded_note else "") + (MORE_NOTE if more else "")}
+    if graded and (outcome or {}).get("acted"):
+        return {"result": text, **about, **graded, "more_available": more,
+                "how_to_say_it": graded_note + (MORE_NOTE if more else "")}
     if nothing_done and kind == "done":
         return {"result": text, **about, "nothing_done": True, "more_available": more,
                 "how_to_say_it": NOTHING_DONE_NOTE}
+    if graded:
+        return {"result": text, **about, **graded, "more_available": more,
+                "how_to_say_it": graded_note + (MORE_NOTE if more else "")}
     if verified and kind == "done":
         return {"result": text, **about, "verified": True, "how_to_say_it": VERIFIED_NOTE}
     note = SPOKEN_NOTE + (MORE_NOTE if more else "")

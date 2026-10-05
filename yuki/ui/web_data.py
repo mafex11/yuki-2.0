@@ -2508,6 +2508,11 @@ def chat_item(item: Any, now: float | None = None) -> dict[str, Any]:
                            "seconds": round(times.get(s.key, s.seconds(now)), 1), "started": s.started if s.running else None,
                            "result": (s.result or "")[:200] if s.ok is False else "", "depth": s.depth}
                           for s in item.real_steps()])
+        # honest review F5: the run's checked level below likely ("Not confirmed: the message did not show up in the
+        # chat"), from its achieved line (a say step, so not among the steps above); nothing at likely or better
+        achieved = next((s for s in reversed(item.steps) if s.key.startswith("achieved:")), None)
+        if achieved is not None and achieved.ok is not True and achieved.result:
+            out["outcome"] = {"text": achieved.result[:200], "ok": achieved.ok}
         if item.expanded is not None:
             out["expanded"] = item.expanded
     if item.kind == "nudge" and isinstance(item.nudge, dict):
