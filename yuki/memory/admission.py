@@ -583,10 +583,11 @@ def resolve_held(store: Any, journal_id: int, answer: str, *, now: float | None 
 def recap_items(store: Any, call_ids: Sequence[int], *, now: float | None = None,
                 limit: int = RECAP_KEEP_MAX) -> list[dict[str, Any]]:
     """The lines of a call's recap card: the call's unanswered :data:`HOLD_CALL` facts (never sensitive, never
-    dropped ones), the most important first, at most ``limit``: ``{"ref": "journal:N", "text": the card's line}``."""
+    dropped ones) that have the judge's short second-person line (a card never shows the journal's "The user ..."
+    wording), the most important first, at most ``limit``: ``{"ref": "journal:N", "text": the card's line}``."""
     if not call_ids:
         return []
-    held = held_facts(store, reasons=(HOLD_CALL,), call_ids=call_ids, now=now)
+    held = [h for h in held_facts(store, reasons=(HOLD_CALL,), call_ids=call_ids, now=now) if h.source.get(SHOWN_KEY)]
     held.sort(key=lambda h: (-h.importance, h.at, h.id))
     return [{"ref": f"journal:{h.id}", "text": h.shown} for h in held[:max(0, int(limit))]]
 

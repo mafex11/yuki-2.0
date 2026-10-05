@@ -284,11 +284,12 @@ def test_the_keep_list_offers_the_most_important_waiting_lines_never_sensitive_o
     held_fact(store, "b", A.HOLD_CALL, importance=8, shown="You said b.")
     held_fact(store, "c", A.HOLD_SENSITIVE, importance=9, shown="You said c.")
     held_fact(store, "d", A.HOLD_DROP, importance=9)
-    held_fact(store, "e", A.HOLD_CALL, importance=5)
-    held_fact(store, "f", A.HOLD_CALL, importance=4, call=6)
-    held_fact(store, "g", A.HOLD_CALL, importance=2)
+    held_fact(store, "e", A.HOLD_CALL, importance=5, shown="You said e.")
+    held_fact(store, "f", A.HOLD_CALL, importance=4, call=6, shown="You said f.")
+    held_fact(store, "g", A.HOLD_CALL, importance=2, shown="You said g.")
+    held_fact(store, "The user said h.", A.HOLD_CALL, importance=9)   # no second-person line: never on a card
     items = A.recap_items(store, [5], now=T0 + 60)
-    assert [i["text"] for i in items] == ["You said b.", "e", "You said a."]
+    assert [i["text"] for i in items] == ["You said b.", "You said e.", "You said a."]
     assert A.recap_items(store, [7], now=T0 + 60) == [] and A.recap_items(store, [], now=T0) == []
     assert A.recap_text(3, people=["Tara"]) == "From your call with Tara: 3 things I'd keep"
     assert A.recap_text(1, app="Discord") == "From your Discord call: 1 thing I'd keep"
