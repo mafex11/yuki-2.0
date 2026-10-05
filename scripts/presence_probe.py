@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         facts = facts_fn()
         row = {"t": round(time.monotonic() - t0), "idle_s": round(idle_fn(), 1),
                "windows_idle_s": round(watcher.raw_idle_s(), 1), "counts": facts.get("counts"),
-               "max_travel": facts.get("max_travel")}
+               "max_travel": facts.get("max_travel"), "answering": facts.get("answering")}
         rows.append(row)
         print(json.dumps(row), flush=True)
     cpu1, tcpu1 = proc.cpu_times(), thread_cpu()
