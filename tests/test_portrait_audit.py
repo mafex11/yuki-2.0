@@ -58,6 +58,10 @@ def usage():
                            cache_read_input_tokens=0)
 
 
+#: The admission judge (yuki.memory.admission) admitting every call fact, so these checks see them in the journal.
+ADMIT_ALL = {"verdicts": [{"fact": n, "verdict": "admit", "sensitive": "none", "shown": ""} for n in range(1, 41)]}
+
+
 class ToolClient:
     """``messages.create`` / ``messages.stream`` answering each tool with a queued input."""
 
@@ -155,7 +159,7 @@ def test_call_side_questions_are_stored_with_their_evidence(store):
                              "evidence": "named in a Discord call", "why": "a person the user plays with",
                              "importance": 5, "source": 1}]}
     with tempfile.TemporaryDirectory() as logs:
-        client = ToolClient({"record_call_side": [answer]})
+        client = ToolClient({"record_call_side": [answer], "admit_call_facts": [ADMIT_ALL]})
         [result] = JournalWorker(store, client=client, embedder=StubEmbedder(), log_dir=Path(logs)).run_once()
     assert result.ok and result.questions and result.questions[0][1] == "added"
     [q] = store.questions()

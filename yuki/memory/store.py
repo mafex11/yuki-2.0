@@ -565,6 +565,12 @@ class NewFact:
     #: How much of the user's attention the cited source had (:func:`capture_attention`, migration 24):
     #: ``front`` | ``visible`` | ``popup``.
     attention: str = "front"
+    #: Admission (yuki.memory.admission): why the fact is held back until the user's yes (``call`` | ``sensitive`` |
+    #: ``drop``), or ``None`` (into memory now). A held fact is written and superseded at once by a ``hold:<reason>``
+    #: batch in the same transaction (:meth:`Store._hold_journal`), so no journal reader sees it.
+    held: str | None = None
+    #: The journal model's sensitivity mark (yuki.memory.admission.SENSITIVE_KINDS); "none" for nearly all.
+    sensitive: str = "none"
 
 
 #: Where a capture's window was when the watcher read it (migration 24; the watcher's own trigger format, a fixed
@@ -3761,9 +3767,31 @@ class Store:
             return 0
         conn.execute("UPDATE journal_batches SET supersedes=? WHERE id=?", (json.dumps(old), batch_id))
         self._forget_withdrawn()
+        # facts of the replaced batches still held back (yuki.memory.admission) are replaced too: no longer offered
+        conn.execute(
+            "UPDATE journal SET superseded_by=? WHERE batch_id IN (%s) AND superseded_by IN"
+            " (SELECT id FROM journal_batches WHERE model LIKE 'hold:%%')" % ",".join("?" * len(old)),
+            (batch_id, *old))
         return conn.execute(
             "UPDATE journal SET superseded_at=?, superseded_by=? WHERE batch_id IN (%s) AND superseded_at IS NULL"
             % ",".join("?" * len(old)), (time.time(), batch_id, *old)).rowcount
+
+    def _hold_journal(self, conn: sqlite3.Connection, facts: Sequence[NewFact], journal_ids: Sequence[int],
+                      thread_id: int | None) -> int:
+        """Admission (yuki.memory.admission): the facts held back until the user's yes are superseded at once by one
+        ``hold:<reason>`` batch per reason (no tokens, no cost), in the caller's transaction. Returns how many."""
+        held: dict[str, list[int]] = {}
+        for fact, jid in zip(facts, journal_ids):
+            reason = getattr(fact, "held", None)
+            if reason:
+                held.setdefault(str(reason), []).append(int(jid))
+        now = time.time()
+        for reason, ids in held.items():
+            batch = self._insert_batch(conn, ModelCall(at=now, thread_id=thread_id, model=f"hold:{reason}",
+                                                       cost_usd=0.0), 0, 0)
+            conn.executemany("UPDATE journal SET superseded_at=?, superseded_by=? WHERE id=?",
+                             [(now, batch, i) for i in ids])
+        return sum(len(v) for v in held.values())
 
     def commit_batch(self, call: ModelCall, capture_ids: Iterable[int], facts: Sequence[NewFact],
                      questions: Sequence[NewQuestion] = (),
@@ -3782,6 +3810,7 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            self._hold_journal(conn, facts, journal_ids, call.thread_id)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
@@ -8070,6 +8099,7 @@ class Store:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
+            self._hold_journal(conn, facts, journal_ids, call.thread_id)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:

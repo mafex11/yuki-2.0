@@ -41,6 +41,10 @@ def usage():
                            cache_read_input_tokens=0)
 
 
+#: The admission judge (yuki.memory.admission) admitting every call fact, so these checks see them in the journal.
+ADMIT_ALL = {"verdicts": [{"fact": n, "verdict": "admit", "sensitive": "none", "shown": ""} for n in range(1, 41)]}
+
+
 class ToolClient:
     """``messages.create`` / ``messages.stream`` answering each tool with a queued input."""
 
@@ -152,13 +156,13 @@ def test_call_journal_natures_and_rejournal_supersedes(store):
 
     with tempfile.TemporaryDirectory() as logs:
         call_capture(store)
-        worker = JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER_OLD]}),
+        worker = JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER_OLD], "admit_call_facts": [ADMIT_ALL]}),
                                embedder=StubEmbedder(), log_dir=Path(logs))
         [first] = worker.run_once()
         assert first.ok and first.natures == ["fact", "fact"]
         assert len([f for f in store.conversation_facts(("commitment",)) if f.origin == "call"]) == 1
         # re-journal with the fixed pipeline (a stub standing in for the model's new reading)
-        client = ToolClient({"record_call_side": [CALL_ANSWER_NEW]})
+        client = ToolClient({"record_call_side": [CALL_ANSWER_NEW], "admit_call_facts": [ADMIT_ALL]})
         lines: list[str] = []
         summary = rejournal.run(store, thread_kind="my_call_side", since=T0 - 3600, until=None, portrait="flag",
                                 log_dir=Path(logs), client=client, out=lines.append)
@@ -184,7 +188,7 @@ def test_rejournal_that_finds_nothing_keeps_the_earlier_facts(store):
 
     with tempfile.TemporaryDirectory() as logs:
         call_capture(store)
-        JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER_OLD]}),
+        JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER_OLD], "admit_call_facts": [ADMIT_ALL]}),
                       embedder=StubEmbedder(), log_dir=Path(logs)).run_once()
         empty = ToolClient({"record_call_side": [{"facts": [], "commitments": []}]})
         lines: list[str] = []
