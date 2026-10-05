@@ -56,6 +56,17 @@ TAKEOVER_MOVE_WORDS: dict[int, str] = {24: "A nudge", 40: "A short move (the usu
 #: A distance set by hand in ui.json that is none of the choices: shown as it is, in these words.
 TAKEOVER_MOVE_OWN = "Your own setting"
 
+#: Settings → Privacy and pause → "Record how I work" (report 78, phase C0): the switch is shown OFF and cannot be
+#: turned on: no recording exists yet, and it waits for your go-ahead (decision D1). Saved in the privacy file
+#: (``[trace] record_actions``, ``leave_out``), which the memory service reads.
+RECORD_LABEL = "Record how I work"
+RECORD_HINT = ("When you say yes, I’d note which button or field you use in each app and what changed, so I can "
+               "learn to do things your way. Never the letters you type, never what you copy, never while a game "
+               "runs.")
+RECORD_WAITING = "Off. This waits for your go-ahead, so it can’t be turned on yet."
+RECORD_LEAVE_OUT_LABEL = "Leave these apps out"
+RECORD_LEAVE_OUT_HINT = "Ready for when you say yes. Nothing is recorded today."
+
 
 #: The window engines a settings file may hold (``window_engine``); anything else reads as "web".
 WINDOW_ENGINES: tuple[str, ...] = ("web", "qt")

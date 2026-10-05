@@ -725,6 +725,7 @@ table.routes .top-mark { font: 500 10.5px/1 var(--f-mono); color: var(--bg); bac
 .srow .ctl { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 /* quiet hours (the 4 Oct item W10): the switch row, then From [time] to [time] */
 .srow.quiet-h small { max-width: 420px; line-height: 1.45; }
+.srow.record-h small { max-width: 420px; line-height: 1.45; }
 .srow.quiet-t { padding-top: 0; border-top: 0; justify-content: flex-start; }
 .quiet-range { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
 .quiet-range .pick { width: 112px; }

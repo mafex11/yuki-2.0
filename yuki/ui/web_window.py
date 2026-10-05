@@ -1411,6 +1411,8 @@ class WebWindow:
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
         "motion": "a_motion", "call_pref": "a_call_pref", "quiet": "a_quiet", "takeover_move": "a_takeover_move",
+        # Record how I work (report 78 C0): the locked switch (refuses on) and its leave-out list
+        "record_actions": "a_record_actions", "record_leave_out": "a_record_leave_out",
         # the feedback round 3 (W3): Correct from your own words with its Undo
         "correct_item": "a_correct_item", "cancel_correction": "a_cancel_correction",
         # the to-do list (appTodo): Done / Not needed, the Undo of a Done, Add from the window (Correct is correct_item)
@@ -1427,7 +1429,7 @@ class WebWindow:
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
                                   "pause", "accent", "motion", "call_pref", "quiet", "ai_role", "ai_key", "ai_custom",
-                                  "takeover_move"})
+                                  "takeover_move", "record_actions", "record_leave_out"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -2091,6 +2093,32 @@ class WebWindow:
         from yuki.ui import ui_settings
 
         return {"px": ui_settings.load(self.ui_path).takeover_move_px}
+
+    def a_record_actions(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Settings → Record how I work: the switch. Turning it on is refused until the user's go-ahead (report 78
+        D1; there is no recording yet); off is what it already is, so nothing is written."""
+        from yuki.ui import ui_settings
+
+        if m.get("on"):
+            return {"ok": False, "error": ui_settings.RECORD_WAITING}
+        return {"on": False}
+
+    def a_record_leave_out(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Settings → Record how I work → leave out: add (``out`` true) or remove an app from ``[trace] leave_out``
+        in the privacy file. Replies with the list kept."""
+        from yuki.ui.window import settings_io
+
+        app = " ".join(str(m.get("app") or "").split())
+        if not app:
+            return {"ok": False, "error": "Pick an app first."}
+        trace = settings_io.read_privacy().get("trace")
+        current = [" ".join(str(v).split()) for v in ((trace or {}).get("leave_out") or []) if str(v).strip()] \
+            if isinstance(trace, dict) else []
+        kept = [v for v in current if v.casefold() != app.casefold()]
+        if m.get("out"):
+            kept.append(app)
+        settings_io.update_privacy("trace", "leave_out", kept)
+        return {"leave_out": kept}
 
     # -- Settings → AI (report 67) ---------------------------------------------------------------------------------
 
