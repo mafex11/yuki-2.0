@@ -611,6 +611,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 #: its report (:mod:`yuki.agent.finish`), not by the model: about 40 output tokens less per finishing call. The line
 #: travels to the voice in this same field of the ``tool_call`` event (a string there, so voice v3.17's
 #: verified-result path reads it unchanged). A string sent here by an older habit counts as ``finish_words``.
+#: appOpen: the longest a launch_app call waits for a game its launcher is still starting, when a caller passes wait_s.
+#: The dispatcher accepts it; it is kept out of launch_app's schema (the brain prompt's size budget), so the thinker
+#: does not ask for it - its opening is confirmed by the light watch instead (``Agent._watch_launch``).
+LAUNCH_WAIT_MAX_S = 60
+
 FINISHES_FIELD = "finishes_with"
 FINISHES_SCHEMA: dict[str, Any] = {
     "type": "boolean",
@@ -1469,6 +1474,7 @@ class _LazyRealBackend:
         "run_powershell",
         "open_url",
         "window_action",
+        "watch_launch",
     }
 
     def window_exists(self, hwnd: int) -> bool:
@@ -1483,7 +1489,13 @@ class _LazyRealBackend:
         the user (the 25 Sept live "open YouTube on Chrome" did). Returns how many apps."""
         import importlib
 
-        return len(importlib.import_module("yuki.actions.launch").get_start_apps())
+        launch = importlib.import_module("yuki.actions.launch")
+        apps = launch.get_start_apps()
+        try:
+            launch._start_links(apps)   # appOpen: the shortcuts' targets and arguments (~0.15 s), read once too
+        except Exception:  # noqa: BLE001 - a launch reads them itself then
+            pass
+        return len(apps)
 
     def prewarm_shell(self) -> bool:
         """Open the persistent PowerShell session now, before anything needs it.
@@ -3204,12 +3216,15 @@ class Dispatcher:
     def _do_launch_app(self, tool_input: dict[str, Any]) -> ToolOutcome:
         query = self._need_str(tool_input, "query")
         args = self._opt_str_list(tool_input, "args")
+        # appOpen: a game still starting through its launcher is waited on longer when asked (bounded)
+        wait_s = max(0, min(LAUNCH_WAIT_MAX_S, self._opt_int(tool_input, "wait_s", 0)))
         # Only pass args when there are some, so a backend written before the
         # parameter existed keeps working for plain launches.
+        kwargs: dict[str, Any] = {"timeout_s": float(wait_s)} if wait_s else {}
         result = (
-            self.backend.launch_app(query, args=args)
+            self.backend.launch_app(query, args=args, **kwargs)
             if args
-            else self.backend.launch_app(query)
+            else self.backend.launch_app(query, **kwargs)
         )
         return self._from_action("launch_app", result)
 

@@ -40,7 +40,7 @@ def test_a_field_without_a_readable_value_is_checked_by_its_parts(monkeypatch: A
 def test_a_suggestion_is_accepted_by_key_and_checked_by_the_field(monkeypatch: Any) -> None:
     pressed: list[str] = []
     after = FieldState(ok=True, value="@Hemanth ", parts=3, parts_text="@Hemanth")
-    monkeypatch.setattr(inp.pyautogui, "press", lambda key: pressed.append(key))
+    monkeypatch.setattr(inp, "_send_presses", lambda key, times=1: pressed.append(key))
     monkeypatch.setattr(inp, "_foreground_mismatch", lambda _h: None)
     monkeypatch.setattr(inp, "_read_field", lambda: after)
     before = FieldState(ok=True, value="@Hem", parts=1, parts_text="@Hem", popup=True, popup_how="controls",
@@ -54,7 +54,7 @@ def test_a_suggestion_is_accepted_by_key_and_checked_by_the_field(monkeypatch: A
 def test_enter_is_withheld_while_a_selected_suggestion_would_take_it(monkeypatch: Any) -> None:
     pressed: list[str] = []
     popup = FieldState(ok=True, value="hi @Hem", popup=True, popup_how="controls", items=("Hemanth",), selected=0)
-    monkeypatch.setattr(inp.pyautogui, "press", lambda key: pressed.append(key))
+    monkeypatch.setattr(inp, "_send_presses", lambda key, times=1: pressed.append(key))
     for name, fn in {"_foreground_mismatch": lambda _h: None,
                      "_refuse_unless_ready": lambda *a, **k: None,
                      "_windows_before": lambda _h: (0, {}),

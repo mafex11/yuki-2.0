@@ -1350,8 +1350,9 @@ class MemoryClient:
         session once it ends (30 minutes without an exchange, or a new
         session id). Fast (well under 20 ms; the write waits at most 8 ms for
         the database, else a background writer finishes it) and never raises.
-        ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others");
-        a turn said to others is kept for the record and never extracted (no rule, to-do or fact).
+        ``addressed``: who a voice turn was said to, from voice's ``turn_closed`` ("yuki" | "others" |
+        "unanswered"); a turn said to others is kept for the record and never extracted (no rule, to-do or fact);
+        an unanswered call turn (the next words came first; nobody judged it) is extracted, the extractor judging.
         ``envelope``: the notes Yuki put after the user's words, when the caller has them apart; ``None``: read
         off ``user_text`` (:func:`yuki.memory.store.split_envelope`). Stored apart from the words (migration 27).
         """
@@ -2488,7 +2489,9 @@ class MemoryClient:
         (``[{"call_id", "app", "process", "track_kind": "call" | "game",
         "state": "recording" | "starting" | "paused" | "off" | "unavailable" |
         "asking", "reason", "speech_s"}]``: each app's own audio, the other
-        people).
+        people). ``stall`` (report 76): a row that records but kept nothing new for ``[calls] stall_min``
+        (``{"call_id", "app", "kind", "since", "minutes", "reason": "no_audio" | "no_speech"}``) or None; the
+        island says so.
         """
         try:
             from yuki.memory.calls import CallConfig
@@ -2525,6 +2528,7 @@ class MemoryClient:
             except Exception:
                 pass
             mic, tracks = self._call_tracks(rows) if rows else (dict(off), [])
+            stall = self._call_stall(rows)
             sessions = [{"id": r.id, "app": r.app, "kind": r.kind, "status": r.status, "asking": asking(r),
                          "ended": False} for r in rows]
             card = None
@@ -2540,7 +2544,7 @@ class MemoryClient:
                          or any(t.get("state") == "recording" for t in tracks))
             if c is None:
                 return {"call": None, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
-                        "tracks": tracks, "pending_card": card}
+                        "tracks": tracks, "pending_card": card, "stall": stall}
             session_start = None
             try:   # the call session this row is in: its first row of the same hold (or merged), for the pill
                 from yuki.memory.callspans import session_start as _session_start
@@ -2567,7 +2571,7 @@ class MemoryClient:
                 "kind": c.kind,
             }
             return {"call": call, "recording": recording, "waiting": waiting, "sessions": sessions, "mic": mic,
-                    "tracks": tracks, "pending_card": card}
+                    "tracks": tracks, "pending_card": card, "stall": stall}
         except Exception:
             return {"call": None, "recording": False, "waiting": None}
 
@@ -2597,6 +2601,23 @@ class MemoryClient:
                            "reason": t.get("reason"),
                            "speech_s": round(speech.get(("others", r.process or ""), 0.0), 1)})
         return mic, tracks
+
+    def _call_stall(self, rows: list) -> dict | None:
+        """A row going on that records but kept nothing new for a while (the call worker's measured flag in its
+        ``call_tracks`` state: ``{"call_id", "app", "kind", "since", "minutes", "reason": "no_audio" |
+        "no_speech"}``), or None. Only for one of ``rows``. Content-free."""
+        import json as _json
+
+        from yuki.memory.calls import TRACKS_STATE
+
+        try:
+            data = _json.loads(self.store.nudge_state(TRACKS_STATE) or "{}")
+        except Exception:
+            return None
+        stall = data.get("stall") if isinstance(data, dict) else None
+        if not isinstance(stall, dict) or stall.get("call_id") not in {r.id for r in rows}:
+            return None
+        return dict(stall)
 
     def _call_others(self, call_id: int) -> int | None:
         try:
@@ -3199,7 +3220,7 @@ class MemoryClient:
     def recent_turns(self, limit: int = 40, session_id: str | None = None) -> list[dict]:
         """The latest exchanges with Yuki (the given conversation session, else the newest one), oldest first.
 
-        Each: ``{"id", "session_id", "request_id", "at", "user", "reply", "actions", "outcome"}``.
+        Each: ``{"id", "session_id", "request_id", "at", "user", "reply", "actions", "outcome", "addressed"}``.
         """
         if session_id is None:
             latest = self.store.latest_turn()
@@ -3209,7 +3230,7 @@ class MemoryClient:
         turns = self.store.turns_for_session(session_id, limit=max(1, int(limit)))
         return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
                  "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
-                 "outcome": t.outcome} for t in turns]
+                 "outcome": t.outcome, "addressed": t.addressed} for t in turns]
 
     # -- a new chat every day, with memory between days (migration 33; report 38 §9) ---------------------------
 
@@ -3297,7 +3318,7 @@ class MemoryClient:
             return []
         return [{"id": t.id, "session_id": t.session_id, "request_id": t.request_id, "at": t.at,
                  "user": t.user_text, "reply": t.reply_text or "", "actions": list(t.actions or []),
-                 "outcome": t.outcome} for t in turns]
+                 "outcome": t.outcome, "addressed": t.addressed} for t in turns]
 
     def app_colors(self, until: Any = None, days: float = 14.0, limit: int = 8) -> dict[str, int]:
         """Each app's rank by time in front over the last ``days`` (0 = most): the window gives an app the
@@ -4266,6 +4287,17 @@ class MemoryClient:
         from yuki.memory import practice as _p
 
         return _p.workflows(self.store)
+
+    def launch_identities(self) -> dict:
+        """What practice memory learned the apps of Start entries run as (``yuki.memory.practice.launch_identities``,
+        appOpen): ``{entry name casefolded: [image names]}``, read back by ``launch_app`` so a game started through its
+        launcher is recognised by its own window. Never raises (``{}``)."""
+        from yuki.memory import practice as _p
+
+        try:
+            return _p.launch_identities(self.store)
+        except Exception:
+            return {}
 
     def workflow_edit(self, ref: Any, action: str, words: str = "") -> dict:
         """The user's say over one Playbook item (``yuki.memory.practice.workflow_edit``): ``save`` (it is right),

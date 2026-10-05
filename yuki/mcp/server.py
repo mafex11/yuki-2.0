@@ -14,6 +14,9 @@ Run::
 Each call is logged content-free (tool, argument names, resolved window,
 latency, result size, outcome) to ``logs/mcp/mcp-YYYYMMDD.jsonl``: the queries
 and results are the user's private data and are not written in the clear.
+
+The server runs the code it started with (:func:`yuki.core.codesnap.freeze`, first thing in :func:`main`): a merge
+while it runs never mixes old and new modules; a failing tool says when the code on disk has changed since.
 """
 
 from __future__ import annotations
@@ -216,8 +219,11 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
             raise ToolError(str(exc)) from exc
         except Exception as exc:
             event.update(ok=False, error=type(exc).__name__, ms=round((time.perf_counter() - t0) * 1000, 1))
+            stale = _stale_code()
+            if stale:
+                event["code_changed"] = True
             log.write(event)
-            raise ToolError(f"Reading Yuki memory failed ({type(exc).__name__}).") from exc
+            raise ToolError(f"Reading Yuki memory failed ({type(exc).__name__}).{stale}") from exc
         event.update(ok=True, chars=len(text), ms=round((time.perf_counter() - t0) * 1000, 1))
         if window is not None:
             event["since"] = window.since_ts
@@ -693,11 +699,32 @@ def _format_todos(todos: Any) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _stale_code() -> str:
+    """When Yuki's code on disk changed since this server started: a sentence saying so and how to load it
+    (the server keeps running the code it started with, :mod:`yuki.core.codesnap`); else ``""``."""
+    from yuki.core import codesnap
+
+    snap = codesnap.current()
+    try:
+        changed = snap.changed() if snap is not None else []
+    except Exception:
+        return ""
+    if not changed:
+        return ""
+    return (f" Yuki's code changed since this memory server started ({datetime.fromtimestamp(snap.at):%d %b %H:%M});"
+            " it still runs the code it started with. Reconnect the yuki-memory server (/mcp) to load the new code.")
+
+
 def _disabled() -> bool:
     return os.environ.get(DISABLED_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def main(argv: list[str] | None = None) -> int:
+    # First: from here on every module this server loads comes from one copy of the code, read now, so a merge
+    # while it runs cannot mix old and new modules (live 2026-10-05: ImportError in search_memory; report 77b).
+    from yuki.core import codesnap
+
+    codesnap.freeze("yuki")
     from yuki.memory.store import default_db_path
 
     parser = argparse.ArgumentParser(prog="yuki-mcp", description="Read-only MCP server over Yuki's memory (stdio).")

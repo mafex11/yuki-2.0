@@ -26,3 +26,6 @@ docs/ui-mockups/revamp-2026-10/
 
 # Claude Code agent worktrees
 .claude/worktrees/
+
+# the uiautomation library writes this beside the working directory
+@AutomationLog.txt

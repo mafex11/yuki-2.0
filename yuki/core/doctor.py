@@ -125,6 +125,126 @@ def check_embed_pipe() -> Check:
     return Check("Memory search (embedder)", OK, f"the embedder pipe is up ({ms:.0f} ms)")
 
 
+CAPTURE_CHECK = "Screen reading"
+
+#: Reads that kept the window's text (``health.outcome``).
+_KEPT = frozenset({"captured", "unchanged", "no_new_text", "deduplicated"})
+
+#: The watcher's reason codes (``health.reason``, content-free) grouped under one plain phrase each. A code's
+#: ``:detail`` (``no_text:terminal``) and ``_before`` ending (the same blocked page seen again) fold into its group.
+#: Formatting only: which words a count is shown with, never what Yuki does.
+_REASON_GROUPS: dict[str, tuple[str, ...]] = {
+    "a full-screen app was in front": ("fullscreen",),
+    "you paused memory": ("paused", "user", "pause"),
+    "the PC was locked": ("locked", "session"),
+    "the window runs as administrator, which Windows keeps out of reach": ("elevated",),
+    "the app draws its own screen, with no text to read": ("opaque",),
+    "the window showed no text": ("no_text", "masked", "no_complete_message"),
+    "the window didn't answer in time": ("window_busy",),
+    "too many reads were waiting": ("uia_backlog",),
+    "a password was on screen": ("password_focused", "password_field"),
+    "a private app or window": ("blocked_app", "user_blocked_app", "blocked_window", "private_window",
+                                "blocked_app_named"),
+    "a blocked site": ("blocked_scheme", "hostless_url", "credentials_in_url", "unparsable_url", "blocked_host",
+                       "adult_host", "user_blocked_domain", "blocked_path"),
+    "the window changed or closed first": ("not_foreground", "window_gone", "in_front", "not_on_screen", "covered",
+                                           "not_user_window"),
+    "Yuki's own windows": ("own_window",),
+    "a menu or tooltip, kept only for the moment": ("now_only",),
+    "the text ran past the time or size limit": ("truncated",),
+    "something went wrong": ("extract_error", "store_error", "unexpected", "store_unavailable"),
+}
+_REASON_WORDS = {code: words for words, codes in _REASON_GROUPS.items() for code in codes}
+#: Groups shown without the app that had most of them (it says nothing there, or the app's name is the wrong one:
+#: Yuki's own windows carry the name of the browser engine they are drawn with).
+_NO_APP = frozenset({"you paused memory", "the PC was locked", "the window changed or closed first",
+                     "Yuki's own windows"})
+
+
+def _reason_words(code: str | None) -> str:
+    base = (code or "").split(":", 1)[0]
+    base = base[: -len("_before")] if base.endswith("_before") else base
+    return _REASON_WORDS.get(base, "reasons not named here")
+
+
+def _count_phrase(rows: list[tuple[str, str, int]], limit: int = 5) -> str:
+    """``"full screen 300, no text 80 (mostly Warp)"``: the top reasons by count, each with its main app when one
+    app has most of them. ``rows``: (reason words, app, count)."""
+    by_reason: dict[str, dict[str, int]] = {}
+    for words, app, n in rows:
+        apps = by_reason.setdefault(words, {})
+        apps[app] = apps.get(app, 0) + n
+    ranked = sorted(by_reason.items(), key=lambda kv: -sum(kv[1].values()))
+    parts = []
+    for words, apps in ranked[:limit]:
+        total = sum(apps.values())
+        app, top = max(apps.items(), key=lambda kv: kv[1])
+        mostly = f", mostly {app}" if app and top * 2 > total and words not in _NO_APP else ""
+        parts.append(f"{words} ({total:,}{mostly})")
+    rest = sum(sum(apps.values()) for _w, apps in ranked[limit:])
+    if rest:
+        parts.append(f"the rest ({rest:,})")
+    return "; ".join(parts)
+
+
+def check_capture_health(db: Path | None = None, *, now: float | None = None, hours: float = 24.0) -> Check:
+    """Why Yuki's reads of your windows came back empty, were skipped or were cut short (report 78 C0): the memory
+    service's content-free health rows of the last ``hours``, counted by outcome and reason code, in plain words.
+    Counts and app names only; read-only."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(CAPTURE_CHECK, SKIP, "no memory database yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        rows = conn.execute("SELECT outcome, reason, coalesce(app, ''), count(*) FROM health WHERE at >= ?"
+                            " GROUP BY outcome, reason, app", (now - hours * 3600.0,)).fetchall()
+    except Exception as exc:
+        return Check(CAPTURE_CHECK, WARN, f"could not read the reads ({type(exc).__name__})")
+    finally:
+        conn.close()
+    kept = short = 0
+    empty: list[tuple[str, str, int]] = []
+    skipped: list[tuple[str, str, int]] = []
+    failed: list[tuple[str, str, int]] = []
+    for outcome, reason, app, n in rows:
+        n = int(n)
+        if outcome in _KEPT:
+            kept += n
+            short += n if reason == "truncated" else 0
+        elif outcome == "empty":
+            empty.append((_reason_words(reason), app, n))
+        elif outcome == "failed":
+            failed.append((_reason_words(reason), app, n))
+        else:   # skipped, or paused (full screen, locked, your pause)
+            skipped.append((_reason_words(reason), app, n))
+    total = kept + sum(r[2] for r in empty + skipped + failed)
+    span = f"the last {hours:g} hours" if hours != 24 else "the last day"
+    if not total:
+        return Check(CAPTURE_CHECK, OK, f"no reads of your windows in {span}")
+    lines = [f"In {span}, {total:,} reads: {kept:,} kept text"
+             + (f" ({short:,} of them cut short: the text ran past the time or size limit)" if short else "")]
+    n_empty, n_skipped, n_failed = (sum(r[2] for r in group) for group in (empty, skipped, failed))
+    if n_empty:
+        lines.append(f"{n_empty:,} came back empty: {_count_phrase(empty)}")
+    if n_skipped:
+        lines.append(f"{n_skipped:,} were skipped: {_count_phrase(skipped)}")
+    if n_failed:
+        lines.append(f"{n_failed:,} failed: {_count_phrase(failed)}")
+    detail = ". ".join(lines) + "."
+    if n_failed >= 10 and n_failed * 20 >= total:
+        return Check(CAPTURE_CHECK, WARN, detail,
+                     "If this keeps happening, send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    return Check(CAPTURE_CHECK, OK, detail)
+
+
 # -- models and keys ----------------------------------------------------------------------------
 
 
@@ -406,6 +526,98 @@ def check_spool_disk() -> Check:
     return Check("Disk space for call audio", status, detail, fix)
 
 
+CALL_RECORDING_CHECK = "Call recording"
+
+
+def _when(ts: float) -> str:
+    """``"3 October, 8 PM"`` (``"3 October, 8:15 PM"`` off the hour): the user's natural dates."""
+    dt = datetime.fromtimestamp(ts)
+    hour = dt.strftime("%I").lstrip("0") or "12"
+    clock = f"{hour} {dt:%p}" if dt.minute == 0 else f"{hour}:{dt:%M} {dt:%p}"
+    return f"{dt.day} {dt:%B}, {clock}"
+
+
+def check_call_recording(db: Path | None = None, *, now: float | None = None, days: float = 7.0) -> Check:
+    """Calls that show "recording" but keep nothing (report 76: three calls in a week showed "recording" for up to
+    an hour and kept nothing, silently). Read-only, content-free, from the database:
+
+    * now: the call worker's measured flag (a row records but kept nothing new for ``[calls] stall_min``);
+    * now: a row still open that the worker has not seen alive for 10 minutes while the service runs (stuck);
+    * the last ``days``: calls whose microphone recording started and ran at least ``stall_min`` but kept no piece
+      of audio on any track (a silent loss)."""
+    import json as _json
+
+    try:
+        from yuki.memory.calls import TRACKS_STATE, CallConfig
+        from yuki.memory.store import CALL_OPEN_STATUSES, default_db_path
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(CALL_RECORDING_CHECK, SKIP, "no memory database yet")
+    stall_s = CallConfig().stall_min * 60.0
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        conn.row_factory = sqlite3.Row
+        problems: list[str] = []
+        row = conn.execute("SELECT value FROM nudge_state WHERE name=?", (TRACKS_STATE,)).fetchone()
+        try:
+            stall = (_json.loads(row["value"]) or {}).get("stall") if row else None
+        except Exception:
+            stall = None
+        marks = ",".join("?" * len(CALL_OPEN_STATUSES))
+        open_rows = conn.execute(f"SELECT id, app, kind, detected_at, last_alive_at FROM calls WHERE status IN ({marks})"
+                                 " AND ended_at IS NULL", CALL_OPEN_STATUSES).fetchall()
+        running = True
+        try:
+            from yuki.memory.api import service_running
+
+            running = service_running(db)
+        except Exception:
+            running = True
+        # only a dead capture (no audio at all) is a problem: a row that hears only silence (a quiet voice channel,
+        # "no_speech") is normal (review F4); and only while the service runs, as a stopped service leaves its rows
+        # open on purpose with their last flag (review F5)
+        if (running and isinstance(stall, dict) and stall.get("reason") == "no_audio"
+                and stall.get("call_id") in {r["id"] for r in open_rows}):
+            problems.append(f"the {stall.get('app') or 'call'} recording shows on, but the microphone sends no sound "
+                            f"for {int(stall.get('minutes') or 0)} min")
+        for r in open_rows if running else []:
+            seen = r["last_alive_at"] if r["last_alive_at"] is not None else r["detected_at"]
+            if now - float(seen) > 600.0:
+                app = r["app"] or ""
+                what = ((f"{app} voice chat" if app else "a game's voice chat") if r["kind"] == "game"
+                        else (f"a {app} call" if app else "a call"))
+                problems.append(f"{what} from {_when(float(r['detected_at']))} is still marked "
+                                f"open, last seen {int((now - float(seen)) // 60)} min ago")
+        lost = conn.execute(
+            # how long the microphone recorded: to its last stop (a Stop pressed mid-call), else to the row's end
+            "SELECT * FROM (SELECT c.id, c.app, c.recording_started_at AS rs,"
+            " CASE WHEN c.recording_stopped_at >= c.recording_started_at THEN c.recording_stopped_at"
+            " ELSE coalesce(c.ended_at, c.last_alive_at) END AS ended"
+            " FROM calls c WHERE c.recording_started_at IS NOT NULL AND c.recording_started_at >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM call_chunks k WHERE k.call_id = c.id OR k.track_call_id = c.id))"
+            " WHERE ended - rs >= ? ORDER BY rs", (now - days * 86400.0, stall_s)).fetchall()
+    except Exception as exc:
+        return Check(CALL_RECORDING_CHECK, WARN, f"could not read the calls ({type(exc).__name__}: {exc})")
+    finally:
+        conn.close()
+    if lost:
+        listed = "; ".join(f"{_when(float(r['rs']))}, {r['app'] or 'a call'}, {int((r['ended'] - r['rs']) // 60)} min"
+                           for r in lost[-3:])
+        problems.append(f"{len(lost)} recorded call{'s' if len(lost) != 1 else ''} in the last {days:g} days kept "
+                        f"nothing ({listed})")
+    if not problems:
+        return Check(CALL_RECORDING_CHECK, OK, "every recording in the last week kept audio")
+    return Check(CALL_RECORDING_CHECK, WARN, "; ".join(problems),
+                 "Check that the microphone works in Windows sound settings; if it keeps happening, send "
+                 "logs\\memory-*.jsonl to whoever maintains Yuki.")
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -506,6 +718,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
     checks: list[tuple[str, Callable[[], Check]]] = [
         ("Memory service", check_memory_service),
         ("Memory search (embedder)", check_embed_pipe),
+        (CAPTURE_CHECK, check_capture_health),
         (MODELS_CHECK, lambda: check_models(settings)),
         (AI_ROLES_CHECK, lambda: check_ai_roles(offline)),
         ("Speech to text (Deepgram)", check_deepgram),
@@ -515,6 +728,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Wake word model", check_wake_model),
         ("Disk space for call audio", check_spool_disk),
         ("Call transcription models", check_whisper),
+        (CALL_RECORDING_CHECK, check_call_recording),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

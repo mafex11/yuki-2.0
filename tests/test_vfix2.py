@@ -1064,14 +1064,19 @@ def test_n8_a_stopped_runs_pitfall_is_kept_in_practice_memory_and_shown_for_that
         client.store.close()
 
 
-def test_n9_the_resolver_gets_closeness_recency_the_usual_chat_and_recent_calls() -> None:
+@pytest.mark.parametrize("day", [
+    "today",
+    # the sweep ran at 00:30 on 5 Oct: the hour back crosses midnight, so the call's own day (pinned: Friday 25 Sep)
+    pytest.param("Thu 24 Sep", marks=pytest.mark.clock("00:30")),
+])
+def test_n9_the_resolver_gets_closeness_recency_the_usual_chat_and_recent_calls(pinned_clock, day: str) -> None:
     """Review (N9 not done): a spoken request's frame lists who the user deals with lately, measured, so the thinker
     can weigh a misheard name ("hey meant") against closeness, recency, the usual app and who was on a recent call."""
     from datetime import datetime
 
     from yuki.agent.frame import LATELY_HEAD, build, people_lately
 
-    now = NOW
+    now = pinned_clock.now()   # noon by default (the call an hour back is today), 00:30 by the mark
     people = [
         {"name": "Hemanth", "relation": "best friend", "aliases": [], "last_contact": now - 1800,
          "usual_route": {"label": "Discord DM hemanth_x"}, "routes": [],
@@ -1082,10 +1087,6 @@ def test_n9_the_resolver_gets_closeness_recency_the_usual_chat_and_recent_calls(
     calls = [{"app": "Discord.exe", "service": "Discord", "start": datetime.fromtimestamp(now - 3600).isoformat(),
               "people": [{"name": "Hemanth", "how": "in the call window"}, {"name": "Priya", "how": "in the list"}]}]
     lines = people_lately(people, calls, now=now)
-    # "today", unless the hour back crosses midnight: then the call's own day (the sweep ran at 00:30)
-    started = datetime.fromtimestamp(now - 3600)
-    day = "today" if started.date() == datetime.fromtimestamp(now).date() else \
-        started.strftime("%a %d %b").replace(" 0", " ")
     assert lines[0].startswith("Hemanth (best friend); last in touch 30 min ago; mostly Discord DM hemanth_x; "
                                f"30 messages a day both ways; on a Discord call with them {day}")
     assert lines[1] == "Nichol; also heard as \"nicole\"; last in touch 9 days ago; mostly Slack DM nichol; a few " \

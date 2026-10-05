@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from yuki.log.events import _as_plain
+from yuki.log.events import _as_plain, content_kept
 from yuki.memory.secret_filter import redact_text
 
 #: Column order of ``requests.csv``. Readers use the header, so new columns go
@@ -70,11 +70,16 @@ def usage_tokens(usage: Any) -> dict[str, int]:
     }
 
 
-def append_request_row(path: Path, row: dict[str, Any]) -> None:
+def append_request_row(path: Path, row: dict[str, Any], *, content: bool | None = None) -> None:
     """Append one request to the CSV, writing the header if the file is new.
 
-    Unknown keys in ``row`` are ignored; missing ones are written empty.
+    Unknown keys in ``row`` are ignored; missing ones are written empty. ``content`` (default
+    :func:`yuki.log.events.content_kept`, off): keep the request's words in the ``request`` column; off, the column
+    is left empty (report 76: the ledger kept the raw request text outside the encrypted database). The words stay in
+    memory (the conversation turns, encrypted); the window's ledger shows a row without them as "A request".
     """
+    if not (content_kept() if content is None else content):
+        row = {**row, "request": ""}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _csv_lock:

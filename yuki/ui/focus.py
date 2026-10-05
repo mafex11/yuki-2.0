@@ -34,8 +34,11 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
-#: ``dwExtraInfo`` stamped on every event Yuki's UI injects ("YUKI" in ASCII).
-INJECT_MARK = 0x594B5549
+from yuki.core.inputtag import YUKI_INPUT_TAG
+
+#: ``dwExtraInfo`` stamped on every event Yuki's UI injects: Yuki's one input stamp, the same value its hands put
+#: on every key and click (:mod:`yuki.core.inputtag`), so the chord hook also ignores keys Yuki types elsewhere.
+INJECT_MARK = YUKI_INPUT_TAG
 
 #: An unassigned virtual-key code (the same one AutoHotkey uses as its default
 #: menu-mask key). No program binds it, so pressing it does nothing -- except

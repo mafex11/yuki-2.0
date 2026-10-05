@@ -1535,6 +1535,14 @@ class TimelineRecorder:
                 return
         except Exception:
             return
+        # appOpen second review (V1): the seen ledger - this window was on screen, so a launch may show it again once
+        # its app hides it in the tray (content-free: the handle, its process and that process's start)
+        seen = getattr(self._windows, "note_on_screen", None)
+        if seen is not None:
+            try:
+                seen([hwnd], persist=True)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         pid = self._w._window_pid(hwnd)
         facts = self._procs.get(pid)
         rules = self.privacy.rules()
@@ -1566,6 +1574,15 @@ class TimelineRecorder:
                       seen_host=seen_host, signal_meeting=signal)
         self._mark_acting(st)
         self._current = st
+        if app and not facts.is_own:   # never for an app the user's privacy rules keep out (its app is "")
+            # appOpen F3: which program started this one (content-free, in memory only, once per process), so the
+            # practice learner can read what the user did right after one of Yuki's openings
+            try:
+                from yuki.memory import lineage
+
+                lineage.note(pid, now, by_yuki=st.by_yuki)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         if hidden:
             self._unhook_names()
         else:
@@ -1996,6 +2013,15 @@ class TimelineRecorder:
             self._open(st.hwnd, now, like=st, state="present" if idle < AWAY_AFTER_S else "away")
             return
         new_input = l1 > l0 + 0.5
+        if new_input:
+            # appOpen final check (L-T3/L-T8): when the user gave input (a time only, in memory), so the practice
+            # learner tells a program the user started from one Yuki's own slow launch started meanwhile
+            try:
+                from yuki.memory import lineage
+
+                lineage.note_input(l1)
+            except Exception:  # noqa: BLE001 - never breaks the timeline
+                pass
         if st.state == "present" and self._watching(st):
             # The app in front is playing media: watching or listening, whatever
             # the idle timer says (see the module docstring).

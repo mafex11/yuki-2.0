@@ -562,6 +562,13 @@ class Settings:
     #: Seconds without a byte before a model call counts as timed out, and to connect.
     model_timeout_s: float = 90.0
     model_connect_timeout_s: float = 10.0
+    #: The same, for the memory service's background model calls (``yuki.agent.failover.make_client``, role
+    #: ``memory``: portrait, audit, journal, episodes, cards, call digests). They stream with adaptive thinking, and
+    #: Sonnet's thinking streams no text by default (display "omitted"), so a long think is a silent stretch: the
+    #: portrait audit's chunks went quiet for over 90 s and failed 10 of 10 nightly runs on ``model_timeout_s``
+    #: (measured 28 Sep-5 Oct: every portrait ReadTimeout at 92-95 s; the calls that got through took up to 152 s).
+    #: Nobody waits on these, so a hung call may take longer to give up.
+    memory_model_timeout_s: float = 300.0
     #: After a failover worked, stay on that target this long before trying the primary again.
     failover_sticky_s: float = 300.0
     #: Loop breaker (yuki.agent.loopguard): the same failing result this many times trips it; this many
@@ -569,7 +576,9 @@ class Settings:
     loop_breaker_repeats: int = 3
     loop_breaker_failed_steps: int = 4
     loop_breaker_max_trips: int = 2
-    #: Daily model spend (agent + voice + memory) above which one notice is shown and logged.
+    #: Daily model spend (agent + voice + memory) above which one notice is shown and logged: the floor of the line.
+    #: Once a few days are known the line is measured instead (yuki.core.cost.CostAlert: 1.5 times a usual day of the
+    #: last week, never under this), so it speaks only on an unusual day (report 76: the fixed line fired 7 of 7 days).
     daily_cost_alert_usd: float = 3.0
     #: Read-only helpers (yuki.agent.subagents): model, effort ("" = none sent), output cap per call,
     #: model calls per helper, wall seconds per helper, input tokens per helper, most at once.

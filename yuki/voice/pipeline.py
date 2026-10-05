@@ -1817,6 +1817,20 @@ class TurnObserver:
         return turn.call and turn.trigger == "user" and not reply and not turn.counted
 
     @staticmethod
+    def addressed(turn: _Turn, reply: str) -> str:
+        """Who a user turn was said to, as memory keeps it: "others" when Yuki chose silence on it (the talker's
+        stay_quiet: its judgement that the words were for someone else), "unanswered" when, in a call, the next
+        words came before Yuki said or did anything - nobody judged those words, so memory's extractor reads them
+        and judges from their content (report 77b: 15 of 23 such turns were followed by a request Yuki answered,
+        and were kept out of memory as talk to the others by this timing alone), else "yuki"."""
+        if not reply and not turn.counted:
+            if turn.quiet:
+                return "others"
+            if turn.call:
+                return "unanswered"
+        return "yuki"
+
+    @staticmethod
     def _ms(a: float | None, b: float | None) -> float | None:
         return round((b - a) * 1000, 1) if a is not None and b is not None else None
 
@@ -1901,8 +1915,7 @@ class TurnObserver:
         others = self.for_others(turn, reply)
         addressed = None
         if turn.trigger == "user":
-            addressed = ("others" if others or (not reply and turn.quiet and not turn.counted)
-                         else "yuki")
+            addressed = self.addressed(turn, reply)
             self.chat({"type": "turn_closed", "turn_id": f"{self.session}-{turn.n}", "addressed": addressed,
                        "replied": bool(reply), "cut_by_user": turn.cut})
         # v3.16: what was really heard, the marker channel, and an unheard turn answered again (content-free)
@@ -1936,7 +1949,7 @@ class TurnObserver:
             # Every turn is logged, marked with who it was addressed to (v3.5, the memory builder's relay):
             # talk the mouth judged was for someone else (the people on a call, dictation to another app)
             # is stored as "others" and never extracted into memory; the thinker is never handed it either
-            # (``quiet_answered``).
+            # (``quiet_answered``). A call turn nobody judged (the next words came first) is "unanswered" (77b).
             memory, log = self.memory, self.log
             # v3.18: the turn is dated when it opened (the user's final words, or the reply a result turn began), not
             # when this row is written (the next turn's opening): practice memory's learners read "what the user said
@@ -4666,7 +4679,13 @@ class Conversation:
         self._tone("error" if item.kind == "failed" else "note")
 
     async def _speak_owed(self, text: str) -> None:
-        """An owed outcome said by code in the one voice: the thinker's own words, never held by the line check."""
+        """An owed outcome said by code in the one voice: the thinker's own words, never held by the line check (but
+        never with Yuki's internal words in them, report 76: the sentences that carry one are left out)."""
+        from yuki.core.ownwords import strip_internal
+
+        text = strip_internal(text)
+        if not text.strip():
+            return
         tts = getattr(self, "_tts", None)
         unguard = getattr(tts, "unguard", None)
         if callable(unguard):
@@ -4676,14 +4695,16 @@ class Conversation:
     async def _speak_result(self, lines: list[str]) -> None:
         """C1 (v3.17): a result's sentences said by code in the one voice, each its own piece (so each starts the moment
         its audio is ready, and a sentence fetched ahead, C2, is found by its words); the thinker's own words, never
-        held by a blocking line check (as an owed outcome's)."""
+        held by a blocking line check (as an owed outcome's), but never with Yuki's internal words in them (report 76:
+        the sentences that carry one are left out)."""
+        from yuki.core.ownwords import strip_internal
+
+        lines = [kept for kept in (strip_internal(line) for line in lines) if kept.strip()]
         tts = getattr(self, "_tts", None)
         unguard = getattr(tts, "unguard", None)
         if lines and not self.observer.bot_speaking:
             self.observer.speech_pending_since = time.monotonic()   # words on their way: Yuki is about to speak
         for line in lines:
-            if not line.strip():
-                continue
             if callable(unguard):
                 unguard(line)
             await self._speak(line)

@@ -301,7 +301,8 @@ def test_call_talk_is_neither_answered_nor_kept_nor_counted() -> None:
         obs.on_frame(FunctionCallInProgressFrame(function_name="stay_quiet", tool_call_id=f"q{i}", arguments={}))
         obs.on_frame(LLMFullResponseEndFrame())
     assert obs.exchanges == 1 and obs.last_exchange == first  # talk to the call is no exchange with Yuki
-    # A friend line cut short by the next words before the mouth decided anything: not kept either.
+    # A friend line cut short by the next words before the mouth decided anything: not answered, not counted; memory
+    # keeps it as "unanswered" (nobody judged it; its extractor does, from the words: report 77b).
     obs.on_frame(TranscriptionFrame(text="haha no way", user_id="u", timestamp="t"))
     obs.on_frame(TranscriptionFrame(text="Yuki, what time is it?", user_id="u", timestamp="t"))
     obs.on_frame(LLMFullResponseStartFrame())
@@ -320,7 +321,7 @@ def test_call_talk_is_neither_answered_nor_kept_nor_counted() -> None:
     # v3.5: every turn is logged, marked with who it was for; memory never extracts the "others" ones.
     kept = [(t["user_text"], t["addressed"]) for t in memory.turns]
     assert kept == [("Yuki, pause the music", "yuki"), ("bro did you see that clutch", "others"),
-                    ("what are we doing after this?", "others"), ("haha no way", "others"),
+                    ("what are we doing after this?", "others"), ("haha no way", "unanswered"),
                     ("Yuki, what time is it?", "yuki")]
     assert obs.totals["for_others"] == 3 and obs.exchanges == 2
 

@@ -198,6 +198,14 @@ class SpeechGuard:
         if not norm:
             fut.set_result(Verdict(True, by="free"))
             return fut
+        from yuki.core.ownwords import internal_word
+
+        if internal_word(text) is not None:
+            # Yuki's own internal vocabulary (the thinker, a tool name, a stray marker word: report 76): never heard,
+            # in shadow mode too. A fixed list of Yuki's own words, no model (yuki.core.ownwords).
+            self.stats["vocab"] = self.stats.get("vocab", 0) + 1
+            fut.set_result(Verdict(False, "internals", by="vocab"))
+            return fut
         if norm in self._turn or norm in self._pending:
             self.stats["repeats"] += 1
             fut.set_result(Verdict(False, "repeat", by="repeat"))
@@ -284,9 +292,10 @@ class SpeechGuard:
             if verdict.by != "free":
                 self.heard(text)
             return verdict
-        if self.shadow:
+        if self.shadow and verdict.by != "vocab":
             # v3.16: the marker channel decides what is spoken; this verdict is only measured (a leak, if any, is
-            # logged with its reason) and the line is said. A check that failed has no verdict: not a catch.
+            # logged with its reason) and the line is said. A check that failed has no verdict: not a catch. Yuki's
+            # own internal words (``vocab``) are dropped in every mode.
             self.heard(text)
             if verdict.by in ("error", "timeout"):
                 return Verdict(True, verdict.why, verdict.ms, by=verdict.by)
@@ -324,10 +333,18 @@ class SpeechGuard:
 
         In shadow mode the line goes out at once and its verdict is only logged when it comes (no wait)."""
         fut = self.start(text)
-        if self.shadow:
+        if self.shadow and not self.blocks(fut):
             self.observe(fut, text)
             return True
         return (await self.decide(fut, text)).ok
+
+    @staticmethod
+    def blocks(fut: Any) -> bool:
+        """The verdict is in and drops the line in every mode, shadow too: Yuki's own internal words (``vocab``)."""
+        try:
+            return bool(fut is not None and fut.done() and fut.result().by == "vocab")
+        except Exception:  # noqa: BLE001
+            return False
 
     def observe(self, fut: "asyncio.Future[Verdict]", text: str) -> None:
         """Shadow mode: log this line's verdict when it arrives, in the background; the line is never held for it."""

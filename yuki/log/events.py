@@ -245,6 +245,107 @@ class UsageTotals:
 # ---------------------------------------------------------------------------
 
 
+#: Set to ``1`` to keep the words in the agents' session logs and the request ledger (a developer chasing a bug,
+#: on their own PC). Unset (the default), they keep counts, ids and timings only (report 76).
+LOG_CONTENT_ENV = "YUKI_LOG_CONTENT"
+
+
+def content_kept() -> bool:
+    """Whether the agents' session logs and ``requests.csv`` keep the words (:data:`LOG_CONTENT_ENV`)."""
+    import os
+
+    return os.environ.get(LOG_CONTENT_ENV, "").strip() == "1"
+
+
+#: String fields a content-free log keeps as they are: ids, Yuki's own names (tools, models, lanes) and states, never
+#: the user's or a page's words. Every other string becomes its length (``<field>_chars``).
+ID_FIELDS: frozenset[str] = frozenset({
+    "session", "session_id", "type", "path", "model", "name", "tool_use_id", "stop_reason", "lane", "outcome",
+    "effort", "kind", "state", "started_at", "role", "mode", "via", "id", "request_id", "tool", "app", "op",
+})
+
+
+def _error_kind(text: str) -> str:
+    """``"ReadTimeout"`` from ``"ReadTimeout: The read operation timed out"``: the exception's type, not its message."""
+    head = text.split(":", 1)[0].strip()
+    return head if head.replace(".", "_").isidentifier() else ""
+
+
+def _trace_frames(text: str) -> str:
+    """A traceback without its messages: the code locations and the exception types (content-free)."""
+    out = []
+    for line in str(text).splitlines():
+        if line.startswith(("Traceback", "  File ")):
+            out.append(line)
+        elif line and not line.startswith(" "):
+            kind = _error_kind(line)
+            if kind:
+                out.append(kind)
+    return "\n".join(out)
+
+
+def _counts_only(value: Any) -> Any:
+    """``value`` with every string that is not an id replaced by its length (see :data:`ID_FIELDS`)."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, v in value.items():
+            if isinstance(v, str) and key not in ID_FIELDS:
+                if key == "traceback":
+                    out[key] = _trace_frames(v)
+                elif key == "error":
+                    out["error_kind"] = _error_kind(v)
+                    out["error_chars"] = len(v)
+                else:
+                    out[f"{key}_chars"] = len(v)
+            else:
+                out[key] = _counts_only(v)
+        return out
+    if isinstance(value, list):
+        return [len(v) if isinstance(v, str) else _counts_only(v) for v in value]
+    return value
+
+
+def _block_shape(block: Any) -> Any:
+    """One content block as counts: its type, a tool's name, and how long its text or input is."""
+    if not isinstance(block, dict):
+        return {"chars": len(json.dumps(block, ensure_ascii=False, default=str))}
+    shape: dict[str, Any] = {"type": block.get("type")}
+    if block.get("name"):
+        shape["name"] = block.get("name")
+    if block.get("id"):
+        shape["id"] = block.get("id")
+    rest = {k: v for k, v in block.items() if k not in ("type", "name", "id", "signature")}
+    shape["chars"] = len(json.dumps(rest, ensure_ascii=False, default=str))
+    return shape
+
+
+def content_free(record: dict[str, Any]) -> dict[str, Any]:
+    """A log record with counts, ids and timings only (report 76: the worker logs kept the user's messages, screen
+    summaries and replies in plain text, outside the encrypted database). The request's bulk becomes its size: the
+    messages their count and length, the tools their names, a response's blocks their type, name and length."""
+    rec = dict(record)
+    heavy: dict[str, Any] = {}
+    if rec.get("type") == "llm_request":
+        messages = rec.pop("messages", None)
+        system = rec.pop("system", None)
+        tools = rec.pop("tools", None)
+        heavy["messages"] = {"count": len(messages) if isinstance(messages, list) else 0,
+                             "chars": len(json.dumps(messages, ensure_ascii=False, default=str))}
+        heavy["system_chars"] = len(json.dumps(system, ensure_ascii=False, default=str))
+        heavy["tools"] = [t.get("name") for t in tools if isinstance(t, dict)] if isinstance(tools, list) else []
+    elif rec.get("type") == "llm_response" and isinstance(rec.get("content"), list):
+        heavy["content"] = [_block_shape(b) for b in rec.pop("content")]
+    for key in ("input", "result", "payload"):
+        if key in rec and not isinstance(rec[key], (int, float, bool)) and rec[key] is not None:
+            value = rec.pop(key)
+            heavy[f"{key}_chars"] = len(json.dumps(value, ensure_ascii=False, default=str))
+            if key == "input" and isinstance(value, dict):
+                heavy["input_keys"] = sorted(str(k) for k in value)
+    out = _counts_only(rec)
+    out.update(heavy)
+    return out
+
+
 def _as_plain(value: Any) -> Any:
     """Best-effort conversion of SDK/dataclass objects to plain JSON types."""
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -283,6 +384,7 @@ class SessionLogger:
         console: Console | None = None,
         session_id: str | None = None,
         quiet: bool = False,
+        content: bool = True,
     ) -> None:
         """Open a new session file.
 
@@ -291,7 +393,10 @@ class SessionLogger:
             console: Rich console to print to; a default one is made if omitted.
             session_id: Override the timestamp-based id (tests use this).
             quiet: Suppress console output but still write JSONL.
+            content: False: the file keeps counts, ids and timings only (:func:`content_free`; the desktop's
+                agents, report 76), and the console shows no words either. The caller still gets each record whole.
         """
+        self.content = content
         self.session_id = session_id or datetime.now().strftime("%Y%m%d-%H%M%S")
         self.sessions_dir = Path(sessions_dir)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -342,6 +447,11 @@ class SessionLogger:
             "type": type,
         }
         record.update({k: _as_plain(v) for k, v in fields.items()})
+        if not self.content:
+            line = json.dumps(content_free(record), ensure_ascii=False, default=_as_plain)
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            return record
         line = json.dumps(record, ensure_ascii=False, default=_as_plain)
         if secret_filter.find(line):
             # A password or key in a request, a tool input or captured screen text: the log keeps the
@@ -603,8 +713,9 @@ class SessionLogger:
     def _print(self, markup: str) -> None:
         """One console line. Every piece of text from outside (the model, tools, the user) is escaped where the line
         is built (``_x``); a line that still does not parse is printed as plain text, never raised (2026-09-29: a
-        stray "[/cyan]" in the model's reasoning raised rich's MarkupError out of the agent loop)."""
-        if self.quiet:
+        stray "[/cyan]" in the model's reasoning raised rich's MarkupError out of the agent loop). A content-free
+        logger prints nothing (its lines carry the words)."""
+        if self.quiet or not self.content:
             return
         try:
             self.console.print(markup, highlight=False)

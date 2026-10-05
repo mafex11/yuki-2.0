@@ -558,7 +558,8 @@ def build_home(memory: Any, *, requests_csv: Path | None = None, since: float | 
             change["undo"] = {"card": c["card"], "until": c["undo_until"], "label": "Undo"}
         away.append({"kind": "card", "title": {"done": "Done from a card", "undone": "Undone"}[n["outcome"]],
                      "at": epoch_of(n.get("outcome_at")) or at, "state": n["outcome"], "changed": [change]})
-    for r in (read_request_log(requests_csv, since, limit=INBOX_MAX) if requests_csv else []):
+    logged = read_request_log(requests_csv, since, limit=INBOX_MAX) if requests_csv else []
+    for r in request_words_from_memory(memory, logged):
         words, _cost = request_row_words(r)
         took = took_words(r.get("wall_s"))
         # how long it took, as a person says it; never the raw "7.0 s, 3 steps, 8¢" line (the 3 Oct feedback)
@@ -1941,6 +1942,29 @@ LEDGER_UNDO_S = UNDO_WITHIN_S
 SAME_REQUEST_S = 2.5
 
 
+def request_words_from_memory(memory: Any, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``rows`` (:func:`yuki.ui.ledger.read_request_log`) with the user's words filled in where the log has none:
+    ``requests.csv`` no longer keeps them (report 76), memory's encrypted exchanges do. A row and an exchange are the
+    same request when they started within :data:`SAME_REQUEST_S` (both are stamped when the request began). Only the
+    days of rows without words are read (``turns_on``); a row with no match keeps "" ("A request"). Never raises
+    (review F7)."""
+    need = [r for r in rows if not str(r.get("what") or "").strip() and r.get("at")]
+    fetch = getattr(memory, "turns_on", None)
+    if not need or not callable(fetch):
+        return rows
+    from yuki.memory.checkins import user_day
+
+    turns: list[dict[str, Any]] = []
+    for day in sorted({user_day(float(r["at"])) for r in need}):
+        turns += [t for t in (_safe(lambda day=day: fetch(day), []) or [])
+                  if isinstance(t, dict) and t.get("at") and str(t.get("user") or "").strip()]
+    for r in need:
+        best = min(turns, key=lambda t: abs(float(t["at"]) - float(r["at"])), default=None)
+        if best is not None and abs(float(best["at"]) - float(r["at"])) <= SAME_REQUEST_S:
+            r["what"] = str(best["user"])
+    return rows
+
+
 def _clip(text: Any, n: int) -> str:
     t = " ".join(str(text or "").split())
     return t if len(t) <= n else t[: n - 1].rstrip() + "…"
@@ -2118,9 +2142,9 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
         rows.extend(run_rows(run, todos, now, rules))
     run_starts = sorted(float(r.get("at") or 0) for r in runs)
     lanes = {"worker": "Typed request", "front_desk": "Quick answer", "voice": "Voice"}
-    for r in read_request_log(requests_csv, since, limit=120) if requests_csv else []:
-        if any(abs(r["at"] - a) <= SAME_REQUEST_S for a in run_starts):
-            continue   # the run trace above has this request, step by step
+    logged = [r for r in (read_request_log(requests_csv, since, limit=120) if requests_csv else [])
+              if not any(abs(r["at"] - a) <= SAME_REQUEST_S for a in run_starts)]   # else the run trace has it
+    for r in request_words_from_memory(memory, logged):
         words, cost = request_row_words(r)
         status = {"done": "done", "failed": "failed", "stopped": "stopped"}.get(r["state"], "done")
         voice = r.get("where") == "voice"
@@ -2289,6 +2313,26 @@ def takeover_view(px: Any) -> dict[str, Any]:
     return {"px": px, "label": U.TAKEOVER_MOVE_LABEL, "hint": U.TAKEOVER_MOVE_HINT, "choices": choices}
 
 
+def record_view(privacy: dict[str, Any] | None, apps: list[str]) -> dict[str, Any]:
+    """Settings → Privacy and pause → Record how I work (report 78 C0): the switch, always shown off and locked
+    (nothing records yet; it waits for the user's go-ahead), and the apps to leave out (the privacy file's
+    ``[trace] leave_out``), with the apps seen this week offered to add. ``apps``: their names, as App access shows
+    them."""
+    from yuki.ui import ui_settings as U
+
+    trace = (privacy or {}).get("trace") if isinstance((privacy or {}).get("trace"), dict) else {}
+    out: list[str] = []
+    for value in trace.get("leave_out", []) if isinstance(trace.get("leave_out"), list) else []:
+        name = " ".join(str(value).split())
+        if name and name.casefold() not in {o.casefold() for o in out}:
+            out.append(name)
+    left = {o.casefold() for o in out}
+    choices = [a for a in apps if a and a.casefold() not in left]
+    return {"on": False, "locked": True, "label": U.RECORD_LABEL, "hint": U.RECORD_HINT, "waiting": U.RECORD_WAITING,
+            "leave_out": out, "choices": choices, "leave_out_label": U.RECORD_LEAVE_OUT_LABEL,
+            "leave_out_hint": U.RECORD_LEAVE_OUT_HINT}
+
+
 def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: dict[str, Any] | None = None,
                    policy_path: Path | None = None, ui_path: Path | None = None) -> dict[str, Any]:
     """Settings: the autonomy policy, app access (look: the privacy blocklist; act: the policy's per-app switch),
@@ -2349,6 +2393,8 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
                                    for k, v in T.ACCENTS.items()]},
         # While I work: how far the mouse must move for me to pause (the takeover watch reads it as a task starts)
         "takeover": takeover_view(ui.takeover_move_px),
+        # Record how I work (report 78 C0): off and locked until the user's go-ahead; the leave-out list is ready
+        "record": record_view(privacy, [a["app"] for a in apps if a.get("look")]),
         "usage": yuki_usage(),
         # Settings → AI (report 67): each job's service and model, each service's key status (never a key); no
         # network here (the page asks for model lists with the ai_models action, off the UI thread)

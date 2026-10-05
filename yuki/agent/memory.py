@@ -455,6 +455,28 @@ class MemoryAccess:
                 raise MemoryUnavailable(f"memory has no {name}()") from None
             raise
 
+    # -- what practice memory learned apps run as (appOpen) ------------------------------------------------------
+
+    #: How long the learned launch identities are kept before memory is asked again (seconds), and how long a launch
+    #: waits for memory's answer at most (a launch never waits on memory for long: then nothing learned is used).
+    LAUNCH_IDS_TTL_S = 60.0
+    LAUNCH_IDS_WAIT_S = 0.5
+
+    def learned_launch_images(self, name: str) -> list[str]:
+        """The programs practice memory learned the app of the Start entry ``name`` runs as (``MemoryClient.
+        launch_identities``), for ``yuki.actions.launch.set_learned_images``. Cached for :data:`LAUNCH_IDS_TTL_S`;
+        ``[]`` when memory is unavailable or slow. Never raises."""
+        now = time.monotonic()
+        cached = getattr(self, "_launch_ids", None)
+        if cached is None or now - cached[0] > self.LAUNCH_IDS_TTL_S:
+            try:
+                table = self.call_method("launch_identities", timeout_s=self.LAUNCH_IDS_WAIT_S)
+            except Exception:
+                table = None
+            table = table if isinstance(table, dict) else (cached[1] if cached is not None else {})
+            self._launch_ids = cached = (now, table)
+        return list(cached[1].get(str(name or "").casefold()) or [])
+
     # -- portrait --------------------------------------------------------------
 
     def invalidate_portrait(self) -> None:
@@ -642,8 +664,8 @@ class MemoryAccess:
             actions: One line per thing Yuki did.
             outcome: ``final``, ``error``, ``cancelled`` or ``abandoned``.
             on_done: Result callback; exceptions from it are swallowed.
-            addressed: Who a voice turn was said to ("yuki" | "others", voice's ``turn_closed``); a turn
-                said to others is kept but never extracted into rules, to-dos or facts.
+            addressed: Who a voice turn was said to ("yuki" | "others" | "unanswered", voice's ``turn_closed``);
+                a turn said to others is kept but never extracted into rules, to-dos or facts.
 
         Returns:
             ``False`` when memory is not installed (nothing queued).

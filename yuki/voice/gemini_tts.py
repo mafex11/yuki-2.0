@@ -679,7 +679,8 @@ def service_class() -> type:
                             # Its audio is ready: the line is heard only if the check keeps it (it ran alongside).
                             checked = True
                             guard = self._yuki_guard
-                            if getattr(guard, "shadow", False):
+                            blocks = getattr(guard, "blocks", None)   # Yuki's internal words: dropped in shadow too
+                            if getattr(guard, "shadow", False) and not (callable(blocks) and blocks(piece.verdict)):
                                 # v3.16, the marker channel: the verdict is logged when it comes; nothing waits.
                                 guard.observe(piece.verdict, strip_tags(piece.text))
                             else:

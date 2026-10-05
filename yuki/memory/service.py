@@ -311,6 +311,7 @@ def run(args: argparse.Namespace) -> int:
     transcriber = None
     transcriber_thread: threading.Thread | None = None
     screen_recall = None
+    game_gate = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -407,7 +408,7 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.callevidence import CallEvidence
 
-                call_evidence = CallEvidence(log=log)
+                call_evidence = CallEvidence(log=log, privacy=watcher.privacy)   # [meetings] always/never_sites
                 watcher.on_screen = call_evidence.seen
             except Exception as exc:  # calls then need the user's own [calls] apps
                 log("error", where="call_evidence", error=f"{type(exc).__name__}: {exc}")
@@ -523,9 +524,15 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory.portrait import PortraitScheduler, PortraitWorker
                 from yuki.memory.watcher import user_idle_s
 
+                def portrait_live() -> dict[str, Any]:
+                    # the recorder's open stretch: the nightly run waits out a meeting or a full-screen game
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen"))}
+
                 portrait = PortraitScheduler(
                     store, PortraitWorker(store, embedder=get_embedder()), db_path=db_path, log=log,
-                    idle_fn=user_idle_s,
+                    idle_fn=user_idle_s, live_fn=portrait_live,
                 )
                 portrait_thread = threading.Thread(
                     target=_guarded(portrait.run, log, "portrait"), args=(stop,), name="yuki-memory-portrait",
@@ -608,8 +615,14 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory.review import ReviewScheduler, ReviewWorker
                 from yuki.memory.watcher import session_locked, user_idle_s
 
+                def review_live() -> dict[str, Any]:
+                    # the recorder's open stretch: the weekly review waits out a meeting or a full-screen game
+                    tl = timeline
+                    st = tl.stats() if tl is not None and tl.alive else {}
+                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen"))}
+
                 review = ReviewScheduler(store, ReviewWorker(store, log=log), db_path=db_path, privacy=privacy,
-                                         log=log, idle_fn=user_idle_s, locked_fn=session_locked)
+                                         log=log, idle_fn=user_idle_s, locked_fn=session_locked, live_fn=review_live)
                 review_thread = threading.Thread(
                     target=_guarded(review.run, log, "review"), args=(stop,), name="yuki-memory-review",
                     daemon=True,
@@ -672,9 +685,27 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     log("error", where="calldigest_start", error=f"{type(exc).__name__}: {exc}")
 
+        # The hard game gate (report 78 §4.5, phase C0): knows when a game runs; logs its decisions only (nothing
+        # obeys it yet). Its own event-driven thread; a failure here never stops memory. A later capture phase asks
+        # gamegate.gate_holds(game_gate): a gate that failed to start (None) holds.
+        try:
+            from yuki.memory.gamegate import GameGate
+
+            def game_voice_open() -> bool:
+                c = calls
+                return c is not None and (getattr(c, "game", None) is not None
+                                          or getattr(c, "_gaming", None) is not None)
+
+            game_gate = GameGate(store=store, privacy_path=privacy.path, log=log,
+                                 game_session_fn=game_voice_open).start()
+        except Exception as exc:
+            log("error", where="game_gate_start", error=f"{type(exc).__name__}: {exc}")
+            game_gate = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
+        game_gate_dead = False
         privacy_error = privacy.last_error
         wall_seen = time.time()
         while not stop.is_set():
@@ -692,6 +723,17 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="watcher", error="hook thread exited")
                 code = 2
                 break
+            if game_gate is not None:
+                # Piggyback (no loop of its own): D3D full screen and the game voice session show no window event.
+                # A dead gate thread is kept, not dropped: it then holds (fails closed), logged once.
+                if game_gate.alive:
+                    try:
+                        game_gate.beat()
+                    except Exception as exc:
+                        log("error", where="game_gate_beat", error=type(exc).__name__)
+                elif not game_gate_dead:
+                    game_gate_dead = True
+                    log("error", where="game_gate", error="game gate thread exited; it holds from now")
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
@@ -739,13 +781,20 @@ def run(args: argparse.Namespace) -> int:
                 log("stats", **meter.reading(), watcher=watcher.stats(),
                     timeline=timeline.stats() if timeline is not None else None,
                     warp=warp.stats() if warp is not None else None,
-                    screen_recall=screen_recall.stats() if screen_recall is not None else None)
+                    screen_recall=screen_recall.stats() if screen_recall is not None else None,
+                    game_gate=game_gate.stats() if game_gate is not None else None)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
                     log("prune", captures_deleted=store.prune(CAPTURE_TTL_DAYS), older_than_days=CAPTURE_TTL_DAYS)
                 except Exception as exc:
                     log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
+                try:   # log files older than 14 days (report 76); counts only
+                    from yuki.log.retention import LOG_RETENTION_DAYS, prune_logs
+
+                    log("prune_logs", older_than_days=LOG_RETENTION_DAYS, **prune_logs(logs_dir()))
+                except Exception as exc:
+                    log("error", where="prune_logs", error=f"{type(exc).__name__}: {exc}")
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -788,6 +837,8 @@ def run(args: argparse.Namespace) -> int:
             calls.stop()   # closes the microphone, spools what is left (encrypted)
         if transcriber is not None:
             transcriber.stop()   # a running batch is asked to stop after its chunk
+        if game_gate is not None:
+            game_gate.stop()
         if watcher is not None:
             watcher.stop()
         if timeline is not None:

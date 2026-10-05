@@ -330,7 +330,14 @@ def test_a_spoken_send_says_one_short_line(tmp_path: Path) -> None:
 # -- 3. the brain's own live line ----------------------------------------------------------------------------------
 
 
-def test_the_situation_checks_plain_line_and_the_now_note_reach_the_island(tmp_path: Path) -> None:
+@pytest.mark.parametrize("when", [
+    pytest.param("at 2:44 PM", marks=pytest.mark.clock("15:14")),
+    # the half hour back crosses midnight (the test ran at 00:14 on 5 Oct and failed then)
+    pytest.param("yesterday at 11:44 PM", marks=pytest.mark.clock("00:14")),
+])
+def test_the_situation_checks_plain_line_and_the_now_note_reach_the_island(tmp_path: Path, pinned_clock, when: str,
+                                                                          monkeypatch) -> None:
+    monkeypatch.setattr(__import__(__name__), "NOW", pinned_clock.now())   # this module's clock, pinned
     desk = _desk()
     mem = FakeMemoryClient(own=[{"text": TEXT, "at": NOW - 1800, "first_seen": NOW - 1800, "thread": 3}])
     note = "Nothing like it in the chat, so sending it now"
@@ -338,10 +345,7 @@ def test_the_situation_checks_plain_line_and_the_now_note_reach_the_island(tmp_p
     agent = _agent(brain, tmp_path, desk, countdown=0.0, memory=MemoryAccess(open_client=lambda: mem))
     events = list(agent.run("tell sam omw"))
     nows = [e.text for e in events if isinstance(e, Partial) and e.what == "now"]
-    from yuki.agent.situation import said_when
-
-    # "at 11:44 PM" today, "yesterday at 11:44 PM" when the half hour back crosses midnight (the test ran at 00:14)
-    assert nows[0] == f"Checked Discord first: you sent something close to this {said_when(NOW - 1800, NOW)}"
+    assert nows[0] == f"Checked Discord first: you sent something close to this {when}"
     assert nows[1] == note
     assert TEXT not in nows[0]                                     # what was looked at, never the content
     call = next(i for i, e in enumerate(events) if isinstance(e, ToolCall) and e.name == "type_text")
