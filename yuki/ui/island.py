@@ -413,7 +413,7 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
         face = {"listening": "woke" if i.voice == "starting" else "listening", "call-notice": "quiet-in-call"}.get(
             state, state)
         if state == "done-flash":
-            face = "done-flash" if (i.final is None or i.final.outcome == "done") else "handed"
+            face = _done_face(i.final)
         # the halo belongs to the open island: the pill never carries it
         return Spec(state, face=face, compact=True, word=compact_word(state, i), rec=rec, step=step_of(run),
                     title=_notice_title(i) if state == "call-notice" else compact_word(state, i))
@@ -487,7 +487,7 @@ def spec_for(state: str, i: IslandInputs, *, voice_key: str = "", stop_key: str 
     if state == "done-flash":
         f = i.final or FinalInfo("Done.")
         if expanded and f.run is not None:
-            return Spec(state, face="done-flash" if f.outcome == "done" else "handed", exp=True, width=RUN_W,
+            return Spec(state, face=_done_face(f), exp=True, width=RUN_W,
                         line=f.text, sub=f.meta or _final_sub(f), rec=rec, body="run", keys=("chev",))
         keys = ("chev",) if f.run is not None else ()   # the finished run's card opens from here
         if f.outcome == "done" and f.level in LEVEL_CHIPS:
@@ -531,6 +531,14 @@ NOTICE_ROOM = COMPACT_MAX_W - (1 + COMPACT_PAD + FACE_W * COMPACT_PITCH + COMPAC
 #: honest (87): the done flash's chip for a run whose outcome level is below likely, and its sub line's word.
 LEVEL_CHIPS = {"unverified": "unconfirmed", "failed": "failed"}
 LEVEL_WORDS = {"unverified": "Not confirmed", "failed": "Didn't work"}
+
+
+def _done_face(f: FinalInfo | None) -> str:
+    """The end's face: the stamped done check only for a run that ended done at likely or better (honest review F6:
+    the pill and the open run card too, not only the flash); below likely, or not done, the plain hand-back face."""
+    if f is None:
+        return "done-flash"
+    return "done-flash" if f.outcome == "done" and f.level not in LEVEL_CHIPS else "handed"
 
 
 def _final_sub(f: FinalInfo) -> str:

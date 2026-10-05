@@ -1870,6 +1870,15 @@ class VoiceBridge(QObject):
         job.verdict = dict(verdict)
         if job.log is not None and verdict.get("label"):
             job.log.add("checked", f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "))
+        if verdict.get("acted") and verdict.get("label"):
+            # review (items not done): the thinker's steps reach the shared action ledger as "not verified" one by one
+            # (a step's level is not on its event); the request's one verdict closes them, so the talker's desktop
+            # block and the next hand-off read the checked level, never only the step marks
+            level = str(verdict.get("level") or "")
+            self.actions.add("the thinker", f'the request "{job.brief()}", as a whole',
+                             f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "),
+                             ok=level != "failed", verified=True if level == "verified" else False if level == "failed"
+                             else None)
         self._log("bridge", op="outcome", job_id=job_id, level=verdict.get("level"), acted=verdict.get("acted"),
                   send=verdict.get("send"))
 

@@ -676,6 +676,37 @@ def failed_row(name: str, tool_input: dict[str, Any] | None) -> str:
 LEVEL_HEADS: dict[str, tuple[str, str]] = {"unverified": ("dash", "Not confirmed"), "failed": ("x", "Didn’t work")}
 
 
+#: honest review F7: the title of a run below likely when no step names what it tried.
+ATTEMPTED_TITLE = "Tried what you asked"
+
+
+def attempted(steps: list[dict[str, Any]], verdict: dict[str, Any] | None) -> str:
+    """honest review F7: the one line for a run that ended done below likely (the card's title, the strip's final word
+    and the window's line), in the running words of what it tried ("Sending Ana the message", "Quitting Slack"),
+    never the brain's past-tense claim: an unconfirmed send's own step, else the step the verdict turned on (its
+    ``what``), else the last effect, else :data:`ATTEMPTED_TITLE`. Machine fields only."""
+    verdict = verdict if isinstance(verdict, dict) else {}
+    if verdict.get("send") == "unconfirmed":
+        sends = [st for st in steps if _about(st.get("input") or {}).get("sends")]
+        if sends:
+            return describe_step(str(sends[-1].get("name") or ""), sends[-1].get("input") or {}, limit=ACHIEVED_CHARS)
+    step = " ".join(str(verdict.get("step") or "").split())
+    if step:
+        return describe_step("", {WHAT: step}, limit=ACHIEVED_CHARS)
+    effects = [st for st in steps if str(st.get("name") or "") != "done"
+               and is_effect(str(st.get("name") or ""), st.get("input"))]
+    if effects:
+        return describe_step(str(effects[-1].get("name") or ""), effects[-1].get("input") or {}, limit=ACHIEVED_CHARS)
+    return ATTEMPTED_TITLE
+
+
+def final_line(steps: list[dict[str, Any]], verdict: dict[str, Any] | None) -> str:
+    """The one line a run that ended done is shown with: what it achieved (:func:`achievement`), or below likely what
+    it tried (:func:`attempted`)."""
+    level = str((verdict or {}).get("level") or "") if isinstance(verdict, dict) else ""
+    return attempted(steps, verdict) if level in LEVEL_HEADS and verdict.get("acted") else achievement(steps)
+
+
 def _sentence_case(text: str) -> str:
     text = " ".join(str(text or "").split())
     return text[:1].upper() + text[1:] if text else ""
@@ -768,7 +799,7 @@ def return_view(outcome: str, text: str, steps: list[dict[str, Any]],
     elif outcome == "handed":
         title = " ".join(str(text or "").split()) or "Handed back. You have the controls."
     else:
-        title = achievement(steps) or FINISHED_TITLE
+        title = final_line(steps, verdict) or FINISHED_TITLE   # review F7: below likely, what it tried
         rows = [r for r in rows if r["text"] != title]
         graded = level_row(verdict)
         if graded is not None:

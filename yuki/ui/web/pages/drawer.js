@@ -44,8 +44,7 @@
   function stepRow(s) {
     const bad = s.ok === false;
     return h('div', { class: 'st' + (bad ? ' bad' : '') + (s.running ? ' run' : '') + (s.depth ? ' d1' : '') },
-      // honest (87): a finished line with a result its checks did not confirm (ok null: "Not confirmed: …") gets a dash
-      s.running ? h('span', { class: 'spin' }, ic('retry')) : bad ? ic('x') : s.ok === null && s.result ? ic('dash') : ic('check'),
+      s.running ? h('span', { class: 'spin' }, ic('retry')) : bad ? ic('x') : ic('check'),
       h('span', null, s.label || '', s.result ? h('small', { text: s.result }) : null),
       // a time only for a step of a second or more, never milliseconds (the 3 Oct item 14)
       s.running && s.started ? h('span', { class: 'ms', data: { since: s.started }, text: fmt.secs(Date.now() / 1000 - s.started) })
@@ -71,6 +70,8 @@
       h('span', { class: 's' + (m.wait ? ' wait' : ''), text: m.state })))) : null;
     return h('div', { class: 'y', data: { k: it.id } }, h('span', { class: 'who', text: 'yuki' }),
       text ? h('span', { class: 'tx' + (it.status === 'failed' ? ' failed' : it.status === 'interrupted' ? ' dim' : ''), text }) : h('span', { class: 'tx dim', text: it.question || '' }),
+      // honest (87, review F5): a run that ended below likely shows its checked level under the reply, with a dash
+      it.outcome && it.outcome.text ? h('div', { class: 'meta' }, it.outcome.ok === false ? ic('x') : ic('dash'), ' ', it.outcome.text) : null,
       liveLine, addedEl, fold, !steps.length && it.meta && !it.running ? h('div', { class: 'meta', text: it.meta }) : null,
       it.status === 'interrupted' ? h('div', { class: 'meta', text: 'interrupted' }) : null);
   }

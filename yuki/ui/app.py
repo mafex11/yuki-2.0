@@ -66,7 +66,7 @@ from yuki.ui.island import PAUSED_NOTE, PAUSE_STOP_LINE, RESUMED_NOTE, Island, o
 from yuki.ui.overlay import Overlay, ReplyCard
 from yuki.ui.runtime import FRONT_DESK, WORKER, AgentRuntime
 from yuki.ui.status import describe_summary, describe_tool
-from yuki.ui.step_words import (FAILED_TITLE, achievement, clock, graded_reply, label_input, return_view,
+from yuki.ui.step_words import (FAILED_TITLE, clock, final_line, graded_reply, label_input, return_view,
                                 took_words)
 from yuki.ui.uilog import UiLog
 from yuki.ui.window_host import WindowHost
@@ -863,7 +863,7 @@ class YukiUi(QObject):
         # text, which stays in the log).
         final = text
         if acted and outcome == "done":
-            line = achievement(list((run or {}).get("calls") or []))
+            line = final_line(list((run or {}).get("calls") or []), verdict)   # review F7: below likely, what it tried
             final = line or text
             host = getattr(self, "window_host", None)
             if line and callable(getattr(host, "emit", None)):

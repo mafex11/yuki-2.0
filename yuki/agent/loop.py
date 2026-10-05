@@ -1840,7 +1840,8 @@ class Agent:
 
     def _trace_step(self, name: str, tool_input: dict[str, Any], *, ok: bool | None, verdict: bool | None = None,
                     why: str = "", result: str = "", ms: float = 0.0, outcome: ToolOutcome | None = None,
-                    kind: str | None = None, control: str | None = None, send: str | None = None) -> None:
+                    kind: str | None = None, control: str | None = None, send: str | None = None,
+                    send_sig: str | None = None) -> None:
         """One step of this request's run trace (practice memory, Phase C): the tool, the app it acted in and the
         control's role and name and the window's title (never a window number as meaning: the ids and coordinates it
         touched go to the run's numbers), its input, the verdict and why, what it reported, how long it took and the
@@ -1890,7 +1891,11 @@ class Agent:
             if control:
                 step["control"] = control
             if send:
-                step["send"] = send   # honest (87): confirmed | unconfirmed in memory's capture of the chat
+                step["send"] = send   # honest (87): confirmed | unconfirmed | unchecked in memory's capture of the chat
+                if send_sig:
+                    step["send_sig"] = send_sig   # which message (a fingerprint): a retry is the same message
+                if window and window.get("title"):
+                    step["window"] = str(window["title"])[:80]   # which chat, when no text was known (review F2)
             launcher = details.get("launcher") if name == "launch_app" else None
             if isinstance(launcher, dict):
                 # appOpen review F1: which launcher took it and when, so practice memory tells a game this launch
@@ -3215,6 +3220,7 @@ class Agent:
         verdict: tuple[bool | None, str] | None = None
         send_note: str | None = None
         send_state: str | None = None   # honest (87): a send's confirmation, for the outcome verdict
+        send_sig: str | None = None
         if name in ACTION_TOOL_NAMES:
             # What the action's own report verifies (v3.14): an outcome is said only on a verified effect.
             verdict = action_verdict(name, outcome)
@@ -3245,6 +3251,14 @@ class Agent:
                         send_note = verdict[1]
                 else:
                     self._sends.append({"tool": name, "confirmed": None, "why": "no text known to look for"})
+                    # honest review F3: a send pressed with no text known (typing failed before it) is a send nothing
+                    # could check: graded by the send rule, never put right by an unrelated verified step
+                    send_state = finish_gate.SEND_UNCHECKED
+                if text.strip():
+                    # which message it was (a fingerprint only, never the text): a later confirmed send puts it right
+                    # only when it is the same message (review F2)
+                    squashed = " ".join(text.split()).casefold()
+                    send_sig = hashlib.sha1(squashed.encode("utf-8", "replace")).hexdigest()[:12]
                 self._typed.pop(int(hwnd_acted or 0), None)
             elif outcome.ok and name == "type_text" and hwnd_acted:
                 held = "" if tool_input.get("clear") else self._typed.get(int(hwnd_acted), "")
@@ -3311,7 +3325,8 @@ class Agent:
         if name not in CONTROL_TOOLS:
             self._trace_step(name, tool_input, ok=outcome.ok, verdict=verdict[0] if verdict else None,
                              why=verdict[1] if verdict else "", result=outcome.summary, ms=outcome.elapsed_ms,
-                             outcome=outcome, control=target.get("control") if acts else None, send=send_state)
+                             outcome=outcome, control=target.get("control") if acts else None, send=send_state,
+                             send_sig=send_sig)
             if acts and verdict is not None and outcome.ok:
                 self._mark_confirmations(target.get("hwnd"), verdict)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload, about=step_words)
