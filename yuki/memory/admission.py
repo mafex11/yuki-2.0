@@ -156,6 +156,9 @@ or GAME VOICE line; anything where the talk around it leaves room for banter. It
 - drop: read with the lines around it, it was not meant as true or makes no sense: a joke, a tease, a boast, an \
 exaggeration, a hypothetical, role-play, quoting a film or someone else, a game callout, or words that do not fit \
 together (misheard). Nobody is asked about it.
+Admit only what is clearly the user's own plan or current doing in their own plain words; when you hesitate between \
+admit and ask, choose ask - a wrong fact in memory costs the user a correction, a line that waits costs one tap. \
+When you hesitate between ask and drop, choose ask. \
 And sensitive (see SENSITIVE ABOUT THE USER below), and shown: the fact said to the user in one short, plain sentence \
 in the second person, as a friend would say it back ("You're moving to Pune in March."; for someone else's line, \
 "Someone on the call said the trek starts at 6 AM on Saturday."), at most about 100 characters, no app or tool names.
@@ -293,7 +296,8 @@ def _line_text(line: dict[str, Any], app: str, safe: Any) -> str:
         "GAME VOICE" if line.get("track_kind") == "game" else "OTHERS")
     where = safe(str(line.get("app") or app or ""), 40)
     unclear = " UNCLEAR" if line.get("unclear") else ""
-    return f"{who}{f' on {where}' if who != 'THE USER' and where else ''}{unclear}: \"{safe(line.get('text'), LINE_CHARS)}\""
+    on = f" on {where}" if who != "THE USER" and where else ""
+    return f"{who}{on}{unclear}: \"{safe(line.get('text'), LINE_CHARS)}\""
 
 
 def build_judge_message(items: Sequence[JudgeItem], nonce: str) -> str:
@@ -675,7 +679,8 @@ def _forget_corrections(store: Any, since: float) -> list[dict[str, Any]]:
         jids: set[int] = set()
         p = store._query("SELECT changes_ciphertext FROM correction_passes WHERE correction_id=?", (r["id"],))
         try:
-            changes = json.loads(store._dec(p[0]["changes_ciphertext"]) or "[]") if p and p[0]["changes_ciphertext"] else []
+            raw = p[0]["changes_ciphertext"] if p else None
+            changes = json.loads(store._dec(raw) or "[]") if raw else []
         except ValueError:
             changes = []
         for c in changes:
@@ -684,16 +689,19 @@ def _forget_corrections(store: Any, since: float) -> list[dict[str, Any]]:
         # the portrait fact it was about: one that ended within a few minutes after it, whose text it quotes
         had = text.partition('(memory had: "')[2].rpartition('"), the user said')[0]
         if had:
-            for f in store._query("SELECT id, text_ciphertext, source_ids FROM portrait_facts WHERE valid_to"
-                                  " BETWEEN ? AND ? AND kind != ?", (r["valid_from"] - 60.0, r["valid_from"] + 3600.0,
-                                                                      CORRECTION_KIND)):
-                if " ".join(store.cipher.decrypt(f["text_ciphertext"]).split()) == " ".join(had.split()):
+            for f in store._query("SELECT id, text_ciphertext, shown_ciphertext, source_ids FROM portrait_facts WHERE"
+                                  " valid_to BETWEEN ? AND ? AND kind != ?",
+                                  (r["valid_from"] - 60.0, r["valid_from"] + 6 * 3600.0, CORRECTION_KIND)):
+                said = {" ".join(str(store._dec(f[c]) or "").split()) for c in ("text_ciphertext", "shown_ciphertext")}
+                if " ".join(had.split()) in said:
                     try:
                         jids |= {int(i) for i in json.loads(f["source_ids"] or "[]")}
                     except ValueError:
                         pass
                     break
-        out.append({"id": int(r["id"]), "journal_ids": sorted(jids)})
+        out.append({"id": int(r["id"]), "journal_ids": sorted(jids), "had": " ".join(had.split()),
+                    # the misheard list's Wrong (the uncertain path already asked the user about it)
+                    "heard": text.startswith('About "what Yuki heard"')})
     return out
 
 
@@ -718,8 +726,9 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
         pass
     cache: dict[int, tuple[str, list[dict[str, Any]]]] = {}
 
-    def outcome(es: Sequence[Any]) -> dict[int, str]:
-        """``{journal id: admitted | held_<reason> | not_a_fact}`` for each entry, as the rules would route it."""
+    def outcome(es: Sequence[Any], detail: Counter[str] | None = None) -> dict[int, str]:
+        """``{journal id: admitted | held_<reason> | not_a_fact}`` for each entry, as the rules would route it;
+        ``detail`` counts the call facts by whose line, nature, verdict and sensitivity (content-free)."""
         res: dict[int, str] = {}
         calls = [e for e in es if (e.source or {}).get("kind") == "call"]
         others = [e for e in es if (e.source or {}).get("kind") != "call"]
@@ -730,6 +739,8 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
         verdicts = judge_call_facts(client, items, settings=settings, names=names).verdicts if items else []
         for e, it, v in zip(calls, items, verdicts):
             reason = route(it.who, it.nature, v)
+            if detail is not None:
+                detail[f"{it.who}/{it.nature}/{v.verdict if v else 'none'}/{v.sensitive if v else '-'}"] += 1
             res[e.id] = (f"held_{reason}" if reason else
                          "not_a_fact" if it.nature in ("humor", "uncertain") else "admitted")
         if others:   # screen facts: only the sensitivity mark holds them (the journal gives it at the source)
@@ -738,20 +749,30 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
                     "not_a_fact" if e.nature in ("humor", "uncertain") else "admitted")
         return res
 
-    got = outcome(list(entries.values()))
+    corrected_detail: Counter[str] = Counter()
+    got = outcome(list(entries.values()), corrected_detail)
+    # the portrait's own bar (its new sensitive line): the corrected portrait fact judged for sensitivity
+    had = [c for c in corrections if c["had"]]
+    bar = dict(zip((c["id"] for c in had), judge_sensitive(client, [c["had"] for c in had], settings=settings)))
     kept_out = 0
+    kept_out_with_bar = 0
     per: Counter[str] = Counter()
     for c in corrections:
+        sensitive_fact = bar.get(c["id"], "none") != "none"
+        per["portrait_fact_sensitive"] += sensitive_fact
+        per["from_misheard_list"] += bool(c["heard"])
         states = [got.get(j) for j in c["journal_ids"] if j in got]
         if not states:
             per["no_journal_evidence"] += 1
+            kept_out_with_bar += sensitive_fact
             continue
         out_all = all(s != "admitted" for s in states)
         kept_out += out_all
+        kept_out_with_bar += out_all or sensitive_fact
         kinds = {(entries[j].source or {}).get("kind") == "call" for j in c["journal_ids"] if j in entries}
         per[("call" if True in kinds else "screen") + ("_kept_out" if out_all else "_admitted")] += 1
     fact_states = Counter(got.values())
-    by_kind = Counter(((entries[j].source or {}).get("kind") == "call" and "call" or "screen", s)
+    by_kind = Counter(("call" if (entries[j].source or {}).get("kind") == "call" else "screen", s)
                       for j, s in got.items())
 
     # good facts: current, uncorrected, cited by a current portrait fact; call ones and screen ones
@@ -765,16 +786,19 @@ def measure(store: Any, *, days: float = 7.0, good: int = 120, client: Any = Non
     rng.shuffle(call_pool)
     rng.shuffle(screen_pool)
     good_calls, good_screen = call_pool[:good], screen_pool[:good]
-    good_got = outcome(good_calls + good_screen)
+    good_detail: Counter[str] = Counter()
+    good_got = outcome(good_calls + good_screen, good_detail)
     good_states = Counter(("call" if (e.source or {}).get("kind") == "call" else "screen", good_got.get(e.id))
                           for e in good_calls + good_screen)
     return {"days": days, "forget_corrections": len(corrections),
-            "corrections_kept_out": kept_out, "corrections_by_kind": dict(per),
+            "corrections_kept_out": kept_out, "corrections_kept_out_with_portrait_bar": kept_out_with_bar,
+            "corrections_by_kind": dict(per),
             "corrected_facts": len(entries), "corrected_fact_states": dict(fact_states),
             "corrected_by_source": {f"{k[0]}:{k[1]}": v for k, v in by_kind.items()},
             "good_call_facts": len(good_calls), "good_screen_facts": len(good_screen),
             "good_states": {f"{k[0]}:{k[1]}": v for k, v in good_states.items()},
-            "good_pool": {"call": len(call_pool), "screen": len(screen_pool)}}
+            "good_pool": {"call": len(call_pool), "screen": len(screen_pool)},
+            "corrected_call_detail": dict(corrected_detail), "good_call_detail": dict(good_detail)}
 
 
 def _journal_rows(store: Any, ids: Sequence[int]) -> list[Any]:
@@ -796,7 +820,8 @@ SENSITIVE_ONLY_TOOL: dict[str, Any] = {
         "type": "object", "additionalProperties": False, "required": ["items"],
         "properties": {"items": {"type": "array", "items": {
             "type": "object", "additionalProperties": False, "required": ["fact", "sensitive"],
-            "properties": {"fact": {"type": "integer"}, "sensitive": {"type": "string", "enum": list(SENSITIVE_KINDS)}}}}},
+            "properties": {"fact": {"type": "integer"},
+                           "sensitive": {"type": "string", "enum": list(SENSITIVE_KINDS)}}}}},
     },
 }
 
