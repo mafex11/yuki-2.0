@@ -579,6 +579,10 @@ class Lane(QThread):
                 elif event.state == "finished":
                     runtime.tool_finished.emit(self.name, job.id, "helper", event.ok, f"{label}: {event.text}")
             elif isinstance(event, Final):
+                verdict = getattr(event, "outcome", None)
+                signal = getattr(runtime, "outcome", None)
+                if isinstance(verdict, dict) and signal is not None:
+                    signal.emit(self.name, job.id, dict(verdict))   # honest (87): before the words, so all repeat it
                 runtime.finished.emit(self.name, job.id, event.text)
             elif isinstance(event, ErrorEvent):
                 if self.agent.cancelled and getattr(self.agent, "cancel_reason", CANCELLED) == PARKED:
@@ -700,6 +704,11 @@ class AgentRuntime(QObject):
     #: (``paused``; why: keys | click | mouse), goes on (``resumed``: it read the screen again), or ended unresumed
     #: (``ended``: a stop follows). Sent the moment it happens, from any thread (Qt queues it to the GUI thread).
     paused_changed = Signal(str, int, str, str)
+    #: honest (87): ``(lane, id, verdict)``: the request's one outcome verdict (``yuki.agent.finish.outcome_verdict``:
+    #: level verified | likely | unverified | failed | answer, what was seen, the send's confirmation, the line said by
+    #: code below likely), sent right before ``finished``. The voice, the done card, the island and the window repeat its
+    #: level and never say more than it.
+    outcome = Signal(str, int, dict)
 
     def __init__(
         self,

@@ -1402,6 +1402,10 @@ class Agent:
         self._send_consulted = False
         self._close_call_consulted = False
         self._sends: list[dict[str, Any]] = []
+        #: honest (87): the claims of the closing message the claim check could not back after asking once (its gaps):
+        #: the outcome verdict is no stronger than "not confirmed" while one stands.
+        self._unbacked: list[str] = []
+        self._last_verdict: dict[str, Any] | None = None
         #: N0 (report 47): the situation checks made in this request (a consequential step needs one it had read).
         self._situation_checks: list[situation_check.CheckRecord] = []
         #: appPT: the questions the user answered in this request (``ask_user``: question, answer). A send whose exact
@@ -1638,6 +1642,8 @@ class Agent:
                           if getattr(self, "authorizer", None) is not None else None),
                 "consults": list(getattr(self, "_consults", [])),
                 "sends": list(getattr(self, "_sends", [])),
+                # honest (87): the request's outcome level (the window's run and the activity page read the summary)
+                "verdict": (getattr(self, "_last_verdict", None) or {}).get("level"),
             }
             self.last_summary = summary
             self.logger.request_summary(summary)
@@ -1833,7 +1839,7 @@ class Agent:
 
     def _trace_step(self, name: str, tool_input: dict[str, Any], *, ok: bool | None, verdict: bool | None = None,
                     why: str = "", result: str = "", ms: float = 0.0, outcome: ToolOutcome | None = None,
-                    kind: str | None = None, control: str | None = None) -> None:
+                    kind: str | None = None, control: str | None = None, send: str | None = None) -> None:
         """One step of this request's run trace (practice memory, Phase C): the tool, the app it acted in and the
         control's role and name and the window's title (never a window number as meaning: the ids and coordinates it
         touched go to the run's numbers), its input, the verdict and why, what it reported, how long it took and the
@@ -1882,6 +1888,8 @@ class Agent:
                     "at": time.time()}
             if control:
                 step["control"] = control
+            if send:
+                step["send"] = send   # honest (87): confirmed | unconfirmed in memory's capture of the chat
             launcher = details.get("launcher") if name == "launch_app" else None
             if isinstance(launcher, dict):
                 # appOpen review F1: which launcher took it and when, so practice memory tells a game this launch
@@ -2421,7 +2429,7 @@ class Agent:
                 if turn.finished:
                     final = self._with_list_left(turn.finished[0])
                     self.logger.final(final)
-                    yield Final(final)
+                    yield Final(final, outcome=self._outcome_verdict())
                     return
                 continue
 
@@ -2477,7 +2485,7 @@ class Agent:
             if text:
                 text = self._with_list_left(text)
                 self.logger.final(text)
-                yield Final(text)
+                yield Final(text, outcome=self._outcome_verdict())
             else:
                 message = f"The model stopped with nothing to say (stop_reason={stop_reason})."
                 self.logger.error(message)
@@ -2530,20 +2538,41 @@ class Agent:
                     f"the finishing {tool} was not verified ({why})"))
             return held
         if not turn.finished or turn.failed or self._claim_rounds >= self.CLAIM_ROUNDS:
-            if turn.finished and self._claim_rounds >= self.CLAIM_ROUNDS and self._claim_gaps(turn):
+            gaps = self._claim_gaps(turn) if turn.finished and not turn.failed else []
+            if turn.finished and self._claim_rounds >= self.CLAIM_ROUNDS and gaps:
                 self.logger.log("claim_accepted", why="asked once already this request", about=turn.done_about)
+            if turn.finished and not turn.failed:
+                self._unbacked = gaps   # honest (87): what the done says that nothing backs caps the verdict
             return held
         gaps = self._claim_gaps(turn)
         if not gaps:
+            self._unbacked = []
             return held
         self._claim_rounds += 1
         self.logger.log("claim_held", gaps=gaps, about=turn.done_about, message=turn.finished[0])
         turn.finished.clear()
         held.append(({"type": "text", "text": (
             f"{CHECK_LABEL}: your done message was not sent: {gaps[0]}. Look first "
-            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows.")},
+            f"(look_at_window, read_tabs or read_page), then finish with done saying what it shows. A done that no "
+            f"step backs reaches them as not confirmed, so word it as what you tried.")},
             "a claim about the screen had no evidence"))
         return held
+
+    def _outcome_verdict(self) -> dict[str, Any] | None:
+        """honest (87): this request's one outcome verdict (:func:`yuki.agent.finish.outcome_verdict`) from its run
+        trace and the closing message's unbacked claims, logged (counts and levels only) and carried on its ``Final``.
+        Never raises: ``None`` when it cannot be made."""
+        try:
+            verdict = finish_gate.outcome_verdict(getattr(self, "_trace", None) or [],
+                                                  unbacked=list(getattr(self, "_unbacked", None) or []))
+        except Exception as exc:  # noqa: BLE001 - the verdict never breaks a request
+            self.logger.log("outcome_verdict_failed", error=f"{type(exc).__name__}: {exc}")
+            return None
+        self.logger.log("outcome_verdict", level=verdict["level"], acted=verdict["acted"], send=verdict["send"],
+                        partial=verdict["partial"], steps=verdict["steps"], open=verdict["open"],
+                        unbacked=len(getattr(self, "_unbacked", None) or []))
+        self._last_verdict = verdict
+        return verdict
 
     def _claim_gaps(self, turn: _Turn) -> list[str]:
         """What this response's ``done`` asserts without evidence from this request's calls, in words for the brain."""
@@ -3181,6 +3210,7 @@ class Agent:
 
         verdict: tuple[bool | None, str] | None = None
         send_note: str | None = None
+        send_state: str | None = None   # honest (87): a send's confirmation, for the outcome verdict
         if name in ACTION_TOOL_NAMES:
             # What the action's own report verifies (v3.14): an outcome is said only on a verified effect.
             verdict = action_verdict(name, outcome)
@@ -3200,6 +3230,7 @@ class Agent:
                     conf = self._confirm_send(target, text, dispatched_at)
                     self._sends.append({"tool": name, "confirmed": conf["confirmed"], "waited_ms": conf["waited_ms"],
                                         "similarity": conf["similarity"]})
+                    send_state = "confirmed" if conf["confirmed"] else "unconfirmed"
                     if conf["confirmed"]:
                         verdict = (True, f"memory's capture of the chat shows the message arrived "
                                          f"({conf['waited_ms']} ms after it was sent)")
@@ -3276,7 +3307,7 @@ class Agent:
         if name not in CONTROL_TOOLS:
             self._trace_step(name, tool_input, ok=outcome.ok, verdict=verdict[0] if verdict else None,
                              why=verdict[1] if verdict else "", result=outcome.summary, ms=outcome.elapsed_ms,
-                             outcome=outcome, control=target.get("control") if acts else None)
+                             outcome=outcome, control=target.get("control") if acts else None, send=send_state)
             if acts and verdict is not None and outcome.ok:
                 self._mark_confirmations(target.get("hwnd"), verdict)
         yield ToolResult(outcome.name, outcome.ok, outcome.summary, payload=outcome.payload, about=step_words)

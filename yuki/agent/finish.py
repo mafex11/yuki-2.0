@@ -72,6 +72,154 @@ def is_expected(why: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# The outcome verdict (honest, report 87): one verdict per request, with its evidence level
+# ---------------------------------------------------------------------------
+
+#: The request's outcome levels, strongest first. ``verified``: a step's own check showed it on screen (what was seen is
+#: ``seen``); ``likely``: the action ran and its check is weak by the nature of the target (a field with no read-back,
+#: a page that does not report its scroll, a control learned to behave so) or a later step backed it; ``unverified``:
+#: nothing could show whether it worked (a send not seen in the chat, a key with nothing watched); ``failed``: a step
+#: failed or its check showed the effect did not happen, and no later step put it right.
+LIKELY = "likely"
+LEVELS = (VERIFIED, LIKELY, UNVERIFIED, FAILED)
+#: No action ran: an answer, nothing done on the desktop to grade.
+ANSWER = "answer"
+#: The levels whose words may be said as they are written (by code, or by the talker without an outcome note).
+SAYABLE = frozenset({VERIFIED, LIKELY, ANSWER})
+
+#: The level each action class gives.
+_CLASS_LEVEL = {VERIFIED: VERIFIED, EXPECTED: LIKELY, UNVERIFIED: UNVERIFIED, CONTRADICTED: FAILED, FAILED: FAILED}
+#: The levels from weakest (index 0) to strongest.
+_RANK = {FAILED: 0, UNVERIFIED: 1, LIKELY: 2, VERIFIED: 3}
+
+#: The level in plain words, for the done card, the island and the window's run (second person, no tool names).
+LEVEL_LABELS = {VERIFIED: "Checked on screen", LIKELY: "Likely done", UNVERIFIED: "Not confirmed",
+                FAILED: "Didn’t work", ANSWER: ""}
+
+#: The sentence said by code for an outcome below ``likely`` when no talker run rewords it (the owed ledger's
+#: fallback): fixed sentences per measured fact, never a reading of the brain's words.
+LINE_SEND_UNCONFIRMED = "I tried to send it, but I couldn't confirm it went."
+LINE_UNVERIFIED = "I tried, but I couldn't confirm it worked."
+LINE_PARTIAL = "Part of that didn't work."
+LINE_FAILED = "That didn't work."
+#: Said after an answer that tells the screen's state without having read it (nothing was done).
+LINE_UNREAD = "I haven't checked that on screen, though."
+
+#: What a verified step's own check saw, per tool operation (plain words: cards, the talker's ``checked``).
+_SEEN_WINDOW = {"close": "its window is gone", "minimize": "its window is minimized",
+                "maximize": "its window is maximized", "fullscreen": "its window is full screen",
+                "restore": "its window is back to normal", "focus": "its window is in front"}
+_SEEN_TOOL = {"focus_window": "its window is in front", "launch_app": "its own window is in front",
+              "open_url": "the page is open at the address", "tab": "the tab shows", "type_text": "the box holds the text",
+              "set_slider": "the level reads back", "app_volume": "the level reads back",
+              "write_clipboard": "the clipboard holds it", "scroll": "the page moved"}
+
+
+def step_level(step: dict[str, Any]) -> str:
+    """One action step's level from its run-trace facts (``ok``, ``verdict``, ``why``, ``confirmed``, ``send``)."""
+    send = step.get("send")
+    if send == "confirmed":
+        return VERIFIED
+    if send == "unconfirmed":
+        return UNVERIFIED
+    level = _CLASS_LEVEL[classify(step.get("ok") is not False, step.get("verdict"), str(step.get("why") or ""))]
+    if level == UNVERIFIED and step.get("confirmed"):
+        return LIKELY   # backed afterwards by something independent (a later verified step in the same window)
+    return level
+
+
+def _seen(step: dict[str, Any], level: str) -> str:
+    """What the step's check saw (or could not), in plain words for the card and the talker."""
+    send = step.get("send")
+    if send == "confirmed":
+        return "the message shows in the chat"
+    if send == "unconfirmed":
+        return "the message did not show up in the chat"
+    tool = str(step.get("tool") or "")
+    if level == VERIFIED:
+        if tool == "window_action":
+            return _SEEN_WINDOW.get(str((step.get("input") or {}).get("action") or ""), "the window reads back that way")
+        return _SEEN_TOOL.get(tool, "the window changed after it")
+    if level == LIKELY:
+        return ("a later step showed it worked" if step.get("confirmed")
+                else "it can't be read back from here, which is normal for it")
+    if level == UNVERIFIED:
+        return "nothing on screen showed whether it worked"
+    return "it failed" if step.get("ok") is False else "the screen showed it didn't happen"
+
+
+def _resolved(index: int, actions: list[dict[str, Any]], levels: list[str]) -> bool:
+    """Whether a later step put an earlier non-verified one right: a send only by a later confirmed send; any other
+    step by a later verified step in the same app, or by a later try of the same tool in the same app (the retry's own
+    level stands for it). Facts of the trace only."""
+    step = actions[index]
+    later = range(index + 1, len(actions))
+    if step.get("send"):
+        return any(actions[j].get("send") == "confirmed" for j in later)
+    app = step.get("app")
+    for j in later:
+        other = actions[j]
+        if other.get("send") or other.get("app") != app:
+            continue
+        if other.get("tool") == step.get("tool") or (app is not None and levels[j] == VERIFIED):
+            return True
+    return False
+
+
+def outcome_verdict(steps: list[dict[str, Any]] | None, *, unbacked: list[str] | tuple[str, ...] = ()
+                    ) -> dict[str, Any]:
+    """The request's one outcome verdict from its run trace (``yuki.agent.loop.Agent._trace``), used by the thinker's
+    log, the voice, the done card, the island and the window's run. Data only: the steps' measured verdicts, a send's
+    confirmation in memory's capture of the chat, and the claims of the closing message the claim check could not back
+    (``unbacked``, its gaps after it asked once); never a reading of the words.
+
+    The level is the weakest of the action steps no later step put right (:func:`_resolved`), and no stronger than
+    ``unverified`` while a claim stays unbacked. Returns ``{"level", "label", "acted", "seen", "send", "partial",
+    "line", "steps", "open"}``: ``seen`` what the deciding step's check saw (or could not), ``send`` ``confirmed`` /
+    ``unconfirmed`` / ``None``, ``line`` the sentence said by code when nothing rewords an outcome below ``likely``
+    (``""`` otherwise)."""
+    actions = [s for s in (steps or []) if isinstance(s, dict) and s.get("kind") == "action"]
+    sends = [s.get("send") for s in actions if s.get("send")]
+    send = None if not sends else ("confirmed" if sends[-1] == "confirmed" else "unconfirmed")
+    if not actions:
+        level = UNVERIFIED if unbacked else ANSWER
+        return {"level": level, "label": LEVEL_LABELS[level], "acted": False,
+                "seen": "what the reply says about the screen was not read in this request" if unbacked else "",
+                "send": None, "partial": False, "line": LINE_UNREAD if unbacked else "", "step": "", "steps": 0,
+                "open": 0}
+    levels = [step_level(s) for s in actions]
+    still = [i for i, lv in enumerate(levels) if lv != VERIFIED and not _resolved(i, actions, levels)]
+    if still:
+        decider = min(still, key=lambda i: (_RANK[levels[i]], -i))   # the weakest; the latest of equals
+        level = levels[decider]
+    else:
+        decider = max(range(len(actions)), key=lambda i: (actions[i].get("send") == "confirmed", i))
+        level = VERIFIED
+    if unbacked and _RANK[level] > _RANK[UNVERIFIED]:
+        level = UNVERIFIED
+        seen = "what the reply says about the screen was not read in this request"
+    else:
+        seen = _seen(actions[decider], level)
+    partial = level == FAILED and any(lv == VERIFIED for lv in levels)
+    if level == FAILED:
+        line = LINE_PARTIAL if partial else LINE_FAILED
+    elif level == UNVERIFIED:
+        line = LINE_SEND_UNCONFIRMED if send == "unconfirmed" else LINE_UNVERIFIED
+    else:
+        line = ""
+    # the deciding step in the brain's own plain words for it (its ``what``, as the window shows the step)
+    step = " ".join(str((actions[decider].get("input") or {}).get("what") or "").split())[:80]
+    return {"level": level, "label": LEVEL_LABELS[level], "acted": True, "seen": seen, "send": send,
+            "partial": partial, "line": line, "step": step, "steps": len(actions), "open": len(still)}
+
+
+def sayable(verdict: dict[str, Any] | None) -> bool:
+    """Whether a request's closing words may be said as written: no verdict (an older agent, a stand-in), or one at
+    ``likely`` or stronger, or an answer with nothing done."""
+    return not isinstance(verdict, dict) or verdict.get("level") in SAYABLE or not verdict.get("level")
+
+
+# ---------------------------------------------------------------------------
 # The finish line
 # ---------------------------------------------------------------------------
 
@@ -93,8 +241,12 @@ def finish_line(name: str, tool_input: dict[str, Any], *, process: str | None = 
     app = app_name(process)
     tool_input = tool_input or {}
     if name == "window_action":
+        if str(tool_input.get("action")) == "close":
+            # honest (87): a close is measured on the window (gone, hidden or cloaked), not the app: live, Slack was
+            # said as "closed" while it still ran in the tray
+            return f"{app}'s window is closed." if process else "The window is closed."
         state = {"minimize": "minimized", "maximize": "maximized", "fullscreen": "full screen",
-                 "restore": "restored", "focus": "in front", "close": "closed"}.get(str(tool_input.get("action")))
+                 "restore": "restored", "focus": "in front"}.get(str(tool_input.get("action")))
         return f"{app} is {state}." if state else "Done."
     if name == "focus_window":
         return f"{app} is in front."
@@ -244,6 +396,7 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
         sleep(min(POLL_S, max(0.0, within_s - elapsed)))
 
 
-__all__ = ["CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
-           "LEARNED_UNVERIFIABLE", "PAGE_SCROLL_UNVERIFIABLE", "UNVERIFIED", "VERIFIED", "app_name", "classify",
-           "confirm_send", "finish_line", "finish_request", "is_expected", "noop_line", "similar"]
+__all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
+           "LEARNED_UNVERIFIABLE", "LEVELS", "LEVEL_LABELS", "LIKELY", "PAGE_SCROLL_UNVERIFIABLE", "SAYABLE",
+           "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
+           "is_expected", "noop_line", "outcome_verdict", "sayable", "similar", "step_level"]
