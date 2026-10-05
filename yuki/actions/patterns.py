@@ -350,6 +350,9 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
     if label == "toggle":
         before, after = shared.get("toggle", (None, None))
         changed = before is not None and after is not None and before != after
+        # the control's own ToggleState before and after (0 off, 1 on, 2 indeterminate): the dispatcher's verdict
+        # goes by it when the window's tree has not caught up yet
+        details["toggle_state"] = {"before": before, "after": after}
         if changed:
             details["verified"] = True
             summary += "; its state changed"

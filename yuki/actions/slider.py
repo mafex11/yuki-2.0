@@ -181,10 +181,12 @@ def _drive_moves(slider: Slider, details: dict[str, Any], *, value: float, want:
                 if remaining <= 0:
                     break
                 if live:
-                    if not watch.wait(remaining):
+                    got = watch.wait(remaining)
+                    after = slider.read()[0]   # read again either way: the value may have come without its event
+                    if not got:
                         break
-                else:
-                    sleep(POLL_S)
+                    continue
+                sleep(POLL_S)
                 after = slider.read()[0]
             if live:
                 details["read_back"] = "on its change event" if there(after) else "no change event in time"

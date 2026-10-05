@@ -1126,6 +1126,39 @@ def _toggle_in(read: list[Any], element_id: int | None, was: Any = None) -> Any:
 _SAME_PLACE_SHARE = 0.6
 
 
+def _on_a_control(read: list[Any], x: int, y: int) -> bool:
+    """Whether point (x, y) lies on something a click acts on in ``read`` (percFix): an interactive element whose box
+    holds the point and that is not a container covering much of the window (the window itself, a page's document,
+    a pane: they take the keyboard, so they read as interactive, but clicking their empty part does nothing of its
+    own; the same rule as the raw-click guard). Facts about boxes and patterns only."""
+    from yuki.agent.situation import CONTAINER_SHARE
+
+    def area(b: Any) -> int:
+        return max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+
+    boxes = [e for e in read if _field(e, "bounds") and len(_field(e, "bounds")) == 4 and not _field(e, "hidden")]
+    whole = max((area(_field(e, "bounds")) for e in boxes), default=0) or 1
+    for e in boxes:
+        b = _field(e, "bounds")
+        if area(b) > CONTAINER_SHARE * whole or not _field(e, "is_interactive"):
+            continue
+        if int(b[0]) <= x < int(b[2]) and int(b[1]) <= y < int(b[3]):
+            return True
+    return False
+
+
+def _own_toggle_state(via: Any) -> str | None:
+    """``"on"``/``"off"``: the state a toggle's own Toggle pattern reported right after it was toggled, when that
+    state differs from the one before (percFix; :func:`yuki.actions.patterns.element_action`); ``None`` when it was
+    clicked by the mouse, did not read as changed, or is indeterminate."""
+    payload = getattr(via, "payload", None)
+    details = payload.get("details") if isinstance(payload, dict) else None
+    own = details.get("toggle_state") if isinstance(details, dict) else None
+    if not isinstance(own, dict) or own.get("before") == own.get("after"):
+        return None
+    return {0: "off", 1: "on"}.get(own.get("after"))
+
+
 def _without_point_verdict(text: str) -> str:
     """A wheel scroll's summary without its single-point "it did not scroll" ending (percFix: said only when the
     window's reads show its content did move, so the point's verdict was wrong)."""
@@ -3645,9 +3678,25 @@ class Dispatcher:
         # percFix: a click at a raw point goes by the mouse; the pointer is brought there first and the window let
         # settle, so the read before the click already shows what the pointer alone did
         prepare = (lambda: self._hover_first(window, x, y, guard)) if not label else None
+        point: dict[str, bool] = {}
+
+        def before(read: list[Any] | None) -> None:
+            # percFix: what is under a raw point in the read just before the click (the pointer already there)
+            if read is not None:
+                point["on_control"] = _on_a_control(read, x, y)
+            return None
+
+        def after(outcome: ToolOutcome, read: list[Any] | None, change: Any = None) -> ToolOutcome:
+            if point.get("on_control") is False and isinstance(outcome.payload, dict):
+                details = dict(outcome.payload.get("details") or {})
+                details["point_on_nothing"] = True
+                outcome.payload = {**outcome.payload, "details": details}
+            return outcome
+
         return self._bracketed("click", window, act, target=element_id if isinstance(element_id, int) else None,
                                target_label=self._short_label(found[1]) if found is not None else "",
-                               prepare=prepare)
+                               prepare=prepare, before_hook=before if not label else None,
+                               after_hook=after if not label else None)
 
     def _aim(self, hwnd: int | None, element_id: Any, x: int, y: int) -> tuple[int, int]:
         """Where a click on element ``element_id`` lands now (report 58 review, F4): its centre in the screen
@@ -3791,11 +3840,15 @@ class Dispatcher:
                                                                     expect_hwnd=guard))
             if via.ok:
                 self._mark_acted(hwnd, "click")
+            held["own"] = _own_toggle_state(via)
             return via
 
         def settled(read: list[Any] | None) -> bool:
-            """percFix: the read after the click shows the toggle in the state asked for (until then the bracket
-            reads the window again on its next event, bounded)."""
+            """percFix: the read after the click shows the toggle in the state asked for, or the control itself
+            already said so right after the pattern call (until then the bracket reads the window again on its next
+            event, bounded)."""
+            if held.get("own") == want:
+                return True
             return read is not None and state_of(_toggle_in(read, element_id, held.get("was"))) == want
 
         def after(via: ToolOutcome, read: list[Any] | None, change: Any = None) -> ToolOutcome:
@@ -3806,9 +3859,15 @@ class Dispatcher:
             # failure the click can be blamed for: unverified, and the account says what changed. Only a toggle
             # that reads the old state in a window where nothing changed, after the wait, is "did not take".
             moved_on = bool(change is not None and getattr(change, "evidence", False))
+            # the control's own ToggleState, read from it right after the pattern call (and after its own change
+            # event): the most direct read-back there is, when the window's tree is slower to show it
+            own_state = _own_toggle_state(via)
             if state == want:
                 verified: bool | None = True
                 note = f"; read back: now {state}"
+            elif own_state == want:
+                verified = True
+                note = f"; read back from the control itself: now {want}"
             elif moved_on:
                 verified = None
                 note = ((f"; read back: still {state} (wanted {want})" if state else
