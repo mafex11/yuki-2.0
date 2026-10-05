@@ -517,6 +517,21 @@ def memory_texts(store: Store, days: float) -> list[str]:
     return texts
 
 
+def corrected_names(store: Store) -> list[str]:
+    """The right names of the user's corrections (memory's name aliases, newest first; report 88: a name corrected
+    once leads the hint of the next call's transcription). Never raises."""
+    try:
+        rows = store.aliases()
+    except Exception:
+        return []
+    out: list[str] = []
+    for a in reversed(rows):
+        name = " ".join(str(a.get("name") or "").split())
+        if name and name.casefold() not in {n.casefold() for n in out}:
+            out.append(name)
+    return out
+
+
 def chunk_line_fields(row: dict[str, Any]) -> dict[str, Any]:
     """Who spoke in a chunk and on which app, for each of its lines: ``{"who", "app", "track_kind"}``.
 
@@ -562,7 +577,8 @@ def transcribe_waiting(store: Store, cfg: Any, *, stop: Callable[[], bool], log:
     if rows and hasattr(backend, "count_tokens") and getattr(cfg, "stt_vocab_tokens", 0) > 0:
         t0 = time.perf_counter()
         try:
-            hint = vocabulary_hint(memory_texts(store, cfg.stt_vocab_days), backend.count_tokens, cfg.stt_vocab_tokens)
+            hint = vocabulary_hint(memory_texts(store, cfg.stt_vocab_days), backend.count_tokens, cfg.stt_vocab_tokens,
+                                   first=corrected_names(store))
         except Exception as exc:
             log("error", where="transcribe.hint", error=f"{type(exc).__name__}: {exc}")
         log("transcribe_hint", terms=len([w for w in hint.split(",") if w.strip()]),

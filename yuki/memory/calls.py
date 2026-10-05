@@ -911,7 +911,7 @@ def heard_by(spans: Sequence[dict[str, Any]], at: float, end: float, *, overlap:
 
 
 def vocabulary_hint(subjects: Iterable[str], count_tokens: Callable[[str], int], budget_tokens: int,
-                    *, min_facts: int = 2) -> str:
+                    *, min_facts: int = 2, first: Iterable[str] = ()) -> str:
     """Names and terms from memory for Whisper's hint (``hotwords``): ``"Claude, Corvana, ..."``.
 
     ``subjects``: what memory's models named as the subject of each fact (portrait and conversation
@@ -922,12 +922,15 @@ def vocabulary_hint(subjects: Iterable[str], count_tokens: Callable[[str], int],
     needs no hint - the measured filter, no capital-letter guess about what a name is). Words are ranked
     by facts x (tokens - 1) and taken until the hint would pass ``budget_tokens``: a short hint, so that it
     guides spelling without being heard where nobody said it.
+
+    ``first`` (report 88): the right names of the user's corrections (memory's name aliases). Their words count
+    however few facts name them (the user corrected a mishearing of them once) and lead the hint, spelled as
+    corrected; the token filter still applies.
     """
     if budget_tokens <= 0:
         return ""
-    counts: dict[str, int] = {}
-    forms: dict[str, dict[str, int]] = {}
-    for text in subjects:
+
+    def words_of(text: str) -> set[str]:
         seen: set[str] = set()
         for raw in (text or "").split():
             word = ""
@@ -938,21 +941,32 @@ def vocabulary_hint(subjects: Iterable[str], count_tokens: Callable[[str], int],
                 if len(word) > 1:
                     seen.add(word)
                 word = ""
-        for word in seen:
+        return seen
+
+    counts: dict[str, int] = {}
+    forms: dict[str, dict[str, int]] = {}
+    for text in subjects:
+        for word in words_of(text):
             key = word.casefold()
             counts[key] = counts.get(key, 0) + 1
             forms.setdefault(key, {})[word] = forms.setdefault(key, {}).get(word, 0) + 1
+    lead: dict[str, str] = {}
+    for name in first:
+        for word in sorted(words_of(str(name or ""))):
+            lead.setdefault(word.casefold(), word)
+    for key in lead:
+        counts[key] = max(counts.get(key, 0), min_facts)
     scored = []
     for key, n in counts.items():
         if n < min_facts:
             continue
-        form = max(forms[key].items(), key=lambda kv: kv[1])[0]
+        form = lead.get(key) or max(forms[key].items(), key=lambda kv: kv[1])[0]
         cost = min(count_tokens(" " + form), count_tokens(" " + form.lower()), count_tokens(" " + form.capitalize()))
         if cost >= 2:
-            scored.append((n * (cost - 1), n, form))
-    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+            scored.append((key in lead, n * (cost - 1), n, form))
+    scored.sort(key=lambda x: (not x[0], -x[1], -x[2], x[3]))
     chosen: list[str] = []
-    for _score, _n, form in scored:
+    for _lead, _score, _n, form in scored:
         if count_tokens(" " + ", ".join([*chosen, form])) > budget_tokens:
             continue
         chosen.append(form)

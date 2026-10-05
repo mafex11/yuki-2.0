@@ -159,6 +159,38 @@ def name_opens(text: str) -> bool:
     return False
 
 
+def with_name(text: str, forms: Any = ()) -> tuple[str, str | None]:
+    """``text`` with a learned heard form of the name (``forms``: memory's data, how speech recognition wrote "Yuki"
+    before, :func:`yuki.voice.keyterms.name_forms`) written as the name where it opens a sentence, after the
+    companions ("UK, pause the music." -> "Yuki pause the music."; "hey yoki" -> "hey Yuki"), and the form used (or
+    ``None``). Inside a sentence nothing changes ("I lived in the UK"). For the fast path's checks only (the
+    dismissal, the name alone, the name opening the words); the words go on to the talker as heard."""
+    variants = sorted({tuple(words(f)) for f in forms or () if words(f)} - {(NAME,)}, key=len, reverse=True)
+    if not variants or not text:
+        return text, None
+    out: list[str] = []
+    used: str | None = None
+    sentence: list[str] = []
+    for ch in text + "\0":
+        if ch not in ".?!\0":
+            sentence.append(ch)
+            continue
+        seg = "".join(sentence)
+        tokens = words(seg)
+        lead = 0
+        while lead < len(tokens) and tokens[lead] in NAME_COMPANIONS:
+            lead += 1
+        for v in variants:
+            if tuple(tokens[lead:lead + len(v)]) == v:
+                pad = " " if seg[:1].isspace() else ""
+                seg = pad + " ".join([*tokens[:lead], "Yuki", *tokens[lead + len(v):]])
+                used = used or " ".join(v)
+                break
+        out.append(seg + ("" if ch == "\0" else ch))
+        sentence = []
+    return "".join(out), used
+
+
 #: The acknowledgement lines (Yuki's own voice, rendered once per voice): a request, and the name alone.
 ACK_LINES = {"request": "Mm-hm.", "name": "Yeah?"}
 #: Edges quieter than this (dBFS) are trimmed from a rendered line, so it plays at once and ends crisply.
