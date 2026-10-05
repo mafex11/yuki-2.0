@@ -318,8 +318,29 @@ def test_the_speech_line_names_screen_names_and_a_name_run_into_the_next_word() 
     assert heard_note(clear, ["Bro"], screen=["Bro", "Res", "Search", "Settings"])[0] is None
 
 
-def test_the_talkers_desktop_block_lists_the_names_in_front() -> None:
+def test_the_talkers_desktop_block_lists_the_names_in_front(monkeypatch: pytest.MonkeyPatch,
+                                                             tmp_path: Path) -> None:
+    import json
+
+    from yuki.core import appnames
     from yuki.voice.hands import Hands
+
+    # honest (87): the app's spoken name comes from the resolver's own data, supplied here, never from this machine's
+    # remembered names or running processes (on a PC without WhatsApp the image name was not mapped and this failed)
+    names = tmp_path / "appnames.json"
+    names.write_text(json.dumps({"version": 2, "apps": {"whatsapp.root": {
+        "c:\\program files\\windowsapps\\whatsapp\\whatsapp.root.exe": {"name": "WhatsApp",
+                                                                         "raw": ["WhatsApp.Root"]}}}}),
+        encoding="utf-8")
+
+    class NoProcesses:
+        def running(self) -> list:
+            return []
+
+        def exe_of(self, pid: int) -> str:
+            return ""
+
+    monkeypatch.setattr(appnames, "_default", appnames.Resolver(probe=NoProcesses(), names_file=names))
 
     class Desk(_OpenDesk):
         def get_window_tree(self, hwnd: int, **_: Any) -> dict:
