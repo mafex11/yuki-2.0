@@ -64,9 +64,14 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     logs = args.logs
     if logs is None:
-        from yuki.core.paths import logs_dir
+        from yuki.core.paths import data_dir, logs_dir
 
-        logs = logs_dir()
+        logs = next((f for f in (data_dir() / "logs", logs_dir()) if f.is_dir() and any(f.glob("memory-*.jsonl"))),
+                    None)
+    if logs is None or not any(Path(logs).glob("memory-*.jsonl")):
+        print(f"No memory-*.jsonl logs found in {logs or 'the usual folders'}; pass --logs.", file=sys.stderr)
+        return 2
+    print(f"Logs read from {logs}.", file=sys.stderr)
     data = collect(logs, time.time() - args.days * 86400.0)
     table = {}
     for app, modes in sorted(data.items()):

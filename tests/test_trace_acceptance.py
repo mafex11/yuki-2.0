@@ -56,7 +56,7 @@ def test_the_analyzer_reports_the_numbers_and_finds_no_typed_marker(tmp_path):
     assert report["keys_per_control"] == {"chrome": 1.0} and report["quiet_spans"] == {"password": 0}
     assert mod.scan_for_marker(db, "violet-otter-4417", logs) == {}
     checks = {what: ok for what, ok, _v in mod.verdict(report, {})}
-    assert checks["zero typed characters in any column or log"] is True
+    assert checks["zero typed characters in the trace's tables or the memory logs"] is True
     assert checks["VALORANT: zero rows"] is True and checks["FL Studio maximised: rows present"] is True
 
 
@@ -72,6 +72,26 @@ def test_the_marker_scan_finds_typed_text_in_a_decrypted_column_or_a_log(tmp_pat
     (logs / "memory-2.jsonl").write_text('{"type": "x", "note": "violet-otter-4417"}\n', encoding="utf-8")
     hits = mod.scan_for_marker(db, "violet-otter-4417", logs)
     assert hits == {"ui_actions.name_ciphertext": 1, "log:memory-2.jsonl": 1}
+
+
+def test_the_marker_seen_by_the_ambient_capture_is_reported_apart_and_missing_logs_fail_loudly(tmp_path, capsys):
+    """Review F7: other tables are not blamed on the trace; no memory logs means the check cannot pass silently."""
+    mod = _load("trace_acceptance")
+    trace_hits, other = mod.split_hits({"ui_actions.name_ciphertext": 1, "log:memory-2.jsonl": 1,
+                                        "captures.delta_ciphertext": 3})
+    assert trace_hits == {"ui_actions.name_ciphertext": 1, "log:memory-2.jsonl": 1}
+    assert other == {"captures.delta_ciphertext": 3}
+    checks = {what: ok for what, ok, _v in mod.verdict(
+        {"valorant_rows": 0, "fl_studio_rows": 1, "takeovers": 1}, {"captures.delta_ciphertext": 3})}
+    assert checks["zero typed characters in the trace's tables or the memory logs"] is True
+    db, t0 = _session_db(tmp_path)
+    empty = tmp_path / "empty-logs"
+    empty.mkdir()
+    rc = mod.main(["--db", str(db), "--since", "00:00", "--until", "23:59", "--typed", "violet-otter-4417",
+                   "--logs", str(empty)])
+    assert rc == 2 and "No memory-*.jsonl logs" in capsys.readouterr().err
+    ab = _load("trace_ab_report")
+    assert ab.main(["--logs", str(empty)]) == 2
 
 
 def test_the_checklist_is_plain_words_and_covers_the_session():

@@ -156,8 +156,8 @@ def scan_for_marker(db: Path, marker: str, logs: Path | None) -> dict[str, int]:
                         found[f"{table}.{name}"] += 1
     finally:
         conn.close()
-    if logs is not None and logs.exists():
-        for path in logs.glob("memory-*.jsonl"):
+    if logs is not None:
+        for path in memory_logs(logs):
             try:
                 low = path.read_text(encoding="utf-8", errors="replace").casefold()
             except OSError:
@@ -165,6 +165,28 @@ def scan_for_marker(db: Path, marker: str, logs: Path | None) -> dict[str, int]:
             if any(n in low for n in needles):
                 found[f"log:{path.name}"] += 1
     return dict(found)
+
+
+def split_hits(hits: dict[str, int]) -> tuple[dict[str, int], dict[str, int]]:
+    """``(trace tables and logs, other tables)``: the ambient capture may legitimately have seen the marker on screen
+    (a chat it reads), which is not the trace keeping typed text."""
+    trace = {k: v for k, v in hits.items() if k.startswith(("ui_", "log:"))}
+    return trace, {k: v for k, v in hits.items() if k not in trace}
+
+
+def memory_logs(folder: Path | None) -> list[Path]:
+    return sorted(folder.glob("memory-*.jsonl")) if folder is not None and folder.is_dir() else []
+
+
+def default_logs() -> Path | None:
+    """Where the memory service writes ``memory-*.jsonl``: the installed app's data folder first (a dev checkout's
+    own logs folder is not where the running service logs), then the checkout's; None when neither has any."""
+    from yuki.core.paths import data_dir, logs_dir
+
+    for folder in (data_dir() / "logs", logs_dir()):
+        if memory_logs(folder):
+            return folder
+    return None
 
 
 def analyze(db: Path, since: float, until: float, quiet: dict[str, tuple[float, float]], *, steps: bool) -> dict:
@@ -252,7 +274,11 @@ def verdict(report: dict, marker_hits: dict | None) -> list[tuple[str, bool | No
     out.append(("stale (structure changed before the answer) kept out of learning", None,
                 f"{report.get('stale_share')}"))
     if marker_hits is not None:
-        out.append(("zero typed characters in any column or log", not marker_hits, json.dumps(marker_hits)))
+        trace_hits, other_hits = split_hits(marker_hits)
+        out.append(("zero typed characters in the trace's tables or the memory logs", not trace_hits,
+                    json.dumps(trace_hits)))
+        out.append(("the marker in other tables (what the ambient capture saw on screen, not the trace)", None,
+                    json.dumps(other_hits)))
     for name, n in report.get("quiet_spans", {}).items():
         out.append((f"nothing recorded during '{name}'", n == 0, str(n)))
     out.append(("VALORANT: zero rows", report["valorant_rows"] == 0, str(report["valorant_rows"])))
@@ -278,7 +304,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--day", help="YYYY-MM-DD (default today)")
     p.add_argument("--typed", help="the marker phrase typed during the session")
     p.add_argument("--quiet", action="append", default=[], help="NAME=HH:MM-HH:MM: a span that must record nothing")
-    p.add_argument("--logs", type=Path, default=None, help="the logs folder (default Yuki's)")
+    p.add_argument("--logs", type=Path, default=None,
+                   help="the memory service's logs folder (default: the installed app's, %%LOCALAPPDATA%%/Yuki/logs)")
     p.add_argument("--steps", action="store_true", help="also print the step lines (with names) on this console")
     args = p.parse_args(argv)
     if args.checklist:
@@ -301,11 +328,13 @@ def main(argv: list[str] | None = None) -> int:
             db = copy_real(tmp)
         t0 = time.perf_counter()
         report = analyze(db, since, until, quiet, steps=args.steps)
-        logs = args.logs
-        if logs is None:
-            from yuki.core.paths import logs_dir
-
-            logs = logs_dir()
+        logs = args.logs if args.logs is not None else default_logs()
+        if args.typed and not memory_logs(logs):
+            print(f"No memory-*.jsonl logs found in {logs or 'the usual folders'}: the log check cannot run. Pass"
+                  " --logs with the memory service's logs folder.", file=sys.stderr)
+            return 2
+        if logs is not None:
+            print(f"Logs read from {logs} ({len(memory_logs(logs))} memory logs).")
         hits = scan_for_marker(db, args.typed, logs) if args.typed else None
         print(json.dumps(report, indent=2, default=str))
         print("\nReport 78 §10.1:")
