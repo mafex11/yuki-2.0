@@ -96,7 +96,10 @@ def write_batch(store: Any, rows: Sequence[dict[str, Any]], elements: Sequence[d
     (``data`` a dict, encrypted here)."""
 
     def op(conn: sqlite3.Connection) -> list[int]:
-        ids = [int(conn.execute(_INSERT, [r.get(c) for c in ACTION_COLUMNS]).lastrowid) for r in rows]
+        ids = []
+        for r in rows:
+            values = {**r, "during_run": int(r.get("during_run") or 0)}
+            ids.append(int(conn.execute(_INSERT, [values.get(c) for c in ACTION_COLUMNS]).lastrowid))
         for el in elements:
             _upsert_element(conn, store, el)
         for f in files:

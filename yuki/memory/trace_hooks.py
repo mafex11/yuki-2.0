@@ -58,8 +58,8 @@ OUTCOME = ((EVENT_OBJECT_SHOW, EVENT_OBJECT_REORDER), (EVENT_OBJECT_STATECHANGE,
 PRIVATE_FORMATS = ("ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory",
                    "Clipboard Viewer Ignore")
 #: Standard clipboard format names (Windows' fixed ids).
-STANDARD_FORMATS = {1: "CF_TEXT", 2: "CF_BITMAP", 3: "CF_METAFILEPICT", 7: "CF_OEMTEXT", 8: "CF_DIB", 13: "CF_UNICODETEXT",
-                    14: "CF_ENHMETAFILE", 15: "CF_HDROP", 16: "CF_LOCALE", 17: "CF_DIBV5"}
+STANDARD_FORMATS = {1: "CF_TEXT", 2: "CF_BITMAP", 3: "CF_METAFILEPICT", 7: "CF_OEMTEXT", 8: "CF_DIB",
+                    13: "CF_UNICODETEXT", 14: "CF_ENHMETAFILE", 15: "CF_HDROP", 16: "CF_LOCALE", 17: "CF_DIBV5"}
 #: Format names kept per copy.
 MAX_FORMATS = 8
 

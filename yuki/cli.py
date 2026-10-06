@@ -42,6 +42,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cost(args[1:])
     if args[:1] == ["doctor"]:
         return _doctor(args[1:])
+    if args[:1] == ["trace"]:
+        return _trace(args[1:])
     console = Console(soft_wrap=True)
     settings = Settings()
     logger = SessionLogger(settings.sessions_dir, console=console)
@@ -98,6 +100,55 @@ def _doctor(args: list[str]) -> int:
     results = run_checks(Settings(), offline="--offline" in args)
     print(report_json(results) if "--json" in args else format_report(results))
     return 1 if any(c.status == FAIL for c in results) else 0
+
+
+def _trace(args: list[str]) -> int:
+    """``yuki trace [--db PATH] [--json]``: what Record how I work noted in the last hour and the last day, counts by
+    app, kind, source and how the element was found (content-free; the database is opened read-only)."""
+    import json
+    import sqlite3
+    import time
+
+    from yuki.memory import trace_store
+    from yuki.memory.store import default_db_path
+
+    db = default_db_path()
+    if "--db" in args and args.index("--db") + 1 < len(args):
+        from pathlib import Path
+
+        db = Path(args[args.index("--db") + 1])
+    if not db.exists():
+        print("No memory database yet.")
+        return 0
+
+    class _ReadOnly:
+        def __init__(self, path) -> None:
+            self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+            self.conn.row_factory = sqlite3.Row
+
+        def _query(self, sql: str, params=()) -> list:
+            return self.conn.execute(sql, params).fetchall()
+
+    store = _ReadOnly(db)
+    now = time.time()
+    try:
+        out = {"last_hour": trace_store.summary(store, since=now - 3600, until=now),
+               "last_day": trace_store.summary(store, since=now - 86400, until=now)}
+    except sqlite3.Error as exc:
+        print(f"The trace could not be read ({type(exc).__name__}).")
+        return 1
+    finally:
+        store.conn.close()
+    if "--json" in args:
+        print(json.dumps(out, indent=2))
+        return 0
+    for label, s in (("Last hour", out["last_hour"]), ("Last day", out["last_day"])):
+        print(f"{label}: {s['actions']} actions, {s['typed']} keys typed (counted, never kept), {s['files']} files")
+        for col in ("process", "kind", "source", "resolved"):
+            parts = ", ".join(f"{k or '-'} {v}" for k, v in list(s[col].items())[:12])
+            print(f"  by {col}: {parts or 'none'}")
+    print(f"Elements known: {out['last_day']['elements']} ({out['last_day']['named_elements']} with a name kept)")
+    return 0
 
 
 def _command(line: str, agent: Agent, console: Console) -> bool:

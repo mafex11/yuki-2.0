@@ -4450,6 +4450,34 @@ class MemoryClient:
         found.sort(key=lambda x: -x["at"])
         return found[:limit]
 
+    # -- the action trace (capC1, report 96; yuki.memory.trace_store): read helpers and forgetting, content-free ------
+
+    def trace_summary(self, hours: float = 1.0, *, until: float | None = None) -> dict:
+        """What the trace noted in the last ``hours``: counts by app, kind, source and how the element was found.
+        Counts only; never raises (``{"error"}``)."""
+        from yuki.memory import trace_store
+
+        end = time.time() if until is None else float(until)
+        try:
+            return trace_store.summary(self.store, since=end - float(hours) * 3600.0, until=end)
+        except Exception as exc:  # noqa: BLE001 - an older database
+            return {"error": type(exc).__name__}
+
+    def trace_forget(self, *, since: float | None = None, until: float | None = None, app: str | None = None) -> dict:
+        """Forget what the trace noted in a time range (an hour) and/or of one app (its name or process), with what
+        was learned from it; ``{"actions", "elements", "files", "links", "diary_id"}``. Undo with
+        :meth:`trace_forget_undo`."""
+        from yuki.memory import trace_store
+        from yuki.memory.store import app_key
+
+        return trace_store.forget(self.store, since=since, until=until, process=app_key(app) if app else None)
+
+    def trace_forget_undo(self, diary_id: int) -> dict:
+        """Bring back what one :meth:`trace_forget` removed (rows still within the 30-day keep)."""
+        from yuki.memory import trace_store
+
+        return trace_store.undo_forget(self.store, int(diary_id))
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
