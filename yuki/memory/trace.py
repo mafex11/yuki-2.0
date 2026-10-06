@@ -23,14 +23,22 @@ For each action, in order (report 78 §4.2):
    between button-down and :data:`IDENTITY_S` after button-up whose element contains the point; (ii)
    ``ElementFromPoint`` asked as soon as the button went down; (iii) for a renderer's whole pane, the smallest element
    under the point; else point-only (``unresolved``). A structure change (shown, hidden, reordered, a menu closed,
-   another window in front) between button-down and the answer makes it ``stale``.
+   another window in front) between button-down and the answer makes it ``stale`` (decided per action as the events
+   come, so a busy app's later events cannot push it out).
 3. **the outcome**: the events of the outcome hooks until :data:`OUTCOME_S` after the action (or the next action),
    at most :data:`yuki.memory.trace_hooks.OUTCOME_CAP`, as a class (``changed`` / ``nothing`` / ``unverifiable``),
-   a content-free summary, and the machine-checked facts C1 can record (``toggle_state``, ``selected``,
+   a content-free summary (with up to :data:`OUTCOME_ELEMENTS` changed elements by role, parent role and position,
+   from spare lookups only), and the machine-checked facts C1 can record (``toggle_state``, ``selected``,
    ``page_reached``, ``window_verified``, ``field_submitted`` (a length only), ``file_saved`` / ``file_opened``,
    ``command_ok``).
 4. **the row**: time, app, page (``page_key``), what was on screen (``capture_id``), the source (``user`` /
    ``user_injected`` / ``yuki``) and whether a Yuki run was in progress, travel and gap, then batched.
+
+Files: a new link in the Recent folder (the shell writes one for a file opened or saved through the common dialogs
+or Explorer); one picked in an open/save dialog is that dialog's app's (``via=dialog``); Ctrl+S with no dialog
+(FL Studio's usual save) re-checks the files opened or saved lately by their own write time (``via=save_chord``).
+Nothing from a span while the trace was blocked (off, paused, an off hour, a game) becomes a row later: the controller
+queues a ``reopen`` mark on each opening and the worker passes over what was written meanwhile.
 
 Budgets (report 78 §4.3): at most :data:`LOOKUPS_PER_S` lookups a second, each within
 :data:`yuki.memory.trace_uia.TIMEOUT_MS`; over budget the action is kept point-only. Hovers and scrolls are looked up
@@ -40,6 +48,7 @@ logs its type and line only.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import queue
@@ -797,7 +806,8 @@ class TraceWorker:
                 written = 0.0
             saved = abs(self._wall() - written) <= 10.0
             if dialog is not None:
-                win = self._window(dialog[1].hwnd, dialog[1].pid)   # the app whose open/save dialog it came from
+                # the app whose open/save dialog it came from, as it was then (its title and page decide privacy)
+                win = dataclasses.replace(dialog[1])
             else:
                 hwnd, pid = self._foreground()
                 win = self._window(hwnd, pid)

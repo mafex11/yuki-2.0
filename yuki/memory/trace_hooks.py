@@ -18,7 +18,8 @@ nothing but put small tuples on the trace worker's queue; it never calls UI Auto
   never read), and whether the copy carries a private mark (``ExcludeClipboardContentFromMonitorProcessing``,
   ``CanIncludeInClipboardHistory``, ``Clipboard Viewer Ignore``: password managers set these).
 * **Files**: a change notification on the shell's Recent folder: ``("recent", t)`` (the worker reads which links
-  are new).
+  are new; a ``DIALOGSTART`` among the low-rate events and the foreground's return tell it a file came from that
+  app's open/save dialog).
 
 While blocked (game gate, pause, consent off) the per-process and outcome hooks are removed and nothing is queued.
 """
