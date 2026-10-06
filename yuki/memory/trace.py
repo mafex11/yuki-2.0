@@ -718,6 +718,9 @@ class TraceWorker:
             command = str(item.get("command") or "").strip()
             if not command:
                 continue
+            if item.get("agent"):
+                self.counters["command_agent_skipped"] += 1    # Warp's own agent ran it, not the user
+                continue
             at = float(item.get("at") or self._wall())
             exit_code = item.get("exit_code")
             facts = {"command_ok": True} if exit_code == 0 else {}
@@ -1279,10 +1282,20 @@ class Trace:
         return None
 
     def beat(self) -> None:
-        """From the service's one-second loop: follow consent, pause, the A/B hours and the game gate."""
-        if self.sink is None:
-            return
+        """From the service's one-second loop: follow consent, pause, the A/B hours and the game gate. Nothing runs
+        (no thread, no hook) until the user first turns recording on; then the threads stay and block instead."""
         rules = self.rules()
+        if self.sink is None:
+            if not rules.record_actions:
+                return
+            try:
+                self.start()
+            except Exception as exc:  # noqa: BLE001 - recording stays off; said once
+                self.state = "failed"
+                self._log("error", where="trace.start", error=type(exc).__name__)
+                self.sink = None
+                self.rules = lambda: TraceRules()   # type: ignore[method-assign]
+                return
         if rules.ab_hours and self._ab is None:
             self._ab = _AbSampler(self._log)
         elif not rules.ab_hours:
@@ -1290,7 +1303,8 @@ class Trace:
         reason = self.blocked_reason()
         blocked = reason is not None
         if blocked != self.sink.blocked:
-            if not blocked and not self._attached and self._attach is not None:
+            if not blocked and self._attach is not None:
+                # (again on every opening: it also ends a mouse rest presence took while the trace was blocked)
                 self._attached = bool(self._attach(self.sink))
                 if not self._attached:
                     self._log("trace_state", state="no_input", why="raw_input_unavailable")
