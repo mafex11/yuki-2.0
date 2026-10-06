@@ -77,6 +77,10 @@ class TraceRules:
     leave_out: tuple[str, ...] = ()
     blocked_folders: tuple[str, ...] = DEFAULT_BLOCKED_FOLDERS
     ab_hours: bool = False
+    #: Decision D3 (7 Oct 2026), kept as config for phase C4; nothing in C1 reads it: ``fix_after_failure``,
+    #: ``demo_hint`` ("at_once"), ``demo_alone_after_times`` (2), ``demo_alone_after_proven_runs`` (1).
+    learning: tuple[tuple[str, Any], ...] = (("fix_after_failure", "at_once"), ("demo_hint", "at_once"),
+                                             ("demo_alone_after_times", 2), ("demo_alone_after_proven_runs", 1))
     #: Expanded, case-folded folder prefixes (computed).
     _folders: tuple[str, ...] = field(default=(), compare=False)
 
@@ -89,8 +93,14 @@ class TraceRules:
             path = os.path.normcase(os.path.normpath(os.path.expandvars(f)))
             if "%" not in path:
                 expanded.append(path.rstrip("\\/"))
+        learning = dict(cls.learning)
+        for key in learning:
+            value = table.get(f"learn_{key}")
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                learning[key] = value
         return cls(record_actions=table.get("record_actions") is True, leave_out=_clean_list(table.get("leave_out")),
-                   blocked_folders=folders, ab_hours=table.get("ab_hours") is True, _folders=tuple(expanded))
+                   blocked_folders=folders, ab_hours=table.get("ab_hours") is True,
+                   learning=tuple(learning.items()), _folders=tuple(expanded))
 
     def left_out(self, process: str, app: str = "") -> bool:
         """Whether the user left this app out (by its app name or process name, any case, ``.exe`` or not)."""

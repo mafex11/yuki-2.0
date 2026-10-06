@@ -27,6 +27,10 @@ def test_a_new_install_is_off():
     assert TraceRules.from_dict(trace).record_actions is False
     assert TraceRules.from_dict({}).record_actions is False
     assert TraceRules.from_dict({"record_actions": "yes"}).record_actions is False      # only a real true turns it on
+    # decision D3, kept as config for phase C4 (nothing in C1 reads it)
+    assert dict(TraceRules.from_dict(trace).learning) == {"fix_after_failure": "at_once", "demo_hint": "at_once",
+                                                          "demo_alone_after_times": 2,
+                                                          "demo_alone_after_proven_runs": 1}
 
 
 def test_the_words_are_plain_and_say_what_is_never_kept():

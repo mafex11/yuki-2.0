@@ -231,11 +231,14 @@ def test_nothing_at_all_while_the_game_gate_holds(rig):
 
 def test_a_gate_that_starts_holding_mid_action_drops_it_and_looks_nothing_up(rig):
     rig.uia.points[(150, 120)] = button()
-    rig.feed("down", rig.clock.t, "left", 150, 120, "user", 0, False)
+    rig.uia.events[(55, -4, 7)] = button(name="Archive")
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False)
+    rig.feed("ev", t + 0.02, EVENT_OBJECT_INVOKED, 55, -4, 7, dt=0.02)   # queued before the gate held
     rig.gate = True
     rig.feed("up", rig.clock.t + 0.05, "left", 150, 120, "user", False)
     rig.settle()
-    assert rig.rows() == [] and rig.uia.calls == [("point", 150, 120)]
+    assert rig.rows() == [] and rig.uia.calls == [("point", 150, 120)]   # no event lookup, no re-read after
 
 
 def test_password_fields_record_nothing_not_even_a_count(rig):

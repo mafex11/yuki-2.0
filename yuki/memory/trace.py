@@ -926,6 +926,10 @@ class TraceWorker:
         return cols, use
 
     def _finish(self, act: _Act, now: float) -> None:
+        blocked = self._blocked()
+        if blocked is not None:          # first: the game gate (or consent off) means no row and no further lookup
+            self.counters["dropped_" + blocked] += 1
+            return
         if act.drop is None and act.win.pid and act.kind in ("click", "rclick", "dclick", "drag", "scroll", "hover"):
             # the timeline may only now have caught up with a window that came to the front with this press
             now_win = self._window(act.win.hwnd, act.win.pid)
@@ -944,9 +948,6 @@ class TraceWorker:
             else:
                 self.counters["dropped_privacy"] += 1
                 self.counters["dropped_" + act.drop.split(":", 1)[0]] += 1
-            return
-        if self._blocked() is not None:
-            self.counters["dropped_" + (self._blocked() or "off")] += 1
             return
         if self._stale(act):
             act.resolved = "stale"

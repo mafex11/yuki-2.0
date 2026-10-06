@@ -151,3 +151,17 @@ def test_a_1000_hz_burst_is_cheap_on_the_readers_thread():
     print(f"\n1000 Hz burst: {per_report_us:.1f} us per report (presence + trace sink), {len(items)} items queued")
     assert per_report_us < 40.0
     assert len(items) <= 2                        # the worker is told the pointer moves, not about every report
+
+
+def test_the_real_cursor_read_per_report_is_cheap():
+    """The one Windows call the sink makes per move (``GetPhysicalCursorPos``, read-only), timed for real."""
+    from yuki.memory.trace_input import _physical_cursor
+
+    read = _physical_cursor()
+    n = 20_000
+    t0 = time.perf_counter()
+    for _ in range(n):
+        read()
+    us = (time.perf_counter() - t0) / n * 1e6
+    print(f"\nGetPhysicalCursorPos: {us:.2f} us a call")
+    assert us < 10.0
