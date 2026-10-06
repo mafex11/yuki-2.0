@@ -67,6 +67,10 @@ needs_lab = pytest.mark.skipif(not PARAKEET_WAV.exists(), reason="the bake-off's
 #: 20 s; run_test then raised, and pipecat's cancel of a worker still in start() never finished: the whole file hung
 #: until the sweep's time limit (5 Oct). A start that is quick returns at once; this only bounds a slow one.
 START_S = 300.0
+#: How long a test waits for Parakeet and the turn models it loads itself before a pipeline starts (the same thread
+#: loads them one after the other, below normal priority): bounded here, outside pipecat, so a stuck load fails the
+#: test instead of hanging the file.
+LOAD_S = 600.0
 
 
 async def _run_until(processor: Any, frames: list[Any], until: type, *, grace_s: float = 1.0,
@@ -660,6 +664,12 @@ def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: 
         stt = ParakeetSTTService(engine=eng)
         stt.load_now()                 # as at a cold wake: both models load while the words come in
         eng.tts("supertonic")
+        # The service's start() waits for its turn models, which load on the engine's one thread right after Parakeet,
+        # so no frame flows before both are loaded anyway: waiting for them here changes nothing this test checks (a
+        # fresh VAD; the voice still loading beside it), and keeps a slow load on a busy PC out of the pipeline's start
+        # bound (7 Oct: under 12 CPU burners the two loads took longer than 300 s, below normal priority by design).
+        await asyncio.wait_for(asyncio.wrap_future(eng.recognizer()), LOAD_S)
+        await asyncio.wait_for(asyncio.wrap_future(eng.turn_models()), LOAD_S)
         frames = [SleepFrame(0.5), *_audio_frames(first), *_audio_frames(np.zeros(16_000 * 4, dtype=np.int16)),
                   SleepFrame(3.0)]
         down, _ = await _run_until(stt, frames, ProposedUserStoppedSpeakingFrame, grace_s=3.0)
