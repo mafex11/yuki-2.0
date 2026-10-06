@@ -520,3 +520,16 @@ def test_focus_events_invalidate_the_cached_field(rig):
     rig.feed("char", rig.clock.t, 1, "user", dt=0.1)
     rig.settle()
     assert [c for c in rig.uia.calls if c[0] == "focus"] == [("focus",), ("focus",)]
+
+
+def test_each_row_keeps_the_time_since_the_previous_action_and_the_travel(rig):
+    rig.uia.points[(150, 120)] = button()
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False)
+    rig.feed("up", t + 0.05, "left", 150, 120, "user", False, dt=0.05)
+    rig.feed("down", t + 1.25, "left", 150, 120, "user", 310, False, dt=1.2)
+    rig.feed("up", t + 1.3, "left", 150, 120, "user", False, dt=0.05)
+    rig.settle()
+    first, second = rig.rows()
+    assert first["gap_ms"] is None and second["gap_ms"] == 1250 and second["travel_px"] == 310
+    assert second["at"] - first["at"] == pytest.approx(1.25, abs=0.01)
