@@ -269,6 +269,24 @@ class InventedMemory:
     def resolve_heard(self, ref, verdict, *, correction_id=None) -> dict:
         return {"ok": True}
 
+    def held_facts(self, reasons=None, days=None) -> list[dict]:
+        # "Waiting for your yes" (report 76 item 5, memory's shapes): a claim of the user's from a call, someone
+        # else's line (no "It's a joke"), and a sensitive screen fact (labelled personal); invented
+        return [
+            {"ref": "journal:931", "text": "You've been to Kyoto three times.", "fact": "The user has been to Kyoto "
+             "three times.", "reason": "call", "at": ago(3 * H), "call": "call:7", "who": "user", "kind": "call",
+             "where": "Mumble call", "app": "Mumble", "shown": True},
+            {"ref": "journal:932", "text": "Someone on the call said the seed swap starts at 9 AM on Sunday.",
+             "fact": "Someone on the call said the seed swap starts at 9 AM on Sunday.", "reason": "call",
+             "at": ago(3 * H + 60), "call": "call:7", "who": "others", "kind": "call", "where": "Mumble call",
+             "app": "Mumble", "shown": True},
+            {"ref": "journal:933", "text": "You checked your holdings at Northbank.", "fact": "The user checked their "
+             "holdings in their brokerage account at Northbank.", "reason": "sensitive", "at": ago(1 * D + 2 * H),
+             "call": None, "who": "user", "kind": "page", "where": "Northbank", "app": "Firefox", "shown": True}]
+
+    def resolve_held(self, ref, answer, *, correction_id=None) -> dict:
+        return {"ok": True, "ref": ref, "answer": answer}
+
     def correct_item(self, ref, words) -> dict:
         return {"ok": True, "ref": ref, "correction_id": 91, "state": "updating"}
 

@@ -3790,36 +3790,99 @@ class Store:
             return None
         return (str(source.get("call") or ""), at, "others" if source.get("who") == "others" else "user")
 
+    @staticmethod
+    def _match_line_facts(old: Sequence[tuple[Any, Any, bool]], new: Sequence[tuple[Any, Any, bool]]
+                          ) -> dict[int, int]:
+        """Pair the facts of a replaced batch with a re-journal's facts on the same call line, one to one: ``old`` and
+        ``new`` are ``(line key, vector or None, held)``; returns ``{old index: new index}``. On a line, the closest
+        pair by the stored embeddings is matched first (cosine; no words read), a tie going to a pair that is held or
+        admitted alike (review V2: two facts resting on one line, a plan admitted and a claim held, each meet their
+        own). A fact off a call (no key) is never matched."""
+        def unit(v: Any) -> np.ndarray | None:
+            if v is None:
+                return None
+            a = np.asarray(v, dtype=np.float32).ravel()
+            n = float(np.linalg.norm(a))
+            return a / n if n > 0 else None
+
+        old_u = [unit(v) for _, v, _ in old]
+        new_u = [unit(v) for _, v, _ in new]
+        pairs: list[tuple[float, int, int, int]] = []
+        for i, (key, _, held) in enumerate(old):
+            if key is None:
+                continue
+            for j, (key2, _, held2) in enumerate(new):
+                if key2 != key:
+                    continue
+                a, b = old_u[i], new_u[j]
+                cos = float(a @ b) if a is not None and b is not None and a.shape == b.shape else 0.0
+                pairs.append((-cos, 0 if bool(held) == bool(held2) else 1, i, j))
+        pairs.sort()
+        out: dict[int, int] = {}
+        taken: set[int] = set()
+        for _, _, i, j in pairs:
+            if i in out or j in taken:
+                continue
+            out[i] = j
+            taken.add(j)
+        return out
+
+    def _line_snapshot(self, conn: sqlite3.Connection, supersedes: Sequence[int]) -> list[dict[str, Any]]:
+        """The current and held facts of the batches a re-journal replaces, read before they are superseded (call
+        facts only): ``{"id", "key" (:meth:`_line_key`), "vec", "held", "answered": (reason, reviewed_at) or None}``.
+        :meth:`_hold_journal` matches the re-journal's facts against them (:meth:`_match_line_facts`)."""
+        old = sorted({int(b) for b in supersedes if b is not None})
+        if not old:
+            return []
+        out: list[dict[str, Any]] = []
+        for r in conn.execute(
+                "SELECT j.id, j.source_ciphertext, j.reviewed_at, j.superseded_at, b.model AS hold_model,"
+                " v.vec_ciphertext FROM journal j LEFT JOIN journal_batches b ON b.id = j.superseded_by"
+                " LEFT JOIN journal_vec v ON v.journal_id = j.id WHERE j.batch_id IN (%s)"
+                " AND (j.superseded_at IS NULL OR b.model LIKE 'hold:%%')" % ",".join("?" * len(old)), old).fetchall():
+            try:
+                src = json.loads(self._dec(r["source_ciphertext"]) or "{}") if r["source_ciphertext"] else {}
+            except (TypeError, ValueError):
+                src = {}
+            key = self._line_key(src)
+            if key is None:
+                continue
+            held = str(r["hold_model"] or "").startswith("hold:")
+            vec = None
+            if r["vec_ciphertext"] is not None:
+                try:
+                    vec = np.frombuffer(self.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
+                except Exception:
+                    vec = None
+            answered = ((str(r["hold_model"])[len("hold:"):], float(r["reviewed_at"]))
+                        if held and r["reviewed_at"] is not None else None)
+            out.append({"id": int(r["id"]), "key": key, "vec": vec, "held": held, "answered": answered})
+        return out
+
     def _hold_journal(self, conn: sqlite3.Connection, facts: Sequence[NewFact], journal_ids: Sequence[int],
-                      thread_id: int | None, supersedes: Sequence[int] = ()) -> int:
+                      thread_id: int | None, prior: Sequence[dict[str, Any]] = ()) -> int:
         """Admission (yuki.memory.admission): the facts held back until the user's yes are superseded at once by one
         ``hold:<reason>`` batch per reason (no tokens, no cost), in the caller's transaction. Returns how many.
 
-        A re-journal (``supersedes``): a new fact on the same call line as a held fact of the replaced batches the user
-        already answered carries that answer (review F7) - it is held under the same reason and marked answered, so
-        a Not true is not admitted again and a Keep (whose kept copy stays) is not stored twice."""
-        answered: dict[tuple[str, float, str], tuple[str, float]] = {}
-        old = sorted({int(b) for b in supersedes if b is not None})
-        if old:
-            for r in conn.execute(
-                    "SELECT j.source_ciphertext, j.reviewed_at, b.model FROM journal j JOIN journal_batches b"
-                    " ON b.id = j.superseded_by WHERE j.batch_id IN (%s) AND j.reviewed_at IS NOT NULL"
-                    " AND b.model LIKE 'hold:%%'" % ",".join("?" * len(old)), old).fetchall():
-                try:
-                    src = json.loads(self._dec(r["source_ciphertext"]) or "{}") if r["source_ciphertext"] else {}
-                except (TypeError, ValueError):
-                    src = {}
-                key = self._line_key(src)
-                if key is not None:
-                    answered[key] = (str(r["model"])[len("hold:"):], float(r["reviewed_at"]))
+        A re-journal (``prior``, :meth:`_line_snapshot` of the replaced batches): the user's answer to a held fact is
+        carried to the one new fact that fact meets on its line (:meth:`_match_line_facts`; review F7) - held under
+        the same reason and marked answered, so a Not true is not admitted again and a Keep (whose kept copy stays) is
+        not stored twice. Never to every fact on the line: another fact resting on the same line (a plan the judge
+        admits beside a claim answered Not true) meets its own earlier fact and goes in as judged (review V2)."""
         held: dict[str, list[int]] = {}
         carried: list[tuple[float, int]] = []
-        for fact, jid in zip(facts, journal_ids):
+        carry: dict[int, tuple[str, float]] = {}
+        if prior and any(p["answered"] for p in prior):
+            new = [(self._line_key(getattr(f, "source", None)), getattr(f, "vector", None),
+                    bool(getattr(f, "held", None))) for f in facts]
+            pairs = self._match_line_facts([(p["key"], p["vec"], p["held"]) for p in prior], new)
+            carry = {j: prior[i]["answered"] for i, j in pairs.items() if prior[i]["answered"]}
+        for n, (fact, jid) in enumerate(zip(facts, journal_ids)):
             reason = getattr(fact, "held", None)
-            prior = answered.get(self._line_key(getattr(fact, "source", None))) if answered else None
-            if prior is not None:
-                reason = reason or prior[0]
-                carried.append((prior[1], int(jid)))
+            answer = carry.get(n)
+            if answer is not None:
+                reason = reason or answer[0]
+                carried.append((answer[1], int(jid)))
             if reason:
                 held.setdefault(str(reason), []).append(int(jid))
         now = time.time()
@@ -3847,9 +3910,10 @@ class Store:
 
         def op(conn: sqlite3.Connection) -> int:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
+            prior = self._line_snapshot(conn, supersedes)   # read before the re-journal supersedes them
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
-            self._hold_journal(conn, facts, journal_ids, call.thread_id, supersedes)
+            self._hold_journal(conn, facts, journal_ids, call.thread_id, prior)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:
@@ -8136,9 +8200,10 @@ class Store:
 
         def op(conn: sqlite3.Connection) -> tuple[int, list[int]]:
             batch_id = self._insert_batch(conn, call, len(ids), len(facts))
+            prior = self._line_snapshot(conn, supersedes)   # read before the re-journal supersedes them
             self._supersede_batches(conn, batch_id, supersedes)
             journal_ids = [self._insert_journal(conn, fact, batch_id) for fact in facts]
-            self._hold_journal(conn, facts, journal_ids, call.thread_id, supersedes)
+            self._hold_journal(conn, facts, journal_ids, call.thread_id, prior)
             if work:
                 self._apply_work(conn, work, batch_id=batch_id, journal_ids=journal_ids)
             for q in questions:

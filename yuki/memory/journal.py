@@ -388,7 +388,8 @@ the photos the next day. Their plan, never the user's to-do.
 - OTHERS: "can you send me the link to the hostel?", then THE USER: "yeah sure, after dinner" -> the \
 user agreed to send the hostel link after dinner: the user's commitment, quoted from the user's own \
 line ("yeah sure, after dinner"), its text saying what was asked ("Send the hostel link that someone \
-on the call asked for, after dinner").
+on the call asked for, after dinner"). A fact of what the user agreed to or plans cites that THE USER \
+line (their answer), never the OTHERS line that asked.
 - OTHERS: "who's booking the cab?", then THE USER: "I'll do it" -> the user said they would book the cab.
 - OTHERS: "we're meeting at six at the station" and nothing from the user about it -> what the user \
 may need later (where and when they meet), never something the user said or agreed to.
@@ -583,6 +584,8 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
     text = f"{text}\n\n{_work.WORK_GUIDANCE}"
     # personal sensitive facts wait for the user's yes (report 76 item 5, yuki.memory.admission)
     text = f"{text}\n\n{_admission.SENSITIVE_GUIDANCE}"
+    if call_side:   # ... a fact; the user's own to-do is still recorded (review V1)
+        text = f"{text}\n\n{_admission.SENSITIVE_COMMITMENTS_GUIDANCE}"
     if call_side:   # what recognition misheard, with the guess; facts in English (the feedback round 3, W5-W6)
         text = f"{text}\n\n{_misheard.MISHEARD_GUIDANCE}"
     if requests and not call_side:

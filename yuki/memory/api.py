@@ -2105,7 +2105,8 @@ class MemoryClient:
         memory as said), ``joke`` (kept as a joke of theirs, never a fact), ``not_true`` (stays out) or ``undo`` (the
         answer taken back). Only a line that card carries is answered (``ref`` ``journal:N`` in its ``keep``). No
         model, at once. Returns ``{"ok", "ref", "answer", "nature"}``, ``ok`` False with ``why`` (``unknown``,
-        ``not_on_card``, ``already``, ``bad_answer``)."""
+        ``not_on_card``, ``already``, ``bad_answer``). A line a re-journal replaced since the card was written is
+        answered on the held fact that took its place (``moved_to``, :func:`yuki.memory.admission.moved_held`)."""
         from yuki.memory import admission
 
         answer = str(answer or "").strip().lower()
@@ -2125,12 +2126,15 @@ class MemoryClient:
         if jid is None or f"journal:{jid}" not in refs:
             return {**out, "why": "not_on_card"}
         try:
-            done = admission.resolve_held(self.store, jid, answer)
+            # review V3: a re-journal since the card replaced the line's held fact; the answer goes to the new one
+            now = admission.moved_held(self.store, jid)
+            done = admission.resolve_held(self.store, now, answer)
         except Exception as exc:
             return {**out, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
         if done is None:
             return {**out, "why": "already"}
-        return {**out, "ok": True, "ref": f"journal:{jid}", "nature": done["nature"]}
+        return {**out, "ok": True, "ref": f"journal:{jid}", "nature": done["nature"],
+                **({"moved_to": f"journal:{now}"} if now != jid else {})}
 
     def held_facts(self, reasons: Any = None, days: float | None = None) -> list[dict]:
         """Facts memory is holding back until the user says yes (yuki.memory.admission), newest first: ``{"ref",
@@ -2167,12 +2171,14 @@ class MemoryClient:
         if jid is None or answer not in admission.ANSWERS:
             return {**out, "why": "bad_answer"}
         try:
-            done = admission.resolve_held(self.store, jid, answer)
+            now = admission.moved_held(self.store, jid)   # review V3: a row shown before a re-journal
+            done = admission.resolve_held(self.store, now, answer)
         except Exception as exc:
             return {**out, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
         if done is None:
             return {**out, "why": "already"}
-        return {**out, "ok": True, "ref": f"journal:{jid}", "nature": done["nature"]}
+        return {**out, "ok": True, "ref": f"journal:{jid}", "nature": done["nature"],
+                **({"moved_to": f"journal:{now}"} if now != jid else {})}
 
     def offer_undo(self, nudge_id: int) -> dict:
         """Undo a card's offer that ran (``todo_add``: the to-do ends as a wrong capture; ``bring_back``: recorded,

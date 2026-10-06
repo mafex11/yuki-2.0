@@ -63,8 +63,8 @@ Examples in the prompts use invented people, places and numbers.
 
 Public API::
 
-    SENSITIVE_KINDS, SENSITIVE_GUIDANCE, CALL_ADMISSION_PROMPT, ADMIT_TOOL, VERDICTS, ANSWERS
-    HOLD_CALL, HOLD_SENSITIVE, HOLD_DROP, HOLD_DAYS, SHOWN_KEY, CONFIRMED_KEY
+    SENSITIVE_KINDS, SENSITIVE_GUIDANCE, SENSITIVE_COMMITMENTS_GUIDANCE, CALL_ADMISSION_PROMPT, ADMIT_TOOL, VERDICTS
+    ANSWERS, HOLD_CALL, HOLD_SENSITIVE, HOLD_DROP, HOLD_DAYS, SHOWN_KEY, CONFIRMED_KEY
     sensitive_kind(value) -> str
     JudgeItem(text, nature, line, around, call_app);  item_from_source(fact, sources, index) -> JudgeItem
     judge_call_facts(client, items, *, settings, names, model) -> JudgeResult
@@ -72,6 +72,7 @@ Public API::
     unheld_links(facts, work_ops_or_questions) -> (kept, left_out)
     admit_call_facts(facts, items, result) -> dict (content-free counts)   # sets NewFact.held / source["keep_shown"]
     held_facts(store, *, since=None, reasons=None, call_ids=None, now=None) -> list[HeldFact]
+    moved_held(store, journal_id) -> int   # the held fact a re-journal put in its place
     resolve_held(store, journal_id, answer, *, now=None) -> dict | None
     recap_items(store, call_ids, *, now=None, limit=RECAP_KEEP_MAX) -> list[dict]
     recap_text(count, *, people=(), app="") -> str
@@ -97,7 +98,7 @@ HOLD_DROP = "drop"
 HOLD_REASONS: tuple[str, ...] = (HOLD_CALL, HOLD_SENSITIVE, HOLD_DROP)
 #: A held fact's batch model is this prefix plus its reason.
 HOLD_MODEL_PREFIX = "hold:"
-#: A held fact nobody answered is offered for this long after it was said, then it lapses (stays out).
+#: A held fact nobody answered is offered for this long after it was held, then it lapses (stays out).
 HOLD_DAYS = 7.0
 #: At most this many lines on a call's recap card.
 RECAP_KEEP_MAX = 3
@@ -149,6 +150,17 @@ seed phrase."
 - none: "The user read an article about a new flu vaccine." (a topic, nothing about them)
 - none: "The user bought a mechanical keyboard for 4,500 rupees." (an ordinary purchase)"""
 
+#: Added to a call batch's journal prompt after :data:`SENSITIVE_GUIDANCE` (review V1): the sensitive mark holds a
+#: fact, never the user's own to-do. Without it the model stopped proposing plans that touch health, money or a legal
+#: matter (pick up a prescription, pay off a card, a clinic visit, call a lawyer) once the prompt said such things wait
+#: for a yes, and a Keep on the fact stores the fact, not a reminder.
+SENSITIVE_COMMITMENTS_GUIDANCE = """\
+THE SENSITIVE MARK IS FOR FACTS ONLY. The user's own commitments are recorded as commitments whatever they touch: \
+a plan to pick up a prescription, go to the clinic for results, pay a card bill or call a lawyer is still their \
+to-do, with its due date, so they get the reminder. Only the fact (what it says about their health, money, legal \
+matters, sexuality or credentials) waits for their yes. Write such a to-do's text and title plainly, with no more \
+personal detail than the plan needs ("Pick up the prescription at 10", "Clinic visit for results on Thursday")."""
+
 CALL_ADMISSION_PROMPT = """\
 You check the facts Yuki's journal took from one of the user's recorded calls, before they enter Yuki's memory of \
 the user. Yuki is a personal assistant on the user's Windows PC. {identity}
@@ -178,7 +190,10 @@ admit and ask, choose ask - a wrong fact in memory costs the user a correction, 
 When you hesitate between ask and drop, choose ask. \
 And sensitive (see SENSITIVE ABOUT THE USER below), and shown: the fact said to the user in one short, plain sentence \
 in the second person, as a friend would say it back ("You're moving to Pune in March."; for someone else's line, \
-"Someone on the call said the trek starts at 6 AM on Saturday."), at most about 100 characters, no app or tool names.
+"Someone on the call said the trek starts at 6 AM on Saturday."), at most about 100 characters, no app or tool names. \
+shown restates the fact exactly as written - Keep stores the fact, not shown - so it never adds, completes or \
+reinterprets anything: for "Someone on the call asked the user if they were coming on the trek." it is "Someone on \
+the call asked if you were coming on the trek.", never what the user may have answered.
 
 Judge from the words and the lines around them, never from a single word. Worked examples (invented):
 - F: "The user will send Tara the hostel link after dinner." on THE USER "yeah I'll send it after dinner", after \
@@ -229,7 +244,8 @@ ADMIT_TOOL: dict[str, Any] = {
                                                      "ABOUT THE USER), else none."},
                         "shown": {"type": "string",
                                   "description": "The fact said to the user in one short plain second-person "
-                                                 "sentence, at most about 100 characters."},
+                                                 "sentence, at most about 100 characters, restating it exactly "
+                                                 "(never adding to it)."},
                     },
                 },
             },
@@ -517,12 +533,16 @@ class HeldFact:
 def held_facts(store: Any, *, since: float | None = None, reasons: Sequence[str] | None = None,
                call_ids: Sequence[int] | None = None, now: float | None = None,
                answered: bool = False) -> list[HeldFact]:
-    """Held journal facts said since ``since`` (default: :data:`HOLD_DAYS` ago), newest first; unanswered only unless
-    ``answered``. ``reasons`` / ``call_ids`` narrow them. Read only, no model."""
+    """Held journal facts held since ``since`` (default: :data:`HOLD_DAYS` ago), newest first; unanswered only unless
+    ``answered``. ``reasons`` / ``call_ids`` narrow them. Read only, no model.
+
+    The window runs from when the fact was held (its ``hold:`` batch's time), never from its own date (review V5): a
+    screen fact is dated by its content, so an old statement or mail read today would be held at once and never
+    offered, and a sensitive fact's explicit yes could not be given."""
     now = time.time() if now is None else float(now)
     since = now - HOLD_DAYS * 86400.0 if since is None else float(since)
     sql = ("SELECT j.*, b.model AS hold_model FROM journal j JOIN journal_batches b ON b.id = j.superseded_by"
-           " WHERE b.model LIKE ? AND j.at >= ?" + ("" if answered else " AND j.reviewed_at IS NULL")
+           " WHERE b.model LIKE ? AND b.at >= ?" + ("" if answered else " AND j.reviewed_at IS NULL")
            + " ORDER BY j.at DESC, j.id DESC")
     rows = store._query(sql, (HOLD_MODEL_PREFIX + "%", since))
     wanted_calls = {int(c) for c in call_ids} if call_ids is not None else None
@@ -544,6 +564,56 @@ def held_facts(store: Any, *, since: float | None = None, reasons: Sequence[str]
             continue
         out.append(held)
     return out
+
+
+def moved_held(store: Any, journal_id: int, *, hops: int = 4) -> int:
+    """The held fact that now stands for held fact ``journal_id`` (review V3): a re-journal replaces an unanswered
+    held fact with the new batch's fact on the same call line (:meth:`yuki.memory.store.Store._supersede_batches`),
+    so a recap card or a window row written before it carries a ref that is no longer held. Follows such a move to
+    the new batch's held, unanswered fact it meets on that line (:meth:`yuki.memory.store.Store._match_line_facts`,
+    the re-journal's own pairing), up to ``hops`` re-journals; else returns ``journal_id`` itself. Read only."""
+    jid = int(journal_id)
+    for _ in range(max(0, int(hops))):
+        rows = store._query("SELECT j.batch_id, j.reviewed_at, j.superseded_by, b.model FROM journal j"
+                            " LEFT JOIN journal_batches b ON b.id = j.superseded_by WHERE j.id=?", (jid,))
+        if not rows:
+            return jid
+        r = rows[0]
+        if r["reviewed_at"] is not None or r["superseded_by"] is None or str(r["model"] or "").startswith(
+                HOLD_MODEL_PREFIX):
+            return jid
+        old_batch, new_batch = int(r["batch_id"]), int(r["superseded_by"])
+
+        def facts(where: str, arg: int) -> list[dict[str, Any]]:
+            out = []
+            for x in store._query(
+                    "SELECT j.id, j.source_ciphertext, j.reviewed_at, b.model AS hold_model FROM journal j"
+                    " LEFT JOIN journal_batches b ON b.id = j.superseded_by WHERE " + where + " ORDER BY j.id",
+                    (arg,)):
+                try:
+                    src = json.loads(store._dec(x["source_ciphertext"]) or "{}") if x["source_ciphertext"] else {}
+                except (TypeError, ValueError):
+                    src = {}
+                out.append({"id": int(x["id"]), "key": store._line_key(src),
+                            "held": str(x["hold_model"] or "").startswith(HOLD_MODEL_PREFIX),
+                            "open": x["reviewed_at"] is None})
+            return out
+
+        old = facts("j.batch_id=?", old_batch)
+        new = facts("j.batch_id=?", new_batch)
+        vecs = store.journal_vectors([f["id"] for f in old + new])
+        for f in old:
+            f["held"] = f["held"] or f["id"] == jid   # the moved fact was held (its hold batch was replaced)
+        pairs = store._match_line_facts([(f["key"], vecs.get(f["id"]), f["held"]) for f in old],
+                                        [(f["key"], vecs.get(f["id"]), f["held"]) for f in new])
+        index = next((i for i, f in enumerate(old) if f["id"] == jid), None)
+        target = new[pairs[index]] if index is not None and index in pairs else None
+        if target is None or not target["held"]:
+            return jid
+        jid = target["id"]
+        if not target["open"]:
+            return jid
+    return jid
 
 
 def _kept_copy(conn: Any, journal_id: int) -> int | None:
