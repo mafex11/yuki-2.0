@@ -1313,6 +1313,7 @@ class Trace:
                 self.sink.reset()
             self.sink.blocked = blocked
             self.hooks.set_blocked(blocked)
+        if (reason or "on") != self.state:
             self.state = reason or "on"
             self._log("trace_state", state=self.state)
         if self._ab is not None:
