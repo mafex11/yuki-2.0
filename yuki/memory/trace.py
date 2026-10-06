@@ -122,7 +122,8 @@ class _Bucket:
 class _Window:
     pid: int = 0
     hwnd: int = 0
-    process: str = ""
+    process: str = ""        # the process key (app_key: lower case, no .exe), as threads.process
+    image: str = ""          # the image name ("chrome.exe"), as the privacy file names apps
     app: str = ""
     own: bool = False
     started: float | None = None
@@ -182,7 +183,7 @@ class TraceWorker:
         gate: ``() -> bool``: the hard game gate holds (``gamegate.gate_holds``).
         acting: ``() -> Acting | None``: a Yuki run in progress.
         page: ``(pid) -> (page_key, url, withheld)`` as the timeline sees the window in front of that process.
-        process: ``(pid) -> (process key, app name, own, started)``.
+        process: ``(pid) -> (process key, image name, app name, own, started)``.
         window_at: ``(x, y) -> (hwnd, pid)``; ``foreground``: ``() -> (hwnd, pid)``; ``title``: ``(hwnd) -> str``;
         ``rect``: ``(hwnd) -> (l, t, r, b)``.
         uia: a :class:`~yuki.memory.trace_uia.TraceUia` (or a fake; ``None``: point-only).
@@ -195,7 +196,7 @@ class TraceWorker:
     def __init__(self, store: Any, *, privacy_rules: Callable[[], Any], trace_rules: Callable[[], TraceRules],
                  gate: Callable[[], bool], acting: Callable[[], Any] = lambda: None,
                  page: Callable[[int], tuple[str | None, str | None, str | None]] = lambda pid: (None, None, None),
-                 process: Callable[[int], tuple[str, str, bool, float | None]] | None = None,
+                 process: Callable[[int], tuple[str, str, str, bool, float | None]] | None = None,
                  window_at: Callable[[int, int], tuple[int, int]] | None = None,
                  foreground: Callable[[], tuple[int, int]] | None = None,
                  title: Callable[[int], str] = lambda hwnd: "",
@@ -285,14 +286,14 @@ class TraceWorker:
 
     def _window(self, hwnd: int, pid: int) -> _Window:
         try:
-            process, app, own, started = self._process(pid) if pid else ("", "", False, None)
+            process, image, app, own, started = self._process(pid) if pid else ("", "", "", False, None)
         except Exception:  # noqa: BLE001
-            process, app, own, started = "", "", False, None
+            process, image, app, own, started = "", "", "", False, None
         try:
             page_key, url, withheld = self._page(pid)
         except Exception:  # noqa: BLE001
             page_key, url, withheld = None, None, None
-        return _Window(pid=pid, hwnd=hwnd, process=process, app=app, own=own, started=started,
+        return _Window(pid=pid, hwnd=hwnd, process=process, image=image, app=app, own=own, started=started,
                        title=self._title(hwnd) if hwnd else "", page_key=page_key, url=url, withheld=withheld)
 
     def _privacy_reason(self, win: _Window) -> str | None:
@@ -302,8 +303,8 @@ class TraceWorker:
             rules = self._privacy()
         except Exception:  # noqa: BLE001
             return "privacy_error"
-        return gate(rules, self._rules(), process=win.process, app=win.app, own=win.own, title=win.title,
-                    url=win.url, withheld=win.withheld)
+        return gate(rules, self._rules(), process=win.image or win.process, app=win.app, own=win.own,
+                    title=win.title, url=win.url, withheld=win.withheld)
 
     def _blocked(self) -> str | None:
         """Why nothing may be recorded right now (consent off or the game gate), or None."""
@@ -1046,13 +1047,13 @@ class TraceWorker:
 # -- defaults (Windows) ------------------------------------------------------------------------------------------------
 
 
-def _process_facts() -> Callable[[int], tuple[str, str, bool, float | None]]:
+def _process_facts() -> Callable[[int], tuple[str, str, str, bool, float | None]]:
     from yuki.memory.store import app_key
     from yuki.memory.watcher import _ProcessCache
 
     cache = _ProcessCache()
 
-    def facts(pid: int) -> tuple[str, str, bool, float | None]:
+    def facts(pid: int) -> tuple[str, str, str, bool, float | None]:
         f = cache.get(int(pid))
         started = None
         try:
@@ -1061,7 +1062,7 @@ def _process_facts() -> Callable[[int], tuple[str, str, bool, float | None]]:
             started = round(float(psutil.Process(int(pid)).create_time()), 1)
         except Exception:  # noqa: BLE001
             pass
-        return app_key(f.process_name) or "", f.app_name or "", bool(f.is_own), started
+        return app_key(f.process_name) or "", f.process_name or "", f.app_name or "", bool(f.is_own), started
 
     return facts
 

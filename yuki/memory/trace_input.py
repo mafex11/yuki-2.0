@@ -163,6 +163,7 @@ class TraceInput:
         self.blocked = True
         # pointer rest
         self._ax = self._ay = 0              # the anchor, in screen px
+        self._anchored = False
         self._sx = self._sy = 0              # net raw counts since the anchor
         self._abs_last: tuple[float, float] | None = None
         self.anchor_at = 0.0                 # when the current rest began (monotonic)
@@ -230,7 +231,10 @@ class TraceInput:
                 self._sy += dy
             x, y = self._cursor()
             m = self.metrics
-            if abs(x - self._ax) * 2 > m.hover_w or abs(y - self._ay) * 2 > m.hover_h:
+            if not self._anchored:                     # the first report since listening: the rest starts here
+                self._ax, self._ay, self.anchor_at, self._anchored = x, y, t, True
+                self._sx = self._sy = 0
+            elif abs(x - self._ax) * 2 > m.hover_w or abs(y - self._ay) * 2 > m.hover_h:
                 self._new_anchor(t, x, y)
             for button, (t0, x0, y0, far) in list(self._down.items()):
                 excursion = max(abs(x - x0), abs(y - y0))
@@ -291,6 +295,7 @@ class TraceInput:
         self._sx = self._sy = 0
         self.travel = 0.0
         self._abs_last = None
+        self._anchored = False
         self.moving = False
 
 
