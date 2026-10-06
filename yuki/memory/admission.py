@@ -73,6 +73,7 @@ Public API::
     admit_call_facts(facts, items, result) -> dict (content-free counts)   # sets NewFact.held / source["keep_shown"]
     held_facts(store, *, since=None, reasons=None, call_ids=None, now=None) -> list[HeldFact]
     moved_held(store, journal_id) -> int   # the held fact a re-journal put in its place
+    replaced(store, journal_id) -> bool    # a re-journal replaced it with a fact that is not held
     resolve_held(store, journal_id, answer, *, now=None) -> dict | None
     recap_items(store, call_ids, *, now=None, limit=RECAP_KEEP_MAX) -> list[dict]
     recap_text(count, *, people=(), app="") -> str
@@ -566,44 +567,59 @@ def held_facts(store: Any, *, since: float | None = None, reasons: Sequence[str]
     return out
 
 
+_ROW_SQL = ("SELECT j.id, j.batch_id, j.source_ciphertext, j.reviewed_at, j.superseded_at, j.superseded_by,"
+            " b.model AS sup_model, b.at AS sup_at FROM journal j LEFT JOIN journal_batches b ON b.id = j.superseded_by")
+
+
+def _held_row(r: Any) -> bool:
+    """A journal row (:data:`_ROW_SQL`) that is a held fact: superseded by a ``hold:`` batch, or an unanswered held
+    fact a re-journal replaced (:meth:`yuki.memory.store.Store._supersede_batches` re-points it to the new batch; it
+    had been superseded, by its hold batch, before that batch's model call started, while the facts that were current
+    are superseded during it)."""
+    if str(r["sup_model"] or "").startswith(HOLD_MODEL_PREFIX):
+        return True
+    return (r["superseded_by"] is not None and r["reviewed_at"] is None and r["superseded_at"] is not None
+            and r["sup_at"] is not None and float(r["superseded_at"]) < float(r["sup_at"]))
+
+
 def moved_held(store: Any, journal_id: int, *, hops: int = 4) -> int:
     """The held fact that now stands for held fact ``journal_id`` (review V3): a re-journal replaces an unanswered
     held fact with the new batch's fact on the same call line (:meth:`yuki.memory.store.Store._supersede_batches`),
     so a recap card or a window row written before it carries a ref that is no longer held. Follows such a move to
-    the new batch's held, unanswered fact it meets on that line (:meth:`yuki.memory.store.Store._match_line_facts`,
-    the re-journal's own pairing), up to ``hops`` re-journals; else returns ``journal_id`` itself. Read only."""
+    the new batch's held fact it meets on that line - the re-journal's own pairing
+    (:meth:`yuki.memory.store.Store._match_line_facts` over the facts that batch replaced) - through up to ``hops``
+    re-journals. Returns ``journal_id`` itself when it was not moved, or when its line's new fact is not held (the
+    re-journal put it into memory, or left it out: :func:`replaced`). Read only, no model."""
+
+    def rows(where: str, *args: Any) -> list[Any]:
+        return store._query(_ROW_SQL + " WHERE " + where + " ORDER BY j.id", args)
+
+    def facts(found: Sequence[Any]) -> list[dict[str, Any]]:
+        out = []
+        for x in found:
+            try:
+                src = json.loads(store._dec(x["source_ciphertext"]) or "{}") if x["source_ciphertext"] else {}
+            except (TypeError, ValueError):
+                src = {}
+            out.append({"id": int(x["id"]), "key": store._line_key(src), "held": _held_row(x),
+                        "open": x["reviewed_at"] is None and not str(x["sup_model"] or "").startswith(
+                            HOLD_MODEL_PREFIX)})
+        return out
+
     jid = int(journal_id)
     for _ in range(max(0, int(hops))):
-        rows = store._query("SELECT j.batch_id, j.reviewed_at, j.superseded_by, b.model FROM journal j"
-                            " LEFT JOIN journal_batches b ON b.id = j.superseded_by WHERE j.id=?", (jid,))
-        if not rows:
+        found = rows("j.id=?", jid)
+        if not found:
             return jid
-        r = rows[0]
-        if r["reviewed_at"] is not None or r["superseded_by"] is None or str(r["model"] or "").startswith(
-                HOLD_MODEL_PREFIX):
-            return jid
+        r = found[0]
+        if str(r["sup_model"] or "").startswith(HOLD_MODEL_PREFIX) or not _held_row(r):
+            return jid   # still held where it was, or not a held fact a re-journal replaced
         old_batch, new_batch = int(r["batch_id"]), int(r["superseded_by"])
-
-        def facts(where: str, arg: int) -> list[dict[str, Any]]:
-            out = []
-            for x in store._query(
-                    "SELECT j.id, j.source_ciphertext, j.reviewed_at, b.model AS hold_model FROM journal j"
-                    " LEFT JOIN journal_batches b ON b.id = j.superseded_by WHERE " + where + " ORDER BY j.id",
-                    (arg,)):
-                try:
-                    src = json.loads(store._dec(x["source_ciphertext"]) or "{}") if x["source_ciphertext"] else {}
-                except (TypeError, ValueError):
-                    src = {}
-                out.append({"id": int(x["id"]), "key": store._line_key(src),
-                            "held": str(x["hold_model"] or "").startswith(HOLD_MODEL_PREFIX),
-                            "open": x["reviewed_at"] is None})
-            return out
-
-        old = facts("j.batch_id=?", old_batch)
-        new = facts("j.batch_id=?", new_batch)
+        # the facts that re-journal replaced, as it saw them: the ones current then and the held ones
+        old = facts(rows("j.batch_id=? AND (j.superseded_by=? OR b.model LIKE ?)", old_batch, new_batch,
+                         HOLD_MODEL_PREFIX + "%"))
+        new = facts(rows("j.batch_id=?", new_batch))
         vecs = store.journal_vectors([f["id"] for f in old + new])
-        for f in old:
-            f["held"] = f["held"] or f["id"] == jid   # the moved fact was held (its hold batch was replaced)
         pairs = store._match_line_facts([(f["key"], vecs.get(f["id"]), f["held"]) for f in old],
                                         [(f["key"], vecs.get(f["id"]), f["held"]) for f in new])
         index = next((i for i, f in enumerate(old) if f["id"] == jid), None)
@@ -612,8 +628,16 @@ def moved_held(store: Any, journal_id: int, *, hops: int = 4) -> int:
             return jid
         jid = target["id"]
         if not target["open"]:
-            return jid
+            return jid   # held (answered or not) where it is now
     return jid
+
+
+def replaced(store: Any, journal_id: int) -> bool:
+    """Held fact ``journal_id`` was never answered and a re-journal replaced it with a fact that is not held (in memory
+    now, or left out): an answer to it has nothing to land on (the card says so instead of "Already answered").
+    Read only."""
+    found = store._query(_ROW_SQL + " WHERE j.id=?", (int(journal_id),))
+    return bool(found) and _held_row(found[0]) and not str(found[0]["sup_model"] or "").startswith(HOLD_MODEL_PREFIX)
 
 
 def _kept_copy(conn: Any, journal_id: int) -> int | None:

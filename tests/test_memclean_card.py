@@ -102,3 +102,19 @@ def test_a_press_is_answered_by_memory_and_the_row_says_so_with_undo(qapp):
     _settle(qapp, ctl)
     assert memory.acks == [(41, "accepted")]
     ctl.card.close()
+
+
+def test_a_line_memory_read_again_since_points_to_the_me_page(qapp):
+    # review V3: a re-journal put the line into memory or left it out: the row says so, never "Already answered."
+    from yuki.ui.nudges import KEEP_MOVED, NudgeCard, NudgeController
+
+    memory = Memory(lambda nudge_id, ref, what: {"ok": False, "why": "moved"})
+    ctl = NudgeController(memory, SimpleNamespace(event=lambda *a, **k: None), card=NudgeCard(linger_ms=60_000),
+                          screen_state=lambda: (5, "accepts"))
+    ctl.card.show_nudge(ctl.record_delivery(dict(KEEP), "card"))
+    row = ctl.card.keep_rows.rows["journal:7"]
+    row["keys"][0].click()
+    _settle(qapp, ctl)
+    assert row["state"].text() == KEEP_MOVED and "Me page" in KEEP_MOVED
+    assert all(k.isHidden() for k in row["keys"]) and row["undo"].isHidden() and row["answer"] == "moved"
+    ctl.card.close()

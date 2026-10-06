@@ -122,6 +122,8 @@ QUESTION_BUTTONS: tuple[str, str, str] = ("Answer", "Skip", "Don't ask")
 #: what the line says once answered (memory's ``recap_keep``).
 KEEP_ANSWERS: tuple[tuple[str, str], ...] = (("keep", "Keep"), ("not_true", "Not true"), ("joke", "It's a joke"))
 KEEP_DONE: dict[str, str] = {"keep": "Kept.", "not_true": "Left out.", "joke": "Kept as a joke."}
+#: A line memory read again since the card was written, whose new reading needs no answer (``recap_keep`` ``moved``).
+KEEP_MOVED = "I read the call again. See the Me page."
 #: A keep list stays up this much longer than its text alone (a few things to decide).
 KEEP_LINGER_EXTRA_MS = 15_000
 
@@ -526,21 +528,23 @@ class KeepRows(QWidget):
 
     def show_answer(self, ref: str, answer: str, ok: bool, why: str = "") -> None:
         """Memory's answer for one row: what became of the line, with Undo; an Undo brings the keys back. A refused
-        press says why in plain words ("Already answered." when memory has an answer for it from elsewhere)."""
+        press says why in plain words ("Already answered." when memory has an answer for it from elsewhere; a line memory
+        read again since, which needs no answer now, points to the Me page)."""
         row = self.rows.get(ref)
         if row is None:
             return
         done = ok and answer in KEEP_DONE
         already = not ok and why == "already" and answer != "undo"
+        moved = not ok and why == "moved" and answer != "undo"
         for key in row["keys"]:
             key.setEnabled(True)
-            key.setVisible(not done and not already)
+            key.setVisible(not done and not already and not moved)
         row["state"].set_text(KEEP_DONE.get(answer, "") if done else "Already answered." if already else
-                              "" if ok else "That didn't save.")
+                              KEEP_MOVED if moved else "" if ok else "That didn't save.")
         row["state"].setVisible(bool(row["state"].text()))
         row["undo"].setVisible(done)
         row["undo"].setEnabled(True)
-        row["answer"] = answer if done else "already" if already else None
+        row["answer"] = answer if done else "already" if already else "moved" if moved else None
 
     def all_answered(self) -> bool:
         return bool(self.rows) and all(r["answer"] for r in self.rows.values())

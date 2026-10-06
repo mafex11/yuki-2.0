@@ -3796,8 +3796,8 @@ class Store:
         """Pair the facts of a replaced batch with a re-journal's facts on the same call line, one to one: ``old`` and
         ``new`` are ``(line key, vector or None, held)``; returns ``{old index: new index}``. On a line, the closest
         pair by the stored embeddings is matched first (cosine; no words read), a tie going to a pair that is held or
-        admitted alike (review V2: two facts resting on one line, a plan admitted and a claim held, each meet their
-        own). A fact off a call (no key) is never matched."""
+        admitted alike, then to the same place among that line's facts (review V2: two facts resting on one line, a
+        plan admitted and a claim held, each meet their own). A fact off a call (no key) is never matched."""
         def unit(v: Any) -> np.ndarray | None:
             if v is None:
                 return None
@@ -3805,9 +3805,18 @@ class Store:
             n = float(np.linalg.norm(a))
             return a / n if n > 0 else None
 
+        def ranks(items: Sequence[tuple[Any, Any, bool]]) -> list[int]:
+            seen: dict[Any, int] = {}
+            out_r = []
+            for key, _, _ in items:
+                out_r.append(seen.get(key, 0))
+                seen[key] = seen.get(key, 0) + 1
+            return out_r
+
         old_u = [unit(v) for _, v, _ in old]
         new_u = [unit(v) for _, v, _ in new]
-        pairs: list[tuple[float, int, int, int]] = []
+        old_r, new_r = ranks(old), ranks(new)
+        pairs: list[tuple[float, int, int, int, int]] = []
         for i, (key, _, held) in enumerate(old):
             if key is None:
                 continue
@@ -3816,11 +3825,11 @@ class Store:
                     continue
                 a, b = old_u[i], new_u[j]
                 cos = float(a @ b) if a is not None and b is not None and a.shape == b.shape else 0.0
-                pairs.append((-cos, 0 if bool(held) == bool(held2) else 1, i, j))
+                pairs.append((-round(cos, 6), 0 if bool(held) == bool(held2) else 1, abs(old_r[i] - new_r[j]), i, j))
         pairs.sort()
         out: dict[int, int] = {}
         taken: set[int] = set()
-        for _, _, i, j in pairs:
+        for _, _, _, i, j in pairs:
             if i in out or j in taken:
                 continue
             out[i] = j

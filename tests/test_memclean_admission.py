@@ -8,6 +8,8 @@ real database, a real model, the microphone or the desktop.
 from __future__ import annotations
 
 import tempfile
+import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +38,16 @@ class StubEmbedder:
 
     def embed(self, texts):
         return [np.ones(8, dtype=np.float32) for _ in texts]
+
+
+class TextEmbedder:
+    """One vector per text (the same text, the same vector; different texts point different ways), like a real
+    embedder for what the re-journal pairing reads."""
+    model_name = "stub-text"
+
+    def embed(self, texts):
+        return [np.random.default_rng(zlib.crc32(t.encode("utf-8"))).standard_normal(16).astype(np.float32)
+                for t in texts]
 
 
 class ToolClient:
@@ -117,12 +129,21 @@ JUDGE = {"verdicts": [
 ]}
 
 
-def journal(store: Store, answers: dict):
+def journal(store: Store, answers: dict, embedder=None):
     from yuki.memory.journal import JournalWorker
 
     client = ToolClient(answers)
-    worker = JournalWorker(store, client=client, embedder=StubEmbedder(), log_dir=Path(tempfile.mkdtemp()))
+    worker = JournalWorker(store, client=client, embedder=embedder or StubEmbedder(),
+                           log_dir=Path(tempfile.mkdtemp()))
     return worker.run_once(), client
+
+
+def rejournal(store: Store, answers: dict, embedder=None) -> None:
+    from yuki.memory.journal import JournalWorker
+
+    [(capture, batch)] = store.journaled_captures(thread_kind="my_call_side")
+    JournalWorker(store, client=ToolClient(answers), embedder=embedder or StubEmbedder(),
+                  log_dir=Path(tempfile.mkdtemp())).rejournal(capture.thread_id, [capture], [batch])
 
 
 # -- routing (structure + the judge's verdict) -------------------------------------------------------------------
@@ -376,20 +397,133 @@ def test_a_rejournal_keeps_the_users_answers(store):
         [h for h in A.held_facts(store, now=T0 + 3900) if "Japan" in h.fact]) == 1
 
 
-def test_a_held_fact_lapses_after_the_hold_days_and_a_rejournal_replaces_it(store):
+def test_a_held_fact_lapses_hold_days_after_it_was_held_and_a_rejournal_replaces_it(store):
+    # review V5: the window runs from when the fact was held, never from its own date (a screen fact is dated by its
+    # content: an old statement read today is held today and must be offered)
     old = held_fact(store, "The user has a cat named Biscuit.", A.HOLD_CALL, at=T0 - (A.HOLD_DAYS + 1) * 86400)
-    assert A.held_facts(store, now=T0) == [] and A.held_facts(store, since=0, now=T0)[0].id == old
+    held_at = time.time()
+    assert [h.id for h in A.held_facts(store, now=held_at)] == [old]
+    later = held_at + (A.HOLD_DAYS + 1) * 86400
+    assert A.held_facts(store, now=later) == [] and A.held_facts(store, since=0, now=later)[0].id == old
     call_with(store, SCENE)
     journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]})
-    first = {h.id for h in A.held_facts(store, now=T0 + 3600)}
-    from yuki.memory.journal import JournalWorker
+    first = {h.id for h in A.held_facts(store, now=T0 + 3600)} - {old}
+    rejournal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]})
+    second = {h.id for h in A.held_facts(store, now=T0 + 3600)} - {old}
+    assert len(second) == len(first) == 5 and not first & second   # the re-journal's own held facts replace them
 
-    [(capture, batch)] = store.journaled_captures(thread_kind="my_call_side")
-    JournalWorker(store, client=ToolClient({"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]}),
-                  embedder=StubEmbedder(), log_dir=Path(tempfile.mkdtemp())).rejournal(capture.thread_id, [capture],
-                                                                                        [batch])
-    second = {h.id for h in A.held_facts(store, now=T0 + 3600)}
-    assert len(second) == len(first) and not first & second   # the re-journal's own held facts replace the old ones
+
+def test_a_sensitive_fact_with_an_old_date_is_offered_when_it_is_held(store):
+    from yuki.memory.api import MemoryClient
+
+    # review V5: a statement from 10 days ago read today is held today: the Me page offers it for the yes it needs
+    fact = NewFact(at=time.time() - 10 * 86400, thread_id=None, app="Firefox", host=None,
+                   fact="The user's card statement shows a missed payment.", importance=5,
+                   vector=np.ones(8, dtype=np.float32), embed_model="stub", nature="fact",
+                   source={"kind": "page", "by": "a page", "where": "Northbank", "at": time.time() - 10 * 86400},
+                   held=A.HOLD_SENSITIVE)
+    store.commit_batch(ModelCall(at=time.time(), thread_id=None, model="test"), [], [fact])
+    [item] = MemoryClient(store).held_facts()
+    assert item["reason"] == "sensitive" and item["fact"] == "The user's card statement shows a missed payment."
+
+
+#: One user line carrying two facts: a plan the judge admits and a claim it asks about (review V2).
+TREK = [line(T0 + 10, "you coming to the trek on Saturday?", "others"),
+        line(T0 + 14, "yeah I'll book the bus tonight, I've done this trek like fifty times")]
+PLAN, CLAIM = "The user will book the bus tickets tonight.", "The user has done this trek about fifty times."
+TREK_ANSWER = {"facts": [cfact(PLAN, 2, importance=6), cfact(CLAIM, 2, importance=4)], "commitments": [],
+               "questions": []}
+TREK_JUDGE = {"verdicts": [verdict(1, "admit"), verdict(2, "ask", shown="You've done this trek about fifty times.")]}
+
+
+def test_an_answer_carried_by_a_rejournal_never_takes_the_other_fact_on_its_line_out_of_memory(store):
+    # review V2: Not true on the claim is carried to the claim only; the plan on the same line stays in memory
+    call_with(store, TREK)
+    emb = TextEmbedder()
+    journal(store, {"record_call_side": [TREK_ANSWER], "admit_call_facts": [TREK_JUDGE]}, emb)
+    assert [e.fact for e in store.journal_between()] == [PLAN]
+    [claim] = A.held_facts(store, now=T0 + 3600)
+    assert claim.fact == CLAIM
+    A.resolve_held(store, claim.id, "not_true", now=T0 + 3700)
+    rejournal(store, {"record_call_side": [TREK_ANSWER], "admit_call_facts": [TREK_JUDGE]}, emb)
+    assert [e.fact for e in store.journal_between()] == [PLAN]                     # the plan stays in memory
+    assert A.held_facts(store, now=T0 + 3800) == []                                # the claim stays answered
+    # the facts come back in the other order and the judge would admit both this time: each still meets its own
+    swapped = {"facts": TREK_ANSWER["facts"][::-1], "commitments": [], "questions": []}
+    admit_both = {"verdicts": [verdict(1, "admit"), verdict(2, "admit")]}
+    rejournal(store, {"record_call_side": [swapped], "admit_call_facts": [admit_both]}, emb)
+    assert [e.fact for e in store.journal_between()] == [PLAN]
+    answered = [h for h in A.held_facts(store, now=T0 + 3900, answered=True) if h.reviewed_at is not None]
+    assert CLAIM in {h.fact for h in answered} and PLAN not in {h.fact for h in answered}
+
+
+def test_without_vectors_the_pairing_keeps_held_with_held_and_the_place_on_the_line():
+    key = ("call:1", 14.0, "user")
+    # no vectors: a held fact meets the held one, an admitted one the admitted one
+    assert Store._match_line_facts([(key, None, False), (key, None, True)],
+                                   [(key, None, True), (key, None, False)]) == {0: 1, 1: 0}
+    # all alike: the same place among the line's facts
+    assert Store._match_line_facts([(key, None, False), (key, None, False)],
+                                   [(key, None, False), (key, None, False)]) == {0: 0, 1: 1}
+    # a fact off a call, or on another line, is never paired
+    assert Store._match_line_facts([(None, None, True), (key, None, True)],
+                                   [(None, None, True), (("call:1", 20.0, "user"), None, True)]) == {}
+
+
+def _keep_card(store: Store, cid: int):
+    from yuki.memory.nudges import NudgeConfig, NudgeWorker
+    from yuki.memory.presence import PresenceWorker
+
+    worker = NudgeWorker(store, config=NudgeConfig(), client=ToolClient({}), log_dir=Path(tempfile.mkdtemp()),
+                         locked_fn=lambda: False, media_fn=lambda: [], render_fn=lambda: [],
+                         event_name="Local\\YukiNudgeReadyTestMemCleanV3", clock=lambda: T0 + 3600)
+    presence = PresenceWorker(worker)
+    [call] = [c for c in store.calls(since=T0 - 60) if c.id == cid]
+    look = presence._recap_look(f"recap:call:{cid}", [call], T0 + 3600)
+    return presence.observe(T0 + 3600, NudgeConfig(), None, [], look)["nudge_id"], look.meta["keep"]
+
+
+def test_a_keep_card_written_before_a_rejournal_answers_the_line_that_took_its_place(store):
+    # review V3: the re-journal re-points the unanswered held facts; the card's refs follow them
+    from yuki.memory.api import MemoryClient
+
+    cid = call_with(store, SCENE)
+    emb = TextEmbedder()
+    journal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]}, emb)
+    nudge, keep = _keep_card(store, cid)
+    japan = next(k["ref"] for k in keep if "Japan" in k["text"])
+    rejournal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [JUDGE]}, emb)
+    [now_held] = [h for h in A.held_facts(store, now=T0 + 3600) if "Japan" in h.fact]
+    assert f"journal:{now_held.id}" != japan and A.moved_held(store, int(japan.split(":")[1])) == now_held.id
+    mem = MemoryClient(store)
+    got = mem.recap_keep(nudge, japan, "keep")
+    assert got["ok"] and got["ref"] == japan and got["moved_to"] == f"journal:{now_held.id}"
+    assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
+    assert not [h for h in A.held_facts(store, now=T0 + 3600) if "Japan" in h.fact]
+    assert mem.recap_keep(nudge, japan, "keep")["why"] == "already"                # answered, wherever it moved
+    assert mem.recap_keep(nudge, japan, "undo")["ok"]                              # Undo from the card still works
+    assert "The user has been to Japan four times." not in {e.fact for e in store.journal_between()}
+    # the window's row from before the re-journal answers the same way
+    assert mem.resolve_held(japan, "not_true")["moved_to"] == f"journal:{now_held.id}"
+    assert mem.resolve_held(japan, "undo")["ok"]
+    # a re-journal that puts the line into memory: nothing to answer any more, and the card is told so
+    admit_all = {"verdicts": [verdict(n, "admit") for n in range(1, 7)]}
+    rejournal(store, {"record_call_side": [CALL_ANSWER], "admit_call_facts": [admit_all]}, emb)
+    assert "The user has been to Japan four times." in {e.fact for e in store.journal_between()}
+    moved = mem.recap_keep(nudge, japan, "keep")
+    assert not moved["ok"] and moved["why"] == "moved"
+    assert mem.resolve_held(japan, "keep")["why"] == "moved"
+
+
+def test_a_sensitive_plan_is_still_a_to_do_and_card_lines_restate_the_fact():
+    # review V1: the sensitive mark holds a fact, never the user's own to-do (call side, where to-dos are taken)
+    from yuki.memory.journal import system_prompt
+
+    assert A.SENSITIVE_COMMITMENTS_GUIDANCE in system_prompt(["Sam"], call_side=True)
+    assert A.SENSITIVE_COMMITMENTS_GUIDANCE not in system_prompt(["Sam"])
+    # review V6: a plan agreed to cites the user's answer; the judge's line restates the fact, never adds to it
+    assert "never the OTHERS line that asked" in system_prompt(["Sam"], call_side=True)
+    assert "shown restates the fact exactly as written" in A.CALL_ADMISSION_PROMPT
 
 
 # -- the keep list -----------------------------------------------------------------------------------------------
