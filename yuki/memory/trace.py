@@ -84,6 +84,16 @@ FILE_INPUT_S = 30.0
 HOVER_MAX_S = 60.0
 #: A press whose release never came is closed after this long (s).
 LOST_UP_S = 10.0
+#: A privacy margin for the race between a key or click that moves the focus (Tab, Enter, a click) and the app's
+#: ``FOCUS`` event (s): a typing run that starts within this long of such an input, before a ``FOCUS`` event came,
+#: has its field read again this long after it started, and a run a ``FOCUS`` event lands on within this long of its
+#: start is dropped (its characters may belong to the next field, a password box). Fails closed.
+FOCUS_RACE_S = 0.5
+#: A save chord re-checks the files that app opened or saved this long after the chord (s): their own write time.
+SAVE_CHECK_S = 1.5
+#: Files remembered (in memory only, any app: Explorer often opens what another app then saves) for a save chord's
+#: re-check.
+KNOWN_FILES = 8
 #: Roles whose answer to ``ElementFromPoint`` is a whole renderer pane (try the descent, path iii) when it covers
 #: most of the window.
 PANE_ROLES = frozenset({"Pane", "Document", "Window", "Custom", "Group"})
@@ -91,9 +101,13 @@ PANE_ROLES = frozenset({"Pane", "Document", "Window", "Custom", "Group"})
 EDIT_ROLES = frozenset({"Edit", "Document", "ComboBox"})
 #: Standard paste accelerators (Windows' own; machine identities of a shortcut).
 PASTE_CHORDS = frozenset({"Ctrl+V", "Shift+Insert"})
+#: The standard Save accelerator (Windows' own): re-checks the files known to be open for a save without a dialog.
+SAVE_CHORDS = frozenset({"Ctrl+S"})
 STRUCTURE_EVENTS = frozenset({EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_REORDER, EVENT_SYSTEM_MENUEND,
                               EVENT_SYSTEM_MENUPOPUPEND})
 IDENTITY_EVENTS = (EVENT_OBJECT_INVOKED, EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD, EVENT_OBJECT_FOCUS)
+#: Changed elements an outcome resolves to role and position at most (report 78 §4.2 step 3).
+OUTCOME_ELEMENTS = 5
 
 _BUTTON_KIND = {"left": "click", "right": "rclick", "middle": "click", "x1": "click", "x2": "click"}
 
@@ -170,6 +184,9 @@ class _Act:
     file: dict[str, Any] | None = None
     command: dict[str, Any] | None = None
     after_type: dict[str, Any] | None = None
+    stale: bool = False
+    recheck_at: float | None = None
+    save_check: bool = False
 
 
 class TraceWorker:
@@ -242,7 +259,13 @@ class TraceWorker:
         self._focus: Any = None                   # the focused element, until a focus event or a window change
         self._focus_valid = False
         self._last_click_edit: tuple[float, Any, int] | None = None
-        self._last_focus_ev = 0.0
+        self._last_focus_ev = float("-inf")
+        self._focus_move_t = float("-inf")       # the last input that may move the focus (a non-run key, a press)
+        self._opened_at = wall()                 # wall time the trace last went from blocked to open
+        self._was_blocked = False
+        self._dialog: tuple[float, int, _Window] | None = None   # an open/save dialog in front: (t, hwnd, owner)
+        self._dialog_closed: tuple[float, _Window] | None = None
+        self._known_files: deque[tuple[str, str]] = deque(maxlen=KNOWN_FILES)   # recent (path, digest), memory only
         self._last_action_t = float("-inf")
         self._last_input: tuple[float, str] | None = None
         self._last_key: _Act | None = None
@@ -367,17 +390,44 @@ class TraceWorker:
         """One queue item (see :mod:`yuki.memory.trace_input` and :mod:`yuki.memory.trace_hooks`)."""
         kind = item[0]
         try:
-            if self._blocked() is not None and kind not in ("fg",):
-                self.counters["dropped_" + (self._blocked() or "off")] += 1
+            if kind == "reopen":
+                self._on_reopen(*item[1:])
                 return
+            blocked = self._blocked()
+            if blocked is not None:
+                self._was_blocked = True
+                if kind != "fg":
+                    self.counters["dropped_" + blocked] += 1
+                    return
+            elif self._was_blocked:
+                self._on_reopen(self._wall())
             getattr(self, "_on_" + kind)(*item[1:])
         except Exception as exc:  # noqa: BLE001 - one bad item never stops the trace
             self._error(kind, exc)
+
+    def _on_reopen(self, wall: float) -> None:
+        """The trace went from blocked (off, paused, an off hour, a game) to open: nothing from the blocked span may
+        become a row later, so the Recent folder's links written meanwhile are passed over, and half-built actions,
+        rests and runs from before are dropped."""
+        self._was_blocked = False
+        self._opened_at = max(self._opened_at, float(wall))
+        self._recent_seen = max(self._recent_seen, float(wall))
+        self._dialog = self._dialog_closed = None
+        self._type = self._hover = self._pending_dclick = self._last_key = self._last_wheel = None
+        self._open.clear()
+        self._hover_due = None
+        self._focus_valid = False
+        if self._acts:
+            self.counters["dropped_reopen"] += len(self._acts)
+            self._acts = []
+        self._last_input = None
 
     def _on_down(self, t: float, button: str, x: int, y: int, source: str, travel: int, dbl: bool) -> None:
         self._close_type(t)
         self._close_hover(t)
         self._input(t, source)
+        self._focus_valid = False                          # a press may move the focus
+        self._focus_move_t = t
         if dbl and self._pending_dclick is not None and self._pending_dclick.button == button:
             prev = self._pending_dclick
             prev.kind = "dclick"
@@ -450,11 +500,13 @@ class TraceWorker:
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
 
     def _focused(self, *, priority: bool) -> Any:
-        """The focused element: the cached one while no focus event or window change came since, else a lookup."""
+        """The focused element: the cached one while no focus event, window change, press or focus-moving key came
+        since, else the field just clicked (only while no focus event came after that click), else a lookup."""
         if self._focus_valid:
             return self._focus
         click = self._last_click_edit
-        if click is not None and click[0] >= self._last_focus_ev - 0.5 and click[1] is not None:
+        if (click is not None and click[1] is not None and click[0] > self._last_focus_ev
+                and click[0] >= self._focus_move_t):
             self._focus, self._focus_valid = click[1], True
             return self._focus
         el = self._lookup(self.uia.focused, priority=priority) if self.uia is not None else None
@@ -486,15 +538,19 @@ class TraceWorker:
         act = self._new_act("paste" if paste else "keys", t, source, win, chord=text, travel=travel,
                             gap_ms=self._gap(t))
         act.after_type = after_type
+        act.save_check = text in SAVE_CHORDS
         self._last_key = act
         if act.drop is None:
             el = self._focused(priority=True)
             if el is None:
                 act.drop = "password_unknown"         # fail closed: the field it went into could not be checked
-            elif el.password:
-                act.drop = "password"
+            elif el.secret():
+                act.drop = el.secret()
             else:
                 act.el, act.resolved, act.lookup_ms = el, "focus", el.ms
+        if text.split("+")[-1] not in RUN_KEYS:
+            self._focus_valid = False                 # Tab, Enter, a shortcut: the focus may move; read it again
+            self._focus_move_t = t
         if paste and act.drop is None and self._clipboard is not None:
             try:
                 seq, formats, private = self._clipboard()
@@ -519,25 +575,52 @@ class TraceWorker:
                 el = self._focused(priority=True)
                 if el is None:
                     run.drop = "password_unknown"
-                elif el.password:
-                    run.drop = "password"
+                elif el.secret():
+                    run.drop = el.secret()
                 else:
                     run.el, run.resolved, run.lookup_ms = el, "focus", el.ms
+                    if t - self._focus_move_t <= FOCUS_RACE_S and self._last_focus_ev < self._focus_move_t:
+                        run.recheck_at = t + FOCUS_RACE_S   # the app may not have moved the focus yet: read it again
         run.typed = (run.typed or 0) + int(n)
         run.last_t = t
+
+    def _recheck(self, run: _Act) -> None:
+        """A run that started right after a focus-moving input, its field read again once the app has had time to
+        move the focus: a password (or unreadable) field now drops the whole run; another plain field takes it."""
+        run.recheck_at = None
+        if run.drop is not None:
+            return
+        el = self._lookup(self.uia.focused, priority=True) if self.uia is not None else None
+        if el is None:
+            run.drop = "password_unknown"
+        elif el.secret():
+            run.drop = el.secret()
+        else:
+            run.el, run.lookup_ms = el, el.ms
+            self._focus, self._focus_valid = el, True
 
     def _close_type(self, t: float) -> None:
         run, self._type = self._type, None
         if run is not None:
             run.open = False
+            if run.recheck_at is not None:
+                self._recheck(run)                    # closed before its re-read: read the field now
 
     def _on_ev(self, t: float, event: int, hwnd: int, id_object: int, id_child: int) -> None:
         ev = (t, event, hwnd, id_object, id_child)
         if event == EVENT_OBJECT_FOCUS:
             self._focus_valid = False
             self._last_focus_ev = t
+            run = self._type
+            if run is not None:
+                if t - run.t <= FOCUS_RACE_S and run.drop is None:
+                    run.drop = "focus_race"           # the focus moved just after the run began: whose letters?
+                run.recheck_at = None
+                self._close_type(t)                   # the next character reads the (new) field again
+        elif event == EVENT_SYSTEM_DIALOGSTART:
+            self._dialog = (t, int(hwnd), self._fg)
         if event in STRUCTURE_EVENTS:
-            self._recent_structure.append((t, event))
+            self._structure(t, event)
         attached = False
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
@@ -556,19 +639,33 @@ class TraceWorker:
                 el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False)
                 if el is not None:
                     act.el, act.resolved, act.lookup_ms = el, "event", el.ms
-                    if el.password:
-                        act.drop = "password"
+                    if el.secret():
+                        act.drop = el.secret()
+
+    def _structure(self, t: float, event: int) -> None:
+        """A structure change (shown, hidden, reordered, a menu closed, another window in front): every action whose
+        lookup was still answering at that time is stale, decided now (a busy app's events cannot push it out)."""
+        self._recent_structure.append((t, event))
+        for act in self._acts:
+            if act.lookup_end is not None and act.t <= t <= act.lookup_end:
+                act.stale = True
 
     def _on_out(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, gen: int = 0) -> None:
         if event in STRUCTURE_EVENTS:
-            self._recent_structure.append((t, event))
+            self._structure(t, event)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
                 act.outs.append((t, event, hwnd, id_object, id_child))
 
     def _on_fg(self, t: float, hwnd: int, pid: int) -> None:
         self._focus_valid = False
-        self._recent_structure.append((t, -1))
+        self._structure(t, -1)
+        dialog = self._dialog
+        if dialog is not None and hwnd != dialog[1]:
+            self._dialog = None
+            self._dialog_closed = (t, dialog[2])     # an open/save dialog closed: its file belongs to this app
+            if self._blocked() is None:
+                self._on_recent(t)                   # the dialog's own Recent entry, if the shell wrote it already
         if self._last_click_edit is not None and self._last_click_edit[2] != hwnd:
             self._last_click_edit = None             # typing now goes into another window
         if self._blocked() is not None:
@@ -678,7 +775,13 @@ class TraceWorker:
             return
         self._recent_seen = newest
         last = self._last_input
+        dialog = self._dialog_closed
+        if dialog is not None and t - dialog[0] > FILE_INPUT_S:
+            dialog = self._dialog_closed = None
         for mtime, link in sorted(found)[-8:]:
+            if mtime < self._opened_at:
+                self.counters["file_before_open"] += 1   # written while the trace was off, paused or gated
+                continue
             target = self._resolve(link)
             if not target or not os.path.isfile(target):
                 continue
@@ -693,14 +796,42 @@ class TraceWorker:
             except OSError:
                 written = 0.0
             saved = abs(self._wall() - written) <= 10.0
-            hwnd, pid = self._foreground()
-            win = self._window(hwnd, pid)
-            act = self._new_act("file_save" if saved else "file_open", t, last[1], win)
-            act.resolved = "event"
-            ext = os.path.splitext(target)[1].lower()[:12]
-            digest = self._digest("ui-file", os.path.normcase(os.path.normpath(target)))
-            act.file = {"path": target, "ext": ext, "digest": digest}
-            act.facts["file_saved" if saved else "file_opened"] = digest
+            if dialog is not None:
+                win = self._window(dialog[1].hwnd, dialog[1].pid)   # the app whose open/save dialog it came from
+            else:
+                hwnd, pid = self._foreground()
+                win = self._window(hwnd, pid)
+            self._file_act("file_save" if saved else "file_open", t, last[1], win, target,
+                           via="dialog" if dialog is not None else "recent")
+
+    def _file_act(self, kind: str, t: float, source: str, win: _Window, target: str, *, via: str) -> _Act:
+        act = self._new_act(kind, t, source, win, via=via)
+        act.resolved = "event"
+        ext = os.path.splitext(target)[1].lower()[:12]
+        digest = self._digest("ui-file", os.path.normcase(os.path.normpath(target)))
+        act.file = {"path": target, "ext": ext, "digest": digest}
+        act.facts["file_saved" if kind == "file_save" else "file_opened"] = digest
+        if act.drop is None:
+            entry = (target, digest)
+            if entry in self._known_files:
+                self._known_files.remove(entry)
+            self._known_files.append(entry)
+        return act
+
+    def _save_check(self, act: _Act) -> None:
+        """A save chord with no dialog (FL Studio's usual Ctrl+S): the files this app opened or saved, by their own
+        write time since the chord, become ``file_save`` rows (an .flp gets its project facts)."""
+        chord_wall = self._at(act.t)
+        for target, _digest in list(self._known_files):
+            try:
+                written = os.path.getmtime(target)
+            except OSError:
+                continue
+            if written < chord_wall - 1.0 or self._rules().folder_blocked(target):
+                continue
+            save = self._file_act("file_save", act.t, act.source, act.win, target, via="save_chord")
+            save.up_t = save.last_t = act.last_t
+            self.counters["file_save_chord"] += 1
 
     def _on_cmd(self, items: list[dict[str, Any]]) -> None:
         """Warp's own history rows (already secret-filtered by its rules) as ``command`` actions."""
@@ -754,7 +885,8 @@ class TraceWorker:
 
     def _due(self, act: _Act, nxt: _Act | None) -> float | None:
         if act.kind == "type":
-            return act.last_t + TYPE_GAP_S if act is self._type else act.last_t
+            due = act.last_t + TYPE_GAP_S if act is self._type else act.last_t
+            return due if act.recheck_at is None else min(due, act.recheck_at)
         if act.kind == "hover":
             return act.t + HOVER_MAX_S if act.open else act.last_t
         if act.open:
@@ -764,6 +896,10 @@ class TraceWorker:
             end = min(end, max(nxt.t, (act.up_t or act.t) + IDENTITY_S))
         if act.kind in ("click", "rclick", "dclick", "drag") and act is self._pending_dclick:
             end = max(end, (act.up_t or act.t) + self._double_s())
+        if act.save_check:
+            end = max(end, act.last_t + SAVE_CHECK_S)
+        if act.recheck_at is not None:
+            end = max(end, act.recheck_at)
         return end
 
     def _double_s(self) -> float:
@@ -781,6 +917,9 @@ class TraceWorker:
                     self._hover_fire(now)
                 else:
                     self._hover_due = None
+            for act in self._acts:
+                if act.recheck_at is not None and now >= act.recheck_at:
+                    self._recheck(act)
             if self._type is not None and now - self._type.last_t > TYPE_GAP_S:
                 self._close_type(now)
             if self._hover is not None and now - self._hover.t >= HOVER_MAX_S:
@@ -834,7 +973,9 @@ class TraceWorker:
     def _stale(self, act: _Act) -> bool:
         if act.resolved not in ("point", "snapshot") or act.lookup_end is None:
             return False
-        return any(act.t <= t <= act.lookup_end for t, _e in self._recent_structure)
+        # decided as the events came (``act.stale``); the short history covers a structure event that reached the
+        # queue before the press itself
+        return act.stale or any(act.t <= t <= act.lookup_end for t, _e in self._recent_structure)
 
     def _outcome(self, act: _Act, now: float) -> tuple[str, dict[str, Any]]:
         counts: Counter[str] = Counter()
@@ -867,10 +1008,44 @@ class TraceWorker:
         if page_after and act.win.page_key and page_after != act.win.page_key:
             counts["page_changed"] += 1
             act.facts["page_reached"] = page_after
-        summary = dict(counts)
+        summary: dict[str, Any] = dict(counts)
+        changed = self._outcome_elements(act)
+        if changed:
+            summary["elements"] = changed
         if counts:
             return "changed", summary
         return ("nothing" if act.el is not None else "unverifiable"), summary
+
+    def _outcome_elements(self, act: _Act) -> list[dict[str, Any]]:
+        """Up to :data:`OUTCOME_ELEMENTS` of the elements that changed (state, value, shown), resolved to role, parent
+        role and position in the window, with spare lookups only (clicks keep their reserve). No names, no values."""
+        if self.uia is None or act.drop is not None or not act.outs:
+            return []
+        seen: set[tuple[int, int, int]] = set()
+        out: list[dict[str, Any]] = []
+        rect = self._rect(act.win.hwnd) if act.win.hwnd else None
+        for _t, event, hwnd, id_object, id_child in act.outs:
+            if event not in (EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_VALUECHANGE, EVENT_OBJECT_SHOW):
+                continue
+            target = (hwnd, id_object, id_child)
+            if target in seen:
+                continue
+            seen.add(target)
+            if len(seen) > OUTCOME_ELEMENTS:
+                break
+            el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False)
+            if el is None:
+                if self._bucket.tokens - 1.0 < RESERVE_FOR_CLICKS:
+                    break                                   # no spare budget left: the counts stand alone
+                continue
+            if el.secret() or (el.pid and act.win.pid and el.pid != act.win.pid):
+                continue
+            entry: dict[str, Any] = {"role": el.role, "parent": el.parent_role or None}
+            if el.bounds:
+                ox, oy = (rect[0], rect[1]) if rect else (0, 0)
+                entry["at"] = f"{(el.bounds[0] + el.bounds[2]) // 2 - ox},{(el.bounds[1] + el.bounds[3]) // 2 - oy}"
+            out.append(entry)
+        return out
 
     def _machine_facts(self, act: _Act) -> None:
         el = act.el
@@ -940,9 +1115,9 @@ class TraceWorker:
                 act.win.page_key = now_win.page_key
         if act.drop is None:
             self._identity_from_events(act)
-        if act.drop is None and act.el is not None and act.el.password:
-            act.drop = "password"
-        if act.drop is None and act.end_el is not None and act.end_el.password:
+        if act.drop is None and act.el is not None and act.el.secret():
+            act.drop = act.el.secret()
+        if act.drop is None and act.end_el is not None and act.end_el.secret():
             act.end_el = None
         if act.drop is not None:
             if act.drop.startswith("skip_"):
@@ -955,6 +1130,8 @@ class TraceWorker:
             act.resolved = "stale"
         if act.el is not None and act.el.role in ("MenuItem",) and act.kind == "click":
             act.kind = "menu"
+        if act.save_check:
+            self._save_check(act)
         self._machine_facts(act)
         outcome, summary = self._outcome(act, now)
         row: dict[str, Any] = {
@@ -1192,6 +1369,10 @@ class Trace:
         self._last_msgs = 0
         self._ab: _AbSampler | None = None
         self.error = ""
+        #: Wall-time spans while the trace was blocked (start, end or None while it still is), and when it first
+        #: opened: a Warp command whose own time falls in one (or before that) is never recorded.
+        self._spans: deque[list[float | None]] = deque(maxlen=256)
+        self._first_open: float | None = None
 
     def rules(self) -> TraceRules:
         return self._section.get()
@@ -1268,9 +1449,38 @@ class Trace:
         self.beat()
 
     def warp_commands(self, items: list[dict[str, Any]]) -> None:
-        """Warp's history rows (secret-filtered by its rules) for ``command`` actions (from the Warp reader)."""
-        if items and not self.blocked_reason():
-            self.queue.put(("cmd", list(items)))
+        """Warp's history rows (secret-filtered by its rules) for ``command`` actions (from the Warp reader). Warp is
+        read every few minutes, so each command is checked against when the trace was open by its own time."""
+        if not items or self.blocked_reason():
+            return
+        kept = [c for c in items if self.open_at(c.get("at"))]
+        if self.worker is not None and len(kept) < len(items):
+            self.worker.counters["dropped_command_blocked_span"] += len(items) - len(kept)
+        if kept:
+            self.queue.put(("cmd", kept))
+
+    def open_at(self, at: Any) -> bool:
+        """Whether the trace was open (recording, not paused, not gated) at this wall time."""
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            return False
+        if self._first_open is None or at < self._first_open:
+            return False
+        return not any(start <= at and (end is None or at < end) for start, end in self._spans)
+
+    def _span(self, blocked: bool) -> None:
+        now = time.time()
+        if blocked:
+            if not self._spans or self._spans[-1][1] is not None:
+                self._spans.append([now, None])
+        else:
+            if self._first_open is None:
+                self._first_open = now
+            if self._spans and self._spans[-1][1] is None:
+                self._spans[-1][1] = now
+            while self._spans and self._spans[0][1] is not None and now - float(self._spans[0][1]) > 2 * 86400.0:
+                self._spans.popleft()
 
     def blocked_reason(self) -> str | None:
         rules = self.rules()
@@ -1315,11 +1525,17 @@ class Trace:
                     self._log("trace_state", state="no_input", why="raw_input_unavailable")
             if not blocked:
                 self.sink.reset()
+                # nothing from the blocked span may become a row later (Recent links, half-built actions)
+                self.queue.put(("reopen", time.time()))
+            self._span(blocked)
             self.sink.blocked = blocked
             self.hooks.set_blocked(blocked)
-        if (reason or "on") != self.state:
-            self.state = reason or "on"
+        state = reason or ("no_input" if self._attach is not None and not self._attached else "on")
+        if state != self.state:
+            self.state = state
             self._log("trace_state", state=self.state)
+            if state == "no_input":
+                self.save_health()
         if self._ab is not None:
             self._ab.beat(self.state == "on")
         now = time.monotonic()

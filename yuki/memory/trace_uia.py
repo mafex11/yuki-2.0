@@ -65,6 +65,7 @@ class Element:
     rid: tuple[int, ...] | None = None
     bounds: tuple[int, int, int, int] | None = None    # left, top, right, bottom (screen px)
     password: bool = False
+    password_known: bool = True                        # False: IsPassword could not be read (fails closed)
     toggle: int | None = None
     selected: bool | None = None
     pid: int = 0
@@ -74,6 +75,15 @@ class Element:
     index: int | None = None
     ms: float = 0.0
     ref: Any = field(default=None, repr=False, compare=False)
+
+    def secret(self) -> str | None:
+        """Why nothing about this element may be kept: ``password``, ``password_unknown`` (IsPassword unreadable:
+        fails closed, as the watcher's ``_PasswordProbe`` treats an unknown answer), else None."""
+        if self.password:
+            return "password"
+        if not self.password_known:
+            return "password_unknown"
+        return None
 
     def contains(self, x: int, y: int) -> bool:
         b = self.bounds
@@ -176,7 +186,7 @@ class TraceUia:
         toggle = number(_P_TOGGLE) if number(_P_HAS_TOGGLE) else None
         return Element(role=ROLE_NAMES.get(int(ctype), f"ControlType{ctype}") if isinstance(ctype, int) else "",
                        name=text(_P_NAME), aid=text(_P_AID), rid=rid, bounds=_bounds(get(_P_BOUNDS)),
-                       password=bool(password), toggle=toggle,
+                       password=bool(password), password_known=password is not None, toggle=toggle,
                        selected=None if selected is None else bool(selected), pid=number(_P_PID) or 0,
                        hwnd=number(_P_HWND) or 0, ms=round((time.perf_counter() - t0) * 1000.0, 2), ref=el)
 

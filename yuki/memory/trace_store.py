@@ -20,6 +20,7 @@ trace stays one owner's code. Everything content-bearing is encrypted with the m
 
 from __future__ import annotations
 
+import bisect
 import json
 import sqlite3
 import time
@@ -132,16 +133,50 @@ def update_action(store: Any, action_id: int, **fields: Any) -> None:
 
 
 def capture_ids(store: Any, wants: Iterable[tuple[str, float]]) -> dict[tuple[str, float], int | None]:
-    """The latest capture of each app at or before a time: ``{(process, at): capture id}`` (what was on screen)."""
-    out: dict[tuple[str, float], int | None] = {}
+    """The latest capture of each app at or before a time: ``{(process, at): capture id}`` (what was on screen).
+
+    Two queries per app per batch (the capture just before the batch's first row, and those inside its span), walked
+    newest-first on the ``captures_at`` index (measured on a copy of the real database: ~0.03-0.1 ms each, against
+    ~2-6 ms for a per-row query that sorted the app's captures); rows are assigned in Python."""
+    by_process: dict[str, list[float]] = {}
     for process, at in set(wants):
+        by_process.setdefault(process, []).append(float(at))
+    out: dict[tuple[str, float], int | None] = {}
+    for process, ats in by_process.items():
+        lo, hi = min(ats), max(ats)
+        caps: list[tuple[float, int]] = []
         try:
-            rows = store._query(
-                "SELECT c.id FROM captures c JOIN threads t ON t.id = c.thread_id WHERE t.process = ? AND c.at <= ?"
-                " AND c.at >= ? ORDER BY c.at DESC LIMIT 1", (process, float(at), float(at) - 6 * 3600.0))
+            caps = _captures_span(store, process, lo, hi)
         except Exception:  # noqa: BLE001 - an older database
-            rows = []
-        out[(process, at)] = int(rows[0][0]) if rows else None
+            caps = []
+        times = [c[0] for c in caps]
+        for at in ats:
+            i = bisect.bisect_right(times, at) - 1
+            out[(process, at)] = caps[i][1] if i >= 0 and times[i] >= at - CAPTURE_LOOKBACK_S else None
+    return out
+
+
+#: How far back the capture for a row may be (s).
+CAPTURE_LOOKBACK_S = 6 * 3600.0
+
+
+def _captures_span(store: Any, process: str, lo: float, hi: float) -> list[tuple[float, int]]:
+    """``[(at, id)]`` oldest first: the app's last capture at or before ``lo`` (within the lookback) and every one in
+    ``(lo, hi]``."""
+    sub = "c.thread_id IN (SELECT id FROM threads WHERE process = ?)"
+    out: list[tuple[float, int]] = []
+    for hint in (" INDEXED BY captures_at", ""):
+        try:
+            before = store._query(
+                f"SELECT c.at, c.id FROM captures c{hint} WHERE c.at <= ? AND c.at >= ? AND {sub}"
+                " ORDER BY c.at DESC LIMIT 1", (lo, lo - CAPTURE_LOOKBACK_S, process))
+            inside = store._query(
+                f"SELECT c.at, c.id FROM captures c{hint} WHERE c.at > ? AND c.at <= ? AND {sub} ORDER BY c.at",
+                (lo, hi, process)) if hi > lo else []
+        except sqlite3.OperationalError:
+            continue                                          # no such index (an older database): plain query
+        out = [(float(r[0]), int(r[1])) for r in before] + [(float(r[0]), int(r[1])) for r in inside]
+        break
     return out
 
 
@@ -163,6 +198,10 @@ def purge(store: Any, *, now: float | None = None, raw_days: float = RAW_DAYS,
                 (raw_cut, raw_cut, raw_cut)).rowcount,
             "actions": conn.execute("DELETE FROM ui_actions WHERE at < ?", (raw_cut,)).rowcount,
             "elements": conn.execute("DELETE FROM ui_elements WHERE coalesce(last_at, 0) < ?", (el_cut,)).rowcount,
+            # a forget's before-image (undone or not): once the keep is past, nothing in it could come back anyway,
+            # so what the user asked to forget never outlives the 30 days
+            "undo_images": conn.execute("DELETE FROM undo_images WHERE surface = 'trace' AND at < ?",
+                                        (raw_cut,)).rowcount,
         }
         return out
 
@@ -306,17 +345,39 @@ def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[
 # -- later joins ---------------------------------------------------------------------------------------------------
 
 
-def attach_episodes(store: Any, *, now: float | None = None, settle_s: float = 900.0, limit: int = 5000) -> int:
-    """Set ``episode_id`` on rows whose final, current episode now exists (episodes are written after the fact)."""
-    now = time.time() if now is None else float(now)
+#: ``nudge_state`` name of :func:`attach_episodes`' cursor: the last episode id it has gone through.
+EPISODE_CURSOR = "trace:episode_cursor"
+
+
+def attach_episodes(store: Any, *, limit: int = 500) -> int:
+    """Set ``episode_id`` on rows once their final, current episode exists (episodes are written after the fact).
+
+    Walks the episodes, not the rows: each final episode newer than the cursor (``nudge_state``
+    :data:`EPISODE_CURSOR`) labels the rows in its span that have no episode yet, or one a later run replaced
+    (``expired_at``). Rows no episode covers are simply never touched again, so they cannot crowd out newer rows.
+    At most ``limit`` episodes a call; returns how many rows were labelled."""
 
     def op(conn: sqlite3.Connection) -> int:
-        cur = conn.execute(
-            "UPDATE ui_actions SET episode_id = (SELECT e.id FROM episodes e WHERE e.final = 1 AND e.expired_at IS NULL"
-            " AND e.started_at <= ui_actions.at AND e.ended_at >= ui_actions.at ORDER BY e.started_at DESC LIMIT 1)"
-            " WHERE id IN (SELECT id FROM ui_actions WHERE episode_id IS NULL AND at < ? ORDER BY at LIMIT ?)",
-            (now - settle_s, int(limit)))
-        return cur.rowcount
+        row = conn.execute("SELECT value FROM nudge_state WHERE name = ?", (EPISODE_CURSOR,)).fetchone()
+        try:
+            cursor = int(row[0]) if row is not None and row[0] is not None else 0
+        except (TypeError, ValueError):
+            cursor = 0
+        episodes = conn.execute(
+            "SELECT id, started_at, ended_at FROM episodes WHERE id > ? AND final = 1 AND expired_at IS NULL"
+            " ORDER BY id LIMIT ?", (cursor, int(limit))).fetchall()
+        if not episodes:
+            return 0
+        done = 0
+        for ep in episodes:
+            done += conn.execute(
+                "UPDATE ui_actions SET episode_id = ? WHERE at >= ? AND at <= ? AND (episode_id IS NULL OR NOT EXISTS"
+                " (SELECT 1 FROM episodes e2 WHERE e2.id = ui_actions.episode_id AND e2.expired_at IS NULL))",
+                (int(ep[0]), float(ep[1]), float(ep[2]))).rowcount
+        conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE"
+                     " SET value = excluded.value, updated_at = excluded.updated_at",
+                     (EPISODE_CURSOR, str(int(episodes[-1][0])), time.time()))
+        return done
 
     try:
         return store._write(op)

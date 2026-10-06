@@ -105,7 +105,7 @@ def test_the_purge_keeps_30_days_of_raw_rows_and_60_of_elements(store):
     store._write(lambda c: c.execute("INSERT INTO ui_links(from_action, to_action, kind, created_at) VALUES"
                                      " (?,?,?,?)", (ids[0], ids[2], "clipboard", now - 31 * DAY)))
     out = ts.purge(store, now=now)
-    assert out == {"files": 1, "links": 1, "actions": 1, "elements": 1}
+    assert out == {"files": 1, "links": 1, "actions": 1, "elements": 1, "undo_images": 0}
     assert store._query("SELECT count(*) FROM ui_actions")[0][0] == 2
     assert [r[0] for r in store._query("SELECT element_key FROM ui_elements")] == ["used"]
 
@@ -150,8 +150,74 @@ def test_episode_ids_are_attached_once_the_episode_is_final(store):
     store._write(lambda c: c.execute(
         "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext, created_at)"
         " VALUES (?,?,?,?,?,?,?)", (now - 3600, now - 1800, now - 3600, now - 1800, 1, store._enc("x"), now)))
-    assert ts.attach_episodes(store, now=now) == 1
+    assert ts.attach_episodes(store) == 1
     assert store._query("SELECT episode_id FROM ui_actions")[0][0] is not None
+
+
+def _episode(store, start: float, end: float, *, expired: float | None = None) -> int:
+    return int(store._write(lambda c: c.execute(
+        "INSERT INTO episodes(started_at, ended_at, window_start, window_end, final, text_ciphertext, created_at,"
+        " expired_at) VALUES (?,?,?,?,?,?,?,?)",
+        (start, end, start, end, 1, store._enc("x"), time.time(), expired)).lastrowid))
+
+
+def test_rows_no_episode_covers_never_starve_newer_rows(store):
+    """Review F5: 5,001 old rows outside any episode, then one newer row inside a final episode: it gets its id."""
+    now = time.time()
+    ts.write_batch(store, [_row(now - 20 * DAY + i) for i in range(5001)])
+    (newer,) = ts.write_batch(store, [_row(now - 3000)])
+    ts.attach_episodes(store, limit=1)                         # nothing final yet: the cursor stays
+    ep = _episode(store, now - 3600, now - 1800)
+    for _ in range(3):
+        ts.attach_episodes(store)
+    assert store._query("SELECT episode_id FROM ui_actions WHERE id=?", (newer,))[0][0] == ep
+    assert store._query("SELECT count(*) FROM ui_actions WHERE episode_id IS NOT NULL")[0][0] == 1
+    assert store.nudge_state(ts.EPISODE_CURSOR) == str(ep)
+    # a later run of the same window replaces the episode: the row follows the new one
+    store._write(lambda c: c.execute("UPDATE episodes SET expired_at=? WHERE id=?", (now, ep)))
+    ep2 = _episode(store, now - 3600, now - 1800)
+    assert ts.attach_episodes(store) == 1
+    assert store._query("SELECT episode_id FROM ui_actions WHERE id=?", (newer,))[0][0] == ep2
+
+
+def test_a_forgotten_trace_does_not_outlive_the_keep_in_undo_images(store):
+    """Review F3: the forget's before-image is purged with the raw rows, undone or not."""
+    now = time.time()
+    ts.write_batch(store, [_row(now - 100, process="sketchpad", command_ciphertext=store._enc("invented cmd"))])
+    ts.forget(store, process="sketchpad", now=now)
+    assert store._query("SELECT count(*) FROM undo_images WHERE surface='trace'")[0][0] == 1
+    later = now + 400 * DAY
+    store.prune_undo_images(older_than_days=30, now=later)    # the shared pruner keeps the user's own images
+    out = ts.purge(store, now=later)
+    assert out["undo_images"] == 1
+    assert store._query("SELECT count(*) FROM undo_images WHERE surface='trace'")[0][0] == 0
+    assert ts.purge(store, now=now + 10 * DAY)["undo_images"] == 0
+
+
+def test_what_was_on_screen_takes_two_queries_per_app_per_batch(store):
+    """Review F9: capture ids per (app, batch), not per row; the right capture for each row."""
+    now = time.time()
+    tid = store._write(lambda c: c.execute(
+        "INSERT INTO threads(thread_key, app, title_ciphertext, first_seen, last_seen, process) VALUES (?,?,?,?,?,?)",
+        ("k-notes", "Field Notes", store._enc("Notes"), now, now, "fieldnotes")).lastrowid)
+    cap = {}
+    for k, at in (("old", now - 7 * 3600), ("a", now - 100), ("b", now - 50), ("c", now - 10)):
+        cap[k] = store._write(lambda c, at=at: c.execute(
+            "INSERT INTO captures(thread_id, at, trigger, delta_ciphertext, chars, hash) VALUES (?,?,?,?,?,?)",
+            (tid, at, "test", store._enc("x"), 1, f"h{at}")).lastrowid)
+    queries = []
+    real = store._query
+    store._query = lambda *a, **k: queries.append(a[0]) or real(*a, **k)
+    try:
+        got = ts.capture_ids(store, [("fieldnotes", now - 60), ("fieldnotes", now - 40), ("fieldnotes", now - 5),
+                                     ("otherapp", now - 5)])
+    finally:
+        store._query = real
+    assert got[("fieldnotes", now - 60)] == cap["a"] and got[("fieldnotes", now - 40)] == cap["b"]
+    assert got[("fieldnotes", now - 5)] == cap["c"] and got[("otherapp", now - 5)] is None
+    assert len(queries) == 3                                   # 2 for the app with a span, 1 for a single row
+    assert ts.capture_ids(store, [("fieldnotes", now - 6.5 * 3600)]) == {("fieldnotes", now - 6.5 * 3600): cap["old"]}
+    assert ts.capture_ids(store, [("fieldnotes", now - 14 * 3600)]) == {("fieldnotes", now - 14 * 3600): None}
 
 
 def test_yukis_untagged_steps_are_matched_to_its_run_but_a_takeover_never(store):

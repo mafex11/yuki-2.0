@@ -135,8 +135,78 @@ def test_warp_rows_reach_the_trace_only_while_it_records(env):
     trace.stop()                                                     # hold the worker: look at the queue itself
     trace.queue = queue.SimpleQueue()
     trace.hooks.alive = True
-    trace.warp_commands([{"command": "ls", "at": 1.0}])
+    trace.warp_commands([{"command": "ls", "at": time.time()}])
     assert trace.queue.get_nowait()[0] == "cmd"
+
+
+def test_warp_commands_typed_while_the_trace_was_blocked_are_never_recorded(env):
+    """Review F4: Warp is read every few minutes; a command is checked by its own time against the blocked spans."""
+    trace, privacy, gate, attached = env
+    before_consent = time.time()
+    time.sleep(0.01)
+    _consent(privacy, True)
+    trace.beat()
+    opened = time.time()
+    time.sleep(0.01)
+    gate.hold = True
+    trace.beat()
+    time.sleep(0.01)
+    in_game = time.time()
+    time.sleep(0.01)
+    gate.hold = False
+    trace.beat()
+    time.sleep(0.01)
+    after = time.time()
+    assert not trace.open_at(before_consent) and not trace.open_at(in_game) and not trace.open_at(None)
+    assert trace.open_at(opened) and trace.open_at(after)
+    trace.stop()                                                     # hold the worker: look at the queue itself
+    trace.queue = queue.SimpleQueue()
+    trace.hooks.alive = True
+    trace.warp_commands([{"command": "invented-build --all", "at": before_consent},
+                         {"command": "invented-test", "at": in_game},
+                         {"command": "invented-lint", "at": after}])
+    kind, items = trace.queue.get_nowait()
+    assert kind == "cmd" and [c["command"] for c in items] == ["invented-lint"]
+    assert trace.worker.counters["dropped_command_blocked_span"] == 2
+
+
+def test_each_opening_tells_the_worker_so_nothing_from_the_blocked_span_is_kept(env, monkeypatch):
+    """Review F1: going from blocked to open queues a reopen mark for the worker."""
+    trace, privacy, gate, attached = env
+    _consent(privacy, True)
+    seen = []
+    real_start = trace.start
+
+    def start():
+        out = real_start()
+        trace.stop()                                                 # hold the worker
+        trace.queue = queue.SimpleQueue()
+        trace.hooks.alive = True
+        return out
+
+    monkeypatch.setattr(trace, "start", start)
+    trace.beat()
+    trace.set_paused(True)
+    trace.set_paused(False)
+    while not trace.queue.empty():
+        seen.append(trace.queue.get_nowait()[0])
+    assert seen.count("reopen") == 2                                # the first opening and the one after the pause
+
+
+def test_no_raw_input_shows_in_the_doctors_state(env):
+    """Review F10: when the sink cannot be attached the state says so (the doctor's warning)."""
+    trace, privacy, gate, attached = env
+    trace._attach = lambda sink: False
+    _consent(privacy, True)
+    trace.beat()
+    assert trace.state == "no_input"
+    import json
+
+    assert json.loads(trace.store.nudge_state("trace:health"))["state"] == "no_input"
+    trace._attach = lambda sink: True
+    trace.set_paused(True)
+    trace.set_paused(False)
+    assert trace.state == "on"
 
 
 def test_ab_hours_alternate_recording(env, monkeypatch):
