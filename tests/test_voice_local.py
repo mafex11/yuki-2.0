@@ -62,6 +62,12 @@ class Log:
 
 needs_lab = pytest.mark.skipif(not PARAKEET_WAV.exists(), reason="the bake-off's models are not on this PC")
 
+#: How long run_test waits for the pipeline to start (the service's start() awaits its models). The models load on a
+#: below-normal thread (by design: Yuki yields to the user's own work), so on a busy PC a load took longer than the old
+#: 20 s; run_test then raised, and pipecat's cancel of a worker still in start() never finished: the whole file hung
+#: until the sweep's time limit (5 Oct). A start that is quick returns at once; this only bounds a slow one.
+START_S = 300.0
+
 
 # -- choices and settings -----------------------------------------------------------------------------------------
 
@@ -386,8 +392,12 @@ def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path)
         stt.add_event_handler("on_update", on_update)
         stt.add_event_handler("on_connected", on_connected)
         stt.load_now()
+        # loaded before the words come (this test is about the turn, not a cold load): the decode then fits in the
+        # 6 s after the audio on a busy PC too
+        await asyncio.wrap_future(eng.recognizer())
+        await asyncio.wrap_future(eng.turn_models())
         frames = [SleepFrame(1.0), *_audio_frames(pcm), *_audio_frames(silence), SleepFrame(6.0)]
-        down, up = await run_test(stt, frames_to_send=frames, start_timeout=20)
+        down, up = await run_test(stt, frames_to_send=frames, start_timeout=START_S)
         return down, up, events
 
     down, up, events = asyncio.run(main())
@@ -428,7 +438,7 @@ def test_the_local_voice_speaks_at_the_output_rate_and_falls_back_to_the_plain_v
         tts.load_now()
         frames = [SleepFrame(0.5), LLMFullResponseStartFrame(), LLMTextFrame("Okay, I paused the music for you."),
                   LLMFullResponseEndFrame(), SleepFrame(6.0)]
-        down, _ = await run_test(tts, frames_to_send=frames, start_timeout=20,
+        down, _ = await run_test(tts, frames_to_send=frames, start_timeout=START_S,
                                  pipeline_params=PipelineParams(audio_out_sample_rate=24_000))
         return [f for f in down if isinstance(f, TTSAudioRawFrame)], tts
 
@@ -612,7 +622,7 @@ def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: 
         eng.tts("supertonic")
         frames = [SleepFrame(0.5), *_audio_frames(first), *_audio_frames(np.zeros(16_000 * 4, dtype=np.int16)),
                   SleepFrame(3.0)]
-        down, _ = await run_test(stt, frames_to_send=frames, start_timeout=20)
+        down, _ = await run_test(stt, frames_to_send=frames, start_timeout=START_S)
         return [f for f in down if isinstance(f, TranscriptionFrame)]
 
     heard = asyncio.run(main())
