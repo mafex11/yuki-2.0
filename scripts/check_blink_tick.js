@@ -51,6 +51,9 @@ const blinks = [];
 const origStill = face.stillBlink.bind(face);
 face.stillBlink = () => { blinks.push(now); origStill(); };
 advance(60000);                          // a minute of idle
+// + the 140 ms hold: a blink on the minute's last tick (62 000 ms, 1 in 5 runs: the 4-7 s gaps are random) is drawn
+// shut inside the minute and open again just after it; without this its second draw was not counted (draws 2n-1)
+advance(500);
 const idle = { draws: L.Perf.draws - settled.draws, loopTicks: L.Perf.ticks - settled.ticks, blinks: blinks.length,
   gaps: blinks.slice(1).map((t, i) => Math.round((t - blinks[i]) / 1000)), timers: timers.size };
 // hidden page and reduced motion: no blink, no draw

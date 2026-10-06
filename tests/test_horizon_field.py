@@ -43,6 +43,14 @@ def pump(app, seconds: float) -> None:
         time.sleep(0.005)
 
 
+def pump_until(app, done, timeout_s: float = 5.0) -> bool:
+    """Pump until ``done()`` (a condition, never a fixed wait: a loaded PC runs timers late), at most ``timeout_s``."""
+    end = time.monotonic() + timeout_s
+    while not done() and time.monotonic() < end:
+        pump(app, 0.01)
+    return bool(done())
+
+
 def _day():
     """A day: Warp 20:00-21:00 (full), Chrome 21:00-21:30, away 21:30-22:00, nothing recorded 02:00-04:00, the
     PC off 05:00-06:00, a Discord call 20:10-23:00 still going."""
@@ -181,7 +189,8 @@ def test_a_wave_animates_only_while_shown_and_holds_still_with_reduce_motion(qap
     wave = Wave("speak", parent=host)
     other = Wave("listen", parent=host)
     host.show()
-    pump(qapp, 0.25)
+    # until 3 frames, not a fixed 0.25 s: on a loaded PC the shared timer had drawn only 2 frames by then
+    assert pump_until(qapp, lambda: wave.frames > 2)
     assert wave.animating and other.animating and wave.frames > 2
     assert TICKER.running and len([w for w in TICKER.waves if w in (wave, other)]) == 2   # one shared timer
     host.hide()                                             # the window goes away: both waves stop
@@ -257,20 +266,28 @@ def test_the_stall_watchdog_logs_a_stuck_gui_thread_with_its_stack(qapp):
     from yuki.ui.stall import StallWatchdog, maybe_start
 
     got: list[dict] = []
-    dog = StallWatchdog(sink=got.append, process="test").start()
+    # threshold 250 ms and a 0.8 s stall (not the 32 ms default and 0.12 s): on a loaded PC the GUI thread or the
+    # checker thread is off the CPU for up to ~300 ms at a time, which made extra "stalls" or missed the real one
+    dog = StallWatchdog(threshold_ms=250, sink=got.append, process="test").start()
+
+    def in_stuck_here() -> list[dict]:   # the frame itself (", in stuck_here"), not a source line naming it
+        return [rec for rec in got if any(", in stuck_here" in line for line in rec["stack"])]
+
     try:
         pump(qapp, 0.1)
         assert got == []                                                 # an idle loop is not a stall
 
         def stuck_here() -> None:
-            time.sleep(0.12)
+            time.sleep(0.8)
 
         QTimer.singleShot(0, stuck_here)
-        pump(qapp, 0.3)
+        # until the stall's line is written (once the heartbeat is back), not a fixed 0.3 s: a starved checker
+        # thread wrote it late, after the watchdog had already been stopped
+        pump_until(qapp, lambda: bool(in_stuck_here()))
     finally:
         dog.stop()
-    assert len(got) == 1 and 90 <= got[0]["ms"] <= 400, got
-    assert any("stuck_here" in line for line in got[0]["stack"])          # where it was stuck
+    stuck = in_stuck_here()                                              # where it was stuck
+    assert len(stuck) == 1 and 700 <= stuck[0]["ms"] <= 3000, got
     os.environ.pop("YUKI_STALL_WATCH", None)
     assert maybe_start("x") is None                                     # debug only: off by default
 
