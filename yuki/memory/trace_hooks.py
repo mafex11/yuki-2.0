@@ -121,6 +121,8 @@ _U.GetAncestor.argtypes = [W.HWND, W.UINT]
 _U.GetAncestor.restype = W.HWND
 _U.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
 _U.GetWindowThreadProcessId.restype = W.DWORD
+_U.WindowFromPhysicalPoint.argtypes = [W.POINT]
+_U.WindowFromPhysicalPoint.restype = W.HWND
 _U.AddClipboardFormatListener.argtypes = [W.HWND]
 _U.AddClipboardFormatListener.restype = W.BOOL
 _U.RemoveClipboardFormatListener.argtypes = [W.HWND]
@@ -460,11 +462,9 @@ def window_title(hwnd: int) -> str:
 
 
 def root_at(x: int, y: int) -> int:
-    """The top-level window under a screen point."""
+    """The top-level window under a screen point (physical pixels, as the pointer was read)."""
     try:
-        import win32gui
-
-        h = win32gui.WindowFromPhysicalPoint((int(x), int(y)))
+        h = int(_U.WindowFromPhysicalPoint(W.POINT(int(x), int(y))) or 0)
         return int(_U.GetAncestor(h, _GA_ROOT) or h) if h else 0
     except Exception:  # noqa: BLE001
         return 0

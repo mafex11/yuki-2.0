@@ -37,6 +37,7 @@ DESCENT_LEVELS = 14
 _P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND = (30000, 30001, 30002, 30003, 30005,
                                                                                    30011, 30019, 30020)
 _P_TOGGLE, _P_SELECTED, _P_VALUE = 30086, 30079, 30045
+_P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM = 30041, 30036     # Is...PatternAvailable: a state only where the pattern is
 _TREE_SCOPE_ELEMENT, _TREE_SCOPE_CHILDREN = 1, 2
 _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
@@ -122,7 +123,7 @@ class TraceUia:
         self._uia = uia
         request = uia.CreateCacheRequest()
         for prop in (_P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND, _P_TOGGLE,
-                     _P_SELECTED):
+                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM):
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
         self._request = request
@@ -171,10 +172,11 @@ class TraceUia:
                 return None
 
         password = number(_P_PASSWORD)
-        selected = number(_P_SELECTED)
+        selected = number(_P_SELECTED) if number(_P_HAS_SELECTION_ITEM) else None
+        toggle = number(_P_TOGGLE) if number(_P_HAS_TOGGLE) else None
         return Element(role=ROLE_NAMES.get(int(ctype), f"ControlType{ctype}") if isinstance(ctype, int) else "",
                        name=text(_P_NAME), aid=text(_P_AID), rid=rid, bounds=_bounds(get(_P_BOUNDS)),
-                       password=bool(password), toggle=number(_P_TOGGLE),
+                       password=bool(password), toggle=toggle,
                        selected=None if selected is None else bool(selected), pid=number(_P_PID) or 0,
                        hwnd=number(_P_HWND) or 0, ms=round((time.perf_counter() - t0) * 1000.0, 2), ref=el)
 
@@ -308,12 +310,14 @@ class TraceUia:
                 return {} if length is None else {"length": length}
             el = element.ref.BuildUpdatedCache(self._request)
             out: dict[str, Any] = {}
-            toggle = el.GetCachedPropertyValue(_P_TOGGLE)
-            if isinstance(toggle, int) and toggle in TOGGLE_WORDS:
-                out["toggle"] = TOGGLE_WORDS[toggle]
-            selected = el.GetCachedPropertyValue(_P_SELECTED)
-            if isinstance(selected, (int, bool)):
-                out["selected"] = bool(selected)
+            if el.GetCachedPropertyValue(_P_HAS_TOGGLE):
+                toggle = el.GetCachedPropertyValue(_P_TOGGLE)
+                if isinstance(toggle, int) and toggle in TOGGLE_WORDS:
+                    out["toggle"] = TOGGLE_WORDS[toggle]
+            if el.GetCachedPropertyValue(_P_HAS_SELECTION_ITEM):
+                selected = el.GetCachedPropertyValue(_P_SELECTED)
+                if isinstance(selected, (int, bool)):
+                    out["selected"] = bool(selected)
             return out
         except Exception:  # noqa: BLE001
             return {}
