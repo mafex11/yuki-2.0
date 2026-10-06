@@ -2365,13 +2365,13 @@ def takeover_view(px: Any) -> dict[str, Any]:
 
 
 def record_view(privacy: dict[str, Any] | None, apps: list[str]) -> dict[str, Any]:
-    """Settings → Privacy and pause → Record how I work (report 78 C0): the switch, always shown off and locked
-    (nothing records yet; it waits for the user's go-ahead), and the apps to leave out (the privacy file's
-    ``[trace] leave_out``), with the apps seen this week offered to add. ``apps``: their names, as App access shows
-    them."""
+    """Settings → Privacy and pause → Record how I work (report 78; unlocked in C1): the switch (the privacy file's
+    ``[trace] record_actions``, off unless it is ``true``) and the apps to leave out (``[trace] leave_out``), with
+    the apps seen this week offered to add. ``apps``: their names, as App access shows them."""
     from yuki.ui import ui_settings as U
 
     trace = (privacy or {}).get("trace") if isinstance((privacy or {}).get("trace"), dict) else {}
+    on = trace.get("record_actions") is True
     out: list[str] = []
     for value in trace.get("leave_out", []) if isinstance(trace.get("leave_out"), list) else []:
         name = " ".join(str(value).split())
@@ -2379,7 +2379,8 @@ def record_view(privacy: dict[str, Any] | None, apps: list[str]) -> dict[str, An
             out.append(name)
     left = {o.casefold() for o in out}
     choices = [a for a in apps if a and a.casefold() not in left]
-    return {"on": False, "locked": True, "label": U.RECORD_LABEL, "hint": U.RECORD_HINT, "waiting": U.RECORD_WAITING,
+    return {"on": on, "locked": False, "label": U.RECORD_LABEL, "hint": U.RECORD_HINT,
+            "waiting": U.RECORD_ON if on else U.RECORD_OFF, "say_on": U.RECORD_ON, "say_off": U.RECORD_OFF,
             "leave_out": out, "choices": choices, "leave_out_label": U.RECORD_LEAVE_OUT_LABEL,
             "leave_out_hint": U.RECORD_LEAVE_OUT_HINT}
 

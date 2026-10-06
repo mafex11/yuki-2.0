@@ -655,16 +655,25 @@ async function inPage(F) {
     tsel().value = '24'; tsel().dispatchEvent(new Event('change', { bubbles: true })); await sleep(250);
     check('TK1 a save that fails puts the choice back', tsel().value === '160', tsel().value);
   }
-  // ---- report 78 C0: Settings -> Record how I work: off and locked until your go-ahead; the leave-out list ----
+  // ---- report 78 C0/C1: Settings -> Record how I work: off for a new install, unlocked in C1; the leave-out list ----
   {
     const rc = () => main().querySelector('[data-k="record"]');
     const ro = () => main().querySelector('[data-k="record-out"]');
     const rtog = () => rc() && rc().querySelector('.tog[data-do="record-on"]');
-    check('RC1 Record how I work is shown off, cannot be turned on, and says it waits for your go-ahead', !!rtog() && rtog().disabled
-      && rtog().getAttribute('aria-checked') === 'false' && rc().textContent.includes('Record how I work') && rc().textContent.includes('go-ahead')
+    check('RC1 Record how I work is shown off, can be turned on, and says what it never keeps', !!rtog() && !rtog().disabled
+      && rtog().getAttribute('aria-checked') === 'false' && rc().textContent.includes('Record how I work') && rc().textContent.includes('Off.')
       && rc().textContent.includes('Never the letters you type'), rc() && rc().textContent.slice(0, 120));
-    rtog().click(); await sleep(150);
-    check('RC1 a press on the locked switch sends nothing and stays off', acts('record_actions').length === 0 && rtog().getAttribute('aria-checked') === 'false');
+    REPLY.record_actions = (m) => ({ ok: true, on: m.on === true });
+    rtog().click(); await sleep(250);
+    check('RC1 turning it on is saved through Python and says it is on', acts('record_actions').some((m) => m.on === true)
+      && rtog().getAttribute('aria-checked') === 'true' && rc().textContent.includes('On.'), rc() && rc().textContent.slice(0, 160));
+    REPLY.record_actions = { ok: false, error: 'Couldn’t save that.' };
+    rtog().click(); await sleep(250);
+    check('RC1 a save that fails puts the switch back', rtog().getAttribute('aria-checked') === 'true');
+    REPLY.record_actions = (m) => ({ ok: true, on: m.on === true });
+    rtog().click(); await sleep(250);
+    check('RC1 turning it off again is saved and says so', acts('record_actions').some((m) => m.on === false)
+      && rtog().getAttribute('aria-checked') === 'false' && rc().textContent.includes('Off.'));
     const chips = () => Array.from(ro().querySelectorAll('[data-do="leave-out-drop"]')).map((b) => b.dataset.app);
     const add = () => ro().querySelector('select[data-change="leave-out-add"]');
     check('RC1 the leave-out list shows the apps left out and offers the others', chips().join('|') === 'Banking app' && !!add()

@@ -2105,13 +2105,14 @@ class WebWindow:
         return {"px": ui_settings.load(self.ui_path).takeover_move_px}
 
     def a_record_actions(self, m: dict[str, Any]) -> dict[str, Any]:
-        """Settings → Record how I work: the switch. Turning it on is refused until the user's go-ahead (report 78
-        D1; there is no recording yet); off is what it already is, so nothing is written."""
-        from yuki.ui import ui_settings
+        """Settings → Record how I work: the switch (report 78 C1; decision D1 of 7 Oct). Saved to the privacy file's
+        ``[trace] record_actions``; the memory service follows it within a second. Replies with what was kept."""
+        from yuki.ui.window import settings_io
 
-        if m.get("on"):
-            return {"ok": False, "error": ui_settings.RECORD_WAITING}
-        return {"on": False}
+        on = m.get("on") is True
+        settings_io.update_privacy("trace", "record_actions", on)
+        trace = settings_io.read_privacy().get("trace")
+        return {"on": isinstance(trace, dict) and trace.get("record_actions") is True}
 
     def a_record_leave_out(self, m: dict[str, Any]) -> dict[str, Any]:
         """Settings → Record how I work → leave out: add (``out`` true) or remove an app from ``[trace] leave_out``

@@ -56,16 +56,19 @@ TAKEOVER_MOVE_WORDS: dict[int, str] = {24: "A nudge", 40: "A short move (the usu
 #: A distance set by hand in ui.json that is none of the choices: shown as it is, in these words.
 TAKEOVER_MOVE_OWN = "Your own setting"
 
-#: Settings → Privacy and pause → "Record how I work" (report 78, phase C0): the switch is shown OFF and cannot be
-#: turned on: no recording exists yet, and it waits for your go-ahead (decision D1). Saved in the privacy file
-#: (``[trace] record_actions``, ``leave_out``), which the memory service reads.
+#: Settings → Privacy and pause → "Record how I work" (report 78; phase C0 showed it off and locked, phase C1 of
+#: 7 Oct 2026 unlocked it after the user's decision D1). Saved in the privacy file (``[trace] record_actions``,
+#: ``leave_out``), which the memory service reads within a second. Off for a new install.
 RECORD_LABEL = "Record how I work"
-RECORD_HINT = ("When you say yes, I’d note which button or field you use in each app and what changed, so I can "
-               "learn to do things your way. Never the letters you type, never what you copy, never while a game "
-               "runs.")
-RECORD_WAITING = "Off. This waits for your go-ahead, so it can’t be turned on yet."
+RECORD_HINT = ("I note which button or field you use in each app, your shortcuts and what changed, so I can learn to "
+               "do things your way. Never the letters you type, never what you copy, never your screen, never while a "
+               "game runs.")
+RECORD_ON = "On. Pausing memory from the tray pauses this too. What I note is kept for 30 days."
+RECORD_OFF = "Off. Nothing about how you work is noted."
+#: Kept for older callers (C0): the switch no longer waits.
+RECORD_WAITING = RECORD_OFF
 RECORD_LEAVE_OUT_LABEL = "Leave these apps out"
-RECORD_LEAVE_OUT_HINT = "Ready for when you say yes. Nothing is recorded today."
+RECORD_LEAVE_OUT_HINT = "Nothing you do in these apps is noted."
 
 
 #: The window engines a settings file may hold (``window_engine``); anything else reads as "web".
