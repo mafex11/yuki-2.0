@@ -74,6 +74,7 @@ from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.titles import TITLE_FIELD as _TITLE_FIELD, clean as _clean_label
 from yuki.memory.embed import Embedder, get_embedder
+from yuki.memory import admission as _admission
 from yuki.memory import misheard as _misheard
 from yuki.memory import workthreads as _work
 from yuki.memory.personality import NATURE_GUIDANCE, NATURES, nature_mark, normalize_nature
@@ -387,7 +388,8 @@ the photos the next day. Their plan, never the user's to-do.
 - OTHERS: "can you send me the link to the hostel?", then THE USER: "yeah sure, after dinner" -> the \
 user agreed to send the hostel link after dinner: the user's commitment, quoted from the user's own \
 line ("yeah sure, after dinner"), its text saying what was asked ("Send the hostel link that someone \
-on the call asked for, after dinner").
+on the call asked for, after dinner"). A fact of what the user agreed to or plans cites that THE USER \
+line (their answer), never the OTHERS line that asked.
 - OTHERS: "who's booking the cab?", then THE USER: "I'll do it" -> the user said they would book the cab.
 - OTHERS: "we're meeting at six at the station" and nothing from the user about it -> what the user \
 may need later (where and when they meet), never something the user said or agreed to.
@@ -580,6 +582,10 @@ def system_prompt(names: Sequence[str], *, questions: bool = True, call_side: bo
             .replace("{questions}", guidance))
     # the user's threads of work (migration 23): kept by this same call, no call of their own
     text = f"{text}\n\n{_work.WORK_GUIDANCE}"
+    # personal sensitive facts wait for the user's yes (report 76 item 5, yuki.memory.admission)
+    text = f"{text}\n\n{_admission.SENSITIVE_GUIDANCE}"
+    if call_side:   # ... a fact; the user's own to-do is still recorded (review V1)
+        text = f"{text}\n\n{_admission.SENSITIVE_COMMITMENTS_GUIDANCE}"
     if call_side:   # what recognition misheard, with the guess; facts in English (the feedback round 3, W5-W6)
         text = f"{text}\n\n{_misheard.MISHEARD_GUIDANCE}"
     if requests and not call_side:
@@ -611,7 +617,7 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                     "type": "object",
                     "additionalProperties": False,
                     "required": ["text", "nature", "importance", "source", "content_date", "milestone",
-                                 "other_ai", "user_said"],
+                                 "other_ai", "user_said", "sensitive", "sensitive_shown"],
                     "properties": {
                         "text": {
                             "type": "string",
@@ -678,6 +684,22 @@ RECORD_FACTS_TOOL: dict[str, Any] = {
                                 "in that tool's own chat; \"no\" - anything else."
                             ),
                         },
+                        "sensitive": {
+                            "type": "string",
+                            "enum": list(_admission.SENSITIVE_KINDS),
+                            "description": (
+                                "The kind of personal sensitive fact about the user it is (see SENSITIVE ABOUT THE "
+                                "USER): sexuality, health, money, credentials or legal; \"none\" for nearly all."
+                            ),
+                        },
+                        "sensitive_shown": {
+                            "type": "string",
+                            "description": (
+                                "Only when sensitive is not none: the fact said to the user in one short plain "
+                                "second-person sentence, as Yuki would ask them about it (\"You checked your "
+                                "Northbank holdings on Saturday morning.\"); else \"\"."
+                            ),
+                        },
                     },
                 },
             },
@@ -715,11 +737,11 @@ RECORD_CALL_SIDE_TOOL: dict[str, Any] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["text", "nature", "importance", "source", "user_said", "involves_user"],
+                    "required": ["text", "nature", "importance", "source", "user_said", "involves_user", "sensitive"],
                     "properties": {
                         **{k: v for k, v in RECORD_FACTS_TOOL["input_schema"]["properties"]["facts"]["items"]
                            ["properties"].items() if k not in ("content_date", "milestone", "other_ai",
-                                                               "user_said")},
+                                                               "user_said", "sensitive_shown")},
                         "user_said": {
                             "type": "boolean",
                             "description": (
@@ -1508,6 +1530,9 @@ class JournalWorker:
             questions = ([] if call_side else
                          self._parse_questions(response, thread, sources, fact_sources, tool=tool["name"]))
             work_ops, work_rejected = self.parse_work(response, tool["name"], offered, thread, sources, fact_sources)
+            # review F8: a thread of work or a question resting only on held (sensitive) facts is left out with them
+            work_ops, work_held = _admission.unheld_links(facts, work_ops)
+            questions, questions_held = _admission.unheld_links(facts, questions)
             embed_error = self._embed_batch(facts, work_ops, offered)
             work_notes = _work.dedupe_starts(work_ops, self.store)
             work_ops = _work.live_ops(work_ops)
@@ -1532,6 +1557,8 @@ class JournalWorker:
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
                 tainted=sum(1 for f in facts if f.tainted), not_users_words=not_users_words or None,
+                held={"sensitive": sum(1 for f in facts if f.held), "work_left_out": work_held,
+                      "questions_left_out": questions_held} if any(f.held for f in facts) else None,
                 open_requests=len(open_requests), requests_fired=fired,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=truncated,
                 sources=len(sources), commands=sum(1 for x in sources if x.command is not None),
@@ -1636,6 +1663,8 @@ class JournalWorker:
         requests: list[dict[str, Any]] = []
         responses: list[Any] = []
         questions: list[NewQuestion] = []
+        judge_items: list[_admission.JudgeItem] = []
+        admission: dict[str, Any] = {}
         cost: float | None = 0.0
         nonce_known = str(uuid.uuid4()).upper()
         said = " ".join(str((s.utterance or {}).get("text") or "") for s in sources)
@@ -1675,6 +1704,8 @@ class JournalWorker:
                 part_sources: list[int] = []
                 offset = len(facts)
                 facts += self._parse_facts(response, thread, part, tool=tool["name"], indexes=part_sources)
+                judge_items += [_admission.item_from_source(f, part, i)
+                                for f, i in zip(facts[offset:], part_sources)]
                 # a call asks only about names the user said: a question citing someone else's line is dropped
                 for q in self._parse_questions(response, thread, part, part_sources, tool=tool["name"],
                                                keep=lambda i, part=part: part[i].users_line):
@@ -1688,6 +1719,30 @@ class JournalWorker:
                 kept, why = self._parse_commitments(response, thread, part, tool["name"])
                 commitments += kept
                 rejected += why
+            # admission (report 76 item 5): a second look at each fact with the line it rests on - the user's own
+            # plans go in now; claims, others' words and anything sensitive wait for the user's yes; jokes taken
+            # literally stay out. A failed look holds every claim (nothing unjudged goes in).
+            judged = _admission.judge_call_facts(self.client, judge_items, settings=self.settings,
+                                                 names=self.user_names(), model=self.model)
+            if judged.exception is not None and unreachable(judged.exception):
+                raise judged.exception   # no network: the whole batch waits and is read again (no attempt spent)
+            last_try = max((int(getattr(c, "attempts", 0) or 0) for c in captures), default=0) + 1 >= self.max_attempts
+            if judged.exception is not None and not last_try:
+                # review F3: an unjudged call would hold every claim, the user's own plans too, with no line a card
+                # could show; the batch is read again (one attempt spent) - only the last attempt stores unjudged
+                raise RuntimeError(f"admission judge failed: {judged.error}") from judged.exception
+            admission = _admission.admit_call_facts(facts, judge_items, judged)
+            if judged.error:
+                admission["judge_error"] = judged.error
+                admission["held_unjudged"] = sum(1 for v, f in zip(judged.verdicts, facts) if v is None and f.held)
+            # review F8: a to-do thread or a question resting only on held facts would carry them out anyway
+            work_ops, admission["work_left_out"] = _admission.unheld_links(facts, work_ops)
+            questions, admission["questions_left_out"] = _admission.unheld_links(facts, questions)
+            requests += judged.requests
+            responses += judged.responses
+            for k in totals:
+                totals[k] += int(judged.usage.get(k) or 0)
+            cost = None if cost is None or judged.cost_usd is None else cost + judged.cost_usd
             call.latency_ms = (time.perf_counter() - t0) * 1000
             call.input_tokens, call.output_tokens = totals["input_tokens"], totals["output_tokens"]
             call.cache_write_tokens, call.cache_read_tokens = totals["cache_write_tokens"], totals["cache_read_tokens"]
@@ -1712,6 +1767,7 @@ class JournalWorker:
             self._log(
                 "journal_call", batch_id=batch_id, thread_id=thread_id, app=thread.app, host=thread.host,
                 rejournal_of=list(supersedes) or None, natures=_nature_counts(facts),
+                admission=admission or None,
                 commitments_left_on_todo_path=ignored or None,
                 model=self.model, capture_ids=capture_ids, truncated_capture_ids=[], sources=len(sources),
                 parts=len(parts), usage=totals, cost_usd=call.cost_usd, latency_ms=round(call.latency_ms, 1),
@@ -2180,6 +2236,15 @@ class JournalWorker:
                 if not_users_words is not None:
                     not_users_words.append(index + 1)
                 continue
+            utterance = getattr(sources[index], "utterance", None)
+            if isinstance(utterance, dict) and utterance.get("unclear") and nature in ("fact", "trait", "story"):
+                # the recogniser itself was unsure of this line (its own probabilities): possibly misheard, never a
+                # plain fact (report 76 item 5; the "Maybe misheard" list asks when it carries a guess)
+                nature = "uncertain"
+            sensitive = _admission.sensitive_kind(item.get("sensitive"))
+            shown = " ".join(str(item.get("sensitive_shown") or "").split())
+            if sensitive != "none" and 0 < len(shown) <= _admission.SHOWN_MAX_CHARS:
+                source[_admission.SHOWN_KEY] = shown   # how the window's "Waiting for your yes" says it to the user
             facts.append(
                 NewFact(at=content_date(item.get("content_date"), sources[index].at) or sources[index].at,
                         thread_id=thread.id, app=thread.app, host=thread.host,
@@ -2188,7 +2253,10 @@ class JournalWorker:
                         attention=capture_attention(getattr(sources[index].capture, "trigger", None)),
                         milestone=item.get("milestone") is True,
                         source=source,
-                        tainted=item.get("other_ai") is True)
+                        tainted=item.get("other_ai") is True,
+                        # personal and sensitive: held until the user's explicit yes (yuki.memory.admission)
+                        sensitive=sensitive,
+                        held=_admission.HOLD_SENSITIVE if sensitive != "none" else None)
             )
             if indexes is not None:
                 indexes.append(index)

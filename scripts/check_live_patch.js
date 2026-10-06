@@ -702,12 +702,12 @@ async function inPage(F) {
   sRow().querySelector('[data-do="fix-undo"]').click(); await sleep(200);
   check('W3 Undo while it waits cancels the correction', last('cancel_correction').correction_id === 93 && !sRow().textContent.includes('Got it, fixing it'));
   await go('#me'); await sleep(500);
-  const mh2 = main().querySelector('.mhsec [data-resolve]');
+  const mh2 = main().querySelector('.mhsec [data-resolve][data-op="heard"]');
   const mtx = mh2.querySelector('.tx').textContent;
   check('W6 a misheard row says what I heard and my guess, with why', /^Heard “[^”]+”, probably \S/.test(mtx) && !!mh2.querySelector('.mh-why') && mh2.querySelector('.mh-why').textContent.length > 10, mtx);
   check('W6 its buttons are Yes, No and It was…', ['Yes', 'No', 'It was…'].every((b) => Array.from(mh2.querySelectorAll('.acts .key')).some((k) => k.textContent.trim() === b))
     && !!mh2.querySelector('[data-verdict="guess_right"]') && !!mh2.querySelector('[data-verdict="wrong"]'));
-  check('W6 never a raw transcript line as the main text', Array.from(main().querySelectorAll('.mhsec [data-resolve] > .tx')).every((t) => t.textContent.startsWith('Heard ')));
+  check('W6 never a raw transcript line as the main text', Array.from(main().querySelectorAll('.mhsec [data-resolve][data-op="heard"] > .tx')).every((t) => t.textContent.startsWith('Heard ')));
   mh2.querySelector('[data-do="correct"]').click(); await sleep(60);
   const fi = mh2.querySelector('.fixbox input');
   check('W6 It was… opens one small line asking what it was', !!fi && fi.value === '' && mh2.querySelector('.fixbox').textContent.includes('What was it?'));
@@ -1094,6 +1094,33 @@ async function inPage(F) {
   let foreign = '';
   for (const hsh of ['#home', '#work', '#work/day', '#me']) { await go(hsh); await sleep(300); if (/[ऀ-ॿ]/.test(main().textContent)) foreign += hsh + ' '; }
   check('English only on Home, Work, Day and Me', !foreign, foreign);
+  }
+
+  // ---- memClean (report 93, second verify V4): "Waiting for your yes" on Me, from the fixture's invented held rows ----
+  {
+  const last = (action) => acts(action).slice(-1)[0] || {};
+  const H = (F.pages.me.held || {}).items || [];
+  await push('me', clone(F.pages.me));
+  await go('#me'); await sleep(500);
+  const sec = () => Array.from(main().querySelectorAll('.mhsec')).find((x) => x.querySelector('[data-op="held"]') || x.textContent.includes('Waiting for your yes'));
+  const rows = () => Array.from((sec() || document.createElement('div')).querySelectorAll('[data-resolve][data-op="held"]'));
+  check('HL1 Me shows "Waiting for your yes" with each held row and its count', !!sec() && H.length >= 3 && rows().length === H.length
+    && sec().querySelector('.label .doto') && +sec().querySelector('.label .doto').textContent === H.length, `${rows().length} of ${H.length}`);
+  const row = (ref) => rows().find((r) => r.dataset.ref === ref);
+  const mine = H.find((m) => !m.others && !m.sensitive), theirs = H.find((m) => m.others), personal = H.find((m) => m.sensitive);
+  const keys = (r) => Array.from(r.querySelectorAll('.acts .key')).map((k) => k.textContent.trim());
+  check('HL2 your own line has Keep, Not true and It’s a joke', !!mine && keys(row(mine.ref)).join('|') === 'Keep|Not true|It’s a joke', mine && keys(row(mine.ref)).join('|'));
+  check('HL3 someone else’s line never offers It’s a joke', !!theirs && keys(row(theirs.ref)).join('|') === 'Keep|Not true', theirs && keys(row(theirs.ref)).join('|'));
+  check('HL4 a sensitive row is labelled personal; no row says “The user”', !!personal && row(personal.ref).textContent.includes('personal, waits for your yes')
+    && rows().every((r) => !r.querySelector('.tx').textContent.includes('The user')));
+  REPLY.resolve_held = (m) => ({ ok: true, ref: m.ref, answer: m.verdict });
+  row(mine.ref).querySelector('[data-verdict="keep"]').click(); await sleep(150);
+  check('HL5 Keep sends resolve_held with the row’s ref and says Kept.', last('resolve_held').ref === mine.ref && last('resolve_held').verdict === 'keep'
+    && sec().textContent.includes('Kept.') && +sec().querySelector('.label .doto').textContent === H.length - 1);
+  REPLY.resolve_held = { ok: false, why: 'moved', error: 'I read that again since, and it changed.' };
+  row(theirs.ref).querySelector('[data-verdict="not_true"]').click(); await sleep(250);
+  check('HL6 an answer memory refuses puts the row back as it was', !!row(theirs.ref) && keys(row(theirs.ref)).join('|') === 'Keep|Not true'
+    && !row(theirs.ref).classList.contains('resolved'));
   }
   return results;
 }

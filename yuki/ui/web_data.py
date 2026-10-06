@@ -1108,6 +1108,30 @@ def misheard_view(memory: Any, calls: dict[int, dict[str, Any]], fallback: list[
             "correct": callable(getattr(memory, "correct_item", None))}
 
 
+def held_view(memory: Any, now: float | None = None) -> dict[str, Any] | None:
+    """"Waiting for your yes" (report 76 item 5, ``yuki.memory.admission``; memory's ``held_facts()``): what memory is
+    holding back until you say yes - a claim from a call it could not settle, someone else's line, and anything
+    personal and sensitive (this page is the private place for that yes; never a corner card), newest first, each
+    said to you (memory's second-person line; else its sentence with only formats changed) with where it came from.
+    Keep / Not true / It's a joke (not on someone else's line) answer at once (``resolve_held``, no model). ``None``
+    when memory has no such list."""
+    from yuki.ui.window.data import epoch, natural, plain
+
+    fn = getattr(memory, "held_facts", None)
+    if not callable(fn):
+        return None
+    items = []
+    for m in _safe(fn, []) or []:
+        if not isinstance(m, dict) or not m.get("ref"):
+            continue
+        at = epoch(m.get("at"))
+        items.append({"ref": str(m["ref"]), "text": plain(natural(str(m.get("text") or ""))),
+                      "sensitive": m.get("reason") == "sensitive", "others": m.get("who") == "others",
+                      "prov": heard_line(str(m.get("app") or ""), None, at, now=now, kind=str(m.get("kind") or ""),
+                                         where=str(m.get("where") or ""))})
+    return {"items": items, "direct": callable(getattr(memory, "resolve_held", None))}
+
+
 def read_pending(path: Path, db: str) -> dict[str, dict[str, Any]]:
     """Corrections sent but not yet applied by memory (``window-pending.json``, shared with the Qt window)."""
     try:
@@ -1203,6 +1227,7 @@ def build_me(memory: Any, *, pending: dict[str, Any] | None = None,
     return {"source": source, "people": persons, "groups": groups, "rules": rules, "routines": routines,
             "not_routines": not_routines, "review": review, "total": total,
             "misheard": misheard_view(memory, calls, fallback, now, lookup), "pending": pending_view(pending, None, now),
+            "held": held_view(memory, now),
             "can": {"pin": callable(getattr(memory, "pin_fact", None)), "review": callable(rq),
                     "heard": callable(getattr(memory, "resolve_heard", None)),
                     "correct": callable(getattr(memory, "correct_item", None))}}

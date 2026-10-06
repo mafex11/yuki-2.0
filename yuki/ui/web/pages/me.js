@@ -190,6 +190,26 @@
       h('div', { class: 'mh-done', attrs: { hidden: list.length ? true : null } }, ic('check'), h('span', { text: 'Nothing to check. I’ll ask when I’m not sure of a word.' }))], null, 'mhsec');
   }
 
+  /* ---------- Waiting for your yes (report 76 item 5): what memory holds back until you say yes ----------
+     A claim from a call I couldn't settle, someone else's line, and anything personal and sensitive (this page is the
+     private place for that yes; it never goes on a corner card). Keep / Not true / It's a joke (never on someone
+     else's line) answer at once, with the same 5 s Undo as Maybe misheard. */
+  function heldRow(m, H) {
+    const acts = H.direct ? [key('Keep', { cls: 'xs', data: { do: 'resolve', verdict: 'keep' }, title: 'Yes, keep it' }),
+      key('Not true', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'not_true' } }),
+      m.others ? null : key('It’s a joke', { cls: 'xs ghost', data: { do: 'resolve', verdict: 'joke' } })] : null;
+    return h('div', { class: 'fact mh', data: { resolve: '', op: 'held', ref: m.ref, k: 'held:' + m.ref } },
+      h('div', { class: 'tx', text: m.text }),
+      h('div', { class: 'meta2' }, h('span', { text: m.prov || '' }), h('span', { text: m.sensitive ? 'personal, waits for your yes' : 'waits for your yes' })),
+      acts ? h('div', { class: 'acts inline' }, acts) : null);
+  }
+  function held(d) {
+    const H = d.held; if (!H) return null;
+    const list = (H.items || []).filter((m) => !resolved.has(m.ref));
+    return Y.sec('Waiting for your yes', list.length, [list.map((m) => heldRow(m, H)),
+      h('div', { class: 'mh-done', attrs: { hidden: list.length ? true : null } }, ic('check'), h('span', { text: 'Nothing waiting. I ask here before I keep something I’m not sure of.' }))], null, 'mhsec');
+  }
+
   /* ---------- people ---------- */
   function routesTable(routes, name) {
     const max = Math.max(1, ...routes.map((r) => (r.mine || 0) + (r.theirs || 0)));
@@ -280,7 +300,8 @@
       h('div', { class: 'me-grid', data: { k: 'people' } }, Y.k(list, 'list'), Y.k(right, 'dossier:' + (cur ? cur.ref || cur.name : ''))),
       h('div', { class: 'me-lower2', data: { k: 'lower' } },
         h('div', { class: 'col', data: { k: 'left' } }, Y.k(portrait(d), 'facts')),
-        h('div', { class: 'col', data: { k: 'right' } }, Y.k(routines(d), 'routines'), Y.k(misheard(d), 'misheard')))];
+        h('div', { class: 'col', data: { k: 'right' } }, Y.k(routines(d), 'routines'), Y.k(misheard(d), 'misheard'),
+          d.held ? Y.k(held(d), 'held') : null))];
   }
 
   /* ---------- actions ---------- */
@@ -367,7 +388,10 @@
   /* Right / Wrong / Not mine at once: the row turns into "Got it" with Undo and a 5 s drain, then leaves; the count
      drops; an answer that fails puts the row back. Undo after memory started on it is too late: it stays removed. */
   const WORDS = { review: { right: 'Got it. I’ll keep it as right.', wrong: 'Got it. I’ve dropped it.', notmine: 'Got it. Not yours; I’ll stop using it.' },
-    heard: { right: 'Got it. I’ll take it as you said it.', wrong: 'Got it. I’ve dropped it.', guess_right: 'Got it, fixing my notes to say it right.' } };
+    heard: { right: 'Got it. I’ll take it as you said it.', wrong: 'Got it. I’ve dropped it.', guess_right: 'Got it, fixing my notes to say it right.' },
+    held: { keep: 'Kept.', not_true: 'Left out.', joke: 'Kept as a joke.' } };
+  const OPS = { review: 'review_mark', heard: 'resolve_heard', held: 'resolve_held' };
+  const opOf = (row) => (OPS[row.dataset.op] ? row.dataset.op : 'heard');
   function countIn(row, delta) {
     const box = row.closest('[data-review]') || row.closest('section');
     const c = box && box.querySelector('.label .doto');
@@ -383,12 +407,12 @@
   }
   A.resolve = (t) => {
     const row = t.closest('[data-resolve]'); if (!row || row.__res) return;
-    const op = row.dataset.op === 'review' ? 'review' : 'heard', verdict = t.dataset.verdict, ref = row.dataset.ref;
+    const op = opOf(row), verdict = t.dataset.verdict, ref = row.dataset.ref;
     resolved.add(ref);
     const kids = Array.from(row.childNodes);
     const res = { verdict, kids, cid: null };
     row.__res = res;
-    res.p = Y.act(op === 'review' ? 'review_mark' : 'resolve_heard', { ref, verdict }).then((r) => {
+    res.p = Y.act(OPS[op], { ref, verdict }).then((r) => {
       if (r.ok) { res.cid = r.correction_id || null; return r; }
       if (row.__res === res) {   // memory didn't take it: the row comes back as it was
         clearTimeout(res.timer); row.__res = null; resolved.delete(ref);
@@ -408,7 +432,7 @@
   A['res-undo'] = (t) => {
     const row = t.closest('[data-resolve]'), res = row && row.__res; if (!res) return;
     clearTimeout(res.timer);
-    const op = row.dataset.op === 'review' ? 'review_mark' : 'resolve_heard', ref = row.dataset.ref;
+    const op = OPS[opOf(row)], ref = row.dataset.ref;
     t.disabled = true;
     res.p.then((first) => (first && first.ok ? Y.act(op, { ref, verdict: 'undo', correction_id: res.cid }) : { ok: true, skipped: true })).then((r) => {
       if (r.skipped) return;

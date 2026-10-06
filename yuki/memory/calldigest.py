@@ -213,6 +213,12 @@ THE OTHERS' PRIVATE MATTERS stay out of the timeline and the gist as they stay o
 SPOKE ON A CALL): a friend's family trouble, health or relationships get no line; the user's part may \
 be kept without the matter ("Comforted Mira").
 
+THE USER'S SENSITIVE MATTERS are kept without the detail too (report 76: the user had to remove such things \
+from memory by hand): their sexuality, a health matter of theirs (a condition, therapy, medication, a test), \
+their own money accounts and what is in them, where their passwords, recovery codes or seed phrases are kept, \
+legal trouble of theirs. Write what the talk was, not the matter ("Talked about something personal with \
+Tara", "Talked about money"), never the diagnosis, the orientation, the account or the place.
+
 GAME VOICE CHAT. A session whose header says "game voice chat" is a game's own voice chat with no \
 call: write a few lines at most for the whole session, in one block - which game, how the match \
 went, and anything the user said that matters beyond the game; no line per callout or round. During \

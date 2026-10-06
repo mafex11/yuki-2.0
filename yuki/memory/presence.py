@@ -387,7 +387,10 @@ spelling, an expansion or a guess of your own. When lines disagree, a later corr
 over an earlier line ("Hollis, not NIST": say Hollis).
 - recap: the user's own words and plans ("you said you'd ...", "you told Sam you'd send the link") - what \
 someone asked of them only as the reason for their plan; never what anyone else said they would do, never \
-an amount of money.
+an amount of money. Never anything personal and sensitive about the user, even in their own words: their \
+sexuality, a health matter (therapy, medication, a diagnosis), their money accounts, where their passwords or \
+seed phrases are, legal trouble - a card on the corner of their screen is not the place; with nothing else \
+to say: none.
 - plans: one short line naming the plan, who it is with and when, then the reminder question ("Tomorrow's the \
 setup call you set with Sam before his restart on the 12th - want a reminder at 8 pm?"); never an amount.
 - followup: a question, like a friend asking how it went.
@@ -910,7 +913,32 @@ class PresenceWorker:
             return self._recap_look(key, session, now)
         return None
 
+    def _keep_look(self, key: str, session: Sequence[Any], now: float) -> Look | None:
+        """The call's recap as a keep list (report 76 item 5, :mod:`yuki.memory.admission`): the call's facts that
+        wait for the user's yes, the most important first - "From your call with Tara: 3 things I'd keep", each with
+        Keep / Not true / It's a joke. No model call writes it; ``None`` when nothing from the call waits."""
+        from yuki.memory import admission
+
+        ids = [c.id for c in session]
+        keep = admission.recap_items(self.store, ids, now=now)
+        if not keep:
+            return None
+        try:
+            contexts = self.store.call_contexts(ids)
+        except Exception:
+            contexts = {}
+        people = list(dict.fromkeys(p.get("name") for ctx in contexts.values() for p in ctx.get("people") or []
+                                    if p.get("how") == "on_call_screen" and p.get("name")))
+        app = str(getattr(session[0], "app", "") or "")
+        text = admission.recap_text(len(keep), people=people, app=app)
+        return Look("recap", key, skip_judge=True,
+                    trigger=f"recap keep list - {len(keep)} line(s) from the user's {app} call wait for a yes",
+                    meta={"calls": ids, "keep": keep, "text": text})
+
     def _recap_look(self, key: str, session: Sequence[Any], now: float) -> Look:
+        keep = self._keep_look(key, session, now)
+        if keep is not None:
+            return keep
         digests = self.store.call_digests([c.id for c in session])
         start, end = min(c.detected_at for c in session), max(c.ended_at for c in session)
         speech = sum(c.speech_s or 0.0 for c in session)
@@ -1805,6 +1833,8 @@ class PresenceWorker:
     def observe(self, now: float, config: Any, view: Any, items: Sequence[Any], look: Look,
                 att: Any = None) -> dict[str, Any]:
         """One look: the two calls, the card written (or not) with its check-in, the thing marked looked-at."""
+        if look.meta.get("keep"):
+            return self._observe_keep(now, look, att)
         checkin = NudgeCheckin(at=now, trigger=look.channel, outcome="error", model=self.w.model)
         result: dict[str, Any] = {}
         nudge: NewNudge | None = None
@@ -1855,6 +1885,32 @@ class PresenceWorker:
                 "detail": (result.get("decision") or {}).get("detail"), "evidence": result.get("evidence"),
                 "cost_usd": checkin.cost_usd, "usage": self.w._usage(checkin),
                 "latency_ms": round(checkin.latency_ms), "error": checkin.error}
+
+    def _observe_keep(self, now: float, look: Look, att: Any = None) -> dict[str, Any]:
+        """The call's keep list as a card (:meth:`_keep_look`): written by code, no model call; its lines are the
+        admission judge's own short lines (``inputs.keep``: ``ref`` ``journal:N`` and ``text``), answered per line
+        through :meth:`yuki.memory.api.MemoryClient.recap_keep`. Never spoken (a notice); one per call (its key)."""
+        keep = list(look.meta.get("keep") or [])
+        head = str(look.meta.get("text") or "")
+        text = "\n".join([head, *(f"- {k['text']}" for k in keep)])
+        checkin = NudgeCheckin(at=now, trigger=look.channel, outcome="notice", model=None,
+                               reason=f"{len(keep)} line(s) from the call wait for the user's yes (keep list)")
+        nudge = NewNudge(kind="notice", text=text, reason=checkin.reason, trigger=look.channel, ref=look.key,
+                         inputs={"channel": look.channel, "key": look.key, "keep": keep, "head": head,
+                                 "calls": look.meta.get("calls")})
+        checkin_id, nudge_id = self.store.record_checkin(checkin, nudge)
+        self._mark(look.key, now, len(keep), shown=nudge_id is not None)
+        if nudge_id is not None:
+            self.w._event.set()
+            if att is not None:
+                att.record(look.channel, now=now)
+                att.record("presence", now=now)
+        self.w._log("nudge_call", checkin_id=checkin_id, trigger=look.channel, model=None, outcome="notice",
+                    key=look.key, keep_lines=len(keep))
+        self.w._log_checkin(checkin_id, checkin, nudge_id)
+        return {"trigger": look.channel, "key": look.key, "outcome": "notice", "nudge_id": nudge_id, "text": text,
+                "offer": None, "reason": checkin.reason, "detail": None, "evidence": None, "cost_usd": 0.0,
+                "usage": None, "latency_ms": 0, "error": None, "keep": keep}
 
 
 def _offer_object(raw: Any) -> Any:
