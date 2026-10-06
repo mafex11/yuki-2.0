@@ -1,0 +1,439 @@
+"""The action trace's tables (migration 38): writes, the element registry, retention, forgetting, read helpers.
+
+Functions over a :class:`yuki.memory.store.Store` (its connection, lock and key), kept out of ``store.py`` so the
+trace stays one owner's code. Everything content-bearing is encrypted with the memory key; digests are keyed HMACs.
+
+* :func:`write_batch`: one transaction per batch (the trace worker writes at most every 2 s): the action rows and the
+  element registry (counts, distinct days, names only as :mod:`yuki.memory.trace_privacy` allows: a command
+  control's name on first use, a title-class name once used on 3 distinct days, a content control's never).
+* :func:`purge`: decision D4, raw rows (actions, links, file facts) older than 30 days; elements unused for 60 days.
+* :func:`forget` / :func:`undo_forget`: forget an hour (any time range) or an app: the raw rows and what was learned
+  from them (elements, file facts, links), with a diary line in ``memory_changelog`` (pass ``trace``) and the
+  before-image in ``undo_images`` (surface ``trace``) so it can be undone while the rows would still be kept.
+* :func:`attach_episodes`: the episode id of each row once its episode window is final (episodes are written after
+  the fact).
+* :func:`match_runs`: Yuki's own actions that made no tagged input (UI Automation pattern calls, the agent's shell
+  scripts) labelled ``yuki`` by the run trace's step and time.
+* :func:`summary`, :func:`paste_joins`: content-free read helpers (the CLI, the doctor, the acceptance analyzer).
+* :func:`load_game_evidence` / :func:`save_game_evidence`: the hard game gate's learned set (``ui_game_processes``).
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from collections import Counter
+from collections.abc import Iterable, Sequence
+from datetime import datetime
+from typing import Any
+
+from yuki.memory.trace_privacy import COMMAND, PROMOTE_DAYS, TITLE
+
+RAW_DAYS = 30.0          # decision D4
+ELEMENT_DAYS = 60.0      # report 78 §8
+DAY_S = 86400.0
+
+#: ``ui_actions`` columns a batch row may set (anything else in a row dict is ignored).
+ACTION_COLUMNS = (
+    "at", "ended_at", "process", "page_key", "kind", "source", "via", "run_key", "run_step", "during_run", "role",
+    "name_ciphertext", "name_digest", "position", "aid_ciphertext", "aid_digest", "element_key", "container_digest",
+    "point", "button", "chord", "typed", "n", "clip_seq", "clip_formats", "file_ciphertext", "file_ext",
+    "file_digest", "command_ciphertext", "exit_code", "outcome", "outcome_ciphertext", "facts", "capture_id",
+    "episode_id", "resolved", "lookup_ms", "travel_px", "gap_ms", "dwell_ms", "end_role", "end_name_ciphertext",
+    "end_name_digest", "end_element_key", "end_position", "proc_started",
+)
+_INSERT = (f"INSERT INTO ui_actions({', '.join(ACTION_COLUMNS)}) VALUES ({', '.join('?' * len(ACTION_COLUMNS))})")
+_ELEMENT_COLUMNS = ("element_key", "process", "role", "name_class", "name_ciphertext", "aid_ciphertext", "days", "n",
+                    "first_at", "last_at", "last_day")
+
+
+def day_of(at: float) -> str:
+    """The local day of an epoch time (``YYYY-MM-DD``)."""
+    return datetime.fromtimestamp(float(at)).strftime("%Y-%m-%d")
+
+
+# -- writes ------------------------------------------------------------------------------------------------------------
+
+
+def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) -> None:
+    """One use of an element: counts, distinct days, and its name only as its class allows."""
+    key = el.get("element_key")
+    if not key:
+        return
+    at = float(el["at"])
+    day = day_of(at)
+    row = conn.execute("SELECT days, n, last_day, name_ciphertext FROM ui_elements WHERE element_key=?",
+                       (key,)).fetchone()
+    cls = el.get("name_class") or ""
+    name = el.get("name") or None
+    if row is None:
+        days = 1
+        keep = name if cls == COMMAND or (cls == TITLE and days >= PROMOTE_DAYS) else None
+        conn.execute(
+            "INSERT INTO ui_elements(element_key, process, role, name_class, name_ciphertext, aid_ciphertext, days, n,"
+            " first_at, last_at, last_day) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (key, el.get("process"), el.get("role"), cls, store._enc(keep) if keep else None,
+             store._enc(el["aid"]) if el.get("aid") else None, days, 1, at, at, day))
+        return
+    days = int(row["days"] or 0) + (1 if row["last_day"] != day else 0)
+    set_name = None
+    if row["name_ciphertext"] is None and name and (cls == COMMAND or (cls == TITLE and days >= PROMOTE_DAYS)):
+        set_name = store._enc(name)
+    conn.execute(
+        "UPDATE ui_elements SET n=n+1, days=?, last_day=?, last_at=max(coalesce(last_at, 0), ?),"
+        " name_ciphertext=coalesce(name_ciphertext, ?), aid_ciphertext=coalesce(aid_ciphertext, ?) WHERE element_key=?",
+        (days, day, at, set_name, store._enc(el["aid"]) if el.get("aid") else None, key))
+
+
+def write_batch(store: Any, rows: Sequence[dict[str, Any]], elements: Sequence[dict[str, Any]] = (),
+                files: Sequence[dict[str, Any]] = ()) -> list[int]:
+    """Write one batch in one transaction; returns the new action ids in order.
+
+    ``rows``: column -> value (already encrypted where a ``*_ciphertext`` column); ``elements``: one use each
+    (``element_key``, ``process``, ``role``, ``name_class``, ``name`` (plain, already filtered), ``aid``, ``at``);
+    ``files``: decision D6 facts, ``{"row": index into rows, "kind", "outcome", "data", "ms", "file_digest"}``
+    (``data`` a dict, encrypted here)."""
+
+    def op(conn: sqlite3.Connection) -> list[int]:
+        ids = [int(conn.execute(_INSERT, [r.get(c) for c in ACTION_COLUMNS]).lastrowid) for r in rows]
+        for el in elements:
+            _upsert_element(conn, store, el)
+        for f in files:
+            index = f.get("row")
+            action = ids[index] if isinstance(index, int) and 0 <= index < len(ids) else f.get("action_id")
+            conn.execute("INSERT INTO ui_files(at, action_id, file_digest, kind, outcome, data_ciphertext, parse_ms)"
+                         " VALUES (?,?,?,?,?,?,?)",
+                         (float(f.get("at") or time.time()), action, f.get("file_digest"), f.get("kind") or "flp",
+                          f.get("outcome") or "ok",
+                          store._enc(json.dumps(f["data"], ensure_ascii=False)) if f.get("data") else None,
+                          f.get("ms")))
+        return ids
+
+    if not rows and not elements and not files:
+        return []
+    return store._write(op)
+
+
+def update_action(store: Any, action_id: int, **fields: Any) -> None:
+    """Set columns of one written row (a hover's dwell once its rest ended, a double click)."""
+    cols = [c for c in fields if c in ACTION_COLUMNS]
+    if not cols:
+        return
+    store._write(lambda conn: conn.execute(
+        f"UPDATE ui_actions SET {', '.join(c + '=?' for c in cols)} WHERE id=?",
+        [fields[c] for c in cols] + [int(action_id)]))
+
+
+# -- what was on screen ------------------------------------------------------------------------------------------------
+
+
+def capture_ids(store: Any, wants: Iterable[tuple[str, float]]) -> dict[tuple[str, float], int | None]:
+    """The latest capture of each app at or before a time: ``{(process, at): capture id}`` (what was on screen)."""
+    out: dict[tuple[str, float], int | None] = {}
+    for process, at in set(wants):
+        try:
+            rows = store._query(
+                "SELECT c.id FROM captures c JOIN threads t ON t.id = c.thread_id WHERE t.process = ? AND c.at <= ?"
+                " AND c.at >= ? ORDER BY c.at DESC LIMIT 1", (process, float(at), float(at) - 6 * 3600.0))
+        except Exception:  # noqa: BLE001 - an older database
+            rows = []
+        out[(process, at)] = int(rows[0][0]) if rows else None
+    return out
+
+
+# -- retention -----------------------------------------------------------------------------------------------------
+
+
+def purge(store: Any, *, now: float | None = None, raw_days: float = RAW_DAYS,
+          element_days: float = ELEMENT_DAYS) -> dict[str, int]:
+    """Decision D4: raw rows older than ``raw_days``; elements unused for ``element_days``. Counts only."""
+    now = time.time() if now is None else float(now)
+    raw_cut, el_cut = now - raw_days * DAY_S, now - element_days * DAY_S
+
+    def op(conn: sqlite3.Connection) -> dict[str, int]:
+        out = {
+            "files": conn.execute("DELETE FROM ui_files WHERE at < ?", (raw_cut,)).rowcount,
+            "links": conn.execute(
+                "DELETE FROM ui_links WHERE coalesce(created_at, 0) < ? OR from_action IN"
+                " (SELECT id FROM ui_actions WHERE at < ?) OR to_action IN (SELECT id FROM ui_actions WHERE at < ?)",
+                (raw_cut, raw_cut, raw_cut)).rowcount,
+            "actions": conn.execute("DELETE FROM ui_actions WHERE at < ?", (raw_cut,)).rowcount,
+            "elements": conn.execute("DELETE FROM ui_elements WHERE coalesce(last_at, 0) < ?", (el_cut,)).rowcount,
+        }
+        return out
+
+    return store._write(op)
+
+
+# -- forgetting ----------------------------------------------------------------------------------------------------
+
+
+def _rows(conn: sqlite3.Connection, sql: str, params: Sequence[Any]) -> list[dict[str, Any]]:
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def _recount_element(conn: sqlite3.Connection, key: str) -> None:
+    """An element after some of its uses were forgotten: counts and days from what is left, the name only while its
+    class still allows it; gone when nothing is left."""
+    left = conn.execute("SELECT at FROM ui_actions WHERE element_key=? OR end_element_key=?", (key, key)).fetchall()
+    if not left:
+        conn.execute("DELETE FROM ui_elements WHERE element_key=?", (key,))
+        return
+    days = {day_of(r[0]) for r in left}
+    row = conn.execute("SELECT name_class FROM ui_elements WHERE element_key=?", (key,)).fetchone()
+    drop_name = row is not None and row[0] == TITLE and len(days) < PROMOTE_DAYS
+    conn.execute(
+        "UPDATE ui_elements SET n=?, days=?, first_at=?, last_at=?, last_day=?"
+        + (", name_ciphertext=NULL" if drop_name else "") + " WHERE element_key=?",
+        (len(left), len(days), min(r[0] for r in left), max(r[0] for r in left), day_of(max(r[0] for r in left)), key))
+
+
+def forget(store: Any, *, since: float | None = None, until: float | None = None, process: str | None = None,
+           by: str = "user", now: float | None = None) -> dict[str, Any]:
+    """Forget the trace of a time range (an hour) or of an app (``process``: its process key), or both together.
+
+    Deletes the raw rows and cascades to what was learned from them: elements (recounted, or removed when nothing
+    is left; forgetting an app removes all of its elements), file facts and links. One diary line goes to
+    ``memory_changelog`` (pass ``trace``, action ``forget``, content-free words) and the before-image to
+    ``undo_images`` (surface ``trace``) so :func:`undo_forget` can bring it back. Returns counts and the diary id."""
+    if since is None and until is None and not process:
+        raise ValueError("say which hour or which app to forget")
+    now = time.time() if now is None else float(now)
+    where, params = ["1=1"], []
+    if since is not None:
+        where.append("at >= ?")
+        params.append(float(since))
+    if until is not None:
+        where.append("at < ?")
+        params.append(float(until))
+    if process:
+        where.append("process = ?")
+        params.append(process)
+    cond = " AND ".join(where)
+
+    def op(conn: sqlite3.Connection) -> dict[str, Any]:
+        actions = _rows(conn, f"SELECT * FROM ui_actions WHERE {cond}", params)
+        ids = [a["id"] for a in actions]
+        keys = sorted({k for a in actions for k in (a.get("element_key"), a.get("end_element_key")) if k})
+        marks = ",".join("?" * len(ids)) or "NULL"
+        files = _rows(conn, f"SELECT * FROM ui_files WHERE action_id IN ({marks})", ids) if ids else []
+        links = _rows(conn, f"SELECT * FROM ui_links WHERE from_action IN ({marks}) OR to_action IN ({marks})",
+                      ids + ids) if ids else []
+        el_where = "process = ?" if process and since is None and until is None else None
+        if el_where:
+            elements = _rows(conn, "SELECT * FROM ui_elements WHERE process = ?", (process,))
+        else:
+            km = ",".join("?" * len(keys)) or "NULL"
+            elements = _rows(conn, f"SELECT * FROM ui_elements WHERE element_key IN ({km})", keys) if keys else []
+        if ids:
+            conn.execute(f"DELETE FROM ui_files WHERE action_id IN ({marks})", ids)
+            conn.execute(f"DELETE FROM ui_links WHERE from_action IN ({marks}) OR to_action IN ({marks})", ids + ids)
+            conn.execute(f"DELETE FROM ui_actions WHERE id IN ({marks})", ids)
+        if el_where:
+            conn.execute("DELETE FROM ui_elements WHERE process = ?", (process,))
+        else:
+            for key in keys:
+                _recount_element(conn, key)
+        counts = {"actions": len(ids), "elements": len(elements), "files": len(files), "links": len(links)}
+        scope = {"since": since, "until": until, "process": process}
+        words = (f"Forgot {counts['actions']} recorded actions" + (" of one app" if process else "")
+                 + (" in a chosen time" if since is not None or until is not None else "") + ".")
+        diary = int(conn.execute(
+            "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (now, None, "trace", "forget", json.dumps(counts), None, None, store._enc(words))).lastrowid)
+        image = {"scope": scope, "actions": actions, "elements": elements, "files": files, "links": links}
+        conn.execute(
+            "INSERT INTO undo_images(run_id, surface, item_id, action, by, at, before_ciphertext) VALUES"
+            " (?,?,?,?,?,?,?)", (None, "trace", diary, "forget", by, now, store._enc(json.dumps(image))))
+        return {**counts, "diary_id": diary}
+
+    return store._write(op)
+
+
+def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[str, Any]:
+    """Bring back what :func:`forget` removed (rows still inside the 30-day keep only). Once only."""
+    now = time.time() if now is None else float(now)
+    raw_cut = now - RAW_DAYS * DAY_S
+
+    def op(conn: sqlite3.Connection) -> dict[str, Any]:
+        row = conn.execute("SELECT id, before_ciphertext, undone_at FROM undo_images WHERE surface='trace'"
+                           " AND item_id=? AND action='forget'", (int(diary_id),)).fetchone()
+        if row is None:
+            return {"ok": False, "error": "nothing to undo"}
+        if row["undone_at"] is not None:
+            return {"ok": False, "error": "already undone"}
+        image = json.loads(store._dec(row["before_ciphertext"]))
+        restored = Counter()
+        for a in image.get("actions", []):
+            if float(a.get("at") or 0) < raw_cut:
+                continue
+            cols = [c for c in ("id", *ACTION_COLUMNS) if c in a]
+            conn.execute(f"INSERT OR IGNORE INTO ui_actions({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                         [a[c] for c in cols])
+            restored["actions"] += 1
+        for e in image.get("elements", []):
+            cols = [c for c in _ELEMENT_COLUMNS if c in e]
+            conn.execute(f"INSERT OR REPLACE INTO ui_elements({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                         [e[c] for c in cols])
+            restored["elements"] += 1
+        for f in image.get("files", []):
+            conn.execute("INSERT OR IGNORE INTO ui_files(id, at, action_id, file_digest, kind, outcome,"
+                         " data_ciphertext, parse_ms) VALUES (?,?,?,?,?,?,?,?)",
+                         (f["id"], f["at"], f["action_id"], f["file_digest"], f["kind"], f["outcome"],
+                          f["data_ciphertext"], f["parse_ms"]))
+            restored["files"] += 1
+        for link in image.get("links", []):
+            conn.execute("INSERT OR IGNORE INTO ui_links(id, from_action, to_action, kind, lag_s, created_at)"
+                         " VALUES (?,?,?,?,?,?)", (link["id"], link["from_action"], link["to_action"], link["kind"],
+                                                   link["lag_s"], link.get("created_at")))
+            restored["links"] += 1
+        conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, row["id"]))
+        conn.execute(
+            "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"
+            " VALUES (?,?,?,?,?,?,?,?)", (now, None, "trace", "undo", json.dumps(dict(restored)), None,
+                                          json.dumps([int(diary_id)]),
+                                          store._enc(f"Brought back {restored['actions']} recorded actions.")))
+        return {"ok": True, **dict(restored)}
+
+    return store._write(op)
+
+
+# -- later joins ---------------------------------------------------------------------------------------------------
+
+
+def attach_episodes(store: Any, *, now: float | None = None, settle_s: float = 900.0, limit: int = 5000) -> int:
+    """Set ``episode_id`` on rows whose final, current episode now exists (episodes are written after the fact)."""
+    now = time.time() if now is None else float(now)
+
+    def op(conn: sqlite3.Connection) -> int:
+        cur = conn.execute(
+            "UPDATE ui_actions SET episode_id = (SELECT e.id FROM episodes e WHERE e.final = 1 AND e.expired_at IS NULL"
+            " AND e.started_at <= ui_actions.at AND e.ended_at >= ui_actions.at ORDER BY e.started_at DESC LIMIT 1)"
+            " WHERE id IN (SELECT id FROM ui_actions WHERE episode_id IS NULL AND at < ? ORDER BY at LIMIT ?)",
+            (now - settle_s, int(limit)))
+        return cur.rowcount
+
+    try:
+        return store._write(op)
+    except Exception:  # noqa: BLE001 - an older database without final episodes
+        return 0
+
+
+#: How far a run step's span is stretched when matching an action to it (s): the step's own clock and the
+#: action's differ by the time the tool took to start.
+RUN_PAD_S = 0.5
+
+
+def match_runs(store: Any, *, since: float, until: float | None = None) -> int:
+    """Label ``yuki`` the actions a Yuki run made without its input stamp, matched by the run trace's step and time.
+
+    Two kinds are matched, both only while a run was in progress (``during_run``): event-only actions (an invoke or
+    a selection with no input at all: UI Automation pattern calls) and untagged injected input (the agent's shell
+    scripts). Each gets the step's ``run_key`` and ``run_step`` when an action step of a run (agent or hand) in the
+    same app spans its time. Hardware input (``user``) is never relabelled: during a run it is a takeover."""
+    until = time.time() if until is None else float(until)
+    try:
+        rows = store._query(
+            "SELECT id, at, process FROM ui_actions WHERE during_run = 1 AND run_key IS NULL AND at >= ? AND at <= ?"
+            " AND (via = 'event_only' OR source = 'user_injected')", (float(since), until))
+        if not rows:
+            return 0
+        steps = store._query(
+            "SELECT run_key, step, at, ended_at, app FROM runs WHERE step > 0 AND kind = 'action' AND at >= ?"
+            " AND at <= ?", (float(since) - 600.0, until + 60.0))
+    except Exception:  # noqa: BLE001
+        return 0
+    updates: list[tuple[str, int, int]] = []
+    for r in rows:
+        best = None
+        for s in steps:
+            start = float(s["at"]) - RUN_PAD_S
+            end = float(s["ended_at"] or s["at"]) + RUN_PAD_S
+            if start <= float(r["at"]) <= end and (not s["app"] or s["app"] == r["process"]):
+                if best is None or float(s["at"]) > float(best["at"]):
+                    best = s
+        if best is not None:
+            updates.append((best["run_key"], int(best["step"]), int(r["id"])))
+    if updates:
+        store._write(lambda conn: conn.executemany(
+            "UPDATE ui_actions SET source='yuki', via='run_step', run_key=?, run_step=? WHERE id=?", updates))
+    return len(updates)
+
+
+# -- reading (content-free) ----------------------------------------------------------------------------------------
+
+
+def summary(store: Any, *, since: float, until: float | None = None) -> dict[str, Any]:
+    """Counts of the trace between two times, by app, kind, source and how the element was found. Content-free."""
+    until = time.time() if until is None else float(until)
+    out: dict[str, Any] = {"since": since, "until": until}
+    for col in ("process", "kind", "source", "resolved"):
+        rows = store._query(f"SELECT coalesce({col}, ''), count(*) FROM ui_actions WHERE at >= ? AND at < ?"
+                            f" GROUP BY 1 ORDER BY 2 DESC", (float(since), until))
+        out[col] = {str(r[0]): int(r[1]) for r in rows}
+    out["actions"] = sum(out["kind"].values())
+    out["during_run"] = int(store._query("SELECT count(*) FROM ui_actions WHERE at >= ? AND at < ? AND during_run=1",
+                                         (float(since), until))[0][0])
+    out["typed"] = int(store._query("SELECT coalesce(sum(typed), 0) FROM ui_actions WHERE at >= ? AND at < ?",
+                                    (float(since), until))[0][0])
+    out["elements"] = int(store._query("SELECT count(*) FROM ui_elements")[0][0])
+    out["named_elements"] = int(store._query("SELECT count(*) FROM ui_elements WHERE name_ciphertext IS NOT NULL")
+                                [0][0])
+    out["files"] = int(store._query("SELECT count(*) FROM ui_files WHERE at >= ? AND at < ?",
+                                    (float(since), until))[0][0])
+    return out
+
+
+def paste_joins(store: Any, *, since: float, until: float | None = None) -> list[dict[str, Any]]:
+    """Each paste with the copy it pasted (the same clipboard sequence number): ``{"copy", "paste", "from", "to",
+    "lag_s"}`` (action ids, process keys). Content-free; C2 turns these into ``ui_links``."""
+    until = time.time() if until is None else float(until)
+    rows = store._query(
+        "SELECT p.id AS paste, p.process AS to_app, p.at AS pat, c.id AS copy, c.process AS from_app, c.at AS cat"
+        " FROM ui_actions p JOIN ui_actions c ON c.kind = 'copy' AND c.clip_seq = p.clip_seq AND c.at <= p.at"
+        " WHERE p.kind = 'paste' AND p.clip_seq IS NOT NULL AND p.at >= ? AND p.at < ? ORDER BY p.at",
+        (float(since), until))
+    return [{"copy": int(r["copy"]), "paste": int(r["paste"]), "from": r["from_app"], "to": r["to_app"],
+             "lag_s": round(float(r["pat"]) - float(r["cat"]), 2)} for r in rows]
+
+
+# -- the hard game gate's learned set ------------------------------------------------------------------------------
+
+
+def load_game_evidence(store: Any) -> dict[str, dict[str, Any]]:
+    """``ui_game_processes`` as the gate's evidence dict (``{}`` on an older database)."""
+    try:
+        rows = store._query("SELECT process, first_seen, last_seen, evidence FROM ui_game_processes")
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        try:
+            entry = json.loads(r["evidence"]) if r["evidence"] else {}
+        except (TypeError, ValueError):
+            entry = {}
+        if isinstance(entry, dict):
+            entry.setdefault("first_seen", r["first_seen"])
+            entry.setdefault("last_seen", r["last_seen"])
+            out[str(r["process"])] = entry
+    return out
+
+
+def save_game_evidence(store: Any, evidence: dict[str, dict[str, Any]]) -> None:
+    """Replace ``ui_game_processes`` with the gate's evidence (a handful of rows)."""
+
+    def op(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM ui_game_processes")
+        for process, entry in evidence.items():
+            conn.execute("INSERT INTO ui_game_processes(process, first_seen, last_seen, evidence) VALUES (?,?,?,?)",
+                         (process, entry.get("first_seen"), entry.get("last_seen"),
+                          json.dumps(entry, sort_keys=True)))
+
+    store._write(op)
+
+
+__all__ = ["ACTION_COLUMNS", "ELEMENT_DAYS", "RAW_DAYS", "attach_episodes", "capture_ids", "day_of", "forget",
+           "load_game_evidence", "match_runs", "paste_joins", "purge", "save_game_evidence", "summary",
+           "undo_forget", "update_action", "write_batch"]

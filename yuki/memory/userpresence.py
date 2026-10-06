@@ -34,6 +34,14 @@ is not reused here because importing it pulls in the whole ``yuki.actions`` pack
 and ~0.1 s in a process that never acts), and it reads the cursor on every move, which this does not need. Raw Input
 registration is one per process: never run both readers in one process (the memory service never runs the tray's).
 
+One reader, two listeners (capC1, 7 Oct 2026): the action trace (:mod:`yuki.memory.trace_input`, only once the user
+said yes) is a *sink* on this same reader (:meth:`Presence.attach_sink`), because Raw Input registration is one per
+process, per usage page and usage: a second registration would take these events. The reader hands the sink plain
+integers from each event after presence has counted it (never the ``RAWINPUT`` buffer); while the sink listens
+(``TraceInput.wants_mouse``) the mouse is not rested, so its clicks are heard. Presence's rule, counts and idle
+signal are the same either way; while the trace is blocked (a game, the pause, consent off) the sink is skipped and
+the rest works as before.
+
 Semantics kept for the callers: :meth:`Presence.idle_s` is seconds since the user's last real input, never less than
 Windows' own idle time (``GetLastInputInfo``: no input of any kind for that long means no real input either). If Raw
 Input is unavailable (no desktop), ``fallback`` answers (the old sampler) and the reason is in :meth:`Presence.facts`;
@@ -93,6 +101,8 @@ _WHEELS = 0x0400 | 0x0800
 _SM_CXSCREEN, _SM_CYSCREEN, _SM_CXVIRTUALSCREEN, _SM_CYVIRTUALSCREEN = 0, 1, 78, 79
 _WM_TIMER = 0x0113
 _REST_TIMER = 1
+#: Posted to the reader's thread: end a mouse rest now (the trace's sink started listening).
+_WM_WAKE_MOUSE = 0x8000 + 31
 
 
 class _FrontIntegrity:
@@ -329,6 +339,10 @@ class _RawReader:
 
     def __init__(self, monitor: PresenceInput) -> None:
         self.monitor = monitor
+        #: The action trace's sink (:class:`yuki.memory.trace_input.TraceInput`) or None: fed after presence.
+        self.sink: Any = None
+        #: ``WM_INPUT`` messages handled (a content-free counter for the trace's health).
+        self.messages = 0
         self.running = False
         self.error = ""
         self.thread_id = 0
@@ -342,6 +356,14 @@ class _RawReader:
             self._thread.start()
         self._ready.wait(wait_s)
         return self.running
+
+    def listen_mouse(self) -> None:
+        """End a mouse rest now (the trace's sink started listening); any thread."""
+        if self.thread_id:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(self.thread_id, _WM_WAKE_MOUSE, 0, 0)
+            except Exception:  # noqa: BLE001
+                pass
 
     def stop(self) -> None:
         """Stops listening (a probe or a test; the service never stops it)."""
@@ -456,13 +478,22 @@ class _RawReader:
             if got in (0, 0xFFFFFFFF):
                 return
             t = clock()
+            self.messages += 1
             kind = buf.header.dwType
+            sink = self.sink
             if kind == _RIM_TYPEMOUSE:
                 if resting[0]:
                     return                                  # queued before the rest began
                 m = buf.data.mouse
                 extra = int(m.ulExtraInformation)
                 flags = int(m.usButtonFlags)
+                if sink is not None and not sink.blocked:
+                    # the trace's sink: plain integers only, never the buffer (it drops at its own first line too)
+                    try:
+                        sink.mouse(t, int(m.usFlags), flags, int(m.usButtonData), int(m.lLastX), int(m.lLastY),
+                                   extra, int(buf.header.hDevice or 0))
+                    except Exception:  # noqa: BLE001 - the trace never breaks presence
+                        pass
                 real = False
                 if flags & _BUTTON_DOWNS:
                     real = monitor.button_down(t, extra) or real
@@ -475,12 +506,18 @@ class _RawReader:
                     real = monitor.absolute(m.lLastX * w / 65535.0, m.lLastY * h / 65535.0, t, extra) or real
                 elif m.lLastX or m.lLastY:
                     real = monitor.relative(int(m.lLastX), int(m.lLastY), t, extra) or real
-                if real:
-                    rest_mouse()
+                if real and (sink is None or not sink.wants_mouse):
+                    rest_mouse()                            # never while the trace listens: its clicks must be heard
             elif kind == _RIM_TYPEKEYBOARD:
                 k = buf.data.keyboard
                 if int(k.Message) in (_WM_KEYDOWN, _WM_SYSKEYDOWN):
                     monitor.key_down(t, int(k.ExtraInformation))
+                if sink is not None and not sink.blocked:
+                    try:
+                        sink.key(t, int(k.VKey), int(k.MakeCode), int(k.Flags), int(k.Message),
+                                 int(k.ExtraInformation), int(buf.header.hDevice or 0))
+                    except Exception:  # noqa: BLE001
+                        pass
 
         def wndproc(hwnd: int, msg: int, w_param: int, l_param: int) -> int:
             try:
@@ -522,6 +559,10 @@ class _RawReader:
                 got = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if got in (0, -1):
                     break
+                if msg.message == _WM_WAKE_MOUSE and not msg.hwnd:
+                    if resting[0]:
+                        wake_mouse()
+                    continue
                 user32.DispatchMessageW(ctypes.byref(msg))
         finally:
             self.running = False
@@ -668,6 +709,25 @@ class Presence:
         elif self.unheard and (self.monitor.latest() > self._unheard_at or not self._unheard_front()):
             self.unheard = False                # the reader hears the user again, or the window left the front
         return max(raw, heard)
+
+    def attach_sink(self, sink: Any) -> bool:
+        """Feed the action trace's sink from this one reader too (starting the reader if no question came yet);
+        returns whether Raw Input is listening. Presence's own behaviour does not change."""
+        if not self._ensure():
+            return False
+        reader = self._reader
+        try:
+            reader.sink = sink
+            wake = getattr(reader, "listen_mouse", None)
+            if wake is not None:
+                wake()
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def reader_messages(self) -> int:
+        """``WM_INPUT`` messages the reader handled (0 before it started)."""
+        return int(getattr(self._reader, "messages", 0) or 0)
 
     def note_unlock(self) -> None:
         """The session was unlocked: the user is at the PC."""

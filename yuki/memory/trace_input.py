@@ -170,6 +170,7 @@ class TraceInput:
         #: The worker was told the pointer moves and has not yet judged the rest; cleared by the worker.
         self.moving = False
         self.travel = 0.0                    # raw counts travelled since the last action
+        self.move_source = USER              # who moved the pointer last (user | user_injected)
         # buttons
         self._down: dict[str, tuple[float, int, int, int]] = {}   # button -> (t, x, y, max excursion px)
         self._last_click: tuple[str, float, int, int] | None = None
@@ -214,8 +215,9 @@ class TraceInput:
         """One Raw Input mouse report, as integers."""
         if self.blocked:
             return
-        if dx or dy:
+        if (dx or dy) and not is_yuki_input(extra):     # Yuki's own stamped moves never make a rest or travel
             self.counts["moves"] += 1
+            self.move_source = USER if device else INJECTED
             if us_flags & _MOVE_ABSOLUTE:              # pen, remote desktop: 0..65535 over a screen
                 w, h = (self._screen or _default_screen())(bool(us_flags & _VIRTUAL_DESKTOP))
                 px, py = dx * w / 65535.0, dy * h / 65535.0
