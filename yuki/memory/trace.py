@@ -241,7 +241,7 @@ class TraceWorker:
         self._last_hover_t = float("-inf")
         self._focus: Any = None                   # the focused element, until a focus event or a window change
         self._focus_valid = False
-        self._last_click_edit: tuple[float, Any] | None = None
+        self._last_click_edit: tuple[float, Any, int] | None = None
         self._last_focus_ev = 0.0
         self._last_action_t = float("-inf")
         self._last_input: tuple[float, str] | None = None
@@ -397,7 +397,7 @@ class TraceWorker:
             if el is not None:
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
                 if el.role in EDIT_ROLES:
-                    self._last_click_edit = (t, el)    # typing next goes into it (or, a password field, is dropped)
+                    self._last_click_edit = (t, el, hwnd)   # typing next goes into it (a password field: dropped)
                 if el.role in PANE_ROLES and self._covers_window(el, hwnd):
                     deeper = self._lookup(self.uia.descend, el, x, y, priority=False)
                     if deeper is not None:
@@ -569,6 +569,8 @@ class TraceWorker:
     def _on_fg(self, t: float, hwnd: int, pid: int) -> None:
         self._focus_valid = False
         self._recent_structure.append((t, -1))
+        if self._last_click_edit is not None and self._last_click_edit[2] != hwnd:
+            self._last_click_edit = None             # typing now goes into another window
         if self._blocked() is not None:
             return
         win = self._window(hwnd, pid)
@@ -806,7 +808,7 @@ class TraceWorker:
     # -- finishing an action -------------------------------------------------------------------------------------------
 
     def _identity_from_events(self, act: _Act) -> None:
-        if act.x is None or self.uia is None or act.drop is not None:
+        if act.x is None or self.uia is None or act.drop is not None or act.kind in ("hover", "scroll"):
             return
         until = (act.up_t or act.t) + IDENTITY_S
         for wanted in IDENTITY_EVENTS:
@@ -1238,7 +1240,8 @@ class Trace:
             self._log("error", where="trace.uia_start", error=type(exc).__name__)
         while not self._stop.is_set():
             due = worker.next_due()
-            timeout = 1.0 if due is None else max(0.0, min(1.0, due - time.monotonic()))
+            # sleeps until the next item or deadline: nothing wakes it while nothing happens (stop() sends an item)
+            timeout = None if due is None else max(0.0, due - time.monotonic())
             try:
                 item = self.queue.get(timeout=timeout)
             except queue.Empty:
