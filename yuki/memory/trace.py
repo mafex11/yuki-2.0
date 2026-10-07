@@ -747,6 +747,14 @@ class TraceWorker:
         if self._type is not None:
             run = self._type
             after_type = {"typed": run.typed, "el": run.el}
+        elif text == "Enter":
+            prev = self._last_key
+            # an Enter right after a paste into a field, with no other action and no focus change between: the
+            # pasted field is what it may submit, read like a field typed into (report 98, review F2: paste_sent)
+            if (prev is not None and prev.kind == "paste" and prev.drop is None and prev.el is not None
+                    and getattr(prev.el, "role", None) in EDIT_ROLES and self._last_action_t == prev.t
+                    and self._last_focus_ev <= prev.t):
+                after_type = {"typed": 0, "el": prev.el}
         self._close_type(t)
         self._close_hover(t)
         self._input(t, source)
