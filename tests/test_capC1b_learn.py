@@ -579,3 +579,41 @@ def test_f7_the_same_route_failing_again_adds_to_its_pitfall_even_when_the_user_
     assert P.get(store, pit.id).n_observed == 2
     found = P.relevant(store, query_vec=vec(P.intent_words(store, WORDS)), apps_in_play=["wordmill", "quillpad"])
     assert next(p for p in found["pitfalls"] if p["id"] == pit.id)["warning"] == "strong"
+
+
+def _page_run(request_id: str) -> dict[str, Any]:
+    return _run(request_id, "open the team roster", [
+        _act("open_url", "browsr", {"url": "https://wiki.example.org/team/roster"}, at=NOW + 1.0, verdict=False)])
+
+
+def _page_reached(store: Any, at: float) -> int:
+    from yuki.memory.store import TimelineRow
+
+    key = store.timeline_key("browsr", "wiki.example.org", "/team/roster", None)
+    store.save_timeline(TimelineRow(id=None, started_at=at, ended_at=at + 60, state="present", process="browsr",
+                                    app="Browsr", host="wiki.example.org", path="/team/roster", page_key=key))
+    return row(store, at, "browsr", "nav", resolved="event", facts={"page_reached": key}, outcome=None)
+
+
+def test_review_a_page_change_becomes_open_url_when_the_address_is_literal(store):
+    worker = Worker(store)
+    P.record_run(store, _page_run("p1"))
+    nav = _page_reached(store, NOW + 30)
+    worker.answers.append({"same_goal": True, "intent": "open the team roster", "steps": [{"from": f"a{nav}"}]})
+    res = fixer(worker).run_once(now=NOW + 40)
+    way = P.get(store, res[0].written["fixed"][0])
+    assert way.run == [{"do": "open_url", "url": "https://wiki.example.org/team/roster"}]
+
+
+def test_review_a_page_change_stays_a_hint_with_a_slot_or_without_a_kept_address(store):
+    worker = Worker(store)
+    P.record_run(store, _page_run("p2"))
+    box = row(store, NOW + 20, "browsr", "type", resolved="focus", role="Edit", key="k-find", typed=6)
+    nav = _page_reached(store, NOW + 30)
+    worker.answers.append({"same_goal": True, "intent": "open the team roster",
+                           "steps": [{"from": f"a{box}", "slot": "the page name"}, {"from": f"a{nav}"}]})
+    res = fixer(worker).run_once(now=NOW + 40)
+    assert P.get(store, res[0].written["fixed"][0]).run == []          # the address could carry the slot
+    bare = {"id": 1, "at": NOW, "kind": "nav", "process": "browsr", "page_key": "no-such-page",
+            "facts": json.dumps({"page_reached": "no-such-page"})}
+    assert L.page_url(store, bare) is None and L.trace_step(bare, None, {"kind": "page"}) is None
