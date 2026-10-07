@@ -564,26 +564,31 @@ class TraceWorker:
             self._input_own = prev.win.own
             return
         hwnd, pid = self._window_at(x, y)
+        # capC1c: the window under the press (taken at button-down by the sink) is gone or covered before the worker
+        # got to it (a menu closed, a window closed, a dialog came up): a lookup now would answer for another window.
+        # The press belongs to the window that was pressed: still there (covered), its own app's row, stale and
+        # point-only, through that window's own gates; gone, its app cannot be known, so nothing is kept.
+        moved = bool(root) and bool(hwnd) and int(root) != int(hwnd)
+        if moved:
+            try:
+                root_pid = int(self._pid_of(int(root)) or 0)
+            except Exception:  # noqa: BLE001
+                root_pid = 0
+            if root_pid:
+                hwnd, pid = int(root), root_pid
         win = self._window(hwnd, pid)
         self._input_own = win.own
         act = self._new_act(_BUTTON_KIND.get(button, "click"), t, source, win, x=x, y=y, button=button,
                             travel=travel, gap_ms=self._gap(t), open=True)
         act.down_root = int(root or hwnd or 0)
         self._open[button] = act
-        if act.drop is None and root and hwnd and int(root) != int(hwnd):
-            # capC1c: the window under the press is gone or covered before the worker got to it (a menu closed, a
-            # dialog came up): a lookup now would answer for another window. Same app: a stale point-only row; another
-            # app (or not known): nothing, as its gates were never checked (fails closed).
-            try:
-                same = bool(pid) and int(self._pid_of(int(root)) or 0) == int(pid)
-            except Exception:  # noqa: BLE001
-                same = False
-            if same:
+        if moved:
+            if int(hwnd) != int(root):
+                act.drop = act.drop or "skip_window_changed"
+            elif act.drop is None:
                 act.stale = True
                 act.lookup_end = t
                 self.counters["stale_window_changed"] += 1
-            else:
-                act.drop = "skip_window_changed"
             return
         if act.drop is None:
             walk = self._walk_kw(hwnd)

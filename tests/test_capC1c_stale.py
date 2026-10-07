@@ -92,14 +92,34 @@ def test_a_menu_closing_under_the_press_before_the_worker_got_to_it_is_stale(rig
     assert rig.w.counters["stale_window_changed"] == 1
 
 
-def test_a_press_whose_window_was_replaced_by_another_apps_is_dropped(rig):
+def test_a_press_whose_window_is_gone_before_the_worker_got_to_it_keeps_nothing(rig):
     rig.under = (HWND[APP], APP)
-    rig.w._pid_of = lambda h: 4242                                   # another process's window was pressed
+    rig.w._pid_of = lambda h: 0                                      # the pressed window no longer exists
     t = rig.clock.t
     rig.feed("down", t, "left", 150, 120, "user", 0, False, MENU)
     rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.08)
     rig.settle()
-    assert rig.rows() == [] and rig.w.counters["skip_window_changed"] == 1
+    assert rig.rows() == [] and rig.w.counters["skip_window_changed"] == 1 and rig.uia.calls == []
+
+
+def test_a_press_on_a_window_now_covered_by_another_app_is_that_windows_apps_row(rig):
+    """The press was in Browser X's window; a Field Notes dialog covered it before the worker got there: the row is
+    Browser X's (its own gates decide), stale and point-only, never Field Notes' element."""
+    from test_trace_worker import BROWSER, VAULT
+
+    rig.under = (HWND[APP], APP)
+    rig.w._pid_of = lambda h: {HWND[BROWSER]: BROWSER, HWND[VAULT]: VAULT}.get(h, 0)
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False, HWND[BROWSER])
+    rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.08)
+    rig.settle()
+    (row,) = rig.rows()
+    assert row["process"] == "browserx" and row["element_key"] is None and rig.uia.calls == []
+    assert rig.w.counters["stale_window_changed"] == 1
+    rig.feed("down", rig.clock.t, "left", 150, 120, "user", 0, False, HWND[VAULT])   # a blocked app's window
+    rig.feed("up", rig.clock.t + 0.08, "left", 150, 120, "user", False, dt=0.08)
+    rig.settle()
+    assert len(rig.rows()) == 1 and rig.w.counters["dropped_blocked_app"] >= 1
 
 
 class _ClosingMenu(FakeUia):
