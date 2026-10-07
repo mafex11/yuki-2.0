@@ -416,13 +416,16 @@ class TraceWorker:
             self.counters["lookup_over_budget"] += 1
         return ok
 
-    def _hung_skip(self, target: tuple[int, int] | None) -> bool:
+    def _hung_skip(self, target: tuple[int, int] | None, *, probe: bool = False) -> bool:
         """capC1b watchdog: whether the window a lookup would go into belongs to an app that is not answering
-        (:class:`yuki.memory.trace_uia.HungWatch`); counted as ``lookup_skipped_hung``."""
+        (:class:`yuki.memory.trace_uia.HungWatch`); counted as ``lookup_skipped_hung``. ``probe`` (second verification
+        V2): the lookup is an MSAA call with no timeout of its own, so the window must also take a no-op message within
+        :data:`yuki.memory.trace_uia.ANSWER_MS` first (an app frozen for less than the 5 s Windows waits before calling
+        it hung would otherwise hold the worker for its whole freeze)."""
         if target is None or self.hung is None:
             return False
         try:
-            if self.hung.skip(int(target[0] or 0), int(target[1] or 0)):
+            if self.hung.skip(int(target[0] or 0), int(target[1] or 0), probe=probe):
                 self.counters["lookup_skipped_hung"] += 1
                 return True
         except Exception as exc:  # noqa: BLE001
@@ -437,11 +440,11 @@ class TraceWorker:
                 self._error("hung_watch", exc)
 
     def _lookup(self, fn: Callable[..., Any], *args: Any, priority: bool, target: tuple[int, int] | None = None,
-                **kw: Any) -> Any:
+                probe: bool = False, **kw: Any) -> Any:
         """One UI Automation lookup within budget (never while the gate holds, never into an app that is not
-        answering: ``target`` is the window it goes into, ``(hwnd, pid)``); None when over budget, skipped or
-        failed."""
-        if self.uia is None or self._blocked() is not None or self._hung_skip(target) \
+        answering: ``target`` is the window it goes into, ``(hwnd, pid)``; ``probe``: an MSAA call, the window must
+        answer a no-op message first - :meth:`_hung_skip`); None when over budget, skipped or failed."""
+        if self.uia is None or self._blocked() is not None or self._hung_skip(target, probe=probe) \
                 or not self._take(priority=priority):
             return None
         t0 = time.perf_counter()
@@ -782,7 +785,8 @@ class TraceWorker:
                                 via="event_only", gap_ms=self._gap(t))
             act.events.append(ev)
             if act.drop is None and self.uia is not None:
-                el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False, target=(hwnd, 0))
+                el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False, target=(hwnd, 0),
+                                  probe=True)
                 if el is not None:
                     act.el, act.resolved, act.lookup_ms = el, "event", el.ms
                     if el.secret():
@@ -1137,7 +1141,8 @@ class TraceWorker:
                 if event != wanted or not act.t <= t <= until:
                     continue
                 target = (hwnd, act.win.pid if hwnd == act.win.hwnd else 0)
-                if self._hung_skip(target) or not self._take(priority=act.el is None or act.resolved != "point"):
+                if self._hung_skip(target, probe=True) or not self._take(priority=act.el is None
+                                                                         or act.resolved != "point"):
                     return
                 t0 = time.perf_counter()
                 try:
@@ -1219,7 +1224,7 @@ class TraceWorker:
             if len(seen) > OUTCOME_ELEMENTS:
                 break
             el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False,
-                              target=(hwnd, act.win.pid if hwnd == act.win.hwnd else 0))
+                              target=(hwnd, act.win.pid if hwnd == act.win.hwnd else 0), probe=True)
             if el is None:
                 if self._bucket.tokens - 1.0 < RESERVE_FOR_CLICKS:
                     break                                   # no spare budget left: the counts stand alone

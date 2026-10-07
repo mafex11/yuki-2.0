@@ -36,7 +36,8 @@ class Fake:
 
 
 def watch(f: Fake, **kw) -> HungWatch:
-    return HungWatch(hung=f.is_hung, answers=f.answers, pid_of=lambda hwnd: 500 + hwnd, clock=f.clock, **kw)
+    return HungWatch(hung=f.is_hung, answers=f.answers, pid_of=lambda hwnd: 500 + hwnd, clock=f.clock,
+                     exists=lambda hwnd: True, **kw)
 
 
 def test_a_hung_window_is_skipped_until_it_answers_again():
@@ -54,7 +55,8 @@ def test_a_hung_window_is_skipped_until_it_answers_again():
     f.hung.clear()
     f.t += 2.0
     assert not w.skip(11, 101) and w.marked() == 0                # it answers: lookups as usual again
-    assert w.counts == {"hung_marked": 1, "hung_slow": 0, "hung_skipped": 3, "hung_recovered": 1}
+    assert w.counts == {"hung_marked": 1, "hung_slow": 0, "hung_unanswered": 0, "hung_skipped": 3,
+                        "hung_recovered": 1}
 
 
 def test_a_slow_lookup_marks_its_app_and_another_app_is_not_affected():
@@ -155,3 +157,51 @@ def test_the_re_probe_never_changes_the_shared_user32_prototype():
     assert (shared.argtypes, shared.restype) == before
     result = wintypes.DWORD(0)
     shared(None, 0, 0, 0, 0x0002, 1, ctypes.byref(result))      # a DWORD result still passes (no ArgumentError)
+
+
+# -- second verification V2: an app frozen for less than 5 s, before an MSAA call --------------------------------------
+
+
+def test_v2_an_msaa_lookup_probes_first_and_skips_an_app_frozen_for_less_than_five_seconds():
+    """Windows calls a window hung only after 5 s without messages; an MSAA call has no timeout. Before one
+    (``probe=True``) the window must take a no-op message: one that does not is marked at once and skipped; UI
+    Automation lookups (their own timeouts) are not probed."""
+    f = Fake()
+    w = watch(f)
+    f.answering = False                                           # frozen, but not yet "hung" by Windows' verdict
+    assert not w.skip(11, 101) and f.probes == []                 # a UI Automation lookup: no probe
+    assert w.skip(11, 101, probe=True) and f.probes == [11]       # the MSAA lookup: probed, skipped, marked
+    assert w.marked() == 1 and w.counts["hung_unanswered"] == 1
+    assert w.skip(11, 101)                                        # then every lookup into it, until it answers
+    f.answering = True
+    f.t += 3.0
+    assert not w.skip(11, 101, probe=True) and w.marked() == 0 and w.counts["hung_recovered"] == 1
+    assert not w.skip(11, 101, probe=True)                        # answering: the call goes ahead
+
+
+def test_v2_a_gone_window_is_never_probed():
+    f = Fake()
+    w = HungWatch(hung=f.is_hung, answers=f.answers, pid_of=lambda hwnd: 0, clock=f.clock, exists=lambda hwnd: False)
+    f.answering = False
+    assert not w.skip(11, 101, probe=True) and f.probes == []
+
+
+def test_v2_the_worker_never_makes_the_outcome_msaa_call_into_a_window_that_does_not_answer(tmp_path):
+    """The user clicks; the app freezes at once (not yet hung by Windows' verdict). The click's outcome event is
+    looked up through MSAA: the worker probes first, skips the call, marks the app; the row is still written."""
+    rig = Rig(tmp_path)
+    try:
+        f = Fake()
+        rig.w.hung = watch(f)
+        rig.uia.points[(150, 120)] = button()
+        rig.click()
+        f.answering = False                                       # frozen right after the click
+        rig.feed("out", rig.clock.t + 0.05, 0x800A, HWND[APP], -4, 3, 1)   # a state change in the window
+        rig.settle()
+        rows = rig.rows()
+        assert rows and rows[-1]["kind"] == "click" and rows[-1]["element_key"]   # the press itself was looked up
+        assert not [c for c in rig.uia.calls if c[0] == "event"]                  # no MSAA call into the frozen app
+        stats = rig.w.stats()
+        assert stats["hung_unanswered"] == 1 and stats["lookup_skipped_hung"] >= 1 and f.probes
+    finally:
+        rig.store.close()

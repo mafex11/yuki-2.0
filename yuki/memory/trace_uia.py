@@ -396,6 +396,14 @@ def window_pid(hwnd: int) -> int:
         return 0
 
 
+def window_exists(hwnd: int) -> bool:
+    """Whether the handle is a window at all (``IsWindow``; sends nothing): a gone window cannot hang a call."""
+    try:
+        return bool(ctypes.windll.user32.IsWindow(ctypes.c_void_p(int(hwnd))))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class HungWatch:
     """Keeps the trace worker out of apps that stopped answering (a UI Automation or MSAA call into a hung app could
     hold the worker for as long as UI Automation's own timeouts allow).
@@ -404,20 +412,29 @@ class HungWatch:
     after one, :meth:`note` marks its process when the lookup took :data:`SLOW_CALL_S` or more (measured by the
     worker). A marked process is skipped - no lookup at all; its actions are kept point-only, as over the lookup
     budget - and asked again at most every :data:`PROBE_EVERY_S` whether it answers (not hung, and it takes a
-    ``WM_NULL`` within :data:`ANSWER_MS`); the first time it does, it is lookups as usual again. Health counters:
-    ``hung_marked``, ``hung_slow``, ``hung_skipped``, ``hung_recovered``. Content-free; nothing in the app changes."""
+    ``WM_NULL`` within :data:`ANSWER_MS`); the first time it does, it is lookups as usual again.
+
+    Second verification V2: ``IsHungAppWindow`` says hung only after 5 s without messages, and an MSAA call
+    (``AccessibleObjectFromEvent``) has no timeout of its own - an app that froze right after a click would hold the
+    worker for its whole freeze. So before such a call (``skip(..., probe=True)``) the window is also sent a
+    ``WM_NULL`` (:func:`window_answers`, at most :data:`ANSWER_MS`); one that does not take it is marked at once
+    (``hung_unanswered``) and the call is skipped. Health counters: ``hung_marked``, ``hung_slow``, ``hung_unanswered``,
+    ``hung_skipped``, ``hung_recovered``. Content-free; nothing in the app changes."""
 
     def __init__(self, *, hung: Any = window_hung, answers: Any = window_answers, pid_of: Any = window_pid,
-                 clock: Any = time.monotonic, slow_s: float = SLOW_CALL_S, probe_every_s: float = PROBE_EVERY_S) -> None:
+                 clock: Any = time.monotonic, slow_s: float = SLOW_CALL_S, probe_every_s: float = PROBE_EVERY_S,
+                 exists: Any = window_exists) -> None:
         self._hung = hung
         self._answers = answers
+        self._exists = exists
         self._pid_of = pid_of
         self._clock = clock
         self.slow_s = float(slow_s)
         self.probe_every_s = float(probe_every_s)
         #: ``{process key (pid, or -hwnd when the pid is unknown): [hwnd, marked at, last probe]}``
         self._marked: dict[int, list[float]] = {}
-        self.counts: dict[str, int] = {"hung_marked": 0, "hung_slow": 0, "hung_skipped": 0, "hung_recovered": 0}
+        self.counts: dict[str, int] = {"hung_marked": 0, "hung_slow": 0, "hung_unanswered": 0, "hung_skipped": 0,
+                                       "hung_recovered": 0}
 
     def _key(self, hwnd: int, pid: int) -> int:
         if not pid and hwnd:
@@ -428,8 +445,9 @@ class HungWatch:
         """How many apps are marked as not answering now."""
         return len(self._marked)
 
-    def skip(self, hwnd: int, pid: int = 0) -> bool:
-        """Whether a lookup into this window must be skipped now (its app is hung, or still marked)."""
+    def skip(self, hwnd: int, pid: int = 0, *, probe: bool = False) -> bool:
+        """Whether a lookup into this window must be skipped now (its app is hung, or still marked). ``probe``: the
+        call has no timeout of its own (MSAA): the window must also take a ``WM_NULL`` within :data:`ANSWER_MS`."""
         if not hwnd and not pid:
             return False
         key = self._key(hwnd, pid)
@@ -452,6 +470,13 @@ class HungWatch:
             self.counts["hung_marked"] += 1
             self.counts["hung_skipped"] += 1
             return True
+        if probe and hwnd and self._exists(int(hwnd)) and not self._answers(int(hwnd)):
+            # V2: frozen less than 5 s (Windows does not call it hung yet) - an MSAA call would wait out the freeze
+            self._marked[key] = [float(hwnd), now, now]
+            self.counts["hung_marked"] += 1
+            self.counts["hung_unanswered"] += 1
+            self.counts["hung_skipped"] += 1
+            return True
         return False
 
     def note(self, hwnd: int, pid: int, seconds: float) -> None:
@@ -467,4 +492,4 @@ class HungWatch:
 
 
 __all__ = ["ANCESTORS", "ANSWER_MS", "Element", "HungWatch", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
-           "TOGGLE_WORDS", "TraceUia", "window_answers", "window_hung", "window_pid"]
+           "TOGGLE_WORDS", "TraceUia", "window_answers", "window_exists", "window_hung", "window_pid"]
