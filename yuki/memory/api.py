@@ -4389,7 +4389,10 @@ class MemoryClient:
             intent = _p.intent_words(self.store, text, known) if text else ""
             vec = self._embed(intent or text, embed_wait_s) if text else None
             named = _p.apps_named(self.store, text, known)
-            out = _p.relevant(self.store, query_vec=vec, apps_in_play=[*named, *known], now=now, detail=bool(detail))
+            # in order of how directly the request is about them (the go-tos show the first few): the apps the words
+            # name, the caller's, then the open windows
+            ordered = [*named, *(str(a) for a in (apps or ()) if a), *(str(a) for a in (open_apps or ()) if a)]
+            out = _p.relevant(self.store, query_vec=vec, apps_in_play=ordered, now=now, detail=bool(detail))
             out["named"] = named
             out["measured"] = vec is not None
         except Exception as exc:

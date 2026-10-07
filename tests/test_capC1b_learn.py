@@ -225,6 +225,18 @@ def test_a_run_that_worked_by_itself_takes_no_way_from_what_the_user_did(store):
     assert worker.calls == [] and P.live(store, ["procedure"]) == []
 
 
+def test_chatting_elsewhere_during_a_run_that_worked_is_no_takeover_and_teaches_nothing(store):
+    worker = Worker(store)
+    P.record_run(store, opening_run(verdict=True))
+    row(store, NOW + 1.5, "chatter", "type", resolved="focus", role="Edit", key="k-msg", typed=12, during_run=1)
+    row(store, NOW + 30, "quillpad", "switch", resolved="event", facts={"window_verified": "quillpad"})
+    assert fixer(worker).run_once(now=NOW + 40) == []                # waits for the learner's judgement
+    P.set_learned(store, P.run_key("agent", "S1", "r1"), "skipped", "nothing to learn", now=NOW + 95)
+    res = fixer(worker).run_once(now=NOW + 100)
+    assert [r.result for r in res] == ["it worked by itself: nothing to learn from what the user did"]
+    assert worker.calls == [] and P.live(store) == []
+
+
 def test_the_model_saying_it_is_not_the_same_goal_writes_nothing(store):
     worker = Worker(store)
     P.record_run(store, opening_run())
