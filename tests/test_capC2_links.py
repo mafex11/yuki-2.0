@@ -62,7 +62,10 @@ def test_migration_39_on_a_fresh_database_and_again(tmp_path):
     try:
         assert len(MIGRATIONS) == 39 and s._query("PRAGMA user_version")[0][0] == 39
         tables = {r[0] for r in s._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert {"ui_tasks", "ui_task_actions", "ui_families", "ui_transitions", "ui_task_runs"} <= tables
+        assert {"ui_tasks", "ui_task_actions", "ui_families", "ui_family_members", "ui_transitions",
+                "ui_task_runs"} <= tables
+        assert "AUTOINCREMENT" in s._query("SELECT sql FROM sqlite_master WHERE name = 'ui_tasks'")[0][0]
+        assert {"route", "vec_ciphertext", "apps"} <= {r[1] for r in s._query("PRAGMA table_info(ui_family_members)")}
         cols = {r[1] for r in s._query("PRAGMA table_info(ui_tasks)")}
         assert {"goal_ciphertext", "model_goal_ciphertext", "outcome_fact", "user_verdict", "vec_ciphertext"} <= cols
         assert "goal" not in cols and "label" not in {r[1] for r in s._query("PRAGMA table_info(ui_families)")}
@@ -87,7 +90,7 @@ def test_migration_39_from_38_keeps_the_trace_rows(tmp_path):
     act(s, NOW, "chatter", "click", role="Button", name="Send", key="k1")
     s.close()
     conn = sqlite3.connect(path)
-    for t in ("ui_tasks", "ui_task_actions", "ui_families", "ui_transitions", "ui_task_runs"):
+    for t in ("ui_tasks", "ui_task_actions", "ui_families", "ui_family_members", "ui_transitions", "ui_task_runs"):
         conn.execute(f"DROP TABLE {t}")
     for i in ("ui_links_from", "ui_links_to", "ui_links_pair", "ui_actions_kind", "ui_actions_file"):
         conn.execute(f"DROP INDEX {i}")

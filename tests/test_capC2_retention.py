@@ -95,3 +95,68 @@ def test_forgetting_an_app_takes_every_task_family_and_transition_of_it(store):
     back = ts.undo_forget(store, out["diary_id"], now=NOW + 3 * DAY + 30)
     assert back["ok"] and count(store, "ui_tasks") == 3 and mixed
     assert store._query("SELECT count(*) FROM ui_transitions WHERE process = 'chatter'")[0][0] >= 1
+
+
+# -- review fix F1: a family accumulates; its members outlive the 30-day task rows -------------------------------------
+
+
+def test_a_family_keeps_its_count_and_usual_path_after_its_tasks_expire_and_grows_when_done_again(store):
+    from test_c_practice import vec
+    from test_capC2_families import three_reports
+    from yuki.memory import practice as P
+
+    reports = three_reports(store)
+    F.refresh(store, Words(), now=NOW + 3 * DAY)
+    fid = store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (reports[0],))[0][0]
+    path_before = store._query("SELECT path_keys FROM ui_families WHERE id = ?", (fid,))[0][0]
+    ts.purge(store, now=NOW + 35 * DAY)
+    assert count(store, "ui_tasks") == 0 and count(store, "ui_family_members") == 3
+    fam = store._query("SELECT n_tasks, path_keys, label_ciphertext FROM ui_families WHERE id = ?", (fid,))[0]
+    assert fam["n_tasks"] == 3 and fam["path_keys"] == path_before and fam["label_ciphertext"]
+    again = task(store, NOW + 36 * DAY, "You sent the weekly report to the team", [ATTACH, FILE, SEND],
+                 outcome="field_submitted")
+    F.refresh(store, Words(), now=NOW + 36 * DAY + 100)
+    assert store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (again,))[0][0] == fid
+    fam = store._query("SELECT n_tasks, path_keys, label_task FROM ui_families WHERE id = ?", (fid,))[0]
+    assert fam["n_tasks"] == 4 and fam["label_task"] == again
+    assert [nd["k"] for nd in F.usual(json.loads(fam["path_keys"]), 4)] == ["k-attach", "k-file",
+                                                                             "chatter|keys|Enter"]
+    out = P.relevant(store, query_vec=vec("send the weekly report to the team"), apps_in_play=["chatter"],
+                     now=NOW + 36 * DAY + 200)
+    assert out["path"] is not None and out["path"]["tasks"] == 4
+
+
+def test_a_member_older_than_90_days_leaves_and_the_family_is_rebuilt_from_the_rest(store):
+    old = task(store, NOW, "You sent the weekly report to the team", [ATTACH, FILE, SEND])
+    F.refresh(store, Words(), now=NOW + 10)
+    new = task(store, NOW + 80 * DAY, "You sent the weekly report to the team", [ATTACH, FILE, SEND])
+    F.refresh(store, Words(), now=NOW + 80 * DAY + 10)
+    fid = store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (new,))[0][0]
+    assert store._query("SELECT n_tasks FROM ui_families WHERE id = ?", (fid,))[0][0] == 2
+    out = ts.purge(store, now=NOW + 91 * DAY)
+    assert out["family_members"] == 1
+    assert [r[0] for r in store._query("SELECT task_id FROM ui_family_members")] == [new] and old
+    assert store._query("SELECT n_tasks FROM ui_families WHERE id = ?", (fid,))[0][0] == 1
+    ts.purge(store, now=NOW + 80 * DAY + 91 * DAY)
+    assert count(store, "ui_families") == 0 and count(store, "ui_family_members") == 0
+
+
+def test_forgetting_an_hour_or_an_app_takes_the_members_of_expired_tasks_too_and_undo_brings_them_back(store):
+    a = task(store, NOW, "You sent the weekly report to the team", [ATTACH, FILE, SEND])
+    b = task(store, NOW + DAY, "You sent the weekly report to the team", [ATTACH, FILE, SEND])
+    F.refresh(store, Words(), now=NOW + DAY + 10)
+    fid = store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (a,))[0][0]
+    later = NOW + 30 * DAY
+    ts.purge(store, now=later + 0.5 * DAY)                      # task a expired (its member is kept), b is not
+    assert [r[0] for r in store._query("SELECT id FROM ui_tasks")] == [b] and count(store, "ui_family_members") == 2
+    # the hour of task a: its rows are gone with the purge, so the forget takes the member by its span
+    store._write(lambda c: c.execute("INSERT INTO ui_actions(at, process, kind, source) VALUES (?, 'chatter',"
+                                     " 'click', 'pointer')", (NOW + 1,)))
+    out = ts.forget(store, since=NOW - 10, until=NOW + 3600, now=later + DAY)
+    assert out["family_members"] == 1 and out["tasks"] == 0
+    assert [r[0] for r in store._query("SELECT task_id FROM ui_family_members")] == [b]
+    assert store._query("SELECT n_tasks FROM ui_families WHERE id = ?", (fid,))[0][0] == 1
+    back = ts.undo_forget(store, out["diary_id"], now=later + DAY + 10)
+    assert back["ok"] and back["family_members"] == 1
+    out = ts.forget(store, process="chatter", now=later + DAY + 20)
+    assert out["family_members"] == 2 and count(store, "ui_family_members") == 0 and count(store, "ui_families") == 0

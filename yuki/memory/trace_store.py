@@ -203,7 +203,7 @@ def purge(store: Any, *, now: float | None = None, raw_days: float = RAW_DAYS,
             "undo_images": conn.execute("DELETE FROM undo_images WHERE surface = 'trace' AND at < ?",
                                         (raw_cut,)).rowcount,
         }
-        out.update(_purge_c2(conn, now, raw_cut, el_cut))
+        out.update(_purge_c2(conn, now, raw_cut, el_cut, store))
         return out
 
     return store._write(op)
@@ -214,10 +214,14 @@ FAMILY_DAYS = 90.0
 TRANSITION_DAYS = ELEMENT_DAYS
 
 
-def _purge_c2(conn: sqlite3.Connection, now: float, raw_cut: float, el_cut: float) -> dict[str, int]:
+def _purge_c2(conn: sqlite3.Connection, now: float, raw_cut: float, el_cut: float,
+              store: Any = None) -> dict[str, int]:
     """capC2's tables: tasks, their ranges and the pass's runs after D4's 30 days; transitions unused for 60 days;
-    families unused for 90 days (a family outlives its tasks: element keys and a short label only). Counts of what
+    families unused for 90 days, and family members older than that (a family outlives its tasks: element keys, a
+    short label and each member's route; the families that lost a member are rebuilt from the rest). Counts of what
     went (only the tables where something did); ``{}`` on a database before migration 39."""
+    from yuki.memory import trace_families
+
     try:
         fam_cut = now - FAMILY_DAYS * DAY_S
         out = {
@@ -227,9 +231,18 @@ def _purge_c2(conn: sqlite3.Connection, now: float, raw_cut: float, el_cut: floa
             "task_runs": conn.execute("DELETE FROM ui_task_runs WHERE at < ?", (raw_cut,)).rowcount,
             "transitions": conn.execute("DELETE FROM ui_transitions WHERE coalesce(last_at, 0) < ?",
                                         (now - TRANSITION_DAYS * DAY_S,)).rowcount,
-            "families": conn.execute("DELETE FROM ui_families WHERE coalesce(last_at, updated_at, 0) < ?",
-                                     (fam_cut,)).rowcount,
         }
+        # members older than a family's keep (after the tasks went, so none is counted again from its task row)
+        old = conn.execute("SELECT task_id, family_id FROM ui_family_members WHERE ended_at < ?", (fam_cut,)).fetchall()
+        conn.execute("DELETE FROM ui_family_members WHERE ended_at < ?", (fam_cut,))
+        before = conn.execute("SELECT count(*) FROM ui_families").fetchone()[0]
+        if store is not None:
+            for fid in sorted({int(r["family_id"]) for r in old}):
+                trace_families.rebuild(conn, store, fid, now=now)
+        conn.execute("DELETE FROM ui_families WHERE coalesce(last_at, updated_at, 0) < ?", (fam_cut,))
+        out["families"] = before - conn.execute("SELECT count(*) FROM ui_families").fetchone()[0]
+        out["family_members"] = len(old) + conn.execute(
+            "DELETE FROM ui_family_members WHERE family_id NOT IN (SELECT id FROM ui_families)").rowcount
     except sqlite3.OperationalError:
         return {}
     return {k: v for k, v in out.items() if v}
@@ -248,7 +261,8 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         conn.execute("SELECT 1 FROM ui_tasks LIMIT 1")
     except sqlite3.OperationalError:
         return {}
-    image: dict[str, Any] = {"tasks": [], "task_actions": [], "families": [], "transitions": [], "tkeys": []}
+    image: dict[str, Any] = {"tasks": [], "task_actions": [], "families": [], "members": [], "transitions": [],
+                             "tkeys": []}
     ats = sorted(float(a["at"]) for a in actions)
     hit: set[int] = set()
     if ats:
@@ -273,7 +287,30 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
                     hit.add(int(t["id"]))
             except (TypeError, ValueError):
                 continue
+    # family members (a counted task's route, kept after the task expires): a live task's goes with the task; an
+    # expired task's goes when its span holds a forgotten row, or (for an app) when it was in that app
+    gone_members: set[int] = set(hit)
+    if ats:
+        for m in conn.execute("SELECT m.task_id, m.started_at, m.ended_at FROM ui_family_members m LEFT JOIN ui_tasks t"
+                              " ON t.id = m.task_id WHERE t.id IS NULL AND m.started_at <= ? AND m.ended_at >= ?",
+                              (ats[-1], ats[0])).fetchall():
+            i = bisect.bisect_left(ats, float(m["started_at"]))
+            if i < len(ats) and ats[i] <= float(m["ended_at"]):
+                gone_members.add(int(m["task_id"]))
+    if process:
+        for m in conn.execute("SELECT task_id, apps FROM ui_family_members").fetchall():
+            try:
+                if process in json.loads(m["apps"] or "[]"):
+                    gone_members.add(int(m["task_id"]))
+            except (TypeError, ValueError):
+                continue
     fams: set[int] = set()
+    if gone_members:
+        mm = ",".join("?" * len(gone_members))
+        members = _rows(conn, f"SELECT * FROM ui_family_members WHERE task_id IN ({mm})", sorted(gone_members))
+        image["members"] = [{**m, "vec_ciphertext": m["vec_ciphertext"].hex() if m.get("vec_ciphertext") else None}
+                            for m in members]
+        fams |= {int(m["family_id"]) for m in members}
     if hit:
         marks = ",".join("?" * len(hit))
         tasks = _rows(conn, f"SELECT * FROM ui_tasks WHERE id IN ({marks})", sorted(hit))
@@ -296,6 +333,9 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         marks = ",".join("?" * len(hit))
         conn.execute(f"DELETE FROM ui_task_actions WHERE task_id IN ({marks})", sorted(hit))
         conn.execute(f"DELETE FROM ui_tasks WHERE id IN ({marks})", sorted(hit))
+    if gone_members:
+        mm = ",".join("?" * len(gone_members))
+        conn.execute(f"DELETE FROM ui_family_members WHERE task_id IN ({mm})", sorted(gone_members))
     # transitions
     if process and since is None and until is None:
         image["transitions"] = _rows(conn, "SELECT * FROM ui_transitions WHERE process = ?", (process,))
@@ -320,13 +360,11 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         image["tkeys"] = [list(k) for k in keys]
         trace_links.add_pairs(conn, list(take.elements()), sign=-1)
         trace_links.add_pairs(conn, list(give.elements()), sign=1)
+    labels = {int(f["id"]): f.get("label_task") for f in image["families"]}
     for fid in sorted(fams):
-        if process:
-            left = conn.execute("SELECT count(*) FROM ui_tasks WHERE family_id = ?", (fid,)).fetchone()[0]
-            if not left:
-                conn.execute("DELETE FROM ui_families WHERE id = ?", (fid,))
-                continue
-        trace_families.rebuild(conn, store, fid, now=now)
+        # deleted when no member is left; its label goes when it came from a forgotten task
+        trace_families.rebuild(conn, store, fid, now=now,
+                               relabel=labels.get(fid) is None or int(labels[fid]) in gone_members)
     # each app's last element (the next transition's start) when it was forgotten
     state = trace_links._load(store)
     last = state.get("last") or {}
@@ -340,7 +378,8 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         state["last"] = last
         conn.execute("UPDATE nudge_state SET value = ? WHERE name = ?",
                      (store._enc(json.dumps(state, separators=(",", ":"))), trace_links.STATE_KEY))
-    counts = {"tasks": len(hit), "families": len(fams), "transitions": len(image["tkeys"])}
+    counts = {"tasks": len(hit), "families": len(fams), "family_members": len(image["members"]),
+              "transitions": len(image["tkeys"])}
     return {"image": image, "counts": counts}
 
 
@@ -361,6 +400,9 @@ def _undo_c2(conn: sqlite3.Connection, image: dict[str, Any]) -> Counter:
     for f in image.get("families") or []:
         put("ui_families", f, ("vec_ciphertext",))
         restored["families"] += 1
+    for m in image.get("members") or []:
+        put("ui_family_members", m, ("vec_ciphertext",))
+        restored["family_members"] += 1
     for t in image.get("tasks") or []:
         put("ui_tasks", t, ("vec_ciphertext",))
         restored["tasks"] += 1

@@ -12,11 +12,15 @@ registry, which keeps them by C1's rules.
 * :func:`refresh` (the practice worker's tick, in the memory service): embeds new or renamed goals, puts each task in
   its family (or a new one), takes out tasks the user said were not one task or not what they did, and rebuilds each
   family it touched.
-* :func:`rebuild` (also the trace forget's cascade, inside its transaction): one family from its tasks again.
+* :func:`rebuild` (also the trace forget's cascade, inside its transaction): one family from its members again. A
+  member (``ui_family_members``) is a counted task's route, apps, span and goal embedding, kept as long as the family
+  (90 days), so a family accumulates: a monthly task still reaches 2 tasks and a usual path after the first one's
+  30-day task row has gone. Only the user's rejection or rename and a forget take a member out.
 * :func:`hints` (:func:`yuki.memory.practice.relevant`): the nearest family's usual path (at most :data:`PATH_STEPS`
   steps) and one trimmed past task of it, within hard character caps.
 
-Families unused for :data:`KEEP_DAYS` are deleted by :func:`yuki.memory.trace_store.purge`.
+Families unused for :data:`KEEP_DAYS` are deleted by :func:`yuki.memory.trace_store.purge`, and so are members older
+than that (their family is rebuilt from the rest).
 """
 
 from __future__ import annotations
@@ -208,20 +212,57 @@ def _blob(store: Any, v: np.ndarray) -> bytes:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _members(conn: sqlite3.Connection, fid: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT id, goal_ciphertext, vec_ciphertext, apps, started_at, ended_at FROM ui_tasks WHERE family_id = ? AND"
-        " (user_verdict IS NULL OR user_verdict NOT IN ('not_one', 'not_mine')) AND vec_ciphertext IS NOT NULL"
-        " ORDER BY ended_at DESC", (int(fid),)).fetchall()
+def add_member(conn: sqlite3.Connection, store: Any, tid: int, fid: int) -> bool:
+    """Count one task in a family (inside the caller's transaction): its route (element keys and machine fields, no
+    goal, no names), apps, span and goal embedding go to ``ui_family_members``, so the family keeps it after the task
+    itself expires at 30 days. False when the task has no vector (or is gone)."""
+    t = conn.execute("SELECT started_at, ended_at, apps, vec_ciphertext FROM ui_tasks WHERE id = ?",
+                     (int(tid),)).fetchone()
+    if t is None or t["vec_ciphertext"] is None:
+        return False
+    steps = [[tok, attrs, at] for tok, attrs, at in route(task_rows(store, int(tid), conn=conn))]
+    conn.execute("INSERT OR REPLACE INTO ui_family_members(task_id, family_id, started_at, ended_at, apps, route,"
+                 " vec_ciphertext) VALUES (?,?,?,?,?,?,?)",
+                 (int(tid), int(fid), float(t["started_at"]), float(t["ended_at"]), t["apps"],
+                  json.dumps(steps, separators=(",", ":")), t["vec_ciphertext"]))
+    return True
 
 
-def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None = None, path: bool = True) -> str:
-    """One family again from its tasks (inside the caller's transaction): its centre, label, apps, count, last use and
-    usual path; deleted when no task is left. ``path`` False (a task just placed, more may follow in the same pass):
-    the usual path is kept as it was (a new family takes its one task's route), the rest is worked out. Returns
-    ``"deleted"`` or ``"rebuilt"``."""
+def drop_member(conn: sqlite3.Connection, tid: int) -> None:
+    """Take a task out of its family's count (the user's rejection or rename, a forget)."""
+    conn.execute("DELETE FROM ui_family_members WHERE task_id = ?", (int(tid),))
+
+
+def _members(conn: sqlite3.Connection, store: Any, fid: int) -> list[sqlite3.Row]:
+    """The family's members, newest first. A live task of the family with no member row yet (placed before the
+    members table, or brought back by a forget's undo) is counted first."""
+    for t in conn.execute(
+            "SELECT t.id FROM ui_tasks t LEFT JOIN ui_family_members m ON m.task_id = t.id WHERE t.family_id = ?"
+            " AND m.task_id IS NULL AND t.vec_ciphertext IS NOT NULL AND (t.user_verdict IS NULL OR t.user_verdict"
+            " NOT IN ('not_one', 'not_mine'))", (int(fid),)).fetchall():
+        add_member(conn, store, int(t["id"]), fid)
+    return conn.execute("SELECT task_id, started_at, ended_at, apps, route, vec_ciphertext FROM ui_family_members"
+                        " WHERE family_id = ? ORDER BY ended_at DESC, task_id DESC", (int(fid),)).fetchall()
+
+
+def _route_of(member: sqlite3.Row) -> list[tuple[str, dict[str, Any], float]]:
+    try:
+        return [(str(t), dict(a or {}), float(at)) for t, a, at in json.loads(member["route"] or "[]")]
+    except (TypeError, ValueError):
+        return []
+
+
+def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None = None, path: bool = True,
+            relabel: bool = False) -> str:
+    """One family again from its members (inside the caller's transaction): its centre, label, apps, count, last use
+    and usual path; deleted when no member is left. Members outlive their tasks (``ui_family_members``), so a task
+    done again after the older ones expired adds to the family instead of resetting it. ``path`` False (a task just
+    placed, more may follow in the same pass): the usual path is kept as it was (a new family takes its one task's
+    route), the rest is worked out. The label is the goal of the live task nearest the centre; with no live task it is
+    kept as it was, unless ``relabel`` (a forget took the task it came from: then it goes). Returns ``"deleted"`` or
+    ``"rebuilt"``."""
     now = time.time() if now is None else float(now)
-    members = _members(conn, fid)
+    members = _members(conn, store, fid)
     if not members:
         conn.execute("UPDATE ui_tasks SET family_id = NULL WHERE family_id = ?", (int(fid),))
         conn.execute("DELETE FROM ui_families WHERE id = ?", (int(fid),))
@@ -231,18 +272,29 @@ def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None
     dims = Counter(v.shape for _m, v in vecs).most_common(1)
     vecs = [(m, v) for m, v in vecs if dims and v.shape == dims[0][0]]
     centre = np.mean([v for _m, v in vecs], axis=0) if vecs else None
-    label_row = max(vecs, key=lambda mv: float(mv[1] @ centre))[0] if vecs else members[0]
+    old = conn.execute("SELECT path_keys, variants_keys, label_ciphertext, label_task FROM ui_families WHERE id = ?",
+                       (int(fid),)).fetchone()
+    live = {int(r["id"]): r["goal_ciphertext"] for r in conn.execute(
+        "SELECT id, goal_ciphertext FROM ui_tasks WHERE family_id = ? AND (user_verdict IS NULL OR user_verdict NOT IN"
+        " ('not_one', 'not_mine'))", (int(fid),)).fetchall()}
+    near = sorted(vecs, key=lambda mv: -float(mv[1] @ centre)) if centre is not None else [(m, None) for m in members]
+    label_task = next((int(m["task_id"]) for m, _v in near if int(m["task_id"]) in live), None)
+    if label_task is not None:
+        label = live[label_task]
+    elif old is not None and not relabel:
+        label, label_task = old["label_ciphertext"], old["label_task"]
+    else:
+        label = None
     apps = Counter(a for m in members for a in json.loads(m["apps"] or "[]"))
-    old = conn.execute("SELECT path_keys, variants_keys FROM ui_families WHERE id = ?", (int(fid),)).fetchone()
     if path or old is None or not old["path_keys"] or old["path_keys"] == "[]":
         chosen = members[:PATH_TASKS] if path else members[:1]
-        nodes, branches = build_path([route(task_rows(store, int(m["id"]), conn=conn)) for m in chosen])
+        nodes, branches = build_path([_route_of(m) for m in chosen])
     else:
         nodes, branches = json.loads(old["path_keys"]), json.loads(old["variants_keys"] or "[]")
     conn.execute(
-        "UPDATE ui_families SET label_ciphertext = ?, n_tasks = ?, apps = ?, path_keys = ?, variants_keys = ?,"
-        " vec_ciphertext = ?, last_at = ?, updated_at = ? WHERE id = ?",
-        (label_row["goal_ciphertext"], len(members), json.dumps([a for a, _n in apps.most_common(6)]),
+        "UPDATE ui_families SET label_ciphertext = ?, label_task = ?, n_tasks = ?, apps = ?, path_keys = ?,"
+        " variants_keys = ?, vec_ciphertext = ?, last_at = ?, updated_at = ? WHERE id = ?",
+        (label, label_task, len(members), json.dumps([a for a, _n in apps.most_common(6)]),
          json.dumps(nodes, separators=(",", ":")), json.dumps(branches[:12], separators=(",", ":")),
          _blob(store, centre) if centre is not None else None, max(float(m["ended_at"]) for m in members), now,
          int(fid)))
@@ -314,12 +366,14 @@ def refresh(store: Any, embedder: Any, *, now: float | None = None) -> dict[str,
             if r["user_verdict"] in REJECTED:
                 if fid is not None:
                     conn.execute("UPDATE ui_tasks SET family_id = NULL WHERE id = ?", (tid,))
+                    drop_member(conn, tid)
                     touched.add(int(fid))
                     out["left"] += 1
                 continue
             if tid in vectors:
                 conn.execute("UPDATE ui_tasks SET vec_ciphertext = ?, embed_model = ?, family_id = NULL WHERE id = ?",
                              (vectors[tid], model, tid))
+                drop_member(conn, tid)
                 if fid is not None:
                     touched.add(int(fid))
                 out["embedded"] += 1
@@ -336,6 +390,7 @@ def refresh(store: Any, embedder: Any, *, now: float | None = None) -> dict[str,
                                        (now,)).lastrowid)
                 out["new"] += 1
             conn.execute("UPDATE ui_tasks SET family_id = ? WHERE id = ?", (fam, tid))
+            add_member(conn, store, tid, fam)
             # its centre at once, so the next task of this pass can join it; the usual path once, below
             rebuild(conn, store, fam, now=now, path=False)
             touched.add(fam)
@@ -513,6 +568,6 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
         return empty
 
 
-__all__ = ["FAMILY_COSINE", "FAMILY_LCS", "KEEP_DAYS", "PATH_STEPS", "SAME_GOAL_COSINE", "build_path", "hints",
-           "lcs_pairs", "lcs_ratio", "rebuild", "refresh", "route", "step_token", "step_words", "usual",
+__all__ = ["FAMILY_COSINE", "FAMILY_LCS", "KEEP_DAYS", "PATH_STEPS", "SAME_GOAL_COSINE", "add_member", "build_path",
+           "drop_member", "hints", "lcs_pairs", "lcs_ratio", "rebuild", "refresh", "route", "step_token", "step_words", "usual",
            "when_words"]
