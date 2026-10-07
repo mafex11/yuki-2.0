@@ -309,7 +309,36 @@ def test_the_users_demo_settings_are_read(store):
         pw.demo_rules()                                              # back to the defaults: recomputed at once
         assert P.get(store, o.id).state == "active"
     finally:
-        P.set_demo_rules({})
+        P.set_demo_rules(None)
+
+
+def test_any_process_reads_the_demo_settings_from_the_settings_file(store):
+    """Review F6: the Yuki window's Playbook page (another process) computes states with the same settings, read from
+    the user's settings file (re-read when it changes; the packaged defaults without a [trace] table)."""
+    from yuki.memory.privacy import user_config_path
+
+    import os
+
+    P.set_demo_rules(None)
+    path = user_config_path()
+    assert os.environ.get("YUKI_MEMORY_DIR") and str(path).startswith(os.environ["YUKI_MEMORY_DIR"])   # a temp dir
+    before = path.read_bytes() if path.exists() else None
+    assert before is None or b"learn_demo" not in before
+    try:
+        assert P.demo_rules() == {"hint": "at_once", "times": 2, "proven_runs": 1}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[trace]\nlearn_demo_alone_after_times = 3\nlearn_demo_alone_after_proven_runs = 0\n",
+                        encoding="utf-8")
+        assert P.demo_rules() == {"hint": "at_once", "times": 3, "proven_runs": 1}   # 0 is no number of runs: kept
+        events = [P.Event(NOW, "demonstrated", 1.0, P.demo_key(1, "aaaa")),
+                  P.Event(NOW + 1, "demonstrated", 1.0, P.demo_key(2, "aaaa"))]
+        assert P.evaluate("procedure", events, created_at=NOW, now=NOW + 10)["state"] == "candidate"
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(before)
+    assert P.demo_rules()["times"] == 2
 
 
 # -- zero ways or trials from bad evidence -------------------------------------------------------------------------

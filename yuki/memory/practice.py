@@ -146,16 +146,17 @@ DEMO_RUN_PREFIX = "demo:"
 DEMO_TIMES = 2
 DEMO_PROVEN_RUNS = 1
 #: review F6: decision D3 as the user's ``[trace]`` settings say it (``learn_demo_hint``,
-#: ``learn_demo_alone_after_times``, ``learn_demo_alone_after_proven_runs``), set by the practice worker from the
-#: trace's rules (:func:`set_demo_rules`); the defaults above until then.
-_DEMO_RULES: dict[str, Any] = {"hint": "at_once", "times": DEMO_TIMES, "proven_runs": DEMO_PROVEN_RUNS}
+#: ``learn_demo_alone_after_times``, ``learn_demo_alone_after_proven_runs``). The memory service's practice worker sets
+#: them from the trace's own rules (:func:`set_demo_rules`); any other process (the Yuki window's Playbook page)
+#: reads the same settings file itself (:func:`demo_rules`), so both compute the same states.
+_DEMO_OVERRIDE: dict[str, Any] | None = None
+_DEMO_FILE: dict[str, Any] = {"key": None, "rules": None}
 
 
-def set_demo_rules(learning: Any) -> dict[str, Any]:
-    """Take decision D3's settings from the trace's ``learning`` table (``demo_hint``, ``demo_alone_after_times``,
-    ``demo_alone_after_proven_runs``; anything missing or not a whole number from 1 to 20 keeps its default).
-    Returns the rules now in force."""
-    table = dict(learning or ()) if not isinstance(learning, dict) else learning
+def _demo_rules_from(learning: Any) -> dict[str, Any]:
+    """D3's rules from a trace ``learning`` table (``demo_hint``, ``demo_alone_after_times``,
+    ``demo_alone_after_proven_runs``); anything missing or not a whole number from 1 to 20 keeps its default."""
+    table = learning if isinstance(learning, dict) else dict(learning or ())
 
     def count(key: str, default: int) -> int:
         try:
@@ -164,16 +165,50 @@ def set_demo_rules(learning: Any) -> dict[str, Any]:
             return default
         return value if 1 <= value <= 20 else default
 
-    _DEMO_RULES.update(hint=str(table.get("demo_hint") or "at_once"),
-                       times=count("demo_alone_after_times", DEMO_TIMES),
-                       proven_runs=count("demo_alone_after_proven_runs", DEMO_PROVEN_RUNS))
-    return dict(_DEMO_RULES)
+    return {"hint": str(table.get("demo_hint") or "at_once"), "times": count("demo_alone_after_times", DEMO_TIMES),
+            "proven_runs": count("demo_alone_after_proven_runs", DEMO_PROVEN_RUNS)}
+
+
+def set_demo_rules(learning: Any) -> dict[str, Any]:
+    """The practice worker's D3 settings, from the trace's rules (``TraceRules.learning``); ``None``: back to reading
+    the settings file (:func:`demo_rules`). Returns the rules now in force."""
+    global _DEMO_OVERRIDE
+    _DEMO_OVERRIDE = None if learning is None else _demo_rules_from(learning)
+    return demo_rules()
 
 
 def demo_rules() -> dict[str, Any]:
-    """Decision D3's rules in force (:func:`set_demo_rules`): ``hint`` ("at_once": a demo seen once is a hint at
-    once; anything else: it is held back until it is a way), ``times``, ``proven_runs``."""
-    return dict(_DEMO_RULES)
+    """Decision D3's rules in force: ``hint`` ("at_once": a demo seen once is a hint at once; anything else: it is
+    held back until it is a way), ``times``, ``proven_runs``. The practice worker's (:func:`set_demo_rules`), else the
+    user's settings file's ``[trace]`` table (re-read when the file changes: one ``stat`` a call; the packaged
+    defaults when it has none; the defaults above when it cannot be read)."""
+    if _DEMO_OVERRIDE is not None:
+        return dict(_DEMO_OVERRIDE)
+    try:
+        from yuki.memory.privacy import DEFAULT_PATH, user_config_path
+
+        path = user_config_path()
+        try:
+            st = path.stat()
+            key = (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = (str(DEFAULT_PATH), 0, 0)
+        if _DEMO_FILE["key"] != key or _DEMO_FILE["rules"] is None:
+            import tomllib
+
+            from yuki.memory.trace_privacy import TraceRules
+
+            table = None
+            if key[0] == str(path):
+                with path.open("rb") as fh:
+                    table = tomllib.load(fh).get("trace")
+            if not isinstance(table, dict):
+                with DEFAULT_PATH.open("rb") as fh:
+                    table = tomllib.load(fh).get("trace") or {}
+            _DEMO_FILE.update(key=key, rules=_demo_rules_from(TraceRules.from_dict(table).learning))
+        return dict(_DEMO_FILE["rules"])
+    except Exception:  # noqa: BLE001 - unreadable settings: the last good ones, else the defaults
+        return dict(_DEMO_FILE["rules"] or _demo_rules_from({}))
 #: How a trial is labelled for the brain and the Playbook page.
 TRIAL_LABEL = "your way, seen once"
 #: Where a way learned from what the user did came from, in the Playbook page's words.
