@@ -347,7 +347,9 @@ def load_state(store: Any) -> dict[str, Any]:
     got = got if isinstance(got, dict) else {}
     return {"cursor": int(got.get("cursor") or 0), "tries": {str(k): int(v) for k, v in (got.get("tries") or {}).items()},
             "redo": [int(x) for x in got.get("redo") or [] if str(x).isdigit()],
-            "retired_tasks": {str(k): int(v) for k, v in (got.get("retired_tasks") or {}).items()}}
+            "retired_tasks": {str(k): int(v) for k, v in (got.get("retired_tasks") or {}).items()},
+            "forgotten": {str(k): int(v) for k, v in (got.get("forgotten") or {}).items()},
+            "log": int(got.get("log") or 0)}
 
 
 def save_state(store: Any, state: dict[str, Any]) -> None:

@@ -424,6 +424,22 @@ def test_a_rejection_on_the_day_page_withdraws_the_demo_and_an_undo_learns_it_ag
     assert got["demo_sync"]["redo"] == 1 and len(demos(store)) == 1 and len(worker.calls) == 2
 
 
+def test_forgetting_the_hour_takes_the_way_learned_from_it_and_undo_brings_it_back(store):
+    tid, steps = chat_demo(store, NOW)
+    ans = answer(steps, slots={steps[2]: "channel", steps[4]: "message"})
+    worker = Worker(store, [ans, ans])
+    lrn = L.Learner(worker, embedder=Words())
+    L.demo_pass(lrn, NOW + 120)
+    assert len(demos(store)) == 1
+    gone = trace_store.forget(store, since=NOW - 1, until=NOW + 60, now=NOW + 150)
+    assert gone["tasks"] == 1
+    got = L.demo_pass(lrn, NOW + 200)
+    assert got["demo_sync"]["withdrawn"] == 1 and demos(store) == []
+    trace_store.undo_forget(store, gone["diary_id"], now=NOW + 250)
+    got = L.demo_pass(lrn, NOW + 300)
+    assert got["demo_sync"]["redo"] == 1 and len(demos(store)) == 1
+
+
 def test_the_pass_waits_in_the_gate_and_spends_from_the_shared_pool(store):
     tid, steps = chat_demo(store, NOW)
     worker = Worker(store, [answer(steps)])
