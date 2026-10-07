@@ -517,7 +517,8 @@ def tasks_between(store: Any, since: float, until: float, *, limit: int = MAX_TA
 def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EVIDENCE) -> list[dict[str, Any]]:
     """Tasks whose outcome the PC checked, the outcome inside ``[since, until)``, newest first, at most ``limit``
     (:data:`MAX_EVIDENCE`): learnable tasks only (a recorded fact, never ``unclear``, never one the user rejected).
-    ``[{"task" (id), "action" (the outcome's action id), "fact", "at" (the outcome's time), "goal", "apps",
+    ``[{"task" (id), "action" (the outcome's action id), "fact", "at" (the outcome's time), "start_at", "end_at"
+    (the task's span), "goal", "apps",
     "words" (second person: "you saved a file (.pptx)"), "clock" ("4 PM")}]``: the ids are for the caller's records,
     the words for the user. Never raises."""
     limit = max(1, min(int(limit), MAX_EVIDENCE))
@@ -537,7 +538,8 @@ def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EV
         if not goal:
             continue
         out.append({"task": int(r["id"]), "action": int(r["outcome_action"]), "fact": r["outcome_fact"],
-                    "at": float(at), "goal": goal, "apps": _apps(r["apps"])[:4],
+                    "at": float(at), "start_at": float(r["started_at"]), "end_at": float(r["ended_at"]),
+                    "goal": goal, "apps": _apps(r["apps"])[:4],
                     "words": outcome_words(r["outcome_fact"], r["file_ext"]), "clock": clock(float(at))})
     out.sort(key=lambda e: -e["at"])
     return out[:limit]
