@@ -18,7 +18,10 @@ For each action, in order (report 78 §4.2):
 
 1. **the hard game gate, then privacy** (:mod:`yuki.memory.trace_privacy`): the consent switch, the tray pause, the
    apps left out, blocked apps, private windows, blocked sites, Yuki's own windows; a password field fails closed.
-   Dropped actions leave only a content-free counter.
+   A window of a process that shows pages whose page the timeline has not settled for that very window (a browser
+   window behind, a tab switch still settling, a probe not answered) fails the blocked-site gate closed
+   (:data:`PAGE_UNKNOWN`); everything is checked again when the action finishes. Dropped actions leave only a
+   content-free counter.
 2. **identity, taken at button-down**: (i) an ``INVOKED`` / ``SELECTION`` / ``FOCUS`` event from the same process
    between button-down and :data:`IDENTITY_S` after button-up whose element contains the point; (ii)
    ``ElementFromPoint`` asked as soon as the button went down; (iii) for a renderer's whole pane, the smallest element
@@ -98,8 +101,8 @@ LOST_UP_S = 10.0
 FOCUS_RACE_S = 0.5
 #: A save chord re-checks the files that app opened or saved this long after the chord (s): their own write time.
 SAVE_CHECK_S = 1.5
-#: Files remembered (in memory only, any app: Explorer often opens what another app then saves) for a save chord's
-#: re-check.
+#: Files remembered (in memory only, each with the app that opened or saved it; a file the shell opened goes to the
+#: app it launched for it) for a save chord's re-check in that app.
 KNOWN_FILES = 8
 #: Roles whose answer to ``ElementFromPoint`` is a whole renderer pane (try the descent, path iii) when it covers
 #: most of the window.
@@ -217,6 +220,7 @@ class TraceWorker:
         privacy_rules: ``() -> PrivacyRules`` (the watcher's gates).
         trace_rules: ``() -> TraceRules``.
         gate: ``() -> bool``: the hard game gate holds (``gamegate.gate_holds``).
+        paused: ``() -> bool``: the tray pause or an A/B off hour (actions in flight then finish into no row).
         acting: ``() -> Acting | None``: a Yuki run in progress.
         page: ``(pid) -> (page_key, url, withheld)`` as the timeline sees the window in front of that process.
         process: ``(pid) -> (process key, image name, app name, own, started)``.
@@ -231,6 +235,7 @@ class TraceWorker:
 
     def __init__(self, store: Any, *, privacy_rules: Callable[[], Any], trace_rules: Callable[[], TraceRules],
                  gate: Callable[[], bool], acting: Callable[[], Any] = lambda: None,
+                 paused: Callable[[], bool] = lambda: False,
                  page: Callable[[int], tuple[str | None, str | None, str | None]] = lambda pid: (None, None, None),
                  process: Callable[[int], tuple[str, str, str, bool, float | None]] | None = None,
                  window_at: Callable[[int, int], tuple[int, int]] | None = None,
@@ -247,6 +252,7 @@ class TraceWorker:
         self._privacy = privacy_rules
         self._rules = trace_rules
         self._gate = gate
+        self._paused = paused
         self._acting = acting
         self._page = page
         self._process = process or _process_facts()
@@ -375,12 +381,17 @@ class TraceWorker:
         return last[1]
 
     def _blocked(self) -> str | None:
-        """Why nothing may be recorded right now (consent off or the game gate), or None."""
+        """Why nothing may be recorded right now (consent off, the pause or an off hour, the game gate), or None."""
         try:
             if not self._rules().record_actions:
                 return "off"
         except Exception:  # noqa: BLE001
             return "off"
+        try:
+            if self._paused():
+                return "paused"
+        except Exception:  # noqa: BLE001
+            return "paused"
         try:
             if self._gate():
                 return "game"
@@ -1577,6 +1588,7 @@ class Trace:
         rules_fn = self.privacy.rules
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,
+            paused=lambda: self._paused or (self._ab is not None and not self._ab.on_now()),
             page=timeline_page(self._timeline_now, self.store), title=_title, rect=_rect, sink=self.sink,
             cursor=self.sink._cursor, clipboard=_clipboard_now, recent=recent, log=self._log_fn,
             hover=(metrics.hover_w, metrics.hover_h, metrics.hover_s))

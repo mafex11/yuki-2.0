@@ -24,7 +24,9 @@ On the reader's thread, per event, so it stays cheap:
   starts a new rest: the net raw movement of the leg just finished is added to the travel since the last action, and
   the worker is told once that the pointer is moving, so it can see a rest of ``SPI_GETMOUSEHOVERTIME`` and look up
   the element under it. A vibrating sensor's reports (about 23 a second of 0-1 px, measured on this PC) stay inside
-  the rectangle: they cost a few additions and one cursor read each, add no travel and wake nothing.
+  the rectangle: they cost a few additions and one cursor read each, add no travel and wake nothing. A pointer that
+  left the rectangle much further than the device's own counts could move it (:data:`JUMP_GAIN`) was placed by
+  software (Yuki's ``SetCursorPos``): the rest starts again there silently and never becomes a hover.
 * **source** of each action: Yuki's stamp in the extra-info field (:func:`yuki.core.inputtag.is_yuki_input`) is
   ``yuki``; injected input without it (``hDevice`` 0: Handy dictation, Deskflow, G Hub macros) is
   ``user_injected``; real hardware is ``user``.

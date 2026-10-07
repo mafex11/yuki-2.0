@@ -289,6 +289,17 @@ def test_the_controller_marks_commands_run_during_a_yuki_run(env):  # noqa: F811
     assert trace.run_at(during) is True and trace.run_at(after + 5) is False
 
 
+def test_an_action_in_flight_when_the_tray_pause_starts_finishes_into_no_row(rig):
+    """Side issue of the second verify: the worker itself honours the pause and the off hours, not only the sink."""
+    rig.uia.points[(150, 120)] = button()
+    paused = {"on": False}
+    rig.w._paused = lambda: paused["on"]
+    rig.click()
+    paused["on"] = True
+    rig.settle()
+    assert rig.rows() == [] and rig.w.counters["dropped_paused"] >= 1
+
+
 # -- V5: blind windows ------------------------------------------------------------------------------------------------
 
 
