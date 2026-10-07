@@ -58,6 +58,9 @@ NAMED: dict[int, str] = {
 NAMED.update({0x70 + i: f"F{i + 1}" for i in range(24)})
 #: Named keys whose repeats fold into one row (a run): arrows, paging, Backspace and Delete.
 RUN_KEYS = frozenset({"Left", "Right", "Up", "Down", "PageUp", "PageDown", "Backspace", "Delete"})
+#: Repeats of the same run key or chord within this long fold into one row (s); wheel notches likewise. Shared by
+#: the worker (one row) and the outcome hooks (one outcome window, one event cap: second verify V6).
+FOLD_S = 1.0
 
 #: Names for a chord's main key that is neither a letter, a digit nor a named key (the US-layout names of the OEM
 #: virtual keys, a machine identity only).
@@ -250,5 +253,5 @@ def altgr_types_default(vk: int, scan: int, shift: bool) -> bool:
     return n != 0           # >0: characters, <0: a dead key (it will compose one)
 
 
-__all__ = ["CHAR", "CHORD", "KeyClass", "KeyClassifier", "MODIFIER", "NAMED", "NAMED_KEY", "NONE", "RUN_KEYS",
+__all__ = ["CHAR", "CHORD", "FOLD_S", "KeyClass", "KeyClassifier", "MODIFIER", "NAMED", "NAMED_KEY", "NONE", "RUN_KEYS",
            "altgr_types_default", "key_name"]

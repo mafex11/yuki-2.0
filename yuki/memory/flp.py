@@ -54,6 +54,9 @@ MAX_EVENTS = 2_000_000
 #: Characters kept per name, and names kept per list.
 MAX_TEXT = 120
 MAX_ITEMS = 300
+#: Bytes of a text event ever copied or decoded (second verify V7): enough for :data:`MAX_TEXT` characters of
+#: UTF-16 with room for the spaces and zeros that are collapsed; an oversized name costs no more than this.
+TEXT_BYTES = MAX_TEXT * 8
 #: Wall time the parse may take (s); past it the reader stops with ``FlpError("slow")``.
 MAX_SECONDS = 2.0
 
@@ -105,6 +108,9 @@ class FlpFacts:
 
 
 def _text(data: bytes, utf16: bool) -> str:
+    data = bytes(data[:TEXT_BYTES])         # never decode more than a name can keep (V7)
+    if utf16 and len(data) % 2:
+        data = data[:-1]
     try:
         raw = data.decode("utf-16-le", errors="replace") if utf16 else data.decode("latin-1")
     except Exception:  # noqa: BLE001
@@ -129,24 +135,83 @@ def _add(items: list[str], value: str) -> None:
         items.append(value)
 
 
+class _Source:
+    """The project's bytes, read forward: from memory, or from a file in :data:`CHUNK` pieces with the payloads
+    nobody reads skipped by seeking (V7: memory stays bounded by the chunk, whatever the file's size)."""
+
+    CHUNK = 1 << 18
+
+    def __init__(self, data: bytes | None = None, fh: Any = None) -> None:
+        self._fh = fh
+        self._buf = data if data is not None else b""
+        self._i = 0
+        self._base = 0           # the file offset of _buf[0]
+
+    @property
+    def pos(self) -> int:
+        return self._base + self._i
+
+    def _fill(self, n: int) -> bool:
+        if self._i + n <= len(self._buf):
+            return True
+        if self._fh is None:
+            return False
+        rest = self._buf[self._i:]
+        self._base += self._i
+        self._i = 0
+        self._buf = rest + self._fh.read(max(self.CHUNK, n))
+        return n <= len(self._buf)
+
+    def byte(self) -> int:
+        if not self._fill(1):
+            raise FlpError("truncated")
+        b = self._buf[self._i]
+        self._i += 1
+        return b
+
+    def take(self, n: int) -> bytes:
+        if not self._fill(n):
+            raise FlpError("truncated")
+        out = bytes(self._buf[self._i:self._i + n])
+        self._i += n
+        return out
+
+    def skip(self, n: int) -> None:
+        if self._i + n <= len(self._buf):
+            self._i += n
+            return
+        if self._fh is None:
+            raise FlpError("truncated")
+        target = self.pos + n
+        self._fh.seek(target)
+        self._buf, self._i, self._base = b"", 0, target
+
+
 def parse_bytes(data: bytes, *, name: str = "") -> FlpFacts:
     """The facts of one project held in ``data``. ``name``: the file's name, the project's name when it has no
     title. Raises :class:`FlpError`."""
     if len(data) > MAX_BYTES:
         raise FlpError("too_big")
-    if len(data) < 22 or data[:4] != b"FLhd":
+    return _parse(_Source(data=bytes(data)), len(data), name)
+
+
+def _parse(src: _Source, total: int, name: str) -> FlpFacts:
+    if total < 22:
         raise FlpError("not_flp")
-    (head_len,) = struct.unpack_from("<I", data, 4)
-    if head_len < 6 or 8 + head_len + 8 > len(data):
+    head = src.take(8)
+    if head[:4] != b"FLhd":
+        raise FlpError("not_flp")
+    (head_len,) = struct.unpack_from("<I", head, 4)
+    if head_len < 6 or 8 + head_len + 8 > total:
         raise FlpError("bad_header")
-    _fmt, channels, _ppq = struct.unpack_from("<hHH", data, 8)
-    pos = 8 + head_len
-    if data[pos:pos + 4] != b"FLdt":
+    _fmt, channels, _ppq = struct.unpack_from("<hHH", src.take(6))
+    src.skip(head_len - 6)
+    chunk = src.take(8)
+    if chunk[:4] != b"FLdt":
         raise FlpError("no_data_chunk")
-    (data_len,) = struct.unpack_from("<I", data, pos + 4)
-    pos += 8
-    end = pos + data_len
-    if end > len(data):
+    (data_len,) = struct.unpack_from("<I", chunk, 4)
+    end = src.pos + data_len
+    if end > total:
         raise FlpError("truncated")
     facts = FlpFacts(channel_count=int(channels))
     utf16 = True
@@ -159,27 +224,24 @@ def parse_bytes(data: bytes, *, name: str = "") -> FlpFacts:
     fine = 0
     deadline = time.perf_counter() + MAX_SECONDS
     n = 0
-    while pos < end:
+    while src.pos < end:
         n += 1
         if n > MAX_EVENTS:
             raise FlpError("too_many_events")
         if not n % 65536 and time.perf_counter() > deadline:
             raise FlpError("slow")
-        ev = data[pos]
-        pos += 1
+        ev = src.byte()
         if ev < _WORD:
-            if pos + 1 > end:
+            if src.pos + 1 > end:
                 raise FlpError("truncated")
-            value = data[pos]
-            pos += 1
+            value = src.byte()
             if ev == EV_CHANNEL_TYPE and context == "channel":
                 channel_type = value
             continue
         if ev < _DWORD:
-            if pos + 2 > end:
+            if src.pos + 2 > end:
                 raise FlpError("truncated")
-            (value,) = struct.unpack_from("<H", data, pos)
-            pos += 2
+            (value,) = struct.unpack("<H", src.take(2))
             if ev == EV_NEW_CHANNEL:
                 context, channel_type, channel_named = "channel", None, False
             elif ev == EV_NEW_PATTERN:
@@ -191,29 +253,32 @@ def parse_bytes(data: bytes, *, name: str = "") -> FlpFacts:
                 fine = int(value)
             continue
         if ev < _TEXT:
-            if pos + 4 > end:
+            if src.pos + 4 > end:
                 raise FlpError("truncated")
-            (value,) = struct.unpack_from("<I", data, pos)
-            pos += 4
+            (value,) = struct.unpack("<I", src.take(4))
             if ev == EV_TEMPO and 0 < value < 10_000_000:
                 facts.tempo = round(value / 1000.0, 3)
             continue
         size = 0
         shift = 0
         while True:
-            if pos >= end or shift > 28:
+            if src.pos >= end or shift > 28:
                 raise FlpError("bad_length")
-            byte = data[pos]
-            pos += 1
+            byte = src.byte()
             size |= (byte & 0x7F) << shift
             shift += 7
             if not byte & 0x80:
                 break
-        if pos + size > end:
+        if src.pos + size > end:
             raise FlpError("truncated")
-        payload = data[pos:pos + size] if ev in (EV_VERSION, EV_TITLE, EV_PATTERN_NAME, EV_PLUGIN_INTERNAL,
-                                                 EV_PLUGIN_NAME, EV_CHANNEL_NAME_OLD) else b""
-        pos += size
+        # only the head of a text event is copied (V7: one oversized event never costs its size in memory)
+        if ev in (EV_VERSION, EV_TITLE, EV_PATTERN_NAME, EV_PLUGIN_INTERNAL, EV_PLUGIN_NAME, EV_CHANNEL_NAME_OLD):
+            keep = min(size, TEXT_BYTES)
+            payload = src.take(keep)
+            src.skip(size - keep)
+        else:
+            payload = b""
+            src.skip(size)
         if ev == EV_VERSION:
             facts.fl_version = _text(payload, False)
             utf16 = _version_utf16(facts.fl_version)
@@ -246,7 +311,10 @@ def parse_bytes(data: bytes, *, name: str = "") -> FlpFacts:
 
 
 def read_flp(path: str | os.PathLike[str]) -> FlpFacts:
-    """The facts of the project at ``path`` (read-only, size-checked before reading). Raises :class:`FlpError`."""
+    """The facts of the project at ``path`` (read-only, size-checked before reading). Raises :class:`FlpError`.
+
+    The file is read forward in :attr:`_Source.CHUNK` pieces, never whole (V7), and never mapped (a mapped view would
+    stop FL Studio from rewriting the file while it is read)."""
     p = Path(path)
     try:
         size = p.stat().st_size
@@ -256,10 +324,9 @@ def read_flp(path: str | os.PathLike[str]) -> FlpFacts:
         raise FlpError("too_big")
     try:
         with p.open("rb") as fh:
-            data = fh.read(MAX_BYTES + 1)
+            return _parse(_Source(fh=fh), size, p.name)
     except OSError as exc:
         raise FlpError("unreadable") from exc
-    return parse_bytes(data, name=p.name)
 
 
 # -- building invented projects (tests and the acceptance tool; never the user's files) ------------------------------

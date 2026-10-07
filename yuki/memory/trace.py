@@ -66,9 +66,9 @@ from yuki.memory.trace_hooks import (
     EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_INVOKED, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_REORDER,
     EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
     EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_DIALOGSTART, EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND,
-    EVENT_SYSTEM_MENUPOPUPSTART, OUTCOME_S,
+    EVENT_SYSTEM_MENUPOPUPSTART, OUTCOME_CAP, OUTCOME_S,
 )
-from yuki.memory.trace_keys import NAMED_KEY, RUN_KEYS
+from yuki.memory.trace_keys import FOLD_S, NAMED_KEY, RUN_KEYS
 from yuki.memory.trace_privacy import COMMAND, CONTENT, NAME_CHARS, TITLE, TraceRules, gate, name_class, normalise_name
 
 #: Lookups a second at most (a token bucket), and how many the low-priority ones (hover, scroll, outcome
@@ -83,8 +83,6 @@ IDENTITY_S = 0.3
 FLUSH_S = 2.0
 #: A typing run ends after this long without a character (s).
 TYPE_GAP_S = 2.0
-#: Repeats of the same run key or chord within this long fold into one row (s); wheel notches likewise.
-FOLD_S = 1.0
 #: A foreground change or a copy counts as the user's (a switch row, a copy row) only within this long of their
 #: input (s); a file from the Recent folder within :data:`FILE_INPUT_S`.
 INPUT_LINK_S = 1.5
@@ -117,6 +115,16 @@ STRUCTURE_EVENTS = frozenset({EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT
 IDENTITY_EVENTS = (EVENT_OBJECT_INVOKED, EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD, EVENT_OBJECT_FOCUS)
 #: Changed elements an outcome resolves to role and position at most (report 78 §4.2 step 3).
 OUTCOME_ELEMENTS = 5
+#: The page answer for a window of a process that shows pages when the timeline has no settled reading of *that*
+#: window (another window of the same browser, one not in front, a probe not answered yet, a probe that found
+#: nothing): its site is not known, so the blocked-site gate fails closed (second verify V1).
+PAGE_UNKNOWN = "page_unknown"
+#: Kinds whose row names an element under the pointer (the page under it decides privacy).
+POINTER_KINDS = frozenset({"click", "rclick", "dclick", "drag", "scroll", "hover"})
+#: Kinds whose row names the focused element (keys and typing go into the page in front).
+FOCUS_KINDS = frozenset({"keys", "paste", "type", "invoke", "select"})
+#: How close in time a Warp command's own start is to the Enter that ran it (s).
+COMMAND_ENTER_S = 2.0
 
 _BUTTON_KIND = {"left": "click", "right": "rclick", "middle": "click", "x1": "click", "x2": "click"}
 
@@ -196,6 +204,8 @@ class _Act:
     stale: bool = False
     recheck_at: float | None = None
     save_check: bool = False
+    container_role: str | None = None      # point-only: the whole-window container the point fell in (V5)
+    end_win: tuple[int, int] | None = None   # a drag's drop window (hwnd, pid), checked like the start (V2)
 
 
 class TraceWorker:
@@ -274,9 +284,12 @@ class TraceWorker:
         self._was_blocked = False
         self._dialog: tuple[float, int, _Window] | None = None   # an open/save dialog in front: (t, hwnd, owner)
         self._dialog_closed: tuple[float, _Window] | None = None
-        self._known_files: deque[tuple[str, str]] = deque(maxlen=KNOWN_FILES)   # recent (path, digest), memory only
+        # recent (path, digest, app's process key, wall time), memory only: a save chord re-checks that app's (V8)
+        self._known_files: deque[tuple[str, str, str, float]] = deque(maxlen=KNOWN_FILES)
         self._last_action_t = float("-inf")
         self._last_input: tuple[float, str] | None = None
+        self._input_own = False                  # the last input went into one of Yuki's own windows (V4)
+        self._enters: deque[tuple[float, str, bool]] = deque(maxlen=64)   # Warp Enters: (wall, source, run) (V4)
         self._last_key: _Act | None = None
         self._last_wheel: _Act | None = None
         self._fg = _Window()
@@ -322,9 +335,9 @@ class TraceWorker:
         except Exception:  # noqa: BLE001
             process, image, app, own, started = "", "", "", False, None
         try:
-            page_key, url, withheld = self._page(pid)
-        except Exception:  # noqa: BLE001
-            page_key, url, withheld = None, None, None
+            page_key, url, withheld = self._page(pid, hwnd)
+        except Exception:  # noqa: BLE001 - fails closed: the page is not known
+            page_key, url, withheld = None, None, PAGE_UNKNOWN
         return _Window(pid=pid, hwnd=hwnd, process=process, image=image, app=app, own=own, started=started,
                        title=self._title(hwnd) if hwnd else "", page_key=page_key, url=url, withheld=withheld)
 
@@ -337,6 +350,29 @@ class TraceWorker:
             return "privacy_error"
         return gate(rules, self._rules(), process=win.image or win.process, app=win.app, own=win.own,
                     title=win.title, url=win.url, withheld=win.withheld)
+
+    def _app_reason(self, win: _Window) -> str | None:
+        """The gates that need no page: Yuki's own windows, the apps left out, blocked apps, private windows. For rows
+        that name only the app (a switch, the app an action brought to the front), never an element of its page."""
+        if not win.process:
+            return "unknown_app"
+        try:
+            rules = self._privacy()
+        except Exception:  # noqa: BLE001
+            return "privacy_error"
+        return gate(rules, self._rules(), process=win.image or win.process, app=win.app, own=win.own,
+                    title=win.title, url=None, withheld=None)
+
+    def _linked_source(self, t: float, within: float) -> str | None:
+        """The source of a row an input caused (a switch, a copy, a file), or None when no input came within
+        ``within`` s. During a Yuki run, the user's input counts only outside Yuki's own windows (a takeover); an
+        Enter in Yuki's ask bar followed by the app Yuki opens is Yuki's (second verify V4)."""
+        last = self._last_input
+        if last is None or t - last[0] > within:
+            return None
+        if last[1] != "yuki" and self._input_own and self._during_run():
+            return "yuki"
+        return last[1]
 
     def _blocked(self) -> str | None:
         """Why nothing may be recorded right now (consent off or the game gate), or None."""
@@ -444,9 +480,11 @@ class TraceWorker:
             self._pending_dclick = None
             self._open[button] = prev                      # its release ends it again
             prev.open = True
+            self._input_own = prev.win.own
             return
         hwnd, pid = self._window_at(x, y)
         win = self._window(hwnd, pid)
+        self._input_own = win.own
         act = self._new_act(_BUTTON_KIND.get(button, "click"), t, source, win, x=x, y=y, button=button,
                             travel=travel, gap_ms=self._gap(t), open=True)
         self._open[button] = act
@@ -462,6 +500,20 @@ class TraceWorker:
                     if deeper is not None:
                         act.el, act.resolved, act.lookup_ms = deeper, "snapshot", (act.lookup_ms or 0) + deeper.ms
                         act.lookup_end = self._clock()
+                    else:
+                        self._point_only(act, el)
+
+    @staticmethod
+    def _point_only(act: _Act, el: Any) -> None:
+        """The only answer is the whole window (a blind window like FL Studio or Warp answers ``ElementFromPoint``
+        with its own pane): the action is point-only (decision D2 a), the point kept relative to the window and the
+        container's role for context, never the window as if it were the element (second verify V5)."""
+        act.container_role = el.role
+        act.el, act.resolved = None, "unresolved"
+        act.lookup_ms = el.ms if el.ms is not None else act.lookup_ms
+
+    def _whole_window(self, el: Any, hwnd: int) -> bool:
+        return el is not None and el.role in PANE_ROLES and self._covers_window(el, hwnd)
 
     def _covers_window(self, el: Any, hwnd: int) -> bool:
         rect = self._rect(hwnd) if hwnd else None
@@ -482,8 +534,22 @@ class TraceWorker:
             act.kind = "drag"
             act.end_x, act.end_y = x, y
             act.travel = (act.travel or 0) + int(round(abs(x - (act.x or x)) + abs(y - (act.y or y))))
-            if act.drop is None and self.uia is not None:
-                act.end_el = self._lookup(self.uia.at_point, x, y, priority=True)
+            if act.drop is not None:
+                return
+            # the drop window is checked like any other before anything in it is looked up (V2): a blocked app,
+            # Yuki's own window, a private window, a blocked or unknown site or an app left out keeps no end element
+            end_hwnd, end_pid = self._window_at(x, y)
+            act.end_win = (end_hwnd, end_pid)
+            end_win = act.win if (end_hwnd, end_pid) == (act.win.hwnd, act.win.pid) else self._window(end_hwnd, end_pid)
+            if self._privacy_reason(end_win) is not None:
+                act.end_win = None
+                self.counters["drag_end_withheld"] += 1
+                return
+            if self.uia is not None:
+                end_el = self._lookup(self.uia.at_point, x, y, priority=True)
+                if end_el is not None and not self._whole_window(end_el, end_hwnd) and (
+                        not end_el.pid or not end_pid or end_el.pid == end_pid):
+                    act.end_el = end_el
 
     def _on_wheel(self, t: float, notches: int, horizontal: bool, x: int, y: int, source: str, travel: int) -> None:
         self._close_type(t)
@@ -497,15 +563,19 @@ class TraceWorker:
                 and last.win.hwnd == hwnd and last.source == source):
             last.n += abs(notches)
             last.last_t = t
+            self._input_own = last.win.own
             return
         win = self._window(hwnd, pid)
+        self._input_own = win.own
         act = self._new_act("scroll", t, source, win, x=x, y=y, chord=direction, n=abs(notches), travel=travel,
                             gap_ms=self._gap(t))
         self._last_wheel = act
         if act.drop is None and self.uia is not None:
             el = self._lookup(self.uia.at_point, x, y, priority=False)
             act.lookup_end = self._clock()
-            if el is not None:
+            if self._whole_window(el, hwnd):
+                self._point_only(act, el)
+            elif el is not None:
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
 
     def _focused(self, *, priority: bool) -> Any:
@@ -541,8 +611,13 @@ class TraceWorker:
                 and (text.split("+")[-1] in RUN_KEYS or kind != NAMED_KEY) and last.source == source):
             last.n += 1
             last.last_t = t
+            self._input_own = last.win.own
             return
         win = self._key_window()
+        self._input_own = win.own
+        if text == "Enter" and win.process == "warp" and self._app_reason(win) is None:
+            # who pressed the Enter that ran a Warp command (its history row comes minutes later; memory only)
+            self._enters.append((self._at(t), source, self._during_run()))
         paste = text in PASTE_CHORDS
         act = self._new_act("paste" if paste else "keys", t, source, win, chord=text, travel=travel,
                             gap_ms=self._gap(t))
@@ -578,6 +653,7 @@ class TraceWorker:
             run = None
         if run is None:
             win = self._key_window()
+            self._input_own = win.own
             run = self._new_act("type", t, source, win, typed=0, gap_ms=self._gap(t), open=True)
             self._type = run
             if run.drop is None:
@@ -633,8 +709,11 @@ class TraceWorker:
         attached = False
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
-                act.events.append(ev)
                 attached = True
+                if len(act.events) < OUTCOME_CAP:
+                    act.events.append(ev)
+                else:
+                    self.counters["events_over_row"] += 1
         if (not attached and event in (EVENT_OBJECT_INVOKED, EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD)
                 and t - self._last_action_t > FOLD_S):
             if not self._during_run():
@@ -664,7 +743,10 @@ class TraceWorker:
             self._structure(t, event)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
-                act.outs.append((t, event, hwnd, id_object, id_child))
+                if len(act.outs) < OUTCOME_CAP:      # V6: one row keeps at most the cap, however many repeats fold
+                    act.outs.append((t, event, hwnd, id_object, id_child))
+                else:
+                    self.counters["outcome_over_row"] += 1
 
     def _on_fg(self, t: float, hwnd: int, pid: int) -> None:
         self._focus_valid = False
@@ -680,14 +762,24 @@ class TraceWorker:
         if self._blocked() is not None:
             return
         win = self._window(hwnd, pid)
+        # V3: the app an action brought to the front is named on its row only when that app may be recorded at all
+        # (a blocked app, Yuki's own window, a private window or an app left out: "a window changed", no name)
+        app_reason = self._app_reason(win)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S and act.fg_change is None:
-                act.fg_change = (t, win.process)
-        last = self._last_input
-        if last is not None and t - last[0] <= INPUT_LINK_S and win.process and hwnd != self._fg.hwnd:
-            act = self._new_act("switch", t, last[1], win, gap_ms=self._gap(t))
+                act.fg_change = (t, None if app_reason else win.process)
+        source = self._linked_source(t, INPUT_LINK_S)
+        if source is not None and win.process and hwnd != self._fg.hwnd:
+            act = self._new_act("switch", t, source, win, gap_ms=self._gap(t))
+            act.drop = app_reason          # a switch names the app only, never its page (its page may still load)
             act.facts["window_verified"] = win.process
             act.resolved = "event"
+        if win.process and win.started is not None and not app_reason:
+            # V8: a file the shell opened belongs to the app it launched for it (started after the file was opened)
+            wall = self._at(t)
+            for i, (path, digest, proc, at) in enumerate(self._known_files):
+                if proc != win.process and win.started >= at - 1.0 and wall - at <= FILE_INPUT_S:
+                    self._known_files[i] = (path, digest, win.process, at)
         self._fg = win
 
     def _on_moving(self, t: float) -> None:
@@ -709,6 +801,9 @@ class TraceWorker:
         sink.moving = False
         if self._open or self._last_action_t >= anchor_at:
             return                                  # a press ended the rest: it is not a hover
+        if int(getattr(sink, "jump_seq", -1)) == int(sink.anchor_seq):
+            self.counters["hover_after_jump"] += 1   # software placed the pointer here (V4): not the user's rest
+            return
         if self._cursor is None:
             return
         x, y = self._cursor()
@@ -730,10 +825,11 @@ class TraceWorker:
         if act.drop is None and self.uia is not None:
             el = self._lookup(self.uia.at_point, x, y, priority=False)
             act.lookup_end = self._clock()
-            if el is not None:
+            if el is not None and not self._whole_window(el, hwnd):
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
             else:
-                act.drop = "skip_hover_unresolved"    # a hover is worth a row only with its element
+                # a hover is worth a row only with its element; the whole window is none (V5)
+                act.drop = "skip_hover_unresolved"
 
     def _take_sink_travel(self) -> int | None:
         sink = self.sink
@@ -752,16 +848,16 @@ class TraceWorker:
             act.last_t = t
 
     def _on_clip(self, t: float, seq: int, owner_pid: int, formats: tuple, private: bool) -> None:
-        last = self._last_input
         if private:
             self.counters["dropped_private_clip"] += 1
             return
-        if last is None or t - last[0] > INPUT_LINK_S:
+        source = self._linked_source(t, INPUT_LINK_S)
+        if source is None:
             self.counters["clip_no_input"] += 1      # the clipboard changed without the user: not their copy
             return
         hwnd, pid = self._foreground()
         win = self._window(hwnd, owner_pid or pid)
-        act = self._new_act("copy", t, last[1], win, clip_seq=int(seq), clip_formats=list(formats)[:8])
+        act = self._new_act("copy", t, source, win, clip_seq=int(seq), clip_formats=list(formats)[:8])
         act.resolved = "event"
 
     def _on_recent(self, t: float) -> None:
@@ -783,7 +879,7 @@ class TraceWorker:
         except OSError:
             return
         self._recent_seen = newest
-        last = self._last_input
+        source = self._linked_source(t, FILE_INPUT_S)
         dialog = self._dialog_closed
         if dialog is not None and t - dialog[0] > FILE_INPUT_S:
             dialog = self._dialog_closed = None
@@ -797,7 +893,7 @@ class TraceWorker:
             if self._rules().folder_blocked(target):
                 self.counters["dropped_blocked_folder"] += 1
                 continue
-            if last is None or t - last[0] > FILE_INPUT_S:
+            if source is None:
                 self.counters["file_no_input"] += 1
                 continue
             try:
@@ -811,7 +907,7 @@ class TraceWorker:
             else:
                 hwnd, pid = self._foreground()
                 win = self._window(hwnd, pid)
-            self._file_act("file_save" if saved else "file_open", t, last[1], win, target,
+            self._file_act("file_save" if saved else "file_open", t, source, win, target,
                            via="dialog" if dialog is not None else "recent")
 
     def _file_act(self, kind: str, t: float, source: str, win: _Window, target: str, *, via: str) -> _Act:
@@ -822,17 +918,19 @@ class TraceWorker:
         act.file = {"path": target, "ext": ext, "digest": digest}
         act.facts["file_saved" if kind == "file_save" else "file_opened"] = digest
         if act.drop is None:
-            entry = (target, digest)
-            if entry in self._known_files:
+            for entry in [e for e in self._known_files if e[0] == target]:
                 self._known_files.remove(entry)
-            self._known_files.append(entry)
+            self._known_files.append((target, digest, win.process, self._at(t)))
         return act
 
     def _save_check(self, act: _Act) -> None:
         """A save chord with no dialog (FL Studio's usual Ctrl+S): the files this app opened or saved, by their own
-        write time since the chord, become ``file_save`` rows (an .flp gets its project facts)."""
+        write time since the chord, become ``file_save`` rows (an .flp gets its project facts). Only that app's
+        files (V8): another program writing its own file meanwhile is not this chord's save."""
         chord_wall = self._at(act.t)
-        for target, _digest in list(self._known_files):
+        for target, _digest, proc, _at in list(self._known_files):
+            if not proc or proc != act.win.process:
+                continue
             try:
                 written = os.path.getmtime(target)
             except OSError:
@@ -868,15 +966,29 @@ class TraceWorker:
             at = float(item.get("at") or self._wall())
             exit_code = item.get("exit_code")
             facts = {"command_ok": True} if exit_code == 0 else {}
+            source, during_run = self._command_source(at, bool(item.get("during_run")))
             row = {"at": at, "ended_at": at + float(item.get("seconds") or 0.0), "process": "warp",
-                   "kind": "command", "source": "user", "via": "warp_history", "during_run": 0,
+                   "kind": "command", "source": source, "via": "warp_history", "during_run": int(during_run),
                    "command_ciphertext": self._enc(secret_filter.redact(command).text), "exit_code": exit_code,
                    "facts": json.dumps(facts) if facts else None, "resolved": "app_data", "outcome": "unverifiable"
                    if exit_code is None else "changed"}
             self._batch.append(row)
             self.counters["rows"] += 1
-            self.counters["source_user"] += 1
+            self.counters["source_" + source] += 1
             self.counters["resolved_app_data"] += 1
+
+    def _command_source(self, at: float, run_then: bool) -> tuple[str, bool]:
+        """Who ran a Warp command and whether a Yuki run was in progress then (V4): the Enter that ran it (the
+        nearest to the command's own start, within :data:`COMMAND_ENTER_S`) gives both; with none seen, a run in
+        progress at that time (from the controller's run spans) makes it Yuki's, else the user's."""
+        best = None
+        for wall, source, during in self._enters:
+            gap = abs(wall - at)
+            if gap <= COMMAND_ENTER_S and (best is None or gap < best[0]):
+                best = (gap, source, during)
+        if best is not None:
+            return best[1], bool(best[2] or run_then)
+        return ("yuki" if run_then else "user"), run_then
 
     # -- deadlines ---------------------------------------------------------------------------------------------------
 
@@ -1008,11 +1120,12 @@ class TraceWorker:
                 counts["invoked"] += 1
         if act.fg_change is not None:
             counts["window_changed"] += 1
-            act.facts.setdefault("window_verified", act.fg_change[1])
+            if act.fg_change[1]:
+                act.facts.setdefault("window_verified", act.fg_change[1])
         page_after = None
         if act.win.pid:
             try:
-                page_after = self._page(act.win.pid)[0]
+                page_after = self._page(act.win.pid, act.win.hwnd)[0]
             except Exception:  # noqa: BLE001
                 page_after = None
         if page_after and act.win.page_key and page_after != act.win.page_key:
@@ -1117,12 +1230,28 @@ class TraceWorker:
         if blocked is not None:          # first: the game gate (or consent off) means no row and no further lookup
             self.counters["dropped_" + blocked] += 1
             return
-        if act.drop is None and act.win.pid and act.kind in ("click", "rclick", "dclick", "drag", "scroll", "hover"):
-            # the timeline may only now have caught up with a window that came to the front with this press
+        if act.drop is None and act.win.pid and act.kind in POINTER_KINDS | FOCUS_KINDS:
+            # the timeline may only now have caught up with the window (it came to the front with this press, or
+            # its page changed under the keys: Ctrl+Tab then typing): checked again for keys and typing too (V1)
             now_win = self._window(act.win.hwnd, act.win.pid)
-            act.drop = self._privacy_reason(now_win)
+            reason = self._privacy_reason(now_win)
+            if reason == f"withheld:{PAGE_UNKNOWN}" and act.win.withheld != PAGE_UNKNOWN:
+                # the page was known and allowed when the action began (no title change pending, the probe answered
+                # for that very window); the page it led to (a link, Enter in a search box) is still loading. A page
+                # that settled on a blocked site by now still drops the row.
+                reason = None
+            act.drop = reason
             if act.win.page_key is None:
                 act.win.page_key = now_win.page_key
+        if act.drop is None and act.end_el is not None and act.end_win is not None:
+            end_hwnd, end_pid = act.end_win
+            end_now = self._window(end_hwnd, end_pid)
+            end_reason = self._privacy_reason(end_now)
+            if end_reason == f"withheld:{PAGE_UNKNOWN}" and (end_hwnd, end_pid) == (act.win.hwnd, act.win.pid):
+                end_reason = None                    # the same window as the start, known at the press
+            if end_reason is not None:
+                act.end_el = None                    # the drop window is withheld (V2): the drag keeps its start only
+                self.counters["drag_end_withheld"] += 1
         if act.drop is None:
             self._identity_from_events(act)
         if act.drop is None and act.el is not None and act.el.secret():
@@ -1165,6 +1294,8 @@ class TraceWorker:
             rect = self._rect(act.win.hwnd) if act.win.hwnd else None
             ox, oy = (rect[0], rect[1]) if rect else (0, 0)
             row["point"] = f"{act.x - ox},{act.y - oy}"
+            if act.container_role:
+                row["role"] = act.container_role     # point-only in a blind window: the container, for context (V5)
         if act.end_el is not None:
             cols, use = self._element_cols(act, act.end_el, prefix="end")
             row.update(cols)
@@ -1315,14 +1446,43 @@ def _read_flp(path: str) -> dict[str, Any]:
 
 def timeline_page(timeline_now: Callable[[], Any], store: Any) -> Callable[[int], tuple[str | None, str | None,
                                                                                         str | None]]:
-    """``(pid) -> (page_key, url, withheld)`` from the timeline's open stretch, when it is that process's window."""
-    cache: dict[tuple, str] = {}
+    """``(pid, hwnd) -> (page_key, url, withheld)`` from the timeline's open stretch, when it is that very window
+    and settled.
 
-    def page(pid: int) -> tuple[str | None, str | None, str | None]:
+    Second verify V1: a window of a process that shows pages (the timeline's last page probe of it found one, or the
+    trace saw it on a page) gets ``(None, None, PAGE_UNKNOWN)`` (the blocked-site gate fails closed) when the
+    timeline has no settled reading of that window: another window of the same browser (one pid, several windows), a
+    browser not in front, a title change still settling (Ctrl+Tab), a page probe not answered yet, or a probe that
+    found no page. A process that never showed a page (an editor, Explorer) is no page: ``(None, None, None)``."""
+    cache: dict[tuple, str] = {}
+    paged: set[int] = set()
+
+    def has_pages(tl: Any, pid: int) -> bool:
+        if pid in paged:
+            return True
+        try:
+            entry = (getattr(tl, "_no_page", None) or {}).get(pid) if tl is not None else None
+        except Exception:  # noqa: BLE001
+            entry = None
+        return entry is not None and int(entry[0]) == 0
+
+    def page(pid: int, hwnd: int = 0) -> tuple[str | None, str | None, str | None]:
+        if not pid:
+            return None, None, None
         tl = timeline_now()
         st = getattr(tl, "_current", None) if tl is not None else None
-        if st is None or not pid or int(getattr(st, "pid", 0) or 0) != int(pid):
-            return None, None, None
+        same = (st is not None and int(getattr(st, "pid", 0) or 0) == int(pid)
+                and (not hwnd or int(getattr(st, "hwnd", 0) or 0) == int(hwnd)))
+        settling = getattr(tl, "_title_first", None) is not None
+        if not same or not getattr(st, "settled", False) or settling:
+            return (None, None, PAGE_UNKNOWN) if has_pages(tl, int(pid)) else (None, None, None)
+        seen = getattr(st, "seen_host", None) or st.host
+        if seen or st.path:
+            if len(paged) > 512:
+                paged.clear()
+            paged.add(int(pid))
+        elif not st.withheld and has_pages(tl, int(pid)):
+            return None, None, PAGE_UNKNOWN          # settled without a page in a process that shows pages
         sig = (st.process, st.host, st.path, st.title, st.withheld, bool(st.fullscreen), st.meeting)
         key = cache.get(sig)
         if key is None:
@@ -1383,6 +1543,11 @@ class Trace:
         #: opened: a Warp command whose own time falls in one (or before that) is never recorded.
         self._spans: deque[list[float | None]] = deque(maxlen=256)
         self._first_open: float | None = None
+        #: Wall-time spans of Yuki's runs (start, end or None while one runs), from the beat: whether a Warp command
+        #: (read minutes later) ran during one (second verify V4). Both span lists are read by the Warp reader's
+        #: thread, so they change under this lock.
+        self._runs: deque[list[float | None]] = deque(maxlen=256)
+        self._span_lock = threading.Lock()
 
     def rules(self) -> TraceRules:
         return self._section.get()
@@ -1463,7 +1628,7 @@ class Trace:
         read every few minutes, so each command is checked against when the trace was open by its own time."""
         if not items or self.blocked_reason():
             return
-        kept = [c for c in items if self.open_at(c.get("at"))]
+        kept = [dict(c, during_run=self.run_at(c.get("at"))) for c in items if self.open_at(c.get("at"))]
         if self.worker is not None and len(kept) < len(items):
             self.worker.counters["dropped_command_blocked_span"] += len(items) - len(kept)
         if kept:
@@ -1475,11 +1640,42 @@ class Trace:
             at = float(at)
         except (TypeError, ValueError):
             return False
-        if self._first_open is None or at < self._first_open:
+        with self._span_lock:
+            if self._first_open is None or at < self._first_open:
+                return False
+            return not any(start <= at and (end is None or at < end) for start, end in self._spans)
+
+    def run_at(self, at: Any) -> bool:
+        """Whether a Yuki run was in progress at this wall time (the beat's one-second view of the acting marker)."""
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
             return False
-        return not any(start <= at and (end is None or at < end) for start, end in self._spans)
+        with self._span_lock:
+            return any(start - 1.0 <= at and (end is None or at <= end + 1.0) for start, end in self._runs)
+
+    def _follow_runs(self) -> None:
+        try:
+            acting = self._acting()
+        except Exception:  # noqa: BLE001
+            acting = None
+        now = time.time()
+        with self._span_lock:
+            open_run = bool(self._runs) and self._runs[-1][1] is None
+            if acting is not None and not open_run:
+                try:
+                    start = min(now, float(getattr(acting, "started_at", now) or now))
+                except (TypeError, ValueError):
+                    start = now
+                self._runs.append([start, None])
+            elif acting is None and open_run:
+                self._runs[-1][1] = now
 
     def _span(self, blocked: bool) -> None:
+        with self._span_lock:
+            self._span_locked(blocked)
+
+    def _span_locked(self, blocked: bool) -> None:
         now = time.time()
         if blocked:
             if not self._spans or self._spans[-1][1] is not None:
@@ -1548,6 +1744,7 @@ class Trace:
                 self.save_health()
         if self._ab is not None:
             self._ab.beat(self.state == "on")
+        self._follow_runs()               # a memory read of the acting marker: cheap, once a second
         now = time.monotonic()
         if now - self._last_health >= 600.0:
             self._last_health = now

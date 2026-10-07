@@ -89,6 +89,39 @@ When done
 """
 
 TREE_APPS = ("chrome", "t3 code", "t3code", "discord", "explorer")
+#: FL Studio's process keys (FL64.exe, FL.exe), matched exactly (second verify V9: a prefix took Flow Launcher).
+FL_APPS = frozenset({"fl64", "fl"})
+#: Modifiers that make a key a shortcut rather than typing.
+SHORTCUT_MODS = frozenset({"Ctrl", "Alt", "Win"})
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", text.casefold())
+
+
+def chord_checks(rows: list[dict], marker: str | None) -> dict:
+    """Typed text that leaked through the chord column (second verify V9): chords whose main key is a letter or digit
+    with no Ctrl/Alt/Win (typing classed as a chord), AltGr-shaped chords (Ctrl+Alt+letter or digit: an AltGr
+    character the classifier missed, or a real shortcut; counted for a look), and whether the main keys of the
+    session's chords, in order, spell the marker."""
+    typed_like = altgr_like = 0
+    letters = []
+    for r in rows:
+        chord = r.get("chord") or ""
+        if r.get("kind") not in ("keys", "paste") or not chord:
+            continue
+        parts = chord.split("+")
+        main, mods = parts[-1], set(parts[:-1])
+        if len(main) != 1 or not main.isalnum():
+            continue
+        letters.append(main.casefold())
+        if not mods & SHORTCUT_MODS:
+            typed_like += 1
+        elif {"Ctrl", "Alt"} <= mods and "Win" not in mods:
+            altgr_like += 1
+    target = _norm(marker or "")
+    spelled = bool(target) and target in "".join(letters)
+    return {"typed_like_chords": typed_like, "altgr_like_chords": altgr_like, "chords_spell_marker": spelled}
 
 
 def _span(text: str, day: datetime) -> float:
@@ -128,7 +161,7 @@ def _cipher(db: Path):
 def scan_for_marker(db: Path, marker: str, logs: Path | None) -> dict[str, int]:
     """Where the typed marker appears: every column of every table of the copy (encrypted ones decrypted in memory)
     and the memory logs. Only counts leave."""
-    needles = {marker.casefold(), re.sub(r"[^0-9a-z]", "", marker.casefold())}
+    needles = {marker.casefold(), _norm(marker)}
     needles.discard("")
     cipher = _cipher(db)
     found: Counter[str] = Counter()
@@ -162,7 +195,8 @@ def scan_for_marker(db: Path, marker: str, logs: Path | None) -> dict[str, int]:
                 low = path.read_text(encoding="utf-8", errors="replace").casefold()
             except OSError:
                 continue
-            if any(n in low for n in needles):
+            # the same normalisation as the columns (V9): "violet otter 4417" in a log is the marker too
+            if any(n in low for n in needles) or any(n in _norm(low) for n in needles):
                 found[f"log:{path.name}"] += 1
     return dict(found)
 
@@ -189,7 +223,8 @@ def default_logs() -> Path | None:
     return None
 
 
-def analyze(db: Path, since: float, until: float, quiet: dict[str, tuple[float, float]], *, steps: bool) -> dict:
+def analyze(db: Path, since: float, until: float, quiet: dict[str, tuple[float, float]], *, steps: bool,
+            marker: str | None = None) -> dict:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     rows = [dict(r) for r in conn.execute("SELECT * FROM ui_actions WHERE at >= ? AND at < ? ORDER BY at",
@@ -213,6 +248,7 @@ def analyze(db: Path, since: float, until: float, quiet: dict[str, tuple[float, 
                                          if sum(c.values())}
     report["stale_share"] = round(sum(1 for r in clicks if r["resolved"] == "stale") / len(clicks), 3) if clicks else None
     report["chords"] = dict(Counter(r["chord"] for r in rows if r["kind"] in ("keys", "paste") and r["chord"]))
+    report.update(chord_checks(rows, marker))
     report["typed_total"] = sum(int(r["typed"] or 0) for r in rows)
     report["hovers"] = sum(1 for r in rows if r["kind"] == "hover")
     report["copies"] = sum(1 for r in rows if r["kind"] == "copy")
@@ -239,7 +275,7 @@ def analyze(db: Path, since: float, until: float, quiet: dict[str, tuple[float, 
             stable[app].append(len(set(by_session.values())) == 1)
     report["aid_stable_share"] = {a: round(sum(v) / len(v), 2) for a, v in stable.items()}
     report["valorant_rows"] = sum(n for a, n in by_app.items() if a and a.startswith("valorant"))
-    report["fl_studio_rows"] = sum(n for a, n in by_app.items() if a and a.startswith("fl"))
+    report["fl_studio_rows"] = sum(n for a, n in by_app.items() if a in FL_APPS)
     report["quiet_spans"] = {}
     for name, (a, b) in quiet.items():
         n = conn.execute("SELECT count(*) FROM ui_actions WHERE at >= ? AND at < ? AND source != 'yuki'"
@@ -279,6 +315,14 @@ def verdict(report: dict, marker_hits: dict | None) -> list[tuple[str, bool | No
                     json.dumps(trace_hits)))
         out.append(("the marker in other tables (what the ambient capture saw on screen, not the trace)", None,
                     json.dumps(other_hits)))
+    if "typed_like_chords" in report:
+        out.append(("no letters or digits recorded as chords without Ctrl, Alt or Win", report["typed_like_chords"] == 0,
+                    str(report["typed_like_chords"])))
+        out.append(("Ctrl+Alt+letter or digit chords (AltGr characters missed, or real shortcuts: look with --steps)",
+                    None, str(report["altgr_like_chords"])))
+        if marker_hits is not None:
+            out.append(("the chords' keys, in order, never spell the marker", not report["chords_spell_marker"],
+                        str(report["chords_spell_marker"])))
     for name, n in report.get("quiet_spans", {}).items():
         out.append((f"nothing recorded during '{name}'", n == 0, str(n)))
     out.append(("VALORANT: zero rows", report["valorant_rows"] == 0, str(report["valorant_rows"])))
@@ -327,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
             tmp = Path(tempfile.mkdtemp(prefix="yuki-trace-check-"))
             db = copy_real(tmp)
         t0 = time.perf_counter()
-        report = analyze(db, since, until, quiet, steps=args.steps)
+        report = analyze(db, since, until, quiet, steps=args.steps, marker=args.typed)
         logs = args.logs if args.logs is not None else default_logs()
         if args.typed and not memory_logs(logs):
             print(f"No memory-*.jsonl logs found in {logs or 'the usual folders'}: the log check cannot run. Pass"
@@ -345,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
-            print("The copy was deleted.")
+            print("The copy was deleted." if not tmp.exists() else f"The copy could not be deleted: {tmp}")
     return 0
 
 

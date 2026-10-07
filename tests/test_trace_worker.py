@@ -104,7 +104,7 @@ class Rig:
         self.sink = None
         self.w = TraceWorker(
             self.store, privacy_rules=lambda: self.privacy, trace_rules=lambda: self.rules, gate=lambda: self.gate,
-            acting=lambda: self.acting, page=lambda pid: self.pages.get(pid, (None, None, None)),
+            acting=lambda: self.acting, page=lambda pid, hwnd=0: self.pages.get(pid, (None, None, None)),
             process=lambda pid: PROCS[pid], window_at=lambda x, y: self.under, foreground=lambda: self.fg,
             title=lambda h: self.titles.get(h, "Notes"), rect=lambda h: (0, 0, 1000, 800), uia=self.uia,
             sink=None, cursor=lambda: self.cursor, clipboard=lambda: self.clip, recent=None,

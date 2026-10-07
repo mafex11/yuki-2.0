@@ -43,7 +43,7 @@ from collections.abc import Callable
 from typing import Any
 
 from yuki.core.inputtag import is_yuki_input
-from yuki.memory.trace_keys import CHAR, CHORD, NAMED_KEY, KeyClassifier
+from yuki.memory.trace_keys import CHAR, CHORD, FOLD_S, NAMED_KEY, RUN_KEYS, KeyClassifier
 
 USER, INJECTED, YUKI = "user", "user_injected", "yuki"
 
@@ -53,6 +53,11 @@ _UP = {0x0002: "left", 0x0008: "right", 0x0020: "middle", 0x0080: "x1", 0x0200: 
 _WHEEL, _HWHEEL = 0x0400, 0x0800
 _MOVE_ABSOLUTE, _VIRTUAL_DESKTOP = 0x01, 0x02
 _WHEEL_DELTA = 120
+#: Pixels a raw count can move the pointer at most, well above Windows' own pointer gain (the speed slider's 3.5x
+#: times Enhance pointer precision's curve): a pointer that moved further than this times the device's net counts
+#: since the rest anchor was placed by software (second verify V4: Yuki's ``SetCursorPos`` read by the next jitter
+#: report must not start a rest the user seems to make).
+JUMP_GAIN = 32
 
 
 def source_of(extra: int | None, device: int | None) -> str:
@@ -143,14 +148,16 @@ class TraceInput:
         metrics: Windows' pointer settings (:class:`Metrics`).
         cursor: ``() -> (x, y)``, the pointer in physical screen pixels (default ``GetPhysicalCursorPos``).
         classifier: the key classifier (default :class:`yuki.memory.trace_keys.KeyClassifier`).
-        on_action: called with the time when an action starts (button-down, chord, named key, wheel): opens the
-            outcome hooks around it. Must return at once.
+        on_action: called with the time when an action starts (button-down, chord, named key, wheel) and whether
+            it is a repeat that folds into the previous action (the same run key or chord, or a wheel notch the same
+            way, within :data:`yuki.memory.trace_keys.FOLD_S`): opens the outcome hooks around it, a fold without a
+            fresh event cap (second verify V6). Must return at once.
         clock: ``time.monotonic``.
     """
 
     def __init__(self, put: Callable[[tuple], None], *, metrics: Metrics | None = None,
                  cursor: Callable[[], tuple[int, int]] | None = None, classifier: KeyClassifier | None = None,
-                 on_action: Callable[[float], None] | None = None, clock: Callable[[], float] = time.monotonic,
+                 on_action: Callable[[float, bool], None] | None = None, clock: Callable[[], float] = time.monotonic,
                  screen: Callable[[bool], tuple[int, int]] | None = None) -> None:
         self._put = put
         self.metrics = metrics if metrics is not None else Metrics()
@@ -168,6 +175,7 @@ class TraceInput:
         self._abs_last: tuple[float, float] | None = None
         self.anchor_at = 0.0                 # when the current rest began (monotonic)
         self.anchor_seq = 0                  # bumped on every new rest
+        self.jump_seq = -1                   # the anchor_seq of a rest begun by a software jump (no hover)
         #: The worker was told the pointer moves and has not yet judged the rest; cleared by the worker.
         self.moving = False
         self.travel = 0.0                    # raw counts travelled since the last action
@@ -175,8 +183,10 @@ class TraceInput:
         # buttons
         self._down: dict[str, tuple[float, int, int, int]] = {}   # button -> (t, x, y, max excursion px)
         self._last_click: tuple[str, float, int, int] | None = None
+        self._fold: tuple[Any, float] | None = None    # the last action's fold key and time (V6)
         #: Content-free counters (read by the trace's stats).
-        self.counts: dict[str, int] = {"moves": 0, "buttons": 0, "wheel": 0, "keys": 0, "dropped": 0, "rests": 0}
+        self.counts: dict[str, int] = {"moves": 0, "buttons": 0, "wheel": 0, "keys": 0, "dropped": 0, "rests": 0,
+                                       "jumps": 0}
 
     @property
     def wants_mouse(self) -> bool:
@@ -191,10 +201,13 @@ class TraceInput:
         self._sx = self._sy = 0
         return int(round(travel))
 
-    def _action(self, t: float) -> None:
+    def _action(self, t: float, key: Any = None) -> None:
+        last = self._fold
+        fold = key is not None and last is not None and last[0] == key and t - last[1] <= FOLD_S
+        self._fold = (key, t)
         if self._on_action is not None:
             try:
-                self._on_action(t)
+                self._on_action(t, fold)
             except Exception:  # noqa: BLE001 - the hooks never break the reader
                 pass
 
@@ -208,6 +221,17 @@ class TraceInput:
         if not self.moving:
             self.moving = True
             self._put(("moving", t))
+
+    def _jump(self, t: float, x: int, y: int) -> None:
+        """The pointer is far from the rest anchor but this device barely moved (second verify V4): something placed
+        it (Yuki's ``SetCursorPos``, its stamped moves, an app warping the pointer). The rest starts again where it
+        is, silently: no travel, no *moving*, and a rest begun by a jump never becomes a hover (:attr:`jump_seq`)."""
+        self._sx = self._sy = 0
+        self._ax, self._ay = x, y
+        self.anchor_at = t
+        self.anchor_seq += 1
+        self.jump_seq = self.anchor_seq
+        self.counts["jumps"] += 1
 
     # -- the reader's calls ------------------------------------------------------------------------------------------
 
@@ -235,7 +259,11 @@ class TraceInput:
                 self._ax, self._ay, self.anchor_at, self._anchored = x, y, t, True
                 self._sx = self._sy = 0
             elif abs(x - self._ax) * 2 > m.hover_w or abs(y - self._ay) * 2 > m.hover_h:
-                self._new_anchor(t, x, y)
+                moved = abs(x - self._ax) + abs(y - self._ay)
+                if moved > JUMP_GAIN * (abs(self._sx) + abs(self._sy)) + m.hover_w + m.hover_h:
+                    self._jump(t, x, y)                # placed by software, not this device's move
+                else:
+                    self._new_anchor(t, x, y)
             for button, (t0, x0, y0, far) in list(self._down.items()):
                 excursion = max(abs(x - x0), abs(y - y0))
                 if excursion > far:
@@ -271,7 +299,7 @@ class TraceInput:
             delta = ctypes.c_short(button_data & 0xFFFF).value
             notches = int(delta / _WHEEL_DELTA) or (1 if delta > 0 else -1)
             x, y = self._cursor()
-            self._action(t)
+            self._action(t, ("wheel", bool(button_flags & _HWHEEL), delta > 0))
             self._put(("wheel", t, notches, bool(button_flags & _HWHEEL), x, y, source, self._take_travel()))
 
     def key(self, t: float, vk: int, scan: int, flags: int, message: int, extra: int, device: int) -> None:
@@ -285,13 +313,15 @@ class TraceInput:
             self._put(("char", t, cls.chars, source_of(extra, device)))
         elif kind in (CHORD, NAMED_KEY):
             self.counts["keys"] += 1
-            self._action(t)
+            # a chord or run key repeated folds into one row: the same outcome window (V6); Enter, Tab... do not
+            self._action(t, ("key", cls.key) if kind == CHORD or cls.key in RUN_KEYS else None)
             self._put(("key", t, kind, cls.key, source_of(extra, device), self._take_travel()))
 
     def reset(self) -> None:
         """Forget held buttons and the rest (the trace was blocked and opens again)."""
         self._down.clear()
         self._last_click = None
+        self._fold = None
         self._sx = self._sy = 0
         self.travel = 0.0
         self._abs_last = None

@@ -224,11 +224,15 @@ class TraceHooks:
     def alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def action(self, t: float) -> None:
-        """An action started (button-down, chord, named key, wheel): open the outcome hooks (cheap; any thread)."""
+    def action(self, t: float, fold: bool = False) -> None:
+        """An action started (button-down, chord, named key, wheel): open the outcome hooks (cheap; any thread).
+
+        ``fold``: a repeat that folds into the previous action's row (a held arrow, the next wheel notch): the window
+        is kept open but the event cap is not renewed, so one row never gets more than :data:`OUTCOME_CAP` events
+        however many repeats it folds (second verify V6)."""
         self._last_action = t
         if self.hwnd:
-            _U.PostMessageW(self.hwnd, WM_TRACE_ACTION, 0, 0)
+            _U.PostMessageW(self.hwnd, WM_TRACE_ACTION, int(bool(fold)), 0)
 
     def set_blocked(self, blocked: bool) -> None:
         if self.hwnd:
@@ -268,9 +272,10 @@ class TraceHooks:
         if had_out:
             self._out = self._hook_set(OUTCOME)
 
-    def _open_outcome(self) -> None:
-        self.gen += 1
-        self._n = 0
+    def _open_outcome(self, fold: bool = False) -> None:
+        if not fold:
+            self.gen += 1
+            self._n = 0
         if self.blocked:
             return
         if not self._out and self._pids:
@@ -349,7 +354,7 @@ class TraceHooks:
     def _wndproc(self, hwnd: int, msg: int, w_param: int, l_param: int) -> int:
         try:
             if msg == WM_TRACE_ACTION:
-                self._open_outcome()
+                self._open_outcome(bool(w_param))
                 return 0
             if msg == _WM_TIMER and w_param == _OUTCOME_TIMER:
                 self._close_outcome_if_quiet()
