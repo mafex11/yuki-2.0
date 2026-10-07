@@ -172,3 +172,30 @@ def test_the_prompt_says_how_to_use_it_in_one_voice():
     assert "WHAT THEY GOT DONE" in p and "Never ask whether that step itself got done" in p
     assert "T7" in str(C.CHECKIN_TOOL["input_schema"]["properties"]["evidence"])
     assert "coach" not in p.split("WHAT THEY GOT DONE")[1][:600].lower()
+
+
+# -- review fixes (report 101, Review fixes: C6-1) -------------------------------------------------------------------
+
+
+def test_a_busy_day_elsewhere_never_crowds_a_rows_checked_task_out(store):
+    saved = task(store, at("10:05"), "You saved the planting plan", [SAVE], outcome="file_saved")
+    for k in range(14):   # more checked tasks than one capped read holds, all in the other thread's session
+        task(store, at("14:00") + k * 60, f"You saved budget draft {k}", [SAVE], outcome="file_saved")
+    worked = [["Garden planner", 60, "thread:7"], ["October budget", 30, "thread:9"]]
+    W.worked_evidence(MemoryClient(store), worked, SESSIONS, THREADS, at("15:00"))
+    assert worked[0][3]["ref"] == f"task:{saved}"
+    assert worked[1][3]["goal"] == "You saved budget draft 13"         # still the latest of its own
+
+
+def test_a_check_in_about_a_thread_still_sees_its_week_on_a_busy_day(store):
+    wid, _jid = _landed(store)
+    ids = _tasks_for_checkin(store, wid)
+    for k in range(14):   # newer checked tasks today, on no thread
+        task(store, at("07:00") + k * 60, f"You saved a recipe card {k}", [SAVE], outcome="file_saved")
+    w = worker_for(store, Stub())
+    m = _moment(store, w)
+    user, offered = w.checkins.build_message(at("10:00"), CFG, observe(store, at("10:00"), CFG), [], m)
+    assert f"T{ids['thread_old']}" in offered and f"[T{ids['thread_old']}]" in user
+    assert len(m.done) == C.DONE_LINES                                 # still capped
+    for left in ("unclear", "rejected", "plain_old"):
+        assert f"T{ids[left]}" not in offered, left

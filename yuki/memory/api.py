@@ -4661,7 +4661,7 @@ class MemoryClient:
             out["ranked"] = vec is not None
             out["families"] = trace_graph.families(self.store, app=app or None, query_vec=vec, limit=limit)
             if app:
-                out["app"] = trace_graph.in_app(self.store, app)
+                out["app"] = trace_graph.in_app(self.store, app, with_families=False)   # families read just above
         except Exception as exc:  # noqa: BLE001
             out["error"] = type(exc).__name__
         return out

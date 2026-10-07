@@ -1344,7 +1344,7 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
             row[1] += m
         worked = sorted((r for r in mins.values() if r[1] >= 1), key=lambda r: -r[1])[:WORKED_SHOWN]
         worked_evidence(memory, worked, sessions, threads, now)
-    coming =[[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
+    coming = [[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
     seen = list(dict.fromkeys(a for m in (board.get("meetings") or [])[:3] for a in m.get("seen") or []))
     return {"focus": focus, "usual": round(usual) if usual is not None else None, "longest": longest,
             "worked": worked, "coming": coming,
@@ -1357,26 +1357,30 @@ def worked_evidence(memory: Any, worked: list[list[Any]], sessions: list[dict[st
     done inside that thread's sessions today (``{"text": "you saved a file (.pptx) at 4 PM", "goal", "ref"
     ("task:12"), "action" (the outcome's action id)}``); a row with none keeps its three items. Only tasks memory calls
     learnable (a recorded outcome, never unclear, never one the user said was not theirs); the ids stay in the data,
-    the page shows words only. Never a card, never spoken. One small read (memory's ``done_evidence``)."""
+    the page shows words only. Never a card, never spoken. Small reads (memory's ``done_evidence``, one per session of
+    the row's thread, newest first, until one holds a checked task)."""
     fn = getattr(memory, "done_evidence", None)
     if not callable(fn) or not worked:
         return
     timed = [s for s in sessions if s.get("start_at") and s.get("end_at")]
     if not timed:
         return
-    day0 = min(float(s["start_at"]) for s in timed)
-    evidence = _safe(lambda: fn(day0, now + 1.0), []) or []
     spans: dict[str, list[tuple[float, float]]] = {}
     for s, th in zip(timed, threads or []):
         if th:
             spans.setdefault(th["ref"], []).append((float(s["start_at"]), float(s["end_at"])))
     for row in worked:
-        inside = [e for e in evidence if isinstance(e, dict) and e.get("at") is not None and e.get("words")
-                  and any(a <= float(e["at"]) <= b for a, b in spans.get(row[2], []))]
-        if inside:
-            e = max(inside, key=lambda x: float(x["at"]))
-            row.append({"text": f"{e['words']} at {e.get('clock') or hm(e['at'])}", "goal": e.get("goal") or "",
-                        "ref": f"task:{int(e['task'])}", "action": int(e["action"])})
+        # read per session of the row's thread, newest first (review C6-1: one capped read of the whole day let a busy
+        # day's other tasks crowd a row's out); the sessions do not overlap, so the first that holds one has the latest
+        for a, b in sorted(spans.get(row[2], []), key=lambda x: -x[1]):
+            got = _safe(lambda a=a, b=b: fn(a, b + 1.0, limit=3), []) or []
+            inside = [e for e in got if isinstance(e, dict) and e.get("at") is not None and e.get("words")
+                      and a <= float(e["at"]) <= b + 1.0]
+            if inside:
+                e = max(inside, key=lambda x: float(x["at"]))
+                row.append({"text": f"{e['words']} at {e.get('clock') or hm(e['at'])}", "goal": e.get("goal") or "",
+                            "ref": f"task:{int(e['task'])}", "action": int(e["action"])})
+                break
 
 
 def dates_said(text: str, now: float) -> str:

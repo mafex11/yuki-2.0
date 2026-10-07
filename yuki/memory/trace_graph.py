@@ -170,26 +170,46 @@ def _latest_task(store: Any, fid: int) -> Any | None:
     return got[0] if got else None
 
 
+def _routes(f: Any) -> tuple[int, int]:
+    """A family's ``(tasks, routes its path was built from)``."""
+    n_tasks = int(f["n_tasks"] or 0)
+    return n_tasks, int(f["path_n"] or 0) or min(n_tasks, F.PATH_TASKS)
+
+
+def _usual_indexes(nodes: Sequence[dict[str, Any]], n_tasks: int, n_routes: int) -> set[int]:
+    """The backbone indexes of the usual path (:func:`yuki.memory.trace_families.usual`); a family of one: every
+    node (its one route)."""
+    if n_tasks < 2:
+        return set(range(len(nodes)))
+    usual = {id(nd) for nd in F.usual(nodes, n_routes)}
+    return {i for i, nd in enumerate(nodes) if id(nd) in usual}
+
+
 def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MAX_STEPS,
                 branches: int = MAX_BRANCHES, follow: bool = True, cosine: float | None = None) -> dict[str, Any]:
     """One family as the graph answers it: ``{"id", "label", "tasks", "apps", "last_at", "last_words", "of" (the
     routes the path's counts are out of), "steps": [{"words", "n"}] (the usual path; a family of one: its one route),
     "branches": [{"words", "n", "where"}], "latest": {"goal", "when", "at", "outcome", "checked", "renamed"} | None,
     "followed_by": [{"label", "n", "of"}], "cosine"}``. Worded from the registry's kept names only."""
-    n_tasks = int(f["n_tasks"] or 0)
-    n_routes = int(f["path_n"] or 0) or min(n_tasks, F.PATH_TASKS)
+    n_tasks, n_routes = _routes(f)
     try:
         nodes = json.loads(f["path_keys"] or "[]")
         variants = json.loads(f["variants_keys"] or "[]")
     except (TypeError, ValueError):
         nodes, variants = [], []
     names = F._names(store, [nd.get("k") for nd in nodes] + [k for b in variants for k in b.get("keys") or []])
-    shown = F.usual(nodes, n_routes) if n_tasks >= 2 else nodes
+    keep = _usual_indexes(nodes, n_tasks, n_routes)
     path = []
-    for nd in shown:
+    #: backbone index -> its 1-based position in ``path`` (the numbered list the reader sees), so a branch's "after
+    #: step N" points at a step that is shown (review C6-2: the backbone also holds steps few routes took)
+    shown_at: dict[int, int] = {}
+    for i, nd in enumerate(nodes):
+        if i not in keep:
+            continue
         words = F.step_words(str(nd.get("k") or ""), nd, names)
         if words:
             path.append({"words": _clip(words, STEP_CHARS), "n": int(nd.get("n") or 0)})
+            shown_at[i] = len(path)
         if len(path) >= steps:
             break
     worded_branches = []
@@ -200,8 +220,9 @@ def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MA
             if not bw:
                 continue
             after = int(b.get("after", -1))
+            pos = max((p for i, p in shown_at.items() if i <= after), default=0)
             worded_branches.append({"words": _clip("; ".join(bw), BRANCH_CHARS), "n": int(b.get("n") or 0),
-                                    "where": "at the start" if after < 0 else f"after step {after + 1}"})
+                                    "where": "at the start" if pos == 0 else f"after step {pos}"})
             if len(worded_branches) >= branches:
                 break
     latest = None
@@ -373,17 +394,19 @@ def transitions(store: Any, process: str, *, from_key: str | None = None,
     return out
 
 
-def in_app(store: Any, app: str, *, now: float | None = None, limit: int = 5) -> dict[str, Any]:
+def in_app(store: Any, app: str, *, now: float | None = None, limit: int = 5,
+           with_families: bool = True) -> dict[str, Any]:
     """"What do I do in <app>": ``{"app", "families": [...] (spanning it, newest first), "elements": [...] and
     "chords": [...] (its go-tos and shortcuts, C1b's tallies, read without counting as served), "transitions":
-    [...]}``. Never raises."""
+    [...]}``. ``with_families`` False: ``families`` stays empty (a caller that already read them). Never raises."""
     from yuki.memory import trace_habits
 
     key = _app_key(app) or str(app or "")
     out: dict[str, Any] = {"app": key, "families": [], "elements": [], "chords": [], "transitions": []}
     if not key:
         return out
-    out["families"] = families(store, app=key, limit=limit, now=now)
+    if with_families:
+        out["families"] = families(store, app=key, limit=limit, now=now)
     try:
         got = trace_habits.go_tos(store, [key], now=now, detail=True, count=False)
     except Exception:  # noqa: BLE001
@@ -399,7 +422,8 @@ def in_app(store: Any, app: str, *, now: float | None = None, limit: int = 5) ->
 
 def next_after_element(store: Any, element_key: str, *, limit: int = 5) -> dict[str, Any]:
     """"What comes next" after an element: ``{"element" (its words), "app", "transitions": [{"to", "n", "gap"}],
-    "paths": [{"family", "label", "next"}]}`` (the next step of each usual path that holds the element). ``{}`` when
+    "paths": [{"family", "label", "next"}]}`` (for each family whose path holds the element, the next step of its
+    usual path after it: the step most of the routes took, never one only a few took). ``{}`` when
     the registry does not have it. Never raises."""
     try:
         el = _elements(store, [element_key]).get(element_key)
@@ -420,10 +444,14 @@ def next_after_element(store: Any, element_key: str, *, limit: int = 5) -> dict[
             keys = [nd.get("k") for nd in nodes]
             if element_key not in keys:
                 continue
+            # the next step of the usual path (review C6-3), not of the raw backbone: a step only a few of the routes
+            # took is never "what comes next"; a family of one: its one route's next step
             i = keys.index(element_key)
-            if i + 1 >= len(nodes):
+            keep = _usual_indexes(nodes, *_routes(f))
+            j = next((j for j in range(i + 1, len(nodes)) if j in keep), None)
+            if j is None:
                 continue
-            nd = nodes[i + 1]
+            nd = nodes[j]
             words = F.step_words(str(nd.get("k") or ""), nd, F._names(store, [nd.get("k")]))
             label = _label(store, f)
             if words and label:
@@ -514,9 +542,21 @@ def tasks_between(store: Any, since: float, until: float, *, limit: int = MAX_TA
     return {"tasks": out, "more": max(0, int(n_all) - len(out)), "left_out": int(rejected or 0)}
 
 
-def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EVIDENCE) -> list[dict[str, Any]]:
+def _thread_ids(store: Any, thread_id: int) -> list[int]:
+    """A thread of work and every thread merged into it (``merged_into``, followed down; bounded)."""
+    rows = store._query("WITH RECURSIVE m(id, depth) AS (SELECT ?, 0 UNION SELECT w.id, m.depth + 1 FROM work_threads w"
+                        " JOIN m ON w.merged_into = m.id WHERE m.depth < 16) SELECT DISTINCT id FROM m LIMIT 200",
+                        (int(thread_id),))
+    return [int(r[0]) for r in rows]
+
+
+def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EVIDENCE,
+                  thread: int | None = None) -> list[dict[str, Any]]:
     """Tasks whose outcome the PC checked, the outcome inside ``[since, until)``, newest first, at most ``limit``
     (:data:`MAX_EVIDENCE`): learnable tasks only (a recorded fact, never ``unclear``, never one the user rejected).
+    ``thread`` (a thread of work's id): only tasks with at least one of the user's journal entries on that thread (or
+    one merged into it) inside their span, so the cap applies to that thread's tasks, not to everything newer (review
+    C6-1; which thread a task belongs to - most of its span's entries - is still the caller's to decide).
     ``[{"task" (id), "action" (the outcome's action id), "fact", "at" (the outcome's time), "start_at", "end_at"
     (the task's span), "goal", "apps",
     "words" (second person: "you saved a file (.pptx)"), "clock" ("4 PM")}]``: the ids are for the caller's records,
@@ -524,9 +564,16 @@ def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EV
     limit = max(1, min(int(limit), MAX_EVIDENCE))
     try:
         lo, hi = float(since), float(until)
-        rows = store._query(
-            _TASK_SQL + " AND t.outcome_fact IS NOT NULL AND t.outcome_fact != ? AND t.outcome_action IS NOT NULL"
-            " ORDER BY t.started_at DESC, t.id DESC LIMIT ?", (lo - TASK_SPAN_MAX_S, hi, lo, UNCLEAR, limit * 4))
+        sql = _TASK_SQL + " AND t.outcome_fact IS NOT NULL AND t.outcome_fact != ? AND t.outcome_action IS NOT NULL"
+        params: list[Any] = [lo - TASK_SPAN_MAX_S, hi, lo, UNCLEAR]
+        if thread is not None:
+            ids = _thread_ids(store, int(thread))
+            if not ids:
+                return []
+            sql += (" AND EXISTS (SELECT 1 FROM journal j WHERE j.work_thread_id IN (%s) AND j.at >= t.started_at"
+                    " AND j.at < t.ended_at + 1 AND j.superseded_at IS NULL AND j.by_yuki = 0)" % ",".join("?" * len(ids)))
+            params += ids
+        rows = store._query(sql + " ORDER BY t.started_at DESC, t.id DESC LIMIT ?", (*params, limit * 4))
     except Exception:  # noqa: BLE001
         return []
     out = []

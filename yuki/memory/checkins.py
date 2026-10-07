@@ -1617,29 +1617,39 @@ class CheckinWorker:
         (``T`` ids; ``m.done`` keeps each one's real task and action ids). Only learnable tasks
         (:func:`yuki.memory.trace_graph.done_evidence`: a recorded outcome, never unclear, never one the user said was
         not theirs): the last :data:`DONE_WITHIN_S`, and for a moment about a thread of work, that thread's within
-        :data:`DONE_THREAD_S` too (a task belongs to the thread most of the journal entries in its span belong to). At
+        :data:`DONE_THREAD_S` too (a task belongs to the thread most of the journal entries in its span belong to; read
+        on its own, so newer tasks elsewhere never crowd it out, and listed before the rest when lines run short). At
         most :data:`DONE_LINES`. Nothing with recording off; never raises."""
         from yuki.memory import trace_graph
         from yuki.memory.workboard import session_threads
 
-        reach = DONE_THREAD_S if m.thread_id is not None else DONE_WITHIN_S
         try:
-            found = trace_graph.done_evidence(self.store, now - reach, now + 1.0, limit=trace_graph.MAX_EVIDENCE)
+            # two reads, each capped on its own (review C6-1): the thread's checked tasks of the week are never cut off
+            # by newer ones elsewhere
+            recent = trace_graph.done_evidence(self.store, now - DONE_WITHIN_S, now + 1.0,
+                                               limit=trace_graph.MAX_EVIDENCE)
+            on_thread = (trace_graph.done_evidence(self.store, now - DONE_THREAD_S, now + 1.0,
+                                                   limit=trace_graph.MAX_EVIDENCE, thread=int(m.thread_id))
+                         if m.thread_id is not None else [])
+            found = list({int(e["task"]): e for e in [*on_thread, *recent]}.values())
             threads = session_threads(self.store, [(e["start_at"], e["end_at"] + 1.0) for e in found]) if found else []
         except Exception:
             return []
-        lines: list[str] = []
+        ours, others = [], []
         for e, th in zip(found, threads):
-            ours = m.thread_id is not None and th is not None and th.get("ref") == f"thread:{m.thread_id}"
-            if not ours and now - e["at"] > DONE_WITHIN_S:
-                continue
+            if m.thread_id is not None and th is not None and th.get("ref") == f"thread:{m.thread_id}":
+                ours.append((e, th))
+            elif now - e["at"] <= DONE_WITHIN_S:
+                others.append((e, th))
+        # the moment's own thread first, then the rest of the day; shown newest first
+        picked = (sorted(ours, key=lambda x: -x[0]["at"]) + sorted(others, key=lambda x: -x[0]["at"]))[:DONE_LINES]
+        lines: list[str] = []
+        for e, th in sorted(picked, key=lambda x: -x[0]["at"]):
             ref = f"T{e['task']}"
             m.done[ref] = {"task": int(e["task"]), "action": int(e["action"]), "at": float(e["at"])}
             where = "; ".join(x for x in (", ".join(e.get("apps") or []), f"on {th['title']}" if th else "") if x)
             lines.append(f"- {_when(e['at'], now)} [{ref}]" + (f" ({safe(where, 160)})" if where else "")
                          + f" {safe(e['goal'], 160)}: {e['words']}")
-            if len(lines) >= DONE_LINES:
-                break
         return lines
 
     def _recent_lines(self, now: float, safe: Callable[[Any, int], str]) -> list[str]:

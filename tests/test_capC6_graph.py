@@ -267,3 +267,87 @@ def test_output_caps_hold_on_a_long_family(store):
     fam = G.families(store, app="drawer")[0]
     assert len(fam["steps"]) == G.MAX_STEPS and all(len(s["words"]) <= G.STEP_CHARS for s in fam["steps"])
     assert len(fam["label"]) <= G.LABEL_CHARS
+
+
+# -- review fixes (report 101, Review fixes) -------------------------------------------------------------------------
+
+BOLD = ("chatter", "click", "Button", "Bold", "k-bold", None)
+PIN = ("chatter", "click", "Button", "Pin", "k-pin", None)
+EMOJI = ("chatter", "click", "Button", "Emoji", "k-emoji", None)
+
+
+def five_routes(store: Any) -> int:
+    """Five routes of one family: Bold and Pin taken 2 of 5 times (on the backbone, off the usual path), an Emoji
+    taken once after the file."""
+    goal = "You sent the weekly report to the team"
+    routes = [[ATTACH, BOLD, FILE, SEND, PIN], [ATTACH, BOLD, FILE, SEND, PIN], [ATTACH, FILE, EMOJI, SEND],
+              [ATTACH, FILE, SEND], [ATTACH, FILE, SEND]]
+    ids = [task(store, NOW + d * DAY, goal, r, outcome="field_submitted") for d, r in enumerate(routes)]
+    F.refresh(store, Words(), now=NOW + 5 * DAY + 100)
+    return _family_of(store, ids[0])
+
+
+def test_a_branch_says_after_which_shown_step_never_a_backbone_index(store):
+    fid = five_routes(store)
+    f = store._query(f"SELECT {G._FAMILY_COLUMNS} FROM ui_families WHERE id = ?", (fid,))[0]
+    keys = [nd["k"] for nd in json.loads(f["path_keys"])]
+    assert "k-bold" in keys and keys.index("k-bold") < keys.index("k-file")   # the scenario: Bold on the backbone
+    fam = G.family_view(store, f)
+    words = [s["words"] for s in fam["steps"]]
+    assert words == ['in chatter: click Button "Attach"', "in chatter: click an unnamed ListItem",
+                     "in chatter: press Enter"]
+    emoji = [b for b in fam["branches"] if "Emoji" in b["words"]]
+    assert emoji and emoji[0]["where"] == "after step 2"                # after the file (shown step 2), not "3"
+    for b in fam["branches"]:                                          # every "after step N" points at a shown step
+        if b["where"].startswith("after step "):
+            assert 1 <= int(b["where"].split()[-1]) <= len(words)
+
+
+def test_what_comes_next_after_an_element_is_the_usual_paths_next_step(store):
+    five_routes(store)
+    nxt = G.next_after_element(store, "k-attach")
+    assert [p["next"] for p in nxt["paths"]] == ["in chatter: click an unnamed ListItem"]   # all 5 took it, not Bold
+    # after a minority step, the next usual step still
+    assert [p["next"] for p in G.next_after_element(store, "k-bold")["paths"]] == ["in chatter: click an unnamed ListItem"]
+    # the last usual step has no next usual step (Pin, 2 of 5, is never "what comes next")
+    assert G.next_after_element(store, "k-edit")["paths"] == []
+
+
+def test_a_family_of_one_still_gives_its_routes_next_step(store):
+    task(store, NOW, "You pinned the weekly report", [ATTACH, BOLD, PIN], outcome="selected")
+    F.refresh(store, Words(), now=NOW + 100)
+    assert [p["next"] for p in G.next_after_element(store, "k-attach")["paths"]] == ['in chatter: click Button "Bold"']
+
+
+def test_done_evidence_for_a_thread_is_never_crowded_out_by_newer_tasks_elsewhere(store):
+    from yuki.memory.store import WorkOp
+
+    op = WorkOp("starts", None, title="Garden planner", state="half done", open_items=[], at=NOW - DAY)
+    store.apply_work([op])
+    wid = int(op.result_id)
+    old = task(store, NOW, "You saved the planting plan", [("drawer", "click", "Button", "Save", "k-s", None)],
+               outcome="file_saved")
+    jid = store.add_journal(NOW + 0.5, None, "Drawer", "The user saved the planting plan.", 6)
+    store._write(lambda c: c.execute("UPDATE journal SET work_thread_id = ? WHERE id = ?", (wid, jid)))
+    for k in range(G.MAX_EVIDENCE + 2):
+        task(store, NOW + 2 * DAY + k * 10, f"You saved draft number {k}",
+             [("drawer", "click", "Button", "Save", "k-s", None)], outcome="file_saved")
+    assert old not in [e["task"] for e in G.done_evidence(store, NOW - 60, NOW + 3 * DAY)]     # the plain read: cut
+    on = G.done_evidence(store, NOW - 60, NOW + 3 * DAY, thread=wid)
+    assert [e["task"] for e in on] == [old]
+    # a thread merged into another counts as it
+    op2 = WorkOp("starts", None, title="Garden", state="half done", open_items=[], at=NOW + 3 * DAY)
+    store.apply_work([op2])
+    store._write(lambda c: c.execute("UPDATE work_threads SET merged_into = ?, status = 'merged' WHERE id = ?",
+                                     (int(op2.result_id), wid)))
+    assert [e["task"] for e in G.done_evidence(store, NOW - 60, NOW + 3 * DAY, thread=int(op2.result_id))] == [old]
+    assert G.done_evidence(store, NOW - 60, NOW + 3 * DAY, thread=999_999) == []
+    plan = " ".join(str(r[-1]) for r in store._query(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM journal j WHERE j.work_thread_id IN (1, 2) AND j.at >= 0 AND j.at < 1"))
+    assert "journal_work_thread" in plan
+
+
+def test_in_app_can_skip_the_families_a_caller_already_read(store):
+    three_reports(store)
+    F.refresh(store, Words(), now=NOW + 3 * DAY)
+    assert G.in_app(store, "chatter")["families"] and G.in_app(store, "chatter", with_families=False)["families"] == []
