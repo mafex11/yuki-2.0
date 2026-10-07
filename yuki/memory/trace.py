@@ -830,6 +830,8 @@ class TraceWorker:
             else:
                 # a hover is worth a row only with its element; the whole window is none (V5)
                 act.drop = "skip_hover_unresolved"
+        if act.drop is not None:
+            act.open, act.last_t, self._hover = False, now, None   # dropped: nothing to wait for (counted at once)
 
     def _take_sink_travel(self) -> int | None:
         sink = self.sink

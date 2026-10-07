@@ -38,7 +38,7 @@ class FakeHooks:
     def stop(self) -> None:
         self.alive = False
 
-    def action(self, t) -> None:
+    def action(self, t, fold=False) -> None:
         pass
 
     def set_blocked(self, blocked: bool) -> None:
