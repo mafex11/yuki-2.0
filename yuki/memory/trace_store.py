@@ -345,8 +345,8 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         state = trace_links._load(store)
         cursor = int(state.get("cursor") or 0)
         lo, hi = ats[0] - trace_links.PIECE_GAP_S, ats[-1] + trace_links.PIECE_GAP_S
-        around = _rows(conn, "SELECT id, at, process, kind, source, resolved, element_key FROM ui_actions WHERE at >= ?"
-                       " AND at <= ? AND id <= ? ORDER BY at, id", (lo, hi, cursor))
+        around = _rows(conn, "SELECT id, at, ended_at, process, kind, source, resolved, element_key FROM ui_actions"
+                       " WHERE at >= ? AND at <= ? AND id <= ? ORDER BY at, id", (lo, hi, cursor))
         gone = {int(a["id"]) for a in actions}
         with_rows, _l, _i = trace_links.transition_pairs(around)
         without, _l, _i = trace_links.transition_pairs([r for r in around if int(r["id"]) not in gone])

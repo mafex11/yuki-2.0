@@ -130,6 +130,16 @@ def test_precut_at_two_minute_pauses_keeps_link_chains_in_one_piece(store):
     assert [sorted(p.ids) for p in with_hover] == [[1, 10]]
 
 
+def test_precut_measures_a_pause_from_the_end_of_a_long_typing_run():
+    rows = [{"id": 1, "at": 0.0, "source": "user", "kind": "click", "resolved": "point"},
+            {"id": 2, "at": 1.0, "ended_at": 151.0, "source": "user", "kind": "type", "resolved": "focus"},
+            {"id": 3, "at": 152.0, "source": "user", "kind": "keys", "resolved": "focus", "chord": "Ctrl+S"},
+            {"id": 4, "at": 400.0, "source": "user", "kind": "click", "resolved": "point"}]
+    cut = T.precut(rows, [])
+    assert [sorted(p.ids) for p in cut] == [[1, 2, 3], [4]]                         # typing for 150 s is no pause
+    assert cut[0].end == 152.0
+
+
 def test_step_lines_are_code_built_and_content_free(store):
     ids, w, pieces, facts = prepared(store)
     lines = T.step_lines(store, pieces, facts)

@@ -125,6 +125,15 @@ def test_clipboard_links_join_only_the_latest_copy_with_the_same_number(store):
     assert lag == 20.0
 
 
+def test_a_copy_and_paste_inside_one_app_is_no_link(store):
+    act(store, NOW, "codepad", "copy", resolved="event", clip_seq=51)
+    act(store, NOW + 4, "codepad", "paste", resolved="focus", key="k-ed", role="Edit", clip_seq=51)   # same app
+    c = act(store, NOW + 10, "codepad", "copy", resolved="event", clip_seq=52)
+    p = act(store, NOW + 14, "chatter", "paste", resolved="focus", key="k-edit", role="Edit", clip_seq=52)
+    TL.update(store, now=NOW + 20)
+    assert links(store) == [(c, p, "clipboard")]
+
+
 def test_a_sequence_number_reused_after_a_restart_is_never_joined_to_an_old_copy(store):
     act(store, NOW, "webby", "copy", resolved="event", clip_seq=7)
     act(store, NOW + 3600, "webby", "copy", resolved="event", clip_seq=2)    # after a restart the numbers start again
@@ -214,6 +223,18 @@ def test_transitions_follow_each_app_across_other_apps_and_skip_noise(store):
     act(store, NOW + 12, "chatter", "click", role="Button", name="Send", key="k-send")
     TL.update(store, now=NOW + 20)
     assert set(trans(store)) == {("chatter", "k-attach", "k-send")}
+
+
+def test_a_long_typing_run_is_input_all_along_for_the_transition_cut():
+    row = lambda i, at, kind, key, end=None: {"id": i, "at": at, "ended_at": end, "process": "notepadx",  # noqa: E731
+                                              "kind": kind, "source": "user", "resolved": "point", "element_key": key}
+    rows = [row(1, 0.0, "click", "k-doc"), row(2, 1.0, "type", "k-body", end=151.0), row(3, 152.0, "click", "k-save")]
+    pairs, last, last_input = TL.transition_pairs(rows)
+    assert [(a, b) for _p, a, b, _g, _t in pairs] == [("k-doc", "k-body"), ("k-body", "k-save")]
+    assert pairs[1][3] == 1.0 and last_input == 152.0                          # the gap from the run's end
+    rows[1]["ended_at"] = None                                                 # a typing run of one moment
+    pairs, _l, _i = TL.transition_pairs(rows)
+    assert [(a, b) for _p, a, b, _g, _t in pairs] == [("k-doc", "k-body")]     # 151 s of no input: cut
 
 
 def test_transitions_are_kept_incrementally_across_calls(store):

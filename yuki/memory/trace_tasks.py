@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from yuki.memory.trace_links import PIECE_GAP_S, USER_SOURCES
+from yuki.memory.trace_links import PIECE_GAP_S, USER_SOURCES, row_end
 
 #: The model (Haiku 4.5, as the practice learner).
 TASK_MODEL = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -222,8 +222,9 @@ class Fact:
 def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
            gap_s: float = PIECE_GAP_S) -> list[Piece]:
     """The window cut into pieces at pauses of ``gap_s`` with no input from the user (any of their rows counts as
-    input, hovers too), then merged so no link (``{"from", "to"}`` action ids) crosses a cut. Pieces keep only the rows
-    a task may be built from (:func:`kept`); pieces left with none are dropped; ids ``p1``... in time order."""
+    input, hovers too), then merged so no link (``{"from", "to"}`` action ids) crosses a cut. A pause is measured from
+    the end of the last input (a typing run that went on for minutes is input all along). Pieces keep only the rows a
+    task may be built from (:func:`kept`); pieces left with none are dropped; ids ``p1``... in time order."""
     users = [r for r in rows if is_user(r)]
     groups: list[list[dict[str, Any]]] = []
     last: float | None = None
@@ -232,7 +233,7 @@ def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
         if last is None or at - last >= gap_s:
             groups.append([])
         groups[-1].append(r)
-        last = at if last is None else max(last, at)
+        last = row_end(r) if last is None else max(last, row_end(r))
     where = {int(r["id"]): i for i, g in enumerate(groups) for r in g}
     reach = list(range(len(groups)))
     for link in links:
@@ -256,7 +257,7 @@ def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
         keep = [r for r in part if kept(r)]
         if not keep:
             continue
-        pieces.append(Piece(f"p{len(pieces) + 1}", float(part[0]["at"]), float(part[-1]["at"]), keep))
+        pieces.append(Piece(f"p{len(pieces) + 1}", float(part[0]["at"]), max(row_end(r) for r in part), keep))
     return pieces
 
 

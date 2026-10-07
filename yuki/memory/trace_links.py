@@ -61,7 +61,8 @@ PRESS_KINDS = ("click", "dclick", "invoke")
 #: Raw rows are kept this long (decision D4): a join never looks further back.
 LOOKBACK_S = 30 * 86400.0
 
-_COLUMNS = ("id, at, process, kind, source, resolved, role, element_key, clip_seq, file_digest, facts, page_key")
+_COLUMNS = ("id, at, ended_at, process, kind, source, resolved, role, element_key, clip_seq, file_digest, facts,"
+            " page_key")
 
 
 def _facts(row: Any) -> dict[str, Any]:
@@ -76,16 +77,30 @@ def _user(row: Any) -> bool:
     return row["source"] in USER_SOURCES
 
 
+def row_end(row: Any) -> float:
+    """When a row's input ended: a typing run or a drag lasts (``ended_at``), anything else is a moment (``at``)."""
+    at = float(row["at"])
+    try:
+        end = row["ended_at"]
+    except (KeyError, IndexError):
+        end = None
+    return max(at, float(end)) if end is not None else at
+
+
 # -- links ---------------------------------------------------------------------------------------------------------
 
 
 def _clipboard_link(conn: sqlite3.Connection, r: Any) -> tuple[int, int, str, float] | None:
+    """A copy in app A and a paste in app B with the same clipboard sequence number (report 78 §5.1: a link joins two
+    apps; a copy and paste inside one app is that app's own steps, kept by its transitions)."""
     if r["kind"] != "paste" or r["clip_seq"] is None or not _user(r):
         return None
     copy = conn.execute(
-        "SELECT id, at, clip_seq, source FROM ui_actions INDEXED BY ui_actions_kind WHERE kind = 'copy' AND at <= ?"
+        "SELECT id, at, clip_seq, source, process FROM ui_actions INDEXED BY ui_actions_kind WHERE kind = 'copy' AND at <= ?"
         " AND at >= ? ORDER BY at DESC, id DESC LIMIT 1", (float(r["at"]), float(r["at"]) - LOOKBACK_S)).fetchone()
     if copy is None or copy["clip_seq"] is None or int(copy["clip_seq"]) != int(r["clip_seq"]) or not _user(copy):
+        return None
+    if str(copy["process"] or "") == str(r["process"] or ""):
         return None
     return int(copy["id"]), int(r["id"]), "clipboard", round(float(r["at"]) - float(copy["at"]), 2)
 
@@ -158,23 +173,24 @@ def transition_pairs(rows: Sequence[Any], last: dict[str, list[Any]] | None = No
                                                                dict[str, list[Any]], float | None]:
     """Fold rows (oldest first) into per-app pairs ``[(process, from_key, to_key, gap_s, at)]``; ``last`` (each app's
     last element ``[key, at]``) and ``last_input`` (the user's last input time) carry over between calls. A pause of
-    :data:`PIECE_GAP_S` without the user's input clears every app's last element."""
+    :data:`PIECE_GAP_S` without the user's input clears every app's last element. A pause is measured from the end
+    of the user's last input (a long typing run is input all along), and a pair's gap from the end of its first step."""
     last = {k: list(v) for k, v in (last or {}).items()}
     pairs: list[tuple[str, str, str, float, float]] = []
     for r in rows:
         if not _user(r):
             continue
-        at = float(r["at"])
+        at, end = float(r["at"]), row_end(r)
         if last_input is not None and at - last_input >= PIECE_GAP_S:
             last = {}
-        last_input = at if last_input is None else max(last_input, at)
+        last_input = end if last_input is None else max(last_input, end)
         if not element_row(r):
             continue
         proc, key = str(r["process"] or ""), str(r["element_key"])
         prev = last.get(proc)
         if prev is not None and prev[0] != key:
             pairs.append((proc, str(prev[0]), key, round(max(0.0, at - float(prev[1])), 3), at))
-        last[proc] = [key, at]
+        last[proc] = [key, end]
     return pairs, last, last_input
 
 
