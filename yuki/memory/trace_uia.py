@@ -358,19 +358,30 @@ def window_hung(hwnd: int) -> bool:
         return False
 
 
+#: This module's own ``SendMessageTimeoutW`` prototype (review F6): built once on a private ``WinDLL`` handle, so the
+#: shared ``ctypes.windll.user32`` function object - which other code in the process calls with its own argument
+#: types (``yuki.perception.tree`` passes a ``DWORD`` result) - is never changed.
+_send_timeout: Any = None
+
+
+def _send_message_timeout() -> Any:
+    global _send_timeout
+    if _send_timeout is None:
+        from ctypes import wintypes
+
+        proto = ctypes.WINFUNCTYPE(ctypes.c_size_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                   wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t))
+        _send_timeout = proto(("SendMessageTimeoutW", ctypes.WinDLL("user32")))
+    return _send_timeout
+
+
 def window_answers(hwnd: int, timeout_ms: int = ANSWER_MS) -> bool:
     """Whether the window takes a no-op message (``WM_NULL``) within ``timeout_ms`` (``SendMessageTimeoutW`` with
     ``SMTO_ABORTIFHUNG``: returns at once for a hung window). Changes nothing in the app."""
-    from ctypes import wintypes
-
     try:
         result = ctypes.c_size_t(0)
-        fn = ctypes.windll.user32.SendMessageTimeoutW
-        fn.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM, wintypes.UINT, wintypes.UINT,
-                       ctypes.POINTER(ctypes.c_size_t)]
-        fn.restype = ctypes.c_size_t
-        return bool(fn(int(hwnd), _WM_NULL, 0, 0, _SMTO_ABORTIFHUNG | _SMTO_BLOCK, int(timeout_ms),
-                       ctypes.byref(result)))
+        return bool(_send_message_timeout()(int(hwnd), _WM_NULL, 0, 0, _SMTO_ABORTIFHUNG | _SMTO_BLOCK,
+                                            int(timeout_ms), ctypes.byref(result)))
     except Exception:  # noqa: BLE001
         return False
 

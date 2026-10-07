@@ -148,7 +148,7 @@ def test_relevant_and_the_memory_client_carry_go_tos_and_a_pitfall_lowers_an_ele
     client = MemoryClient(store)
     assert client.practice("", open_apps=["chatter"])["go_tos"][0]["app"] == "chatter"
     assert client.go_tos(["chatter"])[0]["app"] == "chatter"
-    assert H.served_today() >= 1
+    assert H.served_today(store) >= 1
 
 
 # -- the caps stay untouched -----------------------------------------------------------------------------------------

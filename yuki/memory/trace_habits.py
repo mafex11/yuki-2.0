@@ -238,8 +238,16 @@ _cache: dict[Any, tuple[str, dict[str, Any]]] = {}
 #: ``{store key: (newest action id, newest trace changelog id)}`` this process has folded up to.
 _seen: dict[Any, tuple[int, int]] = {}
 _lock = threading.Lock()
-#: Go-tos served to requests, per local day (the doctor's count; persisted by the practice worker).
+#: Go-tos served to requests by this process, per local day, not yet added to the shared count (review F5: go-tos are
+#: served in the Yuki app's process, the doctor's health is written by the memory service - the count both see is
+#: the ``nudge_state`` value :data:`SERVED_KEY`).
 SERVED: Counter[str] = Counter()
+#: ``nudge_state`` name of the shared count: ``{"day": "YYYY-MM-DD", "n": requests served go-tos that day}``.
+SERVED_KEY = "trace:go_tos_served"
+#: This process adds its count to the shared one at most this often (s): one small write, not one per request.
+SERVED_FLUSH_S = 30.0
+#: ``{store key: when this process last added its count}``.
+_flushed: dict[Any, float] = {}
 
 
 def _cache_key(store: Any) -> Any:
@@ -333,17 +341,61 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
             if entry["elements"] or entry["chords"]:
                 out.append(entry)
         if out:
-            SERVED[_day(now)] += 1
+            note_served(store, now)
         return out
     except Exception:  # noqa: BLE001 - a hint is never worth an error on the request
         return []
 
 
-def served_today(now: float | None = None) -> int:
-    return int(SERVED.get(_day(time.time() if now is None else float(now)), 0))
+def note_served(store: Any, now: float | None = None) -> None:
+    """Count one request that was served go-tos: in this process, added to the shared count (:data:`SERVED_KEY`) at
+    once the first time and then at most every :data:`SERVED_FLUSH_S`. Never raises."""
+    now = time.time() if now is None else float(now)
+    with _lock:
+        SERVED[_day(now)] += 1
+        due = now - _flushed.get(_cache_key(store), float("-inf")) >= SERVED_FLUSH_S
+    if due:
+        flush_served(store, now)
+
+
+def flush_served(store: Any, now: float | None = None) -> None:
+    """Add this process's uncounted go-tos to the shared count, in one statement (another process may add its own at
+    the same time); a new day starts the count again. Never raises (the count is kept for the next try)."""
+    now = time.time() if now is None else float(now)
+    with _lock:
+        pending = {d: n for d, n in SERVED.items() if n}
+        SERVED.clear()
+        _flushed[_cache_key(store)] = now
+    if not pending:
+        return
+    day = max(pending)        # an older day's count left over is past: only the newest day is kept
+    n = int(pending[day])
+    try:
+        store._write(lambda conn: conn.execute(
+            "INSERT INTO nudge_state(name, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+            " value = CASE WHEN json_valid(value) AND json_extract(value, '$.day') = ?"
+            " THEN json_object('day', ?, 'n', coalesce(json_extract(value, '$.n'), 0) + ?)"
+            " WHEN json_valid(value) AND json_extract(value, '$.day') > ? THEN value ELSE excluded.value END,"
+            " updated_at = excluded.updated_at",
+            (SERVED_KEY, json.dumps({"day": day, "n": n}), now, day, day, n, day)))
+    except Exception:  # noqa: BLE001 - kept for the next try
+        with _lock:
+            for d, c in pending.items():
+                SERVED[d] += c
+
+
+def served_today(store: Any, now: float | None = None) -> int:
+    """Requests served go-tos today, by every process (the shared count, :data:`SERVED_KEY`). Never raises."""
+    day = _day(time.time() if now is None else float(now))
+    try:
+        data = json.loads(store.nudge_state(SERVED_KEY) or "{}")
+    except Exception:  # noqa: BLE001
+        return 0
+    return int(data.get("n") or 0) if isinstance(data, dict) and data.get("day") == day else 0
 
 
 __all__ = ["APPS_SHOWN", "BATCH", "CHORD_MODIFIERS", "ELEMENT_KINDS", "HALF_LIFE_DAYS", "IDENTITY_RESOLVED",
            "KEEP_DAYS", "MAX_APPS", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS",
-           "TOP_ELEMENTS", "USER_SOURCES", "chord_keys", "fold_rows", "go_tos", "is_chord", "prune", "served_today",
+           "SERVED_KEY", "TOP_ELEMENTS", "USER_SOURCES", "chord_keys", "flush_served", "fold_rows", "go_tos", "is_chord",
+           "note_served", "prune", "served_today",
            "tallies", "update"]
