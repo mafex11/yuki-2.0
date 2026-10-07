@@ -521,7 +521,8 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
                 best, best_cos = f, c
         if best is None:
             return empty
-        out: dict[str, Any] = {"path": None, "example": None}
+        # capC4: the family's id, so practice.relevant can bring its linked way (family -> path -> playbook)
+        out: dict[str, Any] = {"path": None, "example": None, "family_id": int(best["id"])}
         n_tasks = int(best["n_tasks"] or 0)
         n_routes = int(best["path_n"] or 0) or min(n_tasks, PATH_TASKS)   # what the path's counts are out of
         nodes = json.loads(best["path_keys"] or "[]")
