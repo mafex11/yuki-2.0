@@ -139,6 +139,27 @@ def test_windows_own_per_dpi_metric_is_used_when_there_is_one_and_per_monitor():
     assert broken.drag_size(0, 0) == (4, 4)                           # a failing read: the system's own values
 
 
+def test_a_drag_row_keeps_how_far_the_cursor_ended_from_the_press(tmp_path):
+    import json
+
+    from test_trace_worker import Rig
+
+    from yuki.memory.trace_uia import Element
+
+    rig = Rig(tmp_path)
+    try:
+        rig.uia.points[(150, 120)] = Element(role="Edit", name="Search", bounds=(100, 100, 600, 140), pid=101,
+                                             patterns=("value",))
+        t = rig.clock.t
+        rig.feed("down", t, "left", 150, 120, "user", 0, False, 11)
+        rig.feed("up", t + 0.5, "left", 290, 124, "user", True, dt=0.5)
+        rig.settle()
+        (row,) = rig.rows()
+        assert row["kind"] == "drag" and json.loads(row["facts"])["moved_px"] == 140
+    finally:
+        rig.store.close()
+
+
 def test_the_real_metrics_scale_for_the_monitor_under_a_point():
     m = Metrics()                                                     # read-only system calls
     w, h = m.drag_size(0, 0)

@@ -645,6 +645,10 @@ class TraceWorker:
         if drag:
             act.kind = "drag"
             act.end_x, act.end_y = x, y
+            # capC1c: how far the cursor ended from the press (px, the larger axis): the sink's drag test, kept so a
+            # live hour can check drags near Windows' drag rectangle
+            act.facts["moved_px"] = int(max(abs(x - (act.x if act.x is not None else x)),
+                                            abs(y - (act.y if act.y is not None else y))))
             act.travel = (act.travel or 0) + int(round(abs(x - (act.x or x)) + abs(y - (act.y or y))))
             if act.drop is not None:
                 return
