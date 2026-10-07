@@ -942,6 +942,26 @@ class TaskPass:
 
     # -- the worker's call -----------------------------------------------------------------------------------------
 
+    def mark_empty(self, *, now: float | None = None, limit: int = 50) -> int:
+        """Windows due with no action of the user's at all (the trace off then, or nobody at the PC) are recorded
+        ``empty`` at once, without the gate and without counting towards a pass's windows: one indexed count each, no
+        model. Returns how many."""
+        now = time.time() if now is None else float(now)
+        done = 0
+        for window in windows_due(self.store, now, limit=limit):
+            try:
+                n = self.store._query("SELECT count(*) FROM ui_actions WHERE at >= ? AND at < ? AND source IN"
+                                      " ('user', 'user_injected')", (window.start, window.end))[0][0]
+            except Exception:  # noqa: BLE001
+                return done
+            if n:
+                continue
+            res = PassResult(window, outcome="empty")
+            res.run_id = self._start_run(window, now)
+            self._finish_run(res)
+            done += 1
+        return done
+
     def run_once(self, *, now: float | None = None, limit: int = WINDOWS_PER_PASS) -> list[PassResult]:
         """Pass the windows due (at most ``limit``, oldest first); stops at the first refusal or failure."""
         now = time.time() if now is None else float(now)

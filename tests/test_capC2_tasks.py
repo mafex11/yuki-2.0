@@ -278,6 +278,27 @@ def test_catch_up_four_windows_a_pass_and_nothing_older_than_7_days(store):
     assert h["backlog"] == 0 and h["tasks_today"] == 6 and h["unclear_today"] == 6
 
 
+def test_windows_with_no_action_of_the_user_are_closed_at_once_without_the_gate(store):
+    from yuki.memory.practice_learn import PracticeWorker
+
+    now = NOW + 2 * DAY
+    for i in range(7):
+        episode(store, now - DAY + i * 3600, now - DAY + i * 3600 + 600)          # the trace was off then
+    busy = now - DAY + 3 * 3600
+    act(store, busy + 60, "chatter", "click", role="Button", name="Send", key="k-send", source="yuki")   # Yuki's only
+    with_rows = now - 3600
+    episode(store, with_rows, with_rows + 600)
+    act(store, with_rows + 60, "chatter", "click", role="Button", name="Send", key="k-send")
+    worker = Worker([])
+    worker.store = store
+    pw = PracticeWorker(store, worker, idle_fn=lambda: 5.0, live_fn=lambda: {}, clock=lambda: now)
+    out = pw.task_pass(now)
+    assert out.get("tasks_waiting") == "busy" and not worker.calls                  # the gate still holds the model
+    assert [w.start for w in T.windows_due(store, now, limit=None)] == [with_rows]  # the 7 empty ones are closed
+    assert store._query("SELECT count(*) FROM ui_task_runs WHERE outcome = 'empty' AND ok = 1")[0][0] == 7
+    assert json.loads(store.nudge_state(T.HEALTH_KEY))["backlog"] == 1
+
+
 def test_the_pass_refuses_when_todays_cost_reached_the_cap(store):
     ids, w, pieces, facts = prepared(store)
     store._write(lambda c: c.execute("INSERT INTO ui_task_runs(at, cost_usd, ok) VALUES (?, ?, 1)",

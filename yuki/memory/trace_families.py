@@ -215,9 +215,11 @@ def _members(conn: sqlite3.Connection, fid: int) -> list[sqlite3.Row]:
         " ORDER BY ended_at DESC", (int(fid),)).fetchall()
 
 
-def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None = None) -> str:
+def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None = None, path: bool = True) -> str:
     """One family again from its tasks (inside the caller's transaction): its centre, label, apps, count, last use and
-    usual path; deleted when no task is left. Returns ``"deleted"`` or ``"rebuilt"``."""
+    usual path; deleted when no task is left. ``path`` False (a task just placed, more may follow in the same pass):
+    the usual path is kept as it was (a new family takes its one task's route), the rest is worked out. Returns
+    ``"deleted"`` or ``"rebuilt"``."""
     now = time.time() if now is None else float(now)
     members = _members(conn, fid)
     if not members:
@@ -231,8 +233,12 @@ def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None
     centre = np.mean([v for _m, v in vecs], axis=0) if vecs else None
     label_row = max(vecs, key=lambda mv: float(mv[1] @ centre))[0] if vecs else members[0]
     apps = Counter(a for m in members for a in json.loads(m["apps"] or "[]"))
-    routes = [route(task_rows(store, int(m["id"]), conn=conn)) for m in members[:PATH_TASKS]]
-    nodes, branches = build_path(routes)
+    old = conn.execute("SELECT path_keys, variants_keys FROM ui_families WHERE id = ?", (int(fid),)).fetchone()
+    if path or old is None or not old["path_keys"] or old["path_keys"] == "[]":
+        chosen = members[:PATH_TASKS] if path else members[:1]
+        nodes, branches = build_path([route(task_rows(store, int(m["id"]), conn=conn)) for m in chosen])
+    else:
+        nodes, branches = json.loads(old["path_keys"]), json.loads(old["variants_keys"] or "[]")
     conn.execute(
         "UPDATE ui_families SET label_ciphertext = ?, n_tasks = ?, apps = ?, path_keys = ?, variants_keys = ?,"
         " vec_ciphertext = ?, last_at = ?, updated_at = ? WHERE id = ?",
@@ -330,15 +336,13 @@ def refresh(store: Any, embedder: Any, *, now: float | None = None) -> dict[str,
                                        (now,)).lastrowid)
                 out["new"] += 1
             conn.execute("UPDATE ui_tasks SET family_id = ? WHERE id = ?", (fam, tid))
-            rebuild(conn, store, fam, now=now)       # at once, so the next task of this pass can join it
-            rebuilt.add(fam)
-            touched.discard(fam)
+            # its centre at once, so the next task of this pass can join it; the usual path once, below
+            rebuild(conn, store, fam, now=now, path=False)
+            touched.add(fam)
             out["placed"] += 1
         for fid in touched:
             rebuild(conn, store, fid, now=now)
-        return {"tasks": len(todo), **dict(out), "families": len(touched | rebuilt)}
-
-    rebuilt: set[int] = set()
+        return {"tasks": len(todo), **dict(out), "families": len(touched)}
 
     return store._write(op)
 
