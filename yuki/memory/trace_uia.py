@@ -9,9 +9,9 @@ stored.
 
 * :meth:`TraceUia.at_point`: ``ElementFromPointBuildCache`` at the point taken at button-down (path ii); with
   ``refine`` (capC1c), inside the same lookup, a renderer's whole pane gets the descent and any other unnamed
-  container with no actionable pattern (:data:`CONTAINER_ROLES`, :data:`ACTION_PATTERNS`) the walk to the real
-  control (:meth:`TraceUia.refine`: the nearest actionable or named ancestor still under the point, else the smallest
-  named descendant under it);
+  container (:data:`CONTAINER_ROLES`) the walk to the real control (:meth:`TraceUia.refine`: with no actionable
+  pattern (:data:`ACTION_PATTERNS`), the nearest actionable or named ancestor still under the point, else the smallest
+  named descendant under it; an actionable but unnamed wrapper, a named element under the point if there is one);
 * :meth:`TraceUia.from_event`: the element an ``INVOKED``, ``SELECTION`` or ``FOCUS`` WinEvent named
   (``AccessibleObjectFromEvent`` then ``ElementFromIAccessibleBuildCache``; path i);
 * :meth:`TraceUia.descend`: from a renderer's whole pane (Chromium, CEF answer ``ElementFromPoint`` with the page),
@@ -43,9 +43,12 @@ _P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND
 _P_TOGGLE, _P_SELECTED, _P_VALUE = 30086, 30079, 30045
 _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM = 30041, 30036     # Is...PatternAvailable: a state only where the pattern is
 _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE = 30031, 30028, 30043
+#: ``ValueIsReadOnly`` (second verification V2-1): a Value pattern counts as actionable only when it can be set.
+#: Every Chromium / Electron page Document exposes a read-only Value (the page's address): no control to act on.
+_P_VALUE_READONLY = 30046
 #: capC1c: the control patterns that make an element something a person acts on (UI Automation's own
 #: ``Is...PatternAvailable`` properties, read with the element's other cached facts): the element's own machine facts,
-#: never a word list. Stored with the row as ``facts.patterns``.
+#: never a word list. Stored with the row as ``facts.patterns``. ``value`` only when ``ValueIsReadOnly`` reads false.
 ACTION_PATTERNS = ((_P_HAS_INVOKE, "invoke"), (_P_HAS_TOGGLE, "toggle"), (_P_HAS_SELECTION_ITEM, "select"),
                    (_P_HAS_EXPAND, "expand"), (_P_HAS_VALUE, "value"))
 #: capC1c: the control types that only hold other controls (UI Automation's fixed vocabulary). One of these with no
@@ -103,6 +106,8 @@ class Element:
     refined: str | None = None
     #: capC1c: the first native window handle on it or its ancestors (its top-level window is that one's root).
     window: int = 0
+    #: V2-4: the top-level window under the point right when ``ElementFromPoint`` answered (0: not read).
+    root: int = 0
 
     def actionable(self) -> bool:
         """Whether it exposes one of :data:`ACTION_PATTERNS` (Invoke, Toggle, SelectionItem, ExpandCollapse, Value).
@@ -172,7 +177,8 @@ class TraceUia:
         self._uia = uia
         request = uia.CreateCacheRequest()
         for prop in (_P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND, _P_TOGGLE,
-                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM, _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE):
+                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM, _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE,
+                     _P_VALUE_READONLY):
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
         self._request = request
@@ -223,7 +229,9 @@ class TraceUia:
         password = number(_P_PASSWORD)
         selected = number(_P_SELECTED) if number(_P_HAS_SELECTION_ITEM) else None
         toggle = number(_P_TOGGLE) if number(_P_HAS_TOGGLE) else None
-        patterns = tuple(word for prop, word in ACTION_PATTERNS if number(prop))
+        # V2-1: a read-only Value (or one whose ValueIsReadOnly cannot be read) is nothing a person sets
+        patterns = tuple(word for prop, word in ACTION_PATTERNS
+                         if number(prop) and (prop != _P_HAS_VALUE or number(_P_VALUE_READONLY) == 0))
         hwnd = number(_P_HWND) or 0
         return Element(role=ROLE_NAMES.get(int(ctype), f"ControlType{ctype}") if isinstance(ctype, int) else "",
                        name=text(_P_NAME), aid=text(_P_AID), rid=rid, bounds=_bounds(get(_P_BOUNDS)),
@@ -277,12 +285,30 @@ class TraceUia:
         """Whether it covers the window (half its area or more): a whole pane, never "the real control"."""
         return bool(max_area) and el.area() * 2 >= max_area
 
+    @staticmethod
+    def unnamed_container(el: Element) -> bool:
+        """An unnamed container (:data:`CONTAINER_ROLES`, no name), actionable or not: the walk's starting point
+        (second verification V2-3: Chromium and Electron wrap most named controls in unnamed Groups that expose
+        Invoke)."""
+        return el.role in CONTAINER_ROLES and not (el.name or "").strip()
+
     def refine(self, element: Element, x: int, y: int, *, deadline: float, max_area: int = 0) -> Element | None:
-        """capC1c: the real control behind an unnamed container (:meth:`Element.low_info`), by UI Automation's own
-        facts: (1) the nearest ancestor that exposes an actionable pattern (:data:`ACTION_PATTERNS`) or has a name and
-        still contains the point (never one that covers the window, ``max_area`` being the window's area); else (2)
-        the smallest descendant under the point that has a name or an actionable pattern. None when neither is found
-        before ``deadline``. Reads only; no ancestry (the caller takes it for the element it keeps)."""
+        """capC1c: the real control behind an unnamed container (:meth:`unnamed_container`), by UI Automation's own
+        facts. One with no actionable pattern (:meth:`Element.low_info`): (1) the nearest ancestor that exposes an
+        actionable pattern (:data:`ACTION_PATTERNS`) or has a name and still contains the point (never one that covers
+        the window, ``max_area`` being the window's area); else (2) the smallest descendant under the point that has a
+        name or an actionable pattern. One that is actionable but unnamed (a clickable wrapper, V2-3): a *named*
+        element under the point, the smallest named descendant first, then the nearest named ancestor; the wrapper
+        itself stands when neither is found. None when nothing is found before ``deadline``. Reads only; no ancestry
+        (the caller takes it for the element it keeps)."""
+        if element.actionable():
+            return (self._refine_down(element, x, y, deadline=deadline, named_only=True)
+                    or self._refine_up(element, x, y, deadline=deadline, max_area=max_area, named_only=True))
+        return (self._refine_up(element, x, y, deadline=deadline, max_area=max_area, named_only=False)
+                or self._refine_down(element, x, y, deadline=deadline, named_only=False))
+
+    def _refine_up(self, element: Element, x: int, y: int, *, deadline: float, max_area: int,
+                   named_only: bool) -> Element | None:
         current = element.ref
         for _level in range(REFINE_UP):
             if current is None or time.perf_counter() >= deadline:
@@ -294,12 +320,15 @@ class TraceUia:
             facts = self._facts(parent, time.perf_counter())
             if facts is None or not facts.contains(x, y) or self._covers(facts, max_area):
                 break
-            if (facts.name or "").strip() or facts.actionable():
+            if (facts.name or "").strip() or (not named_only and facts.actionable()):
                 facts.refined = "up"
                 return facts
             if facts.role == "Window" and facts.hwnd:
                 break                                # a window of its own: nothing above it is the control
             current = parent
+        return None
+
+    def _refine_down(self, element: Element, x: int, y: int, *, deadline: float, named_only: bool) -> Element | None:
         best: Element | None = None
         current = element.ref
         for _level in range(REFINE_DOWN):
@@ -317,7 +346,7 @@ class TraceUia:
                     hit = kid
             if hit is None:
                 break
-            if (hit.name or "").strip() or hit.actionable():
+            if (hit.name or "").strip() or (not named_only and hit.actionable()):
                 best = hit                           # deeper is smaller: the last one found is the smallest
             current = hit.ref
         if best is not None:
@@ -330,7 +359,9 @@ class TraceUia:
         (one token of the budget, one hung-app check, :data:`REFINE_SHARE` of its time, the rest kept for the
         ancestry): a container covering the window (``max_area``: the window's area; a renderer's whole pane) gets
         the renderer descent at once (``refined`` ``"descent"`` / ``"path"``), any other unnamed container the walk
-        (:meth:`refine`, ``"up"`` / ``"down"``). A whole pane nothing deeper answers for comes back as it is."""
+        (:meth:`refine`, ``"up"`` / ``"down"``). A whole pane nothing deeper answers for comes back as it is.
+        ``Element.root`` is the top-level window under the point right when ``ElementFromPoint`` answered (V2-4),
+        before the walk and the ancestry: a window the click itself brings up later is never read as the answer's."""
         from ctypes import wintypes
 
         t0 = time.perf_counter()
@@ -338,6 +369,7 @@ class TraceUia:
             el = self._uia.ElementFromPointBuildCache(wintypes.POINT(int(x), int(y)), self._request)
         except Exception:  # noqa: BLE001
             return None
+        root = _root_at(x, y)
         facts = self._facts(el, t0)
         if facts is not None and refine:
             deadline = t0 + budget_s * REFINE_SHARE
@@ -345,11 +377,12 @@ class TraceUia:
                 deeper = self._descend(facts, x, y, deadline=deadline, refine=True, max_area=max_area)
                 if deeper is not None:
                     facts = deeper
-            elif facts.low_info():
+            elif self.unnamed_container(facts):
                 better = self.refine(facts, x, y, deadline=deadline, max_area=max_area)
                 if better is not None:
                     facts = better
         if facts is not None:
+            facts.root = root
             self._ancestry(facts, t0 + budget_s, index=index)
             facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return facts
@@ -396,6 +429,7 @@ class TraceUia:
                  max_area: int) -> Element | None:
         best: Element | None = None
         on_path: Element | None = None
+        on_path_named: Element | None = None
         current = pane.ref
         for _level in range(DESCENT_LEVELS):
             if current is None or time.perf_counter() >= deadline:
@@ -415,8 +449,15 @@ class TraceUia:
             best, current = hit, hit.ref
             if not self._covers(hit, max_area) and ((hit.name or "").strip() or hit.actionable()):
                 on_path = hit
-        if refine and best is not None and best.low_info() and on_path is not None and on_path is not best:
-            best = on_path
+                if (hit.name or "").strip():
+                    on_path_named = hit
+        # the smallest element under the point is an unnamed container: the nearest named element on the way down
+        # (V2-3), else, for one with no actionable pattern, the nearest actionable one
+        instead = None
+        if refine and best is not None and self.unnamed_container(best):
+            instead = on_path_named or (on_path if best.low_info() else None)
+        if instead is not None and instead is not best:
+            best = instead
             best.refined = "path"
         elif best is not None and refine:
             best.refined = "descent"
@@ -514,6 +555,17 @@ def window_answers(hwnd: int, timeout_ms: int = ANSWER_MS) -> bool:
                                             int(timeout_ms), ctypes.byref(result)))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _root_at(x: int, y: int) -> int:
+    """The top-level window under a physical point (``WindowFromPhysicalPoint`` + ``GetAncestor(GA_ROOT)``: no
+    messages sent); 0 when it cannot be read."""
+    try:
+        from yuki.memory.trace_hooks import root_at
+
+        return int(root_at(int(x), int(y)) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def window_pid(hwnd: int) -> int:

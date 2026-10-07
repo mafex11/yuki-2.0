@@ -620,11 +620,16 @@ class TraceWorker:
                         act.lookup_end = self._clock()
                     else:
                         self._point_only(act, el)
-            act.answer_root = self._answer_root(x, y)
+            act.answer_root = self._answer_root(x, y, el)
 
-    def _answer_root(self, x: int, y: int) -> int:
-        """capC1c: the top-level window under the point now (when a lookup answered): compared with the one under the
-        press (:meth:`_stale`)."""
+    def _answer_root(self, x: int, y: int, el: Any = None) -> int:
+        """capC1c: the top-level window under the point when the lookup answered: compared with the one under the
+        press (:meth:`_stale`), only for an element whose own window is unknown. Second verification V2-4: the client
+        reads it right when ``ElementFromPoint`` answers (``el.root``), before the walk and the ancestry, so a window
+        the click itself brings over the point afterwards is never taken for the answer's; read now otherwise."""
+        root = int(getattr(el, "root", 0) or 0) if el is not None else 0
+        if root:
+            return root
         try:
             return int(self._window_at(x, y)[0] or 0)
         except Exception:  # noqa: BLE001
@@ -711,7 +716,7 @@ class TraceWorker:
             act.down_root = int(hwnd or 0)
             el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid))
             act.lookup_end = self._clock()
-            act.answer_root = self._answer_root(x, y)
+            act.answer_root = self._answer_root(x, y, el)
             if self._whole_window(el, hwnd):
                 self._point_only(act, el)
             elif el is not None:
@@ -996,7 +1001,7 @@ class TraceWorker:
             # spare budget only (clicks keep their reserve); an unnamed container's answer is walked like a click's
             el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid), **self._walk_kw(hwnd))
             act.lookup_end = self._clock()
-            act.answer_root = self._answer_root(x, y)
+            act.answer_root = self._answer_root(x, y, el)
             if el is not None and not self._whole_window(el, hwnd) and not (el.name or "").strip() \
                     and not el.actionable():
                 # capC1c: still no name and no actionable pattern after the walk (an unnamed Group, List, Window):
@@ -1283,23 +1288,27 @@ class TraceWorker:
     def _stale(self, act: _Act, *, count: bool = True) -> bool:
         """capC1c: whether the element a lookup answered may not be what was under the press, by machine facts only:
         a structure change whose own window covers the point while the lookup answered (decided as the events came,
-        ``act.stale``; the short history covers one that reached the queue before the press itself); another
-        top-level window under the point when the lookup answered than at the press; the element's own top-level
+        ``act.stale``; the short history covers one that reached the queue before the press itself); for an element
+        whose own window is unknown, another top-level window under the point when ``ElementFromPoint`` answered than
+        at the press (V2-4); the element's own top-level
         window not the one under the press; or its bounds no longer holding the point. A window that came to the
         front after the press (a taskbar click's app) is the click's outcome, never staleness."""
         if act.resolved not in ("point", "snapshot") or act.lookup_end is None:
             return False
         if act.stale:
             return True
-        if act.down_root and act.answer_root and act.answer_root != act.down_root:
+        el = act.el
+        own_window = int(getattr(el, "window", 0) or 0) if el is not None else 0
+        # V2-4: the window under the point at the answer decides only for an element whose own window is unknown; one
+        # whose window is known is judged by that window (below), which is what was under the point when it answered
+        if not own_window and act.down_root and act.answer_root and act.answer_root != act.down_root:
             self.counters["stale_root_changed"] += int(count)
             return True
-        el = act.el
         if el is not None and act.x is not None:
             if el.bounds and not el.contains(act.x, act.y):
                 self.counters["stale_bounds"] += int(count)
                 return True
-            window = int(getattr(el, "window", 0) or 0)
+            window = own_window
             if window and act.down_root:
                 try:
                     top = int(self._root_of(window) or 0)
@@ -1654,9 +1663,25 @@ def _root_of(hwnd: int) -> int:
 
 
 def _window_pid(hwnd: int) -> int:
-    from yuki.memory.trace_uia import window_pid
+    """The process a pressed window shows, read the way :func:`_window_at` reads it (second verification V2-2): for a
+    UWP frame (``ApplicationFrameWindow``) the hosted app's (``content_pid``: enumerates child windows, sends no
+    messages), so the privacy gates see the app, never its host. A frame showing only its host (the app's window
+    detached or gone) is 0: the press's app is unknown and the press keeps nothing. 0 when the window is gone."""
+    try:
+        from yuki.memory.extract.uia import _UWP_FRAME_CLASS, content_pid
 
-    return window_pid(hwnd)
+        pid = int(content_pid(int(hwnd)) or 0) if hwnd else 0
+        if not pid:
+            return 0
+        import win32gui
+        import win32process
+
+        if win32gui.GetClassName(int(hwnd)) == _UWP_FRAME_CLASS \
+                and pid == int(win32process.GetWindowThreadProcessId(int(hwnd))[1]):
+            return 0
+        return pid
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _rect(hwnd: int) -> tuple[int, int, int, int] | None:
@@ -1826,10 +1851,8 @@ class Trace:
         recent = recent_folder()
         self.hooks = TraceHooks(self._put_input, recent=recent)
         metrics = Metrics()
-        from yuki.memory.trace_uia import window_pid
-
         self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at,
-                               pid_of=window_pid)
+                               pid_of=_window_pid)
         rules_fn = self.privacy.rules
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,

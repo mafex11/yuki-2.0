@@ -2,7 +2,7 @@
 
 The first live recording had 9 drags in 8 minutes, several of them plain clicks (an address bar, a search box, a chat
 list). The test now compares the cursor (physical pixels) at button-down and at button-up against ``SM_CXDRAG`` x
-``SM_CYDRAG`` scaled for the monitor's DPI as Windows does (``GetSystemMetricsForDpi``), never the device's raw counts
+``SM_CYDRAG`` as Windows answers it for the monitor's DPI (``GetSystemMetricsForDpi``), never the device's raw counts
 (mickeys, which pointer speed and acceleration rescale). Unlike ``DragDetect``, a wobble that came back is a click;
 how far it went is kept (``came_back``, review C1c-4). Fed as the reader feeds it (plain integers, a fake cursor);
 nothing touches the desktop.
@@ -171,8 +171,10 @@ def test_raw_counts_never_decide_only_the_cursor_does():
     assert ups(items)[-1][6] is True
 
 
-def test_the_rectangle_is_windows_own_at_96_dpi_and_scaled_for_a_150_percent_monitor():
-    for dpi, moved, drag in ((96, 2, False), (96, 3, True), (144, 3, False), (144, 4, True)):
+def test_without_the_per_dpi_call_the_rectangle_is_the_systems_own_on_any_monitor():
+    """Second verification V2-5: Windows' per-DPI metric does not scale SM_CXDRAG (4 at 96, 120, 144 and 192 DPI on
+    this PC), so the fallback must not scale either: a 3 px release is a drag on a 150% monitor too."""
+    for dpi, moved, drag in ((96, 2, False), (96, 3, True), (144, 2, False), (144, 3, True)):
         cur = Cursor()
         s, items = sink(cur, dpi_at=lambda x, y, d=dpi: d)
         s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
@@ -183,6 +185,8 @@ def test_the_rectangle_is_windows_own_at_96_dpi_and_scaled_for_a_150_percent_mon
 
 
 def test_windows_own_per_dpi_metric_is_used_when_there_is_one_and_per_monitor():
+    """Whatever Windows answers for the monitor's DPI is the rectangle (it answers 4 everywhere today; a different
+    answer, faked here, would be followed as it is)."""
     asked: list = []
 
     def for_dpi(metric, dpi):
@@ -218,7 +222,11 @@ def test_a_drag_row_keeps_how_far_the_cursor_ended_from_the_press(tmp_path):
         rig.store.close()
 
 
-def test_the_real_metrics_scale_for_the_monitor_under_a_point():
+def test_the_real_metrics_are_windows_own_answer_for_the_monitor_under_a_point():
+    from yuki.memory.trace_input import _metric_for_dpi, _monitor_dpi
+
     m = Metrics()                                                     # read-only system calls
     w, h = m.drag_size(0, 0)
     assert w >= 1 and h >= 1 and m.is_drag(0, 0, 0, 0) is False
+    dpi = _monitor_dpi()(0, 0)
+    assert (w, h) == (_metric_for_dpi()(68, dpi), _metric_for_dpi()(69, dpi))

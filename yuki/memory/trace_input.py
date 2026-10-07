@@ -19,7 +19,7 @@ On the reader's thread, per event, so it stays cheap:
   window under the press (capC1c: ``WindowFromPhysicalPoint`` + ``GetAncestor``, no UI Automation), so the worker can
   tell whether what is under the press changed before its lookup answered. Button-up makes a click, a double click
   (Windows' double-click time and rectangle) or a drag with its end point: a drag only when the cursor at the release
-  is outside Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``, scaled for the monitor's DPI as Windows does)
+  is outside Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``, as Windows answers it for the monitor's DPI)
   around the cursor at the press (capC1c: cursor pixels, never raw device counts; a resting sensor's 0-1 px jitter
   never makes one). Unlike ``DragDetect``, a cursor that left the rectangle and came back before the release makes a
   click; how far it went leaves with the release (``came_back``). The wheel leaves as notches with its point.
@@ -89,8 +89,8 @@ class Metrics:
         self.double_s, self.double_w, self.double_h = double_s, double_w, double_h
         self.drag_w, self.drag_h = drag_w, drag_h
         #: capC1c: ``(x, y) -> dpi`` of the monitor under a physical point, and ``(metric, dpi) -> value``
-        #: (``GetSystemMetricsForDpi``): the drag rectangle as Windows scales it for that monitor. Without them the
-        #: 96-DPI values above are scaled by ``dpi_at``'s answer, or used as they are.
+        #: (``GetSystemMetricsForDpi``): the drag rectangle as Windows answers it for that monitor (it does not scale
+        #: this metric: V2-5). Without the per-DPI call the system values above are used as they are.
         self._dpi_at = dpi_at
         self._for_dpi = for_dpi
         if read:
@@ -125,17 +125,18 @@ class Metrics:
             self._dpi_at = self._for_dpi = None
 
     def drag_size(self, x: int, y: int) -> tuple[int, int]:
-        """capC1c: Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``) for the monitor under a physical point,
-        scaled for its DPI as Windows does (``GetSystemMetricsForDpi``). The pointer is read in physical pixels
-        (``GetPhysicalCursorPos``), so on a monitor scaled to 150% the rectangle is 150% of its 96-DPI size."""
+        """capC1c: Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``) for the monitor under a physical point, as
+        Windows answers it for that monitor's DPI (``GetSystemMetricsForDpi``), compared with the pointer in physical
+        pixels (``GetPhysicalCursorPos``). Second verification V2-5: Windows does not scale this metric with DPI (on
+        this PC it answers 4 at 96, 120, 144 and 192 DPI, while it does scale e.g. the scroll bar width), so the
+        rectangle stays its system size on a scaled monitor; without the per-DPI call (before Windows 10 1607) the
+        system's own values stand, unscaled, which agrees with it."""
         w, h = self.drag_w, self.drag_h
-        if self._dpi_at is None:
+        if self._dpi_at is None or self._for_dpi is None:
             return w, h
         try:
             dpi = int(self._dpi_at(int(x), int(y)) or 96)
-            if self._for_dpi is not None:
-                return (int(self._for_dpi(self._SM_CXDRAG, dpi)) or w, int(self._for_dpi(self._SM_CYDRAG, dpi)) or h)
-            return max(1, (w * dpi + 48) // 96), max(1, (h * dpi + 48) // 96)
+            return (int(self._for_dpi(self._SM_CXDRAG, dpi)) or w, int(self._for_dpi(self._SM_CYDRAG, dpi)) or h)
         except Exception:  # noqa: BLE001 - the system's own values stand
             return w, h
 
