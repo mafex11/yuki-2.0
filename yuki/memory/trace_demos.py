@@ -199,7 +199,8 @@ def step_words(step: dict[str, Any] | None, row: dict[str, Any], name: str | Non
     if do == "open_app":
         return P._clip(f"Open {step.get('name')}", P.STEP_CHARS)
     if do == "open_url":
-        return P._clip(f"Open {step.get('url')}", P.STEP_CHARS)
+        # the address stays in the step itself; the words (shown to the model and on the page) never carry it
+        return P._clip(f"Open the same page again{where}", P.STEP_CHARS)
     if do == "command":
         return P._clip(f"Run the terminal command for the {step.get('slot') or 'request'}{where} (your terminal tool)",
                        P.STEP_CHARS)

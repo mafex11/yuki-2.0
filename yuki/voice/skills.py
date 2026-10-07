@@ -441,7 +441,7 @@ class SkillRunner:
     def _pick(self, step: SkillStep, apps: list[str], wait_s: float
               ) -> tuple[str, tuple[int, int, dict[str, Any], str, str] | None, int]:
         """capC4: the item a pick step means, in a fresh read: ``("found", (hwnd, read, element, title, app), 1)``, or
-        ``(why, None, matches)`` with why ``no_container`` (the list is not on the screen), ``no_match`` (no visible
+        ``(why, None, how many matched)`` with why ``no_container`` (the list is not on the screen), ``no_match`` (no visible
         child matches), ``many`` (more than one does) or ``no_digest`` (memory could not compute the digests). The
         container is found by its role (and name when the way knows it); its visible descendants of the item's role are
         the candidates (an item the screen does not show is not in the read). A fixed item matches by the keyed digest
@@ -449,7 +449,7 @@ class SkillRunner:
         box_role, box_name = step.box_role.casefold(), _words(step.box_name).casefold()
         role = step.role.casefold()
         deadline = time.monotonic() + max(0.0, wait_s)
-        why, matches = "no_container", 0
+        why = "no_container"
         while True:
             payload = self._overview()
             for hwnd, title, app in self._search(SkillStep(i=step.i, do="pick"), apps, payload):
@@ -490,7 +490,7 @@ class SkillRunner:
                 if len(hits) > 1:
                     return "many", None, len(hits)
             if time.monotonic() >= deadline:
-                return why, None, matches
+                return why, None, 0
             time.sleep(POLL_S)
 
     def _front_app(self) -> tuple[str, str]:
