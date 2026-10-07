@@ -18,10 +18,11 @@ On the reader's thread, per event, so it stays cheap:
   the worker asks UI Automation what is under the pointer before the button is up or a menu closes, and the top-level
   window under the press (capC1c: ``WindowFromPhysicalPoint`` + ``GetAncestor``, no UI Automation), so the worker can
   tell whether what is under the press changed before its lookup answered. Button-up makes a click, a double click
-  (Windows' double-click time and rectangle) or a drag with its end point: a drag only when the cursor left Windows'
-  drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``, scaled for the monitor's DPI as Windows does) around the cursor at
-  the press at any moment while the button was held, ``DragDetect``'s rule (capC1c: cursor pixels, never raw device
-  counts; a resting sensor's 0-1 px jitter never makes one). The wheel leaves as notches with its point.
+  (Windows' double-click time and rectangle) or a drag with its end point: a drag only when the cursor at the release
+  is outside Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``, scaled for the monitor's DPI as Windows does)
+  around the cursor at the press (capC1c: cursor pixels, never raw device counts; a resting sensor's 0-1 px jitter
+  never makes one). Unlike ``DragDetect``, a cursor that left the rectangle and came back before the release makes a
+  click; how far it went leaves with the release (``came_back``). The wheel leaves as notches with its point.
 * **moves** are never stored and never leave as a path. Each report adds its raw counts to the net movement since
   the pointer's current *rest anchor*; the pointer (in screen pixels, as Windows judges a hover) leaving Windows' own
   hover rectangle (``SPI_GETMOUSEHOVERWIDTH`` x ``SPI_GETMOUSEHOVERHEIGHT``, read from the system) around the anchor
@@ -36,7 +37,7 @@ On the reader's thread, per event, so it stays cheap:
   ``user_injected``; real hardware is ``user``.
 
 Queue items (tuples, first field the kind): ``("down", t, button, x, y, source, travel, dbl, root, root_pid)``,
-``("up", t, button, x, y, source, drag)``, ``("wheel", t, notches, horizontal, x, y, source, travel)``,
+``("up", t, button, x, y, source, drag[, came_back])``, ``("wheel", t, notches, horizontal, x, y, source, travel)``,
 ``("key", t, kind, text, source, travel)``, ``("char", t, n, source)``, ``("moving", t)``.
 """
 
@@ -139,11 +140,17 @@ class Metrics:
             return w, h
 
     def is_drag(self, x0: int, y0: int, x1: int, y1: int) -> bool:
-        """capC1c: whether the cursor at ``(x1, y1)`` is outside Windows' drag rectangle centred on a press at
-        ``(x0, y0)`` (both the cursor in physical pixels, never the device's raw counts; the rectangle of the press's
-        monitor). The sink asks it of every cursor read while the button is held, as ``DragDetect`` does, so a drag
-        that comes back before the release is still one. A sensor's 0-1 px jitter never leaves it."""
+        """capC1c: whether a press at ``(x0, y0)`` released at ``(x1, y1)`` (both the cursor in physical pixels, never
+        the device's raw counts) is a drag: the release is outside Windows' drag rectangle centred on the press (the
+        rectangle of the press's monitor). Only the release counts, not where the cursor went while held (that is
+        ``DragDetect``'s rule, deliberately not followed: see :class:`TraceInput`). A sensor's 0-1 px jitter never
+        leaves it."""
         w, h = self.drag_size(x0, y0)
+        return self.outside(x0, y0, x1, y1, w, h)
+
+    @staticmethod
+    def outside(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> bool:
+        """Whether ``(x1, y1)`` is outside a ``w`` x ``h`` rectangle centred on ``(x0, y0)``."""
         return abs(x1 - x0) * 2 > max(w, 1) or abs(y1 - y0) * 2 > max(h, 1)
 
     def facts(self) -> dict[str, Any]:
@@ -348,11 +355,13 @@ class TraceInput:
                 else:
                     self._new_anchor(t, x, y)
             if self._down:
-                # capC1c review: DragDetect's rule, the cursor leaving the drag rectangle around the press at any
-                # moment while the button is held (a sensor's 0-1 px jitter never does); two compares per report
-                for held, (t0, x0, y0, w, h, left) in list(self._down.items()):
-                    if not left and (abs(x - x0) * 2 > w or abs(y - y0) * 2 > h):
-                        self._down[held] = (t0, x0, y0, w, h, True)
+                # capC1c review: how far the cursor went from the press while the button is held, per axis (a few
+                # compares per report). Never decides the kind; a release back inside the rectangle after leaving it
+                # is told to the worker as that distance, so a live hour can see such clicks
+                for held, (t0, x0, y0, w, h, fx, fy) in list(self._down.items()):
+                    ex, ey = abs(x - x0), abs(y - y0)
+                    if ex > fx or ey > fy:
+                        self._down[held] = (t0, x0, y0, w, h, max(fx, ex), max(fy, ey))
         if not button_flags:
             return
         source = source_of(extra, device)
@@ -365,7 +374,7 @@ class TraceInput:
                 dbl = bool(last and last[0] == button and t - last[1] <= m.double_s
                            and abs(x - last[2]) * 2 <= m.double_w and abs(y - last[3]) * 2 <= m.double_h)
                 w, h = m.drag_size(x, y)                # the monitor of the press, read once per press
-                self._down[button] = (t, x, y, max(w, 1), max(h, 1), False)
+                self._down[button] = (t, x, y, max(w, 1), max(h, 1), 0, 0)
                 # a press ends the rest: the pointer must move away before it can hover again
                 self._ax, self._ay, self.anchor_at = x, y, t
                 self.anchor_seq += 1
@@ -386,17 +395,23 @@ class TraceInput:
             if button_flags & flag:
                 x, y = self._cursor()
                 held = self._down.pop(button, None)
-                # capC1c: the cursor (never the device's raw counts, which pointer speed and acceleration rescale)
-                # against Windows' drag rectangle around the press, for that monitor's DPI: a drag when it left the
-                # rectangle at any moment while held (DragDetect's rule: a drag that came back, a knob turned and
-                # released where it began) or is outside it at the release
+                # capC1c: the cursor at the release against the cursor at the press (never the device's raw counts,
+                # which pointer speed and acceleration rescale), in Windows' drag rectangle for that monitor's DPI.
+                # This is not DragDetect's rule (which also fires when the cursor left the rectangle and came back):
+                # the first live hour had plain clicks with a few pixels of wobble recorded as drags. The trade-off:
+                # a drag released where it began (a knob turned and let go at its start) is a click; ``came_back``
+                # (px, the larger axis, 0 when the cursor never left the rectangle) tells the worker of it
+                came_back = 0
                 if held is None:
                     drag = False
                 else:
-                    _t0, x0, y0, w, h, left = held
-                    drag = left or abs(x - x0) * 2 > w or abs(y - y0) * 2 > h
+                    _t0, x0, y0, w, h, fx, fy = held
+                    drag = self.metrics.outside(x0, y0, x, y, w, h)
+                    if not drag and (fx * 2 > w or fy * 2 > h):
+                        came_back = int(max(fx, fy))
                 self._last_click = None if drag else (button, t, x, y)
-                self._put(("up", t, button, x, y, source, drag))
+                # ``came_back`` only when there is one: the item keeps its 7 fields otherwise
+                self._put(("up", t, button, x, y, source, drag) + ((came_back,) if came_back else ()))
         if button_flags & (_WHEEL | _HWHEEL):
             self.counts["wheel"] += 1
             delta = ctypes.c_short(button_data & 0xFFFF).value

@@ -1,11 +1,11 @@
 """capC1c (report 99): a drag is the cursor leaving Windows' drag rectangle between press and release.
 
 The first live recording had 9 drags in 8 minutes, several of them plain clicks (an address bar, a search box, a chat
-list). The test now compares the cursor (physical pixels) while the button is held and at button-up against the press, in
-``SM_CXDRAG`` x ``SM_CYDRAG`` scaled for the monitor's DPI as Windows does (``GetSystemMetricsForDpi``), never the
-device's raw counts (mickeys, which pointer speed and acceleration rescale). Like ``DragDetect``, leaving the
-rectangle at any moment while the button is held makes a drag (review C1c-4), so a drag that comes back is one. Fed
-as the reader feeds it (plain integers, a fake cursor); nothing touches the desktop.
+list). The test now compares the cursor (physical pixels) at button-down and at button-up against ``SM_CXDRAG`` x
+``SM_CYDRAG`` scaled for the monitor's DPI as Windows does (``GetSystemMetricsForDpi``), never the device's raw counts
+(mickeys, which pointer speed and acceleration rescale). Unlike ``DragDetect``, a wobble that came back is a click;
+how far it went is kept (``came_back``, review C1c-4). Fed as the reader feeds it (plain integers, a fake cursor);
+nothing touches the desktop.
 """
 
 from __future__ import annotations
@@ -84,9 +84,10 @@ def test_a_window_moved_by_its_title_bar_is_a_drag():
     assert up[6] is True and (up[3], up[4]) == (800, 600)
 
 
-def test_a_drag_that_comes_back_before_the_release_is_still_a_drag():
-    """Review C1c-4, DragDetect's rule: the cursor left the rectangle while the button was held (a knob turned and
-    released where it began, a drag-select brought back to its start), so it is a drag, with its end at the start."""
+def test_a_wobble_that_comes_back_before_the_release_is_a_click_that_says_how_far_it_went():
+    """The release decides, not DragDetect's 'left at any moment' (review C1c-4: the docstring no longer claims it).
+    The trade-off, a knob turned and let go at its start being a click, is visible: the release carries how far the
+    cursor went (``came_back``)."""
     cur = Cursor()
     s, items = sink(cur)
     s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
@@ -95,12 +96,12 @@ def test_a_drag_that_comes_back_before_the_release_is_still_a_drag():
         s.mouse(0.02, 0, 0, 0, dx, 0, 0, HW)
     s.mouse(0.1, 0, L_UP, 0, 0, 0, 0, HW)
     (up,) = ups(items)
-    assert up[6] is True and (up[3], up[4]) == (500, 400)
-    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)                           # a drag never starts a double click
-    assert items[-1][0] == "down" and items[-1][7] is False
+    assert up[6] is False and up[7] == 5
+    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)                           # and it still makes a double click
+    assert items[-1][0] == "down" and items[-1][7] is True
 
 
-def test_a_wobble_inside_the_rectangle_and_back_is_a_click_and_still_makes_a_double_click():
+def test_a_wobble_inside_the_rectangle_says_nothing_and_a_real_drag_carries_no_came_back():
     cur = Cursor()
     s, items = sink(cur)
     s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
@@ -108,9 +109,34 @@ def test_a_wobble_inside_the_rectangle_and_back_is_a_click_and_still_makes_a_dou
         cur.x += dx
         s.mouse(0.02, 0, 0, 0, dx, 0, 0, HW)
     s.mouse(0.1, 0, L_UP, 0, 0, 0, 0, HW)
-    assert ups(items)[0][6] is False
-    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)
-    assert items[-1][0] == "down" and items[-1][7] is True
+    assert ups(items)[0][6] is False and len(ups(items)[0]) == 7
+    s.mouse(1.0, 0, L_DOWN, 0, 0, 0, 0, HW)
+    cur.x += 9
+    s.mouse(1.05, 0, 0, 0, 9, 0, 0, HW)
+    s.mouse(1.1, 0, L_UP, 0, 0, 0, 0, HW)
+    assert ups(items)[1][6] is True and len(ups(items)[1]) == 7
+
+
+def test_a_click_that_came_back_keeps_the_distance_on_its_row(tmp_path):
+    import json
+
+    from test_trace_worker import Rig
+
+    from yuki.memory.trace_uia import Element
+
+    rig = Rig(tmp_path)
+    try:
+        rig.uia.points[(150, 120)] = Element(role="Button", name="Mute", bounds=(100, 100, 200, 140), pid=101,
+                                             patterns=("invoke",))
+        t = rig.clock.t
+        rig.feed("down", t, "left", 150, 120, "user", 0, False, 11)
+        rig.feed("up", t + 0.3, "left", 150, 120, "user", False, 7, dt=0.3)
+        rig.settle()
+        (row,) = rig.rows()
+        assert row["kind"] == "click" and json.loads(row["facts"])["came_back_px"] == 7
+        assert rig.w.counters["click_came_back"] == 1
+    finally:
+        rig.store.close()
 
 
 def test_each_held_button_has_its_own_rectangle():

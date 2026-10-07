@@ -649,12 +649,17 @@ class TraceWorker:
         area = max(1, (rect[2] - rect[0]) * (rect[3] - rect[1]))
         return el.area() * 2 >= area
 
-    def _on_up(self, t: float, button: str, x: int, y: int, source: str, drag: bool) -> None:
+    def _on_up(self, t: float, button: str, x: int, y: int, source: str, drag: bool, came_back: int = 0) -> None:
         act = self._open.pop(button, None)
         if act is None:
             return
         act.open = False
         act.up_t = act.last_t = t
+        if came_back and not drag:
+            # capC1c review: the cursor left the drag rectangle while held and was released back inside it: kept a
+            # click (the release decides), the distance kept so a live hour can see knob-style drags among clicks
+            act.facts["came_back_px"] = int(came_back)
+            self.counters["click_came_back"] += 1
         if act.kind in ("click", "dclick") and button == "left":
             self._pending_dclick = act if act.kind == "click" else None
         if drag:
@@ -1513,7 +1518,8 @@ class TraceWorker:
             "clip_seq": act.clip_seq, "clip_formats": json.dumps(act.clip_formats) if act.clip_formats else None,
             "outcome": outcome, "outcome_ciphertext": self._enc(json.dumps(summary, sort_keys=True)) if summary
             else None, "resolved": act.resolved if act.el is not None
-            or act.resolved in ("event", "app_data", "stale") else "unresolved", "lookup_ms": round(act.lookup_ms, 2) if act.lookup_ms is not None else None,
+            or act.resolved in ("event", "app_data", "stale") else "unresolved",
+            "lookup_ms": round(act.lookup_ms, 2) if act.lookup_ms is not None else None,
             "travel_px": act.travel, "gap_ms": act.gap_ms, "dwell_ms": act.dwell_ms,
             "proc_started": act.win.started,
         }
