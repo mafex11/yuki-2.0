@@ -4642,6 +4642,46 @@ class MemoryClient:
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__}
 
+    # -- capC4: ways learned from what the user did (report 78 §6.1-6.2) -----------------------------------------------
+
+    def name_digests(self, process: str, role: str, names: Any) -> list[str]:
+        """capC4: the keyed digest the action trace takes over an element's name
+        (``yuki.memory.trace_demos.name_digest``), for each of ``names`` (the skill runner's live ``pick``: it matches a
+        way's fixed item among a container's visible children without memory ever keeping the item's name). Each
+        digest is cut to ``yuki.memory.practice.PICK_DIGEST_CHARS`` hex characters, as the way keeps it. Read only;
+        never raises (``[]``)."""
+        from yuki.memory import practice as _p
+        from yuki.memory import trace_demos
+
+        try:
+            return [trace_demos.name_digest(self.store, str(process or ""), str(role or ""), str(n or ""))
+                    [:_p.PICK_DIGEST_CHARS] for n in list(names or [])[:400]]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def container_digests(self, process: str, boxes: Any) -> list[str]:
+        """capC4, second verification V8: the keyed digest the action trace takes over a picked item's container
+        (``yuki.memory.trace_demos.container_digest``) for each ``(role, AutomationId, parent's role)`` of ``boxes``,
+        cut to ``yuki.memory.practice.PICK_DIGEST_CHARS`` hex characters as the way keeps it. Read only; never raises
+        (``[]``)."""
+        from yuki.memory import practice as _p
+        from yuki.memory import trace_demos
+
+        try:
+            return [trace_demos.container_digest(self.store, str(process or ""), *(str(x or "") for x in tuple(b)[:3]))
+                    [:_p.PICK_DIGEST_CHARS] for b in list(boxes or [])[:400]]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def trace_demos_health(self) -> dict:
+        """capC4: ways and trials learned from what the user did, in counts (content-free)."""
+        from yuki.memory import trace_demos
+
+        try:
+            return trace_demos.health(self.store)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__}
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
