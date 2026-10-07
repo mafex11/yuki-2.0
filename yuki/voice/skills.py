@@ -144,6 +144,9 @@ class SkillStep:
     box_name: str = ""
     item: str = ""
     slot: bool = False
+    #: second verification V8: the container's identity as C1 keys it (the keyed digest of its role, AutomationId and
+    #: its parent's role), so a same-named item in another list of the same role is never picked.
+    box_digest: str = ""
 
     def what(self) -> str:
         """The step in a few words, for reports (content: the thinker and memory only)."""
@@ -284,7 +287,7 @@ def way_step(i: int, way: dict[str, Any], mine: SkillStep | None = None) -> Skil
         url=_words(way.get("url")) or mine.url, app=_words(way.get("app")) or mine.app,
         expect=_words(way.get("expect")) or mine.expect, aid=_words(way.get("aid")),
         box_role=_words(box.get("role")), box_name=_words(box.get("name")), item=_words(way.get("item")),
-        slot=way.get("do") == "pick" and not way.get("item"))
+        slot=way.get("do") == "pick" and not way.get("item"), box_digest=_words(box.get("digest")))
 
 
 def fill_slots(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillStep]:
@@ -299,8 +302,25 @@ def fill_slots(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillS
     return [way_step(n + 1, s, given.get(n)) for n, s in enumerate(run)]
 
 
+def check_picks_for_send(steps: list[SkillStep], args: dict[str, Any]) -> str | None:
+    """Second verification V1: why a way that sends may not run because of whom it picks (``None``: it may). A send
+    goes to the person or chat the user named: a fixed item (the chat the user picked when they did it) is never the
+    recipient of a send, and an item picked by name must be the very ``to`` the user's words gave."""
+    to = _words(args.get("to")).casefold()
+    for step in steps:
+        if step.do != "pick":
+            continue
+        if not step.slot:
+            return (f"step {step.i} always picks the same item, and a send goes only to whom their own words name: "
+                    f"it is a hint for the thinker")
+        if not to or _words(step.text).casefold() != to:
+            return f"step {step.i} would pick \"{step.text[:60]}\", not \"{to[:60]}\" the message goes to"
+    return None
+
+
 def check_texts(steps: list[SkillStep], words: list[str], way_text: str) -> str | None:
-    """Why a step's text may not be typed (``None``: all may): only the user's own words or the way's own words."""
+    """Why a step's text may not be typed (``None``: all may): only the user's own words or the way's own words
+    (``way_text`` ``""`` for a way learned from what the user did: decision D8, its typing is always their words)."""
     for step in steps:
         if step.do == "type" and not said(step.text, [*words, way_text]):
             return (f"step {step.i} would type \"{step.text[:60]}\", which is neither their words nor the learned "
@@ -410,11 +430,15 @@ class SkillRunner:
                 tree, read, _ms = got
                 if step.aid:
                     # capC4: a proven AutomationId (memory keeps it only where that app's are proven) finds the very
-                    # control first; its role must agree
+                    # control first; its role must agree, and (second verification V2: generic ids shared by several
+                    # controls) so must its name - or it has no name and is the only one with that id in the read
                     by_aid = [e for e in (tree.get("elements") or []) if isinstance(e, dict)
                               and isinstance(e.get("id"), int) and str(e.get("automation_id") or "") == step.aid
                               and (not role or str(e.get("role") or "").casefold() == role)]
-                    if len(by_aid) == 1:
+                    named = [e for e in by_aid if _words(e.get("name")).casefold() == name]
+                    if len(named) == 1:
+                        return hwnd, read, named[0], title, app
+                    if len(by_aid) == 1 and not _words(by_aid[0].get("name")):
                         return hwnd, read, by_aid[0], title, app
                 elements = [e for e in (tree.get("elements") or []) if isinstance(e, dict)
                             and isinstance(e.get("id"), int) and _words(e.get("name")).casefold() == name]
@@ -439,6 +463,19 @@ class SkillRunner:
         except Exception:  # noqa: BLE001 - no digests: no match, the run stops
             return None
         return [str(d or "") for d in got] if isinstance(got, list) and len(got) == len(names) else None
+
+    def _box_digests(self, app: str, boxes: list[tuple[str, str, str]]) -> list[str] | None:
+        """Second verification V8: the keyed digests C1 takes over a picked item's container (its role, its
+        AutomationId, its parent's role: :meth:`MemoryClient.container_digests`), or ``None`` when memory cannot
+        answer."""
+        memory = getattr(self.hands, "memory", None)
+        if memory is None or not boxes:
+            return None if memory is None else []
+        try:
+            got = memory.call("pick_boxes", lambda c: c.container_digests(app, boxes), timeout_s=1.5)
+        except Exception:  # noqa: BLE001 - no digests: no match, the run stops
+            return None
+        return [str(d or "") for d in got] if isinstance(got, list) and len(got) == len(boxes) else None
 
     def _pick(self, step: SkillStep, apps: list[str], wait_s: float
               ) -> tuple[str, tuple[int, int, dict[str, Any], str, str] | None, int]:
@@ -476,8 +513,22 @@ class SkillRunner:
                         depth += 1
                     return False
 
+                # second verification V8: with the container's identity known, only items whose own container is that
+                # one (C1's keyed digest of its role, AutomationId and parent's role); without it, the item must be the
+                # only match in the whole window (a same-named item in another list makes it unclear)
                 cands = [e for e in els if str(e.get("role") or "").casefold() == role and _words(e.get("name"))
-                         and inside(e)]
+                         and (inside(e) or not step.box_digest)]
+                if step.box_digest and cands:
+                    def box_of(e: dict[str, Any]) -> tuple[str, str, str]:
+                        parent = by_id.get(e.get("parent")) if isinstance(e.get("parent"), int) else None
+                        grand = by_id.get((parent or {}).get("parent")) if isinstance(
+                            (parent or {}).get("parent"), int) else None
+                        return (str((parent or {}).get("role") or ""), str((parent or {}).get("automation_id") or ""),
+                                str((grand or {}).get("role") or ""))
+                    boxed = self._box_digests(step.app or app, [box_of(e) for e in cands])
+                    if boxed is None:
+                        return "no_digest", None, 0
+                    cands = [e for e, d in zip(cands, boxed) if d.casefold().startswith(step.box_digest.casefold())]
                 if step.slot:
                     want = _words(step.text).casefold()
                     hits = [e for e in cands if want and _words(e.get("name")).casefold() == want]
@@ -487,10 +538,10 @@ class SkillRunner:
                         return "no_digest", None, 0
                     hits = [e for e, d in zip(cands, digests) if step.item and d.casefold().startswith(
                         step.item.casefold())]
-                if len(hits) == 1:
-                    return "found", (hwnd, read, hits[0], title, app), 1
                 if len(hits) > 1:
                     return "many", None, len(hits)
+                if len(hits) == 1 and (step.box_digest or inside(hits[0])):
+                    return "found", (hwnd, read, hits[0], title, app), 1
             if time.monotonic() >= deadline:
                 return why, None, 0
             time.sleep(POLL_S)
@@ -504,11 +555,27 @@ class SkillRunner:
         window = self._windows(payload).get(front) or {}
         return app_key(self._app_of(window)) or "", str(window.get("title") or "")
 
+    def _app_title(self, app: str) -> str:
+        """Second verification V7: the title of ``app``'s own window now - the one in front when it is that app's, else
+        its first window that is not minimized; ``""`` when it has none (any page it then shows is a new one)."""
+        from yuki.memory.store import app_key
+
+        want = app_key(app) or ""
+        payload = self._overview()
+        windows = self._windows(payload)
+        front = windows.get(int(payload.get("foreground_hwnd") or 0)) or {}
+        if not want or app_key(self._app_of(front)) == want:
+            return str(front.get("title") or "")
+        for w in windows.values():
+            if not w.get("is_minimized") and app_key(self._app_of(w)) == want:
+                return str(w.get("title") or "")
+        return ""
+
     def end_ok(self, end: dict[str, Any], last: StepResult | None, before: tuple[str, str]) -> tuple[bool, str]:
         """capC4: whether a part reached its checked end (report 78 §6.2): a window of the app in front (``window_
         verified``); a new page of the app in front (``page_reached``: the window in front is that app's and its title
-        is not the one in front when the part began); otherwise the part's last step was verified by its own measured
-        report. ``(ok, why)``."""
+        is not ``before``'s - that app's own window's title just before the part's last step, second verification V7);
+        otherwise the part's last step was verified by its own measured report. ``(ok, why)``."""
         from yuki.memory.store import app_key
 
         kind = str(end.get("kind") or "")
@@ -642,8 +709,11 @@ class SkillRunner:
                             report=f"{why} (looked for {wait:g} s)", deviation="not_found")
             hwnd, read, element, title, app = found
             role = str(element.get("role") or step.role or "item")
-            verdict = self._held("click", {"hwnd": hwnd, "element": f"{role} in the {step.box_role}"},
-                                 {"hwnd": hwnd, "app": app, "title": title, "element": f"{role} in the {step.box_role}"})
+            # second verification V1: Yuki's own check sees whose item it is (the live name, as for a click), never
+            # only "an item of the list"
+            seen = f'{role} "{_words(element.get("name"))[:80]}" in the {step.box_role}'
+            verdict = self._held("click", {"hwnd": hwnd, "element": seen},
+                                 {"hwnd": hwnd, "app": app, "title": title, "element": seen})
             if verdict is not None:
                 return held(verdict, target)
             try:
@@ -777,7 +847,10 @@ class SkillRunner:
             # be the user's own words now (check_sends)
             raise SkillRefused("it sends what is typed, and only their own words may say what goes to whom")
         way_text = str(item.get("text") or "")
-        why = check_sends(args, words) or check_texts(steps, words, way_text)
+        demo = bool(item.get("demo") or parts)
+        why = check_sends(args, words) or (
+            check_picks_for_send(steps, args) if item.get("sends") or args.get("sends") is True else None) or \
+            check_texts(steps, words, "" if demo else way_text)   # V9: a demo's typing is only ever their words
         if why:
             raise SkillRefused(why)
         # capC4: where each part ends (the index of its last step in ``steps``) and the checked state it ends on
@@ -799,8 +872,12 @@ class SkillRunner:
         deviation: StepResult | None = None
         after_open = False
         self._earlier = []
-        part_before = self._front_app() if ends else ("", "")
+        part_before = ("", "")
         for n, step in enumerate(steps):
+            if n in ends and str(ends[n][1].get("kind") or "") == "page_reached":
+                # second verification V7: a new page means the end app's own window changed by this last step - its
+                # title now, not whatever window was in front when the part began (often another app's)
+                part_before = ("", self._app_title(str(ends[n][1].get("app") or "")))
             result = self._step(step, apps=apps, first=n == 0, after_open=after_open, start_front=start_front,
                                 opened=opened)
             if result.kind == "action" and result.ok:
@@ -839,7 +916,6 @@ class SkillRunner:
                     break
                 if result.verdict is None:
                     result.verdict, result.why = True, f"part {k} reached its checked end ({why_end})"
-                part_before = self._front_app() if n + 1 < len(steps) else part_before
             nxt = steps[n + 1] if n + 1 < len(steps) else None
             if nxt is not None and result.verdict is None and nxt.do == "keys":
                 # a key after a step whose effect could not be seen would be blind (v3.5: no blind keys)
@@ -920,7 +996,8 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
         elif s.do == "pick":
             # the container, the item's role and how it was matched; never the item's name (a content control's)
             tool_input.update(role=s.role, app=s.app, **{"in": {k: v for k, v in (("role", s.box_role),
-                                                                                  ("name", s.box_name)) if v}},
+                                                                                  ("name", s.box_name),
+                                                                                  ("digest", s.box_digest)) if v}},
                               **({"item": s.item} if s.item else {"slot": ""}))
         elif s.do == "type":
             tool_input["text"] = s.text
@@ -941,4 +1018,5 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
 
 
 __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_steps", "check_sends", "check_texts",
+           "check_picks_for_send",
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS"]

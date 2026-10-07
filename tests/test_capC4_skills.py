@@ -318,3 +318,115 @@ def test_a_part_before_the_last_ends_only_on_a_state_checked_on_the_screen(store
     assert TD.state_between(rows, {}, 0.0, 1.5) is None
     assert TD.state_between(rows, {}, 0.0, 3.0)["kind"] == "window_verified"
     assert TD.state_between(rows, {}, 0.0, 1.5, kinds=P.END_KINDS)["kind"] == "selected"
+
+
+# -- second verification fixes ----------------------------------------------------------------------------------------
+
+def _send_desk(store: Any, judged: list[Any]) -> Desk:
+    tree = [el(1, "List", "Chats", aid="chats"), el(11, "ListItem", "Bob Stone", parent=1),
+            el(12, "ListItem", "Alice Park", parent=1)]
+    desk = Desk({100: {"title": "Chatter", "process_name": "chatter"}}, {100: tree}, 100, memory=memory_for(store))
+    desk.authorize = lambda tool, tool_input, target, earlier, force=False: judged.append((tool, dict(tool_input)))
+    return desk
+
+
+def test_a_way_that_sends_never_picks_a_fixed_item_and_a_named_pick_is_the_recipient(store):
+    """Second verification V1: a send goes to whom the user's words name - never the chat the demo picked - and Yuki's
+    own check sees whose item it picks."""
+    judged: list[Any] = []
+    desk = _send_desk(store, judged)
+    end = {"kind": "field_submitted", "app": "chatter"}
+    bob = {"do": "pick", "in": {"role": "List"}, "role": "ListItem", "app": "chatter",
+           "item": TD.name_digest(store, "chatter", "ListItem", "Bob Stone")[:P.PICK_DIGEST_CHARS]}
+    tail = [{"do": "type", "slot": "message"}, {"do": "keys", "keys": ["enter"]}]
+    fixed = item_of([{"run": [bob, *tail], "end": end}], sends=True, demo=True)
+    with pytest.raises(S.SkillRefused, match="always picks the same item"):
+        S.SkillRunner(desk).run({"steps": [{"do": "type", "text": "hi there"}], "sends": True, "to": "Alice",
+                                 "what": "hi there"}, item=fixed, words=["send hi there to Alice"])
+    slot = {k: v for k, v in bob.items() if k != "item"} | {"slot": "person or chat"}
+    named = item_of([{"run": [slot, *tail], "end": end}], sends=True, demo=True)
+    with pytest.raises(S.SkillRefused, match="the message goes to"):
+        S.SkillRunner(desk).run({"steps": [{"do": "pick", "text": "Alice Park"}, {"do": "type", "text": "hi there"}],
+                                 "sends": True, "to": "Alice", "what": "hi there"}, item=named,
+                                words=["send hi there to Alice", "Alice Park"])
+    assert desk.calls == []
+    ok, _r, _f = S.SkillRunner(desk).run({"steps": [{"do": "pick", "text": "Alice Park"},
+                                                    {"do": "type", "text": "hi there"}],
+                                          "sends": True, "to": "Alice Park", "what": "hi there"}, item=named,
+                                         words=["send hi there to Alice Park"])
+    assert ok and [c[1]["element"] for c in desk.calls if c[0] == "click"] == [12]
+    assert any(tool == "click" and "Alice Park" in str(inp.get("element")) for tool, inp in judged)
+
+
+def test_a_proven_automation_id_never_clicks_a_control_with_another_name(store):
+    """Second verification V2: an id shared by two controls is no identity: the name must agree too."""
+    desk = Desk({100: {"title": "Editor", "process_name": "editr"}}, {100: [el(7, "Button", "Delete", aid="btn")]}, 100)
+    item = {"ref": "pb:5", "run": [{"do": "click", "role": "Button", "name": "Save", "aid": "btn"}]}
+    ok, report, facts = S.SkillRunner(desk).run({"steps": [{"do": "click", "role": "Button", "name": "Save"}]},
+                                                item=item, words=["save it"])
+    assert not ok and facts["deviation"] == "not_found" and desk.calls == []
+    # a control with no name of its own, the only one with that id: the id finds it
+    desk = Desk({100: {"title": "Editor", "process_name": "editr"}}, {100: [el(8, "Button", "", aid="SaveBtn")]}, 100)
+    item = {"ref": "pb:5", "run": [{"do": "click", "role": "Button", "name": "Save", "aid": "SaveBtn"}]}
+    ok, _r, _f = S.SkillRunner(desk).run({"steps": [{"do": "click", "role": "Button", "name": "Save"}]}, item=item,
+                                         words=["save it"])
+    assert ok and desk.calls[0][1]["element"] == 8
+
+
+def test_a_new_page_is_the_end_apps_own_window_changing(store):
+    """Second verification V7: a part ending on a new page passes only when the end app's own window changed by the
+    part's last step - not because another app was in front when the part began."""
+    def desk() -> Desk:
+        windows = {100: {"title": "Chat - general", "process_name": "chatter"},
+                   200: {"title": "Old page - Webby", "process_name": "webby"}}
+        return Desk(windows, {100: [], 200: [el(5, "Hyperlink", "Docs")]}, 100)
+
+    parts = [{"run": [{"do": "open_app", "name": "webby"}, {"do": "click", "role": "Hyperlink", "name": "Docs"}],
+              "end": {"kind": "page_reached", "app": "webby"}}]
+    still = desk()
+    ok, report, facts = S.SkillRunner(still).run({"steps": []}, item=item_of(parts), words=["open the docs"])
+    assert not ok and facts["deviation"] == "part_end" and "no new page came up" in report
+    moved = desk()
+    moved.effects[5] = lambda: moved.windows[200].update(title="Docs - Webby")
+    ok, _r, facts = S.SkillRunner(moved).run({"steps": []}, item=item_of(parts), words=["open the docs"])
+    assert ok and facts["verified"] is True
+
+
+def test_a_pick_finds_its_item_only_in_its_own_list(store):
+    """Second verification V8: the container's identity (C1's keyed digest) is matched live; without it the item must
+    be the only match in the whole window."""
+    def desk(*items: tuple[int, int]) -> Desk:
+        tree = [el(1, "List", "Chats", aid="chats"), el(2, "List", "Contacts", aid="contacts")]
+        tree += [el(i, "ListItem", "Bob Stone", parent=p) for i, p in items]
+        return Desk({100: {"title": "Chatter", "process_name": "chatter"}}, {100: tree}, 100, memory=memory_for(store))
+
+    box = TD.container_digest(store, "chatter", "List", "chats", "")[:P.PICK_DIGEST_CHARS]
+    step = {"do": "pick", "in": {"role": "List", "digest": box}, "role": "ListItem", "app": "chatter",
+            "item": TD.name_digest(store, "chatter", "ListItem", "Bob Stone")[:P.PICK_DIGEST_CHARS]}
+    end = {"kind": "selected", "app": "chatter"}
+    item = item_of([{"run": [step], "end": end}])
+    assert item["parts"][0]["run"][0]["in"]["digest"] == box           # practice memory keeps the container's digest
+    only_contacts = desk((21, 2))
+    ok, _r, facts = S.SkillRunner(only_contacts).run({"steps": []}, item=item, words=["open bob"])
+    assert not ok and facts["deviation"] == "not_found" and not only_contacts.calls
+    both = desk((11, 1), (21, 2))
+    ok, _r, _f = S.SkillRunner(both).run({"steps": []}, item=item, words=["open bob"])
+    assert ok and [c[1]["element"] for c in both.calls if c[0] == "click"] == [11]
+    # no container identity kept: a same-named item in another list makes it unclear
+    loose = item_of([{"run": [{**step, "in": {"role": "List"}}], "end": end}])
+    unclear = desk((11, 1), (21, 2))
+    ok, report, _f = S.SkillRunner(unclear).run({"steps": []}, item=loose, words=["open bob"])
+    assert not ok and "2 items match" in report and not unclear.calls
+
+
+def test_a_demo_ways_typing_is_only_ever_the_users_words(store):
+    """Second verification V9: a way learned from what the user did types only their words, never its own step
+    words (decision D8)."""
+    desk = Desk({100: {"title": "Chat", "process_name": "chatter"}}, {100: [el(1, "Button", "Attach")]}, 100)
+    parts = [{"run": [{"do": "click", "role": "Button", "name": "Attach"}, {"do": "type", "slot": "message"}],
+              "end": {"kind": "field_submitted", "app": "chatter"}}]
+    item = item_of(parts, demo=True, text='1. Click Button "Attach" in chatter 2. Type the message in chatter')
+    with pytest.raises(S.SkillRefused, match="neither their words"):
+        S.SkillRunner(desk).run({"steps": [{"do": "type", "text": "Attach in chatter"}]}, item=item,
+                                words=["do the usual"])
+    assert desk.calls == []

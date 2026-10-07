@@ -315,16 +315,20 @@ def _trace_demos_words(raw: str | None, now: float) -> str:
     if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
         return ""
     ways, trials = int(data.get("ways") or 0), int(data.get("trials") or 0)
+    hints = int(data.get("hints") or 0)   # second verification V11: ways its hands cannot take, hints for the thinker
     parts = []
-    if ways or trials:
+    if ways or trials or hints:
         bits = []
         if ways:
             bits.append(f"{ways} it can do on its own")
+        if hints:
+            bits.append(f"{hints} it follows as a guide but can't repeat click by click")
         if trials:
             bits.append(f"{trials} seen only once, kept as hints until you do {'them' if trials != 1 else 'it'} "
                         f"again")
-        parts.append(f"learned {ways + trials} way{'s' if ways + trials != 1 else ''} from what you did ("
-                     + " and ".join(bits) + ")")
+        total = ways + trials + hints
+        parts.append(f"learned {total} way{'s' if total != 1 else ''} from what you did (" + ", ".join(bits[:-1])
+                     + (" and " if len(bits) > 1 else "") + bits[-1] + ")")
     learned, refused = int(data.get("learned_today") or 0), int(data.get("refused_today") or 0)
     if learned:
         parts.append(f"{learned} new today")

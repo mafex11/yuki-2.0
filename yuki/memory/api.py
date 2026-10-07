@@ -4659,6 +4659,20 @@ class MemoryClient:
         except Exception:  # noqa: BLE001
             return []
 
+    def container_digests(self, process: str, boxes: Any) -> list[str]:
+        """capC4, second verification V8: the keyed digest the action trace takes over a picked item's container
+        (``yuki.memory.trace_demos.container_digest``) for each ``(role, AutomationId, parent's role)`` of ``boxes``,
+        cut to ``yuki.memory.practice.PICK_DIGEST_CHARS`` hex characters as the way keeps it. Read only; never raises
+        (``[]``)."""
+        from yuki.memory import practice as _p
+        from yuki.memory import trace_demos
+
+        try:
+            return [trace_demos.container_digest(self.store, str(process or ""), *(str(x or "") for x in tuple(b)[:3]))
+                    [:_p.PICK_DIGEST_CHARS] for b in list(boxes or [])[:400]]
+        except Exception:  # noqa: BLE001
+            return []
+
     def trace_demos_health(self) -> dict:
         """capC4: ways and trials learned from what the user did, in counts (content-free)."""
         from yuki.memory import trace_demos

@@ -821,6 +821,10 @@ def _clean_step(s: Any, *, allow: Sequence[str] = SKILL_DOS) -> dict[str, Any] |
     if s["do"] == "pick":
         box = s.get("in") if isinstance(s.get("in"), dict) else {}
         where = {k: _clip(_redact(box[k]), RUN_FIELD_CHARS) for k in ("role", "name") if box.get(k)}
+        # second verification V8: the container's identity, C1's keyed container digest (hex), cut as an item's is
+        box_digest = "".join(ch for ch in str(box.get("digest") or "").casefold() if ch in "0123456789abcdef")
+        if len(box_digest) >= PICK_DIGEST_CHARS:
+            where["digest"] = box_digest[:PICK_DIGEST_CHARS]
         item = "".join(ch for ch in str(s.get("item") or "").casefold() if ch in "0123456789abcdef")
         if item:
             keep["item"] = item[:PICK_DIGEST_CHARS]
@@ -908,8 +912,9 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
 
     * a click on a named command control (or a menu item, tab or title the 3-day rule kept) -> ``{do: click, role,
       name}``, with ``aid`` only when the caller proved that app's AutomationIds (``aid``);
-    * a click on a content control (a playlist, a chat, a file) -> ``{do: pick, in: {role}, role, app, item: <digest>}``
-      or, when the item changes from one request to the next, ``slot`` instead of ``item``;
+    * a click on a content control (a playlist, a chat, a file) -> ``{do: pick, in: {role, digest}, role, app, item:
+      <digest>}`` (``in.digest``: C1's keyed container digest when the row has one) or, when the item changes from one
+      request to the next, ``slot`` instead of ``item``;
     * a chord or named key -> ``{do: keys}``; typing (or a paste) -> ``{do: type, slot}`` (decision D8: never fixed
       text; ``slot`` ``""`` is the request's own words);
     * a switch to an app or its launch -> ``{do: open_app, name, app}``; a page change -> ``{do: open_url}`` only with
@@ -932,7 +937,10 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
             digest = str(row.get("name_digest") or "")
             if not parent or not role or not process or not (slot or digest):
                 return None
-            step = {"do": "pick", "in": {"role": parent}, "role": role, "app": process}
+            box = {"role": parent}
+            if row.get("container_digest"):
+                box["digest"] = str(row["container_digest"])[:digest_chars]   # V8: which list, not only its role
+            step = {"do": "pick", "in": box, "role": role, "app": process}
             step.update({"slot": slot} if slot else {"item": digest[:digest_chars]})
             return _clean_step(step)
         if not name or not role:
@@ -1268,11 +1276,109 @@ def mark_demo_successes(store: Store, events: Sequence[dict[str, Any]], *, now: 
                                 " LIMIT 1", (pid, key))
             if done or not verified_run(store, key):
                 continue
+            how = demo_run_reached(store, pid, key)
+            if how is None:
+                continue
         except Exception:  # noqa: BLE001 - no proof read: no mark
             continue
         out.append({"playbook_id": pid, "type": "succeeded", "run_key": key, "at": float(e.get("at") or now),
-                    "refs": {"via": "Yuki's run used your way and its last action verified"}})
+                    "refs": {"via": f"Yuki's run used your way and {how}"}})
     return out
+
+
+def _same_demo_step(way: dict[str, Any], ran: dict[str, Any]) -> bool:
+    """Whether a run's executed step (its kept input, a skill run's own ``do``) is the way's stored step: strings
+    compared with strings, keys as a set; a type step's text is the request's, so any typing is that step."""
+    do = way.get("do")
+    if do != ran.get("do"):
+        return False
+    if do == "click":
+        return _words_cf(way.get("name")) == _words_cf(ran.get("name")) and (
+            not way.get("role") or not ran.get("role") or _words_cf(way.get("role")) == _words_cf(ran.get("role")))
+    if do == "keys":
+        return {str(k).casefold() for k in way.get("keys") or []} == {str(k).casefold() for k in ran.get("keys") or []}
+    if do == "pick":
+        box_w = way.get("in") if isinstance(way.get("in"), dict) else {}
+        box_r = ran.get("in") if isinstance(ran.get("in"), dict) else {}
+        return _words_cf(box_w.get("role")) == _words_cf(box_r.get("role")) and (
+            str(way.get("item") or "") == str(ran.get("item") or ""))
+    if do == "open_app":
+        return _words_cf(way.get("name")) == _words_cf(ran.get("name"))
+    if do == "open_url":
+        return _words_cf(way.get("url")).rstrip("/") == _words_cf(ran.get("url")).rstrip("/")
+    if do == "scroll":
+        return str(way.get("direction") or "") == str(ran.get("direction") or "")
+    return do == "type"
+
+
+def _words_cf(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def demo_run_reached(store: Store, pid: int, key: str) -> str | None:
+    """Second verification V6 (decision D3: "1 of Yuki's own runs used it and verified the outcome"): how one of
+    Yuki's runs that cited a way learned from what the user did proves it, or ``None`` when it does not. Either the
+    action trace shows that run (its own rows, source ``yuki``, its run key) reaching a standing demo's checked outcome
+    kind on the same target (its keyed target signature), or the run's executed steps are the way's runnable steps, in
+    order (only its first steps that open an app or a page may be left out: the screen was already past them). A run
+    that cited it and verified something else proves nothing. Machine fields only."""
+    from yuki.memory import trace_demos as TD
+    from yuki.memory import trace_tasks as T
+
+    events = ledger(store, pid)
+    gone = demo_withdrawals(events)
+    standing = {str(e.run_key) for e in events if e.type == "demonstrated" and str(e.run_key or "").startswith(
+        DEMO_RUN_PREFIX) and str(e.run_key) not in gone}
+    if not standing:
+        return None
+    wanted: set[tuple[str, str]] = set()
+    for r in store._query("SELECT run_key, refs_ciphertext FROM playbook_events WHERE playbook_id=? AND"
+                          " type='demonstrated'", (int(pid),)):
+        if str(r["run_key"]) not in standing or not r["refs_ciphertext"]:
+            continue
+        try:
+            refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(refs, dict) and refs.get("fact") and refs.get("target"):
+            wanted.add((str(refs["fact"]), str(refs["target"])))
+    try:
+        rows = store._query("SELECT process, page_key, element_key, file_digest, facts FROM ui_actions WHERE run_key=?"
+                            " AND source='yuki'", (key,))
+    except Exception:  # noqa: BLE001 - a database before the action trace
+        rows = []
+    for r in rows:
+        facts = TD.facts_of(dict(r))
+        for fact, target in wanted:
+            value = facts.get(fact)
+            if value is None or value is False:
+                continue
+            if TD.target_sig(store, fact, T._target(fact, dict(r), value)) == target:   # noqa: SLF001 - one rule
+                return "the action trace shows it reached the same checked outcome"
+    o = get(store, pid)
+    if o is None:
+        return None
+    way = [s for p in o.parts for s in p.get("run") or []] or list(o.run)
+    if not way or any(s.get("do") not in SKILL_DOS for s in way):
+        return None
+    ran = []
+    for s in run_steps(store, key):
+        if s.kind != "action" or not s.ok or s.verdict is False:
+            continue
+        inp = _input_dict(s.input)
+        if inp and inp.get("do"):
+            ran.append(inp)
+
+    def covers(need: list[dict[str, Any]]) -> bool:
+        it = iter(ran)
+        return all(any(_same_demo_step(w, r) for r in it) for w in need)
+
+    for k in range(len(way)):
+        if k and way[k - 1].get("do") not in ("open_app", "open_url"):
+            break
+        if covers(way[k:]):
+            return "it ran your way's own steps, its last action verified"
+    return None
 
 
 @dataclass

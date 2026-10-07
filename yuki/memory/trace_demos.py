@@ -136,7 +136,8 @@ def element_names(store: Any, rows: Sequence[dict[str, Any]]) -> dict[int, str |
 def proven_aid(store: Any, row: dict[str, Any], cache: dict[Any, Any] | None = None) -> str | None:
     """The row's AutomationId when that app's AutomationIds are proven, else ``None``: the element was seen with this
     very AutomationId (its keyed digest) in 2 or more sessions of the app (distinct process starts) and never with
-    another, and no element of that app was ever seen with two different ones across its sessions.
+    another, no element of that app was ever seen with two different ones across its sessions, and no other element of
+    that app was ever seen with this one (second verification V2: an id must tell this control apart).
 
     ``cache`` (review F8: one dict for one task's pass): each element's proof and each app's "an element of it changed
     its AutomationId" answer are read once, not once per click row."""
@@ -160,6 +161,15 @@ def proven_aid(store: Any, row: dict[str, Any], cache: dict[Any, Any] | None = N
                 "SELECT 1 FROM ui_actions WHERE process = ? AND aid_digest IS NOT NULL AND element_key IS NOT NULL"
                 " GROUP BY element_key HAVING count(DISTINCT aid_digest) > 1 LIMIT 1", (str(process),)))
         if cache[pk]:
+            return None
+        # second verification V2: an AutomationId shared by another element of that app (a generic id: a Win32
+        # control id, a template's) is no identity of this one
+        sk = ("shared", str(process), str(digest))
+        if sk not in cache:
+            cache[sk] = bool(store._query(
+                "SELECT 1 FROM ui_actions WHERE process = ? AND aid_digest = ? AND element_key IS NOT NULL AND"
+                " element_key != ? LIMIT 1", (str(process), str(digest), str(key))))
+        if cache[sk]:
             return None
         return store._dec(row["aid_ciphertext"]) or None
     except Exception:  # noqa: BLE001
@@ -344,6 +354,43 @@ def target_sig(store: Any, kind: str, target: Any, task_id: Any = None) -> str:
     return store.cipher.digest("demo-target", str(kind or ""), str(target))[:16]
 
 
+def steps_sig(store: Any, pairs: Sequence[tuple[dict[str, Any], dict[str, Any] | None]]) -> str:
+    """Second verification V3: the way's steps as a short keyed digest, so two demos count together toward D3 only
+    when the user did the *same* thing (decision D3: "after the user did it 2 times"), not merely reached the same
+    target. Over each step's machine shape - what it does, the control's role and kept name, the picked item's digest
+    and its container, the keys, the app opened, the address - never the slot names or expected words the model chose,
+    nor an AutomationId (proven later or not); an action that can only be a hint by its kind and element key."""
+    shape = []
+    for row, step in pairs:
+        if step is None:
+            shape.append(["hint", str(row.get("kind") or ""), str(row.get("element_key") or "")])
+            continue
+        box = step.get("in") if isinstance(step.get("in"), dict) else {}
+        shape.append([str(step.get("do") or ""), " ".join(str(step.get("role") or "").split()).casefold(),
+                      " ".join(str(step.get("name") or "").split()).casefold(), str(step.get("item") or ""),
+                      "slot" if step.get("do") in ("pick", "type", "command") and "item" not in step else "",
+                      str(box.get("role") or ""), str(box.get("digest") or ""),
+                      "+".join(sorted(str(k).casefold() for k in step.get("keys") or [])),
+                      str(step.get("url") or "").rstrip("/"), str(step.get("direction") or "")])
+    return store.cipher.digest("demo-steps", json.dumps(shape, separators=(",", ":")))[:12]
+
+
+def demo_sig(target: str, steps: str) -> str:
+    """The demo run key's evidence half (:func:`yuki.memory.practice.demo_key`): the outcome's target signature and
+    the steps' signature (V3). Two demos combine only when both are equal."""
+    return f"{target}.{steps}"
+
+
+def container_digest(store: Any, process: str, parent_role: str, parent_aid: str, grand_role: str) -> str:
+    """The keyed digest C1 takes over a content control's container (:meth:`yuki.memory.trace.ActionTrace.
+    _element_cols`: ``digest("ui-container", process, parent role, parent AutomationId, grandparent role)``), for the
+    skill runner's live pick (second verification V8)."""
+    from yuki.memory.store import app_key
+
+    return store.cipher.digest("ui-container", app_key(str(process or "")) or str(process or ""),
+                               str(parent_role or ""), str(parent_aid or ""), str(grand_role or ""))
+
+
 def name_digest(store: Any, process: str, role: str, name: str) -> str:
     """The keyed digest C1 takes over an element's name (:meth:`yuki.memory.trace.ActionTrace._element_cols`:
     ``digest("ui-name", process, role, normalise_name(name))``), for matching a picked item live."""
@@ -421,12 +468,14 @@ def health(store: Any, *, now: float | None = None) -> dict[str, Any]:
     """What the demo learner holds, content-free: ways and trials learned from what the user did (live), tasks learned
     from today, how many were refused in code today (kept by the pass)."""
     now = time.time() if now is None else float(now)
-    ways = trials = 0
+    ways = trials = hints = 0
     for o in P.live(store, ["procedure"]):
         if o.origin != "demo":
             continue
         if o.trial:
             trials += 1
+        elif o.hint_only:
+            hints += 1   # second verification V11: a way the hands cannot take is a hint for the thinker, not "alone"
         else:
             ways += 1
     try:
@@ -438,11 +487,12 @@ def health(store: Any, *, now: float | None = None) -> dict[str, Any]:
 
     day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
     same_day = prior.get("day") == day
-    return {"at": now, "day": day, "ways": ways, "trials": trials,
+    return {"at": now, "day": day, "ways": ways, "trials": trials, "hints": hints,
             "learned_today": int(prior.get("learned_today") or 0) if same_day else 0,
             "refused_today": int(prior.get("refused_today") or 0) if same_day else 0}
 
 
-__all__ = ["COLUMNS", "HEALTH_KEY", "STATE_KEY", "due_tasks", "demo_events", "element_names", "end_of", "facts_of",
+__all__ = ["COLUMNS", "HEALTH_KEY", "STATE_KEY", "container_digest", "demo_sig", "due_tasks", "demo_events",
+           "element_names", "end_of", "facts_of", "steps_sig",
            "health", "link_ends", "load_state", "name_digest", "proven_aid", "row_step", "save_state", "sends",
            "split_parts", "state_between", "step_words", "target_sig", "task_actions", "usable"]
