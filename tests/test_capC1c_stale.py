@@ -87,16 +87,32 @@ def test_a_menu_closing_under_the_press_before_the_worker_got_to_it_is_stale(rig
     rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.08)
     rig.settle()
     (row,) = rig.rows()
-    assert row["resolved"] != "point" and row["element_key"] is None
+    assert row["resolved"] == "stale" and row["element_key"] is None
     assert rig.uia.calls == []                                       # no lookup into the window that replaced it
     assert rig.w.counters["stale_window_changed"] == 1
+    assert rig.w.counters["resolved_stale"] == 1 and not rig.w.counters["resolved_unresolved"]
 
 
-def test_a_press_whose_window_is_gone_before_the_worker_got_to_it_keeps_nothing(rig):
+def test_a_press_on_a_menu_that_is_gone_keeps_a_stale_row_for_the_app_the_sink_read(rig):
+    """Review C1c-3: the menu was destroyed before the worker reached the press. The sink read the menu's process at
+    button-down (no messages), so the press stays its app's stale, point-only row instead of disappearing."""
     rig.under = (HWND[APP], APP)
     rig.w._pid_of = lambda h: 0                                      # the pressed window no longer exists
     t = rig.clock.t
-    rig.feed("down", t, "left", 150, 120, "user", 0, False, MENU)
+    rig.feed("down", t, "left", 150, 120, "user", 0, False, MENU, SHELL)
+    rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.08)
+    rig.settle()
+    (row,) = rig.rows()
+    assert row["process"] == "shellbar" and row["resolved"] == "stale" and row["element_key"] is None
+    assert rig.uia.calls == [] and rig.w.counters["stale_window_gone"] == 1
+    assert not rig.w.counters["skip_window_changed"]
+
+
+def test_a_press_whose_window_is_gone_and_whose_app_was_never_read_keeps_nothing(rig):
+    rig.under = (HWND[APP], APP)
+    rig.w._pid_of = lambda h: 0                                      # the pressed window no longer exists
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False, MENU)    # the sink could not read its process
     rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.08)
     rig.settle()
     assert rig.rows() == [] and rig.w.counters["skip_window_changed"] == 1 and rig.uia.calls == []
@@ -156,6 +172,39 @@ def test_a_list_reordering_under_the_point_is_stale(rig):
     rig.feed("down", t, "left", 150, 120, "user", 0, False, HWND[APP])
     rig.feed("out", t + 0.05, EVENT_OBJECT_REORDER, HWND[APP], -4, 0, 1)   # the list's own window holds the point
     rig.feed("up", t + 0.25, "left", 150, 120, "user", False, dt=0.05)
+    rig.settle()
+    assert rig.rows()[0]["resolved"] == "stale"
+    assert rig.w.counters["stale_structure"] == 1
+
+
+@pytest.mark.parametrize("id_object", [-8, -9])        # OBJID_CARET, OBJID_CURSOR
+@pytest.mark.parametrize("kind", ["out", "ev"])
+def test_the_caret_shown_in_the_clicked_field_is_not_stale(rig, id_object, kind):
+    """Review C1c-1: a click into a search box focuses it and Windows shows its caret a few ms later, while the lookup
+    still answers; the caret's handle is the field's own window, which holds the point. Nothing under the point
+    changed: the click stays resolved."""
+    rig.uia.points[(150, 120)] = Element(role="Edit", name="Search", bounds=(100, 110, 400, 130), pid=APP,
+                                         patterns=("value",))
+    rig.uia.slow_s = 0.05
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False, HWND[APP])
+    rig.feed(kind, t + 0.02, EVENT_OBJECT_SHOW, HWND[APP], id_object, 0, *((1,) if kind == "out" else ()))
+    rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.05)
+    rig.settle()
+    (row,) = rig.rows()
+    assert row["resolved"] == "point" and row["role"] == "Edit"
+    assert rig.w.counters["structure_not_content"] == 1 and not rig.w.counters["stale_structure"]
+
+
+def test_a_window_object_shown_over_the_clicked_field_is_still_stale(rig):
+    """The other side: the same show event for a window object (``OBJID_WINDOW``) that holds the point counts."""
+    rig.uia.points[(150, 120)] = Element(role="Edit", name="Search", bounds=(100, 110, 400, 130), pid=APP,
+                                         patterns=("value",))
+    rig.uia.slow_s = 0.05
+    t = rig.clock.t
+    rig.feed("down", t, "left", 150, 120, "user", 0, False, HWND[APP])
+    rig.feed("out", t + 0.02, EVENT_OBJECT_SHOW, DIALOG, 0, 0, 1)
+    rig.feed("up", t + 0.08, "left", 150, 120, "user", False, dt=0.05)
     rig.settle()
     assert rig.rows()[0]["resolved"] == "stale"
 
@@ -241,3 +290,19 @@ def test_the_sink_takes_the_window_under_the_press_at_button_down():
     s2.blocked = False
     s2.mouse(0.0, 0, 0x1, 0, 0, 0, 0, 1)
     assert items[-1][0] == "down" and items[-1][8] == 0             # a failing read never breaks the reader
+
+
+def test_the_sink_takes_the_pressed_windows_process_with_it():
+    items: list = []
+    m = Metrics(read=False, drag_w=4, drag_h=4, double_s=0.5, double_w=4, double_h=4, hover_w=4, hover_h=4,
+                hover_s=0.4)
+    s = TraceInput(items.append, metrics=m, cursor=lambda: (150, 120), clock=lambda: 0.0,
+                   root_at=lambda x, y: MENU, pid_of=lambda h: SHELL if h == MENU else 0)
+    s.blocked = False
+    s.mouse(0.0, 0, 0x1, 0, 0, 0, 0, 1)
+    assert items[-1][0] == "down" and items[-1][8:] == (MENU, SHELL)
+    s2 = TraceInput(items.append, metrics=m, cursor=lambda: (1, 1), clock=lambda: 0.0,
+                    root_at=lambda x, y: MENU, pid_of=lambda h: 1 / 0)
+    s2.blocked = False
+    s2.mouse(0.0, 0, 0x1, 0, 0, 0, 0, 1)
+    assert items[-1][8:] == (MENU, 0)                               # a failing read never breaks the reader

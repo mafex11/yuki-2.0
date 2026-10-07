@@ -124,6 +124,10 @@ PASTE_CHORDS = frozenset({"Ctrl+V", "Shift+Insert"})
 SAVE_CHORDS = frozenset({"Ctrl+S"})
 STRUCTURE_EVENTS = frozenset({EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, EVENT_OBJECT_REORDER, EVENT_SYSTEM_MENUEND,
                               EVENT_SYSTEM_MENUPOPUPEND})
+#: capC1c review: the object ids (WinEvent ``idObject``, Windows' own) whose show / hide never changes what is under a
+#: point: the text caret (``OBJID_CARET``, shown in a field the moment a click focuses it) and the mouse cursor
+#: (``OBJID_CURSOR``). A structure event about them never makes a press stale.
+NOT_CONTENT_OBJECTS = frozenset({-8, -9})
 IDENTITY_EVENTS = (EVENT_OBJECT_INVOKED, EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD, EVENT_OBJECT_FOCUS)
 #: Changed elements an outcome resolves to role and position at most (report 78 §4.2 step 3).
 OUTCOME_ELEMENTS = 5
@@ -548,7 +552,7 @@ class TraceWorker:
         return {"refine": True, "max_area": area}
 
     def _on_down(self, t: float, button: str, x: int, y: int, source: str, travel: int, dbl: bool,
-                 root: int = 0) -> None:
+                 root: int = 0, root_pid: int = 0) -> None:
         self._close_type(t)
         self._close_hover(t)
         self._input(t, source)
@@ -566,14 +570,17 @@ class TraceWorker:
         hwnd, pid = self._window_at(x, y)
         # capC1c: the window under the press (taken at button-down by the sink) is gone or covered before the worker
         # got to it (a menu closed, a window closed, a dialog came up): a lookup now would answer for another window.
-        # The press belongs to the window that was pressed: still there (covered), its own app's row, stale and
-        # point-only, through that window's own gates; gone, its app cannot be known, so nothing is kept.
+        # The press belongs to the window that was pressed: its own app's row, stale and point-only, through that
+        # window's own gates. Still there (covered), its process is read now; gone (a menu or dialog closed), the
+        # process the sink read at button-down (``GetWindowThreadProcessId``, no messages) stands. Only a press whose
+        # app is known neither way keeps nothing.
         moved = bool(root) and bool(hwnd) and int(root) != int(hwnd)
         if moved:
             try:
-                root_pid = int(self._pid_of(int(root)) or 0)
+                now_pid = int(self._pid_of(int(root)) or 0)
             except Exception:  # noqa: BLE001
-                root_pid = 0
+                now_pid = 0
+            root_pid = now_pid or int(root_pid or 0)
             if root_pid:
                 hwnd, pid = int(root), root_pid
         win = self._window(hwnd, pid)
@@ -587,8 +594,11 @@ class TraceWorker:
                 act.drop = act.drop or "skip_window_changed"
             elif act.drop is None:
                 act.stale = True
+                act.resolved = "stale"                     # no lookup: what was under the press is not there now
                 act.lookup_end = t
                 self.counters["stale_window_changed"] += 1
+                if not now_pid:
+                    self.counters["stale_window_gone"] += 1
             return
         if act.drop is None:
             walk = self._walk_kw(hwnd)
@@ -831,7 +841,7 @@ class TraceWorker:
         elif event == EVENT_SYSTEM_DIALOGSTART:
             self._dialog = (t, int(hwnd), self._fg)
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event, hwnd)
+            self._structure(t, event, hwnd, id_object)
         attached = False
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
@@ -857,19 +867,25 @@ class TraceWorker:
                     if el.secret():
                         act.drop = el.secret()
 
-    def _structure(self, t: float, event: int, hwnd: int = 0) -> None:
+    def _structure(self, t: float, event: int, hwnd: int = 0, id_object: int = 0) -> None:
         """A structure change (shown, hidden, reordered, a menu closed): an action whose lookup was still answering at
         that time is stale when the change could alter what is under its press point, decided now (a busy app's
         events cannot push it out). capC1c: only when the event's own window (``GetWindowRect`` of its handle, a
         machine fact) covers the point; a tooltip or a thumbnail shown elsewhere on screen is not. A window that is
         gone by now cannot be placed; the window under the press is compared when the action finishes instead
-        (:meth:`_stale`). Report 78 §4.2: only changes that could touch the press count."""
+        (:meth:`_stale`). Report 78 §4.2: only changes that could touch the press count. The text caret or the
+        cursor shown or hidden (:data:`NOT_CONTENT_OBJECTS`: a click into a field shows its caret at once, its handle
+        the field's own window) changes nothing under the point and never counts."""
+        if id_object in NOT_CONTENT_OBJECTS:
+            self.counters["structure_not_content"] += 1
+            return
         self._recent_structure.append((t, event, int(hwnd or 0)))
         rects: dict[int, Any] = {}
         for act in self._acts:
             if act.lookup_end is not None and act.t <= t <= act.lookup_end and not act.stale \
                     and self._under_point(act, hwnd, rects):
                 act.stale = True
+                self.counters["stale_structure"] += 1
 
     def _under_point(self, act: _Act, hwnd: int, rects: dict[int, Any] | None = None) -> bool:
         """capC1c: whether a window (an event's own handle) covers the action's press point now."""
@@ -886,7 +902,7 @@ class TraceWorker:
 
     def _on_out(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, gen: int = 0) -> None:
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event, hwnd)
+            self._structure(t, event, hwnd, id_object)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
                 if len(act.outs) < OUTCOME_CAP:      # V6: one row keeps at most the cap, however many repeats fold
@@ -1288,8 +1304,11 @@ class TraceWorker:
                     self.counters["stale_other_window"] += int(count)
                     return True
         rects: dict[int, Any] = {}
-        return any(act.t <= t <= act.lookup_end and self._under_point(act, hwnd, rects)
-                   for t, _e, hwnd in self._recent_structure)
+        if any(act.t <= t <= act.lookup_end and self._under_point(act, hwnd, rects)
+               for t, _e, hwnd in self._recent_structure):
+            self.counters["stale_structure"] += int(count)
+            return True
+        return False
 
     def _outcome(self, act: _Act, now: float) -> tuple[str, dict[str, Any]]:
         counts: Counter[str] = Counter()
@@ -1473,11 +1492,13 @@ class TraceWorker:
                 # with no name and none of them)
                 act.facts["patterns"] = list(patterns)
             if act.kind in POINTER_KINDS:
+                # an answer still an unnamed container is counted as one whatever the walk tried (a descent that
+                # stopped on one is not a real control), so walk_* counts only containers that became controls
                 refined = getattr(act.el, "refined", None)
-                if refined:
-                    self.counters["walk_" + refined] += 1
-                elif act.el.low_info():
+                if act.el.low_info():
                     self.counters["walk_container_left"] += 1
+                elif refined:
+                    self.counters["walk_" + refined] += 1
         if act.el is not None and act.el.role in ("MenuItem",) and act.kind == "click":
             act.kind = "menu"
         if act.save_check:
@@ -1491,8 +1512,8 @@ class TraceWorker:
             "typed": act.typed, "n": act.n if act.n != 1 or act.kind in ("scroll", "keys") else None,
             "clip_seq": act.clip_seq, "clip_formats": json.dumps(act.clip_formats) if act.clip_formats else None,
             "outcome": outcome, "outcome_ciphertext": self._enc(json.dumps(summary, sort_keys=True)) if summary
-            else None, "resolved": act.resolved if act.el is not None or act.resolved in ("event", "app_data")
-            else "unresolved", "lookup_ms": round(act.lookup_ms, 2) if act.lookup_ms is not None else None,
+            else None, "resolved": act.resolved if act.el is not None
+            or act.resolved in ("event", "app_data", "stale") else "unresolved", "lookup_ms": round(act.lookup_ms, 2) if act.lookup_ms is not None else None,
             "travel_px": act.travel, "gap_ms": act.gap_ms, "dwell_ms": act.dwell_ms,
             "proc_started": act.win.started,
         }
@@ -1799,7 +1820,10 @@ class Trace:
         recent = recent_folder()
         self.hooks = TraceHooks(self._put_input, recent=recent)
         metrics = Metrics()
-        self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at)
+        from yuki.memory.trace_uia import window_pid
+
+        self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at,
+                               pid_of=window_pid)
         rules_fn = self.privacy.rules
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,

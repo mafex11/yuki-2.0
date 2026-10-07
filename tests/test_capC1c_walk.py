@@ -221,6 +221,20 @@ def test_a_descent_inside_the_lookup_is_the_snapshot_path_and_never_a_second_loo
     assert row["name_ciphertext"] is None                       # a link is a content control: never a name
 
 
+def test_a_descent_that_stopped_on_an_unnamed_container_counts_as_a_container_left(rig):
+    """Review C1c-5: the walk_* counters count only containers that became real controls; a descent that ended on an
+    unnamed Group (its deadline, no named node) is counted as a container left."""
+    rig.uia.points[(150, 120)] = Element(role="Group", bounds=(140, 110, 220, 130), pid=APP, patterns=(),
+                                         refined="descent")
+    _press(rig)
+    assert rig.w.counters["walk_container_left"] == 1 and not rig.w.counters["walk_descent"]
+    rig.uia.points[(150, 120)] = Element(role="Button", name="Send", bounds=(140, 110, 220, 130), pid=APP,
+                                         patterns=("invoke",), refined="descent")
+    rig.clock.t += 5
+    _press(rig)
+    assert rig.w.counters["walk_descent"] == 1 and rig.w.counters["walk_container_left"] == 1
+
+
 def test_a_whole_pane_nothing_deeper_answers_for_is_point_only_without_a_second_lookup(rig):
     rig.uia.points[(150, 120)] = Element(role="Pane", bounds=(0, 0, 1000, 800), pid=APP, patterns=())
     _press(rig)

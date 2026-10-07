@@ -1,10 +1,11 @@
 """capC1c (report 99): a drag is the cursor leaving Windows' drag rectangle between press and release.
 
 The first live recording had 9 drags in 8 minutes, several of them plain clicks (an address bar, a search box, a chat
-list). The test now compares the cursor (physical pixels) at button-down and at button-up against ``SM_CXDRAG`` x
-``SM_CYDRAG`` scaled for the monitor's DPI as Windows does (``GetSystemMetricsForDpi``), never the device's raw counts
-(mickeys, which pointer speed and acceleration rescale) and never a wobble that came back. Fed as the reader feeds it
-(plain integers, a fake cursor); nothing touches the desktop.
+list). The test now compares the cursor (physical pixels) while the button is held and at button-up against the press, in
+``SM_CXDRAG`` x ``SM_CYDRAG`` scaled for the monitor's DPI as Windows does (``GetSystemMetricsForDpi``), never the
+device's raw counts (mickeys, which pointer speed and acceleration rescale). Like ``DragDetect``, leaving the
+rectangle at any moment while the button is held makes a drag (review C1c-4), so a drag that comes back is one. Fed
+as the reader feeds it (plain integers, a fake cursor); nothing touches the desktop.
 """
 
 from __future__ import annotations
@@ -83,7 +84,9 @@ def test_a_window_moved_by_its_title_bar_is_a_drag():
     assert up[6] is True and (up[3], up[4]) == (800, 600)
 
 
-def test_a_wobble_that_comes_back_before_the_release_is_a_click():
+def test_a_drag_that_comes_back_before_the_release_is_still_a_drag():
+    """Review C1c-4, DragDetect's rule: the cursor left the rectangle while the button was held (a knob turned and
+    released where it began, a drag-select brought back to its start), so it is a drag, with its end at the start."""
     cur = Cursor()
     s, items = sink(cur)
     s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
@@ -91,9 +94,38 @@ def test_a_wobble_that_comes_back_before_the_release_is_a_click():
         cur.x += dx
         s.mouse(0.02, 0, 0, 0, dx, 0, 0, HW)
     s.mouse(0.1, 0, L_UP, 0, 0, 0, 0, HW)
+    (up,) = ups(items)
+    assert up[6] is True and (up[3], up[4]) == (500, 400)
+    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)                           # a drag never starts a double click
+    assert items[-1][0] == "down" and items[-1][7] is False
+
+
+def test_a_wobble_inside_the_rectangle_and_back_is_a_click_and_still_makes_a_double_click():
+    cur = Cursor()
+    s, items = sink(cur)
+    s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
+    for dx in (1, 1, -1, -1):                                         # out 2 px (the rectangle is 4 wide) and back
+        cur.x += dx
+        s.mouse(0.02, 0, 0, 0, dx, 0, 0, HW)
+    s.mouse(0.1, 0, L_UP, 0, 0, 0, 0, HW)
     assert ups(items)[0][6] is False
-    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)                           # and it still makes a double click
+    s.mouse(0.2, 0, L_DOWN, 0, 0, 0, 0, HW)
     assert items[-1][0] == "down" and items[-1][7] is True
+
+
+def test_each_held_button_has_its_own_rectangle():
+    cur = Cursor()
+    s, items = sink(cur)
+    s.mouse(0.0, 0, L_DOWN, 0, 0, 0, 0, HW)
+    cur.x += 10
+    s.mouse(0.05, 0, 0, 0, 10, 0, 0, HW)                              # the left button's drag
+    s.mouse(0.1, 0, 0x4, 0, 0, 0, 0, HW)                              # the right button pressed out there
+    cur.x += 1
+    s.mouse(0.15, 0, 0, 0, 1, 0, 0, HW)
+    s.mouse(0.2, 0, 0x8, 0, 0, 0, 0, HW)                              # right up: within its rectangle
+    s.mouse(0.3, 0, L_UP, 0, 0, 0, 0, HW)
+    right, left = ups(items)
+    assert right[2] == "right" and right[6] is False and left[2] == "left" and left[6] is True
 
 
 def test_raw_counts_never_decide_only_the_cursor_does():
