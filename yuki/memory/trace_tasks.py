@@ -662,11 +662,17 @@ def spent_today(store: Any, now: float) -> float:
 
 def windows_due(store: Any, now: float, *, limit: int | None = WINDOWS_PER_PASS) -> list[TaskWindow]:
     """Final episode windows not passed yet, oldest first: none that ended more than :data:`MAX_AGE_DAYS` ago, none
-    passed (``ok``), none that failed :data:`MAX_TRIES` times, none that failed in the last :data:`RETRY_AFTER_S`."""
+    passed (``ok``), none that failed :data:`MAX_TRIES` times, none that failed in the last :data:`RETRY_AFTER_S`.
+    A final window is one with final episodes, or one the episode worker finished with none (its run came back empty,
+    or it gave up after failing): the user's trace rows in it are grouped into tasks all the same."""
     try:
         eps = store._query(
             "SELECT id, window_start, window_end, started_at, ended_at FROM episodes WHERE final = 1 AND expired_at IS"
             " NULL AND window_end >= ? AND window_end <= ? ORDER BY window_start, id",
+            (now - MAX_AGE_DAYS * DAY_S, now))
+        bare = store._query(
+            "SELECT window_start, max(window_end) AS window_end FROM episode_runs WHERE final = 1 AND outcome IN"
+            " ('ok', 'empty', 'gave_up') AND window_end >= ? AND window_end <= ? GROUP BY round(window_start, 1)",
             (now - MAX_AGE_DAYS * DAY_S, now))
         runs = store._query("SELECT window_start, ok, refused, at FROM ui_task_runs WHERE window_start >= ?",
                             (now - (MAX_AGE_DAYS + 1) * DAY_S,))
@@ -688,6 +694,11 @@ def windows_due(store: Any, now: float, *, limit: int | None = WINDOWS_PER_PASS)
         w = out.setdefault(ws, TaskWindow(float(e["window_start"]), float(e["window_end"])))
         w.end = max(w.end, float(e["window_end"]))
         w.episodes.append((int(e["id"]), float(e["started_at"]), float(e["ended_at"])))
+    for b in bare:
+        ws = round(float(b["window_start"]), 1)
+        if ws in out or ws in done or fails[ws] >= MAX_TRIES or now - last_fail.get(ws, -1e18) < RETRY_AFTER_S:
+            continue
+        out[ws] = TaskWindow(float(b["window_start"]), float(b["window_end"]))
     due = sorted(out.values(), key=lambda w: w.start)
     return due if limit is None else due[:limit]
 
@@ -732,6 +743,8 @@ class TaskPass:
         self.budget_usd = float(budget_usd)
         self.model = model
         self._refused_day: str | None = None
+        #: Why the last :meth:`run_once` stopped before its windows were done (the gate closed), or None.
+        self.stopped: str | None = None
 
     def _log(self, type_: str, **fields: Any) -> None:
         fn = self._log_fn or getattr(self.worker, "_log", None)
@@ -963,11 +976,23 @@ class TaskPass:
             done += 1
         return done
 
-    def run_once(self, *, now: float | None = None, limit: int = WINDOWS_PER_PASS) -> list[PassResult]:
-        """Pass the windows due (at most ``limit``, oldest first); stops at the first refusal or failure."""
+    def run_once(self, *, now: float | None = None, limit: int = WINDOWS_PER_PASS,
+                 blocked: Callable[[], str | None] | None = None) -> list[PassResult]:
+        """Pass the windows due (at most ``limit``, oldest first); stops at the first refusal or failure. ``blocked``
+        (the practice worker's gate) is asked again before each window: a game, a call or something full screen that
+        started mid-pass stops it before the next call (why: :attr:`stopped`)."""
         now = time.time() if now is None else float(now)
         out = []
+        self.stopped = None
         for window in windows_due(self.store, now, limit=limit):
+            if blocked is not None:
+                try:
+                    why = blocked()
+                except Exception:  # noqa: BLE001 - a gate that can't tell is a closed gate
+                    why = "gate"
+                if why is not None:
+                    self.stopped = why
+                    break
             res = self.run_window(window, now=now)
             out.append(res)
             if res.outcome in ("refused", "error"):

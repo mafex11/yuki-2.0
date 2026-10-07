@@ -288,6 +288,57 @@ def test_catch_up_four_windows_a_pass_and_nothing_older_than_7_days(store):
     assert h["backlog"] == 0 and h["tasks_today"] == 6 and h["unclear_today"] == 6
 
 
+def test_the_gate_is_asked_again_before_each_window_of_a_catch_up(store):
+    from yuki.memory.practice_learn import PracticeWorker
+
+    now = NOW + 10 * DAY
+    starts = [now - 2 * DAY + i * 3600 for i in range(4)]
+    for s in starts:
+        episode(store, s, s + 600)
+        act(store, s + 30, "chatter", "click", role="Button", name="Send", key="k-send")
+    worker = Worker([{"tasks": [{"pieces": ["p1"], "goal": "You sent a message in the chat", "outcome": "none"}]}
+                     for _ in range(4)])
+    worker.store = store
+    state = {"full": False}
+    real_call = worker._call
+
+    def call_then_a_game(*a, **kw):                    # the user starts a game while the first call is out
+        out = real_call(*a, **kw)
+        state["full"] = True
+        return out
+
+    worker._call = call_then_a_game
+    pw = PracticeWorker(store, worker, idle_fn=lambda: 4000.0, live_fn=lambda: {"fullscreen": state["full"]},
+                        clock=lambda: now)
+    out = pw.task_pass(now)
+    assert len(worker.calls) == 1 and len(out["tasks"]) == 1 and out["tasks_waiting"] == "fullscreen"
+    assert [w.start for w in T.windows_due(store, now, limit=None)] == starts[1:]   # the rest wait, not dropped
+    gate = iter([None, None, "call"])
+    done = T.TaskPass(store, worker).run_once(now=now, blocked=lambda: next(gate))
+    assert len(done) == 2
+
+
+def test_a_final_window_with_no_episode_is_passed_too(store):
+    now = NOW + 2 * DAY
+    for start, outcome in ((now - 9000, "gave_up"), (now - 5000, "empty"), (now - 3000, "error")):
+        store._write(lambda c, s=start, o=outcome: c.execute(
+            "INSERT INTO episode_runs(at, trigger, model, window_start, window_end, final, outcome) VALUES"
+            " (?, 'break', 'm', ?, ?, 1, ?)", (s + 700, s, s + 600, o)))
+    store._write(lambda c: c.execute(
+        "INSERT INTO episode_runs(at, trigger, model, window_start, window_end, final, outcome) VALUES"
+        " (?, 'hour', 'm', ?, ?, 0, 'ok')", (now - 1000, now - 1600, now - 1000)))   # an open window: not yet
+    due = T.windows_due(store, now, limit=None)
+    assert [(w.start, w.episodes) for w in due] == [(now - 9000, []), (now - 5000, [])]   # failing still: waits
+    act(store, now - 9000 + 30, "chatter", "click", role="Button", name="Send", key="k-send")
+    worker = Worker([{"tasks": [{"pieces": ["p1"], "goal": "You sent a message in the chat", "outcome": "none"}]}])
+    tp = T.TaskPass(store, worker)
+    assert tp.mark_empty(now=now) == 1                                              # no action of the user's
+    done = tp.run_once(now=now)
+    assert [r.outcome for r in done] == ["ok"] and len(worker.calls) == 1
+    assert store._query("SELECT episode_id FROM ui_tasks")[0][0] is None
+    assert T.windows_due(store, now, limit=None) == []
+
+
 def test_windows_with_no_action_of_the_user_are_closed_at_once_without_the_gate(store):
     from yuki.memory.practice_learn import PracticeWorker
 
