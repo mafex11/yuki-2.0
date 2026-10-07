@@ -121,13 +121,14 @@ between, a look at something else, an action undone.
 
 Example. PIECES: p1 10:02-10:06 [webby, chatter]: a101 10:02:10 webby · click an unnamed Hyperlink -> a new page \
 came up {f1 new page}; a102 10:02:40 webby · copied; a103 10:03:05 chatter · click an unnamed ListItem (item 2 in a \
-List); a104 10:03:09 chatter · pasted into an unnamed Edit; a105 10:03:12 chatter · keys Enter {f2 field sent} \
-{f3 pasted and sent}; a106 10:04:30 chatter · click Button "Reply"; a107 10:04:40 chatter · typed 22 characters into \
-an unnamed Edit; a108 10:04:44 chatter · keys Enter {f4 field sent}. p2 10:09-10:11 [notepadx]: a120 10:09:02 \
+List); a104 10:03:09 chatter · pasted into an unnamed Edit; a105 10:03:10 chatter · typed 6 characters into an \
+unnamed Edit; a106 10:03:12 chatter · keys Enter {f2 field sent} {f3 pasted and sent}; a107 10:04:30 chatter · click \
+Button "Reply"; a108 10:04:40 chatter · typed 22 characters into an unnamed Edit; a109 10:04:44 chatter · keys Enter \
+{f4 field sent}. p2 10:09-10:11 [notepadx]: a120 10:09:02 \
 notepadx · typed 140 characters into an unnamed Document; a121 10:10:50 notepadx · keys Ctrl+S -> a dialog came up; \
 a122 10:11:05 notepadx · saved a file (.txt) {f5 file saved (.txt)}. Answer: tasks [{"pieces": ["p1"], "goal": "You \
-shared a page from webby in a chat", "outcome": "f3", "detours": [{"from": "a106", "to": "a108"}]}, {"pieces": \
-["p2"], "goal": "You wrote and saved a text note", "outcome": "f5", "detours": []}]. The reply at a106-a108 answered \
+shared a page from webby in a chat", "outcome": "f3", "detours": [{"from": "a107", "to": "a109"}]}, {"pieces": \
+["p2"], "goal": "You wrote and saved a text note", "outcome": "f5", "detours": []}]. The reply at a107-a109 answered \
 someone else: a detour.
 Another: p1 14:00-14:03 [warp]: a301 14:00:20 warp · ran a terminal command {f1 command worked}; p2 14:06-14:09 \
 [webby]: a310 14:06:05 webby · scroll ×9; a311 14:07:40 webby · click Button "Next" -> a new page came up {f2 new \

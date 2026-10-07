@@ -63,8 +63,10 @@ def seed(store: Any, t0: float) -> dict[str, int]:
     ids["chat"] = act(store, t0 + 10, "chatter", "click", role="ListItem", name="Mira Lane", key="k-chat",
                       position="1/List")
     ids["paste"] = act(store, t0 + 15, "chatter", "paste", resolved="focus", role="Edit", key="k-edit", clip_seq=9)
+    # a word typed after the paste: the trace records "field sent" only for an Enter that ends a typing run
+    ids["words"] = act(store, t0 + 16, "chatter", "type", resolved="focus", role="Edit", key="k-edit", typed=6)
     ids["send"] = act(store, t0 + 18, "chatter", "keys", resolved="focus", role="Edit", key="k-edit", chord="Enter",
-                      facts={"field_submitted": {"typed": 0}})
+                      facts={"field_submitted": {"typed": 6}})
     t1 = t0 + 360
     ids["type"] = act(store, t1, "notepadx", "type", resolved="focus", role="Document", key="k-doc", typed=40)
     ids["hover"] = act(store, t1 + 5, "notepadx", "hover", role="Button", name="Bold", key="k-bold")
@@ -111,7 +113,7 @@ def good_answer(ids: dict[str, int], facts: dict[int, list[T.Fact]]) -> dict[str
 def test_precut_at_two_minute_pauses_keeps_link_chains_in_one_piece(store):
     ids, _w, pieces, _f = prepared(store)
     assert [p.pid for p in pieces] == ["p1", "p2", "p3"]
-    assert pieces[0].ids == {ids["copy"], ids["chat"], ids["paste"], ids["send"]}
+    assert pieces[0].ids == {ids["copy"], ids["chat"], ids["paste"], ids["words"], ids["send"]}
     assert ids["hover"] not in pieces[1].ids and ids["stale"] not in pieces[1].ids and ids["yuki"] not in pieces[1].ids
     rows = [{"id": 1, "at": 0.0, "source": "user", "kind": "click", "resolved": "point"},
             {"id": 2, "at": 119.9, "source": "user", "kind": "click", "resolved": "point"},

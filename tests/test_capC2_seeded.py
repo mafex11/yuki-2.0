@@ -24,8 +24,9 @@ _SPEC.loader.exec_module(S)
 PAUSE = 150.0
 
 
-def session(store: Any, t0: float) -> float:
-    """The script, done: each block's actions a few seconds apart, a 2.5-minute pause between blocks."""
+def session(store: Any, t0: float, *, short_pause_after: int | None = None) -> float:
+    """The script, done: each block's actions a few seconds apart, a 2.5-minute pause between blocks
+    (``short_pause_after``: the pause after that block was only a minute)."""
     t = t0
 
     def at(step: float = 4.0) -> float:
@@ -37,9 +38,10 @@ def session(store: Any, t0: float) -> float:
     act(store, at(), "webby", "copy", resolved="event", clip_seq=31)
     act(store, at(), "chatter", "click", role="ListItem", key="k-self", position="0/List")
     act(store, at(), "chatter", "paste", resolved="focus", role="Edit", key="k-msg", clip_seq=31)
+    act(store, at(), "chatter", "type", resolved="focus", role="Edit", key="k-msg", typed=5)     # a word after it
     act(store, at(), "chatter", "keys", resolved="focus", role="Edit", key="k-msg", chord="Enter",
-        facts={"field_submitted": {"typed": 0}})
-    at(PAUSE)
+        facts={"field_submitted": {"typed": 5}})
+    at(60.0 if short_pause_after == 1 else PAUSE)
     # 2. Notepad, save a new file (with one of Yuki's rows and a stale click among them: never a task's)
     act(store, at(), "notepadx", "type", resolved="focus", role="Document", key="k-doc", typed=30)
     act(store, at(), "notepadx", "click", role="Button", name="Format", key="k-fmt", source="yuki")
@@ -131,5 +133,43 @@ def test_the_dry_run_makes_no_call_and_the_script_reads_plainly(store):
     assert out["dry_run"] and out["pieces"] == 7 and out["lines"] >= 13 and not worker.calls
     assert "No model call" in S.report(out)
     assert S.SCRIPT_TEXT.count("\n  PAUSE\n") == 6 and "2 full minutes" in S.SCRIPT_TEXT
-    assert len(S.SCRIPT) == 6 and S.PASS_AT == 5
+    assert len(S.SCRIPT) == 6 and S.PASS_AT == 5 and S.PARTS == [1, 2, 3, 4, 5, 4, 6]
+    assert "type one more word after it" in S.SCRIPT_TEXT                    # a paste sent at once records no outcome
     assert {"paste_sent", "file_saved", "command_ok"} <= {e["kind"] for e in S.SCRIPT}
+
+
+def test_wrong_boundaries_are_not_recovered_even_with_the_right_outcome(store):
+    end = session(store, NOW)
+    episode(store, NOW, end)
+
+    def sloppy(kw: dict[str, Any]) -> dict[str, Any]:
+        ans = labeller(kw)
+        t = ans["tasks"]
+        first, second = t[3]["pieces"]                                    # task 4 split in two
+        merged = {"pieces": t[1]["pieces"] + t[2]["pieces"], "goal": "You saved a note and ran a command",
+                  "outcome": t[1]["outcome"]}                             # tasks 2 and 3 as one, file saved
+        return {"tasks": [t[0], merged,
+                          {"pieces": [first], "goal": "You followed a link", "outcome": t[3]["outcome"]},
+                          {"pieces": [second], "goal": "You followed another link", "outcome": t[3]["outcome"]},
+                          t[4], t[5]]}
+
+    out = S.analyze(store, NOW - 1, end + 1, Worker([sloppy]), now=end + 60)
+    got = {m["n"]: (m["task"] is not None, m["why"]) for m in out["matches"]}
+    assert got[2] == (False, "found with the wrong boundaries") and got[4] == (False, "found with the wrong boundaries")
+    assert got[3] == (False, "its outcome was not found")
+    assert out["recovered"] == 3 and out["passed"] is False
+    assert "wrong boundaries" in S.report(out)
+
+
+def test_a_pause_too_short_leaves_the_boundaries_unknown_and_the_run_cannot_pass(store):
+    end = session(store, NOW, short_pause_after=1)
+    episode(store, NOW, end)
+
+    def by_piece(kw: dict[str, Any]) -> dict[str, Any]:
+        pieces = sorted({line.split(" ", 1)[0] for line in kw["user"].splitlines()
+                         if line[:1] == "p" and line.split(" ", 1)[0][1:].isdigit()}, key=lambda p: int(p[1:]))
+        return {"tasks": [{"pieces": [p], "goal": "You did one thing", "outcome": "none"} for p in pieces]}
+
+    out = S.analyze(store, NOW - 1, end + 1, Worker([by_piece]), now=end + 60)
+    assert out["pieces"] == 6 and out["boundaries_known"] is False and out["passed"] is False
+    assert "do the session again" in S.report(out)
