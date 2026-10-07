@@ -1426,6 +1426,8 @@ class WebWindow:
         # a one-call test. Written here (ai.json, the DPAPI key file): no tray needed, every process follows
         "ai_role": "a_ai_role", "ai_key": "a_ai_key", "ai_custom": "a_ai_custom", "ai_models": "a_ai_models",
         "ai_test": "a_ai_test",
+        # capC2 (decision D5): a task inside a Day session corrected (renamed, not one task, not what you did), Undo
+        "task_correct": "a_task_correct", "task_correct_undo": "a_task_correct_undo",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
@@ -1835,6 +1837,34 @@ class WebWindow:
         self.refresh("home")
         return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "state": result.get("state"),
                 "queued": bool(result.get("queued"))}
+
+    def a_task_correct(self, m: dict[str, Any]) -> dict[str, Any]:
+        """capC2 (decision D5): the user's correction of one task inside a Day session, to memory's ``task_correct``
+        (one small write on this action's own thread; no model): ``verdict`` ``renamed`` with ``words`` (what it was,
+        in their words), ``not_one`` or ``not_mine``. Kept as the task's verdict and shown to later task passes as a
+        worked example. Never a card, never spoken."""
+        ref, verdict = str(m.get("ref") or ""), str(m.get("verdict") or "")
+        words = " ".join(str(m.get("words") or "").split())
+        fn = getattr(self._memory(), "task_correct", None)
+        if not callable(fn):
+            return {"ok": False, "error": "This memory can't correct tasks yet."}
+        r = fn(ref, verdict, words) or {}
+        self.refresh("day")
+        if not r.get("ok"):
+            return {"ok": False, "error": str(r.get("error") or "That can’t be corrected here.")}
+        return {"ref": ref, "verdict": r.get("verdict"), "goal": r.get("goal") or ""}
+
+    def a_task_correct_undo(self, m: dict[str, Any]) -> dict[str, Any]:
+        """capC2: take a task's correction back (memory's ``task_correct_undo``)."""
+        ref = str(m.get("ref") or "")
+        fn = getattr(self._memory(), "task_correct_undo", None)
+        if not callable(fn):
+            return {"ok": False, "error": "This memory can't correct tasks yet."}
+        r = fn(ref) or {}
+        self.refresh("day")
+        if not r.get("ok"):
+            return {"ok": False, "error": str(r.get("error") or "Couldn’t take it back.")}
+        return {"ref": ref, "verdict": None, "goal": r.get("goal") or ""}
 
     #: Memory's "too late" answer to an Undo after its correction pass started, said by Yuki itself.
     TOO_LATE = "Too late to undo: I’m already updating my memory from your answer."

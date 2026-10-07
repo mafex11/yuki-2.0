@@ -3109,6 +3109,127 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS ui_files_at ON ui_files(at);
     """,
+    # 39 (2026-10-07, capC2, docs/research/revamp-2026-10-02/98-build-capC2.md; design: report 78 §5.1-5.4, §8): links
+    # and tasks, the "why" of the trace (yuki.memory.trace_links, trace_tasks, trace_families).
+    # - ui_links (migration 38's table) gets its indexes: one row per exact machine join (clipboard | file | url);
+    #   ui_actions gets two (by kind, and by file digest) so the joins never scan the trace.
+    # - ui_tasks: the user's steps in one finished episode window grouped into a task by the task pass: its span, the
+    #   apps (process keys), the goal in plain words (encrypted; the pass's own goal kept apart once the user renamed
+    #   it, so the correction can be shown to later passes as a worked example), the outcome fact chosen only from
+    #   facts code recorded (or 'unclear'), the family, the user's verdict from the Day page (renamed | not_one |
+    #   not_mine) and the goal's embedding (encrypted). 30-day TTL (decision D4). AUTOINCREMENT: an id is never used
+    #   again, so a family member (below) keyed by its task's id stays that task's after the row expires.
+    # - ui_task_actions: a task's action id ranges (detour = 1: a detour inside it). 30-day TTL.
+    # - ui_families: tasks with the same goal and route: a short label (encrypted), the usual path and its branches
+    #   (element keys and machine fields only, never names), the centroid of the goals' embeddings (encrypted).
+    #   Deleted after 90 days unused. label_task: the task its label was taken from (a forget of that task relabels).
+    #   path_n: how many routes the usual path was built from (at most 12; its steps are counted against that).
+    #   AUTOINCREMENT, like ui_tasks: a forget's undo puts a family back under its own id, never over a newer one.
+    # - ui_family_members: each task counted in a family, kept as its route (element keys and machine fields only, no
+    #   goal, no names), apps, span and the goal's embedding (encrypted), so a family keeps its count and usual path
+    #   after its tasks expire at 30 days (they are kept 90 days, like the family; a forget or the user's rejection
+    #   takes a member out).
+    # - ui_transitions: per app, element key -> next element key, count, median gap, the last gaps, last use. Digests
+    #   only. Deleted after 60 days unused.
+    # - ui_task_runs: one row per task pass on a window: cost (the $0.40 a day cap is checked against it), tasks,
+    #   unclear, refused (over the cap), ok, outcome. 30-day TTL.
+    # Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE INDEX IF NOT EXISTS ui_links_from ON ui_links(from_action);
+    CREATE INDEX IF NOT EXISTS ui_links_to ON ui_links(to_action);
+    CREATE UNIQUE INDEX IF NOT EXISTS ui_links_pair ON ui_links(from_action, to_action, kind);
+    CREATE INDEX IF NOT EXISTS ui_actions_kind ON ui_actions(kind, at);
+    CREATE INDEX IF NOT EXISTS ui_actions_file ON ui_actions(file_digest, at) WHERE file_digest IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS ui_tasks (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id             INTEGER,
+        window_start           REAL,
+        window_end             REAL,
+        started_at             REAL NOT NULL,
+        ended_at               REAL NOT NULL,
+        apps                   TEXT,
+        goal_ciphertext        TEXT,
+        model_goal_ciphertext  TEXT,
+        outcome_fact           TEXT,
+        outcome_action         INTEGER,
+        outcome_target         TEXT,
+        family_id              INTEGER,
+        user_verdict           TEXT,
+        verdict_at             REAL,
+        actions                INTEGER,
+        vec_ciphertext         BLOB,
+        embed_model            TEXT,
+        run_id                 INTEGER,
+        created_at             REAL NOT NULL,
+        updated_at             REAL,
+        valid_to               REAL
+    );
+    CREATE INDEX IF NOT EXISTS ui_tasks_span ON ui_tasks(started_at);
+    CREATE INDEX IF NOT EXISTS ui_tasks_family ON ui_tasks(family_id);
+    CREATE INDEX IF NOT EXISTS ui_tasks_window ON ui_tasks(window_start);
+    CREATE TABLE IF NOT EXISTS ui_task_actions (
+        task_id       INTEGER NOT NULL,
+        first_action  INTEGER NOT NULL,
+        last_action   INTEGER NOT NULL,
+        detour        INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS ui_task_actions_task ON ui_task_actions(task_id);
+    CREATE TABLE IF NOT EXISTS ui_families (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        label_ciphertext TEXT,
+        n_tasks          INTEGER NOT NULL DEFAULT 0,
+        apps             TEXT,
+        path_keys        TEXT,
+        variants_keys    TEXT,
+        playbook_id      INTEGER,
+        vec_ciphertext   BLOB,
+        embed_model      TEXT,
+        last_at          REAL,
+        updated_at       REAL,
+        label_task       INTEGER,
+        path_n           INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS ui_family_members (
+        task_id          INTEGER PRIMARY KEY,
+        family_id        INTEGER NOT NULL,
+        started_at       REAL NOT NULL,
+        ended_at         REAL NOT NULL,
+        apps             TEXT,
+        route            TEXT,
+        vec_ciphertext   BLOB
+    );
+    CREATE INDEX IF NOT EXISTS ui_family_members_family ON ui_family_members(family_id);
+    CREATE TABLE IF NOT EXISTS ui_transitions (
+        process       TEXT NOT NULL,
+        from_key      TEXT NOT NULL,
+        to_key        TEXT NOT NULL,
+        n             INTEGER NOT NULL DEFAULT 0,
+        median_gap_s  REAL,
+        gaps          TEXT,
+        last_at       REAL,
+        PRIMARY KEY (process, from_key, to_key)
+    );
+    CREATE INDEX IF NOT EXISTS ui_transitions_last ON ui_transitions(last_at);
+    CREATE TABLE IF NOT EXISTS ui_task_runs (
+        id            INTEGER PRIMARY KEY,
+        at            REAL NOT NULL,
+        episode_id    INTEGER,
+        window_start  REAL,
+        window_end    REAL,
+        model         TEXT,
+        cost_usd      REAL NOT NULL DEFAULT 0,
+        tasks         INTEGER NOT NULL DEFAULT 0,
+        unclear       INTEGER NOT NULL DEFAULT 0,
+        pieces        INTEGER,
+        actions       INTEGER,
+        refused       INTEGER NOT NULL DEFAULT 0,
+        ok            INTEGER NOT NULL DEFAULT 0,
+        outcome       TEXT,
+        error         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS ui_task_runs_at ON ui_task_runs(at);
+    CREATE INDEX IF NOT EXISTS ui_task_runs_window ON ui_task_runs(window_start);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
