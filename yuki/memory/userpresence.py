@@ -559,7 +559,7 @@ class _RawReader:
                 got = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if got in (0, -1):
                     break
-                if msg.message == _WM_WAKE_MOUSE and not msg.hwnd:
+                if msg.message == _WM_WAKE_MOUSE and not msg.hWnd:
                     if resting[0]:
                         wake_mouse()
                     continue
