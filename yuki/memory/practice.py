@@ -2215,4 +2215,8 @@ __all__ = [
     "stamp_successes", "provenance", "provenance_rank", "pitfall_rank", "pitfall_overflow", "retire_cleaned",
     "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX", "CLEAN_CHECKPOINT", "cap_enabled", "set_clean_state",
     "launch_identities",
+    # capC4: ways learned from what the user did
+    "TRACE_DOS", "MAX_PARTS", "PICK_DIGEST_CHARS", "END_KINDS", "DEMO_RUN_PREFIX", "DEMO_TIMES", "DEMO_PROVEN_RUNS",
+    "TRIAL_LABEL", "DEMO_SOURCE", "demo_step", "clean_parts", "clean_end", "runnable_parts", "demo_key", "demo_task",
+    "demo_withdrawals",
 ]

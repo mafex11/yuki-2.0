@@ -19,6 +19,22 @@ way's own last steps, run as memory keeps them (:func:`fit_to_way`; only a type 
 * **keys**: held together, only into a window of the way's own app (or the one in front when it started), guarded by
   ``expect_hwnd``; verified by the watch (focus, window, title, state).
 * **scroll**, **open_app**, **open_url**: the talker's own hands of those names.
+* **pick** (capC4, report 78 §6.2): an item of a list, a chat, a file - a content control, whose name the action trace
+  never keeps. The container (by role, and name when the way knows it) is found in a fresh read; its visible children
+  of the item's role are read, the keyed digest C1 takes over a name is computed over each child's name (by memory,
+  :meth:`yuki.memory.api.MemoryClient.name_digests`) and the one matching the way's ``item`` is clicked (a fixed item:
+  "always Liked Songs"); or, when the way names a slot, the child whose name is the request's words, matched as a click
+  matches. No unique visible match: the run stops and the thinker gets it.
+
+**Ways learned from what the user did** (capC4, report 78 §6.1-6.2, §7) run **in parts**: each part at most
+:data:`MAX_STEPS` steps, at most 4 parts, each ending on a checked state memory recorded (a window of an app in front,
+a page reached, or the part's last step verified). The parts run in order, and a part's end is verified before the
+next part starts; a part whose end is not reached stops the run and hands over. The talker may give all the way's
+steps, its last steps, or only its typing and slot steps (their text from the user's words); every other step comes
+from memory. A way the user did only once is a **trial** ("your way, seen once"): a hint for the thinker, never run
+here (decision D3). A **Warp command** step is the thinker's terminal tool's, never run here. A demo never authorises a
+send: a way whose steps sent what was typed runs only when the talker declares ``sends`` with whom and what in the
+user's own words (:func:`check_sends`); Yuki's own check (on Claude) still judges each step.
 
 **Each step's expectation is checked** before the next one runs: the action's own measured verdict (a step whose report
 shows it did not take effect, or that failed, stops the run), the next step's precondition (its control on the screen,
@@ -47,10 +63,16 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-#: What a skill step may do: the talker's own verified hands.
-SKILL_DOS = ("click", "type", "keys", "scroll", "open_app", "open_url")
-#: Most steps one run takes (practice memory keeps at most 8 per procedure).
+#: What a skill step may do: the talker's own verified hands (``pick``: capC4, an item of a list by its name's digest).
+SKILL_DOS = ("click", "type", "keys", "scroll", "open_app", "open_url", "pick")
+#: Most steps one run takes (practice memory keeps at most 8 per procedure); a way learned from what the user did runs
+#: in parts of at most this many steps each, at most :data:`MAX_PARTS` parts.
 MAX_STEPS = 8
+MAX_PARTS = 4
+#: How deep below a container a picked item may sit (a ListItem inside a Group inside the List).
+PICK_DEPTH = 6
+#: How long a part's checked end may take to show (a window coming up, a page loading).
+END_WAIT_S = 3.0
 #: A key combination holds at most this many keys.
 MAX_KEYS = 4
 #: The first step's control should be on the screen already (the way fits the screen now, or it does not): one read
@@ -112,11 +134,22 @@ class SkillStep:
     url: str = ""
     app: str = ""
     expect: str = ""
+    #: capC4: a click's proven AutomationId (memory keeps it only where that app's are proven).
+    aid: str = ""
+    #: capC4, pick: the container (role, and name when known), the item's keyed name digest (a fixed item) or "" (the
+    #: item is named by ``text``, the user's words), and whether the way names a slot.
+    box_role: str = ""
+    box_name: str = ""
+    item: str = ""
+    slot: bool = False
 
     def what(self) -> str:
         """The step in a few words, for reports (content: the thinker and memory only)."""
         if self.do == "click":
             return f'click {self.role or "control"} "{self.name}"'
+        if self.do == "pick":
+            return (f'pick "{self.text[:60]}"' if self.slot else "pick the usual item") + \
+                f" in the {self.box_role or 'list'}"
         if self.do == "type":
             return f'type "{self.text[:80]}"'
         if self.do == "keys":
@@ -132,12 +165,15 @@ def _words(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
-def parse_steps(raw: Any) -> list[SkillStep]:
-    """The talker's steps, validated (raises :class:`SkillRefused` before anything runs)."""
+def parse_steps(raw: Any, *, cap: int = MAX_STEPS, allow_empty: bool = False) -> list[SkillStep]:
+    """The talker's steps, validated (raises :class:`SkillRefused` before anything runs). ``cap``: at most this many
+    (a way in parts: all its parts' steps); ``allow_empty``: none at all is fine (a way in parts with no typing)."""
+    if allow_empty and isinstance(raw, list) and not raw:
+        return []
     if not isinstance(raw, list) or not raw:
         raise SkillRefused("no steps were given")
-    if len(raw) > MAX_STEPS:
-        raise SkillRefused(f"more than {MAX_STEPS} steps")
+    if len(raw) > cap:
+        raise SkillRefused(f"more than {cap} steps")
     steps: list[SkillStep] = []
     for i, item in enumerate(raw, 1):
         if not isinstance(item, dict):
@@ -230,16 +266,35 @@ def fit_to_way(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillS
     if start < 0 or not all(_same_step(mine, way) for mine, way in zip(steps, run[start:])):
         raise SkillRefused("those are not the learned way's own steps (its last steps, in order, as the line gives "
                            "them)")
-    out = []
-    for mine, way in zip(steps, run[start:]):
-        out.append(SkillStep(
-            i=mine.i, do=mine.do, role=_words(way.get("role")) or mine.role,
-            name=_words(way.get("name")) or mine.name, window=None, text=mine.text,
-            keys=[str(k).casefold() for k in way.get("keys") or []] or mine.keys,
-            direction=str(way.get("direction") or mine.direction), amount=mine.amount,
-            url=_words(way.get("url")) or mine.url, app=_words(way.get("app")) or mine.app,
-            expect=_words(way.get("expect")) or mine.expect))
-    return out
+    return [way_step(mine.i, way, mine) for mine, way in zip(steps, run[start:])]
+
+
+def way_step(i: int, way: dict[str, Any], mine: SkillStep | None = None) -> SkillStep:
+    """One of the way's stored steps as it runs: every field from memory; only the text (a type step's, a slot pick's)
+    is the talker's (``mine``)."""
+    mine = mine or SkillStep(i=i, do=str(way.get("do") or ""))
+    box = way.get("in") if isinstance(way.get("in"), dict) else {}
+    return SkillStep(
+        i=i, do=str(way.get("do") or mine.do), role=_words(way.get("role")) or mine.role,
+        name=_words(way.get("name")) or mine.name, window=None, text=mine.text,
+        keys=[str(k).casefold() for k in way.get("keys") or []] or mine.keys,
+        direction=str(way.get("direction") or mine.direction or "down"), amount=mine.amount or 5,
+        url=_words(way.get("url")) or mine.url, app=_words(way.get("app")) or mine.app,
+        expect=_words(way.get("expect")) or mine.expect, aid=_words(way.get("aid")),
+        box_role=_words(box.get("role")), box_name=_words(box.get("name")), item=_words(way.get("item")),
+        slot=way.get("do") == "pick" and not way.get("item"))
+
+
+def fill_slots(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillStep]:
+    """capC4: a way in parts run whole from memory, the talker giving only its text-bearing steps (its typing steps
+    and the picks that name a slot), in order, each with the text from the user's words; every other step is the way's
+    own. Raises :class:`SkillRefused` when the talker's steps are not exactly those, in that order."""
+    wants = [n for n, s in enumerate(run) if s.get("do") == "type" or (s.get("do") == "pick" and not s.get("item"))]
+    if len(steps) != len(wants) or any(mine.do != run[n].get("do") for mine, n in zip(steps, wants)):
+        raise SkillRefused("those are not the learned way's steps (all of them in order, its last ones, or only its "
+                           "typing and pick steps with the text from their words)")
+    given = {n: mine for mine, n in zip(steps, wants)}
+    return [way_step(n + 1, s, given.get(n)) for n, s in enumerate(run)]
 
 
 def check_texts(steps: list[SkillStep], words: list[str], way_text: str) -> str | None:
@@ -248,6 +303,9 @@ def check_texts(steps: list[SkillStep], words: list[str], way_text: str) -> str 
         if step.do == "type" and not said(step.text, [*words, way_text]):
             return (f"step {step.i} would type \"{step.text[:60]}\", which is neither their words nor the learned "
                     f"way's own")
+        if step.do == "pick" and step.slot and not said(step.text, words):
+            return (f"step {step.i} would pick \"{step.text[:60]}\", which is not what they said" if step.text
+                    else f"step {step.i} picks an item their words must name, and none was given")
     return None
 
 
@@ -348,6 +406,14 @@ class SkillRunner:
                 if got is None:
                     continue
                 tree, read, _ms = got
+                if step.aid:
+                    # capC4: a proven AutomationId (memory keeps it only where that app's are proven) finds the very
+                    # control first; its role must agree
+                    by_aid = [e for e in (tree.get("elements") or []) if isinstance(e, dict)
+                              and isinstance(e.get("id"), int) and str(e.get("automation_id") or "") == step.aid
+                              and (not role or str(e.get("role") or "").casefold() == role)]
+                    if len(by_aid) == 1:
+                        return hwnd, read, by_aid[0], title, app
                 elements = [e for e in (tree.get("elements") or []) if isinstance(e, dict)
                             and isinstance(e.get("id"), int) and _words(e.get("name")).casefold() == name]
                 hits = [e for e in elements if str(e.get("role") or "").casefold() == role] if role else []
@@ -359,6 +425,107 @@ class SkillRunner:
             if time.monotonic() >= deadline:
                 return None
             time.sleep(POLL_S)
+
+    def _digests(self, app: str, role: str, names: list[str]) -> list[str] | None:
+        """The keyed digests C1 takes over these names (memory's key, :meth:`MemoryClient.name_digests`), or ``None``
+        when memory cannot answer."""
+        memory = getattr(self.hands, "memory", None)
+        if memory is None or not names:
+            return None if memory is None else []
+        try:
+            got = memory.call("pick_digests", lambda c: c.name_digests(app, role, names), timeout_s=1.5)
+        except Exception:  # noqa: BLE001 - no digests: no match, the run stops
+            return None
+        return [str(d or "") for d in got] if isinstance(got, list) and len(got) == len(names) else None
+
+    def _pick(self, step: SkillStep, apps: list[str], wait_s: float
+              ) -> tuple[str, tuple[int, int, dict[str, Any], str, str] | None, int]:
+        """capC4: the item a pick step means, in a fresh read: ``("found", (hwnd, read, element, title, app), 1)``, or
+        ``(why, None, matches)`` with why ``no_container`` (the list is not on the screen), ``no_match`` (no visible
+        child matches), ``many`` (more than one does) or ``no_digest`` (memory could not compute the digests). The
+        container is found by its role (and name when the way knows it); its visible descendants of the item's role are
+        the candidates (an item the screen does not show is not in the read). A fixed item matches by the keyed digest
+        of its name; a slot by the request's words, as a click matches a name."""
+        box_role, box_name = step.box_role.casefold(), _words(step.box_name).casefold()
+        role = step.role.casefold()
+        deadline = time.monotonic() + max(0.0, wait_s)
+        why, matches = "no_container", 0
+        while True:
+            payload = self._overview()
+            for hwnd, title, app in self._search(SkillStep(i=step.i, do="pick"), apps, payload):
+                got = self.hands._read_tree(hwnd)
+                if got is None:
+                    continue
+                tree, read, _ms = got
+                els = [e for e in (tree.get("elements") or []) if isinstance(e, dict) and isinstance(e.get("id"), int)]
+                by_id = {int(e["id"]): e for e in els}
+                boxes = {int(e["id"]) for e in els if str(e.get("role") or "").casefold() == box_role
+                         and (not box_name or _words(e.get("name")).casefold() == box_name)}
+                if not boxes:
+                    continue
+                why = "no_match" if why == "no_container" else why
+
+                def inside(e: dict[str, Any]) -> bool:
+                    parent, depth = e.get("parent"), 0
+                    while isinstance(parent, int) and parent >= 0 and depth < PICK_DEPTH:
+                        if parent in boxes:
+                            return True
+                        parent = (by_id.get(parent) or {}).get("parent")
+                        depth += 1
+                    return False
+
+                cands = [e for e in els if str(e.get("role") or "").casefold() == role and _words(e.get("name"))
+                         and inside(e)]
+                if step.slot:
+                    want = _words(step.text).casefold()
+                    hits = [e for e in cands if want and _words(e.get("name")).casefold() == want]
+                else:
+                    digests = self._digests(step.app or app, step.role, [_words(e.get("name")) for e in cands])
+                    if digests is None:
+                        return "no_digest", None, 0
+                    hits = [e for e, d in zip(cands, digests) if step.item and d.casefold().startswith(
+                        step.item.casefold())]
+                if len(hits) == 1:
+                    return "found", (hwnd, read, hits[0], title, app), 1
+                if len(hits) > 1:
+                    return "many", None, len(hits)
+            if time.monotonic() >= deadline:
+                return why, None, matches
+            time.sleep(POLL_S)
+
+    def _front_app(self) -> tuple[str, str]:
+        """``(app key, title)`` of the window in front."""
+        from yuki.memory.store import app_key
+
+        payload = self._overview()
+        front = int(payload.get("foreground_hwnd") or 0)
+        window = self._windows(payload).get(front) or {}
+        return app_key(self._app_of(window)) or "", str(window.get("title") or "")
+
+    def end_ok(self, end: dict[str, Any], last: StepResult | None, before: tuple[str, str]) -> tuple[bool, str]:
+        """capC4: whether a part reached its checked end (report 78 §6.2): a window of the app in front (``window_
+        verified``); a new page of the app in front (``page_reached``: the window in front is that app's and its title
+        is not the one in front when the part began); otherwise the part's last step was verified by its own measured
+        report. ``(ok, why)``."""
+        from yuki.memory.store import app_key
+
+        kind = str(end.get("kind") or "")
+        want = app_key(str(end.get("app") or "")) or ""
+        if kind in ("window_verified", "page_reached"):
+            deadline = time.monotonic() + END_WAIT_S
+            while True:
+                app, title = self._front_app()
+                if kind == "window_verified" and want and app == want:
+                    return True, f"a window of {want} is in front"
+                if kind == "page_reached" and (not want or app == want) and title and title != before[1]:
+                    return True, "a new page is in front"
+                if time.monotonic() >= deadline:
+                    return False, (f"no window of {want or 'the app'} came to the front" if kind == "window_verified"
+                                   else "no new page came up")
+                time.sleep(POLL_S)
+        if last is not None and last.kind == "action" and last.ok and last.verdict is True:
+            return True, "its last step was verified"
+        return False, "its last step's effect could not be seen"
 
     def _focus(self, wait_s: float) -> Any:
         """The text field that has the keyboard (a FocusSnapshot), waiting up to ``wait_s``; ``None``: none."""
@@ -460,6 +627,35 @@ class SkillRunner:
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="click",
                         target=f'{role} "{_words(element.get("name"))[:80]}" in "{title[:60]}"', app=app, hwnd=hwnd,
                         report=f"{lead}clicked {role} \"{_words(element.get('name'))[:80]}\": {outcome.summary}")
+        if step.do == "pick":
+            wait = AFTER_OPEN_WAIT_S if after_open else (FIRST_FIND_WAIT_S if first else FIND_WAIT_S)
+            how, found, n = self._pick(step, apps, wait)
+            target = f"an item of the {step.box_role or 'list'}"
+            if found is None:
+                why = {"no_container": f"the {step.box_role or 'list'} the way picks from is not on the screen",
+                       "many": f"{n} items match, so which one is not clear",
+                       "no_digest": "memory could not tell which item it is"}.get(
+                    how, "the item the way picks is not visible in it")
+                return done(ok=False, verdict=False, kind="read", tool="find", target=target, why=why,
+                            report=f"{why} (looked for {wait:g} s)", deviation="not_found")
+            hwnd, read, element, title, app = found
+            role = str(element.get("role") or step.role or "item")
+            verdict = self._held("click", {"hwnd": hwnd, "element": f"{role} in the {step.box_role}"},
+                                 {"hwnd": hwnd, "app": app, "title": title, "element": f"{role} in the {step.box_role}"})
+            if verdict is not None:
+                return held(verdict, target)
+            try:
+                lead = self.hands._front(hwnd)
+            except Exception as exc:  # noqa: BLE001
+                return done(ok=False, verdict=False, tool="click", target=target, app=app, hwnd=hwnd,
+                            why="its window could not be brought to the front", report=str(exc)[:200],
+                            deviation="window")
+            outcome = self.hands._dispatcher.dispatch("click", {"element": element["id"], "read": read,
+                                                                "expect_hwnd": hwnd})
+            verdict, why = action_verdict("click", outcome)
+            return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="click",
+                        target=f"{target} in \"{title[:60]}\"", app=app, hwnd=hwnd,
+                        report=f"{lead}picked a {role} in the {step.box_role}: {outcome.summary}")
         if step.do == "type":
             snap = self._focus(FOCUS_WAIT_S if not first else 0.4)
             if snap is None:
@@ -538,11 +734,48 @@ class SkillRunner:
         """Run the way ``item`` (offered to the talker) with the talker's ``args``: ``(ok, report, facts)``.
 
         Raises :class:`SkillRefused` before any step runs when the call cannot be run as written."""
-        steps = fit_to_way(parse_steps(args.get("steps")), [s for s in item.get("run") or [] if isinstance(s, dict)])
+        if item.get("trial"):
+            # capC4, decision D3: a way the user did once is a hint for the thinker, never run alone
+            raise SkillRefused("that way was seen only once (your way, seen once): it is a hint, not run alone")
+        parts = [p for p in item.get("parts") or [] if isinstance(p, dict)]
+        if any(isinstance(s, dict) and s.get("do") == "command" for p in parts for s in p.get("run") or []):
+            raise SkillRefused("it runs a terminal command, which only the thinker's terminal tool may run")
+        if len(parts) > MAX_PARTS or any(len(p.get("run") or []) > MAX_STEPS for p in parts):
+            raise SkillRefused(f"more than {MAX_PARTS} parts of {MAX_STEPS} steps")
+        run = ([s for p in parts for s in p.get("run") or [] if isinstance(s, dict)] if parts
+               else [s for s in item.get("run") or [] if isinstance(s, dict)])
+        given = parse_steps(args.get("steps"), cap=max(MAX_STEPS, len(run)) if parts else MAX_STEPS,
+                            allow_empty=bool(parts))
+        if parts:
+            # only the steps that carry the user's words (typing, a pick by name): the way runs whole from memory;
+            # else the way's own steps (all, or its last ones)
+            if all(s.do in ("type", "pick") for s in given):
+                try:
+                    steps = fill_slots(given, run)
+                except SkillRefused:
+                    steps = fit_to_way(given, run)
+            else:
+                steps = fit_to_way(given, run)
+        else:
+            steps = fit_to_way(given, run)
+        if item.get("sends") and args.get("sends") is not True:
+            # a demo never authorises a send: the way sent what was typed when the user did it, so whom and what must
+            # be the user's own words now (check_sends)
+            raise SkillRefused("it sends what is typed, and only their own words may say what goes to whom")
         way_text = str(item.get("text") or "")
         why = check_sends(args, words) or check_texts(steps, words, way_text)
         if why:
             raise SkillRefused(why)
+        # capC4: where each part ends (the index of its last step in ``steps``) and the checked state it ends on
+        ends: dict[int, tuple[int, dict[str, Any]]] = {}
+        if parts:
+            skipped = len(run) - len(steps)
+            pos = 0
+            for k, p in enumerate(parts, 1):
+                pos += len(p.get("run") or [])
+                last = pos - 1 - skipped
+                if last >= 0 and isinstance(p.get("end"), dict):
+                    ends[last] = (k, p["end"])
         apps = [str(a) for a in item.get("apps") or [] if a]
         payload = self._overview()
         start_front = int(payload.get("foreground_hwnd") or 0)
@@ -552,6 +785,7 @@ class SkillRunner:
         deviation: StepResult | None = None
         after_open = False
         self._earlier = []
+        part_before = self._front_app() if ends else ("", "")
         for n, step in enumerate(steps):
             result = self._step(step, apps=apps, first=n == 0, after_open=after_open, start_front=start_front,
                                 opened=opened)
@@ -578,6 +812,20 @@ class SkillRunner:
             if result.deviation is not None:
                 deviation = result
                 break
+            if n in ends:
+                # capC4: a part ends on a checked state; the next part starts only once it is reached
+                k, end = ends[n]
+                ok_end, why_end = self.end_ok(end, result, part_before)
+                if not ok_end:
+                    deviation = StepResult(step=step, ok=False, verdict=False, kind="read", tool="check",
+                                           why=f"part {k} of the way did not reach its checked end ({why_end})",
+                                           report=f"part {k} ended without its checked state: {why_end}",
+                                           deviation="part_end", at=time.time())
+                    results.append(deviation)
+                    break
+                if result.verdict is None:
+                    result.verdict, result.why = True, f"part {k} reached its checked end ({why_end})"
+                part_before = self._front_app() if n + 1 < len(steps) else part_before
             nxt = steps[n + 1] if n + 1 < len(steps) else None
             if nxt is not None and result.verdict is None and nxt.do == "keys":
                 # a key after a step whose effect could not be seen would be blind (v3.5: no blind keys)
@@ -601,6 +849,8 @@ class SkillRunner:
             "deviation": deviation.deviation if deviation is not None else None,
             "sent_at": None, "results": results, "skill": ref,
         }
+        if parts:
+            facts["parts"] = len(parts)
         firsts = [r for r in results if r.kind == "action"]
         if firsts:
             facts["sent_at"] = firsts[0].started   # the turn log's end of speech -> action
@@ -629,7 +879,10 @@ class SkillRunner:
             return False, report, facts
         ran = deviation.kind == "action"   # the deviating step itself ran (its report showed no effect, or it failed)
         at = (f"step {deviation.step.i} ({deviation.step.what()}) " + ("ran, but " if ran else "was not done: ")
-              + deviation.why)
+              + deviation.why) if deviation.deviation != "part_end" else (
+            f"after step {deviation.step.i} ({deviation.step.what()}), {deviation.why}")
+        if deviation.deviation == "part_end":
+            ran = True
         report = (f"stopped the learned way {ref} (\"{intent}\"): {at}. "
                   + (("Done before it: " + " ".join(done_lines)) if done_lines else
                      ("" if ran else "Nothing was done.")))
@@ -649,7 +902,12 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
         s = r.step
         tool_input: dict[str, Any] = {"do": s.do}
         if s.do == "click":
-            tool_input.update(role=s.role, name=s.name)
+            tool_input.update(role=s.role, name=s.name, **({"aid": s.aid} if s.aid else {}))
+        elif s.do == "pick":
+            # the container, the item's role and how it was matched; never the item's name (a content control's)
+            tool_input.update(role=s.role, app=s.app, **{"in": {k: v for k, v in (("role", s.box_role),
+                                                                                  ("name", s.box_name)) if v}},
+                              **({"item": s.item} if s.item else {"slot": ""}))
         elif s.do == "type":
             tool_input["text"] = s.text
         elif s.do == "keys":
@@ -669,4 +927,4 @@ def trace_steps(results: list[StepResult], pid: int | None) -> list[dict[str, An
 
 
 __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_steps", "check_sends", "check_texts",
-           "fit_to_way", "said", "trace_steps", "SKILL_DOS"]
+           "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS"]
