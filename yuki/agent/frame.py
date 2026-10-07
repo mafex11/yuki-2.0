@@ -378,7 +378,9 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
             # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
             # always reach the brain (the person block gives way first)
             tail = _practice_lines(frame, practice)
-            # capC1b: the user's usual buttons and shortcuts, last of the body: the first to give way to the size
+            # capC2: how the user usually does this (their usual path) and the last time they did it, before the
+            # go-tos; capC1b: the user's usual buttons and shortcuts, last of the body: the first to give way to the size
+            lines += path_lines(practice)
             lines += go_to_lines(practice)
         else:   # an older memory: know-how lines and their "Not:" part
             proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
@@ -594,6 +596,32 @@ def go_to_lines(practice: dict[str, Any] | None) -> list[str]:
         if parts:
             lines.append(f"- in {_one(g['app'], 40)} the user usually " + "; ".join(parts))
     return [GOTO_HEAD, *lines] if lines else []
+
+
+#: capC2 (report 78 §5.4, §6.4): the user's usual path for this kind of task and the last time they did it, from the
+#: tasks memory cut from the action trace. Hints only; worded from kept names only; they give way before the pitfalls.
+PATH_HEAD = "How the user usually does this (their usual path, from {n} times they did \"{family}\"; hints, not steps):"
+EXAMPLE_HEAD = "The last time the user did this ({when}): \"{goal}\" ({outcome}):"
+#: Steps of each the frame shows at most (memory's own caps are the same or lower).
+MAX_PATH_STEPS = 8
+MAX_EXAMPLE_STEPS = 6
+
+
+def path_lines(practice: dict[str, Any] | None) -> list[str]:
+    """The usual path and the last example (``MemoryClient.practice``'s ``path`` and ``example``), numbered steps."""
+    lines: list[str] = []
+    path = (practice or {}).get("path")
+    if isinstance(path, dict) and path.get("steps"):
+        steps = [s for s in path["steps"] if isinstance(s, str) and s.strip()][:MAX_PATH_STEPS]
+        if steps:
+            lines.append(PATH_HEAD.format(n=int(path.get("tasks") or 0), family=_one(path.get("family"), 100)))
+            lines += [f"{i}. {_one(s, 110)}" for i, s in enumerate(steps, 1)]
+    ex = (practice or {}).get("example")
+    if isinstance(ex, dict) and ex.get("goal"):
+        lines.append(EXAMPLE_HEAD.format(when=_one(ex.get("when"), 40), goal=_one(ex.get("goal"), 120),
+                                         outcome=_one(ex.get("outcome"), 60)))
+        lines += [f"- {_one(s, 110)}" for s in (ex.get("steps") or [])[:MAX_EXAMPLE_STEPS] if isinstance(s, str)]
+    return lines
 
 
 def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:

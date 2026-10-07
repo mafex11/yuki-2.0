@@ -4367,7 +4367,8 @@ class MemoryClient:
                                     request_id=request_id, injected=injected, cited=cited, control=control)
 
     def practice(self, words: str = "", *, apps: Any = (), open_apps: Any = (), embed_wait_s: float | None = None,
-                 now: float | None = None, detail: bool = False, go_tos: bool = True) -> dict:
+                 now: float | None = None, detail: bool = False, go_tos: bool = True,
+                 paths: bool | None = None) -> dict:
         """What practice memory holds for one request (``yuki.memory.practice.relevant``): ``{"ways": [procedures, then
         a habit or style note], "pitfalls": [...], "apps": [the apps in play], "named": [apps named in the words],
         "measured": bool, "ms"}``. The apps in play are the apps named in ``words`` (whole words of an app name memory
@@ -4379,7 +4380,9 @@ class MemoryClient:
         (capC1b): the user's usual buttons and fields and their shortcuts in each app in play, counted from the action
         trace (``yuki.memory.trace_habits.go_tos``; ``detail`` gives more); ``go_tos=False`` (a caller that never
         shows them: the talker's lookups) neither works them out nor counts them as served (second verification V7).
-        Never raises (empty lists)."""
+        capC2: ``path`` (the user's usual path for the nearest family of their tasks, at most 8 steps) and ``example``
+        (one trimmed past task of it), each ``None`` when there is none; ``detail`` gives more; ``paths`` (default: as
+        ``go_tos``) leaves them out. Never raises (empty lists)."""
         from yuki.memory import practice as _p
 
         started = time.perf_counter()
@@ -4395,7 +4398,7 @@ class MemoryClient:
             # name, the caller's, then the open windows
             ordered = [*named, *(str(a) for a in (apps or ()) if a), *(str(a) for a in (open_apps or ()) if a)]
             out = _p.relevant(self.store, query_vec=vec, apps_in_play=ordered, now=now, detail=bool(detail),
-                              go_tos=bool(go_tos))
+                              go_tos=bool(go_tos), paths=None if paths is None else bool(paths))
             out["named"] = named
             out["measured"] = vec is not None
         except Exception as exc:
@@ -4596,6 +4599,49 @@ class MemoryClient:
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__}
 
+    # -- capC2: tasks (report 78 §5.2-5.4, decision D5) ----------------------------------------------------------------
+
+    def day_tasks(self, since: float, until: float) -> list[dict]:
+        """capC2: the tasks the user did that started in ``[since, until)`` (``yuki.memory.trace_tasks.day_tasks``):
+        ``[{"id", "ref", "start_at", "end_at", "goal", "apps", "outcome", "outcome_words", "verdict", "episode_id"}]``,
+        oldest first. The Day page lists them inside each session. Read only; never raises (``[]``)."""
+        from yuki.memory import trace_tasks
+
+        return trace_tasks.day_tasks(self.store, float(since), float(until))
+
+    def task_correct(self, task_id: Any, verdict: str, words: str = "") -> dict:
+        """capC2: the user's correction of one task from the Day page: ``renamed`` (``words``: what it was, in their
+        words), ``not_one`` (it was not one task) or ``not_mine`` (it isn't what they did). Stored as the task's
+        ``user_verdict`` and shown to later task passes as a worked example; never a card, never spoken. ``{"ok",
+        "verdict", "goal"}`` or ``{"ok": False, "error"}`` in plain words. Never raises."""
+        from yuki.memory import trace_tasks
+
+        try:
+            tid = int(str(task_id).split(":")[-1])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "That can't be corrected here."}
+        return trace_tasks.correct_task(self.store, tid, str(verdict or ""), str(words or ""))
+
+    def task_correct_undo(self, task_id: Any) -> dict:
+        """capC2: take a task's correction back (its own goal again, no verdict). Never raises."""
+        from yuki.memory import trace_tasks
+
+        try:
+            tid = int(str(task_id).split(":")[-1])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "That can't be undone here."}
+        return trace_tasks.undo_correction(self.store, tid)
+
+    def trace_tasks_health(self) -> dict:
+        """capC2: the task pass in counts (tasks found today, how many unclear, today's cost and its cap, windows
+        waiting); content-free."""
+        from yuki.memory import trace_tasks
+
+        try:
+            return trace_tasks.health(self.store)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__}
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
@@ -4630,6 +4676,8 @@ _STAMP_SQL: dict[str, str] = {
     "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",
     "runs": "SELECT max(id) FROM runs",
     "journal": "SELECT max(id) FROM journal",
+    # capC2: the tasks inside the Day page's sessions (a new one, or a correction)
+    "ui_tasks": "SELECT max(id), max(updated_at) FROM ui_tasks",
 }
 
 

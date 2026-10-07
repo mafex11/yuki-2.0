@@ -203,9 +203,176 @@ def purge(store: Any, *, now: float | None = None, raw_days: float = RAW_DAYS,
             "undo_images": conn.execute("DELETE FROM undo_images WHERE surface = 'trace' AND at < ?",
                                         (raw_cut,)).rowcount,
         }
+        out.update(_purge_c2(conn, now, raw_cut, el_cut))
         return out
 
     return store._write(op)
+
+
+#: capC2 (report 78 §8): a family not seen for this long is deleted; transitions go with the elements (60 days).
+FAMILY_DAYS = 90.0
+TRANSITION_DAYS = ELEMENT_DAYS
+
+
+def _purge_c2(conn: sqlite3.Connection, now: float, raw_cut: float, el_cut: float) -> dict[str, int]:
+    """capC2's tables: tasks, their ranges and the pass's runs after D4's 30 days; transitions unused for 60 days;
+    families unused for 90 days (a family outlives its tasks: element keys and a short label only). Counts of what
+    went (only the tables where something did); ``{}`` on a database before migration 39."""
+    try:
+        fam_cut = now - FAMILY_DAYS * DAY_S
+        out = {
+            "task_actions": conn.execute("DELETE FROM ui_task_actions WHERE task_id IN (SELECT id FROM ui_tasks WHERE"
+                                         " ended_at < ?)", (raw_cut,)).rowcount,
+            "tasks": conn.execute("DELETE FROM ui_tasks WHERE ended_at < ?", (raw_cut,)).rowcount,
+            "task_runs": conn.execute("DELETE FROM ui_task_runs WHERE at < ?", (raw_cut,)).rowcount,
+            "transitions": conn.execute("DELETE FROM ui_transitions WHERE coalesce(last_at, 0) < ?",
+                                        (now - TRANSITION_DAYS * DAY_S,)).rowcount,
+            "families": conn.execute("DELETE FROM ui_families WHERE coalesce(last_at, updated_at, 0) < ?",
+                                     (fam_cut,)).rowcount,
+        }
+    except sqlite3.OperationalError:
+        return {}
+    return {k: v for k, v in out.items() if v}
+
+
+def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any]], *, since: float | None,
+               until: float | None, process: str | None, now: float) -> dict[str, Any]:
+    """capC2's part of a forget, inside its transaction and before the rows go: the tasks built on any forgotten row
+    (one of its ranges holds the row's time), their ranges, the families they were in (rebuilt from the tasks left,
+    deleted when none is left; for an app, every family of that app), and the transitions (an app's all; for a time,
+    the pairs the forgotten rows made are taken back as if they had never been). Returns the before-images for undo
+    and counts. ``{}`` on a database before migration 39."""
+    from yuki.memory import trace_families, trace_links
+
+    try:
+        conn.execute("SELECT 1 FROM ui_tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        return {}
+    image: dict[str, Any] = {"tasks": [], "task_actions": [], "families": [], "transitions": [], "tkeys": []}
+    ats = sorted(float(a["at"]) for a in actions)
+    hit: set[int] = set()
+    if ats:
+        cand = conn.execute("SELECT id FROM ui_tasks WHERE started_at <= ? AND ended_at >= ?",
+                            (ats[-1], ats[0])).fetchall()
+        for t in cand:
+            for rg in conn.execute(
+                    "SELECT a.at AS a0, b.at AS a1 FROM ui_task_actions r LEFT JOIN ui_actions a ON a.id ="
+                    " r.first_action LEFT JOIN ui_actions b ON b.id = r.last_action WHERE r.task_id = ?",
+                    (int(t["id"]),)).fetchall():
+                if rg["a0"] is None or rg["a1"] is None:
+                    continue
+                lo, hi = min(rg["a0"], rg["a1"]), max(rg["a0"], rg["a1"])
+                i = bisect.bisect_left(ats, lo)
+                if i < len(ats) and ats[i] <= hi:
+                    hit.add(int(t["id"]))
+                    break
+    if process:
+        for t in conn.execute("SELECT id, apps FROM ui_tasks").fetchall():
+            try:
+                if process in json.loads(t["apps"] or "[]"):
+                    hit.add(int(t["id"]))
+            except (TypeError, ValueError):
+                continue
+    fams: set[int] = set()
+    if hit:
+        marks = ",".join("?" * len(hit))
+        tasks = _rows(conn, f"SELECT * FROM ui_tasks WHERE id IN ({marks})", sorted(hit))
+        image["tasks"] = [{**t, "vec_ciphertext": t["vec_ciphertext"].hex() if t.get("vec_ciphertext") else None}
+                          for t in tasks]
+        image["task_actions"] = _rows(conn, f"SELECT * FROM ui_task_actions WHERE task_id IN ({marks})", sorted(hit))
+        fams |= {int(t["family_id"]) for t in tasks if t.get("family_id") is not None}
+    if process:
+        for f in conn.execute("SELECT id, apps FROM ui_families").fetchall():
+            try:
+                if process in json.loads(f["apps"] or "[]"):
+                    fams.add(int(f["id"]))
+            except (TypeError, ValueError):
+                continue
+    if fams:
+        fm = ",".join("?" * len(fams))
+        image["families"] = [{**f, "vec_ciphertext": f["vec_ciphertext"].hex() if f.get("vec_ciphertext") else None}
+                             for f in _rows(conn, f"SELECT * FROM ui_families WHERE id IN ({fm})", sorted(fams))]
+    if hit:
+        marks = ",".join("?" * len(hit))
+        conn.execute(f"DELETE FROM ui_task_actions WHERE task_id IN ({marks})", sorted(hit))
+        conn.execute(f"DELETE FROM ui_tasks WHERE id IN ({marks})", sorted(hit))
+    # transitions
+    if process and since is None and until is None:
+        image["transitions"] = _rows(conn, "SELECT * FROM ui_transitions WHERE process = ?", (process,))
+        image["tkeys"] = [[r["process"], r["from_key"], r["to_key"]] for r in image["transitions"]]
+        conn.execute("DELETE FROM ui_transitions WHERE process = ?", (process,))
+    elif actions:
+        state = trace_links._load(store)
+        cursor = int(state.get("cursor") or 0)
+        lo, hi = ats[0] - trace_links.PIECE_GAP_S, ats[-1] + trace_links.PIECE_GAP_S
+        around = _rows(conn, "SELECT id, at, process, kind, source, resolved, element_key FROM ui_actions WHERE at >= ?"
+                       " AND at <= ? AND id <= ? ORDER BY at, id", (lo, hi, cursor))
+        gone = {int(a["id"]) for a in actions}
+        with_rows, _l, _i = trace_links.transition_pairs(around)
+        without, _l, _i = trace_links.transition_pairs([r for r in around if int(r["id"]) not in gone])
+        take, give = Counter(with_rows) - Counter(without), Counter(without) - Counter(with_rows)
+        keys = sorted({(p, a, b) for (p, a, b, _g, _t) in list(take) + list(give)})
+        for p, a, b in keys:
+            row = conn.execute("SELECT * FROM ui_transitions WHERE process = ? AND from_key = ? AND to_key = ?",
+                               (p, a, b)).fetchone()
+            if row is not None:
+                image["transitions"].append(dict(row))
+        image["tkeys"] = [list(k) for k in keys]
+        trace_links.add_pairs(conn, list(take.elements()), sign=-1)
+        trace_links.add_pairs(conn, list(give.elements()), sign=1)
+    for fid in sorted(fams):
+        if process:
+            left = conn.execute("SELECT count(*) FROM ui_tasks WHERE family_id = ?", (fid,)).fetchone()[0]
+            if not left:
+                conn.execute("DELETE FROM ui_families WHERE id = ?", (fid,))
+                continue
+        trace_families.rebuild(conn, store, fid, now=now)
+    # each app's last element (the next transition's start) when it was forgotten
+    state = trace_links._load(store)
+    last = state.get("last") or {}
+    gone_keys = {a.get("element_key") for a in actions if a.get("element_key")}
+    changed = False
+    for proc in list(last):
+        if (process and proc == process) or (last[proc] and last[proc][0] in gone_keys):
+            last.pop(proc)
+            changed = True
+    if changed:
+        state["last"] = last
+        conn.execute("UPDATE nudge_state SET value = ? WHERE name = ?",
+                     (store._enc(json.dumps(state, separators=(",", ":"))), trace_links.STATE_KEY))
+    counts = {"tasks": len(hit), "families": len(fams), "transitions": len(image["tkeys"])}
+    return {"image": image, "counts": counts}
+
+
+def _undo_c2(conn: sqlite3.Connection, image: dict[str, Any]) -> Counter:
+    """Put capC2's before-images back (tasks, ranges, families as they were, transitions as they were)."""
+    restored: Counter = Counter()
+    try:
+        conn.execute("SELECT 1 FROM ui_tasks LIMIT 1")
+    except sqlite3.OperationalError:
+        return restored
+
+    def put(table: str, row: dict[str, Any], blob: tuple[str, ...] = ()) -> None:
+        values = {k: (bytes.fromhex(v) if k in blob and isinstance(v, str) else v) for k, v in row.items()}
+        cols = list(values)
+        conn.execute(f"INSERT OR REPLACE INTO {table}({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                     [values[c] for c in cols])
+
+    for f in image.get("families") or []:
+        put("ui_families", f, ("vec_ciphertext",))
+        restored["families"] += 1
+    for t in image.get("tasks") or []:
+        put("ui_tasks", t, ("vec_ciphertext",))
+        restored["tasks"] += 1
+    for r in image.get("task_actions") or []:
+        conn.execute("INSERT INTO ui_task_actions(task_id, first_action, last_action, detour) VALUES (?,?,?,?)",
+                     (r["task_id"], r["first_action"], r["last_action"], r["detour"]))
+    for p, a, b in image.get("tkeys") or []:
+        conn.execute("DELETE FROM ui_transitions WHERE process = ? AND from_key = ? AND to_key = ?", (p, a, b))
+    for r in image.get("transitions") or []:
+        put("ui_transitions", r)
+        restored["transitions"] += 1
+    return restored
 
 
 # -- forgetting ----------------------------------------------------------------------------------------------------
@@ -268,6 +435,8 @@ def forget(store: Any, *, since: float | None = None, until: float | None = None
         else:
             km = ",".join("?" * len(keys)) or "NULL"
             elements = _rows(conn, f"SELECT * FROM ui_elements WHERE element_key IN ({km})", keys) if keys else []
+        # capC2: tasks, families and transitions learned from these rows (read before the rows go)
+        c2 = _forget_c2(conn, store, actions, since=since, until=until, process=process, now=now)
         if ids:
             conn.execute(f"DELETE FROM ui_files WHERE action_id IN ({marks})", ids)
             conn.execute(f"DELETE FROM ui_links WHERE from_action IN ({marks}) OR to_action IN ({marks})", ids + ids)
@@ -277,7 +446,8 @@ def forget(store: Any, *, since: float | None = None, until: float | None = None
         else:
             for key in keys:
                 _recount_element(conn, key)
-        counts = {"actions": len(ids), "elements": len(elements), "files": len(files), "links": len(links)}
+        counts = {"actions": len(ids), "elements": len(elements), "files": len(files), "links": len(links),
+                  **(c2.get("counts") or {})}
         scope = {"since": since, "until": until, "process": process}
         words = (f"Forgot {counts['actions']} recorded actions" + (" of one app" if process else "")
                  + (" in a chosen time" if since is not None or until is not None else "") + ".")
@@ -285,7 +455,8 @@ def forget(store: Any, *, since: float | None = None, until: float | None = None
             "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (now, None, "trace", "forget", json.dumps(counts), None, None, store._enc(words))).lastrowid)
-        image = {"scope": scope, "actions": actions, "elements": elements, "files": files, "links": links}
+        image = {"scope": scope, "actions": actions, "elements": elements, "files": files, "links": links,
+                 "c2": c2.get("image") or {}}
         conn.execute(
             "INSERT INTO undo_images(run_id, surface, item_id, action, by, at, before_ciphertext) VALUES"
             " (?,?,?,?,?,?,?)", (None, "trace", diary, "forget", by, now, store._enc(json.dumps(image))))
@@ -331,6 +502,7 @@ def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[
                          " VALUES (?,?,?,?,?,?)", (link["id"], link["from_action"], link["to_action"], link["kind"],
                                                    link["lag_s"], link.get("created_at")))
             restored["links"] += 1
+        restored.update(_undo_c2(conn, image.get("c2") or {}))
         conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, row["id"]))
         conn.execute(
             "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"
