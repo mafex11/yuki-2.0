@@ -24,7 +24,9 @@ way's own last steps, run as memory keeps them (:func:`fit_to_way`; only a type 
   of the item's role are read, the keyed digest C1 takes over a name is computed over each child's name (by memory,
   :meth:`yuki.memory.api.MemoryClient.name_digests`) and the one matching the way's ``item`` is clicked (a fixed item:
   "always Liked Songs"); or, when the way names a slot, the child whose name is the request's words, matched as a click
-  matches. No unique visible match: the run stops and the thinker gets it.
+  matches. When the way keeps the container's identity (C1's keyed container digest), only that container's items
+  count; without it the item must be the only match in the window. No unique visible match: the run stops and the
+  thinker gets it. A way that sends never picks a fixed item, and a slot pick's words must be whom it goes to.
 
 **Ways learned from what the user did** (capC4, report 78 §6.1-6.2, §7) run **in parts**: each part at most
 :data:`MAX_STEPS` steps, at most 4 parts, each ending on a checked state memory recorded (a window of an app in front,
