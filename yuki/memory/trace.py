@@ -213,6 +213,8 @@ class _Act:
     save_check: bool = False
     container_role: str | None = None      # point-only: the whole-window container the point fell in (V5)
     end_win: tuple[int, int] | None = None   # a drag's drop window (hwnd, pid), checked like the start (V2)
+    down_root: int = 0                       # capC1c: the top-level window under the press, taken at button-down
+    answer_root: int = 0                     # capC1c: the top-level window under the point when the lookup answered
 
 
 class TraceWorker:
@@ -251,8 +253,13 @@ class TraceWorker:
                  recent: Path | None = None, resolve: Callable[[str], str | None] | None = None,
                  flp: Callable[[str], dict[str, Any]] | None = None, log: Callable[..., None] | None = None,
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
-                 hover: tuple[int, int, float] | None = None, hung: Any = None) -> None:
+                 hover: tuple[int, int, float] | None = None, hung: Any = None,
+                 root_of: Callable[[int], int] | None = None, pid_of: Callable[[int], int] | None = None) -> None:
         self.store = store
+        #: capC1c: ``(hwnd) -> its top-level window`` (``GetAncestor(GA_ROOT)``) and ``(hwnd) -> its process``: the
+        #: machine facts the staleness rule compares (:meth:`_stale`).
+        self._root_of = root_of or _root_of
+        self._pid_of = pid_of or _window_pid
         #: capC1b: the hung-app watchdog (:class:`yuki.memory.trace_uia.HungWatch`): no lookup into an app that is not
         #: answering, by Windows' own verdict or a lookup that took :data:`yuki.memory.trace_uia.SLOW_CALL_S`.
         if hung is None:
@@ -310,7 +317,7 @@ class TraceWorker:
         self._last_key: _Act | None = None
         self._last_wheel: _Act | None = None
         self._fg = _Window()
-        self._recent_structure: deque[tuple[float, int]] = deque(maxlen=64)
+        self._recent_structure: deque[tuple[float, int, int]] = deque(maxlen=64)   # (t, event, its window)
         self._batch: list[dict[str, Any]] = []
         self._elements: list[dict[str, Any]] = []
         self._files: list[dict[str, Any]] = []
@@ -525,7 +532,18 @@ class TraceWorker:
             self._acts = []
         self._last_input = None
 
-    def _on_down(self, t: float, button: str, x: int, y: int, source: str, travel: int, dbl: bool) -> None:
+    def _walk_kw(self, hwnd: int) -> dict[str, Any]:
+        """capC1c: the resolution walk's arguments for a lookup in this window (only a client that has the walk gets
+        them): an unnamed container's answer is walked to the real control; ``max_area`` is the window's area (an
+        element covering half of it or more is a whole pane, never "the control")."""
+        if not getattr(self.uia, "refines", False):
+            return {}
+        rect = self._rect(hwnd) if hwnd else None
+        area = max(0, (rect[2] - rect[0]) * (rect[3] - rect[1])) if rect else 0
+        return {"refine": True, "max_area": area}
+
+    def _on_down(self, t: float, button: str, x: int, y: int, source: str, travel: int, dbl: bool,
+                 root: int = 0) -> None:
         self._close_type(t)
         self._close_hover(t)
         self._input(t, source)
@@ -545,22 +563,48 @@ class TraceWorker:
         self._input_own = win.own
         act = self._new_act(_BUTTON_KIND.get(button, "click"), t, source, win, x=x, y=y, button=button,
                             travel=travel, gap_ms=self._gap(t), open=True)
+        act.down_root = int(root or hwnd or 0)
         self._open[button] = act
+        if act.drop is None and root and hwnd and int(root) != int(hwnd):
+            # capC1c: the window under the press is gone or covered before the worker got to it (a menu closed, a
+            # dialog came up): a lookup now would answer for another window. Same app: a stale point-only row; another
+            # app (or not known): nothing, as its gates were never checked (fails closed).
+            try:
+                same = bool(pid) and int(self._pid_of(int(root)) or 0) == int(pid)
+            except Exception:  # noqa: BLE001
+                same = False
+            if same:
+                act.stale = True
+                act.lookup_end = t
+                self.counters["stale_window_changed"] += 1
+            else:
+                act.drop = "skip_window_changed"
+            return
         if act.drop is None:
             el = self._lookup(self.uia.at_point if self.uia else None, x, y, priority=True, index=True,
-                              target=(hwnd, pid))
+                              target=(hwnd, pid), **self._walk_kw(hwnd))
             act.lookup_end = self._clock()
             if el is not None:
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
                 if el.role in EDIT_ROLES:
                     self._last_click_edit = (t, el, hwnd)   # typing next goes into it (a password field: dropped)
                 if el.role in PANE_ROLES and self._covers_window(el, hwnd):
-                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False, target=(hwnd, pid))
+                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False, target=(hwnd, pid),
+                                          **self._walk_kw(hwnd))
                     if deeper is not None:
                         act.el, act.resolved, act.lookup_ms = deeper, "snapshot", (act.lookup_ms or 0) + deeper.ms
                         act.lookup_end = self._clock()
                     else:
                         self._point_only(act, el)
+            act.answer_root = self._answer_root(x, y)
+
+    def _answer_root(self, x: int, y: int) -> int:
+        """capC1c: the top-level window under the point now (when a lookup answered): compared with the one under the
+        press (:meth:`_stale`)."""
+        try:
+            return int(self._window_at(x, y)[0] or 0)
+        except Exception:  # noqa: BLE001
+            return 0
 
     @staticmethod
     def _point_only(act: _Act, el: Any) -> None:
@@ -605,7 +649,8 @@ class TraceWorker:
                 self.counters["drag_end_withheld"] += 1
                 return
             if self.uia is not None:
-                end_el = self._lookup(self.uia.at_point, x, y, priority=True, target=(end_hwnd, end_pid))
+                end_el = self._lookup(self.uia.at_point, x, y, priority=True, target=(end_hwnd, end_pid),
+                                      **self._walk_kw(end_hwnd))
                 if end_el is not None and not self._whole_window(end_el, end_hwnd) and (
                         not end_el.pid or not end_pid or end_el.pid == end_pid):
                     act.end_el = end_el
@@ -630,8 +675,10 @@ class TraceWorker:
                             gap_ms=self._gap(t))
         self._last_wheel = act
         if act.drop is None and self.uia is not None:
+            act.down_root = int(hwnd or 0)
             el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid))
             act.lookup_end = self._clock()
+            act.answer_root = self._answer_root(x, y)
             if self._whole_window(el, hwnd):
                 self._point_only(act, el)
             elif el is not None:
@@ -766,7 +813,7 @@ class TraceWorker:
         elif event == EVENT_SYSTEM_DIALOGSTART:
             self._dialog = (t, int(hwnd), self._fg)
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event)
+            self._structure(t, event, hwnd)
         attached = False
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
@@ -792,17 +839,36 @@ class TraceWorker:
                     if el.secret():
                         act.drop = el.secret()
 
-    def _structure(self, t: float, event: int) -> None:
-        """A structure change (shown, hidden, reordered, a menu closed, another window in front): every action whose
-        lookup was still answering at that time is stale, decided now (a busy app's events cannot push it out)."""
-        self._recent_structure.append((t, event))
+    def _structure(self, t: float, event: int, hwnd: int = 0) -> None:
+        """A structure change (shown, hidden, reordered, a menu closed): an action whose lookup was still answering at
+        that time is stale when the change could alter what is under its press point, decided now (a busy app's
+        events cannot push it out). capC1c: only when the event's own window (``GetWindowRect`` of its handle, a
+        machine fact) covers the point; a tooltip or a thumbnail shown elsewhere on screen is not. A window that is
+        gone by now cannot be placed; the window under the press is compared when the action finishes instead
+        (:meth:`_stale`). Report 78 §4.2: only changes that could touch the press count."""
+        self._recent_structure.append((t, event, int(hwnd or 0)))
+        rects: dict[int, Any] = {}
         for act in self._acts:
-            if act.lookup_end is not None and act.t <= t <= act.lookup_end:
+            if act.lookup_end is not None and act.t <= t <= act.lookup_end and not act.stale \
+                    and self._under_point(act, hwnd, rects):
                 act.stale = True
+
+    def _under_point(self, act: _Act, hwnd: int, rects: dict[int, Any] | None = None) -> bool:
+        """capC1c: whether a window (an event's own handle) covers the action's press point now."""
+        if act.x is None or not hwnd:
+            return False
+        rects = {} if rects is None else rects
+        if hwnd not in rects:
+            try:
+                rects[hwnd] = self._rect(int(hwnd))
+            except Exception:  # noqa: BLE001
+                rects[hwnd] = None
+        rect = rects[hwnd]
+        return bool(rect) and rect[0] <= act.x < rect[2] and rect[1] <= act.y < rect[3]
 
     def _on_out(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, gen: int = 0) -> None:
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event)
+            self._structure(t, event, hwnd)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
                 if len(act.outs) < OUTCOME_CAP:      # V6: one row keeps at most the cap, however many repeats fold
@@ -812,7 +878,9 @@ class TraceWorker:
 
     def _on_fg(self, t: float, hwnd: int, pid: int) -> None:
         self._focus_valid = False
-        self._structure(t, -1)
+        # capC1c: a window coming to the front is never staleness by itself (a taskbar click always brings one up,
+        # after the press: that is the click's outcome). Whether the window under the press changed before the
+        # lookup answered is checked by machine facts when the action finishes (:meth:`_stale`).
         dialog = self._dialog
         if dialog is not None and hwnd != dialog[1]:
             self._dialog = None
@@ -885,9 +953,17 @@ class TraceWorker:
         self._last_hover_t = anchor_at
         self._hover = act
         if act.drop is None and self.uia is not None:
-            el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid))
+            act.down_root = int(hwnd or 0)
+            # spare budget only (clicks keep their reserve); an unnamed container's answer is walked like a click's
+            el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid), **self._walk_kw(hwnd))
             act.lookup_end = self._clock()
-            if el is not None and not self._whole_window(el, hwnd):
+            act.answer_root = self._answer_root(x, y)
+            if el is not None and not self._whole_window(el, hwnd) and not (el.name or "").strip() \
+                    and not el.actionable():
+                # capC1c: still no name and no actionable pattern after the walk (an unnamed Group, List, Window):
+                # a rest over it says nothing about what the user looked at
+                act.drop = "skip_hover_container"
+            elif el is not None and not self._whole_window(el, hwnd):
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
             else:
                 # a hover is worth a row only with its element; the whole window is none (V5)
@@ -1155,16 +1231,47 @@ class TraceWorker:
                 self._hung_note(target, time.perf_counter() - t0)
                 if el is not None and el.contains(act.x, act.y) and (not el.pid or not act.win.pid
                                                                     or el.pid == act.win.pid):
+                    if (el.low_info() and act.el is not None and not act.el.low_info()
+                            and act.resolved in ("point", "snapshot") and not self._stale(act, count=False)):
+                        # capC1c: the event named only an unnamed container (a focused page region) while the press
+                        # itself found a real control there, still current: the control is kept
+                        self.counters["event_container_kept_point"] += 1
+                        return
                     act.el, act.resolved, act.lookup_ms = el, "event", el.ms
                     return
                 return
 
-    def _stale(self, act: _Act) -> bool:
+    def _stale(self, act: _Act, *, count: bool = True) -> bool:
+        """capC1c: whether the element a lookup answered may not be what was under the press, by machine facts only:
+        a structure change whose own window covers the point while the lookup answered (decided as the events came,
+        ``act.stale``; the short history covers one that reached the queue before the press itself); another
+        top-level window under the point when the lookup answered than at the press; the element's own top-level
+        window not the one under the press; or its bounds no longer holding the point. A window that came to the
+        front after the press (a taskbar click's app) is the click's outcome, never staleness."""
         if act.resolved not in ("point", "snapshot") or act.lookup_end is None:
             return False
-        # decided as the events came (``act.stale``); the short history covers a structure event that reached the
-        # queue before the press itself
-        return act.stale or any(act.t <= t <= act.lookup_end for t, _e in self._recent_structure)
+        if act.stale:
+            return True
+        if act.down_root and act.answer_root and act.answer_root != act.down_root:
+            self.counters["stale_root_changed"] += int(count)
+            return True
+        el = act.el
+        if el is not None and act.x is not None:
+            if el.bounds and not el.contains(act.x, act.y):
+                self.counters["stale_bounds"] += int(count)
+                return True
+            window = int(getattr(el, "window", 0) or 0)
+            if window and act.down_root:
+                try:
+                    top = int(self._root_of(window) or 0)
+                except Exception:  # noqa: BLE001
+                    top = 0
+                if top and top != act.down_root:
+                    self.counters["stale_other_window"] += int(count)
+                    return True
+        rects: dict[int, Any] = {}
+        return any(act.t <= t <= act.lookup_end and self._under_point(act, hwnd, rects)
+                   for t, _e, hwnd in self._recent_structure)
 
     def _outcome(self, act: _Act, now: float) -> tuple[str, dict[str, Any]]:
         counts: Counter[str] = Counter()
@@ -1341,6 +1448,18 @@ class TraceWorker:
             return
         if self._stale(act):
             act.resolved = "stale"
+        if act.el is not None:
+            patterns = getattr(act.el, "patterns", None)
+            if patterns is not None:
+                # capC1c: the actionable patterns the element exposes (machine facts; the go-tos leave out an element
+                # with no name and none of them)
+                act.facts["patterns"] = list(patterns)
+            if act.kind in POINTER_KINDS:
+                refined = getattr(act.el, "refined", None)
+                if refined:
+                    self.counters["walk_" + refined] += 1
+                elif act.el.low_info():
+                    self.counters["walk_container_left"] += 1
         if act.el is not None and act.el.role in ("MenuItem",) and act.kind == "click":
             act.kind = "menu"
         if act.save_check:
@@ -1480,6 +1599,19 @@ def _foreground() -> tuple[int, int]:
     hwnd = int(_U.GetAncestor(hwnd, _GA_ROOT) or hwnd) if hwnd else 0
     pids = _pids_behind(hwnd) if hwnd else ()
     return hwnd, pids[0] if pids else 0
+
+
+def _root_of(hwnd: int) -> int:
+    """capC1c: a window's top-level window (``GetAncestor(GA_ROOT)``); 0 when it is gone."""
+    from yuki.memory.trace_hooks import _U, _GA_ROOT
+
+    return int(_U.GetAncestor(int(hwnd), _GA_ROOT) or 0) if hwnd else 0
+
+
+def _window_pid(hwnd: int) -> int:
+    from yuki.memory.trace_uia import window_pid
+
+    return window_pid(hwnd)
 
 
 def _rect(hwnd: int) -> tuple[int, int, int, int] | None:
@@ -1643,13 +1775,13 @@ class Trace:
                 pass
 
     def start(self) -> Trace:
-        from yuki.memory.trace_hooks import TraceHooks, recent_folder
+        from yuki.memory.trace_hooks import TraceHooks, recent_folder, root_at
         from yuki.memory.trace_input import Metrics, TraceInput
 
         recent = recent_folder()
         self.hooks = TraceHooks(self._put_input, recent=recent)
         metrics = Metrics()
-        self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action)
+        self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at)
         rules_fn = self.privacy.rules
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,

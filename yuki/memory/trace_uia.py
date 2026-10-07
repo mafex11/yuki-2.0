@@ -38,6 +38,22 @@ _P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND
                                                                                    30011, 30019, 30020)
 _P_TOGGLE, _P_SELECTED, _P_VALUE = 30086, 30079, 30045
 _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM = 30041, 30036     # Is...PatternAvailable: a state only where the pattern is
+_P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE = 30031, 30028, 30043
+#: capC1c: the control patterns that make an element something a person acts on (UI Automation's own
+#: ``Is...PatternAvailable`` properties, read with the element's other cached facts): the element's own machine facts,
+#: never a word list. Stored with the row as ``facts.patterns``.
+ACTION_PATTERNS = ((_P_HAS_INVOKE, "invoke"), (_P_HAS_TOGGLE, "toggle"), (_P_HAS_SELECTION_ITEM, "select"),
+                   (_P_HAS_EXPAND, "expand"), (_P_HAS_VALUE, "value"))
+#: capC1c: the control types that only hold other controls (UI Automation's fixed vocabulary). One of these with no
+#: name and none of :data:`ACTION_PATTERNS` says nothing about what was clicked: the resolution walk
+#: (:meth:`TraceUia.refine`) looks for the real control around the point.
+CONTAINER_ROLES = frozenset({"Group", "Pane", "Document", "Custom", "Window"})
+#: Levels the walk goes up (to the nearest actionable or named ancestor) and down (to the smallest named descendant
+#: under the point) at most, and the share of a lookup's time budget it may use (the rest is kept for the chosen
+#: element's ancestry, which its element key needs).
+REFINE_UP = 6
+REFINE_DOWN = 8
+REFINE_SHARE = 0.6
 _TREE_SCOPE_ELEMENT, _TREE_SCOPE_CHILDREN = 1, 2
 _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
@@ -75,6 +91,25 @@ class Element:
     index: int | None = None
     ms: float = 0.0
     ref: Any = field(default=None, repr=False, compare=False)
+    #: capC1c: the actionable control patterns it exposes (:data:`ACTION_PATTERNS`); ``None``: not read (a fake or an
+    #: older answer), treated by its control type.
+    patterns: tuple[str, ...] | None = None
+    #: capC1c: how the resolution walk found it from an unnamed container: ``"up"`` (an ancestor), ``"down"`` (a
+    #: descendant) or ``"path"`` (on a renderer descent's way down); None: the lookup's own answer.
+    refined: str | None = None
+    #: capC1c: the first native window handle on it or its ancestors (its top-level window is that one's root).
+    window: int = 0
+
+    def actionable(self) -> bool:
+        """Whether it exposes one of :data:`ACTION_PATTERNS` (Invoke, Toggle, SelectionItem, ExpandCollapse, Value).
+        Unknown patterns (``None``) count as actionable unless it is a container type (no word list: control types)."""
+        if self.patterns is None:
+            return self.role not in CONTAINER_ROLES
+        return bool(self.patterns)
+
+    def low_info(self) -> bool:
+        """An unnamed container with no actionable pattern: it says nothing about what the user acted on."""
+        return self.role in CONTAINER_ROLES and not (self.name or "").strip() and not self.actionable()
 
     def secret(self) -> str | None:
         """Why nothing about this element may be kept: ``password``, ``password_unknown`` (IsPassword unreadable:
@@ -133,7 +168,7 @@ class TraceUia:
         self._uia = uia
         request = uia.CreateCacheRequest()
         for prop in (_P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND, _P_TOGGLE,
-                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM):
+                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM, _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE):
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
         self._request = request
@@ -184,11 +219,14 @@ class TraceUia:
         password = number(_P_PASSWORD)
         selected = number(_P_SELECTED) if number(_P_HAS_SELECTION_ITEM) else None
         toggle = number(_P_TOGGLE) if number(_P_HAS_TOGGLE) else None
+        patterns = tuple(word for prop, word in ACTION_PATTERNS if number(prop))
+        hwnd = number(_P_HWND) or 0
         return Element(role=ROLE_NAMES.get(int(ctype), f"ControlType{ctype}") if isinstance(ctype, int) else "",
                        name=text(_P_NAME), aid=text(_P_AID), rid=rid, bounds=_bounds(get(_P_BOUNDS)),
                        password=bool(password), password_known=password is not None, toggle=toggle,
                        selected=None if selected is None else bool(selected), pid=number(_P_PID) or 0,
-                       hwnd=number(_P_HWND) or 0, ms=round((time.perf_counter() - t0) * 1000.0, 2), ref=el)
+                       hwnd=hwnd, ms=round((time.perf_counter() - t0) * 1000.0, 2), ref=el, patterns=patterns,
+                       window=hwnd)
 
     def _ancestry(self, element: Element, deadline: float, *, index: bool) -> None:
         """Parent role, up to :data:`ANCESTORS` ancestors (role, AutomationId) and, when asked, the index among the
@@ -208,6 +246,8 @@ class TraceUia:
             if depth == 0:
                 element.parent_role = facts.role
                 parent_el = parent
+            if not element.window and facts.hwnd:
+                element.window = facts.hwnd          # capC1c: its top-level window is this handle's root
             element.ancestors.append((facts.role, facts.aid))
             if facts.role == "Window" and facts.hwnd:
                 break
@@ -225,8 +265,66 @@ class TraceUia:
 
     # -- lookups -----------------------------------------------------------------------------------------------------
 
-    def at_point(self, x: int, y: int, *, budget_s: float, index: bool = False) -> Element | None:
-        """The element at a screen point (path ii), with its ancestry."""
+    #: capC1c: this client has the resolution walk (the worker passes ``refine`` / ``max_area`` only to one that does).
+    refines = True
+
+    @staticmethod
+    def _covers(el: Element, max_area: int) -> bool:
+        """Whether it covers the window (half its area or more): a whole pane, never "the real control"."""
+        return bool(max_area) and el.area() * 2 >= max_area
+
+    def refine(self, element: Element, x: int, y: int, *, deadline: float, max_area: int = 0) -> Element | None:
+        """capC1c: the real control behind an unnamed container (:meth:`Element.low_info`), by UI Automation's own
+        facts: (1) the nearest ancestor that exposes an actionable pattern (:data:`ACTION_PATTERNS`) or has a name and
+        still contains the point (never one that covers the window, ``max_area`` being the window's area); else (2)
+        the smallest descendant under the point that has a name or an actionable pattern. None when neither is found
+        before ``deadline``. Reads only; no ancestry (the caller takes it for the element it keeps)."""
+        current = element.ref
+        for _level in range(REFINE_UP):
+            if current is None or time.perf_counter() >= deadline:
+                break
+            try:
+                parent = self._walker.GetParentElementBuildCache(current, self._request)
+            except Exception:  # noqa: BLE001
+                break
+            facts = self._facts(parent, time.perf_counter())
+            if facts is None or not facts.contains(x, y) or self._covers(facts, max_area):
+                break
+            if (facts.name or "").strip() or facts.actionable():
+                facts.refined = "up"
+                return facts
+            if facts.role == "Window" and facts.hwnd:
+                break                                # a window of its own: nothing above it is the control
+            current = parent
+        best: Element | None = None
+        current = element.ref
+        for _level in range(REFINE_DOWN):
+            if current is None or time.perf_counter() >= deadline:
+                break
+            try:
+                kids = current.FindAllBuildCache(_TREE_SCOPE_CHILDREN, self._true, self._request)
+                n = min(int(kids.Length), 400)
+            except Exception:  # noqa: BLE001
+                break
+            hit: Element | None = None
+            for i in range(n):
+                kid = self._facts(kids.GetElement(i), time.perf_counter())
+                if kid is not None and kid.contains(x, y) and (hit is None or kid.area() < hit.area()):
+                    hit = kid
+            if hit is None:
+                break
+            if (hit.name or "").strip() or hit.actionable():
+                best = hit                           # deeper is smaller: the last one found is the smallest
+            current = hit.ref
+        if best is not None:
+            best.refined = "down"
+        return best
+
+    def at_point(self, x: int, y: int, *, budget_s: float, index: bool = False, refine: bool = False,
+                 max_area: int = 0) -> Element | None:
+        """The element at a screen point (path ii), with its ancestry. ``refine`` (capC1c): an unnamed container's
+        answer is walked to the real control (:meth:`refine`) within :data:`REFINE_SHARE` of the budget; a whole
+        pane (``max_area``: the window's area) is left to the renderer descent."""
         from ctypes import wintypes
 
         t0 = time.perf_counter()
@@ -235,6 +333,10 @@ class TraceUia:
         except Exception:  # noqa: BLE001
             return None
         facts = self._facts(el, t0)
+        if facts is not None and refine and facts.low_info() and not self._covers(facts, max_area):
+            better = self.refine(facts, x, y, deadline=t0 + budget_s * REFINE_SHARE, max_area=max_area)
+            if better is not None:
+                facts = better
         if facts is not None:
             self._ancestry(facts, t0 + budget_s, index=index)
             facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -265,11 +367,15 @@ class TraceUia:
             facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return facts
 
-    def descend(self, pane: Element, x: int, y: int, *, budget_s: float) -> Element | None:
-        """From a renderer's pane, the smallest element under the point, a level of children at a time."""
+    def descend(self, pane: Element, x: int, y: int, *, budget_s: float, refine: bool = False,
+                max_area: int = 0) -> Element | None:
+        """From a renderer's pane, the smallest element under the point, a level of children at a time. ``refine``
+        (capC1c): when that smallest one is an unnamed container, the smallest element on the way down that has a name
+        or an actionable pattern (its nearest such ancestor under the point) is kept instead (``refined="path"``)."""
         t0 = time.perf_counter()
         deadline = t0 + budget_s
         best: Element | None = None
+        on_path: Element | None = None
         current = pane.ref
         for _level in range(DESCENT_LEVELS):
             if current is None or time.perf_counter() >= deadline:
@@ -287,6 +393,11 @@ class TraceUia:
             if hit is None:
                 break
             best, current = hit, hit.ref
+            if not self._covers(hit, max_area) and ((hit.name or "").strip() or hit.actionable()):
+                on_path = hit
+        if refine and best is not None and best.low_info() and on_path is not None and on_path is not best:
+            best = on_path
+            best.refined = "path"
         if best is not None:
             self._ancestry(best, deadline, index=False)
             best.ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -491,5 +602,5 @@ class HungWatch:
         self.counts["hung_slow"] += 1
 
 
-__all__ = ["ANCESTORS", "ANSWER_MS", "Element", "HungWatch", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
+__all__ = ["ACTION_PATTERNS", "ANCESTORS", "ANSWER_MS", "CONTAINER_ROLES", "Element", "HungWatch", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
            "TOGGLE_WORDS", "TraceUia", "window_answers", "window_exists", "window_hung", "window_pid"]
