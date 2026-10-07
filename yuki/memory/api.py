@@ -4375,8 +4375,9 @@ class MemoryClient:
         names) - not the window in front alone. Ways clear a similarity floor to the words (the same vector as the
         related memories); pitfalls of an app in play always come. ``detail``: each item also carries its structured
         body (``steps``, ``run`` - a procedure's executable steps for the talker's skill runner, ``slots``, ``what``,
-        ``instead``, ``default``, ``ask``, ``avoid``), so a caller renders it without the Playbook page. Never raises
-        (empty lists)."""
+        ``instead``, ``default``, ``ask``, ``avoid``), so a caller renders it without the Playbook page. ``go_tos``
+        (capC1b): the user's usual buttons and fields and their shortcuts in each app in play, counted from the action
+        trace (``yuki.memory.trace_habits.go_tos``; ``detail`` gives more). Never raises (empty lists)."""
         from yuki.memory import practice as _p
 
         started = time.perf_counter()
@@ -4392,7 +4393,7 @@ class MemoryClient:
             out["named"] = named
             out["measured"] = vec is not None
         except Exception as exc:
-            out = {"ways": [], "pitfalls": [], "apps": [], "named": [], "measured": False,
+            out = {"ways": [], "pitfalls": [], "go_tos": [], "apps": [], "named": [], "measured": False,
                    "error": f"{type(exc).__name__}: {exc}"}
         out["ms"] = round((time.perf_counter() - started) * 1000, 1)
         return out
@@ -4565,6 +4566,29 @@ class MemoryClient:
         from yuki.memory import trace_store
 
         return trace_store.undo_forget(self.store, int(diary_id))
+
+    def go_tos(self, apps: Any = (), *, detail: bool = False) -> list[dict]:
+        """capC1b: the user's usual buttons and fields and their shortcuts in these apps (process or app names), counted
+        from the action trace (``yuki.memory.trace_habits.go_tos``): names only as the element registry keeps them.
+        Read only; never raises (``[]``)."""
+        from yuki.memory import trace_habits
+        from yuki.memory.store import app_key
+
+        try:
+            return trace_habits.go_tos(self.store, [app_key(str(a)) or str(a) for a in apps or () if a],
+                                       detail=bool(detail))
+        except Exception:  # noqa: BLE001
+            return []
+
+    def trace_learning(self) -> dict:
+        """capC1b: what was learned from the action trace, content-free (``yuki.memory.practice_learn.learn_health``):
+        ways from the user's own fixes, notes of failed routes (and how many failed again), go-tos served today."""
+        from yuki.memory import practice_learn
+
+        try:
+            return practice_learn.learn_health(self.store)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__}
 
 
 __all__ = [

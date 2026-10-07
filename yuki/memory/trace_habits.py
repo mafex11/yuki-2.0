@@ -204,22 +204,29 @@ def update(store: Any, *, now: float | None = None, batch: int = BATCH) -> dict[
     except Exception:  # noqa: BLE001 - a database before migration 38
         return {"skipped": "no trace"}
     newest_id = int(newest[0][0] or 0) if newest else 0
-    state = _load(store)
     log_id = _trace_log_id(store)
+    if _seen.get(_cache_key(store)) == (newest_id, log_id):
+        return {"rows": 0}     # nothing new since this process last folded: no decrypt, no write
+    state = _load(store)
     rebuilt = False
     if log_id != int(state.get("log") or 0):
         state = _empty()
         state["log"] = log_id
         rebuilt = True
     if newest_id <= int(state.get("cursor") or 0) and not rebuilt:
+        _seen[_cache_key(store)] = (newest_id, log_id)
         return {"rows": 0}
     rows = store._query(f"SELECT {_COLUMNS} FROM ui_actions WHERE id > ? ORDER BY id LIMIT ?",
                         (int(state.get("cursor") or 0), int(batch)))
     counted = fold_rows(state, rows)
+    if not rows:
+        state["cursor"] = max(int(state.get("cursor") or 0), newest_id)
     prune(state, now)
     state["at"] = now
     _save(store, state)
     _cache.pop(_cache_key(store), None)
+    if int(state.get("cursor") or 0) >= newest_id:
+        _seen[_cache_key(store)] = (newest_id, log_id)
     return {"rows": len(rows), "counted": counted, "rebuilt": rebuilt, "apps": len(state.get("apps") or {}),
             "more": int(state.get("cursor") or 0) < newest_id}
 
@@ -228,6 +235,8 @@ def update(store: Any, *, now: float | None = None, batch: int = BATCH) -> dict[
 
 #: ``{store key: (stored ciphertext, decoded tallies)}``: the decrypted tallies, re-read when the stored value changed.
 _cache: dict[Any, tuple[str, dict[str, Any]]] = {}
+#: ``{store key: (newest action id, newest trace changelog id)}`` this process has folded up to.
+_seen: dict[Any, tuple[int, int]] = {}
 _lock = threading.Lock()
 #: Go-tos served to requests, per local day (the doctor's count; persisted by the practice worker).
 SERVED: Counter[str] = Counter()

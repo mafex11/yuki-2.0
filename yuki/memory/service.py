@@ -566,8 +566,15 @@ def run(args: argparse.Namespace) -> int:
 
                 practice_model = (portrait.worker if portrait is not None
                                   else _PracticeModel(store, embedder=_practice_embedder()))
+                def practice_trace_rules() -> Any:
+                    # capC1b: decision D3 for the correction learner, from the trace's own [trace] section (the
+                    # trace starts later in this function; None until then: the default, "at once")
+                    tr = trace
+                    return tr.rules() if tr is not None else None
+
                 practice = PracticeWorker(store, practice_model, db_path=db_path, log=log, idle_fn=_practice_idle,
-                                          live_fn=practice_fullscreen, embedder=_practice_embedder())
+                                          live_fn=practice_fullscreen, embedder=_practice_embedder(),
+                                          trace_rules=practice_trace_rules)
                 threading.Thread(target=_guarded(practice.run, log, "practice"), args=(stop,),
                                  name="yuki-memory-practice", daemon=True).start()
             except Exception as exc:  # everything else runs on without it

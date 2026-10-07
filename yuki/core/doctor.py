@@ -254,6 +254,30 @@ _TRACE_STATE_WORDS = {"paused": "paused right now, because memory is paused",
                       "failed": "could not start", "no_input": "not hearing your mouse and keys"}
 
 
+def _trace_learn_words(learn: str | None, health: Any) -> str:
+    """capC1b: what was learned from the trace, in plain words (``trace:learn``, written by the practice worker;
+    the watchdog's skips from ``trace:health``). ``""`` when there is nothing to say."""
+    try:
+        data = json.loads(learn) if learn else {}
+    except (TypeError, ValueError):
+        data = {}
+    parts = []
+    fixes, pits = int(data.get("fixes") or 0), int(data.get("pitfalls") or 0)
+    if fixes:
+        parts.append(f"learned {fixes} way{'s' if fixes != 1 else ''} from your own fixes")
+    if pits:
+        again = int(data.get("repeated") or 0)
+        parts.append(f"kept {pits} note{'s' if pits != 1 else ''} of tries that went wrong"
+                     + (f" ({again} went wrong the same way again)" if again else ""))
+    served = int(data.get("go_tos_today") or 0)
+    if served:
+        parts.append(f"your usual buttons and shortcuts helped {served} request{'s' if served != 1 else ''} today")
+    skipped = int((health or {}).get("hung_skipped") or 0) if isinstance(health, dict) else 0
+    if skipped:
+        parts.append(f"skipped {skipped} look{'s' if skipped != 1 else ''} into apps that stopped answering")
+    return ("; " + "; ".join(parts)) if parts else ""
+
+
 def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
     """Settings -> Record how I work (report 78 C1): off, or on with what it noted in the last day, in plain words.
     Counts only; read-only."""
@@ -288,11 +312,13 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
         yours = conn.execute("SELECT count(*) FROM ui_actions WHERE at >= ? AND source != 'yuki'",
                              (since,)).fetchone()[0]
         row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:health'").fetchone()
+        learn_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:learn'").fetchone()
     except Exception as exc:
         return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
     finally:
         conn.close()
     state = ""
+    health: Any = {}
     try:
         health = json.loads(row[0]) if row else {}
         if now - float(health.get("at") or 0) < 1800:
@@ -307,6 +333,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
                   f" ({yours:,} of them yours; {share}% with the button or field named)")
     if state in _TRACE_STATE_WORDS:
         detail += f"; {_TRACE_STATE_WORDS[state]}"
+    detail += _trace_learn_words(learn_row[0] if learn_row else None, health)
     if state in ("hooks_down", "failed", "no_input"):
         return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
     return Check(TRACE_CHECK, OK, detail)
