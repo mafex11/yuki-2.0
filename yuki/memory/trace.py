@@ -74,6 +74,10 @@ from yuki.memory.trace_hooks import (
 from yuki.memory.trace_keys import FOLD_S, NAMED_KEY, RUN_KEYS
 from yuki.memory.trace_privacy import COMMAND, CONTENT, NAME_CHARS, TITLE, TraceRules, gate, name_class, normalise_name
 
+#: Input and hook items waiting for the worker at most. A worker stuck in a call into a hung app would otherwise
+#: let the queue grow without end; past this, new input items are dropped and counted (``dropped_queue_full``),
+#: control items (stop, reopen, Warp commands) always go through.
+QUEUE_MAX = 5000
 #: Lookups a second at most (a token bucket), and how many the low-priority ones (hover, scroll, outcome
 #: elements, a click's event path when the point already answered) leave untouched for clicks.
 LOOKUPS_PER_S = 4.0
@@ -1540,6 +1544,7 @@ class Trace:
         self._reader_messages = reader_messages
         self._section = PrivacySection(privacy, "trace", TraceRules.from_dict)
         self.queue: queue.SimpleQueue = queue.SimpleQueue()
+        self.dropped_queue_full = 0
         self.sink = None
         self.hooks = None
         self.worker: TraceWorker | None = None
@@ -1582,9 +1587,9 @@ class Trace:
         from yuki.memory.trace_input import Metrics, TraceInput
 
         recent = recent_folder()
-        self.hooks = TraceHooks(self.queue.put, recent=recent)
+        self.hooks = TraceHooks(self._put_input, recent=recent)
         metrics = Metrics()
-        self.sink = TraceInput(self.queue.put, metrics=metrics, on_action=self.hooks.action)
+        self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action)
         rules_fn = self.privacy.rules
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,
@@ -1598,6 +1603,14 @@ class Trace:
         self.state = "started"
         self._log("trace_start", metrics=metrics.facts(), hooks=bool(self.hooks.hwnd), hooks_error=self.hooks.error)
         return self
+
+    def _put_input(self, item: Any) -> None:
+        """Queues one input or hook item unless the worker is that far behind (``QUEUE_MAX``): then it is dropped
+        and counted, so a stalled worker costs bounded memory."""
+        if self.queue.qsize() >= QUEUE_MAX:
+            self.dropped_queue_full += 1
+            return
+        self.queue.put(item)
 
     def _run(self) -> None:
         worker = self.worker
@@ -1790,7 +1803,8 @@ class Trace:
                       "wm_input_per_s": round(stats.get("wm_input", 0) / window, 2),
                       "low_events_per_s": round(hooks.get("low", 0) / window, 3),
                       "outcome_events_per_s": round(hooks.get("outcome", 0) / window, 3),
-                      "events_over_cap": hooks.get("outcome_over", 0), **stats.get("worker", {})}
+                      "events_over_cap": hooks.get("outcome_over", 0), "dropped_queue_full": self.dropped_queue_full,
+                      **stats.get("worker", {})}
             self.store.set_nudge_state("trace:health", json.dumps(health, sort_keys=True))
         except Exception as exc:  # noqa: BLE001
             self._log("error", where="trace.health", error=type(exc).__name__)

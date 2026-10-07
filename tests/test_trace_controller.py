@@ -233,3 +233,21 @@ def test_health_is_saved_content_free_for_the_doctor(env):
     health = json.loads(trace.store.nudge_state("trace:health"))
     assert health["state"] == "on" and "low_events_per_s" in health and "outcome_events_per_s" in health
     assert all(isinstance(v, (int, float, str, type(None))) for v in health.values())
+
+
+def test_a_stalled_worker_keeps_the_queue_bounded(env, monkeypatch):
+    """A worker stuck in a call into a hung app must not let input pile up without end: past QUEUE_MAX, new input
+    items are dropped and counted, while control items still go through."""
+    trace, privacy, gate, attached = env
+    monkeypatch.setattr(trace_mod, "QUEUE_MAX", 10)
+    for _ in range(25):                                   # nothing drains the queue: the worker is not started
+        trace._put_input(("key", 0.0))
+    assert trace.queue.qsize() == 10 and trace.dropped_queue_full == 15
+    trace.queue.put(("reopen", 0.0))                      # control items bypass the cap
+    assert trace.queue.qsize() == 11
+    _consent(privacy, True)
+    trace.beat()
+    trace.save_health()
+    import json
+
+    assert json.loads(trace.store.nudge_state("trace:health"))["dropped_queue_full"] == 15
