@@ -581,16 +581,20 @@ class TraceWorker:
                 act.drop = "skip_window_changed"
             return
         if act.drop is None:
+            walk = self._walk_kw(hwnd)
             el = self._lookup(self.uia.at_point if self.uia else None, x, y, priority=True, index=True,
-                              target=(hwnd, pid), **self._walk_kw(hwnd))
+                              target=(hwnd, pid), **walk)
             act.lookup_end = self._clock()
             if el is not None:
-                act.el, act.resolved, act.lookup_ms = el, "point", el.ms
+                # capC1c: a renderer descent done inside the click's own lookup is the snapshot path (iii)
+                descended = getattr(el, "refined", None) in ("descent", "path")
+                act.el, act.resolved, act.lookup_ms = el, "snapshot" if descended else "point", el.ms
                 if el.role in EDIT_ROLES:
                     self._last_click_edit = (t, el, hwnd)   # typing next goes into it (a password field: dropped)
-                if el.role in PANE_ROLES and self._covers_window(el, hwnd):
-                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False, target=(hwnd, pid),
-                                          **self._walk_kw(hwnd))
+                if el.role in PANE_ROLES and self._covers_window(el, hwnd) and walk.get("max_area"):
+                    self._point_only(act, el)               # the lookup already went down: nothing deeper answers
+                elif el.role in PANE_ROLES and self._covers_window(el, hwnd):
+                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False, target=(hwnd, pid), **walk)
                     if deeper is not None:
                         act.el, act.resolved, act.lookup_ms = deeper, "snapshot", (act.lookup_ms or 0) + deeper.ms
                         act.lookup_end = self._clock()

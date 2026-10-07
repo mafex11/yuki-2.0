@@ -7,7 +7,11 @@ selection state, the parent's role and up to :data:`ANCESTORS` ancestors' roles 
 live reference is kept on the object for one follow-up read (the state after the action), never logged, never
 stored.
 
-* :meth:`TraceUia.at_point`: ``ElementFromPointBuildCache`` at the point taken at button-down (path ii);
+* :meth:`TraceUia.at_point`: ``ElementFromPointBuildCache`` at the point taken at button-down (path ii); with
+  ``refine`` (capC1c), inside the same lookup, a renderer's whole pane gets the descent and any other unnamed
+  container with no actionable pattern (:data:`CONTAINER_ROLES`, :data:`ACTION_PATTERNS`) the walk to the real
+  control (:meth:`TraceUia.refine`: the nearest actionable or named ancestor still under the point, else the smallest
+  named descendant under it);
 * :meth:`TraceUia.from_event`: the element an ``INVOKED``, ``SELECTION`` or ``FOCUS`` WinEvent named
   (``AccessibleObjectFromEvent`` then ``ElementFromIAccessibleBuildCache``; path i);
 * :meth:`TraceUia.descend`: from a renderer's whole pane (Chromium, CEF answer ``ElementFromPoint`` with the page),
@@ -53,7 +57,7 @@ CONTAINER_ROLES = frozenset({"Group", "Pane", "Document", "Custom", "Window"})
 #: element's ancestry, which its element key needs).
 REFINE_UP = 6
 REFINE_DOWN = 8
-REFINE_SHARE = 0.6
+REFINE_SHARE = 0.75
 _TREE_SCOPE_ELEMENT, _TREE_SCOPE_CHILDREN = 1, 2
 _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
@@ -322,9 +326,11 @@ class TraceUia:
 
     def at_point(self, x: int, y: int, *, budget_s: float, index: bool = False, refine: bool = False,
                  max_area: int = 0) -> Element | None:
-        """The element at a screen point (path ii), with its ancestry. ``refine`` (capC1c): an unnamed container's
-        answer is walked to the real control (:meth:`refine`) within :data:`REFINE_SHARE` of the budget; a whole
-        pane (``max_area``: the window's area) is left to the renderer descent."""
+        """The element at a screen point (path ii), with its ancestry. ``refine`` (capC1c), all within this one lookup
+        (one token of the budget, one hung-app check, :data:`REFINE_SHARE` of its time, the rest kept for the
+        ancestry): a container covering the window (``max_area``: the window's area; a renderer's whole pane) gets
+        the renderer descent at once (``refined`` ``"descent"`` / ``"path"``), any other unnamed container the walk
+        (:meth:`refine`, ``"up"`` / ``"down"``). A whole pane nothing deeper answers for comes back as it is."""
         from ctypes import wintypes
 
         t0 = time.perf_counter()
@@ -333,10 +339,16 @@ class TraceUia:
         except Exception:  # noqa: BLE001
             return None
         facts = self._facts(el, t0)
-        if facts is not None and refine and facts.low_info() and not self._covers(facts, max_area):
-            better = self.refine(facts, x, y, deadline=t0 + budget_s * REFINE_SHARE, max_area=max_area)
-            if better is not None:
-                facts = better
+        if facts is not None and refine:
+            deadline = t0 + budget_s * REFINE_SHARE
+            if facts.role in CONTAINER_ROLES and self._covers(facts, max_area):
+                deeper = self._descend(facts, x, y, deadline=deadline, refine=True, max_area=max_area)
+                if deeper is not None:
+                    facts = deeper
+            elif facts.low_info():
+                better = self.refine(facts, x, y, deadline=deadline, max_area=max_area)
+                if better is not None:
+                    facts = better
         if facts is not None:
             self._ancestry(facts, t0 + budget_s, index=index)
             facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -374,6 +386,14 @@ class TraceUia:
         or an actionable pattern (its nearest such ancestor under the point) is kept instead (``refined="path"``)."""
         t0 = time.perf_counter()
         deadline = t0 + budget_s
+        best = self._descend(pane, x, y, deadline=deadline, refine=refine, max_area=max_area)
+        if best is not None:
+            self._ancestry(best, deadline, index=False)
+            best.ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return best
+
+    def _descend(self, pane: Element, x: int, y: int, *, deadline: float, refine: bool,
+                 max_area: int) -> Element | None:
         best: Element | None = None
         on_path: Element | None = None
         current = pane.ref
@@ -398,9 +418,8 @@ class TraceUia:
         if refine and best is not None and best.low_info() and on_path is not None and on_path is not best:
             best = on_path
             best.refined = "path"
-        if best is not None:
-            self._ancestry(best, deadline, index=False)
-            best.ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        elif best is not None and refine:
+            best.refined = "descent"
         return best
 
     def focused(self, *, budget_s: float) -> Element | None:
