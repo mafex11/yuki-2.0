@@ -15,9 +15,14 @@ On the reader's thread, per event, so it stays cheap:
 * **keys** become a class (:mod:`yuki.memory.trace_keys`): a named key or chord leaves as its text, a character as a
   count of one, and the virtual key is dropped with the class.
 * **mouse buttons**: at button-down the pointer's screen point (``GetPhysicalCursorPos``) and a *lookup now* item, so
-  the worker asks UI Automation what is under the pointer before the button is up or a menu closes. Button-up makes a
-  click, a double click (Windows' double-click time and rectangle) or a drag (Windows' drag rectangle) with its end
-  point. The wheel leaves as notches with its point.
+  the worker asks UI Automation what is under the pointer before the button is up or a menu closes, and the top-level
+  window under the press (capC1c: ``WindowFromPhysicalPoint`` + ``GetAncestor``, no UI Automation), so the worker can
+  tell whether what is under the press changed before its lookup answered. Button-up makes a click, a double click
+  (Windows' double-click time and rectangle) or a drag with its end point: a drag only when the cursor at the release
+  is outside Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``, as Windows answers it for the monitor's DPI)
+  around the cursor at the press (capC1c: cursor pixels, never raw device counts; a resting sensor's 0-1 px jitter
+  never makes one). Unlike ``DragDetect``, a cursor that left the rectangle and came back before the release makes a
+  click; how far it went leaves with the release (``came_back``). The wheel leaves as notches with its point.
 * **moves** are never stored and never leave as a path. Each report adds its raw counts to the net movement since
   the pointer's current *rest anchor*; the pointer (in screen pixels, as Windows judges a hover) leaving Windows' own
   hover rectangle (``SPI_GETMOUSEHOVERWIDTH`` x ``SPI_GETMOUSEHOVERHEIGHT``, read from the system) around the anchor
@@ -31,8 +36,8 @@ On the reader's thread, per event, so it stays cheap:
   ``yuki``; injected input without it (``hDevice`` 0: Handy dictation, Deskflow, G Hub macros) is
   ``user_injected``; real hardware is ``user``.
 
-Queue items (tuples, first field the kind): ``("down", t, button, x, y, source, travel, dbl)``,
-``("up", t, button, x, y, source, drag)``, ``("wheel", t, notches, horizontal, x, y, source, travel)``,
+Queue items (tuples, first field the kind): ``("down", t, button, x, y, source, travel, dbl, root, root_pid)``,
+``("up", t, button, x, y, source, drag[, came_back])``, ``("wheel", t, notches, horizontal, x, y, source, travel)``,
 ``("key", t, kind, text, source, travel)``, ``("char", t, n, source)``, ``("moving", t)``.
 """
 
@@ -77,10 +82,17 @@ class Metrics:
     _SM_CXDOUBLECLK, _SM_CYDOUBLECLK, _SM_CXDRAG, _SM_CYDRAG = 36, 37, 68, 69
 
     def __init__(self, *, hover_w: int = 0, hover_h: int = 0, hover_s: float = 0.0, double_s: float = 0.0,
-                 double_w: int = 0, double_h: int = 0, drag_w: int = 0, drag_h: int = 0, read: bool = True) -> None:
+                 double_w: int = 0, double_h: int = 0, drag_w: int = 0, drag_h: int = 0, read: bool = True,
+                 dpi_at: Callable[[int, int], int] | None = None,
+                 for_dpi: Callable[[int, int], int] | None = None) -> None:
         self.hover_w, self.hover_h, self.hover_s = hover_w, hover_h, hover_s
         self.double_s, self.double_w, self.double_h = double_s, double_w, double_h
         self.drag_w, self.drag_h = drag_w, drag_h
+        #: capC1c: ``(x, y) -> dpi`` of the monitor under a physical point, and ``(metric, dpi) -> value``
+        #: (``GetSystemMetricsForDpi``): the drag rectangle as Windows answers it for that monitor (it does not scale
+        #: this metric: V2-5). Without the per-DPI call the system values above are used as they are.
+        self._dpi_at = dpi_at
+        self._for_dpi = for_dpi
         if read:
             self.refresh()
 
@@ -107,11 +119,76 @@ class Metrics:
         self.double_h = int(u.GetSystemMetrics(self._SM_CYDOUBLECLK))
         self.drag_w = int(u.GetSystemMetrics(self._SM_CXDRAG))
         self.drag_h = int(u.GetSystemMetrics(self._SM_CYDRAG))
+        try:
+            self._dpi_at, self._for_dpi = _monitor_dpi(), _metric_for_dpi()
+        except (AttributeError, OSError):      # before Windows 10 1607: the system's own values stand
+            self._dpi_at = self._for_dpi = None
+
+    def drag_size(self, x: int, y: int) -> tuple[int, int]:
+        """capC1c: Windows' drag rectangle (``SM_CXDRAG`` x ``SM_CYDRAG``) for the monitor under a physical point, as
+        Windows answers it for that monitor's DPI (``GetSystemMetricsForDpi``), compared with the pointer in physical
+        pixels (``GetPhysicalCursorPos``). Second verification V2-5: Windows does not scale this metric with DPI (on
+        this PC it answers 4 at 96, 120, 144 and 192 DPI, while it does scale e.g. the scroll bar width), so the
+        rectangle stays its system size on a scaled monitor; without the per-DPI call (before Windows 10 1607) the
+        system's own values stand, unscaled, which agrees with it."""
+        w, h = self.drag_w, self.drag_h
+        if self._dpi_at is None or self._for_dpi is None:
+            return w, h
+        try:
+            dpi = int(self._dpi_at(int(x), int(y)) or 96)
+            return (int(self._for_dpi(self._SM_CXDRAG, dpi)) or w, int(self._for_dpi(self._SM_CYDRAG, dpi)) or h)
+        except Exception:  # noqa: BLE001 - the system's own values stand
+            return w, h
+
+    def is_drag(self, x0: int, y0: int, x1: int, y1: int) -> bool:
+        """capC1c: whether a press at ``(x0, y0)`` released at ``(x1, y1)`` (both the cursor in physical pixels, never
+        the device's raw counts) is a drag: the release is outside Windows' drag rectangle centred on the press (the
+        rectangle of the press's monitor). Only the release counts, not where the cursor went while held (that is
+        ``DragDetect``'s rule, deliberately not followed: see :class:`TraceInput`). A sensor's 0-1 px jitter never
+        leaves it."""
+        w, h = self.drag_size(x0, y0)
+        return self.outside(x0, y0, x1, y1, w, h)
+
+    @staticmethod
+    def outside(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> bool:
+        """Whether ``(x1, y1)`` is outside a ``w`` x ``h`` rectangle centred on ``(x0, y0)``."""
+        return abs(x1 - x0) * 2 > max(w, 1) or abs(y1 - y0) * 2 > max(h, 1)
 
     def facts(self) -> dict[str, Any]:
         return {"hover_w": self.hover_w, "hover_h": self.hover_h, "hover_ms": round(self.hover_s * 1000),
                 "double_ms": round(self.double_s * 1000), "double_w": self.double_w, "double_h": self.double_h,
                 "drag_w": self.drag_w, "drag_h": self.drag_h}
+
+
+def _monitor_dpi() -> Callable[[int, int], int]:
+    """``(x, y) -> dpi`` of the monitor under a physical point (``MonitorFromPoint`` + ``GetDpiForMonitor``, effective
+    DPI). The memory service is per-monitor DPI aware (``yuki.__init__``), so the point and the answer are physical."""
+    from ctypes import wintypes as W
+
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    shcore = ctypes.WinDLL("shcore", use_last_error=True)
+    u.MonitorFromPoint.argtypes = [W.POINT, W.DWORD]
+    u.MonitorFromPoint.restype = W.HMONITOR
+    shcore.GetDpiForMonitor.argtypes = [W.HMONITOR, ctypes.c_int, ctypes.POINTER(W.UINT), ctypes.POINTER(W.UINT)]
+    shcore.GetDpiForMonitor.restype = ctypes.c_long
+    nearest = 2                                 # MONITOR_DEFAULTTONEAREST
+
+    def dpi(x: int, y: int) -> int:
+        mon = u.MonitorFromPoint(W.POINT(int(x), int(y)), nearest)
+        dx, dy = W.UINT(0), W.UINT(0)
+        if not mon or shcore.GetDpiForMonitor(mon, 0, ctypes.byref(dx), ctypes.byref(dy)) != 0:
+            return 96
+        return int(dx.value) or 96
+
+    return dpi
+
+
+def _metric_for_dpi() -> Callable[[int, int], int]:
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    fn = u.GetSystemMetricsForDpi                 # AttributeError before Windows 10 1607
+    fn.argtypes = [ctypes.c_int, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    return lambda metric, dpi: int(fn(int(metric), int(dpi)))
 
 
 def _physical_cursor() -> Callable[[], tuple[int, int]]:
@@ -160,8 +237,18 @@ class TraceInput:
     def __init__(self, put: Callable[[tuple], None], *, metrics: Metrics | None = None,
                  cursor: Callable[[], tuple[int, int]] | None = None, classifier: KeyClassifier | None = None,
                  on_action: Callable[[float, bool], None] | None = None, clock: Callable[[], float] = time.monotonic,
-                 screen: Callable[[bool], tuple[int, int]] | None = None) -> None:
+                 screen: Callable[[bool], tuple[int, int]] | None = None,
+                 root_at: Callable[[int, int], int] | None = None,
+                 pid_of: Callable[[int], int] | None = None) -> None:
         self._put = put
+        #: capC1c: ``(x, y) -> hwnd``, the top-level window under a physical point (``WindowFromPhysicalPoint`` +
+        #: ``GetAncestor(GA_ROOT)``, a few microseconds, no UI Automation): taken at button-down so the worker can
+        #: tell whether what is under the press changed before its lookup answered. None: not taken (0).
+        self._root_at = root_at
+        #: capC1c review: ``(hwnd) -> pid`` (``GetWindowThreadProcessId``, microseconds, sends no message): that
+        #: window's process, taken with it, so a press on a menu or dialog that is gone before the worker reaches it
+        #: still belongs to its app (a stale, point-only row) instead of disappearing. None: not taken (0).
+        self._pid_of = pid_of
         self.metrics = metrics if metrics is not None else Metrics()
         self._cursor = cursor if cursor is not None else _physical_cursor()
         self._screen = screen
@@ -183,7 +270,9 @@ class TraceInput:
         self.travel = 0.0                    # raw counts travelled since the last action
         self.move_source = USER              # who moved the pointer last (user | user_injected)
         # buttons
-        self._down: dict[str, tuple[float, int, int, int]] = {}   # button -> (t, x, y, max excursion px)
+        #: button -> (t, x, y) of the press (cursor px), Windows' drag rectangle there (w, h) and whether the cursor
+        #: has left it while the button was held (``DragDetect``'s rule)
+        self._down: dict[str, tuple[float, int, int, int, int, bool]] = {}
         self._last_click: tuple[str, float, int, int] | None = None
         self._fold: tuple[Any, float] | None = None    # the last action's fold key and time (V6)
         #: Content-free counters (read by the trace's stats).
@@ -266,10 +355,14 @@ class TraceInput:
                     self._jump(t, x, y)                # placed by software, not this device's move
                 else:
                     self._new_anchor(t, x, y)
-            for button, (t0, x0, y0, far) in list(self._down.items()):
-                excursion = max(abs(x - x0), abs(y - y0))
-                if excursion > far:
-                    self._down[button] = (t0, x0, y0, excursion)
+            if self._down:
+                # capC1c review: how far the cursor went from the press while the button is held, per axis (a few
+                # compares per report). Never decides the kind; a release back inside the rectangle after leaving it
+                # is told to the worker as that distance, so a live hour can see such clicks
+                for held, (t0, x0, y0, w, h, fx, fy) in list(self._down.items()):
+                    ex, ey = abs(x - x0), abs(y - y0)
+                    if ex > fx or ey > fy:
+                        self._down[held] = (t0, x0, y0, w, h, max(fx, ex), max(fy, ey))
         if not button_flags:
             return
         source = source_of(extra, device)
@@ -281,21 +374,45 @@ class TraceInput:
                 m = self.metrics
                 dbl = bool(last and last[0] == button and t - last[1] <= m.double_s
                            and abs(x - last[2]) * 2 <= m.double_w and abs(y - last[3]) * 2 <= m.double_h)
-                self._down[button] = (t, x, y, 0)
+                w, h = m.drag_size(x, y)                # the monitor of the press, read once per press
+                self._down[button] = (t, x, y, max(w, 1), max(h, 1), 0, 0)
                 # a press ends the rest: the pointer must move away before it can hover again
                 self._ax, self._ay, self.anchor_at = x, y, t
                 self.anchor_seq += 1
                 self._action(t)
-                self._put(("down", t, button, x, y, source, self._take_travel(), dbl))
+                root = root_pid = 0
+                if self._root_at is not None:
+                    try:
+                        root = int(self._root_at(x, y) or 0)
+                    except Exception:  # noqa: BLE001 - the worker then judges staleness without it
+                        root = 0
+                if root and self._pid_of is not None:
+                    try:
+                        root_pid = int(self._pid_of(root) or 0)
+                    except Exception:  # noqa: BLE001 - the worker reads it later, if the window is still there
+                        root_pid = 0
+                self._put(("down", t, button, x, y, source, self._take_travel(), dbl, root, root_pid))
         for flag, button in _UP.items():
             if button_flags & flag:
                 x, y = self._cursor()
-                t0, x0, y0, far = self._down.pop(button, (t, x, y, 0))
-                m = self.metrics
-                far = max(far, abs(x - x0), abs(y - y0))
-                drag = far * 2 > max(m.drag_w, m.drag_h, 1)
+                held = self._down.pop(button, None)
+                # capC1c: the cursor at the release against the cursor at the press (never the device's raw counts,
+                # which pointer speed and acceleration rescale), in Windows' drag rectangle for that monitor's DPI.
+                # This is not DragDetect's rule (which also fires when the cursor left the rectangle and came back):
+                # the first live hour had plain clicks with a few pixels of wobble recorded as drags. The trade-off:
+                # a drag released where it began (a knob turned and let go at its start) is a click; ``came_back``
+                # (px, the larger axis, 0 when the cursor never left the rectangle) tells the worker of it
+                came_back = 0
+                if held is None:
+                    drag = False
+                else:
+                    _t0, x0, y0, w, h, fx, fy = held
+                    drag = self.metrics.outside(x0, y0, x, y, w, h)
+                    if not drag and (fx * 2 > w or fy * 2 > h):
+                        came_back = int(max(fx, fy))
                 self._last_click = None if drag else (button, t, x, y)
-                self._put(("up", t, button, x, y, source, drag))
+                # ``came_back`` only when there is one: the item keeps its 7 fields otherwise
+                self._put(("up", t, button, x, y, source, drag) + ((came_back,) if came_back else ()))
         if button_flags & (_WHEEL | _HWHEEL):
             self.counts["wheel"] += 1
             delta = ctypes.c_short(button_data & 0xFFFF).value

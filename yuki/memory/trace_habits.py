@@ -32,7 +32,8 @@ elements and :data:`TOP_CHORDS` chords. An element's **name** comes only from th
 which keeps it by the C1 rules: a command control's (Button, CheckBox ...) on first use, a menu item's, tab's or
 title's only once the same one was used on 3 distinct days, a content control's (a chat, a list item, a file) never.
 An element without a kept name shows as its role and position ("a ListItem in a List"). An element the registry no
-longer has (forgotten, unused 60 days) is not shown. ``detail=True`` gives more of each. Read from an in-process cache
+longer has (forgotten, unused 60 days) is not shown, nor (capC1c, :func:`low_info`) one that would show with no name
+and exposes no actionable control pattern (an unnamed Group in a Group): its tally is kept, it is just no hint. ``detail=True`` gives more of each. Read from an in-process cache
 of the decrypted tallies (re-read only when the stored value changed): a request costs dictionary lookups and one
 small indexed read of the registry for the names.
 
@@ -83,7 +84,44 @@ DETAIL_CHORDS = 8
 PITFALL_RANK = 0.5
 DAY_S = 86400.0
 
-_COLUMNS = "id, at, process, kind, source, resolved, element_key, role, position, chord"
+_COLUMNS = "id, at, process, kind, source, resolved, element_key, role, position, chord, facts"
+
+
+def _col(row: Any, name: str) -> Any:
+    """A column of a row that may predate it (a dict built by hand, or a row read before capC1c)."""
+    try:
+        return row[name] if name in row.keys() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _actionable(row: Any) -> bool | None:
+    """capC1c: whether the row's element exposes an actionable control pattern (``facts.patterns``, read from UI
+    Automation with the element); None when the row did not record it (older rows)."""
+    raw = _col(row, "facts")
+    if not raw:
+        return None
+    try:
+        facts = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    patterns = facts.get("patterns") if isinstance(facts, dict) else None
+    return None if patterns is None else bool(patterns)
+
+
+def low_info(tally: dict[str, Any], name: str | None) -> bool:
+    """capC1c: an element that would be shown with no name and that exposes no actionable pattern (an unnamed Group
+    in a Group, an unnamed Document in a Window): it tells the brain nothing about what to press, so it is never shown
+    as a usual control. Its tally is still kept (other uses, later phases). Patterns not recorded (older rows) are
+    judged by the control type: a container type (Group, Pane, Document, Custom, Window) counts as not actionable."""
+    if name:
+        return False
+    actionable = tally.get("a")
+    if actionable is None:
+        from yuki.memory.trace_uia import CONTAINER_ROLES
+
+        actionable = str(tally.get("r") or "") not in CONTAINER_ROLES
+    return not actionable
 
 
 def _decay(score: float, since: float, now: float) -> float:
@@ -154,7 +192,11 @@ def fold_rows(state: dict[str, Any], rows: Iterable[Any]) -> int:
             counted += 1
         elif r["kind"] in ELEMENT_KINDS and r["element_key"] and r["resolved"] in IDENTITY_RESOLVED:
             key = str(r["element_key"])
-            app["el"][key] = _fold(app["el"].get(key), at, {"r": r["role"] or "", "p": r["position"] or ""})
+            extra: dict[str, Any] = {"r": r["role"] or "", "p": r["position"] or ""}
+            actionable = _actionable(r)
+            if actionable is not None:
+                extra["a"] = actionable          # capC1c: the latest row's patterns decide (:func:`low_info`)
+            app["el"][key] = _fold(app["el"].get(key), at, extra)
             counted += 1
     return counted
 
@@ -405,7 +447,9 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
                 score = _decay(v["s"], v["t"], now) * (PITFALL_RANK if k in lowered else 1.0)
                 els.append((score, k, v))
             els.sort(key=lambda x: -x[0])
-            picked[proc] = els[: n_el * 2]       # a few spare for elements the registry no longer has
+            # every tally is a candidate (at most MAX_ELEMENTS an app): some are gone from the registry and the
+            # low-information ones (capC1c) are never shown, so the top ones may sit far down the list
+            picked[proc] = els
             keys += [k for _s, k, _v in picked[proc]]
         names: dict[str, str | None] = {}
         for start in range(0, len(keys), 400):
@@ -423,6 +467,8 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
                 if k not in names:
                     continue            # forgotten or unused 60 days: the registry no longer has it
                 name = names[k]
+                if low_info(v, name):
+                    continue            # capC1c: no name, nothing to press: no hint for the brain
                 elements.append({"label": _label(name, str(v.get("r") or ""), str(v.get("p") or "")),
                                  "role": v.get("r") or "", "named": bool(name), "n": int(v.get("n") or 0),
                                  "days": int(v.get("d") or 0), "last_at": v.get("t"), "score": round(score, 3),
@@ -492,7 +538,7 @@ def served_today(store: Any, now: float | None = None) -> int:
 
 
 __all__ = ["APPS_SHOWN", "BATCH", "CHORD_MODIFIERS", "ELEMENT_KINDS", "HALF_LIFE_DAYS", "IDENTITY_RESOLVED",
-           "KEEP_DAYS", "MAX_APPS", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS",
+           "KEEP_DAYS", "MAX_APPS", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS", "low_info",
            "APP_PREFIX", "app_tallies",
            "SERVED_KEY", "TOP_ELEMENTS", "USER_SOURCES", "chord_keys", "flush_served", "fold_rows", "go_tos", "is_chord",
            "note_served", "prune", "served_today",
