@@ -151,6 +151,27 @@ def test_relevant_and_the_memory_client_carry_go_tos_and_a_pitfall_lowers_an_ele
     assert H.served_today(store) >= 1
 
 
+def test_the_go_tos_served_count_is_shared_by_every_process_and_written_sparingly(store):
+    """Review F5: go-tos are served in the Yuki app's process and the doctor's health is written by the memory
+    service: the count lives in the database. A second store on the same file stands in for the other process."""
+    from yuki.memory.store import Store
+
+    H.SERVED.clear()                                                 # (other tests served go-tos in this process)
+    other = Store.open(store.path)
+    try:
+        H.note_served(store, NOW)                                    # the first one is written at once
+        assert H.served_today(other, NOW) == 1
+        H.note_served(store, NOW + 5)                                # within the flush interval: kept in memory
+        assert H.served_today(other, NOW + 5) == 1
+        H.note_served(other, NOW + 6)                                # the other process adds its own
+        H.flush_served(store, NOW + 7)
+        assert H.served_today(store, NOW + 7) == 3
+        H.note_served(store, NOW + DAY)                              # a new day starts again
+        assert H.served_today(other, NOW + DAY) == 1 and H.served_today(other, NOW) == 0
+    finally:
+        other.close()
+
+
 # -- the caps stay untouched -----------------------------------------------------------------------------------------
 
 

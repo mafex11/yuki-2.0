@@ -138,3 +138,20 @@ def test_the_trace_health_carries_the_watchdogs_counts_for_the_doctor(tmp_path):
         assert "skipped 1 look into apps that stopped answering" in words
     finally:
         rig.store.close()
+
+
+def test_the_re_probe_never_changes_the_shared_user32_prototype():
+    """Review F6: ``window_answers`` uses its own ``SendMessageTimeoutW`` prototype; the shared ``windll`` one keeps
+    whatever argument types other code gave it (``yuki.perception.tree`` passes a ``DWORD`` result). Window 0: no
+    window gets the message."""
+    import ctypes
+    from ctypes import wintypes
+
+    from yuki.memory.trace_uia import window_answers
+
+    shared = ctypes.windll.user32.SendMessageTimeoutW
+    before = (shared.argtypes, shared.restype)
+    assert window_answers(0) is False
+    assert (shared.argtypes, shared.restype) == before
+    result = wintypes.DWORD(0)
+    shared(None, 0, 0, 0, 0x0002, 1, ctypes.byref(result))      # a DWORD result still passes (no ArgumentError)
