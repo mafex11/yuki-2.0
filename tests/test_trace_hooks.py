@@ -136,3 +136,22 @@ def test_a_real_reader_feeds_a_sink_plain_integers_read_only():
     assert seen["types"] <= {"float", "int"}            # never the RAWINPUT buffer or a structure
     assert reader.messages >= seen["mouse"] + seen["key"]
     print(f"\nreal reader, 1 s: {reader.messages} WM_INPUT, {seen['mouse']} mouse and {seen['key']} key reports to the sink")
+
+
+def test_the_real_reader_survives_the_trace_waking_the_mouse():
+    """Live 7 Oct (release 10): the trace's wake message reached the real message loop, which read ``msg.hwnd``
+    (``ctypes.wintypes.MSG`` names it ``hWnd``): the reader died, presence fell back to the idle timer and the trace
+    got no input. Fakes never ran that line; this sends the real thread message to a real reader."""
+    from yuki.memory.userpresence import PresenceInput, _RawReader
+
+    reader = _RawReader(PresenceInput())
+    if not reader.start():
+        pytest.skip(f"no Raw Input here: {reader.error}")
+    try:
+        for _ in range(3):
+            reader.listen_mouse()
+            time.sleep(0.2)
+        assert reader.running and not reader.error, reader.error
+        assert reader._thread is not None and reader._thread.is_alive()
+    finally:
+        reader.stop()
