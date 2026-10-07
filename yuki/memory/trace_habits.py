@@ -16,8 +16,10 @@ What counts (machine fields of ``ui_actions``, migration 38):
   alone (Enter, Tab, an arrow) is not a shortcut.
 
 **Kept up to date cheaply.** :func:`update` folds only the rows written since its cursor (the last ``ui_actions.id``
-it read, at most :data:`BATCH` a call) into per-app tallies held in one encrypted ``nudge_state`` value
-(:data:`STATE_KEY`); the practice worker calls it on its tick, so nothing scans the trace on a request. A tally's
+it read, at most :data:`BATCH` a call) into per-app tallies: one small encrypted ``nudge_state`` value per app (named
+by a keyed digest of the process) plus an index (:data:`STATE_KEY`). A tick reads, decrypts and writes again only the
+apps its new rows are in (second verification V8: one value for every app cost about 0.9 MB rewritten a tick at the
+caps). The practice worker calls it on its tick, so nothing scans the trace on a request. A tally's
 score is an exponentially decayed count (half-life :data:`HALF_LIFE_DAYS`): folding a new use is
 ``score * 0.5 ** (age / half-life) + 1``, so recency needs no rescan. Tallies are capped per app
 (:data:`MAX_ELEMENTS`, :data:`MAX_CHORDS`) and apps overall (:data:`MAX_APPS`); one unused for :data:`KEEP_DAYS` is
@@ -66,8 +68,10 @@ MAX_ELEMENTS = 60
 MAX_CHORDS = 30
 #: Rows folded per :func:`update` call at most (a rebuild after a forget goes on over the next ticks).
 BATCH = 5_000
-#: ``nudge_state`` name of the encrypted tallies.
+#: ``nudge_state`` name of the tallies' encrypted index (:func:`_empty`); each app's tallies are a value of their own
+#: named :data:`APP_PREFIX` + a keyed digest of the process (second verification V8).
 STATE_KEY = "trace:habits"
+APP_PREFIX = STATE_KEY + ":app:"
 #: What one request is shown at most: apps, elements and chords per app (``detail=True``: the second set).
 APPS_SHOWN = 3
 TOP_ELEMENTS = 5
@@ -106,7 +110,14 @@ def chord_keys(chord: Any) -> list[str]:
 
 
 def _empty() -> dict[str, Any]:
-    return {"v": 1, "cursor": 0, "log": 0, "at": 0.0, "apps": {}}
+    """The tallies' index (:data:`STATE_KEY`): the fold cursor, the trace changelog line it was built after, and per
+    app its last use (``t``) and its decayed strength (``s``, as of ``a``). Each app's own tallies live in a value of
+    their own (:func:`_app_name`, second verification V8)."""
+    return {"v": 2, "cursor": 0, "log": 0, "at": 0.0, "apps": {}}
+
+
+def _empty_app() -> dict[str, Any]:
+    return {"el": {}, "ch": {}}
 
 
 def _fold(entry: dict[str, Any] | None, at: float, extra: dict[str, Any]) -> dict[str, Any]:
@@ -148,42 +159,76 @@ def fold_rows(state: dict[str, Any], rows: Iterable[Any]) -> int:
     return counted
 
 
-def prune(state: dict[str, Any], now: float) -> None:
-    """Drop tallies unused for :data:`KEEP_DAYS` and keep the strongest within the caps."""
+def _prune_app(app: dict[str, Any], now: float) -> None:
+    """Drop one app's tallies unused for :data:`KEEP_DAYS` and keep its strongest within the caps."""
     cut = float(now) - KEEP_DAYS * DAY_S
+    for part, cap in (("el", MAX_ELEMENTS), ("ch", MAX_CHORDS)):
+        items = {k: v for k, v in (app.get(part) or {}).items() if float(v.get("t") or 0.0) >= cut}
+        if len(items) > cap:
+            keep = sorted(items, key=lambda k: -_decay(items[k]["s"], items[k]["t"], now))[:cap]
+            items = {k: items[k] for k in keep}
+        app[part] = items
+
+
+def _strength(app: dict[str, Any], now: float) -> float:
+    return sum(_decay(v["s"], v["t"], now) for part in ("el", "ch") for v in (app.get(part) or {}).values())
+
+
+def prune(state: dict[str, Any], now: float) -> None:
+    """Drop tallies unused for :data:`KEEP_DAYS` and keep the strongest within the caps (a whole ``{"apps": {process:
+    {"el", "ch"}}}`` held in memory)."""
     apps = state.get("apps") or {}
     for proc in list(apps):
-        app = apps[proc]
-        for part, cap in (("el", MAX_ELEMENTS), ("ch", MAX_CHORDS)):
-            items = {k: v for k, v in (app.get(part) or {}).items() if float(v.get("t") or 0.0) >= cut}
-            if len(items) > cap:
-                keep = sorted(items, key=lambda k: -_decay(items[k]["s"], items[k]["t"], now))[:cap]
-                items = {k: items[k] for k in keep}
-            app[part] = items
-        if not app["el"] and not app["ch"]:
+        _prune_app(apps[proc], now)
+        if not apps[proc]["el"] and not apps[proc]["ch"]:
             del apps[proc]
     if len(apps) > MAX_APPS:
-        def strength(proc: str) -> float:
-            app = apps[proc]
-            return sum(_decay(v["s"], v["t"], now) for part in ("el", "ch") for v in app[part].values())
-
-        for proc in sorted(apps, key=strength)[: len(apps) - MAX_APPS]:
+        for proc in sorted(apps, key=lambda p: _strength(apps[p], now))[: len(apps) - MAX_APPS]:
             del apps[proc]
+
+
+def _app_name(store: Any, proc: str) -> str:
+    """``nudge_state`` name of one app's tallies (second verification V8: one small value per app, so a tick rewrites
+    only the apps that had new rows): a keyed digest of the process, never its name in the clear."""
+    return APP_PREFIX + str(store.cipher.digest("trace-habits-app", proc))
+
+
+def _decode(store: Any, raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        data = json.loads(store._dec(raw) or "{}")
+    except Exception:  # noqa: BLE001 - unreadable (another key): treated as absent
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _load(store: Any) -> dict[str, Any]:
-    raw = store.nudge_state(STATE_KEY)
-    if not raw:
-        return _empty()
-    try:
-        state = json.loads(store._dec(raw) or "{}")
-    except Exception:  # noqa: BLE001 - unreadable (another key): start again from the rows
-        return _empty()
-    return state if isinstance(state, dict) and state.get("v") == 1 else _empty()
+    """The index, read fresh (a copy the caller may change); an older single-value form (``v`` 1) or an unreadable
+    one starts again from the rows."""
+    state = _decode(store, store.nudge_state(STATE_KEY))
+    return state if state is not None and state.get("v") == 2 else _empty()
 
 
-def _save(store: Any, state: dict[str, Any]) -> None:
-    store.set_nudge_state(STATE_KEY, store._enc(json.dumps(state, separators=(",", ":"))))
+def _load_app(store: Any, proc: str) -> dict[str, Any]:
+    data = _decode(store, store.nudge_state(_app_name(store, proc))) or {}
+    return {"el": dict(data.get("el") or {}), "ch": dict(data.get("ch") or {})}
+
+
+def _put(store: Any, values: dict[str, str | None], *, drop_apps: bool, now: float) -> None:
+    """Write (or with ``None`` delete) these ``nudge_state`` values in one transaction; ``drop_apps``: first delete
+    every app's tallies (a rebuild)."""
+    def tx(conn: Any) -> None:
+        if drop_apps:
+            conn.execute("DELETE FROM nudge_state WHERE name LIKE ?", (APP_PREFIX + "%",))
+        for name, value in values.items():
+            if value is None:
+                conn.execute("DELETE FROM nudge_state WHERE name=?", (name,))
+            else:
+                conn.execute("INSERT INTO nudge_state(name, value, updated_at) VALUES (?,?,?) ON CONFLICT(name) DO"
+                             " UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (name, value, now))
+
+    store._write(tx)
 
 
 def _trace_log_id(store: Any) -> int:
@@ -197,7 +242,9 @@ def _trace_log_id(store: Any) -> int:
 
 def update(store: Any, *, now: float | None = None, batch: int = BATCH) -> dict[str, Any]:
     """Fold the trace rows written since the last call into the tallies (at most ``batch``); rebuild from the rows
-    left after a forget or its undo. Cheap when nothing is new: one indexed read. Returns counts (content-free)."""
+    left after a forget or its undo. Cheap when nothing is new: one indexed read. Second verification V8: only the
+    apps the new rows are in are read, decrypted and written again (plus the small index), never every app's
+    tallies. Returns counts (content-free)."""
     now = time.time() if now is None else float(now)
     try:
         newest = store._query("SELECT max(id) FROM ui_actions")
@@ -218,23 +265,55 @@ def update(store: Any, *, now: float | None = None, batch: int = BATCH) -> dict[
         return {"rows": 0}
     rows = store._query(f"SELECT {_COLUMNS} FROM ui_actions WHERE id > ? ORDER BY id LIMIT ?",
                         (int(state.get("cursor") or 0), int(batch)))
-    counted = fold_rows(state, rows)
+    procs = sorted({str(r["process"]) for r in rows if r["process"] and r["source"] in USER_SOURCES})
+    # a rebuild starts every app from nothing; otherwise only the apps these rows are in are read
+    work: dict[str, Any] = {"cursor": int(state.get("cursor") or 0),
+                            "apps": {p: (_empty_app() if rebuilt else _load_app(store, p)) for p in procs}}
+    counted = fold_rows(work, rows)
+    state["cursor"] = int(work["cursor"])
     if not rows:
         state["cursor"] = max(int(state.get("cursor") or 0), newest_id)
-    prune(state, now)
+    index: dict[str, Any] = state.setdefault("apps", {})
+    values: dict[str, str | None] = {}
+    for proc, app in work["apps"].items():
+        _prune_app(app, now)
+        if app["el"] or app["ch"]:
+            last = max(float(v.get("t") or 0.0) for part in ("el", "ch") for v in app[part].values())
+            index[proc] = {"t": last, "s": round(_strength(app, now), 4), "a": now}
+            values[_app_name(store, proc)] = store._enc(json.dumps(app, separators=(",", ":")))
+        else:
+            index.pop(proc, None)
+            values[_app_name(store, proc)] = None
+    # apps unused for KEEP_DAYS go; past MAX_APPS the weakest go (by the strength the index keeps for each)
+    cut = now - KEEP_DAYS * DAY_S
+    gone = [p for p, v in index.items() if float(v.get("t") or 0.0) < cut]
+    if len(index) - len(gone) > MAX_APPS:
+        rest = sorted((p for p in index if p not in gone),
+                      key=lambda p: _decay(float(index[p].get("s") or 0.0), float(index[p].get("a") or now), now))
+        gone += rest[: len(index) - len(gone) - MAX_APPS]
+    for proc in gone:
+        index.pop(proc, None)
+        values[_app_name(store, proc)] = None
     state["at"] = now
-    _save(store, state)
-    _cache.pop(_cache_key(store), None)
+    values[STATE_KEY] = store._enc(json.dumps(state, separators=(",", ":")))
+    _put(store, values, drop_apps=rebuilt, now=now)
+    with _lock:
+        _cache.pop(_cache_key(store), None)
+        for k in [k for k in _app_cache if k[0] == _cache_key(store) and (rebuilt or k[1] in work["apps"]
+                                                                           or k[1] in gone)]:
+            _app_cache.pop(k, None)
     if int(state.get("cursor") or 0) >= newest_id:
         _seen[_cache_key(store)] = (newest_id, log_id)
-    return {"rows": len(rows), "counted": counted, "rebuilt": rebuilt, "apps": len(state.get("apps") or {}),
-            "more": int(state.get("cursor") or 0) < newest_id}
+    return {"rows": len(rows), "counted": counted, "rebuilt": rebuilt, "apps": len(index),
+            "written": len(work["apps"]), "more": int(state.get("cursor") or 0) < newest_id}
 
 
 # -- reading -------------------------------------------------------------------------------------------------------
 
-#: ``{store key: (stored ciphertext, decoded tallies)}``: the decrypted tallies, re-read when the stored value changed.
+#: ``{store key: (stored ciphertext, decoded index)}``: the decrypted index, re-read when the stored value changed.
 _cache: dict[Any, tuple[str, dict[str, Any]]] = {}
+#: ``{(store key, process): (stored ciphertext, decoded tallies)}``: one app's decrypted tallies, likewise.
+_app_cache: dict[tuple[Any, str], tuple[str, dict[str, Any]]] = {}
 #: ``{store key: (newest action id, newest trace changelog id)}`` this process has folded up to.
 _seen: dict[Any, tuple[int, int]] = {}
 _lock = threading.Lock()
@@ -255,7 +334,8 @@ def _cache_key(store: Any) -> Any:
 
 
 def tallies(store: Any) -> dict[str, Any]:
-    """The current tallies (decrypted, cached in memory until the stored value changes)."""
+    """The current index of the tallies (decrypted, cached in memory until the stored value changes): ``{"cursor",
+    "apps": {process: {"t", "s", "a"}}}``. One app's own tallies: :func:`app_tallies`."""
     raw = store.nudge_state(STATE_KEY) or ""
     key = _cache_key(store)
     with _lock:
@@ -266,6 +346,22 @@ def tallies(store: Any) -> dict[str, Any]:
     with _lock:
         _cache[key] = (raw, state)
     return state
+
+
+def app_tallies(store: Any, proc: str) -> dict[str, Any]:
+    """One app's tallies ``{"el": {element key: tally}, "ch": {chord: tally}}`` (decrypted, cached in memory until its
+    stored value changes; read only - never changed by the caller)."""
+    raw = store.nudge_state(_app_name(store, proc)) or ""
+    key = (_cache_key(store), proc)
+    with _lock:
+        hit = _app_cache.get(key)
+        if hit is not None and hit[0] == raw:
+            return hit[1]
+    data = _decode(store, raw) or {}
+    app = {"el": dict(data.get("el") or {}), "ch": dict(data.get("ch") or {})}
+    with _lock:
+        _app_cache[key] = (raw, app)
+    return app
 
 
 def _label(name: str | None, role: str, position: str) -> str:
@@ -284,20 +380,21 @@ def _label(name: str | None, role: str, position: str) -> str:
 
 
 def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail: bool = False,
-           lower: Iterable[str] = ()) -> list[dict[str, Any]]:
+           lower: Iterable[str] = (), count: bool = True) -> list[dict[str, Any]]:
     """For each app in play (at most :data:`APPS_SHOWN`, :data:`DETAIL_APPS` with ``detail``; in the order given),
     its top elements and chords: ``[{"app", "elements": [{"label", "role", "named", "n", "days", "last_at",
     "score"}], "chords": [{"chord", "keys", "n", "days", "last_at", "score"}]}]``. Elements named only as the
     registry keeps them (:func:`_label`). ``lower``: element keys a pitfall names (ranked lower, never left out).
-    Never raises (``[]``)."""
+    ``count``: a request is shown them (counted as served, :func:`note_served`); a plain read is not. Never raises
+    (``[]``)."""
     try:
         now = time.time() if now is None else float(now)
-        state = tallies(store)
-        table = state.get("apps") or {}
-        wanted = [k for k in dict.fromkeys(app_key(str(a)) for a in apps or () if a) if k and k in table]
+        index = tallies(store).get("apps") or {}
+        wanted = [k for k in dict.fromkeys(app_key(str(a)) for a in apps or () if a) if k and k in index]
         wanted = wanted[: DETAIL_APPS if detail else APPS_SHOWN]
         if not wanted:
             return []
+        table = {proc: app_tallies(store, proc) for proc in wanted}
         n_el, n_ch = (DETAIL_ELEMENTS, DETAIL_CHORDS) if detail else (TOP_ELEMENTS, TOP_CHORDS)
         lowered = set(lower or ())
         picked: dict[str, list[tuple[float, str, dict[str, Any]]]] = {}
@@ -340,7 +437,7 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
                                 for s, c, v in chords]}
             if entry["elements"] or entry["chords"]:
                 out.append(entry)
-        if out:
+        if out and count:
             note_served(store, now)
         return out
     except Exception:  # noqa: BLE001 - a hint is never worth an error on the request
@@ -396,6 +493,7 @@ def served_today(store: Any, now: float | None = None) -> int:
 
 __all__ = ["APPS_SHOWN", "BATCH", "CHORD_MODIFIERS", "ELEMENT_KINDS", "HALF_LIFE_DAYS", "IDENTITY_RESOLVED",
            "KEEP_DAYS", "MAX_APPS", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS",
+           "APP_PREFIX", "app_tallies",
            "SERVED_KEY", "TOP_ELEMENTS", "USER_SOURCES", "chord_keys", "flush_served", "fold_rows", "go_tos", "is_chord",
            "note_served", "prune", "served_today",
            "tallies", "update"]

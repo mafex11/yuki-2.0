@@ -4367,7 +4367,7 @@ class MemoryClient:
                                     request_id=request_id, injected=injected, cited=cited, control=control)
 
     def practice(self, words: str = "", *, apps: Any = (), open_apps: Any = (), embed_wait_s: float | None = None,
-                 now: float | None = None, detail: bool = False) -> dict:
+                 now: float | None = None, detail: bool = False, go_tos: bool = True) -> dict:
         """What practice memory holds for one request (``yuki.memory.practice.relevant``): ``{"ways": [procedures, then
         a habit or style note], "pitfalls": [...], "apps": [the apps in play], "named": [apps named in the words],
         "measured": bool, "ms"}``. The apps in play are the apps named in ``words`` (whole words of an app name memory
@@ -4377,7 +4377,9 @@ class MemoryClient:
         body (``steps``, ``run`` - a procedure's executable steps for the talker's skill runner, ``slots``, ``what``,
         ``instead``, ``default``, ``ask``, ``avoid``), so a caller renders it without the Playbook page. ``go_tos``
         (capC1b): the user's usual buttons and fields and their shortcuts in each app in play, counted from the action
-        trace (``yuki.memory.trace_habits.go_tos``; ``detail`` gives more). Never raises (empty lists)."""
+        trace (``yuki.memory.trace_habits.go_tos``; ``detail`` gives more); ``go_tos=False`` (a caller that never
+        shows them: the talker's lookups) neither works them out nor counts them as served (second verification V7).
+        Never raises (empty lists)."""
         from yuki.memory import practice as _p
 
         started = time.perf_counter()
@@ -4392,7 +4394,8 @@ class MemoryClient:
             # in order of how directly the request is about them (the go-tos show the first few): the apps the words
             # name, the caller's, then the open windows
             ordered = [*named, *(str(a) for a in (apps or ()) if a), *(str(a) for a in (open_apps or ()) if a)]
-            out = _p.relevant(self.store, query_vec=vec, apps_in_play=ordered, now=now, detail=bool(detail))
+            out = _p.relevant(self.store, query_vec=vec, apps_in_play=ordered, now=now, detail=bool(detail),
+                              go_tos=bool(go_tos))
             out["named"] = named
             out["measured"] = vec is not None
         except Exception as exc:
@@ -4579,7 +4582,7 @@ class MemoryClient:
 
         try:
             return trace_habits.go_tos(self.store, [app_key(str(a)) or str(a) for a in apps or () if a],
-                                       detail=bool(detail))
+                                       detail=bool(detail), count=False)
         except Exception:  # noqa: BLE001
             return []
 

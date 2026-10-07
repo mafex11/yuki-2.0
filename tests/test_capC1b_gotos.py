@@ -204,6 +204,87 @@ def test_the_talkers_prompt_cap_and_the_schema_guard_are_untouched():
     # the talker never reads go-tos: its lines are built from ways and pitfalls only
     root = Path(VP.__file__).resolve().parent
     for name in ("practice.py", "mouth.py", "skills.py"):
-        assert "go_tos" not in (root / name).read_text(encoding="utf-8")
+        text = (root / name).read_text(encoding="utf-8")
+        if name == "practice.py":   # second verification V7: its one mention asks memory to leave them out
+            text = text.replace(inspect.getsource(VP._no_go_tos), "").replace("_no_go_tos", "")
+        assert "go_tos" not in text
     assert "go_tos" not in inspect.getsource(VP.lessons_block)
     assert len(json.dumps(tool_params(cacheable=False, screenshot_policy="never"))) < 39_000
+
+
+# -- second verification V7, V8 --------------------------------------------------------------------------------------
+
+
+def test_v7_only_lookups_that_show_the_go_tos_count_them_as_served(store):
+    """The talker's lookups (partial words, then the final ones) never show the go-tos: they ask memory to leave them
+    out, so neither the work nor the doctor's count is done for them. A plain read of the go-tos is not counted."""
+    from yuki.memory.api import MemoryClient
+    from yuki.voice import practice as VP
+
+    for i in range(3):
+        act(store, NOW + i, "chatter", "click", role="Button", name="Send", key="k-send")
+    H.update(store, now=NOW + 10)
+    client = MemoryClient(store)
+    H.flush_served(store)
+    H.SERVED.clear()
+    before = H.served_today(store)
+    for words in ("open", "open chat", "open chat in chatter"):
+        assert "go_tos" not in client.practice(words, open_apps=["chatter"], go_tos=False)
+    assert client.go_tos(["chatter"])[0]["app"] == "chatter"
+    assert sum(H.SERVED.values()) == 0 and H.served_today(store) == before
+    assert client.practice("", open_apps=["chatter"])["go_tos"]       # the thinker's fetch: shown, counted once
+    H.flush_served(store)
+    assert H.served_today(store) == before + 1
+    # the talker asks for them to be left out whenever its memory takes the flag (an older one: asked as before)
+    assert VP._no_go_tos(client.practice) == {"go_tos": False}
+    assert VP._no_go_tos(lambda words="", *, apps=(), open_apps=(), embed_wait_s=None: {}) == {}
+
+
+def _stored(store: Any) -> dict[str, str]:
+    return {r["name"]: r["value"] for r in store._query("SELECT name, value FROM nudge_state WHERE name LIKE ?",
+                                                        (H.STATE_KEY + "%",))}
+
+
+def test_v8_a_tick_rewrites_only_the_apps_with_new_rows_and_never_names_an_app_in_the_clear(store):
+    """At the caps (60 apps of 60 elements and 30 chords) the tallies were one value of about 0.9 MB, decrypted and
+    written again on every tick with a new row. Now each app is its own small value: five new rows in one app
+    rewrite that app and the index only."""
+    rows, els = [], []
+    for a in range(H.MAX_APPS):
+        app = f"app{a:02d}"
+        for e in range(H.MAX_ELEMENTS):
+            key = f"{app}-k{e}"
+            rows.append({"at": NOW + e, "process": app, "kind": "click", "source": "user", "resolved": "point",
+                         "role": "Button", "element_key": key, "outcome": "changed"})
+            els.append({"element_key": key, "process": app, "role": "Button", "name_class": "command", "name": None,
+                        "at": NOW + e})
+        for c in range(H.MAX_CHORDS):
+            rows.append({"at": NOW + 100 + c, "process": app, "kind": "keys", "source": "user", "resolved": "focus",
+                         "chord": f"Ctrl+Alt+{c}", "outcome": "changed"})
+    trace_store.write_batch(store, rows, els)
+    while H.update(store, now=NOW + 200).get("more"):
+        pass
+    before = _stored(store)
+    assert len(before) == H.MAX_APPS + 1                              # the index and one value per app
+    assert not any(f"app{a:02d}" in name for name in before for a in range(H.MAX_APPS))
+    for i in range(5):
+        act(store, NOW + 300 + i, "app07", "click", role="Button", name="Send", key="app07-k1")
+    out = H.update(store, now=NOW + 400)
+    assert out["rows"] == 5 and out["written"] == 1
+    after = _stored(store)
+    changed = [n for n in after if after[n] != before.get(n)]
+    assert sorted(changed) == sorted([H.STATE_KEY, H._app_name(store, "app07")])
+    assert sum(len(after[n]) for n in changed) < 60_000               # was about 880,000 characters a tick
+    got = H.go_tos(store, ["app07"], now=NOW + 400)[0]
+    assert got["elements"][0]["n"] == 6 and len(H.tallies(store)["apps"]) == H.MAX_APPS
+
+
+def test_v8_the_older_single_value_is_rebuilt_from_the_rows(store):
+    for i in range(3):
+        act(store, NOW + i, "chatter", "click", role="Button", name="Send", key="k-send")
+    old = {"v": 1, "cursor": 99, "log": 0, "at": NOW, "apps": {"chatter": {"el": {}, "ch": {}}}}
+    store.set_nudge_state(H.STATE_KEY, store._enc(json.dumps(old)))
+    H._seen.clear()
+    H.update(store, now=NOW + 10)
+    assert labels(H.go_tos(store, ["chatter"], now=NOW + 10)[0]) == ['Button "Send"']
+    assert H.tallies(store)["v"] == 2
