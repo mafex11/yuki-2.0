@@ -1674,6 +1674,7 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
     from yuki.ui.window.data import nat_time
 
     sessions = day_sessions(memory, v)
+    session_tasks(memory, sessions, since, {ln.key: ln.label for ln in v.lanes})
     calls_rows = _safe(lambda: memory.calls_in(since=since, until=since + 86400, limit=30), []) or []
     lookup = name_lookup(people)
     calls = []
@@ -1709,7 +1710,42 @@ def build_day(memory: Any, day: date | None = None, *, now: float | None = None,
             "buckets": buckets, "sessions": sessions, "calls": calls, "totals": totals,
             "week_hours": week if week is not None else week_days(memory, now),
             "pending": pending_view(pending, ("episode:",), now),
-            "can": {"correct": callable(getattr(memory, "correct_item", None))}}
+            "can": {"correct": callable(getattr(memory, "correct_item", None)),
+                    "correct_task": callable(getattr(memory, "task_correct", None))}}
+
+
+def task_view(t: dict[str, Any], labels: dict[str, str] | None = None) -> dict[str, Any]:
+    """One task as the Day page shows it inside its session (capC2, decision D5): the goal, the apps, the time span
+    and the outcome in plain words, the user's verdict when they corrected it, and its ref for the correction."""
+    labels = labels or {}
+    apps = [labels.get(a, a) for a in t.get("apps") or [] if a]
+    return {"ref": t.get("ref"), "goal": " ".join(str(t.get("goal") or "").split()),
+            "apps": list(dict.fromkeys(apps))[:4], "start": hm(t.get("start_at")), "end": hm(t.get("end_at")),
+            "start_at": t.get("start_at"), "end_at": t.get("end_at"), "outcome": t.get("outcome_words") or "",
+            "checked": t.get("outcome") not in (None, "", "unclear"), "verdict": t.get("verdict")}
+
+
+def session_tasks(memory: Any, sessions: list[dict[str, Any]], since: float,
+                  labels: dict[str, str] | None = None) -> None:
+    """capC2 (decision D5): each session's tasks (``tasks``), oldest first, from memory's ``day_tasks``: a task goes
+    in the session holding its middle (else the one it overlaps most); one inside no session is not shown. Never a
+    card, never spoken. Reads only; a memory without tasks leaves the sessions as they are."""
+    fn = getattr(memory, "day_tasks", None)
+    if not callable(fn) or not sessions:
+        return
+    tasks = _safe(lambda: fn(since, since + 86400.0), []) or []
+    for t in tasks:
+        if not isinstance(t, dict) or t.get("start_at") is None or t.get("end_at") is None:
+            continue
+        s0, s1 = float(t["start_at"]), float(t["end_at"])
+        mid = (s0 + s1) / 2
+        home = next((s for s in sessions if s.get("start_at", 0) <= mid < s.get("end_at", 0)), None)
+        if home is None:
+            over = [(min(s1, s.get("end_at", 0)) - max(s0, s.get("start_at", 0)), s) for s in sessions]
+            over = [x for x in over if x[0] > 0]
+            home = max(over, key=lambda x: x[0])[1] if over else None
+        if home is not None:
+            home.setdefault("tasks", []).append(task_view(t, labels))
 
 
 def day_sessions(memory: Any, v: Any) -> list[dict[str, Any]]:
@@ -2579,7 +2615,7 @@ PAGE_TABLES: dict[str, tuple[str, ...]] = {
     # Home's Your list follows Work's split (report 69): who owes what and what you moved to the list are work_items
     "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES, "work_items"),
     "work": ("timeline", *TODO_TABLES, "work_items", "messages"),   # the Work page (4 Oct): replies, loops, meetings
-    "day": ("timeline", "calls"),
+    "day": ("timeline", "calls", "ui_tasks"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
     "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
     "activity": ("runs", "nudges", "todos", "calls", "timeline"),

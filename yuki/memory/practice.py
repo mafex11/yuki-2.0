@@ -1631,7 +1631,8 @@ def takes_failed_route(o: Playbook, bad_steps: set[tuple[str, tuple]]) -> bool:
 
 def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequence[str] = (),
              now: float | None = None, ways: int = MAX_WAYS, habits: int = MAX_HABITS,
-             pitfalls: int = MAX_PITFALLS, detail: bool = False, go_tos: bool = True) -> dict[str, Any]:
+             pitfalls: int = MAX_PITFALLS, detail: bool = False, go_tos: bool = True,
+             paths: bool | None = None) -> dict[str, Any]:
     """What practice memory holds for one request: ``{"ways": [...], "pitfalls": [...], "go_tos": [...], "apps": [...],
     "ms"}``.
 
@@ -1646,7 +1647,12 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     :data:`PITFALL_RANK` lower (``lowered``), never out; a pitfall whose route failed on :data:`REPEATED_RUNS` runs or
     more carries ``warning: "strong"`` and ``repeats``. *Go-tos* (``go_tos``, :func:`yuki.memory.trace_habits.go_tos`):
     for the apps in play in the order given (named ones first), the user's top elements and chords from the action
-    trace, counted by code; names only as the element registry keeps them; ``detail`` gives more."""
+    trace, counted by code; names only as the element registry keeps them; ``detail`` gives more.
+
+    capC2 (report 78 §6.4): ``path`` (the nearest family's usual path, at most 8 steps worded from kept names only, or
+    ``None``) and ``example`` (one trimmed past task of that family, or ``None``), from
+    :func:`yuki.memory.trace_families.hints` with the ways' own similarity floors; ``detail`` gives more. ``paths``
+    (default: as ``go_tos``, so the talker, which asks for no go-tos, gets neither)."""
     started = time.perf_counter()
     now = _now(now)
     in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
@@ -1721,6 +1727,11 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
         from yuki.memory import trace_habits
 
         out["go_tos"] = trace_habits.go_tos(store, order, now=now, detail=detail, lower=bad_keys)
+    if go_tos if paths is None else paths:
+        from yuki.memory import trace_families
+
+        out.update(trace_families.hints(store, q, order, floor=WAY_MIN_COSINE, app_floor=WAY_APP_MIN_COSINE,
+                                        detail=detail, now=now))
     out["ms"] = round((time.perf_counter() - started) * 1000, 2)
     return out
 

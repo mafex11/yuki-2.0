@@ -278,6 +278,32 @@ def _trace_learn_words(learn: str | None, health: Any) -> str:
     return ("; " + "; ".join(parts)) if parts else ""
 
 
+def _trace_tasks_words(raw: str | None, now: float) -> str:
+    """capC2: the task pass in plain words (``trace:tasks``, written by the practice worker): tasks found today, how
+    many of them have no checked end, today's cost against its cap, stretches still waiting. ``""`` when there is
+    nothing to say or the value is a day old."""
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
+        return ""
+    parts = []
+    n, unclear = int(data.get("tasks_today") or 0), int(data.get("unclear_today") or 0)
+    if n:
+        parts.append(f"found {n} task{'s' if n != 1 else ''} in your sessions today"
+                     + (f" ({unclear} of them with no clear end)" if unclear else ""))
+    cost, cap = float(data.get("cost_today") or 0.0), float(data.get("budget") or 0.0)
+    if cost >= 0.005:
+        parts.append(f"that cost about ${cost:.2f} of the ${cap:.2f} a day it may use"
+                     + (" (the day's limit is reached; the rest waits for tomorrow)" if data.get("refused_today")
+                        else ""))
+    waiting = int(data.get("backlog") or 0)
+    if waiting:
+        parts.append(f"{waiting} finished session{'s' if waiting != 1 else ''} still to look at, when you're away")
+    return ("; " + "; ".join(parts)) if parts else ""
+
+
 def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
     """Settings -> Record how I work (report 78 C1): off, or on with what it noted in the last day, in plain words.
     Counts only; read-only."""
@@ -313,6 +339,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
                              (since,)).fetchone()[0]
         row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:health'").fetchone()
         learn_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:learn'").fetchone()
+        tasks_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:tasks'").fetchone()
     except Exception as exc:
         return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
     finally:
@@ -334,6 +361,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
     if state in _TRACE_STATE_WORDS:
         detail += f"; {_TRACE_STATE_WORDS[state]}"
     detail += _trace_learn_words(learn_row[0] if learn_row else None, health)
+    detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
     if state in ("hooks_down", "failed", "no_input"):
         return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
     return Check(TRACE_CHECK, OK, detail)

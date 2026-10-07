@@ -545,6 +545,29 @@ def build() -> dict:
     midnight = NOW - (21 * 60 + 52) * M
     for s in day["sessions"]:
         s["start_at"], s["end_at"] = round(midnight + s["a"] * M, 1), round(midnight + s["b"] * M, 1)
+    # capC2 (decision D5): the tasks inside a session, as web_data.task_view sends them (invented)
+    day["can"]["correct_task"] = True
+
+    def task(ref: str, a: int, b: int, goal: str, apps: list[str], outcome: str, checked: bool = True,
+             verdict: str | None = None) -> dict:
+        return {"ref": ref, "goal": goal, "apps": apps, "start": f"{a // 60:02d}:{a % 60:02d}",
+                "end": f"{b // 60:02d}:{b % 60:02d}", "start_at": round(midnight + a * M, 1),
+                "end_at": round(midnight + b * M, 1), "outcome": outcome, "checked": checked, "verdict": verdict}
+
+    day["sessions"][1]["tasks"] = [
+        task("task:41", 612, 664, "You finished the bed sizes screen and saved it", ["VS Code"],
+             "you saved a file (.ts)"),
+        task("task:42", 671, 690, "You sent Riya a screenshot of the new screen", ["Firefox", "Signal"],
+             "you pasted it in and sent it"),
+        task("task:43", 700, 744, "You checked the beds Riya measured against the planner", ["Notes", "VS Code"],
+             "not sure it got done", checked=False)]
+    day["sessions"][2]["tasks"] = [
+        task("task:44", 806, 851, "You put October’s rent and groceries in the budget", ["Calc"],
+             "you saved a file (.ods)"),
+        task("task:45", 860, 905, "You read about searching a sorted list in Rust", ["Firefox"],
+             "not sure it got done", checked=False, verdict="not_one"),
+        task("task:46", 910, 1020, "You built the Rust exercise and ran its tests", ["VS Code", "Terminal"],
+             "your command worked", verdict="renamed")]
     # Work (the page approved on 4 Oct, report 68): memory's merged list split by the real web_data.work_columns over an
     # invented board (who owes what in the open loops), the chats waiting on a reply, and Today as work_today sends it
     rows = TodoMemory().todos(include_done=True)
@@ -787,6 +810,8 @@ def build() -> dict:
              "free": False, "price": "$1.00 in, $4.00 out (per million tokens)"}], "status": "2 models on this PC",
             "running": True},
         "ai_test": {"ok": True, "works": True, "words": "Works. OpenRouter answered with vendor/quick-chat:free."},
+        # capC2: a task's correction and its Undo (the page keeps your words when a reply carries no goal)
+        "task_correct": {"ok": True}, "task_correct_undo": {"ok": True},
         "thread_days": {"ok": True, "connector": {
             "day": day_name(1), "day_at": ago(1 * D), "label": "Yesterday",
             "text": "Yesterday you finished the bed sizes screen and planned the seed swap with Noor. The watering timer is still open.",
