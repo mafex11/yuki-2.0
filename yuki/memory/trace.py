@@ -25,9 +25,14 @@ For each action, in order (report 78 §4.2):
 2. **identity, taken at button-down**: (i) an ``INVOKED`` / ``SELECTION`` / ``FOCUS`` event from the same process
    between button-down and :data:`IDENTITY_S` after button-up whose element contains the point; (ii)
    ``ElementFromPoint`` asked as soon as the button went down; (iii) for a renderer's whole pane, the smallest element
-   under the point; else point-only (``unresolved``). A structure change (shown, hidden, reordered, a menu closed,
-   another window in front) between button-down and the answer makes it ``stale`` (decided per action as the events
-   come, so a busy app's later events cannot push it out).
+   under the point; else point-only (``unresolved``). capC1c: an unnamed container with no actionable pattern is
+   walked, inside the same lookup, to the real control (:meth:`yuki.memory.trace_uia.TraceUia.refine`). It is
+   ``stale`` only when something could have changed what is under the press before the answer, by machine facts: a
+   structure change (shown, hidden, reordered, a menu closed) whose own window covers the point (decided per action
+   as the events come, so a busy app's later events cannot push it out), another top-level window under the point
+   at the answer than at the press (taken at button-down by the sink), the element's own top-level window not the
+   pressed one, or its bounds no longer holding the point. A window coming to the front after the press is the
+   click's outcome, never staleness.
 3. **the outcome**: the events of the outcome hooks until :data:`OUTCOME_S` after the action (or the next action),
    at most :data:`yuki.memory.trace_hooks.OUTCOME_CAP`, as a class (``changed`` / ``nothing`` / ``unverifiable``),
    a content-free summary (with up to :data:`OUTCOME_ELEMENTS` changed elements by role, parent role and position,
