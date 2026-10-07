@@ -500,6 +500,17 @@ def presence_facts() -> dict[str, Any]:
     return _presence.facts()
 
 
+def attach_input_sink(sink: Any) -> bool:
+    """The action trace's input sink on this process's one Raw Input reader (capC1; Raw Input registration is one
+    per process, so the trace never registers its own). Returns whether Raw Input is listening."""
+    return _presence.attach_sink(sink)
+
+
+def input_messages() -> int:
+    """``WM_INPUT`` messages the one Raw Input reader handled (a content-free counter)."""
+    return _presence.reader_messages()
+
+
 def notification_state() -> int:
     """``SHQueryUserNotificationState`` (QUNS_*), 0 when unavailable."""
     state = ctypes.c_int(0)

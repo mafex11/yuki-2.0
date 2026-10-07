@@ -153,8 +153,8 @@
     return [srow(tk.label, pick(opts, String(tk.px), { change: 'takeover-move' }, tk.label), tk.hint)];
   }
 
-  /* Record how I work (report 78 C0): the switch is shown off and locked (it waits for your go-ahead; nothing
-     records yet), then the apps to leave out: each a chip that removes it, and a pick of the apps seen this week.
+  /* Record how I work (report 78; unlocked in C1): the switch (the privacy file's [trace] record_actions, saved
+     through Python), then the apps to leave out: each a chip that removes it, and a pick of the apps seen this week.
      The words come from Python (ui_settings.RECORD_*); the list is the privacy file's [trace] leave_out */
   function recordRows(rc) {
     const chips = (rc.leave_out || []).map((a) => key(a + ' ×', { cls: 'xs', data: { do: 'leave-out-drop', app: a } }));
@@ -303,8 +303,16 @@
     });
   }
   A['quiet-on'] = (t) => { const on = flip(t); quietSave(t, { on }, () => flip(t)); };
-  /* Record how I work: the switch is locked (disabled); a press that gets through is refused by Python with why */
-  A['record-on'] = (t) => { save(t, 'record_actions', { on: true }, null, null).then(() => { t.setAttribute('aria-checked', 'false'); }); };
+  /* Record how I work: the switch saves through Python; the reply says what was kept (a failed save flips it back) */
+  A['record-on'] = (t) => {
+    const on = flip(t), rc = settings().record || {};
+    save(t, 'record_actions', { on }, on ? 'I’ll note how you work, never what you type.' : 'I’ve stopped noting how you work.', () => flip(t)).then((r) => {
+      if (!r.ok) return;
+      rc.on = typeof r.on === 'boolean' ? r.on : on;   // a canned reply: what you asked
+      rc.waiting = rc.on ? (rc.say_on || rc.waiting) : (rc.say_off || rc.waiting);
+      Y.renderMain();
+    });
+  };
   function leaveOut(t, app, out) {
     const rc = settings().record || {};
     save(t, 'record_leave_out', { app, out }, out ? `${app} will be left out.` : `${app} is no longer left out.`).then((r) => {

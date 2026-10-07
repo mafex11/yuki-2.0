@@ -81,6 +81,12 @@ run's follow-up window, measured triggers only), the old know-how rows are taken
 the user's Playbook-page edits are applied, and once a night - idle, never during a
 call or a game - the miner turns recurring activity into habits or a teach-back
 question. Budgeted (about $0.15 a day in all), nothing while ``paused``.
+
+The action trace (:mod:`yuki.memory.trace`, report 78 phase C1, shadow): only once the user turned on Settings ->
+Record how I work (``[trace] record_actions``), how they work in each app (the element, the kind of action, the
+shortcut, what changed; never typed letters, clipboard content or pixels), as ``ui_actions`` rows. Threads
+``yuki-trace-hooks`` and ``yuki-trace-worker``, fed by presence's one Raw Input reader; never while the hard game gate
+holds or memory is paused; ``--no-trace`` keeps it off whatever Settings say.
 """
 
 from __future__ import annotations
@@ -262,6 +268,8 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
                         help="read only the window in front (no other visible windows, popups or toasts)")
     parser.add_argument("--no-now", action="store_true",
                         help="do not keep or serve the live picture of the screen (yuki.memory.now)")
+    parser.add_argument("--no-trace", action="store_true",
+                        help="never record how you work (the action trace), whatever Settings say")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--stats-every", type=float, default=600.0, help="seconds between stats records (default 600)")
     parser.add_argument("--verbose", action="store_true", help="one console line per capture (content-free)")
@@ -312,6 +320,7 @@ def run(args: argparse.Namespace) -> int:
     transcriber_thread: threading.Thread | None = None
     screen_recall = None
     game_gate = None
+    trace = None
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -702,6 +711,30 @@ def run(args: argparse.Namespace) -> int:
             log("error", where="game_gate_start", error=f"{type(exc).__name__}: {exc}")
             game_gate = None
 
+        # The action trace (report 78 C1, shadow; yuki.memory.trace): nothing runs until the user turns on Settings ->
+        # Record how I work; then it shares presence's one Raw Input reader, obeys the game gate (a gate that failed
+        # to start holds) and the pause. Retention runs either way (raw rows 30 days, elements 60).
+        try:
+            from yuki.memory import trace_store as _trace_store
+
+            log("trace_purge", **_trace_store.purge(store))
+        except Exception as exc:
+            log("error", where="trace_purge", error=type(exc).__name__)
+        if not args.no_trace:
+            try:
+                from yuki.memory.trace import Trace
+                from yuki.memory.watcher import attach_input_sink, input_messages
+
+                trace = Trace(store, privacy=privacy, gate=game_gate, timeline_now=lambda: timeline,
+                              acting=watcher.acting_now, attach=attach_input_sink, log=log,
+                              reader_messages=input_messages)
+                trace.set_paused(paused)
+                if warp is not None:
+                    warp.on_commands = trace.warp_commands
+            except Exception as exc:   # memory runs on without it
+                log("error", where="trace_start", error=type(exc).__name__)
+                trace = None
+
         if not args.verbose:
             print(f"yuki-memory running (log {log.path}); Ctrl+C to stop", flush=True)
         next_stats = time.monotonic() + args.stats_every
@@ -737,6 +770,11 @@ def run(args: argparse.Namespace) -> int:
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
+            if trace is not None:
+                try:
+                    trace.beat()   # consent, pause, A/B hours and the game gate (no loop of its own)
+                except Exception as exc:
+                    log("error", where="trace_beat", error=type(exc).__name__)
             if power is not None:
                 # This loop wakes every second: a jump in wall time means the process did not run
                 # (sleep, hibernation). Read the power history then, and once more when Windows has
@@ -760,6 +798,8 @@ def run(args: argparse.Namespace) -> int:
                     timeline.set_paused(paused)
                 if warp is not None:
                     warp.set_paused(paused)
+                if trace is not None:
+                    trace.set_paused(paused)
                 log("pause_flag", paused=paused)
             if portrait is not None and refresh_path.exists():
                 portrait.wake()
@@ -782,13 +822,29 @@ def run(args: argparse.Namespace) -> int:
                     timeline=timeline.stats() if timeline is not None else None,
                     warp=warp.stats() if warp is not None else None,
                     screen_recall=screen_recall.stats() if screen_recall is not None else None,
-                    game_gate=game_gate.stats() if game_gate is not None else None)
+                    game_gate=game_gate.stats() if game_gate is not None else None,
+                    trace=trace.stats() if trace is not None else None)
+                if trace is not None and trace.sink is not None:
+                    try:   # the later joins: episodes once final, Yuki's untagged steps by the run trace
+                        from yuki.memory import trace_store as _trace_store
+
+                        _trace_store.attach_episodes(store)
+                        _trace_store.match_runs(store, since=time.time() - 3 * 3600.0)
+                        trace.save_health()
+                    except Exception as exc:
+                        log("error", where="trace_joins", error=type(exc).__name__)
             if now - last_prune >= _PRUNE_EVERY_S:
                 last_prune = now
                 try:
                     log("prune", captures_deleted=store.prune(CAPTURE_TTL_DAYS), older_than_days=CAPTURE_TTL_DAYS)
                 except Exception as exc:
                     log("error", where="prune", error=f"{type(exc).__name__}: {exc}")
+                try:   # the action trace: raw rows after 30 days (decision D4), elements unused for 60
+                    from yuki.memory import trace_store as _trace_store
+
+                    log("trace_purge", **_trace_store.purge(store))
+                except Exception as exc:
+                    log("error", where="trace_purge", error=type(exc).__name__)
                 try:   # log files older than 14 days (report 76); counts only
                     from yuki.log.retention import LOG_RETENTION_DAYS, prune_logs
 
@@ -837,6 +893,11 @@ def run(args: argparse.Namespace) -> int:
             calls.stop()   # closes the microphone, spools what is left (encrypted)
         if transcriber is not None:
             transcriber.stop()   # a running batch is asked to stop after its chunk
+        if trace is not None:
+            try:
+                trace.stop()   # writes the last batch
+            except Exception:
+                pass
         if game_gate is not None:
             game_gate.stop()
         if watcher is not None:

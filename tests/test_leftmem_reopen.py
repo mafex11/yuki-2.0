@@ -256,7 +256,7 @@ def test_migration_adds_the_column_to_an_existing_database(tmp_path: Path):
     s.close()
     conn = sqlite3.connect(path)   # back to the shape before migration 37 (v36): the column is new in 37
     conn.execute("ALTER TABLE conversation_facts DROP COLUMN reopened_at")
-    conn.execute(f"PRAGMA user_version={len(MIGRATIONS) - 1}")
+    conn.execute("PRAGMA user_version=36")   # v36 itself (later migrations, 38+, are additive and run again)
     conn.commit()
     conn.close()
     s = Store.open(path)

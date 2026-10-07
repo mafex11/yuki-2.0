@@ -26,7 +26,9 @@ runs in ``yuki-memory`` every :data:`EVERY_S`:
   (encrypted, 30-day TTL like every capture), checkpoint moved in the same
   transaction - so the journal worker turns them into facts
   (:mod:`yuki.memory.journal`, one source per command) and a crash never
-  journals a command twice.
+  journals a command twice;
+* hands the same kept rows (already through :class:`TerminalRules`) to the action trace when it is on
+  (:attr:`WarpReader.on_commands`, capC1): each becomes a ``command`` action there, with its exit code.
 
 Nothing is read while memory is paused, while ``[terminal] enabled`` is
 false or while Warp is a blocked app; the checkpoint then moves past what
@@ -244,6 +246,9 @@ class WarpReader:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.counters: Counter = Counter()
+        #: The action trace's hand-off (``Trace.warp_commands``): called with the kept command dicts after they are
+        #: stored, never with a dropped one. Must return at once.
+        self.on_commands: Callable[[list[dict[str, Any]]], None] | None = None
 
     # -- config ------------------------------------------------------------
 
@@ -322,6 +327,11 @@ class WarpReader:
                 if last is not None and last > after:
                     ids = self.store.add_terminal_commands((CHECKPOINT, str(last)), list(groups.items()), at=now)
                     out["captures"] = len(ids)
+                    if self.on_commands is not None and out["kept"]:
+                        try:
+                            self.on_commands([c for items in groups.values() for c in items])
+                        except Exception:  # noqa: BLE001 - the trace never breaks the reader
+                            self.counters["trace_errors"] += 1
                 if rules.errors:
                     out["pattern_errors"] = list(rules.errors)
             except Exception as exc:

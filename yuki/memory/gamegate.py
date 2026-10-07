@@ -2,8 +2,11 @@
 
 A later capture phase (recording how you work, only once you say yes) must stop completely while a game runs:
 in front or not, windowed or full screen, at the launch screen and on Alt+Tab. That rule is not a setting. This
-module is the gate it will obey. In phase C0 it only **decides and logs** (content-free) so its decisions can be
-checked for three days before anything depends on them; nothing here records input or reads a window.
+module is the gate it will obey. In phase C0 it only **decided and logged** (content-free) so its decisions could be
+checked for three days; nothing here records input or reads a window. From phase C1 the action trace
+(:mod:`yuki.memory.trace`) obeys it: while it holds, the trace drops input at its first step, unhooks its per-app
+window events and asks UI Automation nothing (zero rows, zero lookups). The learned set is kept in
+``ui_game_processes`` (migration 38) with its evidence, and mirrored to the C0 ``nudge_state`` row.
 
 The gate holds while any of these is true:
 
@@ -548,6 +551,17 @@ class GameGate:
     def _read_learned(self) -> dict[str, dict[str, Any]]:
         if self._store is None:
             return {}
+        if hasattr(self._store, "_write"):
+            # capC1: the learned set lives in ui_game_processes (migration 38), with its evidence; the C0 row in
+            # nudge_state is read once when the table is still empty
+            try:
+                from yuki.memory.trace_store import load_game_evidence
+
+                table = load_game_evidence(self._store)
+                if table:
+                    return {stem(k): v for k, v in table.items() if stem(k) and isinstance(v, dict)}
+            except Exception:  # noqa: BLE001
+                pass
         try:
             raw = self._store.nudge_state(LEARNED_STATE)
             data = json.loads(raw) if raw else {}
@@ -587,6 +601,10 @@ class GameGate:
         if self._store is not None:
             try:
                 self._store.set_nudge_state(LEARNED_STATE, json.dumps(evidence, sort_keys=True))
+                if hasattr(self._store, "_write"):
+                    from yuki.memory.trace_store import save_game_evidence
+
+                    save_game_evidence(self._store, evidence)     # ui_game_processes (capC1), with its evidence
             except Exception as exc:  # noqa: BLE001 - kept in memory for this run
                 self._log("error", where="game_gate_store", error=type(exc).__name__)
 

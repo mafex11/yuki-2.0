@@ -154,12 +154,26 @@ blocked_domains = []
 [trace]
 # Recording how you work (docs/research/revamp-2026-10-02/78-capture-and-learning.md): which button
 # or field you use, what kind of action and what changed - never the letters you type, never what
-# you copy.  OFF until you say yes; nothing records it yet, and the window's Settings cannot turn
-# it on until then.
+# you copy, never pixels.  OFF until you turn on Settings -> Privacy and pause -> Record how I work.
+# The tray's pause pauses it; the raw list is kept 30 days.
 record_actions = false
 # Apps left out of it, by the app's name ("FL Studio") or process name ("discord.exe"), set from
 # Settings -> Privacy and pause -> Record how I work.
 leave_out = []
+# Files in these folders are never noted when you open or save them (password-manager vaults, temp).
+blocked_folders = ["%TEMP%", "%APPDATA%\\Bitwarden", "%LOCALAPPDATA%\\1Password", "%APPDATA%\\KeePass",
+                   "%APPDATA%\\KeePassXC", "%LOCALAPPDATA%\\Dashlane"]
+# Measuring what recording costs (report 96): when true, recording is on in even hours and off in odd
+# ones, and the CPU of the app in front and of the memory service is sampled every 10 seconds.
+ab_hours = false
+# How soon Yuki may use what it learns from how you work (your decision of 7 Oct 2026, D3; nothing
+# uses these before phase C4): your fix after Yuki failed is used at once; something you showed once
+# is a hint at once, and Yuki may do it alone after you did it this many times, or after this many
+# of its own runs that proved it.
+learn_fix_after_failure = "at_once"
+learn_demo_hint = "at_once"
+learn_demo_alone_after_times = 2
+learn_demo_alone_after_proven_runs = 1
 # The hard game gate: while any of these programs runs (in front or not, windowed or full screen,
 # the launch screen too), nothing about your input will ever be recorded.  These are games with
 # kernel anti-cheat.  Add your own; the ones listed here always count, even if removed from your

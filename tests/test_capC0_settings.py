@@ -60,8 +60,8 @@ def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def test_the_view_is_off_locked_and_offers_the_apps_not_left_out() -> None:
     v = W.record_view({"trace": {"leave_out": ["Notes", " notes ", "Fieldrunner"]}}, ["Notes", "Calc", "Firefox"])
-    assert v["on"] is False and v["locked"] is True
-    assert v["label"] == ui_settings.RECORD_LABEL and "go-ahead" in v["waiting"]
+    assert v["on"] is False and v["locked"] is False        # capC1 (report 96) unlocked it; still off by default
+    assert v["label"] == ui_settings.RECORD_LABEL and v["waiting"] == ui_settings.RECORD_OFF
     assert "never what you copy" in v["hint"] and "game" in v["hint"]
     assert v["leave_out"] == ["Notes", "Fieldrunner"] and v["choices"] == ["Calc", "Firefox"]
     assert W.record_view({}, [])["leave_out"] == [] and W.record_view({"trace": "x"}, ["A"])["choices"] == ["A"]
@@ -72,15 +72,15 @@ def test_settings_carries_the_switch_even_with_a_memory_that_says_nothing(tmp_pa
         status = activity = call_prefs = None
 
     d = W.build_settings(_Bare(), policy_path=tmp_path / "autonomy.json", ui_path=tmp_path / "ui.json")
-    assert d["record"]["on"] is False and d["record"]["locked"] is True
+    assert d["record"]["on"] is False and d["record"]["locked"] is False
 
 
-def test_the_window_refuses_to_turn_it_on(window) -> None:
+def test_the_window_saves_the_switch_since_c1(window) -> None:
     win, host, privacy = window
-    r = _act(win, host, "record_actions", on=True)
-    assert r["ok"] is False and r["error"] == ui_settings.RECORD_WAITING
-    assert _act(win, host, "record_actions", on=False)["ok"] is True
-    assert not privacy.exists() or "record_actions = true" not in privacy.read_text(encoding="utf-8")
+    r = _act(win, host, "record_actions", on=True)           # capC1: the user's go-ahead came (decision D1)
+    assert r["ok"] is True and r["on"] is True
+    assert tomllib.loads(privacy.read_text(encoding="utf-8"))["trace"]["record_actions"] is True
+    assert _act(win, host, "record_actions", on=False)["on"] is False
     assert {"record_actions", "record_leave_out"} <= win.SETTINGS_ACTIONS
 
 

@@ -245,6 +245,73 @@ def check_capture_health(db: Path | None = None, *, now: float | None = None, ho
     return Check(CAPTURE_CHECK, OK, detail)
 
 
+TRACE_CHECK = "Learning how you work"
+#: What a blocked trace says, in plain words (the trace's own state codes, yuki.memory.trace.Trace.state).
+_TRACE_STATE_WORDS = {"paused": "paused right now, because memory is paused",
+                      "game": "paused right now: a game is running",
+                      "ab_off": "off this hour while its cost is being measured",
+                      "hooks_down": "not listening: its window events stopped",
+                      "failed": "could not start", "no_input": "not hearing your mouse and keys"}
+
+
+def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
+    """Settings -> Record how I work (report 78 C1): off, or on with what it noted in the last day, in plain words.
+    Counts only; read-only."""
+    try:
+        import tomllib
+
+        from yuki.memory.privacy import user_config_path
+        from yuki.memory.store import default_db_path
+    except Exception as exc:
+        return Check(TRACE_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    now = time.time() if now is None else float(now)
+    try:
+        with (privacy_file or user_config_path()).open("rb") as fh:
+            trace = tomllib.load(fh).get("trace") or {}
+    except (OSError, ValueError):
+        trace = {}
+    if trace.get("record_actions") is not True:
+        return Check(TRACE_CHECK, OK, "off. Nothing about how you work is noted (Settings, Privacy and pause)")
+    db = db or default_db_path()
+    if not db.exists():
+        return Check(TRACE_CHECK, OK, "on, nothing noted yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(TRACE_CHECK, WARN, f"on, but the database could not be read ({type(exc).__name__})")
+    try:
+        since = now - 86400.0
+        n, apps = conn.execute("SELECT count(*), count(DISTINCT process) FROM ui_actions WHERE at >= ?",
+                               (since,)).fetchone()
+        named = conn.execute("SELECT count(*) FROM ui_actions WHERE at >= ? AND resolved IN ('event','point',"
+                             "'snapshot','focus')", (since,)).fetchone()[0]
+        yours = conn.execute("SELECT count(*) FROM ui_actions WHERE at >= ? AND source != 'yuki'",
+                             (since,)).fetchone()[0]
+        row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:health'").fetchone()
+    except Exception as exc:
+        return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
+    finally:
+        conn.close()
+    state = ""
+    try:
+        health = json.loads(row[0]) if row else {}
+        if now - float(health.get("at") or 0) < 1800:
+            state = str(health.get("state") or "")
+    except (TypeError, ValueError):
+        pass
+    if not n:
+        detail = "on, nothing noted in the last day"
+    else:
+        share = round(100 * named / n)
+        detail = (f"on: {n:,} actions noted in the last day across {apps} app{'s' if apps != 1 else ''}"
+                  f" ({yours:,} of them yours; {share}% with the button or field named)")
+    if state in _TRACE_STATE_WORDS:
+        detail += f"; {_TRACE_STATE_WORDS[state]}"
+    if state in ("hooks_down", "failed", "no_input"):
+        return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
+    return Check(TRACE_CHECK, OK, detail)
+
+
 # -- models and keys ----------------------------------------------------------------------------
 
 
@@ -719,6 +786,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Memory service", check_memory_service),
         ("Memory search (embedder)", check_embed_pipe),
         (CAPTURE_CHECK, check_capture_health),
+        (TRACE_CHECK, check_trace),
         (MODELS_CHECK, lambda: check_models(settings)),
         (AI_ROLES_CHECK, lambda: check_ai_roles(offline)),
         ("Speech to text (Deepgram)", check_deepgram),

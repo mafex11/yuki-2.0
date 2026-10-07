@@ -2997,6 +2997,118 @@ MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE conversation_facts ADD COLUMN reopened_at REAL;
     """,
+    # 38 (2026-10-07, capC1, docs/research/revamp-2026-10-02/96-build-capC1.md; design: report 78 §8): the action
+    # trace, in shadow (nothing reads it to change behaviour yet; yuki.memory.trace). Written only once the user
+    # turned on Settings -> Record how I work.
+    # - ui_actions: one row per action of the user's (or Yuki's, labelled by source): kind (click | dclick | rclick
+    #   | drag | scroll | keys | type | hover | menu | invoke | select | copy | paste | file_open | file_save | switch
+    #   | nav | command), the element by role, keyed digests and position (names encrypted, only for command
+    #   controls, menu/tab/title/pane names until the 3-day rule promotes them; content controls digest only), the
+    #   chord or named key (never typed text: typed is a count), clipboard sequence and format names (never
+    #   content), the file path encrypted, the outcome class and the machine-checked facts, what was on screen
+    #   (capture_id) and the page (page_key) at button-down, the episode (attached later), the source (user |
+    #   user_injected | yuki) and whether a Yuki run was in progress, and the pointer: travel_px and gap_ms since the
+    #   previous action, dwell_ms of a hover, a drag's end element (end_*). 30-day TTL (decision D4).
+    # - ui_elements: per (app, element key) counts and distinct days; a name only for command controls, or once
+    #   the same digest was used on 3 distinct days. Deleted after 60 days unused.
+    # - ui_links: cross-app links (clipboard | file | url), the table only: phase C2 fills it.
+    # - ui_game_processes: the hard game gate's learned set with its evidence (yuki.memory.gamegate).
+    # - ui_files: what was read from a project file the user opened or saved (decision D6: FL Studio .flp names,
+    #   tempo, plugins, patterns; never audio or sample content), encrypted, linked to the file action.
+    # Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS ui_actions (
+        id                   INTEGER PRIMARY KEY,
+        at                   REAL NOT NULL,
+        ended_at             REAL,
+        process              TEXT NOT NULL,
+        page_key             TEXT,
+        kind                 TEXT NOT NULL,
+        source               TEXT NOT NULL,
+        via                  TEXT,
+        run_key              TEXT,
+        run_step             INTEGER,
+        during_run           INTEGER NOT NULL DEFAULT 0,
+        role                 TEXT,
+        name_ciphertext      TEXT,
+        name_digest          TEXT,
+        position             TEXT,
+        aid_ciphertext       TEXT,
+        aid_digest           TEXT,
+        element_key          TEXT,
+        container_digest     TEXT,
+        point                TEXT,
+        button               TEXT,
+        chord                TEXT,
+        typed                INTEGER,
+        n                    INTEGER,
+        clip_seq             INTEGER,
+        clip_formats         TEXT,
+        file_ciphertext      TEXT,
+        file_ext             TEXT,
+        file_digest          TEXT,
+        command_ciphertext   TEXT,
+        exit_code            INTEGER,
+        outcome              TEXT,
+        outcome_ciphertext   TEXT,
+        facts                TEXT,
+        capture_id           INTEGER,
+        episode_id           INTEGER,
+        resolved             TEXT,
+        lookup_ms            REAL,
+        travel_px            INTEGER,
+        gap_ms               INTEGER,
+        dwell_ms             INTEGER,
+        end_role             TEXT,
+        end_name_ciphertext  TEXT,
+        end_name_digest      TEXT,
+        end_element_key      TEXT,
+        end_position         TEXT,
+        proc_started         REAL
+    );
+    CREATE INDEX IF NOT EXISTS ui_actions_at ON ui_actions(at);
+    CREATE INDEX IF NOT EXISTS ui_actions_el ON ui_actions(element_key, at);
+    CREATE INDEX IF NOT EXISTS ui_actions_process ON ui_actions(process, at);
+    CREATE TABLE IF NOT EXISTS ui_elements (
+        element_key      TEXT PRIMARY KEY,
+        process          TEXT,
+        role             TEXT,
+        name_class       TEXT,
+        name_ciphertext  TEXT,
+        aid_ciphertext   TEXT,
+        days             INTEGER NOT NULL DEFAULT 0,
+        n                INTEGER NOT NULL DEFAULT 0,
+        first_at         REAL,
+        last_at          REAL,
+        last_day         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS ui_elements_last ON ui_elements(last_at);
+    CREATE TABLE IF NOT EXISTS ui_links (
+        id           INTEGER PRIMARY KEY,
+        from_action  INTEGER,
+        to_action    INTEGER,
+        kind         TEXT,
+        lag_s        REAL,
+        created_at   REAL
+    );
+    CREATE TABLE IF NOT EXISTS ui_game_processes (
+        process     TEXT PRIMARY KEY,
+        first_seen  REAL,
+        last_seen   REAL,
+        evidence    TEXT
+    );
+    CREATE TABLE IF NOT EXISTS ui_files (
+        id               INTEGER PRIMARY KEY,
+        at               REAL NOT NULL,
+        action_id        INTEGER,
+        file_digest      TEXT,
+        kind             TEXT NOT NULL,
+        outcome          TEXT NOT NULL,
+        data_ciphertext  TEXT,
+        parse_ms         REAL
+    );
+    CREATE INDEX IF NOT EXISTS ui_files_at ON ui_files(at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
