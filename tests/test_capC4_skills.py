@@ -262,3 +262,59 @@ def test_the_frame_keeps_its_cap_with_a_trial_a_path_and_pitfalls():
     built = frame.build({}, practice=practice)
     assert built.error is None and 0 < len(built.text) <= frame.FRAME_CHARS
     assert P.TRIAL_LABEL in built.text and "[pb:2]" in built.text       # the trial shown as a hint, the pitfall whole
+
+
+# -- review fixes ---------------------------------------------------------------------------------------------------
+
+def test_a_demo_way_with_no_runnable_parts_is_never_run_and_never_offered(store):
+    """Review F2: a way learned from what the user did that Yuki's hands cannot take (no parts) is a hint for the
+    thinker even once it is a way: the talker is not offered it and the skill runner refuses the talker's own steps."""
+    from yuki.voice.practice import qualifies
+
+    desk = Desk({100: {"title": "Chat", "process_name": "chatter"}}, {100: []}, 100)
+    item = {"ref": "pb:2", "id": 2, "kind": "procedure", "intent": "send a message", "apps": ["chatter"], "run": [],
+            "parts": [], "demo": True, "sends": True, "hint_only": True, "trial": False, "state": "active",
+            "confidence": 0.8, "cosine": 0.95}
+    assert not qualifies(item)
+    args = {"steps": [{"do": "type", "text": "hello there"}, {"do": "keys", "keys": ["enter"]}], "sends": False}
+    with pytest.raises(S.SkillRefused, match="hint for the thinker"):
+        S.SkillRunner(desk).run(args, item=item, words=["send hello there"])
+    with pytest.raises(S.SkillRefused, match="hint for the thinker"):   # the flag lost: a demo with no parts still
+        S.SkillRunner(desk).run(args, item={**item, "hint_only": False}, words=["send hello there"])
+    assert desk.calls == []
+    assert qualifies({**item, "hint_only": False}) and not qualifies({**item, "hint_only": False, "trial": True})
+
+
+def test_a_way_in_parts_with_typing_and_no_steps_given_runs_nothing_and_says_so(store):
+    """Review F4: the talker leaving out a way's typing steps is refused, never a run of 0 steps reported done."""
+    desk = Desk({100: {"title": "Chat", "process_name": "chatter"}}, {100: [el(1, "Button", "New message")]}, 100)
+    parts = [{"run": [{"do": "open_app", "name": "chatter"}, {"do": "type", "slot": "message"},
+                      {"do": "keys", "keys": ["enter"]}], "end": {"kind": "field_submitted", "app": "chatter"}}]
+    with pytest.raises(S.SkillRefused, match="no steps to run"):
+        S.SkillRunner(desk).run({"steps": [], "sends": True, "to": "Mira", "what": "hi"}, item=item_of(parts),
+                                words=["send hi to Mira"])
+    assert desk.calls == []
+
+
+def test_a_part_before_the_last_ends_only_on_a_state_checked_on_the_screen(store):
+    """Review F7: a fact recorded between two steps (a control selected) cannot be checked when the part runs, so it
+    never ends a part before the last: practice memory drops such parts and the runner refuses them."""
+    click = {"do": "click", "role": "Button", "name": "Go"}
+    mid_fact = [{"run": [click], "end": {"kind": "selected", "app": "x"}},
+                {"run": [click], "end": {"kind": "window_verified", "app": "x"}}]
+    assert P.clean_parts(mid_fact) == []
+    assert P.clean_parts([{"run": [click], "end": {"kind": "window_verified", "app": "x"}},
+                          {"run": [click], "end": {"kind": "selected", "app": "x"}}])   # the last may
+    desk = Desk({100: {"title": "X", "process_name": "x"}}, {100: [el(1, "Button", "Go")]}, 100)
+    raw = {"ref": "pb:7", "parts": mid_fact, "run": [click, click]}
+    with pytest.raises(S.SkillRefused, match="cannot be checked on the screen"):
+        S.SkillRunner(desk).run({"steps": []}, item=raw, words=["go"])
+    assert desk.calls == []
+    # and the trace's facts between two steps are no cut point
+    rows = [{"id": 1, "at": 1.0, "source": "user", "resolved": "point", "process": "x", "role": "ListItem",
+             "facts": json.dumps({"selected": True})},
+            {"id": 2, "at": 2.0, "source": "user", "resolved": "event", "process": "x",
+             "facts": json.dumps({"window_verified": "x"})}]
+    assert TD.state_between(rows, {}, 0.0, 1.5) is None
+    assert TD.state_between(rows, {}, 0.0, 3.0)["kind"] == "window_verified"
+    assert TD.state_between(rows, {}, 0.0, 1.5, kinds=P.END_KINDS)["kind"] == "selected"

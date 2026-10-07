@@ -133,23 +133,33 @@ def element_names(store: Any, rows: Sequence[dict[str, Any]]) -> dict[int, str |
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def proven_aid(store: Any, row: dict[str, Any]) -> str | None:
+def proven_aid(store: Any, row: dict[str, Any], cache: dict[Any, Any] | None = None) -> str | None:
     """The row's AutomationId when that app's AutomationIds are proven, else ``None``: the element was seen with this
     very AutomationId (its keyed digest) in 2 or more sessions of the app (distinct process starts) and never with
-    another, and no element of that app was ever seen with two different ones across its sessions."""
+    another, and no element of that app was ever seen with two different ones across its sessions.
+
+    ``cache`` (review F8: one dict for one task's pass): each element's proof and each app's "an element of it changed
+    its AutomationId" answer are read once, not once per click row."""
     digest, key, process = row.get("aid_digest"), row.get("element_key"), row.get("process")
     if not digest or not key or not process or not row.get("aid_ciphertext"):
         return None
+    cache = cache if cache is not None else {}
     try:
-        mine = store._query("SELECT aid_digest, count(DISTINCT proc_started) FROM ui_actions WHERE element_key = ? AND"
-                            " aid_digest IS NOT NULL AND proc_started IS NOT NULL AND source IN ('user',"
-                            " 'user_injected') GROUP BY aid_digest", (str(key),))
-        if len(mine) != 1 or mine[0][0] != digest or int(mine[0][1] or 0) < 2:
+        ek = ("element", str(key))
+        if ek not in cache:
+            cache[ek] = [(r[0], int(r[1] or 0)) for r in store._query(
+                "SELECT aid_digest, count(DISTINCT proc_started) FROM ui_actions WHERE element_key = ? AND aid_digest IS"
+                " NOT NULL AND proc_started IS NOT NULL AND source IN ('user', 'user_injected') GROUP BY aid_digest",
+                (str(key),))]
+        mine = cache[ek]
+        if len(mine) != 1 or mine[0][0] != digest or mine[0][1] < 2:
             return None
-        changed = store._query("SELECT 1 FROM ui_actions WHERE process = ? AND aid_digest IS NOT NULL AND element_key"
-                               " IS NOT NULL GROUP BY element_key HAVING count(DISTINCT aid_digest) > 1 LIMIT 1",
-                               (str(process),))
-        if changed:
+        pk = ("app", str(process))
+        if pk not in cache:
+            cache[pk] = bool(store._query(
+                "SELECT 1 FROM ui_actions WHERE process = ? AND aid_digest IS NOT NULL AND element_key IS NOT NULL"
+                " GROUP BY element_key HAVING count(DISTINCT aid_digest) > 1 LIMIT 1", (str(process),)))
+        if cache[pk]:
             return None
         return store._dec(row["aid_ciphertext"]) or None
     except Exception:  # noqa: BLE001
@@ -161,10 +171,11 @@ def proven_aid(store: Any, row: dict[str, Any]) -> str | None:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def row_step(store: Any, row: dict[str, Any], name: str | None, *, slot: str = "", literal_ok: bool = True
-             ) -> dict[str, Any] | None:
+def row_step(store: Any, row: dict[str, Any], name: str | None, *, slot: str = "", literal_ok: bool = True,
+             cache: dict[Any, Any] | None = None) -> dict[str, Any] | None:
     """One usable row (:func:`usable`) as a step (:func:`yuki.memory.practice.demo_step`), with a proven AutomationId
-    on a click and a page's address read from the timeline for a page change (``literal_ok`` only)."""
+    on a click and a page's address read from the timeline for a page change (``literal_ok`` only). ``cache``: the
+    AutomationId proofs read once a pass (:func:`proven_aid`)."""
     if usable(row) is not None or row.get("kind") not in STEP_KINDS:
         return None
     url = None
@@ -172,7 +183,7 @@ def row_step(store: Any, row: dict[str, Any], name: str | None, *, slot: str = "
         from yuki.memory import practice_learn as PL
 
         url = PL.page_url(store, row)
-    aid = proven_aid(store, row) if row.get("kind") in ("click", "dclick", "menu", "select", "invoke") else None
+    aid = proven_aid(store, row, cache) if row.get("kind") in ("click", "dclick", "menu", "select", "invoke") else None
     return P.demo_step(row, name, slot=slot, aid=aid, url=url, literal_ok=literal_ok)
 
 
@@ -231,17 +242,19 @@ def end_of(kind: str, row: dict[str, Any], name: str | None) -> dict[str, Any] |
     return P.clean_end({"kind": kind, "app": process})
 
 
-def state_between(rows: Sequence[dict[str, Any]], names: dict[int, str | None], lo: float, hi: float
-                  ) -> dict[str, Any] | None:
-    """The last checked state the trace recorded on the user's own rows in ``[lo, hi)`` (report 78 §5.3: a fact the
-    machine checked, a window or page verified), as a part's end; ``None`` when there is none."""
+def state_between(rows: Sequence[dict[str, Any]], names: dict[int, str | None], lo: float, hi: float,
+                  kinds: Sequence[str] = P.PART_END_KINDS) -> dict[str, Any] | None:
+    """The last checked state the trace recorded on the user's own rows in ``[lo, hi)`` (report 78 §5.3), as a part's
+    end; ``None`` when there is none. ``kinds``: by default only the states the skill runner checks live at a part's
+    end (review F7: a window of the app in front, a page reached); a fact recorded on a row between two steps (a control
+    selected, a field sent) could not be checked when the part is run, so it is no cut point."""
     best = None
     for r in rows:
         at = float(r["at"])
         if at < lo or at >= hi or r.get("source") not in USER_SOURCES or r.get("resolved") == "stale" or r.get("detour"):
             continue
         facts = facts_of(r)
-        for kind in P.END_KINDS:
+        for kind in kinds:
             if kind in facts and facts[kind] is not None and facts[kind] is not False:
                 end = end_of(kind, r, names.get(int(r["id"])))
                 if end is not None:
@@ -319,10 +332,16 @@ def split_parts(store: Any, picked: Sequence[tuple[dict[str, Any], dict[str, Any
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def target_sig(store: Any, kind: str, target: Any) -> str:
+def target_sig(store: Any, kind: str, target: Any, task_id: Any = None) -> str:
     """The outcome's kind and target as a short keyed digest (the demo run key's second half): two demos combine only
-    when it is equal (decision D3: the same outcome kind on the same target)."""
-    return store.cipher.digest("demo-target", str(kind or ""), str(target or ""))[:16]
+    when it is equal (decision D3: the same outcome kind on the same target).
+
+    Review F5: an outcome with no target (C2 keeps none for a file saved or opened without its file's digest, a page
+    reached without its page key) is no "same target" for anything: its signature is the task's own, so it never
+    combines with another task and stays a trial until one of Yuki's runs proves it."""
+    if target is None or str(target) == "":
+        return store.cipher.digest("demo-target", str(kind or ""), "", "no-target", str(task_id))[:16]
+    return store.cipher.digest("demo-target", str(kind or ""), str(target))[:16]
 
 
 def name_digest(store: Any, process: str, role: str, name: str) -> str:

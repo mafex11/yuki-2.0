@@ -139,10 +139,41 @@ NEUTRAL_EVENTS: tuple[str, ...] = ("injected", "cited", "superseded", "retired_b
 #: target (element key, app, page digest or file digest), so evidence about different targets never combines. One
 #: demo is a *trial* ("your way, seen once": a hint, never run alone by the skill runner); it is a *way* once the user
 #: did it :data:`DEMO_TIMES` times with the same outcome kind on the same target, or once :data:`DEMO_PROVEN_RUNS` of
-#: Yuki's own runs used it and verified the outcome (``ran_ok`` / ``succeeded`` with that run's key).
+#: Yuki's own runs used it and verified the outcome (a ``succeeded`` mark with that run's key, written beside the
+#: learner's ``ran_ok`` only when the run is a verified success by its trace: :func:`mark_demo_successes`; dated after
+#: the first demonstration).
 DEMO_RUN_PREFIX = "demo:"
 DEMO_TIMES = 2
 DEMO_PROVEN_RUNS = 1
+#: review F6: decision D3 as the user's ``[trace]`` settings say it (``learn_demo_hint``,
+#: ``learn_demo_alone_after_times``, ``learn_demo_alone_after_proven_runs``), set by the practice worker from the
+#: trace's rules (:func:`set_demo_rules`); the defaults above until then.
+_DEMO_RULES: dict[str, Any] = {"hint": "at_once", "times": DEMO_TIMES, "proven_runs": DEMO_PROVEN_RUNS}
+
+
+def set_demo_rules(learning: Any) -> dict[str, Any]:
+    """Take decision D3's settings from the trace's ``learning`` table (``demo_hint``, ``demo_alone_after_times``,
+    ``demo_alone_after_proven_runs``; anything missing or not a whole number from 1 to 20 keeps its default).
+    Returns the rules now in force."""
+    table = dict(learning or ()) if not isinstance(learning, dict) else learning
+
+    def count(key: str, default: int) -> int:
+        try:
+            value = int(table.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if 1 <= value <= 20 else default
+
+    _DEMO_RULES.update(hint=str(table.get("demo_hint") or "at_once"),
+                       times=count("demo_alone_after_times", DEMO_TIMES),
+                       proven_runs=count("demo_alone_after_proven_runs", DEMO_PROVEN_RUNS))
+    return dict(_DEMO_RULES)
+
+
+def demo_rules() -> dict[str, Any]:
+    """Decision D3's rules in force (:func:`set_demo_rules`): ``hint`` ("at_once": a demo seen once is a hint at
+    once; anything else: it is held back until it is a way), ``times``, ``proven_runs``."""
+    return dict(_DEMO_RULES)
 #: How a trial is labelled for the brain and the Playbook page.
 TRIAL_LABEL = "your way, seen once"
 #: Where a way learned from what the user did came from, in the Playbook page's words.
@@ -658,6 +689,10 @@ PICK_DIGEST_CHARS = 20
 #: capC4: the checked states a part of a way may end on (report 78 §5.3's facts, and a window or page verified).
 END_KINDS: tuple[str, ...] = ("window_verified", "page_reached", "field_submitted", "toggle_state", "selected",
                               "file_saved", "file_opened", "paste_sent", "command_ok")
+#: review F7: the states a part *before the last* may end on - the ones the skill runner checks live on the screen
+#: (a window of the app in front, a new page). A fact's state (a field sent, a control selected, a file saved) ends
+#: only the last part, where the outcome's own action is the part's last step and its measured report is the check.
+PART_END_KINDS: tuple[str, ...] = ("window_verified", "page_reached")
 
 
 def _input_dict(text: str | None) -> dict[str, Any] | None:
@@ -819,6 +854,8 @@ def clean_parts(parts: Any) -> list[dict[str, Any]]:
         if any(s is None for s in steps) or end is None:
             return []
         out.append({"run": steps, "end": end})
+    if any(p["end"]["kind"] not in PART_END_KINDS for p in out[:-1]):
+        return []   # review F7: a part before the last ends only on a state checked live (a window, a page)
     return out
 
 
@@ -993,7 +1030,21 @@ class Playbook:
                "avoid": self.avoid}
         if parts:
             out.update(parts=parts, sends=bool(b.get("sends")), trial=self.trial)
+        if self.demo:
+            # review F2: every way learned from what the user did says whether it sends and whether the talker's hands
+            # may run it at all (``hint_only``: no parts their hands can take - a hint for the thinker, never run)
+            out.update(demo=True, sends=bool(b.get("sends")), trial=self.trial, hint_only=self.hint_only)
         return out
+
+    @property
+    def hint_only(self) -> bool:
+        """capC4 (review F2): a way learned from what the user did that the skill runner may never run: it has no parts
+        (an action of it cannot be repeated by Yuki's hands, or it would need more than :data:`MAX_PARTS` parts), or a
+        part runs a terminal command (the thinker's). ``False`` for every other object."""
+        if not self.demo:
+            return False
+        parts = self.parts
+        return not parts or not runnable_parts(parts)
 
     def text(self, cap: int = BODY_CHARS) -> str:
         """The object in plain words: a procedure's numbered steps, a habit's default (or "ask"), a pitfall's what
@@ -1144,6 +1195,7 @@ def add_events(store: Store, events: Sequence[dict[str, Any]], *, now: float | N
     good = [e for e in events if str(e.get("type") or "") in EVENT_TYPES and isinstance(e.get("playbook_id"), int)]
     if not good:
         return 0
+    good += mark_demo_successes(store, good, now=now)
 
     def op(conn: Any) -> int:
         n = 0
@@ -1157,6 +1209,35 @@ def add_events(store: Store, events: Sequence[dict[str, Any]], *, now: float | N
     n = store._write(op)
     recompute(store, sorted({int(e["playbook_id"]) for e in good}), now=now)
     return n
+
+
+def mark_demo_successes(store: Store, events: Sequence[dict[str, Any]], *, now: float) -> list[dict[str, Any]]:
+    """capC4 (decision D3, review F1): the ``succeeded`` marks to add beside these events. A ``ran_ok`` on a way learned
+    from what the user did (its ledger has a demo learner's ``demonstrated`` event) proves it only when that run is a
+    verified success by its own trace (:func:`verified_run`: it ended done and its last action's effect was seen) - a
+    label alone (a post-mortem's "ok") never does. Measured, no model; one mark a way and run."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for e in events:
+        key = str(e.get("run_key") or "")
+        pid = int(e["playbook_id"])
+        if e.get("type") != "ran_ok" or not _run_evidence(key) or (pid, key) in seen:
+            continue
+        seen.add((pid, key))
+        try:
+            demo = store._query("SELECT 1 FROM playbook_events WHERE playbook_id=? AND type='demonstrated' AND"
+                                " substr(run_key, 1, ?) = ? LIMIT 1", (pid, len(DEMO_RUN_PREFIX), DEMO_RUN_PREFIX))
+            if not demo:
+                continue
+            done = store._query("SELECT 1 FROM playbook_events WHERE playbook_id=? AND type='succeeded' AND run_key=?"
+                                " LIMIT 1", (pid, key))
+            if done or not verified_run(store, key):
+                continue
+        except Exception:  # noqa: BLE001 - no proof read: no mark
+            continue
+        out.append({"playbook_id": pid, "type": "succeeded", "run_key": key, "at": float(e.get("at") or now),
+                    "refs": {"via": "Yuki's run used your way and its last action verified"}})
+    return out
 
 
 @dataclass
@@ -1213,6 +1294,11 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
     demo_groups: dict[str, set[str]] = {}
     proven_runs: set[str] = set()
     demo_seen = False
+    # review F1 and the open point on post-mortem labels: a run proves a way learned from what the user did only when
+    # it is a verified success (a ``succeeded`` mark, :func:`mark_demo_successes`) that came after the user first did
+    # it - never a run inherited from an older version this way replaced, never a label alone
+    first_demo = min((float(e.at) for e in events if e.type == "demonstrated"
+                      and str(getattr(e, "run_key", None) or "").startswith(DEMO_RUN_PREFIX)), default=None)
     for e in events:
         t, at = e.type, float(e.at)
         w = WEIGHTS.get(t, 0.0)
@@ -1227,7 +1313,7 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
             pos += w
             last_ev = max(last_ev or at, at)
             continue
-        if t in ("ran_ok", "succeeded") and _run_evidence(key):
+        if t == "succeeded" and _run_evidence(key) and first_demo is not None and at >= first_demo:
             proven_runs.add(key)
         counts[t] += 1
         if t == "observed_day":
@@ -1265,7 +1351,8 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
     if demo_seen:
         # capC4 (D3): a way learned from what the user did stands on the user's own word or fix, on the same checked
         # outcome on the same target repeated, or on Yuki's own verified use of it - never on other sources adding up
-        settled = taught or fixed or demo_best >= DEMO_TIMES or len(proven_runs) >= DEMO_PROVEN_RUNS
+        rules = demo_rules()
+        settled = taught or fixed or demo_best >= rules["times"] or len(proven_runs) >= rules["proven_runs"]
     else:
         settled = taught or fixed or len(sources) >= 2
     if negatives >= RETIRE_NEGATIVES and conf < RETIRE_BELOW:
@@ -1821,8 +1908,12 @@ def _item(o: Playbook, cosine: float | None, why: str, detail: bool = False) -> 
     if o.demo:
         # capC4: learned from what the user did; a trial is a hint only (decision D3: never run alone)
         out["source"] = DEMO_SOURCE
+        out["demo"] = True
+        out["sends"] = bool((o.body or {}).get("sends"))
         if o.trial:
             out["trial"] = True
+        if o.hint_only:
+            out["hint_only"] = True   # review F2: never offered to the talker's hands, never run by the skill runner
     if detail:
         out.update(o.detail())
     return out
@@ -1932,6 +2023,7 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     way_hits: list[tuple[float, Playbook, float, str]] = []
     habit_hits: list[tuple[float, Playbook, float, str]] = []
     pit_hits: list[tuple[tuple[float, float], Playbook, float | None, str]] = []
+    hint_at_once = demo_rules()["hint"] == "at_once"
     for o in objs:
         if o.state == "probation":   # migrated know-how: never shown until a successful run confirms it
             continue
@@ -1951,6 +2043,8 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
             continue
         if o.kind in WAY_KINDS and not _is_way(store, o, from_run, proven):
             continue
+        if o.trial and not hint_at_once:
+            continue   # review F6: the user's [trace] learn_demo_hint holds a demo seen once back until it is a way
         why = f"cosine {c:.2f}" + (f", its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"
                                    if hit else "")
         score = rank(c, o)
@@ -1970,7 +2064,7 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     family_pid = _family_playbook(store, hint.pop("family_id", None))
     if family_pid is not None and all(o.id != family_pid for _r, o, _c, _w in way_hits):
         linked = next((o for o in objs if o.id == family_pid and o.kind == "procedure" and o.state != "probation"
-                       and _is_way(store, o, from_run, proven)), None)
+                       and (hint_at_once or not o.trial) and _is_way(store, o, from_run, proven)), None)
         if linked is not None:
             c = cos(linked)
             way_hits.append((rank(c if c is not None else WAY_APP_MIN_COSINE, linked), linked, c,
@@ -2007,14 +2101,25 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
 
 def _family_playbook(store: Store, family_id: Any) -> int | None:
     """capC4: the playbook a family of the user's tasks is linked to (``ui_families.playbook_id``, written by the demo
-    learner), or ``None``."""
+    learner), or ``None``. Review F9: when that version was replaced since (a later run's update, the clean-up pass, a
+    user's edit), the link follows ``superseded_by`` to the live version."""
     if family_id is None:
         return None
     try:
         rows = store._query("SELECT playbook_id FROM ui_families WHERE id = ?", (int(family_id),))
+        pid = int(rows[0][0]) if rows and rows[0][0] is not None else None
+        for _hop in range(16):
+            if pid is None:
+                return None
+            got = store._query("SELECT valid_to, superseded_by FROM playbooks WHERE id = ?", (pid,))
+            if not got:
+                return None
+            if got[0][0] is None:
+                return pid
+            pid = int(got[0][1]) if got[0][1] is not None else None
     except Exception:
         return None
-    return int(rows[0][0]) if rows and rows[0][0] is not None else None
+    return None
 
 
 def _repeats(o: Playbook) -> int:
@@ -2217,6 +2322,6 @@ __all__ = [
     "launch_identities",
     # capC4: ways learned from what the user did
     "TRACE_DOS", "MAX_PARTS", "PICK_DIGEST_CHARS", "END_KINDS", "DEMO_RUN_PREFIX", "DEMO_TIMES", "DEMO_PROVEN_RUNS",
-    "TRIAL_LABEL", "DEMO_SOURCE", "demo_step", "clean_parts", "clean_end", "runnable_parts", "demo_key", "demo_task",
+    "TRIAL_LABEL", "DEMO_SOURCE", "set_demo_rules", "demo_rules", "mark_demo_successes", "PART_END_KINDS", "demo_step", "clean_parts", "clean_end", "runnable_parts", "demo_key", "demo_task",
     "demo_withdrawals",
 ]

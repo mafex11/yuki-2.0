@@ -69,6 +69,8 @@ SKILL_DOS = ("click", "type", "keys", "scroll", "open_app", "open_url", "pick")
 #: in parts of at most this many steps each, at most :data:`MAX_PARTS` parts.
 MAX_STEPS = 8
 MAX_PARTS = 4
+#: The states a part before the last may end on (practice memory's ``PART_END_KINDS``): the ones checked live here.
+PART_END_KINDS = ("window_verified", "page_reached")
 #: How deep below a container a picked item may sit (a ListItem inside a Group inside the List).
 PICK_DEPTH = 6
 #: How long a part's checked end may take to show (a window coming up, a page loading).
@@ -742,6 +744,15 @@ class SkillRunner:
             raise SkillRefused("it runs a terminal command, which only the thinker's terminal tool may run")
         if len(parts) > MAX_PARTS or any(len(p.get("run") or []) > MAX_STEPS for p in parts):
             raise SkillRefused(f"more than {MAX_PARTS} parts of {MAX_STEPS} steps")
+        if item.get("hint_only") or (item.get("demo") and not parts):
+            # review F2: a way learned from what the user did that Yuki's hands cannot take as it is (an action of it
+            # cannot be repeated, or it is longer than 4 parts) is a hint for the thinker; the talker never writes its
+            # steps itself
+            raise SkillRefused("that way is a hint for the thinker: it cannot be run step by step by your hands")
+        if any(isinstance(p.get("end"), dict) and str(p["end"].get("kind") or "") not in PART_END_KINDS
+               for p in parts[:-1]):
+            # review F7: a part before the last ends only on a state checked live on the screen
+            raise SkillRefused("a part of that way ends on a state that cannot be checked on the screen")
         run = ([s for p in parts for s in p.get("run") or [] if isinstance(s, dict)] if parts
                else [s for s in item.get("run") or [] if isinstance(s, dict)])
         given = parse_steps(args.get("steps"), cap=max(MAX_STEPS, len(run)) if parts else MAX_STEPS,
@@ -758,6 +769,9 @@ class SkillRunner:
                 steps = fit_to_way(given, run)
         else:
             steps = fit_to_way(given, run)
+        if not steps:
+            # review F4: a way in parts whose typing steps the talker left out runs nothing - never "done"
+            raise SkillRefused("no steps to run: give the way's typing and pick steps with the words from the request")
         if item.get("sends") and args.get("sends") is not True:
             # a demo never authorises a send: the way sent what was typed when the user did it, so whom and what must
             # be the user's own words now (check_sends)

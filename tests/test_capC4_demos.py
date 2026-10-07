@@ -201,11 +201,115 @@ def test_a_trial_that_one_of_yukis_runs_used_and_verified_is_a_way(store):
     P.add_events(store, [{"playbook_id": o.id, "type": "observed", "run_key": "agent:S1:r1", "at": NOW + 200}],
                  now=NOW + 200)
     assert P.get(store, o.id).state == "candidate"
-    # a run of Yuki's that cited it and worked (the learner's ran_ok) makes it a way
-    P.add_events(store, [{"playbook_id": o.id, "type": "ran_ok", "run_key": "agent:S1:r2", "at": NOW + 300}],
+    # review open point: a run labelled ok whose own trace shows no verified success (its last step's effect unseen)
+    # is no proof either - D3 says the run must verify the outcome
+    unverified = yuki_run(store, "r2", at=NOW + 250, verdict=None, pid=o.id)
+    P.add_events(store, [{"playbook_id": o.id, "type": "ran_ok", "run_key": unverified, "at": NOW + 300}],
                  now=NOW + 300)
+    assert P.get(store, o.id).state == "candidate"
+    assert not [e for e in P.ledger(store, o.id) if e.type == "succeeded"]
+    # a run of Yuki's that cited it and verified its outcome (the learner's ran_ok on a verified run) makes it a way
+    verified = yuki_run(store, "r3", at=NOW + 350, verdict=True, pid=o.id)
+    P.add_events(store, [{"playbook_id": o.id, "type": "ran_ok", "run_key": verified, "at": NOW + 400}],
+                 now=NOW + 400)
     o = P.get(store, o.id)
     assert o.state == "active" and not o.trial and o.label() != P.TRIAL_LABEL
+    assert [e.run_key for e in P.ledger(store, o.id) if e.type == "succeeded"] == [verified]
+
+
+def yuki_run(store: Any, request_id: str, *, at: float, verdict: bool | None, pid: int | None = None) -> str:
+    """One of Yuki's runs (the talker's hands), ended done; its last step verified or not."""
+    from test_c_practice import step
+
+    got = P.record_run(store, {"source": "agent", "session_id": "S1", "request_id": request_id, "lane": "voice",
+                               "at": at, "ended_at": at + 5, "words": "send a message in a channel", "reply": "Sent.",
+                               "outcome": "final", "steps": [step("type_text", app="chatter", verdict=verdict,
+                                                                  playbook=pid)]}, now=at + 5)
+    assert got["ok"], got
+    return got["run_key"]
+
+
+def test_a_first_demo_never_takes_over_a_nearby_way_and_its_old_runs(store):
+    """Review F1: a way learned from a run of Yuki's (not from demos) near the demo's words is never replaced by a first
+    demo, and that run never counts as the demo's proof."""
+    old_key = yuki_run(store, "r9", at=NOW - 500, verdict=True)
+    old = P.add_playbook(store, {"kind": "procedure", "intent": "send a message in a channel", "apps": ["chatter"],
+                                 "family": "messaging in a chat app", "origin": "run",
+                                 "body": {"steps": ["Open chatter", "Type the message", "Press Enter"]}},
+                         events=[{"type": "observed", "run_key": old_key, "at": NOW - 400},
+                                 {"type": "ran_ok", "run_key": old_key, "at": NOW - 400},
+                                 {"type": "succeeded", "run_key": old_key, "at": NOW - 400}],
+                         vector=vec("send a message in a channel. messaging in a chat app"), now=NOW - 400)
+    tid, steps = chat_demo(store, NOW)
+    res = learner(store, [answer(steps, slots={steps[2]: "channel", steps[4]: "message"})]).learn_task(
+        taskrow(store, tid), now=NOW + 120)
+    assert res.written.get("added") and not res.written.get("updated"), res.written
+    [o] = demos(store)
+    assert o.state == "candidate" and o.trial and o.id != old
+    assert P.get(store, old).valid_to is None                        # the old way stands as it was
+    assert not [e for e in P.ledger(store, o.id) if e.type in ("ran_ok", "succeeded")]
+    # even a ledger that inherited a verified run from before the first demo stays a trial
+    events = [P.Event(NOW - 400, "succeeded", 0.0, "agent:S1:r9"), P.Event(NOW, "demonstrated", 1.0,
+                                                                          P.demo_key(1, "aaaa"))]
+    assert P.evaluate("procedure", events, created_at=NOW, now=NOW + 10)["state"] == "candidate"
+    after = [P.Event(NOW, "demonstrated", 1.0, P.demo_key(1, "aaaa")), P.Event(NOW + 5, "ran_ok", 1.0, "agent:S1:r9")]
+    assert P.evaluate("procedure", after, created_at=NOW, now=NOW + 10)["state"] == "candidate"   # a label alone
+    after.append(P.Event(NOW + 5, "succeeded", 0.0, "agent:S1:r9"))
+    assert P.evaluate("procedure", after, created_at=NOW, now=NOW + 10)["state"] == "active"
+
+
+def test_two_demos_on_the_same_target_join_whatever_words_the_model_chose(store):
+    """Review F3: D3 is about the target; two passes that word the intent differently still make one way."""
+    t1, s1 = chat_demo(store, NOW)
+    t2, s2 = chat_demo(store, NOW + DAY)
+    lrn = learner(store, [answer(s1, slots={s1[2]: "channel", s1[4]: "message"}),
+                          answer(s2, slots={s2[2]: "channel", s2[4]: "message"},
+                                 intent="post an update to the team chat", family="team updates")])
+    lrn.learn_task(taskrow(store, t1), now=NOW + 120)
+    lrn.learn_task(taskrow(store, t2), now=NOW + DAY + 120)
+    [o] = demos(store)
+    assert o.state == "active" and not o.trial and o.intent == "post an update to the team chat"
+    assert len({e.run_key for e in P.ledger(store, o.id) if e.type == "demonstrated"}) == 2
+
+
+def test_an_outcome_with_no_target_never_combines(store):
+    """Review F5: C2 keeps no target for some outcomes (a page reached without its key); such demos are no "same
+    target" for each other."""
+    t1, s1 = chat_demo(store, NOW)
+    t2, s2 = chat_demo(store, NOW + DAY)
+    store._write(lambda c: c.execute("UPDATE ui_tasks SET outcome_target = NULL"))
+    ans = lambda s: answer(s, slots={s[2]: "channel", s[4]: "message"})   # noqa: E731
+    lrn = learner(store, [ans(s1), ans(s2)])
+    lrn.learn_task(taskrow(store, t1), now=NOW + 120)
+    lrn.learn_task(taskrow(store, t2), now=NOW + DAY + 120)
+    assert all(o.trial and o.state == "candidate" for o in demos(store))
+    assert TD.target_sig(store, "page_reached", None, 1) != TD.target_sig(store, "page_reached", None, 2)
+    assert TD.target_sig(store, "page_reached", "p1", 1) == TD.target_sig(store, "page_reached", "p1", 2)
+
+
+def test_the_users_demo_settings_are_read(store):
+    """Review F6: [trace] learn_demo_alone_after_times / _proven_runs / learn_demo_hint decide D3's numbers."""
+    from yuki.memory.trace_privacy import TraceRules
+
+    t1, s1 = chat_demo(store, NOW)
+    t2, s2 = chat_demo(store, NOW + DAY)
+    ans = lambda s: answer(s, slots={s[2]: "channel", s[4]: "message"})   # noqa: E731
+    worker = Worker(store, [ans(s1), ans(s2)])
+    rules = TraceRules.from_dict({"learn_demo_alone_after_times": 3, "learn_demo_hint": "when_sure"})
+    pw = L.PracticeWorker(store, worker, embedder=Words(), clock=lambda: NOW + DAY + 120, trace_rules=lambda: rules)
+    try:
+        assert pw.demo_rules() == {"hint": "when_sure", "times": 3, "proven_runs": 1}
+        pw.learner.learn_task(taskrow(store, t1), now=NOW + 120)
+        pw.learner.learn_task(taskrow(store, t2), now=NOW + DAY + 120)
+        [o] = demos(store)
+        assert o.state == "candidate" and o.trial                  # 2 demos: not enough under the user's 3
+        q = vec("send a message in a channel")
+        assert P.relevant(store, query_vec=q, apps_in_play=["chatter"])["ways"] == []   # held back, not a hint
+        rules = TraceRules.from_dict({})
+        pw.demo_rules()                                              # back to the defaults: recomputed at once
+        assert P.get(store, o.id).state == "active"
+    finally:
+        P.set_demo_rules({})
 
 
 # -- zero ways or trials from bad evidence -------------------------------------------------------------------------
@@ -500,3 +604,83 @@ def test_the_playbook_page_shows_the_source_and_your_way_seen_once():
     prop = proposal_view(card)
     assert prop["basis"].startswith("Your way, seen once") and "learned from what you did" in prop["basis"]
     assert procedure_view(card)["learned"].startswith("Learned from what you did") and ORIGIN_WORDS["demo"]
+
+
+# -- review fixes ---------------------------------------------------------------------------------------------------
+
+def hint_only_demo(store: Any, t0: float) -> tuple[int, list[int]]:
+    """The user switches to the chat app, clicks a control with no name (Yuki's hands cannot repeat it), types and
+    presses Enter (sent)."""
+    ids = [row(store, t0, "chatter", "switch", resolved="event", facts={"window_verified": "chatter"}),
+           row(store, t0 + 2, "chatter", "click", role="Button", key="k-unnamed"),
+           row(store, t0 + 4, "chatter", "type", resolved="focus", role="Edit", key="k-msg", typed=11),
+           row(store, t0 + 5, "chatter", "keys", resolved="focus", chord="Enter", role="Edit", key="k-msg",
+               facts={"field_submitted": {"typed": 11}})]
+    return task(store, ids, "You sent a message in the team channel", "field_submitted", ids[-1], target="k-msg"), ids
+
+
+def test_a_hint_only_demo_way_is_never_offered_to_the_talker_nor_run(store):
+    """Review F2: two demos make it a way, but with no parts Yuki's hands can take it stays a hint for the thinker;
+    it keeps whether it sends, and the skill runner refuses the talker's own steps for it."""
+    from yuki.voice.practice import qualifies
+    from yuki.voice.skills import SkillRefused, SkillRunner
+
+    t1, s1 = hint_only_demo(store, NOW)
+    t2, s2 = hint_only_demo(store, NOW + DAY)
+    lrn = learner(store, [answer(s1, slots={s1[2]: "message"}), answer(s2, slots={s2[2]: "message"})])
+    r1 = lrn.learn_task(taskrow(store, t1), now=NOW + 120)
+    lrn.learn_task(taskrow(store, t2), now=NOW + DAY + 120)
+    assert any("hint for the thinker" in r for r in r1.rejected)
+    [o] = demos(store)
+    assert o.state == "active" and o.parts == [] and o.hint_only
+    assert o.body["sends"] is True and o.body["hint_only"] is True
+    [w] = P.relevant(store, query_vec=vec("send a message in a channel"), apps_in_play=["chatter"],
+                     detail=True)["ways"]
+    assert w["hint_only"] and w["sends"] and w["demo"] and not qualifies(w)
+    with pytest.raises(SkillRefused, match="hint for the thinker"):
+        SkillRunner(object()).run({"steps": [{"do": "type", "text": "hello there"}, {"do": "keys", "keys": ["enter"]}],
+                                   "sends": False}, item=w, words=["send hello there"])
+
+
+def test_the_aid_proof_is_read_once_a_pass(store):
+    """Review F8: one task's pass reads each element's proof and each app's answer once, not once per click."""
+    rid = row(store, NOW, "editr", "click", role="Button", name="Save", key="k-save", aid="SaveBtn", proc_started=1.0)
+    row(store, NOW + DAY, "editr", "click", role="Button", name="Save", key="k-save", aid="SaveBtn", proc_started=2.0)
+    r = dict(store._query(f"SELECT {TD.COLUMNS} FROM ui_actions WHERE id = ?", (rid,))[0])
+    calls = []
+    real = store._query
+
+    def counting(sql: str, params: Any = ()) -> Any:
+        calls.append(sql)
+        return real(sql, params)
+
+    store._query = counting
+    try:
+        cache: dict[Any, Any] = {}
+        assert [TD.proven_aid(store, r, cache) for _ in range(5)] == ["SaveBtn"] * 5
+    finally:
+        store._query = real
+    assert len(calls) == 2
+
+
+def test_a_family_follows_its_way_to_the_newer_version(store):
+    """Review F9: a family linked to a way that was replaced since (a run's update, the clean-up pass, an edit)
+    brings the live version along."""
+    from yuki.memory import trace_families as F
+
+    t1, s1 = chat_demo(store, NOW)
+    t2, s2 = chat_demo(store, NOW + DAY)
+    F.refresh(store, Words(), now=NOW + DAY + 50)
+    fid = store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (t1,))[0][0]
+    ans = lambda s: answer(s, slots={s[2]: "channel", s[4]: "message"})   # noqa: E731
+    lrn = learner(store, [ans(s1), ans(s2)])
+    lrn.learn_task(taskrow(store, t1), now=NOW + DAY + 100)
+    lrn.learn_task(taskrow(store, t2), now=NOW + DAY + 200)
+    [o] = demos(store)
+    newer = P.add_playbook(store, {"kind": "procedure", "intent": "write in the team room", "apps": ["chatter"],
+                                   "origin": "run", "body": {"steps": ["Open chatter", "Type", "Press Enter"]}},
+                           vector=vec("write in the team room"), supersedes=o.id, now=NOW + DAY + 300)
+    assert store._query("SELECT playbook_id FROM ui_families WHERE id = ?", (fid,))[0][0] == o.id
+    assert P._family_playbook(store, fid) == newer                   # noqa: SLF001
+    out = P.relevant(store, query_vec=vec("You sent a message in the team channel"), apps_in_play=["chatter"])
+    assert any(w["id"] == newer for w in out["ways"])
