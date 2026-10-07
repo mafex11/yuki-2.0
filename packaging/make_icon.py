@@ -228,6 +228,23 @@ def find_browser() -> str | None:
     return None
 
 
+def _remove_profile(tmp: str) -> None:
+    """Delete a run's throwaway folder. The browser's helper processes can hold files in its profile for a moment
+    after the browser itself exits (Windows: "being used by another process", about 1 run in 15): tried again for up
+    to 5 s, then left for the system's temp cleanup rather than failing a drawing that worked."""
+    import time
+
+    for _ in range(25):
+        try:
+            shutil.rmtree(tmp)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            time.sleep(0.2)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def browser_run(job: dict, scripts: list[Path], browser: str | None = None, timeout: float = 90.0) -> dict:
     """Run ``render.js`` (after ``scripts``) on ``job`` in a headless browser; its JSON answer."""
     exe = browser or find_browser()
@@ -236,12 +253,15 @@ def browser_run(job: dict, scripts: list[Path], browser: str | None = None, time
     body = "".join(f"<script>{p.read_text(encoding='utf-8')}</script>\n" for p in [*scripts, RENDER_JS])
     page = ('<!doctype html><html><head><meta charset="utf-8"></head><body><pre id="out"></pre>\n'
             f"<script>window.JOB = {json.dumps(job)};</script>\n{body}</body></html>")
-    with tempfile.TemporaryDirectory(prefix="yuki-icon-") as tmp:
+    tmp = tempfile.mkdtemp(prefix="yuki-icon-")
+    try:
         html = Path(tmp) / "render.html"
         html.write_text(page, encoding="utf-8")
         cmd = [exe, "--headless", "--disable-gpu", "--hide-scrollbars", "--no-first-run", "--force-device-scale-factor=1",
                f"--user-data-dir={Path(tmp) / 'profile'}", "--virtual-time-budget=20000", "--dump-dom", html.as_uri()]
         done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    finally:
+        _remove_profile(tmp)
     import html as _html
 
     text = done.stdout or ""

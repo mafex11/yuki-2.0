@@ -1407,6 +1407,7 @@ class WebWindow:
         "submit": "a_submit", "askbar": "a_askbar", "copy": "a_copy", "correct": "a_correct",
         "forget": "a_forget", "rule_edit": "a_rule_edit", "person": "a_person", "workflow_edit": "a_workflow_edit",
         "pin": "a_pin", "resolve_heard": "a_resolve_heard", "review_mark": "a_review_mark",
+        "resolve_held": "a_resolve_held",
         "thread_days": "a_thread_days", "chat_day": "a_chat_day", "day_answer": "a_day_answer",
         "permissions_set": "a_permissions_set", "app_look": "a_app_look", "app_act": "a_app_act", "voice": "a_voice",
         "offers": "a_offers", "coach": "a_coach", "questions": "a_questions", "pause": "a_pause", "accent": "a_accent",
@@ -1875,6 +1876,11 @@ class WebWindow:
         model on the click), Undo inside the row's 5 s; an Undo after the correction pass started is too late and the
         item stays resolved. "It was..." in your words is :meth:`a_correct_item`."""
         return self._answer("resolve_heard", m, ("right", "guess_right", "wrong", "undo"))
+
+    def a_resolve_held(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Waiting for your yes (report 76 item 5): Keep (the explicit yes a held fact needs, a sensitive one
+        included), Not true, It's a joke, at once (``resolve_held``, no model), Undo inside the row's 5 s."""
+        return self._answer("resolve_held", m, ("keep", "not_true", "joke", "undo"))
 
     def a_review_mark(self, m: dict[str, Any]) -> dict[str, Any]:
         """To review: Right / Wrong / Not mine at once (``review_mark``), Undo inside the row's 5 s."""

@@ -62,6 +62,53 @@ class Log:
 
 needs_lab = pytest.mark.skipif(not PARAKEET_WAV.exists(), reason="the bake-off's models are not on this PC")
 
+#: How long run_test waits for the pipeline to start (the service's start() awaits its models). The models load on a
+#: below-normal thread (by design: Yuki yields to the user's own work), so on a busy PC a load took longer than the old
+#: 20 s; run_test then raised, and pipecat's cancel of a worker still in start() never finished: the whole file hung
+#: until the sweep's time limit (5 Oct). A start that is quick returns at once; this only bounds a slow one.
+START_S = 300.0
+#: How long a test waits for Parakeet and the turn models it loads itself before a pipeline starts (the same thread
+#: loads them one after the other, below normal priority): bounded here, outside pipecat, so a stuck load fails the
+#: test instead of hanging the file.
+LOAD_S = 600.0
+
+
+async def _run_until(processor: Any, frames: list[Any], until: type, *, grace_s: float = 1.0,
+                     limit_s: float = START_S, **kw: Any) -> tuple[list[Any], list[Any]]:
+    """pipecat's ``run_test`` that ends once ``processor`` has pushed an ``until`` frame (the outcome the test is about:
+    the turn's end, the voice's last audio), ``grace_s`` after it, never sooner than ``frames`` (their own tail sleep
+    included); ``limit_s`` bounds a run whose outcome never comes (then the test's asserts say what is missing). A
+    fixed tail alone failed on a busy PC: the decode and the voice run below normal priority by design and can take
+    longer than any fixed wait (7 Oct)."""
+    from pipecat.frames.frames import EndWorkerFrame
+    from pipecat.observers.base_observer import BaseObserver
+    from pipecat.processors.frame_processor import FrameDirection
+    from pipecat.tests.utils import run_test
+
+    seen = asyncio.Event()
+
+    class Until(BaseObserver):
+        async def on_push_frame(self, data: Any) -> None:
+            if data.source is processor and isinstance(data.frame, until):
+                seen.set()
+
+    async def end_after_outcome() -> None:
+        try:
+            await asyncio.wait_for(seen.wait(), limit_s)
+        except TimeoutError:
+            pass
+        await asyncio.sleep(grace_s)
+        # asks the worker to end nicely: an EndFrame from the source, after whatever is queued
+        await processor.push_frame(EndWorkerFrame(reason="test outcome"), FrameDirection.UPSTREAM)
+
+    ender = asyncio.create_task(end_after_outcome())
+    try:
+        down, up = await run_test(processor, frames_to_send=frames, send_end_frame=False, start_timeout=START_S,
+                                  observers=[Until()], **kw)
+    finally:
+        ender.cancel()
+    return list(down), list(up)
+
 
 # -- choices and settings -----------------------------------------------------------------------------------------
 
@@ -362,7 +409,7 @@ def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path)
     from pipecat.frames.frames import (
         ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame, TranscriptionFrame,
     )
-    from pipecat.tests.utils import SleepFrame, run_test
+    from pipecat.tests.utils import SleepFrame
 
     from yuki.voice.local_models import LocalSpeech
     from yuki.voice.local_stt import ParakeetSTTService
@@ -386,8 +433,13 @@ def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path)
         stt.add_event_handler("on_update", on_update)
         stt.add_event_handler("on_connected", on_connected)
         stt.load_now()
+        # loaded before the words come (this test is about the turn, not a cold load): the decode then fits in the
+        # 6 s after the audio on a busy PC too
+        await asyncio.wrap_future(eng.recognizer())
+        await asyncio.wrap_future(eng.turn_models())
         frames = [SleepFrame(1.0), *_audio_frames(pcm), *_audio_frames(silence), SleepFrame(6.0)]
-        down, up = await run_test(stt, frames_to_send=frames, start_timeout=20)
+        # the run ends 6 s after the turn's proposed end (room for a wrong second end), however long the decode took
+        down, up = await _run_until(stt, frames, ProposedUserStoppedSpeakingFrame, grace_s=6.0)
         return down, up, events
 
     down, up, events = asyncio.run(main())
@@ -408,9 +460,11 @@ def test_parakeet_ends_a_turn_once_with_one_transcript_like_flux(tmp_path: Path)
 @needs_lab
 def test_the_local_voice_speaks_at_the_output_rate_and_falls_back_to_the_plain_voice(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, TTSAudioRawFrame
+    from pipecat.frames.frames import (
+        LLMFullResponseEndFrame, LLMFullResponseStartFrame, LLMTextFrame, TTSAudioRawFrame, TTSStoppedFrame,
+    )
     from pipecat.pipeline.worker import PipelineParams
-    from pipecat.tests.utils import SleepFrame, run_test
+    from pipecat.tests.utils import SleepFrame
 
     from yuki.voice import local_models as lm
     from yuki.voice.local_models import LocalSpeech, ModelFile, ModelSpec
@@ -428,8 +482,8 @@ def test_the_local_voice_speaks_at_the_output_rate_and_falls_back_to_the_plain_v
         tts.load_now()
         frames = [SleepFrame(0.5), LLMFullResponseStartFrame(), LLMTextFrame("Okay, I paused the music for you."),
                   LLMFullResponseEndFrame(), SleepFrame(6.0)]
-        down, _ = await run_test(tts, frames_to_send=frames, start_timeout=20,
-                                 pipeline_params=PipelineParams(audio_out_sample_rate=24_000))
+        down, _ = await _run_until(tts, frames, TTSStoppedFrame,
+                                   pipeline_params=PipelineParams(audio_out_sample_rate=24_000))
         return [f for f in down if isinstance(f, TTSAudioRawFrame)], tts
 
     eng = LocalSpeech().configure(root=[tmp_path, LAB], log=log)
@@ -596,8 +650,8 @@ def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: 
     """A few quiet words at once, while both models still load (a cold wake), make one turn. The volume-gate loss of
     5 Oct (report 86 §3) showed only in the offline session harness; this keeps the plain case covered."""
     import soundfile as sf
-    from pipecat.frames.frames import TranscriptionFrame
-    from pipecat.tests.utils import SleepFrame, run_test
+    from pipecat.frames.frames import ProposedUserStoppedSpeakingFrame, TranscriptionFrame
+    from pipecat.tests.utils import SleepFrame
 
     from yuki.voice.local_models import LocalSpeech
     from yuki.voice.local_stt import ParakeetSTTService
@@ -610,9 +664,15 @@ def test_a_short_request_right_after_the_wake_is_heard_by_a_fresh_vad(tmp_path: 
         stt = ParakeetSTTService(engine=eng)
         stt.load_now()                 # as at a cold wake: both models load while the words come in
         eng.tts("supertonic")
+        # The service's start() waits for its turn models, which load on the engine's one thread right after Parakeet,
+        # so no frame flows before both are loaded anyway: waiting for them here changes nothing this test checks (a
+        # fresh VAD; the voice still loading beside it), and keeps a slow load on a busy PC out of the pipeline's start
+        # bound (7 Oct: under 12 CPU burners the two loads took longer than 300 s, below normal priority by design).
+        await asyncio.wait_for(asyncio.wrap_future(eng.recognizer()), LOAD_S)
+        await asyncio.wait_for(asyncio.wrap_future(eng.turn_models()), LOAD_S)
         frames = [SleepFrame(0.5), *_audio_frames(first), *_audio_frames(np.zeros(16_000 * 4, dtype=np.int16)),
                   SleepFrame(3.0)]
-        down, _ = await run_test(stt, frames_to_send=frames, start_timeout=20)
+        down, _ = await _run_until(stt, frames, ProposedUserStoppedSpeakingFrame, grace_s=3.0)
         return [f for f in down if isinstance(f, TranscriptionFrame)]
 
     heard = asyncio.run(main())

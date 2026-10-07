@@ -2060,9 +2060,15 @@ class MemoryClient:
         inputs = getattr(n, "inputs", None)
         # a check-in card's moment (day_start, followup, ...), as Yuki wrote it: the card's title comes from it
         moment = inputs.get("moment") if isinstance(inputs, dict) and n.trigger == "checkin" else None
+        # a call's keep list (report 76 item 5, yuki.memory.admission): its lines, each answered with recap_keep
+        keep = inputs.get("keep") if isinstance(inputs, dict) and n.trigger == "recap" else None
+        keep = [{"ref": str(k.get("ref")), "text": str(k.get("text") or ""),
+                 "who": "others" if k.get("who") == "others" else "user"} for k in keep or []
+                if isinstance(k, dict) and k.get("ref")] or None
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
                 "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None),
-                "moment": moment, "outcome_at": _iso(getattr(n, "outcome_at", None))}
+                "moment": moment, "outcome_at": _iso(getattr(n, "outcome_at", None)),
+                **({"keep": keep, "head": str(inputs.get("head") or "")} if keep else {})}
 
     def _nudges_config(self) -> Any:
         """The user's ``[nudges]`` table (read only; the service applies the same), defaults when unreadable."""
@@ -2093,6 +2099,88 @@ class MemoryClient:
             return offers.act(self.store, int(nudge_id), enabled=self._nudges_config().offers != "off")
         except Exception as exc:
             return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def recap_keep(self, nudge_id: int, ref: Any, answer: str) -> dict:
+        """The user's answer to one line of a call's keep list (the recap card, yuki.memory.admission): ``keep`` (into
+        memory as said), ``joke`` (kept as a joke of theirs, never a fact), ``not_true`` (stays out) or ``undo`` (the
+        answer taken back). Only a line that card carries is answered (``ref`` ``journal:N`` in its ``keep``). No
+        model, at once. Returns ``{"ok", "ref", "answer", "nature"}``, ``ok`` False with ``why`` (``unknown``,
+        ``not_on_card``, ``already``, ``moved``, ``bad_answer``). A line a re-journal replaced since the card was
+        written is answered on the held fact that took its place (``moved_to``, :func:`yuki.memory.admission.moved_held`);
+        ``moved`` when the re-journal's fact on that line is not held (in memory now, or left out)."""
+        from yuki.memory import admission
+
+        answer = str(answer or "").strip().lower()
+        out: dict[str, Any] = {"ok": False, "ref": str(ref or ""), "answer": answer, "nature": None}
+        if answer not in admission.ANSWERS:
+            return {**out, "why": "bad_answer"}
+        try:
+            n = self.store.nudge(int(nudge_id))
+        except Exception:
+            n = None
+        inputs = getattr(n, "inputs", None) if n is not None else None
+        refs = {str(k.get("ref")) for k in (inputs or {}).get("keep") or [] if isinstance(k, dict)} \
+            if isinstance(inputs, dict) else set()
+        jid = self._journal_id(ref)
+        if n is None:
+            return {**out, "why": "unknown"}
+        if jid is None or f"journal:{jid}" not in refs:
+            return {**out, "why": "not_on_card"}
+        return self._answer_held(jid, answer, out)
+
+    def _answer_held(self, jid: int, answer: str, out: dict[str, Any]) -> dict:
+        """One held fact answered (:meth:`recap_keep`, :meth:`resolve_held`). Review V3: a re-journal since the card or
+        the window row was written replaced the line's held fact; the answer goes to the held fact that took its place,
+        and when that line's new fact is not held there is nothing to answer (``moved``, never "already")."""
+        from yuki.memory import admission
+
+        try:
+            target = admission.moved_held(self.store, jid)
+            done = admission.resolve_held(self.store, target, answer)
+            if done is None and admission.replaced(self.store, target):
+                return {**out, "why": "moved", "error": "I read that again since, and it changed."}
+        except Exception as exc:
+            return {**out, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+        if done is None:
+            return {**out, "why": "already"}
+        return {**out, "ok": True, "ref": f"journal:{jid}", "nature": done["nature"],
+                **({"moved_to": f"journal:{target}"} if target != jid else {})}
+
+    def held_facts(self, reasons: Any = None, days: float | None = None) -> list[dict]:
+        """Facts memory is holding back until the user says yes (yuki.memory.admission), newest first: ``{"ref",
+        "text" (said to the user), "fact", "reason" (call | sensitive), "at" ISO, "call", "who" (user | others: whose
+        line, for a call), "kind" (call | page | message | ...: where it came from), "where", "shown" (``text`` is
+        Yuki's second-person line, not the stored "The user ..." sentence)}``. Dropped ones (judged not meant) are
+        never listed. For a private surface (the window's "Waiting for your yes"); a sensitive one never goes on a
+        corner card. Answer with :meth:`resolve_held`. Read only, never raises."""
+        from yuki.memory import admission
+
+        try:
+            wanted = tuple(reasons) if reasons else (admission.HOLD_CALL, admission.HOLD_SENSITIVE)
+            since = None if days is None else time.time() - float(days) * 86400.0
+            return [{"ref": f"journal:{h.id}", "text": h.shown, "fact": h.fact, "reason": h.reason, "at": _iso(h.at),
+                     "call": f"call:{h.call_id}" if h.call_id is not None else None,
+                     "who": "others" if h.source.get("who") == "others" else "user",
+                     "kind": str(h.source.get("kind") or ""), "where": str(h.source.get("where") or ""),
+                     "app": h.app,
+                     "shown": bool(h.source.get(admission.SHOWN_KEY))}
+                    for h in admission.held_facts(self.store, since=since, reasons=wanted)
+                    if h.reason != admission.HOLD_DROP]
+        except Exception:
+            return []
+
+    def resolve_held(self, ref: Any, answer: str, *, correction_id: int | None = None) -> dict:
+        """The user's explicit answer to a held fact from a private surface (the window): as :meth:`recap_keep`,
+        without a card (``keep`` here is the explicit yes a sensitive fact needs). ``correction_id`` is accepted and
+        ignored (the window's answer path passes one; nothing here queues a correction pass)."""
+        from yuki.memory import admission
+
+        answer = str(answer or "").strip().lower()
+        jid = self._journal_id(ref)
+        out: dict[str, Any] = {"ok": False, "ref": str(ref or ""), "answer": answer, "nature": None}
+        if jid is None or answer not in admission.ANSWERS:
+            return {**out, "why": "bad_answer"}
+        return self._answer_held(jid, answer, out)   # review V3: a row shown before a re-journal
 
     def offer_undo(self, nudge_id: int) -> dict:
         """Undo a card's offer that ran (``todo_add``: the to-do ends as a wrong capture; ``bring_back``: recorded,

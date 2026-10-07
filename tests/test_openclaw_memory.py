@@ -63,6 +63,10 @@ def usage():
                            cache_read_input_tokens=0)
 
 
+#: The admission judge (yuki.memory.admission) admitting every call fact, so these checks see them in the journal.
+ADMIT_ALL = {"verdicts": [{"fact": n, "verdict": "admit", "sensitive": "none", "shown": ""} for n in range(1, 41)]}
+
+
 class ToolClient:
     def __init__(self, answers):
         self.answers = answers
@@ -195,7 +199,7 @@ def test_call_facts_carry_the_users_words_and_describe_says_so(store):
                         final=True)
     answer = {"facts": [{"text": "The user was setting up CLI access with MCP.", "nature": "fact", "importance": 5,
                          "source": 2}], "commitments": [], "questions": []}
-    JournalWorker(store, client=ToolClient({"record_call_side": [answer]}), embedder=StubEmbedder(),
+    JournalWorker(store, client=ToolClient({"record_call_side": [answer], "admit_call_facts": [ADMIT_ALL]}), embedder=StubEmbedder(),
                   log_dir=Path(tempfile.mkdtemp())).run_once()
     [e] = store.journal_between()
     assert e.source["kind"] == "call" and e.source["where"] == "Discord call"

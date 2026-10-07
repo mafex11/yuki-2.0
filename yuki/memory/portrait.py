@@ -131,6 +131,7 @@ from yuki.config import Settings
 from yuki.log.events import _as_plain
 from yuki.log.requests import usage_tokens
 from yuki.memory.journal import HAIKU_MODEL, sanitize_untrusted, user_identity
+from yuki.memory.admission import CONFIRMED_KEY
 from yuki.memory.titles import SHOWN_FIELD as TITLES_SHOWN_FIELD, SUMMARY_FIELD as TITLES_SUMMARY_FIELD
 from yuki.memory.titles import call_lines, fact_label, fact_shown
 from yuki.memory.personality import ASPECT_TITLES, ASPECTS, PERSONALITY_HEADING, nature_mark
@@ -286,6 +287,12 @@ it. A fact that mixes lasting points (their tools, preferences, how they work) w
 as written; rewritten to its lasting points alone, it passes. Numbers are fine where they describe the \
 person's own habits across days (a behaviour or routine pattern), never where they are a tool's meters \
 on one day.
+Personal and sensitive things about the user - their sexuality, a health condition, their own money accounts and \
+what they hold, where their passwords or seed phrases are kept, legal trouble - are a portrait fact only when the \
+user told Yuki themselves (a USER CORRECTION, their answer to Yuki's question, what they said to Yuki, or a \
+journal entry marked THE USER CONFIRMED THIS - they said yes to it when Yuki asked); a page, a chat or a call \
+alone is never enough for these, however plain (report 76: the user had to remove such facts by hand). \
+Their work on such topics (a payments product, a health app) is ordinary work.
 Worked examples (invented):
 - FAILS: "The user's harness rotates across four Claude accounts on Mac and PC. On the evening of \
 2026-08-14, with 15 parallel agents running, the four accounts' combined quota fell to 160% of 400% by \
@@ -1731,8 +1738,10 @@ class PortraitWorker:
         where = j.app + (f" / {j.host}" if j.host else "")
         call = (calls or {}).get(j.id)
         on_call = f" [call: {safe(call, 300)}]" if call else ""
-        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]{on_call}: "
-                f"{safe(j.fact, cap)}")
+        # the user said Keep to it themself (yuki.memory.admission: a held fact's explicit yes, review F6)
+        confirmed = " [THE USER CONFIRMED THIS]" if (getattr(j, "source", None) or {}).get(CONFIRMED_KEY) else ""
+        return (f"J{j.id} {_local(j.at)} {safe(where, 160)} [importance {j.importance}, {_nature_label(j)}]{on_call}"
+                f"{confirmed}: {safe(j.fact, cap)}")
 
     def _ops_message(
         self, *, kind: str, now: float, facts: Sequence[PortraitFact], journal: Sequence[JournalEntry],
