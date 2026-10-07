@@ -268,8 +268,8 @@ _FACT_WORDS = {"file_saved": "file saved", "file_opened": "file opened", "page_r
 def _fact_words(kind: str, row: dict[str, Any], value: Any) -> str:
     if kind == "window_verified":
         return f"a window of {value} in front"
-    if kind == "toggle_state":
-        return f"switched {'on' if str(value).lower() in ('1', 'on', 'true') else 'off'}"
+    if kind == "toggle_state":   # the trace's own words for the state (trace_uia.TOGGLE_WORDS)
+        return {"on": "switched on", "off": "switched off"}.get(str(value).lower(), "switched")
     words = _FACT_WORDS.get(kind, kind)
     if kind in ("file_saved", "file_opened") and row.get("file_ext"):
         words += f" ({row['file_ext']})"
@@ -306,7 +306,9 @@ def facts_of(pieces: Sequence[Piece], links: Sequence[dict[str, Any]]) -> dict[i
             if rid in pastes and r.get("element_key"):
                 open_pastes[(str(r.get("process") or ""), str(r["element_key"]))] = rid
             got = _facts(r)
-            found: list[tuple[str, Any]] = [(k, got[k]) for k in FACT_KINDS if k in got and got[k] not in (None, False)]
+            # a toggle switched off is a fact too (0 is a value, not a missing one)
+            found: list[tuple[str, Any]] = [(k, got[k]) for k in FACT_KINDS
+                                            if k in got and got[k] is not None and got[k] is not False]
             if "field_submitted" in got and r.get("element_key"):
                 if open_pastes.pop((str(r.get("process") or ""), str(r["element_key"])), None) is not None:
                     found.append(("paste_sent", True))
