@@ -1316,7 +1316,8 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
     """Today on the Work page, the same figures as the Day tab (``v``: the day view both read): ``focus`` minutes
     (the Day's Active: at the PC, not full screen) and your ``usual`` by now; the ``longest`` stretch in one app
     (the Day's Longest focus) with the session it was in; ``worked``: the threads of work with the most time today
-    (``[title, minutes, thread ref]``, from today's sessions grouped by the thread their journal entries belong to);
+    (``[title, minutes, thread ref]``, from today's sessions grouped by the thread their journal entries belong to;
+    capC6: a 4th item when the PC checked something got done in it today, :func:`worked_evidence`);
     ``coming``: memory's meetings ahead (``[when words, title]``) and where they were seen."""
     from yuki.ui.window.data import nat_time
 
@@ -1342,11 +1343,40 @@ def work_today(memory: Any, v: Any, sessions: list[dict[str, Any]], board: dict[
             row = mins.setdefault(th["ref"], [th["title"], 0, th["ref"]])
             row[1] += m
         worked = sorted((r for r in mins.values() if r[1] >= 1), key=lambda r: -r[1])[:WORKED_SHOWN]
-    coming = [[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
+        worked_evidence(memory, worked, sessions, threads, now)
+    coming =[[ahead_words(m["at"], bool(m.get("all_day")), now), m.get("title") or ""] for m in board.get("meetings") or []][:3]
     seen = list(dict.fromkeys(a for m in (board.get("meetings") or [])[:3] for a in m.get("seen") or []))
     return {"focus": focus, "usual": round(usual) if usual is not None else None, "longest": longest,
             "worked": worked, "coming": coming,
             "coming_seen": f"seen on your screen in {_and(seen)}" if seen else ""}
+
+
+def worked_evidence(memory: Any, worked: list[list[Any]], sessions: list[dict[str, Any]], threads: list[Any],
+                    now: float) -> None:
+    """capC6 (report 78 §12, C6): each Worked on today row gains, as its 4th item, the latest thing the PC checked got
+    done inside that thread's sessions today (``{"text": "you saved a file (.pptx) at 4 PM", "goal", "ref"
+    ("task:12"), "action" (the outcome's action id)}``); a row with none keeps its three items. Only tasks memory calls
+    learnable (a recorded outcome, never unclear, never one the user said was not theirs); the ids stay in the data,
+    the page shows words only. Never a card, never spoken. One small read (memory's ``done_evidence``)."""
+    fn = getattr(memory, "done_evidence", None)
+    if not callable(fn) or not worked:
+        return
+    timed = [s for s in sessions if s.get("start_at") and s.get("end_at")]
+    if not timed:
+        return
+    day0 = min(float(s["start_at"]) for s in timed)
+    evidence = _safe(lambda: fn(day0, now + 1.0), []) or []
+    spans: dict[str, list[tuple[float, float]]] = {}
+    for s, th in zip(timed, threads or []):
+        if th:
+            spans.setdefault(th["ref"], []).append((float(s["start_at"]), float(s["end_at"])))
+    for row in worked:
+        inside = [e for e in evidence if isinstance(e, dict) and e.get("at") is not None and e.get("words")
+                  and any(a <= float(e["at"]) <= b for a, b in spans.get(row[2], []))]
+        if inside:
+            e = max(inside, key=lambda x: float(x["at"]))
+            row.append({"text": f"{e['words']} at {e.get('clock') or hm(e['at'])}", "goal": e.get("goal") or "",
+                        "ref": f"task:{int(e['task'])}", "action": int(e["action"])})
 
 
 def dates_said(text: str, now: float) -> str:
