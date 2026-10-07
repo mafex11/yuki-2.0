@@ -12,7 +12,10 @@ ago is never passed (it keeps its code-only links, transitions and counts).
 
 **Code pre-cuts.** The window's trace rows are cut into pieces at pauses of :data:`PIECE_GAP_S` with no input from
 the user; a link (:mod:`yuki.memory.trace_links`: a copy and its paste, a file saved and opened, a link and its page)
-never crosses a cut: the pieces between its two ends become one.
+whose two ends have at most :data:`LINK_MERGE_CUTS` pause between them keeps them in one piece. A link further apart
+merges nothing (it would glue the other tasks done in between into one piece): it is shown to the model as a LINKS
+line joining its two pieces, which may then form one task with the pieces between them left separate (report 98,
+"Second verification", V3).
 
 **One Haiku call** (:data:`TASK_PROMPT`, its own forced tool ``record_tasks``, worked examples, no word lists) reads
 code-built step lines (``a812 10:41:07 chatter · click Button "Attach" -> a dialog came up``; a name only as the
@@ -22,8 +25,8 @@ facts as context, and the user's own corrections of earlier tasks as worked exam
 task (they may interleave), the goal in plain words (second person), the outcome as the id of one recorded fact
 (report 78 §5.3), and detours as action id ranges.
 
-**Code checks** every answer: pieces exist and belong to one task each, a goal is plain words of the right size that
-cites no ids, an outcome is a fact recorded inside that task (not in a detour, not in another task's pieces), detours
+**Code checks** every answer: pieces exist and belong to one task each, a goal is plain words of the right size (a
+shown id in its machine form is taken out of it), an outcome is a fact recorded inside that task (not in a detour, not in another task's pieces), detours
 lie inside the task. A task whose outcome is none of its recorded facts is ``unclear``: it can be shown as a past
 example, never become a trial or a way (:func:`learnable`; C4's demo learner reads it).
 
@@ -62,6 +65,8 @@ DAILY_BUDGET_USD = 0.40
 #: A window whose pass failed is tried again after this long, this many times at most.
 RETRY_AFTER_S = 1800.0
 MAX_TRIES = 3
+#: A link merges the stretches of its two ends into one piece when at most this many pauses lie between them.
+LINK_MERGE_CUTS = 1
 #: Trace rows read from one window at most, and step lines shown at most (a long window's pieces are shortened in
 #: the middle; the lines with a recorded outcome are always kept).
 MAX_ROWS = 6_000
@@ -92,8 +97,9 @@ did, what each was for, and whether it got done. Yuki, their assistant, uses thi
 and how, so it never has to guess.
 
 You get, between the data markers:
-- PIECES: the stretch cut by code at pauses of 2 minutes or more. A copy and its paste, a file saved and opened \
-again, or a link and the page it opened always stay inside one piece. Each piece has an id (p1, p2 ...), its time \
+- PIECES: the stretch cut by code at pauses of 2 minutes or more. A copy and its paste, a file saved in one app and \
+opened in another, or a link and the page it opened stay inside one piece when at most one pause lies between them. \
+Each piece has an id (p1, p2 ...), its time \
 span and apps, then its step lines, one action each: "a812 10:41:07 chatter · click Button \\"Attach\\" -> a dialog \
 came up". A button or field is named only when its name may be kept; otherwise it shows its role and place ("an \
 unnamed ListItem (item 3 in a List)"). Typing shows only how many characters, never the text. "... 12 more actions" \
@@ -102,6 +108,9 @@ stands for steps left out of a long piece.
 step - a file saved or opened, a new page came up, a window of an app came to the front, a field the user typed or \
 pasted into was sent and emptied ("field sent"), a switch turned on or off, an item selected, a terminal command \
 that worked, something copied elsewhere pasted and sent.
+- LINKS (sometimes): such a copy and paste, file or link whose two ends are further apart, in two pieces: "p2 a120 \
+-> p6 a301: copied, then pasted". The two linked pieces are usually one task; the pieces between them may be other \
+tasks.
 - JOURNAL (sometimes): short facts about what was on the screen then. Context only; never an outcome.
 - CORRECTIONS (sometimes): how the user corrected earlier answers. Learn from them.
 
@@ -223,7 +232,10 @@ class Fact:
 def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
            gap_s: float = PIECE_GAP_S) -> list[Piece]:
     """The window cut into pieces at pauses of ``gap_s`` with no input from the user (any of their rows counts as
-    input, hovers too), then merged so no link (``{"from", "to"}`` action ids) crosses a cut. A pause is measured from
+    input, hovers too), then merged so no link (``{"from", "to"}`` action ids) crosses a single cut: a link's two
+    stretches are merged when at most :data:`LINK_MERGE_CUTS` pause lies between them. A link further apart (a copy at
+    9 and its paste at 11, with other work between) merges nothing: it would glue hours of other tasks into one piece,
+    which the model can no longer split; :func:`cross_links` shows it to the model instead. A pause is measured from
     the end of the last input (a typing run that went on for minutes is input all along). Pieces keep only the rows a
     task may be built from (:func:`kept`); pieces left with none are dropped; ids ``p1``... in time order."""
     users = [r for r in rows if is_user(r)]
@@ -242,6 +254,8 @@ def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
         if a is None or b is None:
             continue
         lo, hi = min(a, b), max(a, b)
+        if hi - lo > LINK_MERGE_CUTS:
+            continue                                         # far apart: a LINKS line, not one piece
         reach[lo] = max(reach[lo], hi)
     merged: list[list[dict[str, Any]]] = []
     i = 0
@@ -260,6 +274,22 @@ def precut(rows: Sequence[dict[str, Any]], links: Sequence[dict[str, Any]], *,
             continue
         pieces.append(Piece(f"p{len(pieces) + 1}", float(part[0]["at"]), max(row_end(r) for r in part), keep))
     return pieces
+
+
+_LINK_WORDS = {"clipboard": "copied, then pasted", "file": "saved, then opened", "url": "a link, then its page"}
+
+
+def cross_links(pieces: Sequence[Piece], links: Sequence[dict[str, Any]]) -> list[str]:
+    """The links whose two ends are in two pieces (too far apart to merge, :func:`precut`), as lines for the model:
+    ``"p2 a120 -> p6 a301: copied, then pasted"``."""
+    where = {int(r["id"]): p.pid for p in pieces for r in p.rows}
+    out = []
+    for link in sorted(links, key=lambda x: (int(x["from"]), int(x["to"]))):
+        a, b = where.get(int(link["from"])), where.get(int(link["to"]))
+        if a is None or b is None or a == b:
+            continue
+        out.append(f"{a} a{int(link['from'])} -> {b} a{int(link['to'])}: {_LINK_WORDS.get(link.get('kind'), 'linked')}")
+    return out
 
 
 _FACT_WORDS = {"file_saved": "file saved", "file_opened": "file opened", "page_reached": "new page",
@@ -549,17 +579,17 @@ def _aid(value: Any) -> int | None:
 
 
 def clean_goal(text: Any, ids: set[str]) -> str | None:
-    """A goal kept as written (tidied), or None: empty, outside :data:`GOAL_CHARS` / :data:`GOAL_WORDS`, or citing one
-    of the shown ids (a machine id, compared word by word)."""
+    """A goal kept as written (tidied), or None: empty, or outside :data:`GOAL_CHARS` / :data:`GOAL_WORDS`. A word
+    that is one of the shown ids in its exact machine form (``a812``, ``f3``, ``p2``: lower case, as shown) is taken
+    out of the goal, not the task dropped; "the F1 race" or "the P2 ticket" are words, never an id."""
     goal = " ".join(str(text or "").split()).strip().strip("\"'").strip()
     if goal.endswith(".") and not goal.endswith(".."):
         goal = goal[:-1].rstrip()
+    goal = " ".join(w for w in goal.split() if w.strip(".,;:()[]{}\"'") not in ids)
     if not goal or len(goal) > GOAL_CHARS:
         return None
     words = goal.split()
     if not GOAL_WORDS[0] <= len(words) <= GOAL_WORDS[1]:
-        return None
-    if any(w.strip(".,;:()[]{}\"'").lower() in ids for w in words):
         return None
     return goal
 
@@ -569,7 +599,7 @@ def check(tool_input: Any, pieces: Sequence[Piece], facts: dict[int, list[Fact]]
     out = Checked()
     by_pid = {p.pid: p for p in pieces}
     all_facts = {f.fid: f for fs in facts.values() for f in fs}
-    ids = {p.pid.lower() for p in pieces} | {f.lower() for f in all_facts} | {
+    ids = {p.pid for p in pieces} | set(all_facts) | {
         f"a{int(r['id'])}" for p in pieces for r in p.rows}
     used: set[str] = set()
     items = (tool_input or {}).get("tasks") if isinstance(tool_input, dict) else None
@@ -744,6 +774,9 @@ class TaskPass:
         self.budget_usd = float(budget_usd)
         self.model = model
         self._refused_day: str | None = None
+        #: ``{window start: day}``: windows whose call was refused by its estimate today; not prepared again until
+        #: the day changes (today's spend only grows, so the same window would only be refused again).
+        self._too_big: dict[float, str] = {}
         #: Why the last :meth:`run_once` stopped before its windows were done (the gate closed), or None.
         self.stopped: str | None = None
 
@@ -804,7 +837,7 @@ class TaskPass:
     # -- one window ------------------------------------------------------------------------------------------------
 
     def message(self, window: TaskWindow, pieces: Sequence[Piece], lines: dict[str, list[str]],
-                nonce: str, *, now: float) -> str:
+                nonce: str, *, now: float, links: Sequence[dict[str, Any]] = ()) -> str:
         from yuki.memory.journal import sanitize_untrusted
 
         def safe(value: Any, cap: int) -> str:
@@ -817,6 +850,10 @@ class TaskPass:
             parts.append(f"{p.pid} {datetime.fromtimestamp(p.start):%H:%M}-{datetime.fromtimestamp(p.end):%H:%M} "
                          f"[{safe(', '.join(p.apps[:6]), 120)}]:")
             parts += [safe(line, LINE_CHARS + 40) for line in lines.get(p.pid, [])]
+        far = cross_links(pieces, links)
+        if far:
+            parts.append("LINKS (two ends in two pieces):")
+            parts += [safe(line, 120) for line in far[:60]]
         journal = self._journal(window, safe)
         if journal:
             parts.append("JOURNAL (what was on screen; context only):")
@@ -866,7 +903,8 @@ class TaskPass:
         now = time.time() if now is None else float(now)
         res = PassResult(window)
         ok, spent = self.room(now)
-        if not ok:
+        day = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+        if not ok or self._too_big.get(round(window.start, 1)) == day:
             return self._refuse(window, spent, now)
         try:
             rows, links, pieces, facts = self.prepare(window)
@@ -879,9 +917,10 @@ class TaskPass:
                 return res
             lines = step_lines(self.store, pieces, facts)
             nonce = uuid.uuid4().hex.upper()
-            message = self.message(window, pieces, lines, nonce, now=now)
+            message = self.message(window, pieces, lines, nonce, now=now, links=links)
             ok, spent = self.room(now, len(TASK_PROMPT) + len(message))
             if not ok:
+                self._too_big = {round(window.start, 1): day}     # only today's matter
                 return self._refuse(window, spent, now)
             res.run_id = self._start_run(window, now)
             from yuki.memory.store import PortraitRunStats
@@ -1099,9 +1138,17 @@ def correct_task(store: Any, task_id: int, verdict: str, words: str = "", *,
                          " goal_ciphertext = ?, vec_ciphertext = NULL, embed_model = NULL, updated_at = ? WHERE id = ?",
                          (verdict, now, model_goal, store._enc(text), now, int(task_id)))
             return {"ok": True, "verdict": verdict, "goal": text}
+        fam = conn.execute("SELECT family_id FROM ui_tasks WHERE id = ?", (int(task_id),)).fetchone()["family_id"]
         conn.execute("UPDATE ui_tasks SET user_verdict = ?, verdict_at = ?, model_goal_ciphertext = ?,"
-                     " goal_ciphertext = ?, updated_at = ? WHERE id = ?",
+                     " goal_ciphertext = ?, family_id = NULL, updated_at = ? WHERE id = ?",
                      (verdict, now, model_goal, model_goal, now, int(task_id)))
+        # a rejected task leaves its family at once: the usual path the brain is shown never counts it, even
+        # before the next idle refresh (a light rebuild of one family from its kept routes)
+        from yuki.memory import trace_families
+
+        trace_families.drop_member(conn, int(task_id))
+        if fam is not None:
+            trace_families.rebuild(conn, store, int(fam), now=now)
         return {"ok": True, "verdict": verdict, "goal": store._dec(model_goal) if model_goal else ""}
 
     try:

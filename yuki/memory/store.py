@@ -3123,6 +3123,8 @@ MIGRATIONS: tuple[str, ...] = (
     # - ui_families: tasks with the same goal and route: a short label (encrypted), the usual path and its branches
     #   (element keys and machine fields only, never names), the centroid of the goals' embeddings (encrypted).
     #   Deleted after 90 days unused. label_task: the task its label was taken from (a forget of that task relabels).
+    #   path_n: how many routes the usual path was built from (at most 12; its steps are counted against that).
+    #   AUTOINCREMENT, like ui_tasks: a forget's undo puts a family back under its own id, never over a newer one.
     # - ui_family_members: each task counted in a family, kept as its route (element keys and machine fields only, no
     #   goal, no names), apps, span and the goal's embedding (encrypted), so a family keeps its count and usual path
     #   after its tasks expire at 30 days (they are kept 90 days, like the family; a forget or the user's rejection
@@ -3173,7 +3175,7 @@ MIGRATIONS: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS ui_task_actions_task ON ui_task_actions(task_id);
     CREATE TABLE IF NOT EXISTS ui_families (
-        id               INTEGER PRIMARY KEY,
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
         label_ciphertext TEXT,
         n_tasks          INTEGER NOT NULL DEFAULT 0,
         apps             TEXT,
@@ -3184,7 +3186,8 @@ MIGRATIONS: tuple[str, ...] = (
         embed_model      TEXT,
         last_at          REAL,
         updated_at       REAL,
-        label_task       INTEGER
+        label_task       INTEGER,
+        path_n           INTEGER
     );
     CREATE TABLE IF NOT EXISTS ui_family_members (
         task_id          INTEGER PRIMARY KEY,

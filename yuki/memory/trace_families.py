@@ -179,9 +179,11 @@ def build_path(routes: Sequence[list[tuple[str, dict[str, Any], float]]]) -> tup
     return nodes, sorted(branches.values(), key=lambda b: (-b["n"], b["after"]))
 
 
-def usual(nodes: Sequence[dict[str, Any]], n_tasks: int) -> list[dict[str, Any]]:
-    """The usual path: the backbone steps most of the family's tasks took (at least half, and at least 2)."""
-    need = max(2, math.ceil(n_tasks / 2))
+def usual(nodes: Sequence[dict[str, Any]], n_routes: int) -> list[dict[str, Any]]:
+    """The usual path: the backbone steps most of the routes it was built from took (at least half, and at least 2).
+    ``n_routes`` is how many routes :func:`build_path` merged (the latest :data:`PATH_TASKS` at most), never the
+    family's whole count: a node's count can never pass the routes it was counted over."""
+    need = max(2, math.ceil(n_routes / 2))
     return [nd for nd in nodes if int(nd.get("n") or 0) >= need]
 
 
@@ -272,8 +274,8 @@ def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None
     dims = Counter(v.shape for _m, v in vecs).most_common(1)
     vecs = [(m, v) for m, v in vecs if dims and v.shape == dims[0][0]]
     centre = np.mean([v for _m, v in vecs], axis=0) if vecs else None
-    old = conn.execute("SELECT path_keys, variants_keys, label_ciphertext, label_task FROM ui_families WHERE id = ?",
-                       (int(fid),)).fetchone()
+    old = conn.execute("SELECT path_keys, variants_keys, label_ciphertext, label_task, path_n FROM ui_families WHERE"
+                       " id = ?", (int(fid),)).fetchone()
     live = {int(r["id"]): r["goal_ciphertext"] for r in conn.execute(
         "SELECT id, goal_ciphertext FROM ui_tasks WHERE family_id = ? AND (user_verdict IS NULL OR user_verdict NOT IN"
         " ('not_one', 'not_mine'))", (int(fid),)).fetchall()}
@@ -289,15 +291,17 @@ def rebuild(conn: sqlite3.Connection, store: Any, fid: int, *, now: float | None
     if path or old is None or not old["path_keys"] or old["path_keys"] == "[]":
         chosen = members[:PATH_TASKS] if path else members[:1]
         nodes, branches = build_path([_route_of(m) for m in chosen])
+        path_n = len(chosen)
     else:
         nodes, branches = json.loads(old["path_keys"]), json.loads(old["variants_keys"] or "[]")
+        path_n = int(old["path_n"] or 0) or min(len(members), PATH_TASKS)
     conn.execute(
         "UPDATE ui_families SET label_ciphertext = ?, label_task = ?, n_tasks = ?, apps = ?, path_keys = ?,"
-        " variants_keys = ?, vec_ciphertext = ?, last_at = ?, updated_at = ? WHERE id = ?",
+        " variants_keys = ?, vec_ciphertext = ?, last_at = ?, updated_at = ?, path_n = ? WHERE id = ?",
         (label, label_task, len(members), json.dumps([a for a, _n in apps.most_common(6)]),
          json.dumps(nodes, separators=(",", ":")), json.dumps(branches[:12], separators=(",", ":")),
          _blob(store, centre) if centre is not None else None, max(float(m["ended_at"]) for m in members), now,
-         int(fid)))
+         path_n, int(fid)))
     return "rebuilt"
 
 
@@ -505,7 +509,7 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
         in_play = {str(a).casefold() for a in apps_in_play or () if a}
         best, best_cos = None, -1.0
         for f in store._query("SELECT id, label_ciphertext, n_tasks, apps, path_keys, variants_keys, vec_ciphertext,"
-                              " last_at FROM ui_families WHERE vec_ciphertext IS NOT NULL AND n_tasks > 0"):
+                              " last_at, path_n FROM ui_families WHERE vec_ciphertext IS NOT NULL AND n_tasks > 0"):
             fv = _vec(store, f["vec_ciphertext"])
             if fv is None or fv.shape != q.shape:
                 continue
@@ -519,6 +523,7 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
             return empty
         out: dict[str, Any] = {"path": None, "example": None}
         n_tasks = int(best["n_tasks"] or 0)
+        n_routes = int(best["path_n"] or 0) or min(n_tasks, PATH_TASKS)   # what the path's counts are out of
         nodes = json.loads(best["path_keys"] or "[]")
         branches = json.loads(best["variants_keys"] or "[]")
         label = store._dec(best["label_ciphertext"]) if best["label_ciphertext"] else ""
@@ -531,7 +536,7 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
                                                                                                 ex_route]
         names = _names(store, keys)
         if n_tasks >= 2:
-            steps = [w for w in (step_words(nd["k"], nd, names) for nd in usual(nodes, n_tasks)) if w]
+            steps = [w for w in (step_words(nd["k"], nd, names) for nd in usual(nodes, n_routes)) if w]
             n_steps, chars = (DETAIL_PATH_STEPS, DETAIL_PATH_CHARS) if detail else (PATH_STEPS, PATH_CHARS)
             steps = _fit(steps, n_steps, chars)
             if steps:
@@ -544,7 +549,7 @@ def hints(store: Any, query_vec: Any, apps_in_play: Sequence[str] = (), *, floor
                         bw = [w for w in (step_words(k, a, names) for k, a in zip(b.get("keys") or [],
                                                                                   b.get("attrs") or [])) if w]
                         if bw:
-                            worded.append(_clip(f"{int(b.get('n') or 0)} of {n_tasks} times, "
+                            worded.append(_clip(f"{int(b.get('n') or 0)} of the last {n_routes} times, "
                                                 f"{'at the start' if int(b.get('after', -1)) < 0 else 'after step ' + str(int(b['after']) + 1)}"
                                                 f": " + "; ".join(bw), 240))
                     path["variants"] = worded

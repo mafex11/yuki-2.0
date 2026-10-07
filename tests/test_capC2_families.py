@@ -128,7 +128,7 @@ def test_relevant_gives_the_usual_path_and_one_example_worded_from_kept_names(st
     assert ex["steps"][0] == "in chatter: press Ctrl+K" and ex["when"].endswith(("AM", "PM"))
     assert len(path["steps"]) <= F.PATH_STEPS and sum(len(s) + 2 for s in path["steps"]) <= F.PATH_CHARS
     more = _brain(store, "send the weekly report to the team", detail=True)
-    assert more["path"]["variants"] == ["1 of 3 times, at the start: in chatter: press Ctrl+K"]
+    assert more["path"]["variants"] == ["1 of the last 3 times, at the start: in chatter: press Ctrl+K"]
     assert _brain(store, "water the tomato plants")["path"] is None                 # nothing near: no path
     assert P.relevant(store, query_vec=vec("send the weekly report"), apps_in_play=["chatter"],
                       go_tos=False).get("path") is None                             # the talker: none

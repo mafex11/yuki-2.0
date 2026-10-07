@@ -124,8 +124,11 @@ def test_precut_at_two_minute_pauses_keeps_link_chains_in_one_piece(store):
             {"id": 7, "at": 1500.0, "source": "user", "kind": "click", "resolved": "point"}]
     cut = T.precut(rows, [])
     assert [sorted(p.ids) for p in cut] == [[1, 2, 3], [4], [5], [6], [7]]           # a 2-minute pause cuts
-    chained = T.precut(rows, [{"from": 4, "to": 6, "kind": "clipboard"}])
-    assert [sorted(p.ids) for p in chained] == [[1, 2, 3], [4, 5, 6], [7]]           # the chain keeps its pieces
+    chained = T.precut(rows, [{"from": 4, "to": 5, "kind": "clipboard"}])
+    assert [sorted(p.ids) for p in chained] == [[1, 2, 3], [4, 5], [6], [7]]         # one pause between: one piece
+    far = T.precut(rows, [{"from": 4, "to": 6, "kind": "clipboard"}])
+    assert [sorted(p.ids) for p in far] == [[1, 2, 3], [4], [5], [6], [7]]           # two pauses: a LINKS line
+    assert T.cross_links(far, [{"from": 4, "to": 6, "kind": "clipboard"}]) == ["p2 a4 -> p4 a6: copied, then pasted"]
     # a hover is still the user's input: it keeps two clicks 3 minutes apart in one piece
     with_hover = T.precut([rows[0], {"id": 9, "at": 100.0, "source": "user", "kind": "hover", "resolved": "point"},
                            {"id": 10, "at": 200.0, "source": "user", "kind": "click", "resolved": "point"}], [])
@@ -192,7 +195,7 @@ def test_outcomes_only_from_facts_recorded_inside_the_task(store):
 def test_goals_pieces_and_detours_are_checked(store):
     ids, _w, pieces, facts = prepared(store)
     checked = T.check({"tasks": [
-        {"pieces": ["p1"], "goal": f"You pasted at a{ids['paste']} into the chat", "outcome": "none"},   # an id
+        {"pieces": ["p1"], "goal": f"a{ids['paste']} p1 f1", "outcome": "none"},                       # ids only
         {"pieces": ["p2"], "goal": "Saved", "outcome": "none"},                                          # too short
         {"pieces": ["p3", "p9"], "goal": "You ran your build in the terminal", "outcome": "none"},
         {"pieces": ["p3"], "goal": "You ran it again in the terminal", "outcome": "none"},               # p3 taken
@@ -209,6 +212,20 @@ def test_goals_pieces_and_detours_are_checked(store):
                   "outside the task"):
         assert words in reasons
     assert T.check("not a dict", pieces, facts).drafts == [] and T.check(None, pieces, facts).drafts == []
+
+
+def test_a_goal_keeps_its_task_an_id_in_machine_form_is_taken_out_and_f1_or_p2_are_words(store):
+    # second verification V9: a goal naming "the F1 race" or "the P2 ticket" is words, never an id; a shown id in its
+    # machine form is taken out of the goal and the task is kept
+    ids, _w, pieces, facts = prepared(store)
+    checked = T.check({"tasks": [
+        {"pieces": ["p1"], "goal": "You checked the F1 race times in the chat", "outcome": "none"},
+        {"pieces": ["p2"], "goal": f"You filed the P2 ticket as a note (a{ids['save']})", "outcome": "none"},
+        {"pieces": ["p3"], "goal": "You ran your build p3 in the terminal", "outcome": "none"}]}, pieces, facts)
+    assert [d.goal for d in checked.drafts] == ["You checked the F1 race times in the chat",
+                                                "You filed the P2 ticket as a note",
+                                                "You ran your build in the terminal"]
+    assert checked.rejected == []
 
 
 # -- the pass ------------------------------------------------------------------------------------------------------

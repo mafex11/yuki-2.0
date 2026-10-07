@@ -8,9 +8,10 @@ Two things code works out from the trace rows as they come, with no model and no
   set. The copy must be the *latest* copy row at or before the paste: Windows' sequence number only grows within one
   boot, so a later copy row with another number means the clipboard changed since, and an equal number after a
   restart can never be joined to a copy from before it (a later copy always sits between them).
-* ``file``: a file opened whose path digest is that of a file saved earlier (``file_save``). A download is the
-  browser's save of the file, so "a download then an open" is the same join.
-* ``url``: a click or invoke on a ``Hyperlink`` in one app, then within :data:`URL_S` a browser (another app) in
+* ``file``: a file opened whose path digest is that of a file saved earlier (``file_save``) in another app. A
+  download is the browser's save of the file, so "a download then an open" is the same join.
+* ``url``: a click or invoke on a ``Hyperlink`` (its identity taken, never ``stale``) in one app, then within
+  :data:`URL_S` a browser (another app) in
   front with a new page: its ``nav`` or ``switch`` row carries ``page_reached``, or the switch row's page differs from
   that app's page before. One link per hyperlink press.
 
@@ -106,13 +107,15 @@ def _clipboard_link(conn: sqlite3.Connection, r: Any) -> tuple[int, int, str, fl
 
 
 def _file_link(conn: sqlite3.Connection, r: Any) -> tuple[int, int, str, float] | None:
+    """A save in app A and a later open of the same path digest in app B (report 78 §5.1: a link joins two apps; a
+    file saved and opened again in one app is that app's own steps)."""
     if r["kind"] != "file_open" or not r["file_digest"] or not _user(r):
         return None
     save = conn.execute(
-        "SELECT id, at, source FROM ui_actions INDEXED BY ui_actions_file WHERE file_digest = ? AND kind = 'file_save'"
-        " AND at < ? AND at >= ? AND id != ? ORDER BY at DESC LIMIT 1",
+        "SELECT id, at, source, process FROM ui_actions INDEXED BY ui_actions_file WHERE file_digest = ? AND kind ="
+        " 'file_save' AND at < ? AND at >= ? AND id != ? ORDER BY at DESC LIMIT 1",
         (r["file_digest"], float(r["at"]), float(r["at"]) - LOOKBACK_S, int(r["id"]))).fetchone()
-    if save is None or not _user(save):
+    if save is None or not _user(save) or str(save["process"] or "") == str(r["process"] or ""):
         return None
     return int(save["id"]), int(r["id"]), "file", round(float(r["at"]) - float(save["at"]), 2)
 
@@ -137,7 +140,8 @@ def _url_link(conn: sqlite3.Connection, r: Any, taken: set[int]) -> tuple[int, i
         return None
     press = conn.execute(
         "SELECT id, at, process, source FROM ui_actions INDEXED BY ui_actions_at WHERE at <= ? AND at >= ?"
-        " AND role = 'Hyperlink' AND kind IN ('click', 'dclick', 'invoke') AND process != ? ORDER BY at DESC LIMIT 1",
+        " AND role = 'Hyperlink' AND kind IN ('click', 'dclick', 'invoke') AND process != ? AND resolved IN"
+        " ('point', 'event', 'snapshot', 'focus') ORDER BY at DESC LIMIT 1",
         (float(r["at"]), float(r["at"]) - URL_S, r["process"])).fetchone()
     if press is None or not _user(press) or int(press["id"]) in taken:
         return None
@@ -198,37 +202,67 @@ def _median(gaps: Sequence[float]) -> float | None:
     return round(float(statistics.median(gaps)), 3) if gaps else None
 
 
-def add_pairs(conn: sqlite3.Connection, pairs: Iterable[tuple[str, str, str, float, float]], sign: int = 1) -> int:
-    """Add (``sign`` 1) or take away (``sign`` -1, a forget) transition pairs. Returns the rows changed."""
+def _entries(raw: Any) -> list[list[Any]]:
+    """A transition's kept uses ``[[gap_s, at], ...]`` (the last :data:`GAPS_KEPT`, oldest first)."""
+    try:
+        got = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    out: list[list[Any]] = []
+    for g in got if isinstance(got, list) else []:
+        try:
+            if isinstance(g, (list, tuple)) and g:
+                out.append([float(g[0]), float(g[1]) if len(g) > 1 and g[1] is not None else None])
+            else:
+                out.append([float(g), None])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def add_pairs(conn: sqlite3.Connection, pairs: Iterable[tuple[str, str, str, float, float]], sign: int = 1, *,
+              before: float | None = None) -> int:
+    """Add (``sign`` 1) or take away (``sign`` -1, a forget) transition pairs. Each transition keeps its last uses
+    (gap and time, :data:`GAPS_KEPT`), so a take-back recomputes the median and the last use from what is left;
+    ``before`` (a forget: the start of the stretch replayed) bounds the last use when none of the kept times is left.
+    Returns the rows changed."""
     changed = 0
     for proc, a, b, gap, at in pairs:
         row = conn.execute("SELECT n, gaps, last_at FROM ui_transitions WHERE process = ? AND from_key = ? AND"
                            " to_key = ?", (proc, a, b)).fetchone()
-        try:
-            gaps = [float(g) for g in json.loads(row["gaps"] or "[]")] if row is not None else []
-        except (TypeError, ValueError):
-            gaps = []
+        uses = _entries(row["gaps"]) if row is not None else []
         if sign > 0:
-            gaps = (gaps + [float(gap)])[-GAPS_KEPT:]
+            uses = sorted(uses + [[float(gap), float(at)]], key=lambda u: u[1] if u[1] is not None else 0.0)
+            uses = uses[-GAPS_KEPT:]
             if row is None:
                 conn.execute("INSERT INTO ui_transitions(process, from_key, to_key, n, median_gap_s, gaps, last_at)"
-                             " VALUES (?,?,?,?,?,?,?)", (proc, a, b, 1, _median(gaps), json.dumps(gaps), float(at)))
+                             " VALUES (?,?,?,?,?,?,?)", (proc, a, b, 1, _median([u[0] for u in uses]),
+                                                         json.dumps(uses), float(at)))
             else:
                 conn.execute("UPDATE ui_transitions SET n = n + 1, median_gap_s = ?, gaps = ?, last_at = max(coalesce("
                              "last_at, 0), ?) WHERE process = ? AND from_key = ? AND to_key = ?",
-                             (_median(gaps), json.dumps(gaps), float(at), proc, a, b))
+                             (_median([u[0] for u in uses]), json.dumps(uses), float(at), proc, a, b))
             changed += 1
             continue
         if row is None:
             continue
-        if float(gap) in gaps:
-            gaps.remove(float(gap))
+        hit = next((i for i, u in enumerate(uses) if u[1] is not None and abs(u[1] - float(at)) < 1e-6
+                    and abs(u[0] - float(gap)) < 1e-6), None)
+        if hit is None:
+            hit = next((i for i, u in enumerate(uses) if u[1] is None and abs(u[0] - float(gap)) < 1e-6), None)
+        if hit is not None:
+            uses.pop(hit)
         n = int(row["n"] or 0) - 1
         if n <= 0:
             conn.execute("DELETE FROM ui_transitions WHERE process = ? AND from_key = ? AND to_key = ?", (proc, a, b))
         else:
-            conn.execute("UPDATE ui_transitions SET n = ?, median_gap_s = ?, gaps = ? WHERE process = ? AND"
-                         " from_key = ? AND to_key = ?", (n, _median(gaps), json.dumps(gaps), proc, a, b))
+            times = [u[1] for u in uses if u[1] is not None]
+            last_at = max(times) if times else row["last_at"]
+            if not times and before is not None and last_at is not None:
+                last_at = min(float(last_at), float(before))
+            conn.execute("UPDATE ui_transitions SET n = ?, median_gap_s = ?, gaps = ?, last_at = ? WHERE process = ?"
+                         " AND from_key = ? AND to_key = ?",
+                         (n, _median([u[0] for u in uses]), json.dumps(uses), last_at, proc, a, b))
         changed += 1
     return changed
 

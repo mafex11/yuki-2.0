@@ -248,6 +248,67 @@ def _purge_c2(conn: sqlite3.Connection, now: float, raw_cut: float, el_cut: floa
     return {k: v for k, v in out.items() if v}
 
 
+#: A typing run or a drag lasts at most this long (s): how far back a pause's check looks for a row still going on.
+_LONGEST_RUN_S = 6 * 3600.0
+
+
+def _stretch(conn: sqlite3.Connection, lo: float, hi: float, cursor: int) -> tuple[float, float | None]:
+    """The stretch of the user's input around ``lo``..``hi`` that a transition can span: from the 2-minute pause
+    before ``lo`` to the one after ``hi`` (``trace_links.transition_pairs`` clears every app's last element at such a
+    pause, so a replay from a pause is exact). Returns ``(start, end)``; ``end`` None when the stretch runs to the
+    newest row folded (``cursor``). Only the user's rows count, as in the fold."""
+    from yuki.memory import trace_links
+
+    users = tuple(trace_links.USER_SOURCES)
+    um = ",".join("?" * len(users))
+    gap = trace_links.PIECE_GAP_S
+
+    def input_until(t: float) -> float | None:
+        """The end of the user's last input before ``t`` (a long run counts all along)."""
+        got = conn.execute(f"SELECT max(max(at, coalesce(ended_at, at))) FROM ui_actions WHERE at < ? AND at >= ?"
+                           f" AND id <= ? AND source IN ({um})", (t, t - _LONGEST_RUN_S, cursor, *users)).fetchone()
+        return float(got[0]) if got is not None and got[0] is not None else None
+
+    # back: the latest moment at or before lo with no input in the 2 minutes before it (lo itself, or a row's time),
+    # looked for a block of hours at a time: each block's rows oldest first with the input before each row
+    start: float | None = None
+    top = lo
+    while start is None:
+        bottom = top - _LONGEST_RUN_S
+        rows = conn.execute(f"SELECT at, ended_at FROM ui_actions WHERE at < ? AND at >= ? AND id <= ?"
+                            f" AND source IN ({um}) ORDER BY at, id", (top, bottom, cursor, *users)).fetchall()
+        running = input_until(bottom)
+        marks: list[tuple[float, float | None]] = []           # (a moment, the input's end before it)
+        for r in rows:
+            at = float(r["at"])
+            marks.append((at, running))
+            end = max(at, float(r["ended_at"])) if r["ended_at"] is not None else at
+            running = end if running is None else max(running, end)
+        marks.append((top, running))
+        for at, before in reversed(marks):
+            if before is None or at - before >= gap:
+                start = at
+                break
+        if start is None:
+            top = bottom
+    # forward: the first input after hi that comes 2 minutes or more after all input before it
+    last_input = input_until(hi + 1e-6)
+    probe_at, probe_id = hi, -1
+    while True:
+        rows = conn.execute(f"SELECT id, at, ended_at FROM ui_actions WHERE (at > ? OR (at = ? AND id > ?)) AND id <= ?"
+                            f" AND source IN ({um}) ORDER BY at, id LIMIT 2000",
+                            (probe_at, probe_at, probe_id, cursor, *users)).fetchall()
+        if not rows:
+            return start, None
+        for r in rows:
+            at = float(r["at"])
+            if at > hi and last_input is not None and at - last_input >= gap:
+                return start, at
+            end = max(at, float(r["ended_at"])) if r["ended_at"] is not None else at
+            last_input = end if last_input is None else max(last_input, end)
+        probe_at, probe_id = float(rows[-1]["at"]), int(rows[-1]["id"])
+
+
 def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any]], *, since: float | None,
                until: float | None, process: str | None, now: float) -> dict[str, Any]:
     """capC2's part of a forget, inside its transaction and before the rows go: the tasks built on any forgotten row
@@ -337,6 +398,7 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
         mm = ",".join("?" * len(gone_members))
         conn.execute(f"DELETE FROM ui_family_members WHERE task_id IN ({mm})", sorted(gone_members))
     # transitions
+    state_after: dict[str, Any] | None = None
     if process and since is None and until is None:
         image["transitions"] = _rows(conn, "SELECT * FROM ui_transitions WHERE process = ?", (process,))
         image["tkeys"] = [[r["process"], r["from_key"], r["to_key"]] for r in image["transitions"]]
@@ -344,12 +406,16 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
     elif actions:
         state = trace_links._load(store)
         cursor = int(state.get("cursor") or 0)
-        lo, hi = ats[0] - trace_links.PIECE_GAP_S, ats[-1] + trace_links.PIECE_GAP_S
+        start, end = _stretch(conn, ats[0], ats[-1], cursor)
         around = _rows(conn, "SELECT id, at, ended_at, process, kind, source, resolved, element_key FROM ui_actions"
-                       " WHERE at >= ? AND at <= ? AND id <= ? ORDER BY at, id", (lo, hi, cursor))
+                       " WHERE at >= ? AND at < ? AND id <= ? ORDER BY at, id",
+                       (start, end if end is not None else float("inf"), cursor))
         gone = {int(a["id"]) for a in actions}
         with_rows, _l, _i = trace_links.transition_pairs(around)
-        without, _l, _i = trace_links.transition_pairs([r for r in around if int(r["id"]) not in gone])
+        without, w_last, w_input = trace_links.transition_pairs([r for r in around if int(r["id"]) not in gone])
+        if end is None:
+            # the stretch runs to the newest row folded: the carried state is the one without the forgotten rows
+            state_after = {"last": w_last, "input": w_input}
         take, give = Counter(with_rows) - Counter(without), Counter(without) - Counter(with_rows)
         keys = sorted({(p, a, b) for (p, a, b, _g, _t) in list(take) + list(give)})
         for p, a, b in keys:
@@ -358,7 +424,7 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
             if row is not None:
                 image["transitions"].append(dict(row))
         image["tkeys"] = [list(k) for k in keys]
-        trace_links.add_pairs(conn, list(take.elements()), sign=-1)
+        trace_links.add_pairs(conn, list(take.elements()), sign=-1, before=start)
         trace_links.add_pairs(conn, list(give.elements()), sign=1)
     labels = {int(f["id"]): f.get("label_task") for f in image["families"]}
     for fid in sorted(fams):
@@ -370,8 +436,12 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
     last = state.get("last") or {}
     gone_keys = {a.get("element_key") for a in actions if a.get("element_key")}
     changed = False
+    if state_after is not None:
+        last = {k: list(v) for k, v in (state_after["last"] or {}).items()}
+        state["input"] = state_after["input"]
+        changed = True
     for proc in list(last):
-        if (process and proc == process) or (last[proc] and last[proc][0] in gone_keys):
+        if (process and proc == process) or (state_after is None and last[proc] and last[proc][0] in gone_keys):
             last.pop(proc)
             changed = True
     if changed:
@@ -383,8 +453,10 @@ def _forget_c2(conn: sqlite3.Connection, store: Any, actions: list[dict[str, Any
     return {"image": image, "counts": counts}
 
 
-def _undo_c2(conn: sqlite3.Connection, image: dict[str, Any]) -> Counter:
-    """Put capC2's before-images back (tasks, ranges, families as they were, transitions as they were)."""
+def _undo_c2(conn: sqlite3.Connection, image: dict[str, Any], store: Any = None) -> Counter:
+    """Put capC2's before-images back (tasks, ranges, families as they were, transitions as they were). A family's
+    id is never used again (AUTOINCREMENT), so its before-image never lands on a newer family; a family put back whose
+    members no longer match its count (a task joined since) is rebuilt from them (``store`` given)."""
     restored: Counter = Counter()
     try:
         conn.execute("SELECT 1 FROM ui_tasks LIMIT 1")
@@ -414,6 +486,17 @@ def _undo_c2(conn: sqlite3.Connection, image: dict[str, Any]) -> Counter:
     for r in image.get("transitions") or []:
         put("ui_transitions", r)
         restored["transitions"] += 1
+    if store is not None:
+        from yuki.memory import trace_families
+
+        for f in image.get("families") or []:
+            fid = int(f["id"])
+            members = conn.execute("SELECT count(*) FROM ui_family_members WHERE family_id = ?", (fid,)).fetchone()[0]
+            unplaced = conn.execute(
+                "SELECT count(*) FROM ui_tasks t LEFT JOIN ui_family_members m ON m.task_id = t.id WHERE t.family_id"
+                " = ? AND m.task_id IS NULL AND t.vec_ciphertext IS NOT NULL", (fid,)).fetchone()[0]
+            if int(members) + int(unplaced) != int(f.get("n_tasks") or 0):
+                trace_families.rebuild(conn, store, fid)    # something joined since: counted again
     return restored
 
 
@@ -544,7 +627,7 @@ def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[
                          " VALUES (?,?,?,?,?,?)", (link["id"], link["from_action"], link["to_action"], link["kind"],
                                                    link["lag_s"], link.get("created_at")))
             restored["links"] += 1
-        restored.update(_undo_c2(conn, image.get("c2") or {}))
+        restored.update(_undo_c2(conn, image.get("c2") or {}, store))
         conn.execute("UPDATE undo_images SET undone_at=? WHERE id=?", (now, row["id"]))
         conn.execute(
             "INSERT INTO memory_changelog(at, run_id, pass, action, fact_ids, new_fact_ids, cites, text_ciphertext)"

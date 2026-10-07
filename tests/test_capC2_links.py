@@ -244,7 +244,7 @@ def test_transitions_are_kept_incrementally_across_calls(store):
     TL.update(store, now=NOW + 31)
     assert trans(store)[("chatter", "k-attach", "k-send")]["n"] == 1
     gaps = json.loads(trans(store)[("chatter", "k-attach", "k-send")]["gaps"])
-    assert gaps == [30.0]
+    assert gaps == [[30.0, NOW + 30]]                                          # each use: its gap and time
     for i in range(TL.GAPS_KEPT + 5):
         act(store, NOW + 1000 + i * 10, "chatter", "click", role="Button", name="Attach", key="k-attach")
         act(store, NOW + 1001 + i * 10, "chatter", "click", role="Button", name="Send", key="k-send")
