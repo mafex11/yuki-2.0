@@ -378,6 +378,8 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
             # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
             # always reach the brain (the person block gives way first)
             tail = _practice_lines(frame, practice)
+            # capC1b: the user's usual buttons and shortcuts, last of the body: the first to give way to the size
+            lines += go_to_lines(practice)
         else:   # an older memory: know-how lines and their "Not:" part
             proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
             if proc:
@@ -552,12 +554,46 @@ def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
         lines.append(PITFALL_HEAD)
         for p in pits:
             apps = ", ".join(p.get("apps") or []) or "any app"
+            # capC1b: the same route failed again: a strong warning (still never a block)
+            warn = (f" STRONG WARNING: this failed {int(p.get('repeats') or 0)} times the same way; try another "
+                    f"route first (still allowed if the screen shows it is right)." if p.get("warning") == "strong"
+                    else "")
             lines.append(f"- [{p.get('ref')}] [{apps}] \"{_one(p.get('intent'), 80)}\" ({p.get('label')}): "
-                         f"{_one(p.get('text'), 440)}")
+                         f"{_one(p.get('text'), 440)}{warn}")
     frame.procedures = len(ways)
     frame.pitfalls = len(pits)
     frame.playbooks = [int(x["id"]) for x in [*ways, *pits] if isinstance(x.get("id"), int)]
     return lines
+
+
+#: capC1b (report 78 §5.1, §6.4): the user's usual buttons and shortcuts in the apps in play, counted from the action
+#: trace by code. Hints only; the first lines to give way when the frame is over its size.
+GOTO_HEAD = ("What the user usually does in the apps in play (counted from how they work; hints, not steps - prefer "
+             "their shortcut when it does the job):")
+#: Apps, buttons and shortcuts per app the frame names at most.
+MAX_GOTO_APPS = 3
+MAX_GOTO_ELEMENTS = 5
+MAX_GOTO_CHORDS = 3
+
+
+def go_to_lines(practice: dict[str, Any] | None) -> list[str]:
+    """The go-tos part of the frame (``MemoryClient.practice``'s ``go_tos``): per app, "in discord the user usually
+    presses Ctrl+K (12 times), clicks Button "Join Voice" (9 times)". Names only as memory gives them (C1's rules)."""
+    tos = [g for g in (practice or {}).get("go_tos") or [] if isinstance(g, dict) and g.get("app")][:MAX_GOTO_APPS]
+    lines: list[str] = []
+    for g in tos:
+        chords = [c for c in g.get("chords") or [] if isinstance(c, dict) and c.get("chord")][:MAX_GOTO_CHORDS]
+        els = [e for e in g.get("elements") or [] if isinstance(e, dict) and e.get("label")][:MAX_GOTO_ELEMENTS]
+        parts = []
+        if chords:
+            parts.append("presses " + ", ".join(f"{_one(c['chord'], 30)} ({int(c.get('n') or 0)} times)"
+                                                for c in chords))
+        if els:
+            parts.append("goes to " + ", ".join(f"{_one(e['label'], 70)} ({int(e.get('n') or 0)} times)"
+                                                for e in els))
+        if parts:
+            lines.append(f"- in {_one(g['app'], 40)} the user usually " + "; ".join(parts))
+    return [GOTO_HEAD, *lines] if lines else []
 
 
 def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:

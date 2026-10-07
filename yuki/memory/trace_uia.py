@@ -333,4 +333,163 @@ class TraceUia:
             return {}
 
 
-__all__ = ["ANCESTORS", "Element", "ROLE_NAMES", "TIMEOUT_MS", "TOGGLE_WORDS", "TraceUia"]
+# -- the hung-app watchdog (capC1b; left open by C1's second verification) ------------------------------------------
+
+#: A lookup that took this long (s) marks its app as not answering (UI Automation's own timeouts are
+#: :data:`TIMEOUT_MS` a call, a lookup a few calls): measured by the worker, a machine fact, never a guess.
+SLOW_CALL_S = 1.0
+#: While an app is marked, it is asked again at most this often (s) whether it answers.
+PROBE_EVERY_S = 2.0
+#: How long the re-probe waits for the window to answer a no-op message (ms). Windows answers at once for a hung
+#: window (``SMTO_ABORTIFHUNG``): the worker never waits longer than this.
+ANSWER_MS = 50
+
+_WM_NULL = 0x0000
+_SMTO_ABORTIFHUNG = 0x0002
+_SMTO_BLOCK = 0x0001
+
+
+def window_hung(hwnd: int) -> bool:
+    """Windows' own verdict (``IsHungAppWindow``): the window's thread has not taken a message for 5 s. Sends nothing;
+    ``False`` for a window that is gone."""
+    try:
+        return bool(ctypes.windll.user32.IsHungAppWindow(ctypes.c_void_p(int(hwnd))))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+#: This module's own ``SendMessageTimeoutW`` prototype (review F6): built once on a private ``WinDLL`` handle, so the
+#: shared ``ctypes.windll.user32`` function object - which other code in the process calls with its own argument
+#: types (``yuki.perception.tree`` passes a ``DWORD`` result) - is never changed.
+_send_timeout: Any = None
+
+
+def _send_message_timeout() -> Any:
+    global _send_timeout
+    if _send_timeout is None:
+        from ctypes import wintypes
+
+        proto = ctypes.WINFUNCTYPE(ctypes.c_size_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                   wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t))
+        _send_timeout = proto(("SendMessageTimeoutW", ctypes.WinDLL("user32")))
+    return _send_timeout
+
+
+def window_answers(hwnd: int, timeout_ms: int = ANSWER_MS) -> bool:
+    """Whether the window takes a no-op message (``WM_NULL``) within ``timeout_ms`` (``SendMessageTimeoutW`` with
+    ``SMTO_ABORTIFHUNG``: returns at once for a hung window). Changes nothing in the app."""
+    try:
+        result = ctypes.c_size_t(0)
+        return bool(_send_message_timeout()(int(hwnd), _WM_NULL, 0, 0, _SMTO_ABORTIFHUNG | _SMTO_BLOCK,
+                                            int(timeout_ms), ctypes.byref(result)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def window_pid(hwnd: int) -> int:
+    """The process of a window (``GetWindowThreadProcessId``); 0 when it is gone."""
+    try:
+        pid = ctypes.c_ulong(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(int(hwnd)), ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def window_exists(hwnd: int) -> bool:
+    """Whether the handle is a window at all (``IsWindow``; sends nothing): a gone window cannot hang a call."""
+    try:
+        return bool(ctypes.windll.user32.IsWindow(ctypes.c_void_p(int(hwnd))))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class HungWatch:
+    """Keeps the trace worker out of apps that stopped answering (a UI Automation or MSAA call into a hung app could
+    hold the worker for as long as UI Automation's own timeouts allow).
+
+    Before a lookup into a window, :meth:`skip` asks Windows (``IsHungAppWindow``, no message sent) whether it is hung;
+    after one, :meth:`note` marks its process when the lookup took :data:`SLOW_CALL_S` or more (measured by the
+    worker). A marked process is skipped - no lookup at all; its actions are kept point-only, as over the lookup
+    budget - and asked again at most every :data:`PROBE_EVERY_S` whether it answers (not hung, and it takes a
+    ``WM_NULL`` within :data:`ANSWER_MS`); the first time it does, it is lookups as usual again.
+
+    Second verification V2: ``IsHungAppWindow`` says hung only after 5 s without messages, and an MSAA call
+    (``AccessibleObjectFromEvent``) has no timeout of its own - an app that froze right after a click would hold the
+    worker for its whole freeze. So before such a call (``skip(..., probe=True)``) the window is also sent a
+    ``WM_NULL`` (:func:`window_answers`, at most :data:`ANSWER_MS`); one that does not take it is marked at once
+    (``hung_unanswered``) and the call is skipped. Health counters: ``hung_marked``, ``hung_slow``, ``hung_unanswered``,
+    ``hung_skipped``, ``hung_recovered``. Content-free; nothing in the app changes."""
+
+    def __init__(self, *, hung: Any = window_hung, answers: Any = window_answers, pid_of: Any = window_pid,
+                 clock: Any = time.monotonic, slow_s: float = SLOW_CALL_S, probe_every_s: float = PROBE_EVERY_S,
+                 exists: Any = window_exists) -> None:
+        self._hung = hung
+        self._answers = answers
+        self._exists = exists
+        self._pid_of = pid_of
+        self._clock = clock
+        self.slow_s = float(slow_s)
+        self.probe_every_s = float(probe_every_s)
+        #: ``{process key (pid, or -hwnd when the pid is unknown): [hwnd, marked at, last probe]}``
+        self._marked: dict[int, list[float]] = {}
+        self.counts: dict[str, int] = {"hung_marked": 0, "hung_slow": 0, "hung_unanswered": 0, "hung_skipped": 0,
+                                       "hung_recovered": 0}
+
+    def _key(self, hwnd: int, pid: int) -> int:
+        if not pid and hwnd:
+            pid = self._pid_of(int(hwnd)) or 0
+        return int(pid) if pid else -int(hwnd or 0)
+
+    def marked(self) -> int:
+        """How many apps are marked as not answering now."""
+        return len(self._marked)
+
+    def skip(self, hwnd: int, pid: int = 0, *, probe: bool = False) -> bool:
+        """Whether a lookup into this window must be skipped now (its app is hung, or still marked). ``probe``: the
+        call has no timeout of its own (MSAA): the window must also take a ``WM_NULL`` within :data:`ANSWER_MS`."""
+        if not hwnd and not pid:
+            return False
+        key = self._key(hwnd, pid)
+        now = self._clock()
+        entry = self._marked.get(key)
+        if entry is not None:
+            if now - entry[2] < self.probe_every_s:
+                self.counts["hung_skipped"] += 1
+                return True
+            entry[2] = now
+            probe = int(hwnd or entry[0])
+            if probe and not self._hung(probe) and self._answers(probe):
+                del self._marked[key]
+                self.counts["hung_recovered"] += 1
+                return False
+            self.counts["hung_skipped"] += 1
+            return True
+        if hwnd and self._hung(int(hwnd)):
+            self._marked[key] = [float(hwnd), now, now]
+            self.counts["hung_marked"] += 1
+            self.counts["hung_skipped"] += 1
+            return True
+        if probe and hwnd and self._exists(int(hwnd)) and not self._answers(int(hwnd)):
+            # V2: frozen less than 5 s (Windows does not call it hung yet) - an MSAA call would wait out the freeze
+            self._marked[key] = [float(hwnd), now, now]
+            self.counts["hung_marked"] += 1
+            self.counts["hung_unanswered"] += 1
+            self.counts["hung_skipped"] += 1
+            return True
+        return False
+
+    def note(self, hwnd: int, pid: int, seconds: float) -> None:
+        """A lookup into this window took ``seconds``: past :data:`SLOW_CALL_S` its app is marked."""
+        if seconds < self.slow_s or (not hwnd and not pid):
+            return
+        key = self._key(hwnd, pid)
+        if key not in self._marked:
+            now = self._clock()
+            self._marked[key] = [float(hwnd or 0), now, now]
+            self.counts["hung_marked"] += 1
+        self.counts["hung_slow"] += 1
+
+
+__all__ = ["ANCESTORS", "ANSWER_MS", "Element", "HungWatch", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
+           "TOGGLE_WORDS", "TraceUia", "window_answers", "window_exists", "window_hung", "window_pid"]

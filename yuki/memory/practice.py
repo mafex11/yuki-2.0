@@ -115,8 +115,13 @@ MIGRATION_RUN_PREFIX = "knowhow:"
 #: right after one of Yuki's runs did not work, the user did the same thing themselves and it worked (their own
 #: actions, from the timeline and the launch facts, judged the same goal by the post-mortem): the outcome they reached
 #: is the verification. One source, like a run: the way stays a candidate until a run of Yuki's confirms it.
+#: ``user_fixed`` (capC1b, report 78 §6.3, the user's decision D3 of 7 Oct: "a fix after a failure is used at once"):
+#: right after one of Yuki's runs failed, was corrected or was taken over, the user's own actions in the action trace
+#: reached that run's own target state, checked by machine facts (the same app window verified, the same element
+#: changed, the same page reached, the same file saved). As strong as the user's own word: the way is active at once
+#: (the talker may run it), and a later run of it that goes wrong still counts against it.
 WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0, "taught": 3.0, "demonstrated": 1.0,
-                             "ran_trouble": -2.0, "user_corrected": -3.0, "contradicted": -3.0}
+                             "user_fixed": 3.0, "ran_trouble": -2.0, "user_corrected": -3.0, "contradicted": -3.0}
 #: ``succeeded`` (appLearn): the run a way was learned from (its ``observed`` run) ended done with its last action
 #: verified and nobody corrected it - what lets a way learned from a run be shown and announced (:func:`learned_way`).
 #: It weighs nothing: the run's own ``observed`` event is already its evidence.
@@ -129,7 +134,7 @@ NEUTRAL_EVENTS: tuple[str, ...] = ("injected", "cited", "superseded", "retired_b
 EVENT_TYPES: tuple[str, ...] = (*WEIGHTS, *NEUTRAL_EVENTS)
 #: The events that show a way worked (appLearn): the run it came from was a verified success, a later run that followed
 #: it worked, or the user's own word. A way learned from a run without one of them is never shown or announced.
-SUCCESS_EVENTS: tuple[str, ...] = ("succeeded", "ran_ok", "taught", "demonstrated")
+SUCCESS_EVENTS: tuple[str, ...] = ("succeeded", "ran_ok", "taught", "demonstrated", "user_fixed")
 #: How the practice learner judged a run (``runs.learn_note`` is ``"<mode>: <outcome>"``, written by it): the
 #: post-mortem outcomes that count as the job having worked in the end.
 WORKED_OUTCOMES: tuple[str, ...] = ("worked", "worked_after_trouble")
@@ -996,6 +1001,7 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
     seen_days: set[str] = set()
     sources: set[str] = set()
     taught = False
+    fixed = False   # capC1b: the user's own fix after a failed run, checked by machine facts (used at once, D3)
     last_ev = None
     last_verified = None
     negatives = 0
@@ -1020,10 +1026,12 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
             # each distinct day of observation is its own source; a run (or the user's word) is one
             sources.add(f"day:{e.day}" if t == "observed_day" else (e.run_key or f"day:{e.day}"))
             last_ev = max(last_ev or at, at)
-            if t in ("ran_ok", "taught"):
+            if t in ("ran_ok", "taught", "user_fixed"):
                 last_verified = max(last_verified or at, at)
             if t == "taught":
                 taught = True
+            if t == "user_fixed":
+                fixed = True
             if t == "ran_ok" and e.run_key:
                 ok_runs[e.run_key] = at
         elif w < 0:
@@ -1041,7 +1049,7 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
         state = "retired"
     elif age_days > half:
         state = "stale"
-    elif taught or len(sources) >= 2:
+    elif taught or fixed or len(sources) >= 2:
         state = "trusted" if len(clean_after) >= TRUST_USES else "active"
     else:
         state = "candidate"
@@ -1311,7 +1319,7 @@ def provenance(store: Store, o: Playbook, events: Sequence[Any] | None = None) -
         return "user", "the user's own word (saved, taught or quoted)"
     if any(e.type in ("succeeded", "ran_ok") for e in events):
         return "success", "a run that worked marked it"
-    if any(e.type == "demonstrated" for e in events):
+    if any(e.type in ("demonstrated", "user_fixed") for e in events):
         return "user", "the user did it themselves right after Yuki's try did not work, and it worked"
     keys = list(dict.fromkeys(str(e.run_key) for e in events if e.type == "observed" and _run_evidence(e.run_key)))
     if keys:
@@ -1566,21 +1574,86 @@ def _item(o: Playbook, cosine: float | None, why: str, detail: bool = False) -> 
     return out
 
 
+#: capC1b (report 78 §6.3): a way one of whose executable steps is the very step a pitfall's failed route took ranks
+#: this much lower. A pitfall lowers rank only: it never takes a way out, never blocks an action.
+PITFALL_RANK = 0.6
+#: A pitfall whose failed route failed again on this many distinct runs (the same element key and app, or the same
+#: step) is shown to the brain as a strong warning (still never a block).
+REPEATED_RUNS = 2
+
+
+def route_step(step: Any) -> tuple | None:
+    """A skill step's identity for comparing it with a pitfall's failed route (capC1b): what it does, the control's
+    role and name, the address, the app it pins and the keys, whitespace folded and casefolded; ``expect`` and slots
+    aside. Equality of machine fields, never a judgement of text."""
+    if not isinstance(step, dict) or not step.get("do"):
+        return None
+    return (str(step["do"]), *(" ".join(str(step.get(k) or "").split()).casefold() for k in ("role", "name", "url",
+                                                                                             "app")),
+            tuple(str(k).strip().casefold() for k in step.get("keys") or ()))
+
+
+def failed_routes(objs: Sequence[Playbook]) -> tuple[set[tuple[str, tuple]], set[str]]:
+    """The failed routes the live pitfalls keep (capC1b, ``body.route``): ``({(the route's app as an app key, its step
+    as :func:`route_step`)}, their element keys)`` (second verification V6: a route failed in one app, never in every
+    app)."""
+    steps: set[tuple[str, tuple]] = set()
+    keys: set[str] = set()
+    for o in objs:
+        route = (o.body or {}).get("route") if o.kind == "pitfall" else None
+        if not isinstance(route, dict):
+            continue
+        sig = route_step(route.get("step"))
+        if sig is not None:
+            steps.add((app_key(str(route.get("app") or "")) or "", sig))
+        keys.update(str(k) for k in route.get("element_keys") or [] if k)
+    return steps, keys
+
+
+def takes_failed_route(o: Playbook, bad_steps: set[tuple[str, tuple]]) -> bool:
+    """Whether one of a procedure's executable steps is a route that failed (:func:`failed_routes`) in an app it is
+    for: the route's app is one of the way's apps, or the step pins that app (a route kept without an app counts in
+    any). A way learned from the user's own actions (``body.trace``, the correction learner's) never is: its own
+    evidence is the user taking that step to the very state it was for (second verification V5)."""
+    if not bad_steps or o.kind != "procedure" or (o.body or {}).get("trace"):
+        return False
+    apps = {k for k in (app_key(str(a)) for a in o.apps or ()) if k}
+    for s in o.run:
+        sig = route_step(s)
+        if sig is None:
+            continue
+        pinned = app_key(str(s.get("app") or "")) if isinstance(s, dict) else ""
+        for app, bad in bad_steps:
+            if bad == sig and (not app or app in apps or app == pinned):
+                return True
+    return False
+
+
 def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequence[str] = (),
              now: float | None = None, ways: int = MAX_WAYS, habits: int = MAX_HABITS,
-             pitfalls: int = MAX_PITFALLS, detail: bool = False) -> dict[str, Any]:
-    """What practice memory holds for one request: ``{"ways": [...], "pitfalls": [...], "apps": [...], "ms"}``.
+             pitfalls: int = MAX_PITFALLS, detail: bool = False, go_tos: bool = True) -> dict[str, Any]:
+    """What practice memory holds for one request: ``{"ways": [...], "pitfalls": [...], "go_tos": [...], "apps": [...],
+    "ms"}``.
 
     *Ways* (procedures, then at most ``habits`` habit or style note) clear a similarity floor to the request's words:
     :data:`WAY_APP_MIN_COSINE` when scoped to an app in play, else :data:`WAY_MIN_COSINE`; without the words' vector
     none come (no unranked filler). *Pitfalls* of an app in play always come (nearest the words first, then the most
     confident); others clear :data:`PITFALL_MIN_COSINE`. Ranked by cosine scaled by confidence. Disabled, retired and
     superseded objects never come, nor a way learned from a run that did not succeed (:func:`learned_way`: a failed
-    method is never offered as the way to do it; what failed comes as a pitfall)."""
+    method is never offered as the way to do it; what failed comes as a pitfall).
+
+    capC1b (report 78 §6.3-6.4): a way that takes the very step a pitfall's failed route took ranks
+    :data:`PITFALL_RANK` lower (``lowered``), never out; a pitfall whose route failed on :data:`REPEATED_RUNS` runs or
+    more carries ``warning: "strong"`` and ``repeats``. *Go-tos* (``go_tos``, :func:`yuki.memory.trace_habits.go_tos`):
+    for the apps in play in the order given (named ones first), the user's top elements and chords from the action
+    trace, counted by code; names only as the element registry keeps them; ``detail`` gives more."""
     started = time.perf_counter()
     now = _now(now)
     in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
+    order = [k for k in dict.fromkeys(app_key(a) for a in apps_in_play or () if a) if k]
     objs = live(store)
+    bad_steps, bad_keys = failed_routes(objs)
+    lowered: set[int] = set()
     from_run, proven, _succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
     q = None
     if query_vec is not None:
@@ -1620,15 +1693,43 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
             continue
         why = f"cosine {c:.2f}" + (f", its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"
                                    if hit else "")
-        (way_hits if o.kind == "procedure" else habit_hits).append((rank(c, o), o, c, why))
+        score = rank(c, o)
+        if takes_failed_route(o, bad_steps):
+            score *= PITFALL_RANK
+            lowered.add(o.id)
+            why += "; one of its steps is a route that failed before (ranked lower, still allowed)"
+        (way_hits if o.kind == "procedure" else habit_hits).append((score, o, c, why))
     way_hits.sort(key=lambda x: -x[0])
     habit_hits.sort(key=lambda x: -x[0])
-    pit_hits.sort(key=lambda x: (-x[0][0], -x[0][1]))
+    pit_hits.sort(key=lambda x: (-x[0][0], -int(_repeats(x[1]) >= REPEATED_RUNS), -x[0][1]))
     out_ways = [_item(o, c, why, detail) for _r, o, c, why in way_hits[:ways]]
+    for item in out_ways:
+        if item["id"] in lowered:
+            item["lowered"] = True
     out_ways += [_item(o, c, why, detail) for _r, o, c, why in habit_hits[:habits]]
-    out_pits = [_item(o, c, why, detail) for _r, o, c, why in pit_hits[:pitfalls]]
-    return {"ways": out_ways, "pitfalls": out_pits, "apps": in_play, "objects": len(objs),
-            "ms": round((time.perf_counter() - started) * 1000, 2)}
+    out_pits = []
+    for _r, o, c, why in pit_hits[:pitfalls]:
+        item = _item(o, c, why, detail)
+        n = _repeats(o)
+        if n:
+            item["repeats"] = n
+            if n >= REPEATED_RUNS:
+                item["warning"] = "strong"
+        out_pits.append(item)
+    out = {"ways": out_ways, "pitfalls": out_pits, "apps": in_play, "objects": len(objs)}
+    if go_tos:
+        from yuki.memory import trace_habits
+
+        out["go_tos"] = trace_habits.go_tos(store, order, now=now, detail=detail, lower=bad_keys)
+    out["ms"] = round((time.perf_counter() - started) * 1000, 2)
+    return out
+
+
+def _repeats(o: Playbook) -> int:
+    """How many runs failed by a pitfall's failed route (capC1b: one ``observed`` event per failing run); 0 for a
+    pitfall without a route."""
+    route = (o.body or {}).get("route") if o.kind == "pitfall" else None
+    return int(o.n_observed or 0) if isinstance(route, dict) else 0
 
 
 # ---------------------------------------------------------------------------

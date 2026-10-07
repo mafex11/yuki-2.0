@@ -251,8 +251,15 @@ class TraceWorker:
                  recent: Path | None = None, resolve: Callable[[str], str | None] | None = None,
                  flp: Callable[[str], dict[str, Any]] | None = None, log: Callable[..., None] | None = None,
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
-                 hover: tuple[int, int, float] | None = None) -> None:
+                 hover: tuple[int, int, float] | None = None, hung: Any = None) -> None:
         self.store = store
+        #: capC1b: the hung-app watchdog (:class:`yuki.memory.trace_uia.HungWatch`): no lookup into an app that is not
+        #: answering, by Windows' own verdict or a lookup that took :data:`yuki.memory.trace_uia.SLOW_CALL_S`.
+        if hung is None:
+            from yuki.memory.trace_uia import HungWatch
+
+            hung = HungWatch()
+        self.hung = hung
         self._privacy = privacy_rules
         self._rules = trace_rules
         self._gate = gate
@@ -409,9 +416,36 @@ class TraceWorker:
             self.counters["lookup_over_budget"] += 1
         return ok
 
-    def _lookup(self, fn: Callable[..., Any], *args: Any, priority: bool, **kw: Any) -> Any:
-        """One UI Automation lookup within budget (never while the gate holds); None when over budget or failed."""
-        if self.uia is None or self._blocked() is not None or not self._take(priority=priority):
+    def _hung_skip(self, target: tuple[int, int] | None, *, probe: bool = False) -> bool:
+        """capC1b watchdog: whether the window a lookup would go into belongs to an app that is not answering
+        (:class:`yuki.memory.trace_uia.HungWatch`); counted as ``lookup_skipped_hung``. ``probe`` (second verification
+        V2): the lookup is an MSAA call with no timeout of its own, so the window must also take a no-op message within
+        :data:`yuki.memory.trace_uia.ANSWER_MS` first (an app frozen for less than the 5 s Windows waits before calling
+        it hung would otherwise hold the worker for its whole freeze)."""
+        if target is None or self.hung is None:
+            return False
+        try:
+            if self.hung.skip(int(target[0] or 0), int(target[1] or 0), probe=probe):
+                self.counters["lookup_skipped_hung"] += 1
+                return True
+        except Exception as exc:  # noqa: BLE001
+            self._error("hung_watch", exc)
+        return False
+
+    def _hung_note(self, target: tuple[int, int] | None, seconds: float) -> None:
+        if target is not None and self.hung is not None:
+            try:
+                self.hung.note(int(target[0] or 0), int(target[1] or 0), seconds)
+            except Exception as exc:  # noqa: BLE001
+                self._error("hung_watch", exc)
+
+    def _lookup(self, fn: Callable[..., Any], *args: Any, priority: bool, target: tuple[int, int] | None = None,
+                probe: bool = False, **kw: Any) -> Any:
+        """One UI Automation lookup within budget (never while the gate holds, never into an app that is not
+        answering: ``target`` is the window it goes into, ``(hwnd, pid)``; ``probe``: an MSAA call, the window must
+        answer a no-op message first - :meth:`_hung_skip`); None when over budget, skipped or failed."""
+        if self.uia is None or self._blocked() is not None or self._hung_skip(target, probe=probe) \
+                or not self._take(priority=priority):
             return None
         t0 = time.perf_counter()
         try:
@@ -422,7 +456,16 @@ class TraceWorker:
         ms = (time.perf_counter() - t0) * 1000.0
         self.lookup_ms.append(ms)
         self.counters["lookups"] += 1
+        self._hung_note(target, ms / 1000.0)
         return out
+
+    def _front_target(self) -> tuple[int, int] | None:
+        """The window in front, ``(hwnd, pid)``: where a focus lookup goes."""
+        try:
+            hwnd, pid = self._foreground()
+            return int(hwnd or 0), int(pid or 0)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _input(self, t: float, source: str) -> None:
         self._last_input = (t, source)
@@ -504,14 +547,15 @@ class TraceWorker:
                             travel=travel, gap_ms=self._gap(t), open=True)
         self._open[button] = act
         if act.drop is None:
-            el = self._lookup(self.uia.at_point if self.uia else None, x, y, priority=True, index=True)
+            el = self._lookup(self.uia.at_point if self.uia else None, x, y, priority=True, index=True,
+                              target=(hwnd, pid))
             act.lookup_end = self._clock()
             if el is not None:
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
                 if el.role in EDIT_ROLES:
                     self._last_click_edit = (t, el, hwnd)   # typing next goes into it (a password field: dropped)
                 if el.role in PANE_ROLES and self._covers_window(el, hwnd):
-                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False)
+                    deeper = self._lookup(self.uia.descend, el, x, y, priority=False, target=(hwnd, pid))
                     if deeper is not None:
                         act.el, act.resolved, act.lookup_ms = deeper, "snapshot", (act.lookup_ms or 0) + deeper.ms
                         act.lookup_end = self._clock()
@@ -561,7 +605,7 @@ class TraceWorker:
                 self.counters["drag_end_withheld"] += 1
                 return
             if self.uia is not None:
-                end_el = self._lookup(self.uia.at_point, x, y, priority=True)
+                end_el = self._lookup(self.uia.at_point, x, y, priority=True, target=(end_hwnd, end_pid))
                 if end_el is not None and not self._whole_window(end_el, end_hwnd) and (
                         not end_el.pid or not end_pid or end_el.pid == end_pid):
                     act.end_el = end_el
@@ -586,7 +630,7 @@ class TraceWorker:
                             gap_ms=self._gap(t))
         self._last_wheel = act
         if act.drop is None and self.uia is not None:
-            el = self._lookup(self.uia.at_point, x, y, priority=False)
+            el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid))
             act.lookup_end = self._clock()
             if self._whole_window(el, hwnd):
                 self._point_only(act, el)
@@ -603,7 +647,8 @@ class TraceWorker:
                 and click[0] >= self._focus_move_t):
             self._focus, self._focus_valid = click[1], True
             return self._focus
-        el = self._lookup(self.uia.focused, priority=priority) if self.uia is not None else None
+        el = self._lookup(self.uia.focused, priority=priority, target=self._front_target()) \
+            if self.uia is not None else None
         if el is not None:
             self._focus, self._focus_valid = el, True
         return el
@@ -690,7 +735,8 @@ class TraceWorker:
         run.recheck_at = None
         if run.drop is not None:
             return
-        el = self._lookup(self.uia.focused, priority=True) if self.uia is not None else None
+        el = self._lookup(self.uia.focused, priority=True, target=self._front_target()) \
+            if self.uia is not None else None
         if el is None:
             run.drop = "password_unknown"
         elif el.secret():
@@ -739,7 +785,8 @@ class TraceWorker:
                                 via="event_only", gap_ms=self._gap(t))
             act.events.append(ev)
             if act.drop is None and self.uia is not None:
-                el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False)
+                el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False, target=(hwnd, 0),
+                                  probe=True)
                 if el is not None:
                     act.el, act.resolved, act.lookup_ms = el, "event", el.ms
                     if el.secret():
@@ -838,7 +885,7 @@ class TraceWorker:
         self._last_hover_t = anchor_at
         self._hover = act
         if act.drop is None and self.uia is not None:
-            el = self._lookup(self.uia.at_point, x, y, priority=False)
+            el = self._lookup(self.uia.at_point, x, y, priority=False, target=(hwnd, pid))
             act.lookup_end = self._clock()
             if el is not None and not self._whole_window(el, hwnd):
                 act.el, act.resolved, act.lookup_ms = el, "point", el.ms
@@ -1093,7 +1140,9 @@ class TraceWorker:
             for t, event, hwnd, id_object, id_child in act.events:
                 if event != wanted or not act.t <= t <= until:
                     continue
-                if not self._take(priority=act.el is None or act.resolved != "point"):
+                target = (hwnd, act.win.pid if hwnd == act.win.hwnd else 0)
+                if self._hung_skip(target, probe=True) or not self._take(priority=act.el is None
+                                                                         or act.resolved != "point"):
                     return
                 t0 = time.perf_counter()
                 try:
@@ -1103,6 +1152,7 @@ class TraceWorker:
                     el = None
                 self.lookup_ms.append((time.perf_counter() - t0) * 1000.0)
                 self.counters["lookups"] += 1
+                self._hung_note(target, time.perf_counter() - t0)
                 if el is not None and el.contains(act.x, act.y) and (not el.pid or not act.win.pid
                                                                     or el.pid == act.win.pid):
                     act.el, act.resolved, act.lookup_ms = el, "event", el.ms
@@ -1173,7 +1223,8 @@ class TraceWorker:
             seen.add(target)
             if len(seen) > OUTCOME_ELEMENTS:
                 break
-            el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False)
+            el = self._lookup(self.uia.from_event, hwnd, id_object, id_child, priority=False,
+                              target=(hwnd, act.win.pid if hwnd == act.win.hwnd else 0), probe=True)
             if el is None:
                 if self._bucket.tokens - 1.0 < RESERVE_FOR_CLICKS:
                     break                                   # no spare budget left: the counts stand alone
@@ -1194,16 +1245,22 @@ class TraceWorker:
         changed_state = any(e[1] == EVENT_OBJECT_STATECHANGE for e in act.outs)
         if act.kind in ("click", "dclick") and (el.toggle is not None or el.selected is not None) and (
                 changed_state or any(e[1] in (EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD) for e in act.events)):
-            if self._take(priority=False):
+            target = (act.win.hwnd, act.win.pid)
+            if not self._hung_skip(target) and self._take(priority=False):
+                t0 = time.perf_counter()
                 state = self.uia.reread(el)
+                self._hung_note(target, time.perf_counter() - t0)
                 if "toggle" in state:
                     act.facts["toggle_state"] = state["toggle"]
                 if state.get("selected"):
                     act.facts["selected"] = True
         if act.kind == "keys" and act.chord == "Enter" and act.after_type and act.after_type.get("el") is not None:
             field_el = act.after_type["el"]
-            if field_el.role in EDIT_ROLES and self._take(priority=False):
+            target = (act.win.hwnd, act.win.pid)
+            if field_el.role in EDIT_ROLES and not self._hung_skip(target) and self._take(priority=False):
+                t0 = time.perf_counter()
                 state = self.uia.reread(field_el, value_length=True)
+                self._hung_note(target, time.perf_counter() - t0)
                 if state.get("length") == 0:
                     act.facts["field_submitted"] = {"typed": int(act.after_type.get("typed") or 0)}
 
@@ -1378,7 +1435,10 @@ class TraceWorker:
         def pct(p: float) -> float | None:
             return round(lookups[min(len(lookups) - 1, int(p * len(lookups)))], 1) if lookups else None
 
-        return {**dict(self.counters), "lookup_ms_p50": pct(0.5), "lookup_ms_p95": pct(0.95),
+        hung = dict(getattr(self.hung, "counts", {}) or {})
+        if hung:
+            hung["hung_now"] = int(self.hung.marked()) if hasattr(self.hung, "marked") else 0
+        return {**dict(self.counters), **hung, "lookup_ms_p50": pct(0.5), "lookup_ms_p95": pct(0.95),
                 "pending": len(self._acts), "batch": len(self._batch)}
 
 
