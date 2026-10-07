@@ -4682,6 +4682,24 @@ class MemoryClient:
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__}
 
+    def way_path(self, pid: Any) -> dict:
+        """capC5: the recorded path a learned way is replayed against (``yuki.memory.trace_replay.way_path``): per
+        step the app it acted in, the site when it was a web page, whether it stayed in the window of the step before,
+        whether a dialog came up after it. Machine facts only, no names. Read only; never raises."""
+        from yuki.memory import trace_replay
+
+        return trace_replay.way_path(self.store, pid)
+
+    def trace_replay_health(self) -> dict:
+        """capC5: learned ways the skill runner ran this week, the deviations it stopped at, the handovers and
+        takeovers, and whether the A/B switch is on (counts, content-free)."""
+        from yuki.memory import trace_replay
+
+        try:
+            return {**trace_replay.health(self.store), "use_learned": trace_replay.use_learned()}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": type(exc).__name__}
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",
