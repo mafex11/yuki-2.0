@@ -1593,10 +1593,11 @@ def route_step(step: Any) -> tuple | None:
             tuple(str(k).strip().casefold() for k in step.get("keys") or ()))
 
 
-def failed_routes(objs: Sequence[Playbook]) -> tuple[set[tuple], set[str]]:
-    """The failed routes the live pitfalls keep (capC1b, ``body.route``): ``(their steps as :func:`route_step`, their
-    element keys)``."""
-    steps: set[tuple] = set()
+def failed_routes(objs: Sequence[Playbook]) -> tuple[set[tuple[str, tuple]], set[str]]:
+    """The failed routes the live pitfalls keep (capC1b, ``body.route``): ``({(the route's app as an app key, its step
+    as :func:`route_step`)}, their element keys)`` (second verification V6: a route failed in one app, never in every
+    app)."""
+    steps: set[tuple[str, tuple]] = set()
     keys: set[str] = set()
     for o in objs:
         route = (o.body or {}).get("route") if o.kind == "pitfall" else None
@@ -1604,9 +1605,28 @@ def failed_routes(objs: Sequence[Playbook]) -> tuple[set[tuple], set[str]]:
             continue
         sig = route_step(route.get("step"))
         if sig is not None:
-            steps.add(sig)
+            steps.add((app_key(str(route.get("app") or "")) or "", sig))
         keys.update(str(k) for k in route.get("element_keys") or [] if k)
     return steps, keys
+
+
+def takes_failed_route(o: Playbook, bad_steps: set[tuple[str, tuple]]) -> bool:
+    """Whether one of a procedure's executable steps is a route that failed (:func:`failed_routes`) in an app it is
+    for: the route's app is one of the way's apps, or the step pins that app (a route kept without an app counts in
+    any). A way learned from the user's own actions (``body.trace``, the correction learner's) never is: its own
+    evidence is the user taking that step to the very state it was for (second verification V5)."""
+    if not bad_steps or o.kind != "procedure" or (o.body or {}).get("trace"):
+        return False
+    apps = {k for k in (app_key(str(a)) for a in o.apps or ()) if k}
+    for s in o.run:
+        sig = route_step(s)
+        if sig is None:
+            continue
+        pinned = app_key(str(s.get("app") or "")) if isinstance(s, dict) else ""
+        for app, bad in bad_steps:
+            if bad == sig and (not app or app in apps or app == pinned):
+                return True
+    return False
 
 
 def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequence[str] = (),
@@ -1674,7 +1694,7 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
         why = f"cosine {c:.2f}" + (f", its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"
                                    if hit else "")
         score = rank(c, o)
-        if bad_steps and o.kind == "procedure" and any(route_step(s) in bad_steps for s in o.run):
+        if takes_failed_route(o, bad_steps):
             score *= PITFALL_RANK
             lowered.add(o.id)
             why += "; one of its steps is a route that failed before (ranked lower, still allowed)"

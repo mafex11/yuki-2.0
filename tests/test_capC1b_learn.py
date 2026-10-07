@@ -254,13 +254,16 @@ def test_the_model_saying_it_is_not_the_same_goal_writes_nothing(store):
 # -- takeover, element targets, the preference, D3 -----------------------------------------------------------------
 
 
-def saving_run(request_id: str = "r2") -> dict[str, Any]:
-    """Yuki clicked Quillpad's Save button; nothing showed (could not tell); the user took over meanwhile."""
+def saving_run(request_id: str = "r2", *, then_verified: bool = False) -> dict[str, Any]:
+    """Yuki clicked Quillpad's Save button; nothing showed (could not tell); the user took over meanwhile.
+    ``then_verified``: Yuki then pressed Ctrl+S and that verified (the run reached its goal by itself)."""
     steps = [{"tool": "click", "kind": "action", "app": "quillpad", "target": 'Button "Save"',
               "input": {"role": "Button", "name": "Save"}, "control": "Button|Save", "ok": True, "verdict": None,
-              "why": "the report could not tell", "result": "clicked Button 'Save'", "ms": 300.0, "at": NOW + 2.0},
-             {"tool": "hotkey", "kind": "action", "app": "quillpad", "target": "keys", "input": {"keys": ["ctrl", "s"]},
-              "ok": True, "verdict": True, "why": "verified", "result": "pressed", "ms": 100.0, "at": NOW + 3.0}]
+              "why": "the report could not tell", "result": "clicked Button 'Save'", "ms": 300.0, "at": NOW + 2.0}]
+    if then_verified:
+        steps.append({"tool": "hotkey", "kind": "action", "app": "quillpad", "target": "keys",
+                      "input": {"keys": ["ctrl", "s"]}, "ok": True, "verdict": True, "why": "verified",
+                      "result": "pressed", "ms": 100.0, "at": NOW + 3.0})
     return {"source": "agent", "session_id": "S1", "request_id": request_id, "lane": "typed", "at": NOW,
             "ended_at": NOW + 8.0, "words": "save my draft", "reply": "Saved.", "outcome": "final", "steps": steps,
             "wall_s": 8.0}
@@ -485,16 +488,58 @@ def test_f2_a_click_in_the_app_during_a_run_that_verified_its_target_is_no_takeo
     assert P.run_header(store, key).learn == "pending"                # never judged failed here
 
 
-def test_f2_a_takeover_at_a_step_that_did_not_work_learns_but_never_judges_a_verified_run_failed(store):
+def test_v3_a_takeover_on_a_run_that_verified_its_goal_learns_nothing_and_never_judges_it_failed(store):
+    """Second verification V3 (replaces review F2's test, which learned here): Yuki's Save click could not tell, its
+    Ctrl+S then verified - the run reached its goal. The user's click on Save while Yuki replied is no correction."""
     worker = Worker(store)
-    P.record_run(store, saving_run("v4"))
+    P.record_run(store, saving_run("v4", then_verified=True))
     key = P.run_key("agent", "S1", "v4")
+    assert P.verified_run(store, key)
     P.set_learned(store, key, "skipped", "nothing to learn", now=NOW + 9)
     save = row(store, NOW + 5.0, "quillpad", "click", role="Button", name="Save", key="k-save", during_run=1)
     worker.answers.append({"same_goal": True, "intent": "save the draft in Quillpad", "steps": [{"from": f"a{save}"}]})
     res = fixer(worker).run_once(now=NOW + 30)
-    assert res[0].written.get("fixed")
+    assert [r.result for r in res] == ["it worked by itself: nothing to learn from what the user did"]
+    assert worker.calls == [] and P.live(store, ["procedure"]) == []
     assert P.run_header(store, key).learn == "skipped" and P.judged_ok(store, key) is True
+
+
+def test_v3_a_failed_middle_step_of_a_run_that_reached_its_goal_is_never_the_users_way(store):
+    """The verifier's case: Settings not found [2], then Ctrl+, opened it and the Dark mode box verified [4]. The user
+    typed in Quillpad while Yuki replied and clicked Settings 6 minutes later in normal work: nothing is learned."""
+    worker = Worker(store)
+    P.record_run(store, _run("s1", "turn on dark mode in quillpad", [
+        _act("launch_app", "quillpad", {"name": "Quillpad"}, at=NOW + 1.0),
+        _act("click", "quillpad", {"role": "Button", "name": "Settings"}, at=NOW + 2.0, ok=False, verdict=False),
+        _act("hotkey", "quillpad", {"keys": ["ctrl", ","]}, at=NOW + 2.5),
+        _act("click", "quillpad", {"role": "CheckBox", "name": "Dark mode"}, at=NOW + 3.0)], ended_at=NOW + 8.0))
+    row(store, NOW + 6.0, "quillpad", "type", resolved="focus", role="Edit", key="k-body", typed=9, during_run=1)
+    st = row(store, NOW + 370.0, "quillpad", "click", role="Button", name="Settings", key="k-set")
+    worker.answers.append({"same_goal": True, "intent": "turn on dark mode in Quillpad",
+                           "steps": [{"from": f"a{st}", "do": "Click Settings"}]})
+    assert fixer(worker).run_once(now=NOW + 380) == []                 # waits for its judgement
+    res = fixer(worker).run_once(now=NOW + 700)
+    assert [r.result for r in res] == ["it worked by itself: nothing to learn from what the user did"]
+    assert worker.calls == [] and P.live(store, ["procedure"]) == []
+
+
+def test_v3_a_takeover_counts_only_between_the_step_that_did_not_work_and_the_next_that_did():
+    h = type("H", (), {"ended_at": NOW + 20.0, "at": NOW})()
+    steps = [type("S", (), dict(step=1, kind="action", tool="click", app="quillpad", ok=False, verdict=False,
+                                expected=False, at=NOW + 2.0, ms=500.0))(),
+             type("S", (), dict(step=2, kind="action", tool="hotkey", app="quillpad", ok=True, verdict=True,
+                                expected=False, at=NOW + 6.0, ms=100.0))(),
+             type("S", (), dict(step=3, kind="action", tool="click", app="quillpad", ok=False, verdict=None,
+                                expected=False, at=NOW + 9.0, ms=300.0))()]
+    target = {"step": 1}
+
+    def at(t: float, app: str = "quillpad") -> list[dict]:
+        return [{"at": NOW + t, "during_run": 1, "kind": "click", "process": app}]
+
+    assert L.took_over(h, steps, target, at(3.0))                      # between [1] and [2], which worked
+    assert not L.took_over(h, steps, target, at(7.0))                  # after [2] worked
+    assert not L.took_over(h, steps, target, at(3.0, "chatter"))       # another app
+    assert L.took_over(h, steps, {"step": 3}, at(15.0))                # after the last step, nothing worked after it
 
 
 def _cited_way(store: Any) -> int:
@@ -592,6 +637,8 @@ def _page_reached(store: Any, at: float) -> int:
     key = store.timeline_key("browsr", "wiki.example.org", "/team/roster", None)
     store.save_timeline(TimelineRow(id=None, started_at=at, ended_at=at + 60, state="present", process="browsr",
                                     app="Browsr", host="wiki.example.org", path="/team/roster", page_key=key))
+    # the press that reached it (Enter in the address bar), then the page-change row the trace writes after it
+    row(store, at - 0.5, "browsr", "keys", resolved="focus", chord="Enter", facts={"page_reached": key})
     return row(store, at, "browsr", "nav", resolved="event", facts={"page_reached": key}, outcome=None)
 
 
