@@ -148,6 +148,32 @@ def test_the_before_answer_rule_directly():
     assert TraceWorker._before_answer(act, 100.025, 50_010) is True
     assert TraceWorker._before_answer(act, 100.025, 50_030) is False            # dated after the answer
     assert TraceWorker._before_answer(act, 100.015, None) is True               # heard before the answer
+    # second verify V2-3: dated before the press, heard between the press and the answer: not before the answer
+    assert TraceWorker._before_answer(act, 100.010, 49_500) is False
+    assert TraceWorker._before_answer(act, 100.010, 50_005) is True             # dated after the press: it counts
+    act_old = SimpleNamespace(t=100.000, lookup_end=100.030, el=SimpleNamespace(chosen_at=None, chosen_tick=None))
+    assert TraceWorker._before_answer(act_old, 100.010, 49_500) is True         # no answer tick: as before
+
+
+def test_a_redraw_dated_before_the_press_and_heard_before_the_answer_is_not_stale(rig):
+    """Second verify V2-3: the shell redrew the button's hover state as the pointer came onto it (dated 200 ms before
+    the press); a late hook thread delivered it 12 ms after the press, before the answer was settled at 30 ms. It
+    was on screen when the user pressed: the button found is what they pressed."""
+    rig.uia.settle_s = 0.03
+    tick = rig.uia.tick_at
+    t0 = rig.clock.t
+    _press_taskbar(rig, [(0.012, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) - 200)])
+    (row,) = [r for r in rig.rows() if r["kind"] == "click"]
+    assert row["resolved"] == "point" and not rig.w.counters["stale_structure"]
+
+
+def test_a_change_after_the_press_heard_before_the_answer_is_still_stale(rig):
+    rig.uia.settle_s = 0.03
+    tick = rig.uia.tick_at
+    t0 = rig.clock.t
+    _press_taskbar(rig, [(0.012, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) + 10)])
+    (row,) = [r for r in rig.rows() if r["kind"] == "click"]
+    assert row["resolved"] == "stale"
 
 
 def test_a_list_reordering_under_the_point_before_the_answer_is_still_stale(rig):

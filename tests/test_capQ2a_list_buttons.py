@@ -118,7 +118,7 @@ def test_readers_that_judge_a_row_by_its_role_alone_find_no_name_on_it(rig):
     assert _element_names(rig.store, [row]) == {row["id"]: None}
 
 
-# -- review F3 and the sidebar drawn outside any list (9 Oct) -----------------------------------------------------------
+# -- review F3 and the sidebar drawn outside any list (9 Oct) ----------------------------------------------------------
 
 
 def test_a_toolbar_nearer_than_the_list_item_keeps_a_command(rig):
@@ -224,3 +224,60 @@ def test_a_button_already_in_a_list_is_not_asked_about_its_set():
     el = c._facts(me, time.perf_counter())
     c._ancestry(el, time.perf_counter() + 5, index=False)
     assert asked == [] and el.current_set is False
+
+
+# -- second verify V2-1: the content mark is sticky --------------------------------------------------------------------
+
+
+def _card(current: bool) -> Element:
+    return Element(role="Button", name="Invented thread about a kettle", rid=(4, 12), bounds=(10, 200, 300, 240),
+                   pid=APP, parent_role="Group", ancestors=[("Group", ""), ("Group", "nav"), ("Group", "")], index=3,
+                   current_set=current)
+
+
+def _card_clicks(rig, *marks: bool) -> list:
+    for current in marks:
+        _click_on(rig, _card(current), 150, 220)
+        rig.clock.t += 5
+    return [r for r in rig.rows() if r["kind"] == "click"]
+
+
+def test_a_card_seen_as_an_item_stays_one_when_no_thread_is_open(rig):
+    """V2-1: the user clicks a thread card while a thread is open (an item: no name), later the same day from a view
+    with no current thread. The second use still keeps no name, in the registry or in its raw row."""
+    rows = _card_clicks(rig, True, False, False)
+    assert len(rows) == 3 and len({r["element_key"] for r in rows}) == 1
+    assert [r["name_ciphertext"] for r in rows] == [None, None, None]
+    (el,) = rig.store._query("SELECT * FROM ui_elements")
+    assert el["name_class"] == TITLE and el["name_ciphertext"] is None and el["days"] == 1
+
+
+def test_a_card_first_taken_for_a_command_loses_its_name_everywhere_once_known(rig):
+    """V2-1 reversed: no thread open first (taken for a command: named), then seen as an item, then again with no
+    current thread. The registry and every raw row of the card end with no name."""
+    rows = _card_clicks(rig, False)
+    assert rig.store._dec(rows[0]["name_ciphertext"]) == "Invented thread about a kettle"
+    rows = _card_clicks(rig, True, False)
+    assert [r["name_ciphertext"] for r in rows] == [None, None, None]
+    (el,) = rig.store._query("SELECT * FROM ui_elements")
+    assert el["name_class"] == TITLE and el["name_ciphertext"] is None
+
+
+def test_a_sticky_item_still_gets_its_name_on_its_third_day(rig):
+    base = 1_780_000_000.0
+    _use(rig.store, "k-card", TITLE, "Invented thread about a kettle", base)
+    _use(rig.store, "k-card", COMMAND, "Invented thread about a kettle", base + 60)       # no current thread then
+    (el,) = rig.store._query("SELECT * FROM ui_elements")
+    assert el["name_class"] == TITLE and el["name_ciphertext"] is None
+    _use(rig.store, "k-card", COMMAND, "Invented thread about a kettle", base + DAY)
+    _use(rig.store, "k-card", COMMAND, "Invented thread about a kettle", base + 2 * DAY)
+    (el,) = rig.store._query("SELECT * FROM ui_elements")
+    assert el["name_class"] == TITLE and rig.store._dec(el["name_ciphertext"]) == "Invented thread about a kettle"
+
+
+def test_a_real_command_button_is_untouched_by_the_sticky_rule(rig):
+    _click_on(rig, send_button(), 820, 720)
+    rig.clock.t += 5
+    _click_on(rig, send_button(), 820, 720)
+    rows = [r for r in rig.rows() if r["kind"] == "click"]
+    assert [rig.store._dec(r["name_ciphertext"]) for r in rows] == ["Send", "Send"]

@@ -308,11 +308,13 @@ class TraceWorker:
         self._fl_recent = fl_recent
         self._fl_due: float | None = None
         self._fl_top: str | None = None          # the project FL Studio's list had first when last read
-        #: capQ2a: ``(since) -> whether the user moved the mouse by presence's rule since then`` (None: cannot say,
-        #: fails closed). A hover is kept only when the movement that ended in its rest was the user's (the 8 Oct
-        #: audit: 59 hovers from a drifting mouse while the user was away). None: presence is not asked (tests).
+        #: capQ2a: ``(since, hands_since=None) -> whether presence saw the user since then`` (None: cannot say,
+        #: fails closed): a far mouse move by its rule since ``since``, or (second verify V2-2) a click, key or wheel
+        #: since ``hands_since``. A hover is kept only when the movement that ended in its rest was the user's (the 8
+        #: Oct audit: 59 hovers from a drifting mouse while the user was away). None: presence is not asked (tests).
         self._present = present
         self._moving_t: float | None = None
+        self._rest_t: float | None = None        # when the pointer's last judged rest began (V2-2)
         #: capQ2a: ``(epoch s) -> whether Deskflow had the cursor on another computer's screen then``
         #: (:class:`yuki.memory.trace_deskflow.DeskflowScreens`): input then is the other computer's, never a row.
         self._other_screen = other_screen
@@ -615,7 +617,7 @@ class TraceWorker:
         self._dialog = self._dialog_closed = None
         self._type = self._hover = self._pending_dclick = self._last_key = self._last_wheel = None
         self._open.clear()
-        self._hover_due = self._fl_due = self._moving_t = None
+        self._hover_due = self._fl_due = self._moving_t = self._rest_t = None
         self._focus_valid = False
         if self._acts:
             self.counters["dropped_reopen"] += len(self._acts)
@@ -1009,18 +1011,23 @@ class TraceWorker:
         el = act.el
         chosen = getattr(el, "chosen_at", None) if el is not None else None
         answered = act.lookup_end if chosen is None else min(float(chosen), act.lookup_end)
+        chosen_tick = getattr(el, "chosen_tick", None) if el is not None else None
+        dated = tick is not None and chosen_tick is not None and chosen is not None
+        if dated:
+            # review F2: never a change dated before the press (one already there when the user pressed it is what
+            # they pressed on). The press's tick is the answer's less the worker-clock time between them, less one
+            # step of the tick count itself (:func:`tick_step_ms`: a change right after the press, a menu closing on
+            # the down, may read the step before). Windows' tick count wraps every 49.7 days: compared modulo 2**32.
+            # Second verify V2-3: this holds however soon it was heard, a late hook thread delivering the shell's
+            # hover redraw between the press and the answer included
+            press_tick = (int(chosen_tick) - round((float(chosen) - act.t) * 1000.0) - tick_step_ms()) & 0xFFFFFFFF
+            if ((int(tick) - press_tick) & 0xFFFFFFFF) >= 0x80000000:
+                return False
         if t <= answered:
             return True
-        chosen_tick = getattr(el, "chosen_tick", None) if el is not None else None
-        if tick is None or chosen_tick is None or chosen is None:
+        if not dated:
             return False
-        # review F2: and not dated before the press (a change already there when the user pressed it is what they
-        # pressed on). The press's tick is the answer's less the worker-clock time between them, less one step of the
-        # tick count itself (:func:`tick_step_ms`: a change right after the press, a menu closing on the down, may
-        # read the step before). Windows' tick count wraps every 49.7 days: compared modulo 2**32
-        press_tick = (int(chosen_tick) - round((float(chosen) - act.t) * 1000.0) - tick_step_ms()) & 0xFFFFFFFF
-        return (0 < ((int(chosen_tick) - int(tick)) & 0xFFFFFFFF) < 0x80000000
-                and ((int(tick) - press_tick) & 0xFFFFFFFF) < 0x80000000)
+        return 0 < ((int(chosen_tick) - int(tick)) & 0xFFFFFFFF) < 0x80000000
 
     def _under_point(self, act: _Act, hwnd: int, rects: dict[int, Any] | None = None) -> bool:
         """capC1c: whether a window (an event's own handle) covers the action's press point now."""
@@ -1105,6 +1112,7 @@ class TraceWorker:
                 return
         self._hover_due = None
         sink.moving = False
+        prev_rest, self._rest_t = self._rest_t, anchor_at   # V2-2: where the pointer rested before this movement
         if self._open or self._last_action_t >= anchor_at:
             return                                  # a press ended the rest: it is not a hover
         if int(getattr(sink, "jump_seq", -1)) == int(sink.anchor_seq):
@@ -1119,7 +1127,7 @@ class TraceWorker:
                 and abs(x - last[0]) <= 2 * w and abs(y - last[1]) <= 2 * h):
             self.counters["hover_coalesced"] += 1     # the same rest, drifted: still one row
             return
-        if not self._user_moved():
+        if not self._user_moved(prev_rest):
             self.counters["skip_hover_away"] += 1     # capQ2a: the pointer drifted here by itself
             return
         hwnd, pid = self._window_at(x, y)
@@ -1150,16 +1158,22 @@ class TraceWorker:
         if act.drop is not None:
             act.open, act.last_t, self._hover = False, now, None   # dropped: nothing to wait for (counted at once)
 
-    def _user_moved(self) -> bool:
+    def _user_moved(self, prev_rest: float | None = None) -> bool:
         """capQ2a: whether presence says the user moved the mouse during the movement that ended in this rest: its
         latest real mouse movement (:mod:`yuki.memory.userpresence`'s rule: the takeover distance within its window,
         read from the mouse's own reports, never the cursor) came at or after that movement began. A drifting or
-        vibrating mouse never gets that far, so a rest it makes is no hover. Presence that cannot say fails closed
-        (no hover); with no presence wired (tests of other parts) every rest counts, as before."""
+        vibrating mouse never gets that far, so a rest it makes is no hover. Second verify V2-2: or presence heard
+        the user's hand (a click, a key, the wheel) since the pointer's previous rest began (``prev_rest``): a short
+        nudge right after a click is the user's, though shorter than the takeover distance. The cost: the first rest
+        a drifting mouse makes after the user's last input is kept (one per absence; on a copy of the audit day, 1
+        of 62 away hovers against 31 of 44 short real ones). Presence that cannot say fails closed (no hover); with
+        no presence wired (tests of other parts) every rest counts, as before."""
         if self._present is None:
             return True
         since = self._moving_t if self._moving_t is not None else float(getattr(self.sink, "anchor_at", 0.0) or 0.0)
         try:
+            if prev_rest is not None:
+                return bool(self._present(since, prev_rest))
             return bool(self._present(since))
         except Exception as exc:  # noqa: BLE001
             self._error("presence", exc)
@@ -2366,21 +2380,26 @@ def _title(hwnd: int) -> str:
     return window_title(hwnd)
 
 
-def _presence_moved() -> Callable[[float], bool | None]:
-    """capQ2a: ``(since) -> whether the user moved the mouse since then`` by presence's own rule (the one Raw Input
-    reader's :class:`yuki.memory.userpresence.PresenceInput`, the service's presence: a real move is the takeover
-    distance within its window, from the mouse's own reports). None when presence is not listening (it cannot say:
-    a hover is then not kept)."""
+def _presence_moved() -> Callable[..., bool | None]:
+    """capQ2a: ``(since, hands_since=None) -> whether the user moved the mouse since ``since``, or (V2-2) clicked,
+    typed or turned the wheel since ``hands_since``,`` by presence's own rule (the one Raw Input reader's
+    :class:`yuki.memory.userpresence.PresenceInput`, the service's presence: a real move is the takeover distance
+    within its window, from the mouse's own reports). None when presence is not listening (it cannot say: a hover is
+    then not kept)."""
 
-    def moved(since: float) -> bool | None:
+    def moved(since: float, hands_since: float | None = None) -> bool | None:
         from yuki.memory import watcher
 
         presence = getattr(watcher, "_presence", None)
         if presence is None or getattr(presence, "source", "") != "raw_input":
             return None
-        from yuki.memory.userpresence import MOUSE
+        from yuki.memory.userpresence import CLICK, KEYS, MOUSE, WHEEL
 
-        return float(presence.monitor.last(MOUSE)) >= float(since)
+        monitor = presence.monitor
+        if float(monitor.last(MOUSE)) >= float(since):
+            return True
+        return hands_since is not None and max(float(monitor.last(k)) for k in (CLICK, KEYS, WHEEL)) >= float(
+            hands_since)
 
     return moved
 

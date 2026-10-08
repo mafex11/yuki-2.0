@@ -11,14 +11,22 @@ from __future__ import annotations
 import pytest
 from test_trace_worker import FakeSink, Rig, button
 
-from yuki.memory.userpresence import MOUSE, PresenceInput
+from yuki.memory.userpresence import PresenceInput
 
 
 @pytest.fixture
-def rig(tmp_path):
+def rig(tmp_path, monkeypatch):
+    from yuki.memory import trace, watcher
+
     r = Rig(tmp_path)
     r.monitor = PresenceInput(move_px=40, window_s=0.3, now=r.clock)
-    r.w._present = lambda since: r.monitor.last(MOUSE) >= since
+
+    class Service:                                             # the service's presence, listening by Raw Input
+        source = "raw_input"
+        monitor = r.monitor
+
+    monkeypatch.setattr(watcher, "_presence", Service, raising=False)
+    r.w._present = trace._presence_moved()
     r.sink = FakeSink()
     r.w.sink = r.sink
     r.uia.points[(150, 120)] = button(name="Settings")
@@ -91,3 +99,55 @@ def test_the_services_presence_is_asked_by_its_own_rule(monkeypatch):
     assert moved(9.0) is True and moved(11.0) is False
     P.source = "fallback"
     assert moved(9.0) is None
+
+
+# -- second verify V2-2: a short nudge right after the user's click is theirs ------------------------------------------
+
+
+def _users_click(rig, x, y):
+    rig.monitor.button_down(at=rig.clock.t)                    # presence hears it
+    rig.sink.anchor_at, rig.sink.anchor_seq = rig.clock.t, rig.sink.anchor_seq + 1   # a press ends the rest
+    rig.click(x, y)
+    rig.settle(1)
+
+
+def test_a_short_nudge_right_after_the_users_click_is_a_hover(rig):
+    """The user clicks a toolbar button, nudges the mouse 3 counts to the next one and rests on it to read its
+    tooltip: shorter than the takeover distance, but presence heard their click since the pointer last rested."""
+    _rest(rig, hand=True)                                      # onto Settings: a hover
+    rig.settle(1)
+    _users_click(rig, 150, 120)
+    rig.cursor = (400, 300)
+    rig.uia.points[(400, 300)] = button(name="Search")
+    _rest(rig, hand=False)                                     # the nudge
+    rig.settle(62)
+    kinds = [(r["kind"], rig.store._dec(r["name_ciphertext"])) for r in rig.rows()]
+    assert kinds == [("hover", "Settings"), ("click", "Settings"), ("hover", "Search")]
+    assert not rig.w.counters["skip_hover_away"]
+
+
+def test_after_the_user_left_only_the_first_drifting_rest_can_pass(rig):
+    """The cost, by the numbers: the user clicked and left; the mouse drifts every 20 s. The first rest after their
+    click passes (presence heard the click since the last rest), every later one is dropped."""
+    _rest(rig, hand=True)
+    rig.settle(1)
+    _users_click(rig, 150, 120)
+    for i, x in enumerate((400, 600, 800, 1000)):
+        rig.clock.t += 20
+        rig.cursor = (x, 300)
+        rig.uia.points[(x, 300)] = button(name=f"Invented spot {i}")
+        _rest(rig, hand=False)
+        rig.settle(1)
+    hovers = [r for r in rig.rows() if r["kind"] == "hover"]
+    assert len(hovers) == 2 and rig.w.counters["skip_hover_away"] == 3
+
+
+def test_keys_typed_before_the_nudge_count_like_a_click(rig):
+    _rest(rig, hand=True)
+    rig.settle(1)
+    rig.monitor.key_down(at=rig.clock.t)
+    rig.cursor = (400, 300)
+    rig.uia.points[(400, 300)] = button(name="Search")
+    _rest(rig, hand=False)
+    rig.settle(62)
+    assert [r["kind"] for r in rig.rows()] == ["hover", "hover"]
