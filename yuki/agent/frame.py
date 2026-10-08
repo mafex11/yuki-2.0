@@ -571,7 +571,8 @@ def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
 #: capC1b (report 78 §5.1, §6.4): the user's usual buttons and shortcuts in the apps in play, counted from the action
 #: trace by code. Hints only; the first lines to give way when the frame is over its size.
 GOTO_HEAD = ("What the user usually does in the apps in play (counted from how they work; hints, not steps - prefer "
-             "their shortcut when what it did is what the job needs; send it only into that app's window):")
+             "their shortcut when what it did is what the job needs, e.g. Ctrl+K 'a dialog opens; then you use Edit "
+             "\"Search\"' to open a chat: press it, type the name, Enter; send it only into that app's window):")
 #: Apps, buttons and shortcuts per app the frame names at most.
 MAX_GOTO_APPS = 3
 MAX_GOTO_ELEMENTS = 5
