@@ -489,9 +489,13 @@ def test_never_for_a_game_and_game_voice_off(store):
         other.close()
 
 
-def test_straight_into_another_game_ends_the_first_session_at_once(store):
+def test_straight_into_another_game_ends_the_first_session_at_once(store, monkeypatch):
     t0 = time.time() - 3600
     other = r"C:\Games\Other\other-game.exe"
+    # capQ2b: a game by a machine fact (Windows' own game detection names it), never by its share of the GPU
+    from yuki.memory import gamegate
+
+    monkeypatch.setattr(gamegate, "windows_games", lambda: frozenset({gamegate._norm_path(other)}))
     rig = Rig(store, t0)
     rig.stubs.hold("mic", VALORANT, t0 - 10)
     rig.game_in_front()
