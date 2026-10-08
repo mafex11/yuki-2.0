@@ -174,6 +174,10 @@ learn_fix_after_failure = "at_once"
 learn_demo_hint = "at_once"
 learn_demo_alone_after_times = 2
 learn_demo_alone_after_proven_runs = 1
+# Use what Yuki learned from how you work (report 78 phase C5): the ways it learned from what you did
+# and from your fixes, your usual buttons and shortcuts, and your usual paths.  false = Yuki works as
+# it did before it learned from your actions (nothing is deleted).  Read at once, no restart.
+use_learned = true
 # The hard game gate: while any of these programs runs (in front or not, windowed or full screen,
 # the launch screen too), nothing about your input will ever be recorded.  These are games with
 # kernel anti-cheat.  Add your own; the ones listed here always count, even if removed from your

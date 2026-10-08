@@ -84,7 +84,19 @@ DETAIL_CHORDS = 8
 PITFALL_RANK = 0.5
 DAY_S = 86400.0
 
-_COLUMNS = "id, at, process, kind, source, resolved, element_key, role, position, chord, facts"
+_COLUMNS = "id, at, process, kind, source, resolved, element_key, role, position, chord, facts, outcome_ciphertext"
+#: capC5 (report 78 §7.3): what a shortcut did, from its rows' recorded outcomes - the trace's own outcome classes
+#: (counts of what changed after the key), in plain words for the thinker. Deterministic formatting of machine facts.
+OUTCOME_WORDS: dict[str, str] = {"window_changed": "another window comes to the front",
+                                 "page_changed": "another page opens", "dialog": "a dialog opens",
+                                 "menu_opened": "a menu opens", "focus_moved": "the keyboard moves to another control",
+                                 "selected": "the selection changes", "invoked": "a control is pressed"}
+#: The next action of the user's, in the same app within this long after a shortcut, is "what they did with it" (s).
+NEXT_S = 4.0
+#: Outcome classes and next controls kept per shortcut at most; a share at least this large is worded.
+CHORD_OUTCOMES = 8
+CHORD_NEXT = 4
+CHORD_SHARE = 0.5
 
 
 def _col(row: Any, name: str) -> Any:
@@ -177,18 +189,57 @@ def _fold(entry: dict[str, Any] | None, at: float, extra: dict[str, Any]) -> dic
     return entry
 
 
-def fold_rows(state: dict[str, Any], rows: Iterable[Any]) -> int:
-    """Fold trace rows (``ui_actions`` columns :data:`_COLUMNS`) into the tallies; returns how many counted."""
+def _outcome_classes(row: Any, dec: Any) -> list[str]:
+    """capC5: the outcome classes a row recorded (its decrypted summary's counts above zero), those
+    :data:`OUTCOME_WORDS` can word; ``[]`` without a summary or a decrypter."""
+    raw = _col(row, "outcome_ciphertext")
+    if not raw or dec is None:
+        return []
+    try:
+        summary = json.loads(dec(raw) or "{}")
+    except Exception:  # noqa: BLE001 - another key, a broken value: nothing known
+        return []
+    if not isinstance(summary, dict):
+        return []
+    return [c for c in OUTCOME_WORDS if isinstance(summary.get(c), (int, float)) and summary[c] > 0]
+
+
+def _keep_top(table: dict[str, Any], cap: int, n_of: Any) -> dict[str, Any]:
+    if len(table) <= cap:
+        return table
+    return dict(sorted(table.items(), key=lambda kv: -n_of(kv[1]))[:cap])
+
+
+def fold_rows(state: dict[str, Any], rows: Iterable[Any], dec: Any = None) -> int:
+    """Fold trace rows (``ui_actions`` columns :data:`_COLUMNS`) into the tallies; returns how many counted.
+
+    capC5: with ``dec`` (the store's decrypter), a shortcut's tally also counts what its rows recorded happening after
+    it (``o``: outcome class -> count, :data:`OUTCOME_WORDS`) and the control the user used next in the same app within
+    :data:`NEXT_S` (``x``: element key -> ``{"n", "r"}``) - the words "Ctrl+K opens a box you type in next" are made
+    from these, never from a list of known shortcuts."""
     apps: dict[str, Any] = state.setdefault("apps", {})
     counted = 0
+    pending: dict[str, tuple[str, float]] = {}
     for r in rows:
         state["cursor"] = max(int(state.get("cursor") or 0), int(r["id"]))
         if r["source"] not in USER_SOURCES or not r["process"]:
             continue
         at = float(r["at"])
-        app = apps.setdefault(str(r["process"]), {"el": {}, "ch": {}})
+        proc = str(r["process"])
+        app = apps.setdefault(proc, {"el": {}, "ch": {}})
         if r["kind"] == "keys" and is_chord(r["chord"]):
-            app["ch"][str(r["chord"])] = _fold(app["ch"].get(str(r["chord"])), at, {})
+            chord = str(r["chord"])
+            entry = _fold(app["ch"].get(chord), at, {})
+            classes = _outcome_classes(r, dec)
+            if classes:
+                seen = entry.setdefault("o", {})
+                for c in classes:
+                    seen[c] = int(seen.get(c) or 0) + 1
+                entry["o"] = _keep_top(seen, CHORD_OUTCOMES, int)
+            if dec is not None:
+                entry["on"] = int(entry.get("on") or 0) + 1   # uses whose outcome could be read (the share's base)
+            app["ch"][chord] = entry
+            pending[proc] = (chord, at)
             counted += 1
         elif r["kind"] in ELEMENT_KINDS and r["element_key"] and r["resolved"] in IDENTITY_RESOLVED:
             key = str(r["element_key"])
@@ -198,6 +249,13 @@ def fold_rows(state: dict[str, Any], rows: Iterable[Any]) -> int:
                 extra["a"] = actionable          # capC1c: the latest row's patterns decide (:func:`low_info`)
             app["el"][key] = _fold(app["el"].get(key), at, extra)
             counted += 1
+            after = pending.pop(proc, None)
+            if after is not None and at - after[1] <= NEXT_S and after[0] in app["ch"]:
+                nxt = app["ch"][after[0]].setdefault("x", {})
+                got = nxt.get(key) or {"n": 0}
+                got.update(n=int(got.get("n") or 0) + 1, r=r["role"] or "")
+                nxt[key] = got
+                app["ch"][after[0]]["x"] = _keep_top(nxt, CHORD_NEXT, lambda v: int(v.get("n") or 0))
     return counted
 
 
@@ -311,7 +369,7 @@ def update(store: Any, *, now: float | None = None, batch: int = BATCH) -> dict[
     # a rebuild starts every app from nothing; otherwise only the apps these rows are in are read
     work: dict[str, Any] = {"cursor": int(state.get("cursor") or 0),
                             "apps": {p: (_empty_app() if rebuilt else _load_app(store, p)) for p in procs}}
-    counted = fold_rows(work, rows)
+    counted = fold_rows(work, rows, dec=getattr(store, "_dec", None))
     state["cursor"] = int(work["cursor"])
     if not rows:
         state["cursor"] = max(int(state.get("cursor") or 0), newest_id)
@@ -421,6 +479,36 @@ def _label(name: str | None, role: str, position: str) -> str:
     return f"an unnamed {role or 'control'}{where}"
 
 
+#: The words for one shortcut at most (characters).
+DID_CHARS = 110
+
+
+def chord_did(tally: dict[str, Any], names: dict[str, str | None] | None = None) -> str:
+    """capC5 (report 78 §7.3): what a shortcut did, from its rows' recorded outcomes, in plain words: the outcome
+    classes seen after at least :data:`CHORD_SHARE` of its readable uses (``"a dialog opens"``), then the control the
+    user most often used next (``"then you use Edit "Search""``), with how many times. ``""`` when nothing reached the
+    share. Deterministic formatting of counts; names only as the element registry keeps them."""
+    names = names or {}
+    base = int(tally.get("on") or 0)
+    bits: list[str] = []
+    if base:
+        seen = tally.get("o") or {}
+        for cls, n in sorted(seen.items(), key=lambda kv: -int(kv[1] or 0)):
+            if cls in OUTCOME_WORDS and int(n or 0) / base >= CHORD_SHARE:
+                bits.append(f"{OUTCOME_WORDS[cls]} ({int(n)} of {base})")
+            if len(bits) >= 2:
+                break
+    uses = int(tally.get("n") or 0)
+    nxt = sorted((tally.get("x") or {}).items(), key=lambda kv: -int((kv[1] or {}).get("n") or 0))
+    if nxt and uses:
+        key, v = nxt[0]
+        n = int((v or {}).get("n") or 0)
+        if key in names and n / uses >= CHORD_SHARE:
+            bits.append(f"then you use {_label(names.get(key), str((v or {}).get('r') or ''), '')} ({n} of {uses})")
+    text = "; ".join(bits)
+    return text if len(text) <= DID_CHARS else text[: DID_CHARS - 1].rstrip(" ;,") + "…"
+
+
 def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail: bool = False,
            lower: Iterable[str] = (), count: bool = True) -> list[dict[str, Any]]:
     """For each app in play (at most :data:`APPS_SHOWN`, :data:`DETAIL_APPS` with ``detail``; in the order given),
@@ -451,6 +539,8 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
             # low-information ones (capC1c) are never shown, so the top ones may sit far down the list
             picked[proc] = els
             keys += [k for _s, k, _v in picked[proc]]
+            # capC5: the controls the user used right after a shortcut (named only as the registry keeps them)
+            keys += [k for v in (table[proc].get("ch") or {}).values() for k in (v.get("x") or {})]
         names: dict[str, str | None] = {}
         for start in range(0, len(keys), 400):
             part = keys[start:start + 400]
@@ -479,7 +569,8 @@ def go_tos(store: Any, apps: Sequence[str], *, now: float | None = None, detail:
                             key=lambda x: -x[0])[:n_ch]
             entry = {"app": proc, "elements": elements,
                      "chords": [{"chord": c, "keys": chord_keys(c), "n": int(v.get("n") or 0),
-                                 "days": int(v.get("d") or 0), "last_at": v.get("t"), "score": round(s, 3)}
+                                 "days": int(v.get("d") or 0), "last_at": v.get("t"), "score": round(s, 3),
+                                 **({"did": did} if (did := chord_did(v, names)) else {})}
                                 for s, c, v in chords]}
             if entry["elements"] or entry["chords"]:
                 out.append(entry)
@@ -538,7 +629,7 @@ def served_today(store: Any, now: float | None = None) -> int:
 
 
 __all__ = ["APPS_SHOWN", "BATCH", "CHORD_MODIFIERS", "ELEMENT_KINDS", "HALF_LIFE_DAYS", "IDENTITY_RESOLVED",
-           "KEEP_DAYS", "MAX_APPS", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS", "low_info",
+           "KEEP_DAYS", "MAX_APPS", "OUTCOME_WORDS", "chord_did", "MAX_CHORDS", "MAX_ELEMENTS", "PITFALL_RANK", "STATE_KEY", "TOP_CHORDS", "low_info",
            "APP_PREFIX", "app_tallies",
            "SERVED_KEY", "TOP_ELEMENTS", "USER_SOURCES", "chord_keys", "flush_served", "fold_rows", "go_tos", "is_chord",
            "note_served", "prune", "served_today",

@@ -571,7 +571,8 @@ def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
 #: capC1b (report 78 §5.1, §6.4): the user's usual buttons and shortcuts in the apps in play, counted from the action
 #: trace by code. Hints only; the first lines to give way when the frame is over its size.
 GOTO_HEAD = ("What the user usually does in the apps in play (counted from how they work; hints, not steps - prefer "
-             "their shortcut when it does the job):")
+             "their shortcut when what it did is what the job needs, e.g. Ctrl+K 'a dialog opens; then you use Edit "
+             "\"Search\"' to open a chat: press it, type the name, Enter; send it only into that app's window):")
 #: Apps, buttons and shortcuts per app the frame names at most.
 MAX_GOTO_APPS = 3
 MAX_GOTO_ELEMENTS = 5
@@ -588,8 +589,11 @@ def go_to_lines(practice: dict[str, Any] | None) -> list[str]:
         els = [e for e in g.get("elements") or [] if isinstance(e, dict) and e.get("label")][:MAX_GOTO_ELEMENTS]
         parts = []
         if chords:
-            parts.append("presses " + ", ".join(f"{_one(c['chord'], 30)} ({int(c.get('n') or 0)} times)"
-                                                for c in chords))
+            # capC5 (report 78 §7.3): each shortcut with what it did, from its recorded outcomes, so the brain can
+            # choose it for the job
+            parts.append("presses " + ", ".join(
+                f"{_one(c['chord'], 30)} ({int(c.get('n') or 0)} times"
+                + (f": {_one(c['did'], 110)}" if c.get("did") else "") + ")" for c in chords))
         if els:
             parts.append("goes to " + ", ".join(f"{_one(e['label'], 70)} ({int(e.get('n') or 0)} times)"
                                                 for e in els))
