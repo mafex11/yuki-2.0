@@ -325,6 +325,8 @@ class TraceUia:
     def _com_error(self, exc: BaseException) -> None:
         """capQ2a: a COM error from an app that did not answer, counted by its code (content-free), never logged."""
         code = getattr(exc, "hresult", None)
+        if code is None:
+            code = getattr(exc, "winerror", None)        # an HRESULT from an ``oledll`` call
         if code is None and exc.args and isinstance(exc.args[0], int):
             code = exc.args[0]
         key = f"com_error_{int(code) & 0xFFFFFFFF:08x}" if isinstance(code, int) else f"com_error_{type(exc).__name__}"

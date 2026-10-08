@@ -48,6 +48,15 @@ or Explorer); one picked in an open/save dialog is that dialog's app's (``via=di
 Nothing from a span while the trace was blocked (off, paused, an off hour, a game) becomes a row later: the controller
 queues a ``reopen`` mark on each opening and the worker passes over what was written meanwhile.
 
+capQ2a (9 Oct 2026, report 103, from a day of the user's own data): staleness counts only changes before the answer
+was settled (:meth:`TraceWorker._before_answer`); a text field and a send are judged by UI Automation's facts in
+Chromium and Electron editors too (:meth:`TraceWorker._submit_check`); FL Studio's own recent-projects list is read on
+a save chord in it or when its title changes (:mod:`yuki.memory.trace_flrecent`); a hover needs the user's own mouse
+movement by presence's rule; input while Deskflow has the cursor on another computer, and Deskflow's own windows,
+give no row (:mod:`yuki.memory.trace_deskflow`); a command control inside a list, tree or grid keeps a digest only
+(:func:`yuki.memory.trace_privacy.content_item`); event lookups no longer go through ``ElementFromIAccessible`` and
+COM errors are counted, not logged.
+
 Budgets (report 78 §4.3): at most :data:`LOOKUPS_PER_S` lookups a second, each within
 :data:`yuki.memory.trace_uia.TIMEOUT_MS`; over budget the action is kept point-only. Hovers and scrolls are looked up
 only with budget to spare (clicks first). Logs are content-free: counts, kinds, ms and reason codes; an exception
