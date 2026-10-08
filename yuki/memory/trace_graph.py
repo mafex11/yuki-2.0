@@ -246,7 +246,7 @@ def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MA
     if t is not None:
         latest = {"goal": _clip(_dec(store, t["goal_ciphertext"]), LABEL_CHARS), "at": float(t["started_at"]),
                   "when": F.when_words(t["started_at"], now), "outcome": fact_phrase(t["outcome_fact"], t["file_ext"]),
-                  "checked": learnable(dict(t)), "renamed": t["user_verdict"] == "renamed"}
+                  "checked": learnable(dict(t), store), "renamed": t["user_verdict"] == "renamed"}
     out = {"id": int(f["id"]), "label": _label(store, f), "tasks": n_tasks, "apps": _apps(f["apps"])[:6],
            "last_at": f["last_at"], "last_words": F.when_words(f["last_at"], now), "of": n_routes, "steps": path,
            "branches": worded_branches, "latest": latest, "followed_by": [],
@@ -560,7 +560,7 @@ def tasks_between(store: Any, since: float, until: float, *, limit: int = MAX_TA
                     "goal": _clip(_dec(store, r["goal_ciphertext"]), LABEL_CHARS),
                     "renamed": r["user_verdict"] == "renamed", "apps": _apps(r["apps"])[:6],
                     "outcome": r["outcome_fact"] or UNCLEAR, "outcome_phrase": fact_phrase(r["outcome_fact"], r["file_ext"]),
-                    "checked": learnable(dict(r)), "outcome_at": r["outcome_at"], "outcome_action": r["outcome_action"],
+                    "checked": learnable(dict(r), store), "outcome_at": r["outcome_at"], "outcome_action": r["outcome_action"],
                     "family_tasks": int(r["family_tasks"] or 0)})
     return {"tasks": out, "more": max(0, int(n_all) - len(out)), "left_out": int(rejected or 0)}
 
@@ -604,7 +604,7 @@ def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EV
     out = []
     for r in rows:
         at = r["outcome_at"]
-        if at is None or not lo <= float(at) < hi or not learnable(dict(r)):
+        if at is None or not lo <= float(at) < hi or not learnable(dict(r), store):
             continue
         goal = _clip(_dec(store, r["goal_ciphertext"]), LABEL_CHARS)
         if not goal:

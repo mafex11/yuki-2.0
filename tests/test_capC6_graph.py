@@ -389,8 +389,12 @@ def test_done_evidence_is_only_what_was_made_sent_or_run(store):
     assert sorted(e["fact"] for e in ev) == sorted(G.DONE_FACTS)
     assert {e["task"] for e in ev} == {ids[k] for k in G.DONE_FACTS}
     assert set(G.DONE_FACTS) <= set(T.FACT_KINDS)
-    # tasks_between still lists every checked outcome as checked (it says what happened, not that it was finished)
-    assert sum(t["checked"] for t in G.tasks_between(store, NOW - 60, NOW + DAY)["tasks"]) == len(kinds)
+    # tasks_between still lists every checked outcome as checked (it says what happened, not that it was finished),
+    # except a window that came up with nothing else done in its app: capQ2b's window_only rule makes that no
+    # outcome at all (report 104), and this window task's only step is the press that brought it up
+    checked = {t["id"]: t["checked"] for t in G.tasks_between(store, NOW - 60, NOW + DAY)["tasks"]}
+    assert checked[ids["window_verified"]] is False
+    assert sum(checked.values()) == len(kinds) - 1
 
 
 def test_a_branch_past_a_cut_path_says_later_on(store):

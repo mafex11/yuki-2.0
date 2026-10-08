@@ -443,7 +443,7 @@ def due_tasks(store: Any, now: float, *, limit: int = TASKS_PER_PASS,
     out, n = [], 0
     for r in rows:
         d = dict(r)
-        d["learnable"] = T.learnable(d) and float(d["ended_at"] or 0) >= now - MAX_TASK_AGE_S
+        d["learnable"] = T.learnable(d, store) and float(d["ended_at"] or 0) >= now - MAX_TASK_AGE_S
         out.append(d)
         n += int(d["learnable"])
         if n >= limit:

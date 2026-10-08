@@ -572,9 +572,15 @@ def run(args: argparse.Namespace) -> int:
                     tr = trace
                     return tr.rules() if tr is not None else None
 
+                def practice_game() -> bool:
+                    # capQ2b: the hard game gate (started later in this function; None until then: it holds)
+                    from yuki.memory.gamegate import gate_holds
+
+                    return gate_holds(game_gate)
+
                 practice = PracticeWorker(store, practice_model, db_path=db_path, log=log, idle_fn=_practice_idle,
                                           live_fn=practice_fullscreen, embedder=_practice_embedder(),
-                                          trace_rules=practice_trace_rules)
+                                          trace_rules=practice_trace_rules, game_fn=practice_game)
                 threading.Thread(target=_guarded(practice.run, log, "practice"), args=(stop,),
                                  name="yuki-memory-practice", daemon=True).start()
             except Exception as exc:  # everything else runs on without it

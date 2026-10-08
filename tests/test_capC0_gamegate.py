@@ -68,7 +68,8 @@ def _gate(*, procs: list[tuple[int, str]], fullscreen: set[int] = frozenset(), g
     gate = GameGate(store=store, privacy_path=privacy, log=log, game_session_fn=lambda: session,
                     fullscreen_fn=lambda hwnd: hwnd in fullscreen, d3d_fn=lambda: d3d,
                     gpu_fn=lambda pids: (gpu or {}).get(list(pids)[0]), scan_fn=lambda: list(images.items()),
-                    image_fn=lambda pid: images.get(pid, ""), own_fn=lambda pid: False, clock=clock)
+                    image_fn=lambda pid: images.get(pid, ""), own_fn=lambda pid: False, clock=clock,
+                    windows_fn=lambda: frozenset(), exe_fn=lambda pid: "")
     return gate, clock, log, images
 
 
@@ -131,12 +132,12 @@ def test_d3d_exclusive_full_screen_and_a_game_voice_session_hold_it() -> None:
     assert decide(GateView(front="Discord.exe", game_session=True), games).reasons == ("game_voice",)
 
 
-def test_only_a_measured_full_screen_game_share_of_the_gpu_teaches_a_new_game() -> None:
-    assert judge_learn("Fieldrunner.exe", fullscreen=True, gpu_share=55.0) == (True, "draws_like_a_game")
-    assert judge_learn(FL, fullscreen=True, gpu_share=3.0) == (False, "low_gpu")
-    assert judge_learn(FL, fullscreen=True, gpu_share=None) == (False, "no_gpu_reading")   # no reading: never
-    assert judge_learn("Fieldrunner.exe", fullscreen=False, gpu_share=80.0) == (False, "not_fullscreen")
-    assert judge_learn("Yuki.exe", fullscreen=True, gpu_share=90.0, own=True)[0] is False
+def test_only_direct3d_exclusive_full_screen_teaches_a_new_game() -> None:
+    """capQ2b: a Windows fact, never a share of the GPU (FL Studio maximised drew 16% one morning)."""
+    assert judge_learn("Fieldrunner.exe", fullscreen=True, d3d=True) == (True, "d3d_exclusive")
+    assert judge_learn(FL, fullscreen=True, d3d=False) == (False, "not_exclusive")
+    assert judge_learn("Fieldrunner.exe", fullscreen=False, d3d=True) == (False, "not_fullscreen")
+    assert judge_learn("Yuki.exe", fullscreen=True, d3d=True, own=True)[0] is False
 
 
 # -- the gate fed events ------------------------------------------------------------------------------------------------
@@ -151,7 +152,7 @@ def test_fl_studio_maximised_is_measured_and_never_counts() -> None:
         clock.t = 1000.0 + after
         assert not gate.on_check().hold
     assert gate.next_check_in() is None
-    assert log.of("game_gate_not_game") == [{"app": "fl64", "why": "low_gpu", "gpu_share": 2.5}]
+    assert log.of("game_gate_not_game") == [{"app": "fl64", "why": "not_exclusive", "gpu_share": 2.5}]
     assert not log.of("game_gate_learned") and not any(f["hold"] for f in log.of("game_gate"))
     gate.on_foreground(5, 12)
     gate.on_foreground(1, 11)                                    # back to FL: measured again, said once
@@ -185,24 +186,34 @@ def test_a_game_already_running_at_start_holds_from_the_first_look() -> None:
     assert log.of("game_gate")[0]["trigger"] == "start"
 
 
-def test_a_new_game_seen_full_screen_drawing_like_one_is_learned_and_remembered() -> None:
+def test_a_new_game_seen_in_exclusive_full_screen_is_learned_and_remembered() -> None:
+    """capQ2b: learned from Direct3D exclusive full screen (a Windows fact) in two stretches; the GPU share is kept
+    in the log as measured, never decisive."""
     store = _Store()
-    gate, clock, log, _ = _gate(procs=[(30, "Fieldrunner.exe"), (12, "Discord.exe")], fullscreen={4},
-                                gpu={30: 61.0}, store=store)
-    assert not gate.on_foreground(4, 30).hold
-    clock.t += G.CHECK_AFTER_S[0]
-    d = gate.on_check()                                            # one stretch: a candidate, not yet a game
-    assert not d.hold and gate.next_check_in() is None and not log.of("game_gate_learned")
+    gate, clock, log, s = _live_gate(procs={30: "Fieldrunner.exe", 12: "Discord.exe"}, fullscreen={4},
+                                     gpu={30: 61.0})
+    gate._store = store
+
+    def stretch() -> Any:
+        s["d3d"] = False
+        gate.on_foreground(5, 12)
+        s["d3d"] = True                                            # the game goes exclusive full screen
+        gate.on_foreground(4, 30)
+        clock.t += G.CHECK_AFTER_S[0]
+        d = gate.on_check()
+        s["d3d"] = False
+        gate.on_foreground(5, 12)
+        return d
+
+    stretch()                                                      # one stretch: a candidate, not yet a game
+    assert not gate.decision().hold and not log.of("game_gate_learned")
     assert log.of("game_gate_evidence") == [{"app": "fieldrunner", "gpu_share": 61.0, "stretches": 1, "step": 1}]
     assert gate.stats()["candidates"] == 1 and gate.stats()["learned"] == 0
-    gate.on_foreground(5, 12)
-    gate.on_foreground(4, 30)                                      # a second, separate stretch
-    clock.t += G.CHECK_AFTER_S[0]
-    d = gate.on_check()
-    assert d.hold and d.sources == ("learned",) and gate.next_check_in() is None
+    stretch()                                                      # a second, separate stretch
+    assert gate.decision().hold and gate.decision().sources == ("learned",)
     assert log.of("game_gate_learned") == [{"game": "fieldrunner", "gpu_share": 61.0, "stretches": 2}]
     kept = json.loads(store.rows[G.LEARNED_STATE])
-    assert kept["fieldrunner"]["gpu_share"] == 61.0 and kept["fieldrunner"]["stretches"] == 2
+    assert kept["fieldrunner"]["evidence"] == G.SOUND_EVIDENCE and kept["fieldrunner"]["stretches"] == 2
     assert set(kept) == {"fieldrunner"}
     again, *_ = _gate(procs=[(31, "Fieldrunner.exe"), (12, "Discord.exe")], store=store)
     assert again.on_foreground(5, 12).hold                          # remembered, and windowed or behind counts
@@ -228,7 +239,7 @@ def _live_gate(**state: Any):
     gate = GameGate(log=log, game_session_fn=lambda: s["session"], fullscreen_fn=lambda hwnd: hwnd in s["fullscreen"],
                     d3d_fn=lambda: s["d3d"], gpu_fn=lambda pids: s["gpu"].get(list(pids)[0]),
                     scan_fn=lambda: list(s["procs"].items()), image_fn=lambda pid: s["procs"].get(pid, ""),
-                    own_fn=lambda pid: False, clock=clock)
+                    own_fn=lambda pid: False, clock=clock, windows_fn=lambda: frozenset(), exe_fn=lambda pid: "")
     return gate, clock, log, s
 
 
@@ -281,51 +292,68 @@ def test_the_gate_fails_closed() -> None:
     assert not gate.alive and gate.holds() and G.gate_holds(gate)
 
 
-def test_a_learned_program_measured_low_is_corrected_and_forgotten() -> None:
-    """Review fix: a music app's GPU-heavy visualiser twice makes it a learned game; later low stretches take it out
-    again, and the program is forgotten from the stored evidence at zero."""
+def _stretch(gate, clock, s: dict, hwnd: int, pid: int, *, exclusive: bool) -> None:
+    """One full-screen stretch of ``pid`` in front, exclusive or not at its checks; back to Discord after."""
+    s["d3d"] = False
+    gate.on_foreground(5, 12)
+    s["d3d"] = exclusive
+    gate.on_foreground(hwnd, pid)
+    for after in G.CHECK_AFTER_S:
+        if gate.next_check_in() is None:
+            break
+        clock.t += after
+        gate.on_check()
+    s["d3d"] = False
+    gate.on_foreground(5, 12)
+
+
+def test_a_candidate_no_longer_exclusive_is_corrected_and_forgotten() -> None:
+    """Review fix, on the capQ2b facts: one exclusive stretch makes a candidate; a later full-screen stretch that is
+    not exclusive takes it back, and the program is forgotten from the stored evidence at zero."""
     store = _Store()
-    gate, clock, log, images = _gate(procs=[(11, FL), (12, "Discord.exe")], fullscreen={1}, gpu={11: 40.0},
-                                     store=store)
-
-    def stretch(share: float) -> None:
-        gate._gpu_fn = lambda pids: share
-        gate.on_foreground(5, 12)
-        gate.on_foreground(1, 11)
-        for after in G.CHECK_AFTER_S:
-            if gate.next_check_in() is None:
-                break
-            clock.t += after
-            gate.on_check()
-
-    stretch(40.0)
-    stretch(40.0)
-    assert gate.holds() and log.of("game_gate_learned")[0]["game"] == "fl64"
-    stretch(2.0)                                                   # evidence 2 -> 1: not a game any more
-    assert not gate.holds() and log.of("game_gate_unlearned") == [{"app": "fl64", "gpu_share": 2.0, "stretches": 1}]
-    assert json.loads(store.rows[G.LEARNED_STATE])["fl64"]["stretches"] == 1
-    stretch(2.0)                                                   # 1 -> 0: forgotten
+    gate, clock, log, s = _live_gate(procs={11: "Slideshow.exe", 12: "Discord.exe"}, fullscreen={1},
+                                     gpu={11: 40.0})
+    gate._store = store
+    _stretch(gate, clock, s, 1, 11, exclusive=True)                # 1 stretch: a candidate, never a game yet
+    assert not gate.holds() and not log.of("game_gate_learned")
+    assert json.loads(store.rows[G.LEARNED_STATE])["slideshow"]["stretches"] == 1
+    _stretch(gate, clock, s, 1, 11, exclusive=False)               # 1 -> 0: forgotten
     assert json.loads(store.rows[G.LEARNED_STATE]) == {} and gate.stats()["candidates"] == 0
-    assert not gate.holds()
+    assert not gate.holds() and not log.of("game_gate_unlearned")
 
 
-def test_evidence_is_capped_and_one_low_stretch_does_not_drop_a_well_known_game() -> None:
-    gate, clock, log, _ = _gate(procs=[(30, "Fieldrunner.exe"), (12, "Discord.exe")], fullscreen={4})
-
-    def stretch(share: float) -> None:
-        gate._gpu_fn = lambda pids: share
-        gate.on_foreground(5, 12)
-        gate.on_foreground(4, 30)
+def test_a_learned_game_played_borderless_keeps_the_gate_held() -> None:
+    """Second verification V1: a game learned from two exclusive stretches, later played borderless full screen (how
+    most games run), stays learned and the gate holds the whole session, past every check."""
+    store = _Store()
+    gate, clock, log, s = _live_gate(procs={11: "Skyrunner.exe", 12: "Discord.exe"}, fullscreen={1},
+                                     gpu={11: 40.0})
+    gate._store = store
+    _stretch(gate, clock, s, 1, 11, exclusive=True)
+    _stretch(gate, clock, s, 1, 11, exclusive=True)
+    assert log.of("game_gate_learned")[0]["game"] == "skyrunner"
+    for _ in range(3):                                             # three borderless sessions
+        s["d3d"] = False
+        gate.on_foreground(1, 11)
+        assert gate.holds()
         for after in G.CHECK_AFTER_S:
             if gate.next_check_in() is None:
                 break
             clock.t += after
             gate.on_check()
+            assert gate.holds()                                    # held at the 20 s and 90 s checks
+        gate.on_foreground(5, 12)
+        assert gate.holds()                                        # still running behind Discord
+    assert not log.of("game_gate_unlearned")
+    assert json.loads(store.rows[G.LEARNED_STATE])["skyrunner"]["stretches"] == 2
 
+
+def test_evidence_is_capped_and_one_windowed_stretch_does_not_drop_a_well_known_game() -> None:
+    gate, clock, log, s = _live_gate(procs={30: "Fieldrunner.exe", 12: "Discord.exe"}, fullscreen={4})
     for _ in range(6):
-        stretch(70.0)
+        _stretch(gate, clock, s, 4, 30, exclusive=True)
     assert G.stretches(gate._evidence["fieldrunner"]) == G.EVIDENCE_CAP
-    stretch(4.0)                                                   # a lobby screen: 3 -> 2, still a game
+    _stretch(gate, clock, s, 4, 30, exclusive=False)               # borderless: a learned game keeps its count
     assert gate.holds() and not log.of("game_gate_unlearned")
 
 
