@@ -160,7 +160,8 @@ def own_request(at: float = NOW - DAY, text: str = REQUEST) -> D.Request:
 class StubThinker:
     """A stand-in for the thinker, plan-only. It follows the frame's usual path (or, failing that, the last
     example) as a model would, mapping each step's words to the snapshot's ids; with no frame it clicks the first
-    control and presses Enter. ``jitter``: every other call drops its plan's last step. Records every call."""
+    control and presses Enter. ``jitter``: calls 3-4, 7-8 ... (the second pass of B0 and L when the arms run twice)
+    keep only their plan's first step. Records every call."""
 
     def __init__(self, *, est: float = 0.01, cost: float = 0.01, jitter: bool = False) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -214,7 +215,7 @@ class StubThinker:
         if not out:
             first = next(iter(els.values()), None)
             out = ([{"do": "click", "element": first}] if first else []) + [{"do": "keys", "keys": "Enter"}]
-        if self.jitter and len(self.calls) % 2 == 0 and len(out) > 1:
+        if self.jitter and ((len(self.calls) - 1) // 2) % 2 == 1 and len(out) > 1:
             out = out[:1]
         return {"steps": out}, self.cost
 
