@@ -128,3 +128,19 @@ def test_a_dry_run_makes_no_call_and_gives_no_verdict(store):
     assert all(r["runs"][0]["B1"]["scores"] for r in out["rows"])           # B1 is code: scored even so
     assert all(r["runs"][0][a]["skipped"] == "dry run" for r in out["rows"] for a in ("B0", "L"))
     assert "Dry run: no model was called" in C.report_text(out)
+
+
+class _Failing(StubThinker):
+    def plan(self, **kw):
+        self.calls.append(kw)
+        raise ConnectionError("the model's service is down")
+
+
+def test_a_failed_plan_is_never_scored_as_an_empty_one(store):
+    two_kinds(store)
+    out = _run(store, _Failing())
+    failed = [a for r in out["rows"] for run in r["runs"] for a in run.values() if a["error"]]
+    assert failed and all(a["scores"] is None and "ConnectionError" in a["error"] for a in failed)
+    assert all(r["runs"][0]["B1"]["scores"] for r in out["rows"])              # the code arm still scored
+    assert out["errors"] == len(failed) and out["complete"] is False and out["result"] == "cannot tell"
+    assert f"{len(failed)} plans failed" in C.report_text(out)

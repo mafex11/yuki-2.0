@@ -50,14 +50,14 @@ def test_repeat_two_measures_the_drift_and_a_steady_model_passes_it(store):
     two_kinds(store)
     out = _run(store, StubThinker(), repeat=2)
     assert all(len(r["runs"]) == 2 for r in out["rows"]) and len(out["summary"]) == 2
-    assert out["drift"]["max"] == 0.0 and out["verdict"]["repeat_drift"] == 0.0
+    assert out["drift"]["max"] == out["drift"]["composite"] == 0.0 and out["verdict"]["repeat_drift"] == 0.0
     assert "differed" not in " ".join(out["verdict"]["why"])
-    assert "repeatable within 3 points: yes" in C.report_text(out)
+    assert "repeatable within 3 points: yes." in C.report_text(out)
 
 
 def test_a_model_that_moves_more_than_3_points_leaves_no_verdict(store):
     two_kinds(store)
     out = _run(store, StubThinker(jitter=True), repeat=2)
-    assert out["drift"]["max"] > 3.0
+    assert out["drift"]["composite"] > 3.0 and out["verdict"]["repeat_drift"] == out["drift"]["composite"]
     assert out["result"] == "cannot tell" and any("differed" in w for w in out["verdict"]["why"])
-    assert "repeatable within 3 points: no" in C.report_text(out)
+    assert "repeatable within 3 points: no." in C.report_text(out)

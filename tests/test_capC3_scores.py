@@ -73,6 +73,7 @@ def test_aggregate_paired_and_drift():
     s2 = {"L": S.arm_summary([S.score(["a"], ["a"]), S.score(["a"], ["a"])])}
     d = S.drift(s1, s2)
     assert s1["L"]["composite"]["mean"] == 50.0 and d["max"] == 50.0 and d["by_arm"]["L"]["composite"] == 50.0
+    assert d["composite"] == 50.0
 
 
 def _row(b0: float, b1: float, lv: float) -> dict:
