@@ -94,21 +94,60 @@ def test_a_change_heard_before_the_answer_was_settled_is_stale(rig):
 
 
 def test_a_change_windows_dates_before_the_answer_is_stale_however_late_it_was_heard(rig):
-    """The hook thread heard it after the answer (it was busy); Windows' own time of it is an earlier tick."""
+    """The hook thread heard it after the answer (it was busy); Windows' own time of it is an earlier tick, after
+    the press (2 ms in; the answer was settled at 5 ms)."""
     tick = rig.uia.tick_at
     t0 = rig.clock.t
-    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) - 20)])
+    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) + 2)])
     (row,) = [r for r in rig.rows() if r["kind"] == "click"]
     assert row["resolved"] == "stale"
 
 
 def test_the_tick_count_wrapping_round_is_still_ordered(rig):
-    rig.uia.tick0 = 0xFFFFFFFF - 2                 # the answer's tick wraps past zero
+    rig.uia.tick0 = 0xFFFFFFFF - 2                 # the press is 3 ticks before the wrap, the change at the wrap
     tick = rig.uia.tick_at
     t0 = rig.clock.t
-    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, (tick(t0) - 1) & 0xFFFFFFFF)])
+    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, (tick(t0) + 3) & 0xFFFFFFFF)])
     (row,) = [r for r in rig.rows() if r["kind"] == "click"]
     assert row["resolved"] == "stale"
+
+
+def test_a_change_windows_dates_before_the_press_and_delivered_late_is_not_stale(rig):
+    """Review F2: the taskbar's own hover redraw, dated by Windows 500 ms before the press, reached the worker only
+    after the answer: it was already on screen when the user pressed, so the press was on what the lookup found."""
+    tick = rig.uia.tick_at
+    t0 = rig.clock.t
+    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) - 500)])
+    (row,) = [r for r in rig.rows() if r["kind"] == "click"]
+    assert row["resolved"] == "point" and not rig.w.counters["stale_structure"]
+
+
+def test_one_tick_step_before_the_press_still_counts(rig, monkeypatch):
+    """A change right after the press (a menu closing on the down) may read the tick count's step before the press:
+    one step of it (the clock's interrupt interval, a Windows fact) is allowed, no more."""
+    from yuki.memory import trace
+
+    monkeypatch.setattr(trace, "tick_step_ms", lambda: 16)
+    tick = rig.uia.tick_at
+    t0 = rig.clock.t
+    _press_taskbar(rig, [(0.02, EVENT_OBJECT_REORDER, TASKBAR, tick(t0) - 10)])
+    (row,) = [r for r in rig.rows() if r["kind"] == "click"]
+    assert row["resolved"] == "stale"
+
+
+def test_the_before_answer_rule_directly():
+    """The reviewer's case, by the numbers: pressed at 100.000, answer settled at 100.020 (tick 50020), a change
+    heard at 100.025 and dated tick 49500 (500 ms before the press): not before the answer. Dated 50010: it is."""
+    from types import SimpleNamespace
+
+    from yuki.memory.trace import TraceWorker
+
+    el = SimpleNamespace(chosen_at=100.020, chosen_tick=50_020)
+    act = SimpleNamespace(t=100.000, lookup_end=100.030, el=el)
+    assert TraceWorker._before_answer(act, 100.025, 49_500) is False
+    assert TraceWorker._before_answer(act, 100.025, 50_010) is True
+    assert TraceWorker._before_answer(act, 100.025, 50_030) is False            # dated after the answer
+    assert TraceWorker._before_answer(act, 100.015, None) is True               # heard before the answer
 
 
 def test_a_list_reordering_under_the_point_before_the_answer_is_still_stale(rig):

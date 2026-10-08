@@ -144,6 +144,26 @@ _K.FindNextChangeNotification.restype = W.BOOL
 _K.FindCloseChangeNotification.argtypes = [W.HANDLE]
 
 
+_TICK_STEP: list[int] = []
+
+
+def tick_step_ms() -> int:
+    """capQ2a (review F2): how far apart two readings of Windows' tick count (``GetTickCount``, an event's
+    ``dwmsEventTime``) can be for the same moment: the system clock's interrupt interval
+    (``GetSystemTimeAdjustment``'s time increment, 100 ns units), rounded up to whole ms. Read once; 0 when it cannot
+    be read (no slack)."""
+    if not _TICK_STEP:
+        step = 0
+        try:
+            adjustment, increment, disabled = W.DWORD(), W.DWORD(), W.BOOL()
+            if _K.GetSystemTimeAdjustment(ctypes.byref(adjustment), ctypes.byref(increment), ctypes.byref(disabled)):
+                step = -(-int(increment.value) // 10_000)
+        except Exception:  # noqa: BLE001 - not Windows
+            step = 0
+        _TICK_STEP.append(step)
+    return _TICK_STEP[0]
+
+
 def recent_folder() -> Path:
     """The shell's Recent folder (``%APPDATA%\\Microsoft\\Windows\\Recent``)."""
     return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Microsoft" / "Windows" / "Recent"
@@ -481,5 +501,5 @@ def root_at(x: int, y: int) -> int:
 
 
 __all__ = ["LOW_RATE", "OUTCOME", "OUTCOME_CAP", "OUTCOME_S", "PRIVATE_FORMATS", "TraceHooks", "clipboard_formats",
-           "recent_folder", "root_at", "window_title"]
+           "recent_folder", "root_at", "tick_step_ms", "window_title"]
 

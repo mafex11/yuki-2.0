@@ -13,6 +13,12 @@ history reader, and drop input while the cursor is on another screen. No guessin
 * **What is read**: Deskflow's fixed log lines ``[<local time>] INFO: leaving screen`` (the cursor left this PC's
   screen) and ``... INFO: entering screen`` (it came back); every other line is passed over unread. Times are
   Deskflow's own (local, to the millisecond).
+* **Where a span away ends without an ``entering screen``** (review F1, 9 Oct): Deskflow logs no ``entering screen``
+  when it stops or is restarted while the cursor is on the other computer (this PC's log: 4 times in 12 days, a PC
+  shut down or rebooted with the cursor over there). Its own start and stop lines (:data:`RESTARTS`) end any span
+  away, since Deskflow always starts and stops with the cursor on this PC, and so does this PC's boot (``GetTickCount64``
+  gives the boot time): a span that began before the last boot ended at it. Without this, every action after such a
+  reboot was dropped until the cursor next went over and came back.
 * **How**: on demand (the trace asks for an action's time), never polled: the file's size and write time are asked
   first (one ``stat``) and only bytes appended since the last read are read, at most :data:`READ_MAX` a time (a log
   that grew more is read from its last :data:`READ_MAX` bytes, the latest state being what matters). A log that
@@ -35,6 +41,10 @@ DESKFLOW_IMAGES = frozenset({"deskflow.exe", "deskflow-core.exe", "deskflow-daem
                              "deskflow-client.exe"})
 #: Deskflow's fixed log messages for the cursor leaving and entering this PC's screen.
 LEAVING, ENTERING = "leaving screen", "entering screen"
+#: Deskflow's fixed messages for its daemon and server starting and stopping (its 1.26 log, read on this PC 9 Oct):
+#: the cursor is on this PC's own screen whenever one is written, so each ends a span away.
+RESTARTS = frozenset({"starting daemon", "daemon is running", "daemon is stopping",
+                      "started server, waiting for clients", "stopped server"})
 #: Bytes read from the log at most per look.
 READ_MAX = 256 * 1024
 #: Spans away kept at most (memory only).
@@ -64,15 +74,28 @@ def log_candidates(environ: dict[str, str] | None = None) -> list[Path]:
     return out
 
 
+def boot_time() -> float:
+    """This PC's boot time (epoch s): now less ``GetTickCount64`` (ms since boot, a Windows fact); 0.0 if unreadable."""
+    try:
+        import ctypes
+
+        fn = ctypes.windll.kernel32.GetTickCount64
+        fn.restype = ctypes.c_ulonglong
+        return time.time() - int(fn()) / 1000.0
+    except Exception:  # noqa: BLE001 - not Windows: no boot bound
+        return 0.0
+
+
 def parse_line(line: str) -> tuple[float, bool] | None:
-    """``(epoch s, away)`` for a ``leaving screen`` (away) or ``entering screen`` line, else None. The time is
-    Deskflow's own, ``[YYYY-MM-DDTHH:MM:SS.mmm]`` local time."""
+    """``(epoch s, away)`` for a ``leaving screen`` line (away), an ``entering screen`` line or one of Deskflow's
+    start and stop lines (:data:`RESTARTS`: back on this screen), else None. The time is Deskflow's own,
+    ``[YYYY-MM-DDTHH:MM:SS.mmm]`` local time."""
     line = line.strip()
     if not line.startswith("[") or "]" not in line:
         return None
     stamp, _sep, rest = line[1:].partition("]")
     message = rest.split(":", 1)[1].strip() if ":" in rest else ""
-    if message not in (LEAVING, ENTERING):
+    if message not in (LEAVING, ENTERING) and message not in RESTARTS:
         return None
     whole, _dot, frac = stamp.partition(".")
     try:
@@ -89,10 +112,13 @@ class DeskflowScreens:
 
     Args:
         paths: ``() -> candidate log files`` (default :func:`log_candidates`).
+        boot: this PC's boot time, epoch s (default :func:`boot_time`, read once): a span away that began before it
+            ended at it (review F1).
     """
 
-    def __init__(self, paths: Callable[[], list[Path]] | None = None) -> None:
+    def __init__(self, paths: Callable[[], list[Path]] | None = None, boot: float | None = None) -> None:
         self._paths = paths or log_candidates
+        self._boot = boot_time() if boot is None else float(boot)
         self._path: Path | None = None
         self._offset = 0
         self._size = -1
@@ -113,8 +139,16 @@ class DeskflowScreens:
                 best = (mtime, path)
         return best[1] if best else None
 
+    def _end_of(self, start: float | None, end: float | None) -> float | None:
+        """A span's end: its own, else this PC's boot when it began before it (Deskflow wrote no line for it)."""
+        if end is None and start is not None and self._boot and start < self._boot:
+            return self._boot
+        return end
+
     def _note(self, at: float, away: bool) -> None:
         spans = self._spans
+        if spans and spans[-1][1] is None and (ended := self._end_of(spans[-1][0], None)) is not None and ended <= at:
+            spans[-1][1] = ended                      # it began before this PC's last boot: it ended at the boot
         open_span = bool(spans) and spans[-1][1] is None
         if away and not open_span:
             spans.append([at, None])
@@ -154,8 +188,6 @@ class DeskflowScreens:
         lines = data.split(b"\n")
         self._partial = lines.pop() if lines else b""
         for raw in lines:
-            if b"screen" not in raw:
-                continue
             parsed = parse_line(raw.decode("utf-8", "replace"))
             if parsed is not None:
                 self._note(*parsed)
@@ -164,6 +196,7 @@ class DeskflowScreens:
         """Whether Deskflow had the cursor on another screen at epoch time ``at``."""
         self.refresh()
         for start, end in reversed(self._spans):
+            end = self._end_of(start, end)
             if start is not None and start <= at and (end is None or at < end):
                 return True
             if end is not None and end <= at:
@@ -171,4 +204,5 @@ class DeskflowScreens:
         return False
 
 
-__all__ = ["DESKFLOW_IMAGES", "DeskflowScreens", "ENTERING", "LEAVING", "log_candidates", "parse_line"]
+__all__ = ["DESKFLOW_IMAGES", "DeskflowScreens", "ENTERING", "LEAVING", "RESTARTS", "boot_time", "log_candidates",
+           "parse_line"]

@@ -83,7 +83,7 @@ from yuki.memory.trace_hooks import (
     EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE, EVENT_OBJECT_INVOKED, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_REORDER,
     EVENT_OBJECT_SELECTION, EVENT_OBJECT_SELECTIONADD, EVENT_OBJECT_SHOW, EVENT_OBJECT_STATECHANGE,
     EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_DIALOGSTART, EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND,
-    EVENT_SYSTEM_MENUPOPUPSTART, OUTCOME_CAP, OUTCOME_S,
+    EVENT_SYSTEM_MENUPOPUPSTART, OUTCOME_CAP, OUTCOME_S, tick_step_ms,
 )
 from yuki.memory.trace_keys import FOLD_S, NAMED_KEY, RUN_KEYS
 from yuki.memory.trace_privacy import (COMMAND, CONTENT, NAME_CHARS, TITLE, TraceRules, content_item, gate, name_class,
@@ -1000,7 +1000,8 @@ class TraceWorker:
     def _before_answer(act: _Act, t: float, tick: int | None) -> bool:
         """capQ2a: whether a change the trace heard of at ``t`` (Windows' own time of it: ``tick``, ms) came between
         the press and the moment the lookup's answer was settled: heard by then, or dated by Windows in an earlier
-        tick than the answer (an event can reach the hook thread late, never early). The answer's moment is the
+        tick than the answer and not before the press (an event can reach the hook thread late, never early). The
+        answer's moment is the
         element's own ``chosen_at`` / ``chosen_tick``; an answer without them (a fake, an older client) is judged by
         the end of its lookup, as before."""
         if act.lookup_end is None or t < act.t:
@@ -1013,8 +1014,13 @@ class TraceWorker:
         chosen_tick = getattr(el, "chosen_tick", None) if el is not None else None
         if tick is None or chosen_tick is None or chosen is None:
             return False
-        # Windows' tick count wraps every 49.7 days: compared modulo 2**32
-        return 0 < ((int(chosen_tick) - int(tick)) & 0xFFFFFFFF) < 0x80000000
+        # review F2: and not dated before the press (a change already there when the user pressed it is what they
+        # pressed on). The press's tick is the answer's less the worker-clock time between them, less one step of the
+        # tick count itself (:func:`tick_step_ms`: a change right after the press, a menu closing on the down, may
+        # read the step before). Windows' tick count wraps every 49.7 days: compared modulo 2**32
+        press_tick = (int(chosen_tick) - round((float(chosen) - act.t) * 1000.0) - tick_step_ms()) & 0xFFFFFFFF
+        return (0 < ((int(chosen_tick) - int(tick)) & 0xFFFFFFFF) < 0x80000000
+                and ((int(tick) - press_tick) & 0xFFFFFFFF) < 0x80000000)
 
     def _under_point(self, act: _Act, hwnd: int, rects: dict[int, Any] | None = None) -> bool:
         """capC1c: whether a window (an event's own handle) covers the action's press point now."""

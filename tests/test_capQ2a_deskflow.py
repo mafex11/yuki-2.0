@@ -71,6 +71,65 @@ def test_no_deskflow_log_drops_nothing(tmp_path):
     assert d.away(time.time()) is False
 
 
+def test_a_restart_with_the_cursor_away_ends_the_span(tmp_path):
+    """Review F1: the PC was shut down with the cursor on the other computer. Deskflow's log has ``leaving screen``,
+    then its daemon starting again after the reboot, and never ``entering screen``: the span ends at the restart, and
+    the next ``leaving screen`` starts a new one."""
+    log = tmp_path / "deskflow-daemon.log"
+    now = time.time()
+    log.write_text(f"[{_stamp(now - 7200)}] INFO: leaving screen\n"
+                   "Deskflow Daemon v1.26.0\n"
+                   f"[{_stamp(now - 5400)}] NOTE: starting daemon\n"
+                   f"[{_stamp(now - 5400)}] INFO: daemon is running\n", encoding="utf-8")
+    d = DeskflowScreens(paths=lambda: [log], boot=now - 5500)
+    assert d.away(now - 6000) and not d.away(now - 5400) and not d.away(now)
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(_lines((now - 60, now - 30)))
+    assert d.away(now - 45) and not d.away(now - 10)
+
+
+def test_a_restart_ends_the_span_even_when_the_boot_is_unknown(tmp_path):
+    log = tmp_path / "deskflow-daemon.log"
+    now = time.time()
+    log.write_text(f"[{_stamp(now - 7200)}] INFO: leaving screen\n"
+                   f"[{_stamp(now - 5400)}] NOTE: starting daemon\n", encoding="utf-8")
+    d = DeskflowScreens(paths=lambda: [log], boot=0.0)
+    assert d.away(now - 6000) and not d.away(now)
+
+
+@pytest.mark.parametrize("line", ["NOTE: stopped server", "INFO: daemon is stopping",
+                                  "IPC: started server, waiting for clients"])
+def test_its_own_stop_and_start_lines_end_a_span(tmp_path, line):
+    log = tmp_path / "deskflow-daemon.log"
+    now = time.time()
+    log.write_text(f"[{_stamp(now - 100)}] INFO: leaving screen\n[{_stamp(now - 50)}] {line}\n", encoding="utf-8")
+    d = DeskflowScreens(paths=lambda: [log], boot=now - 1000)
+    assert d.away(now - 70) and not d.away(now - 20)
+
+
+def test_a_span_from_before_this_pcs_boot_ended_at_the_boot(tmp_path):
+    """Deskflow wrote nothing at all after the cursor left (the PC lost power): this PC's boot ends the span."""
+    log = tmp_path / "deskflow-daemon.log"
+    now = time.time()
+    log.write_text(f"[{_stamp(now - 7200)}] INFO: leaving screen\n", encoding="utf-8")
+    d = DeskflowScreens(paths=lambda: [log], boot=now - 3600)
+    assert d.away(now - 5000) and not d.away(now - 3000) and not d.away(now)
+    with log.open("a", encoding="utf-8") as fh:            # after the boot it leaves again: a new span
+        fh.write(f"[{_stamp(now - 20)}] INFO: leaving screen\n")
+    assert d.away(now - 5) and not d.away(now - 3000)
+
+
+def test_the_restart_lines_parse_as_back_on_this_screen():
+    assert parse_line("[2026-10-08T18:07:02.451] NOTE: starting daemon")[1] is False
+    assert parse_line("Deskflow Daemon v1.26.0") is None
+
+
+def test_the_boot_time_is_windows_own():
+    from yuki.memory.trace_deskflow import boot_time
+
+    assert 0 < boot_time() <= time.time()
+
+
 def test_its_settings_file_can_name_the_log(tmp_path):
     conf = tmp_path / "Deskflow"
     conf.mkdir()
