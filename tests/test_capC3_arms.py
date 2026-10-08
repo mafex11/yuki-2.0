@@ -8,8 +8,11 @@ test_capC3_world; the model is a stand-in.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
+
+import pytest
 
 from test_c_practice import Words
 from test_capC2_links import store  # noqa: F401 - the store fixture
@@ -162,12 +165,81 @@ def test_the_thinker_is_called_plan_only_with_the_plan_tool_forced_and_costed():
     assert "thinking" not in req and req["max_tokens"] == A.PLAN_MAX_TOKENS
     assert req["system"][0]["cache_control"] == {"type": "ephemeral"} and req["system"][0]["text"] == "SYS"
     assert priced[0][1]["output_tokens"] == 200 and req["model"] == planner.model
-    # the estimate: the whole output budget at most, half of it as typical
-    assert planner.estimate(3000) == 0.0123 and priced[-1][1]["output_tokens"] == A.PLAN_MAX_TOKENS
+    # the estimate before each call, an upper bound (review F5): the whole output budget, the message and the plan
+    # tool's schema (with the tool-use overhead) as input, the system prompt as a prompt-cache WRITE (its dearest
+    # billing), and a margin on top
+    tool_chars = len(json.dumps(A.PLAN_TOOL)) + A.TOOL_USE_TOKENS * A.CHARS_PER_TOKEN
+    assert planner.estimate(3000, system=6000) == pytest.approx(0.0123 * A.UPPER_MARGIN) and A.UPPER_MARGIN > 1
+    t = priced[-1][1]
+    assert t["output_tokens"] == A.PLAN_MAX_TOKENS and t["cache_write_tokens"] == 2001 and t["cache_read_tokens"] == 0
+    assert t["input_tokens"] == int((3000 + tool_chars) / A.CHARS_PER_TOKEN) + 300
+    # the up-front expectation: half the output budget, the system prompt read from the cache
     planner.estimate(3000, typical=True, cached=30_000)
-    assert priced[-1][1]["output_tokens"] == A.PLAN_MAX_TOKENS // 2
-    assert priced[-1][1]["cache_read_tokens"] == 10_000 and priced[-1][1]["input_tokens"] == 1_300
-    # no price in the settings: list prices, never zero
+    assert priced[-1][1]["output_tokens"] == A.PLAN_MAX_TOKENS // 2 and priced[-1][1]["cache_write_tokens"] == 0
+    assert priced[-1][1]["cache_read_tokens"] == 10_000
+    assert priced[-1][1]["input_tokens"] == int((3000 + tool_chars) / A.CHARS_PER_TOKEN) + 300
+    # no price in the settings: list prices, never zero, a cache write dearer than the same text as plain input
     planner = A.ThinkerPlanner(SimpleNamespace(model="sonnet", voice_brain_model="", estimate_cost=lambda m, t: None),
                                client=client)
     assert planner.estimate(3000) > 0.0
+    assert planner.estimate(0, system=30_000) > planner.estimate(30_000)
+
+
+def test_the_check_before_a_call_covers_a_cache_write_of_the_whole_system_prompt():
+    """Review F5: priced by the settings' own rates, the bound is at least the dearest bill the call can bring at the
+    same characters per token: every system token written to the cache, the message and tool as input, the whole
+    output budget."""
+    from yuki.config import Settings
+
+    planner = A.ThinkerPlanner(Settings(), model="sonnet", client=_Client())
+    system, user = A.system_prompt(), "x" * 5000
+    worst = planner._price({"input_tokens": int((len(user) + len(json.dumps(A.PLAN_TOOL))) / A.CHARS_PER_TOKEN),
+                            "cache_write_tokens": int(len(system) / A.CHARS_PER_TOKEN), "cache_read_tokens": 0,
+                            "output_tokens": A.PLAN_MAX_TOKENS})
+    assert planner.estimate(len(user), system=len(system)) > worst
+    budget = A.Budget(3.0, spent=3.0 - worst)          # what is left covers the call's plain price, not its worst
+    with pytest.raises(A.CostCap):
+        budget.check(planner.estimate(len(user), system=len(system)))
+
+
+def test_the_arm_holds_its_learning_setting_for_its_whole_run(store, monkeypatch):
+    """Review F1: the switch is the arm's for the whole arm (the lookup, whether a way qualifies, its replay), and is
+    handed back to the user's settings after; nested lookups inside the arm never hand it back early."""
+    _w, inst, vec = _ready(store, learned=True)
+    state: dict[str, Any] = {"on": None}
+    seen: list[Any] = []
+    monkeypatch.setattr(A, "_switch", lambda: (lambda v: state.__setitem__("on", v)))
+    real = A._qualifies
+    monkeypatch.setattr(A, "_qualifies", lambda item: seen.append(state["on"]) or real(item))
+    for learned in (True, False):
+        seen.clear()
+        A.yuki_arm(store, inst, StubThinker(), A.Budget(1.0), learned=learned, vec=vec, now=inst.cutoff)
+        assert seen and all(v is learned for v in seen) and state["on"] is None
+    with A.learning(True):
+        with A.learning(False):
+            assert state["on"] is False
+        assert state["on"] is True                         # the outer value back, not the user's
+    assert state["on"] is None
+
+
+@pytest.mark.skipif(A._switch() is None, reason="C5's switch is not on this tree yet")
+def test_the_users_own_switch_off_does_not_change_the_learning_build(store):
+    """Review F1, the real switch: with "[trace] use_learned = false" in the user's privacy file, L still runs the way
+    it learned (as with the switch on) and B0 still does not; the user's setting is in force again after."""
+    from yuki.memory import trace_replay
+    from yuki.memory.privacy import user_config_path
+
+    _w, inst, vec = _ready(store, learned=True)
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[trace]\nuse_learned = false\n", encoding="utf-8")
+    assert trace_replay.use_learned() is False
+    stub = StubThinker()
+    lv = A.yuki_arm(store, inst, stub, A.Budget(1.0), learned=True, vec=vec, now=inst.cutoff)
+    assert lv.way and lv.stopped is None and lv.calls == 0 and not stub.calls
+    assert S.score(lv.tokens, inst.reference)["composite"] == 100.0
+    assert trace_replay.use_learned() is False
+    path.write_text("[trace]\nuse_learned = true\n\n", encoding="utf-8")
+    assert trace_replay.use_learned() is True
+    b0 = A.yuki_arm(store, inst, stub, A.Budget(1.0), learned=False, vec=vec, now=inst.cutoff)
+    assert not b0.way and b0.calls == 1 and trace_replay.use_learned() is True

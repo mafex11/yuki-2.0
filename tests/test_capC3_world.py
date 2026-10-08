@@ -167,7 +167,7 @@ class StubThinker:
         self.calls: list[dict[str, Any]] = []
         self.est, self.cost, self.jitter = est, cost, jitter
 
-    def estimate(self, chars: int, *, typical: bool = False, cached: int = 0) -> float:
+    def estimate(self, chars: int, *, typical: bool = False, cached: int = 0, system: int = 0) -> float:
         return self.est / 2 if typical else self.est
 
     def plan(self, *, system: str, user: str, tool: dict[str, Any]) -> tuple[dict[str, Any], float]:
@@ -294,13 +294,89 @@ def test_the_reference_is_the_users_own_route_and_the_snapshot_holds_its_control
     ref = D.reference(store, w["T3"])
     assert ref == [f"{APP}|switch", f"{APP}|keys|Ctrl+K", "k-switch", f"{APP}|keys|Enter", "k-msg",
                    f"{APP}|keys|Enter"]
-    snap = D.snapshot(store, dict(store._query("SELECT * FROM ui_tasks WHERE id = ?", (w["T3"],))[0]),
-                      w["cutoff"], names=NAMES)
+    snap = D.snapshot(store, w["cutoff"], names=NAMES)
     assert {"k-switch", "k-msg", "k-attach", "k-settings", "k-reload", "k-back"} <= snap.keys()
     assert [x.process for x in snap.windows] == [APP, WEB] and snap.windows[0].front
     labels = [e.label for e in snap.elements if e.window == "w1"]
     assert labels == sorted(labels, key=str.casefold)                     # never in the order they were used
     assert "team-channel" not in snap.text()                              # a content control's name: never
+
+
+def test_the_snapshot_holds_nothing_the_evaluated_task_brought(store):
+    """Review F2: an app the task opened and a control it first met (a dialog's new button) are not in the snapshot,
+    as a live tree at the task's start would not show them; an app used earlier that week is listed as not open."""
+    w = world(store, future=False)
+    row(store, NOW + 2 * DAY + 600, "plannerapp", "click", role="Button", name="Today", key="k-today")
+    c = NOW + 4 * DAY
+    distractors(store, c - 1200)
+    ids = [row(store, c, APP, "switch", resolved="event", facts={"window_verified": APP}),
+           row(store, c + 2, "secretapp", "switch", resolved="event", facts={"window_verified": "secretapp"}),
+           row(store, c + 4, "secretapp", "click", role="Button", name="Brand-new", key="k-only-in-task"),
+           row(store, c + 6, APP, "click", role="Button", name="Brand-new too", key="k-new-in-chatter"),
+           *switcher(store, c + 10)[1:]]
+    t = task(store, ids, GOAL, "field_submitted", ids[-1], target="k-msg")
+    F.refresh(store, Words(), now=c + 100)
+    assert int(D.pick_target(store, D.match_family(store, Words(), REQUEST))["id"]) == t
+    [inst], _ = D.build_instances(store, [own_request()], Words(), names=NAMES)
+    assert inst.target_id == t and inst.cutoff == c
+    snap = inst.snapshot
+    assert {"k-only-in-task", "k-new-in-chatter"}.isdisjoint(snap.keys())
+    assert "secretapp" not in snap.text() and "Brand-new" not in snap.text()
+    # the controls it needs that were seen before are there; an app of that week, not the last hour: "not open"
+    assert {"k-switch", "k-msg"} <= snap.keys()
+    assert [(x.process, x.open) for x in snap.windows] == [(APP, True), (WEB, True), ("plannerapp", False)]
+    assert "w3 plannerapp (not open; it can be opened)" in snap.text()
+    # the same snapshot for any task starting then: nothing in it depends on which task is evaluated
+    assert D.snapshot(store, c, names=NAMES) == snap
+    assert w["T3"] != t
+
+
+def test_a_conversation_request_is_cut_where_it_was_said(store):
+    """Review F3: Yuki's own run of the request (and the way practice learned from it) and the user's tasks between
+    the turn and their own later task inform no arm: the cut-off is the turn, not the later task's start."""
+    w = world(store, learned=False, future=False)
+    said = NOW + 2 * DAY + 3600                     # after T2, before T3 (the user's own later task)
+    switcher(store, said + 30)                        # Yuki's run of the request, in the trace
+    store._write(lambda conn: conn.execute(
+        "INSERT INTO runs (run_key, source, step, at, tool) VALUES ('run-c3-test', 'voice', 0, ?, 'skill')",
+        (said + 30,)))
+    P.add_playbook(store, {"kind": "procedure", "intent": "send a message in a channel", "apps": [APP],
+                           "body": {"steps": ["press Ctrl+K", "type the channel", "press Enter"]}, "origin": "fixed"},
+                   now=said + 90)                     # a way practice learned from that run
+    assert any(o.created_at >= said for o in P.live(store, include_disabled=True))
+    req = D.Request(REQUEST, said, "conversation")
+    [inst], _ = D.build_instances(store, [req], Words(), names=NAMES)
+    assert inst.target_id == w["T3"] and inst.cutoff == said < w["cutoff"]
+    D.cut(store, inst.cutoff, embedder=Words())
+    assert store._query("SELECT max(at) FROM ui_actions")[0][0] < said
+    assert not store._query("SELECT 1 FROM runs WHERE at >= ?", (said,))
+    assert not [o for o in P.live(store, include_disabled=True) if o.created_at >= said]
+    # the earlier task must be before the turn: a turn before any such task has no evaluated task
+    early = D.Request(REQUEST, NOW + 30, "conversation")
+    assert D.pick_target(store, D.match_family(store, Words(), REQUEST), after=early.at) is None
+
+
+def test_a_version_that_replaced_another_after_the_cut_off_is_gone_whatever_its_creation_time(store):
+    """The clean-up's reshape writes a new version that keeps the old one's creation time: after a cut before the
+    reshape, only the old version is live (never both, never the new shape)."""
+    w = world(store, future=False)
+    c = w["cutoff"]
+    [old] = [o for o in P.live(store, ["procedure"]) if o.origin == "demo"]
+    ledger = store._query("SELECT count(*) FROM playbook_events WHERE playbook_id = ?", (old.id,))[0][0]
+    assert ledger > 0
+    obj = {"kind": old.kind, "intent": "a reshaped way", "apps": old.apps, "entities": old.entities,
+           "body": {**(old.body or {}), "steps": ["a new shape"]}, "avoid": old.avoid, "family": old.family,
+           "origin": old.origin, "sources": old.sources}
+    new = P.add_playbook(store, obj, supersedes=old.id, now=c + 3600)
+    store._write(lambda conn: conn.execute("UPDATE playbooks SET created_at = ? WHERE id = ?", (old.created_at, new)))
+    assert [o.id for o in P.live(store, ["procedure"]) if o.origin == "demo"] == [new]
+    D.cut(store, c, embedder=Words())
+    assert [o.id for o in P.live(store, ["procedure"]) if o.origin == "demo"] == [old.id]
+    assert P.get(store, new) is None
+    # its evidence from before the cut-off (moved to the new version by the replacement) is its own again
+    assert store._query("SELECT count(*) FROM playbook_events WHERE playbook_id = ?", (old.id,))[0][0] == ledger
+    back = P.get(store, old.id)
+    assert back.state == "active" and not back.trial                   # as at the cut-off (the first test)
 
 
 def test_requests_are_the_users_own_or_turns_that_led_to_yuki_acting_never_goals(store, tmp_path):

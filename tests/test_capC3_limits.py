@@ -46,20 +46,20 @@ def test_the_task_cap_keeps_your_own_requests_first(store):
 
 def test_over_the_cap_up_front_is_refused_before_any_call(store):
     two_kinds(store)
-    stub = StubThinker(est=4.0)                       # typical 2.0 a call, 2 calls a request: $8 expected
+    stub = StubThinker(est=4.0)                       # typical 2.0 a call, 2 calls a request, 2 runs: $16
     out = _run(store, stub)
     assert out["result"] == "refused" and not stub.calls and "rows" not in out
     assert "over the $3.00 cap" in out["why"] and "about 0 requests would fit" in out["why"]
     assert "Refused before any call" in C.report_text(out)
-    # with --repeat 2 the expectation doubles: $2 for one run, $4 for two (a refusal cuts nothing: checked first)
-    assert _run(store, StubThinker(est=1.0), repeat=2)["result"] == "refused"
-    assert _run(store, StubThinker(est=1.0))["result"] != "refused"
+    # the default 2 runs double the expectation: $2 for one run, $4 for two (a refusal cuts nothing: checked first)
+    assert _run(store, StubThinker(est=1.0))["result"] == "refused" and C.REPEAT == 2
+    assert _run(store, StubThinker(est=1.0), repeat=1)["result"] != "refused"
 
 
 def test_no_call_ever_takes_the_run_past_the_cap(store):
     two_kinds(store)
     stub = StubThinker(est=0.5, cost=0.4)             # expected $1.00; each call may cost up to $0.50
-    out = _run(store, stub, budget_usd=1.2)
+    out = _run(store, stub, budget_usd=1.2, repeat=1)
     assert len(stub.calls) == 2 and out["spent_usd"] == 0.8 <= 1.2   # a third call could pass $1.20: never sent
     assert out["complete"] is False and out["stopped"] == "the cost cap" and out["result"] == "cannot tell"
     assert "stopped early" in " ".join(out["verdict"]["why"])

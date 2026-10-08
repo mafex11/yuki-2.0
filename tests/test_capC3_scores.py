@@ -82,28 +82,31 @@ def _row(b0: float, b1: float, lv: float) -> dict:
 
 def test_the_learning_build_must_beat_both_baselines():
     rows = [_row(20, 40, 80)] * 10
-    v = S.verdict(rows)
+    v = S.verdict(rows, repeat_drift=0.0)
     assert v["result"] == "pass" and v["beats"] == {"B0": True, "B1": True} and v["L_vs_B1"]["mean_diff"] == 40.0
     # beating today's Yuki alone proves nothing
-    v = S.verdict([_row(20, 80, 80)] * 10)
+    v = S.verdict([_row(20, 80, 80)] * 10, repeat_drift=0.0)
     assert v["result"] == "fail" and v["beats"] == {"B0": True, "B1": False}
     assert "copying the nearest past example" in " ".join(v["why"])
     # within the margin is no win
-    v = S.verdict([_row(20, 78, 80)] * 10)
+    v = S.verdict([_row(20, 78, 80)] * 10, repeat_drift=0.0)
     assert v["result"] == "fail"
     # a mean carried by one big win while most requests are lost is no win either
     rows = [_row(0, 0, 100)] + [_row(0, 50, 45)] * 9                   # +100 once, -5 nine times: +5.5 mean
-    v = S.verdict(rows)
+    v = S.verdict(rows, repeat_drift=0.0)
     assert v["L_vs_B1"]["mean_diff"] > 3 and v["L_vs_B1"]["losses"] == 9 and v["result"] == "fail"
 
 
 def test_no_verdict_on_too_few_an_incomplete_run_or_runs_that_disagree():
-    assert S.verdict([_row(0, 0, 100)] * 9)["result"] == "cannot tell"
-    v = S.verdict([_row(0, 0, 100)] * 10, complete=False)
+    assert S.verdict([_row(0, 0, 100)] * 9, repeat_drift=0.0)["result"] == "cannot tell"
+    v = S.verdict([_row(0, 0, 100)] * 10, complete=False, repeat_drift=0.0)
     assert v["result"] == "cannot tell" and "stopped early" in v["why"][0]
     v = S.verdict([_row(0, 0, 100)] * 10, repeat_drift=3.5)
     assert v["result"] == "cannot tell" and "differed" in v["why"][0]
     assert S.verdict([_row(0, 0, 100)] * 10, repeat_drift=3.0)["result"] == "pass"
+    # review F4: one run never passes (or fails): whether a second would agree within 3 points is not known
+    v = S.verdict([_row(10, 10, 50)] * 10)
+    assert v["result"] == "cannot tell" and v["repeat_drift"] is None and "planned only once" in v["why"][0]
     # a request an arm did not plan is left out of the comparison
     rows = [_row(0, 0, 100)] * 10 + [{"B0": None, "B1": None, "L": {k: 100 for k in S.SCORE_KEYS}}]
-    assert S.verdict(rows)["requests"] == 10
+    assert S.verdict(rows, repeat_drift=0.0)["requests"] == 10

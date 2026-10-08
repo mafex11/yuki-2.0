@@ -55,6 +55,18 @@ def test_repeat_two_measures_the_drift_and_a_steady_model_passes_it(store):
     assert "repeatable within 3 points: yes." in C.report_text(out)
 
 
+def test_a_single_run_gives_no_verdict_and_two_are_the_default(store):
+    """Review F4: repeatability is measured, never assumed: one run says "cannot tell" whatever its scores."""
+    two_kinds(store)
+    out = _run(store, StubThinker(), repeat=1)
+    assert out["drift"] is None and out["result"] == "cannot tell"
+    assert any("planned only once" in w for w in out["verdict"]["why"])
+    assert "CANNOT TELL" in C.report_text(out)
+    out = _run(store, StubThinker())
+    assert out["repeat"] == C.REPEAT == 2 and all(len(r["runs"]) == 2 for r in out["rows"])
+    assert out["drift"] is not None and out["verdict"]["repeat_drift"] == out["drift"]["composite"]
+
+
 def test_a_model_that_moves_more_than_3_points_leaves_no_verdict(store):
     two_kinds(store)
     out = _run(store, StubThinker(jitter=True), repeat=2)
