@@ -39,11 +39,13 @@ REQUESTS = [f"invented request number {i}" for i in range(1, 11)]
 # -- the plan ----------------------------------------------------------------------------------------------------------
 
 def test_the_plan_keeps_the_requests_as_said_and_alternates_the_switch_per_request():
-    plan = C5.make_plan(["  open the  team notes ", "", "send the weekly figures"], now=NOW)
+    plan = C5.make_plan(["  open the  team notes ", "", "send the weekly figures"], paired=True, now=NOW)
     assert plan["requests"] == ["open the team notes", "send the weekly figures"]   # as said (spaces folded)
     assert [(t["request"], t["on"]) for t in plan["trials"]] == [(1, True), (1, False), (2, False), (2, True)]
-    one = C5.make_plan(REQUESTS, one_each=True, now=NOW)
+    # review F8: by default each real request is done once, the switch alternating per request
+    one = C5.make_plan(REQUESTS, now=NOW)
     assert [t["on"] for t in one["trials"]] == [True, False] * 5 and one["mode"] == "one_each"
+    assert [t["request"] for t in one["trials"]] == list(range(1, 11))
     with pytest.raises(ValueError):
         C5.make_plan(["", "  "])
 
@@ -59,7 +61,7 @@ def test_next_and_done_set_the_switch_for_each_trial_and_put_it_back_on_at_the_e
         flips.append(on)
         C5.set_switch(on, privacy)
 
-    plan = C5.make_plan(REQUESTS[:2], now=NOW)
+    plan = C5.make_plan(REQUESTS[:2], paired=True, now=NOW)
     seen = []
     for k in range(4):
         t = C5.start_next(plan, now=NOW + 100 * k, switch=switch)
@@ -112,7 +114,7 @@ def way(store: Any) -> int:
 
 
 def trial_plan(n: int, *, done: list[tuple[float, float]]) -> dict[str, Any]:
-    plan = C5.make_plan(REQUESTS[:n], now=NOW)
+    plan = C5.make_plan(REQUESTS[:n], paired=True, now=NOW)
     for t, (start, end) in zip(plan["trials"], done):
         t["start"], t["end"] = start, end
     return plan
