@@ -160,8 +160,9 @@ def test_the_thinker_is_called_plan_only_with_the_plan_tool_forced_and_costed():
     assert priced[0][1]["output_tokens"] == 200 and req["model"] == planner.model
     # the estimate: the whole output budget at most, half of it as typical
     assert planner.estimate(3000) == 0.0123 and priced[-1][1]["output_tokens"] == A.PLAN_MAX_TOKENS
-    planner.estimate(3000, typical=True)
+    planner.estimate(3000, typical=True, cached=30_000)
     assert priced[-1][1]["output_tokens"] == A.PLAN_MAX_TOKENS // 2
+    assert priced[-1][1]["cache_read_tokens"] == 10_000 and priced[-1][1]["input_tokens"] == 1_300
     # no price in the settings: list prices, never zero
     planner = A.ThinkerPlanner(SimpleNamespace(model="sonnet", voice_brain_model="", estimate_cost=lambda m, t: None),
                                client=client)

@@ -167,7 +167,7 @@ class StubThinker:
         self.calls: list[dict[str, Any]] = []
         self.est, self.cost, self.jitter = est, cost, jitter
 
-    def estimate(self, chars: int, *, typical: bool = False) -> float:
+    def estimate(self, chars: int, *, typical: bool = False, cached: int = 0) -> float:
         return self.est / 2 if typical else self.est
 
     def plan(self, *, system: str, user: str, tool: dict[str, Any]) -> tuple[dict[str, Any], float]:
