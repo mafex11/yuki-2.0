@@ -194,6 +194,54 @@ def test_a_window_coming_to_the_front_alone_is_no_learnable_outcome(store, names
     assert row["outcome_fact"] == T.UNCLEAR and not T.learnable(row)
 
 
+def test_tasks_stored_before_the_window_rule_are_not_learnable_when_read_back(store, names):
+    """Review F3: tasks written with a window-only outcome (before the rule) are re-checked on their own rows when read
+    for learning; the stored rows are never changed."""
+    from yuki.memory import trace_demos as TD
+
+    ids = seed(store, NOW)
+    TL.update(store, now=NOW + 1400)
+    w = _window(store, NOW)
+    tp = T.TaskPass(store, Worker())
+    _rows, _links, pieces, facts = tp.prepare(w)
+    by = {p.pid: p for p in pieces}
+    every = {f.fid: f for fs in facts.values() for f in fs}
+
+    def draft(pids: list[str], goal: str, fid: str) -> T.Draft:
+        mine = [by[p] for p in pids]
+        rows = sorted((r for p in mine for r in p.rows), key=lambda r: (float(r["at"]), int(r["id"])))
+        return T.Draft(mine, goal, every[fid], [], rows)
+
+    old = [draft(["p3"], "You opened Zenny", _fid(facts, ids["switch"], "window_verified")),
+           draft(["p4"], "You browsed pages in Webby", _fid(facts, ids["front"], "window_verified")),
+           draft(["p1", "p2"], "You made a beat and came back to it", _fid(facts, ids["tb3"], "window_verified"))]
+    tids = tp.write(w, old, None, NOW + 1400)
+    rows = {tid: dict(store._query("SELECT * FROM ui_tasks WHERE id = ?", (tid,))[0]) for tid in tids}
+    assert all(r["outcome_fact"] == "window_verified" for r in rows.values())
+    assert all(T.learnable(r) for r in rows.values())                           # without the store: as before
+    assert [T.learnable(rows[t], store) for t in tids] == [False, False, True]
+    assert [T.stored_window_only(store, rows[t]) for t in tids] == ["nothing_else_there", "work_went_on", None]
+    due = {d["id"]: d["learnable"] for d in TD.due_tasks(store, NOW + 1400, limit=10)}
+    assert [due[t] for t in tids] == [False, False, True]                       # the demo learner's list too
+    assert [r[0] for r in store._query("SELECT outcome_fact FROM ui_tasks ORDER BY id")] == ["window_verified"] * 3
+
+
+def test_corrections_name_apps_by_their_program_as_the_step_lines_do(store, names):
+    """Review F2: the CORRECTIONS lines name apps as the step lines do, never by the process key."""
+    seed(store, NOW)
+    TL.update(store, now=NOW + 1400)
+    w = _window(store, NOW)
+    tp = T.TaskPass(store, Worker())
+    _rows, _links, pieces, _facts = tp.prepare(w)
+    mine = [pieces[0]]                                                          # the beat in bl64
+    tid = tp.write(w, [T.Draft(mine, "You wrote some code", None, [], list(mine[0].rows))], None, NOW + 1400)[0]
+    assert T.correct_task(store, tid, "renamed", "You made a beat", now=NOW + 1500)["ok"]
+    seen: list[str] = []
+    T.TaskPass(store, Worker([lambda kw: seen.append(kw["user"]) or {"tasks": []}])).run_window(w, now=NOW + 1600)
+    fixes = seen[0].split("CORRECTIONS")[1]
+    assert "You called a task in Beatline Studio" in fixes and "bl64" not in fixes
+
+
 def test_a_window_brought_back_at_the_end_of_work_in_it_may_still_be_the_outcome():
     rows = [{"id": 1, "at": 0.0, "process": "notesy", "kind": "type", "source": "user"},
             {"id": 2, "at": 5.0, "process": "chatter", "kind": "click", "source": "user"},

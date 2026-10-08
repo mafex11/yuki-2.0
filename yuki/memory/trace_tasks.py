@@ -689,10 +689,14 @@ def corrections(store: Any, *, now: float | None = None, limit: int = MAX_CORREC
     return out
 
 
-def correction_lines(items: Sequence[dict[str, Any]], safe: Callable[[Any, int], str]) -> list[str]:
+def correction_lines(items: Sequence[dict[str, Any]], safe: Callable[[Any, int], str],
+                     names: Callable[[str], str] | None = None) -> list[str]:
+    """The corrections worded for the model. ``names``: an app's program name (the stored apps are process keys), so
+    these lines name apps as the step lines do (review F2)."""
     lines = []
     for c in items:
-        apps = ", ".join(c.get("apps") or []) or "some apps"
+        keys = [str(a) for a in c.get("apps") or [] if a]
+        apps = ", ".join(dict.fromkeys((names(a) if names is not None else "") or a for a in keys)) or "some apps"
         goal = safe(c.get("goal"), GOAL_CHARS)
         if c["verdict"] == "renamed":
             lines.append(f"- You called a task in {safe(apps, 80)} \"{goal}\"; the user renamed it "
@@ -847,12 +851,36 @@ def check(tool_input: Any, pieces: Sequence[Piece], facts: dict[int, list[Fact]]
     return out
 
 
-def learnable(task: Any) -> bool:
+def learnable(task: Any, store: Any = None) -> bool:
     """Whether a task may ever teach a trial or a way (C4's demo learner): only a checked outcome, never ``unclear``,
     never one the user said was not one task or not what they did. An ``unclear`` task may still be shown as a past
-    example (report 78 §5.3)."""
+    example (report 78 §5.3).
+
+    With ``store`` (review F3), a stored ``window_verified`` outcome is re-checked on the task's own rows by
+    :func:`window_only`, as a new answer is: tasks written before that rule (a single switch, a browsing session
+    ended by a window coming up) are not learnable either. Read-only: the stored row is never changed."""
     get = task.get if isinstance(task, dict) else (lambda k: getattr(task, k, None))
-    return get("outcome_fact") not in (None, "", UNCLEAR) and get("user_verdict") not in REJECTED
+    if get("outcome_fact") in (None, "", UNCLEAR) or get("user_verdict") in REJECTED:
+        return False
+    if store is None or get("outcome_fact") != "window_verified":
+        return True
+    return not stored_window_only(store, task)
+
+
+def stored_window_only(store: Any, task: Any) -> str | None:
+    """:func:`window_only` for a stored task (its own rows, less its detours), or None. A task whose rows cannot be
+    read is not learnable from its window: ``"rows_gone"``."""
+    get = task.get if isinstance(task, dict) else (lambda k: getattr(task, k, None))
+    if get("outcome_fact") != "window_verified":
+        return None
+    try:
+        rows = task_rows(store, int(get("id")))
+        action = int(get("outcome_action"))
+    except Exception:  # noqa: BLE001 - unreadable: no window outcome to learn from
+        return "rows_gone"
+    if not rows:
+        return "rows_gone"
+    return window_only(Fact("", "window_verified", action, get("outcome_target"), ""), rows)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1060,7 +1088,7 @@ class TaskPass:
         if journal:
             parts.append("JOURNAL (what was on screen; context only):")
             parts += journal
-        fixes = correction_lines(corrections(self.store, now=now), safe)
+        fixes = correction_lines(corrections(self.store, now=now), safe, app_name)
         if fixes:
             parts.append("CORRECTIONS (how the user corrected earlier answers):")
             parts += fixes
@@ -1441,4 +1469,4 @@ __all__ = ["DAILY_BUDGET_USD", "FACT_KINDS", "HEALTH_KEY", "MAX_AGE_DAYS", "TASK
            "VERDICTS", "WINDOWS_PER_PASS", "Checked", "Draft", "Fact", "PassResult", "Piece", "TaskPass", "TaskWindow",
            "check", "clean_goal", "correct_task", "correction_lines", "corrections", "day_tasks", "element_label",
            "element_names", "facts_of", "health", "kept", "learnable", "outcome_words", "precut", "spent_today",
-           "step_lines", "task_rows", "undo_correction", "what_words", "window_rows", "windows_due"]
+           "step_lines", "stored_window_only", "task_rows", "undo_correction", "what_words", "window_rows", "windows_due"]
