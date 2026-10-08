@@ -230,6 +230,31 @@ def test_windows_game_store_reads_and_caches_until_it_changes():
     reads = []
     cache = G.WindowsGames(lambda: reads.append(1) or frozenset({"c:\\games\\a.exe"}), watch=False)
     assert cache.paths() == frozenset({"c:\\games\\a.exe"}) and cache.paths() and len(reads) == 1
+    t = {"now": 0.0}
+
+    class _NoWatch:                                                  # the store's key missing: no notification
+        ok = False
+
+        def __init__(self, subkey: str) -> None:
+            pass
+
+        def changed(self) -> bool:
+            return False
+
+    import yuki.memory.gamegate as gg
+
+    real_watch = gg._RegWatch
+    gg._RegWatch = _NoWatch
+    try:
+        unwatched = G.WindowsGames(lambda: reads.append(1) or frozenset(), clock=lambda: t["now"])
+        unwatched.paths()
+        unwatched.paths()
+        assert unwatched.reads == 1                                  # not on every ask
+        t["now"] += G.WindowsGames.UNWATCHED_EVERY_S
+        unwatched.paths()
+        assert unwatched.reads == 2                                  # a backstop, minutes apart
+    finally:
+        gg._RegWatch = real_watch
     real = G.read_windows_games()                                    # the real store, read-only
     assert isinstance(real, frozenset) and all(p == G._norm_path(p) for p in real)
     assert not any(p.endswith("\\bl64.exe") or p.endswith("\\fl64.exe") for p in real)

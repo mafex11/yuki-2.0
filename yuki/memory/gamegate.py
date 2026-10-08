@@ -238,12 +238,18 @@ class WindowsGames:
     """Windows' detected games, cached until Windows changes the store (no polling: a change notification, checked
     without waiting when asked). ``read_fn`` reads the store (tests pass a stub, ``watch=False``: read once)."""
 
-    def __init__(self, read_fn: Callable[[], frozenset[str]] = read_windows_games, *, watch: bool = True) -> None:
+    #: Without a working change notification (the store missing, the watch failed), read again at most this often.
+    UNWATCHED_EVERY_S = 300.0
+
+    def __init__(self, read_fn: Callable[[], frozenset[str]] = read_windows_games, *, watch: bool = True,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         self._read_fn = read_fn
         self._watch_wanted = watch
         self._watch: _RegWatch | None = None
+        self._clock = clock
         self._lock = threading.Lock()
         self._paths: frozenset[str] | None = None
+        self._read_at = float("-inf")
         self.reads = 0
 
     def paths(self) -> frozenset[str]:
@@ -252,15 +258,19 @@ class WindowsGames:
             if self._watch_wanted and self._watch is None:
                 try:
                     self._watch = _RegWatch(GAME_CONFIG_STORE)
-                except Exception:  # noqa: BLE001 - no watch: read once, as a stub would
+                except Exception:  # noqa: BLE001 - no watch: the backstop below
+                    self._watch = None
                     self._watch_wanted = False
-            elif self._watch is not None:
-                changed = self._watch.changed() or not self._watch.ok
+            elif self._watch is not None and self._watch.ok:
+                changed = self._watch.changed()
+            if self._watch_wanted and (self._watch is None or not self._watch.ok):
+                changed = self._clock() - self._read_at >= self.UNWATCHED_EVERY_S
             if self._paths is None or changed:
                 try:
                     self._paths = frozenset(self._read_fn())
                 except Exception:  # noqa: BLE001 - unreadable: what was read before (or nothing)
                     self._paths = self._paths or frozenset()
+                self._read_at = self._clock()
                 self.reads += 1
             return self._paths
 
