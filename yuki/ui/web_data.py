@@ -1876,7 +1876,9 @@ PROPOSALS_SHOWN = 2
 ORIGIN_WORDS = {"distill": "From a run that worked", "run": "From a run that worked",
                 "postmortem": "From a run that worked in the end", "slider": "From a run that worked",
                 "user": "In your words", "taught": "You taught me",
-                "miner": "Seen in what you do", "knowhow": "From what I learned before"}
+                "miner": "Seen in what you do", "knowhow": "From what I learned before",
+                # capC4: a way learned from what the user did themselves (a task with a checked outcome)
+                "demo": "Learned from what you did"}
 #: The kinds the Playbook page and the Activity rows may show (appLearn): ways and the user's style notes. A pitfall
 #: is a quiet note for Yuki's own use, never shown as something learned.
 SHOWN_KINDS = ("procedure", "habit", "style", "question")
@@ -1977,6 +1979,12 @@ def proposal_view(c: dict[str, Any]) -> dict[str, Any]:
         basis = choice_words(choice_view(c))
     when = short_day(epoch_of(c.get("since")))
     tail = f"Seen {seen} time{'s' if seen != 1 else ''}" if seen else "Seen once"
+    if c.get("origin") == "demo":
+        # capC4 (decision D3): your way, seen once - a hint until you do it again, or it works when Yuki follows it
+        return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "", "source": "demo",
+                "basis": (f"Your way, seen once{', ' + when if when else ''}: learned from what you did. I’ll do it "
+                          f"on my own once you’ve done it again, or once it worked when I followed it."),
+                "steps": steps, "app": app_words(c.get("apps") or [])}
     return {"ref": c.get("id"), "kind": c.get("kind"), "title": c.get("title") or "",
             "basis": (basis + (" " if basis else "") + f"{tail}{', ' + when if when else ''}; I’ll use it once you say so.").strip(),
             "steps": steps, "app": app_words(c.get("apps") or [])}
@@ -2010,7 +2018,8 @@ def build_playbook(memory: Any) -> dict[str, Any]:
     props = [proposal_view(c) for c in pending[:PROPOSALS_SHOWN]]
     for c in pending[PROPOSALS_SHOWN:]:
         if c.get("kind") == "procedure":
-            procs.append({**procedure_view(c), "conf_word": "tentative, seen once", "tentative": True})
+            procs.append({**procedure_view(c), "conf_word": "your way, seen once" if c.get("origin") == "demo"
+                          else "tentative, seen once", "tentative": True})
         elif c.get("kind") == "habit":
             choices.append({**choice_view(c), "conf_word": "tentative, seen once", "tentative": True})
         elif c.get("kind") == "style":

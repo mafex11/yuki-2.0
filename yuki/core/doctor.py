@@ -304,6 +304,39 @@ def _trace_tasks_words(raw: str | None, now: float) -> str:
     return ("; " + "; ".join(parts)) if parts else ""
 
 
+def _trace_demos_words(raw: str | None, now: float) -> str:
+    """capC4: ways learned from what you did, in plain words (``trace:demos``, written by the practice worker): how
+    many Yuki may use on its own, how many it has seen only once (hints), what it learned or set aside today. ``""``
+    when there is nothing to say or the value is a day old."""
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
+        return ""
+    ways, trials = int(data.get("ways") or 0), int(data.get("trials") or 0)
+    hints = int(data.get("hints") or 0)   # second verification V11: ways its hands cannot take, hints for the thinker
+    parts = []
+    if ways or trials or hints:
+        bits = []
+        if ways:
+            bits.append(f"{ways} it can do on its own")
+        if hints:
+            bits.append(f"{hints} it follows as a guide but can't repeat click by click")
+        if trials:
+            bits.append(f"{trials} seen only once, kept as hints until you do {'them' if trials != 1 else 'it'} "
+                        f"again")
+        total = ways + trials + hints
+        parts.append(f"learned {total} way{'s' if total != 1 else ''} from what you did (" + ", ".join(bits[:-1])
+                     + (" and " if len(bits) > 1 else "") + bits[-1] + ")")
+    learned, refused = int(data.get("learned_today") or 0), int(data.get("refused_today") or 0)
+    if learned:
+        parts.append(f"{learned} new today")
+    if refused:
+        parts.append(f"{refused} task{'s' if refused != 1 else ''} today set aside (nothing reliable to repeat)")
+    return ("; " + "; ".join(parts)) if parts else ""
+
+
 def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
     """Settings -> Record how I work (report 78 C1): off, or on with what it noted in the last day, in plain words.
     Counts only; read-only."""
@@ -340,6 +373,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
         row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:health'").fetchone()
         learn_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:learn'").fetchone()
         tasks_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:tasks'").fetchone()
+        demos_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:demos'").fetchone()
     except Exception as exc:
         return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
     finally:
@@ -362,6 +396,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
         detail += f"; {_TRACE_STATE_WORDS[state]}"
     detail += _trace_learn_words(learn_row[0] if learn_row else None, health)
     detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
+    detail += _trace_demos_words(demos_row[0] if demos_row else None, now)
     if state in ("hooks_down", "failed", "no_input"):
         return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
     return Check(TRACE_CHECK, OK, detail)
