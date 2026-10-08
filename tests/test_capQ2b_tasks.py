@@ -251,3 +251,37 @@ def test_a_window_brought_back_at_the_end_of_work_in_it_may_still_be_the_outcome
     assert T.window_only(back, rows, {1}) == "nothing_else_there"               # its only work was a detour
     page = T.Fact("f2", "page_reached", 2, "pg", "new page")
     assert T.window_only(page, rows) is None                                    # other outcomes: untouched
+
+
+def test_a_window_flicking_back_to_the_app_in_use_is_no_outcome(store, names):
+    """Second verification V2: a desk-sharing tool takes the focus for a moment and gives it back to the browser the
+    user was reading in. The browser's window coming back is no outcome (``already_there``), for a new answer and for
+    a stored task read back by the demo learner."""
+    from yuki.memory import trace_demos as TD
+
+    t0 = NOW
+    act(store, t0, "webby", "click", role="Hyperlink", key="k-l1", position="1/List", facts={"page_reached": "pg-a"},
+        page_key="pg-a")
+    act(store, t0 + 6, "webby", "scroll", resolved="point")
+    act(store, t0 + 12, "webby", "keys", resolved="focus", chord="Ctrl+C")
+    kvm = act(store, t0 + 13, "kvmshare", "switch", resolved="event", facts={"window_verified": "kvmshare"})
+    back = act(store, t0 + 13.5, "webby", "switch", resolved="event", facts={"window_verified": "webby"})
+    TL.update(store, now=t0 + 200)
+    eid = episode(store, t0 - 10, t0 + 100)
+    w = T.TaskWindow(t0 - 10, t0 + 100, [(eid, t0 - 10, t0 + 100)])
+    tp = T.TaskPass(store, Worker())
+    _rows, _links, pieces, facts = tp.prepare(w)
+    back_f = _fid(facts, back, "window_verified")
+    checked = T.check({"tasks": [{"pieces": [p.pid for p in pieces], "goal": "You read pages in Webby",
+                                  "outcome": back_f}]}, pieces, facts)
+    assert checked.drafts[0].outcome is None and any("already_there" in r for r in checked.rejected)
+    rows = checked.drafts[0].rows
+    assert [int(r["id"]) for r in rows][-2:] == [kvm, back]
+    fact = next(f for f in facts[back] if f.kind == "window_verified")
+    assert T.window_only(fact, rows) == "already_there"
+    # stored before this rule (as two real tasks were): read back, it is not learnable
+    tid = tp.write(w, [T.Draft(list(pieces), "You read pages in Webby", fact, [], rows)], None, t0 + 200)[0]
+    row = dict(store._query("SELECT * FROM ui_tasks WHERE id = ?", (tid,))[0])
+    assert row["outcome_fact"] == "window_verified" and T.learnable(row)        # without the store: as stored
+    assert T.stored_window_only(store, row) == "already_there" and not T.learnable(row, store)
+    assert {d["id"]: d["learnable"] for d in TD.due_tasks(store, t0 + 200, limit=10)}[tid] is False

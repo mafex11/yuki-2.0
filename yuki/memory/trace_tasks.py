@@ -36,7 +36,8 @@ project opened or saved adds its facts (tempo, instrument and effect plugins, co
 was used on 3 distinct days). The model may mark pieces as **noise** (a passing switch, idle taskbar clicks): they are
 counted (``trace:tasks`` ``noise_today``, the log), never stored as tasks. A **window coming to the front** is no
 outcome when the user did nothing else in that app inside the task (one switch is not a learnable task), nor when they
-went on working in it afterwards (it was the start of that work, not its end): such a task stays ``unclear``.
+went on working in it afterwards (it was the start of that work, not its end), nor when it went back to the app
+already in use (another program took the focus for a moment): such a task stays ``unclear``.
 
 **Cost.** Each pass is a ``ui_task_runs`` row with its cost; the pass refuses when today's cost has reached
 :data:`DAILY_BUDGET_USD` (or the next call's estimate would pass it) and tries again the next day.
@@ -137,7 +138,9 @@ app process names in odd forms.
 - outcome: the id of the ONE recorded outcome that shows the task got done (its last checked step), like "f7"; or \
 "none" when no recorded outcome inside the task's own pieces shows it. Never an outcome from another task or from a \
 detour. A window coming to the front is the START of the work done in that window, never the end of it: when the \
-user then browses, reads or edits in that window, the outcome is a later recorded step or "none".
+user then browses, reads or edits in that window, the outcome is a later recorded step or "none". A window of the \
+app the user was already working in, coming back after another app took the focus for a moment, is no outcome \
+either.
 - detours: ranges inside the task that were not part of it, like {"from": "a812", "to": "a840"}: a chat answered in \
 between, a look at something else, an action undone.
 Then "noise": the pieces that are no task at all: a single switch to an app with nothing done in it, a few seconds of \
@@ -737,18 +740,25 @@ def window_only(fact: Fact, rows: Sequence[dict[str, Any]], detour_ids: set[int]
     """capQ2b: why a window coming to the front is no outcome of this task, or None when it may be. Machine facts
     on the task's own rows (not its detours): ``"nothing_else_there"`` when the user did nothing else in the app
     that came up (one switch, or taskbar clicks, is no learnable task), ``"work_went_on"`` when they went on acting
-    in it afterwards (the window coming up began that work; it was not its end)."""
+    in it afterwards (the window coming up began that work; it was not its end), ``"already_there"`` when the app
+    that came up is the app of the user's last action before it (switch rows not counted): the window went back to
+    the app already in use (another program took the focus for a moment and gave it back), so nothing new came up
+    (second verification V2)."""
     if fact.kind != "window_verified":
         return None
     app = str(fact.target or "")
     order = {int(r["id"]): k for k, r in enumerate(rows)}
     at = order.get(int(fact.action))
-    there = [r for r in rows if str(r.get("process") or "") == app and int(r["id"]) not in detour_ids
-             and int(r["id"]) != int(fact.action) and r.get("kind") != "switch"]
+    acts = [r for r in rows if int(r["id"]) not in detour_ids and int(r["id"]) != int(fact.action)
+            and r.get("kind") != "switch"]
+    there = [r for r in acts if str(r.get("process") or "") == app]
     if not app or not there:
         return "nothing_else_there"
     if at is not None and any(order[int(r["id"])] > at for r in there):
         return "work_went_on"
+    before = [r for r in acts if at is not None and order[int(r["id"])] < at]
+    if before and str(before[-1].get("process") or "") == app:
+        return "already_there"
     return None
 
 
