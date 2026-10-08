@@ -586,7 +586,14 @@ class SkillRunner:
 
     @staticmethod
     def _windows(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
-        return {int(w["hwnd"]): w for w in payload.get("windows") or [] if isinstance(w, dict) and w.get("hwnd")}
+        out = {int(w["hwnd"]): w for w in payload.get("windows") or [] if isinstance(w, dict) and w.get("hwnd")}
+        # capC5: a dialog in front that the window list leaves out (Windows' own owner fact, ``GW_OWNER``) counts as a
+        # window of its owner's app, so the replay guard sees it come up and a step may act inside it
+        front, owner = int(payload.get("foreground_hwnd") or 0), int(payload.get("foreground_owner_hwnd") or 0)
+        if front and owner and front not in out:
+            out[front] = {"hwnd": front, "title": str(payload.get("foreground_title") or ""), "owner_hwnd": owner,
+                          "process_name": str((out.get(owner) or {}).get("process_name") or ""), "unlisted": True}
+        return out
 
     @staticmethod
     def _app_of(window: dict[str, Any] | None) -> str:
@@ -810,8 +817,8 @@ class SkillRunner:
                         return "no_digest", None, 0
                     cands = [e for e, d in zip(cands, boxed) if d.casefold().startswith(step.box_digest.casefold())]
                 if step.slot:
-                    want = _words(step.text).casefold()
-                    hits = [e for e in cands if want and _words(e.get("name")).casefold() == want]
+                    said_name = _words(step.text).casefold()   # (never ``want``: that is the path's window)
+                    hits = [e for e in cands if said_name and _words(e.get("name")).casefold() == said_name]
                 else:
                     digests = self._digests(step.app or app, step.role, [_words(e.get("name")) for e in cands])
                     if digests is None:
@@ -1161,7 +1168,13 @@ class SkillRunner:
         try:
             if step.do == "scroll":
                 hands.snapshot()   # the window may be new since the talker's summary
-                hwnd = step.window or int(self._overview().get("foreground_hwnd") or 0)
+                payload = self._overview()
+                hwnd = step.window or int(payload.get("foreground_hwnd") or 0)
+                # capC5: the replay guard holds a scroll to the way's path too (its app, its window, the dialog)
+                off = self._where_off(hwnd, self._app_of(self._windows(payload).get(hwnd)), exp,
+                                      "the window in front") if exp is not None and exp.recorded else None
+                if off is not None:
+                    return off_path(off[0], off[1], f"window {hwnd}", "nothing was scrolled")
                 ok, report, facts = hands._act("scroll", {"window": hwnd, "direction": step.direction,
                                                           "amount": step.amount}, facts)
                 tool, target, app = "scroll", f"window {hwnd}", facts.get("app")
