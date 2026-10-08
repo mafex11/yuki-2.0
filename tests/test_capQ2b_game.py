@@ -141,6 +141,48 @@ def test_the_gate_holds_for_a_game_windows_detected_by_its_path_only():
     assert not gate.holds()                                        # another javaw.exe is no game
 
 
+def _gate_late_windows(procs):
+    """A gate whose Windows game store starts empty and can gain a path later (Windows writes it after the window)."""
+    clock, log = _Clock(), _Log()
+    windows: set[str] = set()
+    gate = GameGate(log=log, fullscreen_fn=lambda hwnd: hwnd == 1, d3d_fn=lambda: False, gpu_fn=lambda pids: 30.0,
+                    scan_fn=lambda: [(p, n) for p, (n, _e) in procs.items()],
+                    image_fn=lambda pid: procs.get(pid, ("", ""))[0], own_fn=lambda pid: False, clock=clock,
+                    windows_fn=lambda: frozenset(G._norm_path(w) for w in windows),
+                    exe_fn=lambda pid: procs.get(pid, ("", ""))[1])
+    return gate, clock, log, windows
+
+
+def test_a_game_windows_detects_after_its_window_came_up_holds_at_the_next_check():
+    """Review F1: a first run of a game no list names; Windows adds it to its store after it came to the front."""
+    procs = {21: ("Starfall.exe", STARFALL), 12: ("Discord.exe", r"C:\Apps\Discord.exe")}
+    gate, clock, _log, windows = _gate_late_windows(procs)
+    gate.on_foreground(5, 12, trigger="start")
+    assert not gate.on_foreground(1, 21).hold
+    windows.add(STARFALL)                                          # Windows writes the game's path now
+    clock.t += G.CHECK_AFTER_S[0]
+    d = gate.on_check()
+    assert d.hold and d.sources == ("windows",) and gate.holds()
+    assert gate.next_check_in() is None                            # a game now: no longer measured
+
+
+def test_a_game_windows_detects_later_holds_at_the_next_beat_without_a_window_switch():
+    procs = {21: ("Starfall.exe", STARFALL), 12: ("Discord.exe", r"C:\Apps\Discord.exe")}
+    gate, clock, _log, windows = _gate_late_windows(procs)
+    gate.on_foreground(5, 12, trigger="start")
+    gate.on_foreground(2, 21)                                      # windowed: no checks planned
+    assert gate.next_check_in() is None and not gate.holds()
+    windows.add(STARFALL)
+    clock.t += G.BEAT_EVERY_S
+    d = gate.beat()
+    assert d is not None and d.hold and d.games == ("starfall",) and gate.holds()
+    windows.discard(STARFALL)                                      # the music program's path never joins: nothing
+    procs[11] = ("BL64.exe", BEATS)
+    gate.on_exit(21)
+    clock.t += G.BEAT_EVERY_S
+    assert not gate.beat().hold
+
+
 def test_exclusive_full_screen_holds_at_once_and_teaches_the_program():
     gate, clock, log, s = _gate({30: ("Skyrider.exe", r"C:\Games\Skyrider.exe"), 12: ("Discord.exe", "")},
                                 fullscreen={4})

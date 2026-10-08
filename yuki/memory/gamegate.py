@@ -636,7 +636,11 @@ class GameGate:
         session = self._session()
         with self._lock:
             self._d3d_live = (now, d3d)
-            if session != ("game_voice" in self._decision.reasons):
+            running = len(self._running)
+            self._refresh_windows()      # a change notification checked without waiting: cheap (review F1)
+            if len(self._running) != running:
+                trigger = "windows_games"
+            elif session != ("game_voice" in self._decision.reasons):
                 trigger = "game_voice"
             elif d3d != self._d3d:
                 trigger = "d3d"
@@ -714,6 +718,7 @@ class GameGate:
         with self._lock:
             if self._checks and self._checks[0] <= now:
                 self._checks.pop(0)
+            self._refresh_windows()      # Windows may have detected the program in front since (review F1)
             stretch = self._stretch
             if stretch is None:
                 self._checks = []
@@ -808,6 +813,22 @@ class GameGate:
         if windows != self._games.windows:
             self._games = GameSet(fixed=self._games.fixed, learned=self._games.learned, windows=windows)
             self.counters["windows_reloads"] += 1
+            self._rematch()
+
+    def _rematch(self) -> None:
+        """Windows' game store changed (review F1): a game Windows detected only after its window came up (its first
+        run) is matched now, not at the next window switch: one scan of the running processes (the store changes
+        rarely), then the program in front (a scan may miss it). A program in front that is now a game stops being
+        measured."""
+        self._scan(self._clock())
+        if not self._front_pid:
+            return
+        source = self._source_of(self._front_pid, self._front)
+        if source is None:
+            return
+        self._track(self._front_pid, self._front, detected=source == "windows")
+        if source != "learned" and self._stretch is not None and self._stretch[1] == self._front_pid:
+            self._stretch, self._checks = None, []
 
     def _source_of(self, pid: int, image: str) -> str | None:
         """Which fact makes the process ``pid`` a game (``list`` / ``learned`` / ``windows``), or None. The path is read
