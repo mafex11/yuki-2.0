@@ -77,7 +77,8 @@ from yuki.memory.trace_hooks import (
     EVENT_SYSTEM_MENUPOPUPSTART, OUTCOME_CAP, OUTCOME_S,
 )
 from yuki.memory.trace_keys import FOLD_S, NAMED_KEY, RUN_KEYS
-from yuki.memory.trace_privacy import COMMAND, CONTENT, NAME_CHARS, TITLE, TraceRules, gate, name_class, normalise_name
+from yuki.memory.trace_privacy import (COMMAND, CONTENT, NAME_CHARS, TITLE, TraceRules, content_item, gate, name_class,
+                                       normalise_name)
 
 #: Input and hook items waiting for the worker at most. A worker stuck in a call into a hung app would otherwise
 #: let the queue grow without end; past this, new input items are dropped and counted (``dropped_queue_full``),
@@ -116,8 +117,30 @@ KNOWN_FILES = 8
 #: Roles whose answer to ``ElementFromPoint`` is a whole renderer pane (try the descent, path iii) when it covers
 #: most of the window.
 PANE_ROLES = frozenset({"Pane", "Document", "Window", "Custom", "Group"})
-#: Roles typing goes into (a click on one can name the field a typing run went into).
+#: Roles typing goes into when an element's own facts were not read (a fake or an older answer). capQ2a: a text field
+#: is decided by UI Automation's facts (:meth:`yuki.memory.trace_uia.Element.field_hint`, and for a submit
+#: :meth:`yuki.memory.trace_uia.TraceUia.field_state`), so a Chromium or Electron composer drawn as a Group with an
+#: editable TextPattern counts too.
 EDIT_ROLES = frozenset({"Edit", "Document", "ComboBox"})
+
+
+def _is_enter(chord: str | None) -> bool:
+    """capQ2a: Enter, alone or with modifiers (Ctrl+Enter sends in some apps; Shift+Enter is a new line, and then the
+    field still holds text, so no submit is seen)."""
+    return bool(chord) and str(chord).split("+")[-1] == "Enter"
+
+
+def _field_hint(el: Any) -> bool:
+    """capQ2a: whether typing may go into this element, by its cached facts (control type when they were not read)."""
+    if el is None:
+        return False
+    hint = getattr(el, "field_hint", None)
+    if callable(hint):
+        try:
+            return bool(hint())
+        except Exception:  # noqa: BLE001
+            return False
+    return getattr(el, "role", None) in EDIT_ROLES
 #: Standard paste accelerators (Windows' own; machine identities of a shortcut).
 PASTE_CHORDS = frozenset({"Ctrl+V", "Shift+Insert"})
 #: The standard Save accelerator (Windows' own): re-checks the files known to be open for a save without a dialog.
@@ -263,8 +286,30 @@ class TraceWorker:
                  flp: Callable[[str], dict[str, Any]] | None = None, log: Callable[..., None] | None = None,
                  clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time,
                  hover: tuple[int, int, float] | None = None, hung: Any = None,
-                 root_of: Callable[[int], int] | None = None, pid_of: Callable[[int], int] | None = None) -> None:
+                 root_of: Callable[[int], int] | None = None, pid_of: Callable[[int], int] | None = None,
+                 fl_recent: Callable[[], Any] | None = None, present: Callable[[float], bool | None] | None = None,
+                 other_screen: Callable[[float], bool] | None = None) -> None:
         self.store = store
+        #: capQ2a: FL Studio's own recent-projects list (``() -> RecentList``, :mod:`yuki.memory.trace_flrecent`),
+        #: read only on a save chord in FL Studio or when its window title changes.
+        if fl_recent is None:
+            from yuki.memory.trace_flrecent import FlRecent
+
+            fl_recent = FlRecent()
+        self._fl_recent = fl_recent
+        self._fl_due: float | None = None
+        self._fl_top: str | None = None          # the project FL Studio's list had first when last read
+        #: capQ2a: ``(since) -> whether the user moved the mouse by presence's rule since then`` (None: cannot say,
+        #: fails closed). A hover is kept only when the movement that ended in its rest was the user's (the 8 Oct
+        #: audit: 59 hovers from a drifting mouse while the user was away). None: presence is not asked (tests).
+        self._present = present
+        self._moving_t: float | None = None
+        #: capQ2a: ``(epoch s) -> whether Deskflow had the cursor on another computer's screen then``
+        #: (:class:`yuki.memory.trace_deskflow.DeskflowScreens`): input then is the other computer's, never a row.
+        self._other_screen = other_screen
+        # recent file rows, ``{(kind, digest): (wall time, the file's write time)}``: one save or open seen through two
+        # doors (a save chord and FL Studio's own list, a dialog's Recent link) is one row
+        self._file_marks: dict[tuple[str, str], tuple[float, float]] = {}
         #: capC1c: ``(hwnd) -> its top-level window`` (``GetAncestor(GA_ROOT)``) and ``(hwnd) -> its process``: the
         #: machine facts the staleness rule compares (:meth:`_stale`).
         self._root_of = root_of or _root_of
@@ -326,7 +371,8 @@ class TraceWorker:
         self._last_key: _Act | None = None
         self._last_wheel: _Act | None = None
         self._fg = _Window()
-        self._recent_structure: deque[tuple[float, int, int]] = deque(maxlen=64)   # (t, event, its window)
+        # (t, event, its window, Windows' own time of it or None)
+        self._recent_structure: deque[tuple[float, int, int, int | None]] = deque(maxlen=64)
         self._batch: list[dict[str, Any]] = []
         self._elements: list[dict[str, Any]] = []
         self._files: list[dict[str, Any]] = []
@@ -499,9 +545,35 @@ class TraceWorker:
 
     def _new_act(self, kind: str, t: float, source: str, win: _Window, **kw: Any) -> _Act:
         act = _Act(kind=kind, t=t, source=source, win=win, during_run=self._during_run(), last_t=t, **kw)
-        act.drop = self._privacy_reason(win)
+        act.drop = self._privacy_reason(win) or self._not_here(win, t)
         self._acts.append(act)
         return act
+
+    @staticmethod
+    def _deskflow(win: _Window) -> bool:
+        from yuki.memory.trace_deskflow import DESKFLOW_IMAGES
+
+        return (win.image or "").casefold() in DESKFLOW_IMAGES
+
+    def _away_at(self, t: float) -> bool:
+        """capQ2a: whether Deskflow had the cursor on another computer's screen at this (monotonic) time."""
+        if self._other_screen is None:
+            return False
+        try:
+            return bool(self._other_screen(self._at(t)))
+        except Exception as exc:  # noqa: BLE001 - its log cannot be read: nothing is dropped for it
+            self._error("deskflow", exc)
+            return False
+
+    def _not_here(self, win: _Window, t: float) -> str | None:
+        """capQ2a: an action that is not this PC's user acting here: Deskflow's own window (it is in front while the
+        cursor is on the other computer) or any input while Deskflow's log has the cursor on another screen. A skip
+        reason (counted, never a row), else None."""
+        if win.process and self._deskflow(win):
+            return "skip_deskflow"
+        if self._away_at(t):
+            return "skip_other_screen"
+        return None
 
     # -- items -------------------------------------------------------------------------------------------------------
 
@@ -534,7 +606,7 @@ class TraceWorker:
         self._dialog = self._dialog_closed = None
         self._type = self._hover = self._pending_dclick = self._last_key = self._last_wheel = None
         self._open.clear()
-        self._hover_due = None
+        self._hover_due = self._fl_due = self._moving_t = None
         self._focus_valid = False
         if self._acts:
             self.counters["dropped_reopen"] += len(self._acts)
@@ -609,7 +681,7 @@ class TraceWorker:
                 # capC1c: a renderer descent done inside the click's own lookup is the snapshot path (iii)
                 descended = getattr(el, "refined", None) in ("descent", "path")
                 act.el, act.resolved, act.lookup_ms = el, "snapshot" if descended else "point", el.ms
-                if el.role in EDIT_ROLES:
+                if _field_hint(el):
                     self._last_click_edit = (t, el, hwnd)   # typing next goes into it (a password field: dropped)
                 if el.role in PANE_ROLES and self._covers_window(el, hwnd) and walk.get("max_area"):
                     self._point_only(act, el)               # the lookup already went down: nothing deeper answers
@@ -747,12 +819,12 @@ class TraceWorker:
         if self._type is not None:
             run = self._type
             after_type = {"typed": run.typed, "el": run.el}
-        elif text == "Enter":
+        elif _is_enter(text):
             prev = self._last_key
             # an Enter right after a paste into a field, with no other action and no focus change between: the
             # pasted field is what it may submit, read like a field typed into (report 98, review F2: paste_sent)
             if (prev is not None and prev.kind == "paste" and prev.drop is None and prev.el is not None
-                    and getattr(prev.el, "role", None) in EDIT_ROLES and self._last_action_t == prev.t
+                    and _field_hint(prev.el) and self._last_action_t == prev.t
                     and self._last_focus_ev <= prev.t):
                 after_type = {"typed": 0, "el": prev.el}
         self._close_type(t)
@@ -845,8 +917,12 @@ class TraceWorker:
             if run.recheck_at is not None:
                 self._recheck(run)                    # closed before its re-read: read the field now
 
-    def _on_ev(self, t: float, event: int, hwnd: int, id_object: int, id_child: int) -> None:
+    def _on_ev(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, tick: int | None = None) -> None:
         ev = (t, event, hwnd, id_object, id_child)
+        if event == EVENT_OBJECT_NAMECHANGE and int(hwnd or 0) == self._fg.hwnd and self._fl_app(self._fg):
+            # capQ2a: FL Studio's window title changed (a project opened, saved under a name, a new one): its own
+            # recent-projects list is read once its write has settled (:meth:`_fl_check`)
+            self._fl_due = t + SAVE_CHECK_S
         if event == EVENT_OBJECT_FOCUS:
             self._focus_valid = False
             self._last_focus_ev = t
@@ -859,7 +935,7 @@ class TraceWorker:
         elif event == EVENT_SYSTEM_DIALOGSTART:
             self._dialog = (t, int(hwnd), self._fg)
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event, hwnd, id_object)
+            self._structure(t, event, hwnd, id_object, tick)
         attached = False
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
@@ -885,7 +961,7 @@ class TraceWorker:
                     if el.secret():
                         act.drop = el.secret()
 
-    def _structure(self, t: float, event: int, hwnd: int = 0, id_object: int = 0) -> None:
+    def _structure(self, t: float, event: int, hwnd: int = 0, id_object: int = 0, tick: int | None = None) -> None:
         """A structure change (shown, hidden, reordered, a menu closed): an action whose lookup was still answering at
         that time is stale when the change could alter what is under its press point, decided now (a busy app's
         events cannot push it out). capC1c: only when the event's own window (``GetWindowRect`` of its handle, a
@@ -893,17 +969,43 @@ class TraceWorker:
         gone by now cannot be placed; the window under the press is compared when the action finishes instead
         (:meth:`_stale`). Report 78 §4.2: only changes that could touch the press count. The text caret or the
         cursor shown or hidden (:data:`NOT_CONTENT_OBJECTS`: a click into a field shows its caret at once, its handle
-        the field's own window) changes nothing under the point and never counts."""
+        the field's own window) changes nothing under the point and never counts.
+
+        capQ2a: only a change that came before the answer was *settled* counts (:meth:`_before_answer`): the moment
+        ``ElementFromPoint`` and the resolution walk were done (``Element.chosen_at``), not the end of the lookup. The
+        rest of a lookup only reads the chosen element's ancestors and index, which never change which element it is,
+        so the taskbar redrawing itself while that ran (8 Oct: 15 of 35 correct taskbar clicks stale, the stale ones
+        the longer lookups) changes nothing. A change Windows itself dates before that moment (the event's own time,
+        ``dwmsEventTime``, an earlier tick than the answer's) counts however late it reached the trace."""
         if id_object in NOT_CONTENT_OBJECTS:
             self.counters["structure_not_content"] += 1
             return
-        self._recent_structure.append((t, event, int(hwnd or 0)))
+        self._recent_structure.append((t, event, int(hwnd or 0), tick))
         rects: dict[int, Any] = {}
         for act in self._acts:
-            if act.lookup_end is not None and act.t <= t <= act.lookup_end and not act.stale \
-                    and self._under_point(act, hwnd, rects):
+            if not act.stale and self._before_answer(act, t, tick) and self._under_point(act, hwnd, rects):
                 act.stale = True
                 self.counters["stale_structure"] += 1
+
+    @staticmethod
+    def _before_answer(act: _Act, t: float, tick: int | None) -> bool:
+        """capQ2a: whether a change the trace heard of at ``t`` (Windows' own time of it: ``tick``, ms) came between
+        the press and the moment the lookup's answer was settled: heard by then, or dated by Windows in an earlier
+        tick than the answer (an event can reach the hook thread late, never early). The answer's moment is the
+        element's own ``chosen_at`` / ``chosen_tick``; an answer without them (a fake, an older client) is judged by
+        the end of its lookup, as before."""
+        if act.lookup_end is None or t < act.t:
+            return False
+        el = act.el
+        chosen = getattr(el, "chosen_at", None) if el is not None else None
+        answered = act.lookup_end if chosen is None else min(float(chosen), act.lookup_end)
+        if t <= answered:
+            return True
+        chosen_tick = getattr(el, "chosen_tick", None) if el is not None else None
+        if tick is None or chosen_tick is None or chosen is None:
+            return False
+        # Windows' tick count wraps every 49.7 days: compared modulo 2**32
+        return 0 < ((int(chosen_tick) - int(tick)) & 0xFFFFFFFF) < 0x80000000
 
     def _under_point(self, act: _Act, hwnd: int, rects: dict[int, Any] | None = None) -> bool:
         """capC1c: whether a window (an event's own handle) covers the action's press point now."""
@@ -918,9 +1020,12 @@ class TraceWorker:
         rect = rects[hwnd]
         return bool(rect) and rect[0] <= act.x < rect[2] and rect[1] <= act.y < rect[3]
 
-    def _on_out(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, gen: int = 0) -> None:
+    def _on_out(self, t: float, event: int, hwnd: int, id_object: int, id_child: int, *rest: int) -> None:
+        """An outcome event: ``rest`` is ``(gen,)`` or, from the hook thread since capQ2a, ``(tick, gen)`` (the
+        event's own time, ``dwmsEventTime``, before the hooks' generation, which stays the item's last field)."""
+        tick = int(rest[0]) if len(rest) >= 2 else None
         if event in STRUCTURE_EVENTS:
-            self._structure(t, event, hwnd, id_object)
+            self._structure(t, event, hwnd, id_object, tick)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S:
                 if len(act.outs) < OUTCOME_CAP:      # V6: one row keeps at most the cap, however many repeats fold
@@ -947,13 +1052,16 @@ class TraceWorker:
         # V3: the app an action brought to the front is named on its row only when that app may be recorded at all
         # (a blocked app, Yuki's own window, a private window or an app left out: "a window changed", no name)
         app_reason = self._app_reason(win)
+        # capQ2a: Deskflow's own window coming up is the cursor leaving for the other computer, never an outcome
+        named = None if app_reason or self._deskflow(win) else win.process
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S and act.fg_change is None:
-                act.fg_change = (t, None if app_reason else win.process)
+                act.fg_change = (t, named)
         source = self._linked_source(t, INPUT_LINK_S)
         if source is not None and win.process and hwnd != self._fg.hwnd:
             act = self._new_act("switch", t, source, win, gap_ms=self._gap(t))
-            act.drop = app_reason          # a switch names the app only, never its page (its page may still load)
+            # a switch names the app only, never its page (its page may still load)
+            act.drop = app_reason or self._not_here(win, t)
             act.facts["window_verified"] = win.process
             act.resolved = "event"
         if win.process and win.started is not None and not app_reason:
@@ -965,6 +1073,7 @@ class TraceWorker:
         self._fg = win
 
     def _on_moving(self, t: float) -> None:
+        self._moving_t = t                        # capQ2a: the movement that may end in a rest began here
         self._close_hover(t)
         if self.sink is None or self._hover_rect is None:
             return
@@ -995,6 +1104,9 @@ class TraceWorker:
                 and abs(x - last[0]) <= 2 * w and abs(y - last[1]) <= 2 * h):
             self.counters["hover_coalesced"] += 1     # the same rest, drifted: still one row
             return
+        if not self._user_moved():
+            self.counters["skip_hover_away"] += 1     # capQ2a: the pointer drifted here by itself
+            return
         hwnd, pid = self._window_at(x, y)
         win = self._window(hwnd, pid)
         source = getattr(sink, "move_source", "user") or "user"
@@ -1022,6 +1134,21 @@ class TraceWorker:
                 act.drop = "skip_hover_unresolved"
         if act.drop is not None:
             act.open, act.last_t, self._hover = False, now, None   # dropped: nothing to wait for (counted at once)
+
+    def _user_moved(self) -> bool:
+        """capQ2a: whether presence says the user moved the mouse during the movement that ended in this rest: its
+        latest real mouse movement (:mod:`yuki.memory.userpresence`'s rule: the takeover distance within its window,
+        read from the mouse's own reports, never the cursor) came at or after that movement began. A drifting or
+        vibrating mouse never gets that far, so a rest it makes is no hover. Presence that cannot say fails closed
+        (no hover); with no presence wired (tests of other parts) every rest counts, as before."""
+        if self._present is None:
+            return True
+        since = self._moving_t if self._moving_t is not None else float(getattr(self.sink, "anchor_at", 0.0) or 0.0)
+        try:
+            return bool(self._present(since))
+        except Exception as exc:  # noqa: BLE001
+            self._error("presence", exc)
+            return False
 
     def _take_sink_travel(self) -> int | None:
         sink = self.sink
@@ -1093,6 +1220,8 @@ class TraceWorker:
             except OSError:
                 written = 0.0
             saved = abs(self._wall() - written) <= 10.0
+            if self._file_seen("file_save" if saved else "file_open", target, written):
+                continue                             # capQ2a: already a row through another door
             if dialog is not None:
                 # the app whose open/save dialog it came from, as it was then (its title and page decide privacy)
                 win = dataclasses.replace(dialog[1])
@@ -1109,6 +1238,13 @@ class TraceWorker:
         digest = self._digest("ui-file", os.path.normcase(os.path.normpath(target)))
         act.file = {"path": target, "ext": ext, "digest": digest}
         act.facts["file_saved" if kind == "file_save" else "file_opened"] = digest
+        try:
+            written = os.path.getmtime(target)
+        except OSError:
+            written = 0.0
+        if len(self._file_marks) >= 64:
+            self._file_marks.pop(next(iter(self._file_marks)))
+        self._file_marks[(kind, digest)] = (self._wall(), written)
         if act.drop is None:
             for entry in [e for e in self._known_files if e[0] == target]:
                 self._known_files.remove(entry)
@@ -1120,18 +1256,98 @@ class TraceWorker:
         write time since the chord, become ``file_save`` rows (an .flp gets its project facts). Only that app's
         files (V8): another program writing its own file meanwhile is not this chord's save."""
         chord_wall = self._at(act.t)
-        for target, _digest, proc, _at in list(self._known_files):
-            if not proc or proc != act.win.process:
+        targets = [(target, proc) for target, _digest, proc, _at in list(self._known_files)]
+        if self._fl_app(act.win):
+            # capQ2a: FL Studio opens projects from its own recent list, which the shell never hears of: that list's
+            # first entries are this save's candidates too (read now, once, lazily)
+            targets += [(path, act.win.process) for path in self._fl_paths()]
+        seen: set[str] = set()
+        for target, proc in targets:
+            key = os.path.normcase(os.path.normpath(target))
+            if not proc or proc != act.win.process or key in seen:
                 continue
+            seen.add(key)
             try:
                 written = os.path.getmtime(target)
             except OSError:
                 continue
             if written < chord_wall - 1.0 or self._rules().folder_blocked(target):
                 continue
+            if self._file_seen("file_save", target, written):
+                continue
             save = self._file_act("file_save", act.t, act.source, act.win, target, via="save_chord")
             save.up_t = save.last_t = act.last_t
             self.counters["file_save_chord"] += 1
+
+    # -- FL Studio's own recent list (capQ2a) ----------------------------------------------------------------------
+
+    @staticmethod
+    def _fl_app(win: _Window) -> bool:
+        from yuki.memory.trace_flrecent import FL_IMAGES
+
+        return bool(win.process) and (win.image or "").casefold() in FL_IMAGES
+
+    def _fl_list(self) -> Any:
+        try:
+            return self._fl_recent()
+        except Exception as exc:  # noqa: BLE001 - no list: nothing to re-check
+            self._error("fl_recent", exc)
+            return None
+
+    def _fl_paths(self) -> list[str]:
+        """The first :data:`KNOWN_FILES` projects of FL Studio's own recent list."""
+        recent = self._fl_list()
+        return list(getattr(recent, "paths", None) or [])[:KNOWN_FILES]
+
+    def _fl_check(self, now: float) -> None:
+        """capQ2a: FL Studio's window title changed a moment ago: its own recent list is read (one registry call when
+        it did not change). A new first project is the one now open: a ``file_open`` row (``via=fl_recent``), or a
+        ``file_save`` when the file itself was written with the list (a save under a new name); its ``.flp`` facts
+        follow (decision D6). The list rewritten before the trace last opened (off, paused, a game) is only
+        remembered, never a row; no input of the user's within :data:`FILE_INPUT_S` is no row either."""
+        self._fl_due = None
+        win = self._fg
+        if not self._fl_app(win) or self._app_reason(win) is not None:
+            return
+        recent = self._fl_list()
+        paths = list(getattr(recent, "paths", None) or [])
+        if not paths:
+            return
+        top, last = paths[0], self._fl_top
+        self._fl_top = top
+        if last is not None and os.path.normcase(top) == os.path.normcase(last):
+            return
+        written = getattr(recent, "written", None)
+        if written is None or float(written) < self._opened_at:
+            self.counters["fl_before_open"] += 1        # rewritten while the trace was off, paused or gated
+            return
+        if not os.path.isfile(top) or self._rules().folder_blocked(top):
+            return
+        source = self._linked_source(now, FILE_INPUT_S)
+        if source is None:
+            self.counters["file_no_input"] += 1
+            return
+        try:
+            file_written = os.path.getmtime(top)
+        except OSError:
+            return
+        kind = "file_save" if file_written >= float(written) - SAVE_CHECK_S else "file_open"
+        if self._file_seen(kind, top, file_written):
+            return
+        self._file_act(kind, now, source, win, top, via="fl_recent")
+        self.counters["file_fl_recent"] += 1
+
+    def _file_seen(self, kind: str, target: str, written: float) -> bool:
+        """Whether this very save (the file at this write time) or open was already a row a moment ago: one file action
+        seen through two doors is one row."""
+        digest = self._digest("ui-file", os.path.normcase(os.path.normpath(target)))
+        mark = self._file_marks.get((kind, digest))
+        wall = self._wall()
+        if mark is None:
+            return False
+        if kind == "file_save":
+            return abs(mark[1] - written) < 1e-3
+        return wall - mark[0] <= FILE_INPUT_S
 
     def _on_cmd(self, items: list[dict[str, Any]]) -> None:
         """Warp's own history rows (already secret-filtered by its rules) as ``command`` actions."""
@@ -1189,6 +1405,8 @@ class TraceWorker:
         dues = []
         if self._hover_due is not None:
             dues.append(self._hover_due)
+        if self._fl_due is not None:
+            dues.append(self._fl_due)
         for i, act in enumerate(self._acts):
             due = self._due(act, self._acts[i + 1] if i + 1 < len(self._acts) else None)
             if due is not None:
@@ -1231,6 +1449,11 @@ class TraceWorker:
                     self._hover_fire(now)
                 else:
                     self._hover_due = None
+            if self._fl_due is not None and now >= self._fl_due:
+                if self._blocked() is None:
+                    self._fl_check(now)
+                else:
+                    self._fl_due = None
             for act in self._acts:
                 if act.recheck_at is not None and now >= act.recheck_at:
                     self._recheck(act)
@@ -1274,7 +1497,8 @@ class TraceWorker:
                     return
                 t0 = time.perf_counter()
                 try:
-                    el = self.uia.from_event(hwnd, id_object, id_child, budget_s=LOOKUP_S, index=True)
+                    near = {"near": (act.x, act.y)} if getattr(self.uia, "event_near", False) else {}
+                    el = self.uia.from_event(hwnd, id_object, id_child, budget_s=LOOKUP_S, index=True, **near)
                 except Exception as exc:  # noqa: BLE001
                     self._error("event_lookup", exc)
                     el = None
@@ -1326,8 +1550,8 @@ class TraceWorker:
                     self.counters["stale_other_window"] += int(count)
                     return True
         rects: dict[int, Any] = {}
-        if any(act.t <= t <= act.lookup_end and self._under_point(act, hwnd, rects)
-               for t, _e, hwnd in self._recent_structure):
+        if any(self._before_answer(act, t, tick) and self._under_point(act, hwnd, rects)
+               for t, _e, hwnd, tick in self._recent_structure):
             self.counters["stale_structure"] += int(count)
             return True
         return False
@@ -1420,20 +1644,47 @@ class TraceWorker:
                     act.facts["toggle_state"] = state["toggle"]
                 if state.get("selected"):
                     act.facts["selected"] = True
-        if act.kind == "keys" and act.chord == "Enter" and act.after_type and act.after_type.get("el") is not None:
-            field_el = act.after_type["el"]
-            target = (act.win.hwnd, act.win.pid)
-            if field_el.role in EDIT_ROLES and not self._hung_skip(target) and self._take(priority=False):
-                t0 = time.perf_counter()
-                state = self.uia.reread(field_el, value_length=True)
-                self._hung_note(target, time.perf_counter() - t0)
-                if state.get("length") == 0:
-                    act.facts["field_submitted"] = {"typed": int(act.after_type.get("typed") or 0)}
+        if act.kind == "keys" and _is_enter(act.chord) and act.after_type and act.after_type.get("el") is not None:
+            self._submit_check(act)
+
+    def _submit_check(self, act: _Act) -> None:
+        """capQ2a: Enter after typing (or a paste) into a field: the field read again once the outcome window is over.
+        It must be a text field by UI Automation's own facts (:meth:`yuki.memory.trace_uia.TraceUia.field_state`: an
+        editable Value, a TextPattern that is not read-only, a focusable Edit or Document; a read-only document never
+        is) and hold no visible character now: then the text left it, ``field_submitted``. One lookup per such Enter,
+        taken from the clicks' budget (spare budget alone missed sends in busy apps), never into a hung app; a
+        password field (or one whose IsPassword is unknown) is never read at all."""
+        field_el = act.after_type["el"]
+        if field_el.secret() or not _field_hint(field_el):
+            return
+        target = (act.win.hwnd, act.win.pid)
+        if self._hung_skip(target) or not self._take(priority=True):
+            self.counters["submit_check_skipped"] += 1
+            return
+        t0 = time.perf_counter()
+        try:
+            check = getattr(self.uia, "field_state", None)
+            state = check(field_el) if callable(check) else self.uia.reread(field_el, value_length=True)
+        except Exception as exc:  # noqa: BLE001
+            self._error("submit_check", exc)
+            state = {}
+        self._hung_note(target, time.perf_counter() - t0)
+        self.counters["lookups"] += 1
+        if state.get("secret") or state.get("field") is False:
+            self.counters["submit_not_field"] += 1
+            return
+        if state.get("length") == 0:
+            act.facts["field_submitted"] = {"typed": int(act.after_type.get("typed") or 0)}
+            self.counters["field_submitted"] += 1
 
     def _element_cols(self, act: _Act, el: Any, prefix: str = "") -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Row columns and the element registry use for one element, as its name class allows."""
         process = act.win.process
-        cls = name_class(el.role, el.parent_role)
+        cls = name_class(el.role, el.parent_role, el.ancestors)
+        # capQ2a: a command control inside a list, tree or grid (a sidebar's thread drawn as a Button) is content: its
+        # raw row keeps a digest only (readers that judge a row by its role alone would take it for a command), its
+        # name reaches the registry only after 3 distinct days, like a tab's or a title's
+        item = content_item(el.role, el.ancestors, el.parent_role)
         norm = normalise_name(el.name)
         name_digest = self._digest("ui-name", process, el.role, norm) if norm else None
         ancestry = "/".join(r for r, _a in el.ancestors)
@@ -1443,21 +1694,24 @@ class TraceWorker:
             from yuki.memory import secret_filter
 
             name = " ".join(secret_filter.redact(el.name).text.split())[:NAME_CHARS] or None
+        row_name = None if item else name
+        if item:
+            self.counters["content_item_named"] += 1
         if cls == TITLE and el.index is not None:
             position = f"{el.index}/{el.parent_role or ''}"
         else:
             position = el.parent_role or None
         cols: dict[str, Any] = {}
         if prefix:
-            cols.update({"end_role": el.role, "end_name_ciphertext": self._enc(name), "end_name_digest": name_digest,
-                         "end_element_key": key, "end_position": position})
+            cols.update({"end_role": el.role, "end_name_ciphertext": self._enc(row_name),
+                         "end_name_digest": name_digest, "end_element_key": key, "end_position": position})
         else:
             container = None
             if cls == CONTENT and el.ancestors:
                 parent_role, parent_aid = el.ancestors[0]
                 grand = el.ancestors[1][0] if len(el.ancestors) > 1 else ""
                 container = self._digest("ui-container", process, parent_role, parent_aid, grand)
-            cols.update({"role": el.role, "name_ciphertext": self._enc(name), "name_digest": name_digest,
+            cols.update({"role": el.role, "name_ciphertext": self._enc(row_name), "name_digest": name_digest,
                          "position": position, "aid_ciphertext": self._enc(el.aid) if el.aid else None,
                          "aid_digest": self._digest("ui-aid", process, el.aid) if el.aid else None,
                          "element_key": key, "container_digest": container})
@@ -1470,6 +1724,8 @@ class TraceWorker:
         if blocked is not None:          # first: the game gate (or consent off) means no row and no further lookup
             self.counters["dropped_" + blocked] += 1
             return
+        if act.drop is None and self._away_at(act.t):
+            act.drop = "skip_other_screen"   # capQ2a: Deskflow's line for it came after the action began
         if act.drop is None and act.win.pid and act.kind in POINTER_KINDS | FOCUS_KINDS:
             # the timeline may only now have caught up with the window (it came to the front with this press, or
             # its page changed under the keys: Ctrl+Tab then typing): checked again for keys and typing too (V1)
@@ -1619,7 +1875,10 @@ class TraceWorker:
         hung = dict(getattr(self.hung, "counts", {}) or {})
         if hung:
             hung["hung_now"] = int(self.hung.marked()) if hasattr(self.hung, "marked") else 0
-        return {**dict(self.counters), **hung, "lookup_ms_p50": pct(0.5), "lookup_ms_p95": pct(0.95),
+        # capQ2a: the client's own counts (COM errors by code, event lookups with nothing there): counted, never logged
+        uia = getattr(self.uia, "counts", None)
+        uia = {k: int(v) for k, v in uia.items()} if isinstance(uia, dict) else {}
+        return {**dict(self.counters), **hung, **uia, "lookup_ms_p50": pct(0.5), "lookup_ms_p95": pct(0.95),
                 "pending": len(self._acts), "batch": len(self._batch)}
 
 
@@ -1862,12 +2121,15 @@ class Trace:
         self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at,
                                pid_of=_window_pid)
         rules_fn = self.privacy.rules
+        from yuki.memory.trace_deskflow import DeskflowScreens
+
         self.worker = TraceWorker(
             self.store, privacy_rules=rules_fn, trace_rules=self.rules, gate=self._gate_holds, acting=self._acting,
             paused=lambda: self._paused or (self._ab is not None and not self._ab.on_now()),
             page=timeline_page(self._timeline_now, self.store), title=_title, rect=_rect, sink=self.sink,
             cursor=self.sink._cursor, clipboard=_clipboard_now, recent=recent, log=self._log_fn,
-            hover=(metrics.hover_w, metrics.hover_h, metrics.hover_s))
+            hover=(metrics.hover_w, metrics.hover_h, metrics.hover_s), present=_presence_moved(),
+            other_screen=DeskflowScreens().away)
         self.hooks.start()
         self._thread = threading.Thread(target=self._run, name="yuki-trace-worker", daemon=True)
         self._thread.start()
@@ -2085,6 +2347,25 @@ def _title(hwnd: int) -> str:
     from yuki.memory.trace_hooks import window_title
 
     return window_title(hwnd)
+
+
+def _presence_moved() -> Callable[[float], bool | None]:
+    """capQ2a: ``(since) -> whether the user moved the mouse since then`` by presence's own rule (the one Raw Input
+    reader's :class:`yuki.memory.userpresence.PresenceInput`, the service's presence: a real move is the takeover
+    distance within its window, from the mouse's own reports). None when presence is not listening (it cannot say:
+    a hover is then not kept)."""
+
+    def moved(since: float) -> bool | None:
+        from yuki.memory import watcher
+
+        presence = getattr(watcher, "_presence", None)
+        if presence is None or getattr(presence, "source", "") != "raw_input":
+            return None
+        from yuki.memory.userpresence import MOUSE
+
+        return float(presence.monitor.last(MOUSE)) >= float(since)
+
+    return moved
 
 
 def _clipboard_now() -> tuple[int, tuple[str, ...], bool]:

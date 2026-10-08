@@ -12,14 +12,24 @@ stored.
   container (:data:`CONTAINER_ROLES`) the walk to the real control (:meth:`TraceUia.refine`: with no actionable
   pattern (:data:`ACTION_PATTERNS`), the nearest actionable or named ancestor still under the point, else the smallest
   named descendant under it; an actionable but unnamed wrapper, a named element under the point if there is one);
-* :meth:`TraceUia.from_event`: the element an ``INVOKED``, ``SELECTION`` or ``FOCUS`` WinEvent named
-  (``AccessibleObjectFromEvent`` then ``ElementFromIAccessibleBuildCache``; path i);
+* :meth:`TraceUia.from_event`: the element an ``INVOKED``, ``SELECTION`` or ``FOCUS`` WinEvent named (path i), and
+  the elements an action's outcome events changed. capQ2a: a window's own object is UI Automation's element for that
+  handle (``ElementFromHandleBuildCache``); any other object's place comes from MSAA (``AccessibleObjectFromEvent``
+  and ``accLocation``) and the element is UI Automation's own answer there (``ElementFromPointBuildCache``, walked up
+  to the element whose bounds are that object's). ``ElementFromIAccessibleBuildCache`` is no longer called: every
+  one of the 868 crash-log entries of 8 Oct (``0x8001010d``, a handled COM error that Python's crash handler writes
+  down anyway) came from it. COM errors are counted (:attr:`TraceUia.counts`), never logged;
 * :meth:`TraceUia.descend`: from a renderer's whole pane (Chromium, CEF answer ``ElementFromPoint`` with the page),
   the smallest element under the point, one level of children at a time within the deadline (path iii);
 * :meth:`TraceUia.focused`: the focused element (the field typing goes into; ``IsPassword`` decides);
 * :meth:`TraceUia.reread`: the clicked element's toggle or selection state after the action, or a field's value
   *length* (UI Automation has no length-only read: the value passes through this one call and only its length is
-  kept).
+  kept);
+* :meth:`TraceUia.field_state` (capQ2a): whether an element is a text field, by UI Automation's own facts (an
+  editable Value, a TextPattern whose ``IsReadOnly`` reads false, or a keyboard-focusable Edit or Document that is
+  not read-only), and its *visible length* (the Value's, else the TextPattern document range's, at most
+  :data:`FIELD_TEXT_CHARS`): what a submit check needs in Chromium and Electron editors, which are often Groups with
+  a TextPattern and no Value. A password field (or one whose ``IsPassword`` cannot be read) is never read at all.
 
 Nothing here clicks, focuses or moves anything.
 """
@@ -28,6 +38,7 @@ from __future__ import annotations
 
 import ctypes
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,6 +72,43 @@ CONTAINER_ROLES = frozenset({"Group", "Pane", "Document", "Custom", "Window"})
 REFINE_UP = 6
 REFINE_DOWN = 8
 REFINE_SHARE = 0.75
+#: capQ2a: ``IsKeyboardFocusable`` and ``IsTextPatternAvailable`` (cached with the other facts), the TextPattern's id
+#: and the ``IsReadOnly`` text attribute (read only by :meth:`TraceUia.field_state`).
+_P_FOCUSABLE, _P_HAS_TEXT = 30009, 30040
+_TEXT_PATTERN_ID = 10014
+_ATTR_READONLY = 40015
+#: capQ2a: characters of a field's text read at most when it has no Value (a TextPattern document range): enough to
+#: tell an emptied composer (an editor keeps a newline or a zero-width mark) from one still holding text; the text
+#: itself is dropped at once, only how many visible characters it had is kept.
+FIELD_TEXT_CHARS = 256
+#: capQ2a: control types whose input is a press, never typed text (UI Automation's fixed vocabulary). An app may
+#: expose a settable Value on one (measured read-only 9 Oct: two of Discord's Buttons do); it is still no text field.
+PRESS_ROLES = frozenset({"Button", "CheckBox", "RadioButton", "SplitButton", "Hyperlink", "MenuItem", "TabItem"})
+#: capQ2a: the control types typing went into before the facts above were read (a fake or an older answer).
+LEGACY_FIELD_ROLES = frozenset({"Edit", "Document", "ComboBox"})
+#: capQ2a: MSAA object ids of a window itself (``OBJID_WINDOW``, ``OBJID_CLIENT``): with ``CHILDID_SELF`` an event
+#: about one is UI Automation's element for that handle.
+_OBJID_WINDOW, _OBJID_CLIENT = 0, -4
+#: capQ2a: a bounds difference (px) still counted as the same element: UI Automation's bounds are fractional for
+#: Chromium and MSAA's whole pixels, so the two readings of one element may round apart by one.
+BOUNDS_SLACK = 1
+
+
+def visible_length(text: str | None) -> int:
+    """capQ2a: the characters a person would see: whitespace, control and format characters (Unicode's own
+    categories ``Cc``, ``Cf``, ``Zs``, ``Zl``, ``Zp``: an editor's trailing newline, a zero-width space or
+    no-break mark it keeps in an empty line) are not counted."""
+    if not text:
+        return 0
+    return sum(1 for ch in text if not ch.isspace() and unicodedata.category(ch) not in ("Cc", "Cf", "Zs", "Zl", "Zp"))
+
+
+def _tick() -> int:
+    """``GetTickCount`` (ms): the clock a WinEvent's own time (``dwmsEventTime``) is in."""
+    try:
+        return int(ctypes.windll.kernel32.GetTickCount()) & 0xFFFFFFFF
+    except Exception:  # noqa: BLE001
+        return 0
 _TREE_SCOPE_ELEMENT, _TREE_SCOPE_CHILDREN = 1, 2
 _CUIAUTOMATION8_CLSID = "{e22ad333-b25f-460c-83d0-0581107395c9}"
 _CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
@@ -108,6 +156,31 @@ class Element:
     window: int = 0
     #: V2-4: the top-level window under the point right when ``ElementFromPoint`` answered (0: not read).
     root: int = 0
+    #: capQ2a: ``IsKeyboardFocusable``, ``IsTextPatternAvailable`` and a Value pattern that reads read-only (None: not
+    #: read): the cached facts :meth:`field_hint` decides by.
+    focusable: bool | None = None
+    text: bool | None = None
+    value_ro: bool | None = None
+    #: capQ2a: when the lookup's answer was settled (``ElementFromPoint`` and the resolution walk done, before the
+    #: ancestry, which never changes which element it is): the worker's clock (``time.monotonic``) and Windows' tick
+    #: count, the clock a WinEvent's own time is in. None: not stamped (the lookup's end stands for it).
+    chosen_at: float | None = None
+    chosen_tick: int | None = None
+
+    def field_hint(self) -> bool:
+        """capQ2a: whether typing may go into it, by the cached facts alone (no call): an editable Value (not a press
+        control, :data:`PRESS_ROLES`), a TextPattern on a keyboard-focusable element (its ``IsReadOnly`` is read when it
+        matters, :meth:`TraceUia.field_state`), or a keyboard-focusable Edit or Document whose Value is not read-only.
+        Facts not read (a fake or an older answer): by control type, as before."""
+        if self.patterns is None and self.focusable is None and self.text is None:
+            return self.role in LEGACY_FIELD_ROLES
+        if self.role in PRESS_ROLES:
+            return False
+        if self.patterns is not None and "value" in self.patterns:
+            return True
+        if self.text and self.focusable:
+            return True
+        return bool(self.focusable) and self.role in ("Edit", "Document") and not self.value_ro
 
     def actionable(self) -> bool:
         """Whether it exposes one of :data:`ACTION_PATTERNS` (Invoke, Toggle, SelectionItem, ExpandCollapse, Value).
@@ -178,15 +251,19 @@ class TraceUia:
         request = uia.CreateCacheRequest()
         for prop in (_P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND, _P_TOGGLE,
                      _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM, _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE,
-                     _P_VALUE_READONLY):
+                     _P_VALUE_READONLY, _P_FOCUSABLE, _P_HAS_TEXT):
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
         self._request = request
-        value_request = uia.CreateCacheRequest()
-        value_request.AddProperty(_P_VALUE)
-        value_request.AddProperty(_P_PASSWORD)
-        value_request.TreeScope = _TREE_SCOPE_ELEMENT
-        self._value_request = value_request
+        # capQ2a: a field's facts first (IsPassword decides before anything of its text is asked for)
+        field_request = uia.CreateCacheRequest()
+        for prop in (_P_TYPE, _P_PASSWORD, _P_HAS_VALUE, _P_VALUE_READONLY, _P_HAS_TEXT, _P_FOCUSABLE):
+            field_request.AddProperty(prop)
+        field_request.TreeScope = _TREE_SCOPE_ELEMENT
+        self._field_request = field_request
+        #: capQ2a: content-free counters (COM errors by code, event lookups that found no element there): the trace
+        #: worker adds them to its health, so an app that does not answer is a count, never a crash-log entry.
+        self.counts: dict[str, int] = {}
         self._walker = uia.ControlViewWalker
         self._true = uia.CreateTrueCondition()
         self._oleacc = ctypes.oledll.oleacc
@@ -230,15 +307,28 @@ class TraceUia:
         selected = number(_P_SELECTED) if number(_P_HAS_SELECTION_ITEM) else None
         toggle = number(_P_TOGGLE) if number(_P_HAS_TOGGLE) else None
         # V2-1: a read-only Value (or one whose ValueIsReadOnly cannot be read) is nothing a person sets
+        has_value = bool(number(_P_HAS_VALUE))
+        value_ro = number(_P_VALUE_READONLY)
         patterns = tuple(word for prop, word in ACTION_PATTERNS
-                         if number(prop) and (prop != _P_HAS_VALUE or number(_P_VALUE_READONLY) == 0))
+                         if number(prop) and (prop != _P_HAS_VALUE or value_ro == 0))
         hwnd = number(_P_HWND) or 0
+        focusable, has_text = number(_P_FOCUSABLE), number(_P_HAS_TEXT)
         return Element(role=ROLE_NAMES.get(int(ctype), f"ControlType{ctype}") if isinstance(ctype, int) else "",
                        name=text(_P_NAME), aid=text(_P_AID), rid=rid, bounds=_bounds(get(_P_BOUNDS)),
                        password=bool(password), password_known=password is not None, toggle=toggle,
                        selected=None if selected is None else bool(selected), pid=number(_P_PID) or 0,
                        hwnd=hwnd, ms=round((time.perf_counter() - t0) * 1000.0, 2), ref=el, patterns=patterns,
-                       window=hwnd)
+                       window=hwnd, focusable=None if focusable is None else bool(focusable),
+                       text=None if has_text is None else bool(has_text),
+                       value_ro=has_value and value_ro != 0)
+
+    def _com_error(self, exc: BaseException) -> None:
+        """capQ2a: a COM error from an app that did not answer, counted by its code (content-free), never logged."""
+        code = getattr(exc, "hresult", None)
+        if code is None and exc.args and isinstance(exc.args[0], int):
+            code = exc.args[0]
+        key = f"com_error_{int(code) & 0xFFFFFFFF:08x}" if isinstance(code, int) else f"com_error_{type(exc).__name__}"
+        self.counts[key] = self.counts.get(key, 0) + 1
 
     def _ancestry(self, element: Element, deadline: float, *, index: bool) -> None:
         """Parent role, up to :data:`ANCESTORS` ancestors (role, AutomationId) and, when asked, the index among the
@@ -383,34 +473,96 @@ class TraceUia:
                     facts = better
         if facts is not None:
             facts.root = root
+            # capQ2a: which element it is is settled now; the ancestry below only describes it
+            facts.chosen_at, facts.chosen_tick = time.monotonic(), _tick()
             self._ancestry(facts, t0 + budget_s, index=index)
             facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return facts
 
-    def from_event(self, hwnd: int, id_object: int, id_child: int, *, budget_s: float,
-                   index: bool = False) -> Element | None:
-        """The element a WinEvent named (path i)."""
+    def _count(self, key: str) -> None:
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+    #: capQ2a: :meth:`from_event` takes ``near`` (the worker passes the click's point only to a client that does).
+    event_near = True
+
+    def from_event(self, hwnd: int, id_object: int, id_child: int, *, budget_s: float, index: bool = False,
+                   near: tuple[int, int] | None = None) -> Element | None:
+        """The element a WinEvent named (path i), with its ancestry. capQ2a: a window's own object
+        (``OBJID_WINDOW`` / ``OBJID_CLIENT`` with ``CHILDID_SELF``) is UI Automation's element for that handle; any
+        other object is placed by MSAA (``AccessibleObjectFromEvent``, ``accLocation``) and the element is UI
+        Automation's answer at ``near`` (a point inside it: the click's) or its centre, walked up to the element whose
+        bounds are the object's own (:data:`BOUNDS_SLACK`). None when nothing there has those bounds (covered, gone,
+        not in the control view: ``event_unmatched``), and on a COM error (counted, :meth:`_com_error`)."""
+        t0 = time.perf_counter()
+        deadline = t0 + budget_s * REFINE_SHARE
+        try:
+            if int(id_child) == 0 and int(id_object) in (_OBJID_WINDOW, _OBJID_CLIENT):
+                el = self._uia.ElementFromHandleBuildCache(ctypes.c_void_p(int(hwnd)), self._request)
+                facts = self._facts(el, t0)
+            else:
+                rect = self._event_rect(hwnd, id_object, id_child)
+                if rect is None:
+                    self._count("event_no_place")
+                    return None
+                facts = self._element_with_bounds(rect, near, deadline=deadline)
+                if facts is None:
+                    self._count("event_unmatched")
+                    return None
+        except Exception as exc:  # noqa: BLE001 - an app that does not answer: a count, never a log line
+            self._com_error(exc)
+            return None
+        if facts is not None:
+            facts.chosen_at, facts.chosen_tick = time.monotonic(), _tick()
+            self._ancestry(facts, t0 + budget_s, index=index)
+            facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return facts
+
+    def _event_rect(self, hwnd: int, id_object: int, id_child: int) -> tuple[int, int, int, int] | None:
+        """An event object's place on screen by MSAA alone (``AccessibleObjectFromEvent`` and ``accLocation``), as
+        ``(left, top, right, bottom)``; None when it has none (gone, hidden, empty)."""
         from comtypes.automation import VARIANT
 
-        t0 = time.perf_counter()
-        try:
-            acc_type = self._module.IAccessible if hasattr(self._module, "IAccessible") else None
-            if acc_type is None:
-                from comtypes.gen.Accessibility import IAccessible as acc_type   # noqa: N813
-            acc = ctypes.POINTER(acc_type)()
-            child = VARIANT()
-            self._oleacc.AccessibleObjectFromEvent(ctypes.c_void_p(int(hwnd)), ctypes.c_long(int(id_object)),
-                                                   ctypes.c_long(int(id_child)), ctypes.byref(acc),
-                                                   ctypes.byref(child))
-            child_id = int(child.value or 0) if isinstance(child.value, int) else 0
-            el = self._uia.ElementFromIAccessibleBuildCache(acc, child_id, self._request)
-        except Exception:  # noqa: BLE001
+        acc_type = self._module.IAccessible if hasattr(self._module, "IAccessible") else None
+        if acc_type is None:
+            from comtypes.gen.Accessibility import IAccessible as acc_type   # noqa: N813
+        acc = ctypes.POINTER(acc_type)()
+        child = VARIANT()
+        self._oleacc.AccessibleObjectFromEvent(ctypes.c_void_p(int(hwnd)), ctypes.c_long(int(id_object)),
+                                               ctypes.c_long(int(id_child)), ctypes.byref(acc), ctypes.byref(child))
+        if not acc:
             return None
-        facts = self._facts(el, t0)
-        if facts is not None:
-            self._ancestry(facts, t0 + budget_s, index=index)
-            facts.ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return facts
+        left, top, width, height = (int(v) for v in acc.accLocation(child))
+        if width <= 0 or height <= 0:
+            return None
+        return left, top, left + width, top + height
+
+    @staticmethod
+    def _same_bounds(bounds: tuple[int, int, int, int] | None, rect: tuple[int, int, int, int]) -> bool:
+        return bool(bounds) and all(abs(a - b) <= BOUNDS_SLACK for a, b in zip(bounds, rect))
+
+    def _element_with_bounds(self, rect: tuple[int, int, int, int], near: tuple[int, int] | None, *,
+                             deadline: float) -> Element | None:
+        """UI Automation's element whose bounds are ``rect``: asked at ``near`` when inside it, else at its centre,
+        then up the control view (at most :data:`REFINE_UP` levels, never past a window of its own)."""
+        from ctypes import wintypes
+
+        left, top, right, bottom = rect
+        if near is not None and left <= near[0] < right and top <= near[1] < bottom:
+            x, y = int(near[0]), int(near[1])
+        else:
+            x, y = (left + right) // 2, (top + bottom) // 2
+        current = self._uia.ElementFromPointBuildCache(wintypes.POINT(x, y), self._request)
+        facts = self._facts(current, time.perf_counter())
+        for _level in range(REFINE_UP + 1):
+            if facts is None:
+                return None
+            if self._same_bounds(facts.bounds, rect):
+                return facts
+            if time.perf_counter() >= deadline or (facts.role == "Window" and facts.hwnd):
+                return None
+            current = self._walker.GetParentElementBuildCache(current, self._request)
+            facts = self._facts(current, time.perf_counter())
+        return None
 
     def descend(self, pane: Element, x: int, y: int, *, budget_s: float, refine: bool = False,
                 max_area: int = 0) -> Element | None:
@@ -421,6 +573,7 @@ class TraceUia:
         deadline = t0 + budget_s
         best = self._descend(pane, x, y, deadline=deadline, refine=refine, max_area=max_area)
         if best is not None:
+            best.chosen_at, best.chosen_tick = time.monotonic(), _tick()
             self._ancestry(best, deadline, index=False)
             best.ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return best
@@ -480,15 +633,10 @@ class TraceUia:
         ``value_length``, ``{"length": n}`` (the value itself is dropped at once). ``{}`` when it cannot answer."""
         if element.ref is None:
             return {}
+        if value_length:
+            state = self.field_state(element)
+            return {"length": state["length"]} if state.get("length") is not None else {}
         try:
-            if value_length:
-                el = element.ref.BuildUpdatedCache(self._value_request)
-                if el.GetCachedPropertyValue(_P_PASSWORD):
-                    return {}
-                value = el.GetCachedPropertyValue(_P_VALUE)
-                length = len(value) if isinstance(value, str) else None
-                del value
-                return {} if length is None else {"length": length}
             el = element.ref.BuildUpdatedCache(self._request)
             out: dict[str, Any] = {}
             if el.GetCachedPropertyValue(_P_HAS_TOGGLE):
@@ -500,7 +648,71 @@ class TraceUia:
                 if isinstance(selected, (int, bool)):
                     out["selected"] = bool(selected)
             return out
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._com_error(exc)
+            return {}
+
+    def field_state(self, element: Element) -> dict[str, Any]:
+        """capQ2a: whether the element is a text field now, by UI Automation's own facts, and its visible length.
+
+        ``{"field": bool, "length": int | None, "how": "value" | "text" | "focus"}``; ``{"secret": True}`` for a
+        password field or one whose ``IsPassword`` cannot be read (nothing of it is read, not even a length); ``{}``
+        when it cannot answer. A text field: a Value pattern that can be set (not on a press control,
+        :data:`PRESS_ROLES`), else a TextPattern whose document range reads ``IsReadOnly`` false, else a keyboard-
+        focusable Edit or Document that reads read-only nowhere. The length is the Value's when it has one, else the
+        TextPattern document range's (at most :data:`FIELD_TEXT_CHARS` characters; a range that long with nothing
+        visible gives no length), counted by :func:`visible_length`; the text is dropped at once."""
+        if element.ref is None:
+            return {}
+        try:
+            el = element.ref.BuildUpdatedCache(self._field_request)
+            get = el.GetCachedPropertyValue
+
+            def number(prop: int) -> int | None:
+                try:
+                    v = get(prop)
+                    return int(v) if isinstance(v, (int, bool)) else None
+                except Exception:  # noqa: BLE001
+                    return None
+
+            password = number(_P_PASSWORD)
+            if password is None or password:
+                return {"secret": True}                   # fails closed: never read, not even a length
+            ctype = number(_P_TYPE)
+            role = ROLE_NAMES.get(ctype, "") if ctype is not None else ""
+            has_value, value_ro = bool(number(_P_HAS_VALUE)), number(_P_VALUE_READONLY)
+            has_text, focusable = bool(number(_P_HAS_TEXT)), bool(number(_P_FOCUSABLE))
+            settable = has_value and value_ro == 0 and role not in PRESS_ROLES
+            text_ro: bool | None = None
+            doc_range = None
+            if has_text:
+                text_pattern = el.GetCurrentPattern(_TEXT_PATTERN_ID).QueryInterface(
+                    self._module.IUIAutomationTextPattern)
+                doc_range = text_pattern.DocumentRange
+                ro = doc_range.GetAttributeValue(_ATTR_READONLY)
+                text_ro = ro if isinstance(ro, bool) else None   # mixed or not supported: not known editable
+            if settable:
+                how = "value"
+            elif text_ro is False:
+                how = "text"
+            elif focusable and role in ("Edit", "Document") and not (has_value and value_ro != 0) and not text_ro:
+                how = "focus"
+            else:
+                return {"field": False}
+            length: int | None = None
+            if has_value and value_ro == 0:
+                value = el.GetCurrentPropertyValue(_P_VALUE)
+                length = visible_length(value) if isinstance(value, str) else None
+                del value
+            elif doc_range is not None:
+                text = doc_range.GetText(FIELD_TEXT_CHARS)
+                if isinstance(text, str):
+                    seen = visible_length(text)
+                    length = None if seen == 0 and len(text) >= FIELD_TEXT_CHARS else seen
+                del text
+            return {"field": True, "length": length, "how": how}
+        except Exception as exc:  # noqa: BLE001
+            self._com_error(exc)
             return {}
 
 
@@ -673,5 +885,7 @@ class HungWatch:
         self.counts["hung_slow"] += 1
 
 
-__all__ = ["ACTION_PATTERNS", "ANCESTORS", "ANSWER_MS", "CONTAINER_ROLES", "Element", "HungWatch", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
-           "TOGGLE_WORDS", "TraceUia", "window_answers", "window_exists", "window_hung", "window_pid"]
+__all__ = ["ACTION_PATTERNS", "ANCESTORS", "ANSWER_MS", "BOUNDS_SLACK", "CONTAINER_ROLES", "Element",
+           "FIELD_TEXT_CHARS", "HungWatch", "PRESS_ROLES", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
+           "TOGGLE_WORDS", "TraceUia", "visible_length", "window_answers", "window_exists", "window_hung",
+           "window_pid"]

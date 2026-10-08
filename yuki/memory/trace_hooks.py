@@ -7,12 +7,12 @@ nothing but put small tuples on the trace worker's queue; it never calls UI Auto
 * **Low-rate events, always on, for the process in front only**: ``INVOKED``, ``SELECTION`` / ``SELECTIONADD``,
   ``SYSTEM_MENUSTART`` / ``MENUEND`` and the popup pair, ``DIALOGSTART``, ``FOCUS``, and ``NAMECHANGE`` of top-level
   windows only (a title: anything else from a streaming app is dropped at the callback's first line):
-  ``("ev", t, event, hwnd, id_object, id_child)``.
+  ``("ev", t, event, hwnd, id_object, id_child, tick)`` (``tick``: the event's own time, ``dwmsEventTime``).
 * **Outcome events, only around an action**: ``STATECHANGE``, ``VALUECHANGE``, ``SHOW``, ``HIDE``, ``REORDER``
   for the process in front, registered when an action starts (:meth:`TraceHooks.action`) and removed
   :data:`OUTCOME_S` after the last action. Never ``LOCATIONCHANGE``. At most :data:`OUTCOME_CAP` events per action
-  are queued (``("out", t, event, hwnd, id_object, id_child, gen)``); the rest are only counted. In a streaming app
-  (a chat being written, a progress bar) nothing outside those windows ever reaches Yuki.
+  are queued (``("out", t, event, hwnd, id_object, id_child, tick, gen)``); the rest are only counted. In a
+  streaming app (a chat being written, a progress bar) nothing outside those windows ever reaches Yuki.
 * **Clipboard** (``AddClipboardFormatListener``): ``("clip", t, seq, owner_pid, formats, private)``: the sequence
   number, the owner's process, the format *names* (``GetUpdatedClipboardFormats``: the clipboard is never opened,
   never read), and whether the copy carries a private mark (``ExcludeClipboardContentFromMonitorProcessing``,
@@ -320,8 +320,11 @@ class TraceHooks:
                 if self._n < OUTCOME_CAP:
                     self._n += 1
                     self.counts["outcome"] += 1
+                    # capQ2a: the event's own time (``dwmsEventTime``, Windows' tick count) rides along, before the
+                    # generation (still the last field): the worker can tell a change Windows dates before a
+                    # lookup's answer even when it reached this thread after it
                     self._put(("out", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child),
-                               self.gen))
+                               int(ms or 0) & 0xFFFFFFFF, self.gen))
                 else:
                     self.counts["outcome_over"] += 1
                 return
@@ -330,7 +333,8 @@ class TraceHooks:
                 self.counts["low_dropped"] += 1      # only the window's own title: a streaming app costs nothing more
                 return
             self.counts["low"] += 1
-            self._put(("ev", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child)))
+            self._put(("ev", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child),
+                       int(ms or 0) & 0xFFFFFFFF))
         except Exception:  # noqa: BLE001 - never let an exception escape a ctypes callback
             pass
 

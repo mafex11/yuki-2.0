@@ -5,7 +5,9 @@
   (``blocked_folders``), and the on/off alternation for measuring the cost (``ab_hours``, off).
 * :func:`name_class`: what may be kept of an element's name, by its UI Automation control type (a machine field):
   - ``command`` (Button, CheckBox, RadioButton, ComboBox, SplitButton, and any item of a ToolBar): the name,
-    encrypted, at most :data:`NAME_CHARS`, through :func:`yuki.memory.secret_filter.redact`;
+    encrypted, at most :data:`NAME_CHARS`, through :func:`yuki.memory.secret_filter.redact`. capQ2a: not when a list,
+    tree or grid or one of their items is among its ancestors (:func:`content_item`: apps that draw a sidebar's
+    threads or servers as Buttons): that one is ``title``, and its raw row keeps no name at all;
   - ``title`` (menu items, tabs, window titles, documents, panes, headers): a keyed digest plus the position; the
     encrypted name stays on the raw row only (it expires with it) and is promoted to the element registry only once
     the same digest was used on :data:`PROMOTE_DAYS` distinct days. A tab titled after a person or a mail subject
@@ -42,12 +44,34 @@ DEFAULT_BLOCKED_FOLDERS = ("%TEMP%", "%APPDATA%\\Bitwarden", "%LOCALAPPDATA%\\1P
                            "%APPDATA%\\KeePassXC", "%LOCALAPPDATA%\\Dashlane")
 
 
-def name_class(role: str | None, parent_role: str | None = None) -> str:
+#: capQ2a: the control types of lists, trees and grids and of their items (UI Automation's fixed vocabulary). A
+#: command control with one of them among its ancestors is an item of that list drawn as a button (a chat app's
+#: thread or server in a sidebar list): what it names is content, not a command.
+ITEM_CONTAINER_ROLES = frozenset({"ListItem", "TreeItem", "DataItem", "List", "Tree", "DataGrid"})
+
+
+def content_item(role: str | None, ancestors: Any = (), parent_role: str | None = None) -> bool:
+    """capQ2a: whether a command-control-type element (or a toolbar item) is an item of a list, tree or grid, by
+    structure alone: one of :data:`ITEM_CONTAINER_ROLES` among its ancestors (``ancestors``: roles, or the trace's
+    ``(role, AutomationId)`` pairs, nearest first). Such an element keeps a digest only, and its name follows the
+    3-distinct-days rule of tabs and titles (:func:`name_class`). A toolbar or command button outside any list (Send,
+    Save, Settings) is not one."""
+    role = role or ""
+    if not (role in COMMAND_ROLES or (parent_role == "ToolBar" and role not in TITLE_ROLES)):
+        return False
+    roles = {a[0] if isinstance(a, (tuple, list)) and a else a for a in (ancestors or ())}
+    if parent_role:
+        roles.add(parent_role)
+    return bool(roles & ITEM_CONTAINER_ROLES)
+
+
+def name_class(role: str | None, parent_role: str | None = None, ancestors: Any = ()) -> str:
     """``command``, ``title`` or ``content`` for an element of control type ``role`` (an item of a ToolBar is a
-    command control whatever its own type)."""
+    command control whatever its own type). capQ2a: a command control inside a list, tree or grid
+    (:func:`content_item`, when its ``ancestors`` are known) is ``title``: a digest, its name only after 3 days."""
     role = role or ""
     if role in COMMAND_ROLES or (parent_role == "ToolBar" and role not in TITLE_ROLES):
-        return COMMAND
+        return TITLE if content_item(role, ancestors, parent_role) else COMMAND
     if role in TITLE_ROLES:
         return TITLE
     return CONTENT
@@ -149,5 +173,6 @@ def gate(rules: Any, trace: TraceRules, *, process: str, app: str = "", own: boo
     return None
 
 
-__all__ = ["COMMAND", "COMMAND_ROLES", "CONTENT", "DEFAULT_BLOCKED_FOLDERS", "NAME_CHARS", "PROMOTE_DAYS", "TITLE",
-           "TITLE_ROLES", "TraceRules", "gate", "name_class", "normalise_name"]
+__all__ = ["COMMAND", "COMMAND_ROLES", "CONTENT", "DEFAULT_BLOCKED_FOLDERS", "ITEM_CONTAINER_ROLES", "NAME_CHARS",
+           "PROMOTE_DAYS", "TITLE", "TITLE_ROLES", "TraceRules", "content_item", "gate", "name_class",
+           "normalise_name"]

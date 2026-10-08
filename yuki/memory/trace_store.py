@@ -64,7 +64,7 @@ def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) ->
         return
     at = float(el["at"])
     day = day_of(at)
-    row = conn.execute("SELECT days, n, last_day, name_ciphertext FROM ui_elements WHERE element_key=?",
+    row = conn.execute("SELECT days, n, last_day, name_ciphertext, name_class FROM ui_elements WHERE element_key=?",
                        (key,)).fetchone()
     cls = el.get("name_class") or ""
     name = el.get("name") or None
@@ -81,6 +81,13 @@ def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) ->
     set_name = None
     if row["name_ciphertext"] is None and name and (cls == COMMAND or (cls == TITLE and days >= PROMOTE_DAYS)):
         set_name = store._enc(name)
+    if cls == TITLE and row["name_class"] == COMMAND:
+        # capQ2a: an element kept as a command control is now known to be an item of a list (a sidebar's thread drawn
+        # as a Button): from this use on it follows the title rule, its name kept only once used on 3 distinct days
+        conn.execute("UPDATE ui_elements SET name_class=?" + (", name_ciphertext=NULL" if days < PROMOTE_DAYS else "")
+                     + " WHERE element_key=?", (TITLE, key))
+        if days < PROMOTE_DAYS:
+            set_name = None
     conn.execute(
         "UPDATE ui_elements SET n=n+1, days=?, last_day=?, last_at=max(coalesce(last_at, 0), ?),"
         " name_ciphertext=coalesce(name_ciphertext, ?), aid_ciphertext=coalesce(aid_ciphertext, ?) WHERE element_key=?",
