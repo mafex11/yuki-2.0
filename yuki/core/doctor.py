@@ -254,7 +254,7 @@ _TRACE_STATE_WORDS = {"paused": "paused right now, because memory is paused",
                       "failed": "could not start", "no_input": "not hearing your mouse and keys"}
 
 
-def _trace_learn_words(learn: str | None, health: Any) -> str:
+def _trace_learn_words(learn: str | None, health: Any, now: float | None = None) -> str:
     """capC1b: what was learned from the trace, in plain words (``trace:learn``, written by the practice worker;
     the watchdog's skips from ``trace:health``). ``""`` when there is nothing to say."""
     try:
@@ -269,7 +269,9 @@ def _trace_learn_words(learn: str | None, health: Any) -> str:
         again = int(data.get("repeated") or 0)
         parts.append(f"kept {pits} note{'s' if pits != 1 else ''} of tries that went wrong"
                      + (f" ({again} went wrong the same way again)" if again else ""))
-    served = int(data.get("go_tos_today") or 0)
+    # capQ2b second verification V3: the go-tos served "today" only when the row is from today (the practice
+    # worker writes it on its tick, which waits while memory is paused)
+    served = int(data.get("go_tos_today") or 0) if _same_day(data, time.time() if now is None else now) else 0
     if served:
         parts.append(f"your usual buttons and shortcuts helped {served} request{'s' if served != 1 else ''} today")
     skipped = int((health or {}).get("hung_skipped") or 0) if isinstance(health, dict) else 0
@@ -416,7 +418,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
                   f" ({yours:,} of them yours; {share}% with the button or field named)")
     if state in _TRACE_STATE_WORDS:
         detail += f"; {_TRACE_STATE_WORDS[state]}"
-    detail += _trace_learn_words(learn_row[0] if learn_row else None, health)
+    detail += _trace_learn_words(learn_row[0] if learn_row else None, health, now)
     detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
     detail += _trace_demos_words(demos_row[0] if demos_row else None, now)
     if state in ("hooks_down", "failed", "no_input"):

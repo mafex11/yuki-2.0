@@ -146,6 +146,11 @@ def test_the_doctors_today_numbers_roll_over_at_midnight():
     nxt = doctor._trace_tasks_words(tasks, morning)
     assert "found" not in nxt and "cost" not in nxt and "2 finished sessions still to look at" in nxt
     assert T.health.__doc__ and "day" in T.health(_EmptyStore(), now=morning)           # new rows carry their day
+    # second verification V3: the go-tos served "today" too (memory paused overnight: the row is not rewritten)
+    learn = json.dumps({"at": evening, "fixes": 1, "pitfalls": 0, "go_tos_today": 4})
+    assert "helped 4 requests today" in doctor._trace_learn_words(learn, {}, evening + 600)
+    nxt = doctor._trace_learn_words(learn, {}, morning)
+    assert "helped" not in nxt and "learned 1 way from your own fixes" in nxt                 # totals stay
 
 
 class _EmptyStore:
