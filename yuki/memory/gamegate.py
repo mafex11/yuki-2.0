@@ -15,17 +15,27 @@ The gate holds while any of these is true:
     anti-cheat: VALORANT and the like), plus any the user adds to their own privacy file. The user can add, never
     remove: the packaged list always counts. It keys on the **game programs**, never on anti-cheat services:
     Vanguard's tray (``vgtray.exe``) runs on this PC all the time and would hold the gate forever;
-  - or a program **seen full screen while drawing like a game**: its own share of the GPU's compute at least
-    :data:`yuki.memory.avsignals.GAME_GPU_SHARE`, the same measured fact the call worker uses for a game's voice
-    chat, in at least :data:`LEARN_AFTER_STRETCHES` separate full-screen stretches. The evidence (a count per
-    program, with the last share) is kept in ``nudge_state`` (:data:`LEARNED_STATE`) and corrects itself: a later
-    stretch measured full screen with a low share at every check takes one back, and at zero the program is
-    forgotten, so one GPU-heavy moment of a music app's visualiser cannot make it a game for good. A full-screen
-    app that does not draw like a game (FL Studio maximised without a caption, a video, a slide show) is not
-    learned, and with no GPU reading nothing is learned at all;
+  - or a program **Windows itself detected as a game** on this PC: the Game Bar's game detection keeps, in
+    ``HKCU\\System\\GameConfigStore\\Children``, the executable it matched to its known-game list
+    (``MatchedExeFullPath``; "Remember this is a game" in the Game Bar adds one too). Read-only, matched by the full
+    path (a launcher's ``javaw.exe`` is a game, every other ``javaw.exe`` is not), re-read only when Windows changes
+    the key (a registry change notification checked without waiting; :class:`WindowsGames`);
+  - or a program **seen in Direct3D exclusive full screen** while it was the full-screen window in front, in at
+    least :data:`LEARN_AFTER_STRETCHES` separate stretches (the learned set). The evidence (a count per program,
+    ``evidence`` "d3d_exclusive") is kept in ``nudge_state`` (:data:`LEARNED_STATE`) and ``ui_game_processes``, and
+    corrects itself while the program is a candidate: a later full-screen stretch that is not exclusive at any check
+    takes one back, and at zero the program is forgotten. A learned game keeps its place when it is later played
+    borderless (how most games run; second verification V1): only the start-up re-check drops a learned entry.
+
+  **Never a guessed threshold** (capQ2b, 9 Oct 2026): until then a program also became a game when its share of the
+  GPU's compute reached 15%. FL Studio, maximised and holding the microphone, drew 16% one morning and the call
+  worker took its microphone for a game's voice chat, which held this gate for 18 minutes (a project save was never
+  recorded). The GPU share is still read at a check and logged as a fact, never decisive. Entries learned from it
+  alone are dropped when the gate starts (:func:`recheck_evidence`), so a wrongly learned FL Studio leaves by code;
 * the shell reports **Direct3D exclusive full screen** (``QUNS_RUNNING_D3D_FULL_SCREEN``), read live by
   :meth:`GameGate.holds`;
-* the call worker has a **game voice session** open or pending (``calls.game`` / ``calls._gaming``), read live.
+* the call worker has a **game voice session** open or pending (``calls.game`` / ``calls._gaming``), read live. The
+  call worker asks :func:`judge_program` (the same facts) whether a full-screen microphone holder is a game.
 
 **Fails closed.** A capture phase asks :func:`gate_holds` (``gate_holds(None)`` is True: a gate that failed to start
 holds), and a started gate whose thread is gone (it died or was stopped) holds.
@@ -33,8 +43,9 @@ holds), and a started gate whose thread is gone (it died or was stopped) holds.
 Lightweight, event-driven: one thread that sleeps in ``MsgWaitForMultipleObjectsEx`` on the foreground-change
 WinEvent and on the handles of the game processes it knows are running (a game's exit wakes it). The process list
 is read once at start and then at most every :data:`SCAN_EVERY_S`, and only when the foreground changes. While an
-unknown program is full screen in front, its GPU share is read at most :data:`CHECKS_PER_STRETCH` times
-(:data:`CHECK_AFTER_S`). No polling loop: D3D full screen and the game voice session, which no window event shows,
+unknown program is full screen in front, D3D exclusive full screen (and, for the log, its GPU share) is read at most
+:data:`CHECKS_PER_STRETCH` times (:data:`CHECK_AFTER_S`). No polling loop: D3D full screen and the game voice session,
+which no window event shows,
 are re-read by :meth:`GameGate.beat` from the memory service's existing one-second loop, at most every
 :data:`BEAT_EVERY_S`.
 
@@ -43,8 +54,9 @@ Log events (the memory log, content-free: process image names of measured progra
 * ``game_gate``: the decision changed (``hold``, ``reasons``, ``games`` running, ``front`` = the game in front or
   "", ``front_fullscreen``, ``trigger``: start / foreground / game_exit / check / d3d / game_voice / beat); written
   on every change, so Alt+Tab in and out of a game shows;
-* ``game_gate_learned``: a program joined the learned set (``game``, ``gpu_share``, ``stretches``);
-* ``game_gate_unlearned``: low stretches took a learned program out again (``app``, ``gpu_share``, ``stretches``);
+* ``game_gate_learned``: a program joined the learned set (``game``, ``gpu_share`` as measured, ``stretches``);
+* ``game_gate_unlearned``: the start-up re-check dropped an entry whose evidence is no Windows fact (``app``,
+  ``gpu_share``, ``stretches``, ``why``); a borderless stretch never takes a learned game out;
 * ``game_gate_evidence``: a stretch counted for or against a program without changing whether it is a game
   (``app``, ``gpu_share``, ``stretches``, ``step``);
 * ``game_gate_not_game``: a full-screen program was measured and is not a game (``app``, ``gpu_share``, ``why``),
@@ -56,12 +68,16 @@ Public API::
         .holds() -> bool                 # the gate now (cheap, any thread; fails closed)
         .beat() -> Decision | None       # from an existing beat: re-read D3D and the voice session, log a change
         .decision() -> Decision          # why
+        .games() -> GameSet              # the game set now (the call worker's judge uses it)
         .stats() -> dict                 # counters, content-free
         .stop()
     gate_holds(gate_or_None) -> bool     # what capture must ask: None (no gate) holds
     decide(view, games) -> Decision      # the pure rule (tests use it with invented process data)
-    judge_learn(app, fullscreen=, gpu_share=, own=) -> (learn, why)
-    GameSet.load(privacy_path, learned)  # the fixed list (packaged + the user's additions) and the learned set
+    judge_learn(app, fullscreen=, d3d=, own=) -> (learn, why)
+    judge_program(image=, exe=, games=, d3d_fn=) -> (game, why)   # a program is a game: machine facts only
+    recheck_evidence(evidence) -> (kept, dropped)                 # stored entries without a Windows fact go
+    GameSet.load(privacy_path, learned, windows)  # fixed list, learned set, Windows' detected games (full paths)
+    windows_games() -> frozenset[str]    # Windows' detected games (normcased paths), cached until the key changes
 """
 
 from __future__ import annotations
@@ -78,8 +94,6 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from yuki.memory.avsignals import GAME_GPU_SHARE
 
 #: ``nudge_state`` row holding the evidence per measured program (candidates and learned games):
 #: ``{"<image stem>": {"stretches": n, "first_seen": ts, "last_seen": ts, "gpu_share": x}}``.
@@ -100,12 +114,19 @@ MAX_HANDLES = 32
 #: Shell notification state for Direct3D exclusive full screen (``SHQueryUserNotificationState``).
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
 
-#: A program becomes a learned game only after this many separate full-screen stretches drew like a game (one
-#: GPU-heavy moment of a music app's visualiser or a video editor is not enough), and each later stretch measured
-#: full screen with a low share takes one back: at zero the program is forgotten. Evidence is capped so a game
-#: played for months can still be corrected by a few low stretches.
+#: A program becomes a learned game only after this many separate full-screen stretches in Direct3D exclusive full
+#: screen (one exclusive-mode video player moment is not enough). Below that, each later full-screen stretch that is
+#: not exclusive at any check takes one back: at zero the candidate is forgotten. A learned game is never taken back
+#: by a borderless stretch (second verification V1: the gate would stop holding with the game in front).
 LEARN_AFTER_STRETCHES = 2
 EVIDENCE_CAP = 3
+#: The only evidence a learned entry may carry (a Windows fact). Entries without it (learned from the GPU share before
+#: capQ2b) are dropped when the gate starts (:func:`recheck_evidence`).
+SOUND_EVIDENCE = "d3d_exclusive"
+
+#: Windows' own store of the games the Game Bar detected on this PC (read-only): each child key that carries
+#: ``MatchedExeFullPath`` is an executable Windows matched to its known-game list after it ran here.
+GAME_CONFIG_STORE = r"System\GameConfigStore\Children"
 
 #: :meth:`GameGate.holds` reads Direct3D exclusive full screen live, reusing a reading this fresh (it may be asked
 #: on every input event in a later phase).
@@ -137,6 +158,138 @@ def confirmed(evidence: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {k: v for k, v in evidence.items() if stretches(v) >= LEARN_AFTER_STRETCHES}
 
 
+def recheck_evidence(evidence: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The stored evidence re-checked (on every start of the gate): an entry stays only when its evidence is a Windows
+    fact (:data:`SOUND_EVIDENCE`). Entries learned from the GPU share alone (``fullscreen_gpu``, or the C0 rows with no
+    ``evidence`` at all) are dropped: that share is no proof of a game (FL Studio drew 16% maximised). Returns
+    ``(kept, dropped program stems)``."""
+    kept, dropped = {}, []
+    for key, entry in evidence.items():
+        if isinstance(entry, dict) and entry.get("evidence") == SOUND_EVIDENCE:
+            kept[key] = entry
+        else:
+            dropped.append(key)
+    return kept, sorted(dropped)
+
+
+def _norm_path(path: str | None) -> str:
+    return os.path.normcase(os.path.normpath(str(path))) if path else ""
+
+
+def read_windows_games() -> frozenset[str]:
+    """The executables Windows detected as games on this PC (:data:`GAME_CONFIG_STORE`), normcased full paths. One
+    read-only walk of about a hundred small keys; ``frozenset()`` when the store is missing."""
+    import winreg
+
+    out: set[str] = set()
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, GAME_CONFIG_STORE, 0, winreg.KEY_READ)
+    except OSError:
+        return frozenset()
+    with root:
+        i = 0
+        while True:
+            try:
+                sub = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as key:
+                    value, kind = winreg.QueryValueEx(key, "MatchedExeFullPath")
+            except OSError:
+                continue
+            if kind in (winreg.REG_SZ, winreg.REG_EXPAND_SZ) and value:
+                out.add(_norm_path(os.path.expandvars(str(value))))
+    return frozenset(out)
+
+
+class _RegWatch:
+    """A change notification on one HKCU key (its subtree), checked without waiting (:meth:`changed`)."""
+
+    def __init__(self, subkey: str) -> None:
+        import winreg
+
+        self.ok = False
+        self._key = None
+        self._evt = None
+        try:
+            self._key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0, winreg.KEY_NOTIFY | winreg.KEY_READ)
+        except OSError:
+            return
+        self._evt = _K.CreateEventW(None, False, False, None)
+        self.ok = bool(self._evt) and self._arm()
+
+    def _arm(self) -> bool:
+        # REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET over the subtree, asynchronous (sets the event),
+        # REG_NOTIFY_THREAD_AGNOSTIC: the gate's thread and the call worker both read
+        return _A.RegNotifyChangeKeyValue(ctypes.c_void_p(int(self._key)), True, 0x1 | 0x4 | 0x10000000,
+                                          self._evt, True) == 0
+
+    def changed(self) -> bool:
+        if not self.ok:
+            return False
+        if _K.WaitForSingleObject(self._evt, 0) != _WAIT_OBJECT_0:
+            return False
+        self.ok = self._arm()
+        return True
+
+
+class WindowsGames:
+    """Windows' detected games, cached until Windows changes the store (no polling: a change notification, checked
+    without waiting when asked). ``read_fn`` reads the store (tests pass a stub, ``watch=False``: read once)."""
+
+    #: Without a working change notification (the store missing, the watch failed), read again at most this often.
+    UNWATCHED_EVERY_S = 300.0
+
+    def __init__(self, read_fn: Callable[[], frozenset[str]] = read_windows_games, *, watch: bool = True,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._read_fn = read_fn
+        self._watch_wanted = watch
+        self._watch: _RegWatch | None = None
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._paths: frozenset[str] | None = None
+        self._read_at = float("-inf")
+        self.reads = 0
+
+    def paths(self) -> frozenset[str]:
+        with self._lock:
+            changed = False
+            if self._watch_wanted and self._watch is None:
+                try:
+                    self._watch = _RegWatch(GAME_CONFIG_STORE)
+                except Exception:  # noqa: BLE001 - no watch: the backstop below
+                    self._watch = None
+                    self._watch_wanted = False
+            elif self._watch is not None and self._watch.ok:
+                changed = self._watch.changed()
+            if self._watch_wanted and (self._watch is None or not self._watch.ok):
+                changed = self._clock() - self._read_at >= self.UNWATCHED_EVERY_S
+            if self._paths is None or changed:
+                try:
+                    self._paths = frozenset(self._read_fn())
+                except Exception:  # noqa: BLE001 - unreadable: what was read before (or nothing)
+                    self._paths = self._paths or frozenset()
+                self._read_at = self._clock()
+                self.reads += 1
+            return self._paths
+
+
+_WINDOWS_GAMES: WindowsGames | None = None
+_WINDOWS_LOCK = threading.Lock()
+
+
+def windows_games() -> frozenset[str]:
+    """Windows' detected games (normcased full paths), from the process-wide :class:`WindowsGames`."""
+    global _WINDOWS_GAMES
+    with _WINDOWS_LOCK:
+        if _WINDOWS_GAMES is None:
+            _WINDOWS_GAMES = WindowsGames()
+        cache = _WINDOWS_GAMES
+    return cache.paths()
+
+
 def gate_holds(gate: GameGate | None) -> bool:
     """What a capture phase must ask: no gate (it failed to start) holds, so does a gate whose thread is gone."""
     return True if gate is None else gate.holds()
@@ -162,30 +315,41 @@ def _list_in(path: Path | None) -> frozenset[str]:
 
 @dataclass(frozen=True)
 class GameSet:
-    """Which programs are games: the fixed list (packaged defaults and the user's additions) and the learned set."""
+    """Which programs are games: the fixed list (packaged defaults and the user's additions), the learned set, and the
+    executables Windows itself detected as games (``windows``: normcased full paths, matched by path only)."""
 
     fixed: frozenset[str] = frozenset()
     learned: dict[str, dict[str, Any]] = field(default_factory=dict)
+    windows: frozenset[str] = frozenset()
 
     @classmethod
-    def load(cls, privacy_path: Path | None = None, learned: dict[str, dict[str, Any]] | None = None) -> GameSet:
+    def load(cls, privacy_path: Path | None = None, learned: dict[str, dict[str, Any]] | None = None,
+             windows: Iterable[str] = ()) -> GameSet:
         from yuki.memory.privacy import DEFAULT_PATH
 
-        return cls(fixed=_list_in(DEFAULT_PATH) | _list_in(privacy_path), learned=dict(learned or {}))
+        return cls(fixed=_list_in(DEFAULT_PATH) | _list_in(privacy_path), learned=dict(learned or {}),
+                   windows=frozenset(_norm_path(p) for p in windows if p))
 
-    def source(self, app: str) -> str | None:
-        """``"list"``, ``"learned"`` or ``None`` (not a game)."""
-        key = stem(app)
+    @property
+    def windows_stems(self) -> frozenset[str]:
+        """The image stems of Windows' detected games: a running process with one of these is checked by its path."""
+        return frozenset(stem(os.path.basename(p)) for p in self.windows)
+
+    def source(self, app: str, exe: str = "") -> str | None:
+        """``"list"``, ``"learned"``, ``"windows"`` (``exe`` is a game Windows detected) or ``None`` (not a game)."""
+        key = stem(app or os.path.basename(exe or ""))
         if not key:
             return None
         if key in self.fixed:
             return "list"
         if key in self.learned:
             return "learned"
+        if exe and _norm_path(exe) in self.windows:
+            return "windows"
         return None
 
-    def is_game(self, app: str) -> bool:
-        return self.source(app) is not None
+    def is_game(self, app: str, exe: str = "") -> bool:
+        return self.source(app, exe) is not None
 
 
 @dataclass(frozen=True)
@@ -197,6 +361,7 @@ class GateView:
     d3d_fullscreen: bool = False        # Direct3D exclusive full screen (the shell's own report)
     running: frozenset[str] = frozenset()   # image names of the programs running that the gate looked at
     game_session: bool = False          # the call worker has a game voice session open or pending
+    detected: frozenset[str] = frozenset()  # image names of running programs Windows detected as games (by path)
 
 
 @dataclass(frozen=True)
@@ -219,7 +384,8 @@ class Decision:
 def decide(view: GateView, games: GameSet) -> Decision:
     """The gate's rule: hold while a game program runs (in front or not), in D3D exclusive full screen, or while a
     game voice session is open. Nothing else counts: an anti-cheat service, a full-screen app that is not a game."""
-    running = sorted({stem(p) for p in (*view.running, view.front) if games.is_game(p)})
+    detected = {stem(p) for p in view.detected if stem(p)}
+    running = sorted({stem(p) for p in (*view.running, view.front) if games.is_game(p)} | detected)
     reasons = []
     if running:
         reasons.append("game_running")
@@ -227,27 +393,84 @@ def decide(view: GateView, games: GameSet) -> Decision:
         reasons.append("d3d_fullscreen")
     if view.game_session:
         reasons.append("game_voice")
-    front = stem(view.front) if games.is_game(view.front) else ""
+    front = stem(view.front) if games.is_game(view.front) or stem(view.front) in detected else ""
     return Decision(hold=bool(reasons), reasons=tuple(reasons), games=tuple(running), front=front,
                     front_fullscreen=bool(view.front_fullscreen),
-                    sources=tuple(games.source(g) or "" for g in running))
+                    sources=tuple(games.source(g) or ("windows" if g in detected else "") for g in running))
 
 
-def judge_learn(app: str, *, fullscreen: bool, gpu_share: float | None, own: bool = False) -> tuple[bool, str]:
+def judge_learn(app: str, *, fullscreen: bool, d3d: bool, own: bool = False) -> tuple[bool, str]:
     """Whether a program in front joins the learned game set, and why (a content-free code).
 
-    Only a measured fact: full screen AND its own GPU compute share at least ``GAME_GPU_SHARE``. Without a GPU
-    reading nothing is learned (unlike the call worker's voice-chat test, which then assumes a game): a wrong entry
-    here would hold the gate for that program for good."""
+    Only a Windows fact: the program is the full-screen window in front AND the shell reports Direct3D exclusive full
+    screen. A full-screen app that is not exclusive (FL Studio maximised, a video, a slide show, a browser) is never
+    learned, whatever it draws."""
     if own or not stem(app):
         return False, "own_or_unknown"
     if not fullscreen:
         return False, "not_fullscreen"
-    if gpu_share is None:
-        return False, "no_gpu_reading"
-    if gpu_share < GAME_GPU_SHARE:
-        return False, "low_gpu"
-    return True, "draws_like_a_game"
+    if not d3d:
+        return False, "not_exclusive"
+    return True, "d3d_exclusive"
+
+
+#: The live gate of this process (the memory service's), registered by :meth:`GameGate.start`: the call worker's
+#: judge (:func:`judge_program`) reads its game set and its D3D reading rather than reading the files again.
+_LIVE: GameGate | None = None
+#: Without a live gate: the game set loaded from the files, reused while they are unchanged (``(stamp, set)``).
+_FALLBACK: tuple[Any, GameSet] | None = None
+_FALLBACK_LOCK = threading.Lock()
+
+
+def _fallback_games() -> GameSet:
+    """The game set without a live gate: the packaged list, the user's additions, Windows' detected games (no learned
+    set: only the gate keeps one). Reloaded only when the user's privacy file changed."""
+    global _FALLBACK
+    try:
+        from yuki.memory.privacy import user_config_path
+
+        path: Path | None = user_config_path()
+    except Exception:  # noqa: BLE001
+        path = None
+    try:
+        st = path.stat() if path is not None else None
+        stamp = (str(path), st.st_mtime_ns, st.st_size) if st else (str(path), None, None)
+    except OSError:
+        stamp = (str(path), None, None)
+    windows = windows_games()
+    with _FALLBACK_LOCK:
+        if _FALLBACK is not None and _FALLBACK[0] == stamp and _FALLBACK[1].windows == windows:
+            return _FALLBACK[1]
+    games = GameSet.load(path, None, windows)
+    with _FALLBACK_LOCK:
+        _FALLBACK = (stamp, games)
+    return games
+
+
+def judge_program(image: str = "", exe: str = "", *, games: GameSet | None = None,
+                  d3d_fn: Callable[[], bool] | None = None) -> tuple[bool, str]:
+    """Whether a program is a game, from machine facts only, and which fact says so: ``"list"`` (the fixed anti-cheat
+    list or the user's additions), ``"windows"`` (Windows detected it, matched by ``exe``), ``"learned"`` (seen in
+    Direct3D exclusive full screen before), ``"d3d"`` (the shell reports Direct3D exclusive full screen now: the
+    caller has checked the program is the full-screen window in front), else ``(False, "no_fact")``.
+
+    The call worker asks this for a full-screen microphone holder in front (``avsignals.gaming_with_voice``): FL
+    Studio, maximised with the microphone and some GPU load, is none of these and is never a game."""
+    if games is None:
+        live = _LIVE
+        games = live.games() if live is not None and live.alive else _fallback_games()
+    src = games.source(image, exe)
+    if src is not None:
+        return True, src
+    if d3d_fn is None:
+        live = _LIVE
+        d3d_fn = live._d3d_now if live is not None and live.alive else _default_d3d
+    try:
+        if d3d_fn():
+            return True, "d3d"
+    except Exception:  # noqa: BLE001 - unreadable: no fact
+        pass
+    return False, "no_fact"
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +531,15 @@ def _default_image(pid: int) -> str:
         return ""
 
 
+def _default_exe(pid: int) -> str:
+    import psutil
+
+    try:
+        return str(psutil.Process(int(pid)).exe() or "")
+    except Exception:  # noqa: BLE001 - gone or not ours to read
+        return ""
+
+
 def _default_own(pid: int) -> bool:
     try:
         from yuki.memory.watcher import _ProcessCache
@@ -334,6 +566,8 @@ class GameGate:
         image_fn: Callable[[int], str] = _default_image,
         own_fn: Callable[[int], bool] = _default_own,
         clock: Callable[[], float] = time.monotonic,
+        windows_fn: Callable[[], Iterable[str]] | None = None,
+        exe_fn: Callable[[int], str] = _default_exe,
     ) -> None:
         self._store = store
         self._privacy_path = Path(privacy_path) if privacy_path else None
@@ -341,18 +575,23 @@ class GameGate:
         self._game_session_fn = game_session_fn
         self._fullscreen_fn = fullscreen_fn
         self._d3d_fn = d3d_fn
-        self._gpu_fn = gpu_fn
+        self._gpu_fn = gpu_fn                            # read at a check for the log only, never decisive
         self._scan_fn = scan_fn
         self._image_fn = image_fn
         self._own_fn = own_fn
         self._clock = clock
+        self._windows_fn = windows_fn if windows_fn is not None else windows_games
+        self._exe_fn = exe_fn
         self._lock = threading.RLock()
-        self._evidence = self._read_learned()           # every measured program: candidates and learned games
-        self._games = GameSet.load(self._privacy_path, confirmed(self._evidence))
+        self.counters: Counter[str] = Counter()
+        # every measured program: candidates and learned games; re-checked at every start (only Windows facts stay)
+        self._evidence = self._recheck(self._read_learned())
+        self._games = GameSet.load(self._privacy_path, confirmed(self._evidence), self._windows())
         self._privacy_stamp = self._stamp()
         self._d3d_live: tuple[float, bool] | None = None   # (when read, value) for holds()
         self._last_beat = float("-inf")
         self._running: dict[int, str] = {}       # pid -> image name, game programs known to be running
+        self._detected: set[int] = set()         # pids of running programs Windows detected as games (by path)
         self._handles: dict[int, int] = {}       # pid -> process handle (SYNCHRONIZE), waited on by the thread
         self._front = ""
         self._front_pid = 0
@@ -366,7 +605,6 @@ class GameGate:
         self._decision = Decision()
         self._held_since: float | None = None
         self._held_total = 0.0
-        self.counters: Counter[str] = Counter()
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._ready = threading.Event()
@@ -399,7 +637,11 @@ class GameGate:
         session = self._session()
         with self._lock:
             self._d3d_live = (now, d3d)
-            if session != ("game_voice" in self._decision.reasons):
+            running = len(self._running)
+            self._refresh_windows()      # a change notification checked without waiting: cheap (review F1)
+            if len(self._running) != running:
+                trigger = "windows_games"
+            elif session != ("game_voice" in self._decision.reasons):
                 trigger = "game_voice"
             elif d3d != self._d3d:
                 trigger = "d3d"
@@ -413,13 +655,19 @@ class GameGate:
         with self._lock:
             return self._decision
 
+    def games(self) -> GameSet:
+        """The game set now (fixed list, learned set, Windows' detected games), Windows' store re-read if it changed."""
+        with self._lock:
+            self._refresh_windows()
+            return self._games
+
     def stats(self) -> dict[str, Any]:
         with self._lock:
             held = self._held_total
             if self._held_since is not None:
                 held += self._clock() - self._held_since
             return {**dict(self.counters), "hold": self._decision.hold, "games_running": len(self._running),
-                    "learned": len(self._games.learned),
+                    "learned": len(self._games.learned), "windows_detected": len(self._games.windows),
                     "candidates": len(self._evidence) - len(self._games.learned), "held_s": round(held, 1)}
 
     @property
@@ -439,15 +687,16 @@ class GameGate:
             self._front_fullscreen = bool(hwnd) and self._safe(self._fullscreen_fn, False, hwnd)
             self._d3d = bool(self._safe(self._d3d_fn, False))
             self._d3d_live = (now, self._d3d)
-            if pid and self._games.is_game(image):
-                self._track(int(pid), image)
+            source = self._source_of(int(pid), image) if pid else None
+            if source is not None:
+                self._track(int(pid), image, detected=source == "windows")
             if now - self._last_scan >= SCAN_EVERY_S:
                 self._scan(now)
             else:
                 self._drop_exited()
             stretch = (self._front_hwnd, self._front_pid)
-            # measured: a program not on the fixed list (an unknown one may be learned, a learned one un-learned)
-            if self._front_fullscreen and pid and self._games.source(image) != "list":
+            # measured: a program no fixed fact names (an unknown one may be learned, a learned one un-learned)
+            if self._front_fullscreen and pid and source in (None, "learned"):
                 if self._stretch != stretch:
                     self._stretch = stretch
                     self._checks = [now + s for s in CHECK_AFTER_S]
@@ -463,13 +712,14 @@ class GameGate:
             return self._evaluate("game_exit")
 
     def on_check(self) -> Decision:
-        """A planned GPU check of the full-screen program in front (not on the fixed list): a stretch that draws like
-        a game adds one to its evidence (learned at :data:`LEARN_AFTER_STRETCHES`); a stretch measured low at every
-        check takes one away (forgotten at zero)."""
+        """A planned check of the full-screen program in front (no fixed fact names it): a stretch in Direct3D
+        exclusive full screen adds one to its evidence (learned at :data:`LEARN_AFTER_STRETCHES`); a stretch that is
+        not exclusive at any check takes one away (forgotten at zero). Its GPU share is read for the log only."""
         now = self._clock()
         with self._lock:
             if self._checks and self._checks[0] <= now:
                 self._checks.pop(0)
+            self._refresh_windows()      # Windows may have detected the program in front since (review F1)
             stretch = self._stretch
             if stretch is None:
                 self._checks = []
@@ -477,12 +727,14 @@ class GameGate:
             hwnd, pid = stretch
             fullscreen = bool(self._safe(self._fullscreen_fn, False, hwnd)) and hwnd == self._front_hwnd
             self._d3d = bool(self._safe(self._d3d_fn, False))
+            self._d3d_live = (now, self._d3d)
+            d3d = self._d3d
             image = self._front
         own = bool(self._safe(self._own_fn, False, pid))
         share = self._safe(self._gpu_fn, None, [pid]) if fullscreen and not own else None
-        learn, why = judge_learn(image, fullscreen=fullscreen, gpu_share=share, own=own)
+        learn, why = judge_learn(image, fullscreen=fullscreen, d3d=d3d, own=own)
         with self._lock:
-            self.counters["gpu_checks"] += 1
+            self.counters["checks"] += 1
             key = stem(image)
             if learn:
                 # one stretch of evidence (a stretch is judged once: its remaining checks are dropped)
@@ -490,11 +742,15 @@ class GameGate:
                 if self._games.is_game(image):
                     self._track(pid, image)
                 self._stretch, self._checks = None, []
-            elif not self._checks and why in ("low_gpu", "no_gpu_reading"):
-                # the last check of the stretch and none drew like a game
-                if why == "low_gpu" and key in self._evidence:
+            elif not self._checks and why == "not_exclusive":
+                # the last check of the stretch and it was never exclusive: one back from a candidate only. A learned
+                # game played borderless (how most games run) keeps its place, or the gate would stop holding with
+                # the game in front (second verification V1)
+                if key in self._games.learned:
+                    pass
+                elif key in self._evidence:
                     self._evidence_step(image, share, -1)
-                elif key and key not in self._evidence and key not in self._not_game:
+                elif key and key not in self._not_game:
                     self._not_game.add(key)   # said once per program per run
                     self._log("game_gate_not_game", app=key, why=why,
                               gpu_share=None if share is None else round(float(share), 1))
@@ -545,8 +801,74 @@ class GameGate:
         stamp = self._stamp()
         if stamp != self._privacy_stamp:
             self._privacy_stamp = stamp
-            self._games = GameSet.load(self._privacy_path, self._games.learned)
+            self._games = GameSet.load(self._privacy_path, self._games.learned, self._games.windows)
             self.counters["list_reloads"] += 1
+        self._refresh_windows()
+
+    def _windows(self) -> frozenset[str]:
+        got = self._safe(self._windows_fn, None)
+        return frozenset(got) if got is not None else frozenset()
+
+    def _refresh_windows(self) -> None:
+        """Windows' detected games again (cached by :class:`WindowsGames` until the store changes: cheap)."""
+        got = self._safe(self._windows_fn, None)
+        if got is None:
+            return
+        windows = frozenset(_norm_path(p) for p in got if p)
+        if windows != self._games.windows:
+            self._games = GameSet(fixed=self._games.fixed, learned=self._games.learned, windows=windows)
+            self.counters["windows_reloads"] += 1
+            self._rematch()
+
+    def _rematch(self) -> None:
+        """Windows' game store changed (review F1): a game Windows detected only after its window came up (its first
+        run) is matched now, not at the next window switch: one scan of the running processes (the store changes
+        rarely), then the program in front (a scan may miss it). A program in front that is now a game stops being
+        measured."""
+        self._scan(self._clock())
+        if not self._front_pid:
+            return
+        source = self._source_of(self._front_pid, self._front)
+        if source is None:
+            return
+        self._track(self._front_pid, self._front, detected=source == "windows")
+        if source != "learned" and self._stretch is not None and self._stretch[1] == self._front_pid:
+            self._stretch, self._checks = None, []
+
+    def _source_of(self, pid: int, image: str) -> str | None:
+        """Which fact makes the process ``pid`` a game (``list`` / ``learned`` / ``windows``), or None. The path is read
+        only for an image Windows detected a game of (a handful of names): never for every process."""
+        source = self._games.source(image)
+        if source is not None or not pid or stem(image) not in self._games.windows_stems:
+            return source
+        exe = self._safe(self._exe_fn, "", int(pid))
+        return "windows" if exe and self._games.source(image, exe) == "windows" else None
+
+    def _recheck(self, evidence: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """The stored learned set re-checked at start (:func:`recheck_evidence`): an entry learned from the GPU share
+        alone (FL Studio maximised drew 16% one morning) is dropped by code, logged and written back."""
+        kept, dropped = recheck_evidence(evidence)
+        if not dropped:
+            return kept
+        for key in dropped:
+            entry = evidence.get(key) if isinstance(evidence.get(key), dict) else {}
+            self.counters["unlearned"] += 1
+            self._log("game_gate_unlearned", app=key, gpu_share=entry.get("gpu_share"), stretches=0,
+                      why="no_windows_fact")
+        self._save_evidence(kept)
+        return kept
+
+    def _save_evidence(self, evidence: dict[str, dict[str, Any]]) -> None:
+        if self._store is None:
+            return
+        try:
+            self._store.set_nudge_state(LEARNED_STATE, json.dumps(evidence, sort_keys=True))
+            if hasattr(self._store, "_write"):
+                from yuki.memory.trace_store import save_game_evidence
+
+                save_game_evidence(self._store, evidence)     # ui_game_processes (capC1), with its evidence
+        except Exception as exc:  # noqa: BLE001 - kept in memory for this run
+            self._log("error", where="game_gate_store", error=type(exc).__name__)
 
     def _read_learned(self) -> dict[str, dict[str, Any]]:
         if self._store is None:
@@ -582,10 +904,10 @@ class GameGate:
         else:
             entry.setdefault("first_seen", round(time.time(), 1))
             entry.update({"stretches": count, "gpu_share": gpu, "last_seen": round(time.time(), 1),
-                          "evidence": "fullscreen_gpu"})
+                          "evidence": SOUND_EVIDENCE})
             evidence[key] = entry
         self._evidence = evidence
-        self._games = GameSet(fixed=self._games.fixed, learned=confirmed(evidence))
+        self._games = GameSet(fixed=self._games.fixed, learned=confirmed(evidence), windows=self._games.windows)
         is_game = key in self._games.learned
         if is_game and not was_game:
             self.counters["learned"] += 1
@@ -598,17 +920,11 @@ class GameGate:
         else:
             self.counters["evidence"] += 1
             self._log("game_gate_evidence", app=key, gpu_share=gpu, stretches=count, step=delta)
-        if self._store is not None:
-            try:
-                self._store.set_nudge_state(LEARNED_STATE, json.dumps(evidence, sort_keys=True))
-                if hasattr(self._store, "_write"):
-                    from yuki.memory.trace_store import save_game_evidence
+        self._save_evidence(evidence)
 
-                    save_game_evidence(self._store, evidence)     # ui_game_processes (capC1), with its evidence
-            except Exception as exc:  # noqa: BLE001 - kept in memory for this run
-                self._log("error", where="game_gate_store", error=type(exc).__name__)
-
-    def _track(self, pid: int, image: str) -> None:
+    def _track(self, pid: int, image: str, *, detected: bool = False) -> None:
+        if detected:
+            self._detected.add(pid)
         if pid in self._running:
             return
         self._running[pid] = image
@@ -621,6 +937,7 @@ class GameGate:
 
     def _untrack(self, pid: int) -> None:
         self._running.pop(pid, None)
+        self._detected.discard(pid)
         handle = self._handles.pop(pid, 0)
         if handle:
             _close(handle)
@@ -639,16 +956,18 @@ class GameGate:
             return
         alive = set()
         for pid, image in seen:
-            if self._games.is_game(image):
+            source = self._source_of(int(pid), image)
+            if source is not None:
                 alive.add(int(pid))
-                self._track(int(pid), image)
+                self._track(int(pid), image, detected=source == "windows")
         for pid in [p for p in self._running if p not in alive]:
             self._untrack(pid)   # gone (a handle we could not open is only checked here)
 
     def _evaluate(self, trigger: str, *, session: bool | None = None) -> Decision:
         view = GateView(front=self._front, front_fullscreen=self._front_fullscreen, d3d_fullscreen=self._d3d,
                         running=frozenset(self._running.values()),
-                        game_session=self._session() if session is None else session)
+                        game_session=self._session() if session is None else session,
+                        detected=frozenset(self._running[p] for p in self._detected if p in self._running))
         decision = decide(view, self._games)
         if decision.key() != self._decision.key():
             now = self._clock()
@@ -680,9 +999,14 @@ class GameGate:
             raise TimeoutError("game gate thread did not start")
         if self._start_error is not None:
             raise self._start_error
+        global _LIVE
+        _LIVE = self     # the call worker's judge reads this gate's game set (judge_program)
         return self
 
     def stop(self, timeout_s: float = 5.0) -> None:
+        global _LIVE
+        if _LIVE is self:
+            _LIVE = None
         if self._thread_id:
             _U.PostThreadMessageW(self._thread_id, _WM_QUIT, 0, 0)
         if self._thread is not None:
@@ -789,6 +1113,13 @@ _K.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _K.OpenProcess.restype = wintypes.HANDLE
 _K.CloseHandle.argtypes = [wintypes.HANDLE]
 _K.CloseHandle.restype = wintypes.BOOL
+_K.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+_K.CreateEventW.restype = wintypes.HANDLE
+_K.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_K.WaitForSingleObject.restype = wintypes.DWORD
+_A = ctypes.WinDLL("advapi32", use_last_error=True)
+_A.RegNotifyChangeKeyValue.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.DWORD, wintypes.HANDLE, wintypes.BOOL]
+_A.RegNotifyChangeKeyValue.restype = wintypes.LONG
 
 
 def _open_wait_handle(pid: int) -> int:
@@ -806,6 +1137,7 @@ def _close(handle: int) -> None:
         pass
 
 
-__all__ = ["GameGate", "GameSet", "GateView", "Decision", "decide", "judge_learn", "stem", "LEARNED_STATE",
-           "SCAN_EVERY_S", "CHECK_AFTER_S", "LEARN_AFTER_STRETCHES", "EVIDENCE_CAP", "BEAT_EVERY_S", "D3D_FRESH_S",
-           "gate_holds", "confirmed", "stretches"]
+__all__ = ["GameGate", "GameSet", "GateView", "Decision", "decide", "judge_learn", "judge_program", "stem",
+           "LEARNED_STATE", "SCAN_EVERY_S", "CHECK_AFTER_S", "LEARN_AFTER_STRETCHES", "EVIDENCE_CAP", "BEAT_EVERY_S",
+           "D3D_FRESH_S", "SOUND_EVIDENCE", "GAME_CONFIG_STORE", "WindowsGames", "gate_holds", "confirmed",
+           "recheck_evidence", "read_windows_games", "stretches", "windows_games"]

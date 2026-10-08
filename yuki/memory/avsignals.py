@@ -29,18 +29,24 @@ Public API::
         .stats() -> dict                      # reads, ms (content-free)
     Holder(app, packaged, path, since).key / .matches(process_key=, exe=, ids=)
     own_executables() -> frozenset[str];  display_name(holder) -> str
-    gaming_with_voice(holder, *, fullscreen, shows_page, camera, pids, gpu_fn=gpu_share) -> (bool, facts)
+    gaming_with_voice(holder, *, fullscreen, shows_page, camera, pids, gpu_fn=gpu_share, game_fn=None)
+        -> (bool, facts)
     foreground_fullscreen() -> dict | None;  gpu_share(pids) -> float | None
 
 **Gaming with voice is not a meeting** (the 26 Sept Valorant case): a game's own voice chat holds
 the microphone and plays sound, exactly like a call. What tells them apart is measured too: the
 microphone holder is the **full-screen app in front**, it shows no web page, it does not hold the
-camera, and it **draws like a game** - its own share of the GPU's compute (NVML, last 10 s) is at
-least :data:`GAME_GPU_SHARE`. A full-screen meeting or video barely uses the GPU's compute and stays
-a meeting; without a GPU reading, full screen + microphone + no camera + no page counts as gaming.
-A call in another app (Discord in the background) is untouched. Since 3 Oct 2026 the call worker
-records such a game's voice chat as a game voice session of its own (``calls.kind`` "game",
-:mod:`yuki.memory.calls`), never as a call.
+camera, and the program **is a game by a machine fact** (:func:`yuki.memory.gamegate.judge_program`):
+on the fixed anti-cheat list (or the user's additions), detected as a game by Windows itself (the Game
+Bar's GameConfigStore, by its full path), learned by the game gate from Direct3D exclusive full screen,
+or in Direct3D exclusive full screen now. A full-screen meeting, a video or a maximised app that is no
+game (FL Studio holding the microphone) is none of these. A call in another app (Discord in the
+background) is untouched. Since 3 Oct 2026 the call worker records such a game's voice chat as a game
+voice session of its own (``calls.kind`` "game", :mod:`yuki.memory.calls`), never as a call.
+
+Until 9 Oct 2026 (capQ2b) "draws like a game" was a GPU share of at least 15%: FL Studio maximised
+drew 16% and was taken for a game (the trace stopped for 18 minutes and the user was asked about its
+"game voice"). The share is still read and logged with the facts, never decisive.
 """
 
 from __future__ import annotations
@@ -400,10 +406,6 @@ def display_name(holder: Holder) -> str:
 # Gaming with voice chat: the full-screen app in front, drawing like a game
 # ---------------------------------------------------------------------------
 
-#: A full-screen app in front whose own GPU compute share (percent, NVML, mean of the last 10 s) is
-#: at least this is drawing like a game. Measured signal, not an app list.
-GAME_GPU_SHARE = 15.0
-
 _gpu: Any = None
 _gpu_lock = threading.Lock()
 
@@ -428,8 +430,24 @@ def gpu_share(pids: Iterable[int]) -> float | None:
     return float(sum(v for pid, v in shares.items() if pid in wanted))
 
 
+def _game_program(holder: Holder, pids: list[int]) -> tuple[bool, str]:
+    """The game gate's judgement of the holder's program (:func:`yuki.memory.gamegate.judge_program`): its executable
+    (a packaged holder's from the process in front)."""
+    from yuki.memory.gamegate import judge_program
+
+    exe = holder.path
+    if not exe:
+        for pid in pids:
+            exe = _pid_identity(int(pid))[0] if pid else ""
+            if exe:
+                break
+    image = Path(exe).name if exe else ("" if holder.packaged else holder.app)
+    return judge_program(image, exe)
+
+
 def gaming_with_voice(holder: Holder, *, fullscreen: bool, shows_page: bool, camera: Iterable[Holder] = (),
-                      pids: Iterable[int] = (), gpu_fn: Callable[[Iterable[int]], float | None] = gpu_share,
+                      pids: Iterable[int] = (), gpu_fn: Callable[[Iterable[int]], float | None] | None = gpu_share,
+                      game_fn: Callable[[Holder, list[int]], tuple[bool, str]] | None = None,
                       ) -> tuple[bool, dict[str, Any]]:
     """Whether the microphone ``holder`` is a full-screen game in front with voice chat (not a meeting).
 
@@ -438,11 +456,12 @@ def gaming_with_voice(holder: Holder, *, fullscreen: bool, shows_page: bool, cam
         fullscreen: The window in front is full screen (``watcher.is_fullscreen_front``).
         shows_page: The window in front shows a web page (a meeting site in a full-screen browser).
         camera: The camera holders now (a camera in use means a meeting or a video call).
-        pids: The processes of the window in front (its GPU share is read for these).
-        gpu_fn: Reads the GPU share (tests pass a stub).
+        pids: The processes of the window in front.
+        gpu_fn: Reads their GPU share, for the log only (``None``: not read). Never decides.
+        game_fn: ``(holder, pids) -> (game, which fact)``; default the game gate's machine facts (tests pass a stub).
 
     Returns:
-        ``(gaming, facts)``; ``facts`` says why (content-free), for the log.
+        ``(gaming, facts)``; ``facts`` says why (content-free: flags, the fact's code, the share), for the log.
     """
     facts: dict[str, Any] = {"fullscreen": bool(fullscreen), "page": bool(shows_page)}
     if not fullscreen or shows_page:
@@ -450,15 +469,19 @@ def gaming_with_voice(holder: Holder, *, fullscreen: bool, shows_page: bool, cam
     if any(c.key == holder.key for c in camera):
         facts["camera"] = True
         return False, facts
-    share = None
+    pids = [int(p) for p in pids if p]
     try:
-        share = gpu_fn(list(pids))
+        game, why = (game_fn or _game_program)(holder, pids)
     except Exception:
-        share = None
-    facts["gpu_share"] = None if share is None else round(share, 1)
-    if share is None:
-        return True, facts
-    return share >= GAME_GPU_SHARE, facts
+        game, why = False, "error"
+    facts["game"] = why
+    if gpu_fn is not None:
+        try:
+            share = gpu_fn(list(pids))
+        except Exception:
+            share = None
+        facts["gpu_share"] = None if share is None else round(share, 1)
+    return bool(game), facts
 
 
 #: The full-screen window's process path, per (window, process), so a game in front is opened (for its path) once,
@@ -497,5 +520,5 @@ def foreground_fullscreen() -> dict[str, Any] | None:
         return None
 
 
-__all__ = ["AvSignals", "AvSnapshot", "Holder", "own_executables", "display_name", "GAME_GPU_SHARE",
+__all__ = ["AvSignals", "AvSnapshot", "Holder", "own_executables", "display_name",
            "gpu_share", "gaming_with_voice", "foreground_fullscreen"]

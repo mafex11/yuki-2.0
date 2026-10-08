@@ -4682,6 +4682,74 @@ class MemoryClient:
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__}
 
+    # -- capC6: the workflow graph's queries (report 78 §5.4, yuki.memory.trace_graph) ------------------------------
+    # Read only; names only from the element registry's kept names; tasks the user rejected never shown as theirs.
+
+    def trace_workflows(self, words: str = "", *, app: str | None = None, limit: int = 5,
+                        embed_wait_s: float | None = 8.0) -> dict:
+        """capC6: the user's workflows (families of tasks done the same way, :func:`yuki.memory.trace_graph.families`):
+        ``{"families": [...], "ranked": bool (by the words' meaning), "app": {...} | None}``. ``words``: the nearest
+        families to them ("how do I usually do X"; with no vector within ``embed_wait_s`` they come most recent first
+        and ``ranked`` is False); ``app``: the families spanning it, plus its go-tos, shortcuts and usual transitions
+        (:func:`yuki.memory.trace_graph.in_app`). Never raises."""
+        from yuki.memory import trace_graph
+
+        out: dict[str, Any] = {"families": [], "ranked": False, "app": None}
+        try:
+            text = " ".join(str(words or "").split())
+            vec = self._embed(text, embed_wait_s) if text else None
+            out["ranked"] = vec is not None
+            out["families"] = trace_graph.families(self.store, app=app or None, query_vec=vec, limit=limit)
+            if app:
+                out["app"] = trace_graph.in_app(self.store, app, with_families=False)   # families read just above
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = type(exc).__name__
+        return out
+
+    def trace_tasks_between(self, since: Any, until: Any = None, *, limit: int = 40) -> dict:
+        """capC6: the tasks the user did overlapping ``[since, until)`` (:func:`yuki.memory.trace_graph.tasks_between`):
+        goals (theirs once renamed), apps, outcomes (checked or not); tasks they said were not theirs or not one task
+        are left out (``left_out`` counts them). Never raises."""
+        from yuki.memory import trace_graph
+
+        try:
+            lo, hi = self._window(since, until)
+            return trace_graph.tasks_between(self.store, lo, hi, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"tasks": [], "more": 0, "left_out": 0, "error": type(exc).__name__}
+
+    def trace_next(self, *, element: str | None = None, task: Any = None) -> dict:
+        """capC6: what usually comes next after an element (its element key: transitions and the usual paths holding
+        it) or after a task (``task:12`` or 12: what the next task in the same stretch of work usually is). Never
+        raises (``{}``)."""
+        from yuki.memory import trace_graph
+
+        try:
+            if element:
+                return trace_graph.next_after_element(self.store, str(element))
+            if task is not None:
+                return trace_graph.next_after_task(self.store, int(str(task).split(":")[-1]))
+        except Exception:  # noqa: BLE001
+            pass
+        return {}
+
+    def trace_task_apps(self, task: Any) -> list[dict]:
+        """capC6: the apps a task spans (``task:12`` or 12), with its own steps in each. Never raises (``[]``)."""
+        from yuki.memory import trace_graph
+
+        try:
+            return trace_graph.task_apps(self.store, int(str(task).split(":")[-1]))
+        except Exception:  # noqa: BLE001
+            return []
+
+    def done_evidence(self, since: float, until: float, *, limit: int = 12) -> list[dict]:
+        """capC6: tasks whose outcome the PC checked inside ``[since, until)`` (learnable only: never unclear, never
+        rejected), newest first, each citing its task and outcome action ids for the caller's records and saying it in
+        plain words ("you saved a file (.pptx)", "4 PM") for the user. The Work page's evidence. Never raises."""
+        from yuki.memory import trace_graph
+
+        return trace_graph.done_evidence(self.store, float(since), float(until), limit=limit)
+
     def way_path(self, pid: Any) -> dict:
         """capC5: the recorded path a learned way is replayed against (``yuki.memory.trace_replay.way_path``): per
         step the app it acted in, the site when it was a web page, whether it stayed in the window of the step before,

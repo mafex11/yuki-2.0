@@ -254,7 +254,7 @@ _TRACE_STATE_WORDS = {"paused": "paused right now, because memory is paused",
                       "failed": "could not start", "no_input": "not hearing your mouse and keys"}
 
 
-def _trace_learn_words(learn: str | None, health: Any) -> str:
+def _trace_learn_words(learn: str | None, health: Any, now: float | None = None) -> str:
     """capC1b: what was learned from the trace, in plain words (``trace:learn``, written by the practice worker;
     the watchdog's skips from ``trace:health``). ``""`` when there is nothing to say."""
     try:
@@ -269,7 +269,9 @@ def _trace_learn_words(learn: str | None, health: Any) -> str:
         again = int(data.get("repeated") or 0)
         parts.append(f"kept {pits} note{'s' if pits != 1 else ''} of tries that went wrong"
                      + (f" ({again} went wrong the same way again)" if again else ""))
-    served = int(data.get("go_tos_today") or 0)
+    # capQ2b second verification V3: the go-tos served "today" only when the row is from today (the practice
+    # worker writes it on its tick, which waits while memory is paused)
+    served = int(data.get("go_tos_today") or 0) if _same_day(data, time.time() if now is None else now) else 0
     if served:
         parts.append(f"your usual buttons and shortcuts helped {served} request{'s' if served != 1 else ''} today")
     skipped = int((health or {}).get("hung_skipped") or 0) if isinstance(health, dict) else 0
@@ -278,16 +280,34 @@ def _trace_learn_words(learn: str | None, health: Any) -> str:
     return ("; " + "; ".join(parts)) if parts else ""
 
 
+def _same_day(data: dict, now: float) -> bool:
+    """capQ2b: whether a health row's "today" numbers are about today: its ``day`` (or, for a row written before it
+    had one, the local day of its ``at``) is the local day of ``now``. A row written yesterday evening keeps its
+    totals for a day, but its "today" counts are yesterday's."""
+    from datetime import datetime
+
+    today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
+    day = data.get("day")
+    if not day:
+        try:
+            day = datetime.fromtimestamp(float(data.get("at") or 0)).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OSError, OverflowError):
+            return False
+    return str(day) == today
+
+
 def _trace_tasks_words(raw: str | None, now: float) -> str:
     """capC2: the task pass in plain words (``trace:tasks``, written by the practice worker): tasks found today, how
     many of them have no checked end, today's cost against its cap, stretches still waiting. ``""`` when there is
-    nothing to say or the value is a day old."""
+    nothing to say or the value is a day old. capQ2b: the "today" numbers only when the row is from today."""
     try:
         data = json.loads(raw) if raw else {}
     except (TypeError, ValueError):
         data = {}
     if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
         return ""
+    if not _same_day(data, now):
+        data = {**data, "tasks_today": 0, "unclear_today": 0, "cost_today": 0.0, "refused_today": 0}
     parts = []
     n, unclear = int(data.get("tasks_today") or 0), int(data.get("unclear_today") or 0)
     if n:
@@ -307,13 +327,17 @@ def _trace_tasks_words(raw: str | None, now: float) -> str:
 def _trace_demos_words(raw: str | None, now: float) -> str:
     """capC4: ways learned from what you did, in plain words (``trace:demos``, written by the practice worker): how
     many Yuki may use on its own, how many it has seen only once (hints), what it learned or set aside today. ``""``
-    when there is nothing to say or the value is a day old."""
+    when there is nothing to say or the value is a day old. capQ2b: "new today" and "set aside today" only when the
+    row is from today (the row is rewritten only when the demo pass runs, so on the next day it still held
+    yesterday's numbers)."""
     try:
         data = json.loads(raw) if raw else {}
     except (TypeError, ValueError):
         data = {}
     if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
         return ""
+    if not _same_day(data, now):
+        data = {**data, "learned_today": 0, "refused_today": 0}
     ways, trials = int(data.get("ways") or 0), int(data.get("trials") or 0)
     hints = int(data.get("hints") or 0)   # second verification V11: ways its hands cannot take, hints for the thinker
     parts = []
@@ -408,7 +432,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
                   f" ({yours:,} of them yours; {share}% with the button or field named)")
     if state in _TRACE_STATE_WORDS:
         detail += f"; {_TRACE_STATE_WORDS[state]}"
-    detail += _trace_learn_words(learn_row[0] if learn_row else None, health)
+    detail += _trace_learn_words(learn_row[0] if learn_row else None, health, now)
     detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
     detail += _trace_demos_words(demos_row[0] if demos_row else None, now)
     detail += replay

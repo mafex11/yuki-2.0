@@ -1850,6 +1850,7 @@ class WebWindow:
             return {"ok": False, "error": "This memory can't correct tasks yet."}
         r = fn(ref, verdict, words) or {}
         self.refresh("day")
+        self.refresh("work")   # capC6: Work's evidence line cites checked tasks; a rejected one must leave it
         if not r.get("ok"):
             return {"ok": False, "error": str(r.get("error") or "That can’t be corrected here.")}
         return {"ref": ref, "verdict": r.get("verdict"), "goal": r.get("goal") or ""}
@@ -1862,6 +1863,7 @@ class WebWindow:
             return {"ok": False, "error": "This memory can't correct tasks yet."}
         r = fn(ref) or {}
         self.refresh("day")
+        self.refresh("work")
         if not r.get("ok"):
             return {"ok": False, "error": str(r.get("error") or "Couldn’t take it back.")}
         return {"ref": ref, "verdict": None, "goal": r.get("goal") or ""}
