@@ -34,6 +34,13 @@ def _tool() -> Any:
 
 C5 = _tool()
 REQUESTS = [f"invented request number {i}" for i in range(1, 11)]
+OFF = [f"invented other request {i}" for i in range(1, 11)]
+
+
+@pytest.fixture(autouse=True)
+def _small_check(monkeypatch):
+    # the small synthetic plans below stand for the check's 10 requests (the N6 tests set it back to 10)
+    monkeypatch.setattr(C5, "DEFAULT_REQUESTS", 1)
 
 
 # -- the plan ----------------------------------------------------------------------------------------------------------
@@ -42,10 +49,15 @@ def test_the_plan_keeps_the_requests_as_said_and_alternates_the_switch_per_reque
     plan = C5.make_plan(["  open the  team notes ", "", "send the weekly figures"], paired=True, now=NOW)
     assert plan["requests"] == ["open the team notes", "send the weekly figures"]   # as said (spaces folded)
     assert [(t["request"], t["on"]) for t in plan["trials"]] == [(1, True), (1, False), (2, False), (2, True)]
-    # review F8: by default each real request is done once, the switch alternating per request
-    one = C5.make_plan(REQUESTS, now=NOW)
-    assert [t["on"] for t in one["trials"]] == [True, False] * 5 and one["mode"] == "one_each"
-    assert [t["request"] for t in one["trials"]] == list(range(1, 11))
+    # review F8 / second verification N6: by default each real request is done once with the switch on, other
+    # requests with it off, the switch alternating request by request
+    one = C5.make_plan(REQUESTS, off_requests=OFF[:3], now=NOW)
+    assert one["mode"] == "on_off" and one["requests"] == REQUESTS + OFF[:3]
+    assert [(t["request"], t["on"]) for t in one["trials"]][:7] == [(1, True), (11, False), (2, True), (12, False),
+                                                                    (3, True), (13, False), (4, True)]
+    assert [t["request"] for t in one["trials"] if t["on"]] == list(range(1, 11))
+    with pytest.raises(ValueError):
+        C5.make_plan(REQUESTS, paired=True, off_requests=OFF[:1])
     with pytest.raises(ValueError):
         C5.make_plan(["", "  "])
 
@@ -146,8 +158,8 @@ def test_the_analyzer_finds_done_takeover_time_deviations_and_handovers(store):
     assert (t4["done"], t4["ways"], t4["deviations"], t4["handed_over"]) == (True, 1, 1, 1)
     assert t4["seconds"] == pytest.approx(113.0) and t4["ratio"] == pytest.approx(0.94, abs=0.01)
     v = out["verdict"]
-    assert v["on_done"] == 2 and v["off_done"] == 1 and v["parts"] == {"done": True, "time": True, "better": True,
-                                                                       "deviations": True}
+    assert v["on_done"] == 2 and v["off_done"] == 1 and v["parts"] == {"enough": True, "done": True, "time": True,
+                                                                       "better": True, "deviations": True}
     assert v["passed"]
     text = C5.report(out)
     assert "PASS" in text and "2 of 2 done" in text and "handed over 1" in text

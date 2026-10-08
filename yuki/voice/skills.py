@@ -614,6 +614,8 @@ class SkillRunner:
         self._prev_pre: set[int] | None = None
         self._prev_exp: Expect | None = None
         self._prev_brought: int | None = None
+        #: The windows open just before the current step acted (seen by its last :meth:`_late_dialog` look).
+        self._at_act: set[int] = set()
         self._brought: int | None = None
         #: Second verification N2: the app a UWP frame window hosts, per window, for this run.
         self._hosted: dict[int, str] = {}
@@ -1428,7 +1430,7 @@ class SkillRunner:
                     part_before = ("", self._app_title(str(ends[n][1].get("app") or "")))
                 exp = expects[n] if n < len(expects) else None
                 pre = set(self._windows(self._overview()))
-                self._brought = None
+                self._brought, self._at_act = None, set()
                 try:
                     result = self._step(step, apps=apps, first=n == 0, after_open=after_open,
                                         start_front=start_front, opened=opened, exp=exp)
@@ -1450,7 +1452,7 @@ class SkillRunner:
                     after_open = False
                 if result.kind == "action" and result.ok and result.deviation is None:
                     self._note_acted(step, result)
-                    off = self._new_dialog(pre, exp, last=n + 1 >= len(steps))
+                    off = self._new_dialog(pre | self._at_act, exp, last=n + 1 >= len(steps))
                     if off is not None:
                         result.deviation, result.different = "dialog", off
                         result.why += f"; then {off}"
@@ -1643,10 +1645,12 @@ class SkillRunner:
         that this step would act in, or that is in front and is the way's. On the path when the step before's
         recording had a dialog; off it when the recording had none; for a way with no recording, only when this step
         acts inside it. Machine facts only (window identity and owner). ``(code, what was different)`` or ``None``."""
-        if self._prev_pre is None:
-            return None
         payload = self._overview()
         windows = self._windows(payload)
+        # what was open just before this step acted: a dialog among them did not come up after it (its own look)
+        self._at_act |= set(windows)
+        if self._prev_pre is None:
+            return None
         front = int(payload.get("foreground_hwnd") or 0)
         seen = self._prev_pre | self._before_run
 
