@@ -322,6 +322,16 @@ def test_requests_are_the_users_own_or_turns_that_led_to_yuki_acting_never_goals
                                                       encoding="utf-8")
     conv = D.conversation_requests(logs)
     assert [(r.text, r.origin, r.at) for r in conv] == [("pin the planner note", "conversation", NOW)]
+    # the user's own words out of a request Yuki composed: Yuki's notes after a blank line, a card before the words,
+    # and on a spoken request the words speech recognition heard (theirs) over the voice's hand-off
+    assert D.request_words("pin the note\n\n[Typed in the ask bar: a small box.]") == "pin the note"
+    assert D.request_words("[You said on a card at 9 AM: water the plants]\nyes do it\n\n[Done on the desktop "
+                           "earlier: none]") == "yes do it"
+    from yuki.agent.memory import VOICE_HEARD_MARK
+
+    spoken = (f"Open the planner note for the user\n\n{VOICE_HEARD_MARK} (newest last): \"open my planner\" / "
+              f"\"the planner note\"]\n[What Yuki's voice already said: on it]")
+    assert D.request_words(spoken) == "open my planner / the planner note"
     # the segmenter's goals never become requests: the late request is left out, the goal is nowhere
     world(store, future=False)
     insts, skipped = D.build_instances(store, [*own, *conv], Words(), names=NAMES)
