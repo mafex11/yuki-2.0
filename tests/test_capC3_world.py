@@ -129,6 +129,30 @@ def world(store: Any, *, learned: bool = True, future: bool = True) -> dict[str,
     return w
 
 
+NOTES_GOAL = "You saved your planner notes file"
+NOTES_REQUEST = "save my planner notes file"
+
+
+def notes(store: Any, t0: float) -> list[int]:
+    """Another kind of task: bring the notes app up, type in the page, Ctrl+S, the file saved."""
+    return [row(store, t0, "notepadx", "switch", resolved="event", facts={"window_verified": "notepadx"}),
+            row(store, t0 + 2, "notepadx", "type", resolved="focus", role="Document", name="Planner", key="k-doc",
+                typed=40),
+            row(store, t0 + 30, "notepadx", "keys", resolved="focus", chord="Ctrl+S", role="Document", key="k-doc"),
+            row(store, t0 + 31, "notepadx", "file_save", resolved="event", file_ext=".txt",
+                facts={"file_saved": "fd-notes"})]
+
+
+def two_kinds(store: Any, *, learned: bool = False) -> dict[str, Any]:
+    """The world (no future) plus the notes task on days 0-3 (the last one evaluated): two evaluated requests."""
+    w = world(store, learned=learned, future=False)
+    for d in range(4):
+        ids = notes(store, NOW + d * DAY + 7200)
+        w[f"N{d}"] = task(store, ids, NOTES_GOAL, "file_saved", ids[-1], target="fd-notes")
+    F.refresh(store, Words(), now=NOW + 3 * DAY + 9000)
+    return w
+
+
 def own_request(at: float = NOW - DAY, text: str = REQUEST) -> D.Request:
     return D.Request(text, at, "you")
 
