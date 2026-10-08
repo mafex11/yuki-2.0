@@ -307,23 +307,45 @@ def _stretch(gate, clock, s: dict, hwnd: int, pid: int, *, exclusive: bool) -> N
     gate.on_foreground(5, 12)
 
 
-def test_a_learned_program_no_longer_exclusive_is_corrected_and_forgotten() -> None:
-    """Review fix, on the capQ2b facts: two exclusive stretches make a learned game; later full-screen stretches that
-    are not exclusive take it out again, and the program is forgotten from the stored evidence at zero."""
+def test_a_candidate_no_longer_exclusive_is_corrected_and_forgotten() -> None:
+    """Review fix, on the capQ2b facts: one exclusive stretch makes a candidate; a later full-screen stretch that is
+    not exclusive takes it back, and the program is forgotten from the stored evidence at zero."""
     store = _Store()
     gate, clock, log, s = _live_gate(procs={11: "Slideshow.exe", 12: "Discord.exe"}, fullscreen={1},
                                      gpu={11: 40.0})
     gate._store = store
-    _stretch(gate, clock, s, 1, 11, exclusive=True)
-    _stretch(gate, clock, s, 1, 11, exclusive=True)
-    assert gate.holds() and log.of("game_gate_learned")[0]["game"] == "slideshow"
-    _stretch(gate, clock, s, 1, 11, exclusive=False)               # evidence 2 -> 1: not a game any more
-    assert not gate.holds()
-    assert log.of("game_gate_unlearned") == [{"app": "slideshow", "gpu_share": 40.0, "stretches": 1}]
+    _stretch(gate, clock, s, 1, 11, exclusive=True)                # 1 stretch: a candidate, never a game yet
+    assert not gate.holds() and not log.of("game_gate_learned")
     assert json.loads(store.rows[G.LEARNED_STATE])["slideshow"]["stretches"] == 1
     _stretch(gate, clock, s, 1, 11, exclusive=False)               # 1 -> 0: forgotten
     assert json.loads(store.rows[G.LEARNED_STATE]) == {} and gate.stats()["candidates"] == 0
-    assert not gate.holds()
+    assert not gate.holds() and not log.of("game_gate_unlearned")
+
+
+def test_a_learned_game_played_borderless_keeps_the_gate_held() -> None:
+    """Second verification V1: a game learned from two exclusive stretches, later played borderless full screen (how
+    most games run), stays learned and the gate holds the whole session, past every check."""
+    store = _Store()
+    gate, clock, log, s = _live_gate(procs={11: "Skyrunner.exe", 12: "Discord.exe"}, fullscreen={1},
+                                     gpu={11: 40.0})
+    gate._store = store
+    _stretch(gate, clock, s, 1, 11, exclusive=True)
+    _stretch(gate, clock, s, 1, 11, exclusive=True)
+    assert log.of("game_gate_learned")[0]["game"] == "skyrunner"
+    for _ in range(3):                                             # three borderless sessions
+        s["d3d"] = False
+        gate.on_foreground(1, 11)
+        assert gate.holds()
+        for after in G.CHECK_AFTER_S:
+            if gate.next_check_in() is None:
+                break
+            clock.t += after
+            gate.on_check()
+            assert gate.holds()                                    # held at the 20 s and 90 s checks
+        gate.on_foreground(5, 12)
+        assert gate.holds()                                        # still running behind Discord
+    assert not log.of("game_gate_unlearned")
+    assert json.loads(store.rows[G.LEARNED_STATE])["skyrunner"]["stretches"] == 2
 
 
 def test_evidence_is_capped_and_one_windowed_stretch_does_not_drop_a_well_known_game() -> None:
@@ -331,7 +353,7 @@ def test_evidence_is_capped_and_one_windowed_stretch_does_not_drop_a_well_known_
     for _ in range(6):
         _stretch(gate, clock, s, 4, 30, exclusive=True)
     assert G.stretches(gate._evidence["fieldrunner"]) == G.EVIDENCE_CAP
-    _stretch(gate, clock, s, 4, 30, exclusive=False)               # borderless once: 3 -> 2, still a game
+    _stretch(gate, clock, s, 4, 30, exclusive=False)               # borderless: a learned game keeps its count
     assert gate.holds() and not log.of("game_gate_unlearned")
 
 

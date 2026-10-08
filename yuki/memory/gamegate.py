@@ -23,8 +23,9 @@ The gate holds while any of these is true:
   - or a program **seen in Direct3D exclusive full screen** while it was the full-screen window in front, in at
     least :data:`LEARN_AFTER_STRETCHES` separate stretches (the learned set). The evidence (a count per program,
     ``evidence`` "d3d_exclusive") is kept in ``nudge_state`` (:data:`LEARNED_STATE`) and ``ui_game_processes``, and
-    corrects itself: a later full-screen stretch that is not exclusive at any check takes one back, and at zero the
-    program is forgotten.
+    corrects itself while the program is a candidate: a later full-screen stretch that is not exclusive at any check
+    takes one back, and at zero the program is forgotten. A learned game keeps its place when it is later played
+    borderless (how most games run; second verification V1): only the start-up re-check drops a learned entry.
 
   **Never a guessed threshold** (capQ2b, 9 Oct 2026): until then a program also became a game when its share of the
   GPU's compute reached 15%. FL Studio, maximised and holding the microphone, drew 16% one morning and the call
@@ -54,8 +55,8 @@ Log events (the memory log, content-free: process image names of measured progra
   "", ``front_fullscreen``, ``trigger``: start / foreground / game_exit / check / d3d / game_voice / beat); written
   on every change, so Alt+Tab in and out of a game shows;
 * ``game_gate_learned``: a program joined the learned set (``game``, ``gpu_share`` as measured, ``stretches``);
-* ``game_gate_unlearned``: stretches took a learned program out again, or the start-up re-check dropped an entry
-  whose evidence is no Windows fact (``app``, ``gpu_share``, ``stretches``, ``why``);
+* ``game_gate_unlearned``: the start-up re-check dropped an entry whose evidence is no Windows fact (``app``,
+  ``gpu_share``, ``stretches``, ``why``); a borderless stretch never takes a learned game out;
 * ``game_gate_evidence``: a stretch counted for or against a program without changing whether it is a game
   (``app``, ``gpu_share``, ``stretches``, ``step``);
 * ``game_gate_not_game``: a full-screen program was measured and is not a game (``app``, ``gpu_share``, ``why``),
@@ -114,9 +115,9 @@ MAX_HANDLES = 32
 QUNS_RUNNING_D3D_FULL_SCREEN = 3
 
 #: A program becomes a learned game only after this many separate full-screen stretches in Direct3D exclusive full
-#: screen (one exclusive-mode video player moment is not enough), and each later full-screen stretch that is not
-#: exclusive at any check takes one back: at zero the program is forgotten. Evidence is capped so a program kept for
-#: months can still be corrected by a few stretches.
+#: screen (one exclusive-mode video player moment is not enough). Below that, each later full-screen stretch that is
+#: not exclusive at any check takes one back: at zero the candidate is forgotten. A learned game is never taken back
+#: by a borderless stretch (second verification V1: the gate would stop holding with the game in front).
 LEARN_AFTER_STRETCHES = 2
 EVIDENCE_CAP = 3
 #: The only evidence a learned entry may carry (a Windows fact). Entries without it (learned from the GPU share before
@@ -742,10 +743,14 @@ class GameGate:
                     self._track(pid, image)
                 self._stretch, self._checks = None, []
             elif not self._checks and why == "not_exclusive":
-                # the last check of the stretch and it was never exclusive
-                if key in self._evidence:
+                # the last check of the stretch and it was never exclusive: one back from a candidate only. A learned
+                # game played borderless (how most games run) keeps its place, or the gate would stop holding with
+                # the game in front (second verification V1)
+                if key in self._games.learned:
+                    pass
+                elif key in self._evidence:
                     self._evidence_step(image, share, -1)
-                elif key and key not in self._evidence and key not in self._not_game:
+                elif key and key not in self._not_game:
                     self._not_game.add(key)   # said once per program per run
                     self._log("game_gate_not_game", app=key, why=why,
                               gpu_share=None if share is None else round(float(share), 1))
