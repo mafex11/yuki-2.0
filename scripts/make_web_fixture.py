@@ -583,7 +583,16 @@ def build() -> dict:
         "today": {"focus": 306, "usual": 340,
                   "longest": {"min": 52, "app": "VS Code", "title": "Bed sizes screen", "at": ago(11 * H + 40 * M),
                               "from": "10:12 AM"},
-                  "worked": [["Garden planner", 196, "thread:7"], ["October budget", 66, "thread:9"],
+                  # capC6: a row may carry what the PC checked got done in it today (W.worked_evidence); the third
+                  # row has none and keeps its three items
+                  "worked": [["Garden planner", 196, "thread:7",
+                              {"text": "you saved a file (.ts) at 11:04 AM",
+                               "goal": "You finished the bed sizes screen and saved it", "ref": "task:41",
+                               "action": 9120}],
+                             ["October budget", 66, "thread:9",
+                              {"text": "you saved a file (.ods) at 2:11 PM",
+                               "goal": "You put October’s rent and groceries in the budget", "ref": "task:44",
+                               "action": 9388}],
                              ["Rust exercises", 38, "thread:11"]],
                   "coming": [["tomorrow 11 AM", "Seed-swap planning on Mumble"], ["Wednesday 7 PM", "Band practice"]],
                   "coming_seen": "seen on your screen in Firefox"},
