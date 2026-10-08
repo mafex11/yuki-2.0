@@ -42,6 +42,7 @@ Rules every query keeps:
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from collections.abc import Sequence
 from datetime import datetime
@@ -73,6 +74,10 @@ STEP_CHARS = F.STEP_CHARS
 BRANCH_CHARS = 240
 #: Tasks of a family looked at for what usually follows it.
 FOLLOW_TASKS = 30
+#: The outcome facts (``trace_tasks.FACT_KINDS``) that mean the user made, sent or ran something: the only ones offered
+#: as "done" evidence (second verification V3). The rest (a window came up, a page reached, a file opened, an item
+#: picked, a setting switched) show a step happened, not that the work the task's goal names got finished.
+DONE_FACTS = ("file_saved", "field_submitted", "paste_sent", "command_ok")
 
 #: An outcome fact as a short neutral phrase (the MCP tools speak about "the user"; the Work page and the check-ins use
 #: :func:`yuki.memory.trace_tasks.outcome_words`, second person).
@@ -146,14 +151,19 @@ def _families(store: Any) -> list[Any]:
 
 
 def _label(store: Any, f: Any) -> str:
-    """A family's label (a member's goal), unless the task it was taken from is one the user rejected (a family whose
-    live tasks are all gone keeps its old label; it is never shown once its task was said to be not theirs)."""
+    """A family's label (a member's goal), only while the task it was taken from is still one of the family's members
+    and not one the user rejected. A family whose live tasks are all gone keeps its old label; a rejection takes the
+    task out of the family (``trace_families.drop_member``), so a label whose task is no longer a member is stale
+    even after the rejected task's own row expired (second verification V1). A label whose member aged out (90 days)
+    is hidden too: the family is then shown without one."""
     if f["label_task"] is not None:
         try:
+            member = store._query("SELECT 1 FROM ui_family_members WHERE family_id = ? AND task_id = ?",
+                                  (int(f["id"]), int(f["label_task"])))
             got = store._query("SELECT user_verdict FROM ui_tasks WHERE id = ?", (int(f["label_task"]),))
-        except Exception:  # noqa: BLE001
-            got = []
-        if got and got[0][0] in REJECTED:
+        except Exception:  # noqa: BLE001 - a database before the members table: nothing to vouch for the label
+            return ""
+        if not member or (got and got[0][0] in REJECTED):
             return ""
     return _clip(_dec(store, f["label_ciphertext"]), LABEL_CHARS)
 
@@ -203,6 +213,8 @@ def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MA
     #: backbone index -> its 1-based position in ``path`` (the numbered list the reader sees), so a branch's "after
     #: step N" points at a step that is shown (review C6-2: the backbone also holds steps few routes took)
     shown_at: dict[int, int] = {}
+    #: the last backbone index the shown path covers when it was cut at ``steps`` (None: the whole path is shown)
+    cut_at: int | None = None
     for i, nd in enumerate(nodes):
         if i not in keep:
             continue
@@ -211,6 +223,7 @@ def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MA
             path.append({"words": _clip(words, STEP_CHARS), "n": int(nd.get("n") or 0)})
             shown_at[i] = len(path)
         if len(path) >= steps:
+            cut_at = i
             break
     worded_branches = []
     if n_tasks >= 2:
@@ -221,8 +234,11 @@ def family_view(store: Any, f: Any, *, now: float | None = None, steps: int = MA
                 continue
             after = int(b.get("after", -1))
             pos = max((p for i, p in shown_at.items() if i <= after), default=0)
+            # past a path cut at ``steps``: no shown step it follows (second verification V5)
+            where = ("later on" if cut_at is not None and after > cut_at
+                     else "at the start" if pos == 0 else f"after step {pos}")
             worded_branches.append({"words": _clip("; ".join(bw), BRANCH_CHARS), "n": int(b.get("n") or 0),
-                                    "where": "at the start" if pos == 0 else f"after step {pos}"})
+                                    "where": where})
             if len(worded_branches) >= branches:
                 break
     latest = None
@@ -302,7 +318,9 @@ def families(store: Any, *, app: str | None = None, query_vec: Any = None, floor
 def followed_by(store: Any, fid: int, *, limit: int = 2) -> list[dict[str, Any]]:
     """What usually comes after a family's tasks: for each of its latest :data:`FOLLOW_TASKS` live tasks, the next
     task the user started in the same stretch of work (the same episode window), counted by that task's family:
-    ``[{"family", "label", "n", "of"}]``, most often first (rejected tasks on neither side). Never raises."""
+    ``[{"family", "label", "n", "of"}]``, most often first (rejected tasks on neither side), only a follower seen at
+    least twice and at least half the times looked at (``n >= max(2, ceil(of / 2))``, the usual path's rule). Never
+    raises."""
     try:
         mine = store._query(f"SELECT id, started_at, window_start FROM ui_tasks WHERE family_id = ? AND {_NOT_REJECTED}"
                             " ORDER BY started_at DESC LIMIT ?", (int(fid), FOLLOW_TASKS))
@@ -317,7 +335,12 @@ def followed_by(store: Any, fid: int, *, limit: int = 2) -> list[dict[str, Any]]
             if nxt and nxt[0][0] is not None:
                 counts[int(nxt[0][0])] += 1
         out = []
+        # "usually" only (second verification V6): the rule of the usual path (``F.usual``), at least twice and at
+        # least half the times looked at; one occurrence is never a habit
+        need = max(2, math.ceil(len(mine) / 2))
         for other, n in counts.most_common(limit):
+            if n < need:
+                break
             got = store._query(f"SELECT {_FAMILY_COLUMNS} FROM ui_families WHERE id = ?", (other,))
             label = _label(store, got[0]) if got else ""
             if label:
@@ -553,7 +576,8 @@ def _thread_ids(store: Any, thread_id: int) -> list[int]:
 def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EVIDENCE,
                   thread: int | None = None) -> list[dict[str, Any]]:
     """Tasks whose outcome the PC checked, the outcome inside ``[since, until)``, newest first, at most ``limit``
-    (:data:`MAX_EVIDENCE`): learnable tasks only (a recorded fact, never ``unclear``, never one the user rejected).
+    (:data:`MAX_EVIDENCE`): learnable tasks only (a recorded fact, never ``unclear``, never one the user rejected)
+    whose fact is one of :data:`DONE_FACTS` (something made, sent or run; a window or page coming up is no proof).
     ``thread`` (a thread of work's id): only tasks with at least one of the user's journal entries on that thread (or
     one merged into it) inside their span, so the cap applies to that thread's tasks, not to everything newer (review
     C6-1; which thread a task belongs to - most of its span's entries - is still the caller's to decide).
@@ -564,8 +588,9 @@ def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EV
     limit = max(1, min(int(limit), MAX_EVIDENCE))
     try:
         lo, hi = float(since), float(until)
-        sql = _TASK_SQL + " AND t.outcome_fact IS NOT NULL AND t.outcome_fact != ? AND t.outcome_action IS NOT NULL"
-        params: list[Any] = [lo - TASK_SPAN_MAX_S, hi, lo, UNCLEAR]
+        sql = (_TASK_SQL + " AND t.outcome_fact IN (%s) AND t.outcome_action IS NOT NULL"
+               % ",".join("?" * len(DONE_FACTS)))
+        params: list[Any] = [lo - TASK_SPAN_MAX_S, hi, lo, *DONE_FACTS]
         if thread is not None:
             ids = _thread_ids(store, int(thread))
             if not ids:
@@ -592,6 +617,6 @@ def done_evidence(store: Any, since: float, until: float, *, limit: int = MAX_EV
     return out[:limit]
 
 
-__all__ = ["FACT_PHRASES", "clock", "HOW_FLOOR", "MAX_EVIDENCE", "MAX_FAMILIES", "MAX_STEPS", "MAX_TASKS", "MAX_TRANSITIONS",
+__all__ = ["DONE_FACTS", "FACT_PHRASES", "clock", "HOW_FLOOR", "MAX_EVIDENCE", "MAX_FAMILIES", "MAX_STEPS", "MAX_TASKS", "MAX_TRANSITIONS",
            "done_evidence", "element_words", "fact_phrase", "families", "family_view", "followed_by", "how_usually",
            "in_app", "next_after_element", "next_after_task", "task_apps", "tasks_between", "transitions"]

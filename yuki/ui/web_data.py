@@ -1356,7 +1356,8 @@ def worked_evidence(memory: Any, worked: list[list[Any]], sessions: list[dict[st
     """capC6 (report 78 §12, C6): each Worked on today row gains, as its 4th item, the latest thing the PC checked got
     done inside that thread's sessions today (``{"text": "you saved a file (.pptx) at 4 PM", "goal", "ref"
     ("task:12"), "action" (the outcome's action id)}``); a row with none keeps its three items. Only tasks memory calls
-    learnable (a recorded outcome, never unclear, never one the user said was not theirs); the ids stay in the data,
+    learnable whose outcome made, sent or ran something (``trace_graph.DONE_FACTS``: a window or page that merely came
+    up is never shown as done), never unclear, never one the user said was not theirs; the ids stay in the data,
     the page shows words only. Never a card, never spoken. Small reads (memory's ``done_evidence``, one per session of
     the row's thread, newest first, until one holds a checked task)."""
     fn = getattr(memory, "done_evidence", None)
@@ -2648,7 +2649,8 @@ TODO_TABLES = ("todos", "conversation_facts", "open_loops")
 PAGE_TABLES: dict[str, tuple[str, ...]] = {
     # Home's Your list follows Work's split (report 69): who owes what and what you moved to the list are work_items
     "home": ("questions", "nudges", "timeline", "goals", "contacts", "calls", *TODO_TABLES, "work_items"),
-    "work": ("timeline", *TODO_TABLES, "work_items", "messages"),   # the Work page (4 Oct): replies, loops, meetings
+    # the Work page (4 Oct): replies, loops, meetings; capC6: a thread's checked evidence line reads ui_tasks
+    "work": ("timeline", *TODO_TABLES, "work_items", "messages", "ui_tasks"),
     "day": ("timeline", "calls", "ui_tasks"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
     "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),

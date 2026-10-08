@@ -199,3 +199,50 @@ def test_a_check_in_about_a_thread_still_sees_its_week_on_a_busy_day(store):
     assert len(m.done) == C.DONE_LINES                                 # still capped
     for left in ("unclear", "rejected", "plain_old"):
         assert f"T{ids[left]}" not in offered, left
+
+
+# -- second verification (report 101, Second verification) ----------------------------------------------------------
+
+
+def test_the_work_page_rebuilds_when_its_tasks_change(store):
+    """V2: Work's evidence line reads ui_tasks, so a new task or one the user rejects moves Work's stamps, and a
+    correction on Day refreshes Work too."""
+    from yuki.ui import web_window
+
+    assert "ui_tasks" in W.PAGE_TABLES["work"]
+    client = MemoryClient(store)
+    before = W.page_stamps(client, "work")
+    tid = task(store, at("10:05"), "You saved the planting plan", [SAVE], outcome="file_saved")
+    written = W.page_stamps(client, "work")
+    T.correct_task(store, tid, "not_mine")
+    rejected = W.page_stamps(client, "work")
+    assert before is not None and len({before, written, rejected}) == 3
+
+    class Mem:
+        def task_correct(self, ref: str, verdict: str, words: str = "") -> dict[str, Any]:
+            return {"ok": True, "verdict": verdict, "goal": ""}
+
+        def task_correct_undo(self, ref: str) -> dict[str, Any]:
+            return {"ok": True}
+
+    win = web_window.WebWindow.__new__(web_window.WebWindow)
+    win.memory = Mem()
+    refreshed: list[str] = []
+    win.refresh = lambda name, *a, **k: refreshed.append(name)
+    win.a_task_correct({"ref": f"task:{tid}", "verdict": "not_mine"})
+    win.a_task_correct_undo({"ref": f"task:{tid}"})
+    assert refreshed.count("work") == 2 and refreshed.count("day") == 2
+
+
+def test_a_window_that_came_up_is_never_shown_as_done(store):
+    """V3: on the Work page and in the check-ins, only what was made, sent or run counts as done."""
+    task(store, at("10:05"), "You opened the planting plan", [SAVE], outcome="window_verified")
+    task(store, at("10:15"), "You got to the seed swap page", [NEXT], outcome="page_reached")
+    worked = [["Garden planner", 60, "thread:7"]]
+    W.worked_evidence(MemoryClient(store), worked, SESSIONS[:1], THREADS[:1], at("15:00"))
+    assert worked == [["Garden planner", 60, "thread:7"]]
+    saved = task(store, at("10:30"), "You saved the planting plan", [SAVE], outcome="file_saved")
+    W.worked_evidence(MemoryClient(store), worked, SESSIONS[:1], THREADS[:1], at("15:00"))
+    assert worked[0][3]["ref"] == f"task:{saved}"
+    p = C.CHECKIN_PROMPT
+    assert "made, sent or ran" in p and "page reached" not in p.split("WHAT THEY GOT DONE")[1][:600]

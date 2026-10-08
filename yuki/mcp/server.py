@@ -632,7 +632,10 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
             def body() -> tuple[str, Window | None]:
                 window = resolve_range(since, until, default_today=True)
                 client = memory.client()
-                result = client.trace_tasks_between(window.since_ts, window.until_ts, limit=int(limit))
+                # only `until` given: the Covers line says "everything before", so read from the start (the client's
+                # own default is that day's midnight); "more" tells Claude to narrow (second verification V4)
+                lo = window.since_ts if window.since_ts is not None else 0.0
+                result = client.trace_tasks_between(lo, window.until_ts, limit=int(limit))
                 return f"{describe(window)}\n{_format_tasks(result)}", window
 
             return run("get_tasks", {"since": since, "until": until}, body)

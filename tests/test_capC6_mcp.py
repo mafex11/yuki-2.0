@@ -152,3 +152,17 @@ def test_get_tasks_default_is_today_and_empty_says_how_it_learns(store, tmp_path
     finally:
         memory.close()
     assert out.startswith("Covers: ") and "0 tasks" in out and "No tasks in this range." in out
+
+
+def test_get_tasks_with_only_until_reads_everything_before_it(store, tmp_path):
+    """Second verification V4: the Covers line says 'everything before'; the read must not stop at that day's
+    midnight."""
+    reports = three_reports(store)                                    # NOW, NOW + 1 day, NOW + 2 days
+    server, memory = _server(store, tmp_path)
+    try:
+        out = _text(asyncio.run(server.call_tool("get_tasks", {"until": _iso(NOW + 2 * 86400 + 3600)})))
+    finally:
+        memory.close()
+    assert out.splitlines()[0].startswith("Covers: everything before ")
+    assert "3 tasks, oldest first" in out and "No tasks in this range" not in out
+    assert len(reports) == 3

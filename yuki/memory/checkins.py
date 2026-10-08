@@ -181,7 +181,8 @@ GOAL_LINES = 8
 THREADS_IN_PLAY = 5
 TEXT_MAX_CHARS = 300
 MAX_OUTPUT_TOKENS = 800
-#: capC6: WHAT THEY GOT DONE - tasks the PC checked as done (a file saved, typed text sent ...) from the last day, and
+#: capC6: WHAT THEY GOT DONE - tasks whose outcome the PC checked as made, sent or run (``trace_graph.DONE_FACTS``: a
+#: file saved, typed text sent ...; never a window or page that merely came up) from the last day, and
 #: for a moment about a thread of work, that thread's from the last week; at most this many lines.
 DONE_WITHIN_S = 24 * 3600.0
 DONE_THREAD_S = 7 * 86400.0
@@ -254,8 +255,10 @@ GOALS does not have (then goal_text: the goal in their own words when they said 
 work; goal_scope: day, thread or project; goal_thread: its W id or ""); "none" when it asks what the goal is (an \
 open "what are you going for today?") or is about how they are.
 - evidence: the ids of the lines it rests on, including at least one of the lines this moment names.
-- WHAT THEY GOT DONE, when given, is what the PC itself checked they finished (a file saved, typed text sent, a \
-page reached, a command that worked), each with its time and a T id. It is a dot to connect, never a check-in on \
+- WHAT THEY GOT DONE, when given, is what the PC itself checked they made, sent or ran (a file saved, typed text \
+sent, something pasted in and sent, a command that worked), each with its time and a T id. The PC checked only that \
+step (after the colon); the words before it are Yuki's reading of the task, so never say the whole of that task or \
+goal is finished because of it. It is a dot to connect, never a check-in on \
 its own: when one bears on their goal you may cite its T id and name it plainly with its time ("You saved the \
 planting plan at 4 PM - is the garden layout done, or more to go?"). Never ask whether that step itself got done \
 (the PC saw it).
@@ -1615,11 +1618,12 @@ class CheckinWorker:
     def _done_lines(self, m: Moment, now: float, safe: Callable[[Any, int], str]) -> list[str]:
         """capC6 (report 78 §12, C6): what the PC checked the user got done lately, as evidence a check-in may cite
         (``T`` ids; ``m.done`` keeps each one's real task and action ids). Only learnable tasks
-        (:func:`yuki.memory.trace_graph.done_evidence`: a recorded outcome, never unclear, never one the user said was
-        not theirs): the last :data:`DONE_WITHIN_S`, and for a moment about a thread of work, that thread's within
-        :data:`DONE_THREAD_S` too (a task belongs to the thread most of the journal entries in its span belong to; read
-        on its own, so newer tasks elsewhere never crowd it out, and listed before the rest when lines run short). At
-        most :data:`DONE_LINES`. Nothing with recording off; never raises."""
+        (:func:`yuki.memory.trace_graph.done_evidence`: a recorded outcome that made, sent or ran something, never
+        unclear, never one the user said was not theirs): the last :data:`DONE_WITHIN_S`, and for a moment about a
+        thread of work, that thread's within :data:`DONE_THREAD_S` too (a task belongs to the thread most of the
+        journal entries in its span belong to; read on its own, so newer tasks elsewhere never crowd it out, and listed
+        before the rest when lines run short). At most :data:`DONE_LINES`. Reads the stored tasks as they are (an
+        install that never recorded has none; turning recording off stops new ones only); never raises."""
         from yuki.memory import trace_graph
         from yuki.memory.workboard import session_threads
 

@@ -508,7 +508,7 @@ def test_the_window_ops_correct_and_undo_through_memory(tmp_path):
         "ref": "task:4", "verdict": "renamed", "goal": "You paid the bill"}
     assert win.a_task_correct_undo({"ref": "task:4"})["goal"] == "You sent the plan"
     assert calls == [("correct", "task:4", "renamed", "You paid the bill"), ("undo", "task:4")]
-    assert refreshed == ["day", "day"]
+    assert refreshed == ["day", "work", "day", "work"]   # capC6: Work's evidence line reads tasks too
     assert {"task_correct", "task_correct_undo"} <= set(web_window.WebWindow.ACTIONS)
 
 

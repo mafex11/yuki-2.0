@@ -351,3 +351,73 @@ def test_in_app_can_skip_the_families_a_caller_already_read(store):
     three_reports(store)
     F.refresh(store, Words(), now=NOW + 3 * DAY)
     assert G.in_app(store, "chatter")["families"] and G.in_app(store, "chatter", with_families=False)["families"] == []
+
+
+# -- second verification (report 101, Second verification) ----------------------------------------------------------
+
+
+def test_a_rejected_label_stays_hidden_after_its_task_row_expired(store):
+    """V1: the rejected task's row goes after 30 days, the family stays 90: its goal is never shown as the label."""
+    from yuki.memory import trace_store
+
+    a = task(store, NOW, "You sent the weekly report to the team", [ATTACH, FILE, SEND], outcome="field_submitted")
+    F.refresh(store, Words(), now=NOW + 100)
+    trace_store.purge(store, now=NOW + 31 * DAY)                       # a's row expires, its member stays
+    assert store._query("SELECT count(*) FROM ui_tasks WHERE id = ?", (a,))[0][0] == 0
+    b = task(store, NOW + 31 * DAY + 600, "You sent the weekly report to the team for Mirela Voss",
+             [ATTACH, FILE, SEND], outcome="field_submitted")
+    F.refresh(store, Words(), now=NOW + 31 * DAY + 700)
+    fid = _family_of(store, b)
+    assert G.families(store, app="chatter")[0]["label"].endswith("Mirela Voss")
+    T.correct_task(store, b, "not_mine")
+    F.refresh(store, Words(), now=NOW + 31 * DAY + 800)
+    assert G.families(store, app="chatter")[0]["label"] == ""          # hidden while b's row lives
+    trace_store.purge(store, now=NOW + 62 * DAY)                       # b's row expires, the family stays
+    assert store._query("SELECT count(*) FROM ui_tasks WHERE id = ?", (b,))[0][0] == 0
+    fams = G.families(store, app="chatter")
+    assert [f["id"] for f in fams] == [fid] and fams[0]["label"] == ""
+    assert "Mirela" not in json.dumps(fams)
+
+
+def test_done_evidence_is_only_what_was_made_sent_or_run(store):
+    """V3: a window or page that came up, a file opened, an item picked, a setting switched: never 'done'."""
+    step = ("drawer", "click", "Button", "Go", "k-go", None)
+    kinds = ["window_verified", "page_reached", "file_opened", "selected", "toggle_state",
+             "file_saved", "field_submitted", "paste_sent", "command_ok"]
+    ids = {k: task(store, NOW + i * 120, f"You did garden step {k}", [step], outcome=k) for i, k in enumerate(kinds)}
+    ev = G.done_evidence(store, NOW - 60, NOW + DAY)
+    assert sorted(e["fact"] for e in ev) == sorted(G.DONE_FACTS)
+    assert {e["task"] for e in ev} == {ids[k] for k in G.DONE_FACTS}
+    assert set(G.DONE_FACTS) <= set(T.FACT_KINDS)
+    # tasks_between still lists every checked outcome as checked (it says what happened, not that it was finished)
+    assert sum(t["checked"] for t in G.tasks_between(store, NOW - 60, NOW + DAY)["tasks"]) == len(kinds)
+
+
+def test_a_branch_past_a_cut_path_says_later_on(store):
+    """V5: 20 usual steps cut at 16; a branch after usual step 19 is never 'after step 16'."""
+    nodes = [{"k": f"pad|keys|Ctrl+{i}", "n": 3} for i in range(20)]
+    variants = [{"after": 18, "keys": ["pad|keys|Alt+1"], "attrs": [{}], "n": 1},
+                {"after": 15, "keys": ["pad|keys|Alt+2"], "attrs": [{}], "n": 1},
+                {"after": 2, "keys": ["pad|keys|Alt+3"], "attrs": [{}], "n": 1}]
+    f = {"id": 999_999, "label_ciphertext": None, "label_task": None, "n_tasks": 3, "apps": '["pad"]',
+         "path_keys": json.dumps(nodes), "variants_keys": json.dumps(variants), "vec_ciphertext": None,
+         "last_at": NOW, "path_n": 3}
+    view = G.family_view(store, f, follow=False)
+    assert len(view["steps"]) == G.MAX_STEPS
+    assert [b["where"] for b in view["branches"]] == ["later on", "after step 16", "after step 3"]
+
+
+def test_followed_by_needs_a_habit_never_one_occurrence(store):
+    """V6: 'usually followed by' only when seen at least twice and at least half the times."""
+    paste = ("notes", "paste", "Edit", None, "k-note", None)
+    copy = ("You copied the seed list", [ATTACH, FILE], "selected")
+    then = ("You pasted the seed list into your notes", [paste], "field_submitted")
+    first = [window_tasks(store, NOW, [copy, then])[0], window_tasks(store, NOW + DAY, [copy])[0],
+             window_tasks(store, NOW + 2 * DAY, [copy])[0]]
+    F.refresh(store, Words(), now=NOW + 3 * DAY)
+    assert G.next_after_task(store, first[0])["followed_by"] == []      # 1 of 3: not a habit
+    assert G.families(store, app="chatter")[0]["followed_by"] == []
+    window_tasks(store, NOW + 3 * DAY, [copy, then])
+    F.refresh(store, Words(), now=NOW + 4 * DAY)
+    got = G.next_after_task(store, first[0])["followed_by"]
+    assert [(x["n"], x["of"]) for x in got] == [(2, 4)] and got[0]["label"].startswith("You pasted")
