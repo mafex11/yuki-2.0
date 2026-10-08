@@ -409,6 +409,9 @@ class Expect:
     #: A dialog came up after this step in the recordings (``None``: no recording - a dialog is on the path only when
     #: the next step acts inside it).
     dialog: bool | None = None
+    #: A new top-level window came to the front after this step in the recording (second verification N4: kept apart
+    #: from a dialog - it never lets an owned window through).
+    new_window: bool = False
     recorded: bool = False
 
 
@@ -532,6 +535,37 @@ def recall_rid(session: str, step: SkillStep, hwnd: int, app: str, elements: lis
     return hits[0] if len(hits) == 1 else None
 
 
+def hosted_app(hwnd: int, pid: int) -> str:
+    """Second verification N2: the process a UWP frame window (``ApplicationFrameWindow``) hosts ("SystemSettings.exe"
+    for Settings), ``""`` for any other window or when it cannot be told. Machine facts from Windows only: the window
+    must still belong to ``pid`` (the window list's), and :func:`yuki.memory.extract.uia.content_pid` - the trace's own
+    reading - names a different process as its content. Enumerates a frame's child windows; sends no messages."""
+    if not hwnd or not pid:
+        return ""
+    try:
+        import win32process
+
+        from yuki.memory.extract.uia import content_pid, process_name
+
+        if int(win32process.GetWindowThreadProcessId(int(hwnd))[1]) != int(pid):
+            return ""
+        other = int(content_pid(int(hwnd)) or 0)
+        return process_name(other) if other and other != int(pid) else ""
+    except Exception:  # noqa: BLE001 - not known: the window's own process
+        return ""
+
+
+def app_words(app: str) -> str:
+    """An app as the user is told of it (second verification N2: never a process file name): its display name from
+    the process name as people say it (``yuki.core.appnames.prettify``: "chrome.exe" -> "Chrome")."""
+    try:
+        from yuki.core.appnames import prettify
+
+        return prettify(str(app or "")) or str(app or "")
+    except Exception:  # noqa: BLE001
+        return str(app or "")
+
+
 def page_host(tree: dict[str, Any] | None) -> str:
     """The site of the web page a read shows (its Document's address, host only, ``www.`` off), ``""`` when none:
     a machine fact of the window, compared host to host (never titles)."""
@@ -573,6 +607,16 @@ class SkillRunner:
         self._pick_host = ""
         #: The run's takeover watch (report 63), looked at inside every wait and just before every action.
         self._watch: Any = None
+        #: Second verification N1: no RuntimeId re-find in a run that picks an item by the user's words.
+        self._no_rid = False
+        #: Second verification N3/N5, per run: the windows open just before the step before this one began, what its
+        #: path said, and the window its own measured report saw come to the front (``None``: none).
+        self._prev_pre: set[int] | None = None
+        self._prev_exp: Expect | None = None
+        self._prev_brought: int | None = None
+        self._brought: int | None = None
+        #: Second verification N2: the app a UWP frame window hosts, per window, for this run.
+        self._hosted: dict[int, str] = {}
 
     def _stop_if_taken(self) -> None:
         """Raise :class:`_TakenOver` when the user took over (review F3: checked inside each step, not only between
@@ -619,9 +663,18 @@ class SkillRunner:
                           "process_name": str((out.get(owner) or {}).get("process_name") or ""), "unlisted": True}
         return out
 
-    @staticmethod
-    def _app_of(window: dict[str, Any] | None) -> str:
-        return str((window or {}).get("process_name") or (window or {}).get("app") or "")
+    def _app_of(self, window: dict[str, Any] | None) -> str:
+        """The app a window of the window list shows: its process, except for a UWP frame (second verification N2),
+        whose hosted app's process it is - the way the trace records it (``trace._window_pid``), so a way learned in
+        Settings is compared with Settings, never with the frame's host."""
+        w = window or {}
+        own = str(w.get("process_name") or w.get("app") or "")
+        hwnd, pid = int(w.get("hwnd") or 0), int(w.get("pid") or 0)
+        if not hwnd or not pid:
+            return own
+        if hwnd not in self._hosted:
+            self._hosted[hwnd] = hosted_app(hwnd, pid)
+        return self._hosted[hwnd] or own
 
     def _in_way(self, app: str, apps: list[str]) -> bool:
         from yuki.memory.store import app_key
@@ -715,12 +768,17 @@ class SkillRunner:
             hits = [e for e in hits if e.get("is_interactive", True)] or hits
         if len(hits) == 1:
             return hits[0], "name", 1
-        # several fit: the RuntimeId only chooses among them; none fits: the very control, its name still bearing the
-        # one it had (review F2: never a control whose name flipped)
-        again = recall_rid(self._session, step, hwnd, app, hits or elements)
+        if hits:
+            # several fit: the target is ambiguous and the run stops (second verification N1: the RuntimeId is a
+            # re-find, never a tie-break - the control an earlier request of the session used may be another row's)
+            return None, "", len(hits)
+        # none fits by name: the very control this step acted on earlier in the session, its name still bearing the one
+        # it had (review F2: never a control whose name flipped); never in a run that picks by the user's words (N1:
+        # the controls after such a pick belong to the item picked now)
+        again = None if self._no_rid else recall_rid(self._session, step, hwnd, app, elements)
         if again is not None:
             return again, "rid", 1
-        return None, "", len(hits)
+        return None, "", 0
 
     def _find(self, step: SkillStep, apps: list[str], wait_s: float, exp: Expect | None = None) -> Located:
         """The step's control in a fresh read (waits up to ``wait_s`` for it): :class:`Located` ``found`` in a
@@ -855,16 +913,13 @@ class SkillRunner:
                         return "no_digest", None, 0
                     hits = [e for e, d in zip(cands, digests) if step.item and d.casefold().startswith(
                         step.item.casefold())]
-                if not hits and not step.slot:
+                if not hits and not step.slot and not self._no_rid:
                     # capC5 anchor 4: the very item this step picked earlier in this session, by its RuntimeId (its name
                     # may have grown since: an unread count), in the same window of the same app; never for a pick by
-                    # the user's words (review F1: that must match the name said now)
+                    # the user's words (review F1: that must match the name said now), nor in a run that has one (N1).
+                    # Several fitting is never settled by it (N1: a re-find, not a tie-break): that stops as "many"
                     again = recall_rid(self._session, step, hwnd, app, cands)
                     hits = [again] if again is not None else []
-                elif len(hits) > 1 and not step.slot:
-                    # several fit: the RuntimeId only chooses among them
-                    again = recall_rid(self._session, step, hwnd, app, hits)
-                    hits = [again] if again is not None else hits
                 if len(hits) > 1:
                     return "many", None, len(hits)
                 if len(hits) == 1 and (step.box_digest or inside(hits[0])):
@@ -981,10 +1036,11 @@ class SkillRunner:
         return "as when you did it" if exp is not None and exp.recorded else "where this way works"
 
     def _elsewhere_words(self, target: str, loc: Located, exp: Expect | None) -> str:
+        seen = app_words(loc.seen_app)
         if loc.why == "window":
-            return f"{target} was in another {loc.seen_app or 'app'} window, not the one this way was working in"
-        where = ", ".join(sorted(exp.apps)) if exp is not None and exp.apps else "the way's app"
-        return f"{target} was only in {loc.seen_app or 'another app'}, not in {where} {self._as_done(exp)}"
+            return f"{target} was in another {seen or 'app'} window, not the one this way was working in"
+        where = ", ".join(app_words(a) for a in sorted(exp.apps)) if exp is not None and exp.apps else "the way's app"
+        return f"{target} was only in {seen or 'another app'}, not in {where} {self._as_done(exp)}"
 
     def _page_off(self, exp: Expect | None, host: str) -> tuple[str, str] | None:
         """A different web page than the recording: the site of the window's page (its Document's address) against
@@ -996,7 +1052,11 @@ class SkillRunner:
         return "page", f"a different site was open ({site(host)}, not {exp.host} {self._as_done(exp)})"
 
     def _dialog_off(self, hwnd: int | None) -> tuple[str, str] | None:
-        """A dialog came up after the step before (a way with no recording) and this step is not inside it."""
+        """A dialog came up after the step before (a way with no recording) and this step is not inside it; or one came
+        up after the step before was looked at (:meth:`_late_dialog`, second verification N3)."""
+        late = self._late_dialog(hwnd)
+        if late is not None:
+            return late
         if not self._dialogs:
             return None
         windows = self._windows(self._overview())
@@ -1079,6 +1139,9 @@ class SkillRunner:
             if verdict is not None:
                 return held(verdict, target)
             self._stop_if_taken()   # review F3: the user took over while it looked or was checked: nothing done
+            late = self._late_dialog(hwnd)   # second verification N3: a dialog that came up while it was checked
+            if late is not None:
+                return off_path(late[0], late[1], target, "nothing was clicked")
             try:
                 lead = self.hands._front(hwnd)
             except Exception as exc:  # noqa: BLE001 - the hands' refusal: could not bring it up
@@ -1087,6 +1150,7 @@ class SkillRunner:
                             deviation="window")
             self._stop_if_taken()
             outcome = self._dispatch("click", {"element": element["id"], "read": read, "expect_hwnd": hwnd})
+            self._saw_front(outcome)
             verdict, why = action_verdict("click", outcome)
             role = str(element.get("role") or step.role or "control")
             if outcome.ok:
@@ -1126,6 +1190,9 @@ class SkillRunner:
             if verdict is not None:
                 return held(verdict, target)
             self._stop_if_taken()   # review F3: the user took over while it looked or was checked: nothing done
+            late = self._late_dialog(hwnd)   # second verification N3
+            if late is not None:
+                return off_path(late[0], late[1], target, "nothing was picked")
             try:
                 lead = self.hands._front(hwnd)
             except Exception as exc:  # noqa: BLE001
@@ -1134,6 +1201,7 @@ class SkillRunner:
                             deviation="window")
             self._stop_if_taken()
             outcome = self._dispatch("click", {"element": element["id"], "read": read, "expect_hwnd": hwnd})
+            self._saw_front(outcome)
             verdict, why = action_verdict("click", outcome)
             if outcome.ok:
                 remember_rid(self._session, step, hwnd, app, element)   # capC5 anchor 4, this session only
@@ -1159,7 +1227,11 @@ class SkillRunner:
             if check is not None:
                 return held(check, field_name)
             self._stop_if_taken()
+            late = self._late_dialog(hwnd)   # second verification N3
+            if late is not None:
+                return off_path(late[0], late[1], field_name, "nothing was typed")
             outcome = self._dispatch("type_text", {"text": step.text, **({"expect_hwnd": hwnd} if hwnd else {})})
+            self._saw_front(outcome)
             verdict, why = action_verdict("type_text", outcome)
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="type_text",
                         target=field_name, app=app, hwnd=hwnd, report=f"typed into {field_name}: {outcome.summary}")
@@ -1171,28 +1243,36 @@ class SkillRunner:
             mine = front == start_front or front in opened
             in_app = (bool(app) and self._in_way(app, sorted(exp.apps))) if exp is not None and exp.apps else (
                 self._in_way(app, apps) if apps else mine)
+            said_app = app_words(app)
             if not front or not in_app:
-                return done(ok=False, verdict=False, kind="read", tool="hotkey", target=f"window {app or front}",
+                return done(ok=False, verdict=False, kind="read", tool="hotkey", target=f"window {said_app or front}",
                             why="the window in front is not the way's app", deviation="window",
-                            report=f"the window in front is {app or 'unknown'}, not one the way acts in; no key sent",
-                            different=f"{app or 'another app'} was in front, not the app the shortcut is for")
-            # capC5 (report 78 §7.3): a shortcut goes only into the app's verified window - one this run acted in, one
-            # that came up during it, or the one in front when it began (before any step acted)
-            verified = (front in self._acted or front in opened or front not in self._before_run
-                        or (not self._acted and front == start_front))
+                            report=f"the window in front is {said_app or 'unknown'}, not one the way acts in; no key "
+                                   f"sent",
+                            different=f"{said_app or 'another app'} was in front, not the app the shortcut is for")
+            # capC5 (report 78 §7.3): a shortcut goes only into the app's verified window - one this run acted in or
+            # opened, the one in front when it began (before any step acted), a window owned by one it acted in, or
+            # (second verification N5) one the step just before brought to the front by its own measured report, when
+            # that step's recording allows a window change. A window that came up by itself is not verified.
+            verified = (front in self._acted or front in opened or (not self._acted and front == start_front)
+                        or self._owned_by_acted(front) or self._brought_by_prev(front))
             if not verified:
-                return off_path("window", f"a {app} window this way had not worked in was in front",
-                                f"window {app or front}", "no key was sent")
-            off = self._where_off(front, app, exp, f"the {app} window in front")
+                return off_path("window", f"a {said_app} window this way had not worked in was in front",
+                                f"window {said_app or front}", "no key was sent")
+            off = self._where_off(front, app, exp, f"the {said_app} window in front")
             if off is not None:
-                return off_path(off[0], off[1], f"window {app or front}", "no key was sent")
+                return off_path(off[0], off[1], f"window {said_app or front}", "no key was sent")
             title = str((window or {}).get("title") or "")
             check = self._held("hotkey", {"hwnd": front, "keys": list(step.keys)},
                                {"hwnd": front, "app": app, "title": title})
             if check is not None:
                 return held(check, f'keys in "{title[:60]}"')
             self._stop_if_taken()
+            late = self._late_dialog(front)   # second verification N3
+            if late is not None:
+                return off_path(late[0], late[1], f"window {said_app or front}", "no key was sent")
             outcome = self._dispatch("hotkey", {"keys": list(step.keys), "expect_hwnd": front})
+            self._saw_front(outcome)
             verdict, why = action_verdict("hotkey", outcome)
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="hotkey",
                         target=f'keys in "{str((window or {}).get("title") or "")[:60]}"', app=app, hwnd=front,
@@ -1216,6 +1296,7 @@ class SkillRunner:
                 # capC5: the replay guard holds a scroll to the way's path too (its app, its window, the dialog)
                 off = self._where_off(hwnd, self._app_of(self._windows(payload).get(hwnd)), exp,
                                       "the window in front") if exp is not None and exp.recorded else None
+                off = off or self._late_dialog(hwnd)   # second verification N3
                 if off is not None:
                     return off_path(off[0], off[1], f"window {hwnd}", "nothing was scrolled")
                 self._stop_if_taken()
@@ -1321,6 +1402,10 @@ class SkillRunner:
         after_open = False
         self._earlier = []
         self._acted, self._last_hwnd, self._before_run, self._dialogs = set(), None, set(before), {}
+        self._prev_pre, self._prev_exp, self._prev_brought, self._brought = None, None, None, None
+        self._hosted = {}
+        # second verification N1: a run that picks an item by the user's words never re-finds a control by RuntimeId
+        self._no_rid = any(s.do == "pick" and s.slot for s in steps)
         part_before = ("", "")
         watch = self._watch = self._watch_takeover()
 
@@ -1343,6 +1428,7 @@ class SkillRunner:
                     part_before = ("", self._app_title(str(ends[n][1].get("app") or "")))
                 exp = expects[n] if n < len(expects) else None
                 pre = set(self._windows(self._overview()))
+                self._brought = None
                 try:
                     result = self._step(step, apps=apps, first=n == 0, after_open=after_open,
                                         start_front=start_front, opened=opened, exp=exp)
@@ -1368,6 +1454,8 @@ class SkillRunner:
                     if off is not None:
                         result.deviation, result.different = "dialog", off
                         result.why += f"; then {off}"
+                # second verification N3/N5: what the next step checks a late dialog and a new window against
+                self._prev_pre, self._prev_exp, self._prev_brought = pre, exp, self._brought
                 if self._run_rest(n, step, steps, result, results, ends, part_before) is not None:
                     deviation = results[-1]
                     break
@@ -1441,19 +1529,17 @@ class SkillRunner:
             except Exception:  # noqa: BLE001 - no path: what the way names
                 path = {}
         recorded = [s if isinstance(s, dict) else {} for s in path.get("steps") or []] if path.get("recorded") else []
-        dialog_apps = {str(a) for a in path.get("dialog_apps") or []}
         out: list[Expect] = []
         for n, step in enumerate(steps):
             rec = recorded[n + skipped] if 0 <= n + skipped < len(recorded) else {}
             if rec.get("known"):
                 app = str(rec.get("app") or "")
+                # second verification N4: an owned window after the step is on the path only when the recording of
+                # this very step had one (a Windows dialog, or an app's own modal window the trace saw was owned); a
+                # new top-level window recorded, or a dialog elsewhere in the app's recordings, never allows one
                 out.append(Expect(apps=frozenset({app}) if app else way_apps, host=str(rec.get("host") or ""),
-                                  same_window=bool(rec.get("same_window")),
-                                  # review F7: an app's own modal window was recorded as a window change, not as a
-                                  # Windows dialog: either allows an owned window after the step on replay
-                                  dialog=bool(rec.get("dialog")) or bool(rec.get("new_window"))
-                                  or (bool(app) and app in dialog_apps),
-                                  recorded=True))
+                                  same_window=bool(rec.get("same_window")), dialog=bool(rec.get("dialog")),
+                                  new_window=bool(rec.get("new_window")), recorded=True))
                 continue
             own = app_key(step.app) if step.do == "pick" and step.app else ""
             out.append(Expect(apps=frozenset({own}) if own else way_apps))
@@ -1488,21 +1574,9 @@ class SkillRunner:
         recordings showed one (or a window change) after this step; never, when they recorded none; for a way with no
         recording, only when the next step acts inside it (checked then; after the last step it is left to the step's
         expectation and the part's end - review F5). Returns what was different, or ``None``."""
-        from yuki.memory.store import app_key
-
         windows = self._windows(self._overview())
-        mine = self._acted | ({self._last_hwnd} if self._last_hwnd else set())
-
-        def of_way(w: dict[str, Any]) -> bool:
-            owner, hops = int(w.get("owner_hwnd") or 0), 0
-            while owner and hops < 4:   # a dialog of a dialog of a window acted in
-                if owner in mine:
-                    return True
-                owner, hops = int((windows.get(owner) or {}).get("owner_hwnd") or 0), hops + 1
-            key = app_key(self._app_of(w)) if self._app_of(w) else ""
-            return bool(exp is not None and exp.apps and key and key in exp.apps)
-
-        new = {h: w for h, w in windows.items() if h not in pre and int(w.get("owner_hwnd") or 0) and of_way(w)}
+        new = {h: w for h, w in windows.items() if h not in pre and int(w.get("owner_hwnd") or 0)
+               and self._of_way(w, windows, exp)}
         if not new:
             return None
         if exp is not None and exp.dialog is True:
@@ -1515,6 +1589,87 @@ class SkillRunner:
             return None
         self._dialogs = new   # the next step must act inside it
         return None
+
+    def _saw_front(self, outcome: Any) -> None:
+        """Second verification N5: the window this step's own measured report saw come to the front (report 58's
+        account: ``foreground_changed`` with the new ``foreground_hwnd``), kept for the next step."""
+        payload = getattr(outcome, "payload", None)
+        payload = payload if isinstance(payload, dict) else {}
+        if isinstance(payload.get("type_text"), dict):
+            payload = payload["type_text"]
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        if details.get("foreground_changed") is True and details.get("foreground_hwnd"):
+            try:
+                self._brought = int(details["foreground_hwnd"])
+            except (TypeError, ValueError):
+                self._brought = None
+
+    def _owned_by_acted(self, hwnd: int) -> bool:
+        """Whether ``hwnd`` is owned (through at most 4 owners) by a window this run acted in."""
+        windows = self._windows(self._overview())
+        owner, hops = int((windows.get(int(hwnd)) or {}).get("owner_hwnd") or 0), 0
+        while owner and hops < 4:
+            if owner in self._acted:
+                return True
+            owner, hops = int((windows.get(owner) or {}).get("owner_hwnd") or 0), hops + 1
+        return False
+
+    def _brought_by_prev(self, hwnd: int) -> bool:
+        """Second verification N5: ``hwnd`` came up during the step just before (not open when it began) and that
+        step's own report saw it come to the front; when that step was recorded, its recording had a window change
+        after it too (a new window or a dialog). With no recording, the report's own fact decides."""
+        if not hwnd or self._prev_brought != int(hwnd) or self._prev_pre is None or int(hwnd) in self._prev_pre:
+            return False
+        exp = self._prev_exp
+        return exp is None or not exp.recorded or bool(exp.new_window) or exp.dialog is True
+
+    def _of_way(self, w: dict[str, Any], windows: dict[int, dict[str, Any]], exp: Expect | None) -> bool:
+        """Whether an owned window is this way's: owned (through at most 4 owners) by a window this run acted in, or
+        of the app the step's path names (review F4: another app's popup elsewhere is not the way's)."""
+        from yuki.memory.store import app_key
+
+        mine = self._acted | ({self._last_hwnd} if self._last_hwnd else set())
+        owner, hops = int(w.get("owner_hwnd") or 0), 0
+        while owner and hops < 4:   # a dialog of a dialog of a window acted in
+            if owner in mine:
+                return True
+            owner, hops = int((windows.get(owner) or {}).get("owner_hwnd") or 0), hops + 1
+        key = app_key(self._app_of(w)) if self._app_of(w) else ""
+        return bool(exp is not None and exp.apps and key and key in exp.apps)
+
+    def _late_dialog(self, hwnd: int | None) -> tuple[str, str] | None:
+        """Second verification N3: a dialog that came up after the step before was looked at (its one look missed it),
+        checked just before this step acts: an owned window not open before the step before began nor before the run,
+        that this step would act in, or that is in front and is the way's. On the path when the step before's
+        recording had a dialog; off it when the recording had none; for a way with no recording, only when this step
+        acts inside it. Machine facts only (window identity and owner). ``(code, what was different)`` or ``None``."""
+        if self._prev_pre is None:
+            return None
+        payload = self._overview()
+        windows = self._windows(payload)
+        front = int(payload.get("foreground_hwnd") or 0)
+        seen = self._prev_pre | self._before_run
+
+        def late(h: int) -> bool:
+            w = windows.get(h)
+            return bool(h) and w is not None and h not in seen and bool(int(w.get("owner_hwnd") or 0))
+
+        act = int(hwnd or 0)
+        found = [h for h in dict.fromkeys((act, front)) if late(h)
+                 and (h == act or self._of_way(windows[h], windows, self._prev_exp))]
+        if not found:
+            return None
+        exp = self._prev_exp
+        if exp is not None and exp.dialog is True:
+            return None
+        title = next((_words(windows[h].get("title")) for h in found if _words(windows[h].get("title"))), "")
+        said_title = f" (\"{title[:50]}\")" if title else ""
+        if exp is not None and exp.dialog is False:
+            return "dialog", f"a dialog came up{said_title} that never came up when you did it"
+        owner = int((windows.get(act) or {}).get("owner_hwnd") or 0)
+        if act and (act in found or owner in found):
+            return None
+        return "dialog", f"a dialog came up{said_title} that the way never goes through"
 
     def _watch_takeover(self) -> Any:
         """Report 63's takeover watch while the steps run (polls only while acting, no hook), or ``None``: the one

@@ -949,7 +949,9 @@ class TraceWorker:
         app_reason = self._app_reason(win)
         for act in self._acts:
             if act.t <= t <= max(act.t, act.up_t or act.last_t) + OUTCOME_S and act.fg_change is None:
-                act.fg_change = (t, None if app_reason else win.process)
+                # capC5 second verification N4: whether the window that came to the front is owned (a dialog, an app's
+                # own modal window) or a new top-level window - Windows' own fact, one cheap call
+                act.fg_change = (t, None if app_reason else win.process, _owned(hwnd))
         source = self._linked_source(t, INPUT_LINK_S)
         if source is not None and win.process and hwnd != self._fg.hwnd:
             act = self._new_act("switch", t, source, win, gap_ms=self._gap(t))
@@ -1353,6 +1355,9 @@ class TraceWorker:
                 counts["invoked"] += 1
         if act.fg_change is not None:
             counts["window_changed"] += 1
+            # capC5 second verification N4: the replay guard allows an owned window after this step on replay only when
+            # one came up here ("owned_window"); "top_window" says the new one was a top-level window
+            counts["owned_window" if len(act.fg_change) > 2 and act.fg_change[2] else "top_window"] += 1
             if act.fg_change[1]:
                 act.facts.setdefault("window_verified", act.fg_change[1])
         page_after = None
@@ -1661,6 +1666,17 @@ def _foreground() -> tuple[int, int]:
     hwnd = int(_U.GetAncestor(hwnd, _GA_ROOT) or hwnd) if hwnd else 0
     pids = _pids_behind(hwnd) if hwnd else ()
     return hwnd, pids[0] if pids else 0
+
+
+def _owned(hwnd: int) -> bool:
+    """capC5 second verification N4: whether ``hwnd`` has an owner window (``GetWindow(GW_OWNER)``): a dialog or an
+    app's own modal window does, a new top-level window does not. False when it is gone or cannot be told."""
+    try:
+        from yuki.perception.windows import owner_of
+
+        return bool(owner_of(int(hwnd))) if hwnd else False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _root_of(hwnd: int) -> int:

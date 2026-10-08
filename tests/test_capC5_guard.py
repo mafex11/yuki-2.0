@@ -57,6 +57,14 @@ class Desk5(Desk):
         payload["foreground_owner_hwnd"] = self.fg_owner
         return text, payload, ms
 
+    def dispatch(self, name: str, args: dict[str, Any]) -> Any:
+        # report 58's account as the real dispatcher gives it: the window in front after the action, and whether it
+        # changed (second verification N5 reads it)
+        before = self.front
+        out = super().dispatch(name, args)
+        out.payload["details"].update(foreground_changed=self.front != before, foreground_hwnd=self.front)
+        return out
+
     def authorize(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any], earlier: list[str],
                   force: bool = False) -> None:
         self.judged.append((tool, dict(tool_input), dict(target)))
@@ -113,7 +121,7 @@ def test_a_different_window_of_the_same_app_stops_and_hands_over():
     desk.effects[1] = lambda: setattr(desk, "front", 300)       # another sheets window comes to the front
     ok, report, facts = run(desk, way(btn("Reports"), btn("Export")))
     assert not ok and facts["deviated_at"] == 2 and facts["deviation"] == "window"
-    assert report.startswith('I stopped at step 2: Button "Export" was in another sheets window')
+    assert report.startswith('I stopped at step 2: Button "Export" was in another Sheets window')
     assert facts["handover"].startswith("I stopped at step 2:") and "skill_context" in facts
     assert clicks(desk) == [1]                                  # nothing clicked in the other window
 
@@ -123,7 +131,7 @@ def test_a_different_app_stops_and_hands_over():
     desk.effects[1] = lambda: setattr(desk, "front", 200)
     ok, report, facts = run(desk, way(btn("Reports"), btn("Export")))
     assert not ok and facts["deviation"] == "app"
-    assert 'I stopped at step 2: Button "Export" was only in notesy, not in sheets as when you did it' in report
+    assert 'I stopped at step 2: Button "Export" was only in Notesy, not in Sheets as when you did it' in report
     assert clicks(desk) == [1]
 
 

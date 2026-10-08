@@ -78,20 +78,25 @@ def test_a_toggle_whose_name_flipped_is_not_clicked_again_by_its_runtime_id():
     assert not ok and clicks(desk) == [5] and facts["deviation"] == "not_found"
 
 
-def test_a_count_added_to_the_name_is_still_the_same_control_and_rids_choose_among_several_matches():
+def test_a_count_added_to_the_name_is_still_the_same_control_and_several_matches_still_stop():
     step = S.SkillStep(i=1, do="click", role="Button", name="Inbox")
     S.remember_rid("s", step, 100, "mailer", {"runtime_id": [1, 2], "role": "Button", "name": "Inbox"}, now=NOW)
     grown = {"id": 5, "runtime_id": [1, 2], "role": "Button", "name": "Inbox 3 unread"}
     flipped = {"id": 5, "runtime_id": [1, 2], "role": "Button", "name": "Outbox"}
     assert S.recall_rid("s", step, 100, "mailer", [grown], now=NOW + 5) == grown
     assert S.recall_rid("s", step, 100, "mailer", [flipped], now=NOW + 5) is None
-    # several controls of that name: the RuntimeId only tells which
+    # several controls of that name: ambiguous, the run stops (second verification N1: the RuntimeId is a re-find,
+    # never a tie-break)
     windows = {100: {"title": "Sheets", "process_name": "sheets"}}
     desk = Desk5(windows, {100: [{**el(8, "Button", "Export"), "runtime_id": [9, 8]}]}, 100)
     ok, _r, _f = run(desk, way(btn("Export")))
     assert ok and clicks(desk) == [8]
     desk.trees[100] = [{**el(7, "Button", "Export"), "runtime_id": [9, 7]},
                        {**el(8, "Button", "Export"), "runtime_id": [9, 8]}]
+    ok, report, facts = run(desk, way(btn("Export")))
+    assert not ok and clicks(desk) == [8] and facts["deviation"] == "not_found" and "2 controls fit" in report
+    # one control, its name grown by a count: the RuntimeId finds it again
+    desk.trees[100] = [{**el(8, "Button", "Export 2 new"), "runtime_id": [9, 8]}]
     ok, _r, facts = run(desk, way(btn("Export")))
     assert ok and clicks(desk) == [8, 8] and "an earlier step of this session" in facts["results"][0].why
 
@@ -187,13 +192,21 @@ def test_after_a_switch_whose_report_could_not_tell_the_next_step_is_not_held_to
 
 # -- F7: an app's own modal window recorded as a window change ------------------------------------------------------------
 
-def test_an_owned_window_after_a_step_recorded_as_a_window_change_is_on_the_path():
-    path = path_of({**rec(), "new_window": True}, rec(same=True))
-    desk = sheets_desk(path, export_in=(101,), trees={100: [el(1, "Button", "Reports")]})
-    desk.effects[1] = lambda: (desk.windows.__setitem__(101, {"title": "Settings", "process_name": "sheets",
-                                                              "owner_hwnd": 100}), setattr(desk, "front", 101))
+def test_an_owned_window_after_a_step_recorded_as_an_owned_window_is_on_the_path():
+    # second verification N4: the trace now says the window that came up was owned (the way_path's "dialog"); a new
+    # top-level window recorded ("new_window") no longer lets an owned window through
+    def desk_for(path: dict[str, Any]) -> Desk5:
+        desk = sheets_desk(path, export_in=(101,), trees={100: [el(1, "Button", "Reports")]})
+        desk.effects[1] = lambda: (desk.windows.__setitem__(101, {"title": "Settings", "process_name": "sheets",
+                                                                  "owner_hwnd": 100}), setattr(desk, "front", 101))
+        return desk
+
+    desk = desk_for(path_of({**rec(), "dialog": True}, rec(same=True)))
     ok, _r, facts = run(desk, way(btn("Reports"), btn("Export")))
     assert ok and clicks(desk) == [1, 106]
+    desk = desk_for(path_of({**rec(), "new_window": True}, rec(same=True)))
+    ok, report, facts = run(desk, way(btn("Reports"), btn("Export")))
+    assert not ok and clicks(desk) == [1] and facts["deviation"] == "dialog"
 
 
 def test_the_recorded_path_marks_a_window_change_after_a_step(store):

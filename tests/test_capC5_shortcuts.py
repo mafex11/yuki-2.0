@@ -97,12 +97,12 @@ def hotkeys(desk: Any) -> list[dict[str, Any]]:
     return [c[1] for c in desk.calls if c[0] == "hotkey"]
 
 
-def _desk(**extra: dict[str, Any]) -> Desk5:
+def _desk(path: dict[str, Any] | None = None, **extra: dict[str, Any]) -> Desk5:
     windows = {100: {"title": "Reports - Sheets", "process_name": "sheets"},
                200: {"title": "Notes", "process_name": "notesy"},
                300: {"title": "Budget - Sheets", "process_name": "sheets"}}
     return Desk5({**windows, **extra}, {100: [el(1, "Button", "Reports")], 300: []}, 100,
-                 path=path_of(rec(), rec()))
+                 path=path or path_of(rec(), rec()))
 
 
 def test_a_shortcut_goes_into_the_window_the_run_acted_in():
@@ -122,12 +122,14 @@ def test_a_shortcut_never_goes_into_another_window_of_the_app_the_run_never_work
     desk.effects[1] = lambda: setattr(desk, "front", 300)    # another sheets window, open before the run, comes up
     ok, report, facts = run(desk, way(btn("Reports"), keys("ctrl", "e")))
     assert not ok and hotkeys(desk) == [] and facts["deviated_at"] == 2
-    assert "a sheets window this way had not worked in was in front" in report
+    assert "a Sheets window this way had not worked in was in front" in report
     assert "no key was sent" in facts["results"][-1].report
 
 
 def test_a_shortcut_goes_into_a_window_that_came_up_during_the_run():
-    desk = _desk()
+    # second verification N5: brought up by the step just before (its own report saw it) whose recording had a new
+    # window after it
+    desk = _desk(path=path_of({**rec(), "new_window": True}, rec()))
 
     def opened() -> None:
         desk.windows[400] = {"title": "Export - Sheets", "process_name": "sheets"}
@@ -142,7 +144,7 @@ def test_a_shortcut_never_goes_into_another_app():
     desk.effects[1] = lambda: setattr(desk, "front", 200)
     ok, report, facts = run(desk, way(btn("Reports"), keys("ctrl", "e")))
     assert not ok and hotkeys(desk) == [] and facts["deviation"] == "window"
-    assert "notesy was in front, not the app the shortcut is for" in report
+    assert "Notesy was in front, not the app the shortcut is for" in report
 
 
 def test_a_shortcut_recorded_in_the_same_window_never_goes_into_a_new_one():
