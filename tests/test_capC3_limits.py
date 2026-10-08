@@ -90,15 +90,15 @@ def test_not_enough_data_says_how_many_and_how_long_and_stops(store):
     st = out["status"]
     assert (st["tasks"], st["families_2plus"], st["families_same_outcome"]) == (0, 0, 0)
     words = C.report_text(out)
-    assert "no checked tasks yet" in words and "2 to 3 weeks" in words and "Stopped: no result." in words
+    assert "No checked tasks yet" in words and "2 to 3 weeks" in words and "Stopped: no result." in words
     # some checked tasks, no kind done twice to the same end: a lower bound from the tasks a day
     ids = switcher(store, NOW)
     task(store, ids, GOAL, "field_submitted", ids[-1], target="k-msg")
     F.refresh(store, Words(), now=NOW + 100)
     st = D.data_status(store, now=NOW + 2 * DAY, need=10)
     assert st["checked_tasks"] == 1 and st["families_same_outcome"] == 0 and not st["enough"]
-    assert st["days_more"] == math.ceil((2 * 10 - 1) / (1 / 2.0)) and st["estimate"].startswith("at least")
-    assert any("more days are likely needed" in s for s in D.status_words(st))
+    assert st["days_more"] == math.ceil((2 * 10 - 1) / (1 / 2.0)) and st["basis"] == "lower bound"
+    assert "at least 38 more days are likely needed" in D.status_words(st)[2]
 
 
 def test_the_rate_estimate_and_too_few_matching_requests(store):
@@ -107,7 +107,7 @@ def test_the_rate_estimate_and_too_few_matching_requests(store):
     assert st["families_same_outcome"] == 1 and st["families_2plus"] == 1 and not st["enough"]
     assert st["days_more"] == math.ceil((3 - 1) / (1 / st["days_recorded"])) and st["ready_by"] > NOW + 4 * DAY
     lines = D.status_words(st)
-    assert lines[1].startswith("Kinds of task you did 2 or more times: 1") and "at the current rate" in lines[2]
+    assert lines[1].startswith("Kinds of task you did 2 or more times: 1") and lines[2].startswith("At the current rate, about")
     # enough families, but your requests match none of them: the same honest stop
     stub = StubThinker()
     out = _run(store, stub, requests=[own_request(text="water the tomato plants")])
