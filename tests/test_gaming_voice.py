@@ -12,7 +12,7 @@ import pytest
 
 from test_av_signals import DISCORD, Stubs, _facts, _recorder, _rows, _worker, shows  # noqa: F401 - shared stubs
 
-from yuki.memory.avsignals import GAME_GPU_SHARE, Holder, gaming_with_voice
+from yuki.memory.avsignals import Holder, gaming_with_voice
 
 VALORANT = r"C:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"
 ZOOM = r"C:\Apps\Zoom\Zoom.exe"
@@ -162,8 +162,10 @@ def test_a_full_screen_call_app_with_low_gpu_stays_a_call(store):
 
 def test_gaming_with_voice_signal_itself():
     game = Holder("VALORANT-Win64-Shipping.exe", False, VALORANT, 0.0)
-    assert gaming_with_voice(game, fullscreen=True, shows_page=False, gpu_fn=lambda p: GAME_GPU_SHARE)[0]
-    assert not gaming_with_voice(game, fullscreen=True, shows_page=False, gpu_fn=lambda p: 1.0)[0]
+    assert gaming_with_voice(game, fullscreen=True, shows_page=False, gpu_fn=lambda p: 15.0)[0]
+    # capQ2b: a game by a machine fact (the fixed list), whatever share of the GPU it draws
+    gaming, facts = gaming_with_voice(game, fullscreen=True, shows_page=False, gpu_fn=lambda p: 1.0)
+    assert gaming and facts["game"] == "list" and facts["gpu_share"] == 1.0
     assert not gaming_with_voice(game, fullscreen=False, shows_page=False, gpu_fn=lambda p: 90.0)[0]
     assert not gaming_with_voice(game, fullscreen=True, shows_page=True, gpu_fn=lambda p: 90.0)[0]
     gaming, facts = gaming_with_voice(game, fullscreen=True, shows_page=False, camera=[game], gpu_fn=lambda p: 90.0)

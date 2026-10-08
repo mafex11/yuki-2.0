@@ -72,7 +72,13 @@ microphone;
 - a weekly review of the user's last seven days (time use against the week before, focus, what got done \
 and what is open), written on Sunday evenings;
 - the user's threads of work (projects, tasks and workflows over days, with where each stands) and the web \
-pages they had open and links shared with them.
+pages they had open and links shared with them;
+- how the user works, from their own clicks and keys (only while they have "Record how I work" on): the tasks they \
+did in each stretch of work (a goal in plain words, the apps, and an outcome the PC checked - a file saved, typed \
+text sent, a page reached - or marked not checked), and their workflows: tasks done the same way grouped together, \
+each with its usual path of steps, how many times and when last. Buttons and fields are named only once Yuki keeps \
+their name (a button's at once, a menu item's or tab's after 3 days, a chat's or file's never); tasks the user said \
+were not theirs are left out.
 
 Not everything in memory is a fact: an item marked as a joke is the user's humour (a bit, a tease, a boast), \
 never something true about them, and an item marked uncertain may be misheard; treat neither as fact. \
@@ -591,6 +597,49 @@ def build_server(db_path: Path, log_dir: Path | None) -> tuple[MCPServer, Memory
 
             return run("get_related", {"query": query}, body)
 
+    # -- how the user works: workflows and tasks from their own clicks (capC6, report 78 §5.4) ---------------------
+
+    if callable(getattr(MemoryClient, "trace_workflows", None)):
+
+        @server.tool(title="Get workflows", annotations=READ_ONLY, structured_output=False)
+        def get_workflows(
+            query: Annotated[str | None, Field(description="A task in plain words ('send the weekly report'); the "
+                                                           "workflows nearest to it in meaning come first. Omit for "
+                                                           "the most recently used.")] = None,
+            app: Annotated[str | None, Field(description="Only workflows that use this app, by its process name "
+                                                         "('discord', 'chrome.exe'); also lists the buttons and "
+                                                         "shortcuts the user goes to most there and what they "
+                                                         "usually do next after each.")] = None,
+            limit: Annotated[int, Field(ge=1, le=8, description="Maximum workflows (1-8).")] = 5,
+        ) -> str:
+            """How the user usually does things on this PC, learned from their own clicks and keys: workflows (tasks done the same way, grouped), each with its usual path of steps (with how many of the recent times took each step), other ways they sometimes go, how many times and when last, the apps it spans, what usually comes after it, and the latest time with its outcome. With app, also that app's most used buttons and fields, shortcuts and usual next steps."""
+
+            def body() -> tuple[str, Window | None]:
+                client = memory.client()
+                result = client.trace_workflows(query or "", app=app or None, limit=int(limit))
+                return _format_workflows(result, query=query, app=app), None
+
+            return run("get_workflows", {"query": query, "app": app}, body)
+
+        @server.tool(title="Get tasks", annotations=READ_ONLY, structured_output=False)
+        def get_tasks(
+            since: Annotated[str | None, Field(description=f"{SINCE_HELP} Default: today.")] = None,
+            until: Annotated[str | None, Field(description=f"{UNTIL_HELP} Default: now.")] = None,
+            limit: Annotated[int, Field(ge=1, le=40, description="Maximum tasks (1-40).")] = 25,
+        ) -> str:
+            """The tasks the user did on the PC in a time range, oldest first, found from their own clicks and keys after each finished stretch of work: each with its time, its goal in plain words (the user's own words when they renamed it), the apps, and its outcome - checked by the PC (a file saved, typed text sent, a page reached, a command that worked) or not checked. Tasks the user said were not theirs or not one task are left out."""
+
+            def body() -> tuple[str, Window | None]:
+                window = resolve_range(since, until, default_today=True)
+                client = memory.client()
+                # only `until` given: the Covers line says "everything before", so read from the start (the client's
+                # own default is that day's midnight); "more" tells Claude to narrow (second verification V4)
+                lo = window.since_ts if window.since_ts is not None else 0.0
+                result = client.trace_tasks_between(lo, window.until_ts, limit=int(limit))
+                return f"{describe(window)}\n{_format_tasks(result)}", window
+
+            return run("get_tasks", {"since": since, "until": until}, body)
+
     return server, memory
 
 
@@ -692,6 +741,100 @@ def _format_todos(todos: Any) -> list[str]:
             meta.append(f"{label} {fmt_at(when) if when else value}")
         out.append(f"- {_one_line(text)}" + (f" ({'; '.join(meta)})" if meta else ""))
     return out
+
+
+# -- capC6: workflows and tasks from the user's own clicks (yuki.memory.trace_graph) ------------------------------
+
+_NO_TRACE = ("Yuki learns these only while the user has \"Record how I work\" on: after each finished stretch of work "
+             "it groups their steps into tasks, and tasks done the same way into a workflow.")
+
+
+def _times(n: int) -> str:
+    return f"{n} time{'' if n == 1 else 's'}"
+
+
+def _format_workflows(result: dict[str, Any], *, query: str | None, app: str | None) -> str:
+    now = local_now()
+    lines = [f"Covers: workflows learned from the user's own clicks and keys, as of {fmt_at(now)} (local time, "
+             f"{utc_offset(now)}); a workflow is kept 90 days after its last use, its tasks 30 days."]
+    fams = [f for f in result.get("families") or [] if isinstance(f, dict)]
+    scope = f", using {app}" if app else ""
+    if query and result.get("ranked"):
+        lines.append(f'Workflows nearest to "{_one_line(query)}"{scope}, best match first (later ones may be only '
+                     f"loosely related): {len(fams)}.")
+    elif query:
+        lines.append(f"Could not rank by meaning right now (the embedder did not answer); workflows{scope}, most "
+                     f"recently used first: {len(fams)}.")
+    else:
+        lines.append(f"Workflows{scope}, most recently used first: {len(fams)}.")
+    for n, f in enumerate(fams, 1):
+        label = f'"{_one_line(f.get("label"))}"' if f.get("label") else "(its words are no longer kept)"
+        apps = ", ".join(f.get("apps") or [])
+        lines.append(f"{n}. {label} - done {_times(int(f.get('tasks') or 0))}, last {fmt_at(_parse_iso(f.get('last_at')))}"
+                     + (f"; apps: {apps}" if apps else ""))
+        steps = f.get("steps") or []
+        if steps and int(f.get("tasks") or 0) >= 2:
+            lines.append(f"   Usual path (how many of the last {f.get('of')} times took each step):")
+            lines += [f"   {i}. {_one_line(s['words'])} ({s['n']} of {f.get('of')})" for i, s in enumerate(steps, 1)]
+        elif steps:
+            lines.append("   Its steps (done once, so no usual path yet):")
+            lines += [f"   {i}. {_one_line(s['words'])}" for i, s in enumerate(steps, 1)]
+        else:
+            lines.append("   No step of it can be named yet (no step done by most of the recent times, or none whose "
+                         "button Yuki keeps).")
+        for b in f.get("branches") or []:
+            lines.append(f"   Another way, {b['n']} of the last {f.get('of')} times, {b['where']}: {_one_line(b['words'])}")
+        for nx in f.get("followed_by") or []:
+            lines.append(f"   Usually followed by \"{_one_line(nx['label'])}\" ({nx['n']} of the last {nx['of']} times)")
+        latest = f.get("latest")
+        if latest:
+            mark = "checked by the PC" if latest.get("checked") else "not checked"
+            words = " (the user's own words)" if latest.get("renamed") else ""
+            lines.append(f"   Latest: {fmt_at(_parse_iso(latest.get('at')))} \"{_one_line(latest.get('goal'))}\"{words}"
+                         f" - outcome: {latest.get('outcome')} ({mark})")
+    a = result.get("app")
+    if isinstance(a, dict):
+        lines.append(f"In {a.get('app') or app} (all of the user's recorded actions there, recent ones weigh more):")
+        els = [f"{_one_line(e['label'])} ({_times(int(e.get('n') or 0))} on {e.get('days')} day"
+               f"{'' if e.get('days') == 1 else 's'})" for e in a.get("elements") or []]
+        chords = [f"{c['chord']} ({_times(int(c.get('n') or 0))} on {c.get('days')} day"
+                  f"{'' if c.get('days') == 1 else 's'})" for c in a.get("chords") or []]
+        nexts = [f"after {_one_line(t['from'])}, {_one_line(t['to'])} ({_times(int(t['n']))}"
+                 + (f", {t['gap']}" if t.get("gap") else "") + ")" for t in a.get("transitions") or []]
+        lines.append("   Goes to most: " + ("; ".join(els) if els else "nothing recorded yet."))
+        lines.append("   Shortcuts: " + ("; ".join(chords) if chords else "none recorded yet."))
+        lines.append("   Usual next steps: " + ("; ".join(nexts) if nexts else "none recorded yet."))
+    if not fams and not (isinstance(a, dict) and (a.get("elements") or a.get("chords") or a.get("transitions"))):
+        lines.append(("Nothing near that. " if query else "No workflows yet. ") + _NO_TRACE)
+    return "\n".join(lines)
+
+
+def _format_tasks(result: dict[str, Any]) -> str:
+    tasks = [t for t in result.get("tasks") or [] if isinstance(t, dict)]
+    lines = [f"{len(tasks)} task{'' if len(tasks) == 1 else 's'}, oldest first (found from the user's own clicks and "
+             "keys after each finished stretch of work; an outcome is either checked by the PC or not checked)."]
+    for t in tasks:
+        start, end = _parse_iso(t.get("start_at")), _parse_iso(t.get("end_at"))
+        goal = _one_line(t.get("goal")) or "(no goal kept)"
+        words = " (the user's own words)" if t.get("renamed") else ""
+        apps = ", ".join(t.get("apps") or [])
+        if t.get("checked"):
+            at = _parse_iso(t.get("outcome_at"))
+            outcome = f"{t.get('outcome_phrase')}, checked by the PC" + (f" at {at:%H:%M}" if at else "")
+        else:
+            outcome = t.get("outcome_phrase") or "not checked"
+        meta = [f"apps: {apps}" if apps else "", f"outcome: {outcome}",
+                f"a workflow done {_times(int(t['family_tasks']))}" if int(t.get("family_tasks") or 0) >= 2 else ""]
+        lines.append(f"- [{fmt_span(start, end)}] {goal}{words} | " + " | ".join(m for m in meta if m))
+    if result.get("more"):
+        lines.append(f"({result['more']} more in this range: narrow since/until.)")
+    if result.get("left_out"):
+        n = int(result["left_out"])
+        lines.append(f"({n} task{'' if n == 1 else 's'} in this range the user said {'was' if n == 1 else 'were'} not "
+                     "theirs or not one task: left out.)")
+    if not tasks:
+        lines.append("No tasks in this range. " + _NO_TRACE)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -956,6 +956,9 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
 .tw .ic { width: 7px; height: 7px; color: var(--text-3); opacity: 0; transition: opacity var(--d-fast); }
 .tw:hover .ic, .tw:focus-visible .ic { opacity: 1; }
 .tw:hover span:first-child { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--hair-2); }
+/* capC6: what the PC checked got done in that work today, a quiet second line */
+.tw.ev { height: auto; min-height: 24px; row-gap: 1px; padding: 3px 4px 3px 0; }
+.tw .twe { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 10px; align-items: baseline; font-size: 13px; line-height: 24px; }
 .tc .mono { font: 500 11px/24px var(--f-mono); color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc span:last-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
