@@ -94,6 +94,10 @@ def test_the_way_stops_at_the_first_step_off_its_path_and_hands_the_rest_to_the_
                                                                         f"an unnamed Edit in {APP}"], None, None)
     item = {"run": [{"do": "open_app", "app": "elsewhere"}], "id": None}
     assert A.run_way(store, item, snap)[2:] == (1, "another app than when you did it")
+    item = {"run": [{"do": "keys", "app": APP, "keys": ["Ctrl", "K"]}], "id": None}   # keys into a window not up
+    assert A.run_way(store, item, snap)[2:] == (1, "its window was not open")
+    snap.windows[0].open = True
+    assert A.run_way(store, item, snap)[0] == [f"{APP}|keys|Ctrl+K"]
 
 
 def test_a_plan_becomes_route_steps_by_the_snapshots_ids():

@@ -39,8 +39,10 @@ def _digest(folder: Path) -> dict[str, str]:
 
 
 def _git_status() -> str:
-    return subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, capture_output=True,
-                          text=True, check=True).stdout
+    """The repo's changes ("" in a copy of the tree that is no git checkout: then only the other checks count)."""
+    got = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, capture_output=True,
+                         text=True)
+    return got.stdout if got.returncode == 0 else ""
 
 
 def _script() -> Any:
