@@ -1695,11 +1695,13 @@ class TraceWorker:
     def _element_cols(self, act: _Act, el: Any, prefix: str = "") -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Row columns and the element registry use for one element, as its name class allows."""
         process = act.win.process
-        cls = name_class(el.role, el.parent_role, el.ancestors)
-        # capQ2a: a command control inside a list, tree or grid (a sidebar's thread drawn as a Button) is content: its
-        # raw row keeps a digest only (readers that judge a row by its role alone would take it for a command), its
-        # name reaches the registry only after 3 distinct days, like a tab's or a title's
-        item = content_item(el.role, el.ancestors, el.parent_role)
+        current_set = bool(getattr(el, "current_set", False))
+        cls = name_class(el.role, el.parent_role, el.ancestors, current_set=current_set)
+        # capQ2a: a command control inside a list, tree or grid (a sidebar's thread drawn as a Button), or one of a
+        # set with a current item (review), is content: its raw row keeps a digest only (readers that judge a row by
+        # its role alone would take it for a command), its name reaches the registry only after 3 distinct days, like
+        # a tab's or a title's
+        item = content_item(el.role, el.ancestors, el.parent_role, current_set=current_set)
         norm = normalise_name(el.name)
         name_digest = self._digest("ui-name", process, el.role, norm) if norm else None
         ancestry = "/".join(r for r, _a in el.ancestors)

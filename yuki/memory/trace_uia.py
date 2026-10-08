@@ -75,6 +75,9 @@ REFINE_SHARE = 0.75
 #: capQ2a: ``IsKeyboardFocusable`` and ``IsTextPatternAvailable`` (cached with the other facts), the TextPattern's id
 #: and the ``IsReadOnly`` text attribute (read only by :meth:`TraceUia.field_state`).
 _P_FOCUSABLE, _P_HAS_TEXT = 30009, 30040
+#: capQ2a review: ``AriaProperties`` (``name=value;...``, WAI-ARIA's fixed attribute names), read only for a command
+#: control's siblings (:meth:`TraceUia._ancestry`): ``current`` marks the current item of a set.
+_P_ARIA_PROPERTIES = 30102
 _TEXT_PATTERN_ID = 10014
 _ATTR_READONLY = 40015
 #: capQ2a: characters of a field's text read at most when it has no Value (a TextPattern document range): enough to
@@ -101,6 +104,44 @@ def visible_length(text: str | None) -> int:
     if not text:
         return 0
     return sum(1 for ch in text if not ch.isspace() and unicodedata.category(ch) not in ("Cc", "Cf", "Zs", "Zl", "Zp"))
+
+
+def aria_properties(text: str | None) -> dict[str, str]:
+    """capQ2a review: UI Automation's ``AriaProperties`` string (``name=value;name=value``, ``\\`` escaping ``;``,
+    ``=`` and itself) as a dict of WAI-ARIA attribute names (case-folded) to values."""
+    out: dict[str, str] = {}
+    if not isinstance(text, str) or not text:
+        return out
+    buf: list[str] = []
+    key: str | None = None
+    escaped = False
+    for ch in text[:4000]:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == "=" and key is None:
+            key, buf = "".join(buf), []
+        elif ch == ";":
+            if key is not None:
+                out[key.strip().casefold()] = "".join(buf).strip()
+            key, buf = None, []
+        else:
+            buf.append(ch)
+    if key is not None:
+        out[key.strip().casefold()] = "".join(buf).strip()
+    return out
+
+
+def aria_current(el: Any) -> bool:
+    """capQ2a review: whether an element (its cached ``AriaProperties``) is marked as the current item of a set:
+    ARIA ``current`` with a value other than ``false``."""
+    try:
+        value = aria_properties(el.GetCachedPropertyValue(_P_ARIA_PROPERTIES)).get("current", "")
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(value) and value.casefold() != "false"
 
 
 def _tick() -> int:
@@ -166,6 +207,9 @@ class Element:
     #: count, the clock a WinEvent's own time is in. None: not stamped (the lookup's end stands for it).
     chosen_at: float | None = None
     chosen_tick: int | None = None
+    #: capQ2a review: a command control that is one of a set whose current item is marked (it or a sibling carries
+    #: ARIA ``current``): an item of a navigation set drawn as a Button (:func:`yuki.memory.trace_privacy.content_item`).
+    current_set: bool = False
 
     def field_hint(self) -> bool:
         """capQ2a: whether typing may go into it, by the cached facts alone (no call): an editable Value (not a press
@@ -255,6 +299,15 @@ class TraceUia:
             request.AddProperty(prop)
         request.TreeScope = _TREE_SCOPE_ELEMENT
         self._request = request
+        # capQ2a review: the same facts and ``AriaProperties``, for a command control's siblings only (one call that
+        # also gives its index)
+        set_request = uia.CreateCacheRequest()
+        for prop in (_P_RUNTIME_ID, _P_BOUNDS, _P_PID, _P_TYPE, _P_NAME, _P_AID, _P_PASSWORD, _P_HWND, _P_TOGGLE,
+                     _P_SELECTED, _P_HAS_TOGGLE, _P_HAS_SELECTION_ITEM, _P_HAS_INVOKE, _P_HAS_EXPAND, _P_HAS_VALUE,
+                     _P_VALUE_READONLY, _P_FOCUSABLE, _P_HAS_TEXT, _P_ARIA_PROPERTIES):
+            set_request.AddProperty(prop)
+        set_request.TreeScope = _TREE_SCOPE_ELEMENT
+        self._set_request = set_request
         # capQ2a: a field's facts first (IsPassword decides before anything of its text is asked for)
         field_request = uia.CreateCacheRequest()
         for prop in (_P_TYPE, _P_PASSWORD, _P_HAS_VALUE, _P_VALUE_READONLY, _P_HAS_TEXT, _P_FOCUSABLE):
@@ -334,7 +387,9 @@ class TraceUia:
 
     def _ancestry(self, element: Element, deadline: float, *, index: bool) -> None:
         """Parent role, up to :data:`ANCESTORS` ancestors (role, AutomationId) and, when asked, the index among the
-        parent's children (one more call), within the deadline."""
+        parent's children (one more call), within the deadline. capQ2a review: for a command control not already an
+        item of a list, tree or grid, that same call also reads the siblings' ``AriaProperties``: whether one of them
+        is marked the current item of the set (``Element.current_set``)."""
         current = element.ref
         parent_el = None
         for depth in range(ANCESTORS):
@@ -356,13 +411,27 @@ class TraceUia:
             if facts.role == "Window" and facts.hwnd:
                 break
             current = parent
-        if index and parent_el is not None and element.rid and time.perf_counter() < deadline:
+        # capQ2a review: a command control not already an item of a list, tree or grid by its ancestry is asked
+        # whether it is one of a set with a current item (its siblings' ARIA ``current``), in the same one call that
+        # gives its index
+        from yuki.memory.trace_privacy import COMMAND_ROLES, content_item
+
+        ask_set = element.role in COMMAND_ROLES and not content_item(element.role, element.ancestors,
+                                                                     element.parent_role)
+        want_index = bool(index and element.rid)
+        if (want_index or ask_set) and parent_el is not None and time.perf_counter() < deadline:
             try:
-                kids = parent_el.FindAllBuildCache(_TREE_SCOPE_CHILDREN, self._true, self._request)
+                kids = parent_el.FindAllBuildCache(_TREE_SCOPE_CHILDREN, self._true,
+                                                   self._set_request if ask_set else self._request)
                 for i in range(min(int(kids.Length), 500)):
-                    kid = self._facts(kids.GetElement(i), time.perf_counter())
-                    if kid is not None and kid.rid == element.rid:
-                        element.index = i
+                    raw = kids.GetElement(i)
+                    if ask_set and not element.current_set and aria_current(raw):
+                        element.current_set = True
+                    if want_index and element.index is None:
+                        kid = self._facts(raw, time.perf_counter())
+                        if kid is not None and kid.rid == element.rid:
+                            element.index = i
+                    if (not want_index or element.index is not None) and (not ask_set or element.current_set):
                         break
             except Exception:  # noqa: BLE001
                 pass
@@ -889,5 +958,5 @@ class HungWatch:
 
 __all__ = ["ACTION_PATTERNS", "ANCESTORS", "ANSWER_MS", "BOUNDS_SLACK", "CONTAINER_ROLES", "Element",
            "FIELD_TEXT_CHARS", "HungWatch", "PRESS_ROLES", "PROBE_EVERY_S", "ROLE_NAMES", "SLOW_CALL_S", "TIMEOUT_MS",
-           "TOGGLE_WORDS", "TraceUia", "visible_length", "window_answers", "window_exists", "window_hung",
+           "TOGGLE_WORDS", "TraceUia", "aria_current", "aria_properties", "visible_length", "window_answers", "window_exists", "window_hung",
            "window_pid"]

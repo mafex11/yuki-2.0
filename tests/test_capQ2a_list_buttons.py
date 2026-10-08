@@ -116,3 +116,111 @@ def test_readers_that_judge_a_row_by_its_role_alone_find_no_name_on_it(rig):
     _click_on(rig, thread_button("Invented plan for the garden, Working, home"), 150, 120)
     row = [r for r in rig.rows() if r["kind"] == "click"][0]
     assert _element_names(rig.store, [row]) == {row["id"]: None}
+
+
+# -- review F3 and the sidebar drawn outside any list (9 Oct) -----------------------------------------------------------
+
+
+def test_a_toolbar_nearer_than_the_list_item_keeps_a_command(rig):
+    """Review F3: a message's own action bar drawn as a ToolBar inside the message's ListItem: its buttons are commands
+    (the nearest container of either kind decides). A plain Group bar inside a list item stays a content item: the
+    structure says nothing more, and its name comes back after 3 distinct days of use."""
+    assert content_item("Button", [("ToolBar", ""), ("Group", ""), ("ListItem", ""), ("List", "")], "ToolBar") is False
+    assert name_class("Button", "Group", [("Group", ""), ("ToolBar", ""), ("ListItem", "")]) == COMMAND
+    assert name_class("Button", "Group", [("Group", ""), ("ListItem", ""), ("ToolBar", "")]) == TITLE
+    reply = Element(role="Button", name="Reply", rid=(4, 11), bounds=(700, 300, 730, 320), pid=APP,
+                    parent_role="ToolBar", ancestors=[("ToolBar", ""), ("Group", ""), ("ListItem", ""), ("List", "")])
+    _click_on(rig, reply, 710, 310)
+    row = [r for r in rig.rows() if r["kind"] == "click"][0]
+    assert rig.store._dec(row["name_ciphertext"]) == "Reply" and not rig.w.counters["content_item_named"]
+
+
+def test_one_of_a_set_with_a_current_item_is_a_content_item(rig):
+    """A chat app's sidebar of threads drawn as Buttons in plain Groups (no list): the set marks its current thread
+    (ARIA ``current``), read from the siblings by the client (``Element.current_set``)."""
+    assert name_class("Button", "Group", [("Group", ""), ("Group", "")], current_set=True) == TITLE
+    assert name_class("Button", "ToolBar", [("ToolBar", "")], current_set=True) == COMMAND
+    card = Element(role="Button", name="Invented trip budget, 2h", rid=(4, 12), bounds=(10, 200, 300, 240), pid=APP,
+                   parent_role="Group", ancestors=[("Group", ""), ("Group", "nav"), ("Group", "")], index=3,
+                   current_set=True)
+    _click_on(rig, card, 150, 220)
+    row = [r for r in rig.rows() if r["kind"] == "click"][0]
+    assert row["name_ciphertext"] is None and row["position"] == "3/Group"
+    (el,) = rig.store._query("SELECT * FROM ui_elements")
+    assert el["name_class"] == TITLE and el["name_ciphertext"] is None
+
+
+def test_aria_properties_are_read_with_their_escapes():
+    from yuki.memory.trace_uia import aria_properties
+
+    assert aria_properties("current=page;level=2") == {"current": "page", "level": "2"}
+    assert aria_properties(r"label=a\;b\=c;current=false") == {"label": "a;b=c", "current": "false"}
+    assert aria_properties("") == {} and aria_properties(None) == {}
+
+
+class _Raw:
+    """A UI Automation element as the client sees it (cached properties only)."""
+
+    def __init__(self, props: dict, kids: list | None = None, parent=None):
+        self.props, self.kids, self.parent = props, kids or [], parent
+
+    def GetCachedPropertyValue(self, prop):  # noqa: N802 - COM's name
+        return self.props.get(prop)
+
+    def FindAllBuildCache(self, scope, cond, request):  # noqa: N802
+        kids = self.kids
+
+        class _Arr:
+            Length = len(kids)
+
+            @staticmethod
+            def GetElement(i):  # noqa: N802
+                return kids[i]
+
+        return _Arr()
+
+
+class _Walker:
+    @staticmethod
+    def GetParentElementBuildCache(el, request):  # noqa: N802
+        return el.parent
+
+
+def _client():
+    from yuki.memory.trace_uia import TraceUia
+
+    c = object.__new__(TraceUia)
+    c._walker, c._true, c._request, c._set_request, c.counts = _Walker(), object(), "plain", "set", {}
+    return c
+
+
+def _button(rid, aria="", parent=None):
+    return _Raw({30003: 50000, 30000: rid, 30005: "Invented", 30102: aria}, parent=parent)
+
+
+@pytest.mark.parametrize("current, expected", [("current=page", True), ("current=false", False), ("", False)])
+def test_the_client_reads_the_siblings_current_mark_in_the_index_call(current, expected):
+    import time
+
+    window = _Raw({30003: 50032, 30020: 5})
+    group = _Raw({30003: 50026}, parent=window)
+    me = _button((1, 1), parent=group)
+    group.kids = [_button((1, 0), current, parent=group), me, _button((1, 2), parent=group)]
+    c = _client()
+    el = c._facts(me, time.perf_counter())
+    c._ancestry(el, time.perf_counter() + 5, index=True)
+    assert el.current_set is expected and el.index == 1
+
+
+def test_a_button_already_in_a_list_is_not_asked_about_its_set():
+    import time
+
+    lst = _Raw({30003: 50008})
+    item = _Raw({30003: 50007}, parent=lst)
+    me = _button((2, 1), parent=item)
+    asked: list = []
+    item.FindAllBuildCache = lambda scope, cond, request: asked.append(request) or _Raw({}).FindAllBuildCache(0, 0, 0)
+    c = _client()
+    el = c._facts(me, time.perf_counter())
+    c._ancestry(el, time.perf_counter() + 5, index=False)
+    assert asked == [] and el.current_set is False
