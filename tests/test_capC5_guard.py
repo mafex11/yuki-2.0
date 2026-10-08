@@ -394,3 +394,21 @@ def test_runtime_ids_kept_are_bounded_and_expire():
         S.remember_rid("s", S.SkillStep(i=1, do="click", role="Button", name=f"b{k}"), 100, "sheets",
                        {"runtime_id": [k], "role": "Button"}, now=NOW + k)
     assert len(S._RIDS) == S.RID_KEEP_N
+
+
+# -- each step verified by report 58's before/after account ----------------------------------------------------------
+
+def test_the_real_hands_run_a_way_through_a_dispatcher_with_the_before_after_account_on():
+    from yuki.agent.tools import Dispatcher
+
+    class Hands:   # the real hands are a plain object (kept by a weak reference)
+        def __init__(self, backend: Any) -> None:
+            self.backend = backend
+            self._dispatcher = Dispatcher(backend, max_tree_elements=300, tree_timeout_s=0.8, verify_outcomes=False)
+
+    hands = Hands(object())
+    disp = S.skill_dispatcher(hands)
+    assert disp is not hands._dispatcher and disp._verify_choice is True     # the talker's quick hands keep theirs
+    assert (disp.max_tree_elements, disp.tree_timeout_s) == (S.SKILL_TREE_ELEMENTS, S.SKILL_TREE_TIMEOUT_S)
+    assert S.skill_dispatcher(hands) is disp                                 # made once per set of hands
+    assert S.skill_dispatcher(Desk5({}, {}, 0)) is not None                  # a stand-in desk: its own, as before
