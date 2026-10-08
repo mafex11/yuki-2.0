@@ -229,6 +229,22 @@ def program_name(key: str | None) -> str:
     return key
 
 
+def prime_program_names(keys: Sequence[str]) -> None:
+    """Let the name resolver look for all of a window's apps among the running processes in one scan (it scans at
+    most once a minute, for the keys asked then; apps the timeline has named before are remembered already)."""
+    wanted = {k for k in (str(key or "").strip().casefold() for key in keys) if k}
+    if not wanted:
+        return
+    try:
+        from yuki.core import appnames
+
+        learn = getattr(appnames.resolver(), "_learn_running", None)
+        if learn is not None:
+            learn(wanted)
+    except Exception:  # noqa: BLE001 - names fall back to the keys
+        pass
+
+
 def _memo(fn: Callable[[str], str]) -> Callable[[str], str]:
     """``fn`` cached per key (one pass names each app once)."""
     seen: dict[str, str] = {}
@@ -1077,6 +1093,8 @@ class TaskPass:
         rows = window_rows(self.store, window.start, window.end)
         if not rows:
             return rows, [], [], {}
+        if self.names is program_name:
+            prime_program_names(sorted({str(r.get("process") or "") for r in rows if is_user(r)}))
         ids = [int(r["id"]) for r in rows]
         links = links_between(self.store, min(ids), max(ids))
         inside = set(ids)
