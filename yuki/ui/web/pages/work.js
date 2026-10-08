@@ -146,9 +146,12 @@
     const meter = h('span', { class: 'fmeter', attrs: { role: 'img', 'aria-label': `${fmt.dur(focus)} so far${usual != null ? `; your usual by now is ${fmt.dur(usual)}` : ''}` } },
       Array.from({ length: all }, (_, i) => h('i', { class: (i < lit ? 'on' : '') + (i === uAt ? ' u' : '') })));
     const L = T.longest;
-    const worked = (T.worked || []).map(([title, min, ref]) => h('button', { class: 'tw', data: { do: 'work-continue', ref },
-      attrs: { type: 'button', title: 'Pick it up: I reopen the windows you had. I type and send nothing.', 'aria-label': `Pick up ${title}, ${fmt.dur(min)} today` } },
-    h('span', { text: title }), h('span', { class: 'mono', text: fmt.dur(min) }), ic('chev')));
+    // capC6: a row may carry what the PC checked you got done in that work today ("you saved a file (.pptx) at 4 PM"),
+    // shown as a quiet line under the title; its task and action ids stay in the data, never on the page
+    const worked = (T.worked || []).map(([title, min, ref, ev]) => h('button', { class: 'tw' + (ev && ev.text ? ' ev' : ''), data: { do: 'work-continue', ref },
+      attrs: { type: 'button', title: 'Pick it up: I reopen the windows you had. I type and send nothing.', 'aria-label': `Pick up ${title}, ${fmt.dur(min)} today${ev && ev.text ? `; ${ev.text}` : ''}` } },
+    h('span', { text: title }), h('span', { class: 'mono', text: fmt.dur(min) }), ic('chev'),
+    ev && ev.text ? h('span', { class: 'twe', text: ev.text, title: ev.goal || '' }) : null));
     const coming = (T.coming || []).map(([when, title]) => h('div', { class: 'tc' }, h('span', { class: 'mono', text: when }), h('span', { text: title, title })));
     return h('div', { class: 'wk-today', data: { k: 'today' } },
       Y.clearing('div', '', h('div', { class: 'label' }, h('span', { text: 'Focus today' }), h('a', { class: 'golink', attrs: { href: '#work/day' } }, 'Your day', ic('chev'))),
