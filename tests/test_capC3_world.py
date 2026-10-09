@@ -424,6 +424,22 @@ def test_requests_are_the_users_own_or_turns_that_led_to_yuki_acting_never_goals
     spoken = (f"Open the planner note for the user\n\n{VOICE_HEARD_MARK} (newest last): \"open my planner\" / "
               f"\"the planner note\"]\n[What Yuki's voice already said: on it]")
     assert D.request_words(spoken) == "open my planner / the planner note"
+    # second review A3: Yuki's own words (a card's suggestion sent unchanged; a "Do it" on an offer before 3 October)
+    # are never a request of the user's, even when Yuki acted on them
+    from yuki.ui.nudges import suggestion_request
+
+    offer = "Send the weekly numbers to the planning channel the way you did on Monday"
+    yukis = [suggestion_request({"id": 12}, offer) + "\n\n[Typed in the ask bar: a small box.]",
+             f'[The user pressed "Do it" on your card N7 at 9 AM]\n{offer}']
+    assert all(D.request_words(t) == "" for t in yukis)
+    more = tmp_path / "logs2"
+    more.mkdir()
+    lines = [x for i, t in enumerate(yukis, 1)
+             for x in ({"type": "user_message", "session": "s2", "turn": i, "ts": NOW + i, "text": t},
+                       {"type": "memory_acting", "session": "s2", "turn": i, "state": "begin"})]
+    (more / "20261003-100000-worker.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n",
+                                                      encoding="utf-8")
+    assert D.conversation_requests(more) == []
     # the segmenter's goals never become requests: the late request is left out, the goal is nowhere
     world(store, future=False)
     insts, skipped = D.build_instances(store, [*own, *conv], Words(), names=NAMES)
