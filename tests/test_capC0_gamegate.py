@@ -1,7 +1,8 @@
 """Report 78 §4.5, phase C0: the hard game gate, logging only.
 
-The gate holds while a game program runs (in front or not, windowed or full screen), in Direct3D exclusive full
-screen, or while a game voice session is open. It keys on game programs, never on Vanguard's always-on tray, and a
+The running gate (``game_running``) holds while a game program runs (in front or not, windowed or full screen), in
+Direct3D exclusive full screen, or while a game voice session is open; since phase F (fGate) the input gate
+(``holds``) holds only while a game is in front (or D3D full screen), see tests/test_fGate_gate.py. It keys on game programs, never on Vanguard's always-on tray, and a
 caption-less maximised app that does not draw like a game (FL Studio) never counts.
 
 Offline: invented process data (pids, image names, GPU shares) and a fake clock. Two read-only checks of the real
@@ -168,15 +169,17 @@ def test_valorant_windowed_then_alt_tab_then_exit_is_logged_at_each_change() -> 
     assert not gate.holds() and log.of("game_gate") == []
     images[20] = VALORANT
     d = gate.on_foreground(2, 20)                                 # VALORANT in a window
-    assert d.hold and log.of("game_gate")[-1] == {
-        "trigger": "foreground", "hold": True, "reasons": ["game_running"], "games": ["valorant-win64-shipping"],
-        "front": "valorant-win64-shipping", "front_fullscreen": False, "sources": ["list"]}
-    gate.on_foreground(5, 12)                                     # Alt+Tab to Discord: still held
-    assert gate.holds() and log.of("game_gate")[-1]["front"] == "" and log.of("game_gate")[-1]["hold"]
+    assert d.hold and gate.holds() and log.of("game_gate")[-1] == {
+        "trigger": "foreground", "hold": True, "hold_input": True, "scope": "front", "reasons": ["game_running"],
+        "games": ["valorant-win64-shipping"], "front": "valorant-win64-shipping", "front_fullscreen": False,
+        "sources": ["list"]}
+    gate.on_foreground(5, 12)                                     # Alt+Tab to Discord: still running, input free
+    assert gate.game_running() and not gate.holds() and log.of("game_gate")[-1]["front"] == ""
+    assert log.of("game_gate")[-1]["hold"] and log.of("game_gate")[-1]["hold_input"] is False
     del images[20]
     clock.t += 3600
     gate.on_exit(20)
-    assert not gate.holds() and log.of("game_gate")[-1]["hold"] is False
+    assert not gate.game_running() and log.of("game_gate")[-1]["hold"] is False
     assert gate.stats()["holds"] == 1 and gate.stats()["held_s"] == pytest.approx(3600.0)
 
 
@@ -229,7 +232,7 @@ def test_a_full_screen_app_left_before_its_check_is_not_judged() -> None:
 
 def test_the_game_voice_session_holds_without_a_window_change() -> None:
     gate, *_ = _gate(procs=[(12, "Discord.exe")], session=True)
-    assert gate.holds()
+    assert gate.game_running() and not gate.holds()               # fGate: a voice session alone holds no input
 
 
 def _live_gate(**state: Any):
@@ -267,16 +270,17 @@ def test_a_game_voice_session_opening_and_closing_is_logged_by_the_beat() -> Non
     gate, clock, log, s = _live_gate(procs={12: "Discord.exe"})
     gate.on_foreground(5, 12)
     s["session"] = True
-    assert gate.holds()
+    assert gate.game_running()
     clock.t += G.BEAT_EVERY_S
     gate.beat()
-    assert log.of("game_gate") == [{"trigger": "game_voice", "hold": True, "reasons": ["game_voice"], "games": [],
-                                    "front": "", "front_fullscreen": False, "sources": []}]
+    assert log.of("game_gate") == [{"trigger": "game_voice", "hold": True, "hold_input": False, "scope": "none",
+                                    "reasons": ["game_voice"], "games": [], "front": "", "front_fullscreen": False,
+                                    "sources": []}]
     s["session"] = False
     clock.t += G.BEAT_EVERY_S
     gate.beat()
     assert log.of("game_gate")[-1]["trigger"] == "game_voice" and log.of("game_gate")[-1]["hold"] is False
-    assert not gate.holds()
+    assert not gate.game_running()
 
 
 def test_the_gate_fails_closed() -> None:
@@ -343,7 +347,7 @@ def test_a_learned_game_played_borderless_keeps_the_gate_held() -> None:
             gate.on_check()
             assert gate.holds()                                    # held at the 20 s and 90 s checks
         gate.on_foreground(5, 12)
-        assert gate.holds()                                        # still running behind Discord
+        assert gate.game_running() and not gate.holds()            # still running behind Discord: input free
     assert not log.of("game_gate_unlearned")
     assert json.loads(store.rows[G.LEARNED_STATE])["skyrunner"]["stretches"] == 2
 
@@ -354,7 +358,7 @@ def test_evidence_is_capped_and_one_windowed_stretch_does_not_drop_a_well_known_
         _stretch(gate, clock, s, 4, 30, exclusive=True)
     assert G.stretches(gate._evidence["fieldrunner"]) == G.EVIDENCE_CAP
     _stretch(gate, clock, s, 4, 30, exclusive=False)               # borderless: a learned game keeps its count
-    assert gate.holds() and not log.of("game_gate_unlearned")
+    assert gate.game_running() and not log.of("game_gate_unlearned")
 
 
 def test_listed_games_are_never_measured_and_old_entries_start_as_candidates() -> None:
@@ -404,17 +408,17 @@ def test_the_thread_starts_listens_and_wakes_when_a_game_exits(tmp_path: Path) -
                         gpu_fn=lambda pids: None, scan_fn=lambda: [(child.pid, "Fieldrunner.exe")],
                         image_fn=lambda pid: "Fieldrunner.exe" if pid == child.pid else "Other.exe",
                         own_fn=lambda pid: False).start()
-        assert gate.alive and gate.holds()
+        assert gate.alive and gate.game_running()
         assert log.of("game_gate_start") and log.of("game_gate")[0]["games"] == ["fieldrunner"]
         child.kill()
         child.wait(10)
         deadline = time.time() + 5
-        while gate.holds() and time.time() < deadline:
+        while gate.game_running() and time.time() < deadline:
             time.sleep(0.02)
-        assert not gate.holds() and log.of("game_gate")[-1]["trigger"] == "game_exit"
+        assert not gate.game_running() and log.of("game_gate")[-1]["trigger"] == "game_exit"
         gate.stop()
         assert not gate.alive and log.of("game_gate_stop")
-        assert gate.holds()                                       # a stopped gate fails closed
+        assert gate.holds() and gate.game_running()               # a stopped gate fails closed
     finally:
         if child.poll() is None:
             child.kill()

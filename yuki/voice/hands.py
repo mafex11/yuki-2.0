@@ -1860,9 +1860,39 @@ class Hands:
             if key not in MEDIA_KEYS:
                 raise _Refused(f"unknown media key {key!r} ({', '.join(MEDIA_KEYS)})")
             times = max(1, min(int(args.get("times") or 1), 50))
+            want = str(args.get("want") or "").strip().lower() if key == "playpause" else ""
+            # fGate (D17(4)): transport through the media session's own command, aimed at one session and checked on
+            # that same session; the system volume through the Core Audio endpoint. Neither is input nor takes focus,
+            # so both work with a game in front. A key stands in only when that route is missing (a stand-in desk) or
+            # failed, and never with a game in front (the input backstop would refuse it anyway).
+            routed = (self._media_command(key, want, times, facts) if key in _TRANSPORT_KEYS
+                      else self._endpoint_volume(key, times, facts))
+            if routed is not None:
+                ok, report, facts = routed
+                game = "" if (ok and facts.get("verified") is True) or facts.get("settled") else self._game_front()
+                if game:
+                    # D17(2), review r2 M1: with a game in front nothing is handed to the thinker (no model pass, no
+                    # read of the window in front, no free-form step): no session to aim at, a session that refused,
+                    # or a command whose effect was not seen stays as the report says, and nothing more is tried
+                    from yuki.memory.gamegate import game_name
+
+                    facts["game_front"] = True
+                    if ok:
+                        facts["settled"] = True
+                    else:
+                        facts["refused"] = "game"
+                    report += f"; {game_name(game)} is in front, so nothing more is tried until you leave it"
+                return ok, report, facts
+            game = self._game_front()
+            if game:
+                from yuki.memory.gamegate import refusal_text
+
+                facts["verified"] = False
+                facts["refused"], facts["game_front"] = "game", True
+                return False, (f"{refusal_text(game, 'front')}; Windows' media controls could not take it either, so "
+                               f"nothing was sent"), facts
             before = self._media_status() if key in _TRANSPORT_KEYS else None
             volume = self._volume() if key in _VOLUME_KEYS else None
-            want = str(args.get("want") or "").strip().lower() if key == "playpause" else ""
             if key in _TRANSPORT_KEYS and before is None:
                 # No media session shows what is playing (a video in a browser that just started often has none
                 # yet; live 2026-09-27 14:18 "media: none" while YouTube played): a key could be neither aimed nor
@@ -1879,6 +1909,8 @@ class Hands:
             facts["sent_at"] = time.monotonic()
             result = self.backend.press(key, times=times)
             ok, report, facts = self._report(result, "", facts)
+            if _detail(result, "refused") == "game":
+                facts["refused"] = "game"   # D17(2): a game came to the front before the key: never handed over
             if ok and before is not None:
                 changed, words = self._media_after(before)
                 report += "; " + words
@@ -2518,26 +2550,154 @@ class Hands:
         tab = getattr(strip, "selected", None)
         return (tab.index, tab.name, len(strip.tabs)) if tab is not None else None
 
-    def _media_status(self) -> tuple[str, str, str] | None:
-        """``(app, status, title)`` of the media session the media keys act on, or ``None``."""
+    def _game_front(self) -> str:
+        """D9 for the hands: the game in front ("" none): the backend's own answer (a test desk's ``game_front``),
+        the real desktop's local read (:func:`yuki.memory.gamegate.game_in_front`), else none (a stand-in desk never
+        reads the real screen, rule 7)."""
+        own = getattr(self.backend, "game_front", None)
         try:
-            sessions = self._dispatcher.activity_facts().get("media") or []
+            if callable(own):
+                return str(own() or "")
+            if _is_real_backend(self.backend):
+                from yuki.memory.gamegate import game_in_front
+
+                return game_in_front()
+        except Exception:  # noqa: BLE001 - unknown: the input layer's backstop still checks
+            return ""
+        return ""
+
+    def _media_route(self) -> Any:
+        """The media session route (``(verb, app, log=) -> MediaCommand``): the backend's own (a test desk's
+        ``media_command``), the real desktop's (:func:`yuki.actions.media.command`), else None (keys only)."""
+        own = getattr(self.backend, "media_command", None)
+        if callable(own):
+            return own
+        if _is_real_backend(self.backend):
+            from yuki.actions.media import command
+
+            return command
+        return None
+
+    def _volume_route(self) -> Any:
+        """The system volume without a key (``(key, times) -> {"level", "muted"} | None``): the backend's own (a test
+        desk's ``endpoint_volume``), the real desktop's (:func:`yuki.actions.media.endpoint_volume`), else None."""
+        own = getattr(self.backend, "endpoint_volume", None)
+        if callable(own):
+            return own
+        if _is_real_backend(self.backend):
+            from yuki.actions.media import endpoint_volume
+
+            return endpoint_volume
+        return None
+
+    def _media_command(self, key: str, want: str, times: int,
+                       facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]] | None:
+        """A transport media key as the media session's own command (fGate, D17(4)): aimed at one session (the
+        playing one, else the current one; never a game's), checked on **that** session (critic M1c). ``None``: no
+        such route here, or it failed before reaching a session (the caller may use the key, never over a game)."""
+        route = self._media_route()
+        if route is None:
+            return None
+        from yuki.actions.media import verb_for_key
+
+        verb = verb_for_key(key, want) or "toggle"
+        log = self.log.event if self.log is not None else None
+        facts["sent_at"] = time.monotonic()
+        result = route(verb, None, log=log)
+        facts["route"] = "media_session"
+        facts["media"] = result.facts()
+        if not result.reached:
+            return None
+        name = (result.app_id or "?").split("!")[-1]
+        if result.outcome == "no_session":
+            # No media session shows what is playing (a video in a browser that just started often has none yet;
+            # live 2026-09-27 14:18): nothing could be aimed or checked, and a blind toggle can undo what they want.
+            # Nothing is sent; the thinker uses the page's own control (v3.9).
+            facts["verified"] = False
+            return False, ("no media session shows what is playing, so nothing could be aimed or checked; nothing "
+                           "was sent"), facts
+        if result.outcome == "already":
+            # "pause" on paused music: nothing to do (a toggle would undo it, live "Paused." that resumed it)
+            facts["settled"] = True
+            return True, f"media: {name} is already {result.status}; nothing was sent", facts
+        if result.outcome == "refused":
+            facts["verified"] = False
+            return False, (f"media: {name}'s media session refused {verb} (it may not offer it); nothing else was "
+                           f"sent"), facts
+        before = (name, result.status, result.title)
+        for _ in range(times - 1 if verb in ("next", "previous") else 0):
+            if not route(verb, result.app_id, log=log).sent:   # the rest of the presses, on the same session
+                break
+        changed, words = self._media_after(before, app_id=result.app_id, verb=verb)
+        now = self._media_status(result.app_id) if want else None
+        # With the state they want known, verified means that session is in it now, not only that it changed.
+        facts["verified"] = changed and (not want or (now is not None and now[1].lower() == want))
+        return True, f"sent {verb} to {name}'s media session (Windows' media controls, no key); {words}", facts
+
+    def _endpoint_volume(self, key: str, times: int,
+                         facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]] | None:
+        """A volume key as the default output's Core Audio level (fGate, D17(4)), read back like the key was.
+        ``None``: no such route here, or Core Audio failed (the caller may use the key, never over a game)."""
+        route = self._volume_route()
+        if route is None:
+            return None
+        volume = self._volume()
+        facts["sent_at"] = time.monotonic()
+        after = route(key, times)
+        if after is None:
+            return None
+        facts["route"] = "core_audio"
+        if volume is None:
+            facts["verified"] = None
+            return True, (f"the system volume is now {after.get('level')}%{' (muted)' if after.get('muted') else ''} "
+                          f"(Windows' audio endpoint, no key)"), facts
+        changed, words = self._volume_after(volume)
+        facts["verified"] = changed
+        return True, f"set the system volume through Windows' audio endpoint (no key); {words}", facts
+
+    def _media_status(self, app_id: str | None = None) -> tuple[str, str, str] | None:
+        """``(app, status, title)`` of one media session: ``app_id``'s (status "closed" when it is gone), else the
+        current one (the one the media keys act on); ``None`` when the sessions can't be read (or none is current)."""
+        try:
+            facts = self._dispatcher.activity_facts()
         except Exception:  # noqa: BLE001
             return None
+        if (facts.get("errors") or {}).get("media"):
+            return None
+        sessions = facts.get("media") or []
+        if app_id:
+            mine = next((m for m in sessions if isinstance(m, dict) and str(m.get("app_id") or "") == app_id), None)
+            if mine is None:
+                return (app_id.split("!")[-1], "closed", "")
+            return (app_id.split("!")[-1], str(mine.get("status") or "unknown"), str(mine.get("title") or ""))
         current = next((m for m in sessions if isinstance(m, dict) and m.get("current")), None)
         if current is None:
             return None
         return (str(current.get("app_id") or "?").split("!")[-1], str(current.get("status") or "unknown"),
                 str(current.get("title") or ""))
 
-    def _media_after(self, before: tuple[str, ...]) -> tuple[bool, str]:
-        """What the media session says after a transport key: watched until it changes, at most
-        :data:`_WATCH_S` (a condition poll). A measured fact for the report."""
+    @staticmethod
+    def _media_moved(before: tuple[str, ...], now: tuple[str, ...], verb: str) -> bool:
+        """Whether a session shows the command's effect: next/previous by a new track (the title, when it was read
+        before; else the status, a closed session never counts), the rest by the status; a key (no verb) by any
+        change, as before."""
+        if not verb:
+            return now != before
+        if verb in ("next", "previous"):
+            if before[2]:
+                return bool(now[2]) and now[2] != before[2]
+            return now[1] != before[1] and now[1] != "closed"
+        return now[1] != before[1]
+
+    def _media_after(self, before: tuple[str, ...], *, app_id: str | None = None, verb: str = "") -> tuple[bool, str]:
+        """What the media session says after a transport command or key: ``app_id``'s session (the one the command
+        was aimed at, critic M1c: another app's title change never counts), else the current one; watched until it
+        shows the effect, at most :data:`_WATCH_S` (a condition poll). A measured fact for the report."""
         deadline = time.monotonic() + _WATCH_S
         after = before
         while time.monotonic() < deadline:
-            now = self._media_status()
-            if now is not None and now != before:
+            now = self._media_status(app_id)
+            if now is not None and self._media_moved(before, now, verb):
                 after = now
                 break
             time.sleep(_POLL_S)

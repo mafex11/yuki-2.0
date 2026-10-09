@@ -1,14 +1,29 @@
-"""The hard game gate (report 78 §4.5): knowing, at any moment, that a game is running.
+"""The hard game gate (report 78 §4.5): knowing, at any moment, that a game is running, and whether one is in front.
 
-A later capture phase (recording how you work, only once you say yes) must stop completely while a game runs:
-in front or not, windowed or full screen, at the launch screen and on Alt+Tab. That rule is not a setting. This
-module is the gate it will obey. In phase C0 it only **decided and logged** (content-free) so its decisions could be
-checked for three days; nothing here records input or reads a window. From phase C1 the action trace
-(:mod:`yuki.memory.trace`) obeys it: while it holds, the trace drops input at its first step, unhooks its per-app
-window events and asks UI Automation nothing (zero rows, zero lookups). The learned set is kept in
-``ui_game_processes`` (migration 38) with its evidence, and mirrored to the C0 ``nudge_state`` row.
+**Two scopes since phase F (9 Oct 2026, the user's decision: "game open but not in front: trace and cards may run;
+nothing ever reaches a game in front"):**
 
-The gate holds while any of these is true:
+* **input** (:meth:`GameGate.holds`, what the action trace obeys): holds while a game is **in front**, while the shell
+  reports Direct3D exclusive full screen, or while an unknown full-screen program in front is still being judged
+  (its learning checks pending). A game running behind Discord no longer stops the trace. The one-edit way back is
+  ``[trace] game_gate = "running"`` in the privacy file (stricter only: any other value means "front"), which brings
+  back the old rule below for input too;
+* **running** (:meth:`GameGate.game_running`, what background CPU jobs obey): the old rule, unchanged: a game program
+  running anywhere, Direct3D exclusive full screen, or a game voice session.
+
+While the input gate holds, the trace drops input at its first step, unhooks its per-app window events and asks UI
+Automation nothing (zero rows, zero lookups); a lookup or a per-process hook aimed at a game's own process is refused
+whatever the gate says (``lookup_refused_game``). Subscribers (:meth:`GameGate.on_change`) hear a change at once, not
+at the next one-second beat. The learned set is kept in ``ui_game_processes`` (migration 38) with its evidence, and
+mirrored to the C0 ``nudge_state`` row.
+
+**The input backstop (D17)**, for the tray's hands (no gate thread needed): :func:`refuse_input` refuses any key,
+click, pointer move, focus (UI Automation focus too), window restore or activation, opened link or app launch while a
+game is in front, or aimed at a game's window, and says so (``input_refused_game``, content-free). "A game in front"
+is read locally (:func:`game_in_front`: the foreground program by :func:`judge_program`, plus Direct3D exclusive full
+screen), optionally widened by a registered fresher source (:func:`set_front_source`: memory's Now board).
+
+The running scope holds while any of these is true:
 
 * **a game program runs** (in front or not). A game program is
   - one of the fixed safety list, ``[trace] game_processes`` in the packaged privacy defaults (games with kernel
@@ -51,9 +66,12 @@ are re-read by :meth:`GameGate.beat` from the memory service's existing one-seco
 
 Log events (the memory log, content-free: process image names of measured programs only, flags, numbers):
 
-* ``game_gate``: the decision changed (``hold``, ``reasons``, ``games`` running, ``front`` = the game in front or
-  "", ``front_fullscreen``, ``trigger``: start / foreground / game_exit / check / d3d / game_voice / beat); written
-  on every change, so Alt+Tab in and out of a game shows;
+* ``game_gate``: the decision changed (``hold``, ``hold_input``, ``scope`` = front / d3d / learning / running /
+  none, ``reasons``, ``games`` running, ``front`` = the game in front or "", ``front_fullscreen``, ``trigger``:
+  start / foreground / game_exit / check / d3d / game_voice / beat); written on every change, so Alt+Tab in and out
+  of a game shows;
+* ``input_refused_game`` (from :func:`refuse_input`, through :func:`add_refusal_listener`): ``action``, ``game``
+  (its image stem, or "d3d"), ``where`` (front / target / point);
 * ``game_gate_learned``: a program joined the learned set (``game``, ``gpu_share`` as measured, ``stretches``);
 * ``game_gate_unlearned``: the start-up re-check dropped an entry whose evidence is no Windows fact (``app``,
   ``gpu_share``, ``stretches``, ``why``); a borderless stretch never takes a learned game out;
@@ -65,13 +83,20 @@ Log events (the memory log, content-free: process image names of measured progra
 Public API::
 
     GameGate(store=None, privacy_path=None, log=None, game_session_fn=None).start()
-        .holds() -> bool                 # the gate now (cheap, any thread; fails closed)
+        .holds() -> bool                 # the input gate now (cheap, any thread; fails closed)
+        .game_running() -> bool          # the running gate (background CPU jobs; fails closed)
+        .front_game() -> str             # the game in front (stem; "d3d" in exclusive full screen) or ""
+        .on_change(callback)             # callback(decision) on every change, on the thread that saw it
         .beat() -> Decision | None       # from an existing beat: re-read D3D and the voice session, log a change
         .decision() -> Decision          # why
         .games() -> GameSet              # the game set now (the call worker's judge uses it)
         .stats() -> dict                 # counters, content-free
         .stop()
     gate_holds(gate_or_None) -> bool     # what capture must ask: None (no gate) holds
+    running_holds(gate_or_None) -> bool  # what background CPU jobs ask: None (no gate) holds
+    gate_scope(privacy_path) -> str      # "front" (default) or "running" ([trace] game_gate)
+    refuse_input(action, hwnd=, pid=, point=, front_ok=) -> str | None   # D17 backstop: None = allowed
+    game_in_front() -> str / window_game(hwnd) -> str / pid_game(pid) -> str   # "" = no game
     decide(view, games) -> Decision      # the pure rule (tests use it with invented process data)
     judge_learn(app, fullscreen=, d3d=, own=) -> (learn, why)
     judge_program(image=, exe=, games=, d3d_fn=) -> (game, why)   # a program is a game: machine facts only
@@ -135,6 +160,11 @@ D3D_FRESH_S = 1.0
 #: :meth:`GameGate.beat` (called from the memory service's existing one-second loop) re-reads D3D full screen and the
 #: game voice session at most this often, so a change the window events cannot see is logged too.
 BEAT_EVERY_S = 5.0
+
+#: ``[trace] game_gate``: what the input gate covers. ``"front"`` (the default since phase F): a game in front, Direct3D
+#: exclusive full screen, or an unknown full-screen program still being judged. ``"running"``: the old rule (a game
+#: running anywhere, or its voice session) for input too. Stricter only: any value other than "running" is "front".
+GATE_SCOPES = ("front", "running")
 
 
 def stem(image: str | None) -> str:
@@ -291,8 +321,15 @@ def windows_games() -> frozenset[str]:
 
 
 def gate_holds(gate: GameGate | None) -> bool:
-    """What a capture phase must ask: no gate (it failed to start) holds, so does a gate whose thread is gone."""
+    """What a capture phase must ask (the input gate): no gate (it failed to start) holds, so does a gate whose thread
+    is gone."""
     return True if gate is None else gate.holds()
+
+
+def running_holds(gate: GameGate | None) -> bool:
+    """What background CPU jobs ask (the running gate: "lightweight while gaming", any game running anywhere): no gate
+    holds, so does a gate whose thread is gone."""
+    return True if gate is None else gate.game_running()
 
 
 def _stems(values: object) -> frozenset[str]:
@@ -301,16 +338,31 @@ def _stems(values: object) -> frozenset[str]:
     return frozenset(s for s in (stem(str(v)) for v in values) if s)
 
 
-def _list_in(path: Path | None) -> frozenset[str]:
+def _trace_table(path: Path | None) -> dict[str, Any]:
     if path is None:
-        return frozenset()
+        return {}
     try:
         with Path(path).open("rb") as fh:
             data = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
-        return frozenset()
-    trace = data.get("trace") if isinstance(data.get("trace"), dict) else {}
-    return _stems(trace.get("game_processes"))
+        return {}
+    return data.get("trace") if isinstance(data.get("trace"), dict) else {}
+
+
+def _list_in(path: Path | None) -> frozenset[str]:
+    return _stems(_trace_table(path).get("game_processes"))
+
+
+def gate_scope(privacy_path: Path | None = None) -> str:
+    """The input gate's scope from ``[trace] game_gate`` (:data:`GATE_SCOPES`): "running" when the packaged defaults or
+    the user's privacy file say exactly that, else "front". Stricter only: a typo or another word never widens what
+    may run."""
+    from yuki.memory.privacy import DEFAULT_PATH
+
+    for path in (DEFAULT_PATH, privacy_path):
+        if str(_trace_table(path).get("game_gate") or "").strip().casefold() == "running":
+            return "running"
+    return "front"
 
 
 @dataclass(frozen=True)
@@ -362,28 +414,39 @@ class GateView:
     running: frozenset[str] = frozenset()   # image names of the programs running that the gate looked at
     game_session: bool = False          # the call worker has a game voice session open or pending
     detected: frozenset[str] = frozenset()  # image names of running programs Windows detected as games (by path)
+    learning: bool = False              # an unknown full-screen program in front, its learning checks still pending
 
 
 @dataclass(frozen=True)
 class Decision:
-    hold: bool = False
+    hold: bool = False                  # the running gate: a game runs anywhere, D3D full screen, a game voice session
     reasons: tuple[str, ...] = ()       # "game_running", "d3d_fullscreen", "game_voice"
     games: tuple[str, ...] = ()         # game programs running (stems), sorted
     front: str = ""                     # the game in front (stem), "" when the program in front is not a game
     front_fullscreen: bool = False
     sources: tuple[str, ...] = ()       # "list" / "learned", per game in ``games``
+    hold_input: bool = False            # the input gate (passive input capture and passive UIA reads hold)
+    scope: str = "none"                 # why the input gate holds: front / d3d / learning / running / none
 
     def key(self) -> tuple:
-        return (self.hold, self.reasons, self.games, self.front, self.front_fullscreen)
+        return (self.hold, self.reasons, self.games, self.front, self.front_fullscreen, self.hold_input, self.scope)
 
     def facts(self) -> dict[str, Any]:
-        return {"hold": self.hold, "reasons": list(self.reasons), "games": list(self.games), "front": self.front,
-                "front_fullscreen": self.front_fullscreen, "sources": list(self.sources)}
+        return {"hold": self.hold, "hold_input": self.hold_input, "scope": self.scope, "reasons": list(self.reasons),
+                "games": list(self.games), "front": self.front, "front_fullscreen": self.front_fullscreen,
+                "sources": list(self.sources)}
 
 
-def decide(view: GateView, games: GameSet) -> Decision:
-    """The gate's rule: hold while a game program runs (in front or not), in D3D exclusive full screen, or while a
-    game voice session is open. Nothing else counts: an anti-cheat service, a full-screen app that is not a game."""
+def decide(view: GateView, games: GameSet, *, scope: str = "front") -> Decision:
+    """The gate's rule.
+
+    The running gate (``hold``): a game program runs (in front or not), D3D exclusive full screen, or a game voice
+    session is open. Nothing else counts: an anti-cheat service, a full-screen app that is not a game.
+
+    The input gate (``hold_input``), with ``scope`` "front" (the default): a game program in front, D3D exclusive full
+    screen, or an unknown full-screen program in front whose learning checks are still pending (``view.learning``);
+    a game behind another window or its voice session alone hold nothing. With ``scope`` "running" it is the running
+    gate (the old rule, ``[trace] game_gate = "running"``)."""
     detected = {stem(p) for p in view.detected if stem(p)}
     running = sorted({stem(p) for p in (*view.running, view.front) if games.is_game(p)} | detected)
     reasons = []
@@ -394,9 +457,20 @@ def decide(view: GateView, games: GameSet) -> Decision:
     if view.game_session:
         reasons.append("game_voice")
     front = stem(view.front) if games.is_game(view.front) or stem(view.front) in detected else ""
+    if front:
+        why = "front"
+    elif view.d3d_fullscreen:
+        why = "d3d"
+    elif view.learning:
+        why = "learning"
+    elif scope == "running" and reasons:
+        why = "running"
+    else:
+        why = "none"
     return Decision(hold=bool(reasons), reasons=tuple(reasons), games=tuple(running), front=front,
                     front_fullscreen=bool(view.front_fullscreen),
-                    sources=tuple(games.source(g) or ("windows" if g in detected else "") for g in running))
+                    sources=tuple(games.source(g) or ("windows" if g in detected else "") for g in running),
+                    hold_input=why != "none", scope=why)
 
 
 def judge_learn(app: str, *, fullscreen: bool, d3d: bool, own: bool = False) -> tuple[bool, str]:
@@ -471,6 +545,225 @@ def judge_program(image: str = "", exe: str = "", *, games: GameSet | None = Non
     except Exception:  # noqa: BLE001 - unreadable: no fact
         pass
     return False, "no_fact"
+
+
+def _never() -> bool:
+    return False
+
+
+# ---------------------------------------------------------------------------
+# D17: the input backstop (any process; no gate thread needed)
+# ---------------------------------------------------------------------------
+
+#: The verdict for the window in front is reused this long while that window stays in front (typing checks before
+#: every character; the foreground handle itself is read every time).
+FRONT_FRESH_S = 0.25
+#: A process's image name and path are reused this long (pid reuse within it is not a concern at this scale).
+PROGRAM_FRESH_S = 5.0
+_PROGRAM_CACHE_MAX = 64
+
+_front_cache: tuple[int, int, float, str] | None = None      # (hwnd, pid, when, game)
+_program_cache: dict[int, tuple[float, str, str]] = {}      # pid -> (when, image, exe)
+_verdict_cache: dict[int, tuple[float, str]] = {}           # pid -> (when, game or ""), not in front, default set
+_backstop_lock = threading.Lock()
+#: ``() -> str | None``: a fresher or fuller answer to "which game is in front" (memory's Now board ``game_front``,
+#: registered by the tray: it knows the learned set too); "" or None: none it knows of.
+_front_source: Callable[[], str | None] | None = None
+_refusal_listeners: list[Callable[..., None]] = []
+#: Refusals by action and where (content-free), for stats and tests.
+REFUSALS: Counter[str] = Counter()
+
+
+def set_front_source(fn: Callable[[], str | None] | None) -> None:
+    """Register (or clear with None) a second answer to "which game is in front" (memory's Now board, D9). The local
+    read always runs first; this only adds a game the local facts don't name (a learned game played borderless)."""
+    global _front_source
+    _front_source = fn
+
+
+def add_refusal_listener(fn: Callable[..., None]) -> None:
+    """``fn("input_refused_game", action=, game=, where=)`` on every refusal (the tray's log; content-free)."""
+    _refusal_listeners.append(fn)
+
+
+def remove_refusal_listener(fn: Callable[..., None]) -> None:
+    try:
+        _refusal_listeners.remove(fn)
+    except ValueError:
+        pass
+
+
+def _foreground_root() -> int:
+    hwnd = int(_U.GetForegroundWindow() or 0)
+    return int(_U.GetAncestor(hwnd, _GA_ROOT) or hwnd) if hwnd else 0
+
+
+def _window_root(hwnd: int) -> int:
+    hwnd = int(hwnd or 0)
+    return int(_U.GetAncestor(hwnd, _GA_ROOT) or hwnd) if hwnd else 0
+
+
+def _window_pid(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    pid = wintypes.DWORD(0)
+    _U.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _point_root(x: int, y: int) -> int:
+    hwnd = int(_U.WindowFromPoint(wintypes.POINT(int(x), int(y))) or 0)
+    return _window_root(hwnd)
+
+
+def _program(pid: int) -> tuple[str, str]:
+    """``(image name, full path)`` of a process ("" each when unreadable). The image name comes from the system's
+    process list when the process refuses a handle (an anti-cheat-protected game does), so a listed game is still
+    named."""
+    now = time.monotonic()
+    with _backstop_lock:
+        hit = _program_cache.get(pid)
+        if hit is not None and now - hit[0] < PROGRAM_FRESH_S:
+            return hit[1], hit[2]
+    image = _default_image(pid)
+    exe = _default_exe(pid) if image else ""
+    with _backstop_lock:
+        if len(_program_cache) >= _PROGRAM_CACHE_MAX:
+            _program_cache.clear()
+        _program_cache[pid] = (now, image, exe)
+    return image, exe
+
+
+def _d3d_exclusive() -> bool:
+    """The shell reports Direct3D exclusive full screen now (``SHQueryUserNotificationState``)."""
+    state = ctypes.c_int(0)
+    try:
+        if _SH.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+    except OSError:
+        return False
+    return state.value == QUNS_RUNNING_D3D_FULL_SCREEN
+
+
+def pid_game(pid: int, *, front: bool = False, games: GameSet | None = None) -> str:
+    """The game a process is (its image stem, or ``"d3d"``), or "". Machine facts only (:func:`judge_program`); Direct3D
+    exclusive full screen counts only for the process in front (``front``). Yuki's own process is never a game."""
+    pid = int(pid or 0)
+    if not pid:
+        return "d3d" if front and _d3d_exclusive() else ""
+    if pid == os.getpid():
+        return ""
+    cacheable = not front and games is None       # the default game set, no live Direct3D: reused for a moment
+    now = time.monotonic()
+    if cacheable:
+        with _backstop_lock:
+            hit = _verdict_cache.get(pid)
+        if hit is not None and now - hit[0] < PROGRAM_FRESH_S:
+            return hit[1]
+    image, exe = _program(pid)
+    game, _why = judge_program(image, exe, games=games, d3d_fn=_d3d_exclusive if front else _never)
+    verdict = (stem(image) or "d3d") if game else ""
+    if cacheable:
+        with _backstop_lock:
+            if len(_verdict_cache) >= _PROGRAM_CACHE_MAX:
+                _verdict_cache.clear()
+            _verdict_cache[pid] = (now, verdict)
+    return verdict
+
+
+def game_in_front() -> str:
+    """D9, read locally: the game in front now (its image stem, or ``"d3d"``), or "". The foreground window is read
+    every time; its verdict is reused for :data:`FRONT_FRESH_S` while it stays in front. A registered source
+    (:func:`set_front_source`) may add a game the local facts don't name."""
+    global _front_cache
+    hwnd = _foreground_root()
+    pid = _window_pid(hwnd)
+    now = time.monotonic()
+    with _backstop_lock:
+        hit = _front_cache
+    if hit is not None and hit[0] == hwnd and hit[1] == pid and now - hit[2] < FRONT_FRESH_S:
+        game = hit[3]
+    else:
+        game = pid_game(pid, front=True)
+        with _backstop_lock:
+            _front_cache = (hwnd, pid, now, game)
+    if not game and _front_source is not None:
+        try:
+            game = str(_front_source() or "")
+        except Exception:  # noqa: BLE001 - the local read stands
+            game = ""
+    return game
+
+
+def window_game(hwnd: int) -> str:
+    """The game owning a window (its top-level window's process), or "". The window in front also counts as a game
+    while the shell reports Direct3D exclusive full screen."""
+    root = _window_root(int(hwnd or 0))
+    if not root:
+        return ""
+    return game_in_front() if root == _foreground_root() else pid_game(_window_pid(root))
+
+
+def game_name(game: str) -> str:
+    """How a game is named in what Yuki says: ``a game (valorant-win64-shipping)``, or the exclusive full-screen one."""
+    return "a game in exclusive full screen" if game == "d3d" else f"a game ({game})"
+
+
+def refusal_text(game: str, where: str) -> str:
+    """What a refusal says (to the model and the user): which game, and that nothing was sent."""
+    name = game_name(game)
+    if where == "front":
+        return (f"{name} is in front: Yuki sends nothing while a game is in front (no keys, clicks, pointer moves, "
+                f"focus, window changes, links or app launches); nothing was done")
+    return f"that window belongs to {name}: Yuki never sends keys, clicks, focus or window changes to a game"
+
+
+def _refused(action: str, game: str, where: str) -> str:
+    REFUSALS[f"{action}:{where}"] += 1
+    for fn in list(_refusal_listeners):
+        try:
+            fn("input_refused_game", action=action, game=game, where=where)
+        except Exception:  # noqa: BLE001 - a log never blocks the refusal
+            pass
+    return refusal_text(game, where)
+
+
+def refuse_input(action: str, *, hwnd: int | None = None, pid: int | None = None,
+                 point: tuple[int, int] | None = None, front_ok: bool = False) -> str | None:
+    """D17's backstop, asked right before every key, click, pointer move, focus (UI Automation focus too), window
+    restore/show/activation, opened link or app launch: ``None`` = allowed, else why not (logged
+    ``input_refused_game``).
+
+    Refused when a game is in front (unless ``front_ok``: the step neither sends input nor takes focus, e.g. a pattern
+    call or minimising a background window), or when the step is aimed at a game: ``hwnd`` (its top-level window's
+    process), ``pid``, or the window under ``point``. Fails closed: a check that raised refuses."""
+    try:
+        if not front_ok:
+            game = game_in_front()
+            if game:
+                return _refused(action, game, "front")
+        if hwnd:
+            game = window_game(int(hwnd))
+            if game:
+                return _refused(action, game, "target")
+        if pid:
+            game = pid_game(int(pid))
+            if game:
+                return _refused(action, game, "target")
+        if point is not None:
+            root = _point_root(int(point[0]), int(point[1]))
+            if not root:
+                game = ""
+            elif root == _foreground_root():
+                game = game_in_front()          # the window in front: its verdict was just read (cached)
+            else:
+                game = pid_game(_window_pid(root))
+            if game:
+                return _refused(action, game, "point")
+    except Exception:  # noqa: BLE001 - fails closed
+        REFUSALS[f"{action}:check_failed"] += 1
+        return "could not check whether a game is in front, so nothing was sent"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +880,8 @@ class GameGate:
         # every measured program: candidates and learned games; re-checked at every start (only Windows facts stay)
         self._evidence = self._recheck(self._read_learned())
         self._games = GameSet.load(self._privacy_path, confirmed(self._evidence), self._windows())
+        self._scope = gate_scope(self._privacy_path)    # [trace] game_gate: "front" or "running"
+        self._listeners: list[Callable[[Decision], None]] = []
         self._privacy_stamp = self._stamp()
         self._d3d_live: tuple[float, bool] | None = None   # (when read, value) for holds()
         self._last_beat = float("-inf")
@@ -613,17 +908,50 @@ class GameGate:
     # -- reading ------------------------------------------------------------------------------------------------
 
     def holds(self) -> bool:
-        """Whether the gate holds now: a game program running, D3D exclusive full screen or a game voice session.
+        """Whether the input gate holds now (what the action trace obeys): a game program in front, D3D exclusive
+        full screen, or an unknown full-screen program in front still being judged. With ``[trace] game_gate =
+        "running"`` it is :meth:`game_running` (the old rule).
 
-        Fails closed: once started, a gate whose thread is gone (it stopped or died) holds. The game voice session
-        and D3D full screen are read live (D3D reused for :data:`D3D_FRESH_S`), as neither changes the window in
-        front; the thread's last decision covers game programs."""
+        Fails closed: once started, a gate whose thread is gone (it stopped or died) holds. D3D full screen is read
+        live (reused for :data:`D3D_FRESH_S`), as it does not change the window in front; the thread's last decision
+        covers the program in front."""
+        if self._thread is not None and not self._thread.is_alive():
+            return True
+        with self._lock:
+            if self._decision.hold_input:
+                return True
+            running = self._scope == "running"
+        if running:
+            return self.game_running()
+        return self._d3d_now()
+
+    def game_running(self) -> bool:
+        """Whether the running gate holds (what background CPU jobs obey: "lightweight while gaming"): a game program
+        running in front or not, D3D exclusive full screen, or a game voice session. Fails closed like :meth:`holds`.
+        The game voice session and D3D full screen are read live."""
         if self._thread is not None and not self._thread.is_alive():
             return True
         with self._lock:
             if self._decision.hold:
                 return True
         return self._session() or self._d3d_now()
+
+    def front_game(self) -> str:
+        """The game in front now: its image stem, ``"d3d"`` while the shell reports Direct3D exclusive full screen
+        with no known game in front (the program in front is then a game by :func:`judge_program`'s own rule), or
+        "" (D9: the Now board's ``game_front``, the cards' gate)."""
+        with self._lock:
+            front = self._decision.front
+        if front:
+            return front
+        return "d3d" if self._d3d_now() else ""
+
+    def on_change(self, callback: Callable[[Decision], None]) -> None:
+        """``callback(decision)`` on every change of the decision, called on the thread that saw it (the gate's own,
+        or the beat's) right after it is made: the trace blocks its input sink inside this call, not at the next
+        one-second beat. A raising callback is logged and never stops the gate."""
+        with self._lock:
+            self._listeners.append(callback)
 
     def beat(self) -> Decision | None:
         """Called from an existing beat (the memory service's loop): at most every :data:`BEAT_EVERY_S`, re-read
@@ -666,13 +994,20 @@ class GameGate:
             held = self._held_total
             if self._held_since is not None:
                 held += self._clock() - self._held_since
-            return {**dict(self.counters), "hold": self._decision.hold, "games_running": len(self._running),
+            return {**dict(self.counters), "hold": self._decision.hold, "hold_input": self._decision.hold_input,
+                    "scope": self._decision.scope, "gate": self._scope, "games_running": len(self._running),
                     "learned": len(self._games.learned), "windows_detected": len(self._games.windows),
                     "candidates": len(self._evidence) - len(self._games.learned), "held_s": round(held, 1)}
 
     @property
     def alive(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def scope(self) -> str:
+        """``[trace] game_gate`` as read now: "front" or "running" (:data:`GATE_SCOPES`)."""
+        with self._lock:
+            return self._scope
 
     # -- the rule, fed by events (the thread calls these; tests call them directly) ------------------------------
 
@@ -802,6 +1137,7 @@ class GameGate:
         if stamp != self._privacy_stamp:
             self._privacy_stamp = stamp
             self._games = GameSet.load(self._privacy_path, self._games.learned, self._games.windows)
+            self._scope = gate_scope(self._privacy_path)
             self.counters["list_reloads"] += 1
         self._refresh_windows()
 
@@ -963,13 +1299,21 @@ class GameGate:
         for pid in [p for p in self._running if p not in alive]:
             self._untrack(pid)   # gone (a handle we could not open is only checked here)
 
+    def _learning(self) -> bool:
+        """An unknown full-screen program in front whose learning checks are still pending (F4.2: the input gate holds
+        until it is judged). A program already judged not a game in this run is not held again."""
+        return (self._stretch is not None and bool(self._checks) and self._stretch[0] == self._front_hwnd
+                and stem(self._front) not in self._not_game and not self._games.is_game(self._front))
+
     def _evaluate(self, trigger: str, *, session: bool | None = None) -> Decision:
         view = GateView(front=self._front, front_fullscreen=self._front_fullscreen, d3d_fullscreen=self._d3d,
                         running=frozenset(self._running.values()),
                         game_session=self._session() if session is None else session,
-                        detected=frozenset(self._running[p] for p in self._detected if p in self._running))
-        decision = decide(view, self._games)
-        if decision.key() != self._decision.key():
+                        detected=frozenset(self._running[p] for p in self._detected if p in self._running),
+                        learning=self._learning())
+        decision = decide(view, self._games, scope=self._scope)
+        changed = decision.key() != self._decision.key()
+        if changed:
             now = self._clock()
             if decision.hold and self._held_since is None:
                 self._held_since = now
@@ -978,8 +1322,16 @@ class GameGate:
                 self._held_total += now - self._held_since
                 self._held_since = None
             self.counters["changes"] += 1
+            if decision.hold_input != self._decision.hold_input:
+                self.counters["input_flips"] += 1
             self._log("game_gate", trigger=trigger, **decision.facts())
         self._decision = decision
+        if changed:
+            for callback in list(self._listeners):
+                try:
+                    callback(decision)
+                except Exception as exc:  # noqa: BLE001 - a subscriber never stops the gate
+                    self._log("error", where="game_gate_listener", error=type(exc).__name__)
         return decision
 
     def _log(self, type: str, **fields: Any) -> None:
@@ -1108,6 +1460,11 @@ _U.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
 _U.GetAncestor.restype = wintypes.HWND
 _U.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 _U.GetWindowThreadProcessId.restype = wintypes.DWORD
+_U.WindowFromPoint.argtypes = [wintypes.POINT]
+_U.WindowFromPoint.restype = wintypes.HWND
+_SH = ctypes.WinDLL("shell32", use_last_error=True)
+_SH.SHQueryUserNotificationState.argtypes = [ctypes.POINTER(ctypes.c_int)]
+_SH.SHQueryUserNotificationState.restype = ctypes.c_long
 _K.GetCurrentThreadId.restype = wintypes.DWORD
 _K.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _K.OpenProcess.restype = wintypes.HANDLE
@@ -1140,4 +1497,6 @@ def _close(handle: int) -> None:
 __all__ = ["GameGate", "GameSet", "GateView", "Decision", "decide", "judge_learn", "judge_program", "stem",
            "LEARNED_STATE", "SCAN_EVERY_S", "CHECK_AFTER_S", "LEARN_AFTER_STRETCHES", "EVIDENCE_CAP", "BEAT_EVERY_S",
            "D3D_FRESH_S", "SOUND_EVIDENCE", "GAME_CONFIG_STORE", "WindowsGames", "gate_holds", "confirmed",
-           "recheck_evidence", "read_windows_games", "stretches", "windows_games"]
+           "recheck_evidence", "read_windows_games", "stretches", "windows_games", "running_holds", "gate_scope",
+           "GATE_SCOPES", "refuse_input", "refusal_text", "game_name", "game_in_front", "window_game", "pid_game",
+           "set_front_source", "add_refusal_listener", "remove_refusal_listener", "REFUSALS", "FRONT_FRESH_S"]

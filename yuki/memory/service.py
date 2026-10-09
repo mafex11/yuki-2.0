@@ -573,10 +573,11 @@ def run(args: argparse.Namespace) -> int:
                     return tr.rules() if tr is not None else None
 
                 def practice_game() -> bool:
-                    # capQ2b: the hard game gate (started later in this function; None until then: it holds)
-                    from yuki.memory.gamegate import gate_holds
+                    # capQ2b: the hard game gate (started later in this function; None until then: it holds). fGate:
+                    # a CPU job, so the running gate ("lightweight while gaming": any game running, in front or not)
+                    from yuki.memory.gamegate import running_holds
 
-                    return gate_holds(game_gate)
+                    return running_holds(game_gate)
 
                 practice = PracticeWorker(store, practice_model, db_path=db_path, log=log, idle_fn=_practice_idle,
                                           live_fn=practice_fullscreen, embedder=_practice_embedder(),
@@ -610,8 +611,13 @@ def run(args: argparse.Namespace) -> int:
                     # the recorder's open stretch (written to the store every 30 s) and Yuki's own marker
                     tl = timeline
                     st = tl.stats() if tl is not None and tl.alive else {}
-                    return {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen")),
-                            "acting": _acting_mod.current(db_path) is not None}
+                    out = {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen")),
+                           "acting": _acting_mod.current(db_path) is not None}
+                    gg = game_gate      # fGate (D9): a game in front holds the cards; behind, it doesn't
+                    if gg is not None and gg.alive:
+                        # [trace] game_gate = "running" (the rollback) holds them while one runs anywhere, as before
+                        out["game_front"] = bool(gg.front_game()) or (gg.scope == "running" and gg.game_running())
+                    return out          # no live gate: the cards' gate reads the open stretch's program instead
 
                 from yuki.core.attention import shared as shared_attention
 

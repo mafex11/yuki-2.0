@@ -177,13 +177,13 @@ NUDGE_EVENT_NAME = "Local\\YukiNudgeReady"
 MAX_OUTPUT_TOKENS = 600
 #: A timeline row reaching this close to now is the open stretch (written every FLUSH_EVERY_S).
 ONGOING_S = 2 * FLUSH_EVERY_S + 15.0
-#: No card while a game or a full-screen app is in front, nor in the hops between rounds: a full-screen row that
-#: ended less than this long ago still holds the cards (report 76: a "go stretch" card came at 01:05 on 5 Oct, in a
-#: 40-second alt-tab to Discord in the middle of a VALORANT session with friends).
-FULLSCREEN_HOLD_S = 10 * 60.0
-#: A game's voice session (a ``calls`` row of kind "game", yuki.memory.calls) seen alive this recently holds the
-#: cards too, whatever is in front; an older open row is a stuck one and holds nothing.
-GAME_ALIVE_S = 5 * 60.0
+#: No card while a game or a full-screen app is in front, nor in the hops between rounds: a game or full-screen
+#: stretch that ended less than ``[nudges] return_hold_s`` ago (this default) still holds the cards (report 76: a "go
+#: stretch" card came at 01:05 on 5 Oct, in a 40-second alt-tab to Discord in the middle of a VALORANT session).
+#: fGate (F4, the user's decision of 9 Oct: a game open but not in front lets cards run): this replaces the 10-minute
+#: full-screen hold and the game voice row's 5-minute hold, which on 8 Oct held the cards 19 minutes with no game in
+#: front (VALORANT last in front 08:41:52, cards back only at 09:00:46).
+RETURN_HOLD_S = 120.0
 #: Per-block caps inside a coach request (characters).
 JOURNAL_CHARS = 5_000
 NOW_JOURNAL_CHARS = 1_500
@@ -631,6 +631,8 @@ class NudgeConfig:
     #: After a meeting row, the meeting is held open while its app still plays sound (Meet drops the
     #: microphone on mute), for at most this long after the microphone was last seen.
     meeting_hold_min: float = 30.0
+    #: fGate (F4): cards come back this long after a game or full-screen stretch ended (the hop between rounds).
+    return_hold_s: float = RETURN_HOLD_S
     #: Observation cards (yuki.memory.presence, kind notice): on, at most this many a day (days start at
     #: resume_day_start; each kind has its own budget in yuki.core.attention), and one not shown within
     #: presence_deliver_min expires unshown (it stays in the card history as missed).
@@ -1010,17 +1012,45 @@ def wide_rows(store: Store, now: float) -> list[TimelineRow]:
     return [r for r in rows if not r.by_yuki]
 
 
-def game_going_on(store: Store, now: float) -> bool:
-    """A game's voice session is going on (an open ``calls`` row of kind "game" seen alive within
-    :data:`GAME_ALIVE_S`): measured by the call worker from the game in front drawing like a game and its microphone,
-    never an app list. Content-free; False when the store cannot say."""
-    try:
-        rows = store.calls(statuses=CALL_OPEN_STATUSES, since=now - 12 * 3600.0, limit=4)
-    except Exception:
+#: A program's game verdict is reused this long (the game set changes when a game is learned or the user edits it).
+_GAME_PROCESS_FRESH_S = 60.0
+_game_processes: dict[str, tuple[float, bool]] = {}
+
+
+def _game_process(process: str) -> bool:
+    """fGate (D9 for replays): whether a timeline row's program is a game, by the game gate's machine facts
+    (:func:`yuki.memory.gamegate.judge_program`: the fixed list, the user's additions, Windows' detected games, the
+    live gate's learned set when one runs here). Never the live Direct3D state: a row is history."""
+    if not process:
         return False
-    return any(r.kind == "game" and r.ended_at is None
-               and float(r.last_alive_at if r.last_alive_at is not None else r.detected_at) >= now - GAME_ALIVE_S
-               for r in rows)
+    now = time.monotonic()
+    hit = _game_processes.get(process)
+    if hit is not None and now - hit[0] < _GAME_PROCESS_FRESH_S:
+        return hit[1]
+    from yuki.memory.gamegate import judge_program
+
+    try:
+        game = bool(judge_program(process, d3d_fn=lambda: False)[0])
+    except Exception:
+        game = False
+    if len(_game_processes) > 256:
+        _game_processes.clear()
+    _game_processes[process] = (now, game)
+    return game
+
+
+def game_row(row: TimelineRow) -> bool:
+    """A timeline row whose program is a game (:func:`_game_process`)."""
+    return _game_process(str(row.process or ""))
+
+
+def _game_front(live: dict[str, Any], ongoing: bool, last: Any) -> bool:
+    """D9: a game is in front now. Live: the memory service's game gate (``live["game_front"]``, from
+    ``GameGate.front_game()``, Direct3D exclusive full screen included). Without it (a replay, or the gate is down):
+    the open stretch's program, by the game gate's facts (critique M9)."""
+    if "game_front" in live:
+        return bool(live["game_front"])
+    return bool(ongoing and last is not None and game_row(last.row))
 
 
 def observe(store: Store, now: float, config: NudgeConfig, live: dict[str, Any] | None = None) -> View:
@@ -1068,11 +1098,11 @@ def observe(store: Store, now: float, config: NudgeConfig, live: dict[str, Any] 
         gate = "yuki_acting"
     elif live.get("meeting") or any(c.row.meeting and c.end >= now - MEETING_GAP_S for c in clips):
         gate = "meeting"
-    elif live.get("fullscreen") or (ongoing and last.row.fullscreen) or any(
-            c.row.fullscreen and c.end >= now - FULLSCREEN_HOLD_S for c in clips_all):
-        gate = "fullscreen"
-    elif game_going_on(store, now):
+    elif _game_front(live, ongoing, last):
         gate = "game"
+    elif live.get("fullscreen") or (ongoing and last.row.fullscreen) or any(
+            (c.row.fullscreen or game_row(c.row)) and c.end >= now - config.return_hold_s for c in clips_all):
+        gate = "fullscreen"     # a full-screen app in front, or the return hold after a game or full-screen stretch
     elif present_recent <= 0.0 or stretch is None:
         gate = "away"
     elif not stretch.settled:

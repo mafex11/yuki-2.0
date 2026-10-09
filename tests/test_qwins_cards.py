@@ -19,7 +19,7 @@ from yuki.memory.cardrules import (
     event_status,
     with_card_rules,
 )
-from yuki.memory.nudges import FULLSCREEN_HOLD_S, GAME_ALIVE_S, NudgeConfig, _todo_lines, observe, todo_items
+from yuki.memory.nudges import RETURN_HOLD_S, NudgeConfig, _todo_lines, observe, todo_items
 from yuki.memory.store import Store, TimelineRow
 
 NOW = datetime(2026, 10, 4, 23, 30).timestamp()
@@ -170,17 +170,20 @@ def test_an_alt_tab_between_rounds_is_still_the_game(store):
 
 
 def test_the_cards_come_back_once_the_game_is_well_over(store):
-    present(store, NOW - 5400, NOW - FULLSCREEN_HOLD_S - 600, "VALORANT", fullscreen=True)
-    present(store, NOW - FULLSCREEN_HOLD_S - 600, NOW, "Warp")
+    present(store, NOW - 5400, NOW - RETURN_HOLD_S - 600, "VALORANT", fullscreen=True)
+    present(store, NOW - RETURN_HOLD_S - 600, NOW, "Warp")
     assert observe(store, NOW, CFG).gate not in ("fullscreen", "game")
 
 
-def test_a_live_game_voice_session_holds_the_cards(store):
+def test_a_game_voice_session_behind_discord_no_longer_holds_the_cards(store):
+    # fGate (the user's decision of 9 Oct): a game open but not in front lets the cards run; its voice row alone
+    # holds nothing (before: any live game voice row held every card, 8 Oct 19 minutes with no game in front)
     present(store, NOW - 1800, NOW, "Discord")
     row = store.start_call(app="VALORANT", process="valorant", via="game", at=NOW - 1700, status="declined",
                            kind="game")
     store.update_call(row, last_alive_at=NOW - 30)
-    assert observe(store, NOW, CFG).gate == "game"
+    assert observe(store, NOW, CFG).gate not in ("game", "fullscreen")
+    assert observe(store, NOW, CFG, {"game_front": True}).gate == "game"      # the live gate says one is in front
 
 
 def test_a_long_game_with_voice_sets_up_the_break_look_after_it(store):
@@ -203,5 +206,5 @@ def test_a_stuck_game_row_holds_nothing(store):
     present(store, NOW - 1800, NOW, "Discord")
     row = store.start_call(app="VALORANT", process="valorant", via="game", at=NOW - 7200, status="recording",
                            kind="game")
-    store.update_call(row, last_alive_at=NOW - GAME_ALIVE_S - 60)
+    store.update_call(row, last_alive_at=NOW - 3600)
     assert observe(store, NOW, CFG).gate != "game"

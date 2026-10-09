@@ -105,6 +105,7 @@ import win32process
 from yuki.actions import ActionResult
 from yuki.actions.input import wait_for_input_ready
 from yuki.actions.shell import run_powershell
+from yuki.memory import gamegate as _gamegate
 from yuki.perception.windows import (
     cloak_state,
     could_be_main_window,
@@ -495,7 +496,10 @@ def _find_app_window(identity: _AppIdentity, pids: set[int]) -> tuple[int | None
 
 
 def _show_window(hwnd: int, timeout_s: float = _SHOW_S) -> bool:
-    """Show a hidden window and wait (bounded) until it is on screen."""
+    """Show a hidden window and wait (bounded) until it is on screen. Never with a game in front, never a game's own
+    window (D17: showing or restoring a window can put it over the game)."""
+    if _gamegate.refuse_input("window_show", hwnd=hwnd) is not None:
+        return False
     try:
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
         if win32gui.IsIconic(hwnd):
@@ -1322,6 +1326,8 @@ def _activate_packaged(
         ``(pid, error)``: the activated process id (the first, with several
         URIs), or ``None`` and why not.
     """
+    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+        return None, refused
     result: dict = {}
 
     def worker() -> None:
@@ -1630,6 +1636,8 @@ def _open_new_window(chosen: dict[str, str], identity: _AppIdentity, budget_s: f
     Returns:
         ``(pid or None, via, error)``.
     """
+    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+        return None, "refused", refused
     appid = chosen["appid"]
     if _is_packaged(appid):
         pid, error = _activate_packaged(appid, "", budget_s)
@@ -2098,6 +2106,8 @@ def _foreground() -> int:
 def _start_entry(appid: str, timeout_s: float) -> tuple[bool, str]:
     """Start a Start entry the way the Start menu does (``shell:AppsFolder\\<AppID>``: a shortcut's own arguments, a
     link's scheme handler). ``(ok, error)``."""
+    if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: no app launch with a game in front
+        return False, refused
     result = run_powershell(f"Start-Process -FilePath {_quote('shell:AppsFolder' + chr(92) + appid)}",
                             timeout_s=timeout_s)
     return bool(result.ok), ("" if result.ok else str(result.details.get("stderr") or result.summary))
@@ -2602,6 +2612,9 @@ def launch_app(
             {"launched": False, "hwnd": None, "candidates": []},
         )
     arg_list = [a for a in (args or []) if a != ""]
+    # D17: no app is launched, shown or brought forward while a game is in front (re-checked before each step below)
+    if (refused := _gamegate.refuse_input("launch")) is not None:
+        return finish(False, refused, {"launched": False, "hwnd": None, "candidates": [], "refused": "game"})
     # Where the time goes, stage by stage (the 25 Sept "open YouTube on Chrome" took 16.4 s
     # and the log could not say where): ms since the call started, per stage end.
     timings: dict[str, float] = {}
@@ -2703,6 +2716,10 @@ def launch_app(
         """Start the app with its arguments (writes ``launched`` and the start's facts into ``into``): ``(pid,
         failure)``. percFix: also used once more to hand the address again (see below)."""
         launched_pid: int | None = None
+        if (refused := _gamegate.refuse_input("launch")) is not None:   # D17: re-checked before every hand-over
+            into["launched"] = False
+            into["refused"] = "game"
+            return None, refused
         if plan is None:
             # shell:AppsFolder\<AppID> is the Start menu's own launch path and works
             # for both packaged apps (AppUserModelID) and desktop shortcuts.
@@ -3068,6 +3085,8 @@ def _try_activate(hwnd: int) -> bool:
         What ``SetForegroundWindow`` reported: False means Windows refused the
         call outright, so there is nothing to wait for.
     """
+    if _gamegate.refuse_input("focus", hwnd=hwnd) is not None:   # D17: never over a game, never into one
+        return False
     foreground = _user32.GetForegroundWindow()
     our_thread = _kernel32.GetCurrentThreadId()
     target_thread = _user32.GetWindowThreadProcessId(ctypes.c_void_p(foreground), None)
@@ -3107,6 +3126,9 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
 
     if not win32gui.IsWindow(hwnd):
         return finish(False, f"hwnd {hwnd} is not a window (it may have closed)", {"hwnd": hwnd})
+    # D17: no focus, restore or activation with a game in front or into a game (re-checked before every attempt)
+    if (refused := _gamegate.refuse_input("focus", hwnd=hwnd)) is not None:
+        return finish(False, refused, {"hwnd": hwnd, "refused": "game"})
 
     info = window_info(hwnd)
     details: dict = {
@@ -3143,6 +3165,9 @@ def focus_window(hwnd: int, *, timeout_s: float = 2.0) -> ActionResult:
     for name, action in attempts:
         if focused():
             break
+        if (refused := _gamegate.refuse_input("focus", hwnd=hwnd)) is not None:
+            details["refused"] = "game"     # a game came to the front meanwhile: no further try
+            return finish(False, refused, details)
         details["attempts"].append(name)
         try:
             accepted = action()
@@ -3320,6 +3345,12 @@ def window_action(hwnd: int, action: str) -> ActionResult:
                              f"focus)", details)
     if not win32gui.IsWindow(hwnd):
         return finish(False, f"hwnd {hwnd} is not a window (it may have closed)", details)
+    # D17: no window action ever on a game's own window; with a game in front only minimising another window (shown
+    # without activating anything) is allowed, never maximise, restore, full screen or close (a save prompt would
+    # come up over the game)
+    if (refused := _gamegate.refuse_input(f"window_{action}", hwnd=hwnd, front_ok=action == "minimize")) is not None:
+        details["refused"] = "game"
+        return finish(False, refused, details)
     info = window_info(hwnd)
     name = f"{info.process_name} \"{info.title}\"" if info else f"hwnd {hwnd}"
     details.update(title=info.title if info else "", process_name=info.process_name if info else "",
@@ -3365,7 +3396,10 @@ def window_action(hwnd: int, action: str) -> ActionResult:
 
     already = reached()
     if not already:
-        win32gui.ShowWindow(hwnd, _SHOW_COMMANDS[action])
+        command = _SHOW_COMMANDS[action]
+        if action == "minimize" and _gamegate.game_in_front():
+            command = win32con.SW_SHOWMINNOACTIVE   # D17: minimised without activating the next window over the game
+        win32gui.ShowWindow(hwnd, command)
     deadline = time.monotonic() + _STATE_WAIT_S
     while not reached() and time.monotonic() < deadline:
         time.sleep(_POLL_S)
@@ -3475,6 +3509,9 @@ def open_url(
     if not url or not url.strip():
         return finish(False, "no url given", {"url": url})
     target = url.strip()
+    # D17: an opened link brings its handler forward (a browser, Spotify, Discord): never with a game in front
+    if (refused := _gamegate.refuse_input("open_url")) is not None:
+        return finish(False, refused, {"url": target, "refused": "game"})
     if app is not None and app.strip():
         launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s)
         launched.details["url"] = target

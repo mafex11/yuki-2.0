@@ -315,6 +315,16 @@ class _LiveSlider:
         self.pattern.SetValue(float(value))
 
     def focus(self) -> None:
+        # D17 (critic H1): a UI Automation SetFocus activates the slider's window, so it is refused with a game in
+        # front or on a game's own element; the keys after it are refused by the input layer's own backstop
+        from yuki.memory.gamegate import refuse_input
+
+        try:
+            pid = int(self.element.CurrentProcessId or 0)
+        except Exception:  # noqa: BLE001 - unknown: the front check still runs
+            pid = 0
+        if (refused := refuse_input("uia_focus", pid=pid or None)) is not None:
+            raise PermissionError(refused)
         self.element.SetFocus()
 
 
