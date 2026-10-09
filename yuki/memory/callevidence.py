@@ -69,6 +69,20 @@ long unrelated hold, review F4); once the app lets go (Meet releases the microph
 app still plays sound and the site was seen within ``screen_alive_s`` (review F3), else it ends by the release
 grace. A browser holding the microphone for a video site is still no call: that page is read and judged as a screen.
 
+**Kept across restarts and asked without a microphone** (PLAN.md F5, D8): the shipped list's verdicts are kept in
+``nudge_state['call_evidence:sites']`` with a digest of the list (``state``: the store), reused while the list is
+unchanged and judged again only when it changes, so a service start costs no model call and the first sighting is
+instant. :meth:`CallEvidence.calling_service` answers "which calling service is this blocked page's host?" for any
+sighting, with no microphone holder needed (the ``site_front`` moment and the Meet tab), never blocking its caller: a
+list not judged yet is judged once on a short-lived thread, and the answer is None until then.
+
+**The Meet tab** (:class:`SiteTabs`, PLAN.md D8): on a sighting of a calling site, the selected tab of that window is
+read as identities (its RuntimeId with the browser's pid, a keyed digest of its name, its place outside the main
+strip; :func:`yuki.memory.extract.uia.tab_identities`) at most once per 10 min per window and site, kept in
+``nudge_state['site_tabs:<service>']``, and served on the Now board (``calling_tabs``). The census
+(:meth:`SiteTabs.census`) finds the tab again in every window of the browser when an offer is due. Content-free logs
+(``tab_strip``, ``tab_census``): group sizes, counts, ms, reason codes, never a tab name.
+
 Logs are content-free (``call_evidence_judged`` / ``call_evidence_applied`` for a cached verdict: app, the
 verdict, the frame's control count, whether it was healthy, the site's median, ms, cost;
 ``call_evidence_sites``: the shipped list's size, how many are calling services, their product names, ms, cost;
@@ -122,6 +136,10 @@ SITE_CACHE = 128
 MAX_SITES = 256
 #: A failed judgement of the shipped site list is tried again after this long (s).
 SITES_RETRY_S = 60.0
+#: Where the shipped list's verdicts are kept across restarts (``nudge_state``), with a digest of the list.
+SITES_STATE_KEY = "call_evidence:sites"
+#: A calling site's tab is read again at most this often per window and site (s).
+TAB_READ_GAP_S = 600.0
 
 #: The judge's three answers.
 IN_CALL, NOT_IN_CALL, UNCLEAR = "in_call", "not_in_call", "unclear"
@@ -297,6 +315,19 @@ def _host_matches(host: str, entry: str) -> bool:
     return host == entry or host.endswith("." + entry)
 
 
+def _product_name(name: Any, host: str, entry: str | None = None) -> str | None:
+    """A calling service's product name as given (spaces folded, at most 40 characters), or None when there is none:
+    empty, or the page's host, its site (without ``www.``) or the shipped list's entry standing in for a name (the
+    ``[meetings]`` fallbacks give those when no name is known). Never a host in a service's place."""
+    text = " ".join(str(name or "").split())[:40]
+    if not text:
+        return None
+    site = host[4:] if host.startswith("www.") else host
+    if text.casefold() in {host, site, str(entry or "").casefold()}:
+        return None
+    return text
+
+
 @dataclass
 class Screen:
     key: str               # app key of the process ("zen", "discord")
@@ -365,14 +396,21 @@ class CallEvidence:
         privacy: The service's :class:`yuki.memory.privacy.PrivacyConfig` (its ``[meetings]`` table: the user's
             ``always_sites``, ``never_sites`` and ``names``); None: the packaged defaults.
         entries: The shipped list of blocked sites (tests); default :func:`shipped_site_entries`.
+        state: Where the shipped list's verdicts are kept across restarts (an object with ``nudge_state(name)`` and
+            ``set_nudge_state(name, value)``: the store); None: in RAM only.
     """
 
     def __init__(self, *, judge_fn: Callable[[Screen], Verdict] | None = None, settings: Any = None,
                  log: Callable[..., Any] | None = None, fresh_s: float = FRESH_S, client: Any = None,
                  model: str | None = None, rejudge_s: float = REJUDGE_S,
                  sites_fn: Callable[[tuple[str, ...]], dict[str, tuple[bool, str]]] | None = None,
-                 privacy: Any = None, entries: Iterable[str] | None = None) -> None:
+                 privacy: Any = None, entries: Iterable[str] | None = None, state: Any = None) -> None:
         self._judge_fn = judge_fn
+        self._state = state
+        #: One judgement of the shipped list at a time (the call worker's pass, or calling_service's thread).
+        self._entries_lock = threading.Lock()
+        self._entries_thread: threading.Thread | None = None
+        self._kept_checked = False
         self._sites_fn = sites_fn
         self._privacy = privacy
         self._entries = tuple(sorted({str(e).strip().casefold() for e in entries if str(e).strip()})) \
@@ -681,9 +719,23 @@ class CallEvidence:
     def _judge_entries(self) -> dict[str, tuple[bool, str]] | None:
         """Judge the whole shipped list of blocked sites once (``sites_fn`` or the model); None when that failed
         (tried again after :data:`SITES_RETRY_S`). Never names a page the user visited."""
-        if time.monotonic() - self._entries_failed_at < SITES_RETRY_S:
-            return None
-        entries = self._entries if self._entries is not None else shipped_site_entries()
+        with self._entries_lock:
+            if self._entry_verdicts is not None:
+                return self._entry_verdicts
+            entries = self._entries if self._entries is not None else shipped_site_entries()
+            kept = self._kept_verdicts(entries)
+            if kept is not None:
+                with self._lock:
+                    self._entry_verdicts = kept
+                self._log("call_evidence_sites", entries=len(entries), calling=sum(1 for c, _s in kept.values() if c),
+                          services=sorted({sv for c, sv in kept.values() if c and sv}), ms=0, cost_usd=0.0, kept=True)
+                return kept
+            if time.monotonic() - self._entries_failed_at < SITES_RETRY_S:
+                return None
+            return self._judge_entries_now(entries)
+
+    def _judge_entries_now(self, entries: tuple[str, ...]) -> dict[str, tuple[bool, str]] | None:
+        """Judge the shipped list (under ``_entries_lock``), keep the verdicts; None when that failed."""
         started = time.perf_counter()
         cost = 0.0
         try:
@@ -705,10 +757,113 @@ class CallEvidence:
         with self._lock:
             self._entry_verdicts = verdicts
             self.cost_usd += cost
+        self._keep_verdicts(entries, verdicts)
         services = sorted({s for c, s in verdicts.values() if c and s})
         self._log("call_evidence_sites", entries=len(entries), calling=sum(1 for c, _s in verdicts.values() if c),
                   services=services, ms=round((time.perf_counter() - started) * 1000), cost_usd=round(cost, 6))
         return verdicts
+
+    @staticmethod
+    def _list_digest(entries: tuple[str, ...]) -> str:
+        """A digest of the shipped list (public data): its verdicts are reused while it is unchanged."""
+        return hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+
+    def _kept_verdicts(self, entries: tuple[str, ...]) -> dict[str, tuple[bool, str]] | None:
+        """The verdicts kept in ``nudge_state['call_evidence:sites']`` for this very list, or None."""
+        if self._state is None:
+            return None
+        try:
+            raw = self._state.nudge_state(SITES_STATE_KEY)
+            data = json.loads(raw) if raw else None
+        except Exception:  # noqa: BLE001 - unreadable: judged again
+            return None
+        if not isinstance(data, dict) or data.get("list") != self._list_digest(entries):
+            return None
+        got = data.get("verdicts") or {}
+        out = {}
+        for entry in entries:
+            item = got.get(entry)
+            calling = bool(item[0]) if isinstance(item, list) and item else False
+            service = str(item[1]) if isinstance(item, list) and len(item) > 1 and calling else ""
+            out[entry] = (calling, " ".join(service.split())[:40])
+        return out
+
+    def _keep_verdicts(self, entries: tuple[str, ...], verdicts: dict[str, tuple[bool, str]]) -> None:
+        if self._state is None:
+            return
+        try:
+            self._state.set_nudge_state(SITES_STATE_KEY, json.dumps(
+                {"list": self._list_digest(entries), "at": round(time.time()),
+                 "verdicts": {e: [bool(c), sv] for e, (c, sv) in verdicts.items()}}, separators=(",", ":")))
+        except Exception:  # noqa: BLE001 - kept in RAM only then
+            pass
+
+    def _judge_entries_soon(self) -> None:
+        """Judge the shipped list once on a short-lived thread (never on the caller's)."""
+        with self._lock:
+            running = self._entries_thread is not None and self._entries_thread.is_alive()
+            if (running or self._entry_verdicts is not None
+                    or time.monotonic() - self._entries_failed_at < SITES_RETRY_S):
+                return   # judging now, judged, or failed moments ago (tried again after SITES_RETRY_S)
+            self._entries_thread = threading.Thread(target=self._judge_entries, name="yuki-memory-sites-judge",
+                                                    daemon=True)
+            thread = self._entries_thread
+        thread.start()
+
+    def calling_service(self, host: str | None, *, judge: bool = True) -> str | None:
+        """The calling service a blocked page's ``host`` is (its product name, e.g. "Google Meet"), or None: not a
+        calling site, a site the user blocked themselves, not known yet, or a calling site with no product name known
+        (never a host or a list entry in its place). The same decision as the microphone path (the user's
+        ``[meetings]`` word, else the shipped list's verdict), with no holder needed. Never blocks: a list not judged
+        yet is judged on a short-lived thread (``judge``), and None is the answer until then."""
+        return self.calling_site(host, judge=judge)[1]
+
+    def site_front_service(self, host: str | None) -> str | None:
+        """For ``MomentHub(calling_service=...)``: the product name; the ``host`` itself (as given, stripped and
+        lower-cased) for a calling site with no product name known, which the hub records as a ``site_front`` with no
+        service (it never keeps or logs a service equal to the host); None when the site is not a calling one."""
+        calling, service = self.calling_site(host)
+        if service:
+            return service
+        if not calling:
+            return None
+        return str(host or "").strip().casefold() or None
+
+    def calling_site(self, host: str | None, *, judge: bool = True) -> tuple[bool, str | None]:
+        """``(calling, product name or None)`` for a blocked page's ``host`` (see :meth:`calling_service`)."""
+        host = str(host or "").strip().casefold()
+        if not host:
+            return False, None
+        meetings = self._meeting_rules()
+        if meetings is not None and meetings.never("", host):
+            return False, None
+        if meetings is not None:
+            named = meetings.match_url(f"https://{host}/")
+            if named:
+                return True, _product_name(named, host)
+        entry = self._entry_of(host)
+        if entry is None:
+            return False, None
+        with self._lock:
+            verdicts = self._entry_verdicts
+        if verdicts is None:
+            kept = None
+            if not self._kept_checked:   # the kept verdicts are read once per process (only this one writes them)
+                self._kept_checked = True
+                kept = self._kept_verdicts(self._entries if self._entries is not None else shipped_site_entries())
+            if kept is not None:
+                with self._lock:
+                    self._entry_verdicts = verdicts = kept
+            elif judge:
+                self._judge_entries_soon()
+        if verdicts is None:
+            return False, None
+        calling, service = verdicts.get(entry, (False, ""))
+        if not calling:
+            return False, None
+        if meetings is not None:
+            service = meetings.name_for(host, meetings.name_for(entry, service or ""))
+        return True, _product_name(service, host, entry)
 
     def _model_sites(self, entries: tuple[str, ...]) -> tuple[dict[str, tuple[bool, str]], float]:
         """``({entry: (calling, service)}, cost)`` for the shipped list, from the model (the list only)."""
@@ -920,5 +1075,187 @@ class CallEvidence:
                 pass
 
 
+class SiteTabs:
+    """The tab of a calling site (the Meet tab in Zen) found by identity, never by title (PLAN.md D8, F5).
+
+    :meth:`seen` is the watcher's ``on_screen`` hook (beside :meth:`CallEvidence.seen`, on the watcher's worker
+    thread): for a sighting of a blocked page whose host is a calling service (:meth:`CallEvidence.calling_service`),
+    at most once per :data:`TAB_READ_GAP_S` per window and service, the window's selected tab is read as identities
+    (``reader``: :func:`yuki.memory.extract.uia.tab_identities`, every group of the strip, at most 0.2 s), learned
+    into ``nudge_state['site_tabs:<service>']`` (:func:`yuki.perception.tabs.learn_identity`) and put on the Now
+    board (``calling_tabs``). Non-calling blocked hosts (a bank) produce nothing. A strip that reads empty logs why
+    (``tab_strip`` with its reason code), so the user's first live check can say whether Zen's strip is readable.
+
+    :meth:`census` finds the tab again in every window of the browser (an offer is due, "open my meeting"):
+    candidates in identity order, ``one`` / ``ask`` (two equal) / ``none``, logged ``tab_census`` content-free.
+
+    Args:
+        evidence: the service's :class:`CallEvidence` (its ``calling_service``).
+        store: the memory store (``cipher`` for the keyed name digests, ``nudge_state`` for the identities).
+        board: the :class:`yuki.memory.now.NowBoard` (``set_calling_tab``), or None.
+        log: ``log(type, **fields)``, content-free.
+        reader: ``reader(hwnd, digest_fn=...) -> dict`` (tests pass a stub); default ``tab_identities``.
+        census_fn: ``census_fn(windows, identity, digest_fn=...) -> dict``; default ``tab_census``.
+    """
+
+    def __init__(self, evidence: Any, *, store: Any = None, board: Any = None, log: Callable[..., Any] | None = None,
+                 reader: Callable[..., dict[str, Any]] | None = None,
+                 census_fn: Callable[..., dict[str, Any]] | None = None, gap_s: float = TAB_READ_GAP_S,
+                 clock: Callable[[], float] = time.time) -> None:
+        self._evidence = evidence
+        self._store = store
+        self._board = board
+        self._log_fn = log
+        self._reader = reader
+        self._census_fn = census_fn
+        self.gap_s = float(gap_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        #: When each (hwnd, service) was last read, and whether its selected tab was identified then.
+        self._read_at: dict[tuple[int, str], float] = {}
+        self._known: dict[int, bool] = {}
+        self.counters = {"sightings": 0, "calling": 0, "reads": 0, "identified": 0, "empty": 0, "census": 0}
+
+    @staticmethod
+    def state_key(service: str) -> str:
+        return f"site_tabs:{service}"
+
+    def digest(self, process: str, name: str) -> str:
+        """The keyed digest of a tab's name (``FieldCipher.digest("tab", process, name)``); ``""`` without a key."""
+        cipher = getattr(self._store, "cipher", None)
+        if cipher is None or not name:
+            return ""
+        return cipher.digest("tab", str(process or "").casefold(), " ".join(str(name).split()))
+
+    def identities(self, service: str) -> dict[str, Any]:
+        """What was learned of ``service``'s tab (``{"process", "runtime_ids", "names", "positions"}``)."""
+        try:
+            raw = self._store.nudge_state(self.state_key(service)) if self._store is not None else None
+            got = json.loads(raw) if raw else {}
+            return got if isinstance(got, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def known(self, hwnd: int) -> bool:
+        """Whether the last read of this window's calling-site tab identified it (``site_front``'s ``tab_known``)."""
+        with self._lock:
+            return bool(self._known.get(int(hwnd)))
+
+    def seen(self, screen: dict[str, Any]) -> None:
+        """The watcher's ``on_screen`` hook. Cheap unless a read is due; never raises."""
+        try:
+            if not screen.get("blocked"):
+                return
+            self.counters["sightings"] += 1
+            host = str(screen.get("host") or "").strip().casefold()
+            service = self._evidence.calling_service(host) if host and self._evidence is not None else None
+            if not service:
+                return
+            self.counters["calling"] += 1
+            hwnd = int(screen.get("hwnd") or 0)
+            process = str(screen.get("process") or "").strip().casefold()
+            now = float(screen.get("at") or self._clock())
+            with self._lock:
+                last = self._read_at.get((hwnd, service))
+                if last is not None and now - last < self.gap_s:
+                    due = False
+                else:
+                    due = True
+                    self._read_at[(hwnd, service)] = now
+                    if len(self._read_at) > 64:
+                        for old in sorted(self._read_at, key=self._read_at.__getitem__)[:32]:
+                            self._read_at.pop(old, None)
+            if due:
+                self._read(hwnd, process, service, now)
+        except Exception as exc:  # noqa: BLE001 - the Meet tab never breaks capture
+            self._log("tab_strip", status="error", error=type(exc).__name__)
+
+    def _read(self, hwnd: int, process: str, service: str, now: float) -> None:
+        reader = self._reader
+        if reader is None:
+            from yuki.memory.extract.uia import tab_identities as reader
+        self.counters["reads"] += 1
+        result = reader(hwnd, digest_fn=lambda name: self.digest(process, name))
+        seen = result.get("sighting")
+        identified = bool(seen)
+        with self._lock:
+            self._known[hwnd] = identified
+        if identified:
+            self.counters["identified"] += 1
+            stored = self.identities(service)
+            from yuki.perception.tabs import learn_identity
+
+            ident = learn_identity(stored, seen)
+            ident["process"] = process
+            try:
+                if self._store is not None:
+                    self._store.set_nudge_state(self.state_key(service), json.dumps(ident, separators=(",", ":")))
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            self.counters["empty"] += 1
+        if self._board is not None:
+            try:
+                info = {"process": process, "service": service, "seen_at": now, "known": identified}
+                if identified:
+                    pos = seen.get("position") or {}
+                    info.update(tab_id=seen.get("tab_id") or "", name_digest=seen.get("digest") or "",
+                                group=pos.get("group"), index=pos.get("index"))
+                self._board.set_calling_tab(hwnd, info)
+            except Exception:  # noqa: BLE001
+                pass
+        self._log("tab_strip", app=process, service=service, tabs=result.get("tabs"),
+                  groups=list(result.get("groups") or [])[:12], nodes=result.get("nodes"),
+                  complete=result.get("complete"), ms=result.get("ms"), selected_group=result.get("selected_group"),
+                  main_group=result.get("main_group"), reason=result.get("reason"), tab_known=identified,
+                  selected_tabs=result.get("selected_tabs"),
+                  pinned=bool(identified and seen.get("position")), shallow_documents=result.get("shallow_documents"),
+                  tabitems_in_documents=result.get("tabitems_in_documents"), depth_capped=result.get("depth_capped"))
+
+    def census(self, service: str, windows: list[tuple[int, int]] | None = None) -> dict[str, Any]:
+        """Find ``service``'s tab in every window of its browser (``windows``: ``[(hwnd, pid)]``; default: the user
+        windows of the process its identities were learned in). Content-free result (:func:`census_job`), logged."""
+        ident = self.identities(service)
+        process = str(ident.get("process") or "")
+        if windows is None:
+            windows = _windows_of(process)
+        fn = self._census_fn
+        if fn is None:
+            from yuki.memory.extract.uia import tab_census as fn
+        self.counters["census"] += 1
+        result = fn(windows, ident, digest_fn=lambda name: self.digest(process, name))
+        best = (result.get("chosen") or [None])[0]
+        self._log("tab_census", app=process or None, service=service, windows=result.get("windows"),
+                  tabs=result.get("tabs"), candidates=len(result.get("candidates") or []),
+                  decision=result.get("decision"), match=getattr(best, "match", None), ms=result.get("ms"),
+                  reasons=[d.get("reason") for d in result.get("diagnostics") or []][:8],
+                  error=result.get("error"))
+        return result
+
+    def stats(self) -> dict[str, Any]:
+        return dict(self.counters)
+
+    def _log(self, type: str, **fields: Any) -> None:
+        if self._log_fn is not None:
+            try:
+                self._log_fn(type, **fields)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _windows_of(process: str) -> list[tuple[int, int]]:
+    """``[(hwnd, pid)]`` of the user windows whose program's app key is ``process`` (``zen``)."""
+    if not process:
+        return []
+    try:
+        from yuki.memory.store import app_key
+        from yuki.perception.windows import list_windows
+
+        return [(w.hwnd, w.pid) for w in list_windows() if app_key(w.process_name) == process]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 __all__ = ["CallEvidence", "Screen", "Verdict", "Life", "JUDGE_PROMPT", "JUDGE_TOOL", "SITES_PROMPT", "SITES_TOOL",
-           "shipped_site_entries", "FRESH_S", "HEALTH_RATIO", "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL", "UNCLEAR"]
+           "SiteTabs", "shipped_site_entries", "FRESH_S", "HEALTH_RATIO", "HEALTH_WINDOW", "IN_CALL", "NOT_IN_CALL",
+           "UNCLEAR", "SITES_STATE_KEY", "TAB_READ_GAP_S"]

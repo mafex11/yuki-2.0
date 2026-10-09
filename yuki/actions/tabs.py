@@ -194,14 +194,16 @@ def _invoke(element: Any, module: Any) -> bool:
 
 
 def _rows(found: list[tuple[Any, Any]]) -> list[dict[str, Any]]:
-    return [{"index": t.index, "id": t.tab_id, "name": t.name, "selected": t.selected} for t, _e in found]
+    return [{"index": t.index, "group": t.group, "id": t.tab_id, "name": t.name, "selected": t.selected}
+            for t, _e in found]
 
 
 def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
     """Select or close the tab of ``hwnd``'s strip whose identity is ``tab_id``, then re-read the strip.
 
     ``tab_id`` is a :attr:`yuki.perception.tabs.Tab.tab_id` from a read of the strip (the
-    TabItem's UIA RuntimeId): the tab is found by it, whatever its title or place now, and
+    TabItem's UIA RuntimeId), from any of the strip's groups (a pinned tab's too): the tab is
+    found by it, whatever its title or place now, and
     one that is no longer there is reported, never replaced by another. ``select`` asks it
     to show (as :func:`select_tab`) and watches it report itself selected; ``close`` invokes
     its own close control (its single Button child; with none or several nothing is done)
@@ -228,7 +230,9 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
         return finish(False, "no tab id given: read the tabs first and pass one of their ids")
 
     def job(automation: Any, shared: dict) -> None:
-        found, nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.25)
+        # a tab id from any group of the strip (PLAN.md D8: a pinned or Essentials tab sits in a smaller group)
+        found, nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.25,
+                                            all_groups=True)
         shared["count"], shared["nodes"] = len(found), nodes
         match = next(((t, e) for t, e in found if t.tab_id and t.tab_id == tab_id), None)
         if match is None:
@@ -259,12 +263,13 @@ def tab_action(hwnd: int, tab_id: str, action: str) -> ActionResult:
                 shared["how"] = "its close control"
                 deadline = time.monotonic() + CLOSE_WATCH_S
                 while time.monotonic() < deadline:
-                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3)
+                    now, _n, _c = walk_tabs(automation, int(hwnd), time.monotonic() + 0.3, all_groups=True)
                     if not any(t.tab_id == tab_id for t, _e in now):
                         shared["seen"] = True
                         break
                     time.sleep(POLL_S)
-        after, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2)
+        after, _n, complete = walk_tabs(automation, int(hwnd), time.monotonic() + ACTION_BUDGET_S * 0.2,
+                                        all_groups=True)
         shared["after"], shared["after_complete"] = _rows(after), complete
 
     pending = _Pending(job, "yuki-tab-action", ACTION_BUDGET_S)

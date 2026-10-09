@@ -1,0 +1,66 @@
+# Spotify's desktop app as data (docs/research/audit-2026-10-09/PLAN.md D0, D4; evidence round4/spotify-desktop-route.md §2).
+#
+# Zero setup: nothing here needs an account, a key or a sign-in. Yuki reads Spotify's own window through UI Automation
+# (read-only in phase F), uses Windows' media session for play/pause/next/previous, and Spotify's own `spotify:` links.
+# Every label below is Spotify's own UI text in one display language, kept as data: code never guesses what a label
+# means. A label is matched only inside its container (PLAN.md M5: Spotify's Home page has 8 more Buttons named "Play").
+# Another language is one more [labels.<code>] table; until one ships, the reader finds the volume slider by its shape
+# and learns the Library row wording itself (yuki.connect.spotify_desktop, PLAN.md L6).
+
+[app]
+# The program that draws Spotify's window. The Microsoft Store build and the classic installer both run Spotify.exe.
+process = "Spotify.exe"
+uri_scheme = "spotify"
+
+[session]
+# Windows' media session app id of Spotify, in both install forms (PLAN.md L7). The Store build's id is
+# "<package family>!<app>" (SpotifyAB.SpotifyMusic_<publisher id>!Spotify); the classic installer's is the exe name.
+# The reader first matches the session to the Spotify window's own process (its AppUserModelID); these forms are the
+# fallback when no window is known. The classic form is untested on the build PC (it runs the Store build).
+classic_app_id = "Spotify.exe"
+store_package_name = "SpotifyAB.SpotifyMusic"
+store_app = "Spotify"
+
+[links]
+# Spotify's in-app links carry a playlist's id (a Hyperlink's Value; seen on Home cards, playlist page headers and the
+# Now Playing view). Library rows carry no link. Query strings (?uid=...) are ignored.
+playlist = "https://xpui.app.spotify.com/playlist/{id}"
+playlist_uri = "spotify:playlist:{id}"
+
+[slider]
+# The volume slider's RangeValue (0.0-1.0 on every read since 5 Oct). The shape fallback looks for the window's only
+# Slider with exactly this range.
+range_min = 0.0
+range_max = 1.0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# English (ships ready). Containers are paths of (role, name) steps from the window root; a control counts only inside
+# its container.
+# ---------------------------------------------------------------------------------------------------------------------
+
+[labels.en]
+# The player bar, present in every full read (51 of 52 logged reads).
+now_playing_bar = [["Group", "Now playing bar"]]
+player_controls = [["Group", "Now playing bar"], ["Group", "Player controls"]]
+# Your Library: DataGrid "Your Library" > DataItem > DataItem > Group "{name}" (28 of 52 reads; absent in the full-screen
+# and Now-Playing-only views).
+library_grid = [["DataGrid", "Your Library"]]
+row_path = ["DataItem", "DataItem", "Group"]
+
+[labels.en.controls]
+# role, name, container (one of the paths above)
+volume = ["Slider", "Change volume", "now_playing_bar"]
+play = ["Button", "Play", "player_controls"]
+pause = ["Button", "Pause", "player_controls"]
+next = ["Button", "Next", "player_controls"]
+previous = ["Button", "Previous", "player_controls"]
+
+[labels.en.rows]
+# The row's own play button: "Play {name}", and "Pause {name}" on the row that is playing (27 of 27 Library reads:
+# exactly when the player bar reads "Pause").
+play = "Play {name}"
+pause = "Pause {name}"
+# The row's open button, which names the owner. A row whose owner is Spotify itself stays digest-only (PLAN.md D1);
+# a row whose owner cannot be parsed (another format) too.
+open = ["{name} Playlist • {owner}", "{name} Downloaded Playlist • {owner}", "{name} Pinned Playlist • {owner}"]
+spotify_owner = "Spotify"

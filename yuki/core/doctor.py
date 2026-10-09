@@ -814,6 +814,169 @@ def check_call_recording(db: Path | None = None, *, now: float | None = None, da
                  "logs\\memory-*.jsonl to whoever maintains Yuki.")
 
 
+MOMENTS_CHECK = "Noting what changes"
+#: Moments newer than this (s) mean they are flowing.
+MOMENTS_FRESH_S = 6 * 3600.0
+
+
+def _privacy_table(name: str, privacy_file: Path | None = None) -> dict[str, Any]:
+    """One table of the user's privacy file (``{}`` when absent or unreadable); the file the memory service reads
+    (``yuki.memory.privacy.user_config_path``: under ``%YUKI_MEMORY_DIR%`` when that is set)."""
+    import tomllib
+
+    path = privacy_file
+    if path is None:
+        try:
+            from yuki.memory.privacy import user_config_path
+
+            path = user_config_path()
+        except Exception:  # noqa: BLE001 - the module unavailable: the default place
+            path = _local() / "memory" / "privacy.toml"
+    try:
+        with open(path, "rb") as fh:
+            table = tomllib.load(fh).get(name)
+        return table if isinstance(table, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_moments(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None,
+                  hours: float = 24.0) -> Check:
+    """PLAN.md F item 7, "moments flowing": the state changes Yuki noted (a meeting joined, a playlist started, a
+    volume moved) that happened in the last ``hours``, counted by kind, and how old the newest is. Read-only,
+    content-free (the ``moments`` table's cleartext columns: kind, times, who). Counted by when each change happened
+    (``at``), never by when its row was written (``seen_at``): a moments rebuild or backfill writes every past
+    moment again, and must not look like a day full of fresh ones (nor hide that nothing new is coming)."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:
+        return Check(MOMENTS_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    if _privacy_table("moments", privacy_file).get("enabled") is False:
+        return Check(MOMENTS_CHECK, SKIP, "switched off ([moments] enabled = false in the privacy file)")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(MOMENTS_CHECK, SKIP, "no memory database yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    except Exception as exc:
+        return Check(MOMENTS_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        has = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='moments'").fetchone()
+        if not has:
+            return Check(MOMENTS_CHECK, SKIP, "not part of this install yet")
+        rows = conn.execute("SELECT kind, count(*), max(at), sum(CASE WHEN by='yuki' THEN 1 ELSE 0 END)"
+                            " FROM moments WHERE at >= ? AND at <= ? GROUP BY kind",
+                            (now - hours * 3600.0, now + 300.0)).fetchall()
+        newest = conn.execute("SELECT max(at) FROM moments WHERE at <= ?", (now + 300.0,)).fetchone()
+    except Exception as exc:
+        return Check(MOMENTS_CHECK, WARN, f"could not read the moments ({type(exc).__name__})")
+    finally:
+        conn.close()
+    total = sum(int(r[1]) for r in rows)
+    newest_at = float(newest[0]) if newest and newest[0] is not None else None
+    span = f"the last {hours:g} hours" if hours != 24 else "the last day"
+    if not total:
+        last = f"; the newest is from {_when(newest_at)}" if newest_at else ""
+        return Check(MOMENTS_CHECK, WARN, f"none noted in {span}{last}",
+                     "If Yuki's memory has been running, restart Yuki from the tray; if it stays, send "
+                     "logs\\memory-*.jsonl to whoever maintains Yuki.")
+    kinds = ", ".join(f"{k.replace('_', ' ')} {int(n)}" for k, n, _m, _y in sorted(rows, key=lambda r: -int(r[1])))
+    yuki = sum(int(r[3] or 0) for r in rows)
+    age = now - newest_at if newest_at else None
+    if age is not None and age < 90:
+        when = "just now"
+    elif age is not None and age < 5400:
+        when = f"{int(round(age / 60))} min ago"
+    else:
+        when = _when(newest_at) if newest_at else "?"
+    detail = f"{total:,} in {span} ({kinds})" + (f", {yuki} of them by Yuki" if yuki else "") + f"; newest {when}"
+    if age is not None and age > MOMENTS_FRESH_S:
+        return Check(MOMENTS_CHECK, WARN, detail + " (nothing new for a while)",
+                     "If you used the PC since, restart Yuki from the tray.")
+    return Check(MOMENTS_CHECK, OK, detail)
+
+
+SPOTIFY_CHECK = "Spotify desktop"
+#: The window states in plain words (yuki.connect.spotify_desktop's codes).
+_SPOTIFY_STATES = {"front": "in front", "covered": "covered by another window",
+                   "visible": "on screen behind another window or on your other screen", "minimised": "minimised"}
+_SPOTIFY_READS = {"ok": "ok", "no_library": "ok (Your Library not shown: full-screen view)",
+                  "not_built": "not built yet (Spotify had not drawn its window for Yuki)",
+                  "unrecognised": "drawn, but its controls were not recognised (a Spotify update renamed them, or "
+                                  "another display language)",
+                  "timeout": "too slow", "error": "failed", "held_game": "held (a game was in front)",
+                  "no_window": "no window"}
+
+
+def check_spotify_desktop(db: Path | None = None, *, now: float | None = None) -> Check:
+    """PLAN.md F item 7: "Spotify desktop: found, media session seen, last window read ok / empty / not built", and
+    what the daily state probe found (can Yuki see Spotify covered, on the other screen, minimised?). From the
+    reader's content-free status in ``nudge_state['spotify_desktop']``; read-only. No account or key is involved."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:
+        return Check(SPOTIFY_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(SPOTIFY_CHECK, SKIP, "no memory database yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            row = conn.execute("SELECT value FROM nudge_state WHERE name='spotify_desktop'").fetchone()
+            learned = conn.execute("SELECT 1 FROM nudge_state WHERE name='spotify_labels'").fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return Check(SPOTIFY_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    try:
+        st = json.loads(row[0]) if row and row[0] else {}
+    except ValueError:
+        st = {}
+    if not st:
+        return Check(SPOTIFY_CHECK, SKIP, "Spotify's window has not been seen since this install (no setup needed)")
+    parts = [f"found {_when(float(st['found_at']))}" if st.get("found_at") else "found"]
+    parts.append(f"music seen {_when(float(st['session_seen_at']))}" if st.get("session_seen_at")
+                 else "its music not seen playing yet")
+    last = st.get("last_read") or {}
+    status = str(last.get("status") or "")
+    if last:
+        where = _SPOTIFY_STATES.get(str(last.get("window_state") or ""), "")
+        bits = []
+        if status in ("ok", "no_library"):
+            bits.append(f"{int(last.get('rows') or 0)} Library rows" if last.get("rows") else "no Library rows")
+            bits.append("the volume slider" if last.get("slider") else "no volume slider")
+        read = f"last window read {_SPOTIFY_READS.get(status, status or '?')}"
+        if bits:
+            read += f" ({', '.join(bits)})"
+        if where:
+            read += f", Spotify {where}"
+        if last.get("at"):
+            read += f", {_when(float(last['at']))}"
+        parts.append(read)
+    probes = st.get("probes") or {}
+    seen = []
+    for code in ("covered", "visible", "minimised"):
+        p = probes.get(code)
+        if not p:
+            continue
+        ok = p.get("status") in ("ok", "no_library") and (p.get("rows") or p.get("slider"))
+        seen.append(f"{_SPOTIFY_STATES[code]}: {'readable' if ok else 'not readable'} ({p.get('day')})")
+    if seen:
+        parts.append("daily check: " + "; ".join(seen))
+    if learned or last.get("label_source") == "learned":
+        parts.append("its button wording was learned (not English)")
+    detail = "; ".join(parts)
+    if status == "unrecognised":
+        return Check(SPOTIFY_CHECK, WARN, detail, "Yuki's labels for Spotify need an update: send "
+                                                  "logs\\memory-*.jsonl to whoever maintains Yuki.")
+    if status in ("not_built", "timeout", "error"):
+        return Check(SPOTIFY_CHECK, WARN, detail, "Bring Spotify to the front once and play something; if this stays, "
+                                                  "send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    return Check(SPOTIFY_CHECK, OK, detail)
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -926,6 +1089,8 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         ("Disk space for call audio", check_spool_disk),
         ("Call transcription models", check_whisper),
         (CALL_RECORDING_CHECK, check_call_recording),
+        (MOMENTS_CHECK, check_moments),
+        (SPOTIFY_CHECK, check_spotify_desktop),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

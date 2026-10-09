@@ -812,28 +812,9 @@ class LoopbackSource:
 # ---------------------------------------------------------------------------
 
 
-class IAudioSessionEvents(IUnknown):
-    _iid_ = GUID("{24918ACC-64B3-37C1-8CA9-74A66E9957A8}")
-    _methods_ = [
-        COMMETHOD([], HRESULT, "OnDisplayNameChanged", (["in"], c_wchar_p, "name"), (["in"], POINTER(GUID), "ctx")),
-        COMMETHOD([], HRESULT, "OnIconPathChanged", (["in"], c_wchar_p, "path"), (["in"], POINTER(GUID), "ctx")),
-        COMMETHOD([], HRESULT, "OnSimpleVolumeChanged", (["in"], c_float, "volume"), (["in"], wintypes.BOOL, "mute"),
-                  (["in"], POINTER(GUID), "ctx")),
-        COMMETHOD([], HRESULT, "OnChannelVolumeChanged", (["in"], wintypes.DWORD, "count"),
-                  (["in"], POINTER(c_float), "volumes"), (["in"], wintypes.DWORD, "changed"),
-                  (["in"], POINTER(GUID), "ctx")),
-        COMMETHOD([], HRESULT, "OnGroupingParamChanged", (["in"], POINTER(GUID), "param"),
-                  (["in"], POINTER(GUID), "ctx")),
-        COMMETHOD([], HRESULT, "OnStateChanged", (["in"], c_int, "state")),
-        COMMETHOD([], HRESULT, "OnSessionDisconnected", (["in"], c_int, "reason")),
-    ]
-
-
-class IAudioSessionNotification(IUnknown):
-    _iid_ = GUID("{641DD20B-4D41-49CC-ABA3-174B9477BB08}")
-    _methods_ = [
-        COMMETHOD([], HRESULT, "OnSessionCreated", (["in"], POINTER(_audio.IAudioSessionControl), "session")),
-    ]
+# The session interfaces are declared once, in yuki.perception.audio (shared with yuki.memory.volumewatch).
+IAudioSessionEvents = _audio.IAudioSessionEvents
+IAudioSessionNotification = _audio.IAudioSessionNotification
 
 
 class _SessionEvents(COMObject):

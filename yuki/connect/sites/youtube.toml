@@ -1,0 +1,25 @@
+# YouTube's documented URL shapes as data (docs/research/audit-2026-10-09/PLAN.md D0, D16, critique M10).
+#
+# One place for every YouTube URL template: the moments extractor reads a page's entity from them (a video id, a
+# channel handle), the skills build their links from them. Zero setup: no API key; channel uploads come from the public
+# RSS feed. Templates are parsed as fixed machine formats: a path segment is a literal, a "{var}" (the whole segment) or a
+# literal prefix plus a var ("@{handle}"); a query part "v={id}" reads that parameter. `moments rebuild` after a change.
+
+[site]
+hosts = ["youtube.com", "www.youtube.com", "m.youtube.com"]
+home = "https://www.youtube.com/"
+
+[pages]
+# kind = template (matched in this order; the first match wins)
+watch = "/watch?v={id}"
+shorts = "/shorts/{id}"
+handle = "/@{handle}"
+channel = "/channel/{id}"
+home = "/"
+
+[urls]
+watch = "https://www.youtube.com/watch?v={id}"
+handle = "https://www.youtube.com/@{handle}"
+channel = "https://www.youtube.com/channel/{id}"
+feed = "https://www.youtube.com/feeds/videos.xml?channel_id={id}"
+oembed = "https://www.youtube.com/oembed?url={url}&format=json"
