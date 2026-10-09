@@ -3230,6 +3230,44 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS ui_task_runs_at ON ui_task_runs(at);
     CREATE INDEX IF NOT EXISTS ui_task_runs_window ON ui_task_runs(window_start);
     """,
+    # 40 (2026-10-10, fMoments; docs/research/audit-2026-10-09/PLAN.md Phase F item 4, decisions D1, D6, D7, D18;
+    # spec round3/map-foundations.md F1.2): moments, one table of state changes (yuki.memory.moments).
+    # - Derived kinds (call_join, game_voice, page, message_sent) are computed from rows that already exist (calls,
+    #   timeline, messages) and point back to them (source, source_id): `python -m yuki.memory.moments rebuild`
+    #   recomputes them, so a rule change is a code change, never an edit of memory.
+    # - Live kinds (site_front, media_play, media_context, volume_change) are their own source, written once when the
+    #   change is seen (source_id: the event time in ms, unique per source).
+    # - Content-free columns in clear (kind, app key, a calling service's product name, times, levels, code words);
+    #   an entity (a page's template value, a playlist name) only encrypted, with a keyed digest for equality. Media
+    #   titles are never kept, only their digest ([moments] media_titles).
+    # - timeline gets an index on updated_at: the extractor reads past its cursor every minute.
+    # Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS moments (
+        id                 INTEGER PRIMARY KEY,
+        at                 REAL NOT NULL,
+        ended_at           REAL,
+        seen_at            REAL NOT NULL,
+        kind               TEXT NOT NULL,
+        app                TEXT,
+        service            TEXT,
+        entity_digest      TEXT,
+        entity_ciphertext  TEXT,
+        value              REAL,
+        value_from         REAL,
+        means              TEXT,
+        by                 TEXT NOT NULL DEFAULT 'user',
+        request_id         TEXT,
+        source             TEXT NOT NULL,
+        source_id          INTEGER,
+        evidence           TEXT,
+        facts              TEXT,
+        UNIQUE(source, source_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS moments_at ON moments(at);
+    CREATE INDEX IF NOT EXISTS moments_kind ON moments(kind, at);
+    CREATE INDEX IF NOT EXISTS timeline_updated ON timeline(updated_at);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -10489,6 +10527,138 @@ class Store:
                  "title": self._dec(r["title_ciphertext"]), "scope": self._dec(r["scope_ciphertext"]),
                  "url": self._dec(r["url_ciphertext"]), "host": r["host"], "by_yuki": bool(r["by_yuki"]),
                  "trigger": r["trigger"], "attention": capture_attention(r["trigger"])} for r in rows]
+
+    # -- moments: one table of state changes (migration 40, yuki.memory.moments) -----------------------------------
+
+    #: The columns of a moment row, in the order :meth:`save_moments` writes them.
+    MOMENT_COLUMNS: tuple[str, ...] = (
+        "at", "ended_at", "seen_at", "kind", "app", "service", "entity_digest", "entity_ciphertext", "value",
+        "value_from", "means", "by", "request_id", "source", "source_id", "evidence", "facts",
+    )
+
+    def save_moments(self, rows: Sequence[dict[str, Any]]) -> int:
+        """Write moments, one transaction; returns how many rows were written or changed.
+
+        Each row is a dict of :data:`MOMENT_COLUMNS` (``facts`` a dict or None; ``entity_ciphertext`` already
+        encrypted by the caller). A row with the same ``(source, source_id, kind)`` is replaced in place (its ``id``
+        and first ``seen_at`` stay). A row with ``partial`` set only updates ``ended_at`` / ``value`` / ``facts`` of
+        that row when it exists (a live span that ended: the media stopped, the Meet tab left the front)."""
+        if not rows:
+            return 0
+        now = time.time()
+        full, partial = [], []
+        for r in rows:
+            facts = r.get("facts")
+            facts_json = json.dumps(facts, sort_keys=True, separators=(",", ":")) if facts else None
+            if r.get("partial"):
+                partial.append((r.get("ended_at"), r.get("value"), facts_json, r["source"], r.get("source_id"),
+                                r["kind"]))
+                continue
+            values = dict(r, seen_at=r.get("seen_at") or now, facts=facts_json, by=r.get("by") or "user")
+            full.append(tuple(values.get(c) for c in self.MOMENT_COLUMNS))
+        cols = ", ".join(self.MOMENT_COLUMNS)
+        sets = ", ".join(f"{c}=excluded.{c}" for c in self.MOMENT_COLUMNS if c not in ("seen_at", "source",
+                                                                                      "source_id", "kind"))
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for v in full:
+                cur = conn.execute(
+                    f"INSERT INTO moments({cols}) VALUES ({','.join('?' * len(self.MOMENT_COLUMNS))})"
+                    f" ON CONFLICT(source, source_id, kind) DO UPDATE SET {sets}", v)
+                n += cur.rowcount
+            for ended_at, value, facts_json, source, source_id, kind in partial:
+                cur = conn.execute(
+                    "UPDATE moments SET ended_at=coalesce(?, ended_at), value=coalesce(?, value),"
+                    " facts=coalesce(?, facts) WHERE source=? AND source_id IS ? AND kind=?",
+                    (ended_at, value, facts_json, source, source_id, kind))
+                n += cur.rowcount
+            return n
+
+        return self._write(op)
+
+    def delete_moments(self, ids: Iterable[int]) -> int:
+        """Delete moments by id (a derived moment its sources no longer give); returns how many."""
+        wanted = sorted({int(i) for i in ids})
+        if not wanted:
+            return 0
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for i in range(0, len(wanted), 500):
+                chunk = wanted[i:i + 500]
+                n += conn.execute("DELETE FROM moments WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk).rowcount
+            return n
+
+        return self._write(op)
+
+    def moments_between(self, since: TimeArg = None, until: TimeArg = None, kinds: Iterable[str] | None = None, *,
+                        app: str | None = None, sources: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Moments with ``at`` in ``[since, until)``, oldest first, as dicts (``facts`` parsed; the entity stays
+        encrypted: ``entity_ciphertext``). Filters: ``kinds``, one ``app`` key, ``sources``."""
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("at < ?")
+            params.append(u)
+        for column, values in (("kind", kinds), ("source", sources)):
+            if values is not None:
+                values = list(values)
+                clauses.append(f"{column} IN ({','.join('?' * len(values))})" if values else "0")
+                params.extend(values)
+        if app is not None:
+            clauses.append("app = ?")
+            params.append(app)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        out = []
+        for r in self._query("SELECT * FROM moments" + where + " ORDER BY at, id", params):
+            d = dict(r)
+            try:
+                d["facts"] = json.loads(d["facts"]) if d.get("facts") else {}
+            except ValueError:
+                d["facts"] = {}
+            out.append(d)
+        return out
+
+    def moment_entity(self, row: dict[str, Any]) -> str | None:
+        """A moment's entity in clear (in-process only; never logged), or None when only its digest was kept."""
+        return self._dec(row.get("entity_ciphertext")) if row.get("entity_ciphertext") else None
+
+    def moment_cursor(self, name: str) -> str | None:
+        """The moments extractor's cursor ``name`` (``calls``, ``timeline``, ``messages``, ``rule``)."""
+        return self.source_checkpoint("moments." + name)
+
+    def set_moment_cursor(self, name: str, value: str) -> None:
+        self.set_source_checkpoint("moments." + name, value)
+
+    def clear_moments(self, *, sources: Iterable[str], kinds: Iterable[str] | None = None,
+                      since: float | None = None) -> int:
+        """Delete the moments of these sources (and kinds; with ``at >= since``): a rebuild starts from nothing."""
+        sources = list(sources)
+        clauses, params = [f"source IN ({','.join('?' * len(sources))})"], list(sources)
+        if kinds is not None:
+            kinds = list(kinds)
+            clauses.append(f"kind IN ({','.join('?' * len(kinds))})")
+            params.extend(kinds)
+        if since is not None:
+            clauses.append("at >= ?")
+            params.append(float(since))
+        return self._write(lambda conn: conn.execute("DELETE FROM moments WHERE " + " AND ".join(clauses),
+                                                     params).rowcount)
+
+    def prune_moments(self, before: float) -> int:
+        """Delete moments that ended (or, still open, began) before ``before`` (``[moments] keep_days``)."""
+        return self._write(lambda conn: conn.execute(
+            "DELETE FROM moments WHERE coalesce(ended_at, at) < ?", (float(before),)).rowcount)
+
+    def moments_counts(self) -> dict[str, Any]:
+        """Content-free counts: rows per kind and per ``by``, the oldest and newest ``at``."""
+        kinds = {r[0]: r[1] for r in self._query("SELECT kind, count(*) FROM moments GROUP BY kind")}
+        by = {r[0]: r[1] for r in self._query("SELECT by, count(*) FROM moments GROUP BY by")}
+        lo, hi = self._query("SELECT min(at), max(at) FROM moments")[0]
+        return {"rows": sum(kinds.values()), "kinds": kinds, "by": by, "first_at": lo, "last_at": hi}
 
 
 def _split_sql(script: str) -> list[str]:

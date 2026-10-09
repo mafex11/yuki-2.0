@@ -1829,9 +1829,13 @@ class CallWorker:
         busy_fn: Callable[[], bool] | None = None,
         watch_factory: Any = _DEFAULT,
         table_fn: Callable[[], list[tuple[int, int, str]]] | None = None,
+        on_call_change: Callable[[str], None] | None = None,
     ) -> None:
         from yuki.memory.timeline import PrivacySection
 
+        #: Told ``"calls"`` right after a call or game voice row starts or ends (yuki.memory.moments: its call joins are
+        #: written within a second instead of at the next refresh). Must return at once; never raises into here.
+        self.on_call_change = on_call_change
         self.store = store
         self.db_path = Path(db_path) if db_path is not None else store.path
         self._section = PrivacySection(privacy, "calls", CallConfig.from_dict) if config is None else None
@@ -1914,6 +1918,12 @@ class CallWorker:
         if self._log_fn is not None:
             try:
                 self._log_fn(type, **fields)
+            except Exception:
+                pass
+        hook = getattr(self, "on_call_change", None)
+        if hook is not None and type in ("call_detected", "game_voice_detected", "call_ended"):
+            try:
+                hook("calls")
             except Exception:
                 pass
 
