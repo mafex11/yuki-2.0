@@ -58,6 +58,26 @@ def test_tokens_are_compared_as_the_trace_writes_them():
     assert S.canon("ab12") == "ab12" and S.canon("") is None
 
 
+@pytest.mark.parametrize(("planned", "trace"), [
+    ("Control+K", "Ctrl+K"), ("control+shift+k", "Ctrl+Shift+K"), ("Windows+E", "Win+E"), ("Cmd+K", "Win+K"),
+    ("Meta+K", "Win+K"), ("Super+E", "Win+E"), ("Option+F4", "Alt+F4"), ("Escape", "Esc"), ("Return", "Enter"),
+    ("Del", "Delete"), ("Shift+Del", "Shift+Delete"), ("PgUp", "PageUp"), ("PgDn", "PageDown"),
+    ("Page Down", "PageDown"), ("ArrowDown", "Down"), ("Down Arrow", "Down"), ("Shift+ArrowUp", "Shift+Up"),
+    ("Spacebar", "Space"), ("Ctrl+Enter", "Ctrl+Enter")])
+def test_other_spellings_of_a_key_are_the_traces_names(planned, trace):
+    """Second review A2: the thinker writes keys freely; the trace writes ``yuki.memory.trace_keys``' names."""
+    assert S.chord(planned) == S.chord(trace) == trace
+    assert S.score([f"w|keys|{planned}"], [f"w|keys|{trace}"])["composite"] == 100.0
+
+
+def test_a_modifier_the_trace_has_no_name_for_is_kept_never_dropped():
+    """Second review A2: an unknown modifier never turns the chord into the plain key (or a smaller chord)."""
+    assert S.chord("Hyper+K") == "Hyper+K" and S.chord("Ctrl+Hyper+K") == "Ctrl+Hyper+K"
+    assert S.score(["w|keys|Hyper+K"], ["w|keys|K"])["composite"] == 0.0
+    assert S.score(["w|keys|Control+Shift+K"], ["w|keys|Shift+K"])["composite"] == 0.0
+    assert S.score(["w|keys|Control+K"], ["w|keys|K"])["composite"] == 0.0
+
+
 def test_edit_distance_hand_checked():
     assert S.edit_distance(list("kitten"), list("sitting")) == 3
     assert S.edit_distance([], ["a"]) == 1 and S.edit_distance(["a"], ["a"]) == 0
