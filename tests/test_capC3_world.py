@@ -379,6 +379,22 @@ def test_a_version_that_replaced_another_after_the_cut_off_is_gone_whatever_its_
     assert back.state == "active" and not back.trial                   # as at the cut-off (the first test)
 
 
+def test_the_familys_link_to_its_way_is_as_at_the_cut_off_after_the_evaluated_task_is_learned(store):
+    """Second review A1: the evaluated task itself is learned after it ends; the learner replaces the family's way and
+    moves the family's link to the new version. After the cut the link points at the version memory held then."""
+    w = world(store, future=False)
+    c = w["cutoff"]
+    fid = int(store._query("SELECT family_id FROM ui_tasks WHERE id = ?", (w["T3"],))[0][0])
+    before = P._family_playbook(store, fid)
+    assert before is not None
+    learn(store, w["T3"], w["ids3"], c + 600)
+    after = P._family_playbook(store, fid)
+    assert after is not None and after != before                       # the way was replaced and the link moved
+    D.cut(store, c, embedder=Words())
+    assert P._family_playbook(store, fid) == before
+    assert store._query("SELECT playbook_id FROM ui_families WHERE id = ?", (fid,))[0][0] == before
+
+
 def test_requests_are_the_users_own_or_turns_that_led_to_yuki_acting_never_goals(store, tmp_path):
     assert D.add_requests([REQUEST, "  send a  message in the team channel ", "open my notes"], now=NOW) == 2
     assert D.requests_path().is_relative_to(tmp_path)                     # the test's own LOCALAPPDATA
