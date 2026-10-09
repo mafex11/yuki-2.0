@@ -22,6 +22,7 @@ nothing but put small tuples on the trace worker's queue; it never calls UI Auto
   app's open/save dialog).
 
 While blocked (game gate, pause, consent off) the per-process and outcome hooks are removed and nothing is queued.
+A game's own process is never hooked, blocked or not (fGate, D17: ``game_pid``; counted ``hooks_refused_game``).
 """
 
 from __future__ import annotations
@@ -199,12 +200,15 @@ class TraceHooks:
         own_pid: this process (never hooked).
         recent: the Recent folder (None: no file notifications).
         clock: ``time.monotonic``.
+        game_pid: ``(pid) -> bool``: the process is a game; such a process never gets a per-process hook (fGate, D17).
     """
 
     def __init__(self, put: Callable[[tuple], None], *, pid_of: Callable[[int], tuple[int, ...]] | None = None,
                  own_pid: int | None = None, recent: Path | None = None,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic,
+                 game_pid: Callable[[int], bool] | None = None) -> None:
         self._put = put
+        self._game_pid = game_pid
         self._pid_of = pid_of or _pids_behind
         self._own = int(own_pid or os.getpid())
         self._recent = recent
@@ -224,7 +228,7 @@ class TraceHooks:
         self.gen = 0
         self._n = 0
         self.counts: dict[str, int] = {"fg": 0, "low": 0, "low_dropped": 0, "outcome": 0, "outcome_over": 0,
-                                       "clip": 0, "recent": 0, "outcome_opens": 0}
+                                       "clip": 0, "recent": 0, "outcome_opens": 0, "hooks_refused_game": 0}
 
     # -- control (any thread) ----------------------------------------------------------------------------------------
 
@@ -278,8 +282,22 @@ class TraceHooks:
             _U.UnhookWinEvent(h)
         handles.clear()
 
+    def _is_game(self, pids: tuple[int, ...]) -> bool:
+        """fGate (D17): whether any process behind the window is a game (a check that raises counts as one)."""
+        if not pids or self._game_pid is None:
+            return False
+        try:
+            return any(self._game_pid(p) for p in pids)
+        except Exception:  # noqa: BLE001 - fails closed: no hook
+            return True
+
     def _follow(self, hwnd: int) -> None:
         pids = tuple(p for p in self._pid_of(hwnd) if p and p != self._own) if hwnd else ()
+        if self._is_game(pids):
+            # never a per-process hook into a game, whatever the gate says (the gate holds while it is in front; this
+            # makes "nothing hooks a game" a code fact, not a timing hope)
+            self.counts["hooks_refused_game"] += 1
+            pids = ()
         if pids == self._pids and (self._low or not pids):
             return
         self._unhook(self._low)

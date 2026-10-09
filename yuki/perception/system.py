@@ -21,6 +21,7 @@ import socket
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable
 from concurrent.futures import TimeoutError as FutureTimeout
 from ctypes import wintypes
 from typing import Any
@@ -542,6 +543,39 @@ def media_sessions(*, timeout_s: float = _MEDIA_TIMEOUT_S) -> list[dict]:
         raise TimeoutError(
             f"media sessions did not answer within {timeout_s * 1000:.0f} ms"
         ) from None
+
+
+#: The longest a media command (play, pause, next...: :mod:`yuki.actions.media`) waits for the media thread.
+MEDIA_COMMAND_TIMEOUT_S = 1.0
+
+
+def _run_media_job(job: Callable[[Any, float], Any], deadline: float) -> Any:
+    """One media job on the media thread: refused once its deadline has passed (it was queued behind a slow read and
+    its caller has given up: a "next" must never land seconds after Yuki said it couldn't)."""
+    if time.monotonic() >= deadline:
+        raise TimeoutError("the media command waited too long for the media thread and was dropped")
+    return job(_media_session_manager(deadline), deadline)
+
+
+def media_job(job: Callable[[Any, float], Any], *, timeout_s: float = MEDIA_COMMAND_TIMEOUT_S) -> Any:
+    """Run ``job(manager, deadline)`` on the one media thread (fGate, D17(4): the media session's own commands).
+
+    Its own submit path: it never trips :func:`media_sessions`' "an earlier read is still waiting" refusal (a read
+    may be pending; the job queues behind it on the same thread and apartment as the cached session manager), and
+    it never waits longer than ``timeout_s`` (default :data:`MEDIA_COMMAND_TIMEOUT_S`). A job still queued when its
+    caller gave up does nothing when it finally runs. No new thread and no poll: the existing ``yuki-media`` worker.
+
+    Raises:
+        TimeoutError: not done within ``timeout_s`` (or dropped for waiting too long).
+        Exception: whatever the job or WinRT raised.
+    """
+    deadline = time.monotonic() + timeout_s
+    with _media_lock:
+        future = _media_thread().submit(_run_media_job, job, deadline)
+    try:
+        return future.result(timeout=timeout_s + 0.05)
+    except FutureTimeout:
+        raise TimeoutError(f"the media command did not finish within {timeout_s * 1000:.0f} ms") from None
 
 
 def _subkeys(key: Any) -> list[str]:

@@ -274,6 +274,8 @@ class TraceWorker:
         window_at: ``(x, y) -> (hwnd, pid)``; ``foreground``: ``() -> (hwnd, pid)``; ``title``: ``(hwnd) -> str``;
         ``rect``: ``(hwnd) -> (l, t, r, b)``.
         uia: a :class:`~yuki.memory.trace_uia.TraceUia` (or a fake; ``None``: point-only).
+        game_pid: ``(pid) -> bool``: the process is a game (fGate, D17): no UI Automation lookup ever goes into a game's
+        window, whatever the gate says (``lookup_refused_game``); ``None``: not checked.
         sink: the :class:`~yuki.memory.trace_input.TraceInput` (its rest anchor and ``moving``), or None.
         cursor: ``() -> (x, y)`` physical; ``clipboard``: ``() -> (seq, formats, private)``.
         recent: the Recent folder, ``resolve``: ``(lnk path) -> target path | None``, ``flp``: ``(path) -> dict``.
@@ -297,8 +299,12 @@ class TraceWorker:
                  hover: tuple[int, int, float] | None = None, hung: Any = None,
                  root_of: Callable[[int], int] | None = None, pid_of: Callable[[int], int] | None = None,
                  fl_recent: Callable[[], Any] | None = None, present: Callable[[float], bool | None] | None = None,
-                 other_screen: Callable[[float], bool] | None = None) -> None:
+                 other_screen: Callable[[float], bool] | None = None,
+                 game_pid: Callable[[int], bool] | None = None) -> None:
         self.store = store
+        #: fGate (D17): ``(pid) -> bool``, the process is a game: a lookup aimed at it is refused (:meth:`_lookup`);
+        #: ``None``: not checked (tests).
+        self._game_pid = game_pid
         #: capQ2a: FL Studio's own recent-projects list (``() -> RecentList``, :mod:`yuki.memory.trace_flrecent`),
         #: read only on a save chord in FL Studio or when its window title changes.
         if fl_recent is None:
@@ -512,13 +518,35 @@ class TraceWorker:
             except Exception as exc:  # noqa: BLE001
                 self._error("hung_watch", exc)
 
+    def _game_target(self, target: tuple[int, int] | None) -> bool:
+        """fGate (D17, F4.2): whether a lookup's window belongs to a game: the window's own process or its top-level
+        window's (the ``root_pid``), by the gate's game set. This closes the race where a click on a windowed game
+        arrives before the foreground event that holds the gate. A check that raises counts as a game (fails
+        closed)."""
+        if target is None or self._game_pid is None:
+            return False
+        hwnd, pid = int(target[0] or 0), int(target[1] or 0)
+        try:
+            pids = {pid} if pid else set()
+            if hwnd:
+                pids.add(int(self._pid_of(int(self._root_of(hwnd) or hwnd)) or 0))
+            return any(self._game_pid(p) for p in pids if p)
+        except Exception as exc:  # noqa: BLE001
+            self._error("game_target", exc)
+            return True
+
     def _lookup(self, fn: Callable[..., Any], *args: Any, priority: bool, target: tuple[int, int] | None = None,
                 probe: bool = False, **kw: Any) -> Any:
-        """One UI Automation lookup within budget (never while the gate holds, never into an app that is not
-        answering: ``target`` is the window it goes into, ``(hwnd, pid)``; ``probe``: an MSAA call, the window must
-        answer a no-op message first - :meth:`_hung_skip`); None when over budget, skipped or failed."""
-        if self.uia is None or self._blocked() is not None or self._hung_skip(target, probe=probe) \
-                or not self._take(priority=priority):
+        """One UI Automation lookup within budget (never while the gate holds, never into a game's window, never into
+        an app that is not answering: ``target`` is the window it goes into, ``(hwnd, pid)``; ``probe``: an MSAA call,
+        the window must answer a no-op message first - :meth:`_hung_skip`); None when over budget, skipped or
+        failed."""
+        if self.uia is None or self._blocked() is not None:
+            return None
+        if self._game_target(target):
+            self.counters["lookup_refused_game"] += 1
+            return None
+        if self._hung_skip(target, probe=probe) or not self._take(priority=priority):
             return None
         t0 = time.perf_counter()
         try:
@@ -2143,6 +2171,36 @@ class Trace:
         #: thread, so they change under this lock.
         self._runs: deque[list[float | None]] = deque(maxlen=256)
         self._span_lock = threading.Lock()
+        #: fGate (F4.2): the gate tells the trace of a change at once (``GameGate.on_change``): the input sink and the
+        #: per-app hooks block inside that call, not at the next one-second beat (before, up to 1 s of a game's input
+        #: could be classified). Opening again stays the beat's (it re-attaches, resets and closes the blocked span).
+        self.gate_blocks = 0
+        if gate is not None and callable(getattr(gate, "on_change", None)):
+            gate.on_change(self._gate_changed)
+
+    def _gate_changed(self, decision: Any) -> None:
+        """The game gate changed (called on the thread that saw it): block the sink and the hooks now when the input
+        gate holds."""
+        if not bool(getattr(decision, "hold_input", True)) and not self._gate_holds():
+            return
+        sink, hooks = self.sink, self.hooks
+        if sink is None or sink.blocked:
+            return
+        sink.blocked = True
+        if hooks is not None:
+            hooks.set_blocked(True)
+        self._span(True)
+        self.gate_blocks += 1
+
+    def _game_pid(self, pid: int) -> bool:
+        """fGate (D17): whether a process is a game by the gate's game set (fixed list, learned set, Windows' detected
+        games), for the worker's lookups and the hooks. No gate: every process counts as one (fails closed)."""
+        gate = self._game_gate
+        if gate is None:
+            return True
+        from yuki.memory.gamegate import pid_game
+
+        return bool(pid_game(int(pid), games=gate.games()))
 
     def rules(self) -> TraceRules:
         return self._section.get()
@@ -2164,7 +2222,7 @@ class Trace:
         from yuki.memory.trace_input import Metrics, TraceInput
 
         recent = recent_folder()
-        self.hooks = TraceHooks(self._put_input, recent=recent)
+        self.hooks = TraceHooks(self._put_input, recent=recent, game_pid=self._game_pid)
         metrics = Metrics()
         self.sink = TraceInput(self._put_input, metrics=metrics, on_action=self.hooks.action, root_at=root_at,
                                pid_of=_window_pid)
@@ -2177,7 +2235,7 @@ class Trace:
             page=timeline_page(self._timeline_now, self.store), title=_title, rect=_rect, sink=self.sink,
             cursor=self.sink._cursor, clipboard=_clipboard_now, recent=recent, log=self._log_fn,
             hover=(metrics.hover_w, metrics.hover_h, metrics.hover_s), present=_presence_moved(),
-            other_screen=DeskflowScreens().away)
+            other_screen=DeskflowScreens().away, game_pid=self._game_pid)
         self.hooks.start()
         self._thread = threading.Thread(target=self._run, name="yuki-trace-worker", daemon=True)
         self._thread.start()

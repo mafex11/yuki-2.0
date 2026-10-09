@@ -178,12 +178,20 @@ learn_demo_alone_after_proven_runs = 1
 # and from your fixes, your usual buttons and shortcuts, and your usual paths.  false = Yuki works as
 # it did before it learned from your actions (nothing is deleted).  Read at once, no restart.
 use_learned = true
-# The hard game gate: while any of these programs runs (in front or not, windowed or full screen,
-# the launch screen too), nothing about your input will ever be recorded.  These are games with
-# kernel anti-cheat.  Add your own; the ones listed here always count, even if removed from your
-# copy (Yuki also reads its own list).  A program seen full screen while drawing like a game (its
-# own share of the GPU) is added by itself.  Anti-cheat services are not listed: Vanguard's tray
-# (vgtray.exe) runs all the time and is not a game.
+# The hard game gate: while any of these programs is in front (windowed or full screen, the launch
+# screen too), nothing about your input is recorded and no card is shown; cards come back 2 minutes
+# after you leave the game (the [nudges] return_hold_s below).  In the background the trace and
+# cards may run, but nothing ever reads, hooks, types into, clicks or focuses the game itself, and
+# Yuki's hands send no keys, clicks, focus changes, links or app launches while a game is in front
+# ("pause" and "next" still work: they go through Windows' media controls, not keys).  Heavy
+# background work still waits while a game runs anywhere.  These are games with kernel anti-cheat.
+# Add your own; the ones listed here always count, even if removed from your copy (Yuki also reads
+# its own list).  A program Windows detects as a game, or one seen in Direct3D exclusive full screen,
+# counts by itself.  Anti-cheat services are not listed: Vanguard's tray (vgtray.exe) runs all the
+# time and is not a game.
+# game_gate = "running" brings back the older, stricter rule: nothing is recorded while a game runs
+# anywhere, in front or not (any other value means "front").
+game_gate = "front"
 game_processes = [
     "VALORANT-Win64-Shipping.exe", "VALORANT.exe",
     "League of Legends.exe",
@@ -289,6 +297,9 @@ confirm_lead_min = 30
 # After a meeting, it is held open while its app still plays sound (Meet drops
 # the microphone on mute), for at most this many minutes after the microphone.
 meeting_hold_min = 30
+# No card while a game or a full-screen app is in front; cards come back this many
+# seconds after you leave it (an alt-tab between rounds is still the game).
+return_hold_s = 120
 # Model calls at least this far apart, and at most this many per hour.
 min_gap_s = 90
 max_calls_per_hour = 12

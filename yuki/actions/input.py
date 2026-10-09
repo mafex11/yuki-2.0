@@ -64,6 +64,12 @@ Every event Yuki injects carries Yuki's stamp, :data:`yuki.core.inputtag.YUKI_IN
 no extra info) and bare ``mouse_event`` are no longer used to send anything; pyautogui stays for its key names
 and their virtual-key table, so a key goes out exactly as before, only stamped. A later capture phase reads the
 stamp back to tell Yuki's input from the user's (dictation, Deskflow and macro tools stay the user's).
+
+**Nothing reaches a game (fGate, D17).** Every key, click, wheel notch and pointer move is checked right before it is
+sent (:func:`yuki.memory.gamegate.refuse_input`): with a game in front, or aimed at a game's window, nothing is sent and
+``input_refused_game`` is noted. The primitives (:func:`_send_each`, :func:`_send_text`, :func:`_move`) hold the
+backstop, so the wheel in :mod:`yuki.actions.scrolling` and the pointer in :mod:`yuki.actions.hover` are covered too;
+the public actions also check first, so their result says plainly why nothing was sent.
 """
 
 from __future__ import annotations
@@ -84,6 +90,7 @@ import win32process
 
 from yuki.actions import ActionResult
 from yuki.core.inputtag import YUKI_INPUT_TAG
+from yuki.memory import gamegate as _gamegate
 from yuki.perception.windows import (
     accepts_input,
     cursor_position,
@@ -239,6 +246,10 @@ def _send_each(records: list[_Input]) -> int:
     event), so an app sees the same sequence it always did. Every record here comes from :func:`_key_event` or
     :func:`_mouse_record`, so every one carries Yuki's tag.
     """
+    mouse = any(int(record.type) == _INPUT_MOUSE for record in records)
+    # D17: nothing reaches a game in front, nor the game window under the pointer (a click or wheel goes there)
+    if _gamegate.refuse_input("mouse" if mouse else "keys", point=cursor_position() if mouse else None) is not None:
+        return 0
     accepted = 0
     for record in records:
         accepted += int(_user32.SendInput(1, ctypes.byref(record), ctypes.sizeof(_Input)))
@@ -361,6 +372,9 @@ def _send_text(text: str, expect_hwnd: int | None = None) -> tuple[int, int, str
         refusal = _foreground_mismatch(expect_hwnd)
         if refusal:
             return sent, expected, f"{refusal} after {index} of {len(body)} characters"
+        # D17: re-checked before every character, like the foreground (a game can come to the front mid-string)
+        if (refusal := _gamegate.refuse_input("type_text")) is not None:
+            return sent, expected, f"{refusal} (after {index} of {len(body)} characters)"
         events = _char_events(char)
         array = (_Input * len(events))(*events)
         expected += len(events)
@@ -508,9 +522,22 @@ def _in_screen_bounds(x: int, y: int) -> bool:
     return left <= x < right and top <= y < bottom
 
 
-def _move(x: int, y: int) -> None:
-    """Put the cursor exactly on (x, y) - instantly, on any monitor."""
+def _move(x: int, y: int) -> bool:
+    """Put the cursor exactly on (x, y) - instantly, on any monitor. False (not moved) with a game in front or a game's
+    window at the point (D17)."""
+    if _gamegate.refuse_input("pointer", point=(int(x), int(y))) is not None:
+        return False
     _user32.SetCursorPos(int(x), int(y))
+    return True
+
+
+def _refused_for_game(action: str, details: dict, started: float, **target: object) -> ActionResult | None:
+    """D17, said up front: a public action refused because a game is in front or is its target (``hwnd``, ``point``,
+    ``front_ok``), as a failed result whose summary says why; ``None`` = go ahead (the primitives check again)."""
+    if (refused := _gamegate.refuse_input(action, **target)) is not None:   # type: ignore[arg-type]
+        details["refused"] = "game"
+        return _result(False, refused, details, started)
+    return None
 
 
 #: How long the focus is watched for a change after a click.  A condition poll
@@ -1975,6 +2002,9 @@ def click(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    game = _refused_for_game("click", details, started, hwnd=expect_hwnd, point=(int(x), int(y)))
+    if game is not None:
+        return game
     # Before anything is sent: what is under the point, and which page the
     # foreground window shows - read concurrently, each on a budget, neither
     # able to stop the click.
@@ -2368,6 +2398,10 @@ def type_text(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    if text or press_enter or clear:
+        game = _refused_for_game("type_text", details, started, hwnd=expect_hwnd)
+        if game is not None:
+            return game
     # Foreground is not the same thing as listening.  Before the first character
     # goes out, give the window a bounded chance to report a focused control; if
     # it never does, say so instead of typing into the void and reporting success.
@@ -2677,6 +2711,9 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    game = _refused_for_game("keys", details, started, hwnd=expect_hwnd)
+    if game is not None:
+        return game
     not_ready = _refuse_unless_ready(
         expect_hwnd, details, started, withheld="the keys were not sent"
     )
@@ -2731,6 +2768,9 @@ def press(
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
+    game = _refused_for_game("keys", details, started, hwnd=expect_hwnd)
+    if game is not None:
+        return game
     not_ready = _refuse_unless_ready(
         expect_hwnd, details, started, withheld="the key was not sent"
     )
@@ -2797,6 +2837,11 @@ def scroll(
     if refusal:
         details["refused"] = "foreground"   # review F6: a continuous scroll stops at once when its window left the front
         return _result(False, refusal, details, started)
+    # D17: a ScrollPattern scroll is no input and takes no focus, so a game in front alone doesn't stop it; a game's
+    # own window never gets one (and the wheel fallback is refused with a game in front, at _send_each)
+    game = _refused_for_game("scroll", details, started, hwnd=expect_hwnd, point=(int(x), int(y)), front_ok=True)
+    if game is not None:
+        return game
     from yuki.actions.scrolling import describe, scroll_at
 
     oks, parts, axes = [], [], []
@@ -2838,7 +2883,12 @@ def point_at(x: int, y: int, *, expect_hwnd: int | None = None) -> ActionResult:
     refusal = _foreground_mismatch(expect_hwnd)
     if refusal:
         return _result(False, refusal, details, started)
-    _move(int(x), int(y))
+    game = _refused_for_game("pointer", details, started, hwnd=expect_hwnd, point=(int(x), int(y)))
+    if game is not None:
+        return game
+    if not _move(int(x), int(y)):
+        details["refused"] = "game"
+        return _result(False, "the pointer was not moved: a game came to the front", details, started)
     return _result(True, f"pointer at ({x},{y})", details, started)
 
 
