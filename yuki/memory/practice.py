@@ -2046,6 +2046,10 @@ def _item(o: Playbook, cosine: float | None, why: str, detail: bool = False) -> 
            "text": o.text(440 if o.kind == "pitfall" else BODY_CHARS),
            "family": o.family, "state": o.state, "label": o.label(), "confidence": o.confidence,
            "cosine": None if cosine is None else round(float(cosine), 3), "why": why}
+    if o.kind == "procedure" and o.origin in ("demo", "fixed"):
+        # capC5: taught by the action trace (a demo, or the user's fix after a failure): the A/B switch's scope, and
+        # the skill runner replays it against its recorded path
+        out["trace"] = True
     if o.demo:
         # capC4: learned from what the user did; a trial is a hint only (decision D3: never run alone)
         out["source"] = DEMO_SOURCE
@@ -2143,7 +2147,14 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     now = _now(now)
     in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
     order = [k for k in dict.fromkeys(app_key(a) for a in apps_in_play or () if a) if k]
-    objs = live(store)
+    from yuki.memory import trace_replay
+
+    # capC5 (report 78 §7): the A/B switch, read live; off is today's Yuki without what the action trace taught (no
+    # demo or fix ways, no go-tos, no usual paths or examples)
+    learned = trace_replay.use_learned()
+    if not learned:
+        go_tos, paths = False, False
+    objs = [o for o in live(store) if learned or not trace_replay.from_trace(o.origin, o.body)]
     bad_steps, bad_keys = failed_routes(objs)
     lowered: set[int] = set()
     from_run, proven, _succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
@@ -2210,6 +2221,12 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
             c = cos(linked)
             way_hits.append((rank(c if c is not None else WAY_APP_MIN_COSINE, linked), linked, c,
                              "the way of your usual path for this"))
+    # capC5: a way whose runs by the skill runner keep stopping off its recorded path ranks lower, never out
+    deviated = trace_replay.deviations(store, [o.id for _r, o, _c, _w in way_hits], now=now) if way_hits else {}
+    if deviated:
+        way_hits = [(score * trace_replay.deviation_factor(deviated.get(o.id, 0)), o, c,
+                     why + (f"; its last {deviated[o.id]} run(s) stopped off its path (ranked lower, still allowed)"
+                            if deviated.get(o.id) else "")) for score, o, c, why in way_hits]
     way_hits.sort(key=lambda x: (x[1].trial, -x[0]))
     habit_hits.sort(key=lambda x: -x[0])
     pit_hits.sort(key=lambda x: (-x[0][0], -int(_repeats(x[1]) >= REPEATED_RUNS), -x[0][1]))
@@ -2220,6 +2237,8 @@ def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequen
     for item in out_ways:
         if item["id"] in lowered:
             item["lowered"] = True
+        if deviated.get(item["id"]):
+            item["deviations"] = int(deviated[item["id"]])
     out_ways += [_item(o, c, why, detail) for _r, o, c, why in habit_hits[:habits]]
     out_pits = []
     for _r, o, c, why in pit_hits[:pitfalls]:

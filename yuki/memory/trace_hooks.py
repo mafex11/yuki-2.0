@@ -7,12 +7,12 @@ nothing but put small tuples on the trace worker's queue; it never calls UI Auto
 * **Low-rate events, always on, for the process in front only**: ``INVOKED``, ``SELECTION`` / ``SELECTIONADD``,
   ``SYSTEM_MENUSTART`` / ``MENUEND`` and the popup pair, ``DIALOGSTART``, ``FOCUS``, and ``NAMECHANGE`` of top-level
   windows only (a title: anything else from a streaming app is dropped at the callback's first line):
-  ``("ev", t, event, hwnd, id_object, id_child)``.
+  ``("ev", t, event, hwnd, id_object, id_child, tick)`` (``tick``: the event's own time, ``dwmsEventTime``).
 * **Outcome events, only around an action**: ``STATECHANGE``, ``VALUECHANGE``, ``SHOW``, ``HIDE``, ``REORDER``
   for the process in front, registered when an action starts (:meth:`TraceHooks.action`) and removed
   :data:`OUTCOME_S` after the last action. Never ``LOCATIONCHANGE``. At most :data:`OUTCOME_CAP` events per action
-  are queued (``("out", t, event, hwnd, id_object, id_child, gen)``); the rest are only counted. In a streaming app
-  (a chat being written, a progress bar) nothing outside those windows ever reaches Yuki.
+  are queued (``("out", t, event, hwnd, id_object, id_child, tick, gen)``); the rest are only counted. In a
+  streaming app (a chat being written, a progress bar) nothing outside those windows ever reaches Yuki.
 * **Clipboard** (``AddClipboardFormatListener``): ``("clip", t, seq, owner_pid, formats, private)``: the sequence
   number, the owner's process, the format *names* (``GetUpdatedClipboardFormats``: the clipboard is never opened,
   never read), and whether the copy carries a private mark (``ExcludeClipboardContentFromMonitorProcessing``,
@@ -142,6 +142,26 @@ _K.FindFirstChangeNotificationW.restype = W.HANDLE
 _K.FindNextChangeNotification.argtypes = [W.HANDLE]
 _K.FindNextChangeNotification.restype = W.BOOL
 _K.FindCloseChangeNotification.argtypes = [W.HANDLE]
+
+
+_TICK_STEP: list[int] = []
+
+
+def tick_step_ms() -> int:
+    """capQ2a (review F2): how far apart two readings of Windows' tick count (``GetTickCount``, an event's
+    ``dwmsEventTime``) can be for the same moment: the system clock's interrupt interval
+    (``GetSystemTimeAdjustment``'s time increment, 100 ns units), rounded up to whole ms. Read once; 0 when it cannot
+    be read (no slack)."""
+    if not _TICK_STEP:
+        step = 0
+        try:
+            adjustment, increment, disabled = W.DWORD(), W.DWORD(), W.BOOL()
+            if _K.GetSystemTimeAdjustment(ctypes.byref(adjustment), ctypes.byref(increment), ctypes.byref(disabled)):
+                step = -(-int(increment.value) // 10_000)
+        except Exception:  # noqa: BLE001 - not Windows
+            step = 0
+        _TICK_STEP.append(step)
+    return _TICK_STEP[0]
 
 
 def recent_folder() -> Path:
@@ -320,8 +340,11 @@ class TraceHooks:
                 if self._n < OUTCOME_CAP:
                     self._n += 1
                     self.counts["outcome"] += 1
+                    # capQ2a: the event's own time (``dwmsEventTime``, Windows' tick count) rides along, before the
+                    # generation (still the last field): the worker can tell a change Windows dates before a
+                    # lookup's answer even when it reached this thread after it
                     self._put(("out", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child),
-                               self.gen))
+                               int(ms or 0) & 0xFFFFFFFF, self.gen))
                 else:
                     self.counts["outcome_over"] += 1
                 return
@@ -330,7 +353,8 @@ class TraceHooks:
                 self.counts["low_dropped"] += 1      # only the window's own title: a streaming app costs nothing more
                 return
             self.counts["low"] += 1
-            self._put(("ev", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child)))
+            self._put(("ev", self._clock(), int(event), int(hwnd or 0), int(id_object), int(id_child),
+                       int(ms or 0) & 0xFFFFFFFF))
         except Exception:  # noqa: BLE001 - never let an exception escape a ctypes callback
             pass
 
@@ -477,5 +501,5 @@ def root_at(x: int, y: int) -> int:
 
 
 __all__ = ["LOW_RATE", "OUTCOME", "OUTCOME_CAP", "OUTCOME_S", "PRIVATE_FORMATS", "TraceHooks", "clipboard_formats",
-           "recent_folder", "root_at", "window_title"]
+           "recent_folder", "root_at", "tick_step_ms", "window_title"]
 

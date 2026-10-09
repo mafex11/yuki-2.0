@@ -361,6 +361,19 @@ def _trace_demos_words(raw: str | None, now: float) -> str:
     return ("; " + "; ".join(parts)) if parts else ""
 
 
+def _trace_replay_words(conn: Any, trace: dict[str, Any], now: float) -> str:
+    """capC5: learned ways done your way this week, the times it stopped because the screen was not as when you did
+    it, the handovers and takeovers, and the A/B switch when it is off, in plain words (counts over the runs table's
+    cleartext columns; ``yuki.memory.trace_replay``). ``""`` when there is nothing to say."""
+    try:
+        from yuki.memory import trace_replay
+
+        on = trace.get(trace_replay.SWITCH_KEY) is not False
+        return trace_replay.health_words(trace_replay.health(conn, now=now), on=on)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
     """Settings -> Record how I work (report 78 C1): off, or on with what it noted in the last day, in plain words.
     Counts only; read-only."""
@@ -398,6 +411,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
         learn_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:learn'").fetchone()
         tasks_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:tasks'").fetchone()
         demos_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:demos'").fetchone()
+        replay = _trace_replay_words(conn, trace, now)   # capC5: ways run your way, deviations, handovers
     except Exception as exc:
         return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
     finally:
@@ -421,6 +435,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
     detail += _trace_learn_words(learn_row[0] if learn_row else None, health, now)
     detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
     detail += _trace_demos_words(demos_row[0] if demos_row else None, now)
+    detail += replay
     if state in ("hooks_down", "failed", "no_input"):
         return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
     return Check(TRACE_CHECK, OK, detail)

@@ -57,14 +57,17 @@ def day_of(at: float) -> str:
 # -- writes ------------------------------------------------------------------------------------------------------------
 
 
-def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) -> None:
-    """One use of an element: counts, distinct days, and its name only as its class allows."""
+def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) -> str | None:
+    """One use of an element: counts, distinct days, and its name only as its class allows. Returns, for a
+    command-type element the registry knows as an item of a list (capQ2a; second verify V2-1), which of its raw rows
+    must keep no name: ``"all"`` (just found to be an item: rows written before, while it was taken for a command, too)
+    or ``"batch"`` (this batch's rows: the use came without its current-item mark); else None."""
     key = el.get("element_key")
     if not key:
-        return
+        return None
     at = float(el["at"])
     day = day_of(at)
-    row = conn.execute("SELECT days, n, last_day, name_ciphertext FROM ui_elements WHERE element_key=?",
+    row = conn.execute("SELECT days, n, last_day, name_ciphertext, name_class FROM ui_elements WHERE element_key=?",
                        (key,)).fetchone()
     cls = el.get("name_class") or ""
     name = el.get("name") or None
@@ -76,15 +79,33 @@ def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) ->
             " first_at, last_at, last_day) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (key, el.get("process"), el.get("role"), cls, store._enc(keep) if keep else None,
              store._enc(el["aid"]) if el.get("aid") else None, days, 1, at, at, day))
-        return
+        return None
     days = int(row["days"] or 0) + (1 if row["last_day"] != day else 0)
+    sticky = cls == COMMAND and row["name_class"] == TITLE
+    if sticky:
+        # capQ2a second verify V2-1: the content mark is sticky. A command-type element is only ever stored as a
+        # title when it was seen as an item of a list or of a set with a current item (the element key carries its
+        # role and ancestors, so only the current-item mark can differ between uses: which thread is open). A later
+        # use with no current item in view is still that item: the title rule, never its name before 3 days
+        cls = TITLE
     set_name = None
     if row["name_ciphertext"] is None and name and (cls == COMMAND or (cls == TITLE and days >= PROMOTE_DAYS)):
         set_name = store._enc(name)
+    scrub = "batch" if sticky else None
+    if cls == TITLE and row["name_class"] == COMMAND:
+        # capQ2a: an element kept as a command control is now known to be an item of a list (a sidebar's thread drawn
+        # as a Button): from this use on it follows the title rule, its name kept only once used on 3 distinct days.
+        # Second verify V2-1: its raw rows written while it was taken for a command lose their name too
+        conn.execute("UPDATE ui_elements SET name_class=?" + (", name_ciphertext=NULL" if days < PROMOTE_DAYS else "")
+                     + " WHERE element_key=?", (TITLE, key))
+        if days < PROMOTE_DAYS:
+            set_name = None
+        scrub = "all"
     conn.execute(
         "UPDATE ui_elements SET n=n+1, days=?, last_day=?, last_at=max(coalesce(last_at, 0), ?),"
         " name_ciphertext=coalesce(name_ciphertext, ?), aid_ciphertext=coalesce(aid_ciphertext, ?) WHERE element_key=?",
         (days, day, at, set_name, store._enc(el["aid"]) if el.get("aid") else None, key))
+    return scrub
 
 
 def write_batch(store: Any, rows: Sequence[dict[str, Any]], elements: Sequence[dict[str, Any]] = (),
@@ -102,7 +123,16 @@ def write_batch(store: Any, rows: Sequence[dict[str, Any]], elements: Sequence[d
             values = {**r, "during_run": int(r.get("during_run") or 0)}
             ids.append(int(conn.execute(_INSERT, [values.get(c) for c in ACTION_COLUMNS]).lastrowid))
         for el in elements:
-            _upsert_element(conn, store, el)
+            scrub = _upsert_element(conn, store, el)
+            if scrub == "all" or (scrub and ids):
+                # capQ2a second verify V2-1: a list's item keeps a digest only in its raw rows (by the element_key
+                # index; a drag's end element only in this batch)
+                floor = 0 if scrub == "all" else ids[0]
+                conn.execute("UPDATE ui_actions SET name_ciphertext=NULL WHERE element_key=? AND id>=?"
+                             " AND name_ciphertext IS NOT NULL", (el["element_key"], floor))
+                if ids:
+                    conn.execute("UPDATE ui_actions SET end_name_ciphertext=NULL WHERE id>=? AND end_element_key=?"
+                                 " AND end_name_ciphertext IS NOT NULL", (ids[0], el["element_key"]))
         for f in files:
             index = f.get("row")
             action = ids[index] if isinstance(index, int) and 0 <= index < len(ids) else f.get("action_id")
