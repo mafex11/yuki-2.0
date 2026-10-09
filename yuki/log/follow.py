@@ -16,6 +16,11 @@ One ``request_id`` follows a request from the user's words to the result:
 Everything printed goes through :func:`yuki.log.events.content_free` (ids, code words, counts, times, 12-hex
 digests), whatever the logs themselves kept (``YUKI_LOG_CONTENT=1``): this tool never shows a word, a title or a
 name. Read-only: files are only read, the database is opened ``mode=ro``.
+
+``--logs``: by default the logs of this checkout (``yuki.core.paths.logs_dir``: a dev checkout's ``logs/``), then,
+when they name nothing, the installed app's (``%LOCALAPPDATA%\\Yuki\\logs``). A search through every session or voice
+file (an id whose own file is not found) reads only files written since request ids exist
+(:data:`STAMPED_SINCE`): the older logs (before 5 Oct 2026 they kept the words) are never opened.
 """
 
 from __future__ import annotations
@@ -43,6 +48,21 @@ PAD_BEFORE_S = 10.0
 PAD_AFTER_S = 30.0
 #: ``moments`` columns that may be shown (plus any ``*_digest``, cut to 12 hex); never a ``*_ciphertext``.
 MOMENT_COLUMNS = ("id", "at", "kind", "app", "service", "by", "request_id", "evidence", "means", "lag_s", "source")
+#: Request ids are stamped from phase F (10 Oct 2026) on; a file last written before this time cannot hold one, so a
+#: search through every file skips it unopened (review r1 L6: the logs before 5 Oct kept the words).
+STAMPED_SINCE = datetime(2026, 10, 9).timestamp()
+
+
+def _stamped(paths: Iterable[Path]) -> list[Path]:
+    """The files written since request ids exist (:data:`STAMPED_SINCE`), by their modification time."""
+    out = []
+    for path in paths:
+        try:
+            if path.stat().st_mtime >= STAMPED_SINCE:
+                out.append(path)
+        except OSError:
+            continue
+    return sorted(out)
 
 
 def _jsonl(path: Path, needle: str | None = None) -> Iterator[dict[str, Any]]:
@@ -65,11 +85,11 @@ def _jsonl(path: Path, needle: str | None = None) -> Iterator[dict[str, Any]]:
 
 def session_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
     """The session-log records stamped with ``request_id``: its own file first (``<session>.jsonl``, the id being
-    ``<session>-<n>``), else every session file."""
+    ``<session>-<n>``), else every session file written since request ids exist (:func:`_stamped`)."""
     folder = logs / "sessions"
     stem = request_id.rsplit("-", 1)[0] if "-" in request_id else ""
     own = folder / f"{stem}.jsonl"
-    files = [own] if stem and own.exists() else sorted(folder.glob("*.jsonl"))
+    files = [own] if stem and own.exists() else _stamped(folder.glob("*.jsonl"))
     out: list[dict[str, Any]] = []
     for path in files:
         for rec in _jsonl(path, request_id):
@@ -81,7 +101,7 @@ def session_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
 def voice_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
     """Voice-log records that name the request."""
     out: list[dict[str, Any]] = []
-    for path in sorted((logs / "voice").glob("*.jsonl")):
+    for path in _stamped((logs / "voice").glob("*.jsonl")):
         for rec in _jsonl(path, request_id):
             if rec.get("request_id") == request_id:
                 out.append({**rec, "_source": "voice", "_file": path.name})
@@ -247,21 +267,33 @@ def _line(rec: dict[str, Any]) -> str:
     return f"{when}  {rec.get('_source', ''):<12} {rec.get('type', '')}  {rest}"
 
 
+def default_logs() -> list[Path]:
+    """The logs folders tried without ``--logs``: this checkout's (``logs_dir``), then the installed app's
+    (``data_dir()/logs``) when that is another folder (review r1 L6: a dev checkout's default named nothing)."""
+    from yuki.core.paths import data_dir, logs_dir
+
+    out = [Path(logs_dir())]
+    installed = Path(data_dir()) / "logs"
+    try:
+        same = installed.resolve() == out[0].resolve()
+    except OSError:
+        same = installed == out[0]
+    if not same:
+        out.append(installed)
+    return out
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m yuki.log.follow",
                                      description="One request across the logs, content-free (read-only).")
     parser.add_argument("request_id")
-    parser.add_argument("--logs", help="the logs folder (default: Yuki's own)")
+    parser.add_argument("--logs", help="the logs folder (default: this checkout's logs, then the installed app's,"
+                                       " %%LOCALAPPDATA%%\\Yuki\\logs)")
     parser.add_argument("--db", help="the memory database for the moments (default: Yuki's own; opened read-only)")
     parser.add_argument("--json", action="store_true", help="one JSON object instead of lines")
     parser.add_argument("--pad", type=float, default=PAD_AFTER_S, help="seconds after the request's last record")
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.logs:
-        logs = Path(args.logs)
-    else:
-        from yuki.core.paths import logs_dir
-
-        logs = logs_dir()
+    folders = [Path(args.logs)] if args.logs else default_logs()
     if args.db:
         db: Path | None = Path(args.db)
     else:
@@ -271,7 +303,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             db = default_db_path()
         except Exception:  # noqa: BLE001
             db = None
+    logs = folders[0]
     out = follow(args.request_id, logs=logs, db=db, pad_after=args.pad)
+    for other in folders[1:]:   # this checkout's logs named nothing: the installed app's
+        if out["records"]:
+            break
+        logs = other
+        out = follow(args.request_id, logs=logs, db=db, pad_after=args.pad)
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
         return 0 if out["records"] else 1

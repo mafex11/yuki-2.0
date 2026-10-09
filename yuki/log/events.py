@@ -207,7 +207,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "takeover",
         # Yuki's own "acting" marker for memory (begin / refresh / end), stamped with the request id
         "memory_acting",
-        # phase S's skills and phase F's guards (decision D12; defined here so content_free keeps their code words)
+        # phase S's skills and phase F's guards (decision D12: one log vocabulary; result words: RESULT_WORD_TYPES)
         "skill_menu",
         "skill_resolve",
         "route_try",
@@ -293,9 +293,21 @@ ENUM_FIELDS: frozenset[str] = frozenset({
     "level", "verdict", "verdict_class", "why", "reason", "status", "tone", "send", "step_level",
     "result_kind", "pattern", "patterns", "control_type", "button", "direction", "how", "source", "lease",
     "process", "process_name", "exe", "window_state", "trigger", "phase", "stage", "decision", "cause", "class",
-    # phase F (fPrivacy): the structural words of skills, routes, checks and moments (decision D12)
-    *("skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
-      "result", "done_check", "recheck", "verb", "rung", "label_source", "gate"),
+})
+#: Phase F (fPrivacy, decision D12): the structural words of skills, routes, checks and moments, kept as code words
+#: only at a record's **top level**, where Yuki's own code writes them (``skill_run(skill=..., route=...)``). Never
+#: inside a nested value: a tool's input is the model's, a payload or a result is read from the world and a skill's
+#: slots are the user's, and there the same key can carry a host, a file or a person (review r1 M1). ``result`` is
+#: not one of them: it carries a tool's output (:data:`RESULT_WORD_TYPES`).
+TOP_ENUM_FIELDS: frozenset[str] = frozenset({
+    "skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
+    "done_check", "recheck", "verb", "rung", "label_source", "gate",
+})
+#: The D12 records whose top-level ``result`` is the outcome word Yuki's own code wrote for a skill run or a check
+#: (``done``, ``unverified``). Everywhere else ``result`` is a tool's output (``{"result": page text}``) and only its
+#: size and shape are logged, whatever it looks like (review r1 M1: ``mafex11.github.io`` is shaped like a code word).
+RESULT_WORD_TYPES: frozenset[str] = frozenset({
+    "skill_run", "done_check", "done_recheck", "route_try", "skill_handoff", "media_command",
 })
 #: The fields a content-free log keeps inside a tool's input, a tool's result and a perception payload: the model
 #: writes a tool's input, so only fields whose values are a fixed vocabulary (a button, a direction, a pattern, a
@@ -306,9 +318,6 @@ NESTED_FIELDS: frozenset[str] = frozenset({
     "control_type", "button", "direction", "how", "lease", "window_state", "phase", "stage", "class",
     "kind", "state", "mode", "via", "role", "roles", "hidden_roles", "flags", "op", "tool", "lane", "outcome",
     "type", "error_kind",
-    # phase F (fPrivacy): the same structural words inside a nested value (a skill run's slots, a check's facts)
-    *("skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
-      "result", "done_check", "recheck", "verb", "rung", "label_source", "gate"),
 })
 #: Phase F (fPrivacy): top-level fields whose value is a structure Yuki fills from the user's world (a skill's slots,
 #: a check's observed facts): shaped like a tool's input (:func:`_shape`: only :data:`NESTED_FIELDS` code words,
@@ -340,6 +349,17 @@ def log_digest(digest: Any) -> str | None:
 
 def _digest_field(key: str) -> bool:
     return key.endswith("_digest")
+
+
+def _digests_only(value: Any) -> Any:
+    """``value`` with every ``*_digest`` field that is not exactly 12 hex characters dropped, at any depth (D20; the
+    rule :func:`content_free` applies, for a logger that keeps content)."""
+    if isinstance(value, dict):
+        return {k: _digests_only(v) for k, v in value.items()
+                if not _digest_field(str(k)) or (isinstance(v, str) and _DIGEST.fullmatch(v))}
+    if isinstance(value, list):
+        return [_digests_only(v) for v in value]
+    return value
 
 #: The UIA control-type names (yuki/perception/tree.py ``_ROLE_NAMES``) and Yuki's own role words built on them.
 _ROLE_WORDS: frozenset[str] = frozenset({
@@ -434,9 +454,9 @@ def _trace_frames(text: str) -> str:
     return "\n".join(out)
 
 
-def _counts_only(value: Any) -> Any:
+def _counts_only(value: Any, top: bool = False) -> Any:
     """``value`` with every string that is not an id (:data:`ID_FIELDS`) or a code word in :data:`ENUM_FIELDS`
-    replaced by its length."""
+    (at the top level also :data:`TOP_ENUM_FIELDS`) replaced by its length."""
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, v in value.items():
@@ -444,7 +464,8 @@ def _counts_only(value: Any) -> Any:
                 if isinstance(v, str) and _DIGEST.fullmatch(v):
                     out[key] = v        # D20: exactly 12 hex characters (log_digest); anything else is dropped
                 continue
-            if isinstance(v, str) and key not in ID_FIELDS and not (key in ENUM_FIELDS and _code_word(v, key)):
+            enum = key in ENUM_FIELDS or (top and key in TOP_ENUM_FIELDS)
+            if isinstance(v, str) and key not in ID_FIELDS and not (enum and _code_word(v, key)):
                 if key == "traceback":
                     out[key] = _trace_frames(v)
                 elif key == "error":
@@ -452,7 +473,7 @@ def _counts_only(value: Any) -> Any:
                     out["error_chars"] = len(v)
                 else:
                     out[f"{key}_chars"] = len(v)
-            elif key in ENUM_FIELDS and _code_words(v, key):
+            elif enum and _code_words(v, key):
                 out[key] = list(v)
             else:
                 out[key] = _counts_only(v)
@@ -496,8 +517,10 @@ def content_free(record: dict[str, Any]) -> dict[str, Any]:
         if isinstance(rec.get(key), (dict, list, tuple)):
             heavy[key] = _shape(rec.pop(key))
     for key in ("input", "result", "payload"):
-        if key == "result" and isinstance(rec.get(key), str) and _code_word(rec[key], key):
-            continue    # phase F: a skill run's or a check's result code word ("done", "unverified") stays
+        if (key == "result" and rec.get("type") in RESULT_WORD_TYPES and isinstance(rec.get(key), str)
+                and _CODE_WORD.fullmatch(rec[key])):
+            heavy["result"] = rec.pop(key)   # phase F (D12): a skill run's or a check's outcome word ("done") stays
+            continue
         if key in rec and not isinstance(rec[key], (int, float, bool)) and rec[key] is not None:
             value = rec.pop(key)
             heavy[f"{key}_chars"] = len(json.dumps(value, ensure_ascii=False, default=str))
@@ -505,7 +528,7 @@ def content_free(record: dict[str, Any]) -> dict[str, Any]:
                 heavy["input_keys"] = sorted(str(k) for k in value if _FIELD_NAME.fullmatch(str(k)))
             # hotInput: the non-word facts inside (verified, flags, counts, hidden roles, a level) stay readable
             heavy[f"{key}_shape"] = _shape(value)
-    out = _counts_only(rec)
+    out = _counts_only(rec, top=True)
     out.update(heavy)
     return out
 
@@ -579,6 +602,8 @@ class SessionLogger:
         #: carries this ``request_id``, which the acting marker, the memory log and ``requests.csv`` repeat, so
         #: ``python -m yuki.log.follow <request_id>`` can put one request together across the logs.
         self.request_id: str | None = None
+        #: The id of the request that ended last (:meth:`end_request`): the caller's ``requests.csv`` line repeats it.
+        self.last_request_id: str | None = None
         self._requests = 0
         self._request_begun = False
         self.log("session_start", session_id=self.session_id, path=str(self.path))
@@ -604,6 +629,16 @@ class SessionLogger:
         self.request_id = str(request_id) if request_id else f"{self.session_id}-{self._requests}"
         self._request_begun = True
         return self.request_id
+
+    def end_request(self) -> str | None:
+        """The request is over (:meth:`request_summary` calls this): later records (a compaction, a steer between
+        requests, the session's end) carry no ``request_id`` until the next one begins, so ``follow`` never counts
+        them as the last request's (review r1 L4). Returns the id that ended (:attr:`last_request_id`)."""
+        if self.request_id is not None:
+            self.last_request_id = self.request_id
+        self.request_id = None
+        self._request_begun = False
+        return self.last_request_id
 
     def close(self) -> None:
         """Flush and close the JSONL file."""
@@ -636,6 +671,10 @@ class SessionLogger:
             self._fh.flush()
             return record
         line = json.dumps(record, ensure_ascii=False, default=_as_plain)
+        if '_digest"' in line:
+            # D20 for every logger (review r1 L5): a ``*_digest`` field keeps exactly 12 hex characters
+            # (log_digest), in the memory service's log too; anything else is dropped. Only a line naming one is walked.
+            line = json.dumps(_digests_only(json.loads(line)), ensure_ascii=False)
         if secret_filter.find(line):
             # A password or key in a request, a tool input or captured screen text: the log keeps the
             # record with the secret as "[password hidden]" (docs/MEMORY.md, "Secret filter"). The
@@ -883,6 +922,7 @@ class SessionLogger:
             The written record.
         """
         record = self.log("request_summary", **summary)
+        self.end_request()
         cost = summary.get("cost_usd")
         cost_text = "cost unknown" if cost is None else f"${cost:.4f}"
         waited = float(summary.get("waiting_for_user_s") or 0.0)

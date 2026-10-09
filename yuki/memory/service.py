@@ -736,13 +736,20 @@ def run(args: argparse.Namespace) -> int:
         # Phase F (fPrivacy): the names stored before the current trace name rule that it would not keep (a document
         # nested in a list item: a chat app's message) are cleared by the rule's own function, once per rule version
         # (source_checkpoints['trace.name_rule']), on a short-lived thread (about a second on 5.5k rows); logged
-        # trace_name_scrub, counts only. A failure leaves the checkpoint, so the next start tries again.
+        # trace_name_scrub, counts only. A failure leaves the checkpoint, so the next start tries again; ancestries
+        # left unrecovered are looked at again at the next start, and cleared at the last try (it fails closed).
+        # While the hard game gate holds (any game running; a gate that failed to start holds) it waits.
         try:
             from yuki.memory import trace_store as _trace_store_scrub
 
+            def _scrub_hold() -> bool:
+                from yuki.memory.gamegate import gate_holds
+
+                return gate_holds(game_gate)
+
             def _name_scrub() -> None:
                 try:
-                    _trace_store_scrub.scrub_names_once(store, log)
+                    _trace_store_scrub.scrub_names_once(store, log, hold=_scrub_hold, stop=stop)
                 except Exception as exc:  # noqa: BLE001
                     log("error", where="trace_name_scrub", error=type(exc).__name__)
 

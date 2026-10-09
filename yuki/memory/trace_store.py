@@ -696,6 +696,12 @@ def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[
 NAME_RULE_CHECKPOINT = "trace.name_rule"
 #: The scrub's time for recovering stored ancestries (s): past it, a row is judged by the parent kept on it alone.
 RECOVER_BUDGET_S = 20.0
+#: Service starts the scrub may end with ancestries it could not recover (review r1 L3): until then the checkpoint is
+#: left at ``<rule>:try<n>`` and the next start looks again; the last try clears those rows' names (fails closed).
+SCRUB_TRIES = 3
+#: While a game runs (the hard game gate holds) the start-up scrub waits, re-asking the gate this often (s): a
+#: one-off job, never a CPU burst during a game (plan: background CPU work waits for "any game running").
+GAME_WAIT_S = 60.0
 
 
 def _role_names() -> tuple[str, ...]:
@@ -711,7 +717,7 @@ def recover_path(cipher: Any, key: str, process: str, role: str, name_digest: st
     """The ancestry (control types, nearest first) an element key was made from, or ``None`` (not found in time).
 
     The trace keys an element by ``digest("ui-el", process, role, ancestry, name digest)``
-    (:meth:`yuki.memory.trace.ActionTrace._element_cols`), the ancestry being up to ``trace_uia.ANCESTORS`` control
+    (:meth:`yuki.memory.trace.TraceWorker._element_cols`), the ancestry being up to ``trace_uia.ANCESTORS`` control
     types joined by ``/``. The digest is keyed, so the roles cannot be read back, but control types are a fixed
     vocabulary and the nearest one is kept on the row (``position``): the key is computed for each candidate path
     with that first role and compared. A match is the very path the trace read, never an estimate (capNames WIP
@@ -744,7 +750,8 @@ def _parent_of(position: str | None) -> str:
     return text.partition("/")[2] if "/" in text else text
 
 
-def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_BUDGET_S) -> dict[str, Any]:
+def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_BUDGET_S,
+                fail_closed: bool = False) -> dict[str, Any]:
     """Clear the names stored before the current name rule that it would not keep (phase F, fPrivacy).
 
     Reads the raw rows of documents and panes (:data:`yuki.memory.trace_privacy.NESTED_CONTENT_ROLES`) that still
@@ -755,7 +762,8 @@ def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_
     content with no name (no row is deleted, so no count changes). One transaction, with SQLite's ``secure_delete``
     on (the old values are overwritten, as ``scrub_secrets``). Returns content-free counts: rows and elements by
     process, role and parent; ``by_parent`` (the parent alone decided) and ``by_ancestry`` (only the recovered path
-    did); ``unrecovered``; ``ms``. ``dry_run``: counts only, nothing written."""
+    did); ``unrecovered``; ``ms``. ``dry_run``: counts only, nothing written. ``fail_closed``: a row whose ancestry
+    was not recovered (and whose parent alone does not decide) is cleared too (:func:`scrub_names_once`'s last try)."""
     t0 = time.perf_counter()
     marks = ",".join("?" * len(NESTED_CONTENT_ROLES))
     roles = sorted(NESTED_CONTENT_ROLES)
@@ -791,7 +799,7 @@ def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_
                 path = recover_path(store.cipher, ident[2], ident[0], ident[1], ident[3] or None, parent, seen,
                                     deadline=deadline)
             if path is None:
-                out = (False, "unrecovered")
+                out = (bool(fail_closed), "unrecovered")
             else:
                 seen[path] += 1
                 out = (True, "ancestry") if nested_content(ident[1], path, parent or None) else (False, "title")
@@ -817,7 +825,7 @@ def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_
     out: dict[str, Any] = {
         "rule": NAME_RULE, "dry_run": bool(dry_run), "rows": len(row_ids), "end_rows": len(end_ids),
         "elements": len(registry), "by_parent": how["parent"], "by_ancestry": how["ancestry"],
-        "kept_title": how["title"], "unrecovered": how["unrecovered"],
+        "kept_title": how["title"], "unrecovered": how["unrecovered"], "fail_closed": bool(fail_closed),
         "where": dict(sorted(by_where.items())),
     }
     if not dry_run and (row_ids or end_ids or registry):
@@ -843,46 +851,88 @@ def _chunks(values: Sequence[Any], size: int = 400) -> Iterable[Sequence[Any]]:
 
 
 def _secure_write(store: Any, op: Any) -> Any:
-    """``store._write(op)`` with SQLite's ``secure_delete`` on for it (the connection's own setting put back)."""
+    """``store._write(op)`` with SQLite's ``secure_delete`` on for it (the connection's own setting put back). The
+    store's lock (re-entrant: ``_write`` takes it again) is held across the setting, the write and the put-back, so no
+    other write runs with the setting changed."""
     lock, conn = getattr(store, "_lock", None), getattr(store, "_conn", None)
-    previous = None
-    if lock is not None and conn is not None:
-        with lock:
-            try:
-                previous = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
-                conn.execute("PRAGMA secure_delete=ON")
-            except sqlite3.Error:
-                previous = None
-    try:
+    if lock is None or conn is None:
         return store._write(op)
-    finally:
-        if previous is not None:
-            with lock:
+    with lock:
+        try:
+            previous: int | None = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
+            conn.execute("PRAGMA secure_delete=ON")
+        except sqlite3.Error:
+            previous = None
+        try:
+            return store._write(op)
+        finally:
+            if previous is not None:
                 try:
                     conn.execute(f"PRAGMA secure_delete={previous}")
                 except sqlite3.Error:
                     pass
 
 
-def scrub_names_once(store: Any, log: Any = None) -> dict[str, Any] | None:
+def scrub_names_once(store: Any, log: Any = None, *, hold: Any = None, stop: Any = None,
+                     wait_s: float = GAME_WAIT_S) -> dict[str, Any] | None:
     """Run :func:`scrub_names` once per name rule (``source_checkpoints['trace.name_rule']``); the memory service
-    calls it at start, off its main thread. Logs ``trace_name_scrub`` (content-free counts). ``None``: already done
-    for this rule. A failure leaves the checkpoint as it was, so the next start tries again."""
+    calls it at start, off its main thread. Logs ``trace_name_scrub`` (content-free counts, ``complete``,
+    ``attempt``). ``None``: already done for this rule (or stopped while waiting). A failure leaves the checkpoint as
+    it was, so the next start tries again.
+
+    Review r1 L3: it never fails open. A run that leaves ancestries unrecovered sets the checkpoint to
+    ``<rule>:try<n>``, not ``<rule>``, so the next start looks again; the :data:`SCRUB_TRIES`-th run clears those rows'
+    names (``fail_closed``) and sets ``<rule>``. ``hold``: while it returns true (the hard game gate holds:
+    :func:`yuki.memory.gamegate.gate_holds`) the scrub waits, asking again every ``wait_s`` (``stop``, an Event, ends
+    the wait; logged once, ``trace_name_scrub_wait``)."""
     try:
-        if store.source_checkpoint(NAME_RULE_CHECKPOINT) == NAME_RULE:
-            return None
+        mark = store.source_checkpoint(NAME_RULE_CHECKPOINT)
     except sqlite3.OperationalError:
         return None
-    counts = scrub_names(store)
+    if mark == NAME_RULE:
+        return None
+    tries = 0
+    if isinstance(mark, str) and mark.startswith(f"{NAME_RULE}:try"):
+        try:
+            tries = max(0, int(mark[len(f"{NAME_RULE}:try"):]))
+        except ValueError:
+            tries = 0
+    if hold is not None:
+        waited = 0
+        while _holds(hold):
+            if not waited and log is not None:
+                _log_quietly(log, "trace_name_scrub_wait", why="game")
+            waited += 1
+            if stop is not None:
+                if stop.wait(max(0.0, float(wait_s))):
+                    return None
+            else:
+                time.sleep(max(0.0, float(wait_s)))
+    last = tries + 1 >= SCRUB_TRIES
+    counts = scrub_names(store, fail_closed=last)
     if counts.get("skipped"):
         return counts
-    store.set_source_checkpoint(NAME_RULE_CHECKPOINT, NAME_RULE)
+    complete = last or not counts.get("unrecovered")
+    store.set_source_checkpoint(NAME_RULE_CHECKPOINT, NAME_RULE if complete else f"{NAME_RULE}:try{tries + 1}")
+    counts.update({"complete": complete, "attempt": tries + 1})
     if log is not None:
-        try:
-            log("trace_name_scrub", **counts)
-        except Exception:  # noqa: BLE001 - logging never breaks the scrub
-            pass
+        _log_quietly(log, "trace_name_scrub", **counts)
     return counts
+
+
+def _holds(hold: Any) -> bool:
+    """Whether a hold (the game gate) holds; one that raises holds (fails closed, as the gate)."""
+    try:
+        return bool(hold())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _log_quietly(log: Any, type_: str, **fields: Any) -> None:
+    try:
+        log(type_, **fields)
+    except Exception:  # noqa: BLE001 - logging never breaks the scrub
+        pass
 
 
 # -- later joins ---------------------------------------------------------------------------------------------------

@@ -42,6 +42,17 @@ def store(tmp_path):
     s.close()
 
 
+@pytest.fixture(autouse=True)
+def _packaged_games_only(monkeypatch):
+    """Hermetic game facts (review r1 L8): the packaged anti-cheat list only; never the user's privacy file, Windows'
+    detected games or a live gate."""
+    from yuki.memory import gamegate
+
+    games = gamegate.GameSet.load(None, None, ())
+    monkeypatch.setattr(gamegate, "_fallback_games", lambda: games)
+    monkeypatch.setattr(gamegate, "_LIVE", None)
+
+
 # =====================================================================================================================
 # 1. Trace privacy
 # =====================================================================================================================
@@ -297,8 +308,70 @@ def test_the_scrub_cli_dry_run_reads_a_copy_read_only(tmp_path, capsys):
 def test_the_service_scrubs_once_at_start_off_its_main_thread():
     src = (ROOT / "yuki" / "memory" / "service.py").read_text(encoding="utf-8")
     start = src.index('log("trace_purge"')
-    block = src[start:start + 1500]
-    assert "scrub_names_once(store, log)" in block and "yuki-memory-namescrub" in block
+    block = src[start:start + 2500]
+    assert "scrub_names_once(store, log, hold=_scrub_hold, stop=stop)" in block and "yuki-memory-namescrub" in block
+    assert "gate_holds(game_gate)" in block                                  # it waits while a game runs
+
+
+def test_the_scrub_never_fails_open_on_an_ancestry_it_could_not_recover(store, monkeypatch):
+    """Review r1 L3: rows whose ancestry was not recovered keep the checkpoint open (``<rule>:try<n>``); the last
+    try clears their names (fails closed) and closes it."""
+    _seed(store)
+    monkeypatch.setattr(trace_store, "recover_path", lambda *a, **k: None)   # every recovery runs out of time
+    logged: list[tuple[str, dict]] = []
+
+    def log(t: str, **f: Any) -> None:
+        logged.append((t, f))
+
+    first = trace_store.scrub_names_once(store, log)
+    assert first["rows"] == 3 and first["end_rows"] == 1 and first["unrecovered"] == 5
+    assert first["complete"] is False and first["attempt"] == 1 and first["fail_closed"] is False
+    assert store.source_checkpoint(trace_store.NAME_RULE_CHECKPOINT) == f"{NAME_RULE}:try1"
+    second = trace_store.scrub_names_once(store, log)
+    assert second["rows"] == 0 and second["unrecovered"] == 5 and second["complete"] is False
+    assert store.source_checkpoint(trace_store.NAME_RULE_CHECKPOINT) == f"{NAME_RULE}:try2"
+    third = trace_store.scrub_names_once(store, log)
+    assert third["attempt"] == trace_store.SCRUB_TRIES and third["fail_closed"] is True and third["complete"] is True
+    assert third["rows"] == 5                                                # the unrecovered ones, cleared
+    assert store.source_checkpoint(trace_store.NAME_RULE_CHECKPOINT) == NAME_RULE
+    assert trace_store.scrub_names_once(store, log) is None
+    assert store._query("SELECT count(*) FROM ui_actions WHERE name_ciphertext IS NOT NULL")[0][0] == 0
+    assert [t for t, _ in logged] == ["trace_name_scrub"] * 3
+    assert "Invented" not in json.dumps(logged)
+
+
+def test_the_start_up_scrub_waits_while_a_game_runs(store):
+    _seed(store)
+    holds = iter([True, True, False])
+    waits: list[float] = []
+    logged: list[str] = []
+
+    class _Stop:
+        def wait(self, s: float) -> bool:
+            waits.append(s)
+            return False
+
+    done = trace_store.scrub_names_once(store, lambda t, **f: logged.append(t), hold=lambda: next(holds),
+                                        stop=_Stop(), wait_s=7.0)
+    assert done is not None and done["rows"] == 4 and waits == [7.0, 7.0]
+    assert logged == ["trace_name_scrub_wait", "trace_name_scrub"]          # the wait is said once
+
+    class _Stopped:
+        def wait(self, s: float) -> bool:
+            return True
+
+    other = Store.open(Path(store.path).parent / "other.db")
+    try:
+        _seed(other)
+        assert trace_store.scrub_names_once(other, None, hold=lambda: True, stop=_Stopped()) is None
+        assert other.source_checkpoint(trace_store.NAME_RULE_CHECKPOINT) is None   # nothing run, nothing marked
+
+        def broken() -> bool:
+            raise RuntimeError("gate unreadable")
+
+        assert trace_store._holds(broken) is True                          # a hold that cannot be read holds
+    finally:
+        other.close()
 
 
 # =====================================================================================================================
@@ -509,8 +582,10 @@ def test_the_new_structural_words_are_kept_and_names_are_not():
                 "service_kind", "result", "done_check", "recheck", "verb", "rung", "label_source", "gate",
                 "request_id"):
         assert key in rec, key
-    assert rec["result"] == "done" and rec["slots"]["skill"] == "message" and rec["slots"]["result"] == "sent"
-    assert rec["slots"]["who_chars"] == len("Quillon Marsh") and "Quillon" not in json.dumps(rec)
+    assert rec["result"] == "done"
+    # review r1 M1: inside a nested value (a skill's slots) the structural words are lengths like every other string
+    assert rec["slots"] == {"who_chars": len("Quillon Marsh"), "skill_chars": 7, "result_chars": 4}
+    assert "Quillon" not in json.dumps(rec)
     prose = content_free({"type": "skill_run", "result": SECRET, "skill": "Quillon Marsh"})
     assert "result" not in prose or not isinstance(prose.get("result"), str)
     assert prose.get("skill_chars") == len("Quillon Marsh") and "plum" not in json.dumps(prose)
@@ -531,6 +606,61 @@ def test_content_free_fuzz_leaks_nothing_through_the_new_fields():
         out = json.dumps(content_free(rec), ensure_ascii=False)
         for w in ("Quillon", "Marsh", "Ottoline", "Severin", "Plumtree", "invented.example", "Invented", "plum",
                   "QUILLON"):
+            assert w not in out, (w, out)
+
+
+#: Lower-case words shaped like code words that are the user's or the world's (a host, a user name, a password).
+WORLD_WORDS = ("mafex11", "mafex11.github.io", "hunter2-secret.example", "quillon_marsh", "ottoline.brack")
+
+
+def test_a_tool_result_is_only_its_size_whatever_it_looks_like(tmp_path):
+    """Review r1 M1: ``result`` carries a tool's output (``agent/tools.py`` wraps a page read as
+    ``{"result": payload}``); a value shaped like a code word is still only its length, at any depth."""
+    top = content_free({"type": "tool_result", "name": "read_page", "ok": True, "result": "mafex11"})
+    assert "mafex11" not in json.dumps(top) and top["result_chars"] == len('"mafex11"') and top["result_shape"] == 7
+    wrapped = content_free({"type": "tool_result", "name": "read_tabs", "result": {"result": "mafex11.github.io"}})
+    assert wrapped["result_shape"] == {"result_chars": len("mafex11.github.io")}
+    for kind in ("final", "error", "perception", "tool_call", "memory_acting", "steer"):
+        assert "hunter2" not in json.dumps(content_free({"type": kind, "result": "hunter2-secret.example"})), kind
+    # the model writes a tool's input: the phase F words there are lengths too
+    shaped = content_free({"type": "tool_call", "name": "x", "input": {"scope": "mafex11", "check": "hunter2",
+                                                                       "route": "quillon_marsh", "gate": "a"}})
+    assert shaped["input_shape"] == {"scope_chars": 7, "check_chars": 7, "route_chars": 13, "gate_chars": 1}
+    # ... and inside any nested value Yuki logs (only a record's top level keeps them)
+    nested = content_free({"type": "skill_run", "skill": "message", "facts": {"scope": "mafex11", "verb": "hunter2"}})
+    assert nested["skill"] == "message" and nested["facts"] == {"scope_chars": 7, "verb_chars": 7}
+    # a D12 record keeps its own outcome word, and only a word
+    assert content_free({"type": "skill_run", "result": "done"})["result"] == "done"
+    assert content_free({"type": "done_check", "result": {"result": "mafex11"}})["result_shape"] == {"result_chars": 7}
+    # through the logger, end to end
+    log = SessionLogger(tmp_path, session_id="s", quiet=True, content=False)
+    log.tool_result("read_page", ok=True, summary="mafex11.github.io", result={"result": "mafex11.github.io"},
+                    elapsed_ms=3.0)
+    log.tool_result("read_tabs", ok=True, summary="x", result="mafex11", elapsed_ms=1.0)
+    log.close()
+    assert "mafex11" not in log.path.read_text(encoding="utf-8")
+
+
+def test_content_free_fuzz_keeps_no_lower_case_world_word_out_of_place():
+    """The fuzz of review r1 M1: lower-case world words in every place Yuki does not write itself (a tool's
+    input, result or payload, a skill's slots, any nested value, ``result`` outside the D12 records)."""
+    from yuki.log.events import RESULT_WORD_TYPES, TOP_ENUM_FIELDS
+
+    rng = random.Random(1011)
+    keys = sorted(TOP_ENUM_FIELDS | {"result", "title"})   # the keys this branch touched, and a title
+    other_types = sorted(EVENT_TYPES - RESULT_WORD_TYPES)
+
+    def blob() -> dict[str, Any]:
+        return {k: rng.choice(WORLD_WORDS) for k in rng.sample(keys, 6)}
+
+    for _ in range(400):
+        rec: dict[str, Any] = {"type": rng.choice(sorted(EVENT_TYPES)), "input": blob(), "payload": blob(),
+                               "slots": blob(), "facts": blob(), "items": [blob(), {"inner": blob()}]}
+        rec["result"] = blob() if rng.random() < 0.5 else rng.choice(WORLD_WORDS)
+        if isinstance(rec["result"], str):
+            rec["type"] = rng.choice(other_types)
+        out = json.dumps(content_free(rec), ensure_ascii=False)
+        for w in ("mafex11", "hunter2", "quillon", "ottoline"):
             assert w not in out, (w, out)
 
 
@@ -570,6 +700,43 @@ def test_every_record_of_a_request_carries_its_request_id(tmp_path):
     assert [r["request_id"] for r in recs if r["type"] == "final"] == ["20261010-091512-worker-2"]
     assert rid == "card-7" and recs[-1]["request_id"] == "card-7" and recs[-1]["type"] == "user_message"
     assert SECRET not in log.path.read_text(encoding="utf-8")
+
+
+def test_a_request_id_ends_with_its_summary(tmp_path):
+    """Review r1 L4: records after the request's summary (a compaction, a steer between requests, the session's end)
+    carry no request id; the next request starts a new one."""
+    log = SessionLogger(tmp_path, session_id="20261010-101010-worker", quiet=True, content=False)
+    log.user_message("first invented request")
+    log.request_summary({"lane": "worker", "outcome": "final"})
+    assert log.request_id is None and log.last_request_id == "20261010-101010-worker-1"
+    log.log("compaction", turns=3)
+    log.log("steer", count=1, dropped="arrived between requests")
+    log.begin_request("card-3")                         # a caller's own id, ended without a user message
+    log.log("tool_call", name="x", input={})
+    log.request_summary({"lane": "card", "outcome": "final"})
+    log.user_message("next invented request")           # starts its own: card-3 is not carried on
+    log.close()
+    recs = _records(log.path)
+    by_type = {r["type"]: r for r in recs}
+    assert "request_id" not in by_type["compaction"] and "request_id" not in by_type["steer"]
+    assert [r.get("request_id") for r in recs if r["type"] == "request_summary"] == [
+        "20261010-101010-worker-1", "card-3"]
+    assert recs[-1]["type"] == "user_message" and recs[-1]["request_id"] == "20261010-101010-worker-3"
+
+
+def test_the_digest_rule_holds_in_a_log_that_keeps_content(tmp_path, store):
+    """Review r1 L5 (D20): the memory service's log keeps content, and a ``*_digest`` there is 12 hex or nothing."""
+    full = store.cipher.digest("moment", "invented playlist")
+    log = SessionLogger(tmp_path, session_id="memory-x", quiet=True, content=True)
+    rec = log.log("moment", kind="media", entity_digest=full, who_digest=log_digest(full),
+                  inner={"x_digest": "Quillon Marsh", "y_digest": log_digest(full), "n": 2}, rows=[{"z_digest": full}])
+    log.close()
+    assert rec["entity_digest"] == full                                     # the caller still gets its record whole
+    (written,) = [r for r in _records(log.path) if r["type"] == "moment"]
+    assert "entity_digest" not in written and written["who_digest"] == full[:12]
+    assert written["inner"] == {"y_digest": full[:12], "n": 2} and written["rows"] == [{}]
+    text = log.path.read_text(encoding="utf-8")
+    assert full not in text and "Quillon" not in text
 
 
 def test_the_agents_acting_token_names_the_same_request():
@@ -758,6 +925,60 @@ def test_follow_finds_a_request_only_the_memory_log_knows(tmp_path):
     out = follow("hand-1-2", logs=logs, db=None)
     assert [r["type"] for r in out["records"]] == ["acting", "site_front", "acting"]
     assert out["notes"]["moments"] == "no_db"
+
+
+def test_follow_without_logs_falls_back_to_the_installed_apps_logs(tmp_path, monkeypatch, capsys):
+    """Review r1 L6: in a dev checkout the default logs folder is the repo's; when it names nothing, the installed
+    app's (``data_dir()/logs``) is read."""
+    from datetime import datetime
+
+    from yuki.core import paths
+    from yuki.log import follow as follow_mod
+
+    checkout = tmp_path / "checkout" / "logs"
+    (checkout / "sessions").mkdir(parents=True)
+    data = tmp_path / "data"
+    installed = data / "logs"
+    installed.mkdir(parents=True)
+    monkeypatch.setattr(paths, "logs_dir", lambda: checkout)
+    monkeypatch.setattr(paths, "data_dir", lambda: data)
+    assert follow_mod.default_logs() == [checkout, installed]
+    mem = SessionLogger(installed, session_id="memory-" + datetime.now().strftime("%Y%m%d-%H%M%S"), quiet=True)
+    mem.log("acting", acting=True, lane="voice", request_id="hand-4-1")
+    mem.close()
+    assert follow_mod.main(["hand-4-1", "--db", str(tmp_path / "none.db")]) == 0
+    assert "hand-4-1" in capsys.readouterr().out
+    monkeypatch.setattr(paths, "logs_dir", lambda: installed)              # the frozen app: one folder
+    assert follow_mod.default_logs() == [installed]
+
+
+def test_follow_never_opens_a_session_log_from_before_request_ids(tmp_path, monkeypatch):
+    """Review r1 L6: an id whose own session file is not found is looked for only in files written since request
+    ids exist (the logs before 5 Oct 2026 kept the words)."""
+    import os
+
+    from yuki.log import follow as follow_mod
+
+    folder = tmp_path / "logs" / "sessions"
+    folder.mkdir(parents=True)
+    old = folder / "20261001-090000.jsonl"
+    old.write_text(json.dumps({"ts": 1.0, "type": "user_message", "request_id": "hand-7-1", "text": SECRET}) + "\n",
+                   encoding="utf-8")
+    then = follow_mod.STAMPED_SINCE - 86400
+    os.utime(old, (then, then))
+    new = folder / "20261010-090000-voice.jsonl"
+    new.write_text(json.dumps({"ts": time.time(), "type": "tool_call", "request_id": "hand-7-1"}) + "\n",
+                   encoding="utf-8")
+    opened: list[str] = []
+    real = follow_mod._jsonl
+
+    def spy(path, needle=None):
+        opened.append(path.name)
+        return real(path, needle)
+
+    monkeypatch.setattr(follow_mod, "_jsonl", spy)
+    recs = follow_mod.session_records(tmp_path / "logs", "hand-7-1")
+    assert [r["type"] for r in recs] == ["tool_call"] and opened == [new.name]
 
 
 def test_the_follow_module_only_reads(tmp_path):
