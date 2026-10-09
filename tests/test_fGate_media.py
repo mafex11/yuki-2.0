@@ -17,6 +17,10 @@ import pytest
 from yuki.actions import media
 from yuki.actions.media import MediaCommand
 
+#: These tests stub the game facts themselves: a test-run stub of the live game check (review r2 L8)
+#: stays off for them.
+LIVE_GAMEGATE = True
+
 STORE_SPOTIFY = "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"
 CLASSIC_SPOTIFY = "Spotify.exe"
 GAME = "valorant-win64-shipping"
@@ -350,3 +354,100 @@ def test_a_stand_in_desk_without_a_route_keeps_its_keys() -> None:
 
     ok, report, facts = Hands(desk)._run("media_key", {"key": "volumedown", "times": 5})
     assert ok and "the volume is now 50.0% (was 60.0%)" in report and "route" not in facts
+
+
+# -- review r2 M1: with a game in front nothing is handed to the thinker --------------------------------------------
+
+
+def _refusing_route(desk: _Desk) -> None:
+    desk.media_command = lambda verb, app=None, log=None: MediaCommand(verb, "refused", app_id="Chrome",
+                                                                       app_key="chrome", status="playing")
+
+
+def test_with_a_game_in_front_no_session_or_a_refusal_is_final() -> None:
+    """``no_session`` and ``refused`` are failures with neither ``refused`` nor ``settled`` set before: Hands then
+    escalated them to the thinker by code, with the game in front. Now they are refused for the game, said plainly."""
+    desk = _Desk(game=GAME, route="no_session")
+    ok, report, facts = _run(desk, key="playpause", want="paused")
+    assert not ok and facts["refused"] == "game" and facts["game_front"] is True and desk.pressed == []
+    assert "is in front, so nothing more is tried" in report
+    desk = _Desk(game=GAME)
+    _refusing_route(desk)
+    ok, report, facts = _run(desk, key="nexttrack")
+    assert not ok and facts["refused"] == "game" and desk.pressed == []
+
+
+def test_with_a_game_in_front_an_unseen_effect_is_settled_not_handed_over() -> None:
+    desk = _Desk(game=GAME)
+    original = desk.media_command
+
+    def next_without_effect(verb: str, app: Any = None, log: Any = None) -> MediaCommand:
+        result = original(verb, app, log)
+        desk.sessions[0]["title"] = "Song A"                    # sent, but the track did not change (yet)
+        return result
+
+    desk.media_command = next_without_effect
+    ok, report, facts = _run(desk, key="nexttrack")
+    assert ok and facts["verified"] is False and facts["settled"] is True and not facts.get("refused")
+    desk = _Desk(game=GAME)
+    desk.endpoint_volume = lambda key, times=1: desk.master_volume()       # Core Audio answered, the level held
+    ok, report, facts = _run(desk, key="volumeup")
+    assert ok and facts["verified"] is False and facts["settled"] is True
+
+
+def test_without_a_game_those_cases_are_unchanged() -> None:
+    desk = _Desk(route="no_session")
+    ok, report, facts = _run(desk, key="playpause", want="paused")
+    assert not ok and not facts.get("refused") and not facts.get("settled") and "game_front" not in facts
+    desk = _Desk(game=GAME)
+    ok, report, facts = _run(desk, key="playpause", want="paused")                   # verified: nothing added
+    assert ok and facts["verified"] is True and "game_front" not in facts and "in front" not in report
+
+
+def test_a_key_refused_for_a_game_that_came_to_the_front_is_not_handed_over() -> None:
+    """The route failed and no game was in front at that check, so the key stands in; the input layer then refused it
+    (a game came to the front): carried into ``facts["refused"]``."""
+    desk = _Desk(route="timeout")
+    desk.press = lambda key, **kw: type("R", (), {"ok": False, "summary": "a game is in front",
+                                                   "details": {"refused": "game"}})()
+    ok, report, facts = _run(desk, key="nexttrack")
+    assert not ok and facts["refused"] == "game"
+
+
+class _Params:
+    def __init__(self, args: dict[str, Any]) -> None:
+        self.function_name, self.arguments, self.tool_call_id = "media_key", args, "c-media"
+        self.results: list[dict[str, Any]] = []
+
+        async def push_frame(frame: Any) -> None:
+            pass
+
+        self.llm = type("LLM", (), {"push_frame": staticmethod(push_frame)})()
+
+    async def result_callback(self, result: dict, properties: Any = None) -> None:
+        self.results.append(result)
+
+
+@pytest.mark.parametrize("game, escalates", [(GAME, False), ("", True)])
+def test_the_hand_off_to_the_thinker_by_code(game: str, escalates: bool) -> None:
+    """End to end through ``Hands.handle``: "pause" with no media session, a game in front: the thinker is not
+    called; with no game the old hand-off stands."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from yuki.voice.hands import Hands
+
+    escalated: list[Any] = []
+
+    async def escalate(*a: Any, **k: Any) -> bool:
+        escalated.append(a)
+        return True
+
+    hands = Hands(_Desk(game=game, route="no_session"))
+    hands.bridge = SimpleNamespace(escalate=escalate, busy_tools=0, gate=None, _ack_if_silent=None,
+                                   desk_job=lambda: None, may_ack=lambda: False, acked=lambda: None)
+    params = _Params({"key": "playpause", "want": "paused"})
+    asyncio.run(hands.handle(params))
+    assert bool(escalated) is escalates
+    if not escalates:
+        assert "is in front, so nothing more is tried" in params.results[-1]["failed"]

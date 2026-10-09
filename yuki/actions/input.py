@@ -239,16 +239,20 @@ def _mouse_record(flags: int, data: int = 0) -> _Input:
     )
 
 
-def _send_each(records: list[_Input]) -> int:
+def _send_each(records: list[_Input], *, why: list[str] | None = None) -> int:
     """Send each record in its own ``SendInput`` call, in order; how many Windows accepted.
 
     One call per record keeps the timing of the ``keybd_event`` / ``mouse_event`` calls this replaces (each was one
     event), so an app sees the same sequence it always did. Every record here comes from :func:`_key_event` or
-    :func:`_mouse_record`, so every one carries Yuki's tag.
+    :func:`_mouse_record`, so every one carries Yuki's tag. Nothing is sent when the game backstop refuses (D17);
+    ``why`` (a caller's list) then gets the refusal, so a public action can say so instead of reporting it done.
     """
     mouse = any(int(record.type) == _INPUT_MOUSE for record in records)
     # D17: nothing reaches a game in front, nor the game window under the pointer (a click or wheel goes there)
-    if _gamegate.refuse_input("mouse" if mouse else "keys", point=cursor_position() if mouse else None) is not None:
+    if (refused := _gamegate.refuse_input("mouse" if mouse else "keys",
+                                          point=cursor_position() if mouse else None)) is not None:
+        if why is not None:
+            why.append(refused)
         return 0
     accepted = 0
     for record in records:
@@ -280,17 +284,26 @@ def _named_key_records(key: str, *, up: bool) -> list[_Input]:
             + [_key_event(m, 0, up=True) for m in after])
 
 
-def _send_chord(*keys: str) -> int:
-    """``pyautogui.hotkey(*keys)``, stamped: each key down in order, then each up in reverse; events accepted."""
+def _send_chord(*keys: str, why: list[str] | None = None) -> int:
+    """``pyautogui.hotkey(*keys)``, stamped: each key down in order, then each up in reverse; events accepted
+    (``why``: see :func:`_send_each`)."""
     records = [r for k in keys for r in _named_key_records(k, up=False)]
     records += [r for k in reversed(keys) for r in _named_key_records(k, up=True)]
-    return _send_each(records)
+    return _send_each(records, why=why)
 
 
-def _send_presses(key: str, times: int = 1) -> int:
-    """``pyautogui.press(key, presses=times, interval=0)``, stamped: down then up, ``times`` times; events accepted."""
+def _send_presses(key: str, times: int = 1, *, why: list[str] | None = None) -> int:
+    """``pyautogui.press(key, presses=times, interval=0)``, stamped: down then up, ``times`` times; events accepted
+    (``why``: see :func:`_send_each`)."""
     once = _named_key_records(key, up=False) + _named_key_records(key, up=True)
-    return _send_each(once * max(1, int(times)))
+    return _send_each(once * max(1, int(times)), why=why)
+
+
+def _game_stopped(why: list[str], details: dict, started: float, summary: str) -> ActionResult:
+    """D17 (review r2 L2): the backstop refused mid-action (a game came to the front): a failed result that says so,
+    never "done"."""
+    details["refused"] = "game"
+    return _result(False, f"{summary}: {why[0]}", details, started)
 
 
 def _char_events(char: str) -> list[_Input]:
@@ -522,10 +535,12 @@ def _in_screen_bounds(x: int, y: int) -> bool:
     return left <= x < right and top <= y < bottom
 
 
-def _move(x: int, y: int) -> bool:
+def _move(x: int, y: int, *, why: list[str] | None = None) -> bool:
     """Put the cursor exactly on (x, y) - instantly, on any monitor. False (not moved) with a game in front or a game's
-    window at the point (D17)."""
-    if _gamegate.refuse_input("pointer", point=(int(x), int(y))) is not None:
+    window at the point (D17); ``why`` (a caller's list) then gets the refusal."""
+    if (refused := _gamegate.refuse_input("pointer", point=(int(x), int(y)))) is not None:
+        if why is not None:
+            why.append(refused)
         return False
     _user32.SetCursorPos(int(x), int(y))
     return True
@@ -1671,8 +1686,14 @@ def _clear_focused(expect_hwnd: int | None, details: dict) -> tuple[str | None, 
     if refusal:
         details["cleared"] = False
         return refusal, ""
-    _send_chord("ctrl", "a")
-    _send_presses("delete")
+    why: list[str] = []
+    _send_chord("ctrl", "a", why=why)
+    if not why:
+        _send_presses("delete", why=why)
+    if why:   # D17: a game came to the front: not "sent" (review r2 L2)
+        details["cleared"] = False
+        details["refused"] = "game"
+        return f"did not clear: {why[0]}", ""
     if not known or not getattr(focus, "has_value", False):
         details["cleared"] = None
         return None, (
@@ -2023,10 +2044,14 @@ def click(
         return _result(False, refusal, details, started)
     before = _focus_state()
     down, up = _MOUSEEVENTF[button]
-    _move(x, y)
-    for _ in range(clicks):
-        _send_mouse(down)
-        _send_mouse(up)
+    why: list[str] = []
+    if not _move(x, y, why=why):
+        return _game_stopped(why, details, started, "nothing was clicked (the pointer was not moved)")
+    for done in range(clicks):
+        # each press with its release in one send: a game coming to the front never leaves a button held down
+        _send_each([_mouse_record(down), _mouse_record(up)], why=why)
+        if why:
+            return _game_stopped(why, details, started, f"stopped after {done} of {clicks} clicks")
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     details["cursor"] = cursor_position()
     outcome = _report_effects(
@@ -2445,7 +2470,10 @@ def type_text(
         if press_enter:
             into, facts = _input_target(_focus_state())
             details.update(facts)
-            _send_presses("enter")
+            why: list[str] = []
+            _send_presses("enter", why=why)
+            if why:
+                return _game_stopped(why, details, started, "Enter was not pressed")
             return _result(
                 True,
                 summary(cleared, f"pressed enter (no text) in {into}", appeared(_POPUP_WATCH_S)),
@@ -2480,7 +2508,11 @@ def type_text(
         if refusal:
             _restore_clipboard(previous)
             return _result(False, refusal, details, started)
-        _send_chord("ctrl", "v")
+        why = []
+        _send_chord("ctrl", "v", why=why)
+        if why:   # D17: a game came to the front: nothing was pasted, the clipboard is put back (review r2 L2)
+            _restore_clipboard(previous)
+            return _game_stopped(why, details, started, "nothing was pasted")
         consumed = _wait_clipboard_released(
             time.monotonic() + _CLIPBOARD_HANDOFF_S
         )
@@ -2584,7 +2616,11 @@ def type_text(
                 details,
                 started,
             )
-        _send_presses("enter")
+        why = []
+        _send_presses("enter", why=why)
+        if why:
+            return _game_stopped(why, details, started, f"typed {len(text)} chars into {into}, then Enter was not "
+                                                        f"pressed")
     # Where it landed, for the log and for a caller checking its work.  Read after
     # the keystrokes, not before: Enter may well have moved the focus on.
     details.update(_where_focus_is()[1])
@@ -2726,7 +2762,10 @@ def hotkey(*keys: str, expect_hwnd: int | None = None) -> ActionResult:
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
-    _send_chord(*resolved)
+    why: list[str] = []
+    _send_chord(*resolved, why=why)
+    if why:
+        return _game_stopped(why, details, started, f"{'+'.join(resolved)} was not pressed")
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
         before,
@@ -2783,7 +2822,10 @@ def press(
         return _result(False, refusal, details, started)
     before = _focus_state()
     shown_hwnd, shown_before = _window_state_before(expect_hwnd, before)
-    _send_presses(normalized, times)
+    why: list[str] = []
+    _send_presses(normalized, times, why=why)
+    if why:
+        return _game_stopped(why, details, started, f"{normalized} was not pressed")
     watch = _start_page_watch(page_hwnd, page_before, page_known)
     outcome = _report_effects(
         before,
@@ -2886,9 +2928,9 @@ def point_at(x: int, y: int, *, expect_hwnd: int | None = None) -> ActionResult:
     game = _refused_for_game("pointer", details, started, hwnd=expect_hwnd, point=(int(x), int(y)))
     if game is not None:
         return game
-    if not _move(int(x), int(y)):
-        details["refused"] = "game"
-        return _result(False, "the pointer was not moved: a game came to the front", details, started)
+    why: list[str] = []
+    if not _move(int(x), int(y), why=why):
+        return _game_stopped(why, details, started, "the pointer was not moved")
     return _result(True, f"pointer at ({x},{y})", details, started)
 
 

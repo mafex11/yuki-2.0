@@ -704,9 +704,14 @@ def window_game(hwnd: int) -> str:
     return game_in_front() if root == _foreground_root() else pid_game(_window_pid(root))
 
 
+def game_name(game: str) -> str:
+    """How a game is named in what Yuki says: ``a game (valorant-win64-shipping)``, or the exclusive full-screen one."""
+    return "a game in exclusive full screen" if game == "d3d" else f"a game ({game})"
+
+
 def refusal_text(game: str, where: str) -> str:
     """What a refusal says (to the model and the user): which game, and that nothing was sent."""
-    name = "a game in exclusive full screen" if game == "d3d" else f"a game ({game})"
+    name = game_name(game)
     if where == "front":
         return (f"{name} is in front: Yuki sends nothing while a game is in front (no keys, clicks, pointer moves, "
                 f"focus, window changes, links or app launches); nothing was done")
@@ -1493,5 +1498,5 @@ __all__ = ["GameGate", "GameSet", "GateView", "Decision", "decide", "judge_learn
            "LEARNED_STATE", "SCAN_EVERY_S", "CHECK_AFTER_S", "LEARN_AFTER_STRETCHES", "EVIDENCE_CAP", "BEAT_EVERY_S",
            "D3D_FRESH_S", "SOUND_EVIDENCE", "GAME_CONFIG_STORE", "WindowsGames", "gate_holds", "confirmed",
            "recheck_evidence", "read_windows_games", "stretches", "windows_games", "running_holds", "gate_scope",
-           "GATE_SCOPES", "refuse_input", "refusal_text", "game_in_front", "window_game", "pid_game",
+           "GATE_SCOPES", "refuse_input", "refusal_text", "game_name", "game_in_front", "window_game", "pid_game",
            "set_front_source", "add_refusal_listener", "remove_refusal_listener", "REFUSALS", "FRONT_FRESH_S"]

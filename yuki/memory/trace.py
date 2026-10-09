@@ -2402,6 +2402,11 @@ class Trace:
             self._span(blocked)
             self.sink.blocked = blocked
             self.hooks.set_blocked(blocked)
+            if not blocked and self._gate_holds():
+                # fGate (review r2 L6): the gate began holding while this beat re-opened, and its _gate_changed saw
+                # the sink still blocked: block again now rather than at the next beat
+                self._gate_changed(None)
+                reason = "game"
         state = reason or ("no_input" if self._attach is not None and not self._attached else "on")
         if state != self.state:
             self.state = state

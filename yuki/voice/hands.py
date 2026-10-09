@@ -1868,13 +1868,27 @@ class Hands:
             routed = (self._media_command(key, want, times, facts) if key in _TRANSPORT_KEYS
                       else self._endpoint_volume(key, times, facts))
             if routed is not None:
-                return routed
+                ok, report, facts = routed
+                game = "" if (ok and facts.get("verified") is True) or facts.get("settled") else self._game_front()
+                if game:
+                    # D17(2), review r2 M1: with a game in front nothing is handed to the thinker (no model pass, no
+                    # read of the window in front, no free-form step): no session to aim at, a session that refused,
+                    # or a command whose effect was not seen stays as the report says, and nothing more is tried
+                    from yuki.memory.gamegate import game_name
+
+                    facts["game_front"] = True
+                    if ok:
+                        facts["settled"] = True
+                    else:
+                        facts["refused"] = "game"
+                    report += f"; {game_name(game)} is in front, so nothing more is tried until you leave it"
+                return ok, report, facts
             game = self._game_front()
             if game:
                 from yuki.memory.gamegate import refusal_text
 
                 facts["verified"] = False
-                facts["refused"] = "game"
+                facts["refused"], facts["game_front"] = "game", True
                 return False, (f"{refusal_text(game, 'front')}; Windows' media controls could not take it either, so "
                                f"nothing was sent"), facts
             before = self._media_status() if key in _TRANSPORT_KEYS else None
@@ -1895,6 +1909,8 @@ class Hands:
             facts["sent_at"] = time.monotonic()
             result = self.backend.press(key, times=times)
             ok, report, facts = self._report(result, "", facts)
+            if _detail(result, "refused") == "game":
+                facts["refused"] = "game"   # D17(2): a game came to the front before the key: never handed over
             if ok and before is not None:
                 changed, words = self._media_after(before)
                 report += "; " + words

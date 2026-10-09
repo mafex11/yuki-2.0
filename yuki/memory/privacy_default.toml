@@ -180,11 +180,13 @@ learn_demo_alone_after_proven_runs = 1
 use_learned = true
 # The hard game gate: while any of these programs is in front (windowed or full screen, the launch
 # screen too), nothing about your input is recorded and no card is shown; cards come back 2 minutes
-# after you leave the game (the [nudges] return_hold_s below).  In the background the trace and
-# cards may run, but nothing ever reads, hooks, types into, clicks or focuses the game itself, and
-# Yuki's hands send no keys, clicks, focus changes, links or app launches while a game is in front
-# ("pause" and "next" still work: they go through Windows' media controls, not keys).  Heavy
-# background work still waits while a game runs anywhere.  These are games with kernel anti-cheat.
+# after you leave the game (the [nudges] return_hold_s below).  With a game in the background the
+# trace and cards may run, but the trace never reads or hooks the game's own windows.  While a game
+# is in front, Yuki's keys, clicks, pointer moves, focus and window changes, links and app launches
+# are refused, and so is any of them aimed at a game's window ("pause" and "next" still work: they
+# go through Windows' media controls, not keys).  Not covered yet: a PowerShell step the assistant
+# writes itself, and Yuki's own window when you ask for it.  Heavy background work still waits while
+# a game runs anywhere.  These are games with kernel anti-cheat.
 # Add your own; the ones listed here always count, even if removed from your copy (Yuki also reads
 # its own list).  A program Windows detects as a game, or one seen in Direct3D exclusive full screen,
 # counts by itself.  Anti-cheat services are not listed: Vanguard's tray (vgtray.exe) runs all the

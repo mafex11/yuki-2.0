@@ -18,6 +18,10 @@ import pytest
 
 from yuki.memory import gamegate as G
 
+#: These tests stub the game facts themselves: a test-run stub of the live game check (review r2 L8)
+#: stays off for them.
+LIVE_GAMEGATE = True
+
 ROOT = Path(__file__).resolve().parents[1] / "yuki"
 GAME = "valorant-win64-shipping"
 
@@ -190,6 +194,68 @@ def test_a_game_coming_to_the_front_mid_string_stops_the_typing(game, user32, mo
     monkeypatch.setattr(G, "game_in_front", front)
     sent, expected, refusal = inp._send_text("abcdef")
     assert 0 < sent < 12 and "after" in refusal and "in front" in refusal
+
+
+@pytest.fixture
+def quiet_reads(monkeypatch):
+    """The public actions' reads around the send (hit test, page, focus, windows) as no-ops: only the send and the
+    game checks are real here."""
+    import yuki.actions.input as inp
+
+    stubs = {"_start_hit_test": None, "_finish_hit_test": (None, "stub"), "_start_page_read": None,
+             "_finish_page_read": (False, None, {}), "_focus_state": {}, "_start_page_watch": None,
+             "_report_effects": "nothing changed", "_refuse_unless_ready": None, "_windows_before": (0, {}),
+             "_page_before_keys": (0, None, False), "_window_state_before": (0, None), "_window_state_after": "",
+             "_windows_appeared": [], "_describe_appeared": "", "_input_target": ("the field", {}),
+             "_where_focus_is": ("the field", {})}
+    for name, answer in stubs.items():
+        monkeypatch.setattr(inp, name, lambda *a, _answer=answer, **k: _answer)
+    return inp
+
+
+def _front_after(monkeypatch, checks: int) -> None:
+    """The game comes to the front after ``checks`` game checks."""
+    calls = {"n": 0}
+
+    def front() -> str:
+        calls["n"] += 1
+        return GAME if calls["n"] > checks else ""
+
+    monkeypatch.setattr(G, "game_in_front", front)
+
+
+def test_a_game_coming_to_the_front_mid_action_is_never_reported_done(game, user32, quiet_reads, monkeypatch) -> None:
+    """Review r2 L2: click, press, hotkey and Enter check what the primitives did; a refusal after the up-front check
+    is a failed result with ``refused = "game"``, never "done"; a click never leaves a button held down."""
+    inp = quiet_reads
+    game["front"] = ""
+    _front_after(monkeypatch, 1)                       # up-front check passes; the pointer move is refused
+    result = inp.click(10, 10)
+    assert not result.ok and result.details["refused"] == "game" and "not moved" in result.summary
+    assert user32.names().count("SetCursorPos") == 0 and user32.names().count("SendInput") == 0
+    _front_after(monkeypatch, 3)                       # the first press+release goes out, the second is refused
+    result = inp.click(10, 10, clicks=2)
+    assert not result.ok and result.details["refused"] == "game" and "after 1 of 2 clicks" in result.summary
+    assert user32.names().count("SendInput") == 2      # down and up of the first click: no lone button-down
+    for action in (lambda: inp.press("enter"), lambda: inp.hotkey("ctrl", "t")):
+        user32.calls.clear()
+        _front_after(monkeypatch, 1)
+        result = action()
+        assert not result.ok and result.details["refused"] == "game" and "was not pressed" in result.summary
+        assert "SendInput" not in user32.names()
+    _front_after(monkeypatch, 1)
+    result = inp.type_text("", press_enter=True)
+    assert not result.ok and result.details["refused"] == "game" and "Enter was not pressed" in result.summary
+    # the clear before typing: a field without a readable value used to say "sent select-all + delete"
+    field = type("Focus", (), {"ok": True, "accepts_text": True, "value": "old", "has_value": False,
+                               "describe": lambda self: "Edit"})()
+    monkeypatch.setattr(inp, "_read_focus", lambda *a, **k: field)
+    user32.calls.clear()
+    _front_after(monkeypatch, 0)
+    details: dict = {}
+    failure, phrase = inp._clear_focused(None, details)
+    assert failure and "did not clear" in failure and details["refused"] == "game" and details["cleared"] is False
+    assert "SendInput" not in user32.names()
 
 
 # -- windows, focus, links and launches --------------------------------------------------------------------------------
@@ -373,21 +439,41 @@ def test_the_slider_focus_is_refused_on_a_game_element_even_behind(game) -> None
 
 # -- the source walk: no unguarded call ------------------------------------------------------------------------------
 
-#: Calls that send input, take focus, show or activate a window, open a link or launch a program.
+#: Calls that send input, take focus, show, raise or activate a window, open a link or launch a program (Win32 names,
+#: and uiautomation's own input and window methods).
 SENSITIVE = {"SendInput", "SetCursorPos", "keybd_event", "mouse_event", "SetForegroundWindow", "BringWindowToTop",
              "SetActiveWindow", "SwitchToThisWindow", "AttachThreadInput", "SetFocus", "ShowWindow", "ShowWindowAsync",
-             "startfile", "ShellExecute", "ShellExecuteW", "ShellExecuteEx", "ShellExecuteExW", "ActivateApplication",
-             "ActivateForProtocol", "CreateProcess", "CreateProcessW", "WinExec"}
-#: ``subprocess`` / ``os`` launchers (by receiver).
-LAUNCHERS = {("subprocess", "Popen"), ("subprocess", "run"), ("subprocess", "call"), ("subprocess", "check_call"),
-             ("subprocess", "check_output"), ("os", "system"), ("os", "spawnv"), ("os", "spawnl")}
+             "SetWindowPos", "SetWindowPlacement", "OpenIcon", "startfile", "ShellExecute", "ShellExecuteW",
+             "ShellExecuteEx", "ShellExecuteExW", "ActivateApplication", "ActivateForProtocol", "CreateProcess",
+             "CreateProcessW", "WinExec", "SendKeys", "SendKey", "PressKey", "Click", "DoubleClick", "RightClick",
+             "MiddleClick", "DragDrop", "MoveCursorToMyCenter", "MoveCursorToInnerPos", "WheelDown", "WheelUp",
+             "SetTopmost", "SetActive", "SetWindowVisualState"}
+#: Window messages posted or sent to a window: sensitive (WM_KEYDOWN, WM_CHAR, WM_CLOSE, WM_SYSCOMMAND, a mouse
+#: message...) unless the message is one of the read-only ones, by its name or its number; a message held in a variable
+#: counts as sensitive.
+MESSAGE_CALLS = {"PostMessage", "PostMessageW", "PostMessageA", "SendMessage", "SendMessageW", "SendMessageA",
+                 "SendMessageTimeout", "SendMessageTimeoutW", "SendMessageTimeoutA", "SendNotifyMessage",
+                 "SendNotifyMessageW", "PostThreadMessage", "PostThreadMessageW"}
+READ_ONLY_MESSAGES = {"WM_NULL": 0x0000, "WM_GETTEXT": 0x000D, "WM_GETTEXTLENGTH": 0x000E, "WM_GETOBJECT": 0x003D}
+#: Launchers by module (``subprocess.Popen``, ``sp.Popen`` after ``import subprocess as sp``, ``Popen`` after
+#: ``from subprocess import Popen``).
+LAUNCHERS = ({("subprocess", n) for n in ("Popen", "run", "call", "check_call", "check_output", "getoutput",
+                                          "getstatusoutput")}
+             | {("os", n) for n in ("system", "popen", "startfile", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+                                    "spawnl", "spawnle", "spawnlp", "spawnlpe", "execv", "execve", "execvp",
+                                    "execvpe", "execl", "execle", "execlp", "execlpe")}
+             | {("webbrowser", n) for n in ("open", "open_new", "open_new_tab")}
+             | {("asyncio", "create_subprocess_exec"), ("asyncio", "create_subprocess_shell")})
 #: Reviewed exceptions, each with its reason.
 ALLOWED = {
     # the PowerShell host Yuki runs its scripts in: a hidden console process, never a window; the GUI launches it
-    # carries (Start-Process) are checked at their own run_powershell call sites below
+    # carries are checked at their own run_powershell call sites (every one in scope is walked)
     ("actions/shell.py", "Popen"),
+    # WM_QUIT to Yuki's own raw-input listener thread (the thread id it started), ending its message loop: no window
+    ("actions/userinput.py", "PostThreadMessageW"),
 }
-#: Read-only PowerShell (it lists the Start menu; it starts nothing).
+#: Read-only PowerShell (it lists the Start menu; it starts nothing). Every other ``run_powershell`` call in scope is
+#: walked, whatever its script (a script in a variable may start anything).
 READ_ONLY_POWERSHELL = {("actions/launch.py", "_powershell_json")}
 SCOPES = ("actions", "perception", "skills", "connect")
 
@@ -398,30 +484,42 @@ def _is_guard(node: ast.AST) -> bool:
         or (isinstance(node.func, ast.Attribute) and node.func.attr == "refuse_input"))
 
 
-_GUARDS: dict[int, list[int]] = {}
+def _is_guard_stmt(node: ast.AST) -> bool:
+    """``if <refuse_input(...) ...>:`` whose body leaves (returns, raises, or skips the rest of its loop body)."""
+    return (isinstance(node, ast.If) and any(_is_guard(n) for n in ast.walk(node.test))
+            and any(isinstance(st, (ast.Return, ast.Raise, ast.Continue, ast.Break)) for st in node.body))
 
 
-def _guards_in(fn: ast.AST) -> list[int]:
-    """Lines of the guard calls a function tests in an ``if`` (its own body, not nested functions')."""
-    if id(fn) in _GUARDS:
-        return _GUARDS[id(fn)]
-    lines: list[int] = _GUARDS.setdefault(id(fn), [])
+def _guarded(path: list[ast.AST]) -> bool:
+    """Whether a call is always preceded by a guard: a guard statement earlier in a block that holds the call (the
+    call's own block or one around it), inside the call's function or a function enclosing it. A guard in another
+    branch, after the call, or one whose body goes on to the call anyway does not count."""
+    first_fn = next((i for i, n in enumerate(path) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if first_fn is None:
+        return False
+    for parent, child in zip(path[first_fn:], path[first_fn + 1:]):
+        for _field, value in ast.iter_fields(parent):
+            if isinstance(value, list) and any(item is child for item in value):
+                for item in value:
+                    if item is child:
+                        break
+                    if _is_guard_stmt(item):
+                        return True
+    return False
 
-    def walk(node: ast.AST, top: bool) -> None:
-        if not top and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return
-        if isinstance(node, (ast.If, ast.While)) and any(_is_guard(n) for n in ast.walk(node.test)):
-            lines.append(node.test.lineno)
-        for child in ast.iter_child_nodes(node):
-            walk(child, False)
 
-    walk(fn, True)
-    return lines
+def _message_is_read_only(node: ast.Call) -> bool:
+    if len(node.args) < 2:
+        return False
+    msg = node.args[1]
+    if isinstance(msg, ast.Constant) and isinstance(msg.value, int):
+        return msg.value in READ_ONLY_MESSAGES.values()
+    name = msg.id if isinstance(msg, ast.Name) else msg.attr if isinstance(msg, ast.Attribute) else ""
+    return name.lstrip("_") in READ_ONLY_MESSAGES
 
 
 def _sensitive_calls() -> list[tuple[str, str, int, list[ast.AST], str]]:
-    """(file, call name, line, enclosing functions innermost first, source) of every sensitive call in scope."""
-    _GUARDS.clear()        # keyed by node id: only valid while these trees are alive
+    """(file, call name, line, path from the module down to the call, source) of every sensitive call in scope."""
     out = []
     for scope in SCOPES:
         base = ROOT / scope
@@ -431,58 +529,150 @@ def _sensitive_calls() -> list[tuple[str, str, int, list[ast.AST], str]]:
             rel = path.relative_to(ROOT).as_posix()
             src = path.read_text(encoding="utf-8")
             tree = ast.parse(src)
+            modules: dict[str, str] = {}               # local name -> module (import x / import x as y)
+            names: dict[str, tuple[str, str]] = {}     # local name -> (module, name) (from x import y [as z])
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        modules[alias.asname or alias.name.split(".")[0]] = alias.name
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    for alias in node.names:
+                        names[alias.asname or alias.name] = (node.module, alias.name)
             stack: list[ast.AST] = []
 
             def walk(node: ast.AST) -> None:
-                named = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                if named:
-                    stack.append(node)
+                stack.append(node)
                 if isinstance(node, ast.Call):
                     func = node.func
-                    name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) \
-                        else ""
-                    receiver = (func.value.id if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
-                                else "")
-                    text = (ast.get_source_segment(src, node) or "") if name == "run_powershell" else name
-                    hit = (name in SENSITIVE or (receiver, name) in LAUNCHERS
-                           or (name == "run_powershell" and ("Start-Process" in text or rel == "actions/launch.py")))
-                    if hit and not (name == "run_powershell" and stack
-                                    and (rel, stack[-1].name) in READ_ONLY_POWERSHELL):
-                        out.append((rel, name, node.lineno, list(reversed(stack)), text))
+                    if isinstance(func, ast.Attribute):
+                        receiver = func.value.id if isinstance(func.value, ast.Name) else ""
+                        launcher = (modules.get(receiver, receiver), func.attr)
+                    elif isinstance(func, ast.Name):
+                        launcher = names.get(func.id, ("", func.id))
+                    else:
+                        launcher = ("", "")
+                    real = launcher[1]
+                    fns = [n for n in stack if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+                    hit = (real in SENSITIVE or launcher in LAUNCHERS
+                           or (real in MESSAGE_CALLS and not _message_is_read_only(node))
+                           or (real == "run_powershell"
+                               and not (fns and (rel, fns[-1].name) in READ_ONLY_POWERSHELL)))
+                    if hit:
+                        text = (ast.get_source_segment(src, node) or "") if real == "run_powershell" else real
+                        out.append((rel, real, node.lineno, list(stack), text))
                 for child in ast.iter_child_nodes(node):
                     walk(child)
-                if named:
-                    stack.pop()
+                stack.pop()
 
             walk(tree)
     return out
 
 
+def _where(path: list[ast.AST]) -> str:
+    fns = [n for n in path if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return fns[-1].name if fns else "<module>"
+
+
 def test_no_input_focus_link_or_launch_call_is_unguarded() -> None:
     calls = _sensitive_calls()
-    assert len(calls) >= 15                                     # the walk sees the known call sites
-    unguarded = []
-    for rel, name, line, enclosing, text in calls:
-        if (rel, name) in ALLOWED:
+    assert len(calls) >= 25                                     # the walk sees the known call sites
+    unguarded = [f"{rel}:{line} {_where(path)}: {text[:80]}" for rel, name, line, path, text in calls
+                 if (rel, name) not in ALLOWED and not _guarded(path)]
+    assert unguarded == [], ("unguarded (put `if refuse_input(...) is not None: return` before it, in the same "
+                             "block or one around it):\n" + "\n".join(unguarded))
+
+
+_PLANTED = '''import subprocess as sp
+import webbrowser
+from subprocess import Popen
+from os import system as run_it
+import win32gui, win32con
+
+
+def warm(element):
+    element.SetFocus()
+
+
+def good(element, gamegate):
+    if gamegate.refuse_input("uia_focus") is not None:
+        return
+    element.SetFocus()
+
+
+def other_branch(element, gamegate, x):
+    if x:
+        if gamegate.refuse_input("uia_focus") is not None:
+            return
+    else:
+        element.SetFocus()
+
+
+def no_exit(element, gamegate, log):
+    if gamegate.refuse_input("uia_focus") is not None:
+        log("refused")
+    element.SetFocus()
+
+
+def after_call(element, gamegate):
+    element.SetFocus()
+    if gamegate.refuse_input("uia_focus") is not None:
+        return
+
+
+def launches(url, cmd):
+    sp.Popen(cmd)
+    Popen(cmd)
+    run_it(cmd)
+    webbrowser.open(url)
+
+
+def messages(hwnd, msg):
+    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+    win32gui.SendMessage(hwnd, 0x0102, 65, 0)
+    win32gui.SendMessage(hwnd, msg, 0, 0)
+    win32gui.SendMessageTimeoutW(hwnd, _WM_GETOBJECT, 0, 0, 2, 100, None)
+    win32gui.SendMessage(hwnd, 0x000E, 0, 0)
+
+
+def raises(hwnd, element):
+    win32gui.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 3)
+    element.SendKeys("x")
+    element.Click()
+
+
+def in_loop(hwnds, gamegate, element):
+    for hwnd in hwnds:
+        if gamegate.refuse_input("focus", hwnd=hwnd) is not None:
             continue
-        if not any(g < line for fn in enclosing for g in _guards_in(fn)):
-            where = enclosing[0].name if enclosing else "<module>"
-            unguarded.append(f"{rel}:{line} {where}: {text[:80]}")
-    assert unguarded == [], "unguarded (call refuse_input in an if before it):\n" + "\n".join(unguarded)
+        element.SetFocus()
+'''
 
 
-def test_the_walk_catches_an_unguarded_call(tmp_path: Path, monkeypatch) -> None:
-    """The walk itself: a planted unguarded SetFocus in a scope folder is reported, a guarded one is not."""
+def test_the_walk_catches_unguarded_calls_of_every_shape(tmp_path: Path) -> None:
+    """The walk itself (review r2 L7), on planted files: every shape below is flagged unless a guard that leaves comes
+    first in a block holding the call; read-only messages and guarded calls are not."""
     planted = tmp_path / "yuki"
     (planted / "connect").mkdir(parents=True)
-    (planted / "connect" / "bad.py").write_text(
-        "def warm(element):\n    element.SetFocus()\n\n"
-        "def good(element, gamegate):\n    if gamegate.refuse_input('uia_focus') is not None:\n        return\n"
-        "    element.SetFocus()\n", encoding="utf-8")
+    (planted / "skills").mkdir(parents=True)
+    (planted / "connect" / "bad.py").write_text(_PLANTED, encoding="utf-8")
+    (planted / "skills" / "ps.py").write_text(
+        "from yuki.actions.shell import run_powershell\n\n\ndef any_script(script):\n    return run_powershell(script)\n",
+        encoding="utf-8")
     globals()["ROOT"] = planted
     try:
         calls = _sensitive_calls()
-        flagged = [c for c in calls if not any(g < c[2] for fn in c[3] for g in _guards_in(fn))]
-        assert [(c[0], c[3][0].name) for c in flagged] == [("connect/bad.py", "warm")]
+        flagged = sorted((c[0], _where(c[3]), c[1]) for c in calls if not _guarded(c[3]))
+        bad = "connect/bad.py"
+        assert flagged == sorted([
+            (bad, "warm", "SetFocus"), (bad, "other_branch", "SetFocus"), (bad, "no_exit", "SetFocus"),
+            (bad, "after_call", "SetFocus"),
+            (bad, "launches", "Popen"), (bad, "launches", "Popen"), (bad, "launches", "system"),
+            (bad, "launches", "open"),
+            (bad, "messages", "PostMessage"), (bad, "messages", "SendMessage"), (bad, "messages", "SendMessage"),
+            (bad, "raises", "SetWindowPos"), (bad, "raises", "SendKeys"), (bad, "raises", "Click"),
+            ("skills/ps.py", "any_script", "run_powershell"),
+        ])
+        assert sorted((_where(c[3]), c[1]) for c in calls if _guarded(c[3])) == [("good", "SetFocus"),
+                                                                                 ("in_loop", "SetFocus")]
     finally:
         globals()["ROOT"] = Path(__file__).resolve().parents[1] / "yuki"

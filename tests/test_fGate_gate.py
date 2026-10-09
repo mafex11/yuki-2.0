@@ -17,6 +17,10 @@ import pytest
 from yuki.memory import gamegate as G
 from yuki.memory.gamegate import Decision, GameGate, GameSet, GateView, decide
 
+#: These tests stub the game facts themselves: a test-run stub of the live game check (review r2 L8)
+#: stays off for them.
+LIVE_GAMEGATE = True
+
 VALORANT = "VALORANT-Win64-Shipping.exe"
 
 
@@ -221,6 +225,27 @@ def test_the_sink_flips_inside_on_change_without_a_beat(trace_env) -> None:
     assert trace.sink.blocked is False and trace.state == "on"
 
 
+def test_a_beat_reopening_while_the_gate_begins_to_hold_blocks_again(trace_env) -> None:
+    """Review r2 L6: the gate starts holding while a beat re-opens (its _gate_changed sees the sink still blocked and
+    does nothing); the beat sees it right after re-opening and blocks again, not one beat later."""
+    trace, gate = trace_env
+    trace.beat()
+    gate.hold = True
+    gate.callbacks[0](Decision(hold=True, hold_input=True, scope="front"))
+    trace.beat()
+    assert trace.state == "game"
+    gate.hold = False
+
+    def attach(sink) -> bool:
+        gate.hold = True                                                             # back in front mid-reopen
+        gate.callbacks[0](Decision(hold=True, hold_input=True, scope="front"))
+        return True
+
+    trace._attach = attach
+    trace.beat()
+    assert trace.sink.blocked is True and trace.hooks.blocked_calls[-1] is True and trace.state == "game"
+
+
 def test_a_lookup_aimed_at_a_game_root_pid_is_refused(tmp_path: Path) -> None:
     from tests.test_trace_worker import APP, HWND, Rig
 
@@ -311,9 +336,13 @@ def test_the_8_oct_shape_frees_the_cards_two_minutes_after_the_game_left_the_fro
     while t <= at(9, 2):
         gates[t] = observe(store, t, cfg).gate
         t += 15
-    free = min(t for t, g in gates.items() if t > at(8, 41, 52) and g not in ("game", "fullscreen"))
+    assert all(g in ("game", "fullscreen") for t, g in gates.items() if at(8, 40) <= t < at(8, 43, 52))
+    # review r2 L1: the B.1 bar's literal wording, "card gate None": nothing else holds the cards in this shape (the
+    # user was present through the game). The real 8 Oct replay reads ``settling`` 08:44:00-08:49:45 after the hold
+    # because that morning's VALORANT stretch was all "away" (the welcome-back rule, not the game gate).
+    free = min(t for t, g in gates.items() if t > at(8, 41, 52) and g is None)
     assert at(8, 43, 52) <= free <= at(8, 43, 52) + 15
-    assert all(g not in ("game", "fullscreen") for t, g in gates.items() if t >= free)
+    assert all(g is None for t, g in gates.items() if t >= free)
 
 
 def test_return_hold_is_a_setting(store) -> None:
