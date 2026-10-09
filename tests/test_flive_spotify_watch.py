@@ -420,11 +420,13 @@ def test_a_warm_up_gets_the_game_check_and_a_stopped_one_is_not_a_failure() -> N
         return SD.WarmResult(before=7, after=40, cold=True, stopped=True, ms=600.0)
 
     reader.warm = stopped   # type: ignore[method-assign]
+    full = reader.result
+    reader.result = SD.SpotifyRead(status="not_built", elements=40)   # the tree was still building when it stopped
     watch.on_media_change(started=["Spotify.exe"])
     assert reader.stop_fns and callable(reader.stop_fns[0])
     warm_log = [f for t, f in logs if t == "spotify_read" and f.get("trigger") == "warm"][-1]
     assert warm_log["status"] == "held_game" and warm_log["stopped"] is True
-    reader.warm = original  # type: ignore[method-assign]
+    reader.warm, reader.result = original, full  # type: ignore[method-assign]
     watch.on_media_change(started=["Spotify.exe"])          # warmed again at once (not the 10-minute "failed" wait)
     assert len(reader.warms) == 2
 

@@ -820,10 +820,18 @@ MOMENTS_FRESH_S = 6 * 3600.0
 
 
 def _privacy_table(name: str, privacy_file: Path | None = None) -> dict[str, Any]:
-    """One table of the user's privacy file (``{}`` when absent or unreadable)."""
+    """One table of the user's privacy file (``{}`` when absent or unreadable); the file the memory service reads
+    (``yuki.memory.privacy.user_config_path``: under ``%YUKI_MEMORY_DIR%`` when that is set)."""
     import tomllib
 
-    path = privacy_file or (_local() / "memory" / "privacy.toml")
+    path = privacy_file
+    if path is None:
+        try:
+            from yuki.memory.privacy import user_config_path
+
+            path = user_config_path()
+        except Exception:  # noqa: BLE001 - the module unavailable: the default place
+            path = _local() / "memory" / "privacy.toml"
     try:
         with open(path, "rb") as fh:
             table = tomllib.load(fh).get(name)
@@ -894,8 +902,11 @@ SPOTIFY_CHECK = "Spotify desktop"
 _SPOTIFY_STATES = {"front": "in front", "covered": "covered by another window",
                    "visible": "on screen behind another window or on your other screen", "minimised": "minimised"}
 _SPOTIFY_READS = {"ok": "ok", "no_library": "ok (Your Library not shown: full-screen view)",
-                  "not_built": "not built yet (Spotify had not drawn its window for Yuki)", "timeout": "too slow",
-                  "error": "failed", "held_game": "held (a game was in front)", "no_window": "no window"}
+                  "not_built": "not built yet (Spotify had not drawn its window for Yuki)",
+                  "unrecognised": "drawn, but its controls were not recognised (a Spotify update renamed them, or "
+                                  "another display language)",
+                  "timeout": "too slow", "error": "failed", "held_game": "held (a game was in front)",
+                  "no_window": "no window"}
 
 
 def check_spotify_desktop(db: Path | None = None, *, now: float | None = None) -> Check:
@@ -957,6 +968,9 @@ def check_spotify_desktop(db: Path | None = None, *, now: float | None = None) -
     if learned or last.get("label_source") == "learned":
         parts.append("its button wording was learned (not English)")
     detail = "; ".join(parts)
+    if status == "unrecognised":
+        return Check(SPOTIFY_CHECK, WARN, detail, "Yuki's labels for Spotify need an update: send "
+                                                  "logs\\memory-*.jsonl to whoever maintains Yuki.")
     if status in ("not_built", "timeout", "error"):
         return Check(SPOTIFY_CHECK, WARN, detail, "Bring Spotify to the front once and play something; if this stays, "
                                                   "send logs\\memory-*.jsonl to whoever maintains Yuki.")

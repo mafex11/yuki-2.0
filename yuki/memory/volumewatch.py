@@ -578,4 +578,21 @@ def _SessionCreated(events: queue.Queue) -> Any:   # noqa: N802
     return _sinks()[3](events)
 
 
-__all__ = ["COALESCE_S", "Coalescer", "MASTER", "VolumeWatch"]
+def hub_on_change(hub: Any) -> Callable[[dict[str, Any]], None]:
+    """``on_change`` for :class:`VolumeWatch` writing through the moments hub (``yuki.memory.moments.MomentHub``):
+    ``hub.volume_change(app, value_from, value, means="master"|"session", at=, front=<the app in front>,
+    yuki_context=<the event carried Yuki's own audio context: by='yuki'>, muted=)``."""
+    def on_change(moment: dict[str, Any]) -> None:
+        if not isinstance(moment.get("value"), (int, float)):
+            return
+        facts = {k: v for k, v in (moment.get("facts") or {}).items()
+                 if k not in ("front", "at", "means", "since", "yuki_context") and v is not None}
+        hub.volume_change(moment.get("app"), moment.get("value_from"), float(moment["value"]),
+                          means=str(moment.get("means") or "session"), at=moment.get("at"),
+                          front=(moment.get("facts") or {}).get("front"), yuki_context=moment.get("by") == "yuki",
+                          **facts)
+
+    return on_change
+
+
+__all__ = ["COALESCE_S", "Coalescer", "MASTER", "VolumeWatch", "hub_on_change"]

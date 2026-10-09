@@ -19,7 +19,8 @@ Library with its own "Play {name}" button, which reads "Pause {name}" on the row
   slider, the Library rows (name, owner kind, which one plays), and the playlist links whose name equals a Library
   row's name (``spotify:playlist:{id}``). A read that finds only the frame (no player controls) is ``not_built``,
   never "no Library"; "no Library" (``no_library``) needs the player controls present and no grid (the full-screen
-  view).
+  view). A drawn tree (at least :data:`DRAWN_MIN_ELEMENTS`) with none of the controls the reader knows is
+  ``unrecognised`` (renamed labels after an update, or another language without a single 0-1 slider).
 
 **Containers** (PLAN.md M5): every label is looked up inside its own container, a path of (role, name) steps in
 ``sites/spotify.toml``: the player controls under Group "Now playing bar" > Group "Player controls", the rows under
@@ -52,6 +53,9 @@ per state (covered, visible, minimised), after 60 s in that state, one warm + sl
 Yuki see Spotify in that state?" without the user doing anything (``[spotify] state_probe``). Its one-shot timer is
 (re)started by events only: Spotify leaving the front, its place on the Now board's layout changing, or a play start
 of a Spotify that is not in front. A warm-up stops as soon as a game comes to the front (checked before every poll).
+Its triggers are the moments hub's subscriptions (``MomentHub.subscribe_media`` / ``subscribe_front``, called with the
+hub's keyword facts) and the Now board's layout; :func:`hub_emit` writes its moments through the hub's
+``media_context`` / ``volume_change``.
 
 Logs are content-free (``spotify_read``, ``spotify_probe``): the trigger, the window state, cold or warm, counts, the
 label source, ms. Never a name, a link, an id or a title.
@@ -109,6 +113,14 @@ CANDIDATES_MAX = 4
 #: After a warm-up that did not build the tree, the same window is not warmed again for this long (s): its reads say
 #: "not built" meanwhile (a window that never builds must not cost 3 s on every trigger).
 WARM_RETRY_S = 600.0
+#: A window tree at least this big is drawn, whatever its labels: the frame alone is 7 elements, the smallest full view
+#: read was 59 (round4/spotify-desktop-route.md §1, §4). A drawn tree without the controls the reader knows is
+#: ``unrecognised`` (a Spotify update renamed them, or another display language with two 0-1 sliders), never
+#: "not built".
+DRAWN_MIN_ELEMENTS = 40
+#: A warm-up ends on a drawn but unrecognised tree once its count stayed the same for this many polls (~0.9 s; a build
+#: climbs 8 -> 24 -> 58 -> 311 within a few hundred ms, ``perception/tree.py`` "Lazily built trees").
+WARM_DRAWN_STABLE_POLLS = 6
 
 FRONT, COVERED, VISIBLE, MINIMISED = "front", "covered", "visible", "minimised"
 
@@ -212,6 +224,14 @@ def playlist_uri(link: str | None) -> str | None:
     if not pid or not pid.isalnum():
         return None
     return uri.replace("{id}", pid)
+
+
+def playlist_uri_ok(uri: str | None) -> bool:
+    """Whether ``uri`` has the shape of ``spotify:playlist:{id}`` (the URI template in the data, an alphanumeric id)."""
+    template = str((data().get("links") or {}).get("playlist_uri") or "")
+    values = match_template(template, str(uri)) if template and uri else None
+    pid = (values or {}).get("id") or ""
+    return bool(pid) and pid.isalnum()
 
 
 def norm(name: Any) -> str:
@@ -429,14 +449,24 @@ class UiaTree:
             return 0
 
     def ask_children(self, handles: Iterable[int]) -> int:
-        """Ask each child window for its UIA root (its own ``WM_GETOBJECT``): what makes a lazily built Chromium tree
-        start building (``perception/tree.py`` "Lazily built trees"). Returns how many answered."""
+        """Ask each child window for its UIA root (its own ``WM_GETOBJECT``) and read from it, as
+        ``perception/tree.py`` does with each child window's subtree: what makes a lazily built Chromium tree start
+        building ("Lazily built trees"). One cached request per child (its first child, control type only), so the
+        child's provider is asked for content and not only for an element. Returns how many answered."""
         asked = 0
+        true = None
         for handle in handles:
             try:
-                self.automation.ElementFromHandle(int(handle))
+                element = self.automation.ElementFromHandle(int(handle))
                 asked += 1
             except Exception:  # noqa: BLE001 - a child that went away
+                continue
+            self.calls += 1
+            try:
+                if true is None:
+                    true = self.automation.CreateTrueCondition()
+                element.FindFirstBuildCache(_TREE_SCOPE_CHILDREN, true, self.count_request)
+            except Exception:  # noqa: BLE001 - a child with nothing in it yet: it was still asked
                 continue
         return asked
 
@@ -481,8 +511,10 @@ class Row:
 @dataclass
 class SpotifyRead:
     """One read of Spotify's window. ``status``: ``ok``, ``not_built`` (only the frame: the tree is not built yet),
-    ``no_library`` (player controls but no Library grid: the full-screen or Now Playing view), ``timeout``, ``error``,
-    ``no_window``, ``held_game`` (a game in front: nothing read)."""
+    ``unrecognised`` (a drawn tree, at least :data:`DRAWN_MIN_ELEMENTS`, with none of the controls the reader knows:
+    labels renamed by an update, or another language with no single 0-1 slider), ``no_library`` (player controls but
+    no Library grid: the full-screen or Now Playing view), ``timeout``, ``error``, ``no_window``, ``held_game`` (a game
+    in front: nothing read)."""
 
     status: str
     built: bool = False
@@ -688,7 +720,9 @@ def read_tree(tree: UiaTree, labels: list[Labels] | None = None, *, learned: dic
     if not out.built:
         if not late():
             out.elements = tree.count()
-        return done("timeout" if late() else "not_built")
+        if late():
+            return done("timeout")
+        return done("unrecognised" if (out.elements or 0) >= DRAWN_MIN_ELEMENTS else "not_built")
     if late():
         return done("timeout")
     if "library" in want or "links" in want:
@@ -783,7 +817,9 @@ def _shape_slider(tree: UiaTree) -> float | None:
 @dataclass
 class WarmResult:
     """What a warm-up did: element counts before and after, whether the player controls (or the shape slider) are
-    there now, how long it took. ``cold``: the tree was not built when the warm-up began."""
+    there now, how long it took. ``cold``: the tree was not built when the warm-up began. ``drawn``: not built by
+    the reader's labels, but a tree of at least :data:`DRAWN_MIN_ELEMENTS` that stopped growing (``unrecognised``:
+    waiting longer would not help)."""
 
     before: int = 0
     after: int = 0
@@ -795,11 +831,21 @@ class WarmResult:
     error: str | None = None
     #: The warm-up stopped early because ``stop_fn`` said so (a game came to the front).
     stopped: bool = False
+    drawn: bool = False
+
+    @property
+    def status(self) -> str:
+        """``ok`` (built), ``unrecognised`` (drawn, labels not known), else the error or ``not_built``."""
+        if self.built:
+            return "ok"
+        if self.drawn:
+            return "unrecognised"
+        return self.error or "not_built"
 
     def counts(self) -> dict[str, Any]:
         return {"elements_before": self.before, "elements": self.after, "built": self.built, "cold": self.cold,
                 "children_asked": self.asked, "polls": self.polls, "warm_ms": round(self.ms, 1),
-                "stopped": self.stopped}
+                "stopped": self.stopped, "drawn": self.drawn}
 
 
 def _built(tree: UiaTree, langs: list[Labels]) -> bool:
@@ -827,7 +873,10 @@ def warm_tree(tree: UiaTree, handles: Iterable[int], *, budget_s: float = WARM_B
     do; else ask every visible child window, then poll the element count until the tree is built (player controls,
     or the shape slider) and its count stopped growing, at most ``budget_s``. A condition poll keyed on counts and
     structure, never a settle sleep. ``stop_fn`` (the game check) is asked before asking the children and before
-    each poll: True stops the warm-up there (``stopped``; never with a game in front, PLAN.md F7)."""
+    each poll: True stops the warm-up there (``stopped``; never with a game in front, PLAN.md F7). A tree that is
+    drawn (at least :data:`DRAWN_MIN_ELEMENTS`) but has none of the known controls ends the warm-up once its count
+    stayed the same for :data:`WARM_DRAWN_STABLE_POLLS` polls (``drawn``): its labels are not known, and waiting the
+    whole budget would not change that."""
     started = clock()
     langs = labels if labels is not None else all_labels()
     out = WarmResult()
@@ -858,8 +907,13 @@ def warm_tree(tree: UiaTree, handles: Iterable[int], *, budget_s: float = WARM_B
             built = _built(tree, langs)
         if built and stable >= WARM_STABLE_POLLS:
             break   # built, and stopped growing
+        if not built and stable >= WARM_DRAWN_STABLE_POLLS and now >= DRAWN_MIN_ELEMENTS:
+            out.drawn = True
+            break   # drawn and stopped growing, but not by any labels the reader knows: unrecognised
     out.after = last
     out.built = built or _built(tree, langs)
+    if out.built:
+        out.drawn = False
     out.ms = (clock() - started) * 1000.0
     return out
 
@@ -1256,8 +1310,12 @@ class SpotifyWatch:
         self._learned_loaded = False
         self._candidates: list[WordingGuess] = []
         self._status: dict[str, Any] | None = None
+        #: When the media read saw Spotify's music start (the hub's ``at``), and whether it was already playing then.
+        self._play_at: float | None = None
+        self._play_initial = False
         self.counters = {"triggers": 0, "jobs": 0, "reads": 0, "warms": 0, "probes": 0, "held_game": 0,
-                         "moments": 0, "links_learned": 0, "labels_learned": 0, "labels_dropped": 0, "errors": 0}
+                         "moments": 0, "links_learned": 0, "labels_learned": 0, "labels_dropped": 0, "errors": 0,
+                         "rewarms": 0}
 
     # -- settings, logging, state -----------------------------------------------------------------
 
@@ -1361,22 +1419,31 @@ class SpotifyWatch:
         except Exception:  # noqa: BLE001
             self.counters["errors"] += 1
 
-    def on_front_change(self, old_app: str | None, new_app: str | None) -> None:
-        """The app in front changed (the timeline's ``on_front_change``): Spotify left the front → one slider read and
-        the probe's clock starts; Spotify came to the front unwarmed → the warm-up."""
-        me = app_key()
-        if (old_app or "").casefold() == me and (new_app or "").casefold() != me:
-            self._trigger("leave_front")
-        elif (new_app or "").casefold() == me:
-            self._away, self._probe_due = None, None
-            if not self._warm_built:
-                self._trigger("appear")
+    def on_front_change(self, old_app: str | None, new_app: str | None, **_facts: Any) -> None:
+        """The app in front changed (``MomentHub.subscribe_front``: ``fn(prev_key, new_key, at=, hwnd=, prev_hwnd=,
+        by_yuki=, request_id=)``, app keys as the timeline stores them): Spotify left the front → one slider read and
+        the probe's clock starts; Spotify came to the front unwarmed → the warm-up. The extra facts are not needed."""
+        try:
+            me = app_key()
+            if (old_app or "").casefold() == me and (new_app or "").casefold() != me:
+                self._trigger("leave_front")
+            elif (new_app or "").casefold() == me:
+                self._away, self._probe_due = None, None
+                if not self._warm_built:
+                    self._trigger("appear")
+        except Exception:  # noqa: BLE001 - never raises into the hub's fan-out
+            self.counters["errors"] += 1
 
-    def on_media_change(self, started: Iterable[Any] = (), stopped: Iterable[Any] = ()) -> None:
-        """Media sessions changed (the timeline's ``on_media_change``): Spotify's session started playing → the
-        play-start read (warming first when needed)."""
+    def on_media_change(self, started: Iterable[Any] = (), stopped: Iterable[Any] = (), *, at: float | None = None,
+                        **facts: Any) -> None:
+        """Media sessions changed (``MomentHub.subscribe_media``: ``fn(started, stopped, at=, initial=)``, each session
+        ``{"app_id", "app", "title"}``; the title is never looked at): Spotify's session started playing → the
+        play-start read (warming first when needed). ``at`` (when the media read saw it start) becomes the playlist
+        moment's ``since``; ``initial`` (it was already playing when the timeline started) is noted on it."""
         try:
             if any(self._is_my_session(a) for a in _app_ids(started)):
+                self._play_at = float(at) if isinstance(at, (int, float)) else self._clock()
+                self._play_initial = bool(facts.get("initial"))
                 self._trigger("play_start")
         except Exception:  # noqa: BLE001
             self.counters["errors"] += 1
@@ -1460,24 +1527,39 @@ class SpotifyWatch:
             self._save_status(session_seen_at=round(self._clock()))
             if not s.library_reads:
                 return
-            warm = self._ensure_warm(ref, state, kind)
+            warm, how = self._ensure_warm(ref, state, kind)
             if self._held(kind):
                 return
-            got = self._reader.read(ref.hwnd, s.read_budget_s, want=("slider", "library", "links"),
-                                    learned=self.learned_labels(), session_playing=True,
-                                    known_names=tuple(self._known))
-            self._after_read(kind, ref, state, got, warm)
+
+            def play_read() -> SpotifyRead:
+                return self._reader.read(ref.hwnd, s.read_budget_s, want=("slider", "library", "links"),
+                                         learned=self.learned_labels(), session_playing=True,
+                                         known_names=tuple(self._known))
+
+            got = play_read()
+            if got.status == "not_built" and how == "warm":
+                # marked warm, yet only the frame answered (Chromium dropped its tree, or the mark was stale): warm
+                # once now and read again, so this play start's playlist is not lost
+                self.counters["rewarms"] += 1
+                self._warm_built = False
+                warm, how = self._ensure_warm(ref, state, kind)
+                if self._held(kind):
+                    return
+                if how == "ran":
+                    got = play_read()
+                    how = "rewarmed"
+            self._after_read(kind, ref, state, got, warm, how)
             self._remember_links(got.links)
             self._learn(got)   # first: a candidate this read confirms gives this read its play state
             self._context(got, state)
             self._volume(got, state, kind)
             return
         if kind == "leave_front":
-            warm = self._ensure_warm(ref, state, kind)
+            warm, how = self._ensure_warm(ref, state, kind)
             if self._held(kind):
                 return
             got = self._reader.read(ref.hwnd, s.read_budget_s, want=("slider",), learned=self.learned_labels())
-            self._after_read(kind, ref, state, got, warm)
+            self._after_read(kind, ref, state, got, warm, how)
             self._volume(got, state, kind)
             if state in PROBE_STATES:
                 self._arm_probe(state)
@@ -1518,41 +1600,51 @@ class SpotifyWatch:
         self._log("spotify_read", trigger=kind, status="held_game")
         return True
 
-    def _ensure_warm(self, ref: WindowRef, state: str | None, trigger: str) -> WarmResult | None:
+    def _ensure_warm(self, ref: WindowRef, state: str | None, trigger: str) -> tuple[WarmResult | None, str]:
+        """Warm the window unless it is warm. ``(result, how)``: ``how`` is ``warm`` (already warm: nothing run),
+        ``skipped`` (a warm-up of this window failed less than :data:`WARM_RETRY_S` ago: not run, the read alone says
+        what the tree is) or ``ran``."""
         if self._warm_built and self._warm_pid == ref.pid:
-            return None
+            return None, "warm"
         failed = self._warm_failed
         if failed is not None and failed[0] == ref.pid and self._mono() - failed[1] < WARM_RETRY_S:
-            return None   # a warm-up of this window did not build moments ago: the read alone says "not built"
+            return None, "skipped"
         s = self.settings()
         result = self._reader.warm(ref.hwnd, s.warm_budget_s, stop_fn=self._game_front)
         self.counters["warms"] += 1
-        self._warm_built = bool(result.built)
+        # a drawn but unrecognised tree is built too (only its labels are unknown): warming it again would not help
+        self._warm_built = bool(result.built or result.drawn)
         if result.stopped and not result.built:
             # a game came to the front: not a window that fails to build (the next trigger warms again)
             self.counters["held_game"] += 1
             status = "held_game"
         else:
-            self._warm_failed = None if result.built else (ref.pid, self._mono())
-            status = "ok" if result.built else (result.error or "not_built")
+            self._warm_failed = None if self._warm_built else (ref.pid, self._mono())
+            status = result.status
         self._log("spotify_read", trigger="warm", cause=trigger, window_state=state, **result.counts(),
                   status=status)
-        return result
+        return result, "ran"
 
     def _after_read(self, trigger: str, ref: WindowRef, state: str | None, got: SpotifyRead,
-                    warm: WarmResult | None) -> None:
+                    warm: WarmResult | None, how: str = "warm") -> None:
+        """Book-keeping and the content-free log of one read. ``how``: what the warm-up did in this job (``warm``,
+        ``ran``, ``skipped``, ``rewarmed``: the window was marked warm, read only the frame, was warmed and read
+        again)."""
         self.counters["reads"] += 1
         first = ref.pid not in self._read_pids
         self._read_pids.add(ref.pid)
         if got.status == "not_built":
             self._warm_built = False   # the next trigger warms again
+        elif got.built:
+            self._warm_built, self._warm_failed = True, None   # the tree answered in full: it is warm
         for row in got.rows:
             if row.spotify_owned is False:
                 self._known[row.name] = None
         while len(self._known) > KNOWN_NAMES_MAX:
             self._known.pop(next(iter(self._known)))
-        cold = bool(warm.cold) if warm is not None else False
-        self._log("spotify_read", trigger=trigger, window_state=state, cold=cold, first=first,
+        # cold: the tree was not built when this job began; None: not known (the warm-up was skipped)
+        cold = bool(warm.cold) if warm is not None else (None if how == "skipped" else False)
+        self._log("spotify_read", trigger=trigger, window_state=state, cold=cold, warm=how, first=first,
                   labels_candidate=got.candidate is not None, **got.counts())
         self._save_status(last_read={"at": round(self._clock()), "trigger": trigger, "status": got.status,
                                      "window_state": state, "rows": len(got.rows), "slider": got.slider is not None,
@@ -1568,11 +1660,17 @@ class SpotifyWatch:
             return
         self._last_context = (row.name, now)
         keep = row.spotify_owned is False   # a Spotify-owned list, or an owner that cannot be parsed: digest only
+        uri = self._link_uri(row.name) if keep else None
+        facts: dict[str, Any] = {"owner": "spotify" if row.spotify_owned else ("other" if keep else "unknown"),
+                                 "link_known": uri is not None, "window_state": state,
+                                 "label_source": got.label_source}
+        if self._play_initial:
+            facts["initial"] = True   # it was already playing when the timeline started
+        # ``entity`` and ``uri`` travel in RAM only, to the moments writer, which encrypts them (never logged here);
+        # ``since``: when the media read saw the music start (the playlist began between then and this read)
         self._put({"kind": "media_context", "at": now, "app": app_key(), "entity": row.name, "entity_keep": keep,
-                   "means": "library_row", "source": "spotify", "evidence": "window_read",
-                   "facts": {"owner": "spotify" if row.spotify_owned else ("other" if keep else "unknown"),
-                             "link": keep and self._has_link(row.name), "window_state": state,
-                             "label_source": got.label_source}})
+                   "uri": uri, "since": self._play_at if self._play_at is not None and self._play_at <= now else None,
+                   "means": "library_row", "source": "spotify", "evidence": "window_read", "facts": facts})
 
     def _volume(self, got: SpotifyRead, state: str | None, trigger: str = "leave_front") -> None:
         """Spotify's own slider against the last reading (the leave-front and the play-start reads both read it):
@@ -1585,10 +1683,12 @@ class SpotifyWatch:
         self._last_slider, self._last_slider_at = got.slider, now
         if before is None or abs(before - got.slider) < 0.5:
             return   # the first read is the baseline; an unchanged level is no change
+        since = round(before_at, 3) if before_at is not None else None
         self._put({"kind": "volume_change", "at": now, "app": app_key(), "value": got.slider,
                    "value_from": before, "means": "in_app", "source": "spotify", "evidence": "window_read",
+                   "since": since,
                    "facts": {"window_state": state, "slider_source": got.slider_source, "trigger": trigger,
-                             "prev_read_at": round(before_at, 3) if before_at is not None else None}})
+                             "prev_read_at": since}})
 
     def _put(self, moment: dict[str, Any]) -> None:
         if self._emit is None:
@@ -1684,9 +1784,12 @@ class SpotifyWatch:
         cipher = getattr(self._store, "cipher", None)
         return cipher.digest("spotify_playlist", norm(name)) if cipher is not None else None
 
-    def _has_link(self, name: str) -> bool:
+    def _link_uri(self, name: str) -> str | None:
+        """The learned ``spotify:playlist:{id}`` of a playlist name (decrypted in this process only), or None."""
         key = self._link_key(name)
-        return bool(key and key in self._links())
+        entry = self._links().get(key) if key else None
+        uri = entry.get("uri") if isinstance(entry, dict) else None
+        return str(uri) if uri and playlist_uri_ok(str(uri)) else None
 
     def _remember_links(self, links: dict[str, str]) -> None:
         """Keep links the read learned (``{row name: spotify:playlist:{id}}``), encrypted, one write."""
@@ -1782,11 +1885,44 @@ def learned_links(store: Any) -> dict[str, str]:
             if isinstance(v, dict) and v.get("name") and v.get("uri")}
 
 
+#: The moments hub's own keyword arguments: a fact under one of these names would collide with them.
+_HUB_KWARGS = frozenset({"at", "link", "keep_name", "since", "means", "front", "yuki_context"})
+
+
+def hub_emit(hub: Any) -> Callable[[dict[str, Any]], None]:
+    """``emit`` for :class:`SpotifyWatch` writing through the moments hub's live inputs (``yuki.memory.moments``,
+    fMoments' ``MomentHub``):
+
+    * ``media_context`` → ``hub.media_context(app, name, at=, link=<the learned spotify: URI or None>,
+      keep_name=<False: digest only>, since=<when the music started>, **code-word facts)``;
+    * ``volume_change`` (means ``in_app``) → ``hub.volume_change(app, value_from, value, means="in_app", at=,
+      since=<the previous slider reading>, **code-word facts)``.
+
+    The playlist name and its link go to the hub in RAM (it encrypts and digests them); facts are code words, numbers
+    and booleans only (the hub drops anything else). A hub that raises is counted by the watcher (``errors``)."""
+    def emit(moment: dict[str, Any]) -> None:
+        facts = {k: v for k, v in (moment.get("facts") or {}).items()
+                 if k not in _HUB_KWARGS and k != "prev_read_at" and v is not None}
+        kind = moment.get("kind")
+        if kind == "media_context":
+            name = str(moment.get("entity") or "")
+            if name:
+                hub.media_context(moment.get("app"), name, at=moment.get("at"), link=moment.get("uri") or None,
+                                  keep_name=bool(moment.get("entity_keep")), since=moment.get("since"), **facts)
+        elif kind == "volume_change" and isinstance(moment.get("value"), (int, float)):
+            hub.volume_change(moment.get("app"), moment.get("value_from"), float(moment["value"]),
+                              means=str(moment.get("means") or "in_app"), at=moment.get("at"),
+                              since=moment.get("since"), **facts)
+
+    return emit
+
+
 __all__ = [
     "COVERED", "DesktopReader", "El", "FRONT", "Labels", "MINIMISED", "PROBE_STATES", "Row", "SpotifyRead",
     "SpotifySettings", "SpotifyWatch", "Step", "UiaTree", "VISIBLE", "WarmResult", "WindowRef", "WordingGuess",
-    "all_labels", "app_key", "apply_wording", "classify_state", "data", "find_window", "foreground_is_game",
+    "all_labels", "app_key", "apply_wording", "classify_state", "data", "find_window", "foreground_is_game", "hub_emit",
     "is_spotify_pid", "is_spotify_session", "judge_wording", "learn_row_wording", "learned_links", "library", "links",
-    "local_find", "playlist_uri", "process_identity", "process_image", "read", "read_tree", "row_wording_candidate",
-    "run_uia", "session_matches", "slider", "spotify_session", "warm", "warm_tree", "window", "window_state",
+    "local_find", "playlist_uri", "playlist_uri_ok", "process_identity", "process_image", "read", "read_tree",
+    "row_wording_candidate", "run_uia", "session_matches", "slider", "spotify_session", "warm", "warm_tree", "window",
+    "window_state",
 ]

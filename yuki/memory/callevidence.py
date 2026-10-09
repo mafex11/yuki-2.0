@@ -315,6 +315,19 @@ def _host_matches(host: str, entry: str) -> bool:
     return host == entry or host.endswith("." + entry)
 
 
+def _product_name(name: Any, host: str, entry: str | None = None) -> str | None:
+    """A calling service's product name as given (spaces folded, at most 40 characters), or None when there is none:
+    empty, or the page's host, its site (without ``www.``) or the shipped list's entry standing in for a name (the
+    ``[meetings]`` fallbacks give those when no name is known). Never a host in a service's place."""
+    text = " ".join(str(name or "").split())[:40]
+    if not text:
+        return None
+    site = host[4:] if host.startswith("www.") else host
+    if text.casefold() in {host, site, str(entry or "").casefold()}:
+        return None
+    return text
+
+
 @dataclass
 class Screen:
     key: str               # app key of the process ("zen", "discord")
@@ -799,20 +812,38 @@ class CallEvidence:
 
     def calling_service(self, host: str | None, *, judge: bool = True) -> str | None:
         """The calling service a blocked page's ``host`` is (its product name, e.g. "Google Meet"), or None: not a
-        calling site, a site the user blocked themselves, or not known yet. The same decision as the microphone
-        path (the user's ``[meetings]`` word, else the shipped list's verdict), with no holder needed. Never blocks:
-        a list not judged yet is judged on a short-lived thread (``judge``), and None is the answer until then."""
+        calling site, a site the user blocked themselves, not known yet, or a calling site with no product name known
+        (never a host or a list entry in its place). The same decision as the microphone path (the user's
+        ``[meetings]`` word, else the shipped list's verdict), with no holder needed. Never blocks: a list not judged
+        yet is judged on a short-lived thread (``judge``), and None is the answer until then."""
+        return self.calling_site(host, judge=judge)[1]
+
+    def site_front_service(self, host: str | None) -> str | None:
+        """For ``MomentHub(calling_service=...)``: the product name; the ``host`` itself (as given, stripped and
+        lower-cased) for a calling site with no product name known, which the hub records as a ``site_front`` with no
+        service (it never keeps or logs a service equal to the host); None when the site is not a calling one."""
+        calling, service = self.calling_site(host)
+        if service:
+            return service
+        if not calling:
+            return None
+        return str(host or "").strip().casefold() or None
+
+    def calling_site(self, host: str | None, *, judge: bool = True) -> tuple[bool, str | None]:
+        """``(calling, product name or None)`` for a blocked page's ``host`` (see :meth:`calling_service`)."""
         host = str(host or "").strip().casefold()
         if not host:
-            return None
+            return False, None
         meetings = self._meeting_rules()
         if meetings is not None and meetings.never("", host):
-            return None
-        if meetings is not None and meetings.match_url(f"https://{host}/"):
-            return " ".join(str(meetings.match_url(f"https://{host}/") or host).split())[:40]
+            return False, None
+        if meetings is not None:
+            named = meetings.match_url(f"https://{host}/")
+            if named:
+                return True, _product_name(named, host)
         entry = self._entry_of(host)
         if entry is None:
-            return None
+            return False, None
         with self._lock:
             verdicts = self._entry_verdicts
         if verdicts is None:
@@ -826,13 +857,13 @@ class CallEvidence:
             elif judge:
                 self._judge_entries_soon()
         if verdicts is None:
-            return None
+            return False, None
         calling, service = verdicts.get(entry, (False, ""))
         if not calling:
-            return None
+            return False, None
         if meetings is not None:
-            service = meetings.name_for(host, meetings.name_for(entry, service or entry))
-        return " ".join(str(service or entry).split())[:40]
+            service = meetings.name_for(host, meetings.name_for(entry, service or ""))
+        return True, _product_name(service, host, entry)
 
     def _model_sites(self, entries: tuple[str, ...]) -> tuple[dict[str, tuple[bool, str]], float]:
         """``({entry: (calling, service)}, cost)`` for the shipped list, from the model (the list only)."""
@@ -1177,6 +1208,7 @@ class SiteTabs:
                   groups=list(result.get("groups") or [])[:12], nodes=result.get("nodes"),
                   complete=result.get("complete"), ms=result.get("ms"), selected_group=result.get("selected_group"),
                   main_group=result.get("main_group"), reason=result.get("reason"), tab_known=identified,
+                  selected_tabs=result.get("selected_tabs"),
                   pinned=bool(identified and seen.get("position")), shallow_documents=result.get("shallow_documents"),
                   tabitems_in_documents=result.get("tabitems_in_documents"), depth_capped=result.get("depth_capped"))
 

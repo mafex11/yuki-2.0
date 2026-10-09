@@ -16,6 +16,7 @@ API::
 
     site("youtube")                          # the parsed TOML (dict), or {} when there is none
     page_of("https://www.youtube.com/watch?v=abc")   # PageMatch(site="youtube", kind="watch", values={"id": "abc"})
+    page_entity("www.youtube.com", "/watch?v=abc")   # ("youtube.watch", "abc"): the moments extractor's hook
     fill("youtube", "watch", id="abc")       # "https://www.youtube.com/watch?v=abc"
     match_template("https://x/playlist/{id}", url)   # {"id": ...} or None (any absolute template)
 """
@@ -201,6 +202,26 @@ def page_of(url: str | None) -> PageMatch | None:
     return None
 
 
+def page_entity(host: str | None, path: str | None) -> tuple[str, str] | None:
+    """The moments extractor's page hook (``yuki.memory.moments.default_page_entity``): ``(template id, value)`` for a
+    page of a known site, by the same templates as :func:`page_of`, or None.
+
+    ``host`` is the page's host as the timeline keeps it, ``path`` its path with the query (``/watch?v=abc``). The id is
+    ``"{site}.{kind}"`` (``youtube.watch``, ``youtube.handle``; the part before the dot is the moment's service); the
+    value is the page's one variable (a video id, a handle), or the kind itself for a page without one (``home``: a
+    moment's entity is a string, never None)."""
+    host = str(host or "").strip().lower()
+    if not host or "/" in host or "?" in host or "#" in host:
+        return None
+    path = str(path or "/").strip() or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    match = page_of(f"https://{host}{path}")
+    if match is None:
+        return None
+    return f"{match.site}.{match.kind}", match.entity or match.kind
+
+
 def fill(site_name: str, url_name: str, **values: str) -> str | None:
     """A site's ``[urls]`` (or ``[links]``) template with ``values`` put in (each URL-quoted), or None when the site
     or template is unknown or a value is missing."""
@@ -214,4 +235,4 @@ def fill(site_name: str, url_name: str, **values: str) -> str | None:
     return None if "{" in out else out
 
 
-__all__ = ["PageMatch", "SITES_DIR", "clear_cache", "fill", "match_template", "page_of", "site", "sites"]
+__all__ = ["PageMatch", "SITES_DIR", "clear_cache", "fill", "match_template", "page_entity", "page_of", "site", "sites"]

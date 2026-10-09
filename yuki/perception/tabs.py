@@ -115,7 +115,8 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float, *, all_groups: bool =
     """``([(tab, element)], nodes visited, complete)`` for ``hwnd``'s tab strip (blocking, bounded).
 
     ``all_groups``: every group's tabs (group by group, in the order met), not only the largest group's.
-    ``diagnostics``: filled with content-free facts about the walk (see the module docstring)."""
+    ``diagnostics``: filled with content-free facts about the walk (see the module docstring). A window that has gone
+    raises (as it always did) when no ``diagnostics`` dict is given; with one, it reads as no tabs, ``reason=error``."""
     diag = diagnostics if diagnostics is not None else {}
     request = automation.CreateCacheRequest()
     for prop in (_P_CONTROL_TYPE, _P_NAME, _P_BOUNDING_RECT, _P_SELECTION_ITEM_IS_SELECTED, _P_RUNTIME_ID):
@@ -125,6 +126,8 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float, *, all_groups: bool =
     try:
         root = automation.ElementFromHandle(int(hwnd))
     except Exception:  # noqa: BLE001 - a window that went away
+        if diagnostics is None:
+            raise   # the caller words it ("could not read the tabs of window X: ...")
         diag.update(groups=[], nodes=0, complete=False, reason="error")
         return [], 0, False
     queue: list[tuple[Any, int, int]] = [(root, 0, 0)]  # element, depth, parent key
