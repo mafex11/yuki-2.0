@@ -1052,6 +1052,7 @@ class TimelineRecorder:
     def __init__(
         self, store: Store, *, privacy: Any = None, log: Callable[..., Any] | None = None,
         on_page_change: Callable[[int], None] | None = None, signals: Any = None, evidence: Any = None,
+        on_media_change: Callable[..., None] | None = None, on_front_change: Callable[..., None] | None = None,
     ) -> None:
         from yuki.memory import watcher as _w
         from yuki.memory.privacy import PrivacyConfig
@@ -1146,6 +1147,22 @@ class TimelineRecorder:
         #: What Yuki is acting on (yuki.memory.acting.Acting), applied on this thread.
         self._acting: Any = None
         self._acting_next: Any = None
+        #: Moments (yuki.memory.moments, plan rev 4 F4; no new polling): called on this thread with the media sessions
+        #: that started or stopped playing at a media read, ``on_media_change(started, stopped, at=, by_yuki=,
+        #: request_id=, initial=)`` (each ``{"app_id", "app", "title"}``; the title in RAM only), and when another app
+        #: or window comes to the front, ``on_front_change(prev_key, new_key, at=, hwnd=, prev_hwnd=, by_yuki=,
+        #: request_id=)`` (app keys as rows store them; "" for an app the privacy rules keep out). Never raise into here.
+        self.on_media_change = on_media_change
+        self.on_front_change = on_front_change
+        #: The playing sessions of the last media read that answered, ``{(app_id, title)}``: the baseline media changes
+        #: are told against (a read that failed changes nothing, so a recovered read is no "start").
+        self._media_seen: set[tuple[str, str]] | None = None
+        #: A media session's app id -> the app key of the process behind it, learned from the stretches' identities
+        #: (image key, AUMID, Start entry) and, for a packaged app never in front yet, from its running process.
+        self._app_ids: dict[str, str] = {}
+        self._app_ids_missing: dict[str, float] = {}
+        #: The app key and window last told as in front (``on_front_change``).
+        self._front: tuple[str, int] | None = None
 
     # -- public ------------------------------------------------------------
 
@@ -1626,6 +1643,11 @@ class TimelineRecorder:
             if reason := rules.check_window(facts.process_name, title):
                 withheld, title = reason, ""
         ids, entry = self._identity(pid, facts.exe, facts.process_name)
+        own_key = app_key(facts.process_name) or ""
+        if own_key and not facts.is_own:
+            for i in ids:   # media sessions name apps by these (in memory only)
+                if i != own_key:
+                    self._app_ids[i] = own_key
         st = _Stretch(start=now, end=now, hwnd=hwnd, pid=pid, process=facts.process_name if app else "",
                       app=app, title=title, withheld=withheld, host=host, ids=ids, entry=entry,
                       fullscreen=fullscreen, hidden=hidden, meeting=meeting,
@@ -1633,6 +1655,7 @@ class TimelineRecorder:
                       seen_host=seen_host, signal_meeting=signal)
         self._mark_acting(st)
         self._current = st
+        self._front_changed(st, now)
         if app and not facts.is_own:   # never for an app the user's privacy rules keep out (its app is "")
             # appOpen F3: which program started this one (content-free, in memory only, once per process), so the
             # practice learner can read what the user did right after one of Yuki's openings
@@ -2142,6 +2165,7 @@ class TimelineRecorder:
         except Exception:
             pass
         playing: list[tuple[str, str, str]] = []
+        entries: dict[str, Any] = {}
         for s in sessions:
             if s.get("status") != "playing":
                 continue
@@ -2153,7 +2177,82 @@ class TimelineRecorder:
             if rules.check_app(label, label):
                 continue  # a blocked app's media is not recorded either
             playing.append((app_id, label, str(s.get("title") or "")))
+            entries[app_id] = entry
         self._playing = playing
+        self._media_changed(playing, entries)
+
+    def _media_changed(self, playing: list[tuple[str, str, str]], entries: dict[str, Any]) -> None:
+        """Tell ``on_media_change`` which sessions started or stopped playing since the last read that answered (by
+        app id and title: a new track is a start). The first read tells what plays then, marked ``initial``."""
+        now_set = {(app_id, title) for app_id, _label, title in playing}
+        before, self._media_seen = self._media_seen, now_set
+        if self.on_media_change is None:
+            return
+        old = before or set()
+        started = sorted(now_set - old)
+        stopped = sorted(old - now_set)
+        if not started and not stopped:
+            return
+        try:
+            acting = self._acting
+            self.on_media_change(
+                [{"app_id": a, "app": self._media_app(a, entries.get(a)), "title": t} for a, t in started],
+                [{"app_id": a, "app": self._media_app(a, entries.get(a)), "title": t} for a, t in stopped],
+                at=time.time(), by_yuki=acting is not None,
+                request_id=getattr(acting, "request_id", None) if acting is not None else None,
+                initial=before is None)
+            self.counters["media_changes"] += 1
+        except Exception as exc:   # never breaks the timeline
+            self._log_error("on_media_change", exc)
+
+    def _media_app(self, app_id: str, entry: Any = None) -> str:
+        """The app key (as rows store it) of the process behind a media session: learned from the stretches in front;
+        else the Start entry's program; else, for a packaged app (an AUMID, ``Family!App``), its running process (once
+        per app id, the processes' own package identity); else the id as a key."""
+        import os
+
+        known = self._app_ids.get(app_id)
+        if known:
+            return known
+        target = getattr(entry, "target", "") if entry is not None else ""
+        if target:
+            key = app_key(os.path.basename(target)) or ""
+            if key:
+                self._app_ids[app_id] = key
+                return key
+        if "!" in app_id and time.monotonic() - self._app_ids_missing.get(app_id, -1e9) > 600.0:
+            try:
+                import psutil
+
+                # the uncached read: this rare scan must not fill the per-pid cache, which this process never prunes
+                facts_for = (getattr(self._windows, "_read_pid_facts", None)
+                             or getattr(self._windows, "_facts_for", None))
+                for pid in psutil.pids() if facts_for is not None else ():
+                    aumid, exe = facts_for(pid)
+                    if aumid == app_id and exe:
+                        key = app_key(os.path.basename(exe)) or ""
+                        if key:
+                            self._app_ids[app_id] = key
+                            return key
+            except Exception:   # noqa: BLE001 - then the id itself
+                pass
+            self._app_ids_missing[app_id] = time.monotonic()
+        return app_key(app_id) or app_id
+
+    def _front_changed(self, st: _Stretch, now: float) -> None:
+        """Tell ``on_front_change`` when the app or window in front is another than the last told (a stretch of the
+        same window in another state, or after a title change, is no front change)."""
+        key, hwnd = app_key(st.process) or "", st.hwnd
+        prev, self._front = self._front, (key, hwnd)
+        if self.on_front_change is None or prev == (key, hwnd):
+            return
+        try:
+            self.on_front_change(prev[0] if prev else "", key, at=now, hwnd=hwnd, prev_hwnd=prev[1] if prev else 0,
+                                 by_yuki=st.by_yuki,
+                                 request_id=getattr(self._acting, "request_id", None) if st.by_yuki else None)
+            self.counters["front_changes"] += 1
+        except Exception as exc:   # never breaks the timeline
+            self._log_error("on_front_change", exc)
 
     # -- tick --------------------------------------------------------------------------
 

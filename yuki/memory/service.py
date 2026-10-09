@@ -321,6 +321,7 @@ def run(args: argparse.Namespace) -> int:
     screen_recall = None
     game_gate = None
     trace = None
+    moments = None   # yuki.memory.moments.MomentHub (built after the AV signals)
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -434,6 +435,21 @@ def run(args: argparse.Namespace) -> int:
         except Exception as exc:  # each reader then makes its own
             log("error", where="avsignals_start", error=f"{type(exc).__name__}: {exc}")
 
+        # Moments (yuki.memory.moments, plan rev 4 F4): one table of state changes, derived from calls, the timeline
+        # and messages (rebuildable) and fed live by the timeline's media read and foreground events, the watcher's
+        # calling-site sightings and the volume watcher. No thread of its own: the loop below beats it (a one-off
+        # rebuild thread runs only when its rules changed). [moments] enabled = false keeps it off.
+        try:
+            from yuki.memory.moments import MomentHub
+
+            moments = MomentHub(store, privacy=privacy, log=log, db_path=db_path,
+                                calling_service=lambda host: (getattr(call_evidence, "calling_service", None)
+                                                              or (lambda _h: None))(host))
+            moments.start()
+        except Exception as exc:  # memory runs on without moments
+            log("error", where="moments_start", error=f"{type(exc).__name__}: {exc}")
+            moments = None
+
         if not args.no_timeline:
             try:
                 from yuki.memory.timeline import TimelineRecorder
@@ -446,6 +462,8 @@ def run(args: argparse.Namespace) -> int:
                     # a microphone hold is a meeting only on a screen judged in a call (revamp A9): the same
                     # verdicts the call worker starts calls on
                     evidence=call_evidence,
+                    on_media_change=moments.on_media_change if moments is not None else None,
+                    on_front_change=moments.on_front_change if moments is not None else None,
                 )
                 timeline.set_paused(paused)  # before start: nothing is recorded, not even the first window
                 timeline.start()
@@ -669,7 +687,8 @@ def run(args: argparse.Namespace) -> int:
                     return tl.current_meeting() if tl is not None and tl.alive else None
 
                 calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now,
-                                   signals=av_signals, evidence=call_evidence)
+                                   signals=av_signals, evidence=call_evidence,
+                                   on_call_change=moments.nudge if moments is not None else None)
                 calls_thread = threading.Thread(
                     target=_guarded(calls.run, log, "calls"), args=(stop, pause_path),
                     name="yuki-memory-calls", daemon=True,
@@ -809,6 +828,11 @@ def run(args: argparse.Namespace) -> int:
                 elif not game_gate_dead:
                     game_gate_dead = True
                     log("error", where="game_gate", error="game gate thread exited; it holds from now")
+            if moments is not None:
+                try:   # queued live moments written; the derived ones refreshed when due or nudged (no loop of its own)
+                    moments.beat()
+                except Exception as exc:
+                    log("error", where="moments_beat", error=type(exc).__name__)
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
@@ -865,7 +889,10 @@ def run(args: argparse.Namespace) -> int:
                     warp=warp.stats() if warp is not None else None,
                     screen_recall=screen_recall.stats() if screen_recall is not None else None,
                     game_gate=game_gate.stats() if game_gate is not None else None,
-                    trace=trace.stats() if trace is not None else None)
+                    trace=trace.stats() if trace is not None else None,
+                    moments=moments.stats() if moments is not None else None)
+                if moments is not None:
+                    moments.log_sources()
                 if trace is not None and trace.sink is not None:
                     try:   # the later joins: episodes once final, Yuki's untagged steps by the run trace
                         from yuki.memory import trace_store as _trace_store
@@ -942,6 +969,8 @@ def run(args: argparse.Namespace) -> int:
                 pass
         if game_gate is not None:
             game_gate.stop()
+        if moments is not None:
+            moments.stop()   # the queued live moments (the derived ones are re-read from their sources next start)
         if watcher is not None:
             watcher.stop()
         if timeline is not None:
