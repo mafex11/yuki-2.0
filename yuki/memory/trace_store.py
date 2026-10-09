@@ -16,11 +16,16 @@ trace stays one owner's code. Everything content-bearing is encrypted with the m
   scripts) labelled ``yuki`` by the run trace's step and time.
 * :func:`summary`, :func:`paste_joins`: content-free read helpers (the CLI, the doctor, the acceptance analyzer).
 * :func:`load_game_evidence` / :func:`save_game_evidence`: the hard game gate's learned set (``ui_game_processes``).
+* :func:`scrub_names` / :func:`scrub_names_once`: phase F (fPrivacy): the names stored before the current name rule
+  (:data:`yuki.memory.trace_privacy.NAME_RULE`) that it would not keep (a document nested in a list item: a chat
+  app's message) cleared by the live rule's own function, once per rule version, from the memory service's start.
+  CLI: ``python -m yuki.memory.trace_store scrub-names [--dry-run] [--db PATH]``.
 """
 
 from __future__ import annotations
 
 import bisect
+import itertools
 import json
 import sqlite3
 import time
@@ -29,7 +34,8 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime
 from typing import Any
 
-from yuki.memory.trace_privacy import COMMAND, PROMOTE_DAYS, TITLE
+from yuki.memory.trace_privacy import (COMMAND, CONTENT, NAME_RULE, NESTED_CONTENT_ROLES, PROMOTE_DAYS, TITLE,
+                                       nested_content)
 
 RAW_DAYS = 30.0          # decision D4
 ELEMENT_DAYS = 60.0      # report 78 §8
@@ -81,6 +87,13 @@ def _upsert_element(conn: sqlite3.Connection, store: Any, el: dict[str, Any]) ->
              store._enc(el["aid"]) if el.get("aid") else None, days, 1, at, at, day))
         return None
     days = int(row["days"] or 0) + (1 if row["last_day"] != day else 0)
+    if cls == CONTENT and row["name_class"] != CONTENT:
+        # phase F (fPrivacy): the name rule now says content for this element (a document nested in a list item: a
+        # chat app's message bubble). The element key carries its role and ancestry, so every earlier use was the
+        # same element: the registry and every raw row of it lose the name, whatever the days
+        conn.execute("UPDATE ui_elements SET name_class=?, name_ciphertext=NULL, n=n+1, days=?, last_day=?,"
+                     " last_at=max(coalesce(last_at, 0), ?) WHERE element_key=?", (CONTENT, days, day, at, key))
+        return "content"
     sticky = cls == COMMAND and row["name_class"] == TITLE
     if sticky:
         # capQ2a second verify V2-1: the content mark is sticky. A command-type element is only ever stored as a
@@ -124,6 +137,13 @@ def write_batch(store: Any, rows: Sequence[dict[str, Any]], elements: Sequence[d
             ids.append(int(conn.execute(_INSERT, [values.get(c) for c in ACTION_COLUMNS]).lastrowid))
         for el in elements:
             scrub = _upsert_element(conn, store, el)
+            if scrub == "content":
+                # phase F: every raw row of a nested document keeps a digest only (start and drag end alike)
+                conn.execute("UPDATE ui_actions SET name_ciphertext=NULL WHERE element_key=?"
+                             " AND name_ciphertext IS NOT NULL", (el["element_key"],))
+                conn.execute("UPDATE ui_actions SET end_name_ciphertext=NULL WHERE end_element_key=?"
+                             " AND end_name_ciphertext IS NOT NULL", (el["element_key"],))
+                continue
             if scrub == "all" or (scrub and ids):
                 # capQ2a second verify V2-1: a list's item keeps a digest only in its raw rows (by the element_key
                 # index; a drag's end element only in this batch)
@@ -669,6 +689,202 @@ def undo_forget(store: Any, diary_id: int, *, now: float | None = None) -> dict[
     return store._write(op)
 
 
+# -- the name rule's scrub (phase F, fPrivacy) ---------------------------------------------------------------------
+
+#: ``source_checkpoints`` name holding the name rule (:data:`yuki.memory.trace_privacy.NAME_RULE`) whose scrub has
+#: run on this database.
+NAME_RULE_CHECKPOINT = "trace.name_rule"
+#: The scrub's time for recovering stored ancestries (s): past it, a row is judged by the parent kept on it alone.
+RECOVER_BUDGET_S = 20.0
+
+
+def _role_names() -> tuple[str, ...]:
+    """UI Automation's control types as the trace names them, and "" (a role that could not be read)."""
+    from yuki.memory.trace_uia import ROLE_NAMES
+
+    return tuple(sorted(set(ROLE_NAMES.values()))) + ("",)
+
+
+def recover_path(cipher: Any, key: str, process: str, role: str, name_digest: str | None, parent: str,
+                 seen: dict[tuple[str, ...], int] | None = None, *, deadline: float | None = None
+                 ) -> tuple[str, ...] | None:
+    """The ancestry (control types, nearest first) an element key was made from, or ``None`` (not found in time).
+
+    The trace keys an element by ``digest("ui-el", process, role, ancestry, name digest)``
+    (:meth:`yuki.memory.trace.ActionTrace._element_cols`), the ancestry being up to ``trace_uia.ANCESTORS`` control
+    types joined by ``/``. The digest is keyed, so the roles cannot be read back, but control types are a fixed
+    vocabulary and the nearest one is kept on the row (``position``): the key is computed for each candidate path
+    with that first role and compared. A match is the very path the trace read, never an estimate (capNames WIP
+    8d45bb4, lifted). ``seen``: paths found before, tried first."""
+    from yuki.memory.trace_uia import ANCESTORS
+
+    def made(path: Sequence[str]) -> str:
+        return cipher.digest("ui-el", process or "", role or "", "/".join(path), name_digest or "")
+
+    first = parent or ""
+    for path in sorted(seen or {}, key=lambda p: -(seen or {})[p]):
+        if (path[0] if path else "") == first and made(path) == key:
+            return path
+    if not first and made(()) == key:
+        return ()
+    roles = _role_names()
+    for length in range(1, ANCESTORS + 1):
+        for rest in itertools.product(roles, repeat=length - 1):
+            if deadline is not None and time.perf_counter() > deadline:
+                return None
+            path = (first, *rest)
+            if made(path) == key:
+                return path
+    return None
+
+
+def _parent_of(position: str | None) -> str:
+    """The parent's control type kept on a row: ``position`` is ``[index/]parent role``."""
+    text = str(position or "")
+    return text.partition("/")[2] if "/" in text else text
+
+
+def scrub_names(store: Any, *, dry_run: bool = False, budget_s: float = RECOVER_BUDGET_S) -> dict[str, Any]:
+    """Clear the names stored before the current name rule that it would not keep (phase F, fPrivacy).
+
+    Reads the raw rows of documents and panes (:data:`yuki.memory.trace_privacy.NESTED_CONTENT_ROLES`) that still
+    hold a name, as a click's element or a drag's end, recovers each element's stored ancestry
+    (:func:`recover_path`) and asks the live rule itself (:func:`yuki.memory.trace_privacy.nested_content`). A path
+    not found in time is judged by the parent kept on the row alone. Where the rule says content: the row's name
+    (``name_ciphertext`` / ``end_name_ciphertext``) is set to NULL, and the element registry keeps that element as
+    content with no name (no row is deleted, so no count changes). One transaction, with SQLite's ``secure_delete``
+    on (the old values are overwritten, as ``scrub_secrets``). Returns content-free counts: rows and elements by
+    process, role and parent; ``by_parent`` (the parent alone decided) and ``by_ancestry`` (only the recovered path
+    did); ``unrecovered``; ``ms``. ``dry_run``: counts only, nothing written."""
+    t0 = time.perf_counter()
+    marks = ",".join("?" * len(NESTED_CONTENT_ROLES))
+    roles = sorted(NESTED_CONTENT_ROLES)
+    try:
+        starts = store._query(
+            f"SELECT id, process, role, position, element_key, name_digest FROM ui_actions WHERE role IN ({marks})"
+            " AND name_ciphertext IS NOT NULL", roles)
+        ends = store._query(
+            f"SELECT id, process, end_role AS role, end_position AS position, end_element_key AS element_key,"
+            f" end_name_digest AS name_digest FROM ui_actions WHERE end_role IN ({marks})"
+            " AND end_name_ciphertext IS NOT NULL", roles)
+        named = store._query(
+            f"SELECT element_key, process, role FROM ui_elements WHERE role IN ({marks})"
+            " AND (name_ciphertext IS NOT NULL OR coalesce(name_class, '') != ?)", [*roles, CONTENT])
+    except sqlite3.OperationalError:
+        return {"skipped": "no_trace_tables"}
+    deadline = t0 + max(0.0, float(budget_s))
+    seen: Counter = Counter()
+    verdicts: dict[tuple[str, str, str, str, str], tuple[bool, str]] = {}
+
+    def judge(r: Any) -> tuple[bool, str]:
+        """(content, how): how = ``parent`` | ``ancestry`` | ``title`` | ``unrecovered``."""
+        parent = _parent_of(r["position"])
+        ident = (str(r["process"] or ""), str(r["role"] or ""), str(r["element_key"] or ""),
+                 str(r["name_digest"] or ""), parent)
+        if ident in verdicts:
+            return verdicts[ident]
+        if nested_content(ident[1], (), parent or None):
+            out = (True, "parent")
+        else:
+            path = None
+            if ident[2]:
+                path = recover_path(store.cipher, ident[2], ident[0], ident[1], ident[3] or None, parent, seen,
+                                    deadline=deadline)
+            if path is None:
+                out = (False, "unrecovered")
+            else:
+                seen[path] += 1
+                out = (True, "ancestry") if nested_content(ident[1], path, parent or None) else (False, "title")
+        verdicts[ident] = out
+        return out
+
+    row_ids: list[int] = []
+    end_ids: list[int] = []
+    keys: set[str] = set()
+    by_where: Counter = Counter()
+    how: Counter = Counter()
+    for kind, rows, target in (("start", starts, row_ids), ("end", ends, end_ids)):
+        for r in rows:
+            content, why = judge(r)
+            how[why] += 1
+            if not content:
+                continue
+            target.append(int(r["id"]))
+            if r["element_key"]:
+                keys.add(str(r["element_key"]))
+            by_where[f"{r['process'] or ''}|{r['role'] or ''}|{_parent_of(r['position'])}|{kind}"] += 1
+    registry = [str(e["element_key"]) for e in named if str(e["element_key"]) in keys]
+    out: dict[str, Any] = {
+        "rule": NAME_RULE, "dry_run": bool(dry_run), "rows": len(row_ids), "end_rows": len(end_ids),
+        "elements": len(registry), "by_parent": how["parent"], "by_ancestry": how["ancestry"],
+        "kept_title": how["title"], "unrecovered": how["unrecovered"],
+        "where": dict(sorted(by_where.items())),
+    }
+    if not dry_run and (row_ids or end_ids or registry):
+        def op(conn: sqlite3.Connection) -> None:
+            for chunk in _chunks(row_ids):
+                conn.execute(f"UPDATE ui_actions SET name_ciphertext=NULL WHERE id IN ({','.join('?' * len(chunk))})",
+                             chunk)
+            for chunk in _chunks(end_ids):
+                conn.execute("UPDATE ui_actions SET end_name_ciphertext=NULL WHERE id IN"
+                             f" ({','.join('?' * len(chunk))})", chunk)
+            for chunk in _chunks(registry):
+                conn.execute(f"UPDATE ui_elements SET name_class=?, name_ciphertext=NULL WHERE element_key IN"
+                             f" ({','.join('?' * len(chunk))})", [CONTENT, *chunk])
+
+        _secure_write(store, op)
+    out["ms"] = round((time.perf_counter() - t0) * 1000.0, 1)
+    return out
+
+
+def _chunks(values: Sequence[Any], size: int = 400) -> Iterable[Sequence[Any]]:
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _secure_write(store: Any, op: Any) -> Any:
+    """``store._write(op)`` with SQLite's ``secure_delete`` on for it (the connection's own setting put back)."""
+    lock, conn = getattr(store, "_lock", None), getattr(store, "_conn", None)
+    previous = None
+    if lock is not None and conn is not None:
+        with lock:
+            try:
+                previous = int(conn.execute("PRAGMA secure_delete").fetchone()[0])
+                conn.execute("PRAGMA secure_delete=ON")
+            except sqlite3.Error:
+                previous = None
+    try:
+        return store._write(op)
+    finally:
+        if previous is not None:
+            with lock:
+                try:
+                    conn.execute(f"PRAGMA secure_delete={previous}")
+                except sqlite3.Error:
+                    pass
+
+
+def scrub_names_once(store: Any, log: Any = None) -> dict[str, Any] | None:
+    """Run :func:`scrub_names` once per name rule (``source_checkpoints['trace.name_rule']``); the memory service
+    calls it at start, off its main thread. Logs ``trace_name_scrub`` (content-free counts). ``None``: already done
+    for this rule. A failure leaves the checkpoint as it was, so the next start tries again."""
+    try:
+        if store.source_checkpoint(NAME_RULE_CHECKPOINT) == NAME_RULE:
+            return None
+    except sqlite3.OperationalError:
+        return None
+    counts = scrub_names(store)
+    if counts.get("skipped"):
+        return counts
+    store.set_source_checkpoint(NAME_RULE_CHECKPOINT, NAME_RULE)
+    if log is not None:
+        try:
+            log("trace_name_scrub", **counts)
+        except Exception:  # noqa: BLE001 - logging never breaks the scrub
+            pass
+    return counts
+
+
 # -- later joins ---------------------------------------------------------------------------------------------------
 
 
@@ -825,6 +1041,85 @@ def save_game_evidence(store: Any, evidence: dict[str, dict[str, Any]]) -> None:
     store._write(op)
 
 
-__all__ = ["ACTION_COLUMNS", "ELEMENT_DAYS", "RAW_DAYS", "attach_episodes", "capture_ids", "day_of", "forget",
-           "load_game_evidence", "match_runs", "paste_joins", "purge", "save_game_evidence", "summary",
-           "undo_forget", "update_action", "write_batch"]
+# -- CLI -----------------------------------------------------------------------------------------------------------
+
+
+class _ReadOnly:
+    """The memory database opened ``mode=ro`` with its key read (never made): the small surface the dry run uses
+    (``_query``, ``cipher``, ``source_checkpoint``); no migration, nothing written."""
+
+    def __init__(self, path: Any) -> None:
+        import threading
+        from pathlib import Path
+
+        from yuki.memory.crypto import FieldCipher, load_or_create_key
+        from yuki.memory.store import KEY_FILENAME
+
+        path = Path(path)
+        key = path.parent / KEY_FILENAME
+        if not key.exists():
+            raise FileNotFoundError(f"no {KEY_FILENAME} beside {path}")
+        self.cipher = FieldCipher(load_or_create_key(key))   # exists: read and unwrapped, never made
+        self._conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=10.0,
+                                     check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._lock = threading.Lock()
+
+    def _query(self, sql: str, params: Sequence[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def _write(self, fn: Any) -> Any:
+        raise PermissionError("read-only")
+
+    def source_checkpoint(self, name: str) -> str | None:
+        rows = self._query("SELECT value FROM source_checkpoints WHERE name=?", (name,))
+        return rows[0]["value"] if rows else None
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``scrub-names [--dry-run] [--db PATH]``: phase F's name scrub, counts only (no name is ever printed). The dry
+    run opens the database read-only (the live one by default); a real run needs ``--db`` (a copy: on the live
+    database the memory service runs it itself, once per rule, at its start)."""
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(prog="python -m yuki.memory.trace_store")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    scrub = sub.add_parser("scrub-names", help="clear stored names the current name rule would not keep")
+    scrub.add_argument("--dry-run", action="store_true", help="counts only; the database is opened read-only")
+    scrub.add_argument("--db", help="the database (default: the live one, dry run only)")
+    args = parser.parse_args(argv)
+    from yuki.memory.store import Store, default_db_path
+
+    db = Path(args.db) if args.db else default_db_path()
+    if args.dry_run:
+        ro = _ReadOnly(db)
+        try:
+            counts = scrub_names(ro, dry_run=True)
+            counts["checkpoint"] = ro.source_checkpoint(NAME_RULE_CHECKPOINT)
+        finally:
+            ro.close()
+    else:
+        if not args.db or Path(args.db).resolve() == Path(default_db_path()).resolve():
+            parser.error("a real run needs --db pointing at a copy; the memory service scrubs the live database")
+        store = Store.open(db)
+        try:
+            counts = scrub_names_once(store) or {"skipped": "already_done", "rule": NAME_RULE}
+        finally:
+            store.close()
+    print(json.dumps(counts, indent=1, sort_keys=True))
+    return 0
+
+
+__all__ = ["ACTION_COLUMNS", "ELEMENT_DAYS", "NAME_RULE_CHECKPOINT", "RAW_DAYS", "attach_episodes", "capture_ids",
+           "day_of", "forget", "load_game_evidence", "match_runs", "paste_joins", "purge", "recover_path",
+           "save_game_evidence", "scrub_names", "scrub_names_once", "summary", "undo_forget", "update_action",
+           "write_batch"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

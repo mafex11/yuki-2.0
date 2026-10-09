@@ -1734,6 +1734,12 @@ class TraceWorker:
         row_name = None if item else name
         if item:
             self.counters["content_item_named"] += 1
+        from yuki.memory.trace_privacy import NESTED_CONTENT_ROLES
+
+        if cls == CONTENT and el.role in NESTED_CONTENT_ROLES:
+            # phase F (fPrivacy): a document or pane nested in a list item, a document or a group (a chat app's
+            # message bubble) is content: a digest and its container, never its name
+            self.counters["content_document_dropped"] += 1
         if cls == TITLE and el.index is not None:
             position = f"{el.index}/{el.parent_role or ''}"
         else:

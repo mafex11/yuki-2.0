@@ -1414,6 +1414,59 @@ class TimelineRecorder:
             return  # the same window came back (a menu or dialog of it closed)
         self._close(now)
         self._open(hwnd, now, carry=st)
+        if self._current is None and hwnd and not self._blocked:
+            self._gap_note_window(hwnd)   # not a user window (the desktop, the taskbar): no stretch, maybe a gap
+
+    # -- gaps (phase F, fPrivacy): why consecutive rows left time uncovered --------------------------------------
+
+    #: Consecutive rows leaving more than this uncovered (s), while not paused or locked and with no sleep between,
+    #: are logged as ``timeline_gap`` (8 Oct 08:54:54-08:57:09 had no row and no word why).
+    GAP_S = 60.0
+    #: The counters a gap's line reports as "since the last row".
+    _GAP_COUNTERS = ("not_user_window", "short_rows", "page_timeouts", "tick_gaps")
+
+    def _gap_state(self) -> dict[str, Any]:
+        """The gap bookkeeping (created on first use): the end of the newest row written, whether recording was
+        paused or locked since, the window classes skipped since, and the counters at that row."""
+        state = self.__dict__.get("_gap")
+        if state is None:
+            state = {"last_end": None, "blocked": False, "classes": Counter(), "mark": {}}
+            self.__dict__["_gap"] = state
+        return state
+
+    def _gap_note_window(self, hwnd: int) -> None:
+        """A foreground window that got no stretch: its window class (Windows' own vocabulary: ``Progman``,
+        ``Shell_TrayWnd``), counted for the next gap's line. Never its title."""
+        name = ""
+        try:
+            buf = ctypes.create_unicode_buffer(128)
+            if self._user32.GetClassNameW(wintypes.HWND(hwnd), buf, 128):
+                name = buf.value[:64]
+        except Exception:  # noqa: BLE001
+            name = ""
+        classes = self._gap_state()["classes"]
+        if len(classes) < 32 or name in classes:
+            classes[name or "unknown"] += 1
+
+    def _gap_after_write(self, row: TimelineRow, new: bool) -> None:
+        """After a row was saved: a new row starting more than :data:`GAP_S` after the newest row's end, with no
+        pause, lock or sleep between, logs ``timeline_gap`` (content-free: the gap, and since the last row the window
+        classes that got no stretch, rows too short to keep, page reads that timed out)."""
+        g = self._gap_state()
+        counts = {k: int(self.counters[k]) for k in self._GAP_COUNTERS}
+        last = g["last_end"]
+        if new:
+            since = {k: counts[k] - int(g["mark"].get(k, 0)) for k in self._GAP_COUNTERS}
+            gap = float(row.started_at) - float(last) if last is not None else 0.0
+            if last is not None and gap > self.GAP_S and not g["blocked"] and since["tick_gaps"] == 0:
+                self.counters["gaps"] += 1
+                self._log("timeline_gap", gap_s=round(gap, 1), not_user_window=since["not_user_window"],
+                          classes=dict(g["classes"].most_common(5)), short_rows=since["short_rows"],
+                          probe_timeouts=since["page_timeouts"])
+            g["blocked"] = False
+            g["classes"] = Counter()
+            g["mark"] = counts
+        g["last_end"] = max(float(last or 0.0), float(row.ended_at))
 
     def _fullscreen(self, hwnd: int) -> bool:
         try:
@@ -1478,6 +1531,7 @@ class TimelineRecorder:
         previous, self._blocked = self._blocked, reason
         self._log("timeline_state", blocked=reason, was=previous)
         if reason is not None:
+            self._gap_state()["blocked"] = True   # paused or locked: the time until the next row is no gap
             self._advance(now)
             self._close(now)
             self._unhook_names()
@@ -1736,7 +1790,9 @@ class TimelineRecorder:
             self._settle(st)
         row = self._row(st, end)
         if row.id is None and end - st.start < MIN_ROW_S:
+            self.counters["short_rows"] += 1
             return None
+        new = row.id is None
         try:
             self.store.save_timeline(row)
         except Exception as exc:
@@ -1744,6 +1800,10 @@ class TimelineRecorder:
             return None
         st.row_id = row.id
         self.counters["writes"] += 1
+        try:
+            self._gap_after_write(row, new)
+        except Exception as exc:  # noqa: BLE001 - the gap line never breaks the timeline
+            self._log_error("gap", exc)
         return row
 
     def _close(self, now: float) -> None:
@@ -1835,9 +1895,12 @@ class TimelineRecorder:
         if site is None:
             if now - h.since < rules.hold_s:
                 return None
-            if self._evidence is not None and st.seen_host is None and not self._call_seen(h, key, now):
-                # an app (not a site in a browser, whose meeting is the site that took the device) holds the
-                # microphone, and no screen of it was seen in a call: a game's voice chat, a recording - no meeting
+            if self._evidence is not None and not self._call_seen(h, key, now):
+                # an app holds the microphone and no screen of it was seen in a call: a game's voice chat, a
+                # recording - no meeting. Phase F (fPrivacy): a browser or an app showing pages too (it was exempt):
+                # any site in front holding the microphone for 20 s (voice typing, a chat's voice mode) was a
+                # "meeting". A calling site gets the site verdict and a readable page the screen verdict
+                # (CallEvidence.state), so a real Meet or Discord call still is one
                 return None
             site = ""
             if st.seen_host is not None:

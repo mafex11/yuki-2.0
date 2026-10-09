@@ -14,7 +14,12 @@
     the same digest was used on :data:`PROMOTE_DAYS` distinct days. A tab titled after a person or a mail subject
     changes every time and never gets there: a count, not a word list;
   - ``content`` (everything else: list and tree items, text, edit fields, links, images, groups): a keyed digest
-    and the container's role and digest, never the name.
+    and the container's role and digest, never the name. Phase F (fPrivacy): a document or a pane **nested** in a
+    list, tree or grid (or one of their items), in another document or in a group (:func:`nested_content`, by its
+    kept ancestors' control types) is content too: a chat app draws each message bubble as a Document inside a list
+    item, and its accessible name is the author and the message. Only a top-level document or pane (its window's
+    page, an app's own pane) keeps the title rule. The same function decides the live capture and the one-time scrub
+    of rows stored before the rule (:func:`yuki.memory.trace_store.scrub_names`, rule :data:`NAME_RULE`).
 * :func:`gate`: the same blocks as the watcher (blocked processes, private windows, blocked hosts and schemes,
   Yuki's own windows) plus the leave-out list, as a short content-free reason code or ``None``.
 
@@ -81,17 +86,43 @@ def content_item(role: str | None, ancestors: Any = (), parent_role: str | None 
     return bool(current_set)
 
 
+#: Phase F (fPrivacy): the title-class control types whose name is content when they are nested (a chat app's
+#: message bubble is a Document inside a list item; an embedded frame is a Pane inside a page's Group).
+NESTED_CONTENT_ROLES = frozenset({"Document", "Pane"})
+#: The containers that make a :data:`NESTED_CONTENT_ROLES` element content: a list, tree or grid or one of their
+#: items, another document, or a group (UI Automation's fixed vocabulary).
+NESTED_IN_ROLES = ITEM_CONTAINER_ROLES | frozenset({"Document", "Group"})
+#: The version of the name rule: :func:`yuki.memory.trace_store.scrub_names` clears the names stored before it once
+#: per version (``source_checkpoints['trace.name_rule']``). Bump it whenever :func:`name_class` keeps fewer names.
+NAME_RULE = "2"
+
+
+def nested_content(role: str | None, ancestors: Any = (), parent_role: str | None = None) -> bool:
+    """Phase F (fPrivacy): whether a Document or Pane (:data:`NESTED_CONTENT_ROLES`) is nested in content: one of
+    :data:`NESTED_IN_ROLES` is its parent (``parent_role``) or among its kept ancestors (``ancestors``: roles, or the
+    trace's ``(role, AutomationId)`` pairs, nearest first, at most ``trace_uia.ANCESTORS``). Structure only, no
+    words. The live capture (:func:`name_class`) and the scrub of stored rows (``trace_store.scrub_names``, which
+    recovers the very ancestry the trace read, else knows only the parent kept on the row) call this one function."""
+    if (role or "") not in NESTED_CONTENT_ROLES:
+        return False
+    roles = [a[0] if isinstance(a, (tuple, list)) and a else a for a in (ancestors or ())]
+    if parent_role:
+        roles.insert(0, parent_role)
+    return any(r in NESTED_IN_ROLES for r in roles)
+
+
 def name_class(role: str | None, parent_role: str | None = None, ancestors: Any = (), *,
                current_set: bool = False) -> str:
     """``command``, ``title`` or ``content`` for an element of control type ``role`` (an item of a ToolBar is a
     command control whatever its own type). capQ2a: a command control inside a list, tree or grid, or one of a set
     with a current item (:func:`content_item`, when its ``ancestors`` / ``current_set`` are known) is ``title``: a
-    digest, its name only after 3 days."""
+    digest, its name only after 3 days. Phase F: a Document or Pane nested in a list item, a document or a group
+    (:func:`nested_content`) is ``content``: a digest, never its name."""
     role = role or ""
     if role in COMMAND_ROLES or (parent_role == "ToolBar" and role not in TITLE_ROLES):
         return TITLE if content_item(role, ancestors, parent_role, current_set=current_set) else COMMAND
     if role in TITLE_ROLES:
-        return TITLE
+        return CONTENT if nested_content(role, ancestors, parent_role) else TITLE
     return CONTENT
 
 
@@ -191,6 +222,6 @@ def gate(rules: Any, trace: TraceRules, *, process: str, app: str = "", own: boo
     return None
 
 
-__all__ = ["COMMAND", "COMMAND_BAR_ROLES", "COMMAND_ROLES", "CONTENT", "DEFAULT_BLOCKED_FOLDERS", "ITEM_CONTAINER_ROLES", "NAME_CHARS",
-           "PROMOTE_DAYS", "TITLE", "TITLE_ROLES", "TraceRules", "content_item", "gate", "name_class",
-           "normalise_name"]
+__all__ = ["COMMAND", "COMMAND_BAR_ROLES", "COMMAND_ROLES", "CONTENT", "DEFAULT_BLOCKED_FOLDERS",
+           "ITEM_CONTAINER_ROLES", "NAME_CHARS", "NAME_RULE", "NESTED_CONTENT_ROLES", "NESTED_IN_ROLES", "PROMOTE_DAYS", "TITLE", "TITLE_ROLES",
+           "TraceRules", "content_item", "gate", "name_class", "nested_content", "normalise_name"]

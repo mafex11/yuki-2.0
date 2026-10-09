@@ -733,6 +733,22 @@ def run(args: argparse.Namespace) -> int:
             log("trace_purge", **_trace_store.purge(store))
         except Exception as exc:
             log("error", where="trace_purge", error=type(exc).__name__)
+        # Phase F (fPrivacy): the names stored before the current trace name rule that it would not keep (a document
+        # nested in a list item: a chat app's message) are cleared by the rule's own function, once per rule version
+        # (source_checkpoints['trace.name_rule']), on a short-lived thread (about a second on 5.5k rows); logged
+        # trace_name_scrub, counts only. A failure leaves the checkpoint, so the next start tries again.
+        try:
+            from yuki.memory import trace_store as _trace_store_scrub
+
+            def _name_scrub() -> None:
+                try:
+                    _trace_store_scrub.scrub_names_once(store, log)
+                except Exception as exc:  # noqa: BLE001
+                    log("error", where="trace_name_scrub", error=type(exc).__name__)
+
+            threading.Thread(target=_name_scrub, name="yuki-memory-namescrub", daemon=True).start()
+        except Exception as exc:
+            log("error", where="trace_name_scrub_start", error=type(exc).__name__)
         if not args.no_trace:
             try:
                 from yuki.memory.trace import Trace
@@ -975,7 +991,7 @@ def _follow_acting(
             for entry in _acting.stale(db_path):   # an end that never came: ignored, and said once
                 if entry["token"] not in leaked:
                     leaked.add(entry["token"])
-                    log("acting_leak", lane=entry["lane"], age_s=entry["age_s"])
+                    log("acting_leak", lane=entry["lane"], age_s=entry["age_s"], request_id=entry.get("request_id"))
         except Exception:
             now = None
         token = now.token if now is not None else None
@@ -986,7 +1002,9 @@ def _follow_acting(
         timeline = timeline_now()
         if timeline is not None:
             timeline.set_acting(now)
-        log("acting", acting=now is not None, lane=now.lane if now is not None else None)
+        # phase F (fPrivacy): the request's id, so the memory log links to its session log and moments (no words)
+        log("acting", acting=now is not None, lane=now.lane if now is not None else None,
+            request_id=(getattr(now, "request_id", "") or None) if now is not None else None)
 
 
 def _guarded(fn: Callable[..., Any], log: _Log, where: str) -> Callable[..., None]:

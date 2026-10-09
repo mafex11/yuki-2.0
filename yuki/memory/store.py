@@ -5281,22 +5281,33 @@ class Store:
             params.append(u)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         raw = self._query("SELECT * FROM timeline" + where + " ORDER BY started_at, id", params)
-        return self._meetings_proven([self._timeline_row(r) for r in raw],
-                                     [float(r["updated_at"] or 0.0) for r in raw])
+        return self._apply_proof([self._timeline_row(r) for r in raw], [float(r["updated_at"] or 0.0) for r in raw])
 
     #: A meeting row needs a call of the same app around it, this close in time (seconds): the call worker sees a
     #: call some seconds after the app takes the microphone and lets it linger ~2 minutes after it lets go.
     MEETING_CALL_SLACK_S = 180.0
+    #: ``calls.via`` values that mean a screen or a calling site was seen in a call (not only a microphone hold).
+    SEEN_CALL_VIA = ("screen", "screen_stale", "meeting")
 
-    def _meetings_proven(self, rows: list[TimelineRow], written: Sequence[float] | None = None) -> list[TimelineRow]:
-        """Rows recorded before the timeline's live call-evidence gate (migration 27) that it marked a meeting only
-        because the app in front held the microphone, with no call of that app around them, read as that app's own
-        time (``meeting`` None): a game's voice chat (VALORANT) or a music app recording (FL Studio) is not a meeting
-        (revamp A9: 1 h 35 m of "meetings" on 2 Oct were those, and they held back the coach's cards). The evidence
-        is measured: the call worker writes a call row (a declined one too) for every hold on a screen judged in a
-        call, so a meeting with no call row of its app was never seen as one. Rows from before the first call row
-        ever written stay as they were (nothing to judge them by), and so do rows since the gate (it judged them
-        live; a meeting the user declined to record still has its call row). Read-time only: rows are untouched."""
+    def _apply_proof(self, rows: list[TimelineRow], written: Sequence[float] | None = None) -> list[TimelineRow]:
+        """The one read-time meeting proof, for every timeline reader (:meth:`timeline_between`,
+        :meth:`timeline_of`, :meth:`timeline_states`; phase F, fPrivacy). Decrypt-free: it reads process, app,
+        meeting, host and times only, and rows are never edited.
+
+        Rows recorded before the timeline's live call-evidence gate (migration 27) that it marked a meeting only
+        because the app in front held the microphone, with no qualifying call of that app around them, read as that
+        app's own time (``meeting`` None): a game's voice chat (VALORANT) or a music app recording (FL Studio) is not
+        a meeting (revamp A9: 1 h 35 m of "meetings" on 2 Oct were those, and they held back the coach's cards). The
+        evidence is measured: the call worker writes a call row (a declined one too) for every hold on a screen
+        judged in a call, so a meeting with no call row of its app was never seen as one.
+
+        A qualifying call (decision D7, the same rule as the moments' ``call_join``): a ``calls`` row of kind
+        ``call`` whose program is not a game (:func:`yuki.memory.gamegate.judge_program`, machine facts only, never
+        what is in front now), and, when it is only a microphone hold (``via='mic'``, from before screen evidence),
+        of an app with a seen call on record (``via`` screen / screen_stale / meeting) or one of the user's own
+        ``[calls] apps``. Rows from before the first call row ever written stay as they were (nothing to judge them
+        by), and so do rows since the gate (judged live) and a site's meeting rows (``host`` set: the site that took
+        the device in a browser)."""
         meet = [r for r in rows if r.meeting and r.process and not r.host]   # an app's own meeting, not a site's
         if not meet:
             return rows
@@ -5313,6 +5324,7 @@ class Store:
         meet = [r for r in meet if id(r) in before]   # rows written since were judged on a screen already
         if not meet:
             return rows
+        seen_marks = ",".join("?" * len(self.SEEN_CALL_VIA))
         try:
             first = self._query("SELECT min(detected_at) FROM calls")[0][0]
             if first is None:
@@ -5322,22 +5334,48 @@ class Store:
             now = time.time()
             # a game's voice chat (calls.kind "game", migration 34) is never a meeting's proof
             calls = self._query(
-                "SELECT process, detected_at, coalesce(ended_at, last_alive_at, ?), app FROM calls"
+                "SELECT process, detected_at, coalesce(ended_at, last_alive_at, ?), app, via FROM calls"
                 " WHERE detected_at < ? AND coalesce(ended_at, last_alive_at, ?) > ? AND kind = 'call'",
                 (now, hi, now, lo))
-        except sqlite3.OperationalError:   # a database before migration 26 (no last_alive_at)
+            seen = self._query(f"SELECT DISTINCT process, app FROM calls WHERE kind = 'call' AND via IN ({seen_marks})",
+                               self.SEEN_CALL_VIA)
+        except sqlite3.OperationalError:   # a database before migration 26 (no last_alive_at) or 34 (no kind)
             try:
                 first = self._query("SELECT min(detected_at) FROM calls")[0][0]
                 now = time.time()
-                calls = self._query("SELECT process, detected_at, coalesce(ended_at, ?), app FROM calls", (now,))
+                calls = self._query("SELECT process, detected_at, coalesce(ended_at, ?), app, via FROM calls", (now,))
+                seen = self._query(f"SELECT DISTINCT process, app FROM calls WHERE via IN ({seen_marks})",
+                                   self.SEEN_CALL_VIA)
             except sqlite3.OperationalError:
                 return rows
             if first is None:
                 return rows
         slack = self.MEETING_CALL_SLACK_S
+        games: dict[str, bool] = {}
+
+        def game(process: str | None) -> bool:
+            key = app_key(process) or ""
+            if key not in games:
+                games[key] = self._program_is_game(key)
+            return games[key]
+
         # the same app: its process key, or its name as Yuki resolves it (a packaged app's call row is keyed by its
         # package, "com.tinyspeck.slackdesktop", where the timeline has the image, "slack")
-        spans = [(app_key(c[0]) or "", _shown(c[3], c[0]).casefold(), float(c[1]), float(c[2])) for c in calls]
+        def keys_of(process: str | None, app: str | None) -> tuple[str, str]:
+            return app_key(process) or "", _shown(app, process).casefold()
+
+        allowed: set[str] = set(self._calls_apps_keys())
+        for c in seen:
+            if not game(c[0]):
+                allowed.update(k for k in keys_of(c[0], c[1]) if k)
+        spans = []
+        for c in calls:
+            if game(c[0]):
+                continue
+            p, n = keys_of(c[0], c[3])
+            if c[4] == "mic" and p not in allowed and n not in allowed:
+                continue   # a microphone hold of an app never seen in a call (VALORANT's 27 Sep rows)
+            spans.append((p, n, float(c[1]), float(c[2])))
         out: list[TimelineRow] = []
         for r in rows:
             if r.meeting and r.process and not r.host and float(first) <= r.started_at and id(r) in before:
@@ -5348,23 +5386,64 @@ class Store:
             out.append(r)
         return out
 
+    #: The name it had before phase F (the docs and older tests refer to it).
+    _meetings_proven = _apply_proof
+
+    @staticmethod
+    def _program_is_game(key: str) -> bool:
+        """Whether a program (its app key) is a game, by machine facts only (:func:`yuki.memory.gamegate.judge_program`:
+        the fixed anti-cheat list, the user's additions, learned Direct3D full screen), never by what is in front
+        now (a stored row's proof must not change with the screen)."""
+        if not key:
+            return False
+        try:
+            from yuki.memory.gamegate import judge_program
+
+            return bool(judge_program(key, d3d_fn=lambda: False)[0])
+        except Exception:  # noqa: BLE001 - no game facts: not a game
+            return False
+
+    def _calls_apps_keys(self) -> list[str]:
+        """The user's own ``[calls] apps`` (app keys) from the privacy file beside this database (read again when it
+        changes); ``[]`` when there is none or it cannot be read (a copy of the database carries no privacy file)."""
+        path = Path(self.path).parent / "privacy.toml"
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return []
+        cached = getattr(self, "_calls_apps_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        keys: list[str] = []
+        try:
+            import tomllib
+
+            with path.open("rb") as fh:
+                apps = (tomllib.load(fh).get("calls") or {}).get("apps") or []
+            keys = [k for k in (app_key(str(a)) for a in apps if str(a).strip()) if k]
+        except Exception:  # noqa: BLE001 - a broken file proves nothing
+            keys = []
+        self._calls_apps_cache = (stamp, keys)
+        return keys
+
     def timeline_of(self, process: str, since: TimeArg = None) -> list[TimelineRow]:
         """One app's stretches (``process`` = its ``app_key``) ending after ``since``, oldest first (decrypted): only
-        its rows are decrypted (v3.13, the voice's recent titles of the window in front)."""
+        its rows are decrypted (v3.13, the voice's recent titles of the window in front). Phase F: through the one
+        meeting proof (:meth:`_apply_proof`), like every timeline reader."""
         where, params = " WHERE process = ?", [process]
         if (s := _ts(since)) is not None:
             where += " AND ended_at > ?"
             params.append(s)
-        return [self._timeline_row(r) for r in self._query(
-            "SELECT * FROM timeline" + where + " ORDER BY started_at, id", params
-        )]
+        raw = self._query("SELECT * FROM timeline" + where + " ORDER BY started_at, id", params)
+        return self._apply_proof([self._timeline_row(r) for r in raw], [float(r["updated_at"] or 0.0) for r in raw])
 
     def timeline_states(self, since: TimeArg = None, until: TimeArg = None) -> list[TimelineRow]:
         """Like :meth:`timeline_between` but content-free and cheap: nothing is decrypted.
 
         The rows carry times, state, app, host, counters and flags only (no
         title, path or Yuki request): enough for presence and breaks, read on
-        every coach tick over a day and a half.
+        every coach tick over a day and a half. Phase F: through the one meeting
+        proof (:meth:`_apply_proof`, decrypt-free), like every timeline reader.
         """
         clauses, params = [], []
         if (s := _ts(since)) is not None:
@@ -5374,16 +5453,17 @@ class Store:
             clauses.append("started_at < ?")
             params.append(u)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        return [TimelineRow(
+        raw = self._query(
+            "SELECT id, started_at, ended_at, state, process, app, host, page_key, active_s, passive_s, away_s,"
+            " media_s, withheld, fullscreen, meeting, mic_s, by_yuki, source, updated_at FROM timeline" + where
+            + " ORDER BY started_at, id", params)
+        return self._apply_proof([TimelineRow(
             id=r["id"], started_at=r["started_at"], ended_at=r["ended_at"], state=r["state"], process=r["process"],
             app=_shown(r["app"], r["process"]), host=r["host"], page_key=r["page_key"], active_s=r["active_s"] or 0.0,
             passive_s=r["passive_s"] or 0.0, away_s=r["away_s"] or 0.0, media_s=r["media_s"] or 0.0,
             withheld=r["withheld"], fullscreen=bool(r["fullscreen"]), meeting=r["meeting"], mic_s=r["mic_s"] or 0.0,
             by_yuki=bool(r["by_yuki"]), source=r["source"],
-        ) for r in self._query(
-            "SELECT id, started_at, ended_at, state, process, app, host, page_key, active_s, passive_s, away_s,"
-            " media_s, withheld, fullscreen, meeting, mic_s, by_yuki, source FROM timeline" + where
-            + " ORDER BY started_at, id", params)]
+        ) for r in raw], [float(r["updated_at"] or 0.0) for r in raw])
 
     def timeline_bounds(self) -> tuple[float | None, float | None]:
         """Earliest start and latest end in the timeline."""

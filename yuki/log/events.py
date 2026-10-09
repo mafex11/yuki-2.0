@@ -205,6 +205,19 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "steer",
         # appTakeover: the user took over while a request acted (paused, resumed, ended)
         "takeover",
+        # Yuki's own "acting" marker for memory (begin / refresh / end), stamped with the request id
+        "memory_acting",
+        # phase S's skills and phase F's guards (decision D12; defined here so content_free keeps their code words)
+        "skill_menu",
+        "skill_resolve",
+        "route_try",
+        "done_check",
+        "done_recheck",
+        "skill_run",
+        "skill_handoff",
+        "media_command",
+        "input_refused_game",
+        "yt_fetch",
     }
 )
 
@@ -280,6 +293,9 @@ ENUM_FIELDS: frozenset[str] = frozenset({
     "level", "verdict", "verdict_class", "why", "reason", "status", "tone", "send", "step_level",
     "result_kind", "pattern", "patterns", "control_type", "button", "direction", "how", "source", "lease",
     "process", "process_name", "exe", "window_state", "trigger", "phase", "stage", "decision", "cause", "class",
+    # phase F (fPrivacy): the structural words of skills, routes, checks and moments (decision D12)
+    *("skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
+      "result", "done_check", "recheck", "verb", "rung", "label_source", "gate"),
 })
 #: The fields a content-free log keeps inside a tool's input, a tool's result and a perception payload: the model
 #: writes a tool's input, so only fields whose values are a fixed vocabulary (a button, a direction, a pattern, a
@@ -290,7 +306,15 @@ NESTED_FIELDS: frozenset[str] = frozenset({
     "control_type", "button", "direction", "how", "lease", "window_state", "phase", "stage", "class",
     "kind", "state", "mode", "via", "role", "roles", "hidden_roles", "flags", "op", "tool", "lane", "outcome",
     "type", "error_kind",
+    # phase F (fPrivacy): the same structural words inside a nested value (a skill run's slots, a check's facts)
+    *("skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
+      "result", "done_check", "recheck", "verb", "rung", "label_source", "gate"),
 })
+#: Phase F (fPrivacy): top-level fields whose value is a structure Yuki fills from the user's world (a skill's slots,
+#: a check's observed facts): shaped like a tool's input (:func:`_shape`: only :data:`NESTED_FIELDS` code words,
+#: numbers and flags stay; every other string, ``name`` and ``app`` included, is its length), never kept by
+#: :data:`ID_FIELDS` at any depth.
+SHAPED_FIELDS: frozenset[str] = frozenset({"slots", "observed", "slot_values"})
 #: A code word is what Yuki's code writes: lower case, digits and ``_ . : + -`` (``read_back_on``, ``keys``,
 #: ``verified``). A capitalised word is a name until shown otherwise, so it is kept only where the vocabulary is
 #: known (:data:`_ROLE_WORDS` for roles and control types, a ``.exe`` for a process).
@@ -299,6 +323,24 @@ _CODE_WORD = re.compile(r"[a-z][a-z0-9_.:+\-]{0,47}")
 #: out and counted, ``other_keys``).
 _FIELD_NAME = re.compile(r"[a-z_][a-z0-9_]{0,47}")
 _EXE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,59}\.exe", re.IGNORECASE)
+#: Decision D20 (critique M7): a keyed digest in a log is its first :data:`DIGEST_CHARS` hex characters, through
+#: :func:`log_digest` in every emitter; a field named ``*_digest`` keeps exactly that shape and is dropped otherwise
+#: (a 64-hex full digest, a name someone put there). Not reversible: "the same playlist / tab / person as last time"
+#: can be told apart without the content.
+DIGEST_CHARS = 12
+_DIGEST = re.compile(r"[0-9a-f]{12}")
+
+
+def log_digest(digest: Any) -> str | None:
+    """The log form of a keyed digest (``FieldCipher.digest``'s 64 hex characters): its first 12, lower case;
+    ``None`` for anything that is not hex (decision D20). Every emitter of a ``*_digest`` field calls this."""
+    text = str(digest or "").strip().lower()[:DIGEST_CHARS]
+    return text if _DIGEST.fullmatch(text) else None
+
+
+def _digest_field(key: str) -> bool:
+    return key.endswith("_digest")
+
 #: The UIA control-type names (yuki/perception/tree.py ``_ROLE_NAMES``) and Yuki's own role words built on them.
 _ROLE_WORDS: frozenset[str] = frozenset({
     "Button", "Calendar", "CheckBox", "ComboBox", "Edit", "Hyperlink", "Image", "ListItem", "List", "Menu",
@@ -350,6 +392,10 @@ def _shape(value: Any, depth: int = 0) -> Any:
             if not _FIELD_NAME.fullmatch(key):
                 dropped += 1
                 continue
+            if _digest_field(key):
+                if isinstance(v, str) and _DIGEST.fullmatch(v):
+                    out[key] = v        # D20: exactly 12 hex characters (log_digest); anything else is dropped
+                continue
             if isinstance(v, str):
                 if key in NESTED_FIELDS and _code_word(v, key):
                     out[key] = v
@@ -394,6 +440,10 @@ def _counts_only(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for key, v in value.items():
+            if _digest_field(str(key)):
+                if isinstance(v, str) and _DIGEST.fullmatch(v):
+                    out[key] = v        # D20: exactly 12 hex characters (log_digest); anything else is dropped
+                continue
             if isinstance(v, str) and key not in ID_FIELDS and not (key in ENUM_FIELDS and _code_word(v, key)):
                 if key == "traceback":
                     out[key] = _trace_frames(v)
@@ -442,7 +492,12 @@ def content_free(record: dict[str, Any]) -> dict[str, Any]:
         heavy["tools"] = [t.get("name") for t in tools if isinstance(t, dict)] if isinstance(tools, list) else []
     elif rec.get("type") == "llm_response" and isinstance(rec.get("content"), list):
         heavy["content"] = [_block_shape(b) for b in rec.pop("content")]
+    for key in SHAPED_FIELDS:
+        if isinstance(rec.get(key), (dict, list, tuple)):
+            heavy[key] = _shape(rec.pop(key))
     for key in ("input", "result", "payload"):
+        if key == "result" and isinstance(rec.get(key), str) and _code_word(rec[key], key):
+            continue    # phase F: a skill run's or a check's result code word ("done", "unverified") stays
         if key in rec and not isinstance(rec[key], (int, float, bool)) and rec[key] is not None:
             value = rec.pop(key)
             heavy[f"{key}_chars"] = len(json.dumps(value, ensure_ascii=False, default=str))
@@ -520,6 +575,12 @@ class SessionLogger:
         # sha1(base64 png) -> saved path, so llm_request logging can swap the
         # inline payload for a file reference.
         self._shot_index: dict[str, str] = {}
+        #: Phase F (fPrivacy): the request in progress (:meth:`begin_request`): every record from its start on
+        #: carries this ``request_id``, which the acting marker, the memory log and ``requests.csv`` repeat, so
+        #: ``python -m yuki.log.follow <request_id>`` can put one request together across the logs.
+        self.request_id: str | None = None
+        self._requests = 0
+        self._request_begun = False
         self.log("session_start", session_id=self.session_id, path=str(self.path))
 
     # -- lifecycle ---------------------------------------------------------
@@ -532,6 +593,17 @@ class SessionLogger:
     def reset_usage(self) -> None:
         """Start a fresh per-request usage total."""
         self.usage = UsageTotals()
+
+    def begin_request(self, request_id: str | None = None) -> str:
+        """Start a request: from now on every record carries its ``request_id`` (a record that names its own keeps
+        it). ``request_id``: one the caller already has (a card run, a hand-off); default
+        ``<session id>-<n>``, the n-th request of this log: the same id the agent's acting marker carries
+        (its token is ``<lane>-<session id>-<n>``, :func:`yuki.memory.acting.request_id_of`). Returns the id. The
+        next :meth:`user_message` does not start another one."""
+        self._requests += 1
+        self.request_id = str(request_id) if request_id else f"{self.session_id}-{self._requests}"
+        self._request_begun = True
+        return self.request_id
 
     def close(self) -> None:
         """Flush and close the JSONL file."""
@@ -556,6 +628,8 @@ class SessionLogger:
             "type": type,
         }
         record.update({k: _as_plain(v) for k, v in fields.items()})
+        if self.request_id is not None and "request_id" not in record:
+            record["request_id"] = self.request_id
         if not self.content:
             line = json.dumps(content_free(record), ensure_ascii=False, default=_as_plain)
             self._fh.write(line + "\n")
@@ -615,7 +689,11 @@ class SessionLogger:
     # -- typed events ------------------------------------------------------
 
     def user_message(self, text: str) -> None:
-        """Log (and show) a new request from the user."""
+        """Log (and show) a new request from the user: it starts the request's ``request_id``
+        (:meth:`begin_request`), unless the caller began it already."""
+        if not self._request_begun:
+            self.begin_request()
+        self._request_begun = False
         self.log("user_message", text=text)
 
     def llm_request(

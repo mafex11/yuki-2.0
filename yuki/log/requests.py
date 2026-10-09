@@ -40,7 +40,20 @@ REQUEST_CSV_FIELDS: tuple[str, ...] = (
     "output_tokens",
     "cost_usd",
     "outcome",
+    # phase F (fPrivacy): the request's id (its session log's records, the acting marker, the memory log and the
+    # moments carry the same one: ``python -m yuki.log.follow <request_id>``), and phase S's skill facts, all code
+    # words or numbers: the skill and route that ran, the done-check's and the re-check's outcome, and how many
+    # moments by Yuki followed within 10 s
+    "request_id",
+    "skill",
+    "route",
+    "done_check",
+    "recheck",
+    "moments_after",
 )
+#: Cells that must be one code word (a skill key, a route, a check's outcome) or a number; anything else is left empty
+#: (never a sentence or a name in the ledger).
+CODE_COLUMNS: tuple[str, ...] = ("request_id", "skill", "route", "done_check", "recheck")
 
 #: The token keys shared by ``request_summary``, ``startup_cost`` and the CSV.
 TOKEN_KEYS: tuple[str, ...] = (
@@ -80,15 +93,54 @@ def append_request_row(path: Path, row: dict[str, Any], *, content: bool | None 
     """
     if not (content_kept() if content is None else content):
         row = {**row, "request": ""}
+    row = {**row, **{k: (row.get(k) if _code_cell(row.get(k)) else None) for k in CODE_COLUMNS if k in row}}
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _csv_lock:
+        if path.exists() and path.stat().st_size > 0:
+            _upgrade_header(path)
         new = not path.exists() or path.stat().st_size == 0
         with path.open("a", encoding="utf-8", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=REQUEST_CSV_FIELDS, extrasaction="ignore")
             if new:
                 writer.writeheader()
             writer.writerow({key: _cell(row.get(key)) for key in REQUEST_CSV_FIELDS})
+
+
+def _code_cell(value: Any) -> bool:
+    """A cell of :data:`CODE_COLUMNS`: empty, a number, or one code word / id (letters, digits, ``_ . : + -``)."""
+    if value is None or isinstance(value, (int, float)) and not isinstance(value, bool):
+        return True
+    return (isinstance(value, str) and 0 < len(value) <= 64 and value.isascii()
+            and all(c.isalnum() or c in "_.:+-" for c in value))
+
+
+def _upgrade_header(path: Path) -> None:
+    """A ledger written before columns were added keeps its rows: its header line is rewritten to today's (old rows
+    simply have the new columns empty). A header that is not an older form of today's is left alone and the file
+    moved aside (``requests-<time>.csv``), so no row is ever read under the wrong column."""
+    import os
+    import time
+
+    try:
+        with path.open(encoding="utf-8", newline="") as fh:
+            first = fh.readline()
+            if not first:
+                return
+            header = next(csv.reader([first]))
+            if tuple(header) == REQUEST_CSV_FIELDS:
+                return
+            rest = fh.read()
+    except OSError:
+        return
+    if tuple(header) == REQUEST_CSV_FIELDS[:len(header)]:
+        tmp = path.with_name(path.name + ".upgrade.tmp")
+        with tmp.open("w", encoding="utf-8", newline="") as out:
+            csv.writer(out).writerow(REQUEST_CSV_FIELDS)
+            out.write(rest)
+        os.replace(tmp, path)
+    else:
+        os.replace(path, path.with_name(f"{path.stem}-{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}"))
 
 
 def _cell(value: Any) -> Any:

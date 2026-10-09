@@ -14,13 +14,18 @@ than as the user's own activity.
 Mechanism (plumbing only, no content decisions):
 
 * a small JSON file next to the memory database (``acting.json``: the
-  requests in progress, each with its text, start time, lane and the agent's
-  process id), replaced atomically;
+  requests in progress, each with its text, start time, lane, the agent's
+  process id and the request's id), replaced atomically;
 * a named auto-reset event ``Local\\YukiMemoryActing-<db digest>`` created by the
   service, set by the agent after every change so the service reacts within
   milliseconds (the service also re-reads the file on a bounded wait, so a
   missed signal or an agent that died mid-request is noticed: entries whose
   process is gone are ignored).
+
+Phase F (fPrivacy): each entry carries the request's ``request_id`` (the id its session log stamps on every record,
+``yuki.log.events.SessionLogger.begin_request``), so the memory log's ``acting`` line, the moments Yuki caused and
+``python -m yuki.log.follow <request_id>`` link one request across the logs without its words. A caller that gives
+none gets :func:`request_id_of` its token.
 
 This module has no heavy imports: the agent side imports it on every request.
 """
@@ -83,6 +88,18 @@ class Acting:
     started_at: float
     lane: str = ""
     pid: int = 0
+    #: Phase F: the request's id (content-free), the same as on its session log's records.
+    request_id: str = ""
+
+
+def request_id_of(token: str, lane: str = "") -> str:
+    """The request id a marker without one stands for: the agent's token is ``<lane>-<session id>-<n>``
+    (``yuki.agent.loop.Agent._acting_start``) and its session log's request id ``<session id>-<n>``
+    (:meth:`yuki.log.events.SessionLogger.begin_request`), so the lane's prefix is taken off (a fixed format of
+    Yuki's own); any other token is its own id."""
+    token = str(token or "")
+    prefix = f"{lane}-" if lane else ""
+    return token[len(prefix):] if prefix and token.startswith(prefix) and len(token) > len(prefix) else token
 
 
 def _pid_alive(pid: int) -> bool:
@@ -165,8 +182,10 @@ def _signal(db_path: str | Path | None) -> bool:
         return False
 
 
-def begin(db_path: str | Path | None, token: str, request: str, *, lane: str = "") -> bool:
-    """Publish that Yuki is acting on ``request`` (idempotent per token). Never raises."""
+def begin(db_path: str | Path | None, token: str, request: str, *, lane: str = "",
+          request_id: str | None = None) -> bool:
+    """Publish that Yuki is acting on ``request`` (idempotent per token). ``request_id``: the request's id (default
+    :func:`request_id_of` the token). Never raises."""
     try:
         from yuki.memory.secret_filter import redact_text  # light (re only)
 
@@ -179,7 +198,7 @@ def begin(db_path: str | Path | None, token: str, request: str, *, lane: str = "
             items = [i for i in before.values() if i.get("token") != token and _live(i, now)]
             started = float((before.get(token) or {}).get("started_at") or now)
             items.append({"token": token, "request": request, "started_at": started, "seen_at": now, "lane": lane,
-                          "pid": os.getpid()})
+                          "pid": os.getpid(), "request_id": str(request_id or request_id_of(token, lane))})
             _write_raw(path, items)
         _signal(db_path)
         return True
@@ -220,7 +239,9 @@ def stale(db_path: str | Path | None, now: float | None = None) -> list[dict[str
         try:
             seen = float(i.get("seen_at") or i.get("started_at") or 0.0)
             if now - seen > MAX_AGE_S and _pid_alive(int(i.get("pid") or 0)):
-                out.append({"token": str(i.get("token")), "lane": str(i.get("lane") or ""), "age_s": round(now - seen)})
+                out.append({"token": str(i.get("token")), "lane": str(i.get("lane") or ""), "age_s": round(now - seen),
+                            "request_id": str(i.get("request_id") or request_id_of(str(i.get("token")),
+                                                                                   str(i.get("lane") or "")))})
         except (TypeError, ValueError):
             continue
     return out
@@ -242,7 +263,8 @@ def current(db_path: str | Path | None) -> Acting | None:
                 continue
             live.append(Acting(token=str(i["token"]), request=str(i.get("request") or ""),
                                started_at=float(i.get("started_at") or 0.0), lane=str(i.get("lane") or ""),
-                               pid=pid))
+                               pid=pid, request_id=str(i.get("request_id") or
+                                                       request_id_of(str(i["token"]), str(i.get("lane") or "")))))
         except (TypeError, ValueError):
             continue
     return max(live, key=lambda a: a.started_at) if live else None
@@ -281,4 +303,4 @@ class ActingEvent:
 
 
 __all__ = ["ACTING_FILE", "MAX_AGE_S", "Acting", "ActingEvent", "acting_event_name", "acting_path", "begin", "current",
-           "end", "stale"]
+           "end", "request_id_of", "stale"]
