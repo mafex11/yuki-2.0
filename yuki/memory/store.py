@@ -3240,7 +3240,8 @@ MIGRATIONS: tuple[str, ...] = (
     # - Content-free columns in clear (kind, app key, a calling service's product name, times, levels, code words);
     #   an entity (a page's template value, a playlist name) only encrypted, with a keyed digest for equality. Media
     #   titles are never kept, only their digest ([moments] media_titles).
-    # - timeline gets an index on updated_at: the extractor reads past its cursor every minute.
+    # - timeline gets an index on updated_at (the extractor reads past its cursor every minute) and a partial index on
+    #   its meeting rows by (process, ended_at) (an app's join candidates near a time, without scanning the history).
     # Additive only; one self-contained entry (renumber freely at a merge).
     """
     CREATE TABLE IF NOT EXISTS moments (
@@ -3267,6 +3268,7 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS moments_at ON moments(at);
     CREATE INDEX IF NOT EXISTS moments_kind ON moments(kind, at);
     CREATE INDEX IF NOT EXISTS timeline_updated ON timeline(updated_at);
+    CREATE INDEX IF NOT EXISTS timeline_meeting_rows ON timeline(process, ended_at) WHERE meeting IS NOT NULL;
     """,
 )
 
@@ -10647,6 +10649,17 @@ class Store:
             params.append(float(since))
         return self._write(lambda conn: conn.execute("DELETE FROM moments WHERE " + " AND ".join(clauses),
                                                      params).rowcount)
+
+    def end_open_moments(self, until: float, *, sources: Iterable[str], kinds: Iterable[str], reason: str) -> int:
+        """End the still-open live spans of these sources and kinds (a run that never stopped cleanly) at ``until``
+        (never before their own ``at``), with ``facts.ended = reason`` (a code word); returns how many."""
+        sources, kinds = list(sources), list(kinds)
+        if not sources or not kinds:
+            return 0
+        sql = ("UPDATE moments SET ended_at = max(at, ?), facts = json_set(coalesce(facts, '{}'), '$.ended', ?)"
+               f" WHERE ended_at IS NULL AND source IN ({','.join('?' * len(sources))})"
+               f" AND kind IN ({','.join('?' * len(kinds))})")
+        return self._write(lambda conn: conn.execute(sql, (float(until), str(reason), *sources, *kinds)).rowcount)
 
     def prune_moments(self, before: float) -> int:
         """Delete moments that ended (or, still open, began) before ``before`` (``[moments] keep_days``)."""

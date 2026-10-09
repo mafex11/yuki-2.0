@@ -2161,7 +2161,9 @@ class TimelineRecorder:
             try:
                 import psutil
 
-                facts_for = getattr(self._windows, "_facts_for", None)
+                # the uncached read: this rare scan must not fill the per-pid cache, which this process never prunes
+                facts_for = (getattr(self._windows, "_read_pid_facts", None)
+                             or getattr(self._windows, "_facts_for", None))
                 for pid in psutil.pids() if facts_for is not None else ():
                     aumid, exe = facts_for(pid)
                     if aumid == app_id and exe:

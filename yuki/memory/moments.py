@@ -42,7 +42,8 @@ own. ``mic_spans`` is never a source.
 **Yuki's own runs (D18).** :func:`attribute` stamps ``by='yuki'`` and the run's ``request_id`` on a moment of the run's
 app and kind inside the run's window plus a per-kind lag (:data:`ATTRIBUTION_LAG_S`). The windows come from
 ``skill_runs`` (phase S, migration 41) once it exists; until then live moments take Yuki's acting marker at the time
-they are seen, and page visits the timeline's own ``by_yuki``.
+they are seen, and page visits and call joins the timeline's own ``by_yuki`` (a join whose earliest candidate is a
+stretch begun while Yuki acted is Yuki's: marked, never dropped).
 
 Logs are content-free: kinds, app keys, code words, counts, times and 12-hex digests (``moment``, ``moment_source``,
 ``site_front``), never a title, a name, a link or a host. The new table never appears in the MCP.
@@ -63,7 +64,7 @@ import os
 import threading
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,8 @@ ATTRIBUTION_LAG_S: dict[str, float] = {
 }
 #: The derived refresh runs at most this often (s) unless nudged; the retention pass this often.
 PRUNE_EVERY_S = 6 * 3600.0
+#: A rebuild that failed (a busy database) is tried again this long after, off the loop (s).
+REBUILD_RETRY_S = 600.0
 #: The checkpoint names (``source_checkpoints``, prefix ``moments.``).
 CURSORS = ("calls", "timeline", "messages", "rule", "context")
 
@@ -174,6 +177,9 @@ class Moment:
     seen_at: float | None = None
     #: Encrypted extras (a learned ``spotify:`` link), written into ``facts`` as ciphertext at flush.
     secret_facts: dict[str, str] = field(default_factory=dict)
+    #: RAM only: ``service`` is a product name a call or a verdict gave, so the ``moment`` log line may carry it (a
+    #: user's own label for a site never goes to a log).
+    log_service: bool = True
 
     def key(self) -> tuple[str, int | None, str]:
         return (self.source, self.source_id, self.kind)
@@ -489,10 +495,15 @@ class CallingSites:
         self._verdicts = verdicts
         self._seen = seen_services
 
-    def service(self, app: str, host: str, meeting: str | None) -> str | None:
+    def judge(self, app: str, host: str, meeting: str | None) -> tuple[bool, str | None, str | None]:
+        """``(calling, service, named_by)``: whether the host is a calling site, its name when one is known, and who
+        named it: ``verdict`` (the call evidence's service), ``call`` (the service a seen call of the app named, equal
+        to the row's meeting label) or ``rule`` (the user's own ``[meetings] names`` entry). Never the host, and never
+        the timeline's meeting label on its own (for a site row that label is often the host): a calling site with no
+        name known gives ``(True, None, None)``. Only ``verdict`` and ``call`` names are product names fit for a log."""
         host = (host or "").casefold()
         if not host:
-            return None
+            return False, None, None
         rules = None
         if self._rules is not None:
             try:
@@ -501,17 +512,25 @@ class CallingSites:
                 rules = None
         if rules is not None:
             if rules.never(app, host):
-                return None
+                return False, None, None
             named = rules.match_url(f"https://{host}/")
-            if named:
-                return named
+            if named:   # match_url falls back to the site itself when the user gave no name
+                from yuki.memory.timeline import site_of
+
+                return (True, None, None) if named == site_of(host) else (True, named, "rule")
         found = [e for e in self._verdicts if _host_under(host, e)]
         if found:
             calling, service = self._verdicts[max(found, key=len)]
-            return (service or meeting or host) if calling else None
+            if not calling:
+                return False, None, None
+            return (True, service, "verdict") if service else (True, None, None)
         if meeting and (app, " ".join(meeting.split()).casefold()) in self._seen:
-            return meeting
-        return None
+            return True, meeting, "call"
+        return False, None, None
+
+    def service(self, app: str, host: str, meeting: str | None) -> str | None:
+        """The name of a calling site (None: not one, or no name known)."""
+        return self.judge(app, host, meeting)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +547,8 @@ class _Cand:
     source: str
     source_id: int
     service: str | None
+    by_yuki: bool = False      # a timeline stretch begun while Yuki acted
+    named_by: str | None = None   # who named the service: "call", "verdict", "rule" (CallingSites.judge)
 
     @property
     def seen(self) -> bool:
@@ -553,19 +574,30 @@ def cluster_joins(cands: Sequence[_Cand], gap_s: float = JOIN_GAP_S) -> list[lis
 
 def join_moment(app: str, group: Sequence[_Cand]) -> Moment:
     """One ``call_join`` from a chain of candidates: ``at`` and the source of the earliest; the evidence of the earliest
-    seen candidate (else ``hold``); the first service a seen candidate named (else any)."""
+    seen candidate (else ``hold``); the first service a seen candidate named (else any). Yuki's (D18) when the earliest
+    is a stretch begun while Yuki acted: the join happened inside one of Yuki's runs (``request_id`` then comes from the
+    run windows, :func:`attribute`)."""
     first = min(group, key=lambda c: (c.at, _SOURCE_ORDER.get(c.source, 9), c.source_id))
     seen = sorted((c for c in group if c.seen), key=lambda c: c.at)
-    named = [c.service for c in seen if c.service] or [c.service for c in sorted(group, key=lambda c: c.at)
-                                                       if c.service]
+    named = [c for c in seen if c.service] or [c for c in sorted(group, key=lambda c: c.at) if c.service]
     ended = None if any(c.end is None for c in group) else max(c.end for c in group if c.end is not None)
     facts = {"calls": sum(1 for c in group if c.source == "calls"),
              "timeline": sum(1 for c in group if c.source == "timeline")}
     if seen:
         facts["seen_at"] = round(seen[0].at, 3)
     return Moment(kind="call_join", at=first.at, ended_at=ended, source=first.source, source_id=first.source_id,
-                  app=app, service=named[0] if named else None, evidence=seen[0].evidence if seen else "hold",
-                  facts=facts)
+                  app=app, service=named[0].service if named else None, evidence=seen[0].evidence if seen else "hold",
+                  by="yuki" if first.by_yuki else "user", facts=facts,
+                  log_service=bool(named) and named[0].named_by in ("call", "verdict"))
+
+
+#: The columns the rules read, and nothing more (never a title, a path or another ciphertext): a ``calls`` row ...
+_CALL_COLS = "id, updated_at, app, process, kind, detected_at, ended_at, hold_since, last_alive_at"
+#: ... a timeline row of a page visit ...
+_VISIT_COLS = ("id, started_at, ended_at, state, process, host, page_key, active_s, passive_s, withheld, meeting,"
+               " by_yuki")
+#: ... and a changed timeline row.
+_TL_COLS = "updated_at, " + _VISIT_COLS
 
 
 class Extractor:
@@ -683,66 +715,101 @@ class Extractor:
         except Exception:  # noqa: BLE001
             return []
 
-    def _changed(self, source: str, now: float) -> tuple[list[Any], float]:
-        """Rows of ``calls`` / ``timeline`` written past the cursor (with the overlap), not yet taken."""
-        cursor = self._cursor(source)
-        rows = self.store._query(f"SELECT * FROM {source} WHERE updated_at > ? ORDER BY updated_at, id",
-                                 (cursor - CURSOR_OVERLAP_S,))
+    #: Rows read per query. A rebuild walks its window chunk by chunk (the store's lock is held per chunk only), so its
+    #: memory is bounded by the chunk, never by the length of the history.
+    READ_CHUNK = 1000
+
+    def _changed(self, source: str, floor: float, now: float, *,
+                 full: bool = False) -> Iterator[tuple[list[Any], float]]:
+        """Rows of ``calls`` / ``timeline`` written past the cursor (with the overlap; ``full``: from the start, the
+        stored cursor untouched) that end at or after ``floor``, not yet taken.
+
+        Yields ``(rows, top)`` per chunk of :attr:`READ_CHUNK` rows in ``(updated_at, id)`` order (``top``: the cursor
+        top so far). Only the columns the rules read (:data:`_CALL_COLS`, :data:`_TL_COLS`): never a title or a path."""
+        if source == "calls":
+            cols, end, end_args = _CALL_COLS, "coalesce(ended_at, last_alive_at, ?)", (now,)
+        else:   # "+": the scan follows timeline(updated_at) (its order), never timeline(ended_at)
+            cols, end, end_args = _TL_COLS, "+ended_at", ()
+        sql = (f"SELECT {cols} FROM {source} WHERE updated_at >= ? AND (updated_at > ? OR id > ?) AND {end} >= ?"
+               " ORDER BY updated_at, id LIMIT ?")
+        if full:   # every row up to the newest is read (or ends before the window): the newest is the cursor top
+            cursor = 0.0
+            top = float(self.store._query(f"SELECT max(updated_at) FROM {source}")[0][0] or 0.0)
+        else:
+            cursor = top = self._cursor(source)
         done = self._done[source]
-        fresh, top = [], cursor
-        for r in rows:
-            u = float(r["updated_at"] or 0.0)
-            top = max(top, u)
-            if done.get(int(r["id"])) == u:
-                continue
-            done[int(r["id"])] = u
-            fresh.append(r)
-        floor = top - CURSOR_OVERLAP_S
-        for k in [k for k, u in done.items() if u < floor]:
-            del done[k]
-        return fresh, top
+        u, last_id = cursor - CURSOR_OVERLAP_S, 2**62   # the first chunk: updated_at > u
+        while True:
+            rows = self.store._query(sql, (u, u, last_id, *end_args, floor, self.READ_CHUNK))
+            if not rows:
+                return
+            fresh = []
+            for r in rows:
+                ru = float(r["updated_at"] or 0.0)
+                top = max(top, ru)
+                if done.get(int(r["id"])) == ru:
+                    continue
+                done[int(r["id"])] = ru
+                fresh.append(r)
+            u, last_id = float(rows[-1]["updated_at"] or 0.0), int(rows[-1]["id"])
+            low = top - CURSOR_OVERLAP_S   # only rows inside the next pass's overlap are remembered
+            for k in [k for k, v in done.items() if v < low]:
+                del done[k]
+            yield fresh, top
+            if len(rows) < self.READ_CHUNK:
+                return
 
     # -- refresh -----------------------------------------------------------------
 
-    def refresh(self, now: float | None = None, *, full: bool = False) -> dict[str, int]:
+    def refresh(self, now: float | None = None, *, full: bool = False, since: float | None = None) -> dict[str, int]:
         """Read every source past its cursor and write the derived moments that changed; returns counts. On an error
-        nothing read in this pass counts as taken (the next pass reads it again)."""
+        nothing read in this pass counts as taken (the next pass reads it again) and the stored cursors stay.
+
+        ``full`` (a rebuild): every source from the start of the keep window (or ``since``, when later), chunk by
+        chunk; the stored cursors move only when the whole pass succeeded."""
         done = {k: dict(v) for k, v in self._done.items()}
         sig = self._sig
         try:
-            return self._refresh(now, full=full)
+            return self._refresh(now, full=full, since=since)
         except BaseException:
             self._done, self._sig = done, sig
             raise
 
-    def _refresh(self, now: float | None, *, full: bool) -> dict[str, int]:
+    def _refresh(self, now: float | None, *, full: bool, since: float | None = None) -> dict[str, int]:
         now = self._clock() if now is None else float(now)
         cutoff = self._cutoff(now)
+        floor = max(cutoff, float(since)) if (full and since is not None) else cutoff   # rows ending before: unread
         counts: Counter = Counter()
         rebuild_apps = self._context(now, force=full)
-        calls_rows, calls_top = self._changed("calls", now)
-        tl_rows, tl_top = self._changed("timeline", now)
         windows: dict[str, list[tuple[float, float]]] = defaultdict(list)
-        for r in calls_rows:
-            counts["calls_rows"] += 1
-            at = call_at(float(r["detected_at"]), r["hold_since"])
-            end = r["ended_at"] if r["ended_at"] is not None else (r["last_alive_at"] or now)
-            if (r["kind"] or "call") == "game":
-                counts["game_voice"] += self._game_voice(r, now)
-                continue
-            app = self.identity.key(r["process"], r["app"])
-            if app and float(end) >= cutoff:
-                windows[app].append((at - JOIN_GAP_S, float(end) + JOIN_GAP_S))
-        pages: list[Any] = []
-        for r in tl_rows:
-            counts["timeline_rows"] += 1
-            if float(r["ended_at"]) < cutoff:
-                continue
-            if r["meeting"] and r["process"]:
-                windows[app_key(r["process"]) or ""].append((float(r["started_at"]) - JOIN_GAP_S,
-                                                             float(r["ended_at"]) + JOIN_GAP_S))
-            elif r["host"] and r["state"] in ("present", "away"):
-                pages.append(r)
+        calls_top = None
+        for rows, calls_top in self._changed("calls", floor, now, full=full):
+            for r in rows:
+                counts["calls_rows"] += 1
+                at = call_at(float(r["detected_at"]), r["hold_since"])
+                end = r["ended_at"] if r["ended_at"] is not None else (r["last_alive_at"] or now)
+                if (r["kind"] or "call") == "game":
+                    counts["game_voice"] += self._game_voice(r, now)
+                    continue
+                app = self.identity.key(r["process"], r["app"])
+                if app and float(end) >= cutoff:
+                    windows[app].append((at - JOIN_GAP_S, float(end) + JOIN_GAP_S))
+        tl_top = None
+        visits_before: dict[int, tuple] = {}
+        counts["page"] += 0
+        for rows, tl_top in self._changed("timeline", floor, now, full=full):
+            pages: list[Any] = []
+            for r in rows:
+                counts["timeline_rows"] += 1
+                if r["meeting"] and r["process"]:
+                    windows[app_key(r["process"]) or ""].append((float(r["started_at"]) - JOIN_GAP_S,
+                                                                 float(r["ended_at"]) + JOIN_GAP_S))
+                elif r["host"] and r["state"] in ("present", "away"):
+                    pages.append(r)
+            written, visits_before = self._pages(pages, now, skip=visits_before)   # this chunk's pages, then gone
+            counts["page"] += written
+            for app in list(windows):
+                windows[app] = _merge_spans(windows[app])
         for app in rebuild_apps:
             if app:
                 windows[app] = [(cutoff, now + JOIN_GAP_S)]
@@ -753,27 +820,26 @@ class Extractor:
                 written, deleted = self._rebuild_joins(app, max(lo, cutoff), hi, now)
                 counts["call_join"] += written
                 counts["call_join_deleted"] += deleted
-        counts["page"] += self._pages(pages, now)
-        counts["message_sent"] += self._messages(now, cutoff)
-        if calls_top > self._cursor("calls"):
-            self.store.set_moment_cursor("calls", repr(calls_top))
-        if tl_top > self._cursor("timeline"):
-            self.store.set_moment_cursor("timeline", repr(tl_top))
+        counts["message_sent"] += self._messages(now, cutoff, full=full)
+        for name, top in (("calls", calls_top), ("timeline", tl_top)):
+            if top is not None and (full or top > self._cursor(name)):
+                self.store.set_moment_cursor(name, repr(top))
         self.counters.update(counts)
         return dict(counts)
 
     def rebuild(self, now: float | None = None, *, since: float | None = None) -> dict[str, int]:
-        """Recompute every derived moment from the sources (those with ``at >= since``, default the keep window)."""
+        """Recompute every derived moment from the sources (those with ``at >= since``, default the keep window).
+
+        The sources are read from ``since`` (or the keep window's start) on, chunk by chunk. The stored cursors move
+        only when it succeeded; after a failure the rule checkpoint stays old, so the hub rebuilds again."""
         now = self._clock() if now is None else float(now)
         since = self._cutoff(now) if since is None else float(since)
-        removed = self.store.clear_moments(sources=DERIVED_SOURCES, kinds=DERIVED_KINDS, since=since)
-        for name in ("calls", "timeline", "messages"):
-            self.store.set_moment_cursor(name, "0")
         self._done = {"calls": {}, "timeline": {}}
         self._sig = None
         self._quiet = True   # a rebuild logs its counts once, not each moment
         try:
-            counts = self.refresh(now, full=True)
+            removed = self.store.clear_moments(sources=DERIVED_SOURCES, kinds=DERIVED_KINDS, since=since)
+            counts = self.refresh(now, full=True, since=since)
         finally:
             self._quiet = False
         self.store.set_moment_cursor("rule", str(RULE_VERSION))
@@ -801,25 +867,29 @@ class Extractor:
             end = float(r["ended_at"]) if r["ended_at"] is not None else None
             chain = end if end is not None else float(r["last_alive_at"] or now)
             out.append(_Cand(at=at, end=end, chain_end=max(chain, at), evidence=evidence or "hold", source="calls",
-                             source_id=int(r["id"]), service=r["service"] or None))
+                             source_id=int(r["id"]), service=r["service"] or None,
+                             named_by="call" if r["service"] else None))
         qualifies = app in self._seen_apps or app in self._calls_apps_now
         for r in self.store._query(
                 "SELECT id, started_at, ended_at, state, process, host, meeting, mic_s, by_yuki FROM timeline"
                 " WHERE meeting IS NOT NULL AND process = ? AND started_at < ? AND ended_at > ?"
                 " ORDER BY started_at, id", (app, hi, lo)):
-            if r["by_yuki"] or r["state"] != "present":
-                continue   # Yuki's own stretches never make a habit (D18)
+            if r["state"] != "present":
+                continue
             if r["host"]:
-                service = self._sites.service(app, r["host"], r["meeting"]) if self._sites is not None else None
-                if not service:
+                calling, service, named_by = self._sites.judge(app, r["host"], r["meeting"]) \
+                    if self._sites is not None else (False, None, None)
+                if not calling:
                     continue
                 evidence = "site"
             else:
                 if not (qualifies and (r["mic_s"] or 0) > 0):
                     continue
-                service, evidence = None, "hold"
+                service, named_by, evidence = None, None, "hold"
+            # a stretch begun while Yuki acted (the timeline's acting marker) stays a candidate, marked Yuki's (D18)
             out.append(_Cand(at=float(r["started_at"]), end=float(r["ended_at"]), chain_end=float(r["ended_at"]),
-                             evidence=evidence, source="timeline", source_id=int(r["id"]), service=service))
+                             evidence=evidence, source="timeline", source_id=int(r["id"]), service=service,
+                             by_yuki=bool(r["by_yuki"]), named_by=named_by))
         return out
 
     def _rebuild_joins(self, app: str, lo: float, hi: float, now: float) -> tuple[int, int]:
@@ -874,40 +944,59 @@ class Extractor:
 
     # -- pages ---------------------------------------------------------------------
 
-    _ROW = ("SELECT id, started_at, ended_at, state, process, host, path_ciphertext, page_key, active_s, passive_s,"
-            " withheld, meeting, by_yuki FROM timeline")
+    #: A visit's rows: the columns the page rule reads (the path is read per visit, only when a template is asked).
+    _ROW = "SELECT " + _VISIT_COLS + " FROM timeline"
+
+    def _step(self, r: Any, *, back: bool) -> Any | None:
+        """The present/away row (any app) right before (``back``) or after ``r`` in time, when it goes on with
+        ``r``'s page visit (the same page key, touching); else None."""
+        start = float(r["started_at"])
+        if back:
+            got = self.store._query(self._ROW + " WHERE started_at < ? AND state IN ('present', 'away')"
+                                    " ORDER BY started_at DESC, id DESC LIMIT 1", (start,))
+            if got and got[0]["page_key"] == r["page_key"] and start - float(got[0]["ended_at"]) <= VISIT_GAP_S:
+                return got[0]
+            return None
+        got = self.store._query(self._ROW + " WHERE started_at >= ? AND (started_at > ? OR id > ?)"   # an index range
+                                " AND state IN ('present', 'away') ORDER BY started_at, id LIMIT 1",
+                                (start, start, int(r["id"])))
+        if got and got[0]["page_key"] == r["page_key"] and float(got[0]["started_at"]) - float(r["ended_at"]) <= \
+                VISIT_GAP_S:
+            return got[0]
+        return None
+
+    def _extend(self, rows: Sequence[Any]) -> list[Any]:
+        """A run of rows of one visit walked back past its first row and on past its last (at most 500 each way)."""
+        before: list[Any] = []
+        cur = rows[0]
+        for _ in range(500):
+            cur = self._step(cur, back=True)
+            if cur is None:
+                break
+            before.append(cur)
+        out = before[::-1] + list(rows)
+        for _ in range(500):
+            nxt = self._step(out[-1], back=False)
+            if nxt is None:
+                break
+            out.append(nxt)
+        return out
 
     def _visit(self, r: Any) -> list[Any]:
         """The rows of the page visit ``r`` is in: neighbours (in time, any app) of the same page, touching."""
-        first = r
-        for _ in range(500):
-            prev = self.store._query(self._ROW + " WHERE started_at < ? AND state IN ('present', 'away')"
-                                     " ORDER BY started_at DESC, id DESC LIMIT 1", (float(first["started_at"]),))
-            if not prev or prev[0]["page_key"] != first["page_key"] or \
-                    float(first["started_at"]) - float(prev[0]["ended_at"]) > VISIT_GAP_S:
-                break
-            first = prev[0]
-        rows = [first]
-        for _ in range(500):
-            cur = rows[-1]
-            nxt = self.store._query(self._ROW + " WHERE (started_at > ? OR (started_at = ? AND id > ?))"
-                                    " AND state IN ('present', 'away') ORDER BY started_at, id LIMIT 1",
-                                    (float(cur["started_at"]), float(cur["started_at"]), int(cur["id"])))
-            if not nxt or nxt[0]["page_key"] != cur["page_key"] or \
-                    float(nxt[0]["started_at"]) - float(cur["ended_at"]) > VISIT_GAP_S:
-                break
-            rows.append(nxt[0])
-        return rows
+        return self._extend([r])
 
-    #: Above this many changed page rows (a rebuild), visits are grouped in one ordered pass instead of row by row.
+    #: Above this many changed page rows (a rebuild's chunk), visits are grouped in one ordered pass, not row by row.
     SEQUENTIAL_PAGES = 64
 
     def _visits_span(self, rows: Sequence[Any]) -> list[list[Any]]:
-        """The visits touching ``rows``, grouped in one ordered pass over their time span (the first one walked back)."""
+        """The visits touching ``rows``, grouped in one ordered pass over their time span; the first visit is walked
+        back past the span's start and the last one on past its end, so a visit cut by a chunk's edge is whole."""
         lo = min(float(r["started_at"]) for r in rows) - VISIT_GAP_S
         hi = max(float(r["ended_at"]) for r in rows) + VISIT_GAP_S
-        span = self.store._query(self._ROW + " WHERE state IN ('present', 'away') AND ended_at >= ? AND started_at <= ?"
-                                 " ORDER BY started_at, id", (lo, hi))
+        # the rows that start inside the span (an index range); a visit begun before it is the first group, walked back
+        span = self.store._query(self._ROW + " WHERE state IN ('present', 'away') AND started_at >= ?"
+                                 " AND started_at <= ? ORDER BY started_at, id", (lo, hi))
         groups: list[list[Any]] = []
         for r in span:
             last = groups[-1][-1] if groups else None
@@ -917,35 +1006,48 @@ class Extractor:
             else:
                 groups.append([r])
         if groups:
-            head = self._visit(groups[0][0])
-            if int(head[0]["id"]) != int(groups[0][0]["id"]):
-                groups[0] = head
+            groups[0] = self._extend(groups[0])
+            if len(groups) > 1:
+                groups[-1] = self._extend(groups[-1])
         wanted = {int(r["id"]) for r in rows}
         return [g for g in groups if any(int(x["id"]) in wanted for x in g)]
 
-    def _pages(self, rows: Sequence[Any], now: float) -> int:
+    def _path(self, row_id: int) -> str | None:
+        """One timeline row's page path, decrypted in-process only (for a URL template; never kept or logged)."""
+        got = self.store._query("SELECT path_ciphertext FROM timeline WHERE id = ?", (int(row_id),))
+        return self.store._dec(got[0][0]) if got and got[0][0] else None
+
+    def _pages(self, rows: Sequence[Any], now: float, *, skip: dict[int, tuple] | None = None
+               ) -> tuple[int, dict[int, tuple]]:
+        """Page moments of the visits touching ``rows``; returns (written, {visit's first row id: its shape}).
+        ``skip``: the previous chunk's shapes in the same pass (a visit across a chunk's edge, unchanged since, is
+        written once)."""
         cfg = self._config()
         rows = [r for r in rows if r["host"] and not r["meeting"] and not r["withheld"]]
         if not rows:
-            return 0
+            return 0, {}
         if len(rows) > self.SEQUENTIAL_PAGES:
             visits = self._visits_span(rows)
         else:
             visits = [self._visit(r) for r in rows]
-        done: set[int] = set()
+        skip = skip or {}
+        done: dict[int, tuple] = {}
         out: list[Moment] = []
         for visit in visits:
             first = visit[0]
             if int(first["id"]) in done:
                 continue
-            done.add(int(first["id"]))
+            dwell = sum(float(v["active_s"] or 0.0) + float(v["passive_s"] or 0.0) for v in visit)
+            shape = (len(visit), int(visit[-1]["id"]), float(visit[-1]["ended_at"]), dwell)
+            done[int(first["id"])] = shape
+            if skip.get(int(first["id"])) == shape:
+                continue
             if first["meeting"] or first["withheld"] or not first["host"]:
                 continue
-            dwell = sum(float(v["active_s"] or 0.0) + float(v["passive_s"] or 0.0) for v in visit)
             template = None
             if self.page_entity is not None:
                 try:
-                    path = self.store._dec(first["path_ciphertext"]) or "/"
+                    path = self._path(int(first["id"])) or "/"
                     template = self.page_entity(str(first["host"]), path)   # path read in-process only
                 except Exception:  # noqa: BLE001
                     template = None
@@ -970,38 +1072,52 @@ class Extractor:
             runs = self._runs(min(m.at for m in out), max(m.at for m in out) + ATTRIBUTION_LAG_S["page"])
             out = [attribute(m, runs, now=now) for m in out]
             self.store.save_moments([m.row(self.store.cipher) for m in out])
-        return len(out)
+        return len(out), done
 
     # -- messages sent ---------------------------------------------------------------
 
-    def _messages(self, now: float, cutoff: float) -> int:
-        cursor = int(self._cursor("messages"))
+    def _messages(self, now: float, cutoff: float, *, full: bool = False) -> int:
+        """``message_sent`` from the user's new messages past the cursor (``full``: from the first), chunk by chunk."""
+        cursor = 0 if full else int(self._cursor("messages"))
         top = self.store._query("SELECT max(id) FROM messages")[0][0]
         if top is None or int(top) <= cursor:
             return 0
-        rows = self.store._query(
-            "SELECT m.id, m.thread_id, m.first_seen, m.at, t.process, t.app FROM messages m"
-            " JOIN threads t ON t.id = m.thread_id WHERE m.id > ? AND m.id <= ? AND m.is_me = 1"
-            " AND m.status = 'new' AND m.first_seen >= ? ORDER BY m.id", (cursor, int(top), cutoff))
+        written, last, contacts = 0, cursor, None
+        while True:
+            rows = self.store._query(
+                "SELECT m.id, m.thread_id, m.first_seen, m.at, t.process, t.app FROM messages m"
+                " JOIN threads t ON t.id = m.thread_id WHERE m.id > ? AND m.id <= ? AND m.is_me = 1"
+                " AND m.status = 'new' AND m.first_seen >= ? ORDER BY m.id LIMIT ?",
+                (last, int(top), cutoff, self.READ_CHUNK))
+            if not rows:
+                break
+            last = int(rows[-1]["id"])
+            if contacts is None:
+                contacts = self._contacts()
+            written += self._message_moments(rows, contacts, now)
+            if len(rows) < self.READ_CHUNK:
+                break
+        self.store.set_moment_cursor("messages", str(int(top)))
+        return written
+
+    def _message_moments(self, rows: Sequence[Any], contacts: dict[int, int], now: float) -> int:
         out: list[Moment] = []
-        if rows:
-            contacts = self._contacts()
-            for r in rows:
-                app = app_key(r["process"]) or app_key(r["app"]) or None
-                facts: dict[str, Any] = {"thread_id": int(r["thread_id"])}
-                if r["thread_id"] in contacts:
-                    facts["contact_id"] = contacts[r["thread_id"]]
-                if r["at"] is not None:
-                    facts["label_lag_s"] = round(float(r["first_seen"]) - float(r["at"]), 1)
-                out.append(Moment(kind="message_sent", at=float(r["first_seen"]), source="messages",
-                                  source_id=int(r["id"]), app=app, entity=f"thread:{int(r['thread_id'])}",
-                                  evidence="capture", facts=facts))
+        for r in rows:
+            app = app_key(r["process"]) or app_key(r["app"]) or None
+            facts: dict[str, Any] = {"thread_id": int(r["thread_id"])}
+            if r["thread_id"] in contacts:
+                facts["contact_id"] = contacts[r["thread_id"]]
+            if r["at"] is not None:
+                facts["label_lag_s"] = round(float(r["first_seen"]) - float(r["at"]), 1)
+            out.append(Moment(kind="message_sent", at=float(r["first_seen"]), source="messages",
+                              source_id=int(r["id"]), app=app, entity=f"thread:{int(r['thread_id'])}",
+                              evidence="capture", facts=facts))
+        if out:
             runs = self._runs(min(m.at for m in out), max(m.at for m in out) + ATTRIBUTION_LAG_S["message_sent"])
             out = [attribute(m, runs, now=now) for m in out]
             self.store.save_moments([m.row(self.store.cipher) for m in out])
             for m in out:
                 self._log_moment(m, now)
-        self.store.set_moment_cursor("messages", str(int(top)))
         return len(out)
 
     def _contacts(self) -> dict[int, int]:
@@ -1065,9 +1181,17 @@ def _code_facts(facts: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _media_key(session: dict[str, Any]) -> int:
+    """A media session's key among the open spans: a RAM-only hash (salted per process) of the app id and title the
+    timeline's read reported, so a stop finds its start whatever app the id resolved to at either read."""
+    return hash((str(session.get("app_id") or ""), str(session.get("title") or "")))
+
+
 def _log_moment(log: Callable[..., Any], m: Moment, now: float) -> None:
-    """One content-free ``moment`` line (kinds, app keys, code words, a 12-hex digest; never the entity)."""
-    fields: dict[str, Any] = dict(kind=m.kind, app=m.app, service=m.service, by=m.by, request_id=m.request_id,
+    """One content-free ``moment`` line (kinds, app keys, code words, a 12-hex digest; never the entity; ``service``
+    only when a call or a verdict named it, never a host or the user's own label)."""
+    fields: dict[str, Any] = dict(kind=m.kind, app=m.app, service=m.service if m.log_service else None, by=m.by,
+                                  request_id=m.request_id,
                                   evidence=m.evidence, means=m.means, lag_s=round(max(0.0, now - m.at), 1),
                                   entity_digest=log_digest(m.entity_digest))
     if m.kind == "volume_change":
@@ -1190,9 +1314,11 @@ class MomentHub:
             acting_fn = lambda: _acting.current(db_path)   # noqa: E731
         self._acting_fn = acting_fn
         self._lock = threading.Lock()
-        self._media_open: dict[tuple[str, str], tuple[int, str | None]] = {}
-        self._media_seen_once = False
-        self._site_open: dict[int, tuple[str, int]] = {}     # hwnd -> (host, source_id)
+        #: Media playing: a RAM-only hash of the session's (app id, title) -> (source_id, app, the start's facts). Keyed
+        #: by what the timeline's media read reports, never by the app it resolves (that can change between reads).
+        self._media_open: dict[int, tuple[int, str | None, dict[str, Any]]] = {}
+        self._site_open: dict[int, tuple[str, int, dict[str, Any]]] = {}     # hwnd -> (host, source_id, facts)
+        self._retry_at = 0.0
         self._front_subs: list[Callable[..., Any]] = []
         self._media_subs: list[Callable[..., Any]] = []
         self._nudged = threading.Event()
@@ -1245,15 +1371,37 @@ class MomentHub:
     # -- the service's beat ----------------------------------------------------------
 
     def start(self, now: float | None = None) -> None:
-        """Rebuild the derived moments once, off the loop, when the rules changed (or on the first start)."""
+        """End the live spans a previous run left open (it stopped without :meth:`stop`); rebuild the derived moments
+        once, off the loop, when the rules changed (or on the first start)."""
         if self._on() is None:
             return
+        self._end_left_open()
         try:
             rule = self.store.moment_cursor("rule")
         except Exception:  # noqa: BLE001
             rule = None
         if rule == str(RULE_VERSION):
             return
+        self._start_rebuild()
+
+    def _end_left_open(self) -> None:
+        """Live spans still open from a run that never stopped cleanly end when that run was last seen alive (its last
+        present or away stretch's end), marked ``ended=restart``."""
+        try:
+            last = self.store._query("SELECT ended_at FROM timeline WHERE state IN ('present', 'away')"
+                                     " ORDER BY ended_at DESC LIMIT 1")
+            n = self.store.end_open_moments(float(last[0][0]) if last else 0.0, sources=("media", "site"),
+                                            kinds=("media_play", "site_front"), reason="restart")
+            if n:
+                self._log("moment_source", source="restart", ended=n)
+        except Exception as exc:  # noqa: BLE001
+            self.errors += 1
+            self._log("error", where="moments.end_open", error=type(exc).__name__)
+
+    def _start_rebuild(self) -> None:
+        """The one-off rebuild thread. On a failure (a busy database) the rule checkpoint stays old and the stored
+        cursors stay where they were; the beat skips its refresh meanwhile and tries again after
+        :data:`REBUILD_RETRY_S`, again off the loop."""
         self._backfill_state = "running"
 
         def run() -> None:
@@ -1264,6 +1412,7 @@ class MomentHub:
                 self._log("moment_source", source="rebuild", rule=RULE_VERSION,
                           ms=round((time.perf_counter() - t0) * 1000), **{k: v for k, v in counts.items() if v})
             except Exception as exc:  # noqa: BLE001
+                self._retry_at = self._clock() + REBUILD_RETRY_S
                 self._backfill_state = "error"
                 self.errors += 1
                 self._log("error", where="moments.rebuild", error=type(exc).__name__)
@@ -1296,6 +1445,10 @@ class MomentHub:
                 self.errors += 1
                 self._log("error", where="moments.flush", error=type(exc).__name__)
             running = self._backfill is not None and self._backfill.is_alive()
+            if not running and self._backfill_state == "error" and now >= self._retry_at:
+                self._start_rebuild()
+                running = True
+            running = running or self._backfill_state == "error"   # no incremental pass until the rebuild succeeded
             if not running and (self._nudged.is_set() or now >= self._next_refresh):
                 self._nudged.clear()
                 self._next_refresh = now + cfg.refresh_s
@@ -1322,8 +1475,19 @@ class MomentHub:
         finally:
             self.cpu_s += time.thread_time() - t0
 
-    def stop(self) -> None:
-        """Write what is queued (the service is stopping)."""
+    def stop(self, now: float | None = None) -> None:
+        """The service is stopping: the open live spans (media playing, a calling site in front) end now, marked
+        ``ended=stop`` (nothing was seen after it), and the queue is written."""
+        at = self._clock() if now is None else float(now)
+        with self._lock:
+            media, self._media_open = list(self._media_open.values()), {}
+            sites, self._site_open = list(self._site_open.values()), {}
+        for key, _app, f in media:
+            self.writer.put(Moment(kind="media_play", at=at, source="media", source_id=key, ended_at=at, partial=True,
+                                   facts={**f, "ended": "stop"}))
+        for _host, key, f in sites:
+            self.writer.put(Moment(kind="site_front", at=at, source="site", source_id=key, ended_at=at, partial=True,
+                                   facts={**f, "ended": "stop"}))
         try:
             self.writer.flush()
         except Exception:  # noqa: BLE001
@@ -1383,32 +1547,33 @@ class MomentHub:
         try:
             runs = self._runs(at - ATTRIBUTION_LAG_S["media_play"] - 3600.0, at) if started else []
             cipher = self.store.cipher
+            for s in stopped:   # first: a session that stops and starts again in one read is ended, then begun
+                with self._lock:
+                    found = self._media_open.pop(_media_key(s), None)
+                if found is not None:
+                    self.writer.put(Moment(kind="media_play", at=at, source="media", source_id=found[0],
+                                           ended_at=at, partial=True))
             for s in started:
                 app = s.get("app") or None
                 title = str(s.get("title") or "")
                 digest = cipher.digest("moment", "media_play", app or "", title) if title else None
                 keep = bool(cfg.media_titles and title and not self._withheld_lately(app, at))
                 key = self.writer.key(at)
+                f: dict[str, Any] = {"initial": True} if facts.get("initial") else {}
                 m = Moment(kind="media_play", at=at, source="media", source_id=key, app=app, entity=title if keep else None,
-                           keep_entity=keep, entity_digest=digest, evidence="poll",
-                           facts={"initial": True} if facts.get("initial") else {})
+                           keep_entity=keep, entity_digest=digest, evidence="poll", facts=dict(f))
                 if by_yuki:
                     m.by, m.request_id = "yuki", request_id
                 m = attribute(m, runs, now=at)
                 with self._lock:
-                    self._media_open[(str(s.get("app_id") or ""), digest or "")] = (key, app)
+                    old = self._media_open.pop(_media_key(s), None)   # a start never stopped: that one ends here
+                    self._media_open[_media_key(s)] = (key, app, f)
                     while len(self._media_open) > self.MAX_OPEN:   # a stop never seen: forget the oldest
                         self._media_open.pop(next(iter(self._media_open)))
+                if old is not None:
+                    self.writer.put(Moment(kind="media_play", at=at, source="media", source_id=old[0], ended_at=at,
+                                           partial=True))
                 self.writer.put(m)
-            for s in stopped:
-                title = str(s.get("title") or "")
-                app = s.get("app") or None
-                digest = cipher.digest("moment", "media_play", app or "", title) if title else None
-                with self._lock:
-                    found = self._media_open.pop((str(s.get("app_id") or ""), digest or ""), None)
-                if found is not None:
-                    self.writer.put(Moment(kind="media_play", at=at, source="media", source_id=found[0],
-                                           ended_at=at, partial=True))
         except Exception as exc:  # noqa: BLE001
             self.errors += 1
             self._log("error", where="moments.media", error=type(exc).__name__)
@@ -1441,7 +1606,7 @@ class MomentHub:
         with self._lock:
             gone = [h for h in self._site_open if (only_hwnd is None or h == only_hwnd) and h != keep_hwnd]
             ended = [self._site_open.pop(h) for h in gone]
-        for _host, key in ended:
+        for _host, key, _facts in ended:
             self.writer.put(Moment(kind="site_front", at=at, source="site", source_id=key, ended_at=at, partial=True))
 
     def site(self, screen: dict[str, Any]) -> None:
@@ -1471,15 +1636,18 @@ class MomentHub:
             self.inputs["site"] += 1
             app = app_key(str(screen.get("process") or "")) or None
             key = self.writer.key(at)
+            service = " ".join(str(service).split())[:40]
+            if service.casefold() in (host, host[4:] if host.startswith("www.") else host):
+                service = None   # a calling site with no product name known: never its host (logs carry no host)
             m = Moment(kind="site_front", at=at, source="site", source_id=key, app=app,
-                       service=" ".join(str(service).split())[:40], evidence="site",
+                       service=service, evidence="site",
                        facts={"sighting": "first" if open_ is None else "again"})
             yuki, request_id = self._acting()
             if yuki:
                 m.by, m.request_id = "yuki", request_id
             m = attribute(m, self._runs(at - 3600.0, at), now=at)
             with self._lock:
-                self._site_open[hwnd] = (host, key)
+                self._site_open[hwnd] = (host, key, dict(m.facts))
                 while len(self._site_open) > self.MAX_OPEN:
                     self._site_open.pop(next(iter(self._site_open)))
             self.writer.put(m)

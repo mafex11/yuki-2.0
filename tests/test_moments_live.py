@@ -294,8 +294,9 @@ def _recorder(store, tmp_path, windows, *, front=None, media=None, facts_for=Non
     rec._procs = SimpleNamespace(get=lambda pid: next(f for p, f, _ in windows.values() if p == pid))
     ns = dict(is_user_window=lambda h: True, process_package_ids=lambda pid: ((aumids or {}).get(pid, ""), ""),
               start_menu_index=lambda: None)
-    if facts_for is not None:
-        ns["_facts_for"] = facts_for
+    if facts_for is not None:   # the uncached read; the cached one fills a per-pid cache nobody prunes here
+        ns["_read_pid_facts"] = facts_for
+        ns["_facts_for"] = lambda pid: pytest.fail("the cached per-pid read")
     rec._windows = SimpleNamespace(**ns)
     rec._hook_names = lambda hwnd: None
     rec._unhook_names = lambda: None
@@ -458,3 +459,88 @@ def test_footprint_of_an_hour_of_synthetic_events(store):
     tracemalloc.stop()
     assert peak < 15 * 2**20                     # < 15 MB (B.1)
     assert cpu / 3600.0 < 0.01                   # < 1% of one core over the simulated hour (generous on a test box)
+
+
+# -- review round 1: spans that end, a rebuild that fails, no host as a service ----------------------------------------
+
+
+def test_a_media_stop_finds_its_start_whatever_app_the_session_resolved_to(store):
+    h = hub(store)
+    aumid = "pkg.example_x!app"
+    h.on_media_change([{"app_id": aumid, "app": "pkg.example_x!app", "title": SECRETS[0]}], [], at=10.0, initial=True)
+    h.on_media_change([], [{"app_id": aumid, "app": "spotify", "title": SECRETS[0]}], at=20.0)   # learned meanwhile
+    h.beat(21.0)
+    row = store.moments_between(kinds=["media_play"])[0]
+    assert row["ended_at"] == 20.0 and h.stats()["media_open"] == 0
+    h.on_media_change([{"app_id": aumid, "app": "spotify", "title": "b"}], [], at=30.0)
+    h.on_media_change([{"app_id": aumid, "app": "spotify", "title": "b"}], [], at=40.0)   # a start never stopped
+    h.beat(41.0)
+    rows = store.moments_between(kinds=["media_play"])
+    assert [(r["at"], r["ended_at"]) for r in rows] == [(10.0, 20.0), (30.0, 40.0), (40.0, None)]
+
+
+def test_stop_ends_open_spans_and_the_next_start_ends_what_a_crash_left_open(store):
+    from yuki.memory.store import TimelineRow
+
+    h = hub(store, calling=lambda host: "Google Meet")
+    h.on_media_change([{"app_id": "a", "app": "spotify", "title": "t"}], [], at=10.0, initial=True)
+    h.site({"process": "zen", "hwnd": 7, "host": "meet.google.com", "blocked": "blocked_host", "at": 12.0})
+    h.beat(13.0)
+    h.stop(now=30.0)
+    got = {r["kind"]: (r["ended_at"], r["facts"]) for r in store.moments_between()}
+    assert got == {"media_play": (30.0, {"initial": True, "ended": "stop"}),
+                   "site_front": (30.0, {"sighting": "first", "ended": "stop"})}
+    assert h.stats()["media_open"] == 0 and h.stats()["site_open"] == 0
+    crashed = hub(store)
+    crashed.on_media_change([{"app_id": "a", "app": "spotify", "title": "u"}], [], at=40.0)
+    crashed.beat(41.0)                                    # ... and the process dies: no stop()
+    store.save_timeline(TimelineRow(
+        id=None, started_at=41.0, ended_at=55.0, state="present", process="code", app="Code", title=None, host=None,
+        path=None, page_key=None, active_s=14, passive_s=0, away_s=0, media_s=0, media_other={}, withheld=None,
+        segments=1, fullscreen=False, meeting=None, mic_s=0, by_yuki=False, yuki_request=None))
+    sink = LogSink()
+    nxt = hub(store, log=sink)
+    nxt.start()
+    if nxt._backfill is not None:
+        nxt._backfill.join(10)
+    row = [r for r in store.moments_between(kinds=["media_play"]) if r["at"] == 40.0][0]
+    assert row["ended_at"] == 55.0 and row["facts"]["ended"] == "restart"   # last seen alive, never "now"
+    assert {"source": "restart", "ended": 1} in sink.of("moment_source")
+    assert store.end_open_moments(99.0, sources=["media"], kinds=["media_play"], reason="restart") == 0
+
+
+def test_a_failed_rebuild_is_retried_off_the_loop_and_the_loop_waits_for_it(store):
+    clock = Clock(1_790_000_000.0)
+    store.start_call(app="Zen", process="zen", via="screen", at=clock.t - 600)
+    h = hub(store, clock=clock)
+    h.extractor.refresh(clock.t)
+    cursors = {n: store.moment_cursor(n) for n in ("calls", "timeline", "messages")}
+    store.set_moment_cursor("rule", "0")
+    real = h.extractor._rebuild_joins
+    h.extractor._rebuild_joins = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("database is locked"))
+    h.start()
+    h._backfill.join(10)
+    assert h.stats()["rebuild"] == "error" and store.moment_cursor("rule") == "0"
+    assert {n: store.moment_cursor(n) for n in ("calls", "timeline", "messages")} == cursors
+    first = h._backfill
+    h.extractor._rebuild_joins = real
+    h.beat(clock.t + 1)                                   # before the retry: no full read on the loop, no rebuild
+    assert h.refreshes == 0 and h._backfill is first
+    clock.t += M.REBUILD_RETRY_S + 1
+    h.beat(clock.t)                                       # the retry, on its own thread again
+    assert h._backfill is not first and h.refreshes == 0
+    h._backfill.join(10)
+    assert h.stats()["rebuild"] == "done" and store.moment_cursor("rule") == str(M.RULE_VERSION)
+    assert len(store.moments_between(kinds=["call_join"])) == 1
+    h.beat(clock.t + 1)
+    assert h.refreshes == 1
+
+
+def test_a_calling_service_that_answers_with_the_host_gives_no_service(store):
+    sink = LogSink()
+    h = hub(store, log=sink, calling=lambda host: host[4:] if host.startswith("www.") else host)
+    h.site({"process": "zen", "hwnd": 7, "host": "www.meet.google.com", "blocked": "blocked_host", "at": 10.0})
+    h.beat(11.0)
+    row = store.moments_between(kinds=["site_front"])[0]
+    assert row["service"] is None and "meet.google.com" not in cleartext(store)
+    assert "meet.google.com" not in repr(sink.records)

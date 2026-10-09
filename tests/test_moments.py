@@ -72,7 +72,7 @@ def test_migration_40_adds_the_moments_table_and_is_safe_to_open_again(tmp_path)
         assert set(Store.MOMENT_COLUMNS) | {"id"} == cols
         idx = {r[1] for r in s._query("PRAGMA index_list(moments)")}
         assert {"moments_at", "moments_kind"} <= idx
-        assert "timeline_updated" in {r[1] for r in s._query("PRAGMA index_list(timeline)")}
+        assert {"timeline_updated", "timeline_meeting_rows"} <= {r[1] for r in s._query("PRAGMA index_list(timeline)")}
     finally:
         s.close()
 
@@ -237,12 +237,18 @@ def test_a_packaged_apps_call_row_is_the_timelines_app(store):
         ("slack", "screen", 1, 1)]
 
 
-def test_yukis_own_stretches_never_make_a_join(store):
+def test_yukis_own_stretches_make_joins_marked_yukis(store):
+    """D18: a meeting stretch begun while Yuki acted is a join marked Yuki's (never dropped: a real join seen only by
+    the timeline stays); a user's join right after Yuki's stretch, in the same chain, is Yuki's too (it began inside
+    the run); a user's own stretch is the user's."""
     call(store, "zen", "screen", T0 - 86400, end=T0 - 86000)
     tl(store, "zen", T0, T0 + 300, meeting="Zen", mic_s=300.0, by_yuki=True)
+    call(store, "zen", "screen", T0 + 60, end=T0 + 900)
     tl(store, "zen", T0 + 7200, T0 + 7500, meeting="Zen", mic_s=300.0, state="away")
+    tl(store, "zen", T0 + 9000, T0 + 9300, meeting="Zen", mic_s=300.0)
     extractor(store).rebuild()
-    assert [round(m["at"] - T0) for m in joins(store)] == [-86400]
+    got = [(round(m["at"] - T0), m["by"], m["evidence"], m["facts"]["calls"]) for m in joins(store)]
+    assert got == [(-86400, "user", "screen", 1), (0, "yuki", "screen", 1), (9000, "user", "hold", 0)]
 
 
 def test_user_meeting_rules_decide_sites_first(store, tmp_path):
@@ -483,3 +489,148 @@ def test_cli_stats_on_a_copy_and_a_database_before_migration_40(tmp_path, capsys
     assert M.main(["rebuild", "--db", str(tmp_path / "new.db")]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["counts"]["call_join"] == 1 and out["table"]["kinds"] == {"call_join": 1}
+
+
+# -- review round 1: a bounded rebuild, Yuki's joins, no host in a log -------------------------------------------------
+
+_TL_INSERT = ("INSERT INTO timeline(started_at, ended_at, state, process, app, title_ciphertext, host,"
+              " path_ciphertext, page_key, active_s, passive_s, away_s, media_s, media_other, withheld, segments,"
+              " updated_at, fullscreen, meeting, mic_s, by_yuki) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+
+def bulk_tl(store, rows, *, title_bytes=0):
+    """Timeline rows in one transaction: ``(start, end, process, host, path, meeting, mic_s, state)`` each (updated_at =
+    end, as the recorder writes it). ``title_bytes``: a stand-in title ciphertext that size (never read here)."""
+    filler = "x" * title_bytes if title_bytes else None
+    vals = []
+    for start, end, process, host, path, meeting, mic_s, state in rows:
+        key = store.timeline_key(process, host, path, None, None, meeting=meeting)
+        vals.append((start, end, state, process, process.title(), filler, host, store._enc(path) if path else None, key,
+                     end - start, 0.0, 0.0, 0.0, None, None, 1, end, 0, meeting, mic_s, 0))
+    store._write(lambda c: c.executemany(_TL_INSERT, vals))
+
+
+def history(start, n):
+    """``n`` invented rows from ``start``: browser visits of 1 to 5 rows of one page (present and away), other apps in
+    between, a Meet stretch every 97 rows; one long visit (40 rows) that any chunk edge cuts."""
+    rows, t, i = [], start, 0
+    while len(rows) < n:
+        if i % 97 == 0:
+            rows.append((t, t + 400, "zen", "meet.google.com", "/abc", "Google Meet", 400.0, "present"))
+            t += 401
+        span = 40 if i == 7 else 1 + (i * 7) % 5
+        page = f"/watch?v=v{i % 23}" if i % 3 else f"/p{i}"
+        for k in range(span):
+            d = 30.0 + (i * 13 + k) % 120
+            rows.append((t, t + d, "chrome", "www.youtube.com", page, None, 0.0, "away" if k % 2 else "present"))
+            t += d + 1.0
+        rows.append((t, t + 50, "code", None, None, None, 0.0, "present"))
+        t += 61.0
+        i += 1
+    return rows[:n]
+
+
+def snap_all(store):
+    return sorted((m["kind"], m["app"], m["at"], m["ended_at"], m["evidence"], m["source"], m["source_id"], m["value"],
+                   m["by"], m["service"], m["entity_digest"], json.dumps(m["facts"], sort_keys=True))
+                  for m in store.moments_between())
+
+
+def test_a_rebuild_reads_chunk_by_chunk_and_gives_what_one_read_gives(store):
+    call(store, "zen", "screen", T0 + 500, end=T0 + 900, service="Google Meet")
+    bulk_tl(store, history(T0, 900))
+    whole = extractor(store, page_entity=yt)
+    whole.READ_CHUNK = 100_000
+    whole.rebuild()
+    one = snap_all(store)
+    assert {m[0] for m in one} == {"call_join", "page"} and len(one) > 50
+    for chunk, sequential in ((7, 3), (50, 64), (333, 10_000)):   # chunk edges everywhere, span and row-by-row paths
+        ex = extractor(store, page_entity=yt)
+        ex.READ_CHUNK, ex.SEQUENTIAL_PAGES = chunk, sequential
+        ex.rebuild()
+        assert snap_all(store) == one, (chunk, sequential)
+    assert ex.refresh().get("page", 0) == 0          # nothing new after the rebuild: nothing written
+
+
+def test_a_rebuild_reads_only_the_window_and_only_the_columns_the_rules_use(store, monkeypatch):
+    old = T0 + 30 * 86400 - 200 * 86400               # far outside the 90-day window
+    bulk_tl(store, history(old, 300) + history(T0, 300), title_bytes=500)
+    asked: list[tuple[str, int, list]] = []
+    real = store._query
+
+    def spy(sql, params=()):
+        rows = real(sql, params)
+        asked.append((sql, len(rows), rows))
+        return rows
+
+    monkeypatch.setattr(store, "_query", spy)
+    ex = extractor(store, page_entity=None)
+    ex.READ_CHUNK = 64
+    ex.rebuild()
+    timeline_reads = [(s, n, rows) for s, n, rows in asked if " FROM timeline" in s]
+    assert timeline_reads and not any("SELECT *" in s or "title_ciphertext" in s for s, _n, _r in timeline_reads)
+    assert not any("path_ciphertext" in s for s, _n, _r in timeline_reads)   # no template asked: no path read
+    scans = [(n, rows) for s, n, rows in timeline_reads if s.startswith("SELECT updated_at, id, started_at")]
+    assert scans and max(n for n, _r in scans) <= 64
+    cutoff = T0 + 30 * 86400 - 90 * 86400
+    assert all(float(r["ended_at"]) >= cutoff for _n, rows in scans for r in rows)
+    asked.clear()
+    ex2 = extractor(store, page_entity=yt)
+    ex2.rebuild()
+    paths = [n for s, n, _r in asked if "path_ciphertext" in s]
+    assert paths and set(paths) == {1}                 # a template asked: one row's path per visit, nothing more
+
+
+def test_a_rebuilds_memory_does_not_grow_with_the_history(tmp_path):
+    import tracemalloc
+
+    peaks = []
+    for n in (2000, 8000):
+        s = Store.open(tmp_path / f"h{n}.db")
+        try:
+            bulk_tl(s, history(T0 + 30 * 86400 - 80 * 86400, n), title_bytes=2000)   # 2 kB of ciphertext a row
+            ex = M.Extractor(s, is_game=is_game, runs_fn=lambda lo, hi: [], clock=lambda: T0 + 30 * 86400)
+            ex.READ_CHUNK = 500
+            tracemalloc.start()
+            ex.rebuild()
+            peaks.append(tracemalloc.get_traced_memory()[1])
+            tracemalloc.stop()
+        finally:
+            s.close()
+    assert peaks[1] < 6 * 2**20, peaks                 # every row at once would be > 16 MB of ciphertext alone
+    assert peaks[1] < 1.6 * peaks[0] + 2**20, peaks    # 4x the history, about the same peak
+
+
+def test_a_failed_rebuild_keeps_the_stored_cursors(store, monkeypatch):
+    call(store, "zen", "screen", T0 + 100, end=T0 + 400)
+    ex = extractor(store)
+    ex.refresh()
+    before = {n: store.moment_cursor(n) for n in ("calls", "timeline", "messages")}
+    assert before["calls"] not in (None, "0")
+    monkeypatch.setattr(ex, "_rebuild_joins", lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("busy")))
+    store.set_moment_cursor("rule", "0")
+    with pytest.raises(sqlite3.OperationalError):
+        ex.rebuild()
+    assert {n: store.moment_cursor(n) for n in ("calls", "timeline", "messages")} == before
+    assert store.moment_cursor("rule") == "0"          # the hub rebuilds again
+
+
+def test_a_calling_site_with_no_product_name_gives_no_service_and_no_host_in_a_log(store, tmp_path):
+    from yuki.memory.timeline import MeetingRules
+
+    store.set_nudge_state(M.SITE_VERDICTS_STATE, json.dumps({"calls.example.org": [True, ""]}))
+    tl(store, "zen", T0, T0 + 600, host="calls.example.org", meeting="calls.example.org", mic_s=600.0)
+    tl(store, "zen", T0 + 86400, T0 + 86400 + 600, host="talk.example.net", meeting="talk.example.net", mic_s=60.0)
+    tl(store, "zen", T0 + 2 * 86400, T0 + 2 * 86400 + 600, host="room.example.io", meeting="room.example.io",
+       mic_s=60.0)
+    rules = MeetingRules.from_dict({"always_sites": ["talk.example.net", "room.example.io"],
+                                    "names": {"room.example.io": "Weekly Sync with Priya"}})
+    lines = []
+    ex = extractor(store, meeting_rules=lambda: rules, log=lambda t, **f: lines.append((t, f)))
+    ex.refresh()                                          # not a rebuild: each new join logs a line
+    assert [(m["service"], m["evidence"]) for m in joins(store)] == [
+        (None, "site"), (None, "site"), ("Weekly Sync with Priya", "site")]
+    text = json.dumps(lines)
+    assert len([t for t, _f in lines if t == "moment"]) == 3
+    for secret in ("calls.example.org", "talk.example.net", "room.example.io", "Weekly Sync with Priya"):
+        assert secret not in text
