@@ -74,9 +74,9 @@ def test_the_defaults_are_the_users_caps():
 
 def test_no_call_can_take_a_run_past_the_cost_cap():
     caps = H.Caps(0.05, 10)
-    stub = Stub(GOOD, cost=0.02, estimate=(0.001, 0.02))
+    stub = Stub(GOOD, cost=0.02, estimate=(0.001, 0.005))   # bills 4x its own worst case: the plan fits ($0.04)
     out = H.run_requests(FIX, stub, caps, repeat=2)
-    assert caps.spent <= 0.05 + 1e-9 and len(stub.calls) == 2
+    assert caps.spent <= 0.05 + 1e-9 and len(stub.calls) == 2   # the 3rd call is checked at the largest charge
     assert out["stopped"].startswith("the cost cap") and out["result"] == "incomplete"
 
 
@@ -110,10 +110,107 @@ def test_the_planned_spend_of_25_fixtures_twice_fits_the_cap():
     assert H.Caps().refusal(plan["expected_usd"], plan["expected_s"]) is None
 
 
+class Billed:
+    """A resolver that bills every call but reports no cost (or reports something that is not a cost), or raises after
+    the call was billed; no ``estimate_usd``, so the list-price estimate applies."""
+
+    def __init__(self, how):
+        self.how, self.calls = how, 0
+
+    def resolve(self, words, at):
+        self.calls += 1
+        if self.how == "raises":
+            raise TimeoutError("after the call was billed")
+        answer = {"skill": "volume", "slots": {}}
+        return answer if self.how == "missing" else {**answer, "cost_usd": self.how}
+
+
+def _many(n=25):
+    return [H.Fixture(f"f{i}", "turn spotify down a little bit please", 0.0, "volume", {}) for i in range(n)]
+
+
+@pytest.mark.parametrize("how", ["missing", "raises", None, "0.01", float("nan"), True])
+def test_a_call_that_reports_no_cost_is_charged_its_worst_case(how):
+    fx = _many()
+    worst = H.default_estimate(fx[0].words)[1]
+    caps = H.Caps()
+    out = H.run_requests(fx, Billed(how), caps, repeat=2)
+    assert caps.calls == 50 and caps.spent == pytest.approx(50 * worst) and caps.spent <= 3.0
+    assert caps.spent == pytest.approx(out["plan"]["worst_usd"], abs=1e-3)
+    if how != "raises":
+        assert out["unreported_cost_calls"] == 50
+        assert "counted at its worst case" in "\n".join(H.requests_text(out))
+
+
+@pytest.mark.parametrize("how", ["missing", "raises"])
+def test_repeat_10_of_a_resolver_without_costs_is_refused_up_front(how):
+    stub = Billed(how)
+    out = H.run_requests(_many(), stub, H.Caps(), repeat=10)
+    assert out["plan"]["worst_usd"] > 3.0 and out["plan"]["expected_usd"] < 3.0
+    assert out["result"] == "refused" and "most it could cost" in out["refusal"] and stub.calls == 0
+
+
+@pytest.mark.parametrize("how", ["missing", "raises", "0.01"])
+def test_the_in_code_cap_stops_a_run_even_without_the_up_front_check(how, monkeypatch):
+    monkeypatch.setattr(H.Caps, "refusal", lambda self, *a, **k: None)      # as if the up-front check were gone
+    fx = _many()
+    worst = H.default_estimate(fx[0].words)[1]
+    caps = H.Caps()
+    stub = Billed(how)
+    out = H.run_requests(fx, stub, caps, repeat=10)
+    assert caps.spent <= 3.0 and stub.calls == int(3.0 // worst) and stub.calls < 250
+    assert out["stopped"].startswith("the cost cap") and out["result"] == "incomplete"
+
+
+def test_what_a_call_is_charged():
+    caps = H.Caps()
+    assert caps.add(0.01, 0.05) == 0.01
+    assert caps.add(-1.0, 0.05) == 0.0                     # never below 0
+    assert caps.add(None, 0.05) == 0.05 and caps.add("0.01", 0.05) == 0.05 and caps.add(True, 0.05) == 0.05
+    assert caps.add(float("inf"), 0.05) == 0.05
+    assert caps.add(0.2, 0.05) == 0.2 and caps.largest == 0.2
+    with pytest.raises(H.CapReached):
+        H.Caps(0.5).before_call(0.6)
+    big = H.Caps(1.0)
+    big.add(0.4, 0.01)
+    big.add(0.4, 0.01)
+    with pytest.raises(H.CapReached):                      # the next call is assumed to cost at least the largest
+        big.before_call(0.01)
+
+
 def test_without_the_resolver_the_suite_says_what_it_needs():
     out = H.run_requests(FIX, None, H.Caps(), repeat=2)
     assert out["result"] == "not available" and "sCore" in out["why"]
-    assert H.load_resolver() is None or callable(getattr(H.load_resolver(), "resolve", None))
+
+
+def test_the_resolver_is_only_built_on_a_copy(live, monkeypatch):
+    with pytest.raises(ValueError):
+        H.load_resolver(None)
+    with pytest.raises(RuntimeError, match="never the live one"):
+        H.load_resolver(live)
+    copy = dbcopy.copy_db(live)
+    try:
+        seen = []
+
+        def factory(*, db_path):
+            seen.append(db_path)
+            raise TypeError("a bug inside the factory")
+
+        monkeypatch.setattr(H, "_resolver_factory", lambda: factory)
+        with pytest.raises(TypeError, match="inside the factory"):     # raised, never retried without the copy
+            H.load_resolver(copy)
+        assert seen == [copy]
+        monkeypatch.setattr(H, "_resolver_factory", lambda: None)
+        assert H.load_resolver(copy) is None
+    finally:
+        dbcopy.remove_copy(copy)
+
+
+def test_a_dry_run_never_builds_the_resolver(monkeypatch):
+    monkeypatch.setattr(H, "load_resolver", lambda *a, **k: pytest.fail("built in a dry run"))
+    out = H.run_requests(FIX, None, H.Caps(), repeat=2, dry_run=True)
+    assert out["result"] == "dry run" and out["estimate"] == "list price"
+    assert "list price" in "\n".join(H.requests_text(out))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -154,6 +251,43 @@ def test_runs_that_disagree_on_two_fixtures_fail_the_repeat_bar():
 
     out = H.run_requests(FIX, Flaky(GOOD), H.Caps(), repeat=2)
     assert out["disagree"] == 2 and not out["bars"]["agree"]["pass"]
+
+
+def test_no_spotify_volume_fixture_leaves_the_run_incomplete_never_a_pass():
+    fx = [f for f in FIX if f.id != "a2"]
+    out = H.run_requests(fx, Stub(GOOD), H.Caps(), repeat=2)
+    sv = out["bars"]["spotify_in_app"]
+    assert sv["fixtures"] == 0 and sv["incomplete"] and not sv["pass"]
+    assert out["bars"]["right"]["pass"] and out["bars"]["agree"]["pass"]
+    assert out["result"] == "incomplete" and "Spotify-volume" in out["why_incomplete"]
+    assert "Incomplete: no Spotify-volume fixture" in "\n".join(H.requests_text(out))
+
+
+@pytest.mark.parametrize("label,got,right", [
+    ({"target": "spotify", "change": "down"}, {"target": "spotify", "change": -10}, True),
+    ({"target": "spotify", "change": "down"}, {"target": "spotify", "change": 10}, False),
+    ({"target": "spotify", "change": "up"}, {"target": "spotify", "change": "+5"}, True),
+    ({"target": "spotify", "change": -10}, {"target": "Spotify", "change": "-10"}, True),
+    ({"target": "spotify", "change": -10}, {"target": "spotify", "change": -5}, False),
+    ({"target": "app", "level": 30}, {"target": "discord", "level": "30"}, True),
+    ({"target": "app"}, {"target": "spotify"}, False),
+    ({"target": "app"}, {}, False),
+    ({"target": "system", "mute": "on"}, {"target": "system", "mute": "on"}, True),
+    ({"target": "system"}, {"target": "spotify"}, False),
+])
+def test_volume_slots_compare_by_their_kind(label, got, right):
+    assert H._slots_right(label, got, "volume") is right
+
+
+def test_names_fold_case_and_spacing_and_free_text_is_kept_but_not_scored():
+    f = H.Fixture("v1", "play the new one from that channel", 1.0, "youtube.video",
+                  {"video": "the new one", "channel": "Some Channel"})
+    answer = {"skill": "youtube.video", "slots": {"video": "id-abc123", "channel": "some  channel"}}
+    out = H.run_requests([f], Stub({f.words: answer}), H.Caps(), repeat=1)
+    assert out["per_run"][0]["right"] == 1 and out["unscored_slots"] == 1
+    assert "1 labelled free-text slots were kept but not scored" in "\n".join(H.requests_text(out))
+    wrong = {"skill": "youtube.video", "slots": {"video": "the new one", "channel": "Other Channel"}}
+    assert H.run_requests([f], Stub({f.words: wrong}), H.Caps(), repeat=1)["per_run"][0]["right"] == 0
 
 
 def test_a_failed_call_is_that_fixtures_error_not_a_crash():

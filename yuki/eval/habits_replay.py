@@ -12,15 +12,18 @@ Suites (:data:`SUITES`) and who fills them in:
   moments code), and :func:`sample_moments` draws the 50 moments the reviewer checks by hand against independent
   sources (the calls row's ``via``, the timeline row's host kind, the memory log's ``call_detected``).
 * ``requests`` (phase S): each labelled fixture (your own words, labelled by you) through the skill resolver, one
-  cached talker call each, ``repeat`` times (:func:`run_requests`, scored by :func:`score_requests`). The resolver is
-  ``yuki.skills.resolve.eval_resolver`` once ``sCore`` / ``sVoice`` ship it; until then the suite says so.
+  cached talker call each, ``repeat`` times (:func:`run_requests`, scored by :func:`score_requests` against
+  :data:`SLOT_SPEC`). The resolver is ``yuki.skills.resolve.eval_resolver(db_path=<copy>)`` once ``sCore`` /
+  ``sVoice`` ship it (:func:`load_resolver` never builds it without a copy); until then the suite says so.
 * ``cost`` (phase P): background model spend per day from the copy's own accounting (:func:`background_cost`).
 * ``routines``, ``lane``, ``taste``: phase R and T, built in ``evalReplay`` on :func:`time_split`.
 
 **Caps** (:class:`Caps`), enforced in code for every run: at most :data:`HARD_MINUTES` minutes and
-:data:`HARD_BUDGET_USD` dollars (a larger ask is refused before anything starts); the expected cost and time are checked
-up front (refused when over), and before every model call its worst-case cost and the clock are checked, so no call
-can take a run past either cap (the c3 pattern, ``c3.py:36-40``). ``dry_run`` makes no model call.
+:data:`HARD_BUDGET_USD` dollars (a larger ask is refused before anything starts); the expected cost, the worst case
+(every call at its worst) and the expected time are checked up front (refused when over), and before every model call
+its worst-case cost and the clock are checked, so no call can take a run past either cap (the c3 pattern,
+``c3.py:36-40``). A call that reports no cost, or raises, is charged its worst case, so the cap never depends on the
+resolver remembering to report. The moments rebuilds run under the same clock. ``dry_run`` makes no model call.
 
 Everything printed or written by this module is content-free: ids, machine keys (skill keys, app keys, code words),
 counts, times and levels. No words, names, titles, hosts, links or entities.
@@ -62,6 +65,11 @@ class CapReached(Exception):
     """The next model call could pass the cost cap, or the time limit is reached."""
 
 
+def reported_cost(value: Any) -> bool:
+    """Whether a call's ``cost_usd`` is a cost at all: a finite number (not a bool, not text, not missing)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 class Caps:
     """The run's limits. ``refusal`` is the up-front check; ``before_call`` runs before every model call."""
 
@@ -78,27 +86,47 @@ class Caps:
         self.started = clock()
         self.spent = 0.0
         self.calls = 0
+        #: The most one call has been charged so far: the next call's check never assumes less.
+        self.largest = 0.0
 
     def elapsed_s(self) -> float:
         return self.clock() - self.started
 
-    def refusal(self, expected_usd: float, expected_s: float) -> str | None:
-        """Why the run is refused before anything is sent (``None``: it may start)."""
-        if expected_usd > self.budget_usd:
-            return f"the expected cost (${expected_usd:.2f}) is over the ${self.budget_usd:.2f} cap"
-        if expected_s > self.limit_s:
+    def time_left_s(self) -> float:
+        return self.limit_s - self.elapsed_s()
+
+    def over_time(self) -> bool:
+        return self.elapsed_s() > self.limit_s
+
+    def refusal(self, expected_usd: float, expected_s: float, worst_usd: float | None = None) -> str | None:
+        """Why the run is refused before anything is sent (``None``: it may start): its expected cost, its worst case
+        (every call at its worst) or its expected time is over what is left of the caps."""
+        left = self.budget_usd - self.spent
+        if expected_usd > left:
+            return f"the expected cost (${expected_usd:.2f}) is over the ${left:.2f} cap"
+        if worst_usd is not None and worst_usd > left:
+            return (f"the most it could cost (${worst_usd:.2f}, every call at its worst case) is over the ${left:.2f}"
+                    " cap; use fewer fixtures or --repeat 1")
+        if expected_s > self.time_left_s():
             return f"the expected time ({expected_s / 60:.0f} min) is over the {self.limit_s / 60:g} min limit"
         return None
 
     def before_call(self, worst_usd: float) -> None:
-        if self.elapsed_s() > self.limit_s:
+        if self.over_time():
             raise CapReached("the time limit")
-        if self.spent + float(worst_usd) > self.budget_usd:
-            raise CapReached(f"the cost cap (${self.spent:.3f} spent; the next call could cost ${worst_usd:.3f})")
+        nxt = max(float(worst_usd), self.largest)
+        if self.spent + nxt > self.budget_usd:
+            raise CapReached(f"the cost cap (${self.spent:.3f} spent; the next call could cost ${nxt:.3f})")
 
-    def add(self, cost_usd: float | None) -> None:
-        self.spent += float(cost_usd or 0.0)
+    def add(self, cost_usd: Any, worst_usd: float) -> float:
+        """Charge one model call; returns what was charged. The cost the call reported when it is a number (never
+        below 0); its worst case when it reported none, or something that is not a finite number, or it raised (a
+        billed call that failed still counts)."""
+        charge = max(float(cost_usd), 0.0) if reported_cost(cost_usd) else float(worst_usd)
+        self.spent += charge
         self.calls += 1
+        self.largest = max(self.largest, charge)
+        return charge
 
     def summary(self) -> dict[str, Any]:
         return {"budget_usd": self.budget_usd, "minutes": round(self.limit_s / 60.0, 1),
@@ -364,10 +392,27 @@ def _takes_argv(fn: Callable[..., Any]) -> bool:
         return False
 
 
-def cli_runner(db_path: Path) -> Callable[[list[str]], dict[str, Any]]:
+def _own_seconds(text: str) -> float | None:
+    """The rebuild's own time from the pipeline's summary: ``yuki.memory.moments`` prints one JSON object whose ``s``
+    is the rebuild alone (no opening, no migration, no printing). ``None`` when the output is not that shape."""
+    try:
+        d = json.loads((text or "").strip())
+    except ValueError:
+        return None
+    s = d.get("s") if isinstance(d, dict) else None
+    return float(s) if isinstance(s, (int, float)) and not isinstance(s, bool) and math.isfinite(s) else None
+
+
+#: The longest one child-process rebuild may take (s), within the time left of the run's limit.
+SUBPROCESS_TIMEOUT_S = 600.0
+
+
+def cli_runner(db_path: Path, *, time_left: Callable[[], float] | None = None
+               ) -> Callable[[list[str]], dict[str, Any]]:
     """Runs ``python -m yuki.memory.moments <args> --db <copy>``: in this process when the module's ``main`` takes an
-    argv (timed without the interpreter's start), else as a child process of the same Python. Its output is kept out
-    of the console (only its line count is reported)."""
+    argv, else as a child process of the same Python, stopped at the time left of the run (``time_left``). Besides the
+    wall time ``s``, ``own_s`` is the pipeline's own time for the rebuild, from its printed summary. Its output is kept
+    out of the console (only its line count is reported)."""
     db_path = Path(db_path)
     if dbcopy.is_live(db_path):
         raise RuntimeError("the moments pipeline runs on a copy here, never the live database")
@@ -380,32 +425,63 @@ def cli_runner(db_path: Path) -> Callable[[list[str]], dict[str, Any]]:
         main = getattr(mod, "main", None)
         t0 = time.perf_counter()
         if callable(main) and _takes_argv(main):
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            buf, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
                 try:
                     code = main(argv)
                 except SystemExit as exc:
                     code = exc.code
+            out = buf.getvalue()
             return {"code": int(code or 0) if not isinstance(code, str) else 1, "s": time.perf_counter() - t0,
-                    "how": "in-process", "lines": buf.getvalue().count("\n")}
+                    "own_s": _own_seconds(out), "how": "in-process",
+                    "lines": out.count("\n") + err.getvalue().count("\n")}
         root = Path(importlib.import_module("yuki").__file__).resolve().parents[1]
-        got = subprocess.run([sys.executable, "-m", "yuki.memory.moments", *argv], cwd=root, capture_output=True,
-                             text=True, timeout=600)
-        return {"code": got.returncode, "s": time.perf_counter() - t0, "how": "subprocess (includes Python's start)",
+        limit = SUBPROCESS_TIMEOUT_S if time_left is None else max(1.0, min(SUBPROCESS_TIMEOUT_S, time_left()))
+        try:
+            got = subprocess.run([sys.executable, "-m", "yuki.memory.moments", *argv], cwd=root, capture_output=True,
+                                 text=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            return {"code": 124, "s": time.perf_counter() - t0, "own_s": None, "how": "subprocess", "timed_out": True,
+                    "lines": 0}
+        return {"code": got.returncode, "s": time.perf_counter() - t0, "own_s": _own_seconds(got.stdout),
+                "how": "subprocess (includes Python's start)",
                 "lines": (got.stdout or "").count("\n") + (got.stderr or "").count("\n")}
 
     return run
 
 
-def moments_bars(db_path: Path, *, runner: Callable[[list[str]], dict[str, Any]] | None = None) -> dict[str, Any]:
+def _rebuild_time(first: dict[str, Any], second: dict[str, Any]) -> tuple[float, str]:
+    """The rebuild's time for the < 5 s bar: the pipeline's own time (the slower of the two rebuilds) when it printed
+    it; else the second rebuild's wall time (the first also opens the copy and migrates it, which is not the
+    rebuild)."""
+    own = [r.get("own_s") for r in (first, second)]
+    if all(isinstance(v, (int, float)) for v in own):
+        return float(max(own)), "the pipeline's own timing, the slower rebuild"
+    return float(second.get("s") or 0.0), f"the second rebuild, {second.get('how')}"
+
+
+def moments_bars(db_path: Path, *, runner: Callable[[list[str]], dict[str, Any]] | None = None,
+                 caps: Caps | None = None) -> dict[str, Any]:
     """Phase F's moments bars on a copy: ``rebuild`` twice through Yuki's own pipeline, then every B.1 bar. The copy
-    is changed (its moments rebuilt); the live database is refused."""
+    is changed (its moments rebuilt); the live database is refused. With ``caps``, no rebuild starts after the run's
+    time limit and a child-process rebuild is stopped at it (an in-process one can't be cut short; it is checked
+    after)."""
     db_path = Path(db_path)
     if dbcopy.is_live(db_path):
         raise RuntimeError("the moments bars run on a copy, never the live database")
-    runner = runner or cli_runner(db_path)
+    runner = runner or cli_runner(db_path, time_left=caps.time_left_s if caps is not None else None)
     out: dict[str, Any] = {"suite": "moments", "phase": "F", "at": time.time(), "result": None}
     out["reference"] = source_reference(db_path)
+
+    def stop_for_time(step: dict[str, Any] | None = None) -> bool:
+        if (caps is None or not caps.over_time()) and not (step or {}).get("timed_out"):
+            return False
+        out["result"] = "stopped"
+        out["why"] = f"the time limit ({caps.limit_s / 60:g} min)" if caps is not None else "the time limit"
+        return True
+
+    if stop_for_time():
+        return out
     try:
         first = runner(["rebuild"])
     except MomentsUnavailable as exc:
@@ -413,6 +489,8 @@ def moments_bars(db_path: Path, *, runner: Callable[[list[str]], dict[str, Any]]
         out["why"] = str(exc)
         return out
     out["rebuild"] = [{k: (round(v, 3) if isinstance(v, float) else v) for k, v in first.items()}]
+    if stop_for_time(first):
+        return out
     if first.get("code"):
         out["result"] = "error"
         out["why"] = f"the rebuild exited with code {first['code']}"
@@ -424,15 +502,18 @@ def moments_bars(db_path: Path, *, runner: Callable[[list[str]], dict[str, Any]]
         return out
     second = runner(["rebuild"])
     out["rebuild"].append({k: (round(v, 3) if isinstance(v, float) else v) for k, v in second.items()})
+    if stop_for_time(second):
+        return out
     again = read_moments(db_path) or []
     fp1, fp2 = fingerprint(rows), fingerprint(again)
+    rebuild_s, rebuild_how = _rebuild_time(first, second)
     bars = {
         "e1": bar_e1(rows),
         "not_meetings": bar_not_meetings(rows),
         "discord_evenings": bar_discord_evenings(rows),
         "youtube_pages": bar_youtube_pages(rows, db_path),
-        "runtime": {"s": round(float(first.get("s") or 0.0), 3), "bar_s": RUNTIME_BAR_S, "how": first.get("how"),
-                    "pass": float(first.get("s") or 0.0) < RUNTIME_BAR_S},
+        "runtime": {"s": round(rebuild_s, 3), "bar_s": RUNTIME_BAR_S, "how": rebuild_how,
+                    "first_call_s": round(float(first.get("s") or 0.0), 3), "pass": rebuild_s < RUNTIME_BAR_S},
         "idempotent": {"rows": [len(rows), len(again)], "same": fp1 == fp2 and not second.get("code"),
                        "pass": fp1 == fp2 and not second.get("code")},
     }
@@ -592,7 +673,7 @@ def moments_text(out: dict[str, Any]) -> list[str]:
                      f"of {len(E1_EXPECTED)} weekdays; Discord call rows on {ref.get('discord_call_evenings')} "
                      f"evenings; meeting rows of apps that were never meetings: "
                      + ", ".join(f"{a} {ref['meeting_rows'][a]}" for a in NOT_MEETINGS) + ".")
-    if out.get("result") in ("not available", "error"):
+    if out.get("result") in ("not available", "error", "stopped"):
         lines.append(f"{out['result'].capitalize()}: {out.get('why')}.")
         return lines
     b = out["bars"]
@@ -803,16 +884,19 @@ def _resolver_factory() -> Callable[..., Any] | None:
     return fn if callable(fn) else None
 
 
-def load_resolver(db_path: Path | None = None) -> Any:
-    """The skill resolver for evals (``yuki.skills.resolve.eval_resolver(db_path=...)``, S), or ``None`` before it
-    exists."""
+def load_resolver(db_path: Path) -> Any:
+    """The skill resolver for evals, built on a **copy**: ``yuki.skills.resolve.eval_resolver(db_path=<copy>)`` (S),
+    or ``None`` before it exists. Never built without the copy's path (it could fall back to Yuki's own database), and
+    never on the live one; an error inside the factory is raised, never retried another way."""
+    if db_path is None:
+        raise ValueError("the resolver is only built on a copy of the memory database (no path given)")
+    db_path = Path(db_path)
+    if dbcopy.is_live(db_path):
+        raise RuntimeError("the resolver is built on a copy of the memory database, never the live one")
     fn = _resolver_factory()
     if fn is None:
         return None
-    try:
-        return fn(db_path=db_path)
-    except TypeError:
-        return fn()
+    return fn(db_path=db_path)
 
 
 def _norm(v: Any) -> Any:
@@ -829,15 +913,73 @@ def _norm(v: Any) -> Any:
         return s
 
 
-def _slots_right(label: dict[str, Any], got: dict[str, Any]) -> bool:
-    """Every slot the user named is in the answer with the same value (case and spacing folded; numbers as numbers).
-    Slots the user left blank are not compared."""
-    named = {k: _norm(v) for k, v in (label or {}).items() if v not in (None, "")}
-    have = {k: _norm(v) for k, v in (got or {}).items()}
-    return all(have.get(k) == v for k, v in named.items())
+#: Each skill's slots (D2; map-skills S2) and how a label is compared with the resolver's value, so a label is never
+#: free words checked against a canonical value:
+#: * ``choice``: a closed set (the label menu offers only these), compared exactly;
+#: * ``points``: a signed number of points, or ``up`` / ``down`` when no amount was named (then only the sign counts);
+#: * ``number``: a number (a level 0-100), compared as a number;
+#: * ``name``: a name as the app shows it (your playlist's name in your Library, a channel, a person, an app key),
+#:   compared with case and spacing folded;
+#: * ``free``: kept with the fixture, never scored (its canonical form is the resolver's own, e.g. a video id).
+#: ``volume.target``: ``spotify`` = Spotify's own volume; ``app`` = another app's (any app key other than the three);
+#: ``system`` = the whole PC; ``own_voice`` = Yuki's voice.
+VOLUME_TARGETS = ("spotify", "app", "system", "own_voice")
+SLOT_SPEC: dict[str, dict[str, tuple[str, tuple[str, ...]]]] = {
+    "meet.open": {},
+    "youtube.home": {"browser": ("name", ())},
+    "youtube.video": {"video": ("free", ()), "channel": ("name", ()), "browser": ("name", ())},
+    "spotify.playlist": {"playlist": ("name", ())},
+    "volume": {"target": ("choice", VOLUME_TARGETS), "change": ("points", ("up", "down")),
+               "level": ("number", ()), "mute": ("choice", ("on", "off")),
+               "control": ("choice", ("in_app", "mixer", "system", "own_voice"))},
+    "message": {"app": ("name", ()), "person": ("name", ()), "text": ("free", ()),
+                "send": ("choice", ("send", "draft"))},
+    "discord.voice": {"channel": ("name", ())},
+}
+
+
+def slot_kind(skill: str | None, slot: str) -> tuple[str, tuple[str, ...]]:
+    """How a slot is labelled and compared (an unknown slot is compared as a name)."""
+    return SLOT_SPEC.get(str(skill), {}).get(slot, ("name", ()))
+
+
+def _number(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _slot_right(skill: str | None, slot: str, want: Any, got: Any) -> bool | None:
+    """One labelled slot against the resolver's value: ``True`` / ``False``, or ``None`` when it is not scored."""
+    kind, options = slot_kind(skill, slot)
+    if kind == "free":
+        return None
+    if skill == "volume" and slot == "target" and _norm(want) == "app":
+        g = _norm(got)
+        return bool(g) and g not in ("spotify", "system", "own_voice")
+    if kind == "points" and _norm(want) in options:
+        g = _number(got)
+        return g is not None and (g > 0 if _norm(want) == "up" else g < 0)
+    if kind in ("points", "number"):
+        w, g = _number(want), _number(got)
+        return w is not None and g is not None and abs(w - g) < 1e-9
+    return _norm(want) == _norm(got)
+
+
+def _slots_right(label: dict[str, Any], got: dict[str, Any], skill: str | None = None) -> bool:
+    """Every scored slot the user named is in the answer with the right value (:data:`SLOT_SPEC`). Slots the user left
+    blank, and free-text slots, are not compared."""
+    have = got or {}
+    checks = [_slot_right(skill, k, v, have.get(k)) for k, v in (label or {}).items() if v not in (None, "")]
+    return all(c for c in checks if c is not None)
 
 
 def _is_spotify_volume(f: Fixture) -> bool:
+    """A fixture for Spotify's own volume: labelled ``volume`` with the closed choice ``target = spotify``."""
     return f.skill == "volume" and _norm((f.slots or {}).get("target")) == "spotify"
 
 
@@ -862,7 +1004,7 @@ def score_requests(fixtures: Sequence[Fixture], runs: Sequence[dict[str, dict[st
                 row["runs"].append({"skill": None, "right": False, "error": p["error"]})
                 continue
             ok_skill = (p.get("skill") or None) == (f.skill or None)
-            ok = ok_skill and (f.skill is None or _slots_right(f.slots, p.get("slots") or {}))
+            ok = ok_skill and (f.skill is None or _slots_right(f.slots, p.get("slots") or {}, f.skill))
             skill_right += ok_skill
             right += ok
             entry = {"skill": p.get("skill"), "skill_right": ok_skill, "right": ok}
@@ -886,16 +1028,25 @@ def score_requests(fixtures: Sequence[Fixture], runs: Sequence[dict[str, dict[st
         disagree = max(sum(1 for f in fixtures if key(runs[i].get(f.id)) != key(runs[j].get(f.id)))
                        for i in range(len(runs)) for j in range(i + 1, len(runs)))
     complete = bool(runs) and all(r["answered"] == r["fixtures"] for r in per_run)
+    n_sv = sum(1 for f in fixtures if _is_spotify_volume(f))
     bars = {
         "right": {"bar": RIGHT_BAR, "rates": [r["right_rate"] for r in per_run],
                   "pass": complete and all((r["right_rate"] or 0) >= RIGHT_BAR for r in per_run)},
-        "spotify_in_app": {"fixtures": per_run[0]["spotify_volume"] if per_run else 0,
-                           "pass": complete and all(r["spotify_in_app"] == r["spotify_volume"] for r in per_run)},
+        # never a pass with nothing to check: no Spotify-volume fixture leaves the bar (and the run) incomplete
+        "spotify_in_app": {"fixtures": n_sv, "incomplete": n_sv == 0,
+                           "pass": complete and n_sv > 0
+                           and all(r["spotify_in_app"] == r["spotify_volume"] for r in per_run)},
         "agree": {"within": AGREE_WITHIN, "disagree": disagree,
                   "pass": complete and disagree is not None and disagree <= AGREE_WITHIN},
     }
+    unscored = sum(1 for f in fixtures for k, v in (f.slots or {}).items()
+                   if v not in (None, "") and slot_kind(f.skill, k)[0] == "free")
+    whole = complete and not any(b.get("incomplete") for b in bars.values())
+    why = None if whole else ("not every fixture was answered" if not complete else
+                              "no Spotify-volume fixture (label one: volume, target spotify)")
     return {"per_run": per_run, "rows": rows, "disagree": disagree, "complete": complete, "bars": bars,
-            "verdict": ("pass" if all(b["pass"] for b in bars.values()) else "fail") if complete else "incomplete"}
+            "unscored_slots": unscored, "why_incomplete": why,
+            "verdict": ("pass" if all(b["pass"] for b in bars.values()) else "fail") if whole else "incomplete"}
 
 
 def run_requests(fixtures: Sequence[Fixture], resolver: Any, caps: Caps, *, repeat: int = 2, dry_run: bool = False,
@@ -906,10 +1057,11 @@ def run_requests(fixtures: Sequence[Fixture], resolver: Any, caps: Caps, *, repe
     plan = plan_requests(fixtures, repeat, resolver)
     out: dict[str, Any] = {"suite": "requests", "phase": "S", "at": time.time(), "fixtures": len(fixtures),
                            "plan": plan, "dry_run": bool(dry_run), "result": None}
-    out["refusal"] = caps.refusal(plan["expected_usd"], plan["expected_s"])
+    out["refusal"] = caps.refusal(plan["expected_usd"], plan["expected_s"], plan["worst_usd"])
     if dry_run:
         out["result"] = "dry run"
-        out["resolver"] = resolver is not None
+        out["resolver"] = resolver is not None or _resolver_factory() is not None
+        out["estimate"] = "the resolver's own" if callable(getattr(resolver, "estimate_usd", None)) else "list price"
         out["caps"] = caps.summary()
         return out
     if not fixtures:
@@ -924,28 +1076,34 @@ def run_requests(fixtures: Sequence[Fixture], resolver: Any, caps: Caps, *, repe
         return out
     runs: list[dict[str, dict[str, Any]]] = []
     stopped = None
+    unreported = 0
     for k in range(max(1, int(repeat))):
         preds: dict[str, dict[str, Any]] = {}
         runs.append(preds)
         for f in fixtures:
+            worst = _estimate(resolver, f.words)[1]
             try:
-                caps.before_call(_estimate(resolver, f.words)[1])
+                caps.before_call(worst)
             except CapReached as exc:
                 stopped = str(exc)
                 break
             try:
-                res = resolver.resolve(f.words, f.at) or {}
+                res = resolver.resolve(f.words, f.at)
             except Exception as exc:  # noqa: BLE001 - one failed call is that fixture's error, never a crash
-                caps.add(0.0)
+                caps.add(None, worst)                  # it may have been billed: its worst case counts
                 preds[f.id] = {"error": type(exc).__name__}
                 continue
-            caps.add(res.get("cost_usd"))
+            res = res if isinstance(res, dict) else {}
+            caps.add(res.get("cost_usd"), worst)
+            if not reported_cost(res.get("cost_usd")):
+                unreported += 1                        # charged its worst case
             preds[f.id] = {"skill": res.get("skill"), "slots": dict(res.get("slots") or {})}
         say(f"Run {k + 1}: {len(preds)} of {len(fixtures)} fixtures (${caps.spent:.3f} spent).")
         if stopped:
             break
     out.update(score_requests(fixtures, runs))
     out["stopped"] = stopped
+    out["unreported_cost_calls"] = unreported
     out["caps"] = caps.summary()
     out["result"] = out["verdict"]
     return out
@@ -960,7 +1118,8 @@ def requests_text(out: dict[str, Any]) -> list[str]:
                  f"{p.get('expected_s', 0) / 60:.1f} min.")
     res = out.get("result")
     if res == "dry run":
-        lines.append("Dry run: no model was called."
+        lines.append("Dry run: no model was called"
+                     + (" (estimated at Haiku's list price)." if out.get("estimate") == "list price" else ".")
                      + ("" if out.get("resolver") else " (The resolver is not on this branch yet.)")
                      + (f" A real run would be refused: {out['refusal']}." if out.get("refusal") else ""))
         return lines
@@ -976,7 +1135,13 @@ def requests_text(out: dict[str, Any]) -> list[str]:
         lines.append(f"The runs differ on {out['disagree']} fixtures (bar: at most {AGREE_WITHIN}).")
     c = out.get("caps") or {}
     lines.append(f"Spent ${c.get('spent_usd', 0):.3f} of ${c.get('budget_usd', 0):.2f} in {c.get('calls', 0)} calls, "
-                 f"{c.get('elapsed_min', 0):g} min." + (f" Stopped at {out['stopped']}." if out.get("stopped") else ""))
+                 f"{c.get('elapsed_min', 0):g} min." + (f" Stopped at {out['stopped']}." if out.get("stopped") else "")
+                 + (f" {out['unreported_cost_calls']} calls reported no cost: each was counted at its worst case."
+                    if out.get("unreported_cost_calls") else ""))
+    if out.get("why_incomplete") and res == "incomplete":
+        lines.append(f"Incomplete: {out['why_incomplete']}.")
+    if out.get("unscored_slots"):
+        lines.append(f"{out['unscored_slots']} labelled free-text slots were kept but not scored.")
     lines.append(f"Result: {str(res).upper()}")
     return lines
 
@@ -1166,8 +1331,8 @@ def write_report(out: dict[str, Any], name: str, folder: Path | None = None) -> 
 
 
 __all__ = ["BACKGROUND_COST_TABLES", "Caps", "CapReached", "E1_EXPECTED", "Fixture", "HARD_BUDGET_USD", "HARD_MINUTES",
-           "MomentsUnavailable", "NOT_MEETINGS", "SUITES", "background_cost", "bar_discord_evenings", "bar_e1",
+           "MomentsUnavailable", "NOT_MEETINGS", "SLOT_SPEC", "SUITES", "VOLUME_TARGETS", "background_cost", "bar_discord_evenings", "bar_e1",
            "bar_not_meetings", "bar_youtube_pages", "cli_runner", "cost_report", "default_estimate", "fingerprint",
-           "load_resolver", "moments_bars", "moments_text", "plan_requests", "read_moments", "requests_text",
-           "run_requests", "sample_moments", "sample_text", "score_requests", "scorecard", "scorecard_text",
+           "load_resolver", "moments_bars", "moments_text", "plan_requests", "read_moments", "reported_cost",
+           "requests_text", "run_requests", "sample_moments", "slot_kind", "sample_text", "score_requests", "scorecard", "scorecard_text",
            "source_reference", "suite_status", "time_split", "user_words", "write_report"]

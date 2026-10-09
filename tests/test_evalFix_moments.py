@@ -103,6 +103,111 @@ def test_a_slow_rebuild_fails_the_runtime_bar(copy):
     assert not out["bars"]["runtime"]["pass"] and out["result"] == "fail"
 
 
+class Timed(Rebuild):
+    """Each call reports the next of ``walls`` as its wall time (and ``owns`` as the pipeline's own, if given)."""
+
+    def __init__(self, path, walls, owns=None):
+        super().__init__(path)
+        self.walls, self.owns = list(walls), list(owns) if owns is not None else None
+
+    def __call__(self, args):
+        got = super().__call__(args)
+        got["s"] = self.walls.pop(0)
+        if self.owns is not None:
+            got["own_s"] = self.owns.pop(0)
+        return got
+
+
+def test_the_runtime_bar_times_the_rebuild_not_opening_and_migrating_the_copy(copy):
+    out = H.moments_bars(copy, runner=Timed(copy, [9.0, 0.5]))          # the first call also migrated the copy
+    rt = out["bars"]["runtime"]
+    assert rt["pass"] and rt["s"] == 0.5 and rt["first_call_s"] == 9.0 and "second rebuild" in rt["how"]
+
+
+def test_the_pipelines_own_rebuild_time_is_used_when_it_prints_it(copy):
+    out = H.moments_bars(copy, runner=Timed(copy, [9.0, 4.0], owns=[0.3, 0.2]))
+    assert out["bars"]["runtime"]["s"] == 0.3 and out["bars"]["runtime"]["pass"]
+    out = H.moments_bars(copy, runner=Timed(copy, [0.1, 0.1], owns=[5.5, 0.2]))
+    assert out["bars"]["runtime"]["s"] == 5.5 and not out["bars"]["runtime"]["pass"]
+
+
+def test_the_cli_runner_reads_the_pipelines_printed_time(copy, monkeypatch):
+    class Mod:
+        @staticmethod
+        def main(argv):
+            write_moments(copy, good_moments(copy))
+            print(json.dumps({"cmd": "rebuild", "dry_run": False, "s": 7.25, "counts": {"call_join": 9}}, indent=1))
+            return 0
+
+    monkeypatch.setattr(H, "moments_module", lambda: Mod)
+    out = H.moments_bars(copy)
+    assert out["rebuild"][0]["own_s"] == 7.25 and out["bars"]["runtime"]["s"] == 7.25
+    assert "own timing" in out["bars"]["runtime"]["how"] and not out["bars"]["runtime"]["pass"]
+
+
+class Clock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_no_rebuild_starts_after_the_time_limit(copy):
+    clock = Clock()
+    caps = H.Caps(3.0, 1, clock=clock)
+    clock.t = 61.0
+    run = Rebuild(copy)
+    out = H.moments_bars(copy, runner=run, caps=caps)
+    assert run.calls == [] and out["result"] == "stopped" and "time limit" in out["why"]
+    assert any(line.startswith("Stopped: the time limit") for line in H.moments_text(out))
+
+
+def test_a_rebuild_that_runs_past_the_limit_stops_the_suite(copy):
+    clock = Clock()
+    caps = H.Caps(3.0, 1, clock=clock)
+
+    class Slow(Rebuild):
+        def __call__(self, args):
+            clock.t += 70.0
+            return super().__call__(args)
+
+    run = Slow(copy)
+    out = H.moments_bars(copy, runner=run, caps=caps)
+    assert len(run.calls) == 1 and out["result"] == "stopped" and "bars" not in out
+
+
+def test_a_child_process_rebuild_is_stopped_at_the_time_left(copy, monkeypatch):
+    clock = Clock()
+    caps = H.Caps(3.0, 1, clock=clock)
+    clock.t = 45.0                                   # 15 s left
+    seen = []
+
+    class Mod:                                       # no main(argv): a child process
+        main = None
+
+    def fake_run(cmd, **kw):
+        seen.append((cmd[-2:], kw["timeout"]))
+        raise H.subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+    monkeypatch.setattr(H, "moments_module", lambda: Mod)
+    monkeypatch.setattr(H.subprocess, "run", fake_run)
+    out = H.moments_bars(copy, caps=caps)
+    assert seen == [(["--db", str(copy)], 15.0)]
+    assert out["result"] == "stopped" and out["rebuild"][0]["timed_out"]
+
+
+def test_the_real_rebuild_runs_on_a_copy_once_fmoments_is_merged(copy):
+    """At merge (fMoments): Yuki's own ``moments rebuild`` through the real CLI runner: it runs, twice, in time and
+    idempotently. (The invented world is not shaped for the E1 bar: 29 Sep and 5 Oct need fMoments' calling sites and
+    fLive's verdicts; the F moments bar is run on the real copy after both merge.)"""
+    pytest.importorskip("yuki.memory.moments")
+    out = H.moments_bars(copy, caps=H.Caps())
+    assert out["result"] in ("pass", "fail"), out.get("why")
+    assert [r["code"] for r in out["rebuild"]] == [0, 0]
+    assert out["bars"]["idempotent"]["pass"] and out["bars"]["runtime"]["pass"]
+
+
 def test_a_rebuild_that_adds_rows_again_is_not_idempotent(copy):
     out = H.moments_bars(copy, runner=Rebuild(copy, append=True))
     idem = out["bars"]["idempotent"]

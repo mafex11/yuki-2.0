@@ -14,7 +14,9 @@ your words; the console shows counts only, except ``fixtures label``, which you 
    ``-144439``, ``-162122``, plus any session stamp in ``exclude-sessions.txt`` next to the fixtures file) and
    requests whose words are Yuki's own. Only then are the words decrypted, on this PC, into the fixtures file.
 2. ``fixtures label``: one phrasing at a time; you pick the skill from the menu of the seven skills (or none), the
-   details you named (the slots), the end state you wanted, and keep or drop.
+   details you named (the slots: closed choices such as whose volume, numbers, names as the app shows them), the end
+   state you wanted, and keep or drop. Collect lists candidates per session stamp, so a scripted live check's burst
+   can be dropped or its stamp added to ``exclude-sessions.txt``.
 3. ``fixtures add "..."``: phrasings written blind, before any resolver output is shown (``--skill meet.open`` labels
    them at once). Needed for the meeting: only 4 real meeting turns exist.
 4. ``fixtures status``: counts per skill against the target set (meeting 4, YouTube 5, playlist 5, volume 6,
@@ -22,8 +24,10 @@ your words; the console shows counts only, except ``fixtures label``, which you 
 
 **Suites** (``run``): ``moments`` (phase F's backfill bars, $0), ``requests`` (phase S: the fixtures through the skill
 resolver, one cached talker call each, twice), ``cost`` (background spend). Every run is capped at 55 minutes and $3 in
-code: a larger ``--budget`` / ``--minutes`` is refused, the expected cost and time are checked before anything starts,
-and each model call's worst case is checked before it is made. ``--dry-run`` prints the planned calls and their cost.
+code: a larger ``--budget`` / ``--minutes`` is refused, the expected cost, the worst case and the expected time are
+checked before anything starts, each model call's worst case is checked before it is made (a call that reports no
+cost is counted at its worst case), and the moments rebuilds run under the same clock. ``--dry-run`` prints the
+planned calls and their cost without building the resolver.
 
 **Scorecard** (``scorecard --copy-real --days 7``): the purpose tests, moments and background spend, content-free, to
 ``%LOCALAPPDATA%\\Yuki\\eval\\scorecard-<date>.json``.
@@ -44,6 +48,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import math
 import os
 import sys
 import time
@@ -63,23 +68,31 @@ FIXTURES_NAME = "fixtures.json"
 EXCLUDE_NAME = "exclude-sessions.txt"
 FIXTURE_CHARS = 300
 
-#: The label menu: the seven skills of D2 (key, what it does in words, its slots). Machine keys, fixed by the plan.
-SKILL_MENU: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("meet.open", "open the Meet tab in Zen (you click Join)", ()),
-    ("youtube.home", "open YouTube home in a browser", ("browser",)),
-    ("youtube.video", "play a YouTube video", ("video", "channel", "browser")),
-    ("spotify.playlist", "play one of your Spotify playlists", ("playlist",)),
-    ("volume", "change a volume (Spotify's own, an app's, the PC's)", ("target", "change", "level", "mute",
-                                                                         "control")),
-    ("message", "message someone on Discord, WhatsApp or Slack", ("app", "person", "text", "send")),
-    ("discord.voice", "join a Discord voice channel", ("channel",)),
+#: The label menu: the seven skills of D2 (key, what it does in words). Machine keys, fixed by the plan. Their slots
+#: and how each is labelled come from ``habits_replay.SLOT_SPEC`` (the same table the score uses).
+SKILL_MENU: tuple[tuple[str, str], ...] = (
+    ("meet.open", "open the Meet tab in Zen (you click Join)"),
+    ("youtube.home", "open YouTube home in a browser"),
+    ("youtube.video", "play a YouTube video"),
+    ("spotify.playlist", "play one of your Spotify playlists"),
+    ("volume", "change a volume (Spotify's own, an app's, the PC's)"),
+    ("message", "message someone on Discord, WhatsApp or Slack"),
+    ("discord.voice", "join a Discord voice channel"),
 )
-SKILL_KEYS = tuple(k for k, _w, _s in SKILL_MENU)
-#: Slots with a closed set of values (shown as choices).
-SLOT_CHOICES: dict[tuple[str, str], tuple[str, ...]] = {
-    ("volume", "control"): ("in_app", "mixer", "system", "own_voice"),
-    ("volume", "mute"): ("on", "off"),
-    ("message", "send"): ("send", "draft"),
+SKILL_KEYS = tuple(k for k, _w in SKILL_MENU)
+#: What a closed choice's values mean, where the key alone doesn't say (shown when labelling).
+CHOICE_HELP: dict[tuple[str, str], str] = {
+    ("volume", "target"): "spotify = Spotify's own volume, app = another app's, system = the whole PC, "
+                          "own_voice = Yuki's voice",
+    ("volume", "control"): "in_app = the app's own slider, mixer = the Windows volume mixer",
+}
+#: The question for each kind of slot (``habits_replay.SLOT_SPEC``).
+SLOT_PROMPTS: dict[str, str] = {
+    "choice": "{slot} ({options})",
+    "points": "{slot} (points, like -10 or +5; or {options} if you named no amount)",
+    "number": "{slot} (a number, 0-100)",
+    "name": "{slot}, as the app shows it",
+    "free": "{slot}, as you said it (kept, not scored)",
 }
 #: The target set (PLAN C.4): a group of skills and how many fixtures it needs.
 TARGETS: tuple[tuple[str, tuple[str, ...], int], ...] = (
@@ -101,8 +114,12 @@ MOMENT_DOMAINS: dict[str, str] = {
     "volume_change": "volume", "message_sent": "message",
 }
 CANDIDATE_WINDOW_S = 180.0
-#: The builders' scripted live-check sessions of 5 Oct (reasoning.md:298), by their session stamp.
+#: The builders' scripted live-check sessions of 5 Oct (reasoning.md:298), by their session stamp. No other stamp is
+#: known (no session carries a live-check marker); ``collect`` shows candidates per session so others can go in the
+#: user's ``exclude-sessions.txt``.
 LIVE_CHECK_SESSIONS = ("20261005-035305", "20261005-144439", "20261005-162122")
+#: Sessions listed by ``collect`` (the ones with the most candidates).
+SESSIONS_SHOWN = 12
 #: A memory session starts within this many seconds of its app run's log stamp.
 SESSION_TOLERANCE_S = 120.0
 #: Turns said to other people (a call), never requests to Yuki.
@@ -315,19 +332,46 @@ def add_fixtures(data: dict[str, Any], texts: Sequence[str], *, skill: str | Non
     return added
 
 
+def _slot_value(skill: str, slot: str, raw: str) -> tuple[Any, str | None]:
+    """A typed answer as the label keeps it (``habits_replay.SLOT_SPEC``): ``(value, None)``, or ``("", why)`` when it
+    is not one the slot takes (left blank)."""
+    kind, options = H.slot_kind(skill, slot)
+    value = _fold(raw)
+    if not value:
+        return "", None
+    if kind == "choice":
+        v = value.casefold()
+        return (v, None) if v in options else ("", f"one of {', '.join(options)}")
+    if kind in ("points", "number"):
+        if kind == "points" and value.casefold() in options:
+            return value.casefold(), None
+        try:
+            x = float(value)
+        except ValueError:
+            x = math.nan
+        if not math.isfinite(x) or (kind == "number" and not 0 <= x <= 100):
+            return "", ("a number of points, or " + " / ".join(options)) if kind == "points" else "a number, 0-100"
+        return (int(x) if x.is_integer() else x), None
+    return value, None
+
+
 def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callable[[str], None], *,
                    relabel: bool = False, save: Callable[[], Any] | None = None) -> Counter:
-    """Ask, one phrasing at a time: the skill (the seven of D2, ``0`` none of these), its slots, the end state you
-    wanted, keep or drop. ``s`` skips, ``q`` stops. Saved after each one. Returns what was done (counts)."""
+    """Ask, one phrasing at a time: the skill (the seven of D2, ``0`` none of these), its slots (closed choices,
+    numbers and names as the app shows them, so they compare with the resolver's; see ``habits_replay.SLOT_SPEC``),
+    the end state you wanted, keep or drop. ``s`` skips, ``q`` stops. Saved after each one. Returns what was done."""
     todo = [f for f in data["fixtures"] if relabel or not f.get("label")]
     done: Counter = Counter()
     say("This shows your own words: run it in your own terminal. s = skip, q = stop (your answers so far are kept).")
+    say("A turn from a scripted live check is not yours: answer n at 'Keep it?' (or add its session to "
+        f"{EXCLUDE_NAME}).")
     for n, f in enumerate(todo, 1):
         when = datetime.fromtimestamp(float(f.get("at") or 0.0)).strftime("%a %d %b %H:%M")
         say("")
-        say(f"[{n}/{len(todo)}] {when}" + (f" (ended in: {f['candidate']})" if f.get("candidate") else ""))
+        say(f"[{n}/{len(todo)}] {when}" + (f", session {str(f['session'])[:15]}" if f.get("session") else "")
+            + (f" (ended in: {f['candidate']})" if f.get("candidate") else ""))
         say(f'  "{f.get("words")}"')
-        for i, (key, words, _slots) in enumerate(SKILL_MENU, 1):
+        for i, (key, words) in enumerate(SKILL_MENU, 1):
             say(f"  {i}. {key}: {words}")
         say("  0. none of these skills")
         choice = ask("Which skill did you want? ").strip().casefold()
@@ -344,16 +388,16 @@ def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callabl
             say("  (not a menu number: skipped)")
             done["skipped"] += 1
             continue
-        slots: dict[str, str] = {}
-        for slot in next((s for k, _w, s in SKILL_MENU if k == skill), ()):
-            options = SLOT_CHOICES.get((str(skill), slot))
-            hint = f" ({' / '.join(options)})" if options else ""
-            value = _fold(ask(f"  {slot}{hint}, as you said it (blank: not said): "))
-            if value and options and value.casefold() not in options:
-                say(f"  (one of {', '.join(options)}: left blank)")
-                value = ""
-            if value:
-                slots[slot] = value.casefold() if options else value
+        slots: dict[str, Any] = {}
+        for slot, (kind, options) in H.SLOT_SPEC.get(str(skill), {}).items():
+            if (str(skill), slot) in CHOICE_HELP:
+                say(f"  ({CHOICE_HELP[(str(skill), slot)]})")
+            q = SLOT_PROMPTS[kind].format(slot=slot, options=" / ".join(options))
+            value, why = _slot_value(str(skill), slot, ask(f"  {q} (blank: not said): "))
+            if why:
+                say(f"  ({why}: left blank)")
+            if value != "":
+                slots[slot] = value
         end = _fold(ask("  The end state you wanted (blank: what the skill does): ")) or None
         keep = ask("  Keep it? [Y/n] ").strip().casefold() not in ("n", "no")
         f["label"] = {"skill": skill, "slots": slots, "end": end, "keep": keep, "labelled_at": time.time()}
@@ -488,6 +532,11 @@ def cmd_fixtures(args: argparse.Namespace) -> int:
               + ", ".join(f"{k[4:]} {v}" for k, v in sorted(counts.items()) if k.startswith("end:")) + ").")
         print(f"Left out: said to others {counts.get('left_out_not_to_yuki', 0)}, live-check sessions "
               f"{counts.get('left_out_live_check', 0)}, Yuki's own words {counts.get('left_out_yuki_words', 0)}.")
+        per_session = Counter(str(c.get("session") or "")[:15] for c in candidates)
+        if per_session:
+            print(f"Candidates by session (a burst from one session may be a scripted live check: put its stamp in "
+                  f"{EXCLUDE_NAME}): " + ", ".join(f"{s} {n}" for s, n in per_session.most_common(SESSIONS_SHOWN))
+                  + (", ..." if len(per_session) > SESSIONS_SHOWN else "") + ".")
         if args.dry_run:
             new = len({_fold(c["words"]).casefold() for c in candidates} - _have(data))
             print(f"Dry run: nothing written ({new} would be new).")
@@ -522,7 +571,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         for s in suites:
             if s == "requests":
                 data = load_fixtures(Path(args.file) if args.file else None)
-                out = H.run_requests(eval_fixtures(data), H.load_resolver(), caps, repeat=args.repeat, dry_run=True)
+                # no resolver is built in a dry run (it is only ever built on a copy): the list-price estimate
+                out = H.run_requests(eval_fixtures(data), None, caps, repeat=args.repeat, dry_run=True)
                 for line in H.requests_text(out):
                     print(line)
             else:
@@ -537,7 +587,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         code = 0
         for s in suites:
             if s == "moments":
-                out = H.moments_bars(path)          # Yuki's own pipeline opens the copy itself
+                out = H.moments_bars(path, caps=caps)   # Yuki's own pipeline opens the copy itself
                 if args.sample:
                     out["sample"] = H.sample_moments(path, args.sample,
                                                      memory_logs=Path(args.memory_logs) if args.memory_logs else None)

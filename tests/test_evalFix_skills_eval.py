@@ -116,6 +116,7 @@ def test_collect_on_the_command_line_shows_counts_and_keeps_words_on_this_pc(tur
     for w in SECRET_WORDS:
         assert w not in out
     assert "candidates: 4" in out and "The copy is deleted." in out
+    assert "Candidates by session" in out and "20261003-101010 4" in out     # stamps and counts only
     data = json.loads((hermetic / "eval" / "fixtures.json").read_text(encoding="utf-8"))
     assert {f["words"] for f in data["fixtures"]} >= {f"turn {SECRET_WORDS[0]} down a bit", SECRET_WORDS[2]}
     assert digest(turns.parent) == before
@@ -158,7 +159,7 @@ def test_labelling_one_phrasing_at_a_time(hermetic):
     done = S.label_fixtures(data, lambda q: next(answers), said.append, save=lambda: saves.append(1))
     assert done == {"kept": 2, "dropped": 1, "skipped": 1} and len(saves) == 3
     labels = [f["label"] for f in data["fixtures"]]
-    assert labels[0]["skill"] == "volume" and labels[0]["slots"] == {"target": "Spotify", "change": "-10",
+    assert labels[0]["skill"] == "volume" and labels[0]["slots"] == {"target": "spotify", "change": -10,
                                                                       "control": "in_app"}
     assert labels[1]["keep"] is False and labels[1]["end"] == "my mix" and labels[1]["slots"] == {}
     assert labels[2] is None
@@ -168,6 +169,28 @@ def test_labelling_one_phrasing_at_a_time(hermetic):
     st = S.status(data)
     assert st["kept"] == 2 and st["dropped"] == 1 and st["unlabelled"] == 1
     assert st["per_skill"] == {"message": 1, "volume": 1}
+
+
+@pytest.mark.parametrize("skill,slot,typed,kept,warned", [
+    ("volume", "target", "Spotify", "spotify", False),
+    ("volume", "target", "the music", "", True),            # not one of the four: blank, never guessed
+    ("volume", "change", "down", "down", False),
+    ("volume", "change", "+5", 5, False),
+    ("volume", "change", "a bit", "", True),
+    ("volume", "level", "30", 30, False),
+    ("volume", "level", "150", "", True),
+    ("spotify.playlist", "playlist", "  Late   Night ", "Late Night", False),
+    ("message", "text", "on my way", "on my way", False),
+    ("volume", "mute", "", "", False),
+])
+def test_slots_are_labelled_in_the_form_the_score_compares(skill, slot, typed, kept, warned):
+    value, why = S._slot_value(skill, slot, typed)
+    assert value == kept and bool(why) is warned
+
+
+def test_the_label_menu_and_the_score_share_one_slot_table():
+    assert set(H.SLOT_SPEC) == set(S.SKILL_KEYS)
+    assert H.SLOT_SPEC["volume"]["target"] == ("choice", ("spotify", "app", "system", "own_voice"))
 
 
 def test_q_stops_and_keeps_what_was_labelled(hermetic):
@@ -207,19 +230,25 @@ def test_run_refuses_caps_over_the_users_limits(hermetic, capsys):
     assert capsys.readouterr().out.count("Refused") == 2
 
 
-def test_run_dry_run_prints_the_plan_without_a_copy(hermetic, capsys):
+def test_run_dry_run_prints_the_plan_without_a_copy(hermetic, capsys, monkeypatch):
     data = S.load_fixtures()
     S.add_fixtures(data, [f"phrase {i}" for i in range(25)], skill="volume")
     S.save_fixtures(data)
+    monkeypatch.setattr(H, "load_resolver", lambda *a, **k: pytest.fail("the resolver was built in a dry run"))
     assert S.main(["run", "--suite", "requests", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "50 talker calls" in out and "no model was called" in out and "phrase" not in out
+    S.add_fixtures(data, [f"more {i}" for i in range(25)], skill="volume")
+    S.save_fixtures(data)
+    assert S.main(["run", "--suite", "requests", "--dry-run", "--repeat", "3"]) == 0
+    assert "A real run would be refused: the most it could cost" in capsys.readouterr().out
 
 
 def test_run_moments_on_a_copy(live, capsys, monkeypatch):
     calls = []
 
-    def runner_for(path):
+    def runner_for(path, **kw):
+        assert callable(kw.get("time_left"))                                   # under the run's clock
         calls.append(path)
         return Rebuild(path)
 
@@ -243,18 +272,30 @@ def test_run_requests_without_the_resolver_says_so(live, capsys):
 
 
 def test_run_requests_with_a_resolver_marks_results_shown(live, capsys, monkeypatch):
+    built_on = []
+
     class Stub:
         def resolve(self, words, at):
+            if words == "spotify down a bit":
+                return {"skill": "volume", "slots": {"target": "spotify", "change": -10, "control": "in_app"},
+                        "cost_usd": 0.001}
             return {"skill": "meet.open", "slots": {}, "cost_usd": 0.001}
 
-    monkeypatch.setattr(H, "load_resolver", lambda db_path=None: Stub())
+    def load(db_path):
+        built_on.append(db_path)
+        return Stub()
+
+    monkeypatch.setattr(H, "load_resolver", load)
     data = S.load_fixtures()
     S.add_fixtures(data, ["open my meeting", "bring up the call"], skill="meet.open")
+    S.add_fixtures(data, ["spotify down a bit"], skill="volume")
+    data["fixtures"][-1]["label"]["slots"] = {"target": "spotify", "change": "down"}
     S.save_fixtures(data)
     assert S.main(["run", "--copy-real", "--suite", "requests", "--repeat", "2"]) == 0
     out = capsys.readouterr().out
     assert "Result: PASS" in out and "open my meeting" not in out
     assert S.load_fixtures()["shown_at"]
+    assert built_on and built_on[0] != live and not built_on[0].exists()        # built on the copy, deleted after
 
 
 def test_the_scorecard_goes_to_the_eval_folder_content_free(live, hermetic, capsys):
