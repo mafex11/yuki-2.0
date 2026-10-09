@@ -218,3 +218,73 @@ def test_tab_identities_in_the_memory_apartment_are_content_free() -> None:
     census = uia.tab_census([(31, 0)], {"names": {"d" * 64: {"n": 1}}}, digest_fn=lambda n: "d" * 64 if "Meet" in n
                             else "e" * 64, automation_fn=lambda: Auto({31: zen()}))
     assert census["decision"] == "one" and census["tabs"] == 12
+
+
+# -- review round 1 ---------------------------------------------------------------------------------------------------
+
+
+def test_a_calling_tab_whose_window_comes_back_stays_on_the_board() -> None:
+    """Review r1 L2: off the layout for a moment and back: gone_at is cleared (the tab is not dropped 600 s later)."""
+    from yuki.memory import now as N
+
+    b = N.NowBoard()
+    b.set_calling_tab(5, {"process": "zen", "service": "Google Meet", "seen_at": 100.0, "known": True})
+    b.set_layout([{"hwnd": 5, "pid": 1}], foreground=5, at=100.0, ms=1)
+    b.set_layout([], foreground=0, at=101.0, ms=1)
+    assert "gone_at" in b._calling_tabs[5]
+    b.set_layout([{"hwnd": 5, "pid": 1}], foreground=5, at=102.0, ms=1)
+    assert "gone_at" not in b._calling_tabs[5]
+    assert "5" in b.snapshot(now=102.0 + N.GONE_TTL_S + 60)["calling_tabs"]
+    b.set_layout([], foreground=0, at=200.0, ms=1)
+    assert "5" not in b.snapshot(now=200.0 + N.GONE_TTL_S + 1)["calling_tabs"]
+
+
+def test_board_signals_come_from_the_wired_producer_at_snapshot_time() -> None:
+    """Review r1 L1: signals_fn (the call worker's holders, the timeline's playing apps) is asked per snapshot."""
+    board = NowBoard()
+    board.signals_fn = lambda: {"mic_holders": {"discord", "zen"}, "playing": ["spotify", "spotify", ""]}
+    sig = board.snapshot()["signals"]
+    assert sig["mic_holders"] == ["discord", "zen"] and sig["playing"] == ["spotify"] and sig["at"] is not None
+    board.signals_fn = lambda: 1 / 0
+    assert board.snapshot()["signals"] == {"mic_holders": [], "playing": [], "at": None}
+
+
+def test_page_of_lists_the_sites_once(monkeypatch) -> None:
+    """Review r1 L7: page_of runs per timeline row in a backfill; the folder is listed once, then cached."""
+    templates.clear_cache()
+    assert templates.page_of("https://www.youtube.com/watch?v=a1") is not None
+
+    def no_listing(*_a, **_k):
+        raise AssertionError("listed the sites folder again")
+
+    monkeypatch.setattr(type(templates.SITES_DIR), "glob", no_listing)
+    t0 = time.perf_counter()
+    for i in range(5000):
+        assert templates.page_of(f"https://www.youtube.com/watch?v=v{i}") is not None
+        assert templates.page_of("https://example.com/x") is None
+    assert time.perf_counter() - t0 < 2.0
+    monkeypatch.undo()
+    templates.clear_cache()
+    assert "youtube" in templates.sites()
+
+
+def test_doctor_moments_count_by_when_they_happened_not_when_written(tmp_path: Path) -> None:
+    """Review r1 L8: a rebuild or backfill writes old moments again (fresh seen_at); they are not 'the last day'."""
+    path = _db(tmp_path)
+    priv = tmp_path / "privacy.toml"
+    priv.write_text("", encoding="utf-8")
+    now = time.time()
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE moments (id INTEGER PRIMARY KEY, at REAL NOT NULL, ended_at REAL, "
+                 "seen_at REAL NOT NULL, kind TEXT NOT NULL, app TEXT, by TEXT NOT NULL DEFAULT 'user', "
+                 "source TEXT NOT NULL DEFAULT 'x')")
+    conn.executemany("INSERT INTO moments(at, seen_at, kind, by) VALUES (?,?,?,?)",
+                     [(now - 10 * 86400 + i, now - 30, "call_join", "user") for i in range(50)]
+                     + [(now - 600, now - 590, "media_play", "user")])
+    conn.commit()
+    conn.close()
+    c = doctor.check_moments(path, priv, now=now)
+    assert c.status == doctor.OK and c.detail.startswith("1 in the last day (media play 1)"), c.detail
+    assert "newest 10 min ago" in c.detail
+    stale = doctor.check_moments(path, priv, now=now + 8 * 3600)    # only backfilled rows written lately
+    assert stale.status == doctor.WARN

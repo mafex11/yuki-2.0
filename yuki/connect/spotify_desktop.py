@@ -30,9 +30,14 @@ never filtered on ``IsOffscreen`` (a covered or minimised window reports its ele
 subtree is fetched in one cache request, then walked locally.
 
 **Labels without English** (PLAN.md L6): if the English labels miss, the volume slider is the window's only Slider with
-a 0-1 range (two or more: none), and the row button wording is learned from one read where Spotify's media session
-says playing and exactly one row's button reads differently from the rest (:func:`learn_row_wording`). Learned
-wording is kept by code (``nudge_state['spotify_labels']``), never hand-written; until then rows carry no play state.
+a 0-1 range (two or more: none), and the row button wording comes from a read where Spotify's media session says
+playing and exactly one row's button reads differently from the rest (:func:`row_wording_candidate`). That is only a
+candidate, held in RAM with no play state: the open button of the one row by another owner (or the one pinned row)
+fits the same shape when the playing item is not a Library row in view. It is learned once a later read sees a row's
+button flip between the two wordings (:func:`judge_wording`: a play button flips as music starts and stops, an owner
+never does), and dropped when two rows carry the "pause" wording at once or the data's wording shows up. Learned
+wording is kept by code, encrypted (``nudge_state['spotify_labels']``), never hand-written; until then rows carry no
+play state.
 
 **Media session** (PLAN.md L7): Spotify's session is the one whose app id belongs to the Spotify window's process (the
 Store build's ``SpotifyAB.SpotifyMusic_…!Spotify``, the classic installer's ``Spotify.exe``; both forms are data).
@@ -41,9 +46,12 @@ Store build's ``SpotifyAB.SpotifyMusic_…!Spotify``, the classic installer's ``
 or in front) and when its media session first plays, never on a request path and never with a game in front; when
 Spotify's music starts, one read of the Library for the playing row (a ``media_context`` moment, the name encrypted by
 the moments writer, a Spotify-owned list digest-only) and of the playlist links on screen (kept encrypted); when Spotify
-leaves the front, one slider read (a ``volume_change`` moment, means ``in_app``); and a daily counts-only state probe:
-once a day per state (covered, visible, minimised), after 60 s in that state, one warm + slider + Library read, to
-answer "can Yuki see Spotify in that state?" without the user doing anything (``[spotify] state_probe``).
+leaves the front, one slider read (a ``volume_change`` moment, means ``in_app``, against the last reading, which the
+play-start read also takes; ``facts.prev_read_at`` says since when); and a daily counts-only state probe: once a day
+per state (covered, visible, minimised), after 60 s in that state, one warm + slider + Library read, to answer "can
+Yuki see Spotify in that state?" without the user doing anything (``[spotify] state_probe``). Its one-shot timer is
+(re)started by events only: Spotify leaving the front, its place on the Now board's layout changing, or a play start
+of a Spotify that is not in front. A warm-up stops as soon as a game comes to the front (checked before every poll).
 
 Logs are content-free (``spotify_read``, ``spotify_probe``): the trigger, the window state, cold or warm, counts, the
 label source, ms. Never a name, a link, an id or a title.
@@ -96,6 +104,8 @@ KNOWN_NAMES_MAX = 500
 CONTEXT_REPEAT_S = 60.0
 #: A row-wording guess needs at least this many rows sharing the play wording (PLAN.md L6: "the rest").
 LEARN_MIN_OTHERS = 2
+#: Row-wording candidates held in RAM at most, waiting for a read that confirms one (a row flipping wording).
+CANDIDATES_MAX = 4
 #: After a warm-up that did not build the tree, the same window is not warmed again for this long (s): its reads say
 #: "not built" meanwhile (a window that never builds must not cost 3 s on every trigger).
 WARM_RETRY_S = 600.0
@@ -255,21 +265,29 @@ def process_identity(pid: int) -> dict[str, str]:
     return out
 
 
+def session_matches(app_id: str | None, ident: dict[str, str] | None, *, strict: bool = False) -> bool:
+    """Whether a session is Spotify's, given the Spotify window process's identity (:func:`process_identity`): its
+    AppUserModelID (or package family) decides when it has one; with only its image known (the package read failed,
+    or a classic install) the image counts, and unless ``strict`` either install form in the data too (a Store build
+    whose package could not be read still has the Store form)."""
+    ident = ident or {}
+    if ident.get("aumid") or ident.get("family"):
+        return is_spotify_session(app_id, aumid=ident.get("aumid") or None,
+                                  family=None if ident.get("aumid") else ident.get("family"))
+    if ident.get("image"):
+        return is_spotify_session(app_id, image=ident["image"]) or (not strict and is_spotify_session(app_id))
+    return is_spotify_session(app_id)
+
+
 def spotify_session(sessions: Iterable[dict[str, Any]], *, pid: int | None = None) -> dict[str, Any] | None:
     """Spotify's session among Windows' media sessions (``perception.system.media_sessions()`` rows), matched to the
-    Spotify window's process ``pid`` when given; None when there is none."""
+    Spotify window's process ``pid`` when given (a session of that very process first); None when there is none."""
     ident = process_identity(pid) if pid else {}
-    for s in sessions or []:
-        app_id = s.get("app_id") if isinstance(s, dict) else getattr(s, "app_id", None)
-        if ident.get("aumid") or ident.get("family"):
-            ok = is_spotify_session(app_id, aumid=ident.get("aumid") or None,
-                                    family=None if ident.get("aumid") else ident.get("family"))
-        elif ident.get("image"):
-            ok = is_spotify_session(app_id, image=ident["image"])
-        else:
-            ok = is_spotify_session(app_id)
-        if ok:
-            return s if isinstance(s, dict) else {"app_id": app_id}
+    rows = [(s, s.get("app_id") if isinstance(s, dict) else getattr(s, "app_id", None)) for s in sessions or []]
+    for strict in (True, False):
+        for s, app_id in rows:
+            if session_matches(app_id, ident, strict=strict):
+                return s if isinstance(s, dict) else {"app_id": app_id}
     return None
 
 
@@ -477,9 +495,13 @@ class SpotifyRead:
     label_source: str | None = None
     elements: int | None = None
     ms: float = 0.0
-    learned: dict[str, str] | None = None
+    #: A row-wording candidate from this read (another language, session playing): provisional, no play state.
+    candidate: WordingGuess | None = None
     calls: int = 0
     error: str | None = None
+    #: ``[(row name, [button labels])]`` as read, in RAM only (the watcher confirms a candidate against it; never
+    #: logged or kept).
+    raw: list[tuple[str, list[str]]] = field(default_factory=list, repr=False)
 
     @property
     def playing(self) -> Row | None:
@@ -514,26 +536,85 @@ def _template_of(label: str, name: str) -> str | None:
     return label.replace(name, "{name}")
 
 
-def learn_row_wording(rows: list[tuple[str, list[str]]]) -> tuple[str, str] | None:
-    """The row play button's wording ``(play, pause)`` from one read taken while Spotify's media session says
+@dataclass
+class WordingGuess:
+    """A row-wording candidate from one playing read (PLAN.md L6), **provisional**: it gives no play state and is
+    never kept on disk until a later read confirms it (:func:`judge_wording`). ``rows``: which wording each row's
+    button carried in the reads so far (``"play"`` / ``"pause"``), by row name, in RAM only (never logged or kept)."""
+
+    play: str
+    pause: str
+    grid: str = ""
+    rows: dict[str, str] = field(default_factory=dict, repr=False)
+
+
+def row_wording_candidate(rows: list[tuple[str, list[str]]]) -> WordingGuess | None:
+    """A candidate for the row play button's wording from one read taken while Spotify's media session says
     playing (PLAN.md L6): the button position where every row's label, with its name replaced by ``{name}``, is the
     same wording except exactly one row's (the playing one), with at least :data:`LEARN_MIN_OTHERS` rows sharing it.
-    None when no position, or more than one, fits (then nothing is learned: never a guess)."""
+    None when no position, or more than one, fits (never a guess).
+
+    One read cannot tell the play button from another button that differs on exactly one row (the open button of
+    the one row by another owner, or the one pinned row, while the playing item is not a Library row in view), so
+    this is only a candidate: :func:`judge_wording` confirms it when a row's button flips between the two wordings
+    (the play button flips as music starts and stops; an owner never does)."""
     width = max((len(buttons) for _n, buttons in rows), default=0)
-    fits = []
+    fits: list[WordingGuess] = []
     for pos in range(width):
-        templates = [_template_of(buttons[pos], name) for name, buttons in rows if pos < len(buttons)]
-        if len(templates) < LEARN_MIN_OTHERS + 1 or any(t is None for t in templates):
+        templated = [(name, _template_of(buttons[pos], name)) for name, buttons in rows if pos < len(buttons)]
+        if len(templated) < LEARN_MIN_OTHERS + 1 or any(t is None for _n, t in templated):
             continue
         counts: dict[str, int] = {}
-        for t in templates:
+        for _n, t in templated:
             counts[t] = counts.get(t, 0) + 1   # type: ignore[index]
         if len(counts) != 2:
             continue
         (a, na), (b, nb) = sorted(counts.items(), key=lambda kv: -kv[1])
         if nb == 1 and na >= LEARN_MIN_OTHERS:
-            fits.append((a, b))
+            fits.append(WordingGuess(play=a, pause=b,   # type: ignore[arg-type]
+                                     rows={n: ("pause" if t == b else "play") for n, t in templated}))
     return fits[0] if len(fits) == 1 else None
+
+
+def learn_row_wording(rows: list[tuple[str, list[str]]]) -> tuple[str, str] | None:
+    """``(play, pause)`` of :func:`row_wording_candidate` (a candidate only), or None."""
+    guess = row_wording_candidate(rows)
+    return (guess.play, guess.pause) if guess is not None else None
+
+
+def _row_wording_now(buttons: list[str], name: str, play: str, pause: str) -> str | None:
+    if pause.replace("{name}", name) in buttons:
+        return "pause"
+    if play.replace("{name}", name) in buttons:
+        return "play"
+    return None
+
+
+def judge_wording(rows: list[tuple[str, list[str]]], play: str, pause: str,
+                  seen: dict[str, str] | None = None) -> str | None:
+    """What one read says about a row wording ``(play, pause)``: ``"contradict"`` when two or more rows carry the
+    pause wording at once (two playing rows: not a play button); ``"confirm"`` when a row in ``seen`` (the wording
+    each row carried before) now carries the other wording (it flipped: a play button does, an owner or a list's
+    kind does not); None when the read says nothing either way."""
+    now = {name: _row_wording_now(buttons, name, play, pause) for name, buttons in rows}
+    if sum(1 for w in now.values() if w == "pause") >= 2:
+        return "contradict"
+    for name, was in (seen or {}).items():
+        if now.get(name) is not None and now[name] != was:
+            return "confirm"
+    return None
+
+
+def apply_wording(got: "SpotifyRead", play: str, pause: str, source: str = "learned") -> None:
+    """Mark ``got``'s rows playing or not with a wording confirmed after the read was taken (its raw labels)."""
+    labels = dict(got.raw)
+    for row in got.rows:
+        buttons = labels.get(row.name) or []
+        state = _row_wording_now(buttons, row.name, play, pause)
+        if state is not None:
+            row.playing = state == "pause"
+            row.play_button = (pause if row.playing else play).replace("{name}", row.name)
+    got.label_source = source
 
 
 def _rows_of(grid: El, labels: Labels) -> list[tuple[str, list[str]]]:
@@ -629,12 +710,13 @@ def read_tree(tree: UiaTree, labels: list[Labels] | None = None, *, learned: dic
             return done("timeout" if late() else "no_library")
         out.grid = True
         raw = _rows_of(grid, used_rows) if used_rows is not None else []
+        out.raw = raw
         wording = _wording(raw, used_rows, learned)
         if wording is None and session_playing and len(raw) >= LEARN_MIN_OTHERS + 1:
-            guess = learn_row_wording(raw)
-            if guess is not None:
-                wording = (guess[0], guess[1], "learned")
-                out.learned = {"play": guess[0], "pause": guess[1], "grid": grid.name}
+            guess = row_wording_candidate(raw)
+            if guess is not None:   # provisional: no play state until a later read confirms it (the watcher)
+                guess.grid = grid.name
+                out.candidate = guess
         out.label_source = wording[2] if wording else "none"
         for name, buttons in raw:
             row = Row(name=name)
@@ -646,11 +728,10 @@ def read_tree(tree: UiaTree, labels: list[Labels] | None = None, *, learned: dic
                         row.spotify_owned = owner == used_rows.spotify_owner
                         break
             if wording is not None:
-                play, pause = wording[0].replace("{name}", name), wording[1].replace("{name}", name)
-                if pause in buttons:
-                    row.playing, row.play_button = True, pause
-                elif play in buttons:
-                    row.playing, row.play_button = False, play
+                state = _row_wording_now(buttons, name, wording[0], wording[1])
+                if state is not None:
+                    row.playing = state == "pause"
+                    row.play_button = wording[1 if row.playing else 0].replace("{name}", name)
             out.rows.append(row)
     if "links" in want and not late():
         # only rows whose owner parsed and is not Spotify (PLAN.md D1: Spotify-owned and unparsed rows digest-only)
@@ -712,10 +793,13 @@ class WarmResult:
     polls: int = 0
     ms: float = 0.0
     error: str | None = None
+    #: The warm-up stopped early because ``stop_fn`` said so (a game came to the front).
+    stopped: bool = False
 
     def counts(self) -> dict[str, Any]:
         return {"elements_before": self.before, "elements": self.after, "built": self.built, "cold": self.cold,
-                "children_asked": self.asked, "polls": self.polls, "warm_ms": round(self.ms, 1)}
+                "children_asked": self.asked, "polls": self.polls, "warm_ms": round(self.ms, 1),
+                "stopped": self.stopped}
 
 
 def _built(tree: UiaTree, langs: list[Labels]) -> bool:
@@ -726,13 +810,24 @@ def _built(tree: UiaTree, langs: list[Labels]) -> bool:
     return _shape_slider(tree) is not None
 
 
+def _stop_now(stop_fn: Callable[[], bool] | None) -> bool:
+    if stop_fn is None:
+        return False
+    try:
+        return bool(stop_fn())
+    except Exception:  # noqa: BLE001 - fails closed: stop
+        return True
+
+
 def warm_tree(tree: UiaTree, handles: Iterable[int], *, budget_s: float = WARM_BUDGET_S,
               labels: list[Labels] | None = None, clock: Callable[[], float] = time.monotonic,
-              sleep: Callable[[float], None] = time.sleep, step_s: float = WARM_STEP_S) -> WarmResult:
+              sleep: Callable[[float], None] = time.sleep, step_s: float = WARM_STEP_S,
+              stop_fn: Callable[[], bool] | None = None) -> WarmResult:
     """Warm a lazily built window (see the module docstring): if the player controls are already there, nothing to
     do; else ask every visible child window, then poll the element count until the tree is built (player controls,
     or the shape slider) and its count stopped growing, at most ``budget_s``. A condition poll keyed on counts and
-    structure, never a settle sleep."""
+    structure, never a settle sleep. ``stop_fn`` (the game check) is asked before asking the children and before
+    each poll: True stops the warm-up there (``stopped``; never with a game in front, PLAN.md F7)."""
     started = clock()
     langs = labels if labels is not None else all_labels()
     out = WarmResult()
@@ -742,9 +837,16 @@ def warm_tree(tree: UiaTree, handles: Iterable[int], *, budget_s: float = WARM_B
         out.ms = (clock() - started) * 1000.0
         return out
     out.cold = True
+    if _stop_now(stop_fn):
+        out.after, out.stopped = out.before, True
+        out.ms = (clock() - started) * 1000.0
+        return out
     out.asked = tree.ask_children(handles)
     last, stable, built = out.before, 0, False
     while clock() - started < budget_s:
+        if _stop_now(stop_fn):
+            out.stopped = True
+            break
         sleep(min(step_s, max(budget_s - (clock() - started), 0.0)))
         out.polls += 1
         now = tree.count()
@@ -940,11 +1042,13 @@ def _child_handles(hwnd: int) -> list[int]:
 
 
 def warm(hwnd: int, budget_s: float = WARM_BUDGET_S, *, automation_fn: Callable[[], Any] | None = None,
-         handles_fn: Callable[[int], list[int]] | None = None) -> WarmResult:
+         handles_fn: Callable[[int], list[int]] | None = None,
+         stop_fn: Callable[[], bool] | None = None) -> WarmResult:
     """Warm Spotify's window (see :func:`warm_tree`), at most ``budget_s`` (plus a small hand-off margin)."""
     def job(automation: Any, shared: dict) -> None:
         tree = UiaTree(automation, hwnd)
-        shared["result"] = warm_tree(tree, (handles_fn or _child_handles)(hwnd), budget_s=budget_s)
+        shared["result"] = warm_tree(tree, (handles_fn or _child_handles)(hwnd), budget_s=budget_s,
+                                     stop_fn=stop_fn)
 
     shared, timed_out = run_uia(job, budget_s + 0.5, name="yuki-spotify-warm", automation_fn=automation_fn)
     result = shared.get("result")
@@ -1066,8 +1170,8 @@ class DesktopReader:
     def state(self, hwnd: int) -> str | None:
         return window_state(hwnd)
 
-    def warm(self, hwnd: int, budget_s: float) -> WarmResult:
-        return warm(hwnd, budget_s)
+    def warm(self, hwnd: int, budget_s: float, **kw: Any) -> WarmResult:
+        return warm(hwnd, budget_s, stop_fn=kw.get("stop_fn"))
 
     def read(self, hwnd: int, budget_s: float, **kw: Any) -> SpotifyRead:
         return read(hwnd, budget_s, **kw)
@@ -1097,9 +1201,13 @@ class SpotifyWatch:
         emit: ``emit(moment: dict)`` for the moments writer (fields as the ``moments`` table, plus ``entity`` in clear
             for the writer to encrypt and digest, and ``entity_keep`` False for digest-only); None: no moments.
         log: ``log(type, **fields)``, content-free.
-        store: the memory store (``nudge_state`` for the status, learned labels and encrypted learned links).
+        store: the memory store (``nudge_state`` for the status, and its cipher for the encrypted learned labels and
+            links).
         privacy: the service's ``PrivacyConfig`` (its ``[spotify]`` table), or None for the defaults.
-        game_front_fn: ``() -> bool``; default :func:`foreground_is_game` (D9's local read).
+        game_front_fn: ``() -> bool`` (the game gate's ``front_game``); default :func:`foreground_is_game` (D9's
+            local read). When given, it is OR-ed with ``local_game_fn`` so a gate that lags the foreground change
+            never lets a read start with a game just come to the front.
+        local_game_fn: the cheap local read (default :func:`foreground_is_game`; tests pass a stub).
         reader: the window reader (default :class:`DesktopReader`).
         spawn: ``spawn(fn)`` runs a job off the caller's thread (default: a daemon thread); tests run it inline.
     """
@@ -1108,11 +1216,13 @@ class SpotifyWatch:
                  log: Callable[..., Any] | None = None, store: Any = None, privacy: Any = None,
                  game_front_fn: Callable[[], bool] | None = None, reader: Any = None,
                  settings: SpotifySettings | None = None, spawn: Callable[[Callable[[], None]], Any] | None = None,
-                 clock: Callable[[], float] = time.time, mono: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.time, mono: Callable[[], float] = time.monotonic,
+                 local_game_fn: Callable[[], bool] | None = None) -> None:
         self._emit = emit
         self._log_fn = log
         self._store = store
-        self._game_front_fn = game_front_fn or foreground_is_game
+        local = local_game_fn or foreground_is_game
+        self._game_fns: tuple[Callable[[], bool], ...] = (game_front_fn, local) if game_front_fn else (local,)
         self._reader = reader or DesktopReader()
         self._settings_fixed = settings
         self._section: Any = None
@@ -1136,15 +1246,18 @@ class SpotifyWatch:
         self._identities: dict[int, dict[str, str]] = {}
         self._read_pids: set[int] = set()
         self._last_slider: float | None = None
+        self._last_slider_at: float | None = None
         self._last_context: tuple[str, float] | None = None
         self._known: dict[str, None] = {}
         self._away: dict[str, Any] | None = None
         self._probe_due: float | None = None
+        self._layout_state: str | None = None
         self._learned: dict[str, str] | None = None
         self._learned_loaded = False
+        self._candidates: list[WordingGuess] = []
         self._status: dict[str, Any] | None = None
         self.counters = {"triggers": 0, "jobs": 0, "reads": 0, "warms": 0, "probes": 0, "held_game": 0,
-                         "moments": 0, "links_learned": 0, "labels_learned": 0, "errors": 0}
+                         "moments": 0, "links_learned": 0, "labels_learned": 0, "labels_dropped": 0, "errors": 0}
 
     # -- settings, logging, state -----------------------------------------------------------------
 
@@ -1181,13 +1294,20 @@ class SpotifyWatch:
             self.counters["errors"] += 1
 
     def learned_labels(self) -> dict[str, str] | None:
+        """The confirmed row wording (``{"play", "pause", "grid", "at"}``), decrypted from
+        ``nudge_state['spotify_labels']``; None when none was learned (or no cipher: then it lives in RAM only)."""
         if not self._learned_loaded:
             self._learned_loaded = True
             raw = self._nudge_get(LABELS_KEY)
+            cipher = getattr(self._store, "cipher", None)
             try:
-                got = json.loads(raw) if raw else None
-                self._learned = got if isinstance(got, dict) else None
-            except ValueError:
+                from yuki.memory.crypto import PREFIX
+
+                sealed = bool(raw) and str(raw).startswith(PREFIX)   # a value kept in clear is never trusted
+                got = json.loads(cipher.decrypt(raw)) if sealed and cipher is not None else None
+                ok = isinstance(got, dict) and isinstance(got.get("play"), str) and isinstance(got.get("pause"), str)
+                self._learned = got if ok else None
+            except Exception:  # noqa: BLE001 - unreadable (another key, or not encrypted): nothing learned
                 self._learned = None
         return self._learned
 
@@ -1210,17 +1330,34 @@ class SpotifyWatch:
     # -- triggers (cheap; any thread) ----------------------------------------------------------------
 
     def on_layout(self, surfaces: list[dict[str, Any]], foreground: int = 0, at: float | None = None) -> None:
-        """The Now board's layout changed: a Spotify window seen for the first time in this process gets its warm-up."""
+        """The Now board's layout changed: a Spotify window seen for the first time in this process gets its warm-up;
+        and when Spotify's place on screen changed (in front, on screen behind, gone from the layout: minimised,
+        covered or closed), the daily probe's 60 s one-shot timer (re)starts (no polling: the layout is an event)."""
         try:
+            spot = None
             for s in surfaces or []:
                 pid = int(s.get("pid") or 0)
-                if pid and pid not in self._seen_pids and is_spotify_pid(pid):
+                if pid and (pid in self._seen_pids or is_spotify_pid(pid)):
+                    spot = s
+                    break
+            if spot is not None:
+                pid = int(spot.get("pid") or 0)
+                if pid not in self._seen_pids:
                     if len(self._seen_pids) > 64:
                         self._seen_pids.clear()
                     self._seen_pids.add(pid)
                     if self._warm_pid != pid:
                         self._trigger("appear")
-                    return
+            if spot is None:
+                place = "gone" if self._layout_state is not None else None
+            else:
+                share = spot.get("share")
+                place = classify_state(minimised=False, front=int(spot.get("hwnd") or 0) == int(foreground or 0),
+                                       share=float(share) if isinstance(share, (int, float)) else None)
+            if place != self._layout_state:
+                self._layout_state = place
+                if place not in (None, FRONT):
+                    self._arm_probe(None)
         except Exception:  # noqa: BLE001
             self.counters["errors"] += 1
 
@@ -1253,11 +1390,7 @@ class SpotifyWatch:
             if ident is None:
                 ident = process_identity(pid)
                 self._identities = {pid: ident}
-            if ident.get("aumid") or ident.get("family"):
-                return is_spotify_session(app_id, aumid=ident.get("aumid") or None,
-                                          family=None if ident.get("aumid") else ident.get("family"))
-            if ident.get("image"):
-                return is_spotify_session(app_id, image=ident["image"])
+            return session_matches(app_id, ident)
         return is_spotify_session(app_id)
 
     def beat(self, now: float | None = None) -> None:
@@ -1315,9 +1448,11 @@ class SpotifyWatch:
             return
         if ref.pid != self._warm_pid:
             self._warm_pid, self._warm_built = ref.pid, False
-            self._last_slider = None
+            self._last_slider, self._last_slider_at = None, None
             self._save_status(found_at=round(self._clock()), pid_seen=True)
         state = self._reader.state(ref.hwnd)
+        if kind in ("appear", "play_start") and state in PROBE_STATES and self._away is None:
+            self._arm_probe(state)   # a Spotify that started minimised and never came to the front is probed too
         if kind == "appear":
             self._ensure_warm(ref, state, kind)
             return
@@ -1333,8 +1468,9 @@ class SpotifyWatch:
                                     known_names=tuple(self._known))
             self._after_read(kind, ref, state, got, warm)
             self._remember_links(got.links)
+            self._learn(got)   # first: a candidate this read confirms gives this read its play state
             self._context(got, state)
-            self._learn(got)
+            self._volume(got, state, kind)
             return
         if kind == "leave_front":
             warm = self._ensure_warm(ref, state, kind)
@@ -1342,19 +1478,37 @@ class SpotifyWatch:
                 return
             got = self._reader.read(ref.hwnd, s.read_budget_s, want=("slider",), learned=self.learned_labels())
             self._after_read(kind, ref, state, got, warm)
-            self._volume(got, state)
-            if state in PROBE_STATES and s.state_probe:
-                self._away = {"state": state, "since": self._mono(), "checks": 0}
-                self._probe_due = self._mono() + s.probe_after_s
+            self._volume(got, state, kind)
+            if state in PROBE_STATES:
+                self._arm_probe(state)
             return
         if kind == "probe_check":
             self._probe_check(ref, state, s)
 
-    def _game_front(self) -> bool:
+    def _arm_probe(self, state: str | None) -> None:
+        """(Re)start the daily probe's 60 s one-shot timer for a stretch away from the front (``state`` None: not
+        known yet; the timer's check adopts the state it then finds, from the time armed)."""
+        s = self.settings()
+        if not s.enabled or not s.state_probe:
+            return
         try:
-            return bool(self._game_front_fn())
-        except Exception:  # noqa: BLE001 - fails closed: no passive read
-            return True
+            if all(self._probed_today(st) for st in PROBE_STATES):
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        self._away = {"state": state, "since": self._mono(), "checks": 0}
+        self._probe_due = self._mono() + s.probe_after_s
+
+    def _game_front(self) -> bool:
+        """Whether a game is in front: the game gate's answer OR the local read of the foreground program (fails
+        closed: no passive read)."""
+        for fn in self._game_fns:
+            try:
+                if fn():
+                    return True
+            except Exception:  # noqa: BLE001
+                return True
+        return False
 
     def _held(self, kind: str) -> bool:
         """A game came to the front while the window warmed: the read waits (logged)."""
@@ -1371,12 +1525,18 @@ class SpotifyWatch:
         if failed is not None and failed[0] == ref.pid and self._mono() - failed[1] < WARM_RETRY_S:
             return None   # a warm-up of this window did not build moments ago: the read alone says "not built"
         s = self.settings()
-        result = self._reader.warm(ref.hwnd, s.warm_budget_s)
+        result = self._reader.warm(ref.hwnd, s.warm_budget_s, stop_fn=self._game_front)
         self.counters["warms"] += 1
         self._warm_built = bool(result.built)
-        self._warm_failed = None if result.built else (ref.pid, self._mono())
+        if result.stopped and not result.built:
+            # a game came to the front: not a window that fails to build (the next trigger warms again)
+            self.counters["held_game"] += 1
+            status = "held_game"
+        else:
+            self._warm_failed = None if result.built else (ref.pid, self._mono())
+            status = "ok" if result.built else (result.error or "not_built")
         self._log("spotify_read", trigger="warm", cause=trigger, window_state=state, **result.counts(),
-                  status="ok" if result.built else (result.error or "not_built"))
+                  status=status)
         return result
 
     def _after_read(self, trigger: str, ref: WindowRef, state: str | None, got: SpotifyRead,
@@ -1393,7 +1553,7 @@ class SpotifyWatch:
             self._known.pop(next(iter(self._known)))
         cold = bool(warm.cold) if warm is not None else False
         self._log("spotify_read", trigger=trigger, window_state=state, cold=cold, first=first,
-                  labels_learned=bool(got.learned), **got.counts())
+                  labels_candidate=got.candidate is not None, **got.counts())
         self._save_status(last_read={"at": round(self._clock()), "trigger": trigger, "status": got.status,
                                      "window_state": state, "rows": len(got.rows), "slider": got.slider is not None,
                                      "cold": cold, "label_source": got.label_source, "first": first})
@@ -1414,15 +1574,21 @@ class SpotifyWatch:
                              "link": keep and self._has_link(row.name), "window_state": state,
                              "label_source": got.label_source}})
 
-    def _volume(self, got: SpotifyRead, state: str | None) -> None:
+    def _volume(self, got: SpotifyRead, state: str | None, trigger: str = "leave_front") -> None:
+        """Spotify's own slider against the last reading (the leave-front and the play-start reads both read it):
+        a change is a ``volume_change`` (means ``in_app``) with ``facts.prev_read_at``, the previous reading's time,
+        so the hub can attribute it (D18) over the whole span the change happened in, not only at ``at``."""
         if got.slider is None:
             return
-        before, self._last_slider = self._last_slider, got.slider
+        now = self._clock()
+        before, before_at = self._last_slider, self._last_slider_at
+        self._last_slider, self._last_slider_at = got.slider, now
         if before is None or abs(before - got.slider) < 0.5:
             return   # the first read is the baseline; an unchanged level is no change
-        self._put({"kind": "volume_change", "at": self._clock(), "app": app_key(), "value": got.slider,
+        self._put({"kind": "volume_change", "at": now, "app": app_key(), "value": got.slider,
                    "value_from": before, "means": "in_app", "source": "spotify", "evidence": "window_read",
-                   "facts": {"window_state": state, "slider_source": got.slider_source}})
+                   "facts": {"window_state": state, "slider_source": got.slider_source, "trigger": trigger,
+                             "prev_read_at": round(before_at, 3) if before_at is not None else None}})
 
     def _put(self, moment: dict[str, Any]) -> None:
         if self._emit is None:
@@ -1433,14 +1599,73 @@ class SpotifyWatch:
         except Exception:  # noqa: BLE001
             self.counters["errors"] += 1
 
-    def _learn(self, got: SpotifyRead) -> None:
-        if not got.learned:
-            return
-        learned = dict(got.learned)
-        learned["at"] = str(round(self._clock()))
+    # -- row wording in another language (PLAN.md L6) -------------------------------------------------
+
+    def _learn(self, got: SpotifyRead) -> bool:
+        """Weigh a read's rows against the learned wording and the candidates (see the module docstring). True when a
+        candidate was confirmed by this read (its rows then carry their play state)."""
+        raw = got.raw
+        if not raw:
+            return False
+        learned = self.learned_labels()
+        if learned:
+            if got.label_source not in (None, "none", "learned"):
+                self._unlearn("data")              # the data's own wording shows now: it takes over
+                return False
+            if got.label_source == "learned":
+                if judge_wording(raw, learned["play"], learned["pause"]) == "contradict":
+                    self._unlearn("two_playing")   # two rows "playing" at once: not the play button
+                return False
+            # no row in view carries the learned wording (Spotify's language changed?): a confirmed candidate may
+            # replace it below; until then it stays
+        if got.label_source not in (None, "none"):
+            self._candidates = []                  # the data's wording reads this Spotify: nothing to learn
+            return False
+        confirmed: WordingGuess | None = None
+        kept: list[WordingGuess] = []
+        for cand in self._candidates:
+            verdict = judge_wording(raw, cand.play, cand.pause, cand.rows)
+            if verdict == "confirm" and confirmed is None:
+                confirmed = cand
+            elif verdict == "contradict":
+                self._log("spotify_read", trigger="labels", action="dropped", reason="two_playing",
+                          candidates=len(self._candidates) - 1)
+            else:
+                kept.append(cand)
+        if confirmed is not None:
+            self._candidates = []
+            self._keep_learned(confirmed)
+            apply_wording(got, confirmed.play, confirmed.pause)
+            return True
+        new = got.candidate
+        if new is not None:
+            same = next((c for c in kept if (c.play, c.pause) == (new.play, new.pause)), None)
+            if same is not None:
+                same.rows.update(new.rows)
+                while len(same.rows) > KNOWN_NAMES_MAX:
+                    same.rows.pop(next(iter(same.rows)))
+            else:
+                kept.append(WordingGuess(new.play, new.pause, new.grid, dict(new.rows)))
+                self._log("spotify_read", trigger="labels", action="candidate", candidates=len(kept))
+        self._candidates = kept[-CANDIDATES_MAX:]
+        return False
+
+    def _keep_learned(self, guess: WordingGuess) -> None:
+        learned = {"play": guess.play, "pause": guess.pause, "grid": guess.grid, "at": str(round(self._clock()))}
         self._learned, self._learned_loaded = learned, True
         self.counters["labels_learned"] += 1
-        self._nudge_set(LABELS_KEY, json.dumps(learned, ensure_ascii=False))
+        cipher = getattr(self._store, "cipher", None)
+        if cipher is not None:   # kept encrypted (no cipher: RAM only, never in clear)
+            self._nudge_set(LABELS_KEY, cipher.encrypt(json.dumps(learned, ensure_ascii=False)))
+        self._save_status(labels={"learned": True, "at": round(self._clock())})
+        self._log("spotify_read", trigger="labels", action="confirmed", candidates=0)
+
+    def _unlearn(self, reason: str) -> None:
+        self._learned, self._learned_loaded = None, True
+        self.counters["labels_dropped"] += 1
+        self._nudge_set(LABELS_KEY, None)
+        self._save_status(labels={"learned": False, "dropped": reason, "at": round(self._clock())})
+        self._log("spotify_read", trigger="labels", action="dropped", reason=reason, candidates=len(self._candidates))
 
     # -- learned links (encrypted in nudge_state) ----------------------------------------------------
 
@@ -1507,6 +1732,8 @@ class SpotifyWatch:
         if away is None or state is None or state == FRONT or not s.state_probe:
             self._away, self._probe_due = None, None
             return
+        if away.get("state") is None:
+            away["state"] = state   # armed by a layout change: in this state since then
         if state != away.get("state"):
             away.update(state=state, since=self._mono())
             self._reschedule()
@@ -1521,11 +1748,12 @@ class SpotifyWatch:
 
     def _probe(self, ref: WindowRef, state: str, s: SpotifySettings) -> None:
         self.counters["probes"] += 1
-        result = self._reader.warm(ref.hwnd, s.warm_budget_s)
+        result = self._reader.warm(ref.hwnd, s.warm_budget_s, stop_fn=self._game_front)
         if self._held("probe"):
             return
         got = self._reader.read(ref.hwnd, s.read_budget_s, want=("slider", "library"),
                                 learned=self.learned_labels())
+        self._learn(got)   # a row flip seen here confirms a wording candidate too (nothing else is kept)
         probes = dict(self.status().get("probes") or {})
         probes[state] = {"day": datetime.fromtimestamp(self._clock()).strftime("%Y-%m-%d"), "status": got.status,
                          "rows": len(got.rows), "slider": got.slider is not None, "cold": bool(result.cold),
@@ -1538,7 +1766,7 @@ class SpotifyWatch:
 
     def stats(self) -> dict[str, Any]:
         return {**self.counters, "warm": self._warm_built, "known_names": len(self._known),
-                "probe_pending": self._probe_due is not None}
+                "probe_pending": self._probe_due is not None, "label_candidates": len(self._candidates)}
 
 
 def learned_links(store: Any) -> dict[str, str]:
@@ -1556,9 +1784,9 @@ def learned_links(store: Any) -> dict[str, str]:
 
 __all__ = [
     "COVERED", "DesktopReader", "El", "FRONT", "Labels", "MINIMISED", "PROBE_STATES", "Row", "SpotifyRead",
-    "SpotifySettings", "SpotifyWatch", "Step", "UiaTree", "VISIBLE", "WarmResult", "WindowRef", "all_labels",
-    "app_key", "classify_state", "data", "find_window", "foreground_is_game", "is_spotify_pid", "is_spotify_session",
-    "learn_row_wording", "learned_links", "library", "links", "local_find", "playlist_uri", "process_identity",
-    "process_image", "read", "read_tree", "run_uia", "slider", "spotify_session", "warm", "warm_tree", "window",
-    "window_state",
+    "SpotifySettings", "SpotifyWatch", "Step", "UiaTree", "VISIBLE", "WarmResult", "WindowRef", "WordingGuess",
+    "all_labels", "app_key", "apply_wording", "classify_state", "data", "find_window", "foreground_is_game",
+    "is_spotify_pid", "is_spotify_session", "judge_wording", "learn_row_wording", "learned_links", "library", "links",
+    "local_find", "playlist_uri", "process_identity", "process_image", "read", "read_tree", "row_wording_candidate",
+    "run_uia", "session_matches", "slider", "spotify_session", "warm", "warm_tree", "window", "window_state",
 ]

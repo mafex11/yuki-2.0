@@ -140,6 +140,10 @@ class NowBoard:
         self._game_front_at: float | None = None
         self.game_front_fn: Callable[[], Any] | None = None
         self._signals: dict[str, Any] = {"mic_holders": [], "playing": [], "at": None}
+        #: ``() -> {"mic_holders": [...], "playing": [...]}`` (app keys), asked at snapshot time when given (the
+        #: service wires it to the call worker's holders and the timeline's playing sessions); else what
+        #: :meth:`set_signals` last put.
+        self.signals_fn: Callable[[], dict[str, Any]] | None = None
         self._layout_subscribers: list[Callable[..., Any]] = []
 
     # -- writes (the watcher) ---------------------------------------------------
@@ -157,8 +161,11 @@ class NowBoard:
                     entry.pop("gone_at", None)
                 elif "gone_at" not in entry:
                     entry["gone_at"] = at
-            for hwnd in [h for h in self._calling_tabs if h not in visible]:
-                self._calling_tabs[hwnd].setdefault("gone_at", at)
+            for hwnd, tab in self._calling_tabs.items():
+                if hwnd in visible:
+                    tab.pop("gone_at", None)   # its window is back on screen
+                else:
+                    tab.setdefault("gone_at", at)
             self._prune(at)
             subscribers = list(self._layout_subscribers)
         for callback in subscribers:   # outside the lock: a subscriber may take its time
@@ -195,9 +202,9 @@ class NowBoard:
         """Content-free live signals: app keys holding the microphone, app keys playing media."""
         with self._lock:
             if mic_holders is not None:
-                self._signals["mic_holders"] = sorted({str(a) for a in mic_holders if a})[:16]
+                self._signals["mic_holders"] = _keys(mic_holders)
             if playing is not None:
-                self._signals["playing"] = sorted({str(a) for a in playing if a})[:16]
+                self._signals["playing"] = _keys(playing)
             self._signals["at"] = time.time() if at is None else float(at)
             self.version += 1
 
@@ -313,12 +320,14 @@ class NowBoard:
                             if not v.get("gone_at") or now - float(v["gone_at"]) <= GONE_TTL_S}
             game_front, game_front_at = self._game_front, self._game_front_at
             signals = dict(self._signals)
-            game_front_fn = self.game_front_fn
+            game_front_fn, signals_fn = self.game_front_fn, self.signals_fn
         if game_front_fn is not None:
             try:
                 game_front, game_front_at = bool(game_front_fn()), now
             except Exception:  # noqa: BLE001 - unknown: the reader falls back to its own local read (D9)
                 game_front, game_front_at = None, None
+        if signals_fn is not None:
+            signals = _signals_of(signals_fn, now)
         return {"at": now, "foreground": layout.get("foreground"), "layout_at": layout.get("at"),
                 "layout_ms": layout.get("ms"), "windows": windows, "popups": popups, "counters": counters,
                 "calling_tabs": calling_tabs, "game_front": game_front, "game_front_at": game_front_at,
@@ -331,6 +340,19 @@ class NowBoard:
                         for e in self._windows.values())
             return {"windows": len(self._windows), "popups": len(self._popups), "chars": chars,
                     "calling_tabs": len(self._calling_tabs)}
+
+
+def _keys(values: Any) -> list[str]:
+    """App keys as a short sorted list (content-free: app keys only)."""
+    return sorted({str(v) for v in (values or []) if v})[:16]
+
+
+def _signals_of(signals_fn: Callable[[], dict[str, Any]], now: float) -> dict[str, Any]:
+    try:
+        got = signals_fn() or {}
+        return {"mic_holders": _keys(got.get("mic_holders")), "playing": _keys(got.get("playing")), "at": now}
+    except Exception:  # noqa: BLE001 - unknown now
+        return {"mic_holders": [], "playing": [], "at": None}
 
 
 def app_data_for(process: str, rect: tuple[int, int, int, int], title: str, *, privacy: Any = None,

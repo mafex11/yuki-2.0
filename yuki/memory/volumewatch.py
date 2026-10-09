@@ -176,6 +176,7 @@ class VolumeWatch:
         self.counters = {"events": 0, "changes": 0, "yuki": 0, "sessions": 0, "released": 0, "wakeups": 0,
                          "idle_wakeups": 0, "errors": 0, "reregistered": 0}
         self.cpu_s = 0.0
+        self._cpu0 = 0.0
 
     # -- control ---------------------------------------------------------------------------------------
 
@@ -206,7 +207,7 @@ class VolumeWatch:
 
     def _run(self) -> None:
         coinit = False
-        c0 = time.thread_time()
+        c0 = self._cpu0 = time.thread_time()
         try:
             if self._register_com:
                 try:
@@ -240,7 +241,7 @@ class VolumeWatch:
                 pass
             self._unregister()
             self.mode = "stopped"
-            self.cpu_s += time.thread_time() - c0
+            self.cpu_s = time.thread_time() - c0
             if coinit:
                 try:
                     import comtypes
@@ -258,6 +259,7 @@ class VolumeWatch:
             except queue.Empty:
                 event = None
             self.counters["wakeups"] += 1
+            self.cpu_s = time.thread_time() - self._cpu0   # this thread's CPU so far (stats() reads it live)
             if event is None and due is None:
                 self.counters["idle_wakeups"] += 1
             if event is not None:

@@ -79,6 +79,14 @@ def test_spotify_watch_logs_and_status_never_hold_names_links_or_ids(seed: int,
     ids = ["".join(rng.choice(string.ascii_letters + string.digits) for _ in range(22)) for _ in range(6)]
     rows = [SD.Row(n, o, i % 3 == 0, i == 2) for i, (n, o) in enumerate(zip(names, owners))]
     links = {n: f"spotify:playlist:{ids[i]}" for i, n in enumerate(names) if i % 3 != 0}
+    # a row wording that holds people's names (the worst case of review r1 M1), confirmed by a row flip on the
+    # second read: whatever is kept must hold none of them in clear
+    play_t, pause_t = "{name} " + owners[0], "{name} " + owners[1]
+
+    def raw(playing: int) -> list[tuple[str, list[str]]]:
+        return [(n, [(pause_t if i == playing else play_t).replace("{name}", n)]) for i, n in enumerate(names)]
+
+    reads = [0]
 
     class Reader:
         def find(self) -> SD.WindowRef:
@@ -87,23 +95,28 @@ def test_spotify_watch_logs_and_status_never_hold_names_links_or_ids(seed: int,
         def state(self, hwnd: int) -> str:
             return "minimised"
 
-        def warm(self, hwnd: int, budget_s: float) -> SD.WarmResult:
+        def warm(self, hwnd: int, budget_s: float, **kw: Any) -> SD.WarmResult:
             return SD.WarmResult(before=7, after=300, built=True, cold=True, ms=900.0)
 
         def read(self, hwnd: int, budget_s: float, **kw: Any) -> SD.SpotifyRead:
+            reads[0] += 1
+            playing = reads[0] % len(names)
+            cand = SD.WordingGuess(play_t, pause_t, names[1],
+                                   {n: "pause" if i == playing else "play" for i, n in enumerate(names)})
             return SD.SpotifyRead(status="ok", built=True, player=True, slider=rng.uniform(0, 100),
-                                  slider_source="english", grid=True, rows=rows, links=links,
-                                  label_source="english", elements=300, ms=150.0,
-                                  learned={"play": names[0] + " {name}", "pause": owners[0] + " {name}",
-                                           "grid": names[1]})
+                                  slider_source="shape", grid=True, rows=rows, links=links,
+                                  label_source="none", elements=300, ms=150.0,
+                                  candidate=cand if kw.get("session_playing") else None, raw=raw(playing))
 
     store, logs, moments = Store(), [], []
     mono = [100.0]
     watch = SD.SpotifyWatch(emit=moments.append, log=lambda t, **f: logs.append((t, f)), store=store,
-                            game_front_fn=lambda: False, reader=Reader(), spawn=lambda fn: fn(),
-                            mono=lambda: mono[0])
+                            game_front_fn=lambda: False, local_game_fn=lambda: False, reader=Reader(),
+                            spawn=lambda fn: fn(), mono=lambda: mono[0])
     watch.on_front_change("x", "spotify")
     watch.on_media_change(started=["Spotify.exe"])
+    watch.on_media_change(started=["Spotify.exe"])          # another row plays: the wording is confirmed
+    assert watch.stats()["labels_learned"] == 1
     watch.on_front_change("spotify", "x")
     mono[0] += 61
     watch.beat()
@@ -114,6 +127,11 @@ def test_spotify_watch_logs_and_status_never_hold_names_links_or_ids(seed: int,
     links_raw = store.state.get(SD.LINKS_KEY, "")
     for s in names + ids:
         assert s not in links_raw          # encrypted
+    labels_raw = store.state.get(SD.LABELS_KEY, "")
+    assert labels_raw.startswith("enc:")
+    for s in names + owners:
+        assert s not in labels_raw         # encrypted (review r1 M1)
+    assert not any(s in json.dumps(watch.stats()) for s in names + owners)
     assert any(t == "spotify_probe" for t, _f in logs)
 
 

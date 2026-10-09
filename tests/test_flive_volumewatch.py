@@ -147,3 +147,27 @@ def test_the_watch_thread_is_one_named_daemon() -> None:
         assert all(t.daemon for t in threading.enumerate() if t.name == "yuki-memory-volume")
     finally:
         w.stop()
+
+
+def test_stats_show_the_threads_cpu_while_it_runs() -> None:
+    """Review r1 L3: the per-thread CPU is readable from stats() during the watch's life, not only after it ends."""
+    def busy(_m) -> None:   # the consumer runs on the watch thread: burn ~80 ms of its CPU
+        end = time.thread_time() + 0.08
+        while time.thread_time() < end:
+            pass
+
+    w = VolumeWatch(busy, register=False, quiet_s=0.02, front_fn=lambda: None)
+    w.start()
+    try:
+        w.feed("endpoint", 10.0, False, "", 0.0)
+        w.feed("endpoint", 30.0, False, "", 0.0)
+        deadline = time.monotonic() + 3.0
+        while w.counters["changes"] < 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        w.feed("endpoint", 31.0, False, "", 0.0)   # one more wake-up after the busy consumer
+        deadline = time.monotonic() + 3.0
+        while w.stats()["cpu_ms"] <= 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert w.alive and w.stats()["cpu_ms"] >= 50
+    finally:
+        w.stop()

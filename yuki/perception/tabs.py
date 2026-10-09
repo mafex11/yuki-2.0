@@ -47,7 +47,6 @@ _TAB_ITEM = 50019
 _DOCUMENT = 50030
 _TREE_SCOPE_CHILDREN = 2
 _TREE_SCOPE_ELEMENT = 1
-_TREE_SCOPE_DESCENDANTS = 4
 
 #: Elements visited at most (Chrome's non-page tree is ~100-250).
 MAX_NODES = 700
@@ -202,26 +201,49 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float, *, all_groups: bool =
 #: A Document this close to the window root is counted in the diagnostics (a browser that draws its own tab strip as
 #: page content would put it there).
 SHALLOW_DOCUMENT_DEPTH = 2
+#: The empty-strip diagnostic looks this many child levels into such a Document, and at most this many elements in
+#: all: a tab strip drawn as page content sits at its top, and the page itself is never walked (review r1 L6).
+INSIDE_DEPTH = 2
+INSIDE_MAX_NODES = 120
 
 
 def _tab_items_inside(automation: Any, documents: list[Any], deadline: float) -> int:
-    """How many TabItems the given Documents hold (control types only, no names); 0 when that cannot be read."""
-    total = 0
+    """How many TabItems sit in the top :data:`INSIDE_DEPTH` child levels of the given Documents (control types only,
+    no names; one ``TreeScope_Children`` request per element, at most :data:`INSIDE_MAX_NODES` elements, within the
+    deadline); 0 when that cannot be read. Never a whole page's subtree."""
+    total = nodes = 0
     try:
-        condition = automation.CreatePropertyCondition(_P_CONTROL_TYPE, _TAB_ITEM)
         request = automation.CreateCacheRequest()
         request.AddProperty(_P_CONTROL_TYPE)
         request.TreeScope = _TREE_SCOPE_ELEMENT
+        condition = automation.ControlViewCondition
     except Exception:  # noqa: BLE001
         return 0
-    for doc in documents:
-        if time.monotonic() >= deadline:
-            break
-        try:
-            found = doc.FindAllBuildCache(_TREE_SCOPE_DESCENDANTS, condition, request)
-            total += int(found.Length) if found else 0
-        except Exception:  # noqa: BLE001
-            continue
+    level = list(documents)
+    for _depth in range(INSIDE_DEPTH):
+        below: list[Any] = []
+        for element in level:
+            if time.monotonic() >= deadline or nodes >= INSIDE_MAX_NODES:
+                return total
+            try:
+                children = element.FindAllBuildCache(_TREE_SCOPE_CHILDREN, condition, request)
+                count = int(children.Length) if children else 0
+            except Exception:  # noqa: BLE001
+                continue
+            for i in range(count):
+                if nodes >= INSIDE_MAX_NODES:
+                    break
+                nodes += 1
+                child = children.GetElement(i)
+                try:
+                    kind = int(child.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if kind == _TAB_ITEM:
+                    total += 1
+                elif kind != _DOCUMENT:
+                    below.append(child)
+        level = below
     return total
 
 

@@ -789,7 +789,8 @@ class CallEvidence:
         """Judge the shipped list once on a short-lived thread (never on the caller's)."""
         with self._lock:
             running = self._entries_thread is not None and self._entries_thread.is_alive()
-            if running or self._entry_verdicts is not None                     or time.monotonic() - self._entries_failed_at < SITES_RETRY_S:
+            if (running or self._entry_verdicts is not None
+                    or time.monotonic() - self._entries_failed_at < SITES_RETRY_S):
                 return   # judging now, judged, or failed moments ago (tried again after SITES_RETRY_S)
             self._entries_thread = threading.Thread(target=self._judge_entries, name="yuki-memory-sites-judge",
                                                     daemon=True)

@@ -835,8 +835,10 @@ def _privacy_table(name: str, privacy_file: Path | None = None) -> dict[str, Any
 def check_moments(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None,
                   hours: float = 24.0) -> Check:
     """PLAN.md F item 7, "moments flowing": the state changes Yuki noted (a meeting joined, a playlist started, a
-    volume moved) in the last ``hours``, counted by kind, and how old the newest is. Read-only, content-free (the
-    ``moments`` table's cleartext columns: kind, times, who)."""
+    volume moved) that happened in the last ``hours``, counted by kind, and how old the newest is. Read-only,
+    content-free (the ``moments`` table's cleartext columns: kind, times, who). Counted by when each change happened
+    (``at``), never by when its row was written (``seen_at``): a moments rebuild or backfill writes every past
+    moment again, and must not look like a day full of fresh ones (nor hide that nothing new is coming)."""
     try:
         from yuki.memory.store import default_db_path
     except Exception as exc:
@@ -855,9 +857,10 @@ def check_moments(db: Path | None = None, privacy_file: Path | None = None, *, n
         has = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='moments'").fetchone()
         if not has:
             return Check(MOMENTS_CHECK, SKIP, "not part of this install yet")
-        rows = conn.execute("SELECT kind, count(*), max(seen_at), sum(CASE WHEN by='yuki' THEN 1 ELSE 0 END)"
-                            " FROM moments WHERE seen_at >= ? GROUP BY kind", (now - hours * 3600.0,)).fetchall()
-        newest = conn.execute("SELECT max(seen_at) FROM moments").fetchone()
+        rows = conn.execute("SELECT kind, count(*), max(at), sum(CASE WHEN by='yuki' THEN 1 ELSE 0 END)"
+                            " FROM moments WHERE at >= ? AND at <= ? GROUP BY kind",
+                            (now - hours * 3600.0, now + 300.0)).fetchall()
+        newest = conn.execute("SELECT max(at) FROM moments WHERE at <= ?", (now + 300.0,)).fetchone()
     except Exception as exc:
         return Check(MOMENTS_CHECK, WARN, f"could not read the moments ({type(exc).__name__})")
     finally:

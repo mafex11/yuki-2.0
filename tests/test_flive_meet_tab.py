@@ -358,3 +358,24 @@ def test_a_failed_list_judgement_is_not_retried_on_every_sighting() -> None:
         assert ev.calling_service("meet.google.com") is None
     time.sleep(0.1)
     assert len(calls) == 1
+
+
+def test_the_empty_strip_diagnostic_never_walks_a_whole_page() -> None:
+    """Review r1 L6: only the top two child levels of a Document near the root are looked at, one children request
+    per element (never a whole-subtree request into the page)."""
+    scopes: list[int] = []
+
+    class Rec(El):
+        def FindAllBuildCache(self, scope: int, cond: Any, request: Any) -> "Arr":
+            scopes.append(scope)
+            return super().FindAllBuildCache(scope, cond, request)
+
+    deep = Rec(DOCUMENT, "page", (), [Rec(GROUP, "", (), [Rec(GROUP, "", (), [Rec(TAB_ITEM, "deep tab", (3,))])])])
+    diag: dict = {}
+    T.walk_tabs(Auto({1: Rec(PANE, "Zen", (), [deep])}), 1, time.monotonic() + 5, all_groups=True, diagnostics=diag)
+    assert diag["reason"] == "no_tab_items" and diag["tabitems_in_documents"] == 0
+    assert set(scopes) == {2}
+    top = Rec(DOCUMENT, "page", (), [Rec(GROUP, "", (), [Rec(TAB_ITEM, "top tab", (4,))])])
+    diag2: dict = {}
+    T.walk_tabs(Auto({1: Rec(PANE, "Zen", (), [top])}), 1, time.monotonic() + 5, diagnostics=diag2)
+    assert diag2["reason"] == "tabs_inside_documents" and diag2["tabitems_in_documents"] == 1

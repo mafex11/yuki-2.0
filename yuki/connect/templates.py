@@ -34,6 +34,9 @@ SITES_DIR = Path(__file__).with_name("sites")
 
 _lock = threading.Lock()
 _cache: dict[str, dict[str, Any]] = {}
+#: The site names and the host -> site index, built once (page_of runs per timeline row in a backfill).
+_names: list[str] | None = None
+_hosts: dict[str, str] | None = None
 
 
 def site(name: str) -> dict[str, Any]:
@@ -56,17 +59,42 @@ def site(name: str) -> dict[str, Any]:
 
 
 def sites() -> list[str]:
-    """The names of every site file."""
+    """The names of every site file (listed once, cached)."""
+    global _names
+    with _lock:
+        if _names is not None:
+            return list(_names)
     try:
-        return sorted(p.stem for p in SITES_DIR.glob("*.toml"))
+        names = sorted(p.stem for p in SITES_DIR.glob("*.toml"))
     except OSError:
-        return []
+        names = []
+    with _lock:
+        _names = names
+    return list(names)
+
+
+def _host_index() -> dict[str, str]:
+    """``{host: site name}`` from every site file's ``[site] hosts`` (the first file listing a host wins)."""
+    global _hosts
+    with _lock:
+        if _hosts is not None:
+            return _hosts
+    index: dict[str, str] = {}
+    for name in sites():
+        for h in (site(name).get("site") or {}).get("hosts") or []:
+            index.setdefault(str(h).lower(), name)
+    with _lock:
+        _hosts = index
+    return index
 
 
 def clear_cache() -> None:
-    """Forget the parsed files (tests, or after a data change)."""
+    """Forget the parsed files, the site list and the host index (tests, or after a data change)."""
+    global _names, _hosts
     with _lock:
         _cache.clear()
+        _names = None
+        _hosts = None
 
 
 @dataclass(frozen=True)
@@ -162,19 +190,14 @@ def page_of(url: str | None) -> PageMatch | None:
         host = (parts.hostname or "").lower()
     except ValueError:
         return None
-    if not host:
+    name = _host_index().get(host) if host else None
+    if name is None:
         return None
-    for name in sites():
-        data = site(name)
-        hosts = [str(h).lower() for h in (data.get("site") or {}).get("hosts") or []]
-        if host not in hosts:
-            continue
-        for kind, template in (data.get("pages") or {}).items():
-            path, _, query = str(template).partition("?")
-            values = _match_parts(path, query, parts.path, parts.query)
-            if values is not None:
-                return PageMatch(site=name, kind=str(kind), values=values)
-        return None
+    for kind, template in (site(name).get("pages") or {}).items():
+        path, _, query = str(template).partition("?")
+        values = _match_parts(path, query, parts.path, parts.query)
+        if values is not None:
+            return PageMatch(site=name, kind=str(kind), values=values)
     return None
 
 

@@ -50,7 +50,7 @@ def _row(name: str, owner: str, playing: bool, *, play: str = "Play {name}", pau
 
 def spotify_tree(rows: list[tuple[str, str, bool]] = LIB, *, library: bool = True, home: bool = True,
                  volume: float = 0.42, playing: bool = True, offscreen: bool = False, labels: dict | None = None,
-                 extra_slider: bool = False) -> Node:
+                 extra_slider: bool = False, open_by_row: dict[str, str] | None = None) -> Node:
     """Spotify's window: the top bar, Your Library (DataGrid > DataItem > DataItem > Group), Home (cards with links,
     the shortcut grid's 8 "Play" buttons, "Pause {name}" buttons outside the grid) and the Now playing bar."""
     lab = {"bar": "Now playing bar", "controls": "Player controls", "grid": "Your Library", "play": "Play {name}",
@@ -69,8 +69,8 @@ def spotify_tree(rows: list[tuple[str, str, bool]] = LIB, *, library: bool = Tru
             Node("Button", "Search in Your Library", invoke=True, offscreen=o))
         grid = Node("DataGrid", lab["grid"], value="", offscreen=o)
         for name, owner, is_playing in rows:
-            grid.add(_row(name, owner, is_playing, play=lab["play"], pause=lab["pause"], open_fmt=lab["open"],
-                          offscreen=o))
+            grid.add(_row(name, owner, is_playing, play=lab["play"], pause=lab["pause"],
+                          open_fmt=(open_by_row or {}).get(name, lab["open"]), offscreen=o))
         panel.add(grid)
         shell.add(panel)
     if home:
@@ -283,20 +283,67 @@ GERMANISH = {"bar": "Wiedergabeleiste", "controls": "Steuerung", "grid": "Deine 
              "next": "Weiter"}
 
 
-def test_non_english_slider_by_shape_wording_learned_from_one_playing_read() -> None:
+def test_non_english_slider_by_shape_wording_candidate_then_confirmed_by_a_row_flip() -> None:
     root = spotify_tree(labels=GERMANISH)
     before = read(root, session_playing=False)
     assert before.status == "ok" and before.built and not before.player
     assert before.slider == 42.0 and before.slider_source == "shape"
     assert before.grid and len(before.rows) == len(LIB)
     assert before.label_source == "none" and all(r.playing is None for r in before.rows)   # no playlist route yet
-    assert before.learned is None
-    learning = read(root, session_playing=True)
-    assert learning.learned == {"play": "{name} abspielen", "pause": "{name} anhalten", "grid": "Deine Sammlung"}
-    assert learning.label_source == "learned" and learning.playing is not None
-    after = read(root, session_playing=False, learned=learning.learned)
+    assert before.candidate is None
+    first = read(root, session_playing=True)
+    cand = first.candidate
+    assert cand is not None and (cand.play, cand.pause, cand.grid) == ("{name} abspielen", "{name} anhalten",
+                                                                       "Deine Sammlung")
+    # a candidate is provisional: no play state from it
+    assert first.label_source == "none" and first.playing is None and all(r.playing is None for r in first.rows)
+    assert cand.rows["Late Lanterns"] == "pause" and cand.rows["Rainy Commute"] == "play"
+    assert SD.judge_wording(first.raw, cand.play, cand.pause, cand.rows) is None      # the same read: no flip
+    # another playlist starts: Late Lanterns flips back to "abspielen" -> confirmed
+    other = [(n, o, n == "Rainy Commute") for n, o, _p in LIB]
+    second = read(spotify_tree(other, labels=GERMANISH), session_playing=True)
+    assert SD.judge_wording(second.raw, cand.play, cand.pause, cand.rows) == "confirm"
+    SD.apply_wording(second, cand.play, cand.pause)
+    assert second.label_source == "learned" and second.playing is not None and second.playing.name == "Rainy Commute"
+    learned = {"play": cand.play, "pause": cand.pause, "grid": cand.grid}
+    after = read(root, session_playing=False, learned=learned)
     assert after.label_source == "learned" and after.playing is not None and after.playing.name == "Late Lanterns"
+    assert after.candidate is None
     assert all(r.spotify_owned is None for r in after.rows)   # an unknown row format: owner never parsed
+
+
+#: Review r1 M1: the playing item is not a Library row in view, and exactly one row differs at the open button.
+MIRA_IVO = [("Rainy Commute", "Mira Okafor", False), ("Garden Tapes", "Mira Okafor", False),
+            ("Morning Static", "Ivo Brandt", False)]
+
+
+def test_an_owner_button_candidate_is_never_confirmed() -> None:
+    root = spotify_tree(MIRA_IVO, labels=GERMANISH)
+    got = read(root, session_playing=True)
+    cand = got.candidate
+    assert cand is not None and "Mira Okafor" in cand.play          # the owner position fits this one read...
+    assert got.playing is None and all(r.playing is None for r in got.rows)   # ...but gives no play state
+    # every later read: paused, the same album still playing, another playlist out of view, scrolled, renamed
+    for rows in (MIRA_IVO, [(n, o, False) for n, o, _p in MIRA_IVO] + [("New Mix", "Ivo Brandt", False)],
+                 MIRA_IVO[:2] + [("Night Bus", "Ivo Brandt", False)], MIRA_IVO[1:]):
+        for playing in (True, False):
+            later = read(spotify_tree(rows, labels=GERMANISH), session_playing=playing)
+            assert SD.judge_wording(later.raw, cand.play, cand.pause, cand.rows) != "confirm"
+    # two rows by Ivo in view: two "playing" rows at once -> contradicted
+    two = read(spotify_tree(MIRA_IVO + [("Night Bus", "Ivo Brandt", False)], labels=GERMANISH))
+    assert SD.judge_wording(two.raw, cand.play, cand.pause, cand.rows) == "contradict"
+
+
+def test_a_pinned_row_candidate_is_contradicted_when_another_row_is_pinned() -> None:
+    pinned = {"Garden Tapes": "{name} Angeheftete Liste • {owner}"}
+    rows = [("Rainy Commute", "Mira Okafor", False), ("Garden Tapes", "Mira Okafor", False),
+            ("Morning Static", "Mira Okafor", False)]
+    got = read(spotify_tree(rows, labels=GERMANISH, open_by_row=pinned), session_playing=True)
+    cand = got.candidate
+    assert cand is not None and "Angeheftete" in cand.pause and got.playing is None
+    both = dict(pinned, **{"Morning Static": "{name} Angeheftete Liste • {owner}"})
+    later = read(spotify_tree(rows, labels=GERMANISH, open_by_row=both), session_playing=True)
+    assert SD.judge_wording(later.raw, cand.play, cand.pause, cand.rows) == "contradict"
 
 
 def test_shape_fallback_refuses_two_candidate_sliders() -> None:
@@ -314,6 +361,17 @@ def test_learn_row_wording_needs_exactly_one_odd_row_at_exactly_one_position() -
     assert SD.learn_row_wording([(n, [f"{n} x • me", f"go {n}"]) for n in ("A1", "B2", "C3")]) is None
     # too few rows to call the rest "the rest"
     assert SD.learn_row_wording([("A1", ["go A1"]), ("B2", ["stop B2"])]) is None
+
+
+def test_judge_wording_flips_and_contradictions() -> None:
+    seen = {"A1": "play", "B2": "play", "C3": "pause"}
+    rows = [("A1", ["go A1"]), ("B2", ["go B2"]), ("C3", ["stop C3"])]
+    assert SD.judge_wording(rows, "go {name}", "stop {name}", seen) is None
+    assert SD.judge_wording([("A1", ["stop A1"]), ("C3", ["go C3"])], "go {name}", "stop {name}", seen) == "confirm"
+    assert SD.judge_wording([("A1", ["stop A1"]), ("D4", ["go D4"])], "go {name}", "stop {name}", seen) == "confirm"
+    assert SD.judge_wording([("D4", ["stop D4"]), ("E5", ["go E5"])], "go {name}", "stop {name}", seen) is None
+    assert SD.judge_wording([("A1", ["stop A1"]), ("C3", ["stop C3"])], "go {name}", "stop {name}",
+                            seen) == "contradict"
 
 
 class SlowAutomation(FakeAutomation):
