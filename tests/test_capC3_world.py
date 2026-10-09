@@ -379,6 +379,19 @@ def test_a_version_that_replaced_another_after_the_cut_off_is_gone_whatever_its_
     assert back.state == "active" and not back.trial                   # as at the cut-off (the first test)
 
 
+def test_your_own_request_is_evaluated_only_on_a_task_after_you_wrote_it(store):
+    """Second review A4: a request written after the family's tasks has nothing to be evaluated on (the task it would
+    be scored against was done before it was written); written between T1 and T3, T3 is evaluated, cut at its start,
+    with the earlier tasks of the family still allowed to come after the writing."""
+    w = world(store, future=False)
+    insts, skipped = D.build_instances(store, [own_request(at=NOW + 10 * DAY)], Words(), names=NAMES)
+    assert insts == [] and skipped[0]["why"].startswith("no task of yours since the request")
+    [inst], _ = D.build_instances(store, [own_request(at=NOW + DAY + 500)], Words(), names=NAMES)
+    assert inst.target_id == w["T3"] and inst.cutoff == w["cutoff"] > inst.request.at
+    [inst], _ = D.build_instances(store, [own_request(at=NOW - DAY)], Words(), names=NAMES)
+    assert inst.target_id == w["T3"] and inst.cutoff == w["cutoff"]
+
+
 def test_the_familys_link_to_its_way_is_as_at_the_cut_off_after_the_evaluated_task_is_learned(store):
     """Second review A1: the evaluated task itself is learned after it ends; the learner replaces the family's way and
     moves the family's link to the new version. After the cut the link points at the version memory held then."""
