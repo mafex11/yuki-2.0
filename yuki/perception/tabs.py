@@ -11,6 +11,25 @@ holding the most is the strip, in tree order (left to right). Page content is
 never walked (a Document's subtree is skipped), and the walk is bounded by a
 node count and a time budget, one cached ``FindAllBuildCache`` per node. Nothing
 is matched on names: a tab is whatever the window's UIA tree says is a TabItem.
+
+**Every group** (``all_groups=True``, PLAN.md D8): a browser with vertical tabs (Zen)
+draws its Essentials, pinned and normal tabs in separate containers, so a pinned
+Meet tab sits in a smaller group than the strip. Then every group's tabs are
+returned, each :class:`Tab` with its group's ordinal (in the order the walk met the
+groups) and its index inside that group. The default path (the largest group) is
+unchanged for the brain's ``read_tabs`` and the voice's desk block.
+
+**Why a strip is empty** (``diagnostics``): a dict of content-free facts the walk
+fills (group sizes, nodes, whether it was cut short, Documents skipped near the
+root, the depth cap) and a ``reason`` code when no tab was found: ``cut_short``,
+``no_tab_items``, ``tabs_inside_documents`` (TabItems exist, but only inside a
+Document near the root: the browser draws its tab strip as page content), or
+``error``. Never a name.
+
+**Identities** (:func:`rank_tabs`): a tab found again by what was learned about it
+(its RuntimeId while the browser lives, digests of its name, its place in a group
+other than the main strip), for the Meet-tab census (PLAN.md D8). Names are digested
+by the caller's function and dropped at once.
 """
 
 from __future__ import annotations
@@ -28,6 +47,7 @@ _TAB_ITEM = 50019
 _DOCUMENT = 50030
 _TREE_SCOPE_CHILDREN = 2
 _TREE_SCOPE_ELEMENT = 1
+_TREE_SCOPE_DESCENDANTS = 4
 
 #: Elements visited at most (Chrome's non-page tree is ~100-250).
 MAX_NODES = 700
@@ -49,6 +69,10 @@ class Tab:
     selected: bool
     bounds: tuple[int, int, int, int] = (0, 0, 0, 0)
     tab_id: str = ""
+    #: The ordinal of the tab's group (container) in the order the walk met the groups, and that group's size
+    #: (``index`` counts inside the group). One group: 0 and the strip's length.
+    group: int = 0
+    group_size: int = 0
 
 
 def runtime_id_text(value: Any) -> str:
@@ -87,17 +111,28 @@ def _rect(value: Any) -> tuple[int, int, int, int]:
             return (0, 0, 0, 0)
 
 
-def walk_tabs(automation: Any, hwnd: int, deadline: float) -> tuple[list[tuple[Tab, Any]], int, bool]:
-    """``([(tab, element)], nodes visited, complete)`` for ``hwnd``'s tab strip (blocking, bounded)."""
+def walk_tabs(automation: Any, hwnd: int, deadline: float, *, all_groups: bool = False,
+              diagnostics: dict[str, Any] | None = None) -> tuple[list[tuple[Tab, Any]], int, bool]:
+    """``([(tab, element)], nodes visited, complete)`` for ``hwnd``'s tab strip (blocking, bounded).
+
+    ``all_groups``: every group's tabs (group by group, in the order met), not only the largest group's.
+    ``diagnostics``: filled with content-free facts about the walk (see the module docstring)."""
+    diag = diagnostics if diagnostics is not None else {}
     request = automation.CreateCacheRequest()
     for prop in (_P_CONTROL_TYPE, _P_NAME, _P_BOUNDING_RECT, _P_SELECTION_ITEM_IS_SELECTED, _P_RUNTIME_ID):
         request.AddProperty(prop)
     request.TreeScope = _TREE_SCOPE_ELEMENT
     condition = automation.ControlViewCondition
-    root = automation.ElementFromHandle(int(hwnd))
+    try:
+        root = automation.ElementFromHandle(int(hwnd))
+    except Exception:  # noqa: BLE001 - a window that went away
+        diag.update(groups=[], nodes=0, complete=False, reason="error")
+        return [], 0, False
     queue: list[tuple[Any, int, int]] = [(root, 0, 0)]  # element, depth, parent key
     groups: dict[int, list[tuple[str, bool, tuple[int, int, int, int], Any]]] = {}
     nodes, key, complete = 0, 0, True
+    documents = shallow_documents = depth_capped = max_depth = 0
+    shallow: list[Any] = []
     while queue:
         if time.monotonic() >= deadline or nodes >= MAX_NODES:
             complete = False
@@ -113,6 +148,7 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float) -> tuple[list[tuple[T
         for i in range(count):
             child = children.GetElement(i)
             nodes += 1
+            max_depth = max(max_depth, depth + 1)
             try:
                 kind = int(child.GetCachedPropertyValue(_P_CONTROL_TYPE) or 0)
             except Exception:  # noqa: BLE001
@@ -124,14 +160,69 @@ def walk_tabs(automation: Any, hwnd: int, deadline: float) -> tuple[list[tuple[T
                     (" ".join(str(name or "").split()), selected,
                      _rect(child.GetCachedPropertyValue(_P_BOUNDING_RECT)), child))
                 continue  # a tab's own children (its close button) are not tabs
-            if kind == _DOCUMENT or depth + 1 >= MAX_DEPTH:
+            if kind == _DOCUMENT:
+                documents += 1
+                if depth + 1 <= SHALLOW_DOCUMENT_DEPTH:
+                    shallow_documents += 1
+                    if len(shallow) < 3:
+                        shallow.append(child)
                 continue  # page content is never walked
+            if depth + 1 >= MAX_DEPTH:
+                depth_capped += 1
+                continue
             queue.append((child, depth + 1, parent_key))
+    diag.update(groups=[len(g) for g in groups.values()], nodes=nodes, complete=complete, documents_skipped=documents,
+                shallow_documents=shallow_documents, depth_capped=depth_capped, max_depth=max_depth)
     if not groups:
+        diag["reason"] = "cut_short" if not complete else "no_tab_items"
+        diag["selected_group"] = None
+        if shallow and time.monotonic() < deadline:
+            inside = _tab_items_inside(automation, shallow, deadline)
+            diag["tabitems_in_documents"] = inside
+            if inside:
+                diag["reason"] = "tabs_inside_documents"
         return [], nodes, complete
-    strip = max(groups.values(), key=len)
-    return [(Tab(index=i + 1, name=n, selected=s, bounds=b, tab_id=_tab_id(e)), e)
-            for i, (n, s, b, e) in enumerate(strip)], nodes, complete
+    diag["reason"] = None
+    ordered = list(groups.values())
+    if all_groups:
+        chosen = list(enumerate(ordered))
+    else:
+        biggest = max(range(len(ordered)), key=lambda i: len(ordered[i]))
+        chosen = [(biggest, ordered[biggest])]
+    out: list[tuple[Tab, Any]] = []
+    for ordinal, strip in chosen:
+        for i, (n, sel, b, e) in enumerate(strip):
+            out.append((Tab(index=i + 1, name=n, selected=sel, bounds=b, tab_id=_tab_id(e), group=ordinal,
+                            group_size=len(strip)), e))
+    diag["selected_group"] = next((t.group for t, _e in out if t.selected), None)
+    diag["main_group"] = max(range(len(ordered)), key=lambda i: len(ordered[i]))
+    return out, nodes, complete
+
+
+#: A Document this close to the window root is counted in the diagnostics (a browser that draws its own tab strip as
+#: page content would put it there).
+SHALLOW_DOCUMENT_DEPTH = 2
+
+
+def _tab_items_inside(automation: Any, documents: list[Any], deadline: float) -> int:
+    """How many TabItems the given Documents hold (control types only, no names); 0 when that cannot be read."""
+    total = 0
+    try:
+        condition = automation.CreatePropertyCondition(_P_CONTROL_TYPE, _TAB_ITEM)
+        request = automation.CreateCacheRequest()
+        request.AddProperty(_P_CONTROL_TYPE)
+        request.TreeScope = _TREE_SCOPE_ELEMENT
+    except Exception:  # noqa: BLE001
+        return 0
+    for doc in documents:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            found = doc.FindAllBuildCache(_TREE_SCOPE_DESCENDANTS, condition, request)
+            total += int(found.Length) if found else 0
+        except Exception:  # noqa: BLE001
+            continue
+    return total
 
 
 def _tab_id(element: Any) -> str:
@@ -207,3 +298,158 @@ def format_tabs(strip: TabStrip) -> str:
         ident = f"[{tab.tab_id}]" if tab.tab_id else "[no id: this window gives its tabs none]"
         lines.append(f"- {ident} {tab.index}{'*' if tab.selected else ''} \"{tab.name}\"")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Identities and the census (PLAN.md D8): a site's tab found again without its title
+# ---------------------------------------------------------------------------
+
+#: Identities kept per site: RuntimeIds (one per browser process lives), name digests, group places.
+MAX_RUNTIME_IDS = 4
+MAX_NAME_DIGESTS = 8
+MAX_POSITIONS = 4
+#: The identity kinds, strongest first.
+MATCH_ORDER = ("runtime_id", "name", "position")
+
+
+def sighting(tab: Tab, *, digest: str, pid: int, main_group: int | None, groups: int, at: float) -> dict[str, Any]:
+    """One sighting of a site's selected tab as identities (content-free but for the caller's keyed name digest):
+    its RuntimeId with the browser's pid, its name digest, and its place when it sits outside the main strip (a
+    pinned or Essentials group, whose places are stable; a normal tab's place moves)."""
+    out: dict[str, Any] = {"at": float(at), "digest": digest or "", "pid": int(pid or 0), "tab_id": tab.tab_id}
+    if main_group is not None and tab.group != main_group:
+        out["position"] = {"group": tab.group, "index": tab.index, "groups": int(groups)}
+    return out
+
+
+def learn_identity(stored: dict[str, Any] | None, seen: dict[str, Any]) -> dict[str, Any]:
+    """``stored`` (a site's identities, as kept in ``nudge_state['site_tabs:<service>']``) with one more sighting:
+    counts and last-seen times, each list capped (the least recently seen dropped first)."""
+    ident = {"runtime_ids": list((stored or {}).get("runtime_ids") or []),
+             "names": dict((stored or {}).get("names") or {}),
+             "positions": list((stored or {}).get("positions") or [])}
+    at = float(seen.get("at") or time.time())
+    if seen.get("tab_id"):
+        ident["runtime_ids"] = [r for r in ident["runtime_ids"]
+                                if not (r.get("id") == seen["tab_id"] and r.get("pid") == seen.get("pid"))]
+        ident["runtime_ids"].append({"id": seen["tab_id"], "pid": int(seen.get("pid") or 0), "at": at})
+        ident["runtime_ids"] = sorted(ident["runtime_ids"], key=lambda r: r.get("at") or 0)[-MAX_RUNTIME_IDS:]
+    if seen.get("digest"):
+        entry = dict(ident["names"].get(seen["digest"]) or {"n": 0})
+        entry["n"] = int(entry.get("n") or 0) + 1
+        entry["at"] = at
+        ident["names"][seen["digest"]] = entry
+        if len(ident["names"]) > MAX_NAME_DIGESTS:
+            oldest = sorted(ident["names"], key=lambda k: ident["names"][k].get("at") or 0)
+            for d in oldest[: len(ident["names"]) - MAX_NAME_DIGESTS]:
+                ident["names"].pop(d, None)
+    pos = seen.get("position")
+    if pos:
+        found = next((p for p in ident["positions"] if (p.get("group"), p.get("index"), p.get("groups"))
+                      == (pos.get("group"), pos.get("index"), pos.get("groups"))), None)
+        if found is None:
+            found = {**pos, "n": 0}
+            ident["positions"].append(found)
+        found["n"] = int(found.get("n") or 0) + 1
+        found["at"] = at
+        ident["positions"] = sorted(ident["positions"], key=lambda p: p.get("at") or 0)[-MAX_POSITIONS:]
+    return ident
+
+
+@dataclass
+class Candidate:
+    """A tab the census found that matches a learned identity: where it is and by which identity."""
+
+    hwnd: int
+    tab_id: str
+    group: int
+    index: int
+    match: str
+    score: int
+    selected: bool = False
+
+    def rank(self) -> tuple[int, int]:
+        return (MATCH_ORDER.index(self.match), -self.score)
+
+
+def rank_tabs(found: list[tuple[int, int, Tab, str]], identity: dict[str, Any] | None) -> list[Candidate]:
+    """The tabs that match ``identity``, in identity order (RuntimeId of the same browser process, then name digest
+    by how often it was seen, then a place outside the main strip), best first. ``found``: ``(hwnd, browser pid,
+    tab, its name digest)`` per tab read (the name itself never reaches here)."""
+    ident = identity or {}
+    ids = {(r.get("id"), int(r.get("pid") or 0)) for r in ident.get("runtime_ids") or [] if r.get("id")}
+    names = {d: int((v or {}).get("n") or 0) for d, v in (ident.get("names") or {}).items()}
+    places = {(p.get("group"), p.get("index"), p.get("groups")): int(p.get("n") or 0)
+              for p in ident.get("positions") or []}
+    groups_per_window: dict[int, int] = {}
+    for hwnd, _pid, tab, _d in found:
+        groups_per_window[hwnd] = max(groups_per_window.get(hwnd, 0), tab.group + 1)
+    out = []
+    for hwnd, pid, tab, digest in found:
+        place = (tab.group, tab.index, groups_per_window.get(hwnd, 0))
+        if tab.tab_id and (tab.tab_id, int(pid or 0)) in ids:
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "runtime_id", 1, tab.selected))
+        elif digest and digest in names:
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "name", names[digest], tab.selected))
+        elif place in places:
+            out.append(Candidate(hwnd, tab.tab_id, tab.group, tab.index, "position", places[place], tab.selected))
+    return sorted(out, key=lambda c: c.rank())
+
+
+def census_decision(candidates: list[Candidate]) -> tuple[str, list[Candidate]]:
+    """``("one", [best])``; ``("ask", [the tied ones])`` when the best ones match by the same identity equally; or
+    ``("none", [])`` (PLAN.md D8: two equal, ask; none, say no Meet tab is open)."""
+    if not candidates:
+        return "none", []
+    best = candidates[0]
+    tied = [c for c in candidates if c.rank() == best.rank()]
+    return ("ask", tied) if len(tied) > 1 else ("one", [best])
+
+
+def census_job(automation: Any, windows: list[tuple[int, int]], identity: dict[str, Any] | None,
+               digest_fn: Any, *, budget_per_window: float = 0.2) -> dict[str, Any]:
+    """Read every window's tabs (all groups, at most ``budget_per_window`` each), digest each name with
+    ``digest_fn(name)`` and drop it, and rank them against ``identity``. Runs on the caller's UIA thread. Content-free
+    result: ``{"candidates", "decision", "chosen", "windows", "tabs", "diagnostics" (per window), "ms"}``."""
+    started = time.perf_counter()
+    found: list[tuple[int, int, Tab, str]] = []
+    diagnostics = []
+    for hwnd, pid in windows:
+        diag: dict[str, Any] = {}
+        tabs, _nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_per_window,
+                                            all_groups=True, diagnostics=diag)
+        diagnostics.append(diag)
+        for tab, _element in tabs:
+            try:
+                digest = digest_fn(tab.name) if tab.name else ""
+            except Exception:  # noqa: BLE001
+                digest = ""
+            found.append((int(hwnd), int(pid or 0), Tab(index=tab.index, name="", selected=tab.selected,
+                                                        tab_id=tab.tab_id, group=tab.group,
+                                                        group_size=tab.group_size), digest))
+    candidates = rank_tabs(found, identity)
+    decision, chosen = census_decision(candidates)
+    return {"candidates": candidates, "decision": decision, "chosen": chosen, "windows": len(windows),
+            "tabs": len(found), "diagnostics": diagnostics, "ms": round((time.perf_counter() - started) * 1000.0, 1)}
+
+
+def read_census(windows: list[tuple[int, int]], identity: dict[str, Any] | None, digest_fn: Any, *,
+                budget_per_window: float = 0.2) -> dict[str, Any]:
+    """:func:`census_job` on its own UIA thread (the tray's side), bounded by the windows' budgets. Never raises."""
+    budget = max(0.2, budget_per_window * max(len(windows), 1) + 0.1)
+    empty: dict[str, Any] = {"candidates": [], "decision": "none", "chosen": [], "windows": len(windows), "tabs": 0,
+                             "diagnostics": []}
+
+    def job(automation: Any, shared: dict) -> None:
+        shared["result"] = census_job(automation, windows, identity, digest_fn, budget_per_window=budget_per_window)
+
+    try:
+        shared, timed_out = _on_uia_thread(job, budget, "yuki-tab-census")
+    except Exception as exc:  # noqa: BLE001
+        return {**empty, "error": type(exc).__name__}
+    return shared.get("result") or {**empty, "error": "timeout" if timed_out else "error"}
+
+
+__all__ = ["Candidate", "MATCH_ORDER", "Tab", "TabStrip", "census_decision", "census_job", "format_tabs",
+           "learn_identity", "rank_tabs", "read_census", "read_tabs", "runtime_id_text", "sighting", "tabs_line",
+           "walk_tabs"]

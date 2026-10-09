@@ -649,13 +649,14 @@ def test_doctor_report_and_offline_run(monkeypatch):
     monkeypatch.setattr(doctor, "check_memory_service",
                         lambda: doctor.Check("Memory service", doctor.FAIL, "not running", "Restart Yuki."))
     for name in ("check_embed_pipe", "check_audio_devices", "check_wake_model", "check_spool_disk", "check_whisper",
-                 "check_gpu", "check_startup", "check_call_recording", "check_capture_health", "check_trace"):
+                 "check_gpu", "check_startup", "check_call_recording", "check_capture_health", "check_trace",
+                 "check_moments", "check_spotify_desktop"):
         monkeypatch.setattr(doctor, name, lambda n=name: doctor.Check(n, doctor.OK, "fine"))
     monkeypatch.setattr(doctor, "check_logs", lambda s: doctor.Check("Log size", doctor.OK, "1 MB"))
     monkeypatch.setattr(doctor, "check_crashes", lambda s: doctor.Check("Recent crashes", doctor.WARN, "2 tracebacks",
                                                                        "Send the file."))
     results = doctor.run_checks(Settings(), offline=True)
-    assert len(results) == 18 and results[0].status == doctor.FAIL   # 15: "AI for each job" (report 67); 16: calls; 17: screen reading (report 78 C0); 18: learning how you work (C1)
+    assert len(results) == 20 and results[0].status == doctor.FAIL   # 15: "AI for each job" (report 67); 16: calls; 17: screen reading (report 78 C0); 18: learning how you work (C1); 19-20: moments flowing, Spotify desktop (fLive)
     assert [r.status for r in results if r.name.startswith(("AI models", "Speech", "Yuki's voice"))] == ["skip"] * 4
     report = doctor.format_report(results)
     assert "[FAIL] Memory service: not running" in report and "fix: Restart Yuki." in report

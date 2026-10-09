@@ -22,6 +22,15 @@ what is on screen the instant a request starts, with how old each read is.
   crosses).  Requests and replies are JSON.  ``now`` returns the board,
   ``refresh`` asks the watcher to read a window again now (no wait).
 * :func:`format_now`: the compact text the brain gets, capped.
+* Live facts for the skills' resolver and done-checks (PLAN.md D8, D9, F5.4), one snapshot:
+  ``calling_tabs`` (per window, the calling site's tab identified by
+  :class:`yuki.memory.callevidence.SiteTabs`: process, service, its RuntimeId, the
+  keyed digest of its name, its group place; never the name), ``game_front`` (is a
+  game in front, with when it was last known: the game gate's answer) and
+  ``signals`` (content-free: the app keys holding the microphone, the app keys
+  playing media).  Subscribers of the layout (:meth:`NowBoard.subscribe_layout`)
+  hear each new layout outside the board's lock (Spotify's window appearing warms
+  its tree, :mod:`yuki.connect.spotify_desktop`).
 
 API for the tray and voice (the voice builder's desk block uses the same)::
 
@@ -123,6 +132,15 @@ class NowBoard:
         self.counters: dict[str, int] = {"reads": 0, "blocked": 0, "popups": 0, "served": 0, "layouts": 0}
         #: Bumped on every write, so a server can reuse the last snapshot it serialised.
         self.version = 0
+        #: Per window: the calling site's tab as identified (content-free but for the keyed name digest).
+        self._calling_tabs: dict[int, dict[str, Any]] = {}
+        #: Is a game in front (None: not known) and when that was last set; ``game_front_fn`` (the game gate's
+        #: ``front_game``), when given, is asked at snapshot time instead.
+        self._game_front: bool | None = None
+        self._game_front_at: float | None = None
+        self.game_front_fn: Callable[[], Any] | None = None
+        self._signals: dict[str, Any] = {"mic_holders": [], "playing": [], "at": None}
+        self._layout_subscribers: list[Callable[..., Any]] = []
 
     # -- writes (the watcher) ---------------------------------------------------
 
@@ -139,7 +157,49 @@ class NowBoard:
                     entry.pop("gone_at", None)
                 elif "gone_at" not in entry:
                     entry["gone_at"] = at
+            for hwnd in [h for h in self._calling_tabs if h not in visible]:
+                self._calling_tabs[hwnd].setdefault("gone_at", at)
             self._prune(at)
+            subscribers = list(self._layout_subscribers)
+        for callback in subscribers:   # outside the lock: a subscriber may take its time
+            try:
+                callback(list(surfaces), int(foreground or 0), at)
+            except Exception:  # noqa: BLE001 - a subscriber never breaks the board
+                pass
+
+    def subscribe_layout(self, callback: Callable[..., Any]) -> None:
+        """``callback(surfaces, foreground, at)`` on every new layout (the watcher's thread; keep it cheap)."""
+        with self._lock:
+            self._layout_subscribers.append(callback)
+
+    def set_calling_tab(self, hwnd: int, info: dict[str, Any]) -> None:
+        """A calling site's tab in ``hwnd`` as identified (:class:`yuki.memory.callevidence.SiteTabs`):
+        ``{process, service, tab_id, name_digest, group, index, seen_at, known}``; never a name."""
+        with self._lock:
+            self._calling_tabs[int(hwnd)] = dict(info)
+            if len(self._calling_tabs) > MAX_WINDOWS:
+                oldest = sorted(self._calling_tabs, key=lambda h: float(self._calling_tabs[h].get("seen_at") or 0))
+                for h in oldest[: len(self._calling_tabs) - MAX_WINDOWS]:
+                    self._calling_tabs.pop(h, None)
+            self.version += 1
+
+    def set_game_front(self, front: bool | None, at: float | None = None) -> None:
+        """Whether a game is in front now (the game gate's on_change), with when."""
+        with self._lock:
+            self._game_front = None if front is None else bool(front)
+            self._game_front_at = time.time() if at is None else float(at)
+            self.version += 1
+
+    def set_signals(self, *, mic_holders: list[str] | None = None, playing: list[str] | None = None,
+                    at: float | None = None) -> None:
+        """Content-free live signals: app keys holding the microphone, app keys playing media."""
+        with self._lock:
+            if mic_holders is not None:
+                self._signals["mic_holders"] = sorted({str(a) for a in mic_holders if a})[:16]
+            if playing is not None:
+                self._signals["playing"] = sorted({str(a) for a in playing if a})[:16]
+            self._signals["at"] = time.time() if at is None else float(at)
+            self.version += 1
 
     def note_title(self, hwnd: int, title: str, at: float) -> None:
         """The window's title changed (an OS event): the entry's read is older than what it shows now."""
@@ -249,15 +309,28 @@ class NowBoard:
                       if now - float(p.get("at") or 0.0) <= POPUP_TTL_S]
             self.counters["served"] += 1
             counters = dict(self.counters)
+            calling_tabs = {str(h): dict(v) for h, v in self._calling_tabs.items()
+                            if not v.get("gone_at") or now - float(v["gone_at"]) <= GONE_TTL_S}
+            game_front, game_front_at = self._game_front, self._game_front_at
+            signals = dict(self._signals)
+            game_front_fn = self.game_front_fn
+        if game_front_fn is not None:
+            try:
+                game_front, game_front_at = bool(game_front_fn()), now
+            except Exception:  # noqa: BLE001 - unknown: the reader falls back to its own local read (D9)
+                game_front, game_front_at = None, None
         return {"at": now, "foreground": layout.get("foreground"), "layout_at": layout.get("at"),
-                "layout_ms": layout.get("ms"), "windows": windows, "popups": popups, "counters": counters}
+                "layout_ms": layout.get("ms"), "windows": windows, "popups": popups, "counters": counters,
+                "calling_tabs": calling_tabs, "game_front": game_front, "game_front_at": game_front_at,
+                "signals": signals}
 
     def sizes(self) -> dict[str, int]:
         """Content-free sizes, for the service's stats."""
         with self._lock:
             chars = sum(len(e.get("text") or "") + sum(len(m.get("text") or "") for m in e.get("messages") or [])
                         for e in self._windows.values())
-            return {"windows": len(self._windows), "popups": len(self._popups), "chars": chars}
+            return {"windows": len(self._windows), "popups": len(self._popups), "chars": chars,
+                    "calling_tabs": len(self._calling_tabs)}
 
 
 def app_data_for(process: str, rect: tuple[int, int, int, int], title: str, *, privacy: Any = None,
@@ -736,5 +809,17 @@ def timing_of(board: dict[str, Any] | None, ms: float) -> NowTiming:
                      front_stale=bool(front.get("stale")) if front else False)
 
 
+def game_in_front(board: dict[str, Any] | None, *, max_age_s: float = 2.0, now: float | None = None) -> bool | None:
+    """PLAN.md D9: the Now board's ``game_front`` when it is at most ``max_age_s`` old, else None (the caller then
+    reads the foreground program itself through ``gamegate.judge_program``)."""
+    if not board or board.get("game_front") is None:
+        return None
+    at = board.get("game_front_at")
+    now = time.time() if now is None else float(now)
+    if at is None or now - float(at) > max_age_s:
+        return None
+    return bool(board["game_front"])
+
+
 __all__ = ["APP_DATA_READERS", "NowBoard", "NowClient", "NowServer", "NowTiming", "app_data_for", "format_now",
-           "gist_of", "pipe_name", "shared_client", "timing_of"]
+           "game_in_front", "gist_of", "pipe_name", "shared_client", "timing_of"]

@@ -19,6 +19,14 @@ Everything here opens property stores with ``STGM_READ`` and at most
 activates a session manager to list session states: no stream is opened, no
 audio is read, no setting is changed.
 Every function raises on a COM failure (the caller decides what that means).
+
+Two exceptions, both explicit: :func:`set_master_volume` sets the default output's
+master level (Core Audio, never a key, with Yuki's event context
+:data:`yuki.core.inputtag.YUKI_AUDIO_CONTEXT`; never raises), for the media keys moved
+off ``SendInput`` (PLAN.md D17(4)). And the event interfaces at the end
+(``IAudioSessionEvents``, ``IAudioSessionNotification``, ``IAudioEndpointVolumeCallback``,
+``IMMNotificationClient``) are declared once here for the call worker's microphone
+watch (:mod:`yuki.memory.loopback`) and the volume watch (:mod:`yuki.memory.volumewatch`).
 """
 
 from __future__ import annotations
@@ -400,3 +408,131 @@ def master_volume() -> dict[str, Any] | None:
                 "muted": bool(volume.GetMute())}
     except Exception:  # noqa: BLE001 - a fact for a report, never a failure
         return None
+
+
+# ---------------------------------------------------------------------------
+# Events (PLAN.md D.1 "moments" row): the session and endpoint callback interfaces, declared once here for the call
+# worker's microphone watch (yuki.memory.loopback.CaptureWatch) and the volume watch (yuki.memory.volumewatch).
+# ---------------------------------------------------------------------------
+
+
+class IAudioSessionEvents(IUnknown):
+    _iid_ = GUID("{24918ACC-64B3-37C1-8CA9-74A66E9957A8}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "OnDisplayNameChanged", (["in"], c_wchar_p, "name"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "OnIconPathChanged", (["in"], c_wchar_p, "path"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "OnSimpleVolumeChanged", (["in"], ctypes.c_float, "volume"),
+                  (["in"], wintypes.BOOL, "mute"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "OnChannelVolumeChanged", (["in"], wintypes.DWORD, "count"),
+                  (["in"], POINTER(ctypes.c_float), "volumes"), (["in"], wintypes.DWORD, "changed"),
+                  (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "OnGroupingParamChanged", (["in"], POINTER(GUID), "param"),
+                  (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "OnStateChanged", (["in"], ctypes.c_int, "state")),
+        COMMETHOD([], HRESULT, "OnSessionDisconnected", (["in"], ctypes.c_int, "reason")),
+    ]
+
+
+class IAudioSessionNotification(IUnknown):
+    _iid_ = GUID("{641DD20B-4D41-49CC-ABA3-174B9477BB08}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "OnSessionCreated", (["in"], POINTER(IAudioSessionControl), "session")),
+    ]
+
+
+class ISimpleAudioVolume(IUnknown):
+    """A session's own (mixer) volume."""
+
+    _iid_ = GUID("{87CE5498-68D6-44E5-9215-6DA47EF883D8}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "SetMasterVolume", (["in"], ctypes.c_float, "level"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "GetMasterVolume", (["out"], POINTER(ctypes.c_float), "level")),
+        COMMETHOD([], HRESULT, "SetMute", (["in"], wintypes.BOOL, "mute"), (["in"], POINTER(GUID), "ctx")),
+        COMMETHOD([], HRESULT, "GetMute", (["out"], POINTER(wintypes.BOOL), "mute")),
+    ]
+
+
+class AUDIO_VOLUME_NOTIFICATION_DATA(ctypes.Structure):
+    """What ``IAudioEndpointVolumeCallback::OnNotify`` gets: who changed it (the event context), mute, level."""
+
+    _fields_ = [("guidEventContext", GUID), ("bMuted", wintypes.BOOL), ("fMasterVolume", ctypes.c_float),
+                ("nChannels", wintypes.UINT), ("afChannelVolumes", ctypes.c_float * 1)]
+
+
+class IAudioEndpointVolumeCallback(IUnknown):
+    _iid_ = GUID("{657804FA-D6AD-4496-8A60-352752AF4F89}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "OnNotify", (["in"], POINTER(AUDIO_VOLUME_NOTIFICATION_DATA), "notify")),
+    ]
+
+
+class IMMNotificationClient(IUnknown):
+    """Device changes (only ``OnDefaultDeviceChanged`` matters to the volume watch: the default output moved)."""
+
+    _iid_ = GUID("{7991EEC9-7E89-4D85-8390-6C703CEC60C0}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "OnDeviceStateChanged", (["in"], c_wchar_p, "device"),
+                  (["in"], wintypes.DWORD, "state")),
+        COMMETHOD([], HRESULT, "OnDeviceAdded", (["in"], c_wchar_p, "device")),
+        COMMETHOD([], HRESULT, "OnDeviceRemoved", (["in"], c_wchar_p, "device")),
+        COMMETHOD([], HRESULT, "OnDefaultDeviceChanged", (["in"], ctypes.c_int, "flow"), (["in"], ctypes.c_int, "role"),
+                  (["in"], c_wchar_p, "device")),
+        COMMETHOD([], HRESULT, "OnPropertyValueChanged", (["in"], c_wchar_p, "device"), (["in"], PROPERTYKEY, "key")),
+    ]
+
+
+def guid_text(value: Any) -> str:
+    """A GUID (a comtypes ``GUID``, a pointer to one, or text) as upper-case ``{...}`` text; ``""`` for none."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip().upper()
+        if hasattr(value, "contents"):
+            if not value:
+                return ""
+            value = value.contents
+        return str(value).upper()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def yuki_context() -> GUID:
+    """Yuki's own Core Audio event context (:data:`yuki.core.inputtag.YUKI_AUDIO_CONTEXT`), passed on every volume Yuki
+    sets so the volume watch tells Yuki's changes from the user's."""
+    from yuki.core.inputtag import YUKI_AUDIO_CONTEXT
+
+    return GUID(YUKI_AUDIO_CONTEXT)
+
+
+def _endpoint_volume() -> Any:
+    device = _enumerator().GetDefaultAudioEndpoint(E_RENDER, E_CONSOLE)
+    iid = IAudioEndpointVolume._iid_
+    raw = device.Activate(byref(iid), comtypes.CLSCTX_ALL, None)
+    return ctypes.cast(c_void_p(raw), POINTER(IAudioEndpointVolume))
+
+
+def set_master_volume(*, level: float | None = None, change: float | None = None,
+                      mute: bool | None = None) -> dict[str, Any] | None:
+    """Set the default output's master volume (0-100, or a change in points) and/or mute, through Core Audio (no key
+    is sent, so it works with a game in front), with Yuki's event context; then read it back. ``{"before",
+    "level", "muted", "muted_before"}``, or None when Core Audio could not be used. Never raises."""
+    try:
+        volume = _endpoint_volume()
+        before = round(float(volume.GetMasterVolumeLevelScalar()) * 100.0, 1)
+        muted_before = bool(volume.GetMute())
+        ctx = yuki_context()
+        target = level if level is not None else (before + float(change) if change is not None else None)
+        if target is not None:
+            volume.SetMasterVolumeLevelScalar(max(0.0, min(1.0, float(target) / 100.0)), byref(ctx))
+        if mute is not None:
+            volume.SetMute(bool(mute), byref(ctx))
+        return {"before": before, "level": round(float(volume.GetMasterVolumeLevelScalar()) * 100.0, 1),
+                "muted": bool(volume.GetMute()), "muted_before": muted_before}
+    except Exception:  # noqa: BLE001 - the caller reports "could not"
+        return None
+
+
+__all__ += ["IAudioSessionEvents", "IAudioSessionNotification", "ISimpleAudioVolume", "IAudioEndpointVolume",
+            "IAudioEndpointVolumeCallback", "IMMNotificationClient", "AUDIO_VOLUME_NOTIFICATION_DATA", "guid_text",
+            "master_volume", "set_master_volume", "yuki_context"]

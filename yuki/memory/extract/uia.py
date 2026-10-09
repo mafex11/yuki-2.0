@@ -979,3 +979,133 @@ def snapshot_from_tree(tree: object) -> Snapshot:
             snap.root = page
     snap.nodes = number(snap.root)
     return snap
+
+
+# ---------------------------------------------------------------------------
+# A calling site's tab: identities and the census (PLAN.md D8, F5), in this apartment
+# ---------------------------------------------------------------------------
+#
+# The Meet tab is never found by its title. When the watcher sees a calling site in front (a blocked page's site
+# identity only), the selected tab of that window is read here - every group of the strip, at most 0.2 s - and kept
+# as identities: its RuntimeId with the browser's pid, a keyed digest of its name (the name itself is dropped in this
+# function, never logged or stored), and its place when it sits outside the main strip (a pinned or Essentials group).
+# The census reads every window of the browser the same way when an offer is due or the user asks for the meeting.
+# Read-only: UIA property reads of the browser's own tab strip; page content is never walked.
+
+TAB_READ_S = 0.2
+
+
+def _on_own_apartment(job: object, budget_s: float, name: str) -> tuple[dict[str, object], bool]:
+    """Run ``job(automation, shared)`` on a worker thread with its own COM apartment (as :func:`read_window` does)."""
+    shared: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except Exception:
+            pass
+        try:
+            _module, automation = _automation()
+            job(automation, shared)  # type: ignore[operator]
+        except BaseException as exc:  # noqa: BLE001 - reported, never raised
+            shared["error"] = type(exc).__name__
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=worker, name=name, daemon=True)
+    thread.start()
+    thread.join(max(budget_s, 0.05) + _HANDOFF_S)
+    return shared, thread.is_alive()
+
+
+def _window_pid(hwnd: int) -> int:
+    try:
+        return int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+    except Exception:
+        return 0
+
+
+def tab_identities(hwnd: int, *, digest_fn: object, budget_s: float = TAB_READ_S,
+                   automation_fn: object = None, now: float | None = None) -> dict[str, object]:
+    """The selected tab of ``hwnd`` as identities (:func:`yuki.perception.tabs.sighting`), plus the walk's
+    content-free diagnostics: ``{"sighting" (or None), "tabs", "groups", "nodes", "complete", "reason",
+    "selected_group", "main_group", "ms", ...}``. ``digest_fn(name) -> str`` is the caller's keyed digest; the name
+    is dropped here. Never raises."""
+    from yuki.perception.tabs import sighting, walk_tabs
+
+    started = time.perf_counter()
+    at = time.time() if now is None else float(now)
+    pid = _window_pid(hwnd)
+
+    def job(automation: object, shared: dict[str, object]) -> None:
+        diag: dict[str, object] = {}
+        found, _nodes, _complete = walk_tabs(automation, int(hwnd), time.monotonic() + budget_s * 0.9,
+                                             all_groups=True, diagnostics=diag)
+        shared["diag"] = diag
+        shared["tabs"] = len(found)
+        selected = [t for t, _e in found if t.selected]
+        if len(selected) == 1:
+            tab = selected[0]
+            try:
+                digest = str(digest_fn(tab.name)) if tab.name else ""  # type: ignore[operator]
+            except Exception:
+                digest = ""
+            groups = len(diag.get("groups") or [])  # type: ignore[arg-type]
+            main_group = diag.get("main_group")
+            shared["sighting"] = sighting(tab, digest=digest, pid=pid, groups=groups, at=at,
+                                          main_group=main_group)  # type: ignore[arg-type]
+        shared["selected_tabs"] = len(selected)
+
+    if automation_fn is not None:
+        shared: dict[str, object] = {}
+        try:
+            job(automation_fn(), shared)  # type: ignore[operator]
+        except Exception as exc:  # noqa: BLE001
+            shared["error"] = type(exc).__name__
+        timed_out = False
+    else:
+        shared, timed_out = _on_own_apartment(job, budget_s, f"yuki-uia-tabs-{hwnd}")
+    diag = dict(shared.get("diag") or {})  # type: ignore[arg-type]
+    out: dict[str, object] = {
+        "sighting": shared.get("sighting"), "tabs": int(shared.get("tabs") or 0),  # type: ignore[arg-type]
+        "selected_tabs": int(shared.get("selected_tabs") or 0),  # type: ignore[arg-type]
+        "ms": round((time.perf_counter() - started) * 1000.0, 1), **diag}
+    if shared.get("error"):
+        out["reason"] = "error"
+        out["error"] = shared["error"]
+    elif timed_out and not out["tabs"]:
+        out["reason"] = "cut_short"
+        out["complete"] = False
+    return out
+
+
+def tab_census(windows: list[tuple[int, int]], identity: dict[str, object] | None, *, digest_fn: object,
+               budget_per_window: float = TAB_READ_S, automation_fn: object = None) -> dict[str, object]:
+    """:func:`yuki.perception.tabs.census_job` over the browser's windows ``[(hwnd, pid)]`` on this apartment's own
+    thread (the memory side: the routine offer). Never raises."""
+    from yuki.perception.tabs import census_job
+
+    budget = max(TAB_READ_S, budget_per_window * max(len(windows), 1))
+    empty: dict[str, object] = {"candidates": [], "decision": "none", "chosen": [], "windows": len(windows),
+                                "tabs": 0, "diagnostics": []}
+
+    def job(automation: object, shared: dict[str, object]) -> None:
+        shared["result"] = census_job(automation, windows, identity, digest_fn,  # type: ignore[arg-type]
+                                      budget_per_window=budget_per_window)
+
+    if automation_fn is not None:
+        shared: dict[str, object] = {}
+        try:
+            job(automation_fn(), shared)  # type: ignore[operator]
+        except Exception as exc:  # noqa: BLE001
+            return {**empty, "error": type(exc).__name__}
+        timed_out = False
+    else:
+        shared, timed_out = _on_own_apartment(job, budget, "yuki-uia-tab-census")
+    result = shared.get("result")
+    if isinstance(result, dict):
+        return result
+    return {**empty, "error": shared.get("error") or ("timeout" if timed_out else "error")}

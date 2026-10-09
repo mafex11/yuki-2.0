@@ -24,6 +24,13 @@ YUKI_INPUT_TAG = 0x594B5549
 
 _LOW32 = 0xFFFFFFFF
 
+#: Yuki's own Core Audio event context (PLAN.md D.1, D18): the GUID Yuki passes as ``ctx`` on every volume or mute it
+#: sets (``ISimpleAudioVolume`` in :mod:`yuki.actions.app_volume`, the endpoint in :mod:`yuki.perception.audio`).
+#: Windows hands it back to every volume listener (``OnSimpleVolumeChanged`` / ``OnNotify``), so the volume watch
+#: (:mod:`yuki.memory.volumewatch`) marks those changes ``by='yuki'`` and never takes them for the user's habit. Text,
+#: so this module stays import-free; the "59 4B 55 49" prefix is :data:`YUKI_INPUT_TAG`'s bytes.
+YUKI_AUDIO_CONTEXT = "{594B5549-A0D1-4C7F-9A55-59554B490001}"
+
 
 def is_yuki_input(extra_info: int | None) -> bool:
     """Whether an input event's extra-info value is Yuki's stamp (the low 32 bits, as Raw Input keeps them)."""
@@ -32,4 +39,10 @@ def is_yuki_input(extra_info: int | None) -> bool:
     return (int(extra_info) & _LOW32) == YUKI_INPUT_TAG
 
 
-__all__ = ["YUKI_INPUT_TAG", "is_yuki_input"]
+def is_yuki_audio_context(context: str | None) -> bool:
+    """Whether a Core Audio event context (GUID text, any case, braces or not) is Yuki's own."""
+    text = str(context or "").strip().strip("{}").upper()
+    return bool(text) and text == YUKI_AUDIO_CONTEXT.strip("{}").upper()
+
+
+__all__ = ["YUKI_AUDIO_CONTEXT", "YUKI_INPUT_TAG", "is_yuki_audio_context", "is_yuki_input"]

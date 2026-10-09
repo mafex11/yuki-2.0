@@ -213,12 +213,19 @@ def set_app_volume(app: str, *, level: float | None = None, change: float | None
         return _noop(app, targets, before, level=level, change=change, was_muted=was_muted, details=details,
                      done=done, system_fn=_system)
     errors = []
+    try:   # Yuki's own event context: the volume watch marks this change by='yuki' (yuki.core.inputtag)
+        from comtypes import GUID
+
+        from yuki.core.inputtag import YUKI_AUDIO_CONTEXT
+        ctx = GUID(YUKI_AUDIO_CONTEXT)
+    except Exception:  # noqa: BLE001 - no context: the change is still made
+        ctx = None
     for s in targets:
         try:
             if level is not None or change is not None:
-                s.volume.SetMasterVolume(new / 100.0, None)
+                s.volume.SetMasterVolume(new / 100.0, ctx)
             if mute is not None:
-                s.volume.SetMute(bool(mute), None)
+                s.volume.SetMute(bool(mute), ctx)
         except Exception as exc:  # noqa: BLE001 - reported per session
             errors.append(f"{type(exc).__name__}: {exc}")
     after_levels, after_muted = [], []
