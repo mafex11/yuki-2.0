@@ -123,6 +123,25 @@ def test_a_plan_becomes_route_steps_by_the_snapshots_ids():
     assert S.score(["?unknown:e99"], ["k-edit"])["composite"] == 0.0
 
 
+def test_a_long_plan_is_cut_like_the_users_route_and_every_other_arm():
+    """Second review A5: the plan's cap is the route's (C2's ``MAX_KEYS``): a 60-step plan that is exactly the user's
+    60 steps scores 100; past the cap every arm and the user's route are cut alike."""
+    from yuki.memory import trace_families as F
+
+    assert A.MAX_PLAN_STEPS == F.MAX_KEYS
+    els = [D.Element(f"e{i}", "w1", "chatter", f"k{i}", "Button", f'Button "b{i}"') for i in range(1, 121)]
+    snap = D.Snapshot([D.Window("w1", "chatter", "Chatter", True, front=True)], els)
+    toks, _ = A.plan_tokens({"steps": [{"do": "click", "element": f"e{i}"} for i in range(1, 61)]}, snap)
+    ref = [f"k{i}" for i in range(1, 61)]
+    assert toks == ref and S.score(toks, ref, cap=A.MAX_PLAN_STEPS)["composite"] == 100.0
+    long_plan, _ = A.plan_tokens({"steps": [{"do": "click", "element": f"e{i}"} for i in range(1, 121)]}, snap)
+    assert len(long_plan) == A.MAX_PLAN_STEPS
+    long_ref = [f"k{i}" for i in range(1, 121)][:F.MAX_KEYS]           # the user's route, as C2 cuts it
+    copied = [f"k{i}" for i in range(1, 121)]                          # an uncut copy (B1) is cut the same at scoring
+    assert (S.score(long_plan, long_ref, cap=A.MAX_PLAN_STEPS)["composite"]
+            == S.score(copied, long_ref, cap=A.MAX_PLAN_STEPS)["composite"] == 100.0)
+
+
 class _Stream:
     def __init__(self, response: Any) -> None:
         self.response = response

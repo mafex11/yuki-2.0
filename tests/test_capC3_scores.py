@@ -78,6 +78,13 @@ def test_a_modifier_the_trace_has_no_name_for_is_kept_never_dropped():
     assert S.score(["w|keys|Control+K"], ["w|keys|K"])["composite"] == 0.0
 
 
+def test_the_cap_cuts_both_routes_after_folding():
+    # a b b c d against a b c x: with cap 3, a b c against a b c (the b repeat folded first)
+    got = S.score(["a", "b", "b", "c", "d"], ["a", "b", "c", "x"], cap=3)
+    assert got["composite"] == 100.0 and (got["plan_steps"], got["user_steps"]) == (3, 3)
+    assert S.score(["a", "b", "b", "c", "d"], ["a", "b", "c", "x"])["recall"] == 75.0
+
+
 def test_edit_distance_hand_checked():
     assert S.edit_distance(list("kitten"), list("sitting")) == 3
     assert S.edit_distance([], ["a"]) == 1 and S.edit_distance(["a"], ["a"]) == 0

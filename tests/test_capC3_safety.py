@@ -92,7 +92,10 @@ def test_a_whole_run_from_the_script_writes_only_the_copy_the_report_and_your_re
 
     orig = c3_data.build_instances
     monkeypatch.setattr(c3_data, "build_instances", lambda *a, **k: orig(*a, **{**k, "names": NAMES}))
-    assert mod.main(["requests", REQUEST, NOTES_REQUEST]) == 0
+    # written before the world's tasks (second review A4: a request is evaluated only on a task done after it)
+    D.add_requests([REQUEST, NOTES_REQUEST], now=NOW - DAY)
+    assert mod.main(["requests", "--list"]) == 0
+    assert "2 requests written down" in capsys.readouterr().out          # the list shows them (asked for)
     assert mod.main(["run", "--copy-real", "--need", "1", "--min-requests", "1", "--no-conversations", "--show-plans"]) == 0
     out = capsys.readouterr().out
     assert "Requests evaluated: 2" in out and "The copy is deleted." in out
@@ -117,7 +120,7 @@ def test_a_copy_you_made_is_copied_again_and_never_changed(real, monkeypatch, ca
     mod = _script()
     monkeypatch.setattr(mod, "_embedder", lambda db, off: Words())
     monkeypatch.setattr(A, "ThinkerPlanner", lambda *a, **k: StubThinker())
-    D.add_requests([REQUEST])
+    D.add_requests([REQUEST], now=NOW - DAY)
     assert mod.main(["run", "--db", str(mine), "--need", "1", "--min-requests", "1", "--no-conversations", "--dry-run",
                      "--show-requests"]) == 0
     out = capsys.readouterr().out
@@ -128,3 +131,6 @@ def test_a_copy_you_made_is_copied_again_and_never_changed(real, monkeypatch, ca
     assert mod.main(["run"]) == 2                                       # no database named: nothing happens
     assert mod.main(["requests", "--list"]) == 0
     assert "1 requests written down" in capsys.readouterr().out
+    assert mod.main(["requests", NOTES_REQUEST]) == 0                   # written from the console: kept with the time
+    assert [r.text for r in D.own_requests()] == [REQUEST, NOTES_REQUEST]
+    assert D.own_requests()[1].at > NOW
