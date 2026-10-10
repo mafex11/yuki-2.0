@@ -2467,28 +2467,44 @@ class MemoryClient:
 
         "This morning" and "today" mean since they sat down, not since midnight (on
         2026-09-25 "how have I been doing since this morning?" counted the 00:00-05:00
-        VALORANT night as morning). Measured by the welcome back's own rule
-        (:func:`yuki.memory.nudges.presence_sessions`: the first settled stretch after a
-        break of ``resume_after_h``); the model decides what their words mean.
+        VALORANT night as morning); the model decides what their words mean.
+
+        yConsumers (state-design.md §2.2, §6.1): a thin wrapper. The memory service's "you right now" record already
+        holds it (``presence.day_began``, one small answer on the Now pipe while the record is fresh); else the one
+        pure rule, :func:`yuki.memory.younow.day_began_from` (the latest settled stretch after a break of
+        ``max(DAY_BREAK_S, resume_after_h)``, the user's ``[nudges]`` table), which the record, the check-ins and the
+        card judge share. The brain's request turn carries it in its you-now block; this stays for the old loop's
+        memory pack and is deleted in jPrune.
         """
         now = time.time() if now is None else float(now)
+        found: tuple[float, float] | None = None
+        known = False
         try:
-            from yuki.memory.nudges import NudgeConfig, presence_sessions
-            from yuki.memory.timeline import _clip, format_duration
+            from yuki.memory.now import shared_client
+            from yuki.memory.younow import STALE_S
 
-            cfg = NudgeConfig()
-            since = now - 36 * 3600.0
-            clips = _clip([r for r in self.store.timeline_states(since, now) if not r.by_yuki], since, now)
-            sessions = [x for x in presence_sessions(clips, cfg) if x.settled]
-            start, gap = None, 0.0
-            for i, x in enumerate(sessions):
-                g = x.start - (sessions[i - 1].end if i else since)
-                if g >= cfg.resume_after_h * 3600.0:
-                    start, gap = x.start, g
+            client = shared_client(getattr(self.store, "path", None))
+            you = client.you(sections=("presence",), wait_s=0.05) if client is not None else None
+            pres = (you or {}).get("presence") or {}
+            if you and now - float(you.get("beat_at") or 0.0) <= STALE_S and (you.get("built") or {}).get(
+                    "presence", {}).get("known"):
+                known = True
+                if pres.get("day_began") is not None:
+                    found = (float(pres["day_began"]), float(pres.get("day_gap_s") or 0.0))
         except Exception:
+            known = False
+        if not known:
+            try:
+                from yuki.memory.younow import day_began_from
+
+                found = day_began_from(self.store, now, self._nudges_config())
+            except Exception:
+                return None
+        if found is None:
             return None
-        if start is None:
-            return None
+        start, gap = found
+        from yuki.memory.timeline import format_duration
+
         day = datetime.fromtimestamp(start)
         return (f"The user's day at the PC began {day:%A %H:%M}, after {format_duration(gap)} away; \"this morning\" "
                 f"and \"today\" in their words mean since then, not since midnight.")

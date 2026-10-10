@@ -3,7 +3,8 @@
 Every part of Yuki used to work out "what is the user doing right now?" on its own: the card worker every 15 s
 (``nudges.observe``), each card maker again for its own model call, the thinker per request. This module keeps one
 typed, capped record in the memory service's RAM, next to the Now board, and rebuilds a part of it only when
-something in that part changed. Until ``yConsumers`` the only reader is the in-process card judge (``jCore``, shadow).
+something in that part changed. Readers: the in-process card judge (``jCore``), and since ``yConsumers`` the brain's
+request turn and the voice talker's one line, over the Now pipe (below).
 
 **Sections** (schema v1, §3.2; every list capped, every text clipped, ≤ 12 KB of JSON in all):
 
@@ -20,7 +21,16 @@ something in that part changed. Until ``yConsumers`` the only reader is the in-p
   overdue, the list's size, the work board's counts (``board(replies=False)``), ≤ 3 plans in the next 24 h (the
   events scan's dated events). ``overdue`` is right as of the build (a rebuild is due when it turns); readers that
   care compare ``due_at`` with their own now, as :func:`render` does.
-* ``usual``, ``prefs`` - empty until ``yUsual`` (after phase L) fills them.
+* ``usual`` (yUsual) - the user's routines (``yuki.memory.routines``, mined nightly from the skill learner's
+  occasions) as they fall today: ``now`` (an active routine whose time is within its hit width,
+  ``routines.HIT_WINDOW_MIN``, of now), ``today`` (later today, ≤ 5), each with its learned skill's key and name (the
+  user's told label first, else the learned name; a nameless skill's code label is never taken for a name), what it is
+  in plain words (``routines.KIND_PHRASES``), its clock minute and window, offer mode and whether its end state already
+  happened today (``routines.done_today``); and the catalog's counts (capabilities, learned, trusted).
+* ``prefs`` (yUsual) - ``usuals``: per preference slot (``<capability>:<slot>@<scope>``) the option the choice rule
+  picks when it is a confirmed usual or a clear observed choice (``yuki.skills.prefs.choose`` rules 1 and 2; rule 3's
+  guesses are left out), ≤ 12, confirmed first. Taste-filled slots are left out (their options are entity keys; taste
+  is phase T's).
 * ``about`` - the nightly brief by reference: how to be with them, routine, careful, how many people.
 * ``cards`` - the card on screen (the UI marked it shown, no reaction, within the card gap), the last card, today's
   shown cards per ``kind/trigger`` and their reactions, and the judge's own facts (modes, Today queue, next wake,
@@ -41,11 +51,14 @@ compares a few values held in RAM and rebuilds a section only when its inputs mo
   timeline's next flush after a bridged hole (below);
 * ``changed`` - the moments hub's counters moved (compared in RAM), a media change, a synthesised transition, its
   oldest item leaving the 30 min window;
-* ``work`` / ``cards`` / ``about`` - the database changed: ``total_changes()`` (the service's own connection) or
-  ``PRAGMA data_version`` (the tray's writes), at most once per 2 s, then one probe query names the dirty sections.
+* ``work`` / ``cards`` / ``about`` / ``usual`` / ``prefs`` - the database changed: ``total_changes()`` (the service's
+  own connection) or ``PRAGMA data_version`` (the tray's writes), at most once per 2 s, then one probe query names the
+  dirty sections (``usual``: the routines, the skills rows, a new skill run; ``prefs``: the preference rows).
   ``nudge_state`` keys of the judge (``judge_*``) are never probed, so the judge's bookkeeping never marks a section.
   ``work`` also at the next instant one of its time windows changes (an item becomes due or overdue, enters or leaves
-  the 24 h window, a plan or a meeting passes);
+  the 24 h window, a plan or a meeting passes); ``usual`` at the next instant a routine's window opens or closes, at
+  the routines' day boundary (04:00), and on a new moment while a routine of ``now`` is not yet done today (the user
+  may have just done it);
 * every section - a gap in the beats longer than :data:`STALE_S` (the process was suspended, as in a sleep with no
   lock on wake, or the loop stalled).
 
@@ -61,6 +74,18 @@ hold set (as :func:`holds_now` derives it, so a hold's time running out counts),
 **Freshness** is judged by the reader: every beat publishes a new top-level mapping with ``beat_at`` (the sections
 are shared by reference; this bumps no version). :func:`holds_now` answers ``["unknown"]`` when ``now - beat_at >
 STALE_S``, so a stalled loop never leaves a stale "no game" in force.
+
+**Other processes** (yConsumers, §3.4, §11): the Now pipe's op ``you`` serves the record (``yuki.memory.now``:
+``NowServer`` finds this process's builder through :func:`live_builder`; ``NowClient.you()`` keeps a version-cached
+copy). When the set of holds changes (and only then) the builder sets one named auto-reset event per reader
+(``now.you_event_name``, readers ``talk`` and ``cards``), so the voice talker's line cache and the tray's card queue
+re-ask instead of polling. The voice wake path never reads it.
+
+**Renderers** (pure; content in RAM only, never logged): ``render(you, "cards")`` (the card writer, ≤ 2,500),
+``render(you, "thinker")`` (the brain's request turn, ≤ 1,200: focus and the day, what just changed for "that" / "it",
+the thread now and the top threads with next steps, due and overdue items, the usual now and the confirmed usuals),
+``render(you, "talker")`` (one line, ≤ 300: focus words and up to three just-changed items; never to-dos, threads,
+news or the usual now: the 25 Sept rule).
 
 **Publishing** swaps an immutable snapshot by reference: sections are frozen (``MappingProxyType`` and tuples) and
 never changed after publishing; :func:`thaw` gives plain dicts and lists (JSON).
@@ -129,7 +154,8 @@ Public API::
     presence_now(you, now) -> {"present", "away", "settled", "at_pc_s", "idle_s", "today_s"}
     day_began(clips, config, since=, sessions=None) -> (start, gap) | None
     day_began_from(store, now, config) -> (start, gap) | None
-    render(you, "cards", now=None) -> str    # <= 2,500 characters, for the card writer (content: RAM only)
+    render(you, "cards" | "thinker" | "talker", now=None) -> str   # <= 2,500 / 1,200 / 300 characters (RAM only)
+    live_builder() -> YouBuilder | None      # this process's live builder (the Now pipe's op "you")
     thaw(you) -> plain dicts and lists
 """
 
@@ -140,10 +166,11 @@ import json
 import sys
 import threading
 import time
+import weakref
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -200,12 +227,34 @@ PLANS_AHEAD_S = 86400.0
 SECTION_CAPS: dict[str, int] = {"presence": 1536, "focus": 614, "changed": 1229, "work": 4096, "usual": 1536,
                                 "prefs": 1229, "about": 1536, "cards": 614}
 RECORD_CAP = 12 * 1024
-#: The renderers' caps (characters). ``thinker`` and ``talker`` come with yConsumers.
-RENDER_CAPS: dict[str, int] = {"cards": 2500}
+#: The renderers' caps (characters): the card writer, the brain's request turn (inside its overview slot), the talker's
+#: volatile line.
+RENDER_CAPS: dict[str, int] = {"cards": 2500, "thinker": 1200, "talker": 300}
+#: The sections each out-of-process reader asks for (a consumer reads only the sections it renders, §11).
+THINKER_SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs")
+TALKER_SECTIONS: tuple[str, ...] = ("focus", "changed")
+#: The talker's line is left out when the record's last beat is older than this when it is read (s): its cache is
+#: refreshed in the background, and a stalled service must not put an old "in VALORANT" in the talker's mouth.
+TALKER_STALE_S = 15.0
+#: The thinker's "just changed" lines and the talker's (newest first).
+THINKER_CHANGED, TALKER_CHANGED = 5, 3
+#: The thinker's threads besides the thread now.
+THINKER_THREADS = 3
 #: The sections, in the order a beat rebuilds them (focus and presence synthesise transitions ``changed`` shows).
 SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs", "about", "cards")
 #: The sections the database probe can mark.
-DB_SECTIONS: tuple[str, ...] = ("focus", "work", "cards", "about")
+DB_SECTIONS: tuple[str, ...] = ("focus", "work", "cards", "about", "usual", "prefs")
+#: ``usual``: routines now (at most) and later today (at most); texts.
+USUAL_NOW_MAX, USUAL_TODAY_MAX = 3, 5
+USUAL_NAME_CHARS, USUAL_WHAT_CHARS = 60, 90
+#: A new moment while a ``now`` routine is not done yet re-reads ``usual`` at most this often (s).
+USUAL_MOMENT_S = 20.0
+#: ``prefs.usuals``: at most this many.
+PREFS_MAX = 12
+#: Display names of app keys kept per builder (``store.app_display_name``, else the key tidied).
+LABELS_KEPT = 128
+#: A moment's calling service (a product name the moments recorded) is kept this short.
+SERVICE_CHARS = 40
 #: The judge's own facts it may publish into ``cards``.
 JUDGE_FACTS: tuple[str, ...] = ("modes", "digest_queued", "next_wake", "budget_left")
 #: Beat timings kept for the stats line's percentiles (about ten minutes of beats).
@@ -225,7 +274,11 @@ _PROBE_SQL = (
     " (SELECT updated_at FROM nudge_state WHERE name = 'presence_events'),"
     " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(shown_at), 0) || ':' || ifnull(max(outcome_at), 0) FROM nudges),"
     " (SELECT max(reacted_at) FROM nudges),"
-    " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(at), 0) FROM portraits)"
+    " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(at), 0) FROM portraits),"
+    " (SELECT count(*) || ':' || ifnull(max(updated_at), 0) FROM routines),"
+    " (SELECT count(*) || ':' || ifnull(max(updated_at), 0) FROM skills),"
+    " (SELECT ifnull(max(id), 0) FROM skill_runs),"
+    " (SELECT count(*) || ':' || ifnull(max(updated_at), 0) FROM prefs)"
 ) % ",".join("'%s'" % s for s in CALL_OPEN_STATUSES)
 
 
@@ -238,6 +291,26 @@ class YouConfig:
     @classmethod
     def from_dict(cls, table: dict | None) -> YouConfig:
         return cls(enabled=bool((table or {}).get("enabled", True)))
+
+
+#: This process's live builder (the memory service makes one), held weakly: the Now pipe's op ``you`` reads it.
+_live_ref: Callable[[], Any] = lambda: None   # noqa: E731
+_live_lock = threading.Lock()
+
+
+def live_builder() -> YouBuilder | None:
+    """The live :class:`YouBuilder` of this process (the memory service's), or None (none has beaten yet, or it went
+    away). A builder registers itself on its first beat, so one the service dropped (its wiring failed, so the loop
+    never beats it) is never served. The Now pipe's op ``you`` serves its snapshot, so the service needs no extra
+    wiring for it."""
+    with _live_lock:
+        return _live_ref()
+
+
+def _register(builder: YouBuilder) -> None:
+    global _live_ref
+    with _live_lock:
+        _live_ref = weakref.ref(builder)
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +718,14 @@ class YouBuilder:
         self._reacted_seen: Any = ...           # max(reacted_at) last seen (... before the first probe)
         self._deadline_told: float | None = None
         self._holds: frozenset[str] | None = None
+        # yUsual / yConsumers
+        self._registered = False                      # live_builder() serves this one from its first beat
+        self._labels: dict[str, str | None] = {}      # app key -> display name (store.app_display_name, else tidied)
+        self._usual_open = False                      # a routine of usual.now not yet done today (moments re-read it)
+        self._usual_done: set[tuple[int, Any]] = set()   # (routine id, routines day) seen done (stays done that day)
+        self._usual_words: dict[tuple[Any, Any], tuple[str | None, str | None]] = {}   # routine -> (name, what)
+        self._push: Any = None                        # the readers' named hold events (None: not made yet; False: none)
+        self.pushes = 0
         # counters (content-free)
         self.beats = 0
         self.errors = 0
@@ -751,6 +832,9 @@ class YouBuilder:
             self._on = True
             self._mark(*SECTIONS)
             self._log("you_off", enabled=True)
+        if self._live and not self._registered:
+            self._registered = True
+            _register(self)   # the Now pipe's op "you" serves this builder from now on
         cfg = self._nudge_cfg.get()
         with self._lock:
             self._round, self._dirty = self._dirty, set()
@@ -769,7 +853,7 @@ class YouBuilder:
         self._watch_gate()
         self._watch_audio(now)
         self._watch_time(now, cfg, front)
-        self._watch_hub()
+        self._watch_hub(now)
         if now - self._db_at >= DB_EVERY_S:
             self._db_at = now
             self._watch_db(now)
@@ -788,11 +872,32 @@ class YouBuilder:
         if holds != self._holds:
             self._holds = holds
             self._breaks.append("holds")
+            self._push_holds()
         if self._breaks:
             for b in self._breaks:
                 self.wakes[b] += 1
             self.last_wake = (now, tuple(self._breaks))
             self.wake.set()
+
+    def _push_holds(self) -> None:
+        """Tell the other processes' readers (§3.4 tray push) that the set of holds changed: one named auto-reset event
+        per reader (``now.you_event_name``), set only here, never on a plain front change. Live builders only."""
+        if not self._live or self._push is False:
+            return
+        if self._push is None:
+            try:
+                from yuki.memory.now import YOU_READERS, NamedEvent, you_event_name
+
+                events = [NamedEvent(you_event_name(self.db_path, r)) for r in YOU_READERS]
+                self._push = [e for e in events if e.handle] or False
+            except Exception as exc:  # noqa: BLE001 - readers then poll their own pace
+                self._log("error", where="younow.push", error=type(exc).__name__)
+                self._push = False
+            if self._push is False:
+                return
+        for event in self._push:
+            event.set()
+        self.pushes += 1
 
     def _check_acting(self) -> None:
         """Whether Yuki is acting, read once (the follower tells the changes; one before the wiring would be lost)."""
@@ -927,7 +1032,7 @@ class YouBuilder:
             if key and session.get("key") != f"app:{key}":
                 self._round.add("presence")
 
-    def _watch_hub(self) -> None:
+    def _watch_hub(self, now: float) -> None:
         hub = self._hub
         if hub is None:
             return
@@ -938,6 +1043,10 @@ class YouBuilder:
         if sig != self._hub_seen:
             self._hub_seen = sig
             self._round.add("changed")
+            if self._usual_open:
+                # a routine due now, not done yet: this moment may be the user doing it; read again shortly (at most
+                # every USUAL_MOMENT_S: a page routine's done check walks the day's page moments)
+                self._due_at("usual", max(now, (self._built.get("usual") or {}).get("at") or 0.0) + USUAL_MOMENT_S)
 
     def _watch_db(self, now: float) -> None:
         """``total_changes()`` + ``data_version`` (one query); when either moved, one probe query names the sections
@@ -964,7 +1073,7 @@ class YouBuilder:
                 self._round.update(DB_SECTIONS)
             self._db_sig = None   # asked again at the next check
             return
-        probes = {"focus": p[0], "work": p[1:8], "cards": p[8:10], "about": p[10]}
+        probes = {"focus": p[0], "work": p[1:8], "cards": p[8:10], "about": p[10], "usual": p[11:14], "prefs": p[14]}
         for section, value in probes.items():
             if self._probe_seen.get(section, ...) != value:
                 self._probe_seen[section] = value
@@ -981,6 +1090,31 @@ class YouBuilder:
         self._breaks.append(kind)
 
     # -- rebuilding -------------------------------------------------------------------
+
+    def _label(self, key: Any) -> str | None:
+        """An app key's display name for the renderers ("Zen" for ``zen``, "VALORANT" for its stem): the name the
+        user's own timeline rows show it under most (``store.app_display_name``), else the key tidied
+        (``appnames.prettify``, structural). Read once per key per run (the cache is bounded)."""
+        key = str(key or "").strip()
+        if not key:
+            return None
+        if key in self._labels:
+            return self._labels[key]
+        try:
+            name = self.store.app_display_name(key)
+        except Exception:  # noqa: BLE001
+            name = None
+        if not name:
+            try:
+                from yuki.core.appnames import prettify
+
+                name = prettify(key)
+            except Exception:  # noqa: BLE001
+                name = key
+        if len(self._labels) >= LABELS_KEPT:
+            self._labels.clear()
+        self._labels[key] = _text(name, LABEL_CHARS)
+        return self._labels[key]
 
     def _due_at(self, name: str, at: float | None) -> None:
         """Ask for ``name`` to be re-read at the instant ``at`` (the earliest asked wins until it is rebuilt)."""
@@ -1076,6 +1210,8 @@ class YouBuilder:
             return bool(_game_process(front_key)) if front_key else bool(ongoing and game_row(last))
 
         game = focus_game(self._gate_fn(), fallback=fallback)
+        # the game's display name for the renderers ("in VALORANT"); the exclusive full-screen "d3d" has none
+        game["label"] = self._label(game["name"]) if game.get("name") and game["name"] != "d3d" else None
         self._fallback = game["source"] != "gate"
         if game["source"] != self._source:
             if self._source is not None:
@@ -1153,8 +1289,14 @@ class YouBuilder:
         if was_open and call is None:
             self._add_synth("call_end", now, app=was_app)
         self._call_was = (call is not None, (getattr(call, "process", None) or None) if call is not None else None)
+        app = app_key(getattr(chosen, "process", None) or "") if chosen is not None else None
+        # the call's app as the call worker named it ("Discord"), else the key's display name; the meeting service
+        # when a meeting row named one (a product name, for "on a Meet call")
+        label = _text(getattr(chosen, "app", None), LABEL_CHARS) if chosen is not None else None
         return {"open": chosen is not None, "kind": ("call" if call is not None else "game") if chosen else None,
-                "since": _r(getattr(chosen, "detected_at", None)) if chosen is not None else None}, True
+                "since": _r(getattr(chosen, "detected_at", None)) if chosen is not None else None,
+                "app": app, "label": label or (self._label(app) if app else None),
+                "service": _text(getattr(chosen, "service", None), SERVICE_CHARS) if chosen is not None else None}, True
 
     # -- presence -----------------------------------------------------------------------
 
@@ -1287,11 +1429,16 @@ class YouBuilder:
         for m in self.store.moments_between(now - CHANGED_S, now + 1.0, kinds=CHANGED_KINDS):
             if m.get("kind") == "message_sent":
                 newest_message = max(newest_message or 0.0, float(m["at"]))
-            items.append({"kind": m.get("kind"), "synth": False, "at": _r(m.get("at"), 0), "app": m.get("app") or None,
-                          "entity": (m.get("entity_digest") or "")[:ENTITY_CHARS] or None,
-                          "by": m.get("by") or "user"})
+            item = {"kind": m.get("kind"), "synth": False, "at": _r(m.get("at"), 0), "app": m.get("app") or None,
+                    "entity": (m.get("entity_digest") or "")[:ENTITY_CHARS] or None, "by": m.get("by") or "user"}
+            if m.get("service"):   # a calling site's product name (call_join, site_front): never a title
+                item["service"] = _text(m["service"], SERVICE_CHARS)
+            items.append(item)
         items += [dict(s) for s in self._synth if s["at"] is not None and s["at"] >= now - CHANGED_S]
         items.sort(key=lambda x: (x["at"] or 0.0))
+        for item in items[-CHANGED_MAX:]:   # the app's display name, for the thinker's and the talker's words
+            if item.get("app"):
+                item["label"] = self._label(item["app"])
         if newest_message is not None:
             if self._message_seen is not None and newest_message > self._message_seen:
                 self._breaks.append("message_sent")
@@ -1390,10 +1537,154 @@ class YouBuilder:
     # -- usual / prefs (yUsual, after phase L) -------------------------------------------------
 
     def _build_usual(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
-        return {"now": [], "today": [], "skills": {}}, False
+        """The routines as they fall today and the catalog's counts (read-only imports of ``routines`` and the
+        catalog; existing readers and ``store._query`` only). A routine is ``now`` while its time is within its hit
+        width (``routines.HIT_WINDOW_MIN``) and ``today`` before that; one past its window has left both. Rebuilt on
+        the probe (routines, skills, skill runs), at the next window edge or the routines' day boundary, and on a new
+        moment while a ``now`` routine is not yet done."""
+        from yuki.memory import routines as R
+
+        known = True
+        skills: tuple[Any, ...] = ()
+        counts: dict[str, int] = {}
+        try:
+            skills = R.load_skills(self.store)   # the catalog on this store: one count query when unchanged
+            counts = {"capabilities": sum(1 for s in skills if getattr(s, "origin", "") == "capability"),
+                      "learned": sum(1 for s in skills if getattr(s, "origin", "") == "learned")}
+            got = self.store._query("SELECT count(*) FROM skills WHERE origin = 'learned' AND state = 'trusted'"
+                                    " AND deleted_at IS NULL AND retired_at IS NULL")
+            counts["trusted"] = int(got[0][0] or 0) if got else 0
+        except Exception:  # noqa: BLE001 - a database before migration 43, or no skill files
+            known = False
+        today = R.day_of(now)
+        start = R.day_start(today)
+        turns = [R.day_start(today + timedelta(days=1))]   # the routines' next 04:00 day
+        width = R.HIT_WINDOW_MIN * 60.0
+        now_items: list[dict[str, Any]] = []
+        later: list[dict[str, Any]] = []
+        try:
+            rows = [r for r in self.store.routines(states=["active"])
+                    if r.get("at_min") is not None and R.dayset_has(str(r.get("dayset")), today)]
+        except Exception:  # noqa: BLE001 - no routines table yet
+            rows, known = [], False
+        rows.sort(key=lambda r: R.from_clock(float(r["at_min"])))
+        names = self._skill_names([str(r.get("skill_id") or "") for r in rows]) if rows else {}
+        for row in rows:
+            centre = start + R.from_clock(float(row["at_min"])) * 60.0
+            lo, hi = centre - width, centre + width
+            if now > hi:
+                continue   # past today
+            turns += [t for t in (lo, hi) if t > now]
+            bucket = now_items if now >= lo else later
+            if len(bucket) >= (USUAL_NOW_MAX if bucket is now_items else USUAL_TODAY_MAX):
+                continue
+            name, what = self._usual_words_of(row, names, skills)
+            done_key = (int(row["id"]), today)
+            done = done_key in self._usual_done   # done stays done for the day: never read again
+            if not done:
+                try:
+                    done = bool(R.done_today(self.store, row, now, skills=skills))
+                except Exception:  # noqa: BLE001
+                    done = False
+                if done:
+                    if len(self._usual_done) >= 64:
+                        self._usual_done.clear()
+                    self._usual_done.add(done_key)
+            bucket.append({"routine_id": int(row["id"]), "skill_id": row.get("skill_id"), "name": name,
+                           "what": what, "at_min": round(float(row["at_min"]), 1), "window": [_r(lo, 0), _r(hi, 0)],
+                           "state": row.get("state"), "offer_mode": row.get("offer_mode") or "early",
+                           "done_today": done})
+        self._usual_open = any(not i["done_today"] for i in now_items)
+        self._due_at("usual", min(turns))
+        return {"now": now_items, "today": later, "skills": counts}, known
+
+    def _skill_names(self, keys: Sequence[str]) -> dict[str, str]:
+        """The learned names of these skill keys (decrypted in RAM). A nameless skill's code-built label (lName stores
+        it as the name with ``provenance.named`` false) is never taken for a name, unless the user renamed it."""
+        keys = [k for k in dict.fromkeys(keys) if k]
+        if not keys:
+            return {}
+        out: dict[str, str] = {}
+        try:
+            rows = self.store._query(
+                "SELECT key, name_ciphertext, provenance FROM skills WHERE origin = 'learned' AND deleted_at IS NULL"
+                " AND key IN (%s)" % ",".join("?" * len(keys)), tuple(keys))
+        except Exception:  # noqa: BLE001
+            return {}
+        for key, name_ct, prov_raw in rows:
+            try:
+                prov = json.loads(prov_raw) if prov_raw else {}
+                name = " ".join(str(self.store._dec(name_ct) or "").split()) if name_ct else ""
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(prov, dict):
+                prov = {}
+            if name and (prov.get("named") is not False or prov.get("named_by") == "user"):
+                out[str(key)] = name
+        return out
+
+    def _usual_words_of(self, row: dict[str, Any], names: dict[str, str],
+                        skills: Sequence[Any]) -> tuple[str | None, str | None]:
+        """``(name, what)`` of a routine: the user's told label, else its learned skill's name; and what it is in
+        plain words (``routines.KIND_PHRASES``: "join a Meet call in Zen"). Cached per routine row version."""
+        key = (row.get("id"), row.get("updated_at"))
+        hit = self._usual_words.get(key)
+        if hit is not None:
+            return hit
+        from yuki.memory import routines as R
+
+        try:
+            label = self.store.routine_label(row)
+        except Exception:  # noqa: BLE001
+            label = None
+        name = _text(label or names.get(str(row.get("skill_id") or "")), USUAL_NAME_CHARS)
+        what = None
+        try:
+            kind, thing, app = R._things(self.store, row, None, skills)
+            verb2 = R.KIND_PHRASES.get(kind, ("", "do this in {app}", ""))[1]
+            what = _text(verb2.format(thing=thing or "it", app=app or "an app"), USUAL_WHAT_CHARS)
+        except Exception:  # noqa: BLE001
+            what = None
+        if len(self._usual_words) >= 64:
+            self._usual_words.clear()
+        self._usual_words[key] = (name, what)
+        return name, what
 
     def _build_prefs(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
-        return {"usuals": []}, False
+        """``usuals``: per preference slot the option the choice rule picks when it is a confirmed usual (rule 1) or a
+        clear observed choice (rule 2), confirmed first, ≤ :data:`PREFS_MAX`. Rule 3's guesses ("the most recent", said
+        aloud when used) are left out, and so are taste-filled slots (their options are entity keys; taste is phase
+        T's). Read-only (``prefs.choose``); rebuilt only when the preference rows change."""
+        from yuki.skills.prefs import choose
+
+        try:
+            slots = self.store._query("SELECT DISTINCT slot, context FROM prefs WHERE ended_at IS NULL")
+        except Exception:  # noqa: BLE001 - a database before migration 41
+            return {"usuals": []}, False
+        try:
+            from yuki.skills.catalog import load
+
+            caps = {s.key: s for s in load().skills if getattr(s, "origin", "") == "capability"}
+        except Exception:  # noqa: BLE001
+            caps = {}
+        found: list[tuple[int, float, dict[str, Any]]] = []
+        for slot, context in slots:
+            slot, context = str(slot or ""), str(context or "")
+            cap_key, _, rest = slot.partition(":")
+            cap = caps.get(cap_key)
+            spec = cap.slot(rest.partition("@")[0]) if cap is not None else None
+            if spec is not None and getattr(spec, "taste", ""):
+                continue
+            choice = choose(self.store, slot, context=context, now=now)
+            if choice is None or choice.source not in ("usual", "observed"):
+                continue
+            item = {"key": slot, "value": _text(choice.option, LABEL_CHARS),
+                    "state": "confirmed" if choice.source == "usual" else "observed"}
+            if context:
+                item["context"] = _text(context, LABEL_CHARS)
+            found.append((0 if choice.source == "usual" else 1, -float(choice.n or 0.0), item))
+        found.sort(key=lambda f: (f[0], f[1], f[2]["key"]))
+        return {"usuals": [f[2] for f in found[:PREFS_MAX]]}, True
 
     # -- about ----------------------------------------------------------------------------
 
@@ -1453,7 +1744,7 @@ class YouBuilder:
                 "builds": dict(self.builds), "unchanged": self.unchanged, "wakes": dict(self.wakes),
                 "db_checks": self.db_checks, "probes": self.probes, "version": self._version, "bytes": size,
                 "clipped": dict(self.clipped), "errors": self.errors, "beat_gaps": self.beat_gaps,
-                "bridges": self.bridges,
+                "bridges": self.bridges, "pushes": self.pushes,
                 "game_source": self._source, "call_unknown": self._call_unknown_since is not None}
 
 
@@ -1565,17 +1856,209 @@ def _render_cards(you: Any, now: float) -> list[tuple[int, str]]:
     return lines
 
 
+def _ago(seconds: float) -> str:
+    s = max(0.0, float(seconds))
+    if s < 90:
+        return f"{int(s)} s ago"
+    if s < 90 * 60:
+        return f"{int(round(s / 60))} min ago"
+    return f"{s / 3600:.1f} h ago"
+
+
+def _app_words(item: Any) -> str:
+    """An item's app as said: the display name the builder kept, else the key tidied (structural), else "an app"."""
+    label = item.get("label")
+    if label:
+        return str(label)
+    app = item.get("app")
+    if app:
+        from yuki.core.appnames import prettify
+
+        return prettify(str(app)) or str(app)
+    return "an app"
+
+
+#: What each kind of change was, in plain words (the closed vocabulary of moments, D1, and this module's synthesised
+#: transitions: machine codes to wording, like the routines' KIND_PHRASES; never matched against anyone's words).
+CHANGE_WORDS: dict[str, str] = {
+    "media_play": "{app} started playing", "media_context": "a playlist started in {app}",
+    "volume_change": "{app}'s volume changed", "site_front": "{service} came to the front in {app}",
+    "call_join": "joined {service} in {app}", "game_voice": "a game's voice chat started in {app}",
+    "message_sent": "a message was sent in {app}", "call_end": "a call ended in {app}", "game_end": "left {app}",
+    "sit_down": "sat down at the PC", "switch": "switched to {app}",
+}
+#: The ``{service}`` words when a moment named none.
+CHANGE_SERVICE: dict[str, str] = {"site_front": "a call page", "call_join": "a call"}
+
+
+def change_words(item: Any) -> str:
+    """One ``changed`` item in plain words ("Spotify started playing"), ``(by Yuki)`` when Yuki's own run made it."""
+    kind = str(item.get("kind") or "")
+    pattern = CHANGE_WORDS.get(kind)
+    if pattern is None:
+        return ""
+    text = pattern.format(app=_app_words(item), service=item.get("service") or CHANGE_SERVICE.get(kind, ""))
+    return text + (" (by Yuki)" if item.get("by") == "yuki" else "")
+
+
+def _newest_changes(you: Any, n: int, *, skip: tuple[str, ...] = ()) -> list[Any]:
+    """The newest ``n`` items of ``changed`` that have words, newest first."""
+    out = []
+    for item in sorted(you.get("changed") or (), key=lambda x: -float(x.get("at") or 0.0)):
+        if item.get("kind") in skip or not change_words(item):
+            continue
+        out.append(item)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _call_words(call: Any) -> str:
+    where = call.get("label") or (_app_words(call) if call.get("app") else "")
+    service = call.get("service")
+    if service and where and service.casefold() != str(where).casefold():
+        return f"on a {service} call in {where}"
+    return f"on a {service or where} call" if (service or where) else "on a call"
+
+
+def _focus_phrase(you: Any, held: set[str], *, talker: bool = False) -> str:
+    """The focus in words from the hold names (labels the builder kept: "in VALORANT", "on a Discord call"). The
+    talker gets only a game, a call, a game's voice chat and a meeting."""
+    focus = you.get("focus") or {}
+    words = []
+    game = focus.get("game") or {}
+    if "game" in held:
+        if game.get("label"):
+            words.append(f"in {game['label']}")
+        else:
+            words.append("in a full-screen game" if game.get("name") == "d3d" else "in a game")
+    elif "return_hold" in held and not talker:
+        words.append("just left a game or full screen")
+    if "fullscreen" in held and "game" not in held and not talker:
+        words.append("something full screen in front")
+    call = focus.get("call") or {}
+    if "call" in held:
+        words.append(_call_words(call) + ("" if talker else f" since {_hm(call.get('since'))}"))
+    elif call.get("open") and call.get("kind") == "game":
+        words.append(f"a game's voice chat open in {_app_words(call)}" if call.get("app") else
+                     "a game's voice chat open")
+    if held & {"meeting", "meeting_audio"} and "call" not in held:
+        words.append("in a meeting")
+    if "yuki_acting" in held and not talker:
+        words.append("Yuki is acting for them")
+    return "; ".join(words)
+
+
+def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
+    """(priority, line) for the brain's request turn (§3.5): focus and the day, what just changed (for "that", "it",
+    "the song"), the thread now and the top threads with next steps, due and overdue items, the usual now and the
+    confirmed usuals. Ids in brackets are memory's own (``W`` threads, due refs)."""
+    lines: list[tuple[int, str]] = []
+    held = set(holds_now(you, now))
+    if "unknown" in held:
+        try:
+            age = f" (its last beat was {_ago(now - float(you['beat_at']))})"
+        except (KeyError, TypeError, ValueError):
+            age = ""
+        lines.append((0, f"Focus: not known just now{age}: treat a game or a call as in front until a look shows "
+                         f"otherwise."))
+    else:
+        lines.append((0, f"Focus: {_focus_phrase(you, held) or 'no game, call or meeting'}."))
+    pres = you.get("presence") or {}
+    p = presence_now(you, now)
+    parts = []
+    if pres.get("day_began"):
+        parts.append(f"their day at the PC began {_hm(pres['day_began'])} after {_dur(pres.get('day_gap_s'))} away "
+                     f"(\"this morning\" and \"today\" mean since then)")
+    if p["away"]:
+        parts.append(f"away for {_dur(p['idle_s'])}" if p["idle_s"] is not None else "away")
+    elif pres.get("at_pc_since"):
+        parts.append(f"at the PC since {_hm(pres['at_pc_since'])}" + ("" if p["settled"] else ", just back"))
+    if parts:
+        lines.append((1, "Day: " + "; ".join(parts) + "."))
+    changes = _newest_changes(you, THINKER_CHANGED)
+    if changes:
+        lines.append((2, "Just changed (newest first): " + "; ".join(
+            f"{_hm(c.get('at'))} {change_words(c)} ({_ago(now - float(c.get('at') or now))})" for c in changes) + "."))
+    work = you.get("work") or {}
+    tn = work.get("thread_now")
+    if tn:
+        lines.append((2, f"Thread now [W{tn['id']}]: {tn.get('title') or ''}"
+                         + (f" - {tn['stands']}" if tn.get("stands") else "")
+                         + (f"; next: {tn['next']}" if tn.get("next") else "")))
+    others = [t for t in work.get("threads") or () if not tn or t.get("id") != tn.get("id")][:THINKER_THREADS]
+    for t in others:
+        lines.append((4, f"Thread [W{t['id']}]: {t.get('title') or ''}" + (f"; next: {t['next']}" if t.get("next")
+                                                                           else "")))
+    for d in work.get("due") or ():
+        when = datetime.fromtimestamp(d["due_at"]).strftime("%a" if d.get("all_day") else "%a %H:%M")
+        lines.append((3, f"Due [{d['ref']}]: {d.get('title') or '(untitled item)'}, {when}"
+                         + (" (overdue)" if d["due_at"] < now else "")))
+    usual = you.get("usual") or {}
+    for u in usual.get("now") or ():
+        lines.append((3, "Usual now: " + _usual_words(u)
+                         + ("; already done today" if u.get("done_today") else "; not done yet today") + "."))
+    confirmed = [x for x in (you.get("prefs") or {}).get("usuals") or () if x.get("state") == "confirmed"]
+    if confirmed:
+        lines.append((5, "Their confirmed usuals: " + "; ".join(f"{x['key']} = {x.get('value')}" for x in confirmed)
+                         + "."))
+    later = list(usual.get("today") or ())
+    if later:
+        lines.append((6, "Usual later today: " + "; ".join(_usual_words(u) for u in later) + "."))
+    return lines
+
+
+def _usual_words(u: Any) -> str:
+    what = u.get("what") or "their usual"
+    name = u.get("name")
+    at = u.get("at_min")
+    m = int(float(at) % 1440.0) if isinstance(at, (int, float)) else None   # a clock minute (routines.hm's form)
+    when = f" around {m // 60:02d}:{m % 60:02d}" if m is not None else ""
+    return (f"\"{name}\" ({what})" if name else what) + when
+
+
+def _render_talker(you: Any, now: float) -> str:
+    """The talker's one volatile line (§3.5): focus words and up to :data:`TALKER_CHANGED` just-changed items, as of
+    the record's last beat (its cache is refreshed in the background); ``""`` when nothing holds and nothing changed,
+    or when the record is older than :data:`TALKER_STALE_S`. Never to-dos, threads, news or the usual now."""
+    try:
+        beat_at = float(you["beat_at"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    if now - beat_at > TALKER_STALE_S:
+        return ""
+    held = set(holds_now(you, min(now, beat_at)))   # the facts as of their beat; the cache said how fresh that is
+    cap = RENDER_CAPS["talker"]
+    focus = _focus_phrase(you, held, talker=True)
+    head = f"Now: {focus}." if focus else ""
+    items: list[str] = []
+    for c in _newest_changes(you, TALKER_CHANGED, skip=("sit_down",)):
+        item = f"{change_words(c)} {_ago(now - float(c.get('at') or now))}"
+        tail = "Just now: " + "; ".join([*items, item]) + "."
+        if len(f"{head} {tail}".strip()) > cap:
+            break   # the older items give way
+        items.append(item)
+    tail = ("Just now: " + "; ".join(items) + ".") if items else ""
+    return f"{head} {tail}".strip()
+
+
 def render(you: Any, kind: str = "cards", *, now: float | None = None) -> str:
-    """The record in words for one reader (content: RAM only, never logged). ``cards``: the card writer's context
-    (focus, presence and session, work, plans, about, today's cards), at most :data:`RENDER_CAPS` characters; lines
-    give way by priority. ``thinker`` and ``talker`` come with yConsumers. ``""`` with no record."""
+    """The record in words for one reader (content: RAM only, never logged), at most :data:`RENDER_CAPS` characters;
+    lines give way by priority. ``cards``: the card writer's context (focus, presence and session, work, plans, about,
+    today's cards). ``thinker``: the brain's request turn (focus and the day, just changed, thread now and top threads,
+    due, the usual now and confirmed usuals; a stale record says "not known", fail closed). ``talker``: one line, focus
+    words and up to three just-changed items (``""`` when there is nothing to say or the record is stale). ``""`` with
+    no record."""
     if kind not in RENDER_CAPS:
         raise ValueError(f"kind must be one of {', '.join(RENDER_CAPS)}, not {kind!r}")
     if not you:
         return ""
     now = time.time() if now is None else float(now)
     cap = RENDER_CAPS[kind]
-    lines = _render_cards(you, now)
+    if kind == "talker":
+        text = _render_talker(you, now)
+        return text if len(text) <= cap else text[: cap - 1].rstrip() + "…"
+    lines = _render_thinker(you, now) if kind == "thinker" else _render_cards(you, now)
     order = sorted(range(len(lines)), key=lambda i: (lines[i][0], i))
     keep: set[int] = set()
     total = 0
@@ -1599,7 +2082,9 @@ _WORD_PATHS = frozenset({
     "focus.game.name", "focus.game.source", "focus.call.kind",
     "changed[].kind", "changed[].app", "changed[].by",
     "work.goals[].scope", "work.goals[].status", "work.due[].ref", "work.due[].owner",
-    "cards.showing.type",
+    "cards.showing.type", "focus.call.app",
+    "usual.now[].state", "usual.now[].offer_mode", "usual.today[].state", "usual.today[].offer_mode",
+    "prefs.usuals[].key", "prefs.usuals[].state",
 })
 
 
@@ -1657,10 +2142,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                                "stats": builder.stats()}
         if args.content:
             out["you"] = thaw(you)
-            out["render_cards"] = render(you, "cards", now=now)
+            for kind in RENDER_CAPS:
+                out[f"render_{kind}"] = render(you, kind, now=now)
         else:
             out["you"] = content_free(thaw(you), now)
-            out["render_cards_chars"] = len(render(you, "cards", now=now))
+            for kind in RENDER_CAPS:
+                out[f"render_{kind}_chars"] = len(render(you, kind, now=now))
         sys.stdout.write(json.dumps(out, indent=1, ensure_ascii=False, default=str) + "\n")
     finally:
         if store is not None:
@@ -1671,8 +2158,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "SCHEMA_V", "STALE_S", "SECTIONS", "SECTION_CAPS", "RECORD_CAP", "RENDER_CAPS", "CHANGED_KINDS", "SYNTH_KINDS",
-    "YouConfig", "YouBuilder", "focus_game", "focus_holds", "holds_now", "presence_now", "day_began",
-    "day_began_from", "meeting_audio", "render", "thaw", "content_free",
+    "THINKER_SECTIONS", "TALKER_SECTIONS", "CHANGE_WORDS", "YouConfig", "YouBuilder", "focus_game", "focus_holds",
+    "holds_now", "presence_now", "day_began", "day_began_from", "meeting_audio", "render", "change_words", "thaw",
+    "content_free", "live_builder",
 ]
 
 

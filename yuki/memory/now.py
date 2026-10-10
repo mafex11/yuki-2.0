@@ -22,6 +22,10 @@ what is on screen the instant a request starts, with how old each read is.
   crosses).  Requests and replies are JSON.  ``now`` returns the board,
   ``refresh`` asks the watcher to read a window again now (no wait).
 * :func:`format_now`: the compact text the brain gets, capped.
+* yConsumers (state-design.md §3.4, §11): op ``you`` serves the memory service's "you right now" record
+  (:mod:`yuki.memory.younow`) on the same pipe, version-cached on both ends (:meth:`NowClient.you`), and the service
+  sets a named auto-reset event per reader (:func:`you_event_name`, :data:`YOU_READERS`) only when the set of holds
+  changes, so a reader re-asks instead of polling.
 * Live facts for the skills' resolver and done-checks (PLAN.md D8, D9, F5.4), one snapshot:
   ``calling_tabs`` (per window, the calling site's tab identified by
   :class:`yuki.memory.callevidence.SiteTabs`: process, service, its RuntimeId, the
@@ -38,6 +42,8 @@ API for the tray and voice (the voice builder's desk block uses the same)::
     board = shared_client().now(wait_s=0.05)      # dict, or None (no service / no answer in 50 ms)
     text = format_now(board, foreground=hwnd)     # "" when board is None
     shared_client().refresh(hwnd)                 # ask for a re-read (returns at once)
+    you = shared_client().you(sections=("focus", "changed"), wait_s=0.05)   # the record (read-only), or None
+    both = shared_client().you(with_board=True)   # {"you": record or None, "board": board or None}, one round trip
 
 Nothing here reads the screen itself; it only keeps and serves what the watcher read.
 """
@@ -50,10 +56,11 @@ import os
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from yuki.core.opacity import AIMING_NOTE, opacity_fact, readable_chars
@@ -538,6 +545,98 @@ def auth_key(cipher: Any) -> bytes:
     return bytes.fromhex(cipher.digest("yuki-now-ipc-v1"))
 
 
+#: The readers of the "you right now" hold event (state-design.md §3.4): each has its own named auto-reset event, so one
+#: reader's wait never takes another's signal. ``talk``: the voice talker's line cache (``yuki.voice.pipeline``);
+#: ``cards``: the tray's card queue (jSwitch: re-ask ``card_due`` for a waiting card instead of polling).
+YOU_READERS: tuple[str, ...] = ("talk", "cards")
+#: The sections the ``you`` op may be asked for (``yuki.memory.younow.SECTIONS``; unknown names are ignored).
+YOU_SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs", "about", "cards")
+
+
+def you_event_name(db_path: str | Path | None, reader: str) -> str:
+    """The named auto-reset event the memory service sets for ``reader`` when the set of holds changes: per database
+    (the acting event's digest) and per reader, in the session's ``Local\\`` namespace."""
+    from yuki.memory.store import default_db_path
+
+    db = Path(db_path) if db_path is not None else default_db_path()
+    digest = hashlib.sha1(str(db.resolve()).lower().encode()).hexdigest()[:12]
+    return f"Local\\YukiYouChanged-{digest}-{reader}"
+
+
+class NamedEvent:
+    """A Win32 auto-reset event, named (created, or opened when another process made it first) or unnamed (``name``
+    None: a kick for a waiter in this process). Never raises; without a handle :meth:`set` is a no-op and
+    :func:`wait_any` falls back to its timeout."""
+
+    def __init__(self, name: str | None) -> None:
+        self.name = name
+        self.handle: int | None = None
+        try:
+            import ctypes
+
+            k = ctypes.windll.kernel32
+            k.CreateEventW.restype = ctypes.c_void_p
+            k.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+            self.handle = k.CreateEventW(None, False, False, name) or None
+        except Exception:  # noqa: BLE001 - no event: waits end on their timeout
+            self.handle = None
+
+    def set(self) -> bool:
+        if not self.handle:
+            return False
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.kernel32.SetEvent(ctypes.c_void_p(self.handle)))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def close(self) -> None:
+        handle, self.handle = self.handle, None
+        if handle:
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def wait_any(events: Sequence[NamedEvent], timeout_s: float) -> int | None:
+    """Wait until one of ``events`` is set (its index; an auto-reset event is reset by the wait) or ``timeout_s``
+    passes (None). Events without a handle are skipped; with none at all it just sleeps the timeout. Never raises."""
+    live = [(i, e.handle) for i, e in enumerate(events) if e.handle]
+    ms = max(0, int(timeout_s * 1000))
+    if not live:
+        time.sleep(ms / 1000.0)
+        return None
+    try:
+        import ctypes
+
+        k = ctypes.windll.kernel32
+        k.WaitForMultipleObjects.restype = ctypes.c_uint32
+        k.WaitForMultipleObjects.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+        handles = (ctypes.c_void_p * len(live))(*[h for _i, h in live])
+        got = int(k.WaitForMultipleObjects(len(live), handles, False, ms))
+    except Exception:  # noqa: BLE001
+        time.sleep(ms / 1000.0)
+        return None
+    if 0 <= got < len(live):
+        return live[got][0]
+    if got == 0xFFFFFFFF:   # WAIT_FAILED: never spin on it
+        time.sleep(ms / 1000.0)
+    return None
+
+
+def _frozen(value: Any) -> Any:
+    """A JSON value as read-only mappings and tuples (a cached copy handed to several readers stays as it came)."""
+    if isinstance(value, dict):
+        return MappingProxyType({k: _frozen(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return tuple(_frozen(v) for v in value)
+    return value
+
+
 class NowServer:
     """Serves a :class:`NowBoard` on the database's pipe (inside ``yuki-memory``).
 
@@ -547,20 +646,26 @@ class NowServer:
         db_path: The database the pipe is named for.
         on_refresh: ``(hwnd or None) -> bool``: ask the watcher for a read now.
         log: ``log(type, **fields)``, content-free.
+        you_fn: ``() -> YouBuilder | None``, read late (op ``you``); default: this process's live builder
+            (:func:`yuki.memory.younow.live_builder`), so the service needs no wiring for it.
     """
 
     def __init__(self, board: NowBoard, cipher: Any, db_path: str | Path | None, *,
                  on_refresh: Callable[[int | None], bool] | None = None,
-                 log: Callable[..., None] | None = None) -> None:
+                 log: Callable[..., None] | None = None, you_fn: Callable[[], Any] | None = None) -> None:
         self.board = board
         self.address = pipe_name(db_path)
         self._key = auth_key(cipher)
         self._on_refresh = on_refresh
         self._log = log
+        self.you_fn = you_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._listener: Any = None
-        self.stats = {"connections": 0, "requests": 0, "refused": 0, "errors": 0, "bytes": 0, "ms_max": 0.0}
+        self._you_cached: dict[tuple[str, ...] | None, tuple[Any, Any, dict[str, Any]]] = {}
+        self._you_lock = threading.Lock()
+        self.stats = {"connections": 0, "requests": 0, "refused": 0, "errors": 0, "bytes": 0, "ms_max": 0.0,
+                      "you": 0, "you_unchanged": 0}
 
     def start(self) -> "NowServer":
         from yuki.memory.embed_ipc import _listener_class
@@ -651,18 +756,78 @@ class NowServer:
     #: A serialised snapshot is reused while the board is unchanged, for at most this long (ages drift by it).
     REUSE_S = 1.0
 
+    def _board(self) -> dict[str, Any]:
+        """The board's snapshot, reused while unchanged for at most :attr:`REUSE_S`."""
+        version, now = self.board.version, time.monotonic()
+        cached = getattr(self, "_cached", None)
+        if cached is not None and cached[0] == version and now - cached[1] <= self.REUSE_S:
+            return cached[2]
+        board = self.board.snapshot()
+        self._cached = (version, now, board)
+        return board
+
+    def _you(self, request: dict[str, Any], rid: Any) -> dict[str, Any]:
+        """Op ``you`` (state-design.md §3.4): ``{op: "you", since: <version>|null, sections: [...]|null,
+        with_board: bool, stats: bool}``. ``{ok: false, error: "off"}`` with no record (``[you] enabled = false``, or no
+        builder in this process): the reader falls back to its own reads. ``{ok, unchanged: true, version, beat_at}``
+        when ``since`` is the record's version; else ``{ok, version, beat_at, you}`` (only the sections asked for, plus
+        the top level). ``board`` (the ``now`` op's reused snapshot) with ``with_board``; ``stats`` (the builder's
+        content-free counters) with ``stats``. The plain copy is reused while the record's version and build marks
+        are the same (``beat_at`` alone moves every beat)."""
+        self.stats["you"] += 1
+        builder = None
+        try:
+            if self.you_fn is not None:
+                builder = self.you_fn()
+            else:
+                from yuki.memory.younow import live_builder
+
+                builder = live_builder()
+        except Exception:  # noqa: BLE001 - no record: the reader's own reads stand
+            builder = None
+        you = builder.snapshot() if builder is not None else None
+        out: dict[str, Any] = {"id": rid}
+        if request.get("with_board"):
+            out["board"] = self._board()
+        if you is None:
+            return {**out, "ok": False, "error": "off"}
+        version, beat_at = you.get("version"), you.get("beat_at")
+        out.update(ok=True, version=version, beat_at=beat_at)
+        if request.get("stats"):
+            try:
+                out["stats"] = builder.stats()
+            except Exception:  # noqa: BLE001
+                out["stats"] = None
+        since = request.get("since")
+        if since is not None and since == version:
+            self.stats["you_unchanged"] += 1
+            out["unchanged"] = True
+            return out
+        asked = request.get("sections")
+        sections = tuple(s for s in YOU_SECTIONS if s in asked) if isinstance(asked, list) and asked else None
+        built = you.get("built")
+        with self._you_lock:
+            cached = self._you_cached.get(sections)
+            if cached is not None and cached[0] == version and cached[1] is built:
+                plain = cached[2]
+            else:
+                from yuki.memory.younow import thaw
+
+                plain = {k: thaw(v) for k, v in you.items()
+                         if k != "beat_at" and (sections is None or k not in YOU_SECTIONS or k in sections)}
+                if len(self._you_cached) >= 8:   # a handful of readers, each with its own sections
+                    self._you_cached.clear()
+                self._you_cached[sections] = (version, built, plain)
+        out["you"] = {**plain, "beat_at": beat_at}
+        return out
+
     def _answer(self, request: dict[str, Any]) -> dict[str, Any]:
         op, rid = request.get("op"), request.get("id")
         self.stats["requests"] += 1
         if op == "now":
-            version, now = self.board.version, time.monotonic()
-            cached = getattr(self, "_cached", None)
-            if cached is not None and cached[0] == version and now - cached[1] <= self.REUSE_S:
-                board = cached[2]
-            else:
-                board = self.board.snapshot()
-                self._cached = (version, now, board)
-            return {"id": rid, "ok": True, "board": board}
+            return {"id": rid, "ok": True, "board": self._board()}
+        if op == "you":
+            return self._you(request, rid)
         if op == "refresh":
             hwnd = request.get("hwnd")
             queued = bool(self._on_refresh(int(hwnd) if hwnd else None)) if self._on_refresh else False
@@ -684,6 +849,12 @@ class NowClient:
         self._next_try = 0.0
         self.absent = False
         self.stats = {"ok": 0, "timeout": 0, "absent": 0, "ms_max": 0.0, "last_ms": 0.0}
+        #: The last "you right now" copy per set of sections: ``(version, record without beat_at)``.
+        self._you_cache: dict[tuple[str, ...] | None, tuple[Any, Any]] = {}
+        self._you_lock = threading.Lock()
+        #: Why the last :meth:`you` gave no record: ``"off"`` (``[you] enabled = false``: fall back to your own reads),
+        #: ``"absent"`` (no service), ``"timeout"``; None after an answer.
+        self.you_error: str | None = None
 
     def _connect(self, wait_s: float) -> Any:
         if self._conn is not None:
@@ -775,6 +946,51 @@ class NowClient:
         """Ask the watcher to read ``hwnd`` (default: the window in front) again now; returns at once."""
         reply = self._ask({"op": "refresh", "hwnd": int(hwnd) if hwnd else None}, wait_s)
         return bool(reply and reply.get("queued"))
+
+    def you(self, *, sections: Sequence[str] | None = None, with_board: bool = False,
+            wait_s: float = 0.05) -> Any:
+        """The memory service's "you right now" record (state-design.md §11), read-only, or None (no service, no answer
+        within ``wait_s``, or ``[you] enabled = false``: :attr:`you_error` says which). Version-cached: the copy last
+        received for these ``sections`` (None: all) is sent back as ``since``, and when nothing changed the service
+        answers in ~100 bytes and that copy comes back with the fresh ``beat_at``. Readers check freshness themselves
+        (``younow.holds_now``: older than ``STALE_S`` is "not known"). ``with_board``: ``{"you": record or None,
+        "board": the Now board or None}`` in one round trip. Never raises."""
+        key = tuple(s for s in YOU_SECTIONS if s in set(sections)) if sections else None
+        with self._you_lock:
+            cached = self._you_cache.get(key)
+        request = {"op": "you", "since": cached[0] if cached is not None else None,
+                   "sections": list(key) if key else None, "with_board": bool(with_board)}
+        reply = self._ask(request, wait_s)
+        board = reply.get("board") if reply else None
+        record = None
+        if not reply or not reply.get("ok"):
+            self.you_error = str(reply.get("error") or "error") if reply else ("absent" if self.absent else "timeout")
+            if reply and reply.get("error") == "off":
+                with self._you_lock:
+                    self._you_cache.clear()
+        elif reply.get("unchanged") and cached is not None:
+            self.you_error = None
+            record = cached[1]
+        elif isinstance(reply.get("you"), dict):
+            self.you_error = None
+            plain = {k: v for k, v in reply["you"].items() if k != "beat_at"}
+            record = _frozen(plain)
+            with self._you_lock:
+                self._you_cache[key] = (reply.get("version"), record)
+        else:   # "unchanged" for a copy this client no longer holds: asked again next time
+            self.you_error = "error"
+            with self._you_lock:
+                self._you_cache.pop(key, None)
+        if record is not None:
+            record = MappingProxyType({**record, "beat_at": reply.get("beat_at")})
+        return {"you": record, "board": board} if with_board else record
+
+    def you_stats(self, wait_s: float = 0.5) -> dict[str, Any] | None:
+        """For the doctor: the service's answer with the builder's content-free counters (``stats``), ``version``,
+        ``beat_at`` and the ``focus`` and ``cards`` sections; ``{ok: false, error: "off"}`` when the record is switched
+        off; None without an answer. Not cached."""
+        reply = self._ask({"op": "you", "sections": ["focus", "cards"], "stats": True}, wait_s)
+        return reply if isinstance(reply, dict) else None
 
     def server_stats(self, wait_s: float = 0.2) -> dict[str, Any] | None:
         reply = self._ask({"op": "stats"}, wait_s)
@@ -887,6 +1103,6 @@ def board_front_source(client_fn: Callable[[], Any] | None = None, *, max_age_s:
     return source
 
 
-__all__ = ["APP_DATA_READERS", "FRONT_SOURCE_REUSE_S", "NowBoard", "NowClient", "NowServer", "NowTiming",
-           "app_data_for", "board_front_source", "format_now", "game_in_front", "gist_of", "pipe_name",
-           "shared_client", "timing_of"]
+__all__ = ["APP_DATA_READERS", "FRONT_SOURCE_REUSE_S", "NamedEvent", "NowBoard", "NowClient", "NowServer", "NowTiming",
+           "YOU_READERS", "YOU_SECTIONS", "app_data_for", "board_front_source", "format_now", "game_in_front", "gist_of",
+           "pipe_name", "shared_client", "timing_of", "wait_any", "you_event_name"]

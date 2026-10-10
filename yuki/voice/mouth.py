@@ -2166,6 +2166,11 @@ Bad: the same -> "or something else on the Sidemen page?" (finishing the cut que
 """
 
 
+#: yConsumers (state-design.md §3.5): the one "you right now" line from the memory service (focus words and up to three
+#: just-changed items, at most 300 characters, read from a background-refreshed cache), in the volatile block after
+#: every cache breakpoint. Background for what "that" or "it" means, never news: Yuki never speaks first.
+YOU_LINE = ("[Memory's view right now (background for what \"that\", \"it\" or \"the song\" means; never news to bring up, "
+            "never said unless they ask): {line}]")
 #: The last line of every request's volatile block in marker mode (v3.16): the format, right where the reply begins.
 MARKER_REMINDER = "[Start your reply with its marker line: say, act or quiet, alone on the first line.]"
 #: Added when the user's turn is answered again because nothing of the last reply to it was heard (v3.16).
@@ -2219,6 +2224,10 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
     bTalk: ``talker`` ``"lean"`` (design 3) carries the lean guides (:data:`LEAN_FOCUS_GUIDE`,
     :data:`LEAN_RECOGNITION_GUIDE`, :data:`LEAN_WORK_GUIDE`, ...) in the same places; ``"full"`` is as before.
+
+    yConsumers: ``state["you"]`` (the memory service's one "you right now" line, ``younow.render(you, "talker")``,
+    at most 300 characters; the pipeline sets it for the lean talker only, from its background cache) rides as
+    :data:`YOU_LINE` right after the focus guide.
     """
     state = state or {}
     keys = state.get("skill_keys") or ()
@@ -2236,6 +2245,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  + (" and on a voice call" if on_call else "")) if game else "on a voice call"
         text += "\n[" + (LEAN_FOCUS_GUIDE.format(where=where) if lean else
                           skill_guide(FOCUS_GUIDE.format(where=where), keys)) + "]"
+    you_line = " ".join(str(state.get("you") or "").split())[:300]
+    if you_line:
+        text += "\n" + YOU_LINE.format(line=you_line)
     if state.get("dictating"):
         # N7 (report 47): measured while they spoke, text went into another app's field (typing or dictation)
         text += (f"\n[Private, never to be said: while they spoke, the text in {state['dictating']} changed: they "
