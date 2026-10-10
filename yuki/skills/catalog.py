@@ -3,9 +3,9 @@ versioned, store-aware, in-process cache (phase L design §2, §4.9, §6 "Loader
 
 Every module that loaded skills (``yuki.skills.connection.load()``) reads :func:`load` here instead. It returns a
 :class:`yuki.skills.connection.Loaded`: the capabilities first (always callable on request, rung A, one neutral menu
-line each), then the user's live learned skills, each a specialised capability (its bound values, its learned name and
-menu line, its means fill policy, its learned rungs). A learned skill never gates its capability: the capability stays
-in the catalog whatever is learned (design §2, critique H1).
+line each), then the user's live learned skills, each a specialised capability (its bound values, its learned name,
+its means fill policy, its learned rungs). A learned skill never gates its capability: the capability stays in the
+catalog whatever is learned (design §2, critique H1).
 
 **Cost** (design §9.4: request time unchanged). With a ``store`` the version check is one count over ``skills``; the
 learned specs are decrypted only when that version changes, never per request. Without a store (the voice path, the
@@ -24,12 +24,19 @@ memory service's nightly passes) passes ``store=`` so the cache follows the data
       {"v": 1,
        "bound": {"<key or fill slot>": <value>, ...},       # the habit's constants (names: encrypted at rest)
        "means": {"<means slot>": {"policy": "<name>"}},    # the learned fill policy (web_route.BROWSER_POLICIES)
-       "menu": "<the learned menu line, <= 140 chars>",
+       "menu": "<the learned menu line, <= 140 chars>",    # the learner keeps it; never read at request time
        "routes": [<route tables, rung B or C, the connection-file shape>],
        "wont": ["<SKILL_WONT_LINES word>", ...],            # only adds to the capability's
        "commit": "<COMMITS word>"}                           # only stricter than the capability's
 
 * ``name_ciphertext``: the learned name (the naming call's, validated).
+
+**Words** (failure fix-plan Item 1): a learned skill's ``Skill.menu`` is its capability's neutral line, never the
+learned menu line. That line is the naming call's free text ("open Claude (claude.ai) in Chrome when they want to chat
+with Claude") and names a browser the skill does not bind (a means slot is never bound: design §4.2); it reached the
+talker's and the planner's menus and, as the hand-off seed's ``goal``, the thinker doing the job by steps, and the
+commit check's and "keep this as your usual?" words. What sets a learned skill apart is its name and its bound values
+(the menu shows both; the seed carries the values as its slots).
 
 A means slot is never bound (app and means are never part of a skill's identity: design §4.2); a slot is bound only
 when its capability names a ``bind`` source for it (an occasion's attribute), and never when it is a slot a
@@ -37,6 +44,17 @@ when its capability names a ``bind`` source for it (an occasion's attribute), an
 turn a draft into a send or join a channel nobody named, review r2 M1); a learned rung is never rung A (rung A is the
 capability's own); ``wont`` and ``commit`` only ever get stricter. A row that breaks any of these is skipped and
 reported (``learned_error``, content-free: its row id and a code word), never guessed.
+
+**The switch** (failure fix-plan Item 1; ``yuki.skills.learned_enabled``): the learned rows are loaded only with the
+user's skills switch ``on``. With ``"capabilities"`` (or ``"off"``) :func:`load` returns the capabilities alone, under a
+version of its own (a menu snapshot or a cached tool block built with the learned lines is never reused for it), and
+never decrypts a learned row; the rows stay in the database. ``load(learned=True)`` reads them anyway (a caller that
+must see the user's learned rows whatever the switch says: none in the request path).
+
+**Nameless rows**: a learned row the naming call never named (``provenance.named`` false, not renamed by the user: a
+night with no call budget) gets ``Skill.name = ""``, as :class:`yuki.skills.connection.Skill` documents; its stored
+label is code-built ("<site> in <browser>: open page") and names things the skill does not bind. The menu leaves such
+a skill off (its capability's line stands for it); it is still in the catalog, so it runs and counts as before.
 
 A bound value runs as the skill's own: on the learned skill's copy of the slot it is the default and the slot's live
 fill, taste fill and in-call question are cleared, so only the user's words replace it (review r2 L1). The contract
@@ -109,7 +127,7 @@ def _decode(store: Any) -> tuple[tuple[_Row, ...], tuple[str, ...]]:
     """The live learned rows, decrypted in RAM, and the content-free errors of the ones skipped."""
     try:
         rows = store._query(
-            "SELECT s.id, s.key, s.spec_ciphertext, s.name_ciphertext, c.key FROM skills s "
+            "SELECT s.id, s.key, s.spec_ciphertext, s.name_ciphertext, c.key, s.provenance FROM skills s "
             "JOIN skills c ON c.id = s.capability_id WHERE s.origin = 'learned' AND s.retired_at IS NULL "
             "AND s.deleted_at IS NULL AND s.state IN (" + ",".join("?" * len(LIVE_STATES)) + ") "
             "ORDER BY CASE s.state WHEN 'trusted' THEN 0 ELSE 1 END, s.uses DESC, s.updated_at DESC, s.id LIMIT ?",
@@ -118,10 +136,10 @@ def _decode(store: Any) -> tuple[tuple[_Row, ...], tuple[str, ...]]:
         return (), ("learned: unreadable",)
     out: list[_Row] = []
     errors: list[str] = []
-    for rid, key, spec_ct, name_ct, cap_key in rows:
+    for rid, key, spec_ct, name_ct, cap_key, prov in rows:
         try:
             spec = json.loads(store._dec(spec_ct) or "{}") if spec_ct else {}
-            name = " ".join(str(store._dec(name_ct) or "").split()) if name_ct else ""
+            name = " ".join(str(store._dec(name_ct) or "").split()) if name_ct and named(prov) else ""
         except Exception:  # noqa: BLE001
             errors.append(f"learned:{int(rid)}: undecryptable")
             continue
@@ -130,6 +148,21 @@ def _decode(store: Any) -> tuple[tuple[_Row, ...], tuple[str, ...]]:
             continue
         out.append(_Row(id=int(rid), key=str(key or ""), capability=str(cap_key or ""), spec=spec, name=name))
     return tuple(out), tuple(errors)
+
+
+def named(provenance: Any) -> bool:
+    """Whether a learned row carries a real name (``skills.provenance``, content-free JSON): the naming call's
+    (``named`` true) or the user's own Rename (``named_by = "user"``). Only a row the learner marked nameless
+    (``named`` false: no call budget, a failed call, a refused name) is not; a row whose provenance says neither (or
+    can't be read) keeps its name, as before."""
+    if isinstance(provenance, (str, bytes)):
+        try:
+            provenance = json.loads(provenance or "{}")
+        except ValueError:
+            return True
+    if not isinstance(provenance, Mapping):
+        return True
+    return provenance.get("named") is not False or provenance.get("named_by") == "user"
 
 
 def _bind_route(route: Route, bound: Mapping[str, Any], policies: Mapping[str, str]) -> Route:
@@ -204,7 +237,8 @@ def specialise(cap: Skill, *, key: str, spec: Mapping[str, Any], name: str = "")
         raise ConnectionError_(f"{where}: two routes share rung, variant and verb")
     wont = tuple(dict.fromkeys([*cap.wont, *(str(w) for w in spec.get("wont") or [] if str(w).strip())]))
     commit = strictest(cap.commit, str(spec.get("commit") or ""))
-    menu = _clip(str(spec.get("menu") or "") or name or cap.menu, MENU_LINE_CHARS)
+    # Item 1: the capability's neutral words, never the learned free text (see "Words" in the module docstring)
+    menu = _clip(cap.menu, MENU_LINE_CHARS)
     digest = hashlib.sha256(json.dumps(spec, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()
     learned = replace(cap, key=key, menu=menu, slots=slots, routes=tuple(routes), wont=wont, commit=commit,
                       origin="learned", capability=cap.key, name=_clip(name, 60), bound=bound, file="learned",
@@ -283,15 +317,81 @@ def _folders(dirs: Iterable[str | Path] | None) -> tuple[str, ...]:
     return tuple(str(Path(d)) for d in dirs) if dirs is not None else (str(connection.CONNECTIONS_DIR),)
 
 
+#: The capabilities-only catalog's version part (the switch's ``capabilities`` / ``off``): never a version the full
+#: catalog has, so nothing keyed on a catalog version (the talker's menu snapshot, the thinker's tool block, the
+#: registry's menu version) carries learned lines over a switch.
+CAPABILITIES_ONLY = "capabilities-only"
+
+
+def learned_on() -> bool:
+    """Whether the learned rows are loaded (the user's skills switch is ``on``: :func:`yuki.skills.learned_enabled`,
+    read as a fresh ``Settings()`` would). On when the switch can't be read (the default)."""
+    try:
+        from yuki.skills import learned_enabled
+
+        return learned_enabled(None)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _capabilities_only(caps: Loaded, dirs: Iterable[str | Path] | None) -> Loaded:
+    """The capabilities alone under their own version (:data:`CAPABILITIES_ONLY`), cached per folder set."""
+    key = (*_folders(dirs), CAPABILITIES_ONLY)
+    with _lock:
+        hit = _cache.get(key)
+        if hit is not None and hit[0] == caps.version:
+            return hit[2]
+        loaded = Loaded(tuple(caps.skills), tuple(caps.errors),
+                        hashlib.sha256(f"{caps.version}|{CAPABILITIES_ONLY}".encode()).hexdigest()[:12])
+        _cache[key] = (caps.version, CAPABILITIES_ONLY, loaded)
+    return loaded
+
+
+def _tell_hidden(store: Any, log: Callable[..., Any] | None) -> None:
+    """Tell ``log`` once per process that the switch leaves the learned rows out (``skills_switch``, content-free:
+    the switch word and how many learned rows the database holds: one count, no decryption)."""
+    if log is None:
+        return
+    with _lock:
+        if "switch:hidden" in _reported:
+            return
+        _reported.add("switch:hidden")
+    n = 0
+    if store is not None:
+        version = learned_version(store)
+        try:
+            n = int(version.split(":", 1)[0]) if version else 0
+        except ValueError:
+            n = 0
+    try:
+        from yuki.skills import mode
+
+        word = mode(None)
+    except Exception:  # noqa: BLE001
+        word = "capabilities"
+    try:
+        log("skills_switch", mode=word, learned="hidden", learned_rows=n)
+    except Exception:  # noqa: BLE001 - a log never breaks a load
+        pass
+
+
 def load(dirs: Iterable[str | Path] | None = None, *, store: Any = None,
-         log: Callable[..., Any] | None = None) -> Loaded:
+         log: Callable[..., Any] | None = None, learned: bool | None = None) -> Loaded:
     """The catalog: the capabilities of ``dirs`` (default: the bundled folder), then the live learned skills. With
     ``store``: its learned rows, decrypted only when their version changed since the process last read them. Without
     one: the learned skills the process last read (none before the first store-aware load). ``log``: ``log(type,
     **fields)``, told each invalid file (``connection_error``) and skipped learned row (``learned_error``) once,
-    content-free. Never raises for the learned part (the capabilities alone then)."""
+    content-free. Never raises for the learned part (the capabilities alone then).
+    ``learned``: whether the learned rows are loaded; ``None`` (every caller today) follows the user's skills switch
+    (:func:`learned_on`): with ``"capabilities"`` or ``"off"`` this is the capabilities alone, no learned row is read,
+    and ``log`` is told so once (``skills_switch``)."""
     global _learned
     caps = connection.load(dirs)
+    if not (learned_on() if learned is None else bool(learned)):
+        loaded = _capabilities_only(caps, dirs)
+        _tell_hidden(store, log)
+        _report(loaded.errors, log)
+        return loaded
     if store is not None:
         learned_v = learned_version(store)
         with _lock:
@@ -314,7 +414,8 @@ def load(dirs: Iterable[str | Path] | None = None, *, store: Any = None,
 
 
 def get(key: str, *, store: Any = None) -> Skill | None:
-    """One catalog entry by key (a capability's or a learned skill's)."""
+    """One catalog entry by key (a capability's or a learned skill's; no learned key with the switch's
+    ``capabilities`` or ``off``)."""
     return load(store=store).get(str(key or ""))
 
 
@@ -356,5 +457,5 @@ def route_ask_means(call: Any) -> Any:
 ROUTES: dict[str, Callable[[Any], Any]] = {"ask_means": route_ask_means}
 
 
-__all__ = ["SPEC_VERSION", "LIVE_STATES", "KEY_CHARS", "capabilities", "learned_version", "specialise", "load", "get",
-           "clear_cache", "route_ask_means", "ROUTES"]
+__all__ = ["SPEC_VERSION", "LIVE_STATES", "KEY_CHARS", "CAPABILITIES_ONLY", "capabilities", "learned_version",
+           "named", "specialise", "learned_on", "load", "get", "clear_cache", "route_ask_means", "ROUTES"]

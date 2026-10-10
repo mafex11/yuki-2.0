@@ -40,6 +40,76 @@ def _brain_default() -> str:
     value = str(data.get("brain") or "").strip().lower() if isinstance(data, dict) else ""
     return value if value in BRAIN_MODES else "loop"
 
+
+#: The skills switch (failure fix-plan Item 1, 10 Oct): ``on`` everything (the shipped capabilities and the skills Yuki
+#: learned from the user), ``capabilities`` the shipped capabilities only (the learned rows are not loaded, so no menu,
+#: tool enum, planner or card sees them), ``off`` no skills anywhere (the old hands and tools: ``Settings.skills``).
+SKILLS_MODES: tuple[str, ...] = ("on", "capabilities", "off")
+#: The values the switch accepts (settings.json also takes JSON ``true`` / ``false``; ``YUKI_SKILLS`` is text). Config
+#: words, not the user's speech. Anything else is not a switch value and leaves the default (``on``).
+_SKILLS_WORDS: dict[str, str] = {
+    "on": "on", "true": "on", "yes": "on", "1": "on",
+    "capabilities": "capabilities", "capability": "capabilities",
+    "off": "off", "false": "off", "no": "off", "0": "off",
+}
+
+
+def skills_mode_of(value: object) -> str | None:
+    """The switch mode a settings value names (:data:`SKILLS_MODES`), ``None`` when it names none: a bool, ``0`` /
+    ``1``, or one of the switch words in any case."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, int) and value in (0, 1):
+        return "on" if value else "off"
+    if isinstance(value, str):
+        return _SKILLS_WORDS.get(value.strip().lower())
+    return None
+
+
+def _skills_default() -> str:
+    """``YUKI_SKILLS``, else ``skills`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else ``on`` (:data:`SKILLS_MODES`),
+    the same way :func:`_brain_default` reads ``brain``."""
+    forced = skills_mode_of(os.environ.get("YUKI_SKILLS") or "")
+    if forced is not None:
+        return forced
+    try:
+        import json
+
+        from yuki.core.models import prefs_path
+
+        data = json.loads(prefs_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, ImportError):
+        return "on"
+    value = skills_mode_of(data.get("skills")) if isinstance(data, dict) else None
+    return value if value is not None else "on"
+
+
+#: :func:`skills_mode`'s last read: ``((YUKI_SKILLS, settings.json's mtime and size), mode)``.
+_skills_seen: tuple[tuple[str, tuple[int, int] | None], str] | None = None
+
+
+def skills_mode() -> str:
+    """The skills switch as a fresh ``Settings()`` would read it now (:func:`_skills_default`), read again only when
+    ``YUKI_SKILLS`` or settings.json changed (one stat a call). For code that holds no ``Settings``: the catalog (a
+    learned row is loaded only with ``on``) and a run with no settings handed in (a routine card's), which before this
+    always counted as on."""
+    global _skills_seen
+    try:
+        from yuki.core.models import prefs_path
+
+        st = prefs_path().stat()
+        stamp: tuple[int, int] | None = (int(st.st_mtime_ns), int(st.st_size))
+    except (OSError, ImportError):
+        stamp = None
+    key = (os.environ.get("YUKI_SKILLS") or "", stamp)
+    seen = _skills_seen
+    if seen is not None and seen[0] == key:
+        return seen[1]
+    mode = _skills_default()
+    _skills_seen = (key, mode)
+    return mode
+
+
 #: Short aliases the user (and the CLI's ``/model`` command) can type.
 MODEL_ALIASES: dict[str, str] = {
     "sonnet": "global.anthropic.claude-sonnet-5",
@@ -433,7 +503,16 @@ class Settings:
         skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
             ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
             talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
-            brings the old behaviour back everywhere (those hands and tools, no menu, no pinned skill).
+            brings the old behaviour back everywhere (those hands and tools, no menu, no pinned skill). Read like
+            ``brain`` (failure fix-plan Item 1): ``YUKI_SKILLS``, else ``"skills"`` in
+            ``%LOCALAPPDATA%/Yuki/settings.json``, else on (:func:`_skills_default`). The values: ``true`` / ``"on"``
+            everything; ``"capabilities"`` the shipped capabilities only (``skills_learned`` false); ``false`` /
+            ``"off"`` no skills anywhere (``skills`` false). Code with no ``Settings`` reads the same switch
+            (:func:`skills_mode`).
+        skills_learned: The skills Yuki learned from the user are loaded (``yuki.skills.catalog``): true only with the
+            switch ``on``; ``"capabilities"`` and ``"off"`` leave the learned rows out of the catalog, so no menu (the
+            talker's, the thinker's, the planner's), tool enum or routine card has them. The rows stay in the database
+            and the Playbook; switching back brings them back.
         skills_max: At most this many skills (one per app and end state).
         skills_menu_chars: The menu's size cap (characters), in the talker's cached hands block and the thinker's
             ``run_skill`` description.
@@ -602,8 +681,10 @@ class Settings:
     voice_skill_min_confidence: float = 0.70
     voice_lessons_chars: int = 400
     voice_hand_traces: bool = True
-    # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these)
-    skills: bool = True
+    # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these). The switch (failure
+    # fix-plan Item 1): YUKI_SKILLS, else "skills" in settings.json, else on; "capabilities" hides the learned rows
+    skills: bool = field(default_factory=lambda: skills_mode() != "off")
+    skills_learned: bool = field(default_factory=lambda: skills_mode() == "on")
     skills_max: int = 20
     skills_menu_chars: int = 2400
     skills_disable_after: int = 2
@@ -723,6 +804,14 @@ class Settings:
         self.screenshot_policy = "never"
         mode = str(self.brain or "").strip().lower()
         self.brain = mode if mode in BRAIN_MODES else "loop"
+        # the skills switch (Item 1): a bool, or the switch's own word given as ``skills`` ("capabilities"); the
+        # learned skills are never on with the skill path off
+        switch = skills_mode_of(self.skills)
+        if switch == "capabilities":
+            self.skills, self.skills_learned = True, False
+        else:
+            self.skills = (switch != "off") if switch is not None else bool(self.skills)
+        self.skills_learned = bool(self.skills and self.skills_learned)
         self.brain_effort_voice = _soft_effort(self.brain_effort_voice)
         self.brain_effort_typed = _soft_effort(self.brain_effort_typed)
         self.brain_max_replans = max(0, int(self.brain_max_replans or 0))

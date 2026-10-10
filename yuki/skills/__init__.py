@@ -20,33 +20,77 @@ Modules (each imported only when used: ``import yuki.skills`` costs almost nothi
 * :mod:`~yuki.skills.prefs`, :mod:`~yuki.skills.taste` - read skeletons (sVoice and tTaste fill in the rest);
 * :mod:`~yuki.skills.intake` - the pipeline CLI: seed, map old procedures onto rungs (dry run, review, apply).
 
-The off switch is ``Settings.skills`` (default on): ``skills = false`` brings back the old behaviour everywhere
-(the thinker's ``app_volume`` tool, no ``run_skill``, no pinned skill, the old voice step runner).
+The switch (failure fix-plan Item 1) is ``"skills"`` in ``%LOCALAPPDATA%/Yuki/settings.json`` (or ``YUKI_SKILLS``),
+read like ``brain`` (``yuki.config._skills_default``):
+
+* ``true`` / ``"on"`` (the default): everything, the shipped capabilities and the skills learned from the user;
+* ``"capabilities"``: the shipped capabilities only (``Settings.skills_learned`` false): the catalog
+  (:func:`yuki.skills.catalog.load`) leaves the learned rows out, so no menu, tool enum, planner id or routine card has
+  them (they stay in the database and the Playbook);
+* ``false`` / ``"off"``: no skills anywhere (``Settings.skills`` false): the old behaviour everywhere (the thinker's
+  ``app_volume`` tool, no ``run_skill``, no pinned skill, the old voice step runner, no planner menu).
+
+Every gate reads :func:`enabled` with the caller's ``Settings`` (built at start, like ``brain``: a change needs a
+restart). A caller with none (a routine card's run, the catalog's :func:`learned_enabled` check) or a stand-in without
+these fields reads the same switch as it is now (``yuki.config.skills_mode``), never a fixed default.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-#: The skill settings and their defaults (``yuki.config.Settings`` carries them once the voice builder adds them;
-#: until then these defaults apply). ``skills`` is the off switch.
+#: The skill settings and their defaults (``yuki.config.Settings`` carries them). ``skills`` is the off switch,
+#: ``skills_learned`` whether the learned skills are loaded (both from the user's switch: :data:`SWITCH`).
 DEFAULTS: dict[str, Any] = {
     "skills": True,
+    "skills_learned": True,
     "skills_max": 20,
     "skills_menu_chars": 2400,
     "skills_disable_after": 2,
     "skills_volume_step": 10,
 }
+#: The settings the user's switch decides: without a ``Settings`` that carries them they follow the switch as it is now
+#: (``yuki.config.skills_mode``), not :data:`DEFAULTS` (a routine card's run hands in no settings: before Item 1 it ran
+#: even with skills switched off).
+SWITCH: tuple[str, ...] = ("skills", "skills_learned")
+
+
+def _switch(name: str) -> bool:
+    """A :data:`SWITCH` setting from the user's switch (on: both; capabilities: ``skills`` only; off: neither)."""
+    try:
+        from yuki.config import skills_mode
+
+        mode = skills_mode()
+    except Exception:  # noqa: BLE001 - no config to read: the default (on)
+        return bool(DEFAULTS.get(name))
+    return mode != "off" if name == "skills" else mode == "on"
 
 
 def setting(settings: Any, name: str) -> Any:
-    """A skill setting from ``settings`` (any object), else its default."""
-    return getattr(settings, name, DEFAULTS.get(name)) if settings is not None else DEFAULTS.get(name)
+    """A skill setting from ``settings`` (any object), else the user's switch (:data:`SWITCH`), else its default."""
+    if settings is not None and hasattr(settings, name):
+        return getattr(settings, name)
+    if name in SWITCH:
+        return _switch(name)
+    return DEFAULTS.get(name)
 
 
 def enabled(settings: Any = None) -> bool:
-    """Whether the skill path is on (``Settings.skills``; default on)."""
+    """Whether the skill path is on (``Settings.skills``; the switch's ``on`` or ``capabilities``)."""
     return bool(setting(settings, "skills"))
+
+
+def learned_enabled(settings: Any = None) -> bool:
+    """Whether the skills learned from the user are loaded (``Settings.skills_learned``; only the switch's ``on``):
+    never with the skill path off."""
+    return enabled(settings) and bool(setting(settings, "skills_learned"))
+
+
+def mode(settings: Any = None) -> str:
+    """The switch as one content-free word for logs: ``on``, ``capabilities`` or ``off``."""
+    if not enabled(settings):
+        return "off"
+    return "on" if learned_enabled(settings) else "capabilities"
 
 
 def menu(store: Any, audience: str = "talker", **kw: Any) -> str:
@@ -77,4 +121,5 @@ def keep_usual(store: Any, slot: str, option: str, answer: str, **kw: Any) -> di
     return _keep(store, slot, option, answer, **kw)
 
 
-__all__ = ["DEFAULTS", "setting", "enabled", "menu", "resolve", "run", "keep_usual"]
+__all__ = ["DEFAULTS", "SWITCH", "setting", "enabled", "learned_enabled", "mode", "menu", "resolve", "run",
+           "keep_usual"]
