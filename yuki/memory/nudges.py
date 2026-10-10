@@ -3,6 +3,13 @@
 Contract: ``docs/MEMORY.md`` -> "Nudges and to-dos"; the review behind this design:
 ``docs/research/coach-and-answers-review.md`` (2026-09-26).
 
+**The card judge** (:mod:`yuki.memory.cardjudge`, state-design.md §4): with ``[judge] mode = "on"`` (jSwitch, a
+setting) the judge alone writes the cards and everything below this paragraph's first list does not run:
+:meth:`NudgeWorker.run` calls ``CardJudge.tick`` (its upkeep, then one evaluation when YouNow woke it or a deadline
+came) and waits on YouNow's wake event, at most a minute. ``"shadow"`` (the shipped default) runs the old chain below
+and lets the judge log what it would show; ``"off"`` runs the old chain alone. :meth:`NudgeWorker.tick` stays callable
+for both.
+
 :class:`NudgeWorker` runs in ``yuki-memory`` (thread ``yuki-memory-nudges``). Every
 :attr:`NudgeConfig.tick_s` (15 s) it reads the timeline and decides, in code, only
 *whether to look* (plumbing: presence, gates, sessions, budget, spacing, rate). What to
@@ -508,7 +515,7 @@ runs, sessions or reviews for them. Their usual meeting or music at the usual ti
 mention or offer it here. With an offer, end the text with a short question naming exactly \
 that action, and fill the offer: do; label (2-4 words naming the action); steps (1-3 plain lines of \
 exactly what the button will do); refs (the ids it acts on); text (todo_add: the to-do in their words; \
-draft: the whole draft; ask: the request as they would type it; else ""); due (todo_add: "YYYY-MM-DD \
+ask: the request as they would type it; else ""); due (todo_add: "YYYY-MM-DD \
 HH:MM" or "YYYY-MM-DD" when the data gives its time, else ""). No offer: offer is null. Never a vague \
 "let me know if". OFFERS ALLOWED NOW (after the data) lists the kinds you may use; anything else is null.
 - Never write an internal id (W12, J1234, todo:3) in the text, the label or the steps: name things by \
@@ -2166,7 +2173,8 @@ class NudgeWorker:
         self.routines = RoutineLane(self)
         #: jCore (state-design.md §4): the one card judge, reading the you-right-now record (``you_fn``: the service's
         #: YouBuilder, read late). ``[judge] mode = "shadow"`` decides and logs what it would show, writes no card and
-        #: makes no model call; None when it could not be built (the old chain runs on as before).
+        #: makes no model call; ``"on"`` (jSwitch) writes the cards itself and :meth:`tick` does not run; None when it
+        #: could not be built (the old chain runs on as before, whatever the mode says).
         self.judge = None
         try:
             from yuki.memory.cardjudge import CardJudge
@@ -2332,8 +2340,9 @@ class NudgeWorker:
     # -- one pass ------------------------------------------------------------------
 
     def tick(self, now: float | None = None) -> list[dict[str, Any]]:
-        """One pass: the welcome back (with what is due folded in), else one due item, a check-in, an observation
-        card, a question or a look (and, under any screen gate, the fold-in of check-in answers)."""
+        """One pass of the old first-writer chain (``[judge] mode = "off"`` / ``"shadow"``; with ``"on"`` :meth:`run`
+        calls the judge instead): the welcome back (with what is due folded in), else one due item, a check-in, an
+        observation card, a question or a look (and, under any screen gate, the fold-in of check-in answers)."""
         now = float(self.clock()) if now is None else float(now)
         config = self.config()
         done: list[dict[str, Any]] = []
@@ -3184,12 +3193,45 @@ class NudgeWorker:
 
     # -- loop ------------------------------------------------------------------------
 
+    def judge_live(self) -> bool:
+        """Whether the card judge writes the cards (``[judge] mode = "on"``, jSwitch): then :meth:`tick` (the old
+        first-writer chain) does not run. False when the judge could not be built, has no YouNow builder to read (a
+        worker built outside the memory service: the old chain runs) or its mode is unreadable."""
+        if self.judge is None or not getattr(self.judge, "_has_you", False):
+            return False
+        try:
+            return self.judge.mode() == "on"
+        except Exception:
+            return False
+
     def run(self, stop: threading.Event | None = None, pause_path: Path | None = None) -> None:
-        """Tick every :attr:`NudgeConfig.tick_s` until stopped (the pause flag is one of the gates)."""
+        """Until stopped. ``[judge] mode = "off"`` / ``"shadow"``: :meth:`tick` (the old chain) every
+        :attr:`NudgeConfig.tick_s`, and in shadow the judge's look after each pass. ``"on"`` (jSwitch): the judge alone
+        (``CardJudge.tick``: its upkeep, then one evaluation when YouNow woke it or a deadline came), waiting on
+        YouNow's wake event with a timeout of the judge's next deadline, at most a minute: no 15 s tick. The mode is
+        read every pass (a switch in Settings takes effect within a minute)."""
         stop = stop or self._stop
         self._stop = stop
         self._log("worker_start", model=self.model, writer_model=self.writer_model, event=self._event.name)
         while not stop.is_set():
+            if self.judge_live():
+                failed = False
+                try:
+                    self.judge.tick(float(self.clock()))
+                except Exception as exc:
+                    failed = True
+                    self._log("worker_error", where="judge", error=f"{type(exc).__name__}: {exc}",
+                              traceback=traceback.format_exc())
+                if stop.is_set():
+                    break
+                if failed:   # never a spin on a wake the failed pass could not clear
+                    stop.wait(15.0)
+                    continue
+                try:
+                    self.judge.wait(self.judge.wait_s(float(self.clock())))
+                except Exception:
+                    stop.wait(60.0)
+                continue
             done = None
             try:
                 done = self.tick()
@@ -3210,6 +3252,11 @@ class NudgeWorker:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.judge is not None:   # the live loop waits on YouNow's wake: wake it so it sees the stop
+            try:
+                self.judge.interrupt()
+            except Exception:
+                pass
 
 
 __all__ = [

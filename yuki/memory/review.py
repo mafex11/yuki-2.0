@@ -41,7 +41,9 @@ first moment after it that the user has been idle for ``idle_min``) and on deman
    ``review`` (``ref`` = ``review:<id>``) through :meth:`Store.record_checkin` and
    sets ``Local\\YukiNudgeReady``, once the user is present (input within
    ``present_s``), outside quiet hours, not snoozed or paused (a review the user
-   asked for skips the last three), within ``deliver_within_h``.
+   asked for skips the last three), within ``deliver_within_h``. With the card judge on (``[judge] mode = "on"``,
+   :mod:`yuki.memory.cardjudge`) a scheduled review's teaser is a line of the Today card instead; one asked for is
+   delivered here as before.
 5. **Portrait**: the candidates are proposals for the next portrait run
    (:meth:`yuki.memory.portrait.PortraitWorker.run`), which sees them with the
    episodes they cite and decides, under its own validation, whether to ADD or
@@ -1343,6 +1345,10 @@ class ReviewScheduler:
         self._section = PrivacySection(privacy, "review", ReviewConfig.from_dict) if config is None else None
         self._fixed_nudges = nudge_config
         self._nudge_section = PrivacySection(privacy, "nudges", NudgeConfig.from_dict) if nudge_config is None else None
+        #: jSwitch: ``[judge] mode``; "on" makes a scheduled review's teaser a line of the Today card (the judge's
+        #: ``review`` candidate) instead of a card of its own. Read lazily (no import of the judge before it is used).
+        self._privacy = privacy
+        self._judge_section: Any = None
         self._log_fn = log
         if idle_fn is None:
             from yuki.memory.watcher import user_idle_s
@@ -1364,6 +1370,18 @@ class ReviewScheduler:
 
     def nudge_config(self) -> Any:
         return self._fixed_nudges if self._fixed_nudges is not None else self._nudge_section.get()
+
+    def judge_on(self) -> bool:
+        """Whether the card judge is live (``[judge] mode = "on"``, jSwitch). False when unreadable (the old path)."""
+        try:
+            if self._judge_section is None:
+                from yuki.memory.cardjudge import JudgeConfig
+                from yuki.memory.timeline import PrivacySection
+
+                self._judge_section = PrivacySection(self._privacy, "judge", JudgeConfig.from_dict)
+            return self._judge_section.get().mode == "on"
+        except Exception:
+            return False
 
     def _log(self, type: str, **fields_: Any) -> None:
         if self._log_fn is not None:
@@ -1426,6 +1444,11 @@ class ReviewScheduler:
         session is locked; a scheduled review also waits through memory's pause,
         the coach's quiet hours, its snooze and ``[nudges] enabled = false``.
         Returns the nudge id written, or None.
+
+        With the card judge on (``[judge] mode = "on"``, jSwitch) a **scheduled** review's teaser is not written here:
+        it is a line of the next Today card (the judge's ``review`` candidate, through the one attention policy, which
+        marks the review delivered with that card). A review the user asked for (``demand``) is written here at once,
+        as before.
         """
         from yuki.memory.nudges import in_quiet_hours
 
@@ -1436,6 +1459,8 @@ class ReviewScheduler:
         review = latest[0]
         if review.nudge_id is not None or not review.teaser:
             return None
+        if review.trigger != "demand" and self.judge_on():
+            return None   # the judge's Today card carries it (cardjudge, type "review")
         if now - (review.finished_at or review.at) > config.deliver_within_h * 3600.0:
             return None
         if self.locked_fn is not None:

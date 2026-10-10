@@ -218,9 +218,57 @@
       Y.append(main, Y.head(titles[name], h('span', { text: D.memory_error || 'Reading your memory…' })));
       return main;
     }
-    try { Y.append(main, pg.build(d, S, D)); }
+    try { Y.append(main, pg.build(d, S, D)); cardExtras(name, main, d); }
     catch (e) { console.error(e); Y.append(main, Y.head(name, h('span', { text: 'This page could not be drawn: ' + e.message }))); }
     return main;
+  }
+
+  /* ================= the card judge's extras (jSwitch; state-design question 7, the agreed UI-freeze exception) =====
+     On a Today card or a "While you were away" list (an Activity card row with `lines`), each numbered line gets Open
+     and Not useful: memory records which line, content-free (digest_line_reaction), and Open goes where the line
+     points (Work for a thread or replies, Calls for a call's notes, the thread for a question). In Settings, the list
+     of card kinds (`card_kinds`) says where each kind is (a card at a good moment, a line on the Today card, only at
+     the best moments, off) and why, with Back up for a kind that was lowered and Fewer for the rest. Python sends the
+     data; with none, nothing is drawn. Existing classes only. */
+  const LINE_SAID = { open: 'Opened', not_useful: 'Not useful: noted' };
+  function digestLines(g) {
+    const said = g.line_reactions || {};
+    return h('div', { class: 'lsteps', data: { k: 'lines:' + g.card } }, (g.lines || []).filter((ln) => ln && ln.n > 0).map((ln) => {
+      const r = said[String(ln.n)];
+      return h('div', { class: 'lstep', data: { row: `line:${g.card}:${ln.n}` } },
+        h('span', { class: 'tm', text: `${ln.n}.` }),
+        h('span', { class: 'wh' }, h('span', { class: 'w1', text: ln.text || '' })),
+        h('span', { class: 'rs' }, r ? h('span', { text: LINE_SAID[r] || r })
+          : [key('Open', { cls: 'xs', data: { do: 'digest-line', card: g.card, n: ln.n, way: 'open' } }),
+            key('Not useful', { cls: 'xs ghost', data: { do: 'digest-line', card: g.card, n: ln.n, way: 'not_useful' } })]));
+    }));
+  }
+  function kindsSection(ck) {
+    const kinds = (ck && ck.kinds) || [];
+    if (!kinds.length) return null;
+    const rows = kinds.map((k) => h('div', { class: 'srow', data: { k: 'kind:' + k.kind } },
+      h('span', null, k.words, h('small', { text: `${k.mode_words} · ${k.why_words}` + (k.shown ? ` · ${k.used} of ${k.shown} used` : '') })),
+      h('span', { class: 'ctl' }, k.can_raise ? key('Back up', { cls: 'xs', data: { do: 'card-kind', kind: k.kind, way: 'up' } })
+        : k.can_lower ? key('Fewer', { cls: 'xs ghost', data: { do: 'card-kind', kind: k.kind, way: 'down' } }) : null)));
+    const right = ck.mode === 'on' ? 'where each kind is, and why' : 'how the new cards would sort them';
+    return Y.k(Y.sec('Cards, by kind', kinds.length, rows, Y.rightLabel(right)), 'card-kinds');
+  }
+  function cardExtras(name, main, d) {
+    if (name === 'settings') { const sec = kindsSection(d.card_kinds); if (sec) main.append(sec); return; }
+    if (name !== 'activity') return;
+    (d.groups || []).forEach((g) => {
+      if (!g.card || !(g.lines || []).length) return;
+      const box = main.querySelector(`[data-group="${CSS.escape(String(g.id))}"] > .fx-d`);
+      if (box) box.insertBefore(digestLines(g), box.querySelector(':scope > .gacts'));
+    });
+  }
+  /* where a line's Open goes, by its id (Yuki's own id formats) or its kind */
+  function openLine(type, ref) {
+    const r = String(ref || ''), t = String(type || '');
+    if (/^W\d+$/.test(r) || t === 'work' || t === 'thread') return go('work', '');
+    if (/^C\d+$/.test(r) || t === 'recap') return go('activity', 'calls');
+    if (/^Q\d+$/.test(r) || t.startsWith('checkin')) return go(S.page, S.sub, { chat: true });
+    return go('home', '');
   }
 
   function mountFaces(root) {
@@ -685,6 +733,29 @@
   };
   Y.actions.undo = (t) => { let box = t.parentElement; while (box && !Y.hasOrig(box)) box = box.parentElement; if (box) Y.restore(box); };
   Y.actions['open-thread'] = () => go(S.page, S.sub, { chat: true });
+  /* a Today line's Open / Not useful (jSwitch): recorded by line number, content-free; Open then goes where it points */
+  Y.actions['digest-line'] = (t) => {
+    const card = t.dataset.card, n = Number(t.dataset.n), way = t.dataset.way;
+    t.disabled = true;
+    Y.act('digest_line', { card, n, reaction: way }).then((r) => {
+      if (!r || !r.ok) { t.disabled = false; Y.toast((r && r.error) || 'Couldn’t record that.', true); return; }
+      Y.morph(t.parentElement, h('span', { class: 'confirm sm' }, ic('check'), h('span', { text: LINE_SAID[way] || 'Noted' })));
+      if (way === 'open') openLine(r.type, r.ref);
+    });
+  };
+  /* Settings' card kinds (jSwitch): Back up (a lowered kind, one step) or Fewer (one step down, as Less of these) */
+  Y.actions['card-kind'] = (t) => {
+    const up = t.dataset.way === 'up';
+    t.disabled = true;
+    Y.act('card_kind', { kind: t.dataset.kind, way: t.dataset.way }).then((r) => {
+      if (!r || !r.ok) {
+        t.disabled = false;
+        Y.toast((r && r.error) || (r && r.why === 'already' ? 'It’s already there.' : 'Couldn’t change that.'), true);
+        return;
+      }
+      Y.toast(up ? `Back up: ${r.mode_words || 'as it was'}.` : `Fewer of these: ${r.mode_words || 'moved down'}.`);
+    });
+  };
   Y.actions.thread = () => go(S.page, S.sub, { chat: !S.chat });          // the rail's Thread: open or close it
   Y.actions['close-thread'] = () => go(S.page, S.sub, { chat: false });
   /* a collapsible row (Yk.fold): open or close it in place, the design's 220 ms reveal; kept by key in S.open */

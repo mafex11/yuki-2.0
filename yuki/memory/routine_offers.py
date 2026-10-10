@@ -48,12 +48,21 @@ its usual window, with no model and no cost:
   declines of the late card in 10 days, or acceptance under 30% after 10 meeting days -> quiet (pre-declared). A run
   the PC couldn't confirm counts against the route only (the skill ledger), never against the routine.
 
+**With the card judge on** (``[judge] mode = "on"``, jSwitch, :mod:`yuki.memory.cardjudge`): :meth:`RoutineLane.tick`
+no longer runs. The judge asks :meth:`RoutineLane.candidates` (the same due rule and toggles), holds the candidate with
+its one policy (its rLane exceptions: a meeting in front passes the routine; meeting audio and a call fail closed;
+settling needs only ``routine_settle_s``; it skips the card gap and the day's 4 but keeps ``routine_per_day``; it never
+jumps a card showing) and writes the card through :meth:`RoutineLane.write` (:meth:`_write`, unchanged). The holds
+are still recorded (:meth:`RoutineLane.held`), :meth:`learn` runs on the judge's wake loop, and the tray's
+:func:`card_still_due` is unchanged.
+
 Logs (content-free, the coach's log and the memory log): ``routine_offer`` (routine id, skill key, mode, lead s,
 forced), ``routine_held`` (the reason, on change), ``tab_census``. The tables are never in the MCP (D13).
 
 Public API::
 
     RoutineLane(worker).tick(now, config, view, gate) -> dict | None;  .due(...);  .learn(now, config)
+    RoutineLane(worker).candidates(now, config, deadline=None) -> [Candidate];  .write(cand, now, config);  .held(...)
     routines(store) / routine(store, id) -> Routine;  record_event(store, id, kind, at=, nudge_id=, detail=)
     feedback(store, nudge_id, kind, now=None) -> dict;  why_line(r);  card_text(r, skill, mode)
     card_still_due(store, nudge_id, now=None, game=None) -> {"due", "why", "final"}
@@ -583,6 +592,8 @@ class RoutineLane:
         self._learned_at = 0.0
         self._request_mtime: float | None = None
         self._request: dict[str, Any] | None = None
+        #: The judge's lane (jSwitch): the routines :meth:`candidates` found due, by candidate key.
+        self._pending: dict[str, Due] = {}
 
     @property
     def store(self) -> Any:
@@ -640,6 +651,82 @@ class RoutineLane:
             self._hold(d, now, config, why)
             return None
         return self._write(d, now, config)
+
+    # -- the card judge's lane (jSwitch: [judge] mode = "on") -----------------------------------------------------------
+
+    def candidates(self, now: float, config: Any, *, deadline: Callable[[float | None], Any] | None = None
+                   ) -> list[Any]:
+        """The routines due now as card candidates for the judge (:mod:`yuki.memory.cardjudge`; type ``routine``,
+        urgency ``deadline``, time-bound: its window). The same due rule as :meth:`tick` (:meth:`due`: the window,
+        the day-set, the end state not reached today, once a day per routine, at most ``routine_per_day`` routine
+        cards, an ``offer-now`` request first) and the same toggles (``routine_offers``, ``offers = "off"``: no card,
+        a request finishes ``off``). What :meth:`tick` adds is the judge's now: the holds (:meth:`holds`) and the
+        shared gates (:meth:`_attention`) are bypassed - the judge's one policy holds the card (a meeting in front
+        passes it, meeting audio and a call fail closed, settling needs ``routine_settle_s``, a card showing holds
+        it) and keeps its ``routine_per_day``. ``deadline(at)``: the next window's start today (the judge wakes then).
+        The learning upkeep (:meth:`learn`) runs on the judge's wake loop, not here."""
+        from yuki.memory.candidates import Candidate
+
+        if not has_tables(self.store):
+            return []
+        request = self._read_request(now)
+        if not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off":
+            if request is not None:
+                self._finish_request(request, "off")
+            return []
+        if deadline is not None:   # the next window to open today (nothing is read outside every window)
+            day = routine_day(now, getattr(config, "resume_day_start", "04:00"))
+            try:
+                for r in routines(self.store):
+                    if in_dayset(r.dayset, day):
+                        start, _end, _at = window(r, day, config)
+                        if start > now:
+                            deadline(start)
+            except Exception:
+                pass
+        out = []
+        self._pending = {}
+        day = routine_day(now, getattr(config, "resume_day_start", "04:00"))
+        for d in self.due(now, config, request=request):
+            r = d.routine
+            rate = r.rate if r.rate is not None else (r.hits / r.eligible if r.eligible else None)
+            forced_at = int(float((request or {}).get("at") or now))
+            key = f"routine:R{r.id}:{day.isoformat()}" + (f":now:{forced_at}" if d.forced else "")
+            words = None
+            if d.skill is not None:
+                try:
+                    words = card_text(r, d.skill, d.mode, card_question(self.store, d.skill))
+                except Exception:
+                    words = None
+            opens = now if d.forced else window(r, day, config)[0]
+            c = Candidate("routine", key, created_at=opens, expires_at=d.until, urgency="deadline", home="card",
+                          time_bound=True, window=(opens, d.until),
+                          confidence=max(0.0, min(1.0, float(rate))) if rate is not None else 0.8,
+                          refs={"routine": r.id}, evidence={f"R{r.id}": d.at}, text=words,
+                          why=f"routine mode={d.mode} forced={int(d.forced)} lead_s={round(d.at - now)}")
+            self._pending[key] = d
+            out.append(c)
+        return out
+
+    def write(self, cand: Any, now: float, config: Any) -> dict[str, Any] | None:
+        """The judge chose this routine's candidate: the card written exactly as :meth:`tick` writes it
+        (:meth:`_write`: the offer through ``offers.routine_offer`` - the offer gate, a trusted route, availability -
+        the fixed words, the why and Won't lines, the ``offered`` event, the offer-now request finished). None: not
+        written (no longer due, or the offer said no: the hold is recorded as :meth:`tick` records it)."""
+        d = (getattr(self, "_pending", None) or {}).get(getattr(cand, "key", ""))
+        if d is None:
+            return None
+        return self._write(d, now, config)
+
+    def held(self, cand: Any, now: float, config: Any, reason: str) -> None:
+        """The judge held this routine's candidate (``reason``: the policy's, content-free): logged and recorded as
+        :meth:`tick`'s holds are (``routine_held`` on change, one ``held`` event a day per reason, an offer-now
+        request's state). The judge's day budget (``B2:routine_day``) is the old ``attention:budget``: final for an
+        offer-now request, as before."""
+        d = (getattr(self, "_pending", None) or {}).get(getattr(cand, "key", ""))
+        if d is not None:
+            reason = str(reason)
+            self._hold(d, now, config, "attention:budget" if reason == "B2:routine_day" else reason)
 
     # -- what is due ---------------------------------------------------------------------------------------------------
 

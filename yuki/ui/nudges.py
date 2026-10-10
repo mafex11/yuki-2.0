@@ -46,6 +46,17 @@ any card; right before it shows, memory is asked whether it is still due
 meeting the user already joined is dropped; one held by an open call or a game in
 front waits for a later look.
 
+Every queued card asks memory the same way right before it shows (``card_due``, jSwitch, state-design §4.4): with
+the card judge live (``[judge] mode = "on"``) memory runs its attention policy again with fresh reads (a game in front,
+an open call, the meeting, Yuki acting, quiet hours, the snooze), so a card that waited never lands in a game or a
+call; with the judge off or in shadow every card but the routine one is due at once (as before). An older memory with
+no ``card_due`` gets the old behaviour (``routine_card_due`` for the routine card, nothing for the rest).
+
+The card judge's **Today card** and **"While you were away"** list (trigger ``today`` / ``away``) show their head (the
+day's question, answered in the card's own field) and their numbered lines under it; Reply opens the ask bar with every
+line numbered and carrying its id (:func:`nudge_reply_request`), so "2: done" is recorded against line 2 by the thinker
+(``answer_question`` on the line's question id), never by matching words. Not now and Less of these are its buttons.
+
 While the overlay is open, nudges go into its conversation instead of the
 corner (the ``in_overlay`` signal), and when it opens the recent ones
 (:data:`OVERLAY_RECENT_HOURS`, via ``recent_nudges()``) come back as cards, so
@@ -76,8 +87,8 @@ from yuki.ui.uilog import UiLog
 # What a card says and offers, as plain data (no Qt): shared with the HTML window's process (re-exported here).
 from yuki.ui.cards import (  # noqa: F401 - re-exported: chatview, window_host and tests import them from here
     CHECKIN_ICONS, CHECKIN_TITLES, KIND_TITLES, NOTICE_TITLES, OFFER_DOS, OFFER_FAILED, card_offer, card_title,
-    checkin_moment, kind_title, offer_expired, offer_label, offer_lines, offer_open, offer_steps, offer_why,
-    routine_card,
+    checkin_moment, digest_card, digest_lines, kind_title, offer_expired, offer_label, offer_lines, offer_open,
+    offer_steps, offer_why, routine_card,
 )
 
 #: The named event the memory service sets when it writes a nudge.
@@ -208,11 +219,44 @@ def nudge_reply_request(nudge: dict[str, Any], reply: str, *, certain: bool = Tr
     lead = "Replying to your nudge" if certain else "The user may be answering your recent nudge, or may be asking something else"
     ref = " ".join(str(nudge.get("ref") or "").split())
     ident = f", id {ref}" if ref and kind == "question" else ""
-    head = f'[{lead} (kind: {kind}{ident}){f", sent {sent}" if sent else ""}: "{text}"'
+    lines = digest_lines(nudge)
+    if lines:
+        # the Today card / "While you were away" (jSwitch, state-design §4.7 H3): every line numbered as the card shows
+        # it, with its id, all on this one bracketed line (the reply's own words start after "]\n"); the thinker
+        # answers a line through answer_question on its id and never by matching words
+        title = card_title(nudge)
+        said = " ".join(str(nudge.get("head") or "").split()) or title
+        parts = []
+        if kind == "question" and ref:
+            parts.append(f'head) [check-in, question id {ref}] "{said}"')
+        parts += [f'{ln["n"]}) [{_line_label(ln)}] "{_clip(ln["text"], 160)}"' for ln in lines]
+        head = (f'[{lead} (kind: {kind}{ident}, your {title} card){f", sent {sent}" if sent else ""}: "{said}" -- its '
+                f'lines by number: {"  ".join(parts)} -- a line that asks is answered with answer_question on its '
+                "question id, in their words; a reply that answers no line records nothing")
+    else:
+        head = f'[{lead} (kind: {kind}{ident}){f", sent {sent}" if sent else ""}: "{text}"'
     reason = " ".join(str(nudge.get("reason") or "").split())
     if reason:
         head += f" -- why you sent it: {reason}"
     return f"{head}]\n{reply}"
+
+
+def _line_label(line: dict[str, Any]) -> str:
+    """A digest line's id as the reply request names it (plumbing on Yuki's own id formats)."""
+    ref, kind = str(line.get("ref") or ""), str(line.get("type") or "")
+    if ref[:1] == "Q" and ref[1:].isdigit():
+        return f"{'check-in, ' if kind.startswith('checkin') else ''}question id question:{ref[1:]}"
+    if ref[:1] == "W" and ref[1:].isdigit():
+        return f"thread {ref}"
+    if ref[:1] == "R" and ref[1:].isdigit():
+        return f"weekly review {ref}"
+    if ref[:1] == "C" and ref[1:].isdigit():
+        return f"call CALL{ref[1:]}"
+    if ref[:1] == "G" and ref[1:].isdigit():
+        return f"goal {ref}"
+    if ref.split(":", 1)[0] in ("todo", "commit", "loop", "event"):
+        return f"item {ref}"
+    return kind or "line"
 
 
 def _squash(value: Any) -> str:
@@ -544,9 +588,13 @@ RUN_LINES: dict[str, str] = {
     "busy": "I'm busy on your desktop right now. Nothing ran.",
     "error": "That didn't work.",
 }
-#: How long memory's "still due?" answer for a queued routine card holds before the tray asks again (s): a "due" is
-#: used at once; a hold (a call, a game in front) is asked again on the next look (:data:`RETRY_MS`) after this long.
+#: How long memory's "still due?" answer for a queued card holds before the tray asks again (s): a "due" is used at
+#: once; a hold (a call, a game in front) is asked again on the next look (:data:`RETRY_MS`) after this long.
 ROUTINE_DUE_FRESH_S = 10.0
+#: The card judge's digest cards: their header icon, and how their lines are set under the head (one per line: the
+#: text layout's own line separator).
+DIGEST_ICON = "day"
+LINE_SEP = "\u2028"
 #: The UI's reasons (``blocked``) that mean Yuki's hands are on the desktop now: a routine card's skill waits for them
 #: (the desk lease: one actor at a time, as the voice hands wait for the thinker's job).
 DESK_BUSY_REASONS: frozenset[str] = frozenset({"worker_busy", "status_strip"})
@@ -820,13 +868,19 @@ class NudgeCard(LatticeCard):
         self.nudge = nudge
         kind = str(nudge.get("kind") or "nudge")
         self._kind = kind
+        if digest_card(nudge):   # the card judge's Today card / "While you were away"
+            self._set_digest(nudge)
+            return
         title = "" if kind == "nudge" else card_title(nudge)   # a plain check-in has no kind heading
         self.title.setText(title)
         question = kind == "question"
         moment = checkin_moment(nudge)   # a check-in (Yuki's own moment on the card), else None
         # a check-in that carries a typed offer shows its key and Will / Won't, as an offer card does
         offer = offer_open(nudge) and (not question or moment is not None)
-        brk = kind == "nudge"
+        # a break (the coach's, or the card judge's session:break); the judge's call-back is a plain card
+        brk = kind == "nudge" and str(nudge.get("trigger") or "") != "session:callback"
+        if kind == "nudge" and not brk:
+            title = card_title(nudge)
         routine = routine_card(nudge)   # "Your usual": the user's usual moment, offered by code (PLAN.md Phase R)
         self._acted, self._draft = False, ""
         when = when_label(nudge.get("at"))
@@ -906,9 +960,58 @@ class NudgeCard(LatticeCard):
             self._foot([])
         else:
             self.dismiss_button.set_parts("Dismiss")
-            self._foot([self.dismiss_button] + ([self.less_button] if kind in LESS_KINDS else []))
+            self._foot([self.dismiss_button] + ([self.less_button] if kind in LESS_KINDS or kind == "nudge" else []))
         self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
             linger_for(text) + (OFFER_LINGER_EXTRA_MS if offer else 0) + (KEEP_LINGER_EXTRA_MS if keep else 0))
+        self._fit_height()
+
+    def _set_digest(self, nudge: dict[str, Any]) -> None:
+        """The card judge's Today card or "While you were away" list: its head (the day's question, answered in the
+        card's own field, or the fixed lead), its numbered lines under it, Reply (the ask bar, every line numbered
+        with its id), Not now and Less of these. Nothing on it offers to do anything."""
+        from yuki.ui import lattice as L
+
+        kind = str(nudge.get("kind") or "notice")
+        question = kind == "question"   # a Today card with a head question: the field answers it
+        title = card_title(nudge)
+        self.title.setText(title)
+        when = when_label(nudge.get("at"))
+        self.when.setText(when)
+        self.set_head(DIGEST_ICON, " · ".join(x for x in (title, when) if x))
+        lines = digest_lines(nudge)
+        text = str(nudge.get("text") or "")
+        head = _squash(nudge.get("head")) or _squash(text.split("\n", 1)[0])
+        self._acted, self._draft = False, ""
+        self.body._lh = 1.45
+        self.body.set_font(L.ui_font(15, 400))
+        self.body.set_text(head)
+        self.rest.set_text(LINE_SEP.join(f"{ln['n']}. {ln['text']}" for ln in lines))
+        self.rest.setVisible(bool(lines))
+        self.rest_gap.setVisible(bool(lines))
+        self.detail.set_plain("")
+        self.detail.setVisible(False)
+        self._detail_gap.setVisible(False)
+        self.keep_rows.set_items([])
+        self.keep_rows.setVisible(False)
+        self.keep_gap.setVisible(False)
+        self.do_button.setVisible(False)
+        self.reply_button.set_parts("Reply", variant="" if question else "pri")
+        self.reply_button.setVisible(True)
+        self.later_button.setVisible(False)
+        self.answer_input.setVisible(question)
+        self.acts.setStretch(self._stretch_at, 0 if question else 1)
+        self.answer_input.setText("")
+        self.less_inline.setVisible(False)
+        for after in (self.undo_button, self.copy_button, self.close_button):
+            after.setVisible(False)
+        self.result.setVisible(False)
+        self.result.set_text("")
+        self.result_gap.setVisible(False)
+        self.draft.setVisible(False)
+        self.dismiss_button.set_parts("Not now")
+        self._foot([self.dismiss_button, self.less_button])
+        self.linger_ms = self._fixed_linger if self._fixed_linger is not None else (
+            linger_for(" ".join([head, *(ln["text"] for ln in lines)])) + KEEP_LINGER_EXTRA_MS)
         self._fit_height()
 
     def _fit_height(self, animate: bool = False) -> None:
@@ -1254,8 +1357,10 @@ class NudgeController(QObject):
         #: The last deferral reason logged, so a busy screen is logged once.
         self._deferred: str | None = None
         self._ack_threads: list[threading.Thread] = []
-        #: The routine card whose "still due?" question to memory is out (one at a time), by id.
+        #: The queued card whose "still due?" question to memory is out (one at a time), by id.
         self._due_asking: str | None = None
+        #: Memory has no ``card_due`` (an older one): the old tray (only the routine card asks, ``routine_card_due``).
+        self._no_card_due = False
 
         self._logged.connect(self._write_log)
         self.watcher.arrived.connect(self.offer)
@@ -1367,7 +1472,7 @@ class NudgeController(QObject):
                 self._retry.start()
             return
         self._deferred = None
-        if routine_card(self.queue[0]) and not self._routine_ready(self.queue[0]):
+        if not self._card_ready(self.queue[0]):
             return
         head = self.queue.pop(0)
         head.pop("_due", None)   # memory's "still due?" answer stays in the queue, never on the shown card
@@ -1381,15 +1486,19 @@ class NudgeController(QObject):
         if not self.queue:
             self._retry.stop()
 
-    def _routine_ready(self, head: dict[str, Any]) -> bool:
-        """Whether the routine card at the head of the queue may show now. It may have waited (behind another card,
-        the task strip, a reply) since the lane wrote it: past its own expiry it is dropped here; otherwise memory is
-        asked once, off the GUI thread (``routine_card_due``: its outcome, the end state, an open call, a game in
-        front), and the answer, fresh for :data:`ROUTINE_DUE_FRESH_S`, says show, drop or wait. False until it may
-        show."""
-        if offer_expired(head):
+    def _card_ready(self, head: dict[str, Any]) -> bool:
+        """Whether the card at the head of the queue may show now (jSwitch: every card, not only the routine one). It
+        may have waited (behind another card, the task strip, a reply) since memory wrote it: a routine card past its
+        own expiry is dropped here; otherwise memory is asked once, off the GUI thread (``card_due``: its outcome, its
+        own expiry, and - with the card judge live, or for the routine card - an open call, a game in front, the
+        meeting, quiet hours), and the answer, fresh for :data:`ROUTINE_DUE_FRESH_S`, says show, drop or wait. An older
+        memory with no ``card_due``: a routine card asks ``routine_card_due``, any other shows (as before). False until
+        it may show."""
+        if routine_card(head) and offer_expired(head):
             self._drop_queued(head, "expired")
             return False
+        if getattr(self, "_no_card_due", False) and not routine_card(head):
+            return True
         answer = head.get("_due")
         if isinstance(answer, tuple) and time.monotonic() - answer[0] < ROUTINE_DUE_FRESH_S:
             if answer[1].get("due"):
@@ -1401,19 +1510,38 @@ class NudgeController(QObject):
             self._ask_due(head)
         return False
 
+    def _routine_ready(self, head: dict[str, Any]) -> bool:
+        """The routine card's readiness (an alias of :meth:`_card_ready`, kept for callers of the old name)."""
+        return self._card_ready(head)
+
     def _ask_due(self, head: dict[str, Any]) -> threading.Thread:
         self._due_asking = _nudge_id(head)
         nudge_id = head.get("id")
+        routine = routine_card(head)
 
         def work() -> None:
             try:
-                got = self.memory.call_method("routine_card_due", nudge_id, timeout_s=TRAY_TIMEOUT_S)
-            except Exception as exc:  # never take the UI down; never a routine card memory couldn't clear
+                if getattr(self, "_no_card_due", False):
+                    raise MemoryUnavailable("memory has no card_due()")
+                got = self.memory.call_method("card_due", nudge_id, timeout_s=TRAY_TIMEOUT_S)
+            except MemoryUnavailable as exc:
+                if not str(exc).startswith("memory has no"):   # slow or down: never a card memory couldn't clear
+                    got = {"due": False, "why": "error", "final": False, "error": "unavailable"}
+                else:   # an older memory: the old tray (routine_card_due for the routine card, nothing for the rest)
+                    self._no_card_due = True
+                    if not routine:
+                        got = {"due": True, "why": "no_card_due"}
+                    else:
+                        try:
+                            got = self.memory.call_method("routine_card_due", nudge_id, timeout_s=TRAY_TIMEOUT_S)
+                        except Exception as exc2:  # never a routine card memory couldn't clear
+                            got = {"due": False, "why": "error", "final": False, "error": type(exc2).__name__}
+            except Exception as exc:  # never take the UI down; never a card memory couldn't clear
                 got = {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
             self._due_checked.emit(head, got if isinstance(got, dict) else {"due": False, "why": "error",
                                                                              "final": False})
 
-        thread = threading.Thread(target=work, name="yuki-ui-routine-due", daemon=True)
+        thread = threading.Thread(target=work, name="yuki-ui-card-due", daemon=True)
         thread.start()
         self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
         return thread
@@ -1424,8 +1552,8 @@ class NudgeController(QObject):
         self._due_asking = None
         head["_due"] = (time.monotonic(), dict(answer))
         due = bool(answer.get("due"))
-        self.ui_log.event("nudge_routine_check", id=head.get("id"), due=due, why=answer.get("why"),
-                          final=answer.get("final"))
+        self.ui_log.event("nudge_routine_check" if routine_card(head) else "nudge_due_check", id=head.get("id"),
+                          kind=head.get("kind"), due=due, why=answer.get("why"), final=answer.get("final"))
         if not due and answer.get("final"):
             self._drop_queued(head, str(answer.get("why") or "not_due"))
             return

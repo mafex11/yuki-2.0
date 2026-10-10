@@ -20,7 +20,9 @@ rule about anyone's words) - of things that are plainly Yuki's own small job:
   fact, a list item) inside the card; reads Yuki's own data only;
 * ``bring_back``: opens again one web page the user already had (a link, or a thread's latest page); the UI
   records what was in front first, and Undo brings that back;
-* ``draft``: a ready-written text shown inside the card with Copy; never typed or sent anywhere;
+* ``draft``: a ready-written text shown inside the card with Copy; never typed or sent anywhere. **Retired**
+  (state-design question 8, jSwitch: a reply for the user to copy is their own work, "work offers never"): no model
+  may offer it any more (:data:`RETIRED_DOS`); a card written before still shows it;
 * ``ask``: a suggested request put **unsent** in the ask bar; nothing runs until the user presses Enter, and then
   it is an ordinary request of theirs with the live strip and Stop;
 * ``run_skill`` (PLAN.md Phase R, D10, D11, D14): **code-only** (:data:`CODE_ONLY_DOS`). Only the routine lane
@@ -63,8 +65,12 @@ from urllib.parse import urlsplit
 OFFER_DOS: tuple[str, ...] = ("todo_add", "show_memory", "bring_back", "draft", "ask", "run_skill")
 #: Kinds only code writes (the routine lane): never in a model's schema, the judge's enum or a model's offer.
 CODE_ONLY_DOS: tuple[str, ...] = ("run_skill",)
+#: Kinds no card offers any more (state-design question 8, jSwitch): ``draft``, a ready-written reply for the user to
+#: copy, is the user's own work ("work offers never"). Kept in :data:`OFFER_DOS` so a card written before still shows
+#: and its button still answers; never in a model's schema or enum, and :func:`validate_offer` refuses it.
+RETIRED_DOS: tuple[str, ...] = ("draft",)
 #: The kinds a model may choose (the writers' ``OFFER_SCHEMA`` and the judge's enum are built from this).
-MODEL_DOS: tuple[str, ...] = tuple(d for d in OFFER_DOS if d not in CODE_ONLY_DOS)
+MODEL_DOS: tuple[str, ...] = tuple(d for d in OFFER_DOS if d not in CODE_ONLY_DOS and d not in RETIRED_DOS)
 #: The one card channel that may carry a code-only kind: the "Your usual" routine card (trigger ``routine``).
 ROUTINE_CHANNEL = "routine"
 #: Offers whose effect Undo takes back (06 §4.3); ``run_skill``: the window that was in front comes back.
@@ -158,7 +164,7 @@ OFFER_SCHEMA: dict[str, Any] = {
                 "refs": {"type": "array", "items": {"type": "string"},
                          "description": "The ids it acts on, from the data (\"W12\", \"L7\", \"CALL41\", \"todo:3\")."},
                 "text": {"type": "string",
-                         "description": "todo_add: the to-do in the user's words; draft: the whole draft; ask: the "
+                         "description": "todo_add: the to-do in the user's words; ask: the "
                                         "request as the user would type it; otherwise \"\"."},
                 "due": {"type": "string",
                         "description": "todo_add only: \"YYYY-MM-DD HH:MM\" or \"YYYY-MM-DD\" when the data gives "
@@ -188,15 +194,13 @@ TO-DOS yet ("want it on your list for Monday?");
 - show_memory: show something you already hold - a thread of work, a call's notes, a link, a know-how - named \
 by its id in refs;
 - bring_back: open again one web page the user already had (an L link, or a W thread's latest page), named in refs;
-- draft: when someone is waiting on a reply from the user (a question on their PR, an ask in a chat), a \
-ready-written reply shown inside the card, in their register, for them to copy and send themselves;
 - ask: a suggested request put in the ask bar, unsent, for the user to change and send themselves (when the only \
 useful help is something you would have to go and look into).
 The user's own work - their code, repos, files, documents, designs, reviews, tests, their apps' sessions - is \
-theirs: never offer to do, open, read, check, run or finish any of it, and never to send, post or follow up a \
-message ("that's my work, I'll do it"). Putting one of its open items on their list (todo_add), showing what \
-you already hold about it (show_memory) or drafting a reply someone is waiting on (draft) does not touch the \
-work and is fine. No offer when another tool (an AI agent, a CI run, a colleague's message) already gave the \
+theirs: never offer to do, open, read, check, run, draft or finish any of it, never a ready-written reply for them \
+to copy, and never to send, post or follow up a message ("that's my work, I'll do it"). Putting one of its open \
+items on their list (todo_add) or showing what you already hold about it (show_memory) does not touch the work and \
+is fine. No offer when another tool (an AI agent, a CI run, a colleague's message) already gave the \
 user the next step and they are acting on it, and never an offer that repeats or carries out another tool's \
 advice. Never offer to add what TO-DOS already has. A card without an offer is complete.
 Opening the user's usual non-work things at the time they usually do them (their meeting tab, a playlist) is done \
@@ -207,9 +211,6 @@ Examples (the shape, not the words):
 open - want it on your list for Wednesday?", offer {"do": "todo_add", "label": "Add to list", "steps": ["add \
 'Finish the pricing slide', due Wed, to your list"], "refs": ["W9"], "text": "Finish the pricing slide", "due": \
 "2026-10-07"}
-- someone waiting on the user's answer: text "Priya asked on the PR whether the retry fix is in - want a reply \
-ready?", offer {"do": "draft", "label": "Show draft", "steps": ["show a reply to Priya you can copy"], "refs": \
-["J812"], "text": "Yes - the retry fix went in with PR #31 this morning.", "due": ""}
 - the user is mid-way through their own code, a review or another AI tool's steps: no offer (offer null)."""
 
 
@@ -333,8 +334,8 @@ def validate_offer(raw: Any, *, ids: Iterable[str], store: Any, now: float | Non
                    allowed_do: Iterable[str] | None = None) -> tuple[dict[str, Any] | None, str]:
     """``(offer, "ok")`` - the typed offer as the card stores it, with what its refs resolve to - or
     ``(None, why)``: ``none`` (no offer), ``not_an_object``, ``unknown_do``, ``not_allowed`` (the kind is not in
-    ``allowed_do``: switched off by the setting or by learning; or a code-only kind, :data:`CODE_ONLY_DOS`, which no
-    model may ever offer, whatever ``allowed_do`` says), ``no_steps``, ``unknown_ref`` (an id the request
+    ``allowed_do``: switched off by the setting or by learning; or a code-only kind, :data:`CODE_ONLY_DOS`, or a
+    retired one, :data:`RETIRED_DOS`, which no model may ever offer, whatever ``allowed_do`` says), ``no_steps``, ``unknown_ref`` (an id the request
     did not offer), ``already_listed`` (a to-do for an item the list has), ``unresolved_ref`` (nothing to show or
     open), ``no_text``, ``bad_due``. Checks ids and enums,
     never words."""
@@ -350,6 +351,8 @@ def validate_offer(raw: Any, *, ids: Iterable[str], store: Any, now: float | Non
         return None, "unknown_do"
     if do in CODE_ONLY_DOS:
         return None, "not_allowed"   # run_skill: the routine lane writes it by code (routine_offer); never a model
+    if do in RETIRED_DOS:
+        return None, "not_allowed"   # draft (question 8): a reply to copy is the user's own work; never offered
     if allowed_do is not None and do not in set(allowed_do):
         return None, "not_allowed"
     steps = [_squash(s, STEP_MAX) for s in (raw.get("steps") if isinstance(raw.get("steps"), list) else [])]
@@ -943,9 +946,10 @@ def record_outcome(store: Any, nudge_id: int, outcome: str, *, now: float | None
 
 
 def channel_of(n: Any) -> str:
-    """The card's channel for learning: an observation card's trigger, a check-in's ``checkin``, else its kind
-    (``resume``)."""
-    if n.kind == "question" and getattr(n, "trigger", None) == "checkin":
+    """The card's channel for learning: an observation card's trigger, a check-in's ``checkin`` (the card judge's
+    check-ins carry their type, ``checkin:<moment>``, jSwitch), else its kind (``resume``)."""
+    trigger = str(getattr(n, "trigger", None) or "")
+    if n.kind == "question" and (trigger == "checkin" or trigger.startswith("checkin:")):
         return "checkin"
     return str((getattr(n, "trigger", None) if n.kind == "notice" else None) or n.kind)
 
@@ -1077,7 +1081,7 @@ def feedback_lines(store: Any, safe: Callable[[Any, int], str], now: float | Non
 
 
 __all__ = [
-    "OFFER_DOS", "CODE_ONLY_DOS", "MODEL_DOS", "ROUTINE_CHANNEL", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS",
+    "OFFER_DOS", "CODE_ONLY_DOS", "RETIRED_DOS", "MODEL_DOS", "ROUTINE_CHANNEL", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS",
     "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
     "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "usage_capability", "habit_keys",

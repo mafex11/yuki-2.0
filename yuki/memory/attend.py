@@ -63,7 +63,8 @@ Public API::
     type_on(type, config) -> bool;  offers_on(config) -> bool           # B3
     writer_budget(calls, now) -> Decision                              # B4
     commit_check(you, now, *, game_fn=None, calls_fn=None) -> Decision
-    History (protocol);  RowHistory(store, config)                     # stored rows (live, jSwitch)
+    fresh_check(store, *, db_path, config, now, type, urgency) -> Decision   # the tray's card_due (no YouNow)
+    History (protocol);  RowHistory(store)                             # stored rows (live, jSwitch)
     user_day_start(now, config) -> float
 """
 
@@ -378,11 +379,16 @@ def commit_check(you: Any, now: float, *, game_fn: Callable[[], bool | None] | N
 
 class RowHistory:
     """B1 / B4 from stored rows (content-free columns): the judge's own cards (``nudges.trigger`` = its type) and its
-    writer calls (``nudge_checkins.trigger`` = ``judge:<type>``). For ``[judge] mode = "on"`` (jSwitch)."""
+    writer calls (``nudge_checkins.trigger`` = ``judge:<type>``). For ``[judge] mode = "on"`` (jSwitch): a restart never
+    resets a budget, and the old chain's cards of the same types (written before the switch) count too. Also the
+    check-in frames shown today and the writer calls per type today (``LOOK_CAPS``)."""
 
-    def __init__(self, store: Any, types: Iterable[str], b1_free: Iterable[str] = B1_FREE_TYPES) -> None:
+    def __init__(self, store: Any, types: Iterable[str] | None = None,
+                 b1_free: Iterable[str] = B1_FREE_TYPES) -> None:
+        from yuki.memory.candidates import TYPES
+
         self.store = store
-        self.types = tuple(types)
+        self.types = tuple(types) if types is not None else tuple(TYPES)
         self.b1_free = tuple(b1_free)
 
     def _rows(self, since: float, now: float) -> list[Any]:
@@ -412,9 +418,104 @@ class RowHistory:
                                  " AND model IS NOT NULL", (now - 86400.0,))
         return [float(r[0]) for r in rows]
 
+    def looks_today(self, now: float, config: Any, type: str) -> int:
+        """Writer calls for ``type`` since the user's day began (the per-moment ``LOOK_CAPS``)."""
+        rows = self.store._query("SELECT count(*) FROM nudge_checkins WHERE at >= ? AND at < ? AND trigger = ?"
+                                 " AND model IS NOT NULL", (user_day_start(now, config), now + 1.0, f"judge:{type}"))
+        return int(rows[0][0] or 0) if rows else 0
+
+    def frames_today(self, now: float, config: Any) -> set[str]:
+        """The check-in frames (past / present / future) a check-in card used today: the judge's (its trigger), the
+        Today card's head (a question card of trigger ``today``: ``checkin:day_start``) and the old chain's (its
+        check-in row's trigger)."""
+        from yuki.memory.candidates import TYPES
+        from yuki.memory.cardjudge import type_of
+
+        rows = self.store._query(
+            "SELECT n.kind, n.trigger, c.trigger FROM nudges n LEFT JOIN nudge_checkins c ON c.id = n.checkin_id"
+            " WHERE n.at >= ? AND n.at < ? AND n.kind = 'question'", (user_day_start(now, config), now + 1.0))
+        out: set[str] = set()
+        for kind, trigger, ctrig in rows:
+            t = "checkin:day_start" if trigger == "today" else type_of(kind, trigger, ctrig)
+            frame = TYPES[t].frame if t in TYPES else None
+            if frame:
+                out.add(frame)
+        return out
+
+
+def fresh_check(store: Any, *, db_path: Any, config: Any, now: float, type: str, urgency: str = "any",
+                game_fn: Callable[[], Any] | None = None, locked_fn: Callable[[], bool] | None = None,
+                acting_fn: Callable[[], bool] | None = None, render_fn: Callable[[], Any] | None = None,
+                asked: bool = False) -> Decision:
+    """The policy's hard holds with fresh reads and no YouNow (the tray's ``card_due`` before it shows a queued card,
+    jSwitch): H0 (``[nudges] enabled``, the pause flag, the lock, the snooze), H1 the game in front (``game_fn``:
+    ``gamegate.game_in_front``, D9's local read; a read that fails holds), H3 an open call (kind ``call``; unreadable
+    holds), H4 the meeting's app still playing (the latest meeting row within ``meeting_hold_min``; unreadable holds)
+    and the meeting in front (a meeting row within ``MEETING_GAP_S``; not for ``routine``), H5 Yuki acting, H7 quiet
+    hours. Full screen, away and a card showing are the tray's own checks. Never raises (a failure holds).
+
+    ``asked``: a card the user asked for just now (an on-demand weekly review, review.py's unchanged path): the
+    switches that path skips (``[nudges] enabled``, the pause, the snooze) and quiet hours don't hold it; the lock,
+    a game, a call, a meeting and Yuki acting still do."""
+    try:
+        sw = read_switches(store, db_path, config, now, locked_fn=locked_fn)
+    except Exception:  # noqa: BLE001
+        return Decision(False, "H0:unknown")
+    if sw.disabled and not asked:
+        return Decision(False, "H0:disabled")
+    if sw.paused and not asked:
+        return Decision(False, "H0:paused")
+    if sw.locked:
+        return Decision(False, "H0:locked")
+    if sw.snoozed_until is not None and sw.snoozed_until > now and not asked:
+        return Decision(False, "H0:snoozed", sw.snoozed_until)
+    try:
+        if game_fn is None:
+            from yuki.memory.gamegate import game_in_front as game_fn
+        if game_fn():
+            return Decision(False, "H1:game")
+    except Exception:  # noqa: BLE001 - fail closed
+        return Decision(False, "H1:game_unknown")
+    try:
+        from yuki.memory.store import CALL_OPEN_STATUSES
+
+        if any(getattr(c, "kind", "call") != "game" for c in store.calls(statuses=CALL_OPEN_STATUSES)):
+            return Decision(False, "H3:call")
+    except Exception:  # noqa: BLE001 - fail closed
+        return Decision(False, "H3:call_unknown")
+    try:
+        from yuki.memory.store import app_key
+        from yuki.memory.timeline import MEETING_GAP_S
+        from yuki.memory.younow import meeting_audio, recent_rows
+
+        hold_s = float(getattr(config, "meeting_hold_min", 30.0)) * 60.0
+        meetings = [r for r in recent_rows(store, now - hold_s, now + 1.0) if r.meeting and not r.by_yuki]
+        if meetings:
+            last = meetings[-1]
+            if meeting_audio(app_key(last.process or ""), render_fn) is not False:
+                return Decision(False, "H4:meeting_audio")
+            if type != "routine" and now - float(last.ended_at) < MEETING_GAP_S:
+                return Decision(False, "H4:meeting", float(last.ended_at) + MEETING_GAP_S)
+    except Exception:  # noqa: BLE001 - fail closed
+        return Decision(False, "H4:meeting_unknown")
+    try:
+        if acting_fn is None:
+            from yuki.memory import acting
+
+            if acting.current(db_path) is not None:
+                return Decision(False, "H5:yuki_acting")
+        elif acting_fn():
+            return Decision(False, "H5:yuki_acting")
+    except Exception:  # noqa: BLE001
+        pass   # as observe: an unreadable marker is not a hold (the card's own buttons never act)
+    if sw.quiet and not asked:
+        return Decision(False, "H7:quiet_hours", sw.quiet_end_at)
+    return ALLOW
+
 
 __all__ = [
     "ALLOW", "B1_GAP_S", "B1_PER_DAY", "CALL_UNKNOWN_PASS_S", "Decision", "History", "RowHistory", "Switches",
-    "WRITER_GAP_S", "WRITER_PER_DAY", "WRITER_PER_HOUR", "budget", "commit_check", "common_hold", "holds",
+    "WRITER_GAP_S", "WRITER_PER_DAY", "WRITER_PER_HOUR", "budget", "commit_check", "common_hold", "fresh_check",
+    "holds",
     "offers_on", "quiet_end", "read_switches", "type_on", "user_day_start", "writer_budget",
 ]
