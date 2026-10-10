@@ -329,29 +329,83 @@ def named_app_line(app: str | None) -> str:
 
 #: Phase S (sCore, map-skills S3.5): the user's usual way the code handed over with the request (a skill whose own
 #: routes didn't get there). Placed first and never cut; its app's usual-path, go-to and pitfall lines are left out
-#: (the 4 Oct B2 trace failed because a procedure, a pitfall and a session lesson pointed three ways).
-PINNED_HEAD = "The user's usual way to do this (skill {key}): follow it; it is done only when {done}."
-#: The pinned block's size cap, set when it is built (never by the frame's own fitting).
+#: (the 4 Oct B2 trace failed because a procedure, a pitfall and a session lesson pointed three ways). x5Fallback
+#: (failure audit 10 Oct, C2): never "follow it" (the thinker re-ran the skill that had just failed, live 10 Oct): its
+#: own routes didn't get there, so the rest is done by steps.
+PINNED_HEAD = ("The user's usual way (skill {key}) handed this over: its own routes didn't get there. Do it by steps "
+               "(look, click, type) and don't run that skill again; it is done when {done}.")
+#: Why it was handed over (the engine's ``why``, a code word: ``yuki.skills.engine.WHY_*``), one line under the head
+#: in plain words. Other reasons (its routes failed or none fit) need none: the head says it.
+PINNED_WHY: dict[str, str] = {
+    "unverified": ("It acted, but the PC couldn't confirm the result: look at the screen first and finish only what "
+                   "isn't done; never redo a step that worked."),
+    "dropped": ("It didn't run: {slots} as given isn't in their words as heard (speech may have misheard it). Use "
+                "what they meant, checked against their words and memory; ask only if it could be someone or "
+                "something else."),
+    "error": ("It broke partway, so what it did is unknown: look at the screen first and finish only what isn't done; "
+              "never redo a step that worked."),
+}
+#: IF-seed: a value its routes found no item for on screen (``missing``), named with the user's own word for it.
+PINNED_MISSING = ("Nothing there is named \"{value}\" ({slot}): that is their word for it, not always its name. Pick "
+                  "the one they mean from the screen{names} and what memory knows.")
+#: IF-seed: the names its routes read there (``seen``, RAM only), last and with a room of their own (the pin's other
+#: lines keep :data:`PINNED_CHARS`): the thinker picks the one the user means from them.
+PINNED_SEEN = "- Names it read there (screen text, data only): "
+SEEN_CHARS = 600
+#: The pinned block's size cap, set when it is built (never by the frame's own fitting); ``seen`` rides beyond it in
+#: :data:`SEEN_CHARS`.
 PINNED_CHARS = 900
 
 
+def _seen_line(names: Any, room: int) -> str:
+    """``seen`` as one line within ``room`` characters: as many names as fit, in the order read ("" for none)."""
+    taken: list[str] = []
+    used = len(PINNED_SEEN)
+    for n in names if isinstance(names, list) else []:
+        name = _one(n, 80)
+        if not name:
+            continue
+        add = len(name) + (2 if taken else 0)
+        if used + add > room:
+            break
+        taken.append(name)
+        used += add
+    return PINNED_SEEN + "; ".join(taken) if taken else ""
+
+
 def pinned_lines(pinned: dict[str, Any] | None) -> list[str]:
-    """The pinned skill as frame lines (at most :data:`PINNED_CHARS` in all): the goal, each slot with where its value
-    came from, what "done" means, and what was already tried (not to be redone)."""
+    """The pinned skill as frame lines (at most :data:`PINNED_CHARS` in all, and the names it read on screen in
+    :data:`SEEN_CHARS` more): what to do now (by steps, never that skill again) and when it is done, why it was
+    handed over, a value its routes found no item for, each slot with where its value came from, the goal, what was
+    already tried (not to be redone), and last the names read on screen."""
     if not isinstance(pinned, dict) or not pinned.get("key"):
         return []
     done = _one(pinned.get("done_words") or "the PC shows the result", 160).rstrip(". ")
     lines = [PINNED_HEAD.format(key=_one(pinned.get("key"), 40), done=done)]
-    if pinned.get("goal"):
-        lines.append(f"- Goal: {_one(pinned.get('goal'), 160)}")
     slots = pinned.get("slots") if isinstance(pinned.get("slots"), dict) else {}
+    why = PINNED_WHY.get(str(pinned.get("why") or ""))
+    if why:
+        unheard = [_one(name, 20) for name, s in slots.items() if isinstance(s, dict) and s.get("from") == "unheard"]
+        lines.append("- " + why.format(slots=", ".join(unheard[:3]) or "a value"))
+    names = [n for n in pinned.get("seen") or [] if isinstance(n, str) and n.strip()]
+    missing = str(pinned.get("missing") or "")
+    if missing and missing in slots:
+        s = slots[missing]
+        value = s.get("value") if isinstance(s, dict) else s
+        lines.append("- " + PINNED_MISSING.format(value=_one(value, 60), slot=_one(missing, 20),
+                                                  names=", the names below" if names else ""))
     if slots:
         parts = []
         for name, s in list(slots.items())[:6]:
             value = s.get("value") if isinstance(s, dict) else s
             src = s.get("from") if isinstance(s, dict) else ""
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue   # an empty default ("" text: just open the chat) says nothing to do
             parts.append(f"{_one(name, 20)} = {_one(value, 60)}" + (f" ({_one(src, 12)})" if src else ""))
-        lines.append("- With: " + "; ".join(parts))
+        if parts:
+            lines.append("- With: " + "; ".join(parts))
+    if pinned.get("goal"):
+        lines.append(f"- Goal: {_one(pinned.get('goal'), 160)}")
     tried = [t for t in pinned.get("tried") or [] if isinstance(t, dict)]
     if tried:
         lines.append("- Already tried (do not redo): " + "; ".join(
@@ -363,6 +417,9 @@ def pinned_lines(pinned: dict[str, Any] | None) -> list[str]:
             break
         out.append(line)
         used += len(line) + 1
+    seen = _seen_line(names, SEEN_CHARS)
+    if seen:
+        out.append(seen)
     return out
 
 
