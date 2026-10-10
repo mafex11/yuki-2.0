@@ -207,7 +207,7 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
     c0, w0 = time.thread_time(), time.perf_counter()
     try:
         idx = B.load_index(store, now)
-        built = O.build(store, now=now, browsers=idx.browsers)
+        built = O.build(store, now=now, browsers=idx.browsers, index=idx)
         res.built = built
         B.bind(built.occasions, idx)
         for o in built.occasions:
@@ -254,8 +254,12 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
                                                               usage=p.group.usage)
         if write_rows:
             cap_ids = W.capability_ids(store)
-            res.counts.update(W.write(store, planned, now=now, cap_ids=cap_ids))
-            res.counts["occasions_saved"] = O.save(store, built.occasions, since=built.since, until=now, now=now)
+            # each key's latest occasion this pass, passing or not: a row used or seen lately stays (review r2 L6)
+            last_seen = {G.skill_key(store.cipher, g.capability, g.keys): g.bar.last_at for g in (*groups, *seen)
+                         if g.capability in caps and g.bar.last_at}
+            res.counts.update(W.write(store, planned, now=now, cap_ids=cap_ids, last_seen=last_seen))
+            res.counts["occasions_saved"] = O.save(store, built.occasions, since=built.since, until=now, now=now,
+                                                   prune=True)
             try:
                 store.set_nudge_state(BROWSERS_STATE, json.dumps({"at": now, "browsers": built.browsers}))
             except Exception:  # noqa: BLE001
@@ -359,7 +363,7 @@ def _incremental(store: Any, *, now: float, log: LogFn | None) -> dict[str, Any]
             browsers = None
         idx = B.load_index(store, now, browsers=browsers)
         lo = now - INCREMENTAL_S
-        built = O.build(store, now=now, since=lo, browsers=idx.browsers)
+        built = O.build(store, now=now, since=lo, browsers=idx.browsers, index=idx)
         B.bind(built.occasions, idx)
         try:
             rows = store._query("SELECT id, key FROM skills WHERE origin = 'learned' AND deleted_at IS NULL AND state"

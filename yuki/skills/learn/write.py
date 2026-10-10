@@ -479,11 +479,15 @@ def name_planned(store: Any, planned: list[Planned], *, settings: Any = None, cl
     return out
 
 
-def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, int]) -> Counter:
+def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, int],
+          last_seen: dict[str, float] | None = None) -> Counter:
     """Upsert the planned rows and move the learned rows that no longer pass, in one transaction; sets each group's
     ``skill_id``. Each existing row is read again inside the transaction (review r1 L7): a Forget / Not mine the
-    Playbook wrote since :func:`plan` leaves the row alone, and a rename it wrote keeps the user's name. Returns counts
-    (content-free)."""
+    Playbook wrote since :func:`plan` leaves the row alone, and a rename it wrote keeps the user's name. A row that
+    stops passing keeps its state while its last occasion or use is under :data:`DORMANT_DAYS` old (design §4.7,
+    review r2 L6; ``last_seen``: each key's latest occasion this pass, passing or not), then goes ``dormant``, and
+    ``retired`` after :data:`RETIRE_DAYS`. Returns counts (content-free)."""
+    last_seen = last_seen or {}
     counts: Counter = Counter()
     existing = _existing(store)
     keep = {p.key for p in planned}
@@ -554,8 +558,12 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
         for key, old in existing.items():
             if key in keep or old.get("deleted_at") is not None or old.get("state") in TOMBSTONES:
                 continue
-            last = max(float(old["prov"].get("last_at") or 0.0), float(old.get("last_used_at") or 0.0))
+            last = max(float(old["prov"].get("last_at") or 0.0), float(old.get("last_used_at") or 0.0),
+                       float(last_seen.get(key) or 0.0))
             idle_days = (now - last) / DAY_S if last else RETIRE_DAYS + 1
+            if idle_days < DORMANT_DAYS:
+                counts["kept_recent"] += 1      # used or seen lately: it keeps its state until 14 days go by
+                continue
             state = "retired" if idle_days >= RETIRE_DAYS else "dormant"
             if old.get("state") == state:
                 continue

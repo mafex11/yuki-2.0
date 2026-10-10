@@ -388,7 +388,9 @@ def compile_b(group: Group, cap: Any, store: Any, *, commit: str) -> tuple[dict[
 
     for r in rows:
         r["process"] = app_key(str(r.get("process") or "")) or ""
-    mine = [r for r in rows if r["process"] == last.app]
+    # the user's own rows only, as the occasion's steps were read (review r2 L10: a row of Yuki's with the same element
+    # key is no step of the user's path)
+    mine = [r for r in rows if r["process"] == last.app and r.get("source") in USER_SOURCES and not r.get("during_run")]
     if sends(mine):
         return None, "it sent what was typed (the commit stays the user's)"
     picked_rows: list[dict[str, Any]] = []

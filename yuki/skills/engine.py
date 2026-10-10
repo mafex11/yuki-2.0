@@ -70,27 +70,32 @@ COMMIT_BY_END: dict[str, str] = {
 }
 #: The end kinds whose commit depends on what serves them (PLAN D24, lSplit review r1 L2): a join of a chat app's voice
 #: channel (the serve needs ``chat_voice``) is the user's own "join X" (rule 8, Q3), so ``words``, where a calling
-#: site's join stays ``user``.
-COMMIT_BY_NEED: dict[tuple[str, str], str] = {("call_join", "chat_voice"): "words"}
+#: site's join stays ``user``. When a serve's needs map to different words, the strictest holds (lCore review r2 L7:
+#: a calling site's join beside a chat's voice need stays ``user``).
+COMMIT_BY_NEED: dict[tuple[str, str], str] = {("call_join", "chat_voice"): "words", ("call_join", "calling_site"): "user"}
 
 
 def commit_for(end: str, needs: tuple[str, ...] | list[str] = (), declared: str = "") -> str:
-    """D24: the commit word of reaching ``end`` (:data:`COMMIT_BY_END`, then :data:`COMMIT_BY_NEED` for the serve's
-    needs); an unknown end kind is ``user``; a capability's ``declared`` commit only ever makes it stricter."""
-    base = COMMIT_BY_END.get(str(end or ""), "user")
-    for need in needs or ():
-        base = COMMIT_BY_NEED.get((str(end or ""), str(need)), base)
+    """D24: the commit word of reaching ``end`` (:data:`COMMIT_BY_END`, or the strictest of :data:`COMMIT_BY_NEED`
+    for the serve's needs when any is listed); an unknown end kind is ``user``; a capability's ``declared`` commit only
+    ever makes it stricter."""
+    end = str(end or "")
+    base = COMMIT_BY_END.get(end, "user")
+    by_need = [COMMIT_BY_NEED[(end, str(n))] for n in needs or () if (end, str(n)) in COMMIT_BY_NEED]
+    if by_need:
+        base = strictest(*by_need) or base
     return strictest(base, str(declared or "")) or "user"
 
 
 def run_commit(skill: Skill) -> str:
     """The commit of the end a run of ``skill`` reaches. A capability that serves a commit end and stops at its
     ``pre_commit_end`` (``browser.site_tab``: the tab in front, the user clicks Join) reaches only that end: its own
-    ``commit`` governs the commit end it serves, never the run (PLAN D24, lSplit review r2 L4). Anything else reaches
-    its own end, whose commit its serve's needs and its own ``commit`` (stricter only) decide."""
+    ``commit`` governs the commit end it serves, never the run (PLAN D24, lSplit review r2 L4), but only when that
+    end is itself no commit (lCore review r2 L7: a ``pre_commit_end`` that is a commit kind keeps the declared commit).
+    Anything else reaches its own end, whose commit its serve's needs and its own ``commit`` (stricter only) decide."""
     needs = tuple(n for serve in skill.serves if serve.end == skill.end for n in serve.needs)
-    if skill.pre_commit_end and skill.pre_commit_end == skill.end:
-        return commit_for(skill.end, needs)
+    if skill.pre_commit_end and skill.pre_commit_end == skill.end and commit_for(skill.end, needs) == "none":
+        return "none"
     return commit_for(skill.end, needs, skill.commit)
 
 
@@ -696,12 +701,30 @@ def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool, again: b
         absolute = _absolute_values(skill, getattr(resolved, "values", None))
         if absolute is None:
             return None
+        # a repeat is ledgered where its run would be (lCore review r2 L9): a learned skill asked with another key
+        # value counts on its capability (:func:`ledger_skill`)
+        key = ledger_skill(skill, absolute).key
     from yuki.skills import registry
+
+    # a correction may follow a run of the learned skill or one its capability took (another key value): the newest
+    # of the two is the run corrected (lCore review r2 L9)
+    keys = [key]
+    if corrects and isinstance(skill, Skill) and getattr(skill, "origin", "") == "learned" and skill.capability \
+            and skill.capability != key:
+        keys.append(str(skill.capability))
 
     def go(client: Any) -> Any:
         store = _store_of(client)
-        digest = None if corrects else registry.values_digest(store, key, absolute)
-        return registry.false_done_after(store, key, digest=digest, corrects=corrects, request_id=ctx.request_id)
+        target = key
+        if len(keys) > 1:
+            newest = -1.0
+            for k in keys:
+                rows = registry.last_runs(store, k, since=time.time() - registry.FALSE_DONE_S - 30.0, limit=1)
+                at = float(rows[0].get("t0") or 0.0) if rows else -1.0
+                if at > newest:
+                    target, newest = k, at
+        digest = None if corrects else registry.values_digest(store, target, absolute)
+        return registry.false_done_after(store, target, digest=digest, corrects=corrects, request_id=ctx.request_id)
 
     marked = _mem(ctx.memory, "skill_false_done", go, timeout_s=0.5)
     if not marked:

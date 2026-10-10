@@ -17,16 +17,21 @@ Segmentation (design §3.2; rebuildable, code only):
    none during one of Yuki's runs) as identity tokens (``group.step_token``); unresolved clicks as a count only; the
    template pages passed on the way.
 5. **Exclusions**: Yuki's own moments; any end inside an acting step of one of Yuki's runs of the same app (``runs``
-   kind action / control, from the step's start to its end plus the kind's attribution lag) or inside a skill run's
-   window, any app (D18: such a moment is the asked occasion of that run when the run verified, never a user occasion); ends in
-   a game's app; ends inside a task the user said was not theirs (kept in :data:`NOT_MINE_STATE`, so the verdicts
+   kind action / control, from the step's start to its end plus the kind's attribution lag; a step that kept no app
+   and acted holds the kinds in :data:`NO_APP_KINDS` of any app) or inside the window of a skill run whose end kind is
+   the moment's own kind, any app (D18: such a moment is the asked occasion of that run when the run verified, never a
+   user occasion; ``moments.attribute``'s kind rule). A late send is checked at its time label too. An end only the
+   user ever reaches (D24 commit ``user``, the capability that serves it deciding: a calling site's join) is never
+   Yuki's: the user's Join after Yuki brought the meeting tab forward stays a user occasion (review r2 M1). Also ends
+   in a game's app; ends inside a task the user said was not theirs (kept in :data:`NOT_MINE_STATE`, so the verdicts
    outlive the trace tables); pages outside a browser; untemplated single pages (their host-scope visit stands for
    them).
 
 Rules for the gaps and the live kinds (design §3.3): a message captured more than :data:`LATE_SEND_S` after its own
 time label counts for demand and means only (no steps, no time context); level moves of two or more sessions within
-:data:`DUCK_S` are one outside event (ducking), never an occasion; a playlist read counts only on a change (never the
-first read, never the playlist already playing).
+:data:`DUCK_S` are one outside event (ducking), never an occasion; a playlist read counts only as a start (never the
+first read, never a read of music already playing when the timeline began, never the playlist that app's previous read
+showed less than :data:`RESUME_GAP_S` before this start: listening that goes on; review r2 M2).
 
 **Asked occasions** (design §4.8, D22): a request whose run reached a checked end with no correction within
 :data:`CORRECTION_S` (skill runs: ``checked = 1`` and the re-check never disagreed; older thinker runs: an acting step
@@ -49,6 +54,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 from yuki.skills.learn.group import step_token
@@ -74,6 +80,20 @@ ASKED_THEN_DID_S = 600.0
 KEEP_DAYS = 90.0
 #: The ``runs`` step kinds that act on the desktop (D18): reads (looking at a window, the situation) never do.
 ACTING_KINDS: tuple[str, ...] = ("action", "control")
+#: The end kinds an acting step that kept no app may have made in any app (a media key, a control-lane step: review r2
+#: L2). A false drop costs one occasion.
+NO_APP_KINDS: tuple[str, ...] = ("media_context", "volume_change", "message_sent")
+#: A playlist read showing the playlist the app's previous read showed, less than this before its start, is listening
+#: that goes on (a resume), never a new start: the routine miner's own onset gap, so one start is one onset.
+RESUME_GAP_S = 2 * 3600.0
+#: The trace is read only around the occasions' steps (review r2 L5): their ``[anchor, end + 5 s]`` spans, read in
+#: chunks that join spans this close together (one indexed query per chunk), keeping only the rows inside a span of
+#: their own app, with only the columns ``group.step_token`` reads.
+TRACE_READ_GAP_S = 900.0
+#: A trace chunk never spans more than this (the night pass's peak stays a couple of hours of rows).
+TRACE_CHUNK_MAX_S = 2 * 3600.0
+TRACE_COLS: tuple[str, ...] = ("at", "process", "kind", "resolved", "element_key", "role", "position", "chord",
+                               "file_ext")
 #: The closed verb -> end table for older thinker runs (design §4.8): the verbs whose checked step reached an end.
 VERB_ENDS: dict[str, str] = {"set_slider": "volume_change", "app_volume": "volume_change", "open_url": "page",
                              "tab_select": "site_front"}
@@ -111,6 +131,8 @@ class Occasion:
     group: Any = None
     means: str | None = None
     key_value_digest: str | None = None
+    #: The start of the visit holding the end (RAM only: the steps are filled after the pass, review r2 L5).
+    visit_at: float | None = None
 
     @property
     def weekday(self) -> int | None:
@@ -258,7 +280,7 @@ class Builder:
     last hour). Every source is read once, indexed, and never written; :func:`save` writes the occasions."""
 
     def __init__(self, store: Any, *, until: float, since: float, browsers: dict[str, int],
-                 is_game: Any = None) -> None:
+                 is_game: Any = None, index: Any = None) -> None:
         self.store = store
         self.until = float(until)
         self.since = float(since)
@@ -268,8 +290,13 @@ class Builder:
 
             is_game = game_judge(store)
         self.is_game = is_game
+        #: The capabilities' serves (``bind.Index``): which capability serves an end decides its D24 commit. Loaded
+        #: only when an end falls inside one of Yuki's steps and none was given.
+        self.index = index
         self.counts: Counter = Counter()
         self.dropped: Counter = Counter()
+        self._threads: dict[int, tuple[str, Any]] = {}
+        self._by_id: dict[int, dict[str, Any]] = {}
 
     # -- loading -------------------------------------------------------------------------------------------------------
 
@@ -299,26 +326,54 @@ class Builder:
                 front.append((float(a), float(b), key))
         return {k: Spans(_merge_visits(v)) for k, v in per.items()}, Spans(front)
 
-    def _trace(self) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[float]], float | None]:
-        per: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    def _trace_from(self) -> float | None:
+        """When the trace begins (its oldest row): an occasion before it has no steps to read."""
         first = _q(self.store, "SELECT min(at) FROM ui_actions")
-        trace_from = float(first[0][0]) if first and first[0][0] is not None else None
-        for r in _q(self.store, "SELECT id, at, process, kind, source, during_run, resolved, element_key, role,"
-                                " position, chord, file_ext FROM ui_actions WHERE at >= ? AND at <= ? ORDER BY at, id",
-                    (self.since - ANCHOR_MAX_S, self.until + STEP_TAIL_S)):
-            d = dict(r)
-            if d.get("source") not in ("user", "user_injected") or d.get("kind") == "hover" \
-                    or d.get("resolved") == "stale" or d.get("during_run"):
-                continue
-            d["process"] = _app(d.get("process"))
-            per[d["process"]].append(d)
-        return per, {k: [float(x["at"]) for x in v] for k, v in per.items()}, trace_from
+        return float(first[0][0]) if first and first[0][0] is not None else None
 
-    def _acting(self) -> tuple[dict[str, Spans], Spans, list[dict[str, Any]]]:
+    def _fill_steps(self, pending: Sequence[Occasion], pages_by_app: dict[str, list[dict[str, Any]]],
+                    page_at: dict[str, list[float]]) -> None:
+        """The steps and cover of the occasions whose visit the trace covers (review r2 L5: the trace is read only
+        around them). Their ``[anchor, end + 5 s]`` spans are read in chunks (spans of any app joined when closer than
+        :data:`TRACE_READ_GAP_S`, at most :data:`TRACE_CHUNK_MAX_S` long; one indexed query each), with only the
+        columns ``group.step_token`` reads, and only the user's own rows inside a span of their own app are kept (no
+        hover, no stale row, none during one of Yuki's runs)."""
+        if not pending:
+            return
+        need: dict[str, list[tuple[float, float, None]]] = defaultdict(list)
+        for o in pending:
+            need[o.app].append((float(o.anchor_at if o.anchor_at is not None else o.at), o.at + STEP_TAIL_S, None))
+        need_spans = {k: Spans(v) for k, v in need.items()}
+        chunks: list[list[float]] = []
+        for a, b, _p in sorted(x for v in need.values() for x in v):
+            if chunks and a - chunks[-1][1] <= TRACE_READ_GAP_S and max(b, chunks[-1][1]) - chunks[-1][0] \
+                    <= TRACE_CHUNK_MAX_S:
+                chunks[-1][1] = max(chunks[-1][1], b)
+            else:
+                chunks.append([a, b])
+        cols = ", ".join(TRACE_COLS)
+        rows_by_app: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for lo, hi in chunks:
+            for r in _q(self.store, f"SELECT {cols} FROM ui_actions WHERE at >= ? AND at <= ? AND source IN ('user',"
+                                    f" 'user_injected') AND kind != 'hover' AND coalesce(resolved, '') != 'stale' AND"
+                                    f" coalesce(during_run, 0) = 0 ORDER BY at, id", (lo, hi)):
+                app = _app(r[1])
+                spans = need_spans.get(app)
+                if spans is None or spans.holding(float(r[0])) is None:
+                    continue
+                rows_by_app[app].append(dict(zip(TRACE_COLS, r), process=app))
+        times_by_app = {k: [float(x["at"]) for x in v] for k, v in rows_by_app.items()}
+        for o in pending:
+            self._steps(o, rows_by_app.get(o.app) or [], times_by_app.get(o.app) or [], pages_by_app, page_at)
+
+    def _acting(self) -> tuple[dict[str, Spans], Spans, Spans, list[dict[str, Any]]]:
         """Yuki's acting steps per app (D18): ``runs`` steps of kind action / control, from their start to their end
-        (start + duration when no end was kept); and the skill runs' windows, which hold for an end moment of **any**
-        app (design §3.2: "any end moment inside a ``skill_runs`` window"; review r1 L3)."""
+        (start + duration when no end was kept); the steps that kept no app and acted (``ok``: a media key, a
+        control-lane step), which hold the ends of :data:`NO_APP_KINDS` of any app (review r2 L2); and the skill runs'
+        windows, which hold an end moment of **any** app whose kind is the run's own end kind (``moments.attribute``'s
+        kind rule, review r2 M1: a site-tab run never holds the user's Join; a volume run never holds his send)."""
         per: dict[str, list[tuple[float, float, Any]]] = defaultdict(list)
+        no_app: list[tuple[float, float, Any]] = []
         skill_windows: list[tuple[float, float, Any]] = []
         steps: list[dict[str, Any]] = []
         acting = ",".join("?" * len(ACTING_KINDS))
@@ -333,6 +388,8 @@ class Builder:
             steps.append(d)
             if d["app"]:
                 per[d["app"]].append((a, b, d))
+            elif d.get("ok"):
+                no_app.append((a, b, d))
         for r in _q(self.store, "SELECT id, run_key, skill, app, end_kind, t0, t_done, outcome, checked, recheck,"
                                 " request_id, rung, variant, via FROM skill_runs WHERE t0 >= ? AND t0 <= ?",
                     (self.since - 3600.0, self.until)):
@@ -343,7 +400,80 @@ class Builder:
             b = float(d["t_done"]) if d.get("t_done") is not None else a
             d["t1"] = b
             skill_windows.append((a, b, d))
-        return {k: Spans(v) for k, v in per.items()}, Spans(skill_windows), steps
+        return {k: Spans(v) for k, v in per.items()}, Spans(no_app), Spans(skill_windows), steps
+
+    @staticmethod
+    def _yuki_step(kind: str, app: str, times: Sequence[float], lag: float, acting: dict[str, Spans], no_app: Spans,
+                   skill_windows: Spans) -> dict[str, Any] | None:
+        """The step or skill run of Yuki's that holds an end of ``kind`` in ``app`` at any of ``times`` (D18; see
+        :meth:`_acting`), else ``None``."""
+        for t in times:
+            spans = acting.get(app)
+            for a, b, d in (spans.overlapping(t, t, lag) if spans is not None else ()):
+                if a <= t <= b + lag:
+                    return d
+            if kind in NO_APP_KINDS:
+                for a, b, d in no_app.overlapping(t, t, lag):
+                    if a <= t <= b + lag:
+                        return d
+            for a, b, d in skill_windows.overlapping(t, t, lag):
+                if a <= t <= b + lag and str(d.get("end_kind") or "") == kind:
+                    return d
+        return None
+
+    def _end_commit(self, kind: str, src: dict[str, Any]) -> str:
+        """D24's commit of reaching this end (``yuki.skills.engine``): the capability that serves it decides, by its
+        serve's needs (a calling site's join is ``user``, a chat app's voice join ``words``); none serves it: the end
+        kind's own commit."""
+        from yuki.skills.engine import commit_for, served_commit
+
+        if self.index is None:
+            try:
+                from yuki.skills.learn.bind import load_index
+
+                self.index = load_index(self.store, self.until, browsers=self.browsers)
+            except Exception:  # noqa: BLE001 - the end kind's own commit
+                self.index = False
+        cap = None
+        if self.index:
+            try:
+                cap = self.index.serving(SimpleNamespace(kind=kind, src=src))
+            except Exception:  # noqa: BLE001
+                cap = None
+        try:
+            return served_commit(cap, kind) if cap is not None else commit_for(kind)
+        except Exception:  # noqa: BLE001
+            return commit_for(kind)
+
+    def _src(self, m: dict[str, Any]) -> dict[str, Any]:
+        """The bind sources of an end moment (RAM only; the entity read apart, :meth:`_entity`)."""
+        kind, facts = m["kind"], m["facts"]
+        src: dict[str, Any] = {"app": m["app"], "service": m.get("service"), "value": m.get("value"),
+                               "means": m.get("means")}
+        if kind == "page":
+            if facts.get("scope") == "host":
+                src["site"] = facts.get("host")
+                src["page"] = None
+                src["top_host"] = facts.get("top_host")
+                src["host"] = facts.get("host")
+            elif facts.get("template"):
+                site, _, page = str(facts["template"]).partition(".")
+                src["site"], src["page"], src["host"] = site, page or None, facts.get("host")
+        if kind == "message_sent":
+            tid = facts.get("thread_id")
+            host, url_ct = self._threads.get(int(tid), ("", None)) if isinstance(tid, int) else ("", None)
+            src["host"] = host[4:] if host.startswith("www.") else host
+            src["thread_id"] = tid
+            src["url_ct"] = url_ct
+            src["contact"] = facts.get("contact_id")
+        src["entity_digest"] = m.get("entity_key") or m.get("entity_digest")
+        return src
+
+    def _entity(self, m: dict[str, Any]) -> Any:
+        try:
+            return self.store._dec(m["entity_ciphertext"]) if m.get("entity_ciphertext") else None
+        except Exception:  # noqa: BLE001 - an entity that can't be read: its digest only
+            return None
 
     # -- the pass ------------------------------------------------------------------------------------------------------
 
@@ -351,9 +481,10 @@ class Builder:
         from yuki.memory.moments import ATTRIBUTION_LAG_S
 
         moments = self._moments()
+        self._by_id = {int(m["id"]): m for m in moments}
         visits, front = self._visits()
-        trace, trace_at, trace_from = self._trace()
-        acting, skill_windows, run_steps = self._acting()
+        trace_from = self._trace_from()
+        acting, no_app, skill_windows, run_steps = self._acting()
         not_mine = not_mine_spans(self.store)
         calls = Spans((float(a), float(b or c or self.until), None) for a, b, c in _q(
             self.store, "SELECT detected_at, ended_at, last_alive_at FROM calls WHERE kind = 'call' AND detected_at <= ?",
@@ -362,7 +493,7 @@ class Builder:
             self.store, "SELECT id, at FROM conversation_turns WHERE at >= ? AND at <= ?",
             (self.since - TURN_BEFORE_S, self.until)))
         turn_at = [t for t, _i in turns]
-        threads = {int(r[0]): (str(r[1] or "").casefold(), r[2]) for r in _q(
+        self._threads = {int(r[0]): (str(r[1] or "").casefold(), r[2]) for r in _q(
             self.store, "SELECT id, host, url_ciphertext FROM threads")}
         pages_by_app: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for m in moments:
@@ -380,25 +511,32 @@ class Builder:
                     break
                 if n["app"] != m["app"]:
                     duck.update({int(m["id"]), int(n["id"])})
-        # each app's playlist read just before the window (an incremental pass compares its first read with it)
-        last_context: dict[str, str | None] = {_app(a): d for a, d, _t in _q(
-            self.store, "SELECT app, entity_digest, max(at) FROM moments WHERE kind = 'media_context' AND at < ?"
-                        " GROUP BY app", (self.since,))}
+        # each app's playlist read just before the window, and when (an incremental pass compares its first read)
+        last_context: dict[str, tuple[str | None, float]] = {}
+        for a, d, t in _q(self.store, "SELECT app, entity_digest, max(at) FROM moments WHERE kind = 'media_context'"
+                                      " AND at < ? GROUP BY app", (self.since,)):
+            k = _app(a)
+            if t is not None and (k not in last_context or float(t) > last_context[k][1]):
+                last_context[k] = (d, float(t))
         # the moment each of Yuki's runs made: "r:<runs step id>", "s:<skill run id>", "q:<request id>" -> moment id
         acted_moments: dict[str, int] = {}
         occasions: list[Occasion] = []
+        pending: list[Occasion] = []
         last_end: dict[str, float] = {}
         for m in moments:
             kind, app, at, mid = m["kind"], m["app"], float(m["at"]), int(m["id"])
             facts = m["facts"]
             self.counts[f"end_{kind}"] += 1
             if kind == "media_context":
+                # a start of the playlist the app's previous read showed, less than a resume gap before: listening
+                # that goes on, never a new start (review r2 M2); a later day's start of the same playlist counts
                 prev = last_context.get(app)
-                last_context[app] = m.get("entity_digest")
+                last_context[app] = (m.get("entity_digest"), at)
                 if "since" not in facts:
                     self.dropped["context_first_read"] += 1
                     continue
-                if prev is not None and prev == m.get("entity_digest"):
+                if prev is not None and prev[0] is not None and prev[0] == m.get("entity_digest") \
+                        and at - prev[1] < RESUME_GAP_S:
                     self.dropped["context_unchanged"] += 1
                     continue
             if (m.get("by") or "user") == "yuki":
@@ -424,20 +562,20 @@ class Builder:
                     self.dropped["page_untemplated"] += 1     # its host-scope visit stands for it
                     continue
             lag = float(ATTRIBUTION_LAG_S.get(kind, 20.0))
-            hit = None
-            spans = acting.get(app)
-            for a, b, d in (spans.overlapping(at, at, lag) if spans is not None else ()):
-                if a <= at <= b + lag:
-                    hit = d
-                    break
-            if hit is None:
-                for a, b, d in skill_windows.overlapping(at, at, lag):
-                    if a <= at <= b + lag:
-                        hit = d
-                        break
+            src = self._src(m)
+            times = [at]
+            lag_s = facts.get("label_lag_s") if kind == "message_sent" else None
+            if isinstance(lag_s, (int, float)) and not isinstance(lag_s, bool) and float(lag_s) > 0.0:
+                times.append(at - float(lag_s))    # a send is checked at its time label too (review r2 L1)
+            hit = self._yuki_step(kind, app, times, lag, acting, no_app, skill_windows)
+            if hit is not None and self._end_commit(kind, src) == "user":
+                # D24 (review r2 M1): an end only the user ever reaches (a calling site's join) is never Yuki's step,
+                # even right after Yuki brought the meeting tab forward: it stays the user's occasion
+                self.counts["acting_user_end_kept"] += 1
+                hit = None
             if hit is not None:
-                # D18 (critique M2): inside one of Yuki's acting steps of this app, or inside a skill run's window
-                # (any app): that run's, never the user's
+                # D18 (critique M2): inside one of Yuki's acting steps of this app (or a step that kept no app), or
+                # inside the window of a skill run of this end kind (any app): that run's, never the user's
                 self.dropped["yuki_acting"] += 1
                 self.dropped[f"yuki_acting:{kind}"] += 1
                 self.dropped[f"yuki_acting:{kind}:{app}"] += 1
@@ -445,29 +583,7 @@ class Builder:
                     # the moment is that run's own end only in the run's app (or a run with no app kept)
                     acted_moments.setdefault(("s:" if hit.get("skill_run") else "r:") + str(hit["id"]), mid)
                 continue
-            src: dict[str, Any] = {"app": app, "service": m.get("service"), "value": m.get("value"),
-                                   "means": m.get("means")}
-            if kind == "page":
-                if facts.get("scope") == "host":
-                    src["site"] = facts.get("host")
-                    src["page"] = None
-                    src["top_host"] = facts.get("top_host")
-                    src["host"] = facts.get("host")
-                else:
-                    site, _, page = str(facts["template"]).partition(".")
-                    src["site"], src["page"], src["host"] = site, page or None, facts.get("host")
-            if kind == "message_sent":
-                tid = facts.get("thread_id")
-                host, url_ct = threads.get(int(tid), ("", None)) if isinstance(tid, int) else ("", None)
-                src["host"] = host[4:] if host.startswith("www.") else host
-                src["thread_id"] = tid
-                src["url_ct"] = url_ct
-                src["contact"] = facts.get("contact_id")
-            try:
-                src["entity"] = self.store._dec(m["entity_ciphertext"]) if m.get("entity_ciphertext") else None
-            except Exception:  # noqa: BLE001 - an entity that can't be read: its digest only
-                src["entity"] = None
-            src["entity_digest"] = m.get("entity_key") or m.get("entity_digest")
+            src["entity"] = self._entity(m)
             o = Occasion(kind=kind, at=at, app=app, end_moment_id=mid, entity_key=m.get("entity_key"), src=src)
             if m.get("evidence") == "hold":
                 o.facts["hold"] = True
@@ -480,9 +596,10 @@ class Builder:
                     o.context_known = False
                     o.facts["late"] = True
                     self.counts["late_send"] += 1
-            self._context(o, visits, front, trace, trace_at, trace_from, calls, turns, turn_at, last_end,
-                          pages_by_app, page_at)
+            if self._context(o, visits, front, trace_from, calls, turns, turn_at, last_end):
+                pending.append(o)
             occasions.append(o)
+        self._fill_steps(pending, pages_by_app, page_at)
         asked = self._asked(run_steps, acted_moments, occasions)
         occasions.extend(asked)
         self.counts["occasions_user"] = sum(1 for o in occasions if o.by == "user")
@@ -490,15 +607,14 @@ class Builder:
         return Built(occasions=occasions, counts=self.counts, dropped=self.dropped, since=self.since,
                      until=self.until, browsers=self.browsers, trace_from=trace_from)
 
-    def _context(self, o: Occasion, visits: dict[str, Spans], front: Spans, trace: dict[str, list[dict[str, Any]]],
-                 trace_at: dict[str, list[float]], trace_from: float | None, calls: Spans,
-                 turns: list[tuple[float, int]], turn_at: list[float], last_end: dict[str, float],
-                 pages_by_app: dict[str, list[dict[str, Any]]], page_at: dict[str, list[float]]) -> None:
-        """The visit, anchor, steps, cover and context of one user occasion."""
+    def _context(self, o: Occasion, visits: dict[str, Spans], front: Spans, trace_from: float | None, calls: Spans,
+                 turns: list[tuple[float, int]], turn_at: list[float], last_end: dict[str, float]) -> bool:
+        """The visit, anchor and context of one user occasion; True when the trace covers its visit (its steps and
+        cover are filled after the pass, :meth:`_fill_steps`)."""
         at, app = o.at, o.app
         if not o.context_known:
             o.cover = "gap"     # a late send: demand and means only, no visit, steps or time context
-            return
+            return False
         held = front.holding(at)
         o.facts["game_front"] = bool(held and held[2] != app and self.is_game(held[2]))
         o.facts["call_open"] = calls.holding(at) is not None
@@ -513,15 +629,23 @@ class Builder:
             o.cover = "gap"
             o.anchor_at = at
             last_end[app] = at
-            return
+            return False
         anchor = max(visit[0] - ANCHOR_LEAD_S, at - ANCHOR_MAX_S, last_end.get(app, float("-inf")))
         o.anchor_at = anchor
+        o.visit_at = visit[0]
         last_end[app] = at
         if trace_from is None or at < trace_from:
             o.cover = "before_trace"
-            return
-        rows = trace.get(app) or []
-        times = trace_at.get(app) or []
+            return False
+        return True
+
+    @staticmethod
+    def _steps(o: Occasion, rows: list[dict[str, Any]], times: list[float],
+               pages_by_app: dict[str, list[dict[str, Any]]], page_at: dict[str, list[float]]) -> None:
+        """The steps and cover of one occasion from its app's kept trace rows (sorted by time)."""
+        at, app = o.at, o.app
+        anchor = float(o.anchor_at if o.anchor_at is not None else at)
+        visit_at = o.visit_at
         lo, hi = bisect.bisect_left(times, anchor), bisect.bisect_right(times, at + STEP_TAIL_S)
         tokens: list[str] = []
         identity = opaque = switches = 0
@@ -539,7 +663,7 @@ class Builder:
                 switches += 1
             else:
                 identity += 1
-        if not any(t.endswith("|switch") for t in tokens) and anchor <= visit[0] <= at:
+        if not any(t.endswith("|switch") for t in tokens) and visit_at is not None and anchor <= visit_at <= at:
             tokens.insert(0, f"{app}|front")     # the switch in, from the timeline's boundary
         plist = pages_by_app.get(app) or []
         ptimes = page_at.get(app) or []
@@ -605,6 +729,7 @@ class Builder:
             if mid is not None and mid not in used_moments:
                 o.end_moment_id = mid
                 used_moments.add(mid)
+                self._src_from_moment(o, mid)
             if corrected:
                 self.counts["asked_corrected"] += 1
             out.append(o)
@@ -630,6 +755,7 @@ class Builder:
             if mid is not None and mid not in used_moments:
                 o.end_moment_id = mid
                 used_moments.add(mid)
+                self._src_from_moment(o, mid)
             if corrected:
                 self.counts["asked_corrected"] += 1
             out.append(o)
@@ -648,6 +774,19 @@ class Builder:
                 if app == o.app:
                     o.facts["after_ask"] = key
         return out
+
+    def _src_from_moment(self, o: Occasion, mid: int) -> None:
+        """An asked occasion whose run made an end moment of its own kind takes that moment's bind sources (service,
+        template, host, entity) where the run gave none (review r2 L3): a keyed run (a page of a site not learned yet)
+        then joins its own value's group, as a user occasion does, not only through the missing-key rule."""
+        m = self._by_id.get(int(mid))
+        if m is None or m["kind"] != o.kind:
+            return
+        got = self._src(m)
+        got["entity"] = self._entity(m)
+        for k, v in got.items():
+            if o.src.get(k) in (None, "") and v not in (None, ""):
+                o.src[k] = v
 
     def _skill_runs(self) -> list[dict[str, Any]]:
         rows = _q(self.store, "SELECT u.id, u.run_key, u.skill, u.app, u.end_kind, u.t0, u.t_done, u.outcome, u.checked,"
@@ -687,19 +826,24 @@ class Builder:
 
 
 def build(store: Any, *, now: float | None = None, since: float | None = None, browsers: dict[str, int] | None = None,
-          is_game: Any = None) -> Built:
-    """One segmentation pass (see the module docstring); ``since`` defaults to the moments' retention."""
+          is_game: Any = None, index: Any = None) -> Built:
+    """One segmentation pass (see the module docstring); ``since`` defaults to the moments' retention. ``index``: the
+    pass's ``bind.Index`` (the D24 commit of an end inside one of Yuki's steps; loaded when needed if not given)."""
     from yuki.skills.learn.bind import measured_browsers
 
     now = time.time() if now is None else float(now)
     since = now - KEEP_DAYS * DAY_S if since is None else float(since)
     if browsers is None:
+        browsers = getattr(index, "browsers", None) if index is not None else None
+    if browsers is None:
         browsers = measured_browsers(store, now)
-    return Builder(store, until=now, since=since, browsers=browsers, is_game=is_game).build()
+    return Builder(store, until=now, since=since, browsers=browsers, is_game=is_game, index=index).build()
 
 
-def save(store: Any, occasions: Sequence[Occasion], *, since: float, until: float, now: float | None = None) -> int:
-    """Replace the occasions in ``[since, until]`` with these, one transaction; returns rows written."""
+def save(store: Any, occasions: Sequence[Occasion], *, since: float, until: float, now: float | None = None,
+         prune: bool = False) -> int:
+    """Replace the occasions in ``[since, until]`` with these, one transaction; returns rows written. ``prune`` (the
+    full pass): rows older than ``since`` go too (review r2 L8: the 90-day window of design §3.4 and §9.4)."""
     now = time.time() if now is None else float(now)
     rows = []
     for o in occasions:
@@ -713,7 +857,10 @@ def save(store: Any, occasions: Sequence[Occasion], *, since: float, until: floa
                                 separators=(",", ":")) or None, now))
 
     def write(conn: Any) -> int:
-        conn.execute("DELETE FROM occasions WHERE at >= ? AND at <= ?", (float(since), float(until) + 1.0))
+        if prune:
+            conn.execute("DELETE FROM occasions WHERE at <= ?", (float(until) + 1.0,))
+        else:
+            conn.execute("DELETE FROM occasions WHERE at >= ? AND at <= ?", (float(since), float(until) + 1.0))
         conn.executemany(
             "INSERT OR REPLACE INTO occasions (end_moment_id, kind, capability, key_value_digest, app, means, at,"
             " anchor_at, weekday, minute, context_known, cover, steps, opaque_n, entity_key, asked_run, by, skill_id,"
