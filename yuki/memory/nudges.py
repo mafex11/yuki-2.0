@@ -2109,6 +2109,7 @@ class NudgeWorker:
         attention: Any = None,
         screen_fn: Callable[[], dict[str, Any] | None] | None = None,
         embedder: Any = None,
+        you_fn: Callable[[], Any] | None = None,
     ) -> None:
         from yuki.memory.checkins import CheckinWorker
         from yuki.memory.presence import PresenceWorker
@@ -2163,6 +2164,16 @@ class NudgeWorker:
 
         #: The "Your usual" routine card (yuki.memory.routine_offers): code only, no model.
         self.routines = RoutineLane(self)
+        #: jCore (state-design.md §4): the one card judge, reading the you-right-now record (``you_fn``: the service's
+        #: YouBuilder, read late). ``[judge] mode = "shadow"`` decides and logs what it would show, writes no card and
+        #: makes no model call; None when it could not be built (the old chain runs on as before).
+        self.judge = None
+        try:
+            from yuki.memory.cardjudge import CardJudge
+
+            self.judge = CardJudge.for_worker(self, you_fn=you_fn)
+        except Exception as exc:
+            self._log("nudge_error", where="judge_start", error=f"{type(exc).__name__}: {exc}")
 
     # -- dependencies ------------------------------------------------------------
 
@@ -3179,10 +3190,16 @@ class NudgeWorker:
         self._stop = stop
         self._log("worker_start", model=self.model, writer_model=self.writer_model, event=self._event.name)
         while not stop.is_set():
+            done = None
             try:
-                self.tick()
+                done = self.tick()
             except Exception as exc:
                 self._log("worker_error", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+            if self.judge is not None:   # jCore: the judge's shadow look, after the old chain (it can never break it)
+                try:
+                    self.judge.shadow(float(self.clock()), done)
+                except Exception as exc:
+                    self._log("nudge_error", where="judge", error=f"{type(exc).__name__}: {exc}")
             try:
                 wait = max(1.0, float(self.config().tick_s))
             except Exception:
