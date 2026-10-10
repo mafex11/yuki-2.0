@@ -51,6 +51,7 @@ from yuki.brain.context import (
     one_line,
     read_report,
     request_turn,
+    seed_block,
     sends_fn,
     step_report,
     steer_blocks,
@@ -63,6 +64,7 @@ from yuki.brain.plan import (
     Checks,
     ExecResult,
     Plan,
+    STEP_STATES,
     Step,
     StepStatus,
 )
@@ -300,6 +302,24 @@ class Host:
         self.memory: Any = _MemoryProxy(brain.memory, brain)
         self.dispatcher: Any = brain.dispatcher
         self.settings: Any = brain.settings
+        # the executor's optional extras (read with getattr; merge of bCore and bExec)
+        #: The session log (the executor passes every record through ``content_free``).
+        self.log: Callable[..., None] = brain.logger.log
+        #: The request's untrusted-data fence (set by the Brain before the executor is made).
+        self.nonce: str = ""
+        #: The user's own words from up to 3 earlier requests (never a card's text), for the commit check.
+        self.earlier_words: list[str] = list(brain._earlier_words)[-3:]
+
+    @property
+    def model_calls(self) -> int:
+        """Model calls so far in this request (the planner's), for the run row."""
+        state = self._brain._state
+        return state.calls if state is not None else 0
+
+    @property
+    def cost_usd(self) -> float:
+        """This request's cost so far without the commit check's (the executor adds its own checker's)."""
+        return float(self._brain._cost_usd)
 
     # -- the pinned protocol ------------------------------------------------------------------------------------------
 
@@ -478,6 +498,14 @@ class Brain:
         self._setup_input_gate()
         #: The last two requests' words and Yuki's final answers (RAM only), for follow-ups (M8).
         self._history: deque[Exchange] = deque(maxlen=2)
+        #: The user's own words of the last 3 requests that had any (never a card's text): the commit check's
+        #: "earlier turns" (design 2.6).
+        self._earlier_words: deque[str] = deque(maxlen=3)
+        #: This request's commit check (bExec's ``CommitCheck``; its calls and cost join the request's).
+        self._checker: Any = None
+        self._checks_seen = 0
+        #: The line the request ended with (the executor's run row carries it).
+        self._final_text = ""
         self._requests = 0
         self._request_started = time.monotonic()
         self._running = False
@@ -1205,6 +1233,9 @@ class Brain:
         self._bs = None
         self._req = None
         self._host_ref = None
+        self._checker = None
+        self._checks_seen = 0
+        self._final_text = ""
         self._reset_accounting()
         self.last_summary = None
 
@@ -1259,14 +1290,16 @@ class Brain:
                         menu_chars=len(gathered.menu), skills=len(gathered.skill_keys or ()),
                         private_read=state.private_read, gather_ms=round(self._gather_ms, 1),
                         parts_ms=gathered.parts_ms)
-        executor = self._executor_for(host)
+        host.nonce = nonce
+        executor = self._executor_for(host, req)
         try:
             self._loop(req, host, state, bs, conv, system, effort, gathered, sends, executor, nonce)
         finally:
             closer = getattr(executor, "close", None)
             if callable(closer):
                 try:
-                    closer()
+                    ended = ("cancelled" if self._cancelled.is_set() else "final" if self._final_text else "error")
+                    closer(reply=self._final_text, outcome=ended)
                 except Exception:  # noqa: BLE001
                     pass
             host.acting_end()
@@ -1412,7 +1445,7 @@ class Brain:
             return self._run_reads_here(source, host, state, nonce)
         started = time.perf_counter()
         try:
-            got = self._run_executor(executor, source)
+            got = self._run_executor(executor, source, host)
         except CallCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 - the seam failed: nothing more runs for this plan
@@ -1439,26 +1472,107 @@ class Brain:
                         **({"facts": plan.facts()} if plan is not None else {}))
         return result
 
-    def _executor_for(self, host: Host) -> Any:
-        """bExec's executor for this request: ``yuki.brain.executor.Executor(host)`` (one per request, so the desk
-        lease and the commit-check memo span replans). ``None`` when it is not there (acting then fails closed)."""
+    def _executor_for(self, host: Host, req: _Request) -> Any:
+        """bExec's executor for this request: ``Executor(host, checker=CommitCheck(...), plan_seed=seed)``, one per
+        request, so the desk lease and the commit-check memo span replans. The commit check gets the failover client
+        (made on first use) and the session log. ``None`` when it can't be made (acting then fails closed)."""
         try:
-            from yuki.brain import executor as module  # type: ignore[attr-defined]
-        except Exception:  # noqa: BLE001 - bExec not merged yet
-            return None
-        make = getattr(module, "Executor", None)
-        if make is None:
+            from yuki.brain.check import CommitCheck
+            from yuki.brain.executor import Executor
+        except Exception as exc:  # noqa: BLE001 - a broken install: answers still run, acting fails closed
+            self.logger.log("error", where="executor_import", error=type(exc).__name__)
             return None
         try:
-            return make(host)
+            self._checker = CommitCheck(lambda: self.client, self.settings, self.logger.log)
+            self._checks_seen = 0
+            return Executor(host, checker=self._checker, plan_seed=req.seed)
         except Exception as exc:  # noqa: BLE001
             self.logger.log("error", where="executor_init", error=type(exc).__name__)
             return None
 
-    @staticmethod
-    def _run_executor(executor: Any, source: PlanStream) -> Any:
-        """The one call into bExec's executor: ``run(source) -> ExecResult`` (the merge reviewer adapts it here)."""
-        return executor.run(source)
+    def _run_executor(self, executor: Any, source: PlanStream, host: Host) -> ExecResult:
+        """The one call into bExec's executor: its streaming intake on this plan's stream. ``begin(header)`` once the
+        header is validated (``_run_plan`` waited for it), ``add_step`` for each step the moment it closes (a result
+        back stops the intake: a steer, a cancel, a mismatch), then ``finish(plan, stop_reason=)`` when the block is
+        complete. Its report comes back as an :class:`ExecResult`."""
+        header = source.header()
+        if header is None:
+            source.complete()
+            return ExecResult(status="invalid")
+        # the user's own words that reached this request outside the executor (an answer to the planner's question, a
+        # steer taken into a turn) count as theirs for the consent rule's spans and the commit check
+        known = set(getattr(executor, "words", []) or [])
+        executor.add_words([w for w in host.user_words if w not in known])
+        executor.begin(header)
+        early = None
+        for step in source.steps():
+            early = executor.add_step(step)
+            if early is not None:
+                break
+        if early is not None:
+            got = executor.finish()
+        else:
+            plan = source.complete() if source.stop is None else None
+            if plan is not None:
+                got = executor.finish(plan)
+            elif source.stop in ("max_tokens", "refusal"):
+                got = executor.finish(stop_reason=source.stop)   # nothing further runs
+            elif source.stop == "cancelled":
+                return ExecResult(status="stopped", reason="cancelled",
+                                  statuses=[_step_status(s) for s in getattr(executor, "statuses", [])])
+            else:   # invalid: the steps already run are reported, the rest never runs
+                statuses = list(getattr(executor, "statuses", []) or [])
+                return ExecResult(status="invalid", statuses=[_step_status(s) for s in statuses],
+                                  acted=any(s.tool and s.verb in ACT_VERBS for s in statuses))
+        return self._exec_result(got, host)
+
+    def _exec_result(self, got: Any, host: Host) -> ExecResult:
+        """bExec's ``RunResult`` as bCore's :class:`ExecResult` (statuses and code words mapped; the done-check's
+        verdict, probe and line; the commit checks this plan made)."""
+        calls = int(getattr(self._checker, "calls", 0) or 0)
+        checks, self._checks_seen = max(0, calls - self._checks_seen), calls
+        raw = list(getattr(got, "statuses", None) or [])
+        reads = [str(r.get("text") or "") for r in getattr(got, "reads", None) or []
+                 if isinstance(r, Mapping) and str(r.get("text") or "").strip()]
+        found = getattr(got, "done", None)
+        base: dict[str, Any] = {
+            "statuses": [_step_status(s) for s in raw], "reads": reads,
+            "acted": any(getattr(s, "tool", "") and getattr(s, "verb", "") in ACT_VERBS for s in raw),
+            "verdict": getattr(found, "verdict", None) if found is not None else None,
+            "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
+            "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
+            "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False))}
+        status = str(getattr(got, "status", "") or "error")
+        if status == "done":
+            # "done" only when the check saw it; any other reading is said as not confirmed, with the executor's line
+            return ExecResult(status="done" if base["verdict"] is True else "unconfirmed", **base)
+        if status == "answer":
+            return ExecResult(status="read", **base)
+        if status == "mismatch":
+            m = getattr(got, "mismatch", None)
+            if m is None:
+                return ExecResult(status="mismatch", reason="mismatch", **base)
+            return ExecResult(status="refused" if m.refused else "mismatch",
+                              step=None if m.verb == "done" else m.step,   # the final check is no step to avoid
+                              expected=m.expected, seen=m.seen, view=m.view, reason=m.why or "mismatch",
+                              seed=dict(m.seed) if m.seed else None,
+                              seen_fenced=bool(getattr(m, "seen_fenced", False)), **base)
+        if status == "steer":
+            return ExecResult(status="steered", reason="the user added words", **base)
+        if status == "declined":
+            return ExecResult(status="declined", **base)
+        if status == "refused":
+            return ExecResult(status="refused", reason="refused", **base)
+        if status == "busy":
+            return ExecResult(status="refused", reason="busy", **{**base, "final": True})
+        if status in ("cancelled", "stopped"):
+            return ExecResult(status="stopped", reason=status, **base)
+        if status == "ask":   # the Brain asks an ask plan's question itself; kept for safety
+            question = str(getattr(got, "line", "") or "")
+            answer = host.ask_text(question) if question else None
+            return ExecResult(status="read", reads=[answer_report(question, answer)], reason="asked",
+                              statuses=base["statuses"], check_calls=checks)
+        return ExecResult(status="error", reason=status, **base)
 
     def _run_reads_here(self, source: PlanStream, host: Host, state: _State, nonce: str) -> ExecResult:
         """Without an executor: an answer plan's reads, in parallel; an act step refuses the plan (nothing acts)."""
@@ -1562,6 +1676,11 @@ class Brain:
                 return False
             self._final(line, outcome)
             return True
+        if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
+            # the executor ends the run here with its own line (a game in front: "after the round?"; the desk busy):
+            # no replan routes around it
+            self._final(result.line, self._result_outcome(result, state, plan, result.line))
+            return True
         if status == "stopped":
             self._push(self._cancel_event())
             return True
@@ -1572,17 +1691,31 @@ class Brain:
         if result.reason == "no_executor":
             self._final(LINE_NO_EXECUTOR, self._outcome(state, level="answer", line=LINE_NO_EXECUTOR))
             return True
-        # mismatch, refused, steered, error: revise, within the budget
-        if state.replans >= bs.max_replans or not self._budget_left(state, bs, self._req):
+        # mismatch, refused, steered, error: revise, within the budget. A revision with the user's own words is not a
+        # replan after a mismatch (the executor's rule, design 2.3): only the call budget bounds it
+        counted = status != "steered"
+        if (counted and state.replans >= bs.max_replans) or not self._budget_left(state, bs, self._req):
             self._finish_stuck(state)
             return True
-        state.replans += 1
+        if counted:
+            state.replans += 1
         if isinstance(result.step, int) and plan is not None and 0 <= result.step < len(plan.steps) \
                 and status in ("mismatch", "refused", "error"):
             state.failed_step = plan.steps[result.step]
         left = bs.max_replans - state.replans
+        blocks: list[dict[str, Any]] = []
+        if result.reads:
+            # what the plan's reads returned before it stopped (each fenced by the executor), so the revision uses it
+            blocks.append({"type": "text", "text": f"{CHECK_LABEL} What that plan's reads returned:\n\n"
+                                                   + "\n\n".join(result.reads)})
+        if result.seed and self._req is not None:
+            # rung C: the skill handed over; the next plan is seeded with it and keeps the skill's done-check
+            self._req.seed = dict(result.seed)
+            seeded = seed_block(result.seed, limit=bs.seed_chars)
+            if seeded:
+                blocks.append({"type": "text", "text": seeded})
         conv.add_user([tool_result(tool_id, step_report(result, plan, limit=bs.result_chars, replans_left=left)),
-                       *extra, *self._steer_turn(host)])
+                       *extra, *blocks, *self._steer_turn(host)])
         return False
 
     def _steer_turn(self, host: Host) -> list[dict[str, Any]]:
@@ -1654,6 +1787,7 @@ class Brain:
 
     def _final(self, text: str, outcome: dict[str, Any]) -> None:
         self._last_outcome = outcome
+        self._final_text = str(text or "")
         self._push(Final(text, outcome=outcome))
 
     def _finish_text(self, text: str, state: _State, bs: BrainSettings, conv: Conversation, host: Host) -> bool:
@@ -1844,6 +1978,8 @@ class Brain:
             self._log_turn(req, reply=reply, outcome=outcome)
             if outcome == "final" and reply:
                 self._history.append(Exchange(words=req.shown, answer=reply, at=req.epoch))
+            if req.words:   # only the user's own words (never a request composed with a card's text)
+                self._earlier_words.append("\n".join(req.words))
         except Exception as exc:  # noqa: BLE001
             self.logger.log("error", where="brain_end", error=type(exc).__name__)
         finally:
@@ -1858,7 +1994,9 @@ class Brain:
             bs = self._bs or BrainSettings.read(self.settings)
             wall_s = time.monotonic() - req.started
             models = self._models_used or [bs.model]
-            cost = None if self._unpriced else round(self._cost_usd, 6)
+            # the commit check's calls are priced by its own checker (bExec): they join the request's cost
+            check_cost = float(getattr(self._checker, "cost_usd", 0.0) or 0.0)
+            cost = None if self._unpriced else round(self._cost_usd + check_cost, 6)
             verdict = (self._last_outcome or {}).get("level")
             plan_facts = {
                 "kind": state.kind if state.plans else None, "plans": state.plans, "replans": state.replans,
@@ -1923,6 +2061,29 @@ def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
     model's text after non-committing steps is never taken as the final word)."""
     return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES for s in result.statuses)
+
+
+def _step_status(s: Any) -> StepStatus:
+    """One of bExec's step statuses as bCore's: ``pending`` -> ``not_run``; an ok draft -> ``drafted``; a failed act
+    step that ran on the PC -> ``mismatch`` (it did something), one that never ran -> ``failed``; ``declined`` ->
+    ``skipped`` (the user said no). The note is the executor's short reason (code words), never window text."""
+    if isinstance(s, StepStatus):
+        return s
+    index = int(getattr(s, "index", 0) or 0)
+    verb = str(getattr(s, "verb", "") or "")
+    state = str(getattr(s, "state", "") or "pending")
+    note = one_line(getattr(s, "why", "") or "", 200)
+    if state == "pending":
+        state = "not_run"
+    elif state == "ok" and note == "drafted":
+        state = "drafted"
+    elif state == "failed" and getattr(s, "tool", "") and verb in ACT_VERBS:
+        state = "mismatch"
+    elif state == "declined":
+        state, note = "skipped", "the user said no"
+    elif state not in STEP_STATES:
+        state = "failed"
+    return StepStatus(index, verb, state, note)
 
 
 def _as_result(got: Any) -> ExecResult:

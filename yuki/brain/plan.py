@@ -68,8 +68,8 @@ PROBE_ARGS: dict[str, tuple[str, ...]] = {
     "tab_shown": ("process", "window", "tab_id", "name"),
     "foreground": ("process", "window"),
     "mic_held": ("process", "window"),
-    "chat_open": ("app", "person", "chat"),
-    "message_sent": ("text", "app"),
+    "chat_open": ("app", "person"),
+    "message_sent": ("text", "app", "person"),
     "moment": ("kind", "app"),
     "driver": ("driver", "call"),
     "field_holds": ("window", "name", "role", "text"),
@@ -467,6 +467,17 @@ def _probe(raw: Any, errors: list[str], where: str) -> Probe | None:
     if extra:
         errors.append(f"{where}.args for {name} take only: {', '.join(allowed) or 'nothing'} (not {', '.join(extra)})")
         return None
+    if name != "none":
+        # one contract: the done-check reads the arguments exactly as this accepts them (required ones present)
+        try:
+            from yuki.brain.done import parse_args
+        except Exception:  # noqa: BLE001 - the done-check not installed: the names above stand
+            parse_args = None
+        if parse_args is not None:
+            parsed, why = parse_args(str(name), text)
+            if parsed is None:
+                errors.append(f"{where}.args: {why}")
+                return None
     for key, value in args.items():
         ok = isinstance(value, (str, int, float, bool)) or value is None or (
             isinstance(value, list) and all(isinstance(v, str) for v in value))
@@ -902,6 +913,12 @@ class ExecResult:
     probe: str = ""
     reason: str = ""
     check_calls: int = 0
+    #: The run ends here with ``line`` (a refusal such as a game in front, the desk busy): no replan.
+    final: bool = False
+    #: A skill's hand-off (rung C) from a ``run_skill`` step: the next plan is seeded with it (its done-check fixed).
+    seed: dict[str, Any] | None = None
+    #: ``seen`` is outside text the executor capped and fenced as untrusted data: it is never cut again.
+    seen_fenced: bool = False
 
 
 __all__ = [

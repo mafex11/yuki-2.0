@@ -704,6 +704,18 @@ class Executor:
                 return None
         except Exception:  # noqa: BLE001
             return None
+        hosted = getattr(self.host, "hold_paused", None)
+        if callable(hosted):
+            # the host's own hold (bCore's Brain: its Paused events, the surfaces' callback, the takeover watch off
+            # and back on, the pause limit, waiting on its wake event): one hold, never two
+            try:
+                goes_on = bool(hosted())
+            except Exception:  # noqa: BLE001 - no hold ran: nothing more starts
+                goes_on = False
+            if goes_on:
+                self._read_cache.clear()   # the screen is read again before the next step
+                return None
+            return RunResult("cancelled")   # a stop, or the limit (the host cancelled the request with its line)
         since = time.monotonic()
         limit = float(getattr(self.settings, "takeover_idle_stop_s", 0) or PAUSE_LIMIT_S)
         wake = getattr(self.host, "pause_wake", None)

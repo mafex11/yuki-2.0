@@ -633,7 +633,9 @@ def step_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, *, li
     reason = one_line(_field(result, "reason", ""), 300)
     if reason:
         lines.append(f"Why: {reason}")
-    seen = clip(str(_field(result, "seen", "") or ""), limit)
+    seen = str(_field(result, "seen", "") or "")
+    # outside text the executor fenced was capped before its fence went on: cutting it now would cut the fence's end
+    seen = seen.strip() if _field(result, "seen_fenced", False) else clip(seen, limit)
     if seen:
         lines.append(f"What showed:\n{seen}")
     view = str(_field(result, "view", "") or "")
