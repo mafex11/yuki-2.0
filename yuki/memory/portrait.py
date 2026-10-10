@@ -200,6 +200,9 @@ MAX_EPISODES = 80
 LOOP_STALE_DAYS = 7
 LOOP_EXPIRE_DAYS = 14
 LOOP_KIND = "open_loop"
+#: The origin of the routine facts code writes from counts (``yuki.memory.routines.MEASURED_ORIGIN``, PLAN.md Phase R):
+#: the validator refuses a model's UPDATE or INVALIDATE of one.
+MEASURED_ORIGIN = "measured"
 #: Loop check (:meth:`PortraitWorker.check_loops`): between portrait runs, a small Haiku call
 #: asks whether newer evidence (journal, later facts, corrections) shows an open loop settled.
 #: At most one every LOOP_CHECK_EVERY_S, only when new evidence arrived, over at most
@@ -1948,6 +1951,11 @@ class PortraitWorker:
             if out.op == "NOOP":
                 out.status = "noop"
                 touched.add(fact_id)
+                continue
+            if target.origin == MEASURED_ORIGIN:
+                # code writes and ends these from the counts (yuki.memory.routines, PLAN.md Phase R); a model never
+                # rewrites or drops one
+                reject("a measured routine: code keeps it from the counts")
                 continue
             # an open loop that fails the bar may be dropped on the rules alone, citing nothing, and so may
             # a fact whose journal evidence was all read again (re-journaled) and now supports nothing

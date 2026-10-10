@@ -3412,6 +3412,73 @@ MIGRATIONS: tuple[str, ...] = (
         UNIQUE(kind, entity_key)
     );
     """,
+    # 42 (2026-10-10, rMiner; docs/research/audit-2026-10-09/PLAN.md Phase R, decisions D3, D6, D7, D14; spec
+    # round3/map-routines.md R1.2): the routine miner's tables (yuki.memory.routines).
+    # - routines: one row per usual moment of one skill, mined by code from the moments table (no model). key =
+    #   "<skill>|<means app>[|<entity digest>]" (D3: the skill's routine_on moments; the service is never part of it);
+    #   skill_id is the skill's key in yuki/skills/connections ("meet.open"), app the means app key ("zen"). trigger
+    #   clock (mined) or told (the user said it; active after 2 confirming hits). dayset weekdays | weekends | all.
+    #   at_min: the window's median onset as a minute of the local clock day (0-1440); mad_min its spread. The bars'
+    #   numbers (hits, seen_hits = D7's seen hit days, eligible, rate, lift, p, stable) are the last mining's. state
+    #   candidate | active | dormant | retired; offer_mode early | late | quiet | off (the card lane's ladder, rLane).
+    #   fact_id: the code-written portrait fact (origin measured) that mirrors it; fact_sig / fact_at: what that fact
+    #   says (day-set and time, as code words) and when it was written (it is rewritten when they move, else weekly);
+    #   fact_off: that fact was ended or rewritten by something else (the user's review, a correction), so no fact is
+    #   written for this row again.
+    #   Content stays encrypted (label, params); everything else is numbers and machine keys.
+    # - routine_events: what happened to a routine (state changes from the miner; offered, accepted, declined,
+    #   ignored, self_served, mode_change, ... from the card lane), detail content-free JSON.
+    # Neither table is exposed by the MCP. Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS routines (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        key                TEXT NOT NULL,
+        skill_id           TEXT,
+        app                TEXT,
+        entity_digest      TEXT,
+        params_ciphertext  TEXT,
+        label_ciphertext   TEXT,
+        trigger            TEXT NOT NULL,
+        dayset             TEXT NOT NULL,
+        at_min             REAL,
+        mad_min            REAL,
+        after_key          TEXT,
+        hits               INTEGER NOT NULL DEFAULT 0,
+        seen_hits          INTEGER NOT NULL DEFAULT 0,
+        eligible           INTEGER NOT NULL DEFAULT 0,
+        rate               REAL,
+        lift               REAL,
+        p                  REAL,
+        stable             INTEGER,
+        first_hit_at       REAL,
+        last_hit_at        REAL,
+        misses_in_row      INTEGER NOT NULL DEFAULT 0,
+        state              TEXT NOT NULL,
+        active_since       REAL,
+        offer_mode         TEXT NOT NULL DEFAULT 'early',
+        told               INTEGER NOT NULL DEFAULT 0,
+        told_at            REAL,
+        confirmed_at       REAL,
+        fact_id            INTEGER,
+        fact_off           INTEGER NOT NULL DEFAULT 0,
+        fact_sig           TEXT,
+        fact_at            REAL,
+        created_at         REAL NOT NULL,
+        updated_at         REAL NOT NULL,
+        mined_at           REAL
+    );
+    CREATE INDEX IF NOT EXISTS routines_key ON routines(key, state);
+    CREATE TABLE IF NOT EXISTS routine_events (
+        id          INTEGER PRIMARY KEY,
+        routine_id  INTEGER NOT NULL,
+        at          REAL NOT NULL,
+        kind        TEXT NOT NULL,
+        nudge_id    INTEGER,
+        detail      TEXT
+    );
+    CREATE INDEX IF NOT EXISTS routine_events_r ON routine_events(routine_id, at);
+    CREATE INDEX IF NOT EXISTS routine_events_at ON routine_events(at, kind);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -10910,6 +10977,200 @@ class Store:
         by = {r[0]: r[1] for r in self._query("SELECT by, count(*) FROM moments GROUP BY by")}
         lo, hi = self._query("SELECT min(at), max(at) FROM moments")[0]
         return {"rows": sum(kinds.values()), "kinds": kinds, "by": by, "first_at": lo, "last_at": hi}
+
+    # -- routines: the routine miner's tables (migration 42, yuki.memory.routines) -----------------------------------
+
+    #: The columns of a routine row :meth:`save_routine` writes (``id`` aside).
+    ROUTINE_COLUMNS: tuple[str, ...] = (
+        "key", "skill_id", "app", "entity_digest", "params_ciphertext", "label_ciphertext", "trigger", "dayset",
+        "at_min", "mad_min", "after_key", "hits", "seen_hits", "eligible", "rate", "lift", "p", "stable",
+        "first_hit_at", "last_hit_at", "misses_in_row", "state", "active_since", "offer_mode", "told", "told_at",
+        "confirmed_at", "fact_id", "fact_off", "fact_sig", "fact_at", "created_at", "updated_at", "mined_at",
+    )
+
+    def routines(self, states: Iterable[str] | None = None, *, key: str | None = None,
+                 skill: str | None = None) -> list[dict[str, Any]]:
+        """Routine rows as dicts (the label and params stay encrypted), oldest first; filters: ``states``, one
+        ``key``, one ``skill`` (the skill's key)."""
+        clauses, params = [], []
+        if states is not None:
+            states = list(states)
+            clauses.append(f"state IN ({','.join('?' * len(states))})" if states else "0")
+            params.extend(states)
+        if key is not None:
+            clauses.append("key = ?")
+            params.append(key)
+        if skill is not None:
+            clauses.append("skill_id = ?")
+            params.append(skill)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return [dict(r) for r in self._query("SELECT * FROM routines" + where + " ORDER BY id", params)]
+
+    def routine(self, routine_id: int) -> dict[str, Any] | None:
+        rows = self._query("SELECT * FROM routines WHERE id = ?", (int(routine_id),))
+        return dict(rows[0]) if rows else None
+
+    def routine_label(self, row: dict[str, Any]) -> str | None:
+        """A routine's label in clear (told, or a learned name; in-process only, never logged), or None."""
+        return self._dec(row.get("label_ciphertext")) if row.get("label_ciphertext") else None
+
+    def save_routine(self, row: dict[str, Any], *, events: Sequence[tuple[str, float, dict[str, Any] | None]] = ()
+                     ) -> int:
+        """Insert a routine (no ``id``) or update the columns ``row`` names (with ``id``), and add its ``events``
+        (``(kind, at, detail)``), in one transaction; returns the row's id."""
+        values = {c: row[c] for c in self.ROUTINE_COLUMNS if c in row}
+
+        def op(conn: sqlite3.Connection) -> int:
+            rid = row.get("id")
+            if rid is None:
+                cols = list(values)
+                cur = conn.execute(f"INSERT INTO routines({', '.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                                   [values[c] for c in cols])
+                rid = int(cur.lastrowid)
+            elif values:
+                conn.execute(f"UPDATE routines SET {', '.join(f'{c}=?' for c in values)} WHERE id = ?",
+                             [*values.values(), int(rid)])
+            for kind, at, detail in events:
+                self._routine_event(conn, int(rid), kind, at, None, detail)
+            return int(rid)
+
+        return self._write(op)
+
+    @staticmethod
+    def _routine_event(conn: sqlite3.Connection, routine_id: int, kind: str, at: float, nudge_id: int | None,
+                       detail: dict[str, Any] | None) -> int:
+        cur = conn.execute(
+            "INSERT INTO routine_events(routine_id, at, kind, nudge_id, detail) VALUES (?,?,?,?,?)",
+            (int(routine_id), float(at), str(kind), nudge_id,
+             json.dumps(detail, sort_keys=True, separators=(",", ":")) if detail else None))
+        return int(cur.lastrowid)
+
+    def add_routine_event(self, routine_id: int, kind: str, at: float | None = None, *, nudge_id: int | None = None,
+                          detail: dict[str, Any] | None = None) -> int:
+        """One routine event (content-free ``detail``: numbers and code words only); returns its id."""
+        when = time.time() if at is None else float(at)
+        return self._write(lambda conn: self._routine_event(conn, routine_id, kind, when, nudge_id, detail))
+
+    def routine_events(self, routine_id: int | None = None, *, since: TimeArg = None, until: TimeArg = None,
+                       kinds: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Routine events with ``at`` in ``[since, until)``, oldest first (``detail`` parsed)."""
+        clauses, params = [], []
+        if routine_id is not None:
+            clauses.append("routine_id = ?")
+            params.append(int(routine_id))
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("at < ?")
+            params.append(u)
+        if kinds is not None:
+            kinds = list(kinds)
+            clauses.append(f"kind IN ({','.join('?' * len(kinds))})" if kinds else "0")
+            params.extend(kinds)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        out = []
+        for r in self._query("SELECT * FROM routine_events" + where + " ORDER BY at, id", params):
+            d = dict(r)
+            try:
+                d["detail"] = json.loads(d["detail"]) if d.get("detail") else {}
+            except ValueError:
+                d["detail"] = {}
+            out.append(d)
+        return out
+
+    def set_routine_mode(self, routine_id: int, mode: str, at: float | None = None, *,
+                         detail: dict[str, Any] | None = None) -> bool:
+        """Move a routine's ``offer_mode`` (early | late | quiet | off) and note a ``mode_change`` event with the
+        old and new mode; False when the routine is missing or already in that mode."""
+        when = time.time() if at is None else float(at)
+
+        def op(conn: sqlite3.Connection) -> bool:
+            row = conn.execute("SELECT offer_mode FROM routines WHERE id = ?", (int(routine_id),)).fetchone()
+            if row is None or row[0] == mode:
+                return False
+            conn.execute("UPDATE routines SET offer_mode = ?, updated_at = ? WHERE id = ?",
+                         (str(mode), when, int(routine_id)))
+            self._routine_event(conn, int(routine_id), "mode_change", when, None,
+                                {"mode_from": row[0], "mode_to": str(mode), **(detail or {})})
+            return True
+
+        return self._write(op)
+
+    def presence_spans(self, since: float, until: float) -> list[tuple[float, float]]:
+        """The user's own present stretches overlapping ``[since, until)`` (timeline rows ``present`` not begun while
+        Yuki acted), oldest first, as ``(started_at, ended_at)``: content-free (no title, page or app read)."""
+        return [(float(r[0]), float(r[1])) for r in self._query(
+            "SELECT started_at, ended_at FROM timeline WHERE state = 'present' AND by_yuki = 0 AND ended_at >= ?"
+            " AND started_at < ? ORDER BY started_at, id", (float(since), float(until)))]
+
+    def longest_episode_id(self, since: float, until: float) -> int | None:
+        """The id of the longest current episode overlapping ``[since, until)`` (a code-written fact's citation for
+        one day), or None; content-free (no text decrypted)."""
+        rows = self._query("SELECT id FROM episodes WHERE expired_at IS NULL AND ended_at > ? AND started_at < ?"
+                           " ORDER BY (ended_at - started_at) DESC, id LIMIT 1", (float(since), float(until)))
+        return int(rows[0][0]) if rows else None
+
+    def app_display_name(self, app: str | None) -> str | None:
+        """The name an app key is most often shown under in the user's own timeline rows ("Zen" for ``zen``), or
+        None."""
+        if not app:
+            return None
+        rows = self._query("SELECT app FROM timeline WHERE process = ? AND app != '' AND by_yuki = 0 GROUP BY app"
+                           " ORDER BY count(*) DESC, max(started_at) DESC LIMIT 1", (str(app),))
+        return str(rows[0][0]) if rows else None
+
+    def fact_trail(self, fact_id: int, *, limit: int = 32) -> list[dict[str, Any]]:
+        """A portrait fact version and the versions that replaced it (following ``superseded_by`` while a version is
+        ended), oldest first, content-free (nothing decrypted): ``{id, kind, origin, pinned, reviewed_at, valid_to,
+        expired_at, superseded_by, run_id, run_kind}`` (``run_kind``: the kind of the portrait run that wrote the
+        version, None for a write of no run). The routine miner asks it who ended or rewrote its measured line."""
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        nxt: int | None = int(fact_id)
+        while nxt is not None and nxt not in seen and len(out) < limit:
+            seen.add(nxt)
+            rows = self._query(
+                "SELECT f.id, f.kind, f.origin, f.pinned, f.reviewed_at, f.valid_to, f.expired_at, f.superseded_by,"
+                " f.run_id, r.kind AS run_kind FROM portrait_facts f LEFT JOIN portrait_runs r ON r.id = f.run_id"
+                " WHERE f.id = ?", (nxt,))
+            if not rows:
+                break
+            version = dict(rows[0])
+            out.append(version)
+            nxt = int(version["superseded_by"]) if version["valid_to"] is not None and version["superseded_by"] \
+                else None
+        return out
+
+    def fact_ended_by(self, fact_id: int, *, slack_s: float = 120.0) -> list[dict[str, Any]]:
+        """The memory diary's lines that say who ended a portrait fact version (an INVALIDATE leaves no other trace):
+        lines listing it in ``fact_ids`` whose run's span holds the version's end (a line of no run, such as the
+        review queue's: within ``slack_s`` of it), latest first, content-free: ``{pass, action, run_id, run_kind,
+        new_fact_ids}``. Empty when the version is current or no line says."""
+        rows = self._query("SELECT expired_at, valid_to FROM portrait_facts WHERE id = ?", (int(fact_id),))
+        if not rows or rows[0]["valid_to"] is None:
+            return []
+        end = float(rows[0]["expired_at"] if rows[0]["expired_at"] is not None else rows[0]["valid_to"])
+        out = []
+        for r in self._query(
+                "SELECT m.at, m.run_id, m.pass, m.action, m.new_fact_ids, r.kind AS run_kind, r.at AS run_at,"
+                " r.finished_at FROM memory_changelog m JOIN json_each(m.fact_ids) j LEFT JOIN portrait_runs r"
+                " ON r.id = m.run_id WHERE j.value = ? AND m.at <= ? ORDER BY m.at DESC, m.id DESC",
+                (int(fact_id), end + slack_s)):
+            if r["run_id"] is not None and r["run_at"] is not None:
+                hi = float(r["finished_at"]) if r["finished_at"] is not None else float(r["at"]) + 6 * 3600.0
+                held = float(r["run_at"]) - slack_s <= end <= hi + slack_s
+            else:
+                held = abs(float(r["at"]) - end) <= slack_s
+            if not held:
+                continue
+            try:
+                news = [int(i) for i in json.loads(r["new_fact_ids"] or "[]")]
+            except (ValueError, TypeError):
+                news = []
+            out.append({"pass": r["pass"], "action": r["action"], "run_id": r["run_id"], "run_kind": r["run_kind"],
+                        "new_fact_ids": news})
+        return out
 
 
 def _split_sql(script: str) -> list[str]:
