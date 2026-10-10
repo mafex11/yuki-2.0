@@ -99,6 +99,16 @@ def client(tmp_path):
     c.close()
 
 
+def _site_front(client: Any, service: str | None, *, app: str = "zen", at: float | None = None) -> None:
+    """Memory's sighting of a calling site's page in front (a ``site_front`` moment, as the watcher writes it)."""
+    from yuki.memory.moments import Moment
+
+    when = __import__("time").time() + 1.0 if at is None else at
+    m = Moment(kind="site_front", at=when, source="site", source_id=int(when * 1000), app=app, service=service,
+               evidence="site", facts={"sighting": "first"})
+    client.store.save_moments([m.row(client.store.cipher)])
+
+
 def _ident(client: Any, **ident: Any) -> None:
     client.store.set_nudge_state(f"site_tabs:{SERVICE}", json.dumps({"process": "zen", **ident}))
 
@@ -167,7 +177,13 @@ def test_no_meet_tab_says_so_or_opens_the_link_the_user_told(client, guard) -> N
         (client.store._enc(json.dumps({"link": "https://meet.google.com/aaa-bbbb-ccc"})),)))
     opened: list = []
     ctx = _ctx(client, words=["open my meeting"])
-    ctx.verbs = {"open_url": lambda call: opened.append(dict(call.args)) or E.RouteResult(ran=True, outcome="opened")}
+
+    def open_url(call: Any) -> E.RouteResult:
+        opened.append(dict(call.args))
+        _site_front(client, "Google Meet")         # memory sees the Meet page itself come to the front in Zen
+        return E.RouteResult(ran=True, outcome="opened")
+
+    ctx.verbs = {"open_url": open_url}
     got = _run(client, "meet.open", {}, ctx)
     assert got.outcome == "done" and got.route == "A:told_link:open_url"
     assert opened == [{"url": "https://meet.google.com/aaa-bbbb-ccc", "app": "Zen"}]
@@ -349,7 +365,8 @@ def test_a_video_named_only_in_words_goes_to_the_thinker_and_nothing_auto_plays(
     got = _run(client, "youtube.video", {"video": "the new Quillon one"},
                _ctx(client, words=["play the new Quillon one"]))
     assert got.outcome == "handed_over" and guard["opened"] == []
-    assert got.handoff["done"]["call"] == "video_shown"
+    assert got.handoff["done"]["probe"] == "all"
+    assert [p["call"] for p in got.handoff["done"]["parts"]] == ["video_shown", "video_playing"]
     # nothing names a video: never filled from taste (no video slot taste), so nothing plays unasked
     got = _run(client, "youtube.video", {}, _ctx(client, words=["play a video"]))
     assert got.outcome == "handed_over" and guard["opened"] == [] and "video" not in got.values
@@ -385,3 +402,85 @@ def test_logs_are_content_free(client, guard) -> None:
     text = json.dumps(logs, default=str)
     for secret in SECRETS:
         assert secret not in text
+
+
+# -- review round 1 ----------------------------------------------------------------------------------------------------
+
+
+def test_r1_m2_youtube_video_is_done_only_when_that_video_shows_and_plays(client, guard, monkeypatch) -> None:
+    """Review r1 M2 (B.2: page and media session playing): "Playing it on YouTube." only once the page in front is the
+    very video and the browser's media session plays; autoplay blocked or the tab behind is "couldn't confirm"."""
+    from yuki.skills.connection import load
+
+    route = load().get("youtube.video").routes[0]
+    assert route.done.probe == "all" and [p.args["call"] for p in route.done.parts] == ["video_shown",
+                                                                                        "video_playing"]
+    assert route.recheck.args["call"] == "video_playing" and route.recheck.same_source is True
+    playing: dict[str, Any] = {"status": None, "asked": []}
+
+    def media(ctx: Any, args: Any) -> Any:
+        playing["asked"].append(args["app"])
+        return playing["status"], {"stub": True}
+
+    monkeypatch.setattr(D, "probe_media_session", media)
+    res = E.RouteResult(ran=True, app="arc", facts_ram={"video_id": "abcDEF12345", "browser": "arc"})
+    clock = Clock()
+    pctx = D.ProbeContext(since=NOW, result=res, clock=clock.now, sleep=clock.sleep)
+    guard["front"] = (58, "arc.exe")
+    guard["urls"] = ["https://www.youtube.com/watch?v=abcDEF12345"]
+    assert D.wait(route.done, pctx).verdict is None                       # shown, not seen playing: never a done
+    playing["status"] = True
+    assert D.wait(route.done, pctx).verdict is True
+    guard["urls"] = ["https://www.youtube.com/watch?v=other999"]
+    assert D.wait(route.done, pctx).verdict is False                      # another video is a "no"
+    assert set(playing["asked"]) == {"arc"}
+    # after a hand-off (no route result) the playing check reads the browser in front
+    playing["asked"].clear()
+    guard["urls"] = ["https://www.youtube.com/watch?v=abcDEF12345"]
+    assert D.read(route.done, D.ProbeContext(since=NOW))[0] is True and playing["asked"] == ["arc"]
+
+
+def test_r1_l2_meet_recheck_and_told_link_need_memorys_google_meet_sighting(client, guard) -> None:
+    """Review r1 L2: a tab that came forward but isn't the Meet page is caught by memory's own site_front sighting."""
+    from yuki.skills.connection import load
+
+    census, told = load().get("meet.open").routes
+    assert census.recheck.args["call"] == "site_front" and told.done.args["call"] == "site_front"
+    since = __import__("time").time() - 30.0
+    pctx = D.ProbeContext(since=since, memory_call=lambda what, fn: fn(client))
+    args = {"app": "zen", "service": "Google Meet"}
+    _site_front(client, "Google Meet", at=since - 60)                    # before the run: not this run's
+    assert W.probe_site_front(pctx, args)[0] is None
+    _site_front(client, "Zoom", at=since + 1)                            # another calling site came up in Zen
+    assert W.probe_site_front(pctx, args)[0] is False
+    _site_front(client, "Google Meet", app="chrome", at=since + 2)       # Meet, but in another browser
+    assert W.probe_site_front(pctx, args)[0] is False
+    _site_front(client, "Google Meet", at=since + 3)
+    assert W.probe_site_front(pctx, args) == (True, {"n": 2})
+
+
+def test_r1_m3_the_browser_rule_replay_runs_on_a_store_and_prints_counts_only(client) -> None:
+    """Review r1 M3: the replay behind B.2's browser bar is committed and re-runnable (on a copy; here on invented
+    rows): sessions split in time, the definition chosen on the first half and scored on the held-out half."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "browser_rule_replay.py"
+    spec = importlib.util.spec_from_file_location("browser_rule_replay", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    s = client.store
+    t = NOW - 12 * 86400
+    for k, host in enumerate(("docs.example.org", "news.example.org", "shop.example.org")):
+        _timeline(s, "thistlenav", "Thistle Nav", host, t + k, 300)
+    for day in range(1, 9):                                       # 8 YouTube sessions a day apart, in Thistle Nav
+        start = t + day * 86400
+        _timeline(s, "thistlenav", "Thistle Nav", "news.example.org", start - 120, 100)   # in front just before
+        _timeline(s, "thistlenav", "Thistle Nav", "www.youtube.com", start, 600)
+    _timeline(s, "quillbrowse", "Quill", "www.youtube.com", t + 9.5 * 86400, 600)          # one in another browser
+    out = mod.replay(s, since=t, cut=None)
+    assert out["sessions"] == 9 and out["choose_n"] + out["held_n"] == 9 and len(out["grid"]) == 20
+    assert out["shipped"]["held_hits"] == out["held_n"] - 1                 # the Quill session is the one miss
+    assert out["shipped"]["by_source"]["front"][0] >= 1
+    text = json.dumps(out)
+    assert "thistlenav" not in text and "quillbrowse" not in text and "youtube" not in text

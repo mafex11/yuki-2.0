@@ -18,7 +18,6 @@ title = "WhatsApp"
 images = ["WhatsApp.Root.exe", "WhatsApp.exe"]
 processes = ["whatsapp.root", "whatsapp"]
 services = ["web.whatsapp.com", "whatsapp.root", "whatsapp"]
-message_app = "whatsapp"
 # its chat search (only ever sent into WhatsApp's own window, with no game in front)
 search = ["ctrl", "f"]
 send = ["enter"]

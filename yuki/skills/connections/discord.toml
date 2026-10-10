@@ -20,8 +20,6 @@ images = ["Discord.exe"]
 processes = ["discord"]
 # the services memory's people index stores Discord routes under (a URL host, or the process key)
 services = ["discord.com", "discord"]
-# the app key memory's capture filters the user's sent messages by (MemoryClient.sent_messages)
-message_app = "discord"
 # its documented shortcuts (only ever sent into Discord's own window, with no game in front)
 switcher = ["ctrl", "k"]
 open = ["enter"]

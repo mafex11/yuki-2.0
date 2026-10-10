@@ -34,11 +34,11 @@ type = "text"
 required = true
 ask = "Who to?"
 
-# The app, when the user named one.
+# The app, only when the user named one: validated as said (no options list, so an app the talker supplies but the
+# user never said is dropped and the person's usual route stands). An app with no chat data here is a question.
 [[skill.message.slot]]
 name = "app"
 type = "app"
-options = ["discord", "whatsapp", "slack"]
 
 # What to write: the user's own words only ("" = just open the chat).
 [[skill.message.slot]]

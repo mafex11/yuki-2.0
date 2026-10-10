@@ -17,7 +17,6 @@ title = "Slack"
 images = ["slack.exe"]
 processes = ["slack"]
 services = ["app.slack.com", "slack"]
-message_app = "slack"
 switcher = ["ctrl", "k"]
 open = ["enter"]
 send = ["enter"]

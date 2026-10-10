@@ -122,6 +122,13 @@ class Desk:
         self.effects: dict[Any, Any] = {}
         self._dispatcher = self
         self.act_off_for: str | None = None
+        #: The text field with the keyboard (role, name). A switcher or search shortcut moves it to that box when
+        #: ``switcher_opens``; Enter or a picked row gives it back to the chat's composer.
+        self.field = ("Edit", "Message")
+        self.switcher_opens = True
+        self.box_keys = {"ctrl+k", "ctrl+f"}
+        #: What the chat's composer holds (typed into it; Enter in it sends and empties it; the app keeps a draft).
+        self.composer = ""
 
     def overview_text(self) -> tuple[str, dict[str, Any], float]:
         return "", {"windows": [{"hwnd": h, "pid": 0, **w} for h, w in self.windows.items()],
@@ -130,6 +137,14 @@ class Desk:
     def dispatch(self, name: str, args: dict[str, Any]) -> Any:
         self.calls.append((name, dict(args)))
         key = args.get("element") if name == "click" else (name, "+".join(args.get("keys") or []))
+        if name == "type_text" and self.field[1] == "Message":
+            self.composer += str(args.get("text") or "")
+        if name == "hotkey" and key[1] in self.box_keys and self.switcher_opens:
+            self.field = ("Edit", "Switcher")
+        elif (name == "hotkey" and key[1] == "enter") or name == "click":
+            if name == "hotkey" and self.field[1] == "Message":
+                self.composer = ""
+            self.field = ("Edit", "Message")
         effect = self.effects.get(key)
         if effect is not None:
             effect()
@@ -154,7 +169,9 @@ class Desk:
         return ""
 
     def _focus(self, timeout_s: float = 0.4) -> Any:
-        return SimpleNamespace(accepts_text=True, is_password=False, window=self.front, role="Edit", name="Message")
+        return SimpleNamespace(accepts_text=True, is_password=False, window=self.front, role=self.field[0],
+                               name=self.field[1], text_source="value",
+                               value=self.composer if self.field[1] == "Message" else "")
 
     def snapshot(self) -> None:
         return None

@@ -25,8 +25,10 @@ in front, or the last one in front at most 30 minutes ago; else their usual (the
 resolver filled); else the browser YouTube was last shown in; else the browser they use most; else Windows' default
 handler. "A browser" is measured, never a list: a program whose own timeline rows (not Yuki's) of the last 14 days
 showed pages of at least 3 hosts, or a YouTube page (a chat app that draws its one site in its own window shows one or
-two hosts: the threshold comes from the user's own memory, where the rule then picked the browser actually used
-for 94.5% of 379 YouTube sessions; counting any program with a page, 57.5%).
+two hosts). ``scripts/browser_rule_replay.py`` replays the rule on a copy of memory with a time split (the definition
+chosen on the earlier half, scored on the later one): on 10 Oct it picked the browser actually used for 84.9% of the
+33 held-out YouTube sessions, under B.2's 94% bar (the misses are the plan's "last in front <= 30 min" step); counting
+any program with a page, 57.6%.
 The address (from ``yuki/connect/sites/youtube.toml``) is a launch argument (``launch.open_url``: nothing typed).
 youtube.home opens the home page and nothing else: nothing plays until the user picks. youtube.video opens the picked
 video's own link and is checked by the page in front showing that video and the browser's media session playing. A
@@ -302,12 +304,15 @@ def probe_meet_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, di
 
 
 def measured_browsers(store: Any, *, now: float | None = None, days: float = BROWSER_DAYS,
-                      site_hosts: Sequence[str] = ()) -> list[dict[str, Any]]:
+                      site_hosts: Sequence[str] = (), min_hosts: int = BROWSER_MIN_HOSTS,
+                      by_site: bool = True) -> list[dict[str, Any]]:
     """The browsers among the programs in the user's own timeline rows (never Yuki's) of the last ``days``, most used
     first: ``{"key", "name", "seconds", "last", "hosts", "site_last"}`` (app key, display name as Windows shows it, time
     on pages, its last row's end, distinct hosts, when it last showed a page of ``site_hosts``). A browser is measured,
     never listed: a program that showed pages of at least :data:`BROWSER_MIN_HOSTS` hosts, or a page of the site itself
-    (an app that draws one site in its own window, such as a chat app, shows one or two). Never raises (``[]``)."""
+    (an app that draws one site in its own window, such as a chat app, shows one or two). ``min_hosts`` / ``by_site``
+    are the definition's two knobs, for the replay that chose them (``scripts/browser_rule_replay.py``). Never raises
+    (``[]``)."""
     now = time.time() if now is None else float(now)
     hosts = [str(h).casefold() for h in site_hosts if h]
     site_sql = (f"max(CASE WHEN host IN ({','.join('?' * len(hosts))}) THEN ended_at END)" if hosts else "NULL")
@@ -322,7 +327,7 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     out = []
     for process, seconds, last, n_hosts, site_last in rows:
         key = _app_key(process)
-        if not key or not (int(n_hosts or 0) >= BROWSER_MIN_HOSTS or site_last is not None):
+        if not key or not (int(n_hosts or 0) >= int(min_hosts) or (by_site and site_last is not None)):
             continue
         name = ""
         try:
@@ -354,12 +359,12 @@ def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, 
 
 
 def browser_rule(*, named: str | None, said: bool, front: str | None, recent: str | None, pref: str | None,
-                 measured: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
+                 measured: Sequence[Mapping[str, Any]], site_first: bool = True) -> tuple[str, str]:
     """``(browser app key, where it came from)`` by the rule (map-skills S2.2, redteam D4): ``words`` (named and in
     their words) > ``front`` (a measured browser in front) > ``recent`` (the last browser in front, <= 30 min ago) >
     ``pref`` (their usual, the resolver's fill) > ``site`` (the browser the site was last shown in) > ``most`` (the
     browser they use most) > ``default`` (``""``: Windows' handler). Pure: the replay on a database copy runs it too
-    (``site`` before ``most``: in the replay on the copy it lifted the share from 93.1% to 95.0% of 379 sessions)."""
+    (``scripts/browser_rule_replay.py``; ``site_first = False`` is the variant without the ``site`` step, for it)."""
     keys = [str(m.get("key") or "") for m in measured if m.get("key")]
     if named and said:
         return _app_key(named), "words"
@@ -369,7 +374,7 @@ def browser_rule(*, named: str | None, said: bool, front: str | None, recent: st
         return recent, "recent"
     if pref:
         return _app_key(pref), "pref"
-    shown = [m for m in measured if m.get("key") and m.get("site_last") is not None]
+    shown = [m for m in measured if m.get("key") and m.get("site_last") is not None] if site_first else []
     if shown:
         return str(max(shown, key=lambda m: float(m["site_last"]))["key"]), "site"
     if keys:
@@ -533,15 +538,46 @@ def probe_video_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, d
 
 
 def probe_video_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    """youtube.video's re-check: the browser's own media session says playing (a second source)."""
+    """youtube.video's playing check (part of its done-check, review r1 M2, and its re-check): the browser's own media
+    session says playing. The browser is the one the route opened the page in; after a hand-off (no route result) the
+    program of the window in front (the page the done-check's other part reads is in it)."""
     from yuki.skills.donecheck import probe_media_session
 
     result = getattr(ctx, "result", None)
     ram = getattr(result, "facts_ram", None) or {}
     browser = str(ram.get("browser") or getattr(result, "app", "") or "")
     if not browser:
+        _hwnd, image = _front()
+        browser = _app_key(image)
+    if not browser:
         return None, {"status": "no_browser"}
     return probe_media_session(ctx, {"app": browser, "status": "playing"})
+
+
+def probe_site_front(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    """meet.open's re-check and the told link's done-check (review r1 L2, B.2's alternative): memory's own sighting of
+    the calling site in front since the run began, a ``site_front`` moment of ``service`` (a product name the moments
+    keep, never a title) in ``app``. Seen: True. Only another calling site of that app in front since: False (the tab
+    that came up is not the meeting). Nothing seen yet: None (the 1 s moment beat may lag)."""
+    call = getattr(ctx, "memory_call", None)
+    if call is None:
+        return None, {"status": "no_memory"}
+    app, service = _app_key(args.get("app")), " ".join(str(args.get("service") or "").split())
+    if not app or not service:
+        return None, {"status": "no_args"}
+    try:
+        rows = call("moments", lambda c: getattr(c, "store", c).moments_between(
+            float(ctx.since), time.time() + 1.0, kinds=["site_front"], app=app))
+    except Exception:  # noqa: BLE001
+        return None, {"status": "unread"}
+    if not isinstance(rows, list):
+        return None, {"status": "unread"}
+    opened = [r for r in rows if isinstance(r, Mapping) and r.get("service") is not None]
+    if any(str(r.get("service")).casefold() == service.casefold() for r in opened):
+        return True, {"n": len(opened)}
+    if opened:
+        return False, {"n": len(opened), "status": "other_site"}
+    return None, {"n": 0, "status": "not_seen_yet"}
 
 
 def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -580,11 +616,12 @@ ROUTES: dict[str, Callable[[RouteCall], RouteResult]] = {
 }
 PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {
     "meet_shown": probe_meet_shown, "video_shown": probe_video_shown, "video_playing": probe_video_playing,
-    "page_seen": probe_page_seen,
+    "page_seen": probe_page_seen, "site_front": probe_site_front,
 }
 
 __all__ = ["ROUTES", "PROBES", "route_meet_open", "route_youtube_home", "route_youtube_video", "probe_meet_shown",
-           "probe_video_shown", "probe_video_playing", "probe_page_seen", "browser_rule", "choose_browser",
+           "probe_video_shown", "probe_video_playing", "probe_page_seen", "probe_site_front", "browser_rule",
+           "choose_browser",
            "measured_browsers", "last_in_front", "site_hosts", "BROWSER_MIN_HOSTS", "video_link",
            "LINE_MEET_UNREADABLE", "LINE_MEET_NONE",
            "LINE_MEET_UNKNOWN", "LINE_ZEN_CLOSED", "LINE_MEET_NO_ID", "ASK_MEET_WHICH"]

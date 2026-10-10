@@ -24,7 +24,8 @@ The app is the one the user named, else the usual route's; the done line names a
   with the app's filter character, Enter) or chat search (WhatsApp: its search shortcut, the name, then the result row
   picked by the keyed digest of that name), run through the voice hands' step runner (each step checked, Yuki's own
   check on every key and every typed text, the user's hands stop it), into the app's own window only, brought forward
-  first by the guarded ``focus_window``.
+  first by the guarded ``focus_window``. The name is typed only once another text field took the keyboard after the
+  shortcut (the switcher or the search box opened; :func:`_run_switch`); otherwise nothing more is sent.
 
 **Checked open by encrypted ids, never a title** (:func:`chat_state`): memory's own read of the window in front (the
 watcher's Now board, read after the run began) is looked up as a capture thread (``Store.find_thread``: a keyed digest
@@ -36,7 +37,10 @@ confirmed open.**
 judged by Yuki's own check with the user's words, and both whom and what must stand in their words
 (:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
 types it and leaves it; no text just opens the chat. A send is "done" only when memory captured the user's own message
-with that text in that app (``message_sent``, the messages table); "pressed send, couldn't confirm it landed" otherwise.
+with that text in that very chat (the messages table, matched by the route's capture thread ids, never by the app's
+name); "pressed send, couldn't confirm it landed" otherwise, once the send key went out (its own step dispatched).
+If Yuki's own check holds the send key after the text was typed, the user is told it's typed and not sent (never
+asked: a "yes" would type it twice).
 A rung that acted on a send is never followed by another (the engine's rule: never twice).
 
 **discord.voice** (:func:`route_voice_join`): Discord's quick switcher with its voice filter ("!") and the channel's
@@ -79,6 +83,9 @@ LINE_NOT_TYPED = "I opened your chat with {name}, but couldn't type it."
 LINE_DRAFT_UNCONFIRMED = "I typed it in your chat with {name}, but couldn't confirm it's there."
 LINE_TYPED_NOT_SENT = "I typed it in your chat with {name}, but couldn't confirm it, so I didn't send it."
 LINE_SENT_UNCONFIRMED = "I pressed send to {name}, but couldn't confirm it landed."
+#: Yuki's own check held the send key after the text was typed (review r1 L6): told, not asked, so a "yes" never
+#: re-runs the skill and types the text a second time into the kept draft.
+LINE_TYPED_HELD = "It's typed in your chat with {name}, but I held back sending it. Press Enter when you want it to go."
 LINE_VOICE_UNCONFIRMED = "I opened {channel} in Discord, but couldn't confirm you joined it."
 #: The done lines (said only once the done-check saw it).
 SAY_OPENED = "Your chat with {name} is open{where}."
@@ -444,8 +451,99 @@ def _stopped(facts: Mapping[str, Any], app: str, *, acted: bool) -> RouteResult 
     return None
 
 
-def _step_verdicts(facts: Mapping[str, Any]) -> list[bool | None]:
-    return [getattr(r, "verdict", None) for r in facts.get("results") or [] if getattr(r, "kind", "") == "action"]
+def _step_verdict(facts: Mapping[str, Any], do: str) -> bool | None:
+    """The verdict of the first action of kind ``do`` in this run (``None``: none ran, or its effect couldn't be
+    seen)."""
+    for r in facts.get("results") or []:
+        if getattr(r, "kind", "") == "action" and getattr(getattr(r, "step", None), "do", "") == do:
+            return getattr(r, "verdict", None)
+    return None
+
+
+def _draft_kept(hands: Any, text: str) -> bool:
+    """Whether the text field with the keyboard (the opened chat's composer) already holds exactly ``text``, whitespace
+    and case folded: an identity check of the user's own words, read in RAM and dropped (never logged)."""
+    from yuki.skills.donecheck import _norm_text
+
+    read = getattr(hands, "_focus", None)
+    if not callable(read) or not text:
+        return False
+    try:
+        snap = read(timeout_s=0.4)
+    except Exception:  # noqa: BLE001
+        return False
+    if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+        return False
+    if getattr(snap, "text_source", "") == "text":
+        held = f"{getattr(snap, 'before', '') or ''}{getattr(snap, 'after', '') or ''}"
+    else:
+        held = str(getattr(snap, "value", "") or "")
+    return bool(held.strip()) and _norm_text(held) == _norm_text(text)
+
+
+def _dispatched(facts: Mapping[str, Any], do: str) -> bool:
+    """Whether a step of kind ``do`` ran in this run: its action went out (``result.ok``: dispatched), whatever its
+    screen watch then saw (review r1 M1: a send key whose watch saw no change was still pressed)."""
+    return any(getattr(r, "kind", "") == "action" and bool(getattr(r, "ok", False))
+               and getattr(getattr(r, "step", None), "do", "") == do for r in facts.get("results") or [])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The quick switcher seen open before anything is typed into it (review r1 L1)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: How long the field with the keyboard may take to change after the switcher's shortcut (s; only while waiting).
+SWITCHER_WAIT_S = 1.5
+
+
+def _field(hands: Any) -> tuple[int, int, str, str] | None:
+    """The text field with the keyboard as an identity (its window, native window, role and name: UI facts, never
+    read for meaning), or ``None`` when no text field has it or it can't be read."""
+    read = getattr(hands, "_focus", None)
+    if not callable(read):
+        return None
+    try:
+        snap = read(timeout_s=0.4)
+    except Exception:  # noqa: BLE001
+        return None
+    if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
+        return None
+    return (int(getattr(snap, "window", 0) or 0), int(getattr(snap, "hwnd", 0) or 0),
+            str(getattr(snap, "role", "") or ""), str(getattr(snap, "name", "") or ""))
+
+
+def _field_changed(ctx: Any, hands: Any, before: tuple[int, int, str, str] | None) -> bool:
+    """Whether another text field took the keyboard after the shortcut (the switcher's or the search box's), read
+    every :data:`POLL_S` for at most :data:`SWITCHER_WAIT_S`."""
+    deadline = ctx.clock() + SWITCHER_WAIT_S
+    while True:
+        now = _field(hands)
+        if now is not None and now != before:
+            return True
+        if ctx.clock() + POLL_S > deadline:
+            return False
+        ctx.sleep(POLL_S)
+
+
+def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, apps: Sequence[str], key: str,
+                way_text: str) -> tuple[bool, dict[str, Any]]:
+    """The switcher's (or search's) steps, its shortcut first on its own: the name is typed and Enter pressed only once
+    a different text field took the keyboard (the switcher opened). If it didn't, nothing more is sent (a name typed
+    into the open chat's composer and Enter would send it): ``facts["switcher"] = "unseen"``."""
+    before = _field(hands)
+    ok, first = run_steps(hands, steps[:1], words=call.ctx.words, apps=apps, key=key)
+    first["steps"] = len(steps)
+    if not ok or int(first.get("steps_done") or 0) < 1:
+        return False, first
+    if not _field_changed(call.ctx, hands, before):
+        first["switcher"] = "unseen"
+        return False, first
+    ok, rest = run_steps(hands, steps[1:], words=call.ctx.words, apps=apps, key=key, way_text=way_text)
+    merged = dict(rest)
+    merged["steps"] = len(steps)
+    merged["steps_done"] = int(first.get("steps_done") or 0) + int(rest.get("steps_done") or 0)
+    merged["results"] = list(first.get("results") or []) + list(rest.get("results") or [])
+    return ok, merged
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -651,17 +749,32 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
                            facts_ram=ram)
-    steps: list[dict[str, Any]] = [{"do": "type", "text": text}]
+    # review r1 L6: the chat's composer already holds exactly these words (a draft Yuki typed on an earlier run whose
+    # send key was held, kept by the app): they are never typed a second time; only the send key, if asked
+    kept = _draft_kept(call.ctx.hands, text)
+    steps: list[dict[str, Any]] = [] if kept else [{"do": "type", "text": text}]
     if send:
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
-    ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
-                        key="message", sends={"to": target.said, "what": text} if send else None)
-    verdicts = _step_verdicts(run)
-    typed = verdicts[0] if verdicts else (None if not run.get("refused_steps") else False)
-    pressed = bool(send and ok and len(verdicts) >= 2)
+    if steps:
+        _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
+                             key="message", sends={"to": target.said, "what": text} if send else None)
+    else:
+        run = {"steps": 0, "steps_done": 0, "results": []}
+    facts["kept_draft"] = kept
+    typed = True if kept else _step_verdict(run, "type")
+    if typed is None and not kept and run.get("refused_steps"):
+        typed = False
+    # review r1 M1: the send key counts as pressed once it went out (its own step dispatched), never from the run's
+    # overall ok (a screen watch that saw no change after Enter makes the run "not ok", yet the message may be gone)
+    pressed = bool(send and _dispatched(run, "keys"))
     ram.update(typed=typed, pressed=pressed)
     facts.update(typed={True: "yes", False: "no", None: "unknown"}[typed], pressed=pressed,
                  steps=int(run.get("steps") or len(steps)), steps_done=int(run.get("steps_done") or 0))
+    if send and not pressed and run.get("held") and _dispatched(run, "type"):
+        # review r1 L6: the text is in the composer and Yuki's own check held the send key. Told, not asked: a "yes"
+        # would re-run the skill and type the text again into the kept draft
+        return RouteResult(ran=True, ask=LINE_TYPED_HELD.format(name=name), outcome="typed_held", app=app,
+                           facts={**facts, "held_at": "send"}, facts_ram=ram)
     stop = _stopped(run, app, acted=True)
     if stop is not None:
         stop.facts.update(facts)
@@ -726,12 +839,14 @@ def route_switcher(call: RouteCall) -> RouteResult:
     if failed is not None:
         return failed
     since = time.time()
-    ok, run = run_steps(hands, steps, words=call.ctx.words, apps=list(data.get("images") or []), key="message",
-                        way_text=way_text)
+    ok, run = _run_switch(call, hands, steps, apps=list(data.get("images") or []), key="message", way_text=way_text)
     done = int(run.get("steps_done") or 0)
     stop = _stopped(run, app, acted=done > 0)
     if stop is not None:
         return stop
+    if run.get("switcher") == "unseen":
+        # review r1 L1: the shortcut went but no other field took the keyboard: nothing typed, nothing sent
+        return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
     if done == 0:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
     return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd)
@@ -763,11 +878,42 @@ def _switch_steps(call: RouteCall, data: Mapping[str, Any], route: ChatRoute) ->
     return [], ""
 
 
+#: How many of the user's newest captured messages (every app) the send check reads.
+SENT_ROWS = 50
+
+
+def sent_in_chat(ctx: Any, text: str, thread_ids: Sequence[int]) -> tuple[bool | None, dict[str, Any]]:
+    """The user's own message with ``text`` captured since the run began in one of these capture threads (the chat the
+    route opened, by memory's thread ids; review r1 M5, L7): True. Matched by thread, never by the app's name (a chat
+    kept under an older program key or display name still counts; the same text in another chat of that app doesn't).
+    Nothing matching yet: ``None``, never False (the watcher lags)."""
+    from yuki.skills.donecheck import _same_text
+
+    ids = {int(t) for t in thread_ids or [] if isinstance(t, int)}
+    call = getattr(ctx, "memory_call", None)
+    if call is None:
+        return None, {"status": "no_memory"}
+    if not ids:
+        return None, {"status": "no_threads"}
+    try:
+        got = call("sent_messages", lambda c: c.sent_messages(None, since=float(ctx.since), limit=SENT_ROWS))
+    except Exception:  # noqa: BLE001
+        return None, {"status": "unread"}
+    if not isinstance(got, list):
+        return None, {"status": "unread"}
+    rows = [r for r in got if isinstance(r, Mapping) and isinstance(r.get("thread"), int) and int(r["thread"]) in ids]
+    hits = sum(1 for r in rows if _same_text(text, str(r.get("text") or "")))
+    if hits:
+        return True, {"n": len(rows), "matched": hits}
+    return None, {"n": len(rows), "other_chats": len(got) - len(rows), "status": "not_seen_yet"}
+
+
 def probe_message_done(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    """``message``'s done-check. A send: memory captured the user's own message with that text in that app since the run
-    began (``message_sent``; none yet is "couldn't confirm", never "no"; send never pressed is "no" when nothing could
-    have gone). A draft: the chat was seen open and the text read back typed. Just opening: the chat seen open. With
-    ``live`` (the re-check) or after a hand-off (no route result) it reads the chat again now."""
+    """``message``'s done-check. A send: memory captured the user's own message with that text in that chat since the
+    run began (:func:`sent_in_chat`, by the route's thread ids; none yet is "couldn't confirm", never "no"; send never
+    pressed is "no" when nothing could have gone). A draft: the chat was seen open and the text read back typed. Just
+    opening: the chat seen open. With ``live`` (the re-check) or after a hand-off (no route result) it reads the chat
+    again now."""
     app = str(args.get("app") or "")
     send = str(args.get("send") or "") == "send"
     text = _words(args.get("text"))
@@ -781,10 +927,14 @@ def probe_message_done(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
             if ram.get("chat") is False or ram.get("typed") is False:
                 return False, {"status": "not_sent"}
             return None, {"status": "not_pressed"}
-        from yuki.skills.donecheck import probe_message_sent
-
-        data = app_data(ram.get("app") or app) if ram else {}
-        return probe_message_sent(ctx, {"text": text, "app": data.get("message_app") or None})
+        thread_ids = list(ram.get("thread_ids") or [])
+        if not thread_ids:
+            # after a hand-off: every chat memory has with them (whatever app the thinker used)
+            store = _probe_store(ctx)
+            target = find_target(store, str(args.get("person") or "")) if store is not None else None
+            if isinstance(target, Target):
+                thread_ids = [t for r in target.routes for t in r.thread_ids]
+        return sent_in_chat(ctx, text, thread_ids)
     if ram and not live:
         chat = ram.get("chat")
         if chat is False:
@@ -883,12 +1033,15 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     query = prefix + (name[len(prefix):].strip() if prefix and name.startswith(prefix) else name)
     steps = [{"do": "keys", "keys": [str(k) for k in data["switcher"]]}, {"do": "type", "text": query},
              {"do": "keys", "keys": [str(k) for k in data.get("open") or ["enter"]]}]
-    ok, run = run_steps(hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
-                        key="discord.voice", way_text=query)
+    ok, run = _run_switch(call, hands, steps, apps=list(data.get("images") or []), key="discord.voice",
+                          way_text=query)
     done = int(run.get("steps_done") or 0)
     stop = _stopped(run, app, acted=done > 0)
     if stop is not None:
         return stop
+    if run.get("switcher") == "unseen":
+        # review r1 L1: the switcher never took the keyboard: the channel's name is never typed into a chat
+        return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
     if done == 0:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
     joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
@@ -931,4 +1084,4 @@ PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message
 
 __all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
            "pick_route", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
-           "route_switcher", "route_voice_join", "probe_message_done"]
+           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat"]

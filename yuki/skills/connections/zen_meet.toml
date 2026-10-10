@@ -52,7 +52,15 @@ args = { process = "zen.exe", service = "Google Meet" }
 # a wrong tab or a Zen that would not come forward is never followed by opening the told link (a second Meet tab)
 retry_after_acting = false
 done = { probe = "driver", driver = "web_route", call = "meet_shown", process = "zen.exe", within_s = 2 }
-recheck = { probe = "foreground", process = "zen.exe", after_s = 3 }
+# memory's own sighting of Google Meet in front in Zen since the run began (a site_front moment: a second source that
+# tells a Meet tab from any other tab; review r1 L2)
+[skill."meet.open".route.recheck]
+probe = "driver"
+driver = "web_route"
+call = "site_front"
+app = "zen"
+service = "Google Meet"
+after_s = 3
 
 # Rung A, second: no Meet tab open and a told link -> open it in Zen (launch arguments, nothing typed).
 [[skill."meet.open".route]]
@@ -61,5 +69,12 @@ variant = "told_link"
 via = "open_url"
 when = { slot = "link", present = true }
 args = { url = "{link}", app = "Zen" }
-done = { probe = "foreground", process = "zen.exe", within_s = 4 }
-recheck = { probe = "moment", kind = "site_front", app = "zen", after_s = 4 }
+recheck = { probe = "foreground", process = "zen.exe", after_s = 3 }
+# done only when memory saw Google Meet itself in front in Zen (review r1 L2), not just Zen in front
+[skill."meet.open".route.done]
+probe = "driver"
+driver = "web_route"
+call = "site_front"
+app = "zen"
+service = "Google Meet"
+within_s = 6

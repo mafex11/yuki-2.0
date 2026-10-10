@@ -493,3 +493,168 @@ def test_a_person_with_no_chat_in_these_apps_goes_to_the_thinker(client, guard) 
     route(client.store, contact(client.store, "Rook Vale"), "pigeon", "dm", "Rook Vale", None, [tid])
     got = _run(client, _ctx(client, hands=_desk(client, guard), words=["message Rook"]), {"person": "Rook"})
     assert got.outcome == "handed_over" and guard["focused"] == [] and guard["opened"] == []
+
+
+# -- review round 1 ----------------------------------------------------------------------------------------------------
+
+
+def _capture(client: Any, tid: int, text: str, n: int = 777) -> None:
+    """The watcher captures the user's own message ``text`` in thread ``tid`` (after any run's start)."""
+    msg(client.store, tid, n, me=True, at=NOW + 5, text=text)
+    client.store._write(lambda conn: conn.execute("UPDATE messages SET first_seen = ? WHERE id = (SELECT max(id) "
+                                                  "FROM messages)", (10 ** 10,)))
+
+
+def test_r1_m1_a_send_key_that_went_out_with_no_visible_change_is_pressed_not_unsent(client, guard) -> None:
+    """Review r1 M1: Enter was dispatched but its screen watch saw no change (the run reports no_effect). Yuki must
+    never say "I didn't send it": it reads memory's capture and says "couldn't confirm it landed" when it isn't
+    seen, or "Sent" when it is."""
+    for captured in (False, True):
+        desk = _desk(client, guard)
+        presses = {"n": 0}
+        real = desk.dispatch
+
+        def dispatch(name: str, args: dict[str, Any], _real: Any = real, _presses: dict = presses,
+                     _captured: bool = captured) -> Any:
+            out = _real(name, args)
+            if name == "hotkey" and args.get("keys") == ["enter"]:
+                _presses["n"] += 1
+                if _presses["n"] == 1:
+                    _open_on(guard, client, client.w["juno_dc"], DISCORD_HWND, "Discord.exe")()
+                else:
+                    if _captured:
+                        _capture(client, client.w["juno_dc"], "see you at nine", n=800 + _presses["n"])
+                    return SimpleNamespace(ok=True, payload={"details": {"verified": False}}, summary="no change",
+                                           elapsed_ms=1.0)
+            return out
+
+        desk.dispatch = dispatch
+        got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
+                   {"person": "Juno", "text": "see you at nine", "send": "send"})
+        assert desk.keys() == ["ctrl+k", "enter", "enter"]                    # the send key went out
+        assert "didn't send" not in (got.say or "")
+        if captured:
+            assert got.outcome == "done" and got.done_line == "Sent to Juno Pike on Discord.", got
+        else:
+            assert got.outcome == "unverified"
+            assert got.say == "I pressed send to Juno Pike, but couldn't confirm it landed."
+
+
+def test_r1_m5_a_send_in_an_old_style_whatsapp_chat_is_confirmed_by_its_thread(client, guard) -> None:
+    """Review r1 M5: threads kept before 2 Oct carry app "WhatsApp.Root" (process whatsapp.root); the send is matched
+    by the route's own capture thread, never by the app's name, so it is confirmed."""
+    from _sweb_world import contact, route, thread
+
+    tid = thread(client.store, "WhatsApp.Root", "WhatsApp", None, "WhatsApp.Root.exe", "Wren Ashby", mine=5)
+    assert client.store._query("SELECT app FROM threads WHERE id = ?", (tid,))[0][0] == "WhatsApp.Root"
+    route(client.store, contact(client.store, "Wren Ashby"), "whatsapp.root", "dm", "Wren Ashby", "+44 7700 900456",
+          [tid])
+    desk = _desk(client, guard, WA_HWND, "WhatsApp.Root.exe")
+    desk.front = WA_HWND
+    guard["on_open"] = lambda uri: _open_on(guard, client, tid, WA_HWND, "WhatsApp.Root.exe")()
+    desk.effects[("hotkey", "enter")] = lambda: _capture(client, tid, "otter cove")
+    got = _run(client, _ctx(client, hands=desk, words=["send otter cove to Wren"]),
+               {"person": "Wren", "text": "otter cove", "send": "send"})
+    assert guard["opened"] == ["whatsapp://send?phone=447700900456"]
+    assert got.outcome == "done" and got.done_line == "Sent to Wren Ashby on WhatsApp.", got
+
+
+def test_r1_l7_the_same_text_in_another_chat_of_that_app_is_not_this_send(client, guard) -> None:
+    """Review r1 L7: a matching message captured in another chat of the same app never counts as "Sent to X"."""
+    since = NOW + 100
+    juno, dune = client.w["juno_dc"], client.w["dune_dc"]
+    result = SimpleNamespace(facts_ram={"app": "discord", "thread_ids": [juno], "chat": True, "typed": True,
+                                        "pressed": True})
+    ctx = D.ProbeContext(since=since, memory_call=lambda what, fn: fn(client), result=result)
+    args = {"app": "discord", "person": "Juno", "text": "otter cove", "send": "send"}
+    _capture(client, dune, "otter cove", n=901)                            # in Mira Dune's chat, not Juno's
+    got = CH.probe_message_done(ctx, args)
+    assert got[0] is None and got[1]["other_chats"] >= 1
+    _capture(client, juno, "otter cove", n=902)
+    assert CH.probe_message_done(ctx, args)[0] is True
+
+
+def test_r1_l1_the_name_is_never_typed_when_the_switcher_did_not_open(client, guard) -> None:
+    """Review r1 L1: if no other field took the keyboard after Ctrl+K, nothing is typed and Enter is never pressed
+    (the name would go into the open chat and be sent)."""
+    desk = _desk(client, guard)
+    desk.switcher_opens = False
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert desk.keys() == ["ctrl+k"] and desk.typed() == []
+    assert got.outcome == "handed_over" and not got.done                  # nothing typed: the thinker, pinned
+    desk = _desk(client, guard)
+    desk.switcher_opens = False
+    got = _run(client, _ctx(client, hands=desk, words=["join lantern-club"]), {"channel": "lantern-club"},
+               key="discord.voice")
+    assert desk.keys() == ["ctrl+k"] and desk.typed() == [] and guard["pressed"] == [] and not got.done
+
+
+def test_r1_l6_a_held_send_key_after_typing_is_told_and_a_rerun_never_types_twice(client, guard) -> None:
+    """Review r1 L6: Yuki's own check holds the send key after the text was typed: the user is told it's typed and not
+    sent (a statement, not a yes/no question that would re-run the skill)."""
+    desk = _desk(client, guard)
+    desk.effects[("hotkey", "enter")] = _open_on(guard, client, client.w["juno_dc"], DISCORD_HWND, "Discord.exe")
+    n = {"enter": 0}
+    real_auth = desk.authorize
+
+    def authorize(tool: str, tool_input: dict[str, Any], target: Any = None, earlier: Any = None, *,
+                  force: bool = False) -> Any:
+        if tool == "hotkey" and tool_input.get("keys") == ["enter"]:
+            n["enter"] += 1
+            if n["enter"] == 2:                                           # the send key
+                return SimpleNamespace(allowed=False, question="Send it to Juno?", why="ask")
+        return real_auth(tool, tool_input, target, earlier, force=force)
+
+    desk.authorize = authorize
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert got.outcome == "asked" and not got.done
+    assert got.ask == ("It's typed in your chat with Juno Pike, but I held back sending it. Press Enter when you want "
+                       "it to go.")
+    assert "?" not in got.ask
+    assert desk.typed() == ["@juno.pike", "see you at nine"] and desk.keys() == ["ctrl+k", "enter"]
+    # if the skill runs again anyway ("send it"), the draft Discord kept is never typed a second time
+    assert desk.composer == "see you at nine"
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno", "yes send it"]),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert desk.typed() == ["@juno.pike", "see you at nine", "@juno.pike"]
+    assert desk.keys() == ["ctrl+k", "enter", "ctrl+k", "enter", "enter"] and desk.composer == ""
+    assert got.outcome == "unverified" and got.say == "I pressed send to Juno Pike, but couldn't confirm it landed."
+
+
+def test_r1_l3_an_app_the_user_never_said_is_dropped_and_the_usual_route_stands(client, guard) -> None:
+    guard["on_open"] = lambda uri: _open_on(guard, client, client.w["vesper_dc"], DISCORD_HWND, "Discord.exe")()
+    got = _run(client, _ctx(client, words=["message Vesper"]), {"person": "Vesper", "app": "whatsapp"})
+    assert guard["opened"] == ["discord://-/channels/@me/111122223333"]
+    assert got.outcome == "done" and got.done_line == "Your chat with Vesper Lark is open on Discord."
+
+
+def test_r1_m4_a_game_and_a_live_call_never_send_input_to_the_game(client, guard) -> None:
+    """Review r1 M4 (the part sWeb owns): with a game in front during a call, no input reaches the game on the ask or
+    after the user's "yes" (the resolver's order is sCore's: see the xfail test below)."""
+    guard["game"] = "skyrunner"
+    desk = _desk(client, guard)
+    desk.in_call = True
+    for slots, words in (({"channel": "lantern-club"}, ["join lantern-club"]),
+                         ({"channel": "lantern-club", "leave_call": True}, ["yes join lantern-club"])):
+        got = E.resolve_and_run("discord.voice", slots, words,
+                                _ctx(client, hands=desk, words=words, game=lambda: "skyrunner"),
+                                live=Live(game="skyrunner", in_call=True))
+        assert got.outcome in ("asked", "held_game") and not got.done
+    got = E.resolve_and_run("message", {}, ["message"], _ctx(client, hands=desk, words=["message"],
+                                                              game=lambda: "skyrunner"), live=Live(game="skyrunner"))
+    assert not got.done
+    assert desk.calls == [] and guard["opened"] == [] and guard["focused"] == []
+
+
+@pytest.mark.xfail(reason="sCore resolve.py asks ask_in_call / missing required slots before its game hold; fix "
+                          "reported in builds/sWeb.md (review r1 M4)", strict=False)
+def test_r1_m4_a_game_in_front_during_a_call_answers_after_the_round(client) -> None:
+    from yuki.skills.resolve import Held
+
+    got = resolve("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"], store=client.store,
+                  live=Live(game="skyrunner", in_call=True))
+    assert isinstance(got, Held) and got.say == "You're in a game: after the round?"
+    got = resolve("message", {}, ["message"], store=client.store, live=Live(game="skyrunner"))
+    assert isinstance(got, Held)

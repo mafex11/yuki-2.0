@@ -6,8 +6,10 @@
 # "A browser" is a measured fact, never a list: a program whose timeline rows carried a web page in the last 14 days
 # (yuki/skills/web_route.py). The address is a launch argument (nothing typed). youtube.home opens the home page only:
 # nothing plays until the user picks. youtube.video opens one picked video (its link from the offered options, phase T)
-# and is checked playing. URL shapes come from yuki/connect/sites/youtube.toml, never copied here. Never with a game in
-# front ("after the round?").
+# and is done only when that video's page is in front and the browser's media session plays. Its rung A is dormant in
+# phase S: no link can reach the video slot until phase T offers the options (a video named in words goes to the
+# thinker with the skill pinned). URL shapes come from yuki/connect/sites/youtube.toml, never copied here. Never with
+# a game in front ("after the round?").
 #
 # Zero setup (D0): nothing to connect, no API; the browser's own window.
 
@@ -74,6 +76,19 @@ call = "youtube_video"
 needs_focus = true
 when = { slot = "video", field = "ref", has = true }
 args = { site = "youtube" }
-done = { probe = "driver", driver = "web_route", call = "video_shown", site = "youtube", within_s = 6 }
-# the browser's own media session says playing (a second source)
-recheck = { probe = "driver", driver = "web_route", call = "video_playing", after_s = 4 }
+# Done only when both are seen (review r1 M2; B.2: the page and the media session playing): the page in front is that
+# very video, and the browser's own media session says playing. Autoplay blocked or the tab behind: "couldn't confirm".
+[skill."youtube.video".route.done]
+probe = "all"
+within_s = 6
+parts = [
+  { probe = "driver", driver = "web_route", call = "video_shown", site = "youtube" },
+  { probe = "driver", driver = "web_route", call = "video_playing" },
+]
+# a later re-read: the media session still playing (a source the done-check also read: flagged as such)
+[skill."youtube.video".route.recheck]
+probe = "driver"
+driver = "web_route"
+call = "video_playing"
+after_s = 4
+same_source = true
