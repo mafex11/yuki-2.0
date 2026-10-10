@@ -40,6 +40,7 @@ from yuki.brain.plan import (
     finish_plan,
     parse_header,
     parse_step,
+    probe_errors,
 )
 from yuki.brain.tools import tool_params
 from yuki.log.events import AgentEvent, Partial, Thinking
@@ -214,7 +215,20 @@ class PlanStream:
             self._ready.append(step)
 
     def _closed_input(self, text: str) -> None:
-        """The plan block is complete: validate the whole input (also what streamed as steps)."""
+        """The plan block is complete: validate the whole input (also what streamed as steps). An invalid plan's report
+        also carries every other probe problem in it (bWire merge: the streamed check stops at the first bad field,
+        and one retry should fix them all)."""
+        self._validate_whole(text)
+        if self.stop == "invalid":
+            try:
+                raw = json.loads(text or "{}")
+            except ValueError:
+                raw = None
+            for error in probe_errors(raw):
+                if error not in self.errors:
+                    self.errors.append(error)
+
+    def _validate_whole(self, text: str) -> None:
         self._closed = True
         if self.stop is not None:
             return

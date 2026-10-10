@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from yuki.brain.plan import LOOK_WHATS, MEMORY_KINDS, PLAN_TOOL, VERB_FIELDS, plan_schema
+from yuki.brain.plan import LOOK_WHATS, MEMORY_KINDS, PLAN_TOOL, VERB_FIELDS, plan_schema, probe_args_text
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Schemas
@@ -30,12 +30,11 @@ def _obj(properties: dict[str, Any], required: list[str] | None = None) -> dict[
 
 
 #: The verbs' field use, one line each, in the plan tool's description (the executor's contract, plan.VERB_FIELDS).
-_VERB_LINES = "\n".join(f"- {verb}: {text}" for verb, text in VERB_FIELDS.items())
+_VERB_LINES = "\n".join(f"{verb}: {text}" for verb, text in VERB_FIELDS.items())
 
-PLAN_DESCRIPTION = (
-    "Your first call for every request: what they want, where, how, and how the PC will show it worked. Verbs:\n"
-    + _VERB_LINES
-)
+#: The verbs, then each probe's argument names (bWire merge: the done-check enforces them, so the planner is told them;
+#: "your first call" is said in the core prompt, so it is not repeated here, to keep the block within 8,000).
+PLAN_DESCRIPTION = "Verbs:\n" + _VERB_LINES + "\n" + probe_args_text()
 
 LOOK_TOOL: dict[str, Any] = {
     "name": "look",

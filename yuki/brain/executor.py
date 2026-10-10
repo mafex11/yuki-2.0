@@ -57,7 +57,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from yuki.agent.tools import sends_for_certain, tool_traits
+from yuki.agent.tools import _is_own_window, sends_for_certain, tool_traits
 from yuki.brain import consent, done, util
 from yuki.brain.check import CheckVerdict, CommitCheck
 from yuki.brain.consent import Call, Live, field_of, words
@@ -290,6 +290,8 @@ class Executor:
         self.started = time.time()
         self.started_mono = time.monotonic()
         self.lease = _Lease()
+        #: A step that named no window acted on the request's origin (logged once).
+        self._origin_used = False
         self.acting = False
         self.replans = 0
         self.revision = 0
@@ -668,7 +670,7 @@ class Executor:
             if field_of(step, "window", None) else (None, {})
         if hwnd is None and not field_of(step, "window", None) and \
                 verb in ELEMENT_VERBS | {"hotkey", "press", "window_action", "tab", "focus_window"}:
-            hwnd = done.as_hwnd(payload.get("foreground_hwnd"))
+            hwnd = self._front(payload, log=False)
             entry = next((w for w in payload.get("windows") or [] if isinstance(w, dict)
                           and done.as_hwnd(w.get("hwnd")) == hwnd), {}) if hwnd else {}
         element = field_of(step, "element", None)
@@ -1084,6 +1086,24 @@ class Executor:
 
     # -- resolution --------------------------------------------------------------------------------------------------
 
+    def _front(self, payload: Mapping[str, Any] | None, *, log: bool = True) -> int | None:
+        """The window a step that names none acts on: the foreground, except while Yuki's own window is in front (a
+        typed request: the ask bar or the chat page), when it is the request's origin (``host.origin_hwnd``: the window
+        in front when the user called Yuki up), if that window is still listed. Code facts only."""
+        payload = payload if isinstance(payload, Mapping) else {}
+        front = done.as_hwnd(payload.get("foreground_hwnd"))
+        origin = done.as_hwnd(getattr(self.host, "origin_hwnd", None))
+        if origin is None or origin == front:
+            return front
+        if not any(isinstance(w, dict) and done.as_hwnd(w.get("hwnd")) == origin for w in payload.get("windows") or []):
+            return front
+        if front is not None and not _is_own_window(front):
+            return front
+        if log and not self._origin_used:
+            self._origin_used = True
+            self._emit_log("brain_origin", used=True, front_known=front is not None)
+        return origin
+
     def _resolve(self, index: int, step: Any) -> tuple[Call | None, str]:
         """The step as a Dispatcher call with its target's code facts: the window (an hwnd, or the one window a title
         hint or app names), the element by its name and role in a read of that window, the tab by its name in the
@@ -1104,7 +1124,7 @@ class Executor:
         hwnd, entry = done.window_of(self.dispatcher, ref, payload=payload) if ref else (None, {})
         if ref and hwnd is None:
             return None, "no single window fits that window"
-        front = done.as_hwnd(payload.get("foreground_hwnd"))
+        front = self._front(payload)
         if hwnd is None and verb in ELEMENT_VERBS | {"hotkey", "press", "window_action", "tab", "focus_window"}:
             hwnd = front
             entry = next((w for w in payload.get("windows") or [] if isinstance(w, dict)
@@ -1605,8 +1625,7 @@ class Executor:
                     hwnd, _entry = done.window_of(self.dispatcher, field_of(step, "window", None),
                                                     lock=self._dispatch_lock)
                     if hwnd is None:
-                        front = done.overview(self.dispatcher, lock=self._dispatch_lock).get("foreground_hwnd")
-                        hwnd = done.as_hwnd(front)
+                        hwnd = self._front(done.overview(self.dispatcher, lock=self._dispatch_lock))
                     if hwnd is None:
                         raise ValueError("no window to read")
                     tool_input = {"hwnd": hwnd}

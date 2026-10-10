@@ -27,6 +27,7 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
+from yuki.brain import done as _done
 from yuki.log.events import AgentEvent
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -46,40 +47,33 @@ VERBS: tuple[str, ...] = ACT_VERBS + READ_VERBS
 KINDS: tuple[str, ...] = ("act", "answer", "ask")
 COMMITS: tuple[str, ...] = ("none", "send", "join", "lasting")
 
-#: The skill engine's probes (``yuki.skills.connection.PROBES`` minus ``all``, read through ``donecheck``).
-SKILL_PROBES: tuple[str, ...] = (
-    "read_back", "uia_name", "media_session", "audio_active", "level", "page_at", "tab_shown", "foreground",
-    "mic_held", "chat_open", "message_sent", "moment", "driver",
-)
-#: The four generic UIA probes ``yuki/brain/done.py`` adds (bExec).
-GENERIC_PROBES: tuple[str, ...] = ("field_holds", "window_state", "gone", "file_exists")
+#: The skill engine's probes (``yuki.skills.connection.PROBES`` minus ``all``, read through ``donecheck``) and the four
+#: generic UIA probes: one list, ``yuki/brain/done.py``'s (bWire merge: the plan and the done-check read one table).
+SKILL_PROBES: tuple[str, ...] = _done.ENGINE_PROBES
+GENERIC_PROBES: tuple[str, ...] = _done.GENERIC_PROBES
 #: The closed probe list of ``done.probe`` and ``expect.probe``; ``none`` is allowed and is never "done".
 PROBES: tuple[str, ...] = SKILL_PROBES + GENERIC_PROBES + ("none",)
 
-#: Each probe's argument names (what ``done.args`` / ``expect.args`` may hold). The skill probes' names are the keys
-#: ``yuki.skills.donecheck`` reads; the generic ones are this file's contract with ``done.py``.
+#: Each probe's argument names, required first (what ``done.args`` / ``expect.args`` may hold): ``done.PROBE_ARGS``,
+#: which :func:`yuki.brain.done.parse_args` enforces (a process probe's ``window`` is read as its ``process``).
 PROBE_ARGS: dict[str, tuple[str, ...]] = {
-    "read_back": (),
-    "uia_name": ("process", "window", "role", "name", "container"),
-    "media_session": ("app", "status", "changed"),
-    "audio_active": ("process", "window"),
-    "level": ("value", "target", "tolerance"),
-    "page_at": ("site", "kind", "process", "window"),
-    "tab_shown": ("process", "window", "tab_id", "name"),
-    "foreground": ("process", "window"),
-    "mic_held": ("process", "window"),
-    "chat_open": ("app", "person"),
-    "message_sent": ("text", "app", "person"),
-    "moment": ("kind", "app"),
-    "driver": ("driver", "call"),
-    "field_holds": ("window", "name", "role", "text"),
-    "window_state": ("window", "state"),
-    "gone": ("window", "name", "role"),
-    "file_exists": ("path",),
-    "none": (),
-}
+    **{name: (*required, *optional) for name, (required, optional) in _done.PROBE_ARGS.items()}, "none": ()}
 #: Probes only the skill engine can read (a route's own read-back, a driver module's probe): never a plan's pick.
 ENGINE_ONLY_PROBES: frozenset[str] = frozenset({"read_back", "driver"})
+
+
+def probe_args_text() -> str:
+    """Each probe a plan may pick, with its argument names (``?``: optional), on one line for the plan tool: the
+    planner writes ``done.args`` / ``expect.args`` with the names the done-check reads (``done.PROBE_ARGS``)."""
+    parts = []
+    for name, (required, optional) in _done.PROBE_ARGS.items():
+        if name in ENGINE_ONLY_PROBES:
+            continue
+        names = [*required, *(f"{o}?" for o in optional)]
+        if name == "window_state":
+            names = [n if n != "state" else "state=" + "|".join(_done.WINDOW_STATES) for n in names]
+        parts.append(f"{name} {','.join(names)}")
+    return "done/expect args, a JSON object as a string (? optional): " + "; ".join(parts)
 
 #: What ``look`` reads (a step's value, the ``look`` tool's ``what``) and the windows it needs.
 LOOK_WHATS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", "clipboard", "system")
@@ -156,8 +150,11 @@ def _probe_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": ["probe", "args"],
         "properties": {
-            "probe": {"type": "string", "enum": list(PROBES)},
-            "args": {"type": "string", "description": "Its arguments: a JSON object as a string."},
+            # the probes a plan may write (a seed's engine-only probe is taken by writing none: the seed's check
+            # applies); each one's argument names are in the plan tool's description (probe_args_text), so the
+            # 8,000-character tool block stays in budget (bWire merge)
+            "probe": {"type": "string", "enum": [p for p in PROBES if p not in ENGINE_ONLY_PROBES]},
+            "args": {"type": "string"},
         },
     }
 
@@ -208,22 +205,24 @@ def plan_schema() -> dict[str, Any]:
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
             "expect": {"anyOf": [_probe_schema(), {"type": "null"}]},
-            "say": _nullable("string", "Voice: words for a slow step."),
+            "say": _nullable("string"),
         },
     }
+    # goal, route, question and say carry no description here: the core prompt says each (one line in their terms;
+    # steps or skill:<id>; kind ask: one question; voice words for a slow step), and the probe arguments took the room
     return {
         "type": "object",
         "additionalProperties": False,
         "required": ["goal", "kind", "revises", "target", "route", "consent", "done", "question", "steps"],
         "properties": {
-            "goal": {"type": "string", "description": "One line, in the user's terms."},
+            "goal": {"type": "string"},
             "kind": {"type": "string", "enum": list(KINDS)},
             "revises": _nullable("string", "The plan id it replaces."),
             "target": target,
-            "route": {"type": "string", "description": "steps, or skill:<id> from the menu."},
+            "route": {"type": "string"},
             "consent": consent,
             "done": _probe_schema(),
-            "question": _nullable("string", "kind ask: the one question."),
+            "question": _nullable("string"),
             "steps": {"type": "array", "items": step},
         },
     }
@@ -462,29 +461,38 @@ def _probe(raw: Any, errors: list[str], where: str) -> Probe | None:
     if args is None:
         errors.append(f"{where}.args must parse as one JSON object (\"{{}}\" for none)")
         return None
-    allowed = PROBE_ARGS[name]
-    extra = sorted(k for k in args if k not in allowed)
-    if extra:
-        errors.append(f"{where}.args for {name} take only: {', '.join(allowed) or 'nothing'} (not {', '.join(extra)})")
-        return None
-    if name != "none":
-        # one contract: the done-check reads the arguments exactly as this accepts them (required ones present)
-        try:
-            from yuki.brain.done import parse_args
-        except Exception:  # noqa: BLE001 - the done-check not installed: the names above stand
-            parse_args = None
-        if parse_args is not None:
-            parsed, why = parse_args(str(name), text)
-            if parsed is None:
-                errors.append(f"{where}.args: {why}")
-                return None
-    for key, value in args.items():
-        ok = isinstance(value, (str, int, float, bool)) or value is None or (
-            isinstance(value, list) and all(isinstance(v, str) for v in value))
-        if not ok:
-            errors.append(f"{where}.args.{key} must be a string, number, true/false or a list of strings")
+    if name == "none":
+        if args:
+            errors.append(f"{where}.args for none take nothing (\"{{}}\")")
+            return None
+    else:
+        # one contract (bWire merge): the done-check reads the arguments exactly as this accepts them (its names, a
+        # process probe's window as its process, the required ones present, and the value types: a string, number or
+        # true/false each; uia_name's container a list of [role, name] pairs)
+        parsed, why = _done.parse_args(str(name), args)
+        if parsed is None:
+            errors.append(f"{where}.args: {why}")
             return None
     return Probe(name=str(name), args=args, raw=text)
+
+
+def probe_errors(raw: Any) -> list[str]:
+    """Every probe problem in a whole plan input at once (its ``done`` and each step's ``expect``), in the validator's
+    own words. The streamed validator stops at the first bad field, so when a plan comes back invalid the planner is
+    also told the rest of its probe problems in the same report (one retry fixes them all). Never raises."""
+    out: list[str] = []
+    if not isinstance(raw, Mapping):
+        return out
+    try:
+        if raw.get("done") is not None:
+            _probe(raw.get("done"), out, "done")
+        steps = raw.get("steps")
+        for index, step in enumerate(steps if isinstance(steps, list) else []):
+            if isinstance(step, Mapping) and step.get("expect") is not None:
+                _probe(step.get("expect"), out, f"step {index + 1}: expect")
+    except Exception:  # noqa: BLE001 - a hint only: the validator's own errors stand
+        pass
+    return out
 
 
 def required_probe(plan: Plan) -> str | None:
@@ -927,4 +935,5 @@ __all__ = [
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
+    "probe_args_text", "probe_errors",
 ]

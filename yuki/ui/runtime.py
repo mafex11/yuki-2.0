@@ -577,9 +577,10 @@ class Lane(QThread):
         agent = self.active
         if agent is not self.agent:
             # bWire: the new brain takes this typed request (brain-design.md 2): the user's own typed words only, the
-            # card / coach-note / where-typed text as labelled context (never quotable), the log id when it has one
+            # card / coach-note / where-typed text as labelled context (never quotable), the log id when it has one,
+            # and the window that was in front when the user called Yuki up (Yuki's own box is in front by now)
             events = agent.run(job.request, user_words=list(job.typed_words or ()), context=job.context or "",
-                               channel="typed", request_id=job.log_request_id or "")
+                               channel="typed", request_id=job.log_request_id or "", origin_hwnd=job.origin_hwnd)
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
@@ -790,6 +791,11 @@ class Lane(QThread):
             return []  # stopped or withdrawn: a request the user dropped is never handed to the worker
         if getattr(agent, "needed_hands", False) and "plan" not in refused:
             refused.append("plan")
+            origins = getattr(self.runtime, "_brain_origins", None)
+            if job.origin_hwnd and isinstance(origins, dict):
+                # the new brain's act plan goes to the worker with the window that was in front when the user called
+                # Yuki up (written here, popped in _on_lane_done, like _log_ids; the old loop's hand-off is unchanged)
+                origins[job.id] = int(job.origin_hwnd)
         return refused
 
     def _withdrawn_text(self, job_id: int, text: str) -> str:
@@ -939,6 +945,9 @@ class AgentRuntime(QObject):
         self._skills: dict[int, dict[str, Any]] = {}   # phase S: front-desk requests' pinned skill, kept for a hand-off
         #: bWire: front-desk requests' typed words and labelled context (the new brain's), kept for a hand-off.
         self._typed: dict[int, tuple[tuple[str, ...] | None, str | None]] = {}
+        #: bWire: the window in front when the user called Yuki up, for a front-desk request the new brain hands to the
+        #: worker (written by the lane's thread, popped in _on_lane_done).
+        self._brain_origins: dict[int, int] = {}
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -1146,7 +1155,7 @@ class AgentRuntime(QObject):
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
                          app_named: str | None = None, log_request_id: str | None = None,
                          skill: dict[str, Any] | None = None, typed_words: "Iterable[str] | str | None" = None,
-                         context: str | None = None) -> int:
+                         context: str | None = None, origin_hwnd: int | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -1157,13 +1166,15 @@ class AgentRuntime(QObject):
             log_request_id: The id the request already has in the logs (the front desk's session-log id), kept by
                 the worker's run (phase F: one request id from the words to the result).
             typed_words / context: bWire: the user's typed words and the labelled context, for the new brain.
+            origin_hwnd: bWire: the window in front when the user called Yuki up (only the new brain's hand-off
+                passes it; the old loop's hand-off runs with none, as before).
 
         Returns:
             The new request id.
         """
         request_id = next(self._ids)
         self._worker_outstanding.append(request_id)
-        waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
+        waiting = self.worker.enqueue(Job(request_id, request, origin_hwnd or None, source, memory_query=memory_query,
                                           user_words=_words_tuple(user_words),
                                           app_named=" ".join(str(app_named or "").split()) or None,
                                           log_request_id=log_request_id or None,
@@ -1203,7 +1214,10 @@ class AgentRuntime(QObject):
         typed = None if job.typed_words is None else (*job.typed_words, text)
         note = (f"This request was set aside on Yuki's question, which went unanswered for a while: \"{question}\". "
                 f"The user has now answered (the last of their words). Carry on with it from where it stopped.")
-        context = "\n\n".join(part for part in (job.context or "", note) if part)
+        # a request with none of the user's words (a card suggestion, a window's Continue): the Brain shows the request
+        # text only when no words come, and the answer is a word now, so its subject goes in the context here
+        asked = f"The request as it came: {job.request}" if job.typed_words == () and job.request else ""
+        context = "\n\n".join(part for part in (asked, job.context or "", note) if part)
         _lane, new_id = self.submit(request, origin_hwnd=job.origin_hwnd, source=job.source,
                                     lane=WORKER if lane_name == WORKER else None, typed_words=typed,
                                     context=context if typed is not None else None)
@@ -1373,6 +1387,7 @@ class AgentRuntime(QObject):
             self._skills.pop(request_id, None)
             return
         typed, context = self._typed.pop(request_id, (None, None))
+        origin = self._brain_origins.pop(request_id, None)
         if needed_hands:
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
@@ -1381,7 +1396,7 @@ class AgentRuntime(QObject):
                                            app_named=self._apps_named.pop(request_id, None),
                                            log_request_id=log_id,
                                            skill=self._skills.pop(request_id, None),
-                                           typed_words=typed, context=context)
+                                           typed_words=typed, context=context, origin_hwnd=origin)
             # both runtime ids (the front desk's, the worker's) and the one log id they share from here on
             self.ui_log.event("handoff", id=request_id, worker_id=new_id, refused=list(refused),
                               **({"request_id": log_id} if log_id else {}))

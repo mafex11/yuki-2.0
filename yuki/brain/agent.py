@@ -159,6 +159,9 @@ class _Request:
     request_id: str
     seed: dict[str, Any] | None
     number: int
+    #: The window in front when the user called Yuki up (typed: the ask bar or the chat page is in front by the time
+    #: the request runs). Code facts only: an hwnd number.
+    origin_hwnd: int | None = None
     started: float = field(default_factory=time.monotonic)
     started_at: datetime = field(default_factory=datetime.now)
     epoch: float = field(default_factory=time.time)
@@ -310,6 +313,11 @@ class Host:
         self.nonce: str = ""
         #: The user's own words from up to 3 earlier requests (never a card's text), for the commit check.
         self.earlier_words: list[str] = list(brain._earlier_words)[-3:]
+        #: The window in front when the user called Yuki up (an hwnd, or ``None``): the executor's stand-in for the
+        #: foreground while Yuki's own window is in front (a step that names no window acts there).
+        self.origin_hwnd: int | None = req.origin_hwnd
+        #: The executor's desk lease (set by the Brain once the executor is made): freed while a question waits.
+        self.desk: Any = None
 
     @property
     def model_calls(self) -> int:
@@ -355,11 +363,24 @@ class Host:
 
     def ask_text(self, question: str) -> str | None:
         """One question, the user's reply as text (``None``: no answer, or cancelled). The reply joins
-        :attr:`user_words`."""
+        :attr:`user_words`. The desk lease is freed first (design 2.3, L4: the desk is free while a question waits; the
+        next act step takes it again), whoever asks: the executor, an ask plan or the ``ask_user`` tool."""
+        self.free_desk()
         answer = self._brain._ask(question)
         if answer is not None and answer.strip() and not self.cancelled():
             self.user_words.append(answer.strip())
         return answer
+
+    def free_desk(self) -> None:
+        """Free the executor's desk lease if it holds it (idempotent; never raises)."""
+        lease = self.desk
+        if lease is None or not getattr(lease, "held", False):
+            return
+        try:
+            lease.release()
+            self.log("brain_desk", state="freed", why="ask")
+        except Exception:  # noqa: BLE001
+            pass
 
     def hold_paused(self) -> bool:
         """When the user took over: say so (:class:`Paused`), wait for a resume, a stop or the limit; ``True`` when it
@@ -1139,11 +1160,13 @@ class Brain:
     # -- the request --------------------------------------------------------------------------------------------------
 
     def run(self, request: str, *, user_words: list[str], context: str = "", channel: str, request_id: str,
-            plan_seed: dict | None = None) -> Iterator[AgentEvent]:
+            plan_seed: dict | None = None, origin_hwnd: int | None = None) -> Iterator[AgentEvent]:
         """Handle one request (design 2). ``user_words``: the typed text or the heard turns, from the runtime or the
         bridge only; when none come, nothing is quotable (fail closed, M2) and ``request`` is shown as context only;
         ``context``: card / coach / where-typed text, shown labelled and never quotable; ``channel``: ``voice`` |
-        ``typed``; ``request_id``: the id every log record of it carries; ``plan_seed``: a skill's hand-off (rung C).
+        ``typed``; ``request_id``: the id every log record of it carries; ``plan_seed``: a skill's hand-off (rung C);
+        ``origin_hwnd``: the window in front when the user called Yuki up (a typed request runs with Yuki's own box in
+        front): told to the planner as a code line (the hwnd only), and the executor's stand-in for the foreground.
         Yields events; pauses on :class:`AskUser`; ends with exactly one :class:`Final` or :class:`ErrorEvent`."""
         self._begin(request, user_words, channel)
         words = [str(w).strip() for w in (user_words or []) if str(w).strip()]
@@ -1152,13 +1175,24 @@ class Brain:
         if not words and asked:
             # the request may be composed with card text: shown as labelled context, never as the user's words
             context = f"The request as it came: {asked}" + (f"\n\n{context}" if context.strip() else "")
+        try:
+            origin = int(origin_hwnd) if origin_hwnd else None
+        except (TypeError, ValueError):
+            origin = None
+        if origin:
+            # code facts only (the hwnd number, never window text): what "this" and "here" point at
+            line = (f"When they called Yuki up, window [{origin}] was in front; Yuki's own box may be in front now. A "
+                    f"step that names no window then acts on [{origin}]; keys and clicks reach it only once it is in "
+                    f"front again.")
+            context = f"{context}\n\n{line}" if context.strip() else line
         self.logger.reset_usage()
         self.logger.begin_turn()
         # no id from the caller: the log's own (``<session id>-<n>``), as the old loop's acting marker carries it
         rid = self.logger.begin_request(str(request_id) if request_id else None)
         req = _Request(request=str(request or ""), words=words, context=context,
                        channel="voice" if channel == "voice" else "typed", request_id=str(rid or request_id or ""),
-                       seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests)
+                       seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests,
+                       origin_hwnd=origin)
         self._req = req
         self._acting_words = req.shown
         if not words:
@@ -1308,6 +1342,7 @@ class Brain:
                         parts_ms=gathered.parts_ms)
         host.nonce = nonce
         executor = self._executor_for(host, req)
+        host.desk = getattr(executor, "lease", None)
         try:
             self._loop(req, host, state, bs, conv, system, effort, gathered, sends, executor, nonce)
         finally:
