@@ -36,9 +36,11 @@ confirmed open.**
 **Rule 8** (Q3): ``send = "send"`` (the user plainly said "send X to Y") types X and presses the app's send key, both
 judged by Yuki's own check with the user's words, and both whom and what must stand in their words
 (:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
-types it and leaves it; no text just opens the chat. A send is "done" only when memory captured the user's own message
-with that text in that very chat (the messages table, matched by the route's capture thread ids, never by the app's
-name); "pressed send, couldn't confirm it landed" otherwise, once the send key went out (its own step dispatched).
+types it and leaves it; no text just opens the chat. The opened chat's composer is read first: other text already
+there (the app's kept draft) means nothing is typed or pressed, said plainly. A send is "done" only when memory
+captured the user's own message equal to that text in that very chat (the messages table, matched by the route's
+capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the send key
+went out (its own step dispatched).
 If Yuki's own check holds the send key after the text was typed, the user is told it's typed and not sent (never
 asked: a "yes" would type it twice).
 A rung that acted on a send is never followed by another (the engine's rule: never twice).
@@ -46,7 +48,9 @@ A rung that acted on a send is never followed by another (the engine's rule: nev
 **discord.voice** (:func:`route_voice_join`): Discord's quick switcher with its voice filter ("!") and the channel's
 name from the user's words, Enter; if Discord doesn't take the microphone within 2 s, Discord's "Join Voice" button
 (its label from the data, judged like the switcher's keys). A join that took is noted in tastes (kind
-``discord_voice``, encrypted). Asking first when a call is live is the skill's data (the ``leave_call`` slot).
+``discord_voice``, encrypted). With a call live it asks first, in the rung (after the engine's game check), and the
+question says what will happen (review r2 M2): "Switch to {channel}?" when the call is Discord's own, else "Join
+{channel} on Discord as well?" (nothing leaves another app's call); the answer comes back as the ``join_in_call`` slot.
 
 Every route takes focus: never with a game in front (the engine holds the run: "after the round?"), each focus and
 opened link asks ``gamegate.refuse_input`` here, and the input layer refuses again. Without the voice hands (the
@@ -86,7 +90,14 @@ LINE_SENT_UNCONFIRMED = "I pressed send to {name}, but couldn't confirm it lande
 #: Yuki's own check held the send key after the text was typed (review r1 L6): told, not asked, so a "yes" never
 #: re-runs the skill and types the text a second time into the kept draft.
 LINE_TYPED_HELD = "It's typed in your chat with {name}, but I held back sending it. Press Enter when you want it to go."
+#: The opened chat's composer already holds other text (the app's kept draft; review r2 H1): nothing typed, nothing
+#: pressed (Enter would send that text with the user's words).
+LINE_DRAFT_THERE = "There's already unsent text in your chat with {name}, so I left it."
 LINE_VOICE_UNCONFIRMED = "I opened {channel} in Discord, but couldn't confirm you joined it."
+#: Asked before a join while a call is live (review r2 M2: the question says what the route does; never a promise to
+#: leave a call it can't leave). The app's own words come from its data (``[chat.asks]``); these are the fallbacks.
+ASK_ALSO_JOIN = "You're already in a call. Join {channel} on {app} as well?"
+ASK_SWITCH = "Switch to {channel}?"
 #: The done lines (said only once the done-check saw it).
 SAY_OPENED = "Your chat with {name} is open{where}."
 SAY_DRAFT = "It's typed in your chat with {name}{where}, not sent."
@@ -460,25 +471,35 @@ def _step_verdict(facts: Mapping[str, Any], do: str) -> bool | None:
     return None
 
 
-def _draft_kept(hands: Any, text: str) -> bool:
-    """Whether the text field with the keyboard (the opened chat's composer) already holds exactly ``text``, whitespace
-    and case folded: an identity check of the user's own words, read in RAM and dropped (never logged)."""
-    from yuki.skills.donecheck import _norm_text
-
+def _composer_text(hands: Any) -> str | None:
+    """What the text field with the keyboard (the opened chat's composer) holds now, read in RAM and dropped (never
+    logged); ``None`` when no text field has the keyboard or it can't be read."""
     read = getattr(hands, "_focus", None)
-    if not callable(read) or not text:
-        return False
+    if not callable(read):
+        return None
     try:
         snap = read(timeout_s=0.4)
     except Exception:  # noqa: BLE001
-        return False
+        return None
     if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
-        return False
+        return None
     if getattr(snap, "text_source", "") == "text":
-        held = f"{getattr(snap, 'before', '') or ''}{getattr(snap, 'after', '') or ''}"
-    else:
-        held = str(getattr(snap, "value", "") or "")
-    return bool(held.strip()) and _norm_text(held) == _norm_text(text)
+        return f"{getattr(snap, 'before', '') or ''}{getattr(snap, 'after', '') or ''}"
+    return str(getattr(snap, "value", "") or "")
+
+
+def _composer_state(hands: Any, text: str) -> str:
+    """The opened chat's composer against the user's words (review r1 L6, r2 H1): ``"empty"``, ``"same_text"`` (it
+    already holds exactly ``text``, whitespace and case folded: an identity check of the user's own words),
+    ``"other_text"`` (anything else: the app's kept draft) or ``"unread"``."""
+    from yuki.skills.donecheck import _norm_text
+
+    held = _composer_text(hands)
+    if held is None:
+        return "unread"
+    if not held.strip():
+        return "empty"
+    return "same_text" if text and _norm_text(held) == _norm_text(text) else "other_text"
 
 
 def _dispatched(facts: Mapping[str, Any], do: str) -> bool:
@@ -494,6 +515,9 @@ def _dispatched(facts: Mapping[str, Any], do: str) -> bool:
 
 #: How long the field with the keyboard may take to change after the switcher's shortcut (s; only while waiting).
 SWITCHER_WAIT_S = 1.5
+#: When no text field has the keyboard right after the app came forward, how long its own field may take to take it
+#: before the shortcut is sent (s; review r2 L3: a composer focused late must not pass for the switcher opening).
+SETTLE_S = 0.5
 
 
 def _field(hands: Any) -> tuple[int, int, str, str] | None:
@@ -525,12 +549,27 @@ def _field_changed(ctx: Any, hands: Any, before: tuple[int, int, str, str] | Non
         ctx.sleep(POLL_S)
 
 
+def _settled_field(ctx: Any, hands: Any) -> tuple[int, int, str, str] | None:
+    """The text field with the keyboard once focus has settled: read every :data:`POLL_S` for at most
+    :data:`SETTLE_S` until one has it (only while this skill waits), else ``None``."""
+    deadline = ctx.clock() + SETTLE_S
+    while True:
+        now = _field(hands)
+        if now is not None or ctx.clock() + POLL_S > deadline:
+            return now
+        ctx.sleep(POLL_S)
+
+
 def _run_switch(call: RouteCall, hands: Any, steps: list[dict[str, Any]], *, apps: Sequence[str], key: str,
                 way_text: str) -> tuple[bool, dict[str, Any]]:
     """The switcher's (or search's) steps, its shortcut first on its own: the name is typed and Enter pressed only once
     a different text field took the keyboard (the switcher opened). If it didn't, nothing more is sent (a name typed
-    into the open chat's composer and Enter would send it): ``facts["switcher"] = "unseen"``."""
+    into the open chat's composer and Enter would send it): ``facts["switcher"] = "unseen"``. When no text field has
+    the keyboard as the app comes forward, the read waits for focus to settle first (review r2 L3), so a composer that
+    takes the keyboard late is the "before", never the switcher."""
     before = _field(hands)
+    if before is None:
+        before = _settled_field(call.ctx, hands)
     ok, first = run_steps(hands, steps[:1], words=call.ctx.words, apps=apps, key=key)
     first["steps"] = len(steps)
     if not ok or int(first.get("steps_done") or 0) < 1:
@@ -746,12 +785,28 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
                            facts_ram=ram)
     if chat is not True:
         # never type into a chat that isn't confirmed open: it may be someone else's
+        if chat is False and send:
+            # review r2 L4: another chat opened and nothing was typed: settled with the driver's own line (never "the
+            # PC shows it didn't go through", and not counted as a failed send)
+            return RouteResult(ran=True, ask=LINE_UNSURE_CHAT.format(app=_title(app), name=name),
+                               outcome="other_chat", app=app, facts=facts, facts_ram={**ram, "typed": False,
+                                                                                     "pressed": False})
         return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
                            unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
                            facts_ram=ram)
-    # review r1 L6: the chat's composer already holds exactly these words (a draft Yuki typed on an earlier run whose
-    # send key was held, kept by the app): they are never typed a second time; only the send key, if asked
-    kept = _draft_kept(call.ctx.hands, text)
+    # The composer is read before anything is typed (review r1 L6, r2 H1). Exactly these words already there (a draft
+    # Yuki typed on an earlier run whose send key was held, kept by the app): never typed a second time; only the send
+    # key, if asked. Any other text there (the chat's own kept draft): nothing typed and nothing pressed, in either mode
+    # (appended, Enter would send that text with the user's words). Unreadable: typed as before (the live check
+    # settles whether each app's composer can be read; until then a hidden draft is the residual risk, and the send's
+    # done-check, an exact match of the captured message, then says "couldn't confirm").
+    composer = _composer_state(call.ctx.hands, text)
+    facts["composer"] = composer
+    if composer == "other_text":
+        ram.update(typed=False, pressed=False)
+        return RouteResult(ran=True, ask=LINE_DRAFT_THERE.format(name=name), outcome="draft_in_the_way", app=app,
+                           facts={**facts, "typed": "no", "pressed": False}, facts_ram=ram)
+    kept = composer == "same_text"
     steps: list[dict[str, Any]] = [] if kept else [{"do": "type", "text": text}]
     if send:
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
@@ -886,8 +941,13 @@ def sent_in_chat(ctx: Any, text: str, thread_ids: Sequence[int]) -> tuple[bool |
     """The user's own message with ``text`` captured since the run began in one of these capture threads (the chat the
     route opened, by memory's thread ids; review r1 M5, L7): True. Matched by thread, never by the app's name (a chat
     kept under an older program key or display name still counts; the same text in another chat of that app doesn't).
+    The captured text must equal ``text`` once whitespace and case are folded (review r2 H1: a message that only
+    contains the user's words carried something else with them, such as a kept draft, and is never "Sent").
     Nothing matching yet: ``None``, never False (the watcher lags)."""
-    from yuki.skills.donecheck import _same_text
+    from yuki.skills.donecheck import _norm_text
+
+    def _same_text(want: str, got: str) -> bool:
+        return bool(want) and _norm_text(want) == _norm_text(got)
 
     ids = {int(t) for t in thread_ids or [] if isinstance(t, int)}
     call = getattr(ctx, "memory_call", None)
@@ -1008,9 +1068,47 @@ def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | No
     return None
 
 
+def _current_calls(memory: Any) -> list[str] | None:
+    """The app keys of the calls memory sees going on now (``MemoryClient.current_calls``: an app using the microphone
+    as a call), or ``None`` when it can't say."""
+    from yuki.skills.engine import _mem
+
+    if memory is None:
+        return None
+    calls = _mem(memory, "current_calls", lambda c: c.current_calls(), timeout_s=0.3)
+    if not isinstance(calls, list):
+        return None
+    return [k for k in (_app_key(c.get("process") or c.get("app")) for c in calls if isinstance(c, Mapping)) if k]
+
+
+def _call_question(call: RouteCall, data: Mapping[str, Any], app: str, name: str, mic_before: bool | None
+                   ) -> tuple[str, str] | None:
+    """The question asked before a join while a call is live (review r2 M2, L1), or ``None`` (no call live). Asked
+    here, in the rung, so it comes after the engine's game check (a game in front is "after the round?", never this
+    question). The live call is this app's own (it holds the microphone now, or memory's open calls name it): "Switch
+    to {channel}?" (the app leaves its current channel by itself). Another app's, or one memory can't name: "Join
+    {channel} on {app} as well?" (no route leaves another app's call, so none is promised). Words from the app's data
+    (``[chat.asks]``). ``(question, code word)``."""
+    from yuki.skills.engine import _in_call
+
+    keys = {_app_key(p) for p in data.get("processes") or []}
+    calls = _current_calls(call.ctx.memory) or []
+    own = mic_before is True or any(k in keys for k in calls)
+    try:
+        live = bool(_in_call(call.ctx.hands, call.ctx.memory))
+    except Exception:  # noqa: BLE001
+        live = False
+    if not (own or live):
+        return None
+    asks = data.get("asks") if isinstance(data.get("asks"), Mapping) else {}
+    line = str(asks.get("switch") or ASK_SWITCH) if own else str(asks.get("in_call") or ASK_ALSO_JOIN)
+    return line.replace("{channel}", name).replace("{app}", _title(app)), "own" if own else "other"
+
+
 def route_voice_join(call: RouteCall) -> RouteResult:
-    """``discord.voice``'s rung A: the quick switcher with the voice filter and the channel's name, Enter, then
-    "Join Voice" if the microphone wasn't taken (see the module docstring)."""
+    """``discord.voice``'s rung A: asked first when a call is live (:func:`_call_question`), then the quick switcher
+    with the voice filter and the channel's name, Enter, then "Join Voice" if the microphone wasn't taken (see the
+    module docstring)."""
     app = str(call.args.get("app") or "")
     data = app_data(app)
     if not data:
@@ -1019,16 +1117,21 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     name = _words(channel.get("name") if isinstance(channel, Mapping) else channel)
     if not name:
         return RouteResult(ran=False, ask="Which voice channel?", outcome="no_channel")
-    if call.values.get("leave_call") is False:
+    if call.values.get("join_in_call") is False:
         return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
+    image = str((data.get("images") or [""])[0])
+    # the microphone before anything is done: the question's "is it Discord's own call", and the onset's baseline
+    before = _mic_held(image)
+    if call.values.get("join_in_call") is not True:
+        asked = _call_question(call, data, app, name, before)
+        if asked is not None:
+            return RouteResult(ran=False, ask=asked[0], outcome="ask_in_call", facts={"call": asked[1]})
     hands = call.ctx.hands
     if hands is None or not data.get("switcher"):
         return RouteResult(ran=False, outcome="no_hands" if hands is None else "no_switcher")
-    image = str((data.get("images") or [""])[0])
     hwnd, failed = _focus_app(data)
     if failed is not None:
         return failed
-    before = _mic_held(image)
     prefix = str((data.get("prefix") or {}).get("voice") or "")
     query = prefix + (name[len(prefix):].strip() if prefix and name.startswith(prefix) else name)
     steps = [{"do": "keys", "keys": [str(k) for k in data["switcher"]]}, {"do": "type", "text": query},
@@ -1046,6 +1149,10 @@ def route_voice_join(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
     joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
     pressed = ""
+    if not joined and before is not False:
+        # review r2 L5: no onset can show (the microphone unreadable, or Discord already held it): the switcher's
+        # channel still gets the same time to open before "Join Voice" is pressed (never the channel in view before)
+        call.ctx.sleep(VOICE_WAIT_S)
     if not joined:
         label = ((data.get("labels") or {}).get("en") or {}).get("join_voice")
         if isinstance(label, list) and len(label) >= 2:

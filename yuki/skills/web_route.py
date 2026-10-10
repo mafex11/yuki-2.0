@@ -13,7 +13,11 @@ identities (:func:`yuki.perception.tabs.read_census`). Then:
 
 * the strip can't be read (no tab at all): Yuki says so and does nothing (the user's first live check settles whether
   Zen's strip is readable);
-* none matches: "There's no Meet tab open in Zen" (or, with a Meet link the user told, the next rung opens it);
+* part of it wasn't read (a window's walk cut short at its 0.2 s, a window that read nothing; the census's per-window
+  diagnostics) and no single Meet tab was found: Yuki says it couldn't read all of Zen's tabs and does nothing, not
+  even a told link (review r2 M1);
+* none matches on a strip read whole: "There's no Meet tab open in Zen" (or, with a Meet link the user told, the next
+  rung opens it);
 * two match equally: Yuki asks which, counted along the strip, and the user's answer comes back as the ``pick`` slot;
 * one: that tab is selected by its RuntimeId (``yuki.actions.tabs.tab_action``: a UI Automation pattern, no key, no
   pointer; a candidate that won't select gives way to the next one), then Zen comes forward (the guarded
@@ -28,7 +32,10 @@ showed pages of at least 3 hosts, or a YouTube page (a chat app that draws its o
 two hosts). ``scripts/browser_rule_replay.py`` replays the rule on a copy of memory with a time split (the definition
 chosen on the earlier half, scored on the later one): on 10 Oct it picked the browser actually used for 84.9% of the
 33 held-out YouTube sessions, under B.2's 94% bar (the misses are the plan's "last in front <= 30 min" step); counting
-any program with a page, 57.6%.
+any program with a page, 57.6%. Refining that step inside the plan's rule (review r2 M3: skip glance rows of 5-120 s,
+rows with input only, rows with a page only) chose no refinement on the earlier half (84.9% held out again; no
+refinement reaches 94% even picked on the held-out half: 90.9% at best). The bar is unmet: a waiver or a re-ordered
+rule is Claude's and the user's call.
 The address (from ``yuki/connect/sites/youtube.toml``) is a launch argument (``launch.open_url``: nothing typed).
 youtube.home opens the home page and nothing else: nothing plays until the user picks. youtube.video opens the picked
 video's own link and is checked by the page in front showing that video and the browser's media session playing. A
@@ -49,6 +56,9 @@ from yuki.skills.engine import RouteCall, RouteResult
 
 #: What Yuki says when it does nothing for meet.open (asked or told plainly; never a "done").
 LINE_MEET_UNREADABLE = "I can't read Zen's tabs right now, so I left Zen as it is."
+#: Some of Zen's tabs were read, not all (a window's walk cut short, or a window that read nothing): a Meet tab may be
+#: in the part not read, so "none" is never said and no told link is opened (review r2 M1).
+LINE_MEET_PARTIAL = "I couldn't read all of Zen's tabs, so I left Zen as it is."
 LINE_MEET_NONE = "There's no Meet tab open in Zen."
 LINE_MEET_UNKNOWN = "I don't know your Meet tab yet. Bring it up in Zen once and I'll find it next time."
 LINE_ZEN_CLOSED = "Zen isn't open, so there's no Meet tab to bring up."
@@ -182,6 +192,16 @@ def _strip_order(c: Any) -> tuple[int, int, int]:
     return (int(getattr(c, "group", 0) or 0), int(getattr(c, "index", 0) or 0), int(getattr(c, "hwnd", 0) or 0))
 
 
+def read_whole(census: Mapping[str, Any], n_windows: int) -> bool:
+    """Whether the census read every window's tab strip whole: one diagnostics entry per window, each walk complete
+    with no ``reason`` (``cut_short``, ``error``, ``no_tab_items``, ``tabs_inside_documents``: content-free codes of
+    :func:`yuki.perception.tabs.walk_tabs`). A missing entry counts as not read."""
+    diags = census.get("diagnostics")
+    if not isinstance(diags, list) or len(diags) < int(n_windows):
+        return False
+    return all(isinstance(d, Mapping) and d.get("complete") is True and not d.get("reason") for d in diags)
+
+
 def _say(line: str, outcome: str, **facts: Any) -> RouteResult:
     """Nothing done, said plainly (the engine's settled "asked" path: never a done, never counted against the rung)."""
     return RouteResult(ran=False, ask=line, outcome=outcome, facts=facts)
@@ -213,6 +233,11 @@ def route_meet_open(call: RouteCall) -> RouteResult:
         return _say(LINE_MEET_UNREADABLE, "strip_unreadable", **facts)
     decision = str(census.get("decision") or "none")
     chosen = list(census.get("chosen") or [])
+    facts["whole"] = read_whole(census, len(windows))
+    if (decision in ("none", "ask") or not chosen) and not facts["whole"]:
+        # review r2 M1: part of the strip wasn't read (a walk cut short, a window that read nothing): the Meet tab may
+        # be there. Never "no Meet tab", never a question missing it, never the told link (a second Meet tab)
+        return _say(LINE_MEET_PARTIAL, "strip_partial", **facts)
     if decision == "none" or not chosen:
         return RouteResult(ran=False, outcome="no_tab", facts=facts) if link else _say(LINE_MEET_NONE, "no_tab",
                                                                                        **facts)
@@ -341,18 +366,24 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     return out
 
 
-def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, within_s: float = RECENT_S
-                  ) -> str | None:
-    """Of ``keys`` (browsers), the one in front most recently, if its row ended at most ``within_s`` ago."""
+def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, within_s: float = RECENT_S,
+                  min_s: float = 0.0, active_only: bool = False, page_only: bool = False) -> str | None:
+    """Of ``keys`` (browsers), the one in front most recently, if its row ended at most ``within_s`` ago. The knobs are
+    for the replay's refinements inside the plan's rule (review r2 M3; ``scripts/browser_rule_replay.py``): ``min_s``
+    skips glance rows (the user's time on the row, active plus passive, under it), ``active_only`` counts only rows
+    with input, ``page_only`` only rows that showed a web page. Shipped: none of them (the replay's choice)."""
     now = time.time() if now is None else float(now)
     if not keys:
         return None
     marks = ",".join("?" * len(keys))
+    extra = "".join(part for part, on in ((" AND (active_s + passive_s) >= ?", min_s > 0),
+                                          (" AND active_s > 0", active_only),
+                                          (" AND host IS NOT NULL", page_only)) if on)
     try:
         rows = store._query(
             f"SELECT process FROM timeline WHERE process IN ({marks}) AND state = 'present' AND by_yuki = 0 "
-            "AND ended_at >= ? AND started_at <= ? ORDER BY ended_at DESC LIMIT 1",
-            (*keys, now - within_s, now))
+            f"AND ended_at >= ? AND started_at <= ?{extra} ORDER BY ended_at DESC LIMIT 1",
+            (*keys, now - within_s, now, *((float(min_s),) if min_s > 0 else ())))
     except Exception:  # noqa: BLE001
         return None
     return _app_key(rows[0][0]) if rows else None
@@ -623,5 +654,5 @@ __all__ = ["ROUTES", "PROBES", "route_meet_open", "route_youtube_home", "route_y
            "probe_video_shown", "probe_video_playing", "probe_page_seen", "probe_site_front", "browser_rule",
            "choose_browser",
            "measured_browsers", "last_in_front", "site_hosts", "BROWSER_MIN_HOSTS", "video_link",
-           "LINE_MEET_UNREADABLE", "LINE_MEET_NONE",
+           "LINE_MEET_UNREADABLE", "LINE_MEET_PARTIAL", "LINE_MEET_NONE", "read_whole",
            "LINE_MEET_UNKNOWN", "LINE_ZEN_CLOSED", "LINE_MEET_NO_ID", "ASK_MEET_WHICH"]

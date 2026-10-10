@@ -117,12 +117,18 @@ def _cand(tab_id: str, *, match: str = "runtime_id", group: int = 0, index: int 
     return Candidate(hwnd=ZEN, tab_id=tab_id, group=group, index=index, match=match, score=score)
 
 
-def _census(*cands: Candidate, decision: str | None = None, tabs: int = 9) -> dict[str, Any]:
+def _whole(*groups: int) -> dict[str, Any]:
+    """One window's diagnostics for a walk that read its strip whole (perception/tabs.walk_tabs' codes)."""
+    return {"groups": list(groups), "complete": True, "reason": None}
+
+
+def _census(*cands: Candidate, decision: str | None = None, tabs: int = 9,
+            diagnostics: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     chosen = [cands[0]] if cands else []
     if decision == "ask":
         chosen = list(cands)
     return {"candidates": list(cands), "decision": decision or ("one" if cands else "none"), "chosen": chosen,
-            "tabs": tabs, "windows": 1}
+            "tabs": tabs, "windows": 1, "diagnostics": diagnostics if diagnostics is not None else [_whole(tabs)]}
 
 
 def _ctx(client: Any, *, words: list[str], origin: str = "voice", log: list | None = None,
@@ -198,6 +204,78 @@ def test_two_equal_meet_tabs_are_a_question_and_the_answer_picks_along_the_strip
     assert got.ask == "I see 2 Meet tabs in Zen. Which one, counting along the tab list: the first or the second?"
     got = _run(client, "meet.open", {"pick": 2}, _ctx(client, words=["the second one", "2"]))
     assert got.outcome == "done" and guard["selected"] == [(ZEN, "42.7.9")]   # index 5 is second along the strip
+
+
+def _recorder(opened: list) -> Any:
+    """An ``open_url`` verb that records what it was asked to open (and opens nothing)."""
+    def verb(call: Any) -> E.RouteResult:
+        opened.append(dict(call.args))
+        return E.RouteResult(ran=True, outcome="opened")
+    return verb
+
+
+def _tell_link(client: Any) -> None:
+    client.store._write(lambda conn: conn.execute(
+        "UPDATE skills SET told_ciphertext = ? WHERE key = 'meet.open'",
+        (client.store._enc(json.dumps({"link": "https://meet.google.com/aaa-bbbb-ccc"})),)))
+
+
+def test_r2_m1_a_strip_read_cut_short_is_never_no_meet_tab_and_never_opens_the_told_link(client, guard) -> None:
+    """Review r2 M1: a window's walk stopped at its 0.2 s (complete=False, reason cut_short) read only part of Zen's
+    strip: the Meet tab may be in the part not read. Yuki says it couldn't read all of Zen's tabs and does nothing, not
+    even the told link (a second Meet tab)."""
+    _ident(client, names={"abc123": {"n": 3, "at": NOW}})
+    cut = {"groups": [5], "complete": False, "reason": None}
+    guard["census"] = _census(tabs=5, diagnostics=[cut])
+    got = _run(client, "meet.open", {}, _ctx(client, words=["open my meeting"]))
+    assert got.outcome == "asked" and got.ask == W.LINE_MEET_PARTIAL and got.ask != W.LINE_MEET_NONE
+    _tell_link(client)
+    opened: list = []
+    ctx = _ctx(client, words=["open my meeting"])
+    ctx.verbs = {"open_url": _recorder(opened)}
+    got = _run(client, "meet.open", {}, ctx)
+    assert got.outcome == "asked" and got.ask == W.LINE_MEET_PARTIAL and opened == [] and not got.done
+    assert guard["selected"] == [] and guard["focused"] == [] and guard["opened"] == []
+    # a strip whose only window read nothing because its walk was cut short says the same, with or without tabs found
+    guard["census"] = _census(tabs=5, diagnostics=[{"groups": [], "complete": False, "reason": "cut_short"}])
+    got = _run(client, "meet.open", {}, ctx)
+    assert got.ask == W.LINE_MEET_PARTIAL and opened == []
+
+
+def test_r2_m1_a_second_zen_window_that_read_nothing_is_never_no_meet_tab(client, guard) -> None:
+    """Review r2 M1: two Zen windows, one read whole, the other read nothing (an error, no tab items, its tabs inside a
+    document, or no diagnostics at all): no Meet tab in the first is not "no Meet tab in Zen"."""
+    _ident(client, names={"abc123": {"n": 3, "at": NOW}})
+    guard["windows"] = [(ZEN, 4321), (ZEN + 1, 4321)]
+    _tell_link(client)
+    opened: list = []
+    ctx = _ctx(client, words=["open my meeting"])
+    ctx.verbs = {"open_url": _recorder(opened)}
+    for second in ({"groups": [], "complete": False, "reason": "error"},
+                   {"groups": [], "complete": True, "reason": "no_tab_items"},
+                   {"groups": [], "complete": True, "reason": "tabs_inside_documents"}, None):
+        diags = [_whole(7)] + ([second] if second is not None else [])
+        guard["census"] = dict(_census(tabs=7, diagnostics=diags), windows=2)
+        got = _run(client, "meet.open", {}, ctx)
+        assert got.outcome == "asked" and got.ask == W.LINE_MEET_PARTIAL, second
+    assert opened == [] and guard["focused"] == [] and guard["selected"] == []
+    # two equal Meet tabs found on a partial read: not asked about (a third may be in the part not read)
+    guard["census"] = dict(_census(_cand("42.7.9", match="name", index=5, score=3),
+                                   _cand("42.7.2", match="name", index=2, score=3), decision="ask", tabs=7,
+                                   diagnostics=[_whole(7), {"groups": [], "complete": False, "reason": "cut_short"}]),
+                           windows=2)
+    got = _run(client, "meet.open", {}, ctx)
+    assert got.ask == W.LINE_MEET_PARTIAL and got.options == []
+    # one Meet tab found by identity on a partial read is still brought up (it is the tab, wherever the rest are)
+    _ident(client, runtime_ids=[{"id": "42.7.1", "pid": 4321, "at": NOW}])
+    guard["census"] = dict(_census(_cand("42.7.1"), tabs=7,
+                                   diagnostics=[_whole(7), {"groups": [], "complete": False, "reason": "cut_short"}]),
+                           windows=2)
+    got = _run(client, "meet.open", {}, ctx)
+    assert got.outcome == "done" and guard["selected"] == [(ZEN, "42.7.1")]
+    # both windows read whole and no Meet tab: "There's no Meet tab open in Zen" (or the told link)
+    guard["census"] = dict(_census(tabs=9, diagnostics=[_whole(7), _whole(2)]), windows=2)
+    assert W.read_whole(guard["census"], 2)
 
 
 def test_a_candidate_that_wont_select_gives_way_to_the_next_and_none_is_said(client, guard) -> None:

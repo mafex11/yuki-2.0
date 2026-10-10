@@ -2,7 +2,8 @@
 # Q3/rule 8; B.2; map-skills S2.5).
 #
 # discord.voice joins a voice channel through Discord's own quick switcher (Ctrl+K, then "!" and the channel's name:
-# Discord's documented voice-channel filter), asks first when the user is already in a call, and presses Discord's
+# Discord's documented voice-channel filter), asks first when the user is already in a call (saying what will happen:
+# Discord switches its own channel; another app's call is never left, so none is promised), and presses Discord's
 # "Join Voice" button only if the switcher only opened the channel (unverified until the first live run). Checked by
 # Discord taking the microphone within 5 s (an onset: a microphone it already held proves nothing). Joining is judged
 # like a send (rule 8): only on the user's plain words, through Yuki's own check. Never with a game in front.
@@ -45,6 +46,12 @@ uri = "discord://-/channels/{guild}/{channel}"
 [chat.labels.en]
 join_voice = ["Button", "Join Voice"]
 
+# What is asked before a join while a call is live (review r2 M2): Discord's own call -> it switches channel by itself;
+# any other call (Meet, a WhatsApp call, a Slack huddle, or one memory can't name) stays live, so the join is "as well".
+[chat.asks]
+switch = "Switch to {channel}?"
+in_call = "You're already in a call. Join {channel} on Discord as well?"
+
 [skill."discord.voice"]
 end = "call_join"
 kind = "change"
@@ -62,12 +69,12 @@ type = "entity"
 required = true
 ask = "Which voice channel?"
 
-# Asked (never guessed) when a call is live and the user's words didn't already say to leave it.
+# The user's answer to the in-call question ([chat.asks]): true joins anyway, false leaves their call as it is. The
+# question is asked in the rung (yuki/skills/chat.py route_voice_join), after the engine's game check, so a game in
+# front is "after the round?" and never this question (review r2 L1); never guessed.
 [[skill."discord.voice".slot]]
-name = "leave_call"
+name = "join_in_call"
 type = "bool"
-ask_in_call = true
-ask = "You're already in a call. Leave it and join?"
 
 [[skill."discord.voice".route]]
 rung = "A"

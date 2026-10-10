@@ -18,6 +18,10 @@ the copy, replays, and deletes the copy. Only the ``timeline`` table is read (an
   half); the best one there (ties: the earlier in the grid) is then scored on the sessions **after** the cut (the
   held-out half), beside the shipped definition (3 hosts, by_site, site_first). The cut defaults to the median session
   start (half the sessions each side); ``--cut YYYY-MM-DD`` sets it.
+* **Refinements of the "last in front <= 30 min" step** (review r2 M3: all the held-out misses come from it), inside
+  the plan's rule: skip glance rows (the user's time on the row under 5-120 s), count only rows with input, count only
+  rows that showed a page (``web_route.last_in_front``'s knobs). Run with the shipped definition, chosen on the
+  choosing half the same way (ties: the earlier in the grid, the shipped step first) and scored on the held-out half.
 
 Content-free output only: counts, shares and the knobs (no app names, no hosts, no titles).
 
@@ -48,6 +52,10 @@ BAR = 0.94
 #: The shipped definition (web_route's defaults).
 SHIPPED = (3, True, True)
 GRID = [(h, by_site, site_first) for h in (1, 2, 3, 4, 5) for by_site in (False, True) for site_first in (False, True)]
+#: The "recent" step's refinements: (min seconds on the row, rows with input only, rows with a page only); the shipped
+#: step (no refinement) first.
+RECENT_GRID = [(m, active, page) for m in (0, 5, 10, 15, 20, 30, 60, 120) for active in (False, True)
+               for page in (False, True)]
 
 
 def _ts(day: str) -> float:
@@ -126,6 +134,8 @@ def replay(store: Any, *, since: float, cut: float | None, gap_s: float = SESSIO
     sources: Counter = Counter()
     misses: Counter = Counter()
     alt: dict[str, Counter] = {"choose": Counter(), "held": Counter()}
+    rec: dict[tuple[float, bool, bool], dict[str, Counter]] = {v: {"choose": Counter(), "held": Counter()}
+                                                               for v in RECENT_GRID}
     t0 = time.perf_counter()
     for start, truth in found:
         now = start - 1.0
@@ -155,6 +165,15 @@ def replay(store: Any, *, since: float, cut: float | None, gap_s: float = SESSIO
                 alt_key, _alt = site_first_rule(front=front, recent=recents[keys], pref=pref, measured=measured)
                 alt[part]["n"] += 1
                 alt[part]["hit"] += int(alt_key == truth)
+                for v in RECENT_GRID:
+                    recent = W.last_in_front(store, list(keys), now=now, min_s=v[0], active_only=v[1],
+                                             page_only=v[2]) if keys else None
+                    if v == RECENT_GRID[0]:
+                        assert recent == recents[keys], "the shipped recent step drifted"
+                    key_v, _src = W.browser_rule(named=None, said=False, front=front, recent=recent, pref=pref,
+                                                 measured=measured, site_first=site_first)
+                    rec[v][part]["n"] += 1
+                    rec[v][part]["hit"] += int(key_v == truth)
     ms = round((time.perf_counter() - t0) * 1000.0)
 
     def share(c: Counter) -> float | None:
@@ -166,6 +185,10 @@ def replay(store: Any, *, since: float, cut: float | None, gap_s: float = SESSIO
               "held": [scores[g]["held"]["hit"], scores[g]["held"]["n"], share(scores[g]["held"])]} for g in GRID]
     held_best = scores[best]["held"]
     held_shipped = scores[SHIPPED]["held"]
+    rbest = max(RECENT_GRID, key=lambda v: (share(rec[v]["choose"]) or 0.0, -RECENT_GRID.index(v)))
+    recent_table = [{"min_s": v[0], "active_only": v[1], "page_only": v[2],
+                     "choose": [rec[v]["choose"]["hit"], rec[v]["choose"]["n"], share(rec[v]["choose"])],
+                     "held": [rec[v]["held"]["hit"], rec[v]["held"]["n"], share(rec[v]["held"])]} for v in RECENT_GRID]
     return {
         "sessions": len(found), "since": dt.datetime.fromtimestamp(since).strftime("%Y-%m-%d"),
         "cut": dt.datetime.fromtimestamp(cut).strftime("%Y-%m-%d %H:%M"),
@@ -180,6 +203,13 @@ def replay(store: Any, *, since: float, cut: float | None, gap_s: float = SESSIO
                     "by_source": {k: [v, misses[k]] for k, v in sorted(sources.items())}},
         "not_shipped_site_first_order": {"choose_share": share(alt["choose"]), "held_share": share(alt["held"]),
                                          "held_hits": alt["held"]["hit"]},
+        "recent_step": {"chosen": {"min_s": rbest[0], "active_only": rbest[1], "page_only": rbest[2],
+                                   "choose_share": share(rec[rbest]["choose"]), "held_share": share(rec[rbest]["held"]),
+                                   "held_hits": rec[rbest]["held"]["hit"],
+                                   "margin_sessions": rec[rbest]["held"]["hit"]
+                                   - math.ceil(BAR * rec[rbest]["held"]["n"])},
+                        "best_held_any": max((r["held"][2] or 0.0) for r in recent_table),
+                        "grid": recent_table},
         "gap_min": round(gap_s / 60.0, 1), "bar": BAR, "grid": table, "ms": ms,
     }
 
@@ -224,6 +254,16 @@ def main(argv: list[str] | None = None) -> int:
     for row in out["grid"]:
         print(f"  hosts>={row['min_hosts']} by_site={row['by_site']!s:5} site_first={row['site_first']!s:5} "
               f"choose {row['choose'][2]:.1%}  held {row['held'][2]:.1%}")
+    r = out["recent_step"]
+    rc = r["chosen"]
+    print(f"recent-step refinements (shipped definition), chosen on the first half: min_s={rc['min_s']} "
+          f"active_only={rc['active_only']} page_only={rc['page_only']} ({rc['choose_share']:.1%} there) -> held out "
+          f"{rc['held_share']:.1%} ({rc['held_hits']}/{out['held_n']}, {rc['margin_sessions']:+d} vs the bar); "
+          f"the best held-out share of any refinement (not a fair pick: chosen on the held-out half) "
+          f"{r['best_held_any']:.1%}")
+    for row in r["grid"]:
+        print(f"  min_s={row['min_s']:>3} active_only={row['active_only']!s:5} page_only={row['page_only']!s:5} "
+              f"choose {row['choose'][0]}/{row['choose'][1]}  held {row['held'][0]}/{row['held'][1]}")
     print(f"replay {out['ms']} ms")
     return 0
 

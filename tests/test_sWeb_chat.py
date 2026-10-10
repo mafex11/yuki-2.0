@@ -259,9 +259,14 @@ def test_another_chat_in_front_is_a_no_and_a_send_stops_there(client, guard) -> 
     desk.effects[("hotkey", "enter")] = _open_on(guard, client, client.w["dune_dc"], DISCORD_HWND, "Discord.exe")
     got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
                {"person": "Juno", "text": "see you at nine", "send": "send"})
-    assert got.outcome == "failed" and not got.done and got.handoff is None
-    assert desk.typed() == ["@juno.pike"]                                 # never typed into the wrong chat
-    assert _runs(client)[-1]["checked"] == 0
+    # review r2 L4: nothing was typed, so the driver's own line is said (never "the PC shows it didn't go through")
+    # and the run is settled, not a failed send; no second rung, no hand-off
+    assert got.outcome == "asked" and not got.done and got.handoff is None
+    assert got.say == "I opened Discord, but couldn't confirm it's your chat with Juno Pike, so I didn't type anything."
+    assert "didn't go through" not in got.say
+    assert desk.typed() == ["@juno.pike"] and desk.keys() == ["ctrl+k", "enter"]   # never typed into the wrong chat
+    row = _runs(client)[-1]
+    assert row["outcome"] == "asked" and row["checked"] is None
 
 
 def test_a_deep_link_opens_the_chat_with_no_key_and_works_without_the_voice_hands(client, guard) -> None:
@@ -433,12 +438,18 @@ def test_already_in_a_call_asks_first_and_a_join_that_never_took_is_said_plainly
     desk.in_call = True
     got = E.resolve_and_run("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"],
                             _ctx(client, hands=desk, words=["join lantern-club"]))
-    assert got.outcome == "asked" and got.ask == "You're already in a call. Leave it and join?" and desk.calls == []
+    assert got.outcome == "asked" and got.ask == "You're already in a call. Join lantern-club on Discord as well?"
+    assert desk.calls == [] and guard["focused"] == []
     guard["mic"] = [False]
     guard["press_outcome"] = "missing"
-    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club", "leave_call": True}, ["yes join lantern-club"],
-                            _ctx(client, hands=desk, words=["yes join lantern-club"]))
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club", "join_in_call": True},
+                            ["yes join lantern-club"], _ctx(client, hands=desk, words=["yes join lantern-club"]))
     assert got.outcome == "failed" and not got.done and got.handoff is None
+    # "no": their call is left as it is, nothing done
+    desk.calls.clear()
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club", "join_in_call": False},
+                            ["no join lantern-club"], _ctx(client, hands=desk, words=["no join lantern-club"]))
+    assert got.outcome == "asked" and got.ask == "Okay, I'll leave your call as it is." and desk.calls == []
 
 
 def test_a_game_in_front_holds_the_join(client, guard) -> None:
@@ -637,7 +648,7 @@ def test_r1_m4_a_game_and_a_live_call_never_send_input_to_the_game(client, guard
     desk = _desk(client, guard)
     desk.in_call = True
     for slots, words in (({"channel": "lantern-club"}, ["join lantern-club"]),
-                         ({"channel": "lantern-club", "leave_call": True}, ["yes join lantern-club"])):
+                         ({"channel": "lantern-club", "join_in_call": True}, ["yes join lantern-club"])):
         got = E.resolve_and_run("discord.voice", slots, words,
                                 _ctx(client, hands=desk, words=words, game=lambda: "skyrunner"),
                                 live=Live(game="skyrunner", in_call=True))
@@ -648,13 +659,178 @@ def test_r1_m4_a_game_and_a_live_call_never_send_input_to_the_game(client, guard
     assert desk.calls == [] and guard["opened"] == [] and guard["focused"] == []
 
 
-@pytest.mark.xfail(reason="sCore resolve.py asks ask_in_call / missing required slots before its game hold; fix "
-                          "reported in builds/sWeb.md (review r1 M4)", strict=False)
-def test_r1_m4_a_game_in_front_during_a_call_answers_after_the_round(client) -> None:
+def test_r2_l1_a_game_in_front_during_a_call_answers_after_the_round(client, guard) -> None:
+    """Review r2 L1 (the discord.voice part, fixed in sWeb's own files): the in-call question is asked in the rung,
+    after the engine's game check, so a game in front during a call is "after the round?", never the question."""
     from yuki.skills.resolve import Held
 
     got = resolve("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"], store=client.store,
                   live=Live(game="skyrunner", in_call=True))
     assert isinstance(got, Held) and got.say == "You're in a game: after the round?"
+    guard["game"] = "skyrunner"
+    desk = _desk(client, guard)
+    desk.in_call = True
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"],
+                            _ctx(client, hands=desk, words=["join lantern-club"], game=lambda: "skyrunner"),
+                            live=Live(game="skyrunner", in_call=True))
+    assert got.outcome == "held_game" and got.say == "You're in a game: after the round?"
+    assert desk.calls == [] and guard["focused"] == []
+
+
+@pytest.mark.xfail(reason="sCore resolve.py asks a missing required slot ('Who to?') before its game hold; fix "
+                          "reported in builds/sWeb.md (review r1 M4, r2 L1)", strict=False)
+def test_r1_m4_a_game_in_front_with_no_person_answers_after_the_round(client) -> None:
+    from yuki.skills.resolve import Held
+
     got = resolve("message", {}, ["message"], store=client.store, live=Live(game="skyrunner"))
     assert isinstance(got, Held)
+
+
+# -- review round 2 ----------------------------------------------------------------------------------------------------
+
+
+def _kept_draft_world(client: Any, guard: dict[str, Any], desk: Any, draft: str, sent: list[str]) -> None:
+    """Juno's chat opens on the switcher's Enter holding ``draft`` (the app's kept draft); every Enter pressed in the
+    composer records what it would send, and the watcher captures it."""
+    presses = {"n": 0}
+
+    def enter() -> None:
+        presses["n"] += 1
+        if presses["n"] == 1:
+            _open_on(guard, client, client.w["juno_dc"], DISCORD_HWND, "Discord.exe")()
+            desk.composer = draft
+
+    real = desk.dispatch
+
+    def dispatch(name: str, args: dict[str, Any]) -> Any:
+        if name == "hotkey" and args.get("keys") == ["enter"] and desk.field[1] == "Message":
+            sent.append(desk.composer)
+            _capture(client, client.w["juno_dc"], desk.composer, n=950 + len(sent))
+        return real(name, args)
+
+    desk.dispatch = dispatch
+    desk.effects[("hotkey", "enter")] = enter
+
+
+def test_r2_h1_a_chat_holding_other_unsent_text_gets_nothing_typed_and_nothing_sent(client, guard) -> None:
+    """Review r2 H1: the chat opens with the user's own half-typed draft in the composer. "Send see you at nine to
+    Juno" types nothing and presses nothing (Enter would send the draft with it), and says so plainly; a draft run
+    doesn't append either."""
+    for mode, words in (("send", "send see you at nine to Juno"), ("draft", "message Juno see you at nine")):
+        desk = _desk(client, guard)
+        sent: list[str] = []
+        _kept_draft_world(client, guard, desk, "hey are you free ", sent)
+        logs: list = []
+        got = _run(client, _ctx(client, hands=desk, words=[words], log=logs),
+                   {"person": "Juno", "text": "see you at nine", "send": mode})
+        assert got.outcome == "asked" and not got.done, (mode, got)
+        assert got.say == "There's already unsent text in your chat with Juno Pike, so I left it."
+        assert desk.typed() == ["@juno.pike"] and desk.keys() == ["ctrl+k", "enter"], mode   # 0 typed, 0 send
+        assert sent == [] and desk.composer == "hey are you free ", mode                    # the draft untouched
+        assert "hey are you free" not in json.dumps(logs, default=str)
+        _no_secrets(logs, client)
+
+
+def test_r2_h1_a_send_is_done_only_when_the_captured_message_equals_the_text(client, guard) -> None:
+    """Review r2 H1: a captured message that only contains the user's words (something went with them) is never
+    "Sent": "couldn't confirm". Equal once whitespace and case are folded: "Sent"."""
+    since = NOW + 100
+    juno = client.w["juno_dc"]
+    result = SimpleNamespace(facts_ram={"app": "discord", "thread_ids": [juno], "chat": True, "typed": True,
+                                        "pressed": True})
+    ctx = D.ProbeContext(since=since, memory_call=lambda what, fn: fn(client), result=result)
+    args = {"app": "discord", "person": "Juno", "text": "see you at nine", "send": "send"}
+    _capture(client, juno, "hey are you free see you at nine", n=960)
+    assert CH.probe_message_done(ctx, args)[0] is None
+    assert CH.sent_in_chat(ctx, "see you at nine", [juno])[0] is None
+    _capture(client, juno, "  See you   at NINE ", n=961)
+    assert CH.probe_message_done(ctx, args)[0] is True
+
+
+def test_r2_h1_an_exact_draft_is_never_retyped_and_an_empty_composer_is_typed(client, guard) -> None:
+    """The composer read decides only what it can see: exactly the user's words there -> only the send key (r1 L6);
+    an empty composer -> typed and sent."""
+    desk = _desk(client, guard)
+    sent: list[str] = []
+    _kept_draft_world(client, guard, desk, "see you at nine", sent)
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert desk.typed() == ["@juno.pike"] and sent == ["see you at nine"]
+    assert got.outcome == "done" and got.done_line == "Sent to Juno Pike on Discord."
+    desk = _desk(client, guard)
+    sent = []
+    _kept_draft_world(client, guard, desk, "", sent)
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"]),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert desk.typed() == ["@juno.pike", "see you at nine"] and sent == ["see you at nine"]
+    assert got.outcome == "done"
+
+
+def test_r2_l3_a_composer_focused_late_never_passes_for_the_switcher(client, guard) -> None:
+    """Review r2 L3: no text field has the keyboard right after Discord comes forward; its composer takes it a moment
+    later; Ctrl+K opens nothing. The settled read makes the composer the "before", so nothing is typed or sent."""
+    desk = _desk(client, guard)
+    desk.switcher_opens = False
+    real_focus = desk._focus
+    calls = {"n": 0}
+
+    def late_focus(timeout_s: float = 0.4) -> Any:
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real_focus(timeout_s)
+
+    desk._focus = late_focus
+    got = _run(client, _ctx(client, hands=desk, words=["message Juno"]), {"person": "Juno"})
+    assert desk.typed() == [] and desk.keys() == ["ctrl+k"] and not got.done
+
+
+def test_r2_m2_the_in_call_question_says_what_will_happen(client, guard, monkeypatch) -> None:
+    """Review r2 M2: no route leaves another app's call, so none is promised: a call in another app (or one memory
+    can't name) -> "Join {channel} on Discord as well?"; Discord's own call (it holds the microphone, or memory's open
+    calls name it) -> "Switch to {channel}?". The words are the connection file's data."""
+    data = CH.app_data("discord")
+    assert data["asks"]["in_call"] == "You're already in a call. Join {channel} on Discord as well?"
+    assert data["asks"]["switch"] == "Switch to {channel}?"
+    for calls, mic, want in (([], False, "You're already in a call. Join lantern-club on Discord as well?"),
+                             (["zen"], False, "You're already in a call. Join lantern-club on Discord as well?"),
+                             (["discord"], False, "Switch to lantern-club?"),
+                             ([], True, "Switch to lantern-club?")):
+        desk = _desk(client, guard)
+        desk.in_call = True
+        guard["mic"] = [mic]
+        monkeypatch.setattr(CH, "_current_calls", lambda memory, _c=calls: list(_c))
+        got = E.resolve_and_run("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"],
+                                _ctx(client, hands=desk, words=["join lantern-club"]))
+        assert got.outcome == "asked" and got.ask == want, (calls, mic, got.ask)
+        assert "Leave" not in got.ask and desk.calls == [] and guard["focused"] == []
+    # no call live, Discord not holding the microphone: no question, it joins
+    desk = _desk(client, guard)
+    desk.in_call = False
+    monkeypatch.setattr(CH, "_current_calls", lambda memory: [])
+    guard["mic"] = [False, False, True]
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"],
+                            _ctx(client, hands=desk, words=["join lantern-club"]))
+    assert got.outcome == "done" and desk.keys() == ["ctrl+k", "enter"]
+
+
+def test_r2_l2_a_plain_yes_alone_fails_safe(client, guard) -> None:
+    """Review r2 L2 (carried to sVoice/sCore): the answer turn's words are only ["yes"], so the channel from the
+    asking turn isn't in them and is dropped: Yuki asks for the channel again, never guesses, nothing is pressed."""
+    desk = _desk(client, guard)
+    desk.in_call = True
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club", "join_in_call": True}, ["yes"],
+                            _ctx(client, hands=desk, words=["yes"]))
+    assert got.outcome == "asked" and got.ask == "Which voice channel?" and desk.calls == []
+
+
+def test_r2_l5_an_unreadable_microphone_still_waits_before_join_voice(client, guard, monkeypatch) -> None:
+    """Review r2 L5: with the microphone state unreadable no onset can show; "Join Voice" is still pressed only after
+    the switcher's channel had the same 2 s to open."""
+    desk = _desk(client, guard)
+    guard["mic"] = [None]
+    ctx = _ctx(client, hands=desk, words=["join lantern-club"])
+    at: dict[str, float] = {}
+    desk.effects[("hotkey", "enter")] = lambda: at.setdefault("enter", ctx.clock())
+    monkeypatch.setattr(CH, "_press", lambda hwnd, role, name: at.setdefault("press", ctx.clock()) and "pressed")
+    got = E.resolve_and_run("discord.voice", {"channel": "lantern-club"}, ["join lantern-club"], ctx, live=Live())
+    assert at["press"] - at["enter"] >= CH.VOICE_WAIT_S and not got.done
+    assert got.say == "I opened lantern-club in Discord, but couldn't confirm you joined it."
