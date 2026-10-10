@@ -44,6 +44,13 @@ checks every nudge's evidence ids against the request, like the to-do mentions):
   milestone that connects to what is open, the screen meeting something memory holds, a personal
   event's follow-up, a thread of work left open. Looked at after the due items and before the
   questions, with every gate above and no call open. Never spoken (the user's decision, 29 Sept).
+* the routine card (:mod:`yuki.memory.routine_offers`, kind ``notice``, trigger ``routine``: "Your usual") -
+  written by code with no model at the user's measured usual moment (their meeting tab around 08:52 on
+  weekdays), first in the pass, before the welcome back. It passes only the gates None, settling (30 s after
+  sitting down) and meeting, and holds by itself on a game or full screen in front, the 120 s return hold, any
+  open call, the meeting app's sound, away and Yuki acting (D11); it skips the card gap but never jumps a card
+  showing; at most ``routine_per_day`` (2) a day. Its "Open it" runs the routine's skill in the tray, never an
+  agent run; never work (yuki.memory.offers ``run_skill``).
 
 A break nudge only once the user has been at the PC ``break_after_min`` (90) without a
 break of ``break_min`` - their session with its short hops folded in, or sessions back to
@@ -497,7 +504,8 @@ ask.
 - An offer is optional, and only your own small job (the rules below): put an open item on their list \
 with a time (todo_add), show where a thread of theirs stands (show_memory), open again a page they had \
 (bring_back). Picking their work back up is theirs: never offer to reopen or check their code, files, \
-runs, sessions or reviews for them. With an offer, end the text with a short question naming exactly \
+runs, sessions or reviews for them. Their usual meeting or music at the usual time comes on its own card; never \
+mention or offer it here. With an offer, end the text with a short question naming exactly \
 that action, and fill the offer: do; label (2-4 words naming the action); steps (1-3 plain lines of \
 exactly what the button will do); refs (the ids it acts on); text (todo_add: the to-do in their words; \
 draft: the whole draft; ask: the request as they would type it; else ""); due (todo_add: "YYYY-MM-DD \
@@ -648,6 +656,16 @@ class NudgeConfig:
     checkins_enabled: bool = True
     checkins_per_day: int = 3
     checkin_gap_min: float = 90.0
+    #: The routine card ("Your usual", yuki.memory.routine_offers, PLAN.md Phase R): on; at most routine_per_day a day
+    #: (days start at resume_day_start); in the usual window, from routine_lead_min to routine_lead_last_min before
+    #: the usual time (mode early; mode late: 1-3 min after it); its button expires routine_expire_after_min after the
+    #: usual time; once the user sat down it waits routine_settle_s (D11). ``offers = "off"`` stops it too.
+    routine_offers: bool = True
+    routine_per_day: int = 2
+    routine_lead_min: float = 8.0
+    routine_lead_last_min: float = 1.0
+    routine_expire_after_min: float = 10.0
+    routine_settle_s: float = 30.0
 
     @classmethod
     def from_dict(cls, table: dict | None) -> NudgeConfig:
@@ -964,6 +982,10 @@ class View:
     at_pc_since: float | None = None
     #: The current stretch holds break_min of presence: they really sat down (a glance never does).
     settled: bool = False
+    #: Every screen hold true now, not only the first one ``gate`` names (``yuki_acting``, ``meeting``, ``game``,
+    #: ``fullscreen``, ``return_hold``, ``away``, ``settling``): the routine lane holds by itself on each of them
+    #: whatever the gate says (D11), e.g. a game in front during a meeting's five-minute tail.
+    holds: frozenset[str] = frozenset()
 
 
 def _break_between(clips: Sequence[Any], start: float, end: float) -> dict[str, Any]:
@@ -1092,26 +1114,31 @@ def observe(store: Store, now: float, config: NudgeConfig, live: dict[str, Any] 
         last_break = _break_between(wide, prev.end if prev is not None else wide_since, stretch.start)
         if prev is None:
             last_break["reaches_back"] = True   # nothing of theirs recorded in the day and a half before
-    gate = None
     live = live or {}
+    holds: set[str] = set()
     if (ongoing and last.row.by_yuki) or live.get("acting"):
-        gate = "yuki_acting"
-    elif live.get("meeting") or any(c.row.meeting and c.end >= now - MEETING_GAP_S for c in clips):
-        gate = "meeting"
-    elif _game_front(live, ongoing, last):
-        gate = "game"
-    elif live.get("fullscreen") or (ongoing and last.row.fullscreen) or any(
-            (c.row.fullscreen or game_row(c.row)) and c.end >= now - config.return_hold_s for c in clips_all):
-        gate = "fullscreen"     # a full-screen app in front, or the return hold after a game or full-screen stretch
-    elif present_recent <= 0.0 or stretch is None:
-        gate = "away"
+        holds.add("yuki_acting")
+    if live.get("meeting") or any(c.row.meeting and c.end >= now - MEETING_GAP_S for c in clips):
+        holds.add("meeting")
+    if _game_front(live, ongoing, last):
+        holds.add("game")
+    if live.get("fullscreen") or (ongoing and last.row.fullscreen):
+        holds.add("fullscreen")     # a full-screen app in front
+    if any((c.row.fullscreen or game_row(c.row)) and c.end >= now - config.return_hold_s for c in clips_all):
+        holds.add("return_hold")    # the return hold after a game or full-screen stretch
+    if present_recent <= 0.0 or stretch is None:
+        holds.add("away")
     elif not stretch.settled:
-        gate = "settling"
+        holds.add("settling")
+    # the coach's gate: the first hold in this order (a full screen and the return hold are both "fullscreen")
+    gate = next((g for g, names in (("yuki_acting", ("yuki_acting",)), ("meeting", ("meeting",)), ("game", ("game",)),
+                                    ("fullscreen", ("fullscreen", "return_hold")), ("away", ("away",)),
+                                    ("settling", ("settling",))) if holds.intersection(names)), None)
     return View(now, since, rows, runs, current, present_recent, gate,
                 stretch.start if stretch is not None else None,
                 last_break["seconds"] if last_break else 0.0, last_break,
                 at_pc_since=stretch.start if stretch is not None else None,
-                settled=bool(stretch is not None and stretch.settled))
+                settled=bool(stretch is not None and stretch.settled), holds=frozenset(holds))
 
 
 # ---------------------------------------------------------------------------
@@ -2132,6 +2159,10 @@ class NudgeWorker:
         self.embedder = embedder
         #: Yuki's check-ins about the user's goals and their day (yuki.memory.checkins).
         self.checkins = CheckinWorker(self)
+        from yuki.memory.routine_offers import RoutineLane
+
+        #: The "Your usual" routine card (yuki.memory.routine_offers): code only, no model.
+        self.routines = RoutineLane(self)
 
     # -- dependencies ------------------------------------------------------------
 
@@ -2158,7 +2189,8 @@ class NudgeWorker:
                     fh.write(json.dumps(record, ensure_ascii=False, default=_as_plain) + "\n")
         except OSError:
             pass
-        if self._service_log is not None and type in ("nudge_checkin", "nudge_gate", "nudge_error", "worker_error"):
+        if self._service_log is not None and type in ("nudge_checkin", "nudge_gate", "nudge_error", "worker_error",
+                                                      "routine_offer", "routine_held", "tab_census"):
             try:
                 self._service_log(type, **{k: v for k, v in record.items() if not k.endswith("_ciphertext")
                                            and k not in ("ts", "type", "traceback")})
@@ -2321,6 +2353,18 @@ class NudgeWorker:
                     and now - view.at_pc_since >= config.break_consider_min * 60.0:
                 self._calm_pending = True   # a long stretch in a game: look at the first calm moment after it
         self._note_gate(gate)
+        if gate not in ("disabled", "paused"):
+            # the "Your usual" routine card (D10, D11): before the welcome back, with its own holds; under the coarse
+            # gates (locked, snoozed, quiet hours: no view) it shows nothing and only keeps its ledger
+            try:
+                routine = self.routines.tick(now, config, view, gate)
+            except Exception as exc:
+                routine = None
+                self._log("nudge_error", where="routine", error=f"{type(exc).__name__}: {exc}",
+                          traceback=traceback.format_exc())
+            if routine is not None:
+                done.append(self._delivered("routine", routine, now))
+                return done
         if gate is not None:
             return done
         items = todo_items(self.store, now=now)
@@ -2416,6 +2460,17 @@ class NudgeWorker:
         """A call is going on (yuki.memory.calls: a call app holding the microphone, recorded or not)."""
         try:
             return bool(self.store.calls(statuses=CALL_OPEN_STATUSES, limit=1))
+        except Exception:
+            return False
+
+    def _call_open(self) -> bool:
+        """A call (kind ``call``: a meeting, a Discord call, a voice channel) is going on; a game's voice chat (kind
+        ``game``) is not one here: the routine lane holds on a game in front by its own check, and a game open behind
+        lets cards run (D8, D11; map-routines R2.3). On 8 Oct 08:51 VALORANT's voice session, open behind Zen since
+        07:01, would otherwise have held the morning card."""
+        try:
+            return any(getattr(c, "kind", "call") != "game"
+                       for c in self.store.calls(statuses=CALL_OPEN_STATUSES))
         except Exception:
             return False
 

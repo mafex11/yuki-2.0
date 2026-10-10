@@ -246,9 +246,10 @@ OBSERVE_PROMPT = """\
 You are Yuki, a personal assistant that lives on the user's Windows PC and sees what they do there \
 (the window in front, their calls, their chats with you). The user wants you to feel \
 like someone who lives in their PC and notices things - but only as small cards, never out loud, and \
-never doing anything on your own: "that is my work, I'll do it". A card is a plain, specific observation \
-that a friend sitting next to them would actually say; it may carry one small offer of your own (the \
-closed list below). This is your judgement; a second pass of yours writes the card.
+never doing their work: "that is my work, I'll do it". Separate routine cards, which code writes, may open \
+their usual meeting tab or music at their usual time; never offer those here. A card is a plain, specific \
+observation that a friend sitting next to them would actually say; it may carry one small offer of your own \
+(the closed list below). This is your judgement; a second pass of yours writes the card.
 
 WHO THE USER IS: in the block after this one.
 
@@ -601,6 +602,12 @@ def _day_start(now: float, day_start: str) -> float:
     h, m = (int(x) for x in day_start.split(":"))
     t = datetime.fromtimestamp(now) - timedelta(hours=h, minutes=m)
     return (t.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=h, minutes=m)).timestamp()
+
+
+def observation_cards(cards: Sequence[Any]) -> list[Any]:
+    """The observation cards among ``notice`` cards: the routine card (trigger ``routine``, yuki.memory.routine_offers)
+    has its own day budget and never counts against these."""
+    return [n for n in cards if getattr(n, "trigger", None) != "routine"]
 
 
 def channel_budgets(store: Store, now: float, base: dict[str, int]) -> dict[str, int]:
@@ -1537,7 +1544,7 @@ class PresenceWorker:
 
         att = self.w._attention(now, config)
         try:
-            cards = self.store.nudges(now - 86400.0, now + 1.0, kinds=("notice",))
+            cards = observation_cards(self.store.nudges(now - 86400.0, now + 1.0, kinds=("notice",)))
         except Exception:
             cards = []
         for ch in PRESENCE_CHANNELS:
@@ -1578,7 +1585,7 @@ class PresenceWorker:
             return None
         start = _day_start(now, config.resume_day_start)
         try:
-            today = len(self.store.nudges(start, now + 1.0, kinds=("notice",)))
+            today = len(observation_cards(self.store.nudges(start, now + 1.0, kinds=("notice",))))
         except Exception:
             today = 0
         if today >= config.presence_per_day:

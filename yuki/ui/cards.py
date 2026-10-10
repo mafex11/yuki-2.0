@@ -24,7 +24,11 @@ KIND_TITLES: dict[str, str] = {
 NOTICE_TITLES: dict[str, str] = {
     "notice": "Noticed", "stuck": "Noticed", "recap": "After your call", "followup": "Asking",
     "recall": "From memory", "thread": "Your work", "plans": "Coming up",
+    # the routine card (yuki.memory.routine_offers, PLAN.md Phase R): the user's usual moment, offered by code
+    "routine": "Your usual",
 }
+#: The routine card's trigger (its heading is :data:`NOTICE_TITLES` ``routine``).
+ROUTINE_TRIGGER = "routine"
 #: A check-in's heading by the moment Yuki itself wrote on its card (``yuki.memory.checkins.MOMENTS``; the card's
 #: ``moment``), and the heading of a check-in whose moment is not on its row.
 CHECKIN_TITLES: dict[str, str] = {"day_start": "Today", "new_thread": "Your new thread", "followup": "Following up",
@@ -33,17 +37,21 @@ CHECKIN_TITLE = "Checking in"
 #: Its header's dot icon by moment.
 CHECKIN_ICONS: dict[str, str] = {"day_start": "day", "new_thread": "work", "followup": "retry", "evening": "pause",
                                  "care": "hand"}
-#: The offer kinds the UI knows how to run (memory's closed list, yuki.memory.offers.OFFER_DOS).
-OFFER_DOS: frozenset[str] = frozenset({"todo_add", "show_memory", "bring_back", "draft", "ask"})
-#: Offers whose result can be taken back (memory's ``offer_undo``: a to-do added, a page opened again).
-UNDOABLE_DOS: frozenset[str] = frozenset({"todo_add", "bring_back"})
-#: What the card says when its offer could not run (memory's ``why``), plain words.
+#: The offer kinds the UI knows how to run (memory's closed list, yuki.memory.offers.OFFER_DOS); ``run_skill`` is the
+#: routine card's: memory checks it and the tray runs the skill (never an agent run).
+OFFER_DOS: frozenset[str] = frozenset({"todo_add", "show_memory", "bring_back", "draft", "ask", "run_skill"})
+#: Offers whose result can be taken back (memory's ``offer_undo``: a to-do added, a page opened again, the window
+#: that was in front before a routine card's skill brought another one forward).
+UNDOABLE_DOS: frozenset[str] = frozenset({"todo_add", "bring_back", "run_skill"})
+#: What the card says when its offer could not run (memory's ``why``, or the tray's for a skill run), plain words.
 OFFER_FAILED: dict[str, str] = {
     "expired": "This offer expired. Nothing ran.",
     "gone": "That's no longer there. Nothing ran.",
     "off": "Offers are turned off. Nothing ran.",
     "already": "Already done.",
     "error": "That didn't work. Nothing ran.",
+    "not_ready": "I can't do that from a card yet. Nothing ran.",
+    "busy": "I'm busy on your desktop right now. Nothing ran.",
 }
 
 
@@ -126,6 +134,19 @@ def offer_lines(nudge: dict[str, Any] | None) -> str:
     return "\n".join(lines)
 
 
+def routine_card(nudge: dict[str, Any] | None) -> bool:
+    """Whether a card is the "Your usual" routine card (an observation card of trigger ``routine``)."""
+    n = nudge or {}
+    return str(n.get("kind") or "") == "notice" and str(n.get("trigger") or "") == ROUTINE_TRIGGER
+
+
+def offer_why(nudge: dict[str, Any] | None) -> str:
+    """A routine card's why line, from the counts ("You've joined it around 08:58 on 7 of the last 9 weekdays."),
+    ``""`` for any other card."""
+    offer = card_offer(nudge)
+    return " ".join(str((offer or {}).get("why") or "").split()) if offer and offer.get("do") == "run_skill" else ""
+
+
 def offer_expired(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
     """Whether a card's offer is past its time (``expires_at``): its button is gone, also in the history."""
     offer = card_offer(nudge)
@@ -146,5 +167,7 @@ def offer_open(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
     return str(n.get("reaction") or "") not in ("dismissed", "less", "snoozed")
 
 
-__all__ = ["CHECKIN_ICONS", "CHECKIN_TITLE", "CHECKIN_TITLES", "KIND_TITLES", "NOTICE_TITLES", "OFFER_DOS", "UNDOABLE_DOS", "OFFER_FAILED", "epoch_of", "kind_title",
-           "card_title", "checkin_moment", "card_offer", "offer_label", "offer_steps", "offer_lines", "offer_expired", "offer_open"]
+__all__ = ["CHECKIN_ICONS", "CHECKIN_TITLE", "CHECKIN_TITLES", "KIND_TITLES", "NOTICE_TITLES", "ROUTINE_TRIGGER",
+           "OFFER_DOS", "UNDOABLE_DOS", "OFFER_FAILED", "epoch_of", "kind_title", "card_title", "checkin_moment",
+           "card_offer", "offer_label", "offer_steps", "offer_lines", "routine_card", "offer_why", "offer_expired",
+           "offer_open"]

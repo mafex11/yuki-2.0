@@ -5,14 +5,15 @@ hours and meeting / full-screen checks in ``yuki.memory.nudges``, the card queue
 ``yuki.ui.nudges``, the voice narrator's cooldown and settle in ``yuki.voice.narrator``. A rule
 tuned in one place silently diverged from the others. :class:`Attention` is the one place those
 rules live, per **channel** (``coach``, ``reminder``, ``standing_request``, ``question``,
-``voice_progress``, ``notice``, ``checkin`` (:mod:`yuki.memory.checkins`), and the observation cards of
+``voice_progress``, ``notice``, ``checkin`` (:mod:`yuki.memory.checkins`), the observation cards of
 :mod:`yuki.memory.presence`: ``stuck``, ``recap``, ``followup``, ``recall``, ``thread``, all counted together
-in ``presence``), each with a
+in ``presence``, and ``routine``, the "Your usual" card of :mod:`yuki.memory.routine_offers`), each with a
 :class:`ChannelRule`:
 
 * **budget** - at most ``budget`` deliveries per ``window_s`` (rolling);
 * **cooldown** - at least ``cooldown_s`` after the channel's last delivery;
-* **card gap** - channels that show a card (``card=True``) keep ``card_gap_s`` from any other card;
+* **card gap** - channels that show a card (``card=True``) keep ``card_gap_s`` from any other card (a channel with
+  ``card_gap=False``, the routine card, skips it for itself but still moves it for the others);
 * **quiet hours** - ``quiet_start``-``quiet_end`` local time (wrapping midnight), for channels
   with ``quiet=True``;
 * **full-screen / meeting gates** - measured facts (``facts()["fullscreen"]`` /
@@ -59,6 +60,10 @@ class ChannelRule:
     quiet: bool = True           # held in quiet hours
     fullscreen: bool = True      # held while a full-screen app is in front
     meeting: bool = True         # held during a meeting or call
+    #: Keeps the card gap after another card (``card=True`` only). The routine card sets it False (PLAN.md Phase R,
+    #: critique M20): a welcome back at 08:48 would otherwise hide the whole 08:50-08:57 window. It never skips the
+    #: one-pending-card rule, and its own delivery still moves the gap for every other card.
+    card_gap: bool = True
 
 
 #: Defaults, matching what the coach and the voice did on their own before (docs/HANDBOOK.md §6):
@@ -95,6 +100,11 @@ DEFAULT_RULES: dict[str, ChannelRule] = {
     "checkin": ChannelRule(budget=3, window_s=DAY_S, cooldown_s=3600.0, card=True),
     "voice_progress": ChannelRule(budget=4, window_s=60.0, cooldown_s=1.5, quiet=False, fullscreen=False,
                                   meeting=True),
+    # the "Your usual" routine card (yuki.memory.routine_offers, PLAN.md Phase R): at most two a day, held in quiet
+    # hours and over a full screen; the lane holds it itself on any open call, meeting audio, a game in front, away
+    # and Yuki acting (D11), so the meeting fact is not this rule's; it skips the card gap (never a card showing)
+    "routine": ChannelRule(budget=2, window_s=DAY_S, cooldown_s=0.0, card=True, quiet=True, fullscreen=True,
+                           meeting=False, card_gap=False),
 }
 #: The observation channels (yuki.memory.presence), each also counted in ``presence``.
 PRESENCE_CHANNELS: tuple[str, ...] = ("notice", "stuck", "recap", "followup", "recall", "thread", "plans")
@@ -189,7 +199,7 @@ class Attention:
             return Decision(False, "quiet_hours", None)
         if rule.fullscreen and facts.get("fullscreen"):
             return Decision(False, "fullscreen", None)
-        if rule.card and self._last_card and now - self._last_card < self.card_gap_s:
+        if rule.card and rule.card_gap and self._last_card and now - self._last_card < self.card_gap_s:
             return Decision(False, "card_gap", self._last_card + self.card_gap_s)
         history = self._history.get(channel)
         if history:
