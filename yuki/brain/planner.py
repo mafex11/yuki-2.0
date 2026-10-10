@@ -364,12 +364,15 @@ class PlanStream:
 
 @dataclass
 class ToolStart:
-    """A ``tool_use`` block as it begins (``input`` is filled once the response is complete)."""
+    """A ``tool_use`` block as it begins (``input`` is filled once the response is complete). ``bad_input``: a
+    streamed input that did not parse as one JSON object (eager streaming hands on what the model wrote unchecked, and
+    the SDK's tolerant parser may return it cut short): the tool is not run, it is answered as an error."""
 
     name: str
     id: str
     index: int
     input: dict[str, Any] = field(default_factory=dict)
+    bad_input: bool = False
 
 
 @dataclass
@@ -421,6 +424,8 @@ class ModelCall:
         self.tool: ToolStart | None = None
         self.plan: PlanStream | None = None
         self._scanner: PlanScanner | None = None
+        #: A non-plan tool's input as it streamed (re-parsed strictly at the end, as the plan is).
+        self._tool_json: list[str] | None = None
         self._blocks: dict[int, dict[str, Any]] = {}
         self._text_parts: list[str] = []
         self._partial_at: dict[str, float] = {}
@@ -534,11 +539,16 @@ class ModelCall:
                 self._text_parts.append(piece)
                 if self.tool is None:
                     self._partial("reply", "".join(self._text_parts))
-            elif dtype == "input_json_delta" and self._scanner is not None and self.tool is not None \
-                    and index == self.tool.index:
-                for found, text in self._scanner.feed(str(getattr(delta, "partial_json", "") or "")):
-                    if self.plan is not None:
-                        self.plan._feed(found, text)
+            elif dtype == "input_json_delta" and self.tool is not None and index == self.tool.index:
+                piece = str(getattr(delta, "partial_json", "") or "")
+                if self._scanner is not None:
+                    for found, text in self._scanner.feed(piece):
+                        if self.plan is not None:
+                            self.plan._feed(found, text)
+                else:
+                    if self._tool_json is None:
+                        self._tool_json = []
+                    self._tool_json.append(piece)
         elif kind == "content_block_stop":
             index = int(getattr(event, "index", 0) or 0)
             slot = self._blocks.get(index) or {}
@@ -568,6 +578,25 @@ class ModelCall:
     def _step_out(self, step: Step) -> None:
         if self._voice and step.say:
             self._partial("step", step.say, force=True)
+
+    def _strict_tool_input(self) -> None:
+        """A non-plan tool's streamed input, parsed strictly (the plan's own blocks are, by :class:`PlanStream`): what
+        does not parse as one JSON object marks the tool ``bad_input`` instead of running on a cut-short value."""
+        tool, parts = self.tool, self._tool_json
+        if tool is None or tool.name == PLAN_TOOL or parts is None:
+            return
+        text = "".join(parts).strip()
+        if not text:
+            return   # nothing streamed for it: the SDK's input stands (an empty object)
+        try:
+            strict = json.loads(text)
+        except ValueError:
+            strict = None
+        if isinstance(strict, dict):
+            tool.input = strict
+            return
+        tool.bad_input = True
+        self._log("brain_tool_input_invalid", tool=tool.name, chars=len(text))
 
     def _replay_final(self) -> None:
         """Plain (non-streamed) mode: the whole response at once, handled as if streamed."""
@@ -614,6 +643,7 @@ class ModelCall:
                 if getattr(block, "type", None) == "tool_use" and str(getattr(block, "id", "")) == self.tool.id:
                     raw = getattr(block, "input", None)
                     self.tool.input = dict(raw) if isinstance(raw, Mapping) else {}
+        self._strict_tool_input()
         text = "".join(str(getattr(b, "text", "") or "") for b in content if getattr(b, "type", None) == "text")
         if self.stop_reason is None:
             self.stop_reason = getattr(final, "stop_reason", None)

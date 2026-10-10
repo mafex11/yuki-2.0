@@ -478,11 +478,12 @@ def _probe(raw: Any, errors: list[str], where: str) -> Probe | None:
 
 def required_probe(plan: Plan) -> str | None:
     """The probe class the plan must end on (design 2.4): ``skill`` (the skill's own check), ``message_sent`` (a
-    send), ``mic_held`` (a join), ``none`` (an answer or a question), or ``None`` (the planner's pick)."""
-    if plan.seeded or plan.skill:
-        return "skill"
+    send), ``mic_held`` (a join), ``none`` (an answer or a question), or ``None`` (the planner's pick). A seed's fixed
+    check applies to its act plans only: an answer or a question in a seeded request changes nothing to check."""
     if plan.kind in ("answer", "ask"):
         return "none"
+    if plan.seeded or plan.skill:
+        return "skill"
     if plan.consent.commit == "send":
         return "message_sent"
     if plan.consent.commit == "join":
@@ -524,6 +525,8 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
         elif skill not in checks.skills:
             errors.append(f"no skill {skill!r} in the menu: use one listed there, or route steps")
         route = SKILL_ROUTE_PREFIX + skill
+        if kind != "act":
+            errors.append("a skill route runs the skill, so it is kind act (an answer or a question routes steps)")
     c = raw.get("consent") if isinstance(raw.get("consent"), Mapping) else None
     if c is None:
         errors.append("consent must be an object with commit, quote, to and text")
@@ -583,8 +586,8 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
                 raise PlanError(["a skill route checks itself: done.probe none"])
             return replace(plan, done=Probe(), done_by_skill=True)
         # a hand-off that carried no done check of its own: the rules of the plan's own class below
-        need = None if plan.kind == "act" and plan.consent.commit not in ("send", "join") else (
-            "none" if plan.kind != "act" else "message_sent" if plan.consent.commit == "send" else "mic_held")
+        # (an act plan here: answers and questions never need "skill")
+        need = {"send": "message_sent", "join": "mic_held"}.get(plan.consent.commit)
     if need == "none":
         if not done.none:
             raise PlanError(["an answer or a question changes nothing to check: done.probe none"])
@@ -763,7 +766,9 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
                          f"to and text), or set its slots so it leaves a draft"])
     if header.consent.commit == "send":
         raw_send = (verb == "type_text" and (step.submit or "\r" in (value or "") or "\n" in (value or "")))
-        typed_before = any(p.verb == "type_text" and (p.window or "") == (step.window or "") for p in prior)
+        # a window left out (or named one way here and another there) counts as the same window: fail closed
+        typed_before = any(p.verb == "type_text" and (not p.window or not step.window or p.window == step.window)
+                           for p in prior)
         if verb in ("click", "press", "hotkey") and typed_before:
             raw_send = True
         if raw_send:

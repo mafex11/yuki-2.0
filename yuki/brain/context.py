@@ -38,6 +38,9 @@ from yuki.brain.prompt import menu_text, profile_text
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
 RECENT_LABEL = "[The last requests in this conversation: their words and Yuki's final answer]"
 WORDS_LABEL = "[Their exact words]"
+#: The words block when the runtime or the bridge passed no words of the user's (fail closed, M2): nothing is quotable.
+NO_WORDS_LINE = ("[Their exact words: none came with this request, so nothing here is theirs to quote or send. The "
+                 "request is in the context below]")
 CONTEXT_LABEL = ("[Context the request came with: text from Yuki's own card or note. Not the user's words: never quote "
                  "or send it as theirs]")
 YOU_LABEL = "[You right now, from Yuki's memory service]"
@@ -438,7 +441,7 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
         texts.append(recent)
     texts.append(CHANNEL_LINES.get(channel, CHANNEL_LINES["typed"]))
     said = "\n".join(w.strip() for w in words if str(w).strip())
-    texts.append(f"{WORDS_LABEL}\n{said}")
+    texts.append(f"{WORDS_LABEL}\n{said}" if said else NO_WORDS_LINE)
     if context.strip():
         texts.append(f"{CONTEXT_LABEL}\n" + fence(clip(context, limits.context_chars),
                                                   source="Yuki's own card or note", nonce=nonce))
@@ -534,6 +537,84 @@ def _field(result: Any, name: str, default: Any = None) -> Any:
     return getattr(result, name, default)
 
 
+def swap_blocks(swaps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """A chip the user tapped on the send countdown, as a fact for the revision (design 2.5(a)): code-written and
+    labelled Yuki's, never the user's words, so the plan cannot quote it as theirs. The tap itself reaches the consent
+    rule through ``Host.swaps()``."""
+    out = []
+    for swap in swaps:
+        value, was = one_line(swap.get("value"), 80), one_line(swap.get("was"), 80)
+        if not value:
+            continue
+        if swap.get("kind") == "who":
+            fact = f"the message goes to {value}" + (f", not {was}" if was else "")
+            fix = f"consent.to {value}"
+        else:
+            fact = f"the message goes on {value}" + (f", not {was}" if was else "")
+            fix = f"the capability for {value}"
+        out.append({"type": "text", "text": f"{CHECK_LABEL} On the send countdown the user tapped a choice: {fact}. "
+                                            f"Nothing was sent. Revise the plan with {fix}; the text stays the same."})
+    return out
+
+
+def _step_line(step: Any) -> str:
+    """One plan step as the model wrote it, for a report after its response was cut off (the model's own values go
+    back to the model; nothing here is logged)."""
+    parts = [str(getattr(step, "verb", "") or "")]
+    element = getattr(step, "element", None)
+    if element is not None and getattr(element, "name", None):
+        parts.append(f"{one_line(element.name, 60)} ({one_line(getattr(element, 'role', ''), 30)})")
+    if getattr(step, "window", None):
+        parts.append(f"window {one_line(step.window, 60)}")
+    if getattr(step, "value", None):
+        parts.append(f"value {one_line(step.value, 120)!r}")
+    if getattr(step, "submit", False):
+        parts.append("then Enter")
+    return ", ".join(p for p in parts if p)
+
+
+def cutoff_report(plan: Plan | None, statuses: Sequence[StepStatus | Mapping[str, Any]], *, taken: int) -> str:
+    """The model's response was cut off (``max_tokens``, or a tool input that could not be read) after some of its
+    plan's steps were handed on: which ran and how, so the next plan does not repeat them (a second tab, text typed
+    twice). The cut response is never appended; this is a user turn of its own (append-only). Code-written."""
+    lines = [f"{CHECK_LABEL} Your last response was cut off before it was complete, so it was not kept and the rest of "
+             f"its plan did not run."]
+    got: dict[int, Any] = {}
+    for s in statuses:
+        index = s.get("index") if isinstance(s, Mapping) else getattr(s, "index", None)
+        if isinstance(index, int):
+            got[index] = s
+    steps = list(plan.steps) if plan is not None else []
+    count = min(max(taken, (max(got) + 1) if got else 0), len(steps))
+    rows = []
+    for i in range(count):
+        s = got.get(i)
+        state = (s.get("state") if isinstance(s, Mapping) else getattr(s, "state", None)) if s is not None else None
+        note = (s.get("note") if isinstance(s, Mapping) else getattr(s, "note", "")) if s is not None else ""
+        rows.append(f"{i + 1}. {_step_line(steps[i])}: {state or 'handed on, status unknown'}"
+                    + (f" - {one_line(note, 160)}" if note else ""))
+    if rows:
+        lines.append("Steps of that plan that were handed on:\n" + "\n".join(rows))
+    elif statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    lines.append("Plan the rest from here, shorter: never repeat a step that ran unless a look shows it did not take.")
+    return "\n".join(lines)
+
+
+def held_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
+    """A plan that ended (done, not confirmed, drafted, declined) while the user added something: its line was held,
+    not said (``loop.Agent``'s held final, design 7). Code-written."""
+    status = str(_field(result, "status", "") or "")
+    lines = [f"{CHECK_LABEL} Plan {plan.id if plan else ''} ended: {status}."]
+    statuses = _field(result, "statuses", None) or []
+    if statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    lines.append(f"Yuki's line for the user was: {one_line(line, 200)}")
+    lines.append("It was not said: the user added the words below before it went out. Take them into account: send a "
+                 "revised plan if they change what to do; if nothing more needs doing, reply in one short line.")
+    return "\n".join(lines)
+
+
 def step_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, *, limit: int,
                 replans_left: int) -> str:
     """What a plan's run showed, for the replan: every step's status, the step that did not match with what it expected
@@ -589,5 +670,5 @@ def answer_report(question: str, answer: str | None) -> str:
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "request_turn", "Conversation",
-           "tool_result", "steer_blocks", "step_report", "read_report", "invalid_report", "answer_report", "clip",
+           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report", "invalid_report", "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

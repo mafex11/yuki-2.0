@@ -33,25 +33,28 @@ import queue
 import threading
 import time
 from collections import Counter, deque
-from dataclasses import dataclass, field, fields as dc_fields
+from dataclasses import dataclass, field, fields as dc_fields, replace
 from datetime import datetime
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from yuki.brain.context import (
+    CHECK_LABEL,
     Conversation,
     Exchange,
     Gathered,
     answer_report,
+    cutoff_report,
     gather,
+    held_report,
     invalid_report,
     load_catalog,
     one_line,
-    read_people,
     read_report,
     request_turn,
     sends_fn,
     step_report,
     steer_blocks,
+    swap_blocks,
     tool_result,
 )
 from yuki.brain.plan import (
@@ -91,8 +94,8 @@ RESUME_GRACE_S = 1.5
 #: The outcome levels' words (``finish.LEVEL_LABELS``'s values: the done card and the island repeat them).
 LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Likely done",
                                 "unverified": "Not confirmed", "failed": "Didn’t work", "answer": ""}
-#: Lines said by code (design 2.3, 2.4): never a claim the probe did not see.
-LINE_DONE = "Done, and the PC shows it."
+#: Lines said by code (design 2.3, 2.4): never a claim the probe did not see (a done comes with the executor's line
+#: from the probe's evidence; without one it is said as not confirmed).
 LINE_UNCONFIRMED = "I tried, but I couldn't confirm it worked."
 LINE_STUCK = "I got stuck {where}{why}. Try another way?"
 LINE_DECLINED = "Okay, I didn't do that."
@@ -120,6 +123,17 @@ OUTCOME_KEYS: tuple[str, ...] = ("level", "label", "acted", "seen", "send", "par
 WORKER_JOIN_S = 5.0
 #: How long a launch watch may hold a run row at most (s; the watch's own 180 s and slack).
 WATCH_JOIN_S = 200.0
+#: Executor results that end the request with their line (unless the user added something meanwhile: design 7).
+ENDINGS: tuple[str, ...] = ("done", "unconfirmed", "drafted", "declined")
+#: Step states that mean an act step did something on the PC (``ExecResult.acted`` is also read).
+ACTED_STATES: tuple[str, ...] = ("ok", "mismatch", "drafted")
+#: Cut-off responses (``max_tokens`` or an unreadable tool input) asked again in one request; the next ends stuck.
+MAX_CUTOFFS = 1
+#: A cut-off response is asked again with this much more room, up to the ceiling (streamed / plain: the SDK refuses a
+#: plain call whose output could outlast its HTTP timeout).
+CUTOFF_TOKENS_STREAMED, CUTOFF_TOKENS_PLAIN = 64000, 20000
+#: A tool whose streamed input did not parse is answered with this (never run on a cut-short value).
+BAD_INPUT_TEXT = "Not run: its input could not be read as one JSON object. Send the call again."
 
 _END = object()
 
@@ -146,6 +160,12 @@ class _Request:
     started_at: datetime = field(default_factory=datetime.now)
     epoch: float = field(default_factory=time.time)
 
+    @property
+    def shown(self) -> str:
+        """The request as the summary, the ledger, the turn log and the follow-up history show it: the user's words, or
+        the request text when none came (display only: never quotable)."""
+        return "\n".join(self.words) or self.request
+
 
 @dataclass
 class _State:
@@ -161,7 +181,14 @@ class _State:
     failed_step: Step | None = None
     repeat_rejected: bool = False
     last: ExecResult | None = None
+    #: M9: the request already holds the user's private content (the people block's own messages, a memory, file or
+    #: clipboard read), so an outbound fetch is a commit from here on.
     private_read: bool = False
+    #: A plan's ending (line, outcome) held because the user added something before it was said (design 7).
+    held: tuple[str, dict[str, Any]] | None = None
+    #: Cut-off responses so far, and the output ceiling now in force (0: the setting's).
+    cutoffs: int = 0
+    max_tokens: int = 0
     verdict: bool | None = None
     probe: str = ""
     check_calls: int = 0
@@ -258,7 +285,8 @@ def with_watch_steps(run: dict[str, Any], watches: Sequence[dict[str, Any]], *,
 class Host:
     """One request's :class:`yuki.brain.plan.ExecHost`, plus optional helpers the executor may use (``getattr``):
     ``hold_paused()``, ``countdown(...)``, ``ask_text(question)``, ``account(model, usage, ...)``, ``late_line(text)``,
-    ``run_fields()``. Every method is safe to call from the executor's thread."""
+    ``run_fields()``, ``private_read()`` (M9: consent row 5's "fetch after a private read"), ``swaps()`` (the
+    countdown's tapped chips, for row 4's recipient check). Every method is safe to call from the executor's thread."""
 
     def __init__(self, brain: "Brain", req: _Request) -> None:
         self._brain = brain
@@ -340,6 +368,21 @@ class Host:
         model calls and cost so far, the words added mid-run."""
         return self._brain._run_fields(self._req)
 
+    def private_read(self) -> bool:
+        """Whether this request already holds the user's private content (M9), whoever read it: the request turn's
+        people block (the user's own last messages), a memory, file or clipboard read run outside the plan, or one the
+        executor reported through :meth:`emit`. From then on a plan ``fetch`` of an address is a may-commit step
+        (consent row 5)."""
+        state = self._brain._state
+        return bool(state is not None and state.private_read)
+
+    def swaps(self) -> list[dict[str, str]]:
+        """The chips the user tapped on the send countdown in this request, oldest first: ``{"kind": "who" | "where",
+        "value": the tapped choice, "was": what it replaced}``. A tap is the user's own choice of person or place (from
+        the runtime, never a model's output), but it is not words: nothing here is quotable. Consent row 4 may accept a
+        revised plan's ``consent.to`` equal to a tapped ``who`` value."""
+        return self._brain._swaps_seen()
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # The Brain
@@ -394,6 +437,9 @@ class Brain:
         self.cancel_reason = CANCELLED
         self._steers: deque[str] = deque()
         self._steer_lock = threading.Lock()
+        #: Countdown chips tapped this request: waiting for the next turn, and all of them (``Host.swaps``).
+        self._swaps: list[dict[str, str]] = []
+        self._swaps_all: list[dict[str, str]] = []
         self._pending_answer: str | None = None
         self._awaiting_answer = False
         self._ask_open: _Ask | None = None
@@ -435,10 +481,13 @@ class Brain:
         self._requests = 0
         self._request_started = time.monotonic()
         self._running = False
-        self._early: Gathered | None = None
-        self._early_words = ""
+        #: The voice's early start: the pack read ahead (context, the words it was read for, its nonce), the generation
+        #: it belongs to (each request's start moves it on, so a pack that lands later is dropped), its reader.
+        self._early: tuple[Gathered, str, str] | None = None
+        self._early_gen = 0
         self._early_lock = threading.Lock()
         self._early_thread: threading.Thread | None = None
+        self._early_thread_gen = -1
         self._watches: list[dict[str, Any]] = []
         self._watch_lock = threading.Lock()
         self._status_plan: Plan | None = None
@@ -511,6 +560,20 @@ class Brain:
             out = list(self._steers)
             self._steers.clear()
             return out
+
+    def _take_swaps(self) -> list[dict[str, str]]:
+        with self._steer_lock:
+            out, self._swaps = self._swaps, []
+            return out
+
+    def _swaps_seen(self) -> list[dict[str, str]]:
+        with self._steer_lock:
+            return [dict(s) for s in self._swaps_all]
+
+    def _steer_waiting(self) -> bool:
+        """Something the user added (words, or a countdown chip) waits for the next turn."""
+        with self._steer_lock:
+            return bool(self._steers or self._swaps)
 
     def set_app_named(self, app: str | None) -> None:
         """Kept for the runtime's interface (``loop.Agent.set_app_named``). The new brain takes the user's exact
@@ -827,15 +890,17 @@ class Brain:
         if state == "swapped" and choice is not None:
             kind, value = choice
             if kind == "who":
-                words = f"Not {who or 'them'}: send it to {value} instead" + (f", on {app}" if app else "") + "."
+                swap = {"kind": "who", "value": value, "was": who}
                 event.update(who=value, who_alts=tuple(x for x in (who, *who_alts) if x and x != value)[:2])
             else:
-                words = f"Send it to {who or 'them'} on {value} instead of {where or app}."
+                swap = {"kind": "where", "value": value, "was": where or app}
                 event.update(where=value, where_alts=tuple(x for x in (where, *where_alts) if x and x != value)[:2])
             event["window"] = ""
-            # the tap is the user's choice: it goes in as their words (loop.Agent does the same), so the revised plan
-            # can quote it for the new person or place
-            self.steer(f"{words} (tapped on the send countdown)")
+            # the tap is the user's choice but not their words (design 2.5(a)): the revision gets it as a code-written
+            # fact, and the consent rule sees it through Host.swaps(); nothing composed here becomes quotable
+            with self._steer_lock:
+                self._swaps.append(swap)
+                self._swaps_all.append(dict(swap))
             self.logger.log("send_countdown", state="swapped", swap=kind,
                             after_ms=round((time.monotonic() - started) * 1000))
             self._push(SendPending("swapped", seconds=seconds, **event))
@@ -932,11 +997,16 @@ class Brain:
         return None if self._cancelled.is_set() else item.answer
 
     def _judge_answer(self, question: str, answer: str) -> bool:
-        """The user's reply to Yuki's yes/no question, read by the small model as a go-ahead or not (no word list:
-        design rule). Fail closed: an error, a timeout or an unclear reply is no. Content-free log."""
+        """The user's reply to Yuki's yes/no question, read by the small check model as a go-ahead or not (no word list:
+        design rule). Only the check model (``check_model``, else ``judge_model``: a Haiku), never the planner's: forced
+        tool use is a 400 on the newest planners. Fail closed: no check model, an error, a timeout or an unclear reply
+        is no. Content-free log."""
         started = time.perf_counter()
         bs = self._bs or BrainSettings.read(self.settings)
-        model = bs.check_model or bs.model
+        model = bs.check_model
+        if not model:
+            self.logger.log("ask_judge", ok=False, error="no_check_model", ms=0.0)
+            return False
         try:
             client = self.client
             claude = getattr(client, "claude_only", None)
@@ -964,37 +1034,44 @@ class Brain:
     def begin_early(self, words: str | Sequence[str]) -> None:
         """The voice's early start (design 10.1): read the request turn's parts now, while the talker's ``hand_over``
         is still being written, so ``run`` finds them ready (the overview is used when at most 2 s old, the rest when at
-        most ``pack_max_age_s``). Returns at once; never raises."""
+        most ``pack_max_age_s``, and only by the next request, for the same words). Returns at once; never raises."""
         text = words if isinstance(words, str) else "\n".join(str(w) for w in words if str(w).strip())
         with self._early_lock:
-            if self._early_thread is not None and self._early_thread.is_alive():
+            gen = self._early_gen
+            if (self._early_thread is not None and self._early_thread.is_alive()
+                    and self._early_thread_gen == gen):
                 return
             bs = BrainSettings.read(self.settings)
 
             def build() -> None:
                 try:
+                    from yuki.agent.untrusted import new_nonce
+
+                    nonce = new_nonce()
                     got = gather(dispatcher=self.dispatcher, memory=self.memory, settings=self.settings, words=text,
-                                 names=list(getattr(self.settings, "user_names", []) or []), limits=bs,
-                                 nonce=self._nonce_for_early())
+                                 names=list(getattr(self.settings, "user_names", []) or []), limits=bs, nonce=nonce)
                     with self._early_lock:
-                        self._early, self._early_words = got, text
-                    self.logger.log("brain_early", parts_ms=got.parts_ms)
+                        kept = self._early_gen == gen
+                        if kept:
+                            self._early = (got, text, nonce)
+                    # a request started meanwhile took no pack: this one is for nobody now, never the next request
+                    self.logger.log("brain_early", parts_ms=got.parts_ms, kept=kept)
                 except Exception as exc:  # noqa: BLE001
                     self.logger.log("brain_early", error=type(exc).__name__)
 
             self._early_thread = threading.Thread(target=build, name="yuki-brain-early", daemon=True)
+            self._early_thread_gen = gen
             self._early_thread.start()
 
-    def _nonce_for_early(self) -> str:
-        from yuki.agent.untrusted import new_nonce
-
-        self._early_nonce = new_nonce()
-        return self._early_nonce
-
     def _take_early(self) -> tuple[Gathered | None, str, str | None]:
+        """The pack read ahead for this request, if one is ready (taken once); a reader still running belongs to no one
+        from now on."""
         with self._early_lock:
-            early, words, self._early = self._early, self._early_words, None
-        return early, words, getattr(self, "_early_nonce", None)
+            pack, self._early = self._early, None
+            self._early_gen += 1
+        if pack is None:
+            return None, "", None
+        return pack
 
     # -- status ("how's it going?") -----------------------------------------------------------------------------------
 
@@ -1022,20 +1099,27 @@ class Brain:
     def run(self, request: str, *, user_words: list[str], context: str = "", channel: str, request_id: str,
             plan_seed: dict | None = None) -> Iterator[AgentEvent]:
         """Handle one request (design 2). ``user_words``: the typed text or the heard turns, from the runtime or the
-        bridge only (``[request]`` when empty); ``context``: card / coach / where-typed text, shown labelled and never
-        quotable; ``channel``: ``voice`` | ``typed``; ``request_id``: the id every log record of it carries;
-        ``plan_seed``: a skill's hand-off (rung C). Yields events; pauses on :class:`AskUser`; ends with exactly one
-        :class:`Final` or :class:`ErrorEvent`."""
+        bridge only; when none come, nothing is quotable (fail closed, M2) and ``request`` is shown as context only;
+        ``context``: card / coach / where-typed text, shown labelled and never quotable; ``channel``: ``voice`` |
+        ``typed``; ``request_id``: the id every log record of it carries; ``plan_seed``: a skill's hand-off (rung C).
+        Yields events; pauses on :class:`AskUser`; ends with exactly one :class:`Final` or :class:`ErrorEvent`."""
         self._begin(request, user_words, channel)
-        words = [str(w).strip() for w in (user_words or []) if str(w).strip()] or [str(request or "").strip()]
-        req = _Request(request=str(request or ""), words=words, context=str(context or ""),
+        words = [str(w).strip() for w in (user_words or []) if str(w).strip()]
+        context = str(context or "")
+        asked = str(request or "").strip()
+        if not words and asked:
+            # the request may be composed with card text: shown as labelled context, never as the user's words
+            context = f"The request as it came: {asked}" + (f"\n\n{context}" if context.strip() else "")
+        req = _Request(request=str(request or ""), words=words, context=context,
                        channel="voice" if channel == "voice" else "typed", request_id=str(request_id),
                        seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests)
         self._req = req
-        self._acting_words = "\n".join(words)
+        self._acting_words = req.shown
         self.logger.reset_usage()
         self.logger.begin_turn()
         self.logger.begin_request(req.request_id)
+        if not words:
+            self.logger.log("brain_no_user_words", request_chars=len(asked))
         outcome, reply = "abandoned", ""
         worker = self._worker = threading.Thread(target=self._work, args=(req,), name=f"yuki-brain-{self.lane}",
                                                  daemon=True)
@@ -1106,6 +1190,8 @@ class Brain:
         stale = self.take_steers()
         if stale:
             self.logger.log("steer", count=len(stale), dropped="arrived between requests")
+        with self._steer_lock:
+            self._swaps, self._swaps_all = [], []
         self._q = queue.Queue()
         self._pending_answer = None
         self._awaiting_answer = False
@@ -1142,15 +1228,20 @@ class Brain:
         from yuki.agent.untrusted import new_nonce
 
         early, early_words, early_nonce = self._take_early()
-        nonce = early_nonce if early is not None and early_nonce else new_nonce()
         said = "\n".join(req.words)
+        if early is not None and " ".join(early_words.split()) != " ".join(said.split()):
+            # read ahead for other words (or for a request that never came): none of it is this request's
+            self.logger.log("brain_early", dropped="other words")
+            early = None
+        nonce = early_nonce if early is not None and early_nonce else new_nonce()
         self._set_skill_context(req, host)
         started = time.perf_counter()
         gathered = gather(dispatcher=self.dispatcher, memory=self.memory, settings=self.settings, words=said,
                           names=list(getattr(self.settings, "user_names", []) or []), limits=bs, nonce=nonce,
                           reuse=early)
-        if early is not None and early_words != said:
-            gathered.people = read_people(self.memory, said, limit=bs.people_chars, nonce=nonce)
+        # M9: the people block carries the user's own last messages (and the chat in front): from the first call, an
+        # outbound fetch goes through a plan step, where the consent rule and the commit check see it
+        state.private_read = bool(gathered.people)
         self._gather_ms = (time.perf_counter() - started) * 1000
         self._menu_lines = gathered.menu_lines
         catalog = load_catalog() if gathered.skill_keys is not None else None
@@ -1166,7 +1257,8 @@ class Brain:
                         overview_chars=len(gathered.overview), you_chars=len(gathered.you),
                         people_chars=len(gathered.people), profile_chars=len(gathered.profile),
                         menu_chars=len(gathered.menu), skills=len(gathered.skill_keys or ()),
-                        gather_ms=round(self._gather_ms, 1), parts_ms=gathered.parts_ms)
+                        private_read=state.private_read, gather_ms=round(self._gather_ms, 1),
+                        parts_ms=gathered.parts_ms)
         executor = self._executor_for(host)
         try:
             self._loop(req, host, state, bs, conv, system, effort, gathered, sends, executor, nonce)
@@ -1211,9 +1303,9 @@ class Brain:
             checks = Checks(plan_id=plan_id, channel=req.channel, seed=req.seed, skills=gathered.skill_keys,
                             sends=sends, failed_step=state.failed_step, repeat_rejected=state.repeat_rejected,
                             current_plan=state.current.id if state.current is not None else None)
-            params = build_params(model=bs.model, max_tokens=bs.max_tokens, system=system, messages=conv.messages(),
-                                  effort=effort, thinking_display=bs.thinking_display, stream=bs.stream,
-                                  eager=bs.eager)
+            params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
+                                  messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
+                                  stream=bs.stream, eager=bs.eager)
             call = ModelCall(self.client, params, checks=checks, emit=self._push, cancelled=self._cancelled.is_set,
                              log=self.logger.log, voice=req.channel == "voice", stream=bs.stream)
             state.calls += 1
@@ -1234,11 +1326,11 @@ class Brain:
                 raise
             state.repeat_rejected = checks.repeat_rejected
             self._record_call(resp, call, exec_s=self._last_exec_s if result is not None else 0.0)
-            if result is not None and result.acted:
+            if result is not None and _acted(result):
                 state.acted = True
             if resp.broken or resp.stop_reason == "max_tokens":
-                # a cut-off or unreadable response is not appended (its tool use has no whole input): asked again
-                self.logger.log("brain_reissue", why="broken" if resp.broken else "max_tokens", acted=state.acted)
+                if self._after_cutoff(call, result, resp, state, bs, conv, host):
+                    return
                 continue
             if resp.stop_reason == "refusal":
                 self._final(LINE_REFUSAL, self._outcome(state, level="failed" if state.acted else "answer",
@@ -1247,16 +1339,53 @@ class Brain:
             conv.add_assistant(resp.content)
             extra = self._extra_tools(resp)
             if resp.tool is None:
-                self._finish_text(resp.text, state)
-                return
+                if self._finish_text(resp.text, state, bs, conv, host):
+                    return
+                continue
             if resp.tool.name == PLAN_TOOL:
                 done = self._after_plan(call.plan, result, resp, state, bs, conv, extra, host)
                 if done:
                     return
                 continue
+            if resp.tool.bad_input:
+                # eager streaming: the input did not parse strictly (the SDK may have cut it short): never run
+                conv.add_user([tool_result(resp.tool.id, BAD_INPUT_TEXT, error=True), *extra,
+                               *self._steer_turn(host)])
+                continue
             run = self._run_tool(resp.tool.name, resp.tool.input, host, state, gathered, nonce)
             conv.add_user([tool_result(resp.tool.id, run.text, error=not run.ok), *extra,
                            *self._steer_turn(host)])
+
+    def _after_cutoff(self, call: ModelCall, result: ExecResult | None, resp: CallResult, state: _State,
+                      bs: BrainSettings, conv: Conversation, host: Host) -> bool:
+        """A response cut off at ``max_tokens``, or with a tool input the stream could not read: it is never appended
+        (its tool use has no whole input). It is asked again once, with more room. When steps of its plan were already
+        handed on (only non-committing ones run before a plan is complete), the model is told which, in a code-written
+        user turn of its own (append-only), so the re-plan does not repeat them. A second cut-off ends with the stuck
+        line. ``True`` when the request ended."""
+        state.cutoffs += 1
+        source = call.plan
+        taken = source.taken if source is not None else 0
+        ran = taken > 0 or (result is not None and _acted(result))
+        self.logger.log("brain_reissue", why="broken" if resp.broken else "max_tokens", acted=state.acted, ran=ran,
+                        taken=taken, n=state.cutoffs)
+        if ran:
+            plan = source.plan if source is not None else None
+            if plan is not None:
+                state.current = plan
+            if result is not None:
+                state.last = result
+        if state.cutoffs > MAX_CUTOFFS:
+            self._finish_stuck(state)
+            return True
+        now = state.max_tokens or bs.max_tokens
+        ceiling = CUTOFF_TOKENS_STREAMED if bs.stream else CUTOFF_TOKENS_PLAIN
+        state.max_tokens = max(now, min(ceiling, now * 2))
+        if ran:
+            report = cutoff_report(source.plan if source is not None else None,
+                                   result.statuses if result is not None else [], taken=taken)
+            conv.add_user([{"type": "text", "text": report}, *self._steer_turn(host)])
+        return False
 
     # -- one plan -----------------------------------------------------------------------------------------------------
 
@@ -1409,10 +1538,29 @@ class Brain:
             state.current = plan
         state.last = result
         status = result.status
-        if status in ("done", "unconfirmed", "drafted", "declined"):
-            line = result.line or {"done": LINE_DONE, "unconfirmed": LINE_UNCONFIRMED, "drafted": LINE_DRAFTED,
+        if status != "read":
+            state.held = None   # an act plan ran after a held ending: its own result decides now (reads don't)
+        if status == "done" and not result.line:
+            # a done must carry the executor's line from the probe's evidence (design 2.4): never a generic claim
+            self.logger.log("brain_done_without_line", probe=result.probe or None)
+            given = dict(result.outcome) if isinstance(result.outcome, Mapping) else None
+            if given is not None:
+                given.update(level="unverified", label="", line=LINE_UNCONFIRMED)
+            result = state.last = replace(result, status="unconfirmed", outcome=given)
+            status = "unconfirmed"
+        if status in ENDINGS:
+            line = result.line or {"unconfirmed": LINE_UNCONFIRMED, "drafted": LINE_DRAFTED,
                                    "declined": LINE_DECLINED}[status]
-            self._final(line, self._result_outcome(result, state, plan, line))
+            outcome = self._result_outcome(result, state, plan, line)
+            if self._steer_waiting() and self._budget_left(state, bs, self._req):
+                # the user added something before the line went out: it is held (loop.Agent's held final) and the
+                # model takes one more step with their words; the held line stands if nothing changes
+                state.held = (line, outcome)
+                self.logger.log("steer", held_final=status)
+                conv.add_user([tool_result(tool_id, held_report(result, plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
+            self._final(line, outcome)
             return True
         if status == "stopped":
             self._push(self._cancel_event())
@@ -1438,13 +1586,18 @@ class Brain:
         return False
 
     def _steer_turn(self, host: Host) -> list[dict[str, Any]]:
-        """What the user added mid-task, taken now: their own words for the next call (and for the consent rule)."""
+        """What the user added mid-task, taken now: their own words for the next call (and for the consent rule), and
+        any countdown chip they tapped, as a code-written fact (never quotable words)."""
         texts = self.take_steers()
-        if not texts:
+        swaps = self._take_swaps()
+        if not texts and not swaps:
             return []
-        self.logger.log("steer", count=len(texts))
-        host.user_words.extend(texts)
-        return steer_blocks(texts)
+        if texts:
+            self.logger.log("steer", count=len(texts))
+            host.user_words.extend(texts)
+        if swaps:
+            self.logger.log("send_swap_told", count=len(swaps))
+        return [*swap_blocks(swaps), *steer_blocks(texts)]
 
     def _extra_tools(self, resp: CallResult) -> list[dict[str, Any]]:
         """A second tool use in one response (asked for one): answered as an error, never run."""
@@ -1503,22 +1656,43 @@ class Brain:
         self._last_outcome = outcome
         self._push(Final(text, outcome=outcome))
 
-    def _finish_text(self, text: str, state: _State) -> None:
-        """A plain-text reply. An answer when nothing acted; after an act plan, the model's words never claim a
-        result: code says where it stopped (design 2.2, 2.4)."""
+    def _finish_text(self, text: str, state: _State, bs: BrainSettings, conv: Conversation, host: Host) -> bool:
+        """A plain-text reply (already appended). If the user added something while it was written, it is not the last
+        word: their words go in and the model takes one more step, within the budget (``loop.Agent``'s held reply).
+        Otherwise: an answer when nothing acted; after an act plan, the model's words never claim a result: a held
+        ending's code line stands, else code says where it stopped (design 2.2, 2.4). ``True`` when the request
+        ended."""
+        if self._steer_waiting() and self._budget_left(state, bs, self._req):
+            self.logger.log("steer", held_final="reply")
+            conv.add_user([{"type": "text", "text": f"{CHECK_LABEL} Your reply above was not sent: the user added this "
+                                                    f"before it went out. Take it into account, then reply again (or "
+                                                    f"plan, if it asks for something to be done)."},
+                           *self._steer_turn(host)])
+            return False
         text = (text or "").strip()
         last = state.last
+        if state.held is not None:
+            # a plan ended and its line was held for the user's addition; the model changed nothing: the line stands
+            # when something acted (code's line, never the model's claim), else the model's answer to it
+            if state.acted or last is None or last.status != "declined":
+                self._final(*state.held)
+                return True
         if last is not None and last.line and last.status in ("refused", "mismatch", "error"):
             # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words
             self._final(last.line, self._outcome(state, level="failed" if state.acted else "answer", line=last.line))
-            return
+            return True
         if state.acted:
             self._finish_stuck(state)
-            return
+            return True
         self._final(text or LINE_NO_REPLY, self._outcome(state, level="answer"))
+        return True
 
     def _finish_stuck(self, state: _State, *, budget: bool = False) -> None:
-        """The code line for an act plan that could not get there, or an answer that ran out of budget."""
+        """The code line for an act plan that could not get there, or an answer that ran out of budget. A held ending
+        (no plan ran after it) is said as it was."""
+        if state.held is not None:
+            self._final(*state.held)
+            return
         if state.kind != "act" and not state.acted:
             line = LINE_ANSWER_BUDGET if budget else LINE_NO_REPLY
             self._final(line, self._outcome(state, level="answer", line=line))
@@ -1644,7 +1818,7 @@ class Brain:
         return {"source": "brain", "session_id": getattr(self.memory, "session_id", None),
                 "request_id": f"{self.lane}-{req.number}", "log_request_id": req.request_id,
                 "lane": "voice" if req.channel == "voice" else self.lane, "at": req.epoch,
-                "words": "\n".join(req.words), "model_calls": state.calls if state is not None else 0,
+                "words": req.shown, "model_calls": state.calls if state is not None else 0,
                 "cost_usd": None if self._unpriced else round(self._cost_usd, 6),
                 "wall_s": round(time.monotonic() - req.started, 2),
                 "added": self._host_words(req)[len(req.words):]}
@@ -1669,7 +1843,7 @@ class Brain:
             self._summarize(req, outcome=outcome)
             self._log_turn(req, reply=reply, outcome=outcome)
             if outcome == "final" and reply:
-                self._history.append(Exchange(words="\n".join(req.words), answer=reply, at=req.epoch))
+                self._history.append(Exchange(words=req.shown, answer=reply, at=req.epoch))
         except Exception as exc:  # noqa: BLE001
             self.logger.log("error", where="brain_end", error=type(exc).__name__)
         finally:
@@ -1695,7 +1869,7 @@ class Brain:
                 "ask_calls": self._extra_calls.get("ask", 0), "invalid": state.invalid,
                 "gather_ms": round(self._gather_ms, 1), "channel": req.channel}
             summary: dict[str, Any] = {
-                "request": "\n".join(req.words), "lane": self.lane, "outcome": outcome,
+                "request": req.shown, "lane": self.lane, "outcome": outcome,
                 "model": models[0] if len(models) == 1 else "+".join(models), "effort": self._effort or None,
                 "started_at": req.started_at.isoformat(timespec="seconds"), "wall_s": round(wall_s, 2),
                 "waiting_for_user_s": round(self._waited_s, 2), "model_s": round(self._model_s, 2),
@@ -1738,11 +1912,17 @@ class Brain:
             actions = []
             if state.current is not None and state.current.kind == "act":
                 actions = [f"{s.verb}" for s in state.current.steps]
-            queued = log_turn(request_id=f"{self.lane}-{req.number}", at=req.epoch, user_text="\n".join(req.words),
+            queued = log_turn(request_id=f"{self.lane}-{req.number}", at=req.epoch, user_text=req.shown,
                               reply_text=reply, actions=actions, outcome=outcome, on_done=done)
             self.logger.log("memory_turn_queued", queued=bool(queued), outcome=outcome, reply_chars=len(reply))
         except Exception as exc:  # noqa: BLE001
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
+
+
+def _acted(result: ExecResult) -> bool:
+    """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
+    model's text after non-committing steps is never taken as the final word)."""
+    return bool(result.acted) or any(s.verb in ACT_VERBS and s.state in ACTED_STATES for s in result.statuses)
 
 
 def _as_result(got: Any) -> ExecResult:
