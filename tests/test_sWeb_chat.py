@@ -677,9 +677,8 @@ def test_r2_l1_a_game_in_front_during_a_call_answers_after_the_round(client, gua
     assert desk.calls == [] and guard["focused"] == []
 
 
-@pytest.mark.xfail(reason="sCore resolve.py asks a missing required slot ('Who to?') before its game hold; fix "
-                          "reported in builds/sWeb.md (review r1 M4, r2 L1)", strict=False)
 def test_r1_m4_a_game_in_front_with_no_person_answers_after_the_round(client) -> None:
+    # sWire: sCore's resolver now holds an all-focus skill before any question (the xfail marker is gone)
     from yuki.skills.resolve import Held
 
     got = resolve("message", {}, ["message"], store=client.store, live=Live(game="skyrunner"))

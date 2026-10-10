@@ -2131,6 +2131,10 @@ class Agent:
                 "steers": list(self._steer_texts), "breaker": len(self._breaker.trips),
                 "numbers": sorted(numbers), "injected": list(self._practice_shown),
                 "app": _foreground_app(self._overview_payload),
+                # phase S (sVoice r1 L1, sWire): the skill this request ran or had pinned (a code word), so the old
+                # learners skip it (practice_learn.skill_of_run reads the header's signals)
+                "skill": ((getattr(self, "_request_skill", None) or {}).get("key")
+                          or (getattr(self, "_skill_last", None) or {}).get("skill")),
             }
             logger = self.logger
 

@@ -977,6 +977,87 @@ def check_spotify_desktop(db: Path | None = None, *, now: float | None = None) -
     return Check(SPOTIFY_CHECK, OK, detail)
 
 
+SKILLS_CHECK = "Skills"
+#: The Spotify window states the doctor names (``yuki.skills.spotify_route.STATES``), in plain words.
+_SKILL_STATES = {"covered": "covered", "visible": "other screen", "minimised": "minimised"}
+
+
+def check_skills(db: Path | None = None, *, settings: Any = None, now: float | None = None,
+                 days: float = 7.0) -> Check:
+    """PLAN.md D.2 (Phase S): "skills: n loaded, 0 invalid connection files", the last week's runs (done, couldn't
+    confirm, false done: the bar is 0), "Spotify routes proven: covered yes/no, other screen yes/no, minimised yes/no;
+    mixer linked both ways yes/no" (from the connection data the live checks edit), and whether Yuki has learned the
+    Meet tab. Read-only (the database ``mode=ro``), content-free (code words and counts). No account or key."""
+    try:
+        from yuki import skills as skills_pkg
+        from yuki.skills import connection
+    except Exception as exc:
+        return Check(SKILLS_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    if not skills_pkg.enabled(settings):
+        return Check(SKILLS_CHECK, SKIP, "switched off (skills = false): Yuki uses its older ways")
+    try:
+        loaded = connection.load()
+    except Exception as exc:
+        return Check(SKILLS_CHECK, WARN, f"the skill files could not be read ({type(exc).__name__})",
+                     "Reinstall Yuki; if it stays, send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    errors = len(loaded.errors)
+    parts = [f"{len(loaded.skills)} loaded, {errors} invalid connection file{'s' if errors != 1 else ''}"]
+    false_done = 0
+    try:
+        from yuki.skills.spotify_route import proven
+
+        got = proven(loaded)
+        states = []
+        for code, words in _SKILL_STATES.items():
+            yes = any(bool((got.get(key) or {}).get(code)) for key in ("volume", "spotify.playlist"))
+            states.append(f"{words} {'yes' if yes else 'no'}")
+        parts.append("Spotify routes proven: " + ", ".join(states)
+                     + f"; mixer linked both ways {'yes' if got.get('mixer_linked') else 'no'}")
+    except Exception:  # noqa: BLE001 - a line left out, never a failed check
+        pass
+    try:
+        from yuki.memory.store import default_db_path
+
+        db = db or default_db_path()
+    except Exception:  # noqa: BLE001
+        db = None
+    if db is not None and Path(db).exists():
+        now = time.time() if now is None else float(now)
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+            try:
+                has = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='skill_runs'").fetchone()
+                row = conn.execute(
+                    "SELECT count(*), sum(CASE WHEN outcome='done' AND checked=1 THEN 1 ELSE 0 END), "
+                    "sum(CASE WHEN outcome='unverified' THEN 1 ELSE 0 END), "
+                    "sum(CASE WHEN recheck=0 THEN 1 ELSE 0 END) FROM skill_runs WHERE t0 >= ?",
+                    (now - days * 86400.0,)).fetchone() if has else None
+                meet = conn.execute("SELECT value FROM nudge_state WHERE name='site_tabs:Google Meet'").fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                runs, done, unconfirmed, false_done = (int(v or 0) for v in row)
+                span = f"the last {days:g} days" if days != 7 else "the last week"
+                parts.append(f"{runs} run{'s' if runs != 1 else ''} in {span}: {done} done, {unconfirmed} couldn't "
+                             f"confirm, {false_done} false done")
+            try:
+                learned = json.loads(meet[0]) if meet and meet[0] else {}
+            except ValueError:
+                learned = {}
+            known = isinstance(learned, dict) and bool(learned.get("runtime_ids") or learned.get("names"))
+            parts.append(f"Meet tab learned: {'yes' if known else 'no'}")
+        except Exception as exc:  # noqa: BLE001
+            parts.append(f"the run ledger could not be read ({type(exc).__name__})")
+    detail = "; ".join(parts)
+    if errors:
+        return Check(SKILLS_CHECK, WARN, detail, "A skill file did not load: send logs\\memory-*.jsonl to whoever "
+                                                 "maintains Yuki.")
+    if false_done:
+        return Check(SKILLS_CHECK, WARN, detail, "A skill said done but the second check disagreed: tell Claude which "
+                                                 "one, or send logs\\memory-*.jsonl.")
+    return Check(SKILLS_CHECK, OK, detail)
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -1091,6 +1172,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         (CALL_RECORDING_CHECK, check_call_recording),
         (MOMENTS_CHECK, check_moments),
         (SPOTIFY_CHECK, check_spotify_desktop),
+        (SKILLS_CHECK, lambda: check_skills(settings=settings)),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

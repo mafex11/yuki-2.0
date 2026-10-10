@@ -39,6 +39,8 @@ The talker handles alone (to = talker):
 focusing, minimizing, maximizing or closing a window they name, showing or closing a tab on the tabs line, clicking an \
 item that is on an items line, typing their words into the field the focus line names, opening an address or an app, \
 opening Yuki's own window;
+- one of the user's skills on the Skills line, when there is one: the talker runs it in one call, whatever app it is \
+in;
 - ending this conversation, or quiet time.
 
 The thinker is needed (to = thinker) for everything else: their day, activity, calls, meetings and memory, their files, \
@@ -50,8 +52,8 @@ screen is true when doing it needs what is inside the window in front (a video, 
 
 Good: "what did I do today?" -> thinker. "pause the music" -> talker. "open Chrome" -> talker. "thanks, perfect" -> \
 talker. "click the mix" and the mix is on the items line -> talker; it is not -> thinker, screen true. "open Spotify \
-and play my focus playlist" -> thinker. "who's my accountant?" -> thinker. "close the Claude tabs" and they are on the \
-tabs line -> talker. On a call, "bro did you see that clutch" -> talker. "my cousin just got a job at Zomato" -> \
+and play my focus playlist" -> talker when the Skills line has a playlist skill, else thinker. "who's my \
+accountant?" -> thinker. "close the Claude tabs" and they are on the tabs line -> talker. On a call, "bro did you see that clutch" -> talker. "my cousin just got a job at Zomato" -> \
 thinker (a fact to keep)."""
 
 #: The one tool, forced: its fields are written in this order, so ``to`` is known a few tokens in.
@@ -84,10 +86,36 @@ class Route:
     usage: dict[str, int] = field(default_factory=dict)
 
 
+#: The Skills line is cut to this (characters): each skill's key and what it does, no slots or names.
+SKILLS_CHARS = 700
+
+
+def skills_line(menu: str | None) -> str:
+    """The Skills line from the talker's Skills menu (:func:`yuki.skills.menu.skill_line`'s ``- <key>: <what it
+    does> [slots]`` lines, our own format): each line up to its first slot, cut to :data:`SKILLS_CHARS` at a line.
+    ``""`` without a menu (sVoice r2 L2, sWire: the router knows what the talker's ``run_skill`` covers)."""
+    out: list[str] = []
+    size = 0
+    for line in str(menu or "").splitlines():
+        line = line.strip()
+        if not (line.startswith("- ") and ":" in line):
+            continue
+        head = line.split(" [", 1)[0]
+        if size + len(head) + 1 > SKILLS_CHARS:
+            break
+        out.append(head)
+        size += len(head) + 1
+    return "\n".join(out)
+
+
 def router_request(words: str, *, history: list[tuple[str, str]] | None = None, desk: str | None = None,
-                   call: str | None = None, model: str = "") -> dict[str, Any]:
-    """The router's request: its prompt, the forced tool, and one user message with the turn's inputs."""
+                   call: str | None = None, model: str = "", skills: str | None = None) -> dict[str, Any]:
+    """The router's request: its prompt, the forced tool, and one user message with the turn's inputs. ``skills``:
+    the talker's Skills menu this conversation (each skill's key and what it does go on a Skills line)."""
     lines: list[str] = []
+    line = skills_line(skills)
+    if line:
+        lines.append("[Skills line (the talker runs each in one call):\n" + line + "]")
     if call:
         lines.append(f"[They are on a voice call on {call}: most of what they say is for the people on it.]")
     past = list(history or [])[-4:]
@@ -168,4 +196,4 @@ async def decide(client: Any, request: dict[str, Any], *, timeout_s: float = 3.0
     return route
 
 
-__all__ = ["ROUTER_PROMPT", "ROUTE_TOOL", "Route", "decide", "router_request"]
+__all__ = ["ROUTER_PROMPT", "ROUTE_TOOL", "Route", "decide", "router_request", "skills_line"]

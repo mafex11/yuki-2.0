@@ -1198,7 +1198,12 @@ DONE_BAR = 0.9
 
 def _purpose_fast_and_true(conn: sqlite3.Connection, since: float, until: float) -> dict[str, Any]:
     """Per skill, from ``skill_runs`` (S): runs, done (the done-check said true), couldn't confirm, failed, time from
-    your words to the done line (p50, p90), false done (the re-check disagreed or you corrected it)."""
+    your words to the done line (p50, p90), false done (the re-check disagreed or you corrected it). A run that changed
+    nothing by design (``yuki.skills.registry.IDLE_OUTCOMES``: already so, held for a game, asked, refused, cancelled,
+    playing on another device, no route) is counted apart (``idle``) and never in a rate's denominator (sCore r1 L7);
+    a run still marked ``running`` (cut short) is counted apart too."""
+    from yuki.skills.registry import IDLE_OUTCOMES
+
     cols = _columns(conn, "skill_runs")
     if not cols:
         return {"available": False, "needs": "skill_runs (sCore, migration 41)"}
@@ -1211,9 +1216,12 @@ def _purpose_fast_and_true(conn: sqlite3.Connection, since: float, until: float)
     per: dict[str, dict[str, Any]] = {}
     for r in rows:
         s = per.setdefault(str(r["k"]), {"runs": 0, "done": 0, "unconfirmed": 0, "failed": 0, "false_done": 0,
-                                         "_s": []})
-        s["runs"] += 1
+                                         "idle": 0, "_s": []})
         checked, outcome = r["checked"], r["outcome"]
+        if outcome in IDLE_OUTCOMES or outcome == "running":
+            s["idle"] += 1                              # nothing to check (or never finished): not in the rates
+            continue
+        s["runs"] += 1
         if checked == 1 or (checked is None and outcome == "done" and "checked" not in cols):
             s["done"] += 1
         elif checked == 0 or outcome == "failed":
@@ -1274,7 +1282,9 @@ def scorecard(db_path: Path, *, days: float = 7.0, now: float | None = None) -> 
     with contextlib.closing(_ro(db_path)) as conn:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         moments = _counts_by(conn, "moments", "kind", "at", since, now)
-        prefs = _counts_by(conn, "pref_events", "kind", "at", since, now)
+        # migration 41's pref_events names its event ``type`` (map-skills S4.1; sCore's merge note), not ``kind``
+        prefs = (_counts_by(conn, "pref_events", "type", "at", since, now)
+                 if "type" in _columns(conn, "pref_events") else _counts_by(conn, "pref_events", "kind", "at", since, now))
         out = {
             "at": now, "days": float(days), "since": since, "db_version": int(version),
             "purpose_1_fast_and_true": _purpose_fast_and_true(conn, since, now),
@@ -1300,7 +1310,8 @@ def scorecard_text(card: dict[str, Any]) -> list[str]:
         for k, s in p1["per_skill"].items():
             lines.append(f"   {k}: runs {s['runs']}, done {s['done']} ({(s['done_rate'] or 0):.0%}), couldn't confirm "
                          f"{s['unconfirmed']}, failed {s['failed']}, p50 {s['p50_s']} s, p90 {s['p90_s']} s, "
-                         f"false done {s['false_done']}. {'PASS' if s['pass'] else 'FAIL'}")
+                         f"false done {s['false_done']}, nothing to change {s.get('idle', 0)}. "
+                         f"{'PASS' if s['pass'] else 'FAIL'}")
     p2 = card["purpose_2_shown_once"]
     lines.append("2. Shown once, reused: " + (f"preference events {p2['pref_events']}." if p2.get("available")
                                                else f"not yet ({p2['needs']})."))

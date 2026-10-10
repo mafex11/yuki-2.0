@@ -2120,6 +2120,9 @@ class Dispatcher:
         #: Phase S: what the thinker's ``run_skill`` needs from the request (``memory``, the user's ``words``,
         #: ``request_id``, ``log``, ``settings``), set by the agent loop at each request's start.
         self.skill_context: dict[str, Any] = {}
+        #: Phase S (sWire, sVoice r1 M2): where the per-app "Act" switches are read for ``run_skill``'s window-touching
+        #: rungs (``yuki.agent.judge.PolicyReader``); ``None``: the judge's shared reader of the stored policy.
+        self.act_policy: Any = None
         #: Append the live picture of the screen (yuki.memory.now: what the windows on screen show, popups,
         #: the focus line) to :meth:`overview_text`, i.e. the brain's per-turn situation block. Off unless the
         #: owner of the dispatcher turns it on (the agent loop, from ``Settings.now_in_situation``).
@@ -4620,8 +4623,14 @@ class Dispatcher:
         from yuki.skills.engine import run_for_thinker
 
         ctx = self.skill_context or {}
+        state: dict[str, Any] = {}
         result = run_for_thinker(tool_input, list(ctx.get("words") or []), memory=ctx.get("memory"),
-                                 log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"))
+                                 log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"),
+                                 verbs=self._skill_act_verbs(state))
+        off = state.get("act_off")
+        acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
+        if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):
+            return self._skill_act_off(result, off, ctx.get("memory"), acted)
         verified = True if result.done else (False if result.outcome == "failed" else None)
         details: dict[str, Any] = {"verified": verified}
         if result.held:
@@ -4638,6 +4647,65 @@ class Dispatcher:
             payload["refused"] = "game"
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],
                            content=[{"type": "text", "text": text}], payload=payload)
+
+    #: The skill verbs that touch an app's window (press a control in it, set its own slider, bring it forward, pick its
+    #: tab, a driver): refused in an app whose Settings "Act" switch is off (the voice hands' ``ACT_VIAS``).
+    SKILL_ACT_VIAS = ("uia_invoke", "slider", "focus", "tab_select", "driver")
+
+    def _skill_act_verbs(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Phase S (sWire, sVoice r1 M2): the engine's verbs for the thinker's ``run_skill``, each refusing a
+        window-touching rung (:data:`SKILL_ACT_VIAS`) in an app whose "Act" switch is off (``act_off``; the app's name
+        kept in ``state["act_off"]``). A rung whose data says it neither takes focus nor sends input (``game =
+        "always"`` and ``needs_focus = false``: the mixer, the PC's level) runs, as ``app_volume`` did. Looked up when
+        called, so the engine's own table stays the one source."""
+        from yuki.skills import engine
+
+        def wrap(via: str) -> Any:
+            def run(call: Any) -> Any:
+                route = call.route
+                window_free = getattr(route, "game", None) == "always" and not getattr(route, "needs_focus", True)
+                if via in self.SKILL_ACT_VIAS and not window_free:
+                    try:
+                        from yuki.agent.judge import _shared_reader
+
+                        policy = self.act_policy if self.act_policy is not None else _shared_reader()
+                        off = policy.app_off(engine.acted_app(call.skill, route, call.args))
+                    except Exception:  # noqa: BLE001 - an unreadable policy is the backstop's
+                        off = None
+                    if off:
+                        state.setdefault("act_off", off)
+                        return engine.RouteResult(ran=False, outcome="act_off")
+                fn = engine.VERB_FUNCS.get(via)
+                return fn(call) if fn is not None else engine.RouteResult(ran=False, outcome="no_verb")
+            return run
+
+        return {via: wrap(via) for via in list(engine.VERB_FUNCS)}
+
+    def _skill_act_off(self, result: Any, off: str, memory: Any, acted: bool) -> ToolOutcome:
+        """A ``run_skill`` refused in an app whose "Act" switch is off: the judge's plain line, never pinned for the
+        thinker to do by hand, and the ledger row says ``refused`` (a rung that acted before keeps its moment)."""
+        from yuki.agent.judge import app_off_line
+
+        run_key = getattr(result, "run_key", None)
+        if run_key and memory is not None:
+            def go(client: Any) -> Any:
+                from yuki.skills import registry
+
+                return registry.finish_run(getattr(client, "store", client), run_key, outcome="refused",
+                                           checked=None, acted=acted)
+
+            try:
+                call = getattr(memory, "call", None)
+                call("skill_run_finish", go, timeout_s=0.5) if callable(call) else go(memory)
+            except Exception:  # noqa: BLE001 - the ledger never breaks a tool
+                pass
+        line = app_off_line(off)
+        text = (f"Not done: Act is switched off for {off} in Yuki's settings, so Yuki does not click, type or press "
+                f"keys there; nothing was done there, and do not do it by hand either. Say: {line}")
+        return ToolOutcome(name="run_skill", ok=False, summary=text[:200], content=[{"type": "text", "text": text}],
+                           payload={"details": {"verified": None, "refused": "act_off"}, "skill": result.skill,
+                                    "outcome": "refused", "route": result.route, "handoff": None,
+                                    "refused": "act_off"})
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:
         return self._from_action(

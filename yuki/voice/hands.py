@@ -1575,10 +1575,11 @@ class Hands:
         except Exception:  # noqa: BLE001 - a trace's context is a hint
             return default
 
-    def _mint_hand_id(self, call: Any = None) -> str:
-        """A new hand id, ``voice-<turn key>-h<n>``, kept for ``call`` so the hand's trace reuses it."""
+    def _mint_hand_id(self, call: Any = None, key: str | None = None) -> str:
+        """A new hand id, ``voice-<turn key>-h<n>``, kept for ``call`` so the hand's trace reuses it. ``key``: the
+        turn key the caller already read (a skill hand reads it once for its id and the engine's request id)."""
         self._trace_n += 1
-        key = str(self._call_safely(self.turn_key, "") or "voice")
+        key = str(key) if key else str(self._call_safely(self.turn_key, "") or "voice")
         hand_id = f"voice-{key}-h{self._trace_n}"
         if call is not None:
             self._hand_ids[call] = hand_id
@@ -1871,8 +1872,13 @@ class Hands:
         self.busy += 1
         if self.bridge is not None:
             self.bridge.busy_tools += 1
+        # sWire (sVoice r2 L4 + fWire R1.3): the hand's own id (voice-<turn>-h<n>) on its hands lines and its acting
+        # marker; the engine's ledger and D19 keep the turn key (a model calling twice in one turn is no repeat), and
+        # follow joins the two (yuki.log.follow: a hand id also reads its turn's skill lines)
+        turn = self._skill_request_id()       # read once: the hand id and the engine's request id name one turn
+        hand_id = self._mint_hand_id(params.tool_call_id, key=turn or "voice")
         try:
-            ok, report, facts = await asyncio.to_thread(self._skill_hand, args)
+            ok, report, facts = await asyncio.to_thread(self._skill_hand, args, hand_id, turn)
         except Exception as exc:  # noqa: BLE001 - a crash is a failed run
             ok, report, facts = False, f"{type(exc).__name__}: {exc}", {"outcome": "error", "verified": None}
         finally:
@@ -1903,8 +1909,9 @@ class Hands:
                     self.last_skill["outcome"] = "held_game"
                 report = f"Held: a game is in front, nothing was sent. Say: {HELD_LINE}"
         try:
-            await self._skill_reply(params, name, args, ok, report, facts, ms)
+            await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id)
         finally:
+            self._hand_ids.pop(params.tool_call_id, None)
             if prefs is not None:
                 # review r1 L4: the preference side runs after the line was said (a bounded memory call)
                 try:
@@ -1913,10 +1920,11 @@ class Hands:
                     learned = {}
                 if self.log is not None and learned:
                     self.log.event("hands", op=name, prefs=True, corrected=int(learned.get("corrected") or 0),
-                                   still_card=bool(learned.get("still_card")), call=params.tool_call_id)
+                                   still_card=bool(learned.get("still_card")), call=params.tool_call_id,
+                                   request_id=hand_id)
 
     async def _skill_reply(self, params: Any, name: str, args: dict[str, Any], ok: bool, report: str,
-                           facts: dict[str, Any], ms: float) -> None:
+                           facts: dict[str, Any], ms: float, hand_id: str | None = None) -> None:
         """The result of one ``run_skill``: the line code says (done only when verified), the hand-off with the skill
         pinned, or the report for the talker."""
         from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
@@ -1944,6 +1952,7 @@ class Hands:
                 pass
         if self.log is not None:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
+                           request_id=hand_id,
                            skill_outcome=outcome or None, verified=facts.get("verified"), done_line=bool(line),
                            keep_question=bool(facts.get("keep_question")), focus_taken=bool(facts.get("focus_taken")),
                            act_off=bool(facts.get("act_off")), memory_slow=bool(facts.get("memory_slow")),
@@ -1966,10 +1975,11 @@ class Hands:
             except Exception as exc:  # noqa: BLE001
                 passed = False
                 if self.log is not None:
-                    self.log.event("hands", op=name, escalate_error=type(exc).__name__)
+                    self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
             if passed:
                 if self.log is not None:
-                    self.log.event("hands", op=name, escalated=True, acked=ack, call=params.tool_call_id)
+                    self.log.event("hands", op=name, escalated=True, acked=ack, call=params.tool_call_id,
+                                   request_id=hand_id)
                 if ack:
                     self.bridge.acked()
                 await params.result_callback({"not_verified": report[:700], "passed_on": True,
@@ -2084,7 +2094,8 @@ class Hands:
             raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
                            held=str(getattr(verdict, "question", "") or ""))
 
-    def _skill_hand(self, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    def _skill_hand(self, args: dict[str, Any], hand_id: str | None = None,
+                    turn: str | None = None) -> tuple[bool, str, dict[str, Any]]:
         """Blocking: resolve and run one skill (:func:`yuki.skills.engine.resolve_and_run`), then learn from the user's
         words: a correction naming another option (:func:`yuki.skills.prefs.note_correction`), the pending "Keep this
         as your usual?", a "still your usual?" card. The acting marker goes up only right before a rung that takes
@@ -2115,8 +2126,10 @@ class Hands:
             if marker["token"] is not None or not callable(begin) or sound_only:
                 return   # sound_only: the focus rung is refused by its verb, nothing takes focus (D18)
             token = f"voice-skill-{id(self)}-{time.monotonic_ns()}"
+            # fWire R1.3: the marker carries the hand's id, as every other hand's does (probed)
+            extra = {"request_id": hand_id} if hand_id and _takes_kw(begin, "request_id") else {}
             try:
-                if begin(token, " / ".join(words[-2:]) or skill_key, lane="voice"):
+                if begin(token, " / ".join(words[-2:]) or skill_key, lane="voice", **extra):
                     marker["token"] = token
             except Exception:  # noqa: BLE001 - the marker never breaks a run
                 pass
@@ -2132,7 +2145,8 @@ class Hands:
             and not hasattr(memory, "store") else None
         # review r1 L2: the engine's own D9 read fails closed ("unknown" holds), so its reader may raise
         ctx = engine.RunContext(origin="voice", words=words, memory=resolve_wait or memory, hands=self,
-                                log=self._skill_log, request_id=self._skill_request_id(),
+                                log=self._skill_log,
+                                request_id=turn if hand_id is not None else self._skill_request_id(),
                                 session_id=getattr(memory, "session_id", None), on_focus=on_focus,
                                 verbs=self._skill_verbs(state), game=self._game_strict)
         try:

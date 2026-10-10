@@ -455,13 +455,11 @@ def replace_value(m, value):
 
 
 def test_skill_runs_windows_mark_derived_joins_once_the_table_exists(store):
-    assert M.skill_runs_between(store, 0, T0) == []   # phase S's table is not there yet
+    assert M.skill_runs_between(store, 0, T0) == []   # sWire: migration 41's real table, empty
     store._write(lambda c: c.execute(
-        "CREATE TABLE skill_runs (id INTEGER PRIMARY KEY, request_id TEXT, app TEXT, end_kind TEXT, t0 REAL,"
-        " t_done REAL)"))
-    store._write(lambda c: c.execute(
-        "INSERT INTO skill_runs(request_id, app, end_kind, t0, t_done) VALUES ('voice-3', 'discord', 'call_join', ?, ?)",
-        (T0 - 5, T0 + 2)))
+        "INSERT INTO skill_runs(at, skill, origin, request_id, app, end_kind, t0, t_done)"
+        " VALUES (?, 'discord.voice', 'voice', 'voice-3', 'discord', 'call_join', ?, ?)",
+        (T0 - 5, T0 - 5, T0 + 2)))
     call(store, "discord", "screen", T0, end=T0 + 600)
     call(store, "discord", "screen", T0 + 86400, end=T0 + 86400 + 600)
     M.Extractor(store, is_game=is_game, clock=lambda: T0 + 2 * 86400).rebuild()

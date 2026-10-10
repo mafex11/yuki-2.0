@@ -4784,15 +4784,18 @@ class MemoryClient:
                 self._skills_version = loaded.version
         return loaded
 
-    def skill_menu(self, audience: str = "talker", *, now: float | None = None) -> str:
+    def skill_menu(self, audience: str = "talker", *, now: float | None = None, rank: str | None = "n_obs") -> str:
         """The skill menu for the talker (its cached prompt block) or the thinker (its ``run_skill`` tool), built by
         code from the connection files, the trust ledger and the user's taste (:func:`yuki.skills.menu.menu_text`).
+        ``rank``: the taste order, names most seen first by default for both (sVoice r2 M2, sWire: the talker's menu
+        sits in a 1-hour cached block, so an hour-ranked list would rewrite it; ``"hour"`` for the old order).
         ``""`` when no skill is loaded. Never raises."""
         from yuki.skills.menu import THINKER, TALKER, menu_text
 
         try:
             loaded = self._skills_seeded()
-            return menu_text(self.store, audience=THINKER if audience == THINKER else TALKER, loaded=loaded, now=now)
+            return menu_text(self.store, audience=THINKER if audience == THINKER else TALKER, loaded=loaded, now=now,
+                             rank=rank)
         except Exception:  # noqa: BLE001
             return ""
 

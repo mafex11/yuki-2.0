@@ -50,6 +50,8 @@ LINE_FAILED = "That didn't work."
 LINE_SEND_FAILED = "I tried to send it, but the PC shows it didn't go through, so I stopped there."
 LINE_OTHER_DEVICE = "{app} is playing on another device, so I left it."
 LINE_ALREADY = "That's already how it is."
+#: Memory didn't answer the resolve in time (the voice's ``hands.MEMORY_SLOW_LINE``, the same words): nothing ran.
+LINE_MEMORY_SLOW = "I couldn't reach my memory just now, try again?"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -703,7 +705,8 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         return _simple(resolved.skill, "held_game", ctx, started, held="game", say=resolved.say)
     if isinstance(resolved, Refused):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="refused", reason=resolved.why)
-        return _simple(resolved.skill, "refused", ctx, started, say=LINE_FAILED)
+        return _simple(resolved.skill, "refused", ctx, started,
+                       say=LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED)
     if isinstance(resolved, Handoff):
         return _handoff(resolved.skill, resolved.values, resolved.filled, [], ctx, started, why=resolved.why,
                         run_key=None)
@@ -1017,6 +1020,11 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
                                live=live, again=again, default_step=step, disable_after=disable_after)
 
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)
+    if resolved is None and ctx.memory is not None and ctx.origin in ("thinker", "card"):
+        # sVoice r2 M3 for the thinker and card origins (sWire): memory didn't answer the resolve in time, so the
+        # user's usuals, the ledger's disabled rungs and told values are unknown: nothing runs, said plainly (the voice
+        # does the same through its own longer wait, hands._ResolveWait)
+        return run(Refused(str(skill_key or ""), "memory_slow"), ctx)
     if resolved is None:
         resolved = go(None)
     _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
@@ -1045,11 +1053,13 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
 
 def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = None,
                     log: Callable[..., Any] | None = None, request_id: str | None = None,
-                    settings: Any = None, game: Callable[[], str] | None = None) -> SkillResult:
+                    settings: Any = None, game: Callable[[], str] | None = None,
+                    verbs: Mapping[str, Callable[[RouteCall], RouteResult]] | None = None) -> SkillResult:
     """The thinker's ``run_skill`` tool (``agent/tools.py``). A hand-off here means the thinker does it itself with
-    the skill pinned (the loop pins it); with a game in front the run is held (D17)."""
+    the skill pinned (the loop pins it); with a game in front the run is held (D17). ``verbs``: the dispatcher's
+    wrappers (sWire: a window-touching rung in an app whose "Act" switch is off is refused, as the voice does)."""
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
-                     request_id=request_id, game=game)
+                     request_id=request_id, game=game, verbs=dict(verbs or {}))
     return resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
                            else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings,
                            corrects=bool(args.get("corrects")))

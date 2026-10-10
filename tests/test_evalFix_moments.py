@@ -295,6 +295,7 @@ def test_the_hand_check_sample_is_stratified_and_names_independent_sources(copy,
 def test_the_time_split_cuts_only_rows_written_since(copy):
     write_moments(copy, good_moments(copy))
     conn = sqlite3.connect(copy)
+    conn.execute("DROP TABLE IF EXISTS skill_runs")   # sWire: migration 41's real table; this test's stand-in is simpler
     conn.execute("CREATE TABLE skill_runs (id INTEGER PRIMARY KEY, at REAL NOT NULL)")
     conn.execute("CREATE TABLE routines (id INTEGER PRIMARY KEY, created_at REAL NOT NULL, updated_at REAL)")
     cut = ts("2026-10-01", "00:00:00")
@@ -305,7 +306,7 @@ def test_the_time_split_cuts_only_rows_written_since(copy):
     conn.close()
     got = H.time_split(copy, cut)
     assert got["skill_runs"] == 2 and got["routines"] == 1 and got["moments"] == before
-    assert "tastes" not in got
+    assert got.get("tastes", 0) == 0                    # sWire: migration 41 builds tastes (empty in the copy)
     with pytest.raises(RuntimeError):
         H.time_split(dbcopy.real_db_path(), cut)
 

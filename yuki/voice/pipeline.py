@@ -4518,9 +4518,12 @@ class Conversation:
         hands = getattr(self.bridge, "hands", None)
         snap = getattr(hands, "last", None) if hands is not None else None
         s = self.settings
+        # sVoice r2 L2 (sWire): the router knows the talker's skills, so "play my focus playlist" stays the talker's
+        menu = getattr(getattr(self, "mouth_memory", None), "skills", None) if self._skill_keys() else None
         request = router_request(heard[-1], history=history, desk=getattr(snap, "text", None) or None,
                                  call=self.call_app,
-                                 model=str(getattr(s, "voice_router_model", "") or s.voice_mouth_model))
+                                 model=str(getattr(s, "voice_router_model", "") or s.voice_mouth_model),
+                                 skills=menu)
         turn = self.observer.user_turns
         self._router_task = asyncio.ensure_future(self._route(request, heard, context, call, turn))
 

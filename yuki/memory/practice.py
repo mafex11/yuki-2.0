@@ -536,6 +536,9 @@ def record_run(store: Store, run: dict[str, Any], *, now: float | None = None) -
         numbers += [n for s in steps for n in _step_input(s)[1]]
         signals["numbers"] = sorted(set(numbers))[:300]
         signals["wall_s"] = round(float(run.get("wall_s") or 0.0), 2)
+        if isinstance(run.get("skill"), str) and run["skill"].strip():
+            # phase S (sWire): the skill the request ran or had pinned, a code word (practice_learn.skill_of_run)
+            signals["skill"] = run["skill"].strip()[:80]
         injected = _ids(run.get("injected"))
         cited = list(dict.fromkeys(_ids(run.get("cited")) + [i for s in steps for i in _cites(s)]))
         learn = "pending" if (signals["actions"] or signals["asks"] or cited) and outcome != "parked" else "skipped"

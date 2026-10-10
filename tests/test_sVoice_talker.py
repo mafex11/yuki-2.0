@@ -115,7 +115,13 @@ def test_skills_now_rides_in_the_volatile_block_at_most_300_chars() -> None:
     assert len(line) <= 302 and text.index("[Skills now") < text.index(M.DESK_LABEL)
 
 
-def test_fetch_skills_reads_the_menu_and_drops_anything_else() -> None:
+def test_fetch_skills_reads_the_menu_and_drops_anything_else(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yuki.skills import connection as C
+
+    # sWire: no connection file loaded, so an empty or bad menu has no file fallback (sVoice r2 M1) and reads None
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", tmp_path)
+    C.clear_cache()
+
     class Mem:
         def __init__(self, menu: Any) -> None:
             self.menu = menu

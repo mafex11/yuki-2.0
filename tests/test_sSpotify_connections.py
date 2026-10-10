@@ -30,6 +30,8 @@ from yuki.skills.menu import menu_text, skill_line
 from yuki.skills.resolve import Ask, EvalResolver, Live, Plan, resolve
 
 SHIPPED = C.CONNECTIONS_DIR
+#: sSpotify's two skills (sWire: sWeb's five ship in the same folder, with their own drivers and tests)
+SPOTIFY_KEYS = ("volume", "spotify.playlist")
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -53,7 +55,7 @@ def store(tmp_path: Path, loaded: C.Loaded):
 
 
 def test_the_shipped_files_load_with_no_error_and_no_warning(loaded) -> None:
-    assert loaded.keys == ("volume", "spotify.playlist")
+    assert set(SPOTIFY_KEYS) <= set(loaded.keys)                       # with sWeb's five (sWire)
     assert loaded.warnings == ()                                       # every rung has its re-check (D19)
     vol, pl = loaded.get("volume"), loaded.get("spotify.playlist")
     assert (vol.app, vol.end, vol.kind) == ("audio", "volume_change", "change")
@@ -73,6 +75,8 @@ def test_every_rung_ends_on_a_machine_check_and_focus_rungs_never_run_with_a_gam
                 assert r.game == "never", r.key
             if r.done.probe == "read_back":
                 assert r.via == "driver"                               # the driver's own read-back
+            if skill.key not in SPOTIFY_KEYS:
+                continue                                               # sWeb's skills: test_sWeb_connections
             assert r.driver == "spotify_route" and r.call in S.ROUTES, r.key
             for check in (r.done, r.recheck):
                 if check.probe == "driver":

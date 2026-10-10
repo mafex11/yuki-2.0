@@ -125,12 +125,26 @@ def session_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def voice_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
-    """Voice-log records that name the request."""
+def related_ids(request_id: str) -> tuple[str, ...]:
+    """The ids one request goes by: its own, and for a voice hand that ran one of the user's skills
+    (``voice-<turn>-h<n>``, fWire) also its turn (``<turn>``): the skill engine's lines and its run's ledger row and
+    moments carry the turn, one request per user turn, so a model calling a skill twice in one turn is never counted
+    as the user repeating it (sCore D19, sVoice r2 L4; sWire)."""
+    ids = [request_id]
+    head, _, tail = request_id.rpartition("-")
+    if head.startswith("voice-") and tail[:1] == "h" and tail[1:].isdigit() and len(head) > len("voice-"):
+        ids.append(head[len("voice-"):])
+    return tuple(ids)
+
+
+def voice_records(logs: Path, request_id: str, ids: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    """Voice-log records that name the request (or one of ``ids``, :func:`related_ids`)."""
+    want = set(ids or ()) | {request_id}
+    needle = min(want, key=len)          # the turn is a part of a hand's id: one needle finds both
     out: list[dict[str, Any]] = []
     for path in _stamped((logs / "voice").glob("*.jsonl")):
-        for rec in _jsonl(path, request_id):
-            if rec.get("request_id") == request_id:
+        for rec in _jsonl(path, needle):
+            if rec.get("request_id") in want:
                 out.append({**rec, "_source": "voice", "_file": path.name})
     return out
 
@@ -170,9 +184,10 @@ def memory_records(logs: Path, request_id: str, t0: float | None, t1: float | No
     return out
 
 
-def moment_records(db: Path | None, request_id: str, t0: float | None, t1: float | None) -> tuple[list[dict], str]:
-    """The moments that name the request or fall inside ``[t0, t1]`` (read-only), and a note (``ok``,
-    ``no_db``, ``no_moments_table``)."""
+def moment_records(db: Path | None, request_id: str, t0: float | None, t1: float | None,
+                   ids: Sequence[str] | None = None) -> tuple[list[dict], str]:
+    """The moments that name the request (or one of ``ids``) or fall inside ``[t0, t1]`` (read-only), and a note
+    (``ok``, ``no_db``, ``no_moments_table``)."""
     if db is None or not Path(db).exists():
         return [], "no_db"
     try:
@@ -186,8 +201,9 @@ def moment_records(db: Path | None, request_id: str, t0: float | None, t1: float
             return [], "no_moments_table"
         where, params = [], []
         if "request_id" in cols:
-            where.append("request_id = ?")
-            params.append(request_id)
+            want = sorted(set(ids or ()) | {request_id})
+            where.append(f"request_id IN ({', '.join('?' for _ in want)})")
+            params += want
         if t0 is not None and t1 is not None and "at" in cols:
             where.append("(at >= ? AND at <= ?)")
             params += [t0, t1]
@@ -254,8 +270,9 @@ def follow(request_id: str, *, logs: Path, db: Path | None = None, pad_before: f
            pad_after: float = PAD_AFTER_S) -> dict[str, Any]:
     """Everything the logs hold about one request, oldest first, content-free: ``{"request_id", "span",
     "records", "notes", "counts"}``."""
+    ids = related_ids(request_id)
     session = session_records(logs, request_id)
-    voice = voice_records(logs, request_id)
+    voice = voice_records(logs, request_id, ids)
     stamps = [float(r["ts"]) for r in session + voice if isinstance(r.get("ts"), (int, float))]
     t0 = min(stamps) - pad_before if stamps else None
     t1 = max(stamps) + pad_after if stamps else None
@@ -266,7 +283,7 @@ def follow(request_id: str, *, logs: Path, db: Path | None = None, pad_before: f
         if named:
             t0, t1 = min(named) - pad_before, max(named) + pad_after
             memory = memory_records(logs, request_id, t0, t1)
-    moments, note = moment_records(db, request_id, t0, t1)
+    moments, note = moment_records(db, request_id, t0, t1, ids)
     summaries = [r for r in session if r.get("type") == "request_summary"]
     rows = request_rows(logs / "requests.csv", request_id, summaries)
     merged = []

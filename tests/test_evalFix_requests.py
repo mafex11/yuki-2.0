@@ -324,7 +324,11 @@ def test_user_words_reads_yukis_formats_only():
 
 def _skill_tables(path, now):
     conn = sqlite3.connect(path)
+    # sWire: migration 41 builds the real skills / skill_runs; this test keeps its own spec-shaped stand-ins (the real
+    # tables are scored by test_the_scorecard_reads_the_real_skill_ledger below)
     conn.executescript("""
+        DROP TABLE IF EXISTS skill_runs;
+        DROP TABLE IF EXISTS skills;
         CREATE TABLE skills (id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE);
         CREATE TABLE skill_runs (id INTEGER PRIMARY KEY, at REAL NOT NULL, skill_id INTEGER NOT NULL,
             outcome TEXT NOT NULL, checked INTEGER, ms REAL, recheck INTEGER, request_id TEXT);
@@ -360,16 +364,57 @@ def test_the_scorecard_measures_the_purpose_tests_content_free(live, tmp_path):
     p3 = card["purpose_3_picks_it_up"]
     assert p3["events"] == {"accepted": 1, "held": 1, "offered": 2} and p3["over_game_or_call"] == 1 and not p3["pass"]
     assert card["background_cost"]["total_usd"] == 0.7 and card["background_cost"]["usd_per_day"] == 0.1
-    assert card["purpose_2_shown_once"]["available"] is False
+    p2 = card["purpose_2_shown_once"]                            # sWire: migration 41's pref_events (no events yet)
+    assert p2["available"] is True and p2["pref_events"] == {}
     text = json.dumps(card) + "\n".join(H.scorecard_text(card))
     assert "volume" in text and "Zen" not in text
 
 
 def test_the_scorecard_says_what_is_not_built_yet(live, tmp_path):
     path = dbcopy.copy_db(live, tmp_path / "copy")
+    # sWire: migration 41 is in; with no run yet purpose 1 is available and empty
+    p1 = H.scorecard(path, days=7)["purpose_1_fast_and_true"]
+    assert p1["available"] is True and p1["per_skill"] == {} and p1["false_done"] == 0
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE skill_runs")                                   # a database from before migration 41
+    conn.commit()
+    conn.close()
     card = H.scorecard(path, days=7)
     assert card["purpose_1_fast_and_true"] == {"available": False, "needs": "skill_runs (sCore, migration 41)"}
     assert card["purpose_3_picks_it_up"]["available"] is False
     assert card["footprint"]["available"] is False
     lines = H.scorecard_text(card)
     assert any(line.startswith("1. Fast and true: not yet") for line in lines)
+
+
+def test_the_scorecard_reads_the_real_skill_ledger(live, tmp_path):
+    """sWire: the scorecard on migration 41's own tables, written by the registry (not a stand-in): idle outcomes
+    (already, held for a game, asked, on another device) are counted apart and never in the rates (sCore r1 L7), a
+    re-check that disagreed is a false done, and pref_events' ``type`` column is counted."""
+    from yuki.memory.store import Store
+    from yuki.skills import connection as C
+    from yuki.skills import registry as R
+
+    now = ts("2026-10-11", "19:00:00")
+    path = dbcopy.copy_db(live, tmp_path / "copy")
+    s = Store.open(path)
+    try:
+        R.seed(s, C.load())
+        runs = [("done", True, 1.2), ("done", True, 2.0), ("unverified", None, 3.0), ("failed", False, 4.0),
+                ("already", None, 0.5), ("held_game", None, 0.1), ("other_device", None, 2.1), ("asked", None, 0.2)]
+        for i, (outcome, checked, secs) in enumerate(runs):
+            t0 = now - 3600 * (i + 1)
+            key = R.start_run(s, skill="volume", origin="voice", t0=t0, request_id=f"voice-1-{i}")
+            assert key and R.finish_run(s, key, outcome=outcome, checked=checked, t_done=t0 + secs, ms=secs * 1000)
+        key = R.start_run(s, skill="meet.open", origin="voice", t0=now - 600, request_id="voice-2-1")
+        R.finish_run(s, key, outcome="done", checked=True, t_done=now - 599, ms=900)
+        R.set_recheck(s, key, False)
+    finally:
+        s.close()
+    card = H.scorecard(path, days=7, now=now)
+    vol, meet = card["purpose_1_fast_and_true"]["per_skill"]["volume"], card["purpose_1_fast_and_true"]["per_skill"]["meet.open"]
+    assert (vol["runs"], vol["done"], vol["unconfirmed"], vol["failed"], vol["idle"]) == (4, 2, 1, 1, 4)
+    assert vol["done_rate"] == 0.5 and vol["p50_s"] == 1.2           # the two seen dones (the lower middle)
+    assert meet["false_done"] == 1 and card["purpose_1_fast_and_true"]["false_done"] == 1
+    assert card["purpose_2_shown_once"]["available"] is True
+    assert any("nothing to change 4" in line for line in H.scorecard_text(card))

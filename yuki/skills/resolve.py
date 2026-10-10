@@ -376,6 +376,11 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     if skill is None:
         return Refused(str(skill_key or ""), "unknown_skill")
     live = live or Live()
+    if live.game and skill.routes and all(r.needs_focus or r.game == "never" for r in skill.routes):
+        # sWeb r1 M4 / r2 L1 (sWire): with a game in front, a skill whose every route takes focus is held before any
+        # question ("Who to?" mid-round could only end in "after the round?"); routes that may run with a game
+        # (``game = "always"``, or ``"states"`` in a proven window state) keep the normal path
+        return Held(skill.key, live.game)
     heard = [words] if isinstance(words, str) else [str(w) for w in words or [] if w]
     given = dict(slots or {})
     told = told_values(store, skill.key)
@@ -550,9 +555,11 @@ class EvalResolver:
         if self._prompt is not None:
             return self._prompt(menu)
         try:
-            from yuki.voice.mouth import HANDS_PROMPT
+            # sVoice merge note (sWire): the talker's real hands block for this menu (its Skills paragraph, the volume
+            # and playlist wording, then the menu), so the suite sees what the talker sees
+            from yuki.voice.mouth import hands_block
 
-            head = str(HANDS_PROMPT)
+            return str(hands_block(menu))
         except Exception:  # noqa: BLE001 - the menu alone
             head = "You are Yuki's voice. Pick the user's usual way from the Skills list with run_skill, or tell_yuki."
         return head + "\n\n" + menu

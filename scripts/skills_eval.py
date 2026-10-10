@@ -84,7 +84,11 @@ SKILL_KEYS = tuple(k for k, _w in SKILL_MENU)
 CHOICE_HELP: dict[tuple[str, str], str] = {
     ("volume", "target"): "spotify = Spotify's own volume, app = another app's, system = the whole PC, "
                           "own_voice = Yuki's voice",
-    ("volume", "control"): "in_app = the app's own slider, mixer = the Windows volume mixer",
+    # sSpotify §3.2 (sWire): audio.toml's control default is "in_app" for every target, meaning the target's own
+    # control; "mixer" is only for an app that has its own control as well (Spotify)
+    ("volume", "control"): "in_app = the target's own control (Spotify's slider; another app's level in the mixer; "
+                           "the PC's volume), mixer = the Windows volume mixer for an app with its own slider "
+                           "(Spotify)",
 }
 #: The question for each kind of slot (``habits_replay.SLOT_SPEC``).
 SLOT_PROMPTS: dict[str, str] = {
