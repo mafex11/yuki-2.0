@@ -14,8 +14,11 @@ applies decides:
    the commit check says ``effect = join``: **refuse** (bring the window forward, "you click Join"). The one
    exception: a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``,
    on the user's plain words (the commit check's ``asked``; decision 7).
-4. **Send**: the step sends for certain (typed with Enter or a line break, a click while Yuki's typed text waits), is a
-   ``run_skill`` whose skill sends with these slots, or the commit check says ``effect = send``: **refuse**
+4. **Send**: the step sends for certain (``tools.sends_for_certain``: typed with Enter or a line break, or a click on
+   a control that is not a button, menu item or split button while Yuki's typed text waits in that window), is a
+   ``run_skill`` whose skill sends with these slots, or the commit check says ``effect = send`` (a button, menu item or
+   split button click, or a key, in a window where that text waits is may-commit and goes to the check, told the text
+   waits, so "type a search, click Search" is not refused as a send; designer's call, review r2 L1): **refuse**
    ("undeclared send") unless the plan declared ``consent.commit = send`` and the step is a sending capability. Then
    allowed only when (a) ``quote`` is a whole-words span of the user's words, (b) ``to`` is named in the quote (memory's
    people index, ``contacts.named_in``, or its words in the quote), (c) the step's text equals ``consent.text`` and is
@@ -59,6 +62,11 @@ LINE_JOIN = "{app} is in front: you click Join."
 LINE_JOIN_PLAIN = "You click Join."
 LINE_UNDECLARED_SEND = ("that step would send something the plan did not declare as a send: send only through the "
                         "message capability with commit send, or leave it as a draft")
+#: The same refusal for typing with Enter (``submit`` or a line break): Enter as its own step is checked (row 5), so a
+#: search box or an address bar still works; a message still goes through the capability.
+LINE_TYPED_ENTER = ("typing with Enter sends what was typed, and the plan declared no send: type it without submit and "
+                    "press Enter as its own step (that step is checked), send a message through the message capability "
+                    "with commit send, or leave it as a draft")
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
 LINE_DRAFTED = "It's typed in; send it when you're ready."
@@ -541,7 +549,8 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
           failed: bool) -> Verdict:
     """Row 4 for a step that sends."""
     if consent["commit"] != "send":
-        return Verdict(REFUSE, 4, "undeclared_send", line=LINE_UNDECLARED_SEND)
+        return Verdict(REFUSE, 4, "undeclared_send",
+                       line=LINE_TYPED_ENTER if step.tool == "type_text" else LINE_UNDECLARED_SEND)
     if step.tool != "run_skill" or sk is None or not getattr(sk, "sends", False):
         return Verdict(REFUSE, 4, "not_capability", line=LINE_NOT_CAPABILITY)
     _key, slots = skill_input(step, plan)

@@ -39,6 +39,7 @@ import json
 import os
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,6 +92,10 @@ COVERS: dict[str, tuple[str, ...]] = {
     "moment": ("app",), "driver": ("app",), "field_holds": ("window", "item"), "window_state": ("app", "window"),
     "gone": ("window", "item"), "file_exists": ("item",),
 }
+#: A plan that declares no send or join can't send or join (consent rows 3-4), so a send or a join it reads can only be
+#: the user's own: ``message_sent`` is not a pick, nor a ``moment`` of these kinds (the capability's checks read those).
+COMMIT_MOMENTS = frozenset({"message_sent", "call_join", "game_voice"})
+PICK_PROBES: tuple[str, ...] = tuple(p for p in PROBES if p != "message_sent")
 #: Probes whose result can flip by itself soon after (read again ~2 s later, off the speaking path).
 FLIPPABLE = frozenset({"media_session", "page_at", "foreground", "tab_shown", "window_state", "audio_active"})
 #: When the re-check reads again (s after the done line).
@@ -121,6 +126,7 @@ LINES: dict[str, str] = {
     "field_holds": "The {name} box holds it.",
     "window_state": "{App} is {state}.",
     "gone": "{App}'s window is closed.",
+    "gone_plain": "The window is closed.",
     "gone_element": "\"{name}\" is gone.",
     "file_exists": "{file} is there.",
 }
@@ -199,12 +205,20 @@ def parse_args(probe: str, text: Any) -> tuple[dict[str, Any] | None, str]:
     return out, ""
 
 
+def probe_name(spec: Any, default: str = NONE) -> str:
+    """The probe a ``done`` or ``expect`` names: the design's JSON field ``probe``, or ``name`` on bCore's validated
+    ``Probe`` (``default`` when neither is set)."""
+    from yuki.brain.consent import field_of
+
+    return str(field_of(spec, "probe", "") or field_of(spec, "name", "") or default)
+
+
 def plan_done(plan: Any) -> tuple[str, dict[str, Any] | None, str]:
     """The plan's ``done`` as ``(probe, args, why)``: ``args`` ``None`` with ``why`` when it doesn't parse."""
     from yuki.brain.consent import field_of
 
     done = field_of(plan, "done", {})
-    probe = str(field_of(done, "probe", NONE) or NONE)
+    probe = probe_name(done)
     args, why = parse_args(probe, field_of(done, "args", "{}"))
     return probe, args, why
 
@@ -231,7 +245,7 @@ def allowed_probes(plan: Any, seed: Mapping[str, Any] | None = None) -> tuple[st
         return (NONE,)
     if cls in ("skill", "send", "join"):
         return None
-    return PROBES
+    return PICK_PROBES
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -249,20 +263,29 @@ def as_hwnd(value: Any) -> int | None:
     return int(text) if text.isdigit() and int(text) > 0 else None
 
 
-def overview(dispatcher: Any) -> dict[str, Any]:
-    """The desktop overview's payload (the window list), ``{}`` when it can't be read."""
+def _locked(lock: Any) -> Any:
+    """The executor's dispatch lock held around a Dispatcher read (its screen model is shared with the reads running
+    beside it), or nothing when there is none."""
+    return lock if lock is not None else nullcontext()
+
+
+def overview(dispatcher: Any, *, lock: Any = None) -> dict[str, Any]:
+    """The desktop overview's payload (the window list), ``{}`` when it can't be read. ``lock``: the executor's
+    dispatch lock (the overview updates the Dispatcher's window list)."""
     try:
-        _text, payload, _ms = dispatcher.overview_text()
+        with _locked(lock):
+            _text, payload, _ms = dispatcher.overview_text()
         return payload if isinstance(payload, dict) else {}
     except Exception:  # noqa: BLE001
         return {}
 
 
-def window_of(dispatcher: Any, ref: Any, *, payload: Mapping[str, Any] | None = None) -> tuple[int | None, dict]:
+def window_of(dispatcher: Any, ref: Any, *, payload: Mapping[str, Any] | None = None,
+              lock: Any = None) -> tuple[int | None, dict]:
     """The window a plan's ``window`` field names: an hwnd as given (if it is on the window list), else the one window
     whose title holds the hint's words or whose app is the hint (string identity: whole-word spans, the app's key).
     ``(hwnd, its window-list entry)``; ``(None, {})`` when none or several fit."""
-    payload = payload if payload is not None else overview(dispatcher)
+    payload = payload if payload is not None else overview(dispatcher, lock=lock)
     windows = [w for w in (payload or {}).get("windows") or [] if isinstance(w, dict) and w.get("hwnd")]
     hwnd = as_hwnd(ref)
     if hwnd is not None:
@@ -333,7 +356,8 @@ def find_named(elements: Sequence[Mapping[str, Any]], name: str, role: str = "")
 class ProbeEnv:
     """What a probe read may use: when the run began, the dispatcher (generic probes), the memory (engine probes that
     read it), the last act step's own verdict (``read_back``), onset baselines, and the window the last act step acted
-    on as it was then (``acted``: ``hwnd``, ``title``, ``process_name``; ``gone`` follows that very window)."""
+    on as it was then (``acted``: ``hwnd``, ``title``, ``process_name``; ``gone`` follows that very window), and the
+    executor's dispatch lock (``lock``: probe reads of the Dispatcher take it, as the executor's own reads do)."""
 
     since: float
     dispatcher: Any = None
@@ -341,6 +365,7 @@ class ProbeEnv:
     last_verdict: bool | None = None
     baseline: Mapping[str, Any] = field(default_factory=dict)
     acted: Mapping[str, Any] = field(default_factory=dict)
+    lock: Any = None
 
 
 def _memory_call(memory: Any) -> Callable[[str, Callable[[Any], Any]], Any] | None:
@@ -455,12 +480,13 @@ def wait_read(probe: str, args: Mapping[str, Any], env: ProbeEnv, *, budget_s: f
 def _window_arg(args: Mapping[str, Any], env: ProbeEnv) -> tuple[int | None, dict]:
     if env.dispatcher is None:
         return as_hwnd(args.get("window")), {}
-    return window_of(env.dispatcher, args.get("window"))
+    return window_of(env.dispatcher, args.get("window"), lock=env.lock)
 
 
-def _read_tree(dispatcher: Any, hwnd: int) -> list[dict[str, Any]] | None:
+def _read_tree(dispatcher: Any, hwnd: int, lock: Any = None) -> list[dict[str, Any]] | None:
     try:
-        outcome = dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
+        with _locked(lock):
+            outcome = dispatcher.dispatch("look_at_window", {"hwnd": int(hwnd)})
     except Exception:  # noqa: BLE001
         return None
     payload = getattr(outcome, "payload", None)
@@ -477,7 +503,7 @@ def probe_field_holds(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None,
     hwnd, _entry = _window_arg(args, env)
     if hwnd is None or env.dispatcher is None:
         return None, {"status": "no_window"}
-    elements = _read_tree(env.dispatcher, hwnd)
+    elements = _read_tree(env.dispatcher, hwnd, env.lock)
     if elements is None:
         return None, {"status": "unread"}
     element, n = find_named(elements, str(args.get("name") or ""), str(args.get("role") or ""))
@@ -523,7 +549,7 @@ def probe_gone(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dict[s
         if acted_hwnd is not None and fits(ref, acted):
             hwnd = acted_hwnd
         else:
-            payload = overview(env.dispatcher)
+            payload = overview(env.dispatcher, lock=env.lock)
             if not isinstance(payload.get("windows"), list):
                 return None, {"status": "unread"}
             hits = fitting([w for w in payload["windows"] if isinstance(w, dict) and w.get("hwnd")], ref)
@@ -674,7 +700,8 @@ def line_for(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *
     if probe == "gone":
         if args.get("name"):
             return LINES["gone_element"].format(name=" ".join(str(args.get("name")).split())[:80])
-        return LINES["gone"].format(App=app)
+        named = str(args.get("process") or (window_entry or {}).get("process_name") or "")
+        return LINES["gone"].format(App=_display(named)) if named else LINES["gone_plain"]
     if probe == "file_exists":
         return LINES["file_exists"].format(file=Path(str(args.get("path") or "")).name or "It")
     return LINES.get(probe, LINES["read_back"]).format(App=app)
@@ -810,10 +837,21 @@ def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window:
     if probe == NONE or args is None or probe not in PROBES:
         # the validator lets no act plan through without a probe; a broken one is never "done"
         return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="nothing was set to check it", probe=probe)
+    if probe not in PICK_PROBES or (probe == "moment" and str(args.get("kind") or "") in COMMIT_MOMENTS):
+        # this plan sent and joined nothing (rows 3-4): a send or a join read now would be the user's own doing
+        return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="a send or a join is not this plan's to check",
+                          probe=probe, args=args)
     entry: dict[str, Any] = dict(last_window or {}) if probe == "read_back" else {}
     if probe in GENERIC_PROBES and probe != "file_exists" and env.dispatcher is not None:
-        found, entry = window_of(env.dispatcher, args.get("window"))
+        found, entry = window_of(env.dispatcher, args.get("window"), lock=env.lock)
         hwnd = found or hwnd
+        if probe == "gone" and not entry:
+            # a closed window is off the list: the window the last act step acted on names it, when it is that window
+            acted = dict(env.acted or {})
+            ref_hwnd = as_hwnd(args.get("window"))
+            if acted and ((ref_hwnd is not None and ref_hwnd == as_hwnd(acted.get("hwnd")))
+                          or (ref_hwnd is None and fits(args.get("window"), acted))):
+                entry = {"title": str(acted.get("title") or ""), "process_name": str(acted.get("process_name") or "")}
     verdict, evidence, _reads = wait_read(probe, args, env, budget_s=DONE_BUDGET_S, hwnd=hwnd, cancelled=cancelled)
     consent = plan_consent(plan)
     if verdict is not True:
@@ -905,8 +943,8 @@ def outcome(result: DoneResult | None, steps: Sequence[Mapping[str, Any]], *, st
             "did": bool(did_other), "refused": int(refused)}
 
 
-__all__ = ["COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT_BUDGET_S", "FLIPPABLE", "GENERIC_PROBES", "LINES",
-           "NONE", "PROBES", "PROBE_ARGS", "DoneResult", "ProbeEnv", "allowed_probes", "as_hwnd", "coverage",
-           "engine_line", "find_named", "line_for", "not_confirmed", "outcome", "overview", "parse_args", "pick_done",
-           "plan_class", "plan_done", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck",
-           "wait_read", "window_of"]
+__all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT_BUDGET_S", "FLIPPABLE",
+           "GENERIC_PROBES", "LINES", "NONE", "PICK_PROBES", "PROBES", "PROBE_ARGS", "DoneResult", "ProbeEnv",
+           "allowed_probes", "as_hwnd", "coverage", "engine_line", "find_named", "line_for", "not_confirmed", "outcome",
+           "overview", "parse_args", "pick_done", "plan_class", "plan_done", "probe_name", "read", "recheck_later",
+           "seed_done", "seen_words", "skill_done", "stuck", "wait_read", "window_of"]

@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -465,10 +466,25 @@ def load_skills(*, store: Any = None) -> Any:
     return load()
 
 
+#: The catalog is looked up several times per step (consent, the commit check, the marker, the done-check): one load
+#: serves them for this long (s), so the connection files are not stat'ed again on every lookup.
+SKILLS_TTL_S = 2.0
+_skills_cache: list[Any] = [0.0, None]
+_skills_lock = threading.Lock()
+
+
 def skill(key: Any) -> Any:
-    """One skill of the catalog by its key (``None``: no such skill, or the files could not be read). Never raises."""
+    """One skill of the catalog by its key (``None``: no such skill, or the files could not be read). The catalog
+    loaded at most once per :data:`SKILLS_TTL_S`. Never raises."""
     try:
-        return load_skills().get(str(key or ""))
+        now = time.monotonic()
+        with _skills_lock:
+            at, loaded = _skills_cache
+        if loaded is None or now - float(at) > SKILLS_TTL_S:
+            loaded = load_skills()
+            with _skills_lock:
+                _skills_cache[0], _skills_cache[1] = now, loaded
+        return loaded.get(str(key or ""))
     except Exception:  # noqa: BLE001 - unreadable data is no skill
         return None
 

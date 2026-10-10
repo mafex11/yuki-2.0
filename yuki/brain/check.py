@@ -18,8 +18,9 @@ app, no worked incident) and under 2,500 characters. A step it gave no verdict f
 ``failed`` (the consent rule then fails closed: ask for a lasting step, draft for a send).
 
 **Memo.** Per request, keyed by (window, verb, element role and name, a digest of the step's other input, whether
-Yuki's unsent text waits there): a verdict is never reused on another window, nor across typing. No review stage, no
-window grants, no denial counters.
+Yuki's unsent text waits there), and only for the user's words it was given: a verdict is never reused on another
+window, nor across typing, nor after the words changed (a steer, an answer, another turn: the memo starts empty). No
+review stage, no window grants, no denial counters.
 
 **Logs** (content-free): steps checked, effects counted, asks, ms, the model's usage.
 """
@@ -239,14 +240,14 @@ class CommitCheck:
     """One request's commit checks: the model calls and the per-request memo.
 
     Args:
-        client: A callable returning the model client (the agent's failover client; the check always runs on the
-            default Claude path, :func:`yuki.agent.failover.claude_path`, as the old judge did).
+        client: The model client (the agent's failover client: an object with ``messages``), or a callable returning
+            it (bCore's ``Brain.client`` property passed as is, or a getter). The check always runs on the default
+            Claude path, :func:`yuki.agent.failover.claude_path`, as the old judge did.
         settings: ``check_model`` (else ``judge_model``), ``check_timeout_s``, ``estimate_cost``.
         log: ``log(event_type, **fields)``; fields are passed through ``yuki.log.events.content_free``.
     """
 
-    def __init__(self, client: Callable[[], Any] | None, settings: Any = None,
-                 log: Callable[..., None] | None = None) -> None:
+    def __init__(self, client: Any = None, settings: Any = None, log: Callable[..., None] | None = None) -> None:
         self._client = client
         self.settings = settings
         self._log = log
@@ -258,13 +259,33 @@ class CommitCheck:
         """A new request: the memo and the counts start empty."""
         with self._lock:
             self.memo: dict[str, CheckVerdict] = {}
+            self._words_sig = ""
             self.calls = 0
             self.cost_usd = 0.0
             self.ms: list[float] = []
 
-    def cached(self, call: Call, *, typed: bool = False) -> CheckVerdict | None:
+    def _sync_words(self, user_words: Sequence[str]) -> None:
+        """The memo holds verdicts for one set of the user's words: when they changed (a steer or an answer added to
+        them, a later turn's words on a checker kept across turns), it starts empty."""
+        text = json.dumps([" ".join(str(w or "").split()) for w in user_words or []], ensure_ascii=False)
+        sig = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:16]
+        with self._lock:
+            if sig != self._words_sig:
+                self.memo = {}
+                self._words_sig = sig
+
+    def client_now(self) -> Any:
+        """The model client: the object given, or what the callable given returns (``None``: none)."""
+        c = self._client
+        if c is None or hasattr(c, "messages"):
+            return c
+        return c() if callable(c) else c
+
+    def cached(self, call: Call, *, typed: bool = False, words: Sequence[str] | None = None) -> CheckVerdict | None:
         """The memo's verdict for this very step on this very window (with Yuki's unsent text waiting there or not,
-        ``typed``), or ``None``."""
+        ``typed``), or ``None``. ``words``: the user's words now (a memo from other words is dropped first)."""
+        if words is not None:
+            self._sync_words(words)
         with self._lock:
             got = self.memo.get(memo_key(call, typed=typed))
         if got is None or (got.hwnd or 0) != int(call.hwnd or 0):
@@ -280,6 +301,7 @@ class CommitCheck:
         with the text when known (a click or a key there can send it: said on its line). ``typed_by_step``: instead,
         per step (by ``call.index``), the unsent text in its window at that step's own moment (a plan's batch: a
         step before the typing and one after it in the same window differ); a step not in it has none."""
+        self._sync_words(user_words)
         pending = _pending(typed_pending)
 
         def typed_text(c: Call) -> str | None:
@@ -343,7 +365,7 @@ class CommitCheck:
             try:
                 from yuki.agent.failover import claude_path
 
-                client = claude_path(self._client())
+                client = claude_path(self.client_now())
                 try:
                     response = client.messages.create(**request(user_words, lines, model=model, earlier=earlier,
                                                                 strict=self._strict))
@@ -422,7 +444,7 @@ class OneVerdict:
 
 
 def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | None = None, *,
-        words: Sequence[str], checker: CommitCheck | None = None, client: Callable[[], Any] | None = None,
+        words: Sequence[str], checker: CommitCheck | None = None, client: Any = None,
         settings: Any = None, earlier: Sequence[str] = (), board: Mapping[str, Any] | None = None,
         policy: Any = None, log: Callable[..., None] | None = None) -> OneVerdict:
     """The consent rule (rows 1-6) over one step with a one-step commit check: the talker's hands and rung B.
@@ -430,7 +452,9 @@ def one(name: str, tool_input: Mapping[str, Any], target: Mapping[str, Any] | No
     ``target``: the code facts the hand read (``hwnd``, ``app``: the window's process, ``title``, ``role`` and ``name``
     of the element, ``typed_pending``: Yuki's typed text waits in that window, ``files_read``). ``words``: the user's
     own heard words for this turn (never the talker's wording). ``board``: the Now board (read now when ``None``).
-    No plan declares a send, so a hand that would send is handed over (``handover``). Never raises (an error: an ask)."""
+    ``checker``: give a fresh one per turn, or call its ``begin_request()`` each turn; a checker kept across turns
+    still drops its memo when the words differ. No plan declares a send, so a hand that would send is handed over
+    (``handover``). Never raises (an error: an ask)."""
     try:
         target = dict(target or {})
         hwnd = target.get("hwnd")

@@ -57,7 +57,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
-from yuki.agent.tools import tool_traits
+from yuki.agent.tools import sends_for_certain, tool_traits
 from yuki.brain import consent, done, util
 from yuki.brain.check import CheckVerdict, CommitCheck
 from yuki.brain.consent import Call, Live, field_of, words
@@ -93,6 +93,9 @@ VALUE_FIELDS: dict[str, frozenset[str]] = {
     "run_powershell": frozenset({"command"}), "write_clipboard": frozenset({"text"}),
     "run_skill": frozenset({"skill", "slots"}), "open_yuki": frozenset({"page"}),
 }
+#: A ``click``'s plain value (bCore's validator: ``left``, ``right``, ``middle``, ``double``) as the click tool's input.
+CLICK_VALUES: dict[str, dict[str, Any]] = {"left": {}, "right": {"button": "right"}, "middle": {"button": "middle"},
+                                           "double": {"clicks": 2}}
 
 #: Budgets (§2.3): an act run takes at most this many replans (``brain_max_replans`` overrides it) and model calls;
 #: an answer plan at most this many calls or seconds.
@@ -121,6 +124,7 @@ LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
 LINE_CUT_SHORT = "I lost my train of thought partway through, so I stopped there."
 LINE_DRAFT_HELD = "I opened the chat but didn't type the text in."
+LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -302,7 +306,9 @@ class Executor:
 
             self.nonce = new_nonce()
         self._pool: ThreadPoolExecutor | None = None
-        self._dispatch_lock = threading.Lock()
+        # every Dispatcher read and act (overviews, probe reads, the reads running beside an act) takes this lock: its
+        # screen model is shared; re-entrant, so a read inside a held section can't deadlock its own thread
+        self._dispatch_lock = threading.RLock()
         self._read_cache: dict[int, tuple[float, int | None, list[dict[str, Any]], dict[str, Any]]] = {}
         self._closed = False
         self._recheck: threading.Thread | None = None
@@ -329,6 +335,7 @@ class Executor:
         self.skill_outcomes: list[_SkillRun] = []
         self.batch: dict[int, CheckVerdict] = {}
         self._batch_typed: dict[int, bool] = {}
+        self._batch_words = -1   # how many of the user's words the batch was checked on (they only grow)
         self.stopped: RunResult | None = None
         self.plan_since = time.time()
 
@@ -506,6 +513,20 @@ class Executor:
         return f"{lead}step {current.index + 1} of {total}" + (f", {what}" if what else "") + \
             (f" ({done_n} done)" if done_n else "")
 
+    def _reads_now(self) -> set[str]:
+        """What this request has read (M9): this executor's own reads and the planner's (:meth:`note_read`), and
+        ``private`` when the host says the request already holds the user's private content read elsewhere
+        (``host.private_read()``, bCore's)."""
+        out = set(self.reads_seen)
+        private = getattr(self.host, "private_read", None)
+        if callable(private):
+            try:
+                if private():
+                    out.add("private")
+            except Exception:  # noqa: BLE001 - this executor's own reads still count
+                pass
+        return out
+
     def note_read(self, kind: str) -> None:
         """The planner's own tools read a file, the clipboard or memory this request (``file`` / ``clipboard`` /
         ``memory``): a later web fetch is then a may-commit step (M9), as for a plan's own reads."""
@@ -559,12 +580,12 @@ class Executor:
         """The commit check, once, over every may-commit step of ``pending`` (their windows as the overview shows them
         now, their elements as the plan names them; at run time a step whose window or element turns out different is
         checked again on its own)."""
-        payload = done.overview(self.dispatcher)
+        payload = done.overview(self.dispatcher, lock=self._dispatch_lock)
         self._last_overview = payload or self._last_overview
         calls: list[Call] = []
         typed_by_step: dict[int, str] = {}   # each may-commit step: Yuki's unsent text in its window at its moment
         typed: dict[int, str] = dict(self.typed_pending)
-        reads = set(self.reads_seen)
+        reads = self._reads_now()
         for i in pending:
             step = self.steps[i]
             verb = self._verb(step)
@@ -583,16 +604,12 @@ class Executor:
                 calls.append(call)
                 if call.hwnd and int(call.hwnd) in typed:
                     typed_by_step[i] = typed[int(call.hwnd)]
-            if verb == "type_text" and call.hwnd:
-                if field_of(step, "submit", False):
-                    typed.pop(int(call.hwnd), None)
-                else:
-                    held = "" if call.input.get("clear") else typed.get(int(call.hwnd), "")
-                    typed[int(call.hwnd)] = held + str(call.input.get("text") or "")
-            elif verb in ("press", "hotkey") and call.hwnd:
-                typed.pop(int(call.hwnd), None)
+            # the same rule as after a step runs (_after_act); a run_skill has no window before it runs, so its draft is
+            # not foreseen here: a step whose waiting text differs at run time is checked again on its own
+            self._typed_step(typed, call)
         if calls:
             # one call; each step's line says whether Yuki's unsent text waits in its window at its own moment
+            self._batch_words = len(self.words)
             self.batch = self.checker.run(self._all_words(), calls, earlier=self.earlier, plan=self.head,
                                           typed_by_step=typed_by_step)
             self._batch_typed = {c.index: c.index in typed_by_step for c in calls}
@@ -604,9 +621,10 @@ class Executor:
         takes no input, so no desk lease and no acting marker; the lease, if an earlier act holds it, is freed while
         the user is asked. ``None`` when every gated fetch ran."""
         calls: dict[int, Call | None] = {i: self._fetch_call(i, self.steps[i]) for i in indices}
-        live0 = Live(reads=frozenset(self.reads_seen), join_controls=self.join_controls)
+        live0 = Live(reads=frozenset(self._reads_now()), join_controls=self.join_controls)
         todo = [c for c in calls.values() if c is not None and consent.may_commit(c, live0, self.head)]
         if todo:
+            self._batch_words = len(self.words)
             self.batch.update(self.checker.run(self._all_words(), todo, earlier=self.earlier, plan=self.head))
         for i in indices:
             call, status = calls[i], self.statuses[i]
@@ -725,7 +743,9 @@ class Executor:
             status.state, status.why = "skipped", "wrong thread"
             return RunResult("refused", line=LINE_BUSY, final=True)
         live = self._live(call)
-        verdict = consent.check(call, self.head, self._all_words(), live, self._verdict_for(call, live))
+        cv = self._verdict_for(call, live)
+        effect = str(getattr(cv, "effect", "") or "") if cv is not None and not getattr(cv, "failed", False) else ""
+        verdict = consent.check(call, self.head, self._all_words(), live, cv)
         self._emit_log("consent", verb=call.tool, row=verdict.row, result=verdict.result, why=verdict.why)
         if verdict.result == consent.ASK:
             self.lease.release()
@@ -781,10 +801,12 @@ class Executor:
                 self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {gate.why}", kind="control",
                                  refused=True)
                 return RunResult("refused", line=gate.line, final=True)
-        return self._dispatch_act(index, step, call)
+        return self._dispatch_act(index, step, call, effect=effect)
 
-    def _dispatch_act(self, index: int, step: Any, call: Call, *, speak: bool = True) -> RunResult | None:
-        """The Dispatcher call of an allowed step, its acting marker, step line, events, trace and check."""
+    def _dispatch_act(self, index: int, step: Any, call: Call, *, speak: bool = True,
+                      effect: str = "") -> RunResult | None:
+        """The Dispatcher call of an allowed step, its acting marker, step line, events, trace and check. ``effect``:
+        the commit check's effect for this step (``""``: none was had), for what the step leaves waiting."""
         status = self.statuses[index]
         if self._takes_marker(call):
             try:
@@ -811,11 +833,11 @@ class Executor:
         verdict = own
         expect = field_of(step, "expect", None)
         if outcome.ok and expect is not None:
-            probe = str(field_of(expect, "probe", "") or "")
+            probe = done.probe_name(expect, "")   # the design's "probe", or bCore's validated Probe's "name"
             args, bad = done.parse_args(probe, field_of(expect, "args", "{}"))
             if args is not None and probe in done.PROBES:
                 env = done.ProbeEnv(since=started_at, dispatcher=self.dispatcher, memory=self.host.memory,
-                                    last_verdict=own)
+                                    last_verdict=own, lock=self._dispatch_lock)
                 got, evidence, _reads = done.wait_read(probe, args, env, budget_s=done.EXPECT_BUDGET_S,
                                                        hwnd=call.hwnd, cancelled=self.host.cancelled)
                 if got is not None or own is None:
@@ -851,7 +873,7 @@ class Executor:
                     send_sig = hashlib.sha1(text.casefold().encode("utf-8", "replace")).hexdigest()[:12]
         self._trace_step(call, outcome, ok=bool(outcome.ok), verdict=verdict, why=why, ms=ms, started=started_at,
                          send=send_state, send_sig=send_sig)
-        self._after_act(call, outcome)
+        self._after_act(call, outcome, effect=effect, verdict=verdict)
         self.last_act = {"hwnd": call.hwnd, "app": call.app, "title": call.title, "verdict": verdict}
         if call.tool == "run_skill":
             return self._skill_result(index, step, call, outcome)
@@ -907,14 +929,21 @@ class Executor:
             opened = (payload.get("details") or {}).get("verified") is True if isinstance(payload, dict) else False
             if not opened:
                 status.state, status.why = "failed", "chat_not_confirmed"
-                return RunResult("refused", line="I couldn't confirm the chat is open, so I didn't type anything.",
-                                 final=True)
-            payload_now = done.overview(self.dispatcher)
-            front = done.as_hwnd(payload_now.get("foreground_hwnd"))
-            entry = next((w for w in payload_now.get("windows") or [] if isinstance(w, dict)
-                          and done.as_hwnd(w.get("hwnd")) == front), {}) if front else {}
-            typed = Call(tool="type_text", input={"text": verdict.type_after, "press_enter": False,
-                                                  **({"expect_hwnd": front} if front else {})},
+                return RunResult("refused", line=LINE_CHAT_UNCONFIRMED, final=True)
+            # the user may take over or stop between the capability's check and the typing: nothing starts then
+            held = self._hold_pause()
+            if held is not None or self.host.cancelled():
+                status.state, status.why = "skipped", "stopped before typing"
+                return held if held is not None else RunResult("cancelled")
+            key, slots = (run.key, run.slots) if run is not None else consent.skill_input(drafted, self.head)
+            outcome_run = run.outcome if run is not None else None
+            front, entry, fits, _listed = self._skill_windows(outcome_run, key, slots)
+            if front is None or fits is False:
+                # the window in front is not the capability's chat (another app came forward): nothing is typed
+                status.state, status.why = "failed", "chat_not_in_front"
+                return RunResult("refused", line=LINE_CHAT_UNCONFIRMED, final=True)
+            typed = Call(tool="type_text",
+                         input={"text": verdict.type_after, "press_enter": False, "expect_hwnd": front},
                          index=index, hwnd=front, app=str(entry.get("process_name") or ""),
                          title=str(entry.get("title") or ""))
             typed_live = self._live(typed)
@@ -933,6 +962,10 @@ class Executor:
                     status.state, status.why = "declined", "the user said no"
                     self._trace_step(typed, None, ok=False, verdict=False, why="declined", kind="ask")
                     return RunResult("declined", line=LINE_DECLINED, final=True)
+                again, _entry, fits, _listed = self._skill_windows(outcome_run, key, slots)
+                if again != front or fits is False:   # the chat must still be in front after the answer
+                    status.state, status.why = "failed", "chat_not_in_front"
+                    return RunResult("refused", line=LINE_CHAT_UNCONFIRMED, final=True)
                 gate = consent.screen_gate(typed, self._live(typed)) or consent.after_ask(gate)
             if not gate.allowed:
                 status.state, status.why = "refused", gate.why
@@ -966,14 +999,9 @@ class Executor:
 
     def _countdown(self, call: Call) -> str:
         """The send countdown (``SendPending`` with its swap chip): ``going``, ``stopped`` (a cancel), or ``swapped``
-        (the user's words arrived: a chip tap or a correction; they go to the planner)."""
+        (the user's words arrived: a chip tap or a correction; they go to the planner). The host's own countdown
+        (``host.countdown``) when it has one, else this one."""
         self._swap_words = []
-        seconds = getattr(self.host, "send_countdown_s", None)
-        if seconds is None:
-            seconds = getattr(self.settings, "send_countdown_s", None)
-        seconds = DEFAULT_COUNTDOWN_S if seconds is None else float(seconds or 0.0)
-        if seconds <= 0:
-            return "going"
         c = consent.plan_consent(self.head)
         key, slots = consent.skill_input(call, self.head)
         sk = util.skill(key)
@@ -981,6 +1009,35 @@ class Executor:
         app = (words(slots.get(app_slot)) if app_slot else "") or (str(getattr(sk, "app", "") or "") if sk else "")
         info = {"who": c["to"], "where": util.app_name(app) if app else "", "app": util.app_name(app) if app else "",
                 "text": c["text"], "typed": False, "from_memory": False, "window": ""}
+        hosted = getattr(self.host, "countdown", None)
+        if callable(hosted):
+            # the host's own countdown (bCore's Brain: its swap chips, and its takeover and chip state see the send
+            # open); one countdown, never two
+            try:
+                state = str(hosted(who=info["who"], where=info["where"], app=info["app"], text=info["text"],
+                                   typed=False) or "")
+            except Exception:  # noqa: BLE001 - no countdown ran: nothing is sent
+                state = "stopped"
+            state = state if state in ("going", "stopped", "swapped") else "stopped"
+            if state == "going":
+                # words the user said while it counted (a correction) stop the send for a replan, as a chip would
+                try:
+                    late = [str(w) for w in (self.host.steer_pending() or []) if str(w).strip()]
+                except Exception:  # noqa: BLE001
+                    late = []
+                if late:
+                    self._swap_words = late
+                    self.steers += late
+                    self.words += late
+                    state = "swapped"
+            self._emit_log("send_countdown", state=state, hosted=True)
+            return state
+        seconds = getattr(self.host, "send_countdown_s", None)
+        if seconds is None:
+            seconds = getattr(self.settings, "send_countdown_s", None)
+        seconds = DEFAULT_COUNTDOWN_S if seconds is None else float(seconds or 0.0)
+        if seconds <= 0:
+            return "going"
         if getattr(self.host, "channel", "") == "voice" and c["to"]:
             self._emit(Say(f"Sending to {c['to']}"))
         self._emit(SendPending("counting", seconds=seconds, **info))
@@ -1029,7 +1086,7 @@ class Executor:
             tool_input = self._tool_input(verb, step)
         except ValueError as exc:
             return None, str(exc)
-        payload = done.overview(self.dispatcher)
+        payload = done.overview(self.dispatcher, lock=self._dispatch_lock)
         self._last_overview = payload or self._last_overview
         ref = field_of(step, "window", None)
         hwnd, entry = done.window_of(self.dispatcher, ref, payload=payload) if ref else (None, {})
@@ -1092,7 +1149,8 @@ class Executor:
             return None, "no window to look in"
         name = str(field_of(element, "name", "") or "")
         role = str(field_of(element, "role", "") or "")
-        if role.casefold() == "id":
+        if role.casefold() == "id" or _element_ref(name) is not None:
+            # an id from a look: role "id", or the name written "[12]" / "#12" (bCore's Element.ref_id)
             ref = done.as_hwnd(name.strip("[]# "))
             info = self.dispatcher.element_info({"element": ref, "expect_hwnd": hwnd}) if ref is not None else None
             if not info:
@@ -1179,15 +1237,25 @@ class Executor:
                 number = _number(text, float)
                 out["by" if text.strip()[:1] in "+-" else "to"] = number
             elif verb == "app_volume":
-                number = _number(text, float)
                 app = words(field_of(field_of(self.head, "target", {}), "app", ""))
                 if not app:
                     raise ValueError("app_volume names the app in its value: {\"app\": ..., \"level\": ...}")
-                out.update(app=app, **({"change": number} if text.strip()[:1] in "+-" else {"level": number}))
+                plain = text.strip().casefold()
+                if plain in ("mute", "unmute"):   # the plan's fixed words for the mixer's mute (bCore's validator)
+                    out.update(app=app, mute=plain == "mute")
+                else:
+                    number = _number(text, float)
+                    out.update(app=app, **({"change": number} if text.strip()[:1] in "+-" else {"level": number}))
             elif verb == "run_skill":
                 raise ValueError("run_skill's value is its slots as a JSON object")
-            elif verb in ("click", "focus_window"):
-                pass
+            elif verb == "click":
+                plain = text.strip().casefold()
+                if plain in CLICK_VALUES:
+                    out.update(CLICK_VALUES[plain])
+                else:
+                    raise ValueError(f"click's value is one of {', '.join(CLICK_VALUES)} (or none), not {text[:40]!r}")
+            elif verb == "focus_window":
+                pass   # its window is the step's own field
             else:
                 raise ValueError(f"{verb} can't take that value")
         if verb == "type_text":
@@ -1226,7 +1294,7 @@ class Executor:
         call = self._fetch_call(-1, step)
         if call is None or call.tool != "fetch_url":
             return False
-        earlier = set(self.reads_seen)
+        earlier = self._reads_now()
         for other in self.steps:
             if other is step:
                 break
@@ -1252,7 +1320,7 @@ class Executor:
             if c["commit"] == "send" and c["to"]:
                 recent = tuple(self._recent_to(c["to"], c["quote"]))
         return Live(game=consent.game_now(board), calling=consent.calling_windows(board),
-                    typed_pending=frozenset(self.typed_pending), reads=frozenset(self.reads_seen),
+                    typed_pending=frozenset(self.typed_pending), reads=frozenset(self._reads_now()),
                     join_controls=self.join_controls, recent=recent, people_in=self._people_in)
 
     def _verdict_for(self, call: Call, live: Live) -> CheckVerdict | None:
@@ -1261,13 +1329,14 @@ class Executor:
         if not consent.may_commit(call, live, self.head):
             return None
         typed = bool(call.hwnd) and int(call.hwnd) in self.typed_pending
-        got = self.batch.get(call.index)
+        # a batch verdict holds only for the words it was given: after a steer or added words, the step is checked anew
+        got = self.batch.get(call.index) if self._batch_words == len(self.words) else None
         if got is not None and not got.failed and int(got.hwnd or 0) == int(call.hwnd or 0) and \
                 self._batch_typed.get(call.index, typed) == typed:
             planned = self._predicted_key(call.index)
             if planned is None or planned == (call.role.casefold(), words(call.name).casefold()):
                 return got
-        cached = self.checker.cached(call, typed=typed)
+        cached = self.checker.cached(call, typed=typed, words=self._all_words())
         if cached is not None:
             return cached
         return self.checker.run(self._all_words(), [call], earlier=self.earlier, plan=self.head,
@@ -1342,20 +1411,120 @@ class Executor:
                 return False
         return tool_traits(call.tool, call.input).needs in ("input", "focus", "window")
 
-    def _after_act(self, call: Call, outcome: Any) -> None:
-        """What an act leaves for the next steps' code facts: Yuki's typed text waiting in a window (a click there may
-        send it), cleared by Enter or a send."""
+    @staticmethod
+    def _typed_step(typed: dict[int, str], call: Call, *, effect: str = "") -> None:
+        """What one step on a window does to Yuki's unsent text there (``typed``: window -> text, changed in place).
+        The one rule :meth:`_after_act` applies after a step ran and :meth:`_batch_check` simulates before the steps
+        run. The text stops waiting only when the step sent for sure (typed with Enter or a line break, a click while
+        it waits: ``sends_for_certain``) or the commit check said this very step sends (``effect = send``; the batch
+        can't know that yet, so it keeps the text). Any other key or click leaves it waiting (a Tab, an emoji button,
+        shift+Enter send nothing), as the old loop's ``_typed`` did. ``type_text`` without Enter adds its text
+        (``clear`` empties the field first). A step with no window (a ``run_skill``) changes nothing here."""
+        if not call.hwnd:
+            return
+        hwnd = int(call.hwnd)
+        if effect == "send" or sends_for_certain(consent.traits_of(call, Live(typed_pending=frozenset(typed)))):
+            typed.pop(hwnd, None)
+        elif call.tool == "type_text":
+            held = "" if call.input.get("clear") else typed.get(hwnd, "")
+            typed[hwnd] = (held + str(call.input.get("text") or ""))[-2000:]
+
+    def _after_act(self, call: Call, outcome: Any, *, effect: str = "", verdict: bool | None = None) -> None:
+        """What an act leaves for the next steps' code facts: Yuki's unsent text waiting in a window (a click there may
+        send it). A step on a window follows :meth:`_typed_step`. A ``run_skill`` has no window of its own: see
+        :meth:`_after_skill`."""
+        if call.tool == "run_skill":
+            self._after_skill(call, outcome, verdict)
+            return
         if not getattr(outcome, "ok", False) or not call.hwnd:
             return
-        if call.tool == "type_text":
-            if call.input.get("press_enter"):
-                self.typed_pending.pop(int(call.hwnd), None)
-            else:
-                held = "" if call.input.get("clear") else self.typed_pending.get(int(call.hwnd), "")
-                self.typed_pending[int(call.hwnd)] = (held + str(call.input.get("text") or ""))[-2000:]
-        elif call.tool in ("press", "hotkey") or (call.tool == "click" and call.role in ("Button", "MenuItem",
-                                                                                          "SplitButton")):
-            self.typed_pending.pop(int(call.hwnd), None)
+        self._typed_step(self.typed_pending, call, effect=effect)
+
+    def _after_skill(self, call: Call, outcome: Any, verdict: bool | None) -> None:
+        """A capability that ran with text in its text slot: when it sent for sure and its own check saw it, its chat
+        holds nothing of Yuki's any more; otherwise (a draft, or a send its check couldn't see) that text waits in its
+        chat window, so a later key or click there is judged as one that may send it (rows 4-5). The chat window: the
+        capability's own ``details.hwnd`` when it reports one, else the window in front when it is the capability's
+        app, else that app's listed windows. Never raises."""
+        try:
+            payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            if payload.get("refused") or details.get("refused") or str(payload.get("outcome") or "") == "held_game":
+                return   # held before it acted: nothing was typed
+            key, slots = consent.skill_input(call, self.head)
+            sk = util.skill(key)
+            name = consent.text_slot(sk) if sk is not None else ""
+            text = words(slots.get(name)) if name else ""
+            sent = bool(getattr(outcome, "ok", False)) and verdict is True and consent.skill_sends(sk, slots,
+                                                                                                    partial=False)
+            if not text and not sent:
+                return
+            front, _entry, fits, listed = self._skill_windows(outcome, key, slots)
+            own = done.as_hwnd(details.get("hwnd"))
+            windows = {own} if own is not None else (
+                ({front} if front is not None and fits is not False else set()) | (set(listed) if fits is not True
+                                                                                     else set()))
+            for hwnd in windows:
+                if sent:
+                    self.typed_pending.pop(int(hwnd), None)
+                else:
+                    self.typed_pending[int(hwnd)] = text[-2000:]
+        except Exception:  # noqa: BLE001 - bookkeeping; a missed record leaves the next click to the commit check
+            pass
+
+    def _skill_windows(self, outcome: Any, key: str, slots: Mapping[str, Any]
+                       ) -> tuple[int | None, dict[str, Any], bool | None, list[int]]:
+        """Where a capability's chat is now: ``(the window in front, its window-list entry, whether it is the
+        capability's app, every listed window of that app)``. The app is its route's own ``app`` (the route the run
+        took, by ``payload.route``), else its app slot, else the capability's app; its programs are that app's
+        connection data (``[chat] processes`` / ``images``). Fit ``None``: the data names no program. When the
+        capability reports its window (``details.hwnd``), the fit also needs that window in front."""
+        payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        now = done.overview(self.dispatcher, lock=self._dispatch_lock)
+        self._last_overview = now or self._last_overview
+        front = done.as_hwnd(now.get("foreground_hwnd"))
+        windows = [w for w in now.get("windows") or [] if isinstance(w, dict) and done.as_hwnd(w.get("hwnd"))]
+        entry = next((w for w in windows if done.as_hwnd(w.get("hwnd")) == front), {}) if front else {}
+        programs = self._skill_programs(payload, key, slots)
+        from yuki.memory.store import app_key
+
+        fits: bool | None = None
+        if programs:
+            fits = bool(entry) and app_key(str(entry.get("process_name") or "")) in programs
+        own = done.as_hwnd(details.get("hwnd"))
+        if own is not None:
+            fits = own == front and fits is not False
+        listed = [int(done.as_hwnd(w.get("hwnd")) or 0) for w in windows
+                  if programs and app_key(str(w.get("process_name") or "")) in programs]
+        return front, dict(entry), fits, [h for h in listed if h]
+
+    @staticmethod
+    def _skill_programs(payload: Mapping[str, Any], key: str, slots: Mapping[str, Any]) -> frozenset[str]:
+        """The programs (app keys) of the app a capability's run acted in, from catalog data (module docstring of
+        :meth:`_skill_windows`); empty when the data names none. Never raises."""
+        try:
+            sk = util.skill(key)
+            if sk is None:
+                return frozenset()
+            app = ""
+            taken = str(payload.get("route") or "")
+            for route in getattr(sk, "routes", ()) or ():
+                if taken and str(getattr(route, "key", "") or "") == taken:
+                    app = str((getattr(route, "args", None) or {}).get("app") or "")
+                    break
+            if not app:
+                slot = next((sl.name for sl in getattr(sk, "slots", ()) or () if getattr(sl, "type", "") == "app"), "")
+                app = words(slots.get(slot)) if slot else ""
+            app = app or str(getattr(sk, "app", "") or "")
+            from yuki.memory.store import app_key
+            from yuki.skills.chat import app_data
+
+            data = app_data(app) if app else {}
+            names = [str(n) for n in list(data.get("processes") or []) + list(data.get("images") or [])]
+            return frozenset(k for k in (app_key(n) for n in names) if k)
+        except Exception:  # noqa: BLE001 - no data: the fit is unknown
+            return frozenset()
 
     # -- reads -------------------------------------------------------------------------------------------------------
 
@@ -1421,9 +1590,11 @@ class Executor:
                     "window" if field_of(step, "window", None) else "desktop")
                 tool = LOOK_TOOLS.get(what, "look_at_window")
                 if tool in ("look_at_window", "read_page", "read_tabs"):
-                    hwnd, _entry = done.window_of(self.dispatcher, field_of(step, "window", None))
+                    hwnd, _entry = done.window_of(self.dispatcher, field_of(step, "window", None),
+                                                    lock=self._dispatch_lock)
                     if hwnd is None:
-                        hwnd = done.as_hwnd(done.overview(self.dispatcher).get("foreground_hwnd"))
+                        front = done.overview(self.dispatcher, lock=self._dispatch_lock).get("foreground_hwnd")
+                        hwnd = done.as_hwnd(front)
                     if hwnd is None:
                         raise ValueError("no window to read")
                     tool_input = {"hwnd": hwnd}
@@ -1470,7 +1641,8 @@ class Executor:
                  "process_name": self.last_act.get("app") or ""} if self.last_act.get("hwnd") else {}
         env = done.ProbeEnv(since=self.started, dispatcher=self.dispatcher,
                             memory=self.host.memory, last_verdict=self.last_act.get("verdict"),
-                            baseline=dict((self.seed or {}).get("baseline") or {}), acted=acted)
+                            baseline=dict((self.seed or {}).get("baseline") or {}), acted=acted,
+                            lock=self._dispatch_lock)
         if cls == "skill" and self.seed and self.seed.get("done") and not str(
                 field_of(self.head, "route", "")).startswith("skill:"):
             result = done.seed_done(self.seed, env)
@@ -1535,7 +1707,14 @@ class Executor:
             self._recheck_verdict = {"recheck": word}
             self._emit_log("done_recheck", check=result.probe, result=word)
             if verdict is False:
-                self._emit(Say(done.LINE_RECHECK))
+                late = getattr(self.host, "late_line", None)
+                if self._closed and callable(late):   # the request already ended: the host's late line (bCore's)
+                    try:
+                        late(done.LINE_RECHECK)
+                    except Exception:  # noqa: BLE001
+                        pass
+                else:
+                    self._emit(Say(done.LINE_RECHECK))
 
         self._recheck = done.recheck_later(result, env, on_result)
 
@@ -1558,7 +1737,9 @@ class Executor:
         expected = ""
         expect = field_of(step, "expect", None)
         if expect is not None:
-            expected = f"{field_of(expect, 'probe', '')} {field_of(expect, 'args', '')}".strip()
+            args = field_of(expect, "args", "")
+            args = json.dumps(dict(args), ensure_ascii=False, default=str) if isinstance(args, Mapping) else str(args)
+            expected = f"{done.probe_name(expect, '')} {args}".strip()
         fenced = seen_fenced and bool(seen)
         mismatch = Mismatch(step=index, verb=self._verb(step), expected=expected,
                             seen=seen if fenced else (seen or why)[:DIFF_CHARS], view=self._view(hwnd) if hwnd else "",
@@ -1709,7 +1890,7 @@ class Executor:
         words_text = " ".join(self.words)[:600]
         overview_payload = {}
         try:
-            overview_payload = done.overview(self.dispatcher) if self.trace else {}
+            overview_payload = done.overview(self.dispatcher, lock=self._dispatch_lock) if self.trace else {}
         except Exception:  # noqa: BLE001
             overview_payload = {}
         numbers = set(self.numbers)
@@ -1801,6 +1982,19 @@ def _json_object(value: Any) -> dict[str, Any] | None:
     except ValueError:
         return None
     return got if isinstance(got, dict) else None
+
+
+def _element_ref(name: str) -> int | None:
+    """An element id written as a step's element name, ``[12]`` or ``#12`` (bCore's ``Element.ref_id``), else
+    ``None``."""
+    text = str(name or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    elif text.startswith("#"):
+        text = text[1:].strip()
+    else:
+        return None
+    return int(text) if text.isdigit() else None
 
 
 def _number(text: str, kind: type) -> Any:
