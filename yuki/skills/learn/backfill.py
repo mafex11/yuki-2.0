@@ -34,8 +34,10 @@ marks it done with no call. Nothing is sent when the closed list is empty (no ca
 routine miner (never in a game or a call), ``run_once(store, settings=..., log=...)``; every later call is one
 ``nudge_state`` read. ``learn backfill-usuals`` (the learner CLI) maps to :func:`main`.
 
-**Content-free logs:** one ``learn_backfill_usuals`` line (counts, code words, cost, latency); the request and the
-response only encrypted with the store's key.
+**Content-free logs:** one ``learn_backfill_usuals`` line (counts, code words, cost, latency) and, when the model
+answered, one ``learn_backfill_usuals_call`` line (model, cost, latency, stop reason; the request and the response only
+encrypted with the store's key). The ``_call`` line is what the cost ledger counts when the day's ``learn`` log also
+holds the naming call's (review r1 L4).
 
 Usage (pipeline CLI)::
 
@@ -483,13 +485,18 @@ def _emit(emit: Callable[..., Any] | None, result: BackfillResult, *, store: Any
           response: Any = None) -> None:
     if emit is None:
         return
-    extra: dict[str, Any] = {}
     if req is not None:
-        extra["request_ciphertext"] = _seal(store, req)
-        extra["response_ciphertext"] = _seal(store, getattr(response, "content", None))
-        extra["stop_reason"] = getattr(response, "stop_reason", None)
+        # the call's own line: core/cost.py counts only ``*_call`` lines in a log file that holds any (the naming
+        # call shares ``learn-YYYYMMDD.jsonl``), so the back-fill's cost is never dropped (review r1 L4)
+        try:
+            emit("learn_backfill_usuals_call", model=req.get("model"), cost_usd=round(result.cost_usd, 6),
+                 latency_ms=round(result.latency_ms, 1), stop_reason=getattr(response, "stop_reason", None),
+                 request_ciphertext=_seal(store, req),
+                 response_ciphertext=_seal(store, getattr(response, "content", None)))
+        except Exception:  # noqa: BLE001
+            pass
     try:
-        emit("learn_backfill_usuals", **result.as_fields(), **extra)
+        emit("learn_backfill_usuals", **result.as_fields())
     except Exception:  # noqa: BLE001
         pass
 

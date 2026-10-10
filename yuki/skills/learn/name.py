@@ -10,16 +10,21 @@ for every group that has no name yet, in one call, and checks every answer by co
 * the capability's own neutral menu line and key (shipped data, the same for any user), the end kind and its ``wont``
   words (what the skill never does: the user joins);
 * each **fixed** (bound) value only when its capability reads it from an occasion's ``app``, ``service``, ``site``
-  (a site file's name or a registrable domain: anything else is withheld), ``page`` (a template kind) or ``means``:
+  (a site file's name, or a domain cut to its registrable domain: anything else is withheld), ``page`` (a template
+  kind) or ``means``:
   a value read from an ``entity``, ``value`` or ``contact`` (a playlist, a level, a person) is **never** sent, only
   "fixed (not shown)";
 * the **means** used (the program or control, with shares; app keys as display names);
 * the slots that still **vary**: their names, types and kinds, never their values;
 * the **kept** control names of a recorded path (names Yuki already keeps: ``trace_store`` promotion);
-* a time summary computed here from the occasions' times ("on weekdays, mostly 08:50-09:05"), and how often;
+* a time summary computed here from the occasions' times ("on weekdays, mostly 14:10-14:40"), and how often;
 * at most 3 of the user's own phrasings from asked occasions, each only when it holds none of the group's withheld
   values (the caller passes them in RAM: ``NameInput.withhold``); with a capability whose varying slots name people
   or things and no withheld values given, no phrasing is sent (they can't be checked).
+
+A value the request itself sends (a fixed app, service, site or page value, a means value, and their display names)
+is never withheld (review r1 M1): the model is asked to name the service or the program, so a name holding it is
+right, and sending it already exposed it.
 
 **The prompt carries no example taken from this user's habits** (critique M8): its examples are placeholders
 (``BrowserX``, ``example.org``).
@@ -27,10 +32,11 @@ for every group that has no name yet, in one call, and checks every answer by co
 **What comes back** (forced tool call ``name_skills``): per group ``name`` (2-6 words), ``menu`` (one line, at most
 140 characters, saying when to pick it), ``ask`` per varying slot, ``everyday`` (true / false; false when unsure) and
 up to 3 ``use_when`` phrasings. **Validated by code:** the JSON shape, every length, one line each, no template
-braces, and **no withheld value inside** (a case-folded containment check of the values the caller knows: a privacy
-guard over known values, never a reading of meaning). A group whose name or menu fails, or whose call failed, stays
-**nameless**: it gets a code-built label (``"CallSite in BrowserX: site tab"``, from sendable values and the
-capability key only), runs on request and is **never offered** (``Named.named`` is false: the offer gate's input).
+braces, and **no withheld value inside** (a case-folded check of the values the caller knows, whole words for values
+of up to 3 characters: a privacy guard over known values, never a reading of meaning). A group whose name or menu
+fails, or whose call failed, stays **nameless**: it gets a code-built label (``"CallSite in BrowserX: site tab"``,
+from sendable values and the capability key only), runs on request, and ``Named.named`` is false (the offer gate's
+input; which offer classes need it is lWire's call, see the build report's merge note 5).
 
 **Cost and cadence** (design §9.4): at most :data:`MAX_GROUPS` groups and **one call per** :data:`CALL_GAP_S` (a
 night); groups already named are answered from the **signature cache** (a keyed digest of what would be sent, minus
@@ -46,7 +52,8 @@ only encrypted with the store's key (as every memory worker logs them).
 user renamed: their name wins), ranked best first, and call :func:`name_groups`. Each :class:`Named` gives the label
 for ``skills.name_ciphertext``, ``menu`` for the spec's ``menu``, ``asks`` / ``use_when`` for the spec, and ``named`` /
 ``everyday`` for the content-free provenance the offer gate reads (``judged`` capabilities offer only when ``named``
-and ``everyday`` are both true; any capability offers only when ``named``).
+and ``everyday`` are both true; whether ``logistics`` / ``everyday`` capabilities also need ``named`` is the gate's
+call: design §4.7 says E1 does not depend on the model).
 
 Usage (pipeline CLI; read-only on the database)::
 
@@ -93,9 +100,11 @@ STEP_CHARS = 40
 VALUE_CHARS = 60
 #: A means value is "used nearly always" (named in the label and the signature) at this share.
 DOMINANT_SHARE = 0.8
-#: The model's output cap (10 groups of a name, a line, a few questions and phrasings).
-MAX_TOKENS = 1_800
-#: The cache: one encrypted value in ``nudge_state``; at most this many entries (the oldest go first).
+#: The model's output cap: 10 groups at their length caps take about 2,200 tokens (review r1 L3); a reply cut at the
+#: cap counts as a failed call (no try is counted against the groups).
+MAX_TOKENS = 3_000
+#: The cache: one encrypted value in ``nudge_state``; at most this many entries (the least recently seen go first;
+#: a hit refreshes its entry's time at most once a :data:`CALL_GAP_S`).
 CACHE_STATE = "learn:names:v1"
 CACHE_MAX = 64
 #: A group whose answer failed validation is asked again at most this many times, then rests this long.
@@ -108,6 +117,10 @@ SENT_SOURCES: tuple[str, ...] = ("app", "service", "site", "page", "means")
 #: Slot types whose values name people or things (a varying slot of these makes the user's phrasings uncheckable
 #: without the withheld values).
 NAMING_TYPES: tuple[str, ...] = ("entity", "person", "text")
+
+#: Values of at most this many characters are matched as whole words by the withheld check (a person "Al" is not
+#: inside "usual"); longer ones anywhere (review r1 L1).
+WHOLE_WORD_CHARS = 3
 
 #: Code words of a nameless result (``Named.why``; content-free, logged as counts).
 WHY: tuple[str, ...] = ("budget", "call_failed", "unreachable", "no_answer", "bad_name", "bad_menu", "bad_shape",
@@ -194,8 +207,11 @@ class NameInput:
     ``steps``: the kept control names of the group's recorded path (rung B), in order. ``times``: the user
     occasions' times (epoch seconds). ``n`` / ``days``: how often (default: from ``times``). ``when``: the routine
     finder's line, when one exists (replaces the computed time summary). ``phrasings``: the user's own words from
-    asked occasions. ``withhold``: every slot value the group's occasions and asked runs carried (people, playlists,
-    videos, texts, levels), decrypted in RAM: never sent, and no answer may contain one."""
+    asked occasions. ``withhold``: the values of the group's **fill** slots and of every slot read from an
+    ``entity``, ``value`` or ``contact`` source (people, playlists, videos, texts, levels) that its occasions and
+    asked runs carried, decrypted in RAM: never sent, and no answer may contain one. App, service, site, page and
+    means values are not withheld (they are what a name should say); any such value passed here that the request
+    sends is dropped from the check."""
 
     key: str
     capability: str
@@ -277,18 +293,20 @@ def _withheld_set(values: Iterable[Any]) -> tuple[str, ...]:
 
 
 def _holds(text: str, withheld: Sequence[str]) -> bool:
-    """Whether ``text`` contains one of the withheld values (case-folded). A value of digits only counts as a whole
-    number (``40`` is not inside ``400``)."""
+    """Whether ``text`` contains one of the withheld values (case-folded). A value of digits only, or of at most
+    :data:`WHOLE_WORD_CHARS` characters, counts only as a whole word (``40`` is not inside ``400``, a person "Al" is
+    not inside "usual"); a longer value counts anywhere."""
     low = _fold(text)
     if not low:
         return False
     for value in withheld:
-        if value.isdigit():
+        if value.isdigit() or len(value) <= WHOLE_WORD_CHARS:
+            joins = str.isdigit if value.isdigit() else str.isalnum
             i = low.find(value)
             while i >= 0:
                 before = low[i - 1] if i > 0 else " "
                 after = low[i + len(value)] if i + len(value) < len(low) else " "
-                if not before.isdigit() and not after.isdigit():
+                if not joins(before) and not joins(after):
                     return True
                 i = low.find(value, i + 1)
         elif value in low:
@@ -313,13 +331,40 @@ def _app_name(key: str, apps: Mapping[str, str]) -> str:
         return str(key)[:VALUE_CHARS]
 
 
-def _site_ok(value: str) -> bool:
-    """A site value that may be sent: a site file's name (letters, digits, ``_``) or a domain name (Q13: a
-    registrable domain; never a path or a title)."""
+def _registrable(host: str) -> str:
+    """A domain cut to its registrable domain (Q13, critique L7; review r1 L5): the last two labels, or three when
+    the last is a two-letter country code under a short second level (``co.uk``, ``com.au``). A fixed format rule
+    with no suffix list: cutting too far only sends less (``mafex.github.io`` -> ``github.io``), and a workspace
+    subdomain (``acme.slack.com`` -> ``slack.com``) never goes out."""
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    keep = 3 if len(labels[-1]) == 2 and len(labels[-2]) <= 3 else 2
+    return ".".join(labels[-keep:])
+
+
+def _site_value(value: str) -> str | None:
+    """The site value that may be sent, or ``None`` (withheld): a site file's name as loaded from
+    ``yuki/connect/sites`` (an address of one of that file's hosts reads as the file's name), else a domain cut to its
+    registrable domain; never a path, a title or any other word (Q13)."""
     from yuki.skills.connection import domain_like
 
     text = value.strip().casefold()
-    return domain_like(text) or (0 < len(text) <= 40 and text.replace("_", "").isalnum())
+    if not text:
+        return None
+    try:
+        from yuki.skills.connection import scope_value
+        from yuki.connect.templates import sites
+
+        names = set(sites())
+        text = scope_value(text) or text
+    except Exception:  # noqa: BLE001 - no site data: domains only
+        names = set()
+    if text in names:
+        return text
+    if domain_like(text):
+        return _registrable(text)
+    return None
 
 
 def _page_ok(value: str) -> bool:
@@ -363,7 +408,7 @@ class _Payload:
 
 def time_summary(times: Iterable[float]) -> str:
     """When the occasions happen, from their times alone (local time): which days ("on weekdays", "at weekends",
-    "on any day") and the middle half of their clock times when it spans at most 3 hours ("mostly 08:51-09:01"), else
+    "on any day") and the middle half of their clock times when it spans at most 3 hours ("mostly 14:10-14:40"), else
     "at varied times". The clock is read on a circle (cut at its largest gap), so 23:50 and 00:10 are 20 minutes
     apart. Content-free; ``""`` for no times."""
     pts: list[tuple[int, int]] = []
@@ -418,18 +463,28 @@ def payload(group: NameInput, loaded: Any) -> _Payload:
     bind = dict(getattr(cap, "bind", {}) or {})
     slot_of = {s.name: s for s in getattr(cap, "slots", ()) or ()}
     withheld_values: list[Any] = list(group.withhold or ())
+    sent: set[str] = set()   # case-folded values the request itself shows: never withheld (review r1 M1)
     fixed: list[tuple[str, str, str]] = []
     hidden: list[str] = []
     for slot_name, value in (group.bound or {}).items():
         source = bind.get(str(slot_name), "")
         text = _line(value) if isinstance(value, (str, int, float)) and not isinstance(value, bool) else ""
         ok = bool(text) and source in SENT_SOURCES and len(text) <= VALUE_CHARS
+        shown = text
         if ok and source == "site":
-            ok = _site_ok(text)
+            shown = _site_value(text) or ""
+            ok = bool(shown)
         if ok and source == "page":
             ok = _page_ok(text)
         if ok:
-            shown = _app_name(text.casefold(), group.apps) if source == "app" else text
+            if source == "app":
+                shown = _app_name(text.casefold(), group.apps)
+                sent.add(text.casefold())   # the app key: an app name is sendable (Q13), its display name is shown
+            elif shown.casefold() == text.casefold():
+                sent.add(text.casefold())
+            else:
+                withheld_values.append(value)   # a host cut to its registrable domain: the full host stays withheld
+            sent.add(shown.casefold())
             fixed.append((str(slot_name), source, shown))
         else:
             hidden.append(str(slot_name))
@@ -448,6 +503,7 @@ def payload(group: NameInput, loaded: Any) -> _Payload:
             if not value or len(value) > VALUE_CHARS:
                 continue
             shown = value if value in options else _app_name(value.casefold(), group.apps)
+            sent.update((value.casefold(), shown.casefold()))
             share = int(count or 0) / total
             used.append((shown, round(100 * share)))
             if share >= DOMINANT_SHARE:
@@ -457,14 +513,14 @@ def payload(group: NameInput, loaded: Any) -> _Payload:
     bound_names = {str(k) for k in (group.bound or {})}
     varies = [(s.name, s.type, s.kind) for s in getattr(cap, "slots", ()) or ()
               if s.role in ("key", "fill") and s.name not in bound_names and not s.told and s.type != "bool"]
-    withheld = _withheld_set(withheld_values)
+    withheld = tuple(v for v in _withheld_set(withheld_values) if v not in sent)
     steps = [_line(s)[:STEP_CHARS] for s in list(group.steps or ())[:STEPS_MAX]
              if _line(s) and not _holds(_line(s), withheld)]
-    # the user's words go out only when they can be checked: the caller gave the group's withheld values, or nothing
-    # that varies names a person or a thing
+    # the user's words go out only when they can be checked: the caller gave the group's withheld values (other than
+    # the ones the request sends anyway), or nothing that varies names a person or a thing
     naming_varies = any(t in NAMING_TYPES for _n, t, _k in varies)
     phrasings: list[str] = []
-    if _withheld_set(group.withhold) or not naming_varies:
+    if any(v not in sent for v in _withheld_set(group.withhold)) or not naming_varies:
         for words in group.phrasings or ():
             text = _line(words)
             if not text or len(text) > PHRASING_CHARS or _holds(text, withheld):
@@ -503,10 +559,19 @@ def signature(store: Any, p: _Payload) -> str:
 
 def label(p: _Payload) -> str:
     """The nameless label, built by code from sendable values and the capability key only ("CallSite in BrowserX:
-    site tab"; a usage record with nothing fixed: "message"). Never a withheld value."""
-    head = " ".join(v for _s, _src, v in p.fixed if v)
-    if p.dominant:
-        head = f"{head} in {p.dominant[0]}" if head else p.dominant[0]
+    site tab"; a usage record with nothing fixed: "message"). Never a withheld value. A fixed means (the browser, a
+    ``means`` source) goes after "in", never into the head, and a program is named once (review r1 L7)."""
+    roles = {s.name: s.role for s in getattr(p.cap, "slots", ()) or ()}
+    head_values: list[str] = []
+    fixed_means: list[str] = []
+    for slot, src, value in p.fixed:
+        if value:
+            (fixed_means if src == "means" or roles.get(slot) == "means" else head_values).append(value)
+    head = " ".join(head_values)
+    in_head = {v.casefold() for v in head_values}
+    program = next((v for v in [*p.dominant, *fixed_means] if v.casefold() not in in_head), "")
+    if program:
+        head = f"{head} in {program}" if head else program
     tail = _tail(p.group.capability)
     text = f"{head}: {tail}" if head else tail
     text = _line(text)
@@ -770,6 +835,7 @@ def name_groups(store: Any, groups: Sequence[NameInput], *, loaded: Any = None, 
     entries: dict[str, Any] = dict(cache.get("entries") or {})
     tries: dict[str, Any] = dict(cache.get("tries") or {})
     todo: list[tuple[_Payload, str]] = []
+    touched = False   # a hit refreshed its entry's time: the cache is written once at the end (review r1 L2)
     for group in groups:
         p = payload(group, loaded)
         sig = signature(store, p)
@@ -778,6 +844,9 @@ def name_groups(store: Any, groups: Sequence[NameInput], *, loaded: Any = None, 
         if got is not None:
             out[group.key] = got
             run.cached += 1
+            if now - float(hit.get("at") or 0.0) >= CALL_GAP_S:
+                entries[sig] = {**hit, "at": now}
+                touched = True
             continue
         if _resting(tries, sig, now) and not force:
             out[group.key] = _nameless(p, "resting", sig)
@@ -810,11 +879,11 @@ def name_groups(store: Any, groups: Sequence[NameInput], *, loaded: Any = None, 
                 if why in ("bad_name", "bad_menu", "bad_shape", "no_answer"):
                     n = int((tries.get(sig) or [0, 0.0])[0] or 0) + 1
                     tries[sig] = [n, now]
-        if store is not None:
-            try:
-                _cache_write(store, {**cache, "entries": entries, "tries": tries})
-            except Exception as exc:  # noqa: BLE001 - the names still count this run
-                run.error = run.error or f"cache:{type(exc).__name__}"
+    if (run.asked or touched) and store is not None and not dry_run:
+        try:
+            _cache_write(store, {**cache, "entries": entries, "tries": tries})
+        except Exception as exc:  # noqa: BLE001 - the names still count this run
+            run.error = run.error or f"cache:{type(exc).__name__}"
     for named in out.values():
         if named.named:
             run.named += 1
@@ -872,7 +941,11 @@ def _call(store: Any, batch: Sequence[tuple[_Payload, str]], *, client: Any, set
         run.cost_usd = float(settings.estimate_cost(req["model"], usage_tokens(response.usage)) or 0.0)
     except Exception:  # noqa: BLE001
         run.cost_usd = 0.0
-    answer = _answer(response)
+    # a reply cut at the token cap is a failed call, not a bad answer: no try counts against the groups (review r1 L3)
+    cut = getattr(response, "stop_reason", None) == "max_tokens"
+    if cut:
+        run.error = "max_tokens"
+    answer = None if cut else _answer(response)
     by_key = {p.group.key: p for p in payloads}
     out: dict[str, tuple[Named | None, str]] = {}
     for item in answer or []:
