@@ -8,7 +8,7 @@ Until 3 Oct a card's "Do it" handed one model-written sentence to the full-power
 instruction; nothing bounded what it touched (the one real click pulled T3 Code over the user's Chrome window and
 was cancelled after 22 s, then recorded as "it was useful"). Now an offer is a **typed object**::
 
-    {"do": "todo_add" | "show_memory" | "bring_back" | "draft" | "ask",
+    {"do": "todo_add" | "show_memory" | "bring_back" | "draft" | "ask" | "run_skill",
      "label": short button text, "steps": [1-3 lines the card shows under "Will:"],
      "refs": [evidence ids it acts on], "text": to-do text | draft | suggested request, "due": "YYYY-MM-DD[ HH:MM]"}
 
@@ -22,7 +22,18 @@ rule about anyone's words) - of things that are plainly Yuki's own small job:
   records what was in front first, and Undo brings that back;
 * ``draft``: a ready-written text shown inside the card with Copy; never typed or sent anywhere;
 * ``ask``: a suggested request put **unsent** in the ask bar; nothing runs until the user presses Enter, and then
-  it is an ordinary request of theirs with the live strip and Stop.
+  it is an ordinary request of theirs with the live strip and Stop;
+* ``run_skill`` (PLAN.md Phase R, D10, D11, D14): **code-only** (:data:`CODE_ONLY_DOS`). Only the routine lane
+  (:mod:`yuki.memory.routine_offers`) writes it, from what the user measurably does at that time (the "Your usual"
+  card: their meeting tab, never their work); it is never in a model's schema or the judge's enum
+  (:data:`MODEL_DOS`), :func:`validate_offer` refuses it from any model dict, and :func:`allowed_dos` gives it to
+  the ``routine`` channel only. Only a skill whose data says ``offerable``, that never sends, with a trusted route
+  (``yuki.skills.registry.offer_ready``, D14: 2 verified runs for opening things) is offered
+  (:func:`routine_offer`). Pressing it (:func:`act`) re-checks the offer's own expiry, that the routine is still on
+  and the route still trusted, and answers ``running``: **memory never runs it**. The tray runs the skill (its
+  hands live there, as for ``bring_back``) under the voice run's safety (desk lease, Yuki's marker, the game
+  re-check) and reports back (:func:`offer_result`: ``done`` / ``failed``). Undo brings back the window that was in
+  front. It never joins, unmutes, types or sends anything: the user clicks Join.
 
 The model fills the fields; code validates ids and enums (never words) twice - when the card is written
 (:func:`validate_offer`: an unknown ``do``, an id the request did not offer, a ref that does not resolve, empty
@@ -48,9 +59,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 #: The closed capability list (see the module docstring).
-OFFER_DOS: tuple[str, ...] = ("todo_add", "show_memory", "bring_back", "draft", "ask")
-#: Offers whose effect Undo takes back (06 §4.3).
-UNDOABLE: frozenset[str] = frozenset({"todo_add", "bring_back"})
+OFFER_DOS: tuple[str, ...] = ("todo_add", "show_memory", "bring_back", "draft", "ask", "run_skill")
+#: Kinds only code writes (the routine lane): never in a model's schema, the judge's enum or a model's offer.
+CODE_ONLY_DOS: tuple[str, ...] = ("run_skill",)
+#: The kinds a model may choose (the writers' ``OFFER_SCHEMA`` and the judge's enum are built from this).
+MODEL_DOS: tuple[str, ...] = tuple(d for d in OFFER_DOS if d not in CODE_ONLY_DOS)
+#: The one card channel that may carry a code-only kind: the "Your usual" routine card (trigger ``routine``).
+ROUTINE_CHANNEL = "routine"
+#: Offers whose effect Undo takes back (06 §4.3); ``run_skill``: the window that was in front comes back.
+UNDOABLE: frozenset[str] = frozenset({"todo_add", "bring_back", "run_skill"})
 #: An offer can be acted on for this long after its card was written (s); then its button is gone (06 §4.2).
 OFFER_TTL_S = 30 * 60.0
 #: Undo stays possible this long after the action (the card shows it for seconds; the chat thread keeps it).
@@ -58,7 +75,7 @@ UNDO_WITHIN_S = 10 * 60.0
 #: The button's text when the model gave none (or one too long): named for the action, never "Do it".
 DEFAULT_LABELS: dict[str, str] = {
     "todo_add": "Add to list", "show_memory": "Show me", "bring_back": "Open it again", "draft": "Show draft",
-    "ask": "Edit in ask bar",
+    "ask": "Edit in ask bar", "run_skill": "Open it",
 }
 #: The card's "Won't:" line per kind: fixed UI copy (what the code path cannot do), never model-written.
 WONT_LINES: dict[str, str] = {
@@ -67,10 +84,21 @@ WONT_LINES: dict[str, str] = {
     "bring_back": "Opens that page only. Types, clicks, reads and sends nothing.",
     "draft": "Sends it nowhere and types it nowhere. Copy it if you want it.",
     "ask": "Runs nothing until you press Enter. You can change it first.",
+    # a routine card carries its skill's own line (SKILL_WONT_LINES); this one only when the skill names none
+    "run_skill": "Won't type, click or send anything.",
+}
+#: A routine card's "Won't:" line per code word of its skill's ``wont`` list (the connection file's data, e.g.
+#: ``meet.open``: ``wont = ["join"]``): fixed UI copy. A skill naming a word not here is never offered (fail closed).
+SKILL_WONT_LINES: dict[str, str] = {
+    "join": "Won't join, unmute, type or send anything. You click Join.",
 }
 #: What each kind's refs must resolve to (``None``: refs are context only, any offered id).
 NEEDS: dict[str, str | None] = {"todo_add": None, "show_memory": "item", "bring_back": "url", "draft": None,
-                                "ask": None}
+                                "ask": None, "run_skill": "routine"}
+#: Outcomes of a ``run_skill`` card beyond ``yuki.memory.store.NUDGE_OUTCOMES``: ``running`` (pressed; the tray runs
+#: the skill) and ``failed`` (it ran and the PC didn't show it done, or it couldn't run). Written by
+#: :func:`_set_outcome` (the store's own setter takes the older outcomes).
+RUN_OUTCOMES: tuple[str, ...] = ("running", "failed")
 #: Field caps (characters).
 LABEL_MAX = 28
 STEP_MAX = 160
@@ -108,7 +136,7 @@ OFFER_SCHEMA: dict[str, Any] = {
             "additionalProperties": False,
             "required": ["do", "label", "steps", "refs", "text", "due"],
             "properties": {
-                "do": {"type": "string", "enum": list(OFFER_DOS),
+                "do": {"type": "string", "enum": list(MODEL_DOS),
                        "description": "What the button does, from the closed list (see the prompt)."},
                 "label": {"type": "string",
                           "description": "The button's text, 2-4 words naming the action (\"Add to list\")."},
@@ -132,7 +160,7 @@ OFFER_SCHEMA: dict[str, Any] = {
 
 #: The judge's offer fields (``observe_decision``, strict): only the kind and the ids; the writer fills the rest.
 JUDGE_OFFER_PROPERTIES: dict[str, Any] = {
-    "offer_do": {"type": "string", "enum": ["none", *OFFER_DOS],
+    "offer_do": {"type": "string", "enum": ["none", *MODEL_DOS],
                  "description": "The one offer from the closed list, or none (the usual case)."},
     "offer_refs": {"type": "array", "items": {"type": "string"},
                    "description": "The ids the offer acts on (\"W12\", \"L7\", \"CALL41\"); else empty."},
@@ -160,6 +188,9 @@ you already hold about it (show_memory) or drafting a reply someone is waiting o
 work and is fine. No offer when another tool (an AI agent, a CI run, a colleague's message) already gave the \
 user the next step and they are acting on it, and never an offer that repeats or carries out another tool's \
 advice. Never offer to add what TO-DOS already has. A card without an offer is complete.
+Opening the user's usual non-work things at the time they usually do them (their meeting tab, a playlist) is done \
+by Yuki's routine cards, which code writes from what they measurably do; never offer it here, and never anything \
+outside the list above.
 Examples (the shape, not the words):
 - a thread's open item with a day that TO-DOS does not have: text "The pricing slide for Thursday's deck is still \
 open - want it on your list for Wednesday?", offer {"do": "todo_add", "label": "Add to list", "steps": ["add \
@@ -257,6 +288,15 @@ def resolve_ref(store: Any, ref: str, now: float | None = None) -> dict[str, Any
                 return None
             return {"ref": ref, "kind": "todo", "title": _squash(item.title or "On your list", 80),
                     "text": _squash(item.text, ITEM_CHARS), "url": None}
+        if (n := _number(ref, "R")) is not None:
+            # a routine (yuki.memory.routine_offers): only one still active and offered (not quiet, not off)
+            from yuki.memory import routine_offers
+
+            r = routine_offers.routine(store, n)
+            if r is None or not r.offering:
+                return None
+            return {"ref": ref, "kind": "routine", "title": routine_offers.routine_title(store, r),
+                    "text": routine_offers.why_line(r), "url": None}
     except Exception:
         return None
     return None
@@ -282,7 +322,8 @@ def validate_offer(raw: Any, *, ids: Iterable[str], store: Any, now: float | Non
                    allowed_do: Iterable[str] | None = None) -> tuple[dict[str, Any] | None, str]:
     """``(offer, "ok")`` - the typed offer as the card stores it, with what its refs resolve to - or
     ``(None, why)``: ``none`` (no offer), ``not_an_object``, ``unknown_do``, ``not_allowed`` (the kind is not in
-    ``allowed_do``: switched off by the setting or by learning), ``no_steps``, ``unknown_ref`` (an id the request
+    ``allowed_do``: switched off by the setting or by learning; or a code-only kind, :data:`CODE_ONLY_DOS`, which no
+    model may ever offer, whatever ``allowed_do`` says), ``no_steps``, ``unknown_ref`` (an id the request
     did not offer), ``already_listed`` (a to-do for an item the list has), ``unresolved_ref`` (nothing to show or
     open), ``no_text``, ``bad_due``. Checks ids and enums,
     never words."""
@@ -296,6 +337,8 @@ def validate_offer(raw: Any, *, ids: Iterable[str], store: Any, now: float | Non
         return None, "none"
     if do not in OFFER_DOS:
         return None, "unknown_do"
+    if do in CODE_ONLY_DOS:
+        return None, "not_allowed"   # run_skill: the routine lane writes it by code (routine_offer); never a model
     if allowed_do is not None and do not in set(allowed_do):
         return None, "not_allowed"
     steps = [_squash(s, STEP_MAX) for s in (raw.get("steps") if isinstance(raw.get("steps"), list) else [])]
@@ -356,12 +399,25 @@ def stored_offer(nudge: Any) -> dict[str, Any] | None:
         return None
     if NEEDS[do] is not None and not offer.get("refs"):
         return None
+    if do == "run_skill" and (not str(offer.get("skill") or "").strip()
+                              or not isinstance(offer.get("expires_at"), (int, float))
+                              or _routine_id(offer) is None):
+        return None   # only the routine lane's shape (routine_offer): a skill, its routine, its own expiry
     return offer
+
+
+def _routine_id(offer: dict[str, Any]) -> int | None:
+    """The routine a ``run_skill`` offer acts on (its ``R<id>`` ref, a fixed id format)."""
+    for ref in offer.get("refs") or []:
+        if (n := _number(str(ref), "R")) is not None:
+            return n
+    return None
 
 
 def card_offer_view(nudge: Any) -> dict[str, Any] | None:
     """What the UI shows and runs for a card's offer: the typed fields, the fixed "won't" line, the moment it
-    expires (ISO), and whether Undo applies; None without a typed offer."""
+    expires (ISO), and whether Undo applies; None without a typed offer. A ``run_skill`` card carries its skill's own
+    "won't" line, the routine's "why" line (from the counts) and its own expiry."""
     offer = stored_offer(nudge)
     if offer is None:
         return None
@@ -370,10 +426,107 @@ def card_offer_view(nudge: Any) -> dict[str, Any] | None:
             if offer.get(k) is not None}
     view["wont"] = WONT_LINES[offer["do"]]
     view["undo"] = offer["do"] in UNDOABLE
-    if isinstance(at, (int, float)):
+    if offer["do"] == "run_skill":
+        view["wont"] = str(offer.get("wont") or WONT_LINES["run_skill"])
+        if offer.get("why"):
+            view["why"] = str(offer["why"])
+        view["expires_at"] = datetime.fromtimestamp(float(offer["expires_at"])).astimezone().isoformat(
+            timespec="seconds")
+    elif isinstance(at, (int, float)):
         view["expires_at"] = datetime.fromtimestamp(float(at) + OFFER_TTL_S).astimezone().isoformat(
             timespec="seconds")
     return view
+
+
+# ---------------------------------------------------------------------------
+# The routine card's offer: written by code, never a model (PLAN.md Phase R, D14)
+# ---------------------------------------------------------------------------
+
+
+def skill_wont_line(skill: Any) -> str | None:
+    """The routine card's "Won't:" line for ``skill`` (its ``wont`` code words through :data:`SKILL_WONT_LINES`), the
+    generic line when it names none, or None when it names a word without a line (never offered: fail closed)."""
+    words = [str(w) for w in getattr(skill, "wont", ()) or ()]
+    if not words:
+        return WONT_LINES["run_skill"]
+    lines = [SKILL_WONT_LINES.get(w) for w in words]
+    if any(line is None for line in lines):
+        return None
+    return " ".join(dict.fromkeys(lines))   # type: ignore[arg-type]
+
+
+def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires_at: float, why: str,
+                  available: Callable[[Any], bool | None] | None = None,
+                  ready: Callable[[Any, Any], bool] | None = None,
+                  skills: Callable[[], Any] | None = None) -> tuple[dict[str, Any] | None, str]:
+    """The ``run_skill`` offer of a routine card, built by code (no model), or ``(None, why)``:
+
+    * ``no_skill`` (the routine's skill isn't loaded), ``not_offerable`` (its data doesn't say ``offerable``),
+      ``sends`` (a skill that may send something is never offered: sends are the user's, rule 8), ``no_preview``
+      (no card question in its data), ``unknown_wont`` (a ``wont`` word without a line), ``bad_params`` (a bound
+      parameter the skill has no slot for);
+    * ``not_ready``: its route isn't trusted for offers (``yuki.skills.registry.offer_ready``, D14: 2 verified runs
+      for opening things, 5 and none failed in the last 5 for changing things; never re-implemented here);
+    * ``unavailable``: the skill's own availability check, last because it reads the screen (``available(skill)``:
+      the Meet tab census; ``None`` = couldn't read counts as not available).
+
+    ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``skill_id``, ``params``, ``offer_mode``).
+    ``ready`` / ``skills`` replace the registry check and the skill loader (tests, replays)."""
+    now = time.time() if now is None else float(now)
+    key = str(getattr(routine, "skill_id", "") or "")
+    try:
+        if skills is not None:
+            loaded = skills()
+        else:
+            from yuki.skills.connection import load
+
+            loaded = load()
+        skill = loaded.get(key) if key else None
+    except Exception:
+        skill = None
+    if skill is None:
+        return None, "no_skill"
+    if not getattr(skill, "offerable", False):
+        return None, "not_offerable"
+    if getattr(skill, "sends", False) or getattr(skill, "sends_when", ()):
+        return None, "sends"
+    preview = _squash(getattr(skill, "preview", ""), STEP_MAX)
+    if not preview:
+        return None, "no_preview"
+    wont = skill_wont_line(skill)
+    if wont is None:
+        return None, "unknown_wont"
+    params = getattr(routine, "params", None) or {}
+    names = {s.name for s in getattr(skill, "slots", ()) or ()}
+    if not isinstance(params, dict) or any(k not in names or not isinstance(v, (str, int, float, bool))
+                                           for k, v in params.items()):
+        return None, "bad_params"
+    try:
+        if ready is not None:
+            trusted = bool(ready(store, skill))
+        else:
+            from yuki.skills.registry import offer_ready
+
+            trusted = bool(offer_ready(store, skill, now=now))
+    except Exception:
+        trusted = False
+    if not trusted:
+        return None, "not_ready"
+    if available is not None:
+        try:
+            ok = available(skill)
+        except Exception:
+            ok = None
+        if ok is not True:
+            return None, "unavailable"
+    # the card's one step: the skill's own question as a plain line ("Open the Meet tab in Zen?" -> "Open the Meet
+    # tab in Zen"; a fixed data field, not the user's words)
+    step = preview[:-1].rstrip() if preview.endswith("?") else preview
+    offer = {"do": "run_skill", "label": DEFAULT_LABELS["run_skill"], "steps": [step],
+             "refs": [f"R{int(routine.id)}"], "text": "", "due": None, "skill": skill.key, "slots": dict(params),
+             "expires_at": float(expires_at), "wont": wont, "why": _squash(why, STEP_MAX),
+             "routine": int(routine.id), "mode": str(getattr(routine, "offer_mode", "") or "")}
+    return offer, "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +560,11 @@ def act(store: Any, nudge_id: int, *, now: float | None = None, enabled: bool = 
     * ``show_memory`` returns the items, read again now (done);
     * ``bring_back`` returns the page to open (``url``, ``title``; the UI opens it and keeps what was in front);
     * ``draft`` returns the draft (done); ``ask`` returns the suggestion (``prefilled``: the UI puts it in the ask
-      bar, unsent; what the user then does with it is recorded by :func:`record_outcome`).
+      bar, unsent; what the user then does with it is recorded by :func:`record_outcome`);
+    * ``run_skill`` runs **nothing here**: after its own expiry, the routine (still on, not quiet or off) and the
+      route's trust (D14) are checked again, it answers ``running`` with the ``skill`` and ``slots`` for the tray to
+      run (``not_ready`` when the route lost its trust, ``gone`` when the routine did); the tray reports back with
+      :func:`offer_result`.
     """
     now = time.time() if now is None else float(now)
     n = store.nudge(int(nudge_id))
@@ -421,6 +578,8 @@ def act(store: Any, nudge_id: int, *, now: float | None = None, enabled: bool = 
         return {"ok": False, "why": "off", "do": do}
     if n.outcome:
         return {"ok": False, "why": "already", "state": n.outcome, "do": do}
+    if do == "run_skill":
+        return _act_run_skill(store, n, offer, now)
     if now - n.at > OFFER_TTL_S:
         store.set_nudge_outcome(n.id, "expired", at=now, only_if=(None,))
         return {"ok": False, "why": "expired", "do": do}
@@ -462,10 +621,105 @@ def act(store: Any, nudge_id: int, *, now: float | None = None, enabled: bool = 
     return {"ok": False, "why": "no_offer"}
 
 
+def _set_outcome(store: Any, nudge_id: int, outcome: str, *, at: float | None = None,
+                 only_if: Iterable[str | None] | None = None) -> bool:
+    """``store.set_nudge_outcome`` for every outcome, :data:`RUN_OUTCOMES` included (the store's own list predates
+    them: written here with the same compare-and-set, one transaction). False when the card is unknown or its outcome
+    is not one of ``only_if``."""
+    from yuki.memory import store as store_mod
+
+    if outcome in store_mod.NUDGE_OUTCOMES:
+        return bool(store.set_nudge_outcome(int(nudge_id), outcome, at=at, only_if=only_if))
+    if outcome not in RUN_OUTCOMES:
+        raise ValueError(f"outcome must be one of {store_mod.NUDGE_OUTCOMES + RUN_OUTCOMES}, not {outcome!r}")
+    when = float(at) if at is not None else time.time()
+    allowed = None if only_if is None else tuple(only_if)
+
+    def op(conn: Any) -> bool:
+        row = conn.execute("SELECT outcome FROM nudges WHERE id=?", (int(nudge_id),)).fetchone()
+        if row is None or (allowed is not None and row["outcome"] not in allowed):
+            return False
+        conn.execute("UPDATE nudges SET outcome=?, outcome_at=? WHERE id=?", (outcome, when, int(nudge_id)))
+        return True
+
+    return bool(store._write(op))
+
+
+def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dict[str, Any]:
+    """:func:`act` for ``run_skill`` (see there): checks, then ``running``; nothing runs in memory. Only the routine
+    card (channel ``routine``: kind ``notice``, trigger ``routine``) may carry it: any other card is refused
+    (``no_offer``), whatever its offer says."""
+    do = "run_skill"
+    if channel_of(n) != ROUTINE_CHANNEL:
+        return {"ok": False, "why": "no_offer", "do": do}
+    if now > float(offer["expires_at"]):
+        _set_outcome(store, n.id, "expired", at=now, only_if=(None,))
+        return {"ok": False, "why": "expired", "do": do}
+    rid = _routine_id(offer)
+    try:
+        from yuki.memory import routine_offers
+
+        r = routine_offers.routine(store, rid) if rid is not None else None
+    except Exception:
+        r = None
+    if r is None or not r.offering or r.skill_id != offer.get("skill"):
+        return {"ok": False, "why": "gone", "do": do}
+    try:
+        from yuki.skills.connection import load
+        from yuki.skills.registry import offer_ready
+
+        skill = load().get(str(offer["skill"]))
+        ready = bool(skill is not None and skill.offerable and not skill.sends and not skill.sends_when
+                     and offer_ready(store, skill, now=now))
+    except Exception:
+        ready = False
+    if not ready:
+        return {"ok": False, "why": "not_ready", "do": do}
+    if not _set_outcome(store, n.id, "running", at=now, only_if=(None,)):
+        got = store.nudge(n.id)
+        return {"ok": False, "why": "already", "state": getattr(got, "outcome", None) or "running", "do": do}
+    return {"ok": True, "do": do, "state": "running", "skill": str(offer["skill"]),
+            "slots": dict(offer.get("slots") or {}), "routine": int(rid), "undo": True}
+
+
+#: The content-free fields a card run's report may carry into the routine's ledger (``routine_events.detail``).
+RESULT_FIELDS: tuple[str, ...] = ("outcome", "route", "ms", "verified", "focus")
+
+
+def offer_result(store: Any, nudge_id: int, ok: bool, detail: dict[str, Any] | None = None, *,
+                 now: float | None = None) -> bool:
+    """What came of a ``run_skill`` card the tray ran: ``done`` (the skill's done-check saw it, ``ok``) or
+    ``failed``; only a ``running`` card moves (False otherwise, and for any other kind). The routine's ledger gets
+    ``run_ok`` / ``run_failed`` with ``detail``'s content-free fields (:data:`RESULT_FIELDS`: the engine's outcome code,
+    the route key, ms, verified, focus taken). A failed run counts against the route only (the engine's ledger),
+    never against the routine."""
+    now = time.time() if now is None else float(now)
+    n = store.nudge(int(nudge_id))
+    offer = stored_offer(n) if n is not None else None
+    if offer is None or offer["do"] != "run_skill":
+        return False
+    if not _set_outcome(store, n.id, "done" if ok else "failed", at=now, only_if=("running",)):
+        return False
+    rid = _routine_id(offer)
+    clean = {k: v for k, v in (detail or {}).items() if k in RESULT_FIELDS
+             and (v is None or isinstance(v, (bool, int, float)) or (isinstance(v, str) and len(v) <= 40))}
+    try:
+        from yuki.memory import routine_offers
+
+        if rid is not None:
+            routine_offers.record_event(store, rid, "run_ok" if ok else "run_failed", at=now, nudge_id=n.id,
+                                        detail=clean)
+    except Exception:
+        pass
+    return True
+
+
 def undo(store: Any, nudge_id: int, *, now: float | None = None) -> dict[str, Any]:
-    """Take back what a card's offer did (``todo_add``: the to-do ends as a wrong capture; ``bring_back``: the UI
-    brings back what was in front, memory records it): ``{"ok": True, "state": "undone"}`` or ``{"ok": False,
-    "why"}`` (``unknown``, ``no_undo``, ``not_done``, ``too_late``)."""
+    """Take back what a card's offer did (``todo_add``: the to-do ends as a wrong capture; ``bring_back`` and
+    ``run_skill``: the UI brings back what was in front, memory records it; a ``run_skill`` run the PC couldn't
+    confirm (``failed``) may have brought a window forward too, so it can be undone as well, and its outcome stays
+    ``failed``: a route failure is never learned against the routine or the offer kind): ``{"ok": True, "state":
+    "undone"}`` or ``{"ok": False, "why"}`` (``unknown``, ``no_undo``, ``not_done``, ``too_late``)."""
     now = time.time() if now is None else float(now)
     n = store.nudge(int(nudge_id))
     if n is None:
@@ -473,10 +727,13 @@ def undo(store: Any, nudge_id: int, *, now: float | None = None) -> dict[str, An
     offer = stored_offer(n)
     if offer is None or offer["do"] not in UNDOABLE:
         return {"ok": False, "why": "no_undo"}
-    if n.outcome != "done":
+    undoable = ("done", "failed") if offer["do"] == "run_skill" else ("done",)
+    if n.outcome not in undoable:
         return {"ok": False, "why": "not_done", "state": n.outcome}
     if n.outcome_at is not None and now - n.outcome_at > UNDO_WITHIN_S:
         return {"ok": False, "why": "too_late"}
+    if n.outcome == "failed":   # run_skill only (undoable): the UI brought the window back; nothing to record
+        return {"ok": True, "do": offer["do"], "state": "undone"}
     if offer["do"] == "todo_add":
         info = _undo_map(store).get(str(n.id)) or {}
         todo_id = info.get("todo")
@@ -545,11 +802,14 @@ def offer_scores(store: Any, now: float | None = None) -> dict[tuple[str, str], 
 def allowed_dos(store: Any, channel: str, now: float | None = None, *, enabled: bool = True,
                 scores: dict[tuple[str, str], float] | None = None) -> tuple[str, ...]:
     """The offer kinds a card of ``channel`` may carry now: none when offers are off, else every kind whose
-    score is above :data:`OFF_AT` (a kind the user kept turning down rests until its signals age out)."""
+    score is above :data:`OFF_AT` (a kind the user kept turning down rests until its signals age out). The
+    code-only kinds (:data:`CODE_ONLY_DOS`: ``run_skill``) go to the ``routine`` channel only, and that channel gets
+    nothing else: a checkin, resume, nudge or observation card (every model-written card) never gets them."""
     if not enabled:
         return ()
     scores = offer_scores(store, now) if scores is None else scores
-    return tuple(d for d in OFFER_DOS if scores.get((channel, d), 0.0) > OFF_AT)
+    kinds = CODE_ONLY_DOS if channel == ROUTINE_CHANNEL else MODEL_DOS
+    return tuple(d for d in kinds if scores.get((channel, d), 0.0) > OFF_AT)
 
 
 def offer_allowed(store: Any, channel: str, do: str, now: float | None = None, *, enabled: bool = True) -> bool:
@@ -584,6 +844,10 @@ def outcome_words(n: Any, now: float | None = None) -> str:
         return f"pressed {label}, then closed the ask bar without sending it: not wanted"
     if outcome == "expired":
         return f"pressed {label} after it had expired: nothing ran"
+    if outcome == "running":
+        return f"pressed {label}; it is running"
+    if outcome == "failed":
+        return f"pressed {label}; it ran, but the PC didn't show it done"
     if n.reaction == "accepted":
         return f"pressed {label}"
     return ""
@@ -592,11 +856,14 @@ def outcome_words(n: Any, now: float | None = None) -> str:
 def feedback_lines(store: Any, safe: Callable[[Any, int], str], now: float | None = None,
                    days: float = 30.0) -> list[str]:
     """COACH FEEDBACK lines about offers: each card where the user did something with its offer, and per
-    ``(channel, do)`` kind that is being turned down, how much (numbers, so the models stop offering it)."""
+    ``(channel, do)`` kind that is being turned down, how much (numbers, so the models stop offering it). The
+    routine cards are left out: code writes them and learns from them itself (yuki.memory.routine_offers); no model
+    writes or offers them."""
     now = time.time() if now is None else float(now)
     lines: list[str] = []
     try:
-        cards = store.nudges(now - days * 86400.0, now + 1.0, kinds=OFFER_CARD_KINDS)
+        cards = [c for c in store.nudges(now - days * 86400.0, now + 1.0, kinds=OFFER_CARD_KINDS)
+                 if channel_of(c) != ROUTINE_CHANNEL]
     except Exception:
         return []
     from yuki.memory.conversations import card_label
@@ -614,7 +881,7 @@ def feedback_lines(store: Any, safe: Callable[[Any, int], str], now: float | Non
             counts[(channel_of(n), stored_offer(n)["do"])][got[0]] += 1
     scores = offer_scores(store, now)
     for (channel, do), score in sorted(scores.items()):
-        if score > -1.0:
+        if score > -1.0 or channel == ROUTINE_CHANNEL:
             continue
         c = counts[(channel, do)]
         parts = [f"{v} {k.replace('_', ' ')}" for k, v in sorted(c.items()) if v]
@@ -625,8 +892,10 @@ def feedback_lines(store: Any, safe: Callable[[Any, int], str], now: float | Non
 
 
 __all__ = [
-    "OFFER_DOS", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS", "WONT_LINES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
+    "OFFER_DOS", "CODE_ONLY_DOS", "MODEL_DOS", "ROUTINE_CHANNEL", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS",
+    "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
-    "stored_offer", "card_offer_view", "act", "undo", "record_outcome", "channel_of", "signal", "offer_scores",
-    "allowed_dos", "offer_allowed", "outcome_words", "feedback_lines",
+    "stored_offer", "card_offer_view", "skill_wont_line", "routine_offer", "act", "offer_result", "undo",
+    "record_outcome", "channel_of", "signal", "offer_scores", "allowed_dos", "offer_allowed", "outcome_words",
+    "feedback_lines",
 ]

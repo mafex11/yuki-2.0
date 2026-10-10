@@ -2090,15 +2090,54 @@ class MemoryClient:
     def offer_act(self, nudge_id: int) -> dict:
         """The user pressed a card's offer button: check it again and run it, by code (:func:`yuki.memory.offers.act`):
         ``{"ok": True, "do", "state", ...}`` (``todo_add``: added; ``show_memory``: ``items``; ``bring_back``: the
-        ``url`` and ``title`` for the UI to open; ``draft``: ``text``; ``ask``: ``text`` for the ask bar, unsent) or
-        ``{"ok": False, "why"}`` (``expired`` after 30 minutes, ``gone``, ``off``, ``already``, ``unknown``,
-        ``no_offer``). Never a model call, never an agent run; a second press changes nothing."""
+        ``url`` and ``title`` for the UI to open; ``draft``: ``text``; ``ask``: ``text`` for the ask bar, unsent;
+        ``run_skill``: ``running`` with the ``skill`` and ``slots`` the tray runs itself, then reports with
+        :meth:`offer_result`) or ``{"ok": False, "why"}`` (``expired`` after 30 minutes, or a routine card's own
+        expiry, ``gone``, ``not_ready``, ``off``, ``already``, ``unknown``, ``no_offer``). Never a model call, never an
+        agent run; a second press changes nothing."""
         from yuki.memory import offers
 
         try:
             return offers.act(self.store, int(nudge_id), enabled=self._nudges_config().offers != "off")
         except Exception as exc:
             return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def offer_result(self, nudge_id: int, ok: bool, detail: dict | None = None) -> bool:
+        """What came of a routine card's skill run in the tray (``run_skill``, PLAN.md Phase R): ``ok`` when its
+        done-check saw it done. Only a ``running`` card moves (``done`` / ``failed``); the routine's ledger gets
+        ``run_ok`` / ``run_failed`` with ``detail``'s content-free fields (:func:`yuki.memory.offers.offer_result`)."""
+        from yuki.memory import offers
+
+        try:
+            return offers.offer_result(self.store, int(nudge_id), bool(ok),
+                                       detail if isinstance(detail, dict) else None)
+        except Exception:
+            return False
+
+    def routine_feedback(self, nudge_id: int, kind: str) -> dict:
+        """The user's "Less of these" (``less``: early -> "started a minute ago" -> quiet; on a quiet routine, off) or
+        a "don't offer this" (``never``: off) on a routine card, once per card
+        (:func:`yuki.memory.routine_offers.feedback`): ``{"ok", "routine", "mode_from", "mode_to"}`` or ``{"ok":
+        False, "why"}``. Code only, at once."""
+        from yuki.memory import routine_offers
+
+        try:
+            return routine_offers.feedback(self.store, int(nudge_id), str(kind))
+        except Exception as exc:
+            return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def routine_card_due(self, nudge_id: int) -> dict:
+        """Whether a routine card that waited in the tray's queue may still show now
+        (:func:`yuki.memory.routine_offers.card_still_due`): ``{"due": True}`` or ``{"due": False, "why", "final"}``
+        (final: its outcome, a reaction, its own expiry, its routine no longer offering, the user already joined: the
+        tray drops it; not final: an open call or a game in front: it stays queued). Code only; a failure says not due,
+        not final."""
+        from yuki.memory import routine_offers
+
+        try:
+            return routine_offers.card_still_due(self.store, int(nudge_id))
+        except Exception as exc:
+            return {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
 
     def recap_keep(self, nudge_id: int, ref: Any, answer: str) -> dict:
         """The user's answer to one line of a call's keep list (the recap card, yuki.memory.admission): ``keep`` (into
