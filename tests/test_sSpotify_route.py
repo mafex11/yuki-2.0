@@ -64,12 +64,14 @@ class Window:
     def __init__(self, rows: list[tuple[str, str, str]] | None = None, *, volume: float = 0.42, library: bool = True,
                  home_cards: tuple[str, ...] = ("Copper Kites", "Not In Shelf"), page: tuple[str, str] | None = None,
                  play_word: str = "Play", pause_word: str = "Pause", volume_label: str = "Change volume",
-                 search_box: bool = False, extra_slider: bool = False, frame_only: bool = False) -> None:
+                 search_box: bool = False, extra_slider: bool = False, frame_only: bool = False,
+                 header: tuple[str, str | None] | None = None, now_playing_link: str | None = None) -> None:
         self.rows = list(DEFAULT_ROWS if rows is None else rows)
         self.play_word, self.pause_word = play_word, pause_word
         self.row_buttons: dict[str, list[Node]] = {}
         self.card_buttons: dict[str, Node] = {}
         self.page_button: Node | None = None
+        self.header_button: Node | None = None
         self.bare_play: list[Node] = []
         self.search_box: Node | None = None
         if frame_only:
@@ -115,7 +117,19 @@ class Window:
             main.add(Node("Group", name).add(self.page_button, Node("Hyperlink", name,
                                                                      value=LINK.replace("{id}", IDS.get(name, "x"))),
                                              tracks))
+        if header is not None:
+            # another page's header still in view (an album named like the playlist): its own button and links
+            hname, hlink = header
+            self.header_button = Node("Button", f"{play_word} {hname}", invoke=True)
+            head = Node("Group", hname).add(self.header_button)
+            if hlink:
+                head.add(Node("Hyperlink", "Invented Artist", value=hlink))
+            main.add(head)
         shell.add(main)
+        if now_playing_link:
+            # the Now Playing view beside the page: its link to the playing context
+            shell.add(Node("Group", "Invented now playing view").add(
+                Node("Hyperlink", "Invented context", value=now_playing_link)))
         bar = Node("Group", "Now playing bar")
         controls = Node("Group", "Player controls").add(Node("Button", "Previous", invoke=True),
                                                         Node("Button", "Pause", invoke=True),
@@ -1420,3 +1434,223 @@ def test_r1_l4_a_slider_set_job_is_bounded_by_the_time_left() -> None:
     S._set_slider(desk, HWND, to=30.0, by=None, budget_s=0.4)
     S._set_slider(desk, HWND, to=50.0, by=None, budget_s=30.0)
     assert [b for c, *rest in desk.calls if c == "uia" for b in rest] == [S.SET_FLOOR_S, S.SET_S]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def test_r2_m1_spotifys_mixer_route_runs_the_this_pc_check_first(client, loaded, monkeypatch) -> None:
+    """A mute, or a level with the user's "mixer" usual, while Spotify plays on another device: "another device",
+    with Spotify's mixer entry never set and no rung charged (review r2 M1, Q11, D19). With a game in front and with
+    Spotify closed to the tray too."""
+    cases = [({"target": "Spotify", "mute": "on"}, ["mute Spotify"], Window(), ""),
+             ({"target": "Spotify", "level": 30, "control": "mixer"}, ["Spotify mixer to 30"], Window(), ""),
+             ({"target": "Spotify", "mute": "on"}, ["mute Spotify"], Window(), GAME),
+             ({"target": "Spotify", "mute": "on"}, ["mute Spotify"], None, "")]
+    for slots, words, w, game in cases:
+        desk = FakeDesk(w, status="playing", audio=False, state="covered" if game else "front")
+        before = dict(desk.mixer)
+        S.forget_warm()
+        res = run(client, loaded, desk, "volume", slots, words, game=game, monkeypatch=monkeypatch)
+        assert res.outcome == "other_device" and res.say == S.LINE_OTHER_VOLUME and not res.done, (slots, game)
+        assert desk.volumes == [] and desk.mixer == before and desk.sets == [] and desk.hotkeys == []
+        assert desk.focused == [] and desk.masters == []
+        row = rows_of(client, "volume")[-1]
+        assert row["outcome"] == "other_device" and row["checked"] is None
+    assert all(t.failed == 0 and t.streak == 0 for t in R.trust(client.store, "volume").values())
+    # playing here: the mute still goes through the mixer (unchanged)
+    desk = FakeDesk(Window(), status="playing", audio=True)
+    res = run(client, loaded, desk, "volume", {"target": "Spotify", "mute": "on"}, ["mute Spotify"],
+              monkeypatch=monkeypatch)
+    assert res.done and res.route == "A:mixer:driver" and desk.volumes == [("spotify", None, None, True)]
+    # another app's mute never asks Spotify's session (the check is Spotify's own)
+    desk = FakeDesk(Window(), status="playing", audio=False)
+    res = run(client, loaded, desk, "volume", {"target": "Chrome", "mute": "on"}, ["mute Chrome"],
+              monkeypatch=monkeypatch)
+    assert res.done and desk.volumes == [("chrome", None, None, True)]
+    assert ("render",) not in desk.calls
+
+
+def test_r2_l1_a_pause_row_that_cannot_be_confirmed_stops_with_couldnt_confirm(client, loaded, monkeypatch) -> None:
+    """The row reads "Pause {name}" and Core Audio, or the media session, can't be read: "couldn't confirm", said
+    plainly, on the Library rung: no link opened, nothing pressed, no media command, no hand-off, no rung charged
+    (review r2 L1)."""
+    uri = _learn_link(client, "Paper Comets")
+    cases = [dict(status="playing", audio=None), dict(status="unread", audio=True, app_id=""),
+             dict(status="none", audio=True)]
+    for kw in cases:
+        w = Window(rows=[("Paper Comets", "Odile Fenn", "pause")], home_cards=())
+        desk = FakeDesk(w, **kw)
+        desk.on_open = lambda u, desk=desk: setattr(desk, "w", Window(home_cards=(), page=("Paper Comets", "pause")))
+        S.forget_warm()
+        res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+                  monkeypatch=monkeypatch)
+        assert res.outcome == "unverified" and not res.done and res.say == S.LINE_ALREADY_UNCONFIRMED, kw
+        assert res.route == "A:library:driver" and res.handoff is None, kw
+        assert desk.opened == [] and desk.pressed == [] and desk.media_calls == [] and desk.focused == [], kw
+        assert desk.launched == [], kw
+        assert res.clock.t - 1000.0 <= E.BUDGET_S + 4.0 + 1.0, kw              # the check's own time, once more
+        row = rows_of(client, "spotify.playlist")[-1]
+        assert row["outcome"] == "unverified" and row["checked"] is None, kw
+    assert all(t.failed == 0 and t.streak == 0 for t in R.trust(client.store, "spotify.playlist").values())
+    # Core Audio readable again within the check's time: "already", never "done", nothing pressed
+    reads = iter([None, None, None, True])
+    w = Window(rows=[("Paper Comets", "Odile Fenn", "pause")], home_cards=())
+    desk = FakeDesk(w, status="playing", audio=lambda: next(reads, True))
+    S.forget_warm()
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+              monkeypatch=monkeypatch)
+    assert res.outcome == "already" and res.done_line == "Paper Comets is already playing on Spotify."
+    assert desk.opened == [] and desk.pressed == []
+    # the check reads "not so" (the user paused it meanwhile): then it isn't playing, and the next rungs may play it
+    w = Window(rows=[("Paper Comets", "Odile Fenn", "pause")], home_cards=())
+    desk = FakeDesk(w, status="playing", audio=None)
+    page = Window(home_cards=(), page=("Paper Comets", "play"))
+    real_status = desk.spotify_status
+    seen = {"n": 0}
+
+    def status(pid: int | None) -> tuple[str, str]:
+        seen["n"] += 1
+        if seen["n"] == 2:                                # right after the rung: the user pauses it
+            desk.status = "paused"
+            w.row_buttons["Paper Comets"][0].name = "Play Paper Comets"
+        return real_status(pid)
+
+    desk.spotify_status = status                         # type: ignore[method-assign]
+    desk.on_open = lambda u: setattr(desk, "w", page)
+    playing_after_press(desk, page)
+    S.forget_warm()
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+              monkeypatch=monkeypatch)
+    assert res.tried and res.tried[0]["route"] == "A:library:driver" and res.tried[0]["outcome"] == "contradicted"
+    assert res.route == "A:link:driver" and res.done and desk.opened == [uri]
+
+
+def test_r2_l2_the_link_route_presses_only_the_opened_pages_own_button(client, loaded, monkeypatch) -> None:
+    """After the learned link opens, a same-named header still in view (an album page called like the playlist) is
+    never pressed: the page button must sit in a container that shows the learned link; once the playlist's page
+    arrives its own button is pressed (review r2 L2)."""
+    uri = _learn_link(client, "Paper Comets")
+    album = "https://xpui.app.spotify.com/album/Rr5Ss6Tt7Uu8Vv9Ww0Xx1Y"
+    learned = LINK.replace("{id}", IDS["Paper Comets"])
+    for header_link, np_link in ((album, None), (None, learned), (album, learned)):
+        w = Window(home_cards=())
+        desk = FakeDesk(w)
+        stale = Window(home_cards=(), header=("Paper Comets", header_link), now_playing_link=np_link)
+        desk.on_open = lambda u, desk=desk, stale=stale: setattr(desk, "w", stale)    # the page never arrives
+        playing_after_press(desk, stale)
+        S.forget_warm()
+        res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+                  monkeypatch=monkeypatch)
+        assert desk.opened == [uri] and desk.pressed == [], (header_link, np_link)
+        assert stale.header_button.name == "Play Paper Comets" and not res.done
+        assert any(t["outcome"] == "page_not_shown" for t in res.tried), res.tried
+    # slow navigation: the stale header for a few reads, then the playlist's own page
+    w = Window(home_cards=())
+    desk = FakeDesk(w)
+    stale = Window(home_cards=(), header=("Paper Comets", album))
+    page = Window(home_cards=(), page=("Paper Comets", "play"))
+    reads = {"n": 0}
+    real_uia = desk.uia
+
+    def uia(job: Any, budget_s: float) -> Any:
+        if desk.w is stale:
+            reads["n"] += 1
+            if reads["n"] > 3:
+                desk.w = page
+        return real_uia(job, budget_s)
+
+    desk.uia = uia                                        # type: ignore[method-assign]
+    desk.on_open = lambda u: setattr(desk, "w", stale)
+    playing_after_press(desk, page)
+    S.forget_warm()
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+              monkeypatch=monkeypatch)
+    assert res.done and res.route == "A:link:driver"
+    assert [n for _p, n, _v in desk.pressed] == [page.page_button] and stale.header_button.name == "Play Paper Comets"
+
+
+def test_r2_l2_the_page_check_climbs_to_the_nearest_links_and_stops_at_app_chrome() -> None:
+    """The identity check itself, on one read: the page's own container shows the link -> ok; the nearest links are
+    another page's (or another playlist's) -> other; no link before app chrome (the Library grid, the volume slider)
+    -> none, even with the Now Playing view showing the learned link beside the page."""
+    uri = f"spotify:playlist:{IDS['Paper Comets']}"
+    langs = S._langs()
+
+    def check(w: Window, button: Node, want: str = uri) -> str:
+        tree = SD.UiaTree(FakeAutomation({HWND: w.root}), HWND)
+        found = [b for b in tree.find("Button") if b.ref.node is button]
+        assert len(found) == 1
+        return S._page_link(tree, found[0], want, langs)
+
+    page = Window(home_cards=(), page=("Paper Comets", "play"))
+    assert check(page, page.page_button) == "ok"
+    assert check(page, page.page_button, "spotify:playlist:Zz0Zz0Zz0Zz0Zz0Zz0Zz0Z") == "other"
+    album = Window(home_cards=(), header=("Paper Comets", "https://xpui.app.spotify.com/album/Rr5Ss6Tt7Uu8Vv9Ww0Xx1Y"))
+    assert check(album, album.header_button) == "other"
+    bare = Window(home_cards=(), header=("Paper Comets", None),
+                  now_playing_link=LINK.replace("{id}", IDS["Paper Comets"]))
+    assert check(bare, bare.header_button) == "none"
+
+
+class _SlowReadDesk(FakeDesk):
+    """A UIA job whose tree read outlasts the caller's wait (released by the test afterwards)."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        import threading
+
+        self.hold = threading.Event()
+        self.threads: list[Any] = []
+
+    def uia(self, job: Callable[[Any, dict], None], budget_s: float) -> tuple[dict, bool]:
+        import threading
+
+        shared: dict = {}
+
+        def slow() -> None:
+            self.hold.wait(2.0)
+            job(FakeAutomation({HWND: self.w.root}), shared)
+
+        t = threading.Thread(target=slow, daemon=True)
+        self.threads.append(t)
+        t.start()
+        t.join(0.05)
+        return shared, t.is_alive()
+
+
+def test_r2_l3_the_library_search_never_acts_after_the_caller_stopped_waiting(client, loaded, monkeypatch) -> None:
+    """A search step whose read overran: its open, fill or clear never lands afterwards; a fill still going when the
+    wait ended is flagged ``late``, and the search then clears the filter once more (review r2 L3, L13)."""
+    _search_labels(monkeypatch)
+    for step in ("open", "fill", "clear"):
+        w = Window(home_cards=(), search_box=step != "open")
+        if step == "clear":
+            w.search_box.value = "Moss Radio"
+        desk = _SlowReadDesk(w)
+        got = S._search_job(desk, HWND, step=step, text="Moss Radio")
+        desk.hold.set()
+        for t in desk.threads:
+            t.join(2.0)
+        assert desk.pressed == [] and not got.get("late"), step
+    # a fill in the middle of its call when the wait ended: "late"
+    desk2 = _LateDesk(Window(home_cards=(), search_box=True))
+    try:
+        got = S._search_job(desk2, HWND, step="fill", text="Moss Radio")
+        assert got.get("late") is True and "filled" not in got
+    finally:
+        desk2.release.set()
+    # play_search: a late fill -> the filter is cleared twice (the second after the late fill could have landed)
+    steps: list[str] = []
+
+    def job(desk: Any, hwnd: int, *, step: str, text: str = "") -> dict:
+        steps.append(step)
+        return {"open": {"box": True}, "fill": {"late": True}, "clear": {"cleared": True}}[step]
+
+    monkeypatch.setattr(S, "_search_job", job)
+    res = run(client, loaded, FakeDesk(Window(home_cards=(), search_box=True)), "spotify.playlist",
+              {"playlist": "Moss Radio"}, ["play Moss Radio"], monkeypatch=monkeypatch)
+    assert not res.done and any(t["outcome"] == "no_search_box" for t in res.tried)
+    assert steps[0] == "open" and steps[-2:] == ["clear", "clear"] and "fill" in steps

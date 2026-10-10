@@ -105,6 +105,7 @@ LINE_OTHER_VOLUME = "Spotify is playing on another device, so I left its volume.
 LINE_OTHER_AFTER = ("Spotify took it, but there's no sound from Spotify on this PC: it's playing on another device. "
                     "Say pause to stop it.")
 LINE_PLAY_UNCONFIRMED = "I pressed play on it, but I couldn't confirm it's playing."
+LINE_ALREADY_UNCONFIRMED = "Spotify shows it as already playing, but I couldn't confirm that, so I left it."
 LINE_VOLUME_UNCONFIRMED = "I moved it, but I couldn't confirm the new level."
 LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time before {target:g}%."
 
@@ -524,12 +525,59 @@ def _same(tree: Any, a: Any, b: Any) -> bool:
         return False
 
 
+#: How many containers up from a page's play button its page's own link is looked for (review r2 L2); the climb stops
+#: sooner at the nearest container holding a link, or at app chrome.
+PAGE_CLIMB = 8
+
+
+def _page_link(tree: Any, button: Any, uri: str, langs: list[Any]) -> str:
+    """Whether a page's play button belongs to the page of the learned link (review r2 L2: an identity check scoped to
+    the button's own container, so a same-named album or artist header still in view while Spotify navigates is never
+    pressed). One cached read of the window; climbing from the button, the nearest container that holds a Hyperlink
+    outside every DataGrid must hold one whose value is the data's playlist link template with the learned id
+    (round4 §2: a playlist page's header carries its own link; another page's header carries that page's links). The
+    climb stops at app chrome, a container holding the Library grid (its label) or the volume slider (its 0-1 range):
+    the Now Playing view's link to the playing context sits beside the page, never in its container.
+    ``ok``; ``other`` (the nearest links are another page's); ``none`` (no link in its container); ``unread``."""
+    sd = _sd()
+    whole = tree.subtree(sd.El(role="", name="", ref=tree.root))
+    parent: dict[int, Any] = {}
+    for el in (whole, *whole.walk()):
+        for kid in el.kids or []:
+            parent[id(kid)] = el
+    me = next((e for e in whole.walk() if e.role == button.role and e.name == button.name and _same(tree, e, button)),
+              None)
+    if me is None:
+        return "unread"
+    in_grid = {id(x) for g in whole.walk() if g.role == "DataGrid" for x in g.walk()}
+    s = sd.data().get("slider") or {}
+    lo, hi = float(s.get("range_min", 0.0)), float(s.get("range_max", 1.0))
+    grids = {(step.role, step.name) for lab in langs for step in lab.library_grid[:1]}
+
+    def chrome(el: Any) -> bool:
+        return any((e.role, e.name) in grids or (e.role == "Slider" and e.rng is not None
+                                                 and abs(e.rng[0] - lo) < 1e-6 and abs(e.rng[1] - hi) < 1e-6)
+                   for e in el.walk())
+
+    node = parent.get(id(me))
+    for _ in range(PAGE_CLIMB):
+        if node is None or node is whole or chrome(node):
+            return "none"
+        links = [e for e in node.walk() if e.role == "Hyperlink" and id(e) not in in_grid]
+        if links:
+            return "ok" if any(sd.playlist_uri(e.value) == uri for e in links) else "other"
+        node = parent.get(id(node))
+    return "none"
+
+
 def look_page(tree: Any, want: str, langs: list[Any] | None = None,
-              learned: Mapping[str, str] | None = None) -> Look:
+              learned: Mapping[str, str] | None = None, link: str | None = None) -> Look:
     """A playlist page's own button for ``want`` (after the link route): a Button reading "Play {name}" or "Pause
     {name}" (the data's or the learned wording, names folded) that sits outside every DataGrid (the Library grid and
     Home's card grids are DataGrids; Home's 8 bare "Play" buttons never match a "Play {name}"). Exactly one, else
-    ``missing`` / ``ambiguous``."""
+    ``missing`` / ``ambiguous``. With ``link`` (the learned ``spotify:playlist:{id}`` just opened), the button counts
+    only when its own container shows that link (:func:`_page_link`), else ``not_shown`` (the page isn't in view
+    yet)."""
     sd = _sd()
     langs = langs if langs is not None else _langs()
     if not sd._built(tree, langs):
@@ -545,6 +593,10 @@ def look_page(tree: Any, want: str, langs: list[Any] | None = None,
         outside = [(b, s) for b, s in fits if not any(g.name == b.name and _same(tree, b, g) for g in inside)]
         if len(outside) == 1:
             button, state = outside[0]
+            if link:
+                shown = _page_link(tree, button, link, langs)
+                if shown != "ok":
+                    return Look("not_shown", name=want, details={"page_link": shown})
             tpl = play if state == "play" else pause
             head, _, tail = tpl.partition("{name}")
             name = button.name[len(head): len(button.name) - len(tail) if tail else None] or want
@@ -620,9 +672,10 @@ def _pattern_refused(hwnd: int) -> bool:
 
 
 def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None, press: bool = False,
-          page: bool = False, grid: bool = True) -> Look:
-    """One read of the row (and, with ``page``, the page's button when the row isn't in view); with ``press``, the
-    "Play {name}" button found is invoked in the same job (decide and press on one read)."""
+          page: bool = False, grid: bool = True, link: str | None = None) -> Look:
+    """One read of the row (and, with ``page``, the page's button when the row isn't in view; with ``link``, only a
+    page button whose own container shows that link); with ``press``, the "Play {name}" button found is invoked in
+    the same job (decide and press on one read)."""
     if press and _pattern_refused(hwnd):
         return Look("refused")
     gone = threading.Event()
@@ -634,8 +687,8 @@ def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None,
         tree = _sd().UiaTree(automation, int(hwnd))
         look = look_row(tree, want, langs, learned) if grid else Look("not_in_view")
         if page and look.status in ("not_in_view", "no_library", "no_rows"):
-            other = look_page(tree, want, langs, learned)
-            if other.status in ("ok", "ambiguous"):
+            other = look_page(tree, want, langs, learned, link=link)
+            if other.status in ("ok", "ambiguous", "not_shown"):
                 look = other
         look.calls = tree.calls
         shared["look"] = look
@@ -646,7 +699,8 @@ def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None,
                 shared["acting"] = True
             look.pressed = bool(desk.press(look.button.ref, "invoke"))
 
-    shared, late = desk.uia(job, READ_S + (0.4 if press else 0.0))
+    # the link check reads the whole window once more (one cached request) before its press
+    shared, late = desk.uia(job, READ_S + (0.4 if press else 0.0) + (READ_S if link else 0.0))
     with gate:
         gone.set()
         acting = bool(shared.get("acting"))
@@ -929,11 +983,20 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
     digest = _entity_digest(call, look.name)
     said = f"Playing {look.name} on Spotify."
     if look.state == "pause":
+        # review r2 L1: the row reads "Pause {name}" (Spotify shows it playing). Nothing here acts, but the run stops
+        # on this rung either way: ``ran=None`` with ``already`` -> the engine checks the no-op first ("already" when
+        # it sees it), and a check that can't confirm it ends "couldn't confirm" (settled) instead of passing on to
+        # the focus-taking link rung and the thinker for a playlist that is already playing. A check that reads "not
+        # so" (the row back to "Play {name}", the session paused) still moves on: then it isn't playing.
+        already = f"{look.name} is already playing on Spotify."
         if status == "playing":
-            return _rr(ran=False, already=True, outcome="already", say=f"{look.name} is already playing on Spotify.",
-                       facts=facts, entity_digest=digest, unverified_line=LINE_PLAY_UNCONFIRMED)
+            return _rr(ran=None, already=True, outcome="already", say=already, facts=facts, entity_digest=digest,
+                       unverified_line=LINE_ALREADY_UNCONFIRMED)
         if not app_id:
-            return _rr(ran=False, outcome="no_session", facts=facts)
+            # no session to read or to send play to (unread, or none listed): only "couldn't confirm" is honest
+            facts["media"] = "no_session"
+            return _rr(ran=None, already=True, outcome="already_unread", say=already, facts=facts,
+                       entity_digest=digest, unverified_line=LINE_ALREADY_UNCONFIRMED)
         mc = DESK.media("play", app_id, log=_logger(call))
         outcome = str(getattr(mc, "outcome", "") or "error")
         facts["media"] = outcome
@@ -945,8 +1008,8 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
             return _rr(ran=None, outcome="resumed", say=said, facts=facts, entity_digest=digest,
                        unverified_line=LINE_PLAY_UNCONFIRMED)
         if outcome == "already":
-            return _rr(ran=False, already=True, outcome="already", say=f"{look.name} is already playing on Spotify.",
-                       facts=facts, entity_digest=digest, unverified_line=LINE_PLAY_UNCONFIRMED)
+            return _rr(ran=None, already=True, outcome="already", say=already, facts=facts, entity_digest=digest,
+                       unverified_line=LINE_ALREADY_UNCONFIRMED)
         return _rr(ran=False, outcome="media_" + outcome, facts=facts)
     if look.pressed and look.details.get("not_taken"):
         # a no-focus press on a Spotify not in front that its row never showed (Chromium took the Invoke and did
@@ -1140,7 +1203,9 @@ def play_link(call: Any) -> Any:
                 warm = win.pid in _warmed
             if not warm:
                 _ensure_warm(DESK, win, call, facts)
-            look = _look(DESK, win.hwnd, name, learned=learned, press=True, page=True, grid=False)
+            # review r2 L2: only the opened page's own button (its container shows the learned link), never a
+            # same-named header of the view still in front while Spotify navigates
+            look = _look(DESK, win.hwnd, name, learned=learned, press=True, page=True, grid=False, link=uri)
             if look.status in ("ok", "ambiguous"):
                 break
         if clock() + POLL_S > until:
@@ -1156,12 +1221,26 @@ def play_link(call: Any) -> Any:
 def _search_job(desk: Any, hwnd: int, *, step: str, text: str = "") -> dict[str, Any]:
     """One step of the Library search (labels ``controls.library_search`` / ``controls.library_filter`` in the site
     data): ``open`` (press the search button when the box isn't there), ``fill`` (Value.SetValue of the box),
-    ``clear`` (set it back to empty and read it back). Patterns only."""
+    ``clear`` (set it back to empty and read it back). Patterns only, and none once the caller stopped waiting
+    (review r2 L3: a fill landing after the clear would leave Your Library filtered; ``late`` says one may still be
+    going)."""
     sd = _sd()
     if _pattern_refused(hwnd):
         return {"refused": True}
     buttons = extra_control("library_search")
     boxes = extra_control("library_filter")
+    gone = threading.Event()
+    gate = threading.Lock()       # "the caller stopped waiting" and "a pattern call starts" decided one at a time
+
+    def act(shared: dict, ref: Any, pattern: str, *value: Any) -> bool | None:
+        with gate:
+            if gone.is_set():
+                return None
+            shared["acting"] = True
+        try:
+            return bool(desk.press(ref, pattern, *value))
+        finally:
+            shared["acting"] = False
 
     def find(tree: Any, specs: list) -> list[Any]:
         # every label inside its own container (M5): a spec with no container path is never searched from the root
@@ -1184,18 +1263,23 @@ def _search_job(desk: Any, hwnd: int, *, step: str, text: str = "") -> dict[str,
                 shared["box"] = True
                 return
             btn = find(tree, buttons)
-            shared["pressed"] = len(btn) == 1 and bool(desk.press(btn[0].ref, "invoke"))
+            shared["pressed"] = len(btn) == 1 and bool(act(shared, btn[0].ref, "invoke"))
         elif step == "fill":
-            shared["filled"] = len(box) == 1 and bool(desk.press(box[0].ref, "value", text))
+            shared["filled"] = len(box) == 1 and bool(act(shared, box[0].ref, "value", text))
         elif step == "clear":
             if len(box) != 1:
                 shared["cleared"] = None
                 return
-            desk.press(box[0].ref, "value", "")
+            if act(shared, box[0].ref, "value", "") is None:
+                return
             again = find(sd.UiaTree(automation, int(hwnd)), boxes)
             shared["cleared"] = len(again) == 1 and not str(again[0].value or "").strip()
 
     shared, _late = desk.uia(job, READ_S)
+    with gate:
+        gone.set()
+        if shared.get("acting"):
+            shared["late"] = True          # the job overran in the middle of a pattern call: it may still land
     return shared
 
 
@@ -1223,11 +1307,13 @@ def play_search(call: Any) -> Any:
         return _rr(ran=False, outcome="no_search", facts=facts)
     look = Look("missing")
     facts_ram: dict[str, Any] = {}
+    late_fill = False
     try:
         until = clock() + min(SEARCH_WAIT_S, max(_left(call), 0.5))
         filled = False
         while not filled:
-            filled = bool(_search_job(DESK, win.hwnd, step="fill", text=want).get("filled"))
+            got = _search_job(DESK, win.hwnd, step="fill", text=want)
+            filled, late_fill = bool(got.get("filled")), late_fill or bool(got.get("late"))
             if filled or clock() + POLL_S > until:
                 break
             sleep(POLL_S)
@@ -1254,7 +1340,13 @@ def play_search(call: Any) -> Any:
             if look.pressed and state != "front" and reads and last_ok and seen == "play":
                 look.details["not_taken"] = True      # as _confirm_flip: a backgrounded window ignored the Invoke
     finally:
-        facts["filter_cleared"] = _search_job(DESK, win.hwnd, step="clear").get("cleared")
+        cleared = _search_job(DESK, win.hwnd, step="clear")
+        if late_fill or cleared.get("late"):
+            # a fill (or the clear) overran in the middle of its call and may land after this clear: once more, one
+            # poll step later (L13: Your Library is never left filtered)
+            sleep(POLL_S)
+            cleared = _search_job(DESK, win.hwnd, step="clear")
+        facts["filter_cleared"] = cleared.get("cleared")
     _log_read(call, "search", state, facts, look)
     got = _after_look(call, look, status, app_id, facts)
     got.facts_ram.update(facts_ram)
@@ -1353,26 +1445,34 @@ def _set_line(ctx: Any, line: str) -> None:
             pass
 
 
+def _not_pressed(ctx: Any) -> bool:
+    """Whether the route's result is a no-op being checked (the row already read "Pause {name}": nothing pressed)."""
+    return bool(getattr(getattr(ctx, "result", None), "already", False))
+
+
 def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
     """The playlist's done-check (D19): its row (or the page's button) reads "Pause {name}", Spotify's session says
     playing **and** Spotify sounds on this PC -> True. The row flipped and the session plays but no sound here -> None
     (``other_device``, said plainly: it started on another device). The row still reads "Play {name}", or the session
-    isn't playing -> False. Anything unread -> None."""
+    is paused or stopped -> False. The row reads "Pause {name}" and Windows lists no Spotify session at all: the two
+    disagree -> None. Anything unread -> None. The line said when it ends unconfirmed names what was done (a press,
+    or nothing: the row already read "Pause {name}")."""
     look, status, audio, ev = _playing_facts(ctx, args)
     if look is None:
         return None, ev
+    unconfirmed = LINE_ALREADY_UNCONFIRMED if _not_pressed(ctx) else LINE_PLAY_UNCONFIRMED
     if look.status == "ok" and look.state == "pause" and status == "playing":
         if audio is True:
-            _set_line(ctx, LINE_PLAY_UNCONFIRMED)
+            _set_line(ctx, unconfirmed)
             return True, ev
         if audio is False:
             ev["reason"] = "other_device"
-            _set_line(ctx, LINE_OTHER_AFTER)
+            _set_line(ctx, LINE_OTHER if _not_pressed(ctx) else LINE_OTHER_AFTER)
             return None, ev
-        _set_line(ctx, LINE_PLAY_UNCONFIRMED)
+        _set_line(ctx, unconfirmed)
         return None, ev
-    _set_line(ctx, LINE_PLAY_UNCONFIRMED)
-    if look.status == "ok" and (look.state == "play" or status in ("paused", "stopped", "none")):
+    _set_line(ctx, unconfirmed)
+    if look.status == "ok" and (look.state == "play" or status in ("paused", "stopped")):
         return False, ev
     return None, ev
 
@@ -1656,6 +1756,13 @@ def volume_mixer(call: Any) -> Any:
     win = before_slider = None
     if target in own and target == app_key():
         win = DESK.window()
+        # review r2 M1: the "this PC" check before Spotify's mixer entry is set (a mute, or the user's "mixer" usual).
+        # Spotify keeps a quiet local session while it plays on another device; setting that one would read back fine
+        # and end "done" while the other device keeps playing (Q11: left alone, never "done"). The run's cached
+        # verdict makes this free after an earlier rung.
+        _status, _app_id, where = _this_pc(call, facts, win.pid if win is not None else None)
+        if where == "other":
+            return _other_device(facts, volume=True)
         before_slider = _read_slider(DESK, win.hwnd) if win is not None else None
     result = DESK.app_volume(target, level=level, change=change, mute=mute)
     ran, verified, before, after = _mixer_after(result)
