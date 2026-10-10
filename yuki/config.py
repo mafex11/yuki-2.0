@@ -407,6 +407,11 @@ class Settings:
         voice_router_model: The router's model (empty: the talker's model).
         voice_router_adopt_s: A thinker the router started is withdrawn, unseen, if the talker has not handed the
             turn over within this many seconds of its start (or chose another way).
+        voice_talker: bTalk (brain rebuild rev 2, design 3 and 10.1): the talker's prompt and hand-off tool, ``"full"``
+            (today's, ``tell_yuki``) or ``"lean"`` (``hand_over``: the exact words go by code). Empty (the default):
+            derived from ``brain``: ``loop`` / ``typed`` -> full, ``all`` -> lean. Set it only for debugging. The router
+            (``voice_router``) is off under ``brain = "all"`` whatever it says (``yuki.voice.mouth.router_on``); the
+            only supported pairs are loop / typed -> (full, router as set) and all -> (lean, off).
         voice_reply_words_cap: The talker's spoken reply ends at its next sentence end once it has said this many
             words; the rest is held for "want the rest?" (v3.17, H2). 0 = off.
         voice_qos: While a conversation is live, the process is opted out of Windows' power throttling and the voice
@@ -576,6 +581,7 @@ class Settings:
     voice_router: bool = True
     voice_router_model: str = ""
     voice_router_adopt_s: float = 2.5
+    voice_talker: str = ""
     voice_reply_words_cap: int = 45
     # vGame (docs/research/revamp-2026-10-02/79-build-vGame.md)
     voice_fast_dismiss: bool = True
