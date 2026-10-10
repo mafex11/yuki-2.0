@@ -1,10 +1,22 @@
-"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T; map-routines T1). Read skeleton (sCore).
+"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T; map-routines T1). Read skeleton (sCore) and the
+seeds that exist before phase T (sWeb).
 
 Table ``tastes`` (migration 41, T1.1's schema): one row per ``(kind, entity_key)`` (``yt_channel``,
 ``spotify_playlist``, ``discord_voice``, ...), the display name and its link encrypted, and two hour-of-day
 histograms (weekday / weekend; 24 decayed counts, content-free). Phase T (``tTaste``) recomputes it nightly from the
-moments and adds ``recompute`` / ``options``; this file only reads it, for the resolver's slot fill and the menu's
+moments and adds ``recompute`` / ``options``; the read side here serves the resolver's slot fill and the menu's
 candidate names. Names are decrypted in-process and never logged.
+
+**Seeds (phase S, no fetching; fresh uploads are phase T):**
+
+* :func:`seed_youtube`: the YouTube channels the user visits, from their own ``page`` moments on YouTube's
+  channel-handle template (``youtube.handle``, ``yuki/connect/sites/youtube.toml``; Yuki's own visits never count),
+  recomputed from the last 60 days with a 21-day half-life (map-routines T1.2, T1.3), never incremented, so a rerun
+  changes nothing. No network: a handle's channel id is phase T's (one public read per channel).
+* :func:`note`: one choice the user made in their own words that a skill then saw done (a Discord voice channel joined,
+  kind ``discord_voice``: map-routines T1.2 "his words only").
+
+``seed(store)`` runs every seed (the nightly intake's hook). Content-free counts back; names only encrypted.
 """
 
 from __future__ import annotations
@@ -103,4 +115,134 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
     return None
 
 
-__all__ = ["SIGMA_MIN", "MENU_CANDIDATES", "Taste", "hour_score", "top", "candidates", "find"]
+# ---------------------------------------------------------------------------------------------------------------------
+# Seeds (sWeb): what exists before phase T's nightly recompute
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: How far back the seeds look, and the half-life of an observation (map-routines T1.3).
+SEED_DAYS = 60.0
+HALF_LIFE_DAYS = 21.0
+#: The page template whose value is a YouTube channel's handle (``yuki/connect/sites/youtube.toml``'s ``handle``).
+YT_HANDLE_TEMPLATE = "youtube.handle"
+
+
+def _norm(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def entity_key(store: Any, kind: str, value: Any) -> str:
+    """A taste's ``entity_key``: the store's keyed digest of the kind and the normalised id (a handle, a channel's
+    name), never the value in clear."""
+    return str(store.cipher.digest("taste", str(kind), _norm(value)))
+
+
+def _slot_of(at: float) -> tuple[bool, int]:
+    stamp = datetime.fromtimestamp(float(at))
+    return stamp.weekday() >= 5, stamp.hour
+
+
+def seed_youtube(store: Any, *, now: float | None = None, days: float = SEED_DAYS) -> dict[str, int]:
+    """Recompute the ``yt_channel`` tastes (source ``observed``) from the user's own ``page`` moments on YouTube's
+    handle template in the last ``days``: per handle, two hour histograms of visits decayed with a
+    :data:`HALF_LIFE_DAYS` half-life, its name (the handle) and link (the handle page) encrypted. Rows no visit
+    supports any more are removed. Idempotent; never raises (``{"error": 1}`` on failure). Content-free counts."""
+    now = time.time() if now is None else float(now)
+    try:
+        rows = store.moments_between(now - float(days) * 86400.0, now + 1.0, kinds=["page"])
+    except Exception:  # noqa: BLE001 - no moments table yet
+        return {"channels": 0, "visits": 0, "error": 1}
+    from yuki.connect.templates import fill
+
+    found: dict[str, dict[str, Any]] = {}
+    visits = 0
+    for r in rows:
+        facts = r.get("facts") or {}
+        if r.get("by") != "user" or r.get("service") != "youtube" or facts.get("template") != YT_HANDLE_TEMPLATE:
+            continue
+        try:
+            handle = " ".join(str(store.moment_entity(r) or "").split()).lstrip("@")
+        except Exception:  # noqa: BLE001 - a row the key can't read
+            continue
+        if not handle:
+            continue
+        key = entity_key(store, "yt_channel", handle)
+        entry = found.setdefault(key, {"name": handle, "wd": [0.0] * 24, "we": [0.0] * 24, "n": 0.0, "last": 0.0})
+        at = float(r["at"])
+        weight = math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
+        weekend, hour = _slot_of(at)
+        entry["we" if weekend else "wd"][hour] += weight
+        entry["n"] += weight
+        entry["last"] = max(entry["last"], at)
+        visits += 1
+
+    def write(conn: Any) -> int:
+        old = {str(k) for (k,) in conn.execute(
+            "SELECT entity_key FROM tastes WHERE kind = 'yt_channel' AND source = 'observed'").fetchall()}
+        for key, e in found.items():
+            ref = fill("youtube", "handle", handle=e["name"]) or ""
+            conn.execute(
+                "INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
+                "hist_weekend, n_obs, last_at, updated_at) VALUES ('yt_channel', ?, ?, ?, 'observed', ?, ?, ?, ?, ?) "
+                "ON CONFLICT(kind, entity_key) DO UPDATE SET name_ciphertext = excluded.name_ciphertext, "
+                "ref_ciphertext = excluded.ref_ciphertext, source = 'observed', hist_weekday = excluded.hist_weekday, "
+                "hist_weekend = excluded.hist_weekend, n_obs = excluded.n_obs, last_at = excluded.last_at, "
+                "updated_at = excluded.updated_at",
+                (key, store._enc(e["name"]), store._enc(ref) if ref else None,
+                 json.dumps([round(x, 4) for x in e["wd"]]), json.dumps([round(x, 4) for x in e["we"]]),
+                 round(e["n"], 4), e["last"], now))
+        gone = sorted(old - set(found))
+        for key in gone:
+            conn.execute("DELETE FROM tastes WHERE kind = 'yt_channel' AND source = 'observed' AND entity_key = ?",
+                         (key,))
+        return len(gone)
+
+    try:
+        removed = store._write(write)
+    except Exception:  # noqa: BLE001
+        return {"channels": 0, "visits": visits, "error": 1}
+    return {"channels": len(found), "visits": visits, "removed": int(removed)}
+
+
+def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float | None = None,
+         source: str = "said") -> bool:
+    """One choice the user named and a skill saw done (a voice channel joined): ``kind``'s row for ``name`` gets one
+    more observation at that hour (its name and link encrypted). Never raises (False on failure)."""
+    clean = " ".join(str(name or "").split())
+    if not clean or not str(kind or "").strip():
+        return False
+    at = time.time() if at is None else float(at)
+    weekend, hour = _slot_of(at)
+    key = entity_key(store, kind, clean)
+
+    def write(conn: Any) -> None:
+        row = conn.execute("SELECT hist_weekday, hist_weekend, n_obs FROM tastes WHERE kind = ? AND entity_key = ?",
+                           (kind, key)).fetchone()
+        wd, we = (_hist(row[0]), _hist(row[1])) if row else ([0.0] * 24, [0.0] * 24)
+        (we if weekend else wd)[hour] += 1.0
+        n = float(row[2] or 0.0) + 1.0 if row else 1.0
+        if row:
+            conn.execute("UPDATE tastes SET name_ciphertext = ?, ref_ciphertext = coalesce(?, ref_ciphertext), "
+                         "hist_weekday = ?, hist_weekend = ?, n_obs = ?, last_at = ?, updated_at = ? "
+                         "WHERE kind = ? AND entity_key = ?",
+                         (store._enc(clean), store._enc(ref) if ref else None, json.dumps(wd), json.dumps(we), n, at,
+                          at, kind, key))
+        else:
+            conn.execute("INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
+                         "hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (kind, key, store._enc(clean), store._enc(ref) if ref else None, source, json.dumps(wd),
+                          json.dumps(we), n, at, at))
+
+    try:
+        store._write(write)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def seed(store: Any, *, now: float | None = None) -> dict[str, Any]:
+    """Every phase S seed (the nightly intake's hook): content-free counts per seed."""
+    return {"yt_channel": seed_youtube(store, now=now)}
+
+
+__all__ = ["SIGMA_MIN", "MENU_CANDIDATES", "Taste", "hour_score", "top", "candidates", "find", "SEED_DAYS",
+           "HALF_LIFE_DAYS", "YT_HANDLE_TEMPLATE", "entity_key", "seed_youtube", "note", "seed"]

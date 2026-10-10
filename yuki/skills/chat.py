@@ -1,0 +1,934 @@
+"""Chats: the drivers of ``message`` and ``discord.voice`` (PLAN.md Phase S-2; decisions D0, D2, D17, D19, Q3/rule 8;
+B.2; map-skills S2.5).
+
+The connection files name these calls (``connections/message.toml``, ``connections/discord.toml``); each chat app's
+own facts (its programs, the services memory stores its chats under, its link and URI shapes, its shortcuts, its labels)
+are data in that app's connection file, table ``[chat]`` (``discord.toml``, ``whatsapp.toml``, ``slack.toml``), read by
+:func:`app_data`. Nothing here names an app.
+
+**Whom, and where.** The ``person`` slot is the user's own words. Memory's people index finds them
+(:func:`yuki.memory.contacts.resolve`: names, aliases, misheard forms the user corrected, a first name for a full
+one); two people who fit are a question, never a guess. A group chat or channel is found by its name (the chat name's
+words, identity only). The
+person's routes are ranked by memory (``rank_routes``: the user's own lasting choice first, then where they message
+most lately); each route's app comes from its stored service or its threads' programs, matched against the apps' data.
+The app is the one the user named, else the usual route's; the done line names an app the user didn't.
+
+**Opening the chat** (rung A, two ways per app, in order):
+
+* :func:`route_open_link`: a deep link built from the chat's own address in memory (a capture thread's URL, by the app's
+  documented URL shape: ``discord://-/channels/...``, ``slack://channel?team=...&id=...``), or WhatsApp's
+  ``whatsapp://send?phone=`` when the chat's stored handle is a phone number (digits, checked in code). Opened with its
+  default handler (``launch.open_url``'s guarded ``os.startfile``).
+* :func:`route_switcher`: the app's own quick switcher (Discord and Slack: Ctrl+K, the chat's name as memory keeps it
+  with the app's filter character, Enter) or chat search (WhatsApp: its search shortcut, the name, then the result row
+  picked by the keyed digest of that name), run through the voice hands' step runner (each step checked, Yuki's own
+  check on every key and every typed text, the user's hands stop it), into the app's own window only, brought forward
+  first by the guarded ``focus_window``.
+
+**Checked open by encrypted ids, never a title** (:func:`chat_state`): memory's own read of the window in front (the
+watcher's Now board, read after the run began) is looked up as a capture thread (``Store.find_thread``: a keyed digest
+of the app and the chat's scope) and must be one of the route's thread ids; another chat of that app in front is a
+"no". Failing that, one of the route's threads read since the run began. **Nothing is typed into a chat that isn't
+confirmed open.**
+
+**Rule 8** (Q3): ``send = "send"`` (the user plainly said "send X to Y") types X and presses the app's send key, both
+judged by Yuki's own check with the user's words, and both whom and what must stand in their words
+(:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
+types it and leaves it; no text just opens the chat. A send is "done" only when memory captured the user's own message
+with that text in that app (``message_sent``, the messages table); "pressed send, couldn't confirm it landed" otherwise.
+A rung that acted on a send is never followed by another (the engine's rule: never twice).
+
+**discord.voice** (:func:`route_voice_join`): Discord's quick switcher with its voice filter ("!") and the channel's
+name from the user's words, Enter; if Discord doesn't take the microphone within 2 s, Discord's "Join Voice" button
+(its label from the data, judged like the switcher's keys). A join that took is noted in tastes (kind
+``discord_voice``, encrypted). Asking first when a call is live is the skill's data (the ``leave_call`` slot).
+
+Every route takes focus: never with a game in front (the engine holds the run: "after the round?"), each focus and
+opened link asks ``gamegate.refuse_input`` here, and the input layer refuses again. Without the voice hands (the
+thinker's own run, a card) a route that must type or press keys doesn't run; the thinker then does it itself with the
+skill pinned. Logs and facts are content-free (code words, counts); names, chat names, links and text stay in RAM.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+from yuki.skills.engine import RouteCall, RouteResult
+
+#: The lines said when nothing is done (asked or told plainly; never a "done").
+ASK_WHO = "Who to?"
+LINE_UNKNOWN = "I don't know who {who} is."
+ASK_WHICH = "Which {who}: {names}?"
+ASK_OTHER_APP = "I don't have a {app} chat with {name}. {usual} instead?"
+LINE_NO_APP_CHAT = "I don't have a {app} chat with {name}."
+LINE_NO_ROUTE = "I don't know where you message {name}."
+LINE_ACT_OFF = "Act is switched off for {app} in Yuki's settings, so I left it."
+LINE_TOOK_OVER = "You took over, so I left it there."
+LINE_HELD = "Should I go ahead?"
+LINE_STAY = "Okay, I'll leave your call as it is."
+#: What a "couldn't confirm" says, by what was done.
+LINE_UNSURE_CHAT = "I opened {app}, but couldn't confirm it's your chat with {name}, so I didn't type anything."
+LINE_OPEN_UNCONFIRMED = "I opened {app}, but couldn't confirm it's your chat with {name}."
+LINE_NOT_TYPED = "I opened your chat with {name}, but couldn't type it."
+LINE_DRAFT_UNCONFIRMED = "I typed it in your chat with {name}, but couldn't confirm it's there."
+LINE_TYPED_NOT_SENT = "I typed it in your chat with {name}, but couldn't confirm it, so I didn't send it."
+LINE_SENT_UNCONFIRMED = "I pressed send to {name}, but couldn't confirm it landed."
+LINE_VOICE_UNCONFIRMED = "I opened {channel} in Discord, but couldn't confirm you joined it."
+#: The done lines (said only once the done-check saw it).
+SAY_OPENED = "Your chat with {name} is open{where}."
+SAY_DRAFT = "It's typed in your chat with {name}{where}, not sent."
+SAY_SENT = "Sent to {name}{where}."
+SAY_JOINED = "Joined {channel} on {app}."
+
+#: The chat seen open before anything is typed (s); Discord taking the microphone after the switcher, after Join (s).
+CHAT_WAIT_S = 4.0
+VOICE_WAIT_S = 2.0
+JOIN_WAIT_S = 3.0
+POLL_S = 0.25
+#: A route kind with no filter character in a quick switcher (a group DM goes by its own name).
+KINDS = ("dm", "group", "channel")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The apps' own data ([chat] of each connection file)
+# ---------------------------------------------------------------------------------------------------------------------
+
+_lock = threading.Lock()
+_cache: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
+
+
+def _conn_dir() -> Path:
+    from yuki.skills import connection
+
+    return Path(connection.CONNECTIONS_DIR)
+
+
+def app_data(app: str) -> dict[str, Any]:
+    """The ``[chat]`` table of ``connections/<app>.toml`` (cached until the file changes); ``{}`` when there is none."""
+    key = str(app or "").strip().casefold()
+    if not key or not key.replace("_", "").isalnum():
+        return {}
+    path = _conn_dir() / f"{key}.toml"
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    stamp = (st.st_mtime, st.st_size)
+    with _lock:
+        hit = _cache.get(str(path))
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        data = {}
+    chat = data.get("chat") if isinstance(data.get("chat"), dict) else {}
+    with _lock:
+        _cache[str(path)] = (stamp, chat)
+    return chat
+
+
+def chat_apps() -> list[str]:
+    """The apps whose connection file has a ``[chat]`` table (file names, sorted)."""
+    try:
+        names = sorted(p.stem for p in _conn_dir().glob("*.toml"))
+    except OSError:
+        return []
+    return [n for n in names if app_data(n)]
+
+
+def _app_key(name: Any) -> str:
+    from yuki.memory.store import app_key
+
+    return app_key(str(name or "")) or ""
+
+
+def app_of(service: str | None, processes: Sequence[str] = ()) -> str:
+    """The chat app a route belongs to: its stored service (a URL host or a program's key) among an app's
+    ``services``, else one of its threads' programs among an app's ``processes``. Identities from data; ``""``."""
+    s = str(service or "").strip().casefold()
+    procs = {_app_key(p) for p in processes if p}
+    apps = chat_apps()
+    for app in apps:
+        d = app_data(app)
+        if s and (s in {str(x).casefold() for x in d.get("services") or []}
+                  or s in {_app_key(x) for x in d.get("processes") or []}):
+            return app
+    for app in apps:
+        if procs & {_app_key(x) for x in app_data(app).get("processes") or []}:
+            return app
+    return ""
+
+
+def _title(app: str) -> str:
+    return str(app_data(app).get("title") or app.title())
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Whom and where (memory's people index; RAM only)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class ChatRoute:
+    """One place the user talks with the target: its app (from data), kind, chat name and handle as memory keeps them,
+    its capture threads (ids, merged ones resolved) and their addresses (RAM only)."""
+
+    app: str
+    kind: str
+    chat: str
+    handle: str | None
+    thread_ids: list[int]
+    urls: list[str] = field(default_factory=list)
+    preferred: bool = False
+
+
+@dataclass
+class Target:
+    """Whom the message is for: the name memory keeps (a person's, or a group chat's), the user's own words for them,
+    and the routes, the usual first."""
+
+    name: str
+    said: str
+    routes: list[ChatRoute]
+    place: bool = False
+
+
+@dataclass
+class Asked:
+    """A question (or a plain line) instead of a guess."""
+
+    line: str
+    options: list[str] = field(default_factory=list)
+    outcome: str = "asked"
+
+
+def _words(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _chat_route(store: Any, route: Any) -> ChatRoute:
+    ids = [int(t) for t in getattr(route, "thread_ids", []) or [] if isinstance(t, int)]
+    procs: list[str] = []
+    urls: list[str] = []
+    if ids:
+        marks = ",".join("?" * len(ids))
+        try:
+            for proc, url_ct in store._query(f"SELECT process, url_ciphertext FROM threads WHERE id IN ({marks})",
+                                             ids):
+                if proc:
+                    procs.append(str(proc))
+                if url_ct:
+                    try:
+                        url = store._dec(url_ct)
+                    except Exception:  # noqa: BLE001 - a row the key can't read
+                        url = None
+                    if url:
+                        urls.append(str(url))
+        except Exception:  # noqa: BLE001
+            pass
+    return ChatRoute(app=app_of(getattr(route, "service", ""), procs), kind=str(getattr(route, "kind", "") or ""),
+                     chat=str(getattr(route, "chat", "") or ""), handle=getattr(route, "handle", None),
+                     thread_ids=ids, urls=list(dict.fromkeys(urls)),
+                     preferred=bool(getattr(route, "preferred", False)))
+
+
+def find_target(store: Any, person: str) -> Target | Asked:
+    """Whom ``person`` (the user's words) names: one of their people (``contacts.resolve``: a name or alias, whole or a
+    whole-word part of it, a misheard form the user corrected; two who fit: a question), else a group chat or channel
+    whose name is those words (identity), else "I don't know who that is"."""
+    from yuki.memory import contacts as C
+
+    who = _words(person)
+    if not who:
+        return Asked(ASK_WHO, outcome="no_person")
+    try:
+        found = C.resolve(store, who)
+    except Exception:  # noqa: BLE001
+        found = []
+    people: dict[int, Any] = {}
+    for c in found:
+        people.setdefault(int(c.id), c)
+    if len(people) > 1:
+        names = [c.name for c in people.values()][:3]
+        return Asked(ASK_WHICH.format(who=who, names=" or ".join(names)), names, outcome="two_people")
+    if people:
+        contact = next(iter(people.values()))
+        try:
+            ranking = C.rank_routes(store, contact)
+            routes = [_chat_route(store, r) for r in ranking.routes]
+        except Exception:  # noqa: BLE001
+            routes = []
+        return Target(name=contact.name, said=who, routes=routes)
+    want = C.tokens(who)
+    try:
+        places = [r for r in C.places(store) if want and C.tokens(r.chat) == want]
+    except Exception:  # noqa: BLE001
+        places = []
+    if places:
+        now = time.time()
+        try:
+            places = sorted((C.measure_route(store, r, None, now) for r in places), key=lambda r: -r.score)
+        except Exception:  # noqa: BLE001
+            pass
+        return Target(name=places[0].chat, said=who, routes=[_chat_route(store, r) for r in places], place=True)
+    return Asked(LINE_UNKNOWN.format(who=who), outcome="unknown_person")
+
+
+def pick_route(target: Target, app_named: str | None) -> ChatRoute | Asked:
+    """The route to use: the named app's (none: a question offering the usual one), else the usual route."""
+    known = [r for r in target.routes if r.app]
+    if app_named:
+        hit = next((r for r in known if r.app == app_named), None)
+        if hit is not None:
+            return hit
+        if known:
+            return Asked(ASK_OTHER_APP.format(app=_title(app_named), name=target.name, usual=_title(known[0].app)),
+                         [known[0].app], outcome="no_app_chat")
+        return Asked(LINE_NO_APP_CHAT.format(app=_title(app_named), name=target.name), outcome="no_app_chat")
+    if known:
+        return known[0]
+    return Asked(LINE_NO_ROUTE.format(name=target.name), outcome="no_route")
+
+
+def _store(ctx: Any) -> Any:
+    from yuki.skills.engine import _mem, _store_of
+
+    memory = getattr(ctx, "memory", None)
+    if memory is None:
+        return None
+    return _mem(memory, "skill_store", lambda c: _store_of(c), timeout_s=0.5)
+
+
+def _probe_store(ctx: Any) -> Any:
+    call = getattr(ctx, "memory_call", None)
+    if call is None:
+        return None
+    try:
+        return call("skill_store", lambda c: getattr(c, "store", c))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _app_named(values: Mapping[str, Any]) -> str | None:
+    app = values.get("app")
+    return _app_key(app) or None if app else None
+
+
+def _target_route(call: RouteCall) -> tuple[Target, ChatRoute] | RouteResult:
+    """The target and its route for this run (resolved once per run, kept on the run's context), or a result: a
+    question, or "couldn't run" without memory."""
+    cache = getattr(call.ctx, "_chat_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(call.ctx, "_chat_cache", cache)
+        except Exception:  # noqa: BLE001
+            pass
+    person = call.values.get("person")
+    person = person.get("name") if isinstance(person, Mapping) else person
+    key = (_words(person), _app_named(call.values) or "")
+    if key not in cache:
+        store = _store(call.ctx)
+        if store is None:
+            cache[key] = None
+        else:
+            target = find_target(store, str(person or ""))
+            cache[key] = target if isinstance(target, Asked) else (target, pick_route(target, key[1] or None))
+    got = cache[key]
+    if got is None:
+        return RouteResult(ran=False, outcome="no_memory")
+    if isinstance(got, Asked):
+        return RouteResult(ran=False, ask=got.line, options=list(got.options), outcome=got.outcome)
+    target, route = got
+    if isinstance(route, Asked):
+        if route.outcome == "no_route":
+            # memory knows the person, but no chat of theirs is in an app these routes drive: the thinker may (pinned)
+            return RouteResult(ran=False, outcome="no_route")
+        return RouteResult(ran=False, ask=route.line, options=list(route.options), outcome=route.outcome)
+    return target, route
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Deep links and the quick switcher (data: the app's documented shapes and shortcuts)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _phone(handle: str | None) -> str | None:
+    """A handle that is a phone number: digits (7-15), an optional leading +, spaces and dashes aside. Checked in
+    code, a fixed format."""
+    text = "".join(str(handle or "").split()).replace("-", "")
+    digits = text[1:] if text.startswith("+") else text
+    return digits if digits.isdigit() and 7 <= len(digits) <= 15 else None
+
+
+def deep_link(data: Mapping[str, Any], route: ChatRoute) -> str | None:
+    """The app's own link to this chat: the first of the app's ``links`` whose URL shape one of the chat's captured
+    addresses matches (its values put into the URI shape), else the phone link when the handle is a phone number."""
+    from yuki.connect.templates import match_template
+
+    for link in data.get("links") or []:
+        if not isinstance(link, Mapping):
+            continue
+        url_t, uri_t = str(link.get("url") or ""), str(link.get("uri") or "")
+        if not url_t or not uri_t:
+            continue
+        for url in route.urls:
+            got = match_template(url_t, url)
+            if got:
+                out = uri_t
+                for k, v in got.items():
+                    if not str(v).replace("@", "").isalnum():
+                        out = ""
+                        break
+                    out = out.replace("{" + k + "}", str(v))
+                if out and "{" not in out:
+                    return out
+    phone = data.get("phone") if isinstance(data.get("phone"), Mapping) else None
+    number = _phone(route.handle)
+    if phone and number and phone.get("uri"):
+        return str(phone["uri"]).replace("{phone}", number)
+    return None
+
+
+def switcher_query(data: Mapping[str, Any], route: ChatRoute) -> str:
+    """What goes into the quick switcher: the app's filter character for the chat's kind and the chat's name as memory
+    keeps it (a leading filter character already there is not doubled)."""
+    prefix = str((data.get("prefix") or {}).get(route.kind) or "")
+    name = _words(route.chat)
+    if prefix and name.startswith(prefix):
+        name = name[len(prefix):].strip()
+    return prefix + name
+
+
+def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], apps: Sequence[str], key: str,
+              way_text: str = "", sends: Mapping[str, str] | None = None) -> tuple[bool, dict[str, Any]]:
+    """Steps through the voice hands' step runner (:class:`yuki.skills.uia_route.SkillRunner`: each checked, keys and
+    typing judged by Yuki's own check, the user's hands stop it). ``way_text``: the route's own words that may be typed
+    (a chat's name memory keeps); everything else typed must be the user's words. ``sends``: ``{"to", "what"}`` when the
+    steps send (rule 8: both must stand in the user's words). Refused before any step:
+    ``(False, {"refused_steps": True})``."""
+    from yuki.skills.uia_route import SkillRefused, SkillRunner
+
+    item: dict[str, Any] = {"run": [dict(s) for s in steps], "apps": list(apps), "ref": f"skill:{key}",
+                            "intent": key, "text": way_text}
+    args: dict[str, Any] = {"steps": [dict(s) for s in steps], "sends": bool(sends)}
+    if sends:
+        item["sends"] = True
+        args.update(to=str(sends.get("to") or ""), what=str(sends.get("what") or ""))
+    try:
+        ok, _report, facts = SkillRunner(hands).run(args, item=item, words=[str(w) for w in words if w])
+    except SkillRefused:
+        return False, {"refused_steps": True, "steps_done": 0}
+    return bool(ok), dict(facts or {})
+
+
+def _stopped(facts: Mapping[str, Any], app: str, *, acted: bool) -> RouteResult | None:
+    """A run of steps that stopped for a reason the user hears (Act off, Yuki's own check, they took over, a game came
+    up), as the route's result; ``None`` otherwise."""
+    if facts.get("act_off"):
+        return RouteResult(ran=acted, ask=LINE_ACT_OFF.format(app=_title(app)), outcome="act_off")
+    if facts.get("held"):
+        return RouteResult(ran=acted, ask=str(facts.get("question") or "") or LINE_HELD, outcome="held_by_check")
+    if facts.get("took_over_at"):
+        return RouteResult(ran=acted, ask=LINE_TOOK_OVER, outcome="taken_over")
+    if not facts.get("refused_steps") and int(facts.get("steps_done") or 0) < int(facts.get("steps") or 0) \
+            and _refused("keys"):
+        return RouteResult(ran=acted, held="game", outcome="refused")
+    return None
+
+
+def _step_verdicts(facts: Mapping[str, Any]) -> list[bool | None]:
+    return [getattr(r, "verdict", None) for r in facts.get("results") or [] if getattr(r, "kind", "") == "action"]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Is the chat open? (memory's encrypted thread ids, never a title)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _board_now(wait_s: float = 0.15) -> dict[str, Any] | None:
+    """Memory's Now board (the watcher's latest reads), or ``None``."""
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        return client.now(wait_s=wait_s) if client is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _board_refresh(hwnd: int) -> bool:
+    """Ask the watcher to read ``hwnd`` again now (returns at once)."""
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        return bool(client.refresh(int(hwnd))) if client is not None else False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def chat_state(store: Any, thread_ids: Sequence[int], data: Mapping[str, Any], since: float,
+               board: Mapping[str, Any] | None) -> tuple[bool | None, dict[str, Any]]:
+    """Whether the chat with these capture threads is open now: memory's read of the window in front (read after
+    ``since``, with a chat scope or an address) is one of them -> True; another chat or view of the same app in front
+    -> False; else one of the threads read since -> True; else None. Identity by keyed digests of the chat's scope or
+    address (``Store.find_thread``), never a window title."""
+    ids = {int(t) for t in thread_ids or []}
+    if not ids:
+        return None, {"status": "no_threads"}
+    keys = {_app_key(p) for p in data.get("processes") or []}
+    ev: dict[str, Any] = {}
+    windows = list((board or {}).get("windows") or [])
+    front = next((w for w in windows if w.get("foreground")), None)
+    if front is not None:
+        proc = _app_key(front.get("process"))
+        fresh = bool(front.get("read_at")) and float(front["read_at"]) >= float(since)
+        if proc not in keys:
+            ev["board"] = "other_app"
+        elif front.get("blocked"):
+            ev["board"] = "blocked"
+        elif not fresh:
+            ev["board"] = "stale"
+        elif not (front.get("scope") or front.get("url")):
+            ev["board"] = "no_identity"           # a title alone is never an identity
+        else:
+            try:
+                tid = store.find_thread(front.get("app"), front.get("title"), front.get("url"),
+                                        process=front.get("process"), scope=front.get("scope"))
+            except Exception:  # noqa: BLE001
+                tid = None
+            if tid is not None and int(tid) in ids:
+                return True, {"by": "board"}
+            return False, {"by": "board", "status": "other_chat"}
+    else:
+        ev["board"] = "none"
+    marks = ",".join("?" * len(ids))
+    try:
+        rows = store._query(f"SELECT max(last_seen), max(messages_seen_at) FROM threads WHERE id IN ({marks})",
+                            sorted(ids))
+        seen = max((float(x) for x in (rows[0] if rows else ()) if x is not None), default=0.0)
+    except Exception:  # noqa: BLE001
+        seen = 0.0
+    if seen >= float(since):
+        return True, {"by": "threads"}
+    return None, ev
+
+
+def _wait_chat(call: RouteCall, data: Mapping[str, Any], route: ChatRoute, since: float, hwnd: int
+               ) -> tuple[bool | None, dict[str, Any]]:
+    """:func:`chat_state` read every :data:`POLL_S` for at most :data:`CHAT_WAIT_S` (only while this skill waits),
+    asking the watcher once to read the window again. Ends at the first "open"; else the last read's word (a "no" only
+    if the window still shows another chat at the end)."""
+    from yuki.skills.engine import _mem, _store_of
+
+    ctx = call.ctx
+    if ctx.memory is None:
+        return None, {"status": "no_memory"}
+    deadline = ctx.clock() + CHAT_WAIT_S
+    refreshed = False
+    while True:
+        board = _board_now()
+        got = _mem(ctx.memory, "chat_state",
+                   lambda c: chat_state(_store_of(c), route.thread_ids, data, since, board), timeout_s=0.8)
+        verdict, ev = got if isinstance(got, tuple) else (None, {"status": "unread"})
+        if verdict is True:
+            return verdict, ev
+        # "another chat" counts only as the last word: a read taken just before the app switched shows the old one
+        if not refreshed and hwnd:
+            _board_refresh(hwnd)
+            refreshed = True
+        if ctx.clock() + POLL_S > deadline:
+            return verdict, ev
+        ctx.sleep(POLL_S)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Desktop plumbing (each guarded; replaced in tests)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _refused(action: str, hwnd: int | None = None) -> bool:
+    """D17's backstop asked here, before a focus, an opened link or keys (the input layer asks again)."""
+    from yuki.memory import gamegate
+
+    return gamegate.refuse_input(action, hwnd=hwnd) is not None
+
+
+def _app_hwnd(data: Mapping[str, Any]) -> int:
+    from yuki.skills.uia_route import app_window
+
+    for image in data.get("images") or []:
+        hwnd = app_window(str(image))
+        if hwnd:
+            return int(hwnd)
+    return 0
+
+
+def _focus(hwnd: int) -> Any:
+    from yuki.actions import launch
+
+    return launch.focus_window(int(hwnd))
+
+
+def _open_uri(uri: str) -> Any:
+    from yuki.skills.engine import open_uri
+
+    return open_uri(uri)
+
+
+def _held_by_game(result: Any) -> bool:
+    details = getattr(result, "details", None) or {}
+    return isinstance(details, Mapping) and details.get("refused") == "game"
+
+
+def _mic_held(image: str) -> bool | None:
+    from yuki.skills.donecheck import baseline_mic_held
+
+    return baseline_mic_held({"process": image})
+
+
+def _press(hwnd: int, role: str, name: str) -> str:
+    from yuki.skills.uia_route import press
+
+    return press(int(hwnd), role=role, name=name, pattern="invoke").outcome
+
+
+def _focus_app(data: Mapping[str, Any]) -> tuple[int, RouteResult | None]:
+    """The app's own window, brought forward (guarded): ``(hwnd, None)`` or ``(0, a result: not open, refused...)``."""
+    hwnd = _app_hwnd(data)
+    if not hwnd:
+        return 0, RouteResult(ran=False, outcome="not_open")
+    if _refused("focus", hwnd=hwnd):
+        return 0, RouteResult(ran=False, held="game", outcome="refused")
+    result = _focus(hwnd)
+    if _held_by_game(result):
+        return 0, RouteResult(ran=False, held="game", outcome="refused")
+    if not getattr(result, "ok", False):
+        return 0, RouteResult(ran=False, outcome="no_focus")
+    return hwnd, None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# message
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _text_mode(values: Mapping[str, Any]) -> tuple[str, bool]:
+    text = _words(values.get("text"))
+    return text, bool(text) and str(values.get("send") or "") == "send"
+
+
+def _where(values: Mapping[str, Any], app: str) -> str:
+    return "" if _app_named(values) else f" on {_title(app)}"
+
+
+def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Target, route: ChatRoute, *, via: str,
+                since: float, hwnd: int) -> RouteResult:
+    """After the chat was asked to open: wait until it is seen open, then (only then) type the user's words, and press
+    send when they plainly said so. The route's result: acted, with its RAM facts for the done-check."""
+    text, send = _text_mode(call.values)
+    name = target.name
+    where = _where(call.values, app)
+    chat, ev = _wait_chat(call, data, route, since, hwnd)
+    facts: dict[str, Any] = {"via": via, "chat": {True: "open", False: "other", None: "unknown"}[chat],
+                             "by": str(ev.get("by") or ev.get("board") or ev.get("status") or ""),
+                             "mode": "send" if send else ("draft" if text else "open")}
+    ram: dict[str, Any] = {"app": app, "thread_ids": list(route.thread_ids), "chat": chat}
+    if not text:
+        return RouteResult(ran=True, outcome="opened", app=app, say=SAY_OPENED.format(name=name, where=where),
+                           unverified_line=LINE_OPEN_UNCONFIRMED.format(app=_title(app), name=name), facts=facts,
+                           facts_ram=ram)
+    if chat is not True:
+        # never type into a chat that isn't confirmed open: it may be someone else's
+        return RouteResult(ran=True, outcome="chat_unconfirmed" if chat is None else "other_chat", app=app,
+                           unverified_line=LINE_UNSURE_CHAT.format(app=_title(app), name=name), facts=facts,
+                           facts_ram=ram)
+    steps: list[dict[str, Any]] = [{"do": "type", "text": text}]
+    if send:
+        steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
+    ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
+                        key="message", sends={"to": target.said, "what": text} if send else None)
+    verdicts = _step_verdicts(run)
+    typed = verdicts[0] if verdicts else (None if not run.get("refused_steps") else False)
+    pressed = bool(send and ok and len(verdicts) >= 2)
+    ram.update(typed=typed, pressed=pressed)
+    facts.update(typed={True: "yes", False: "no", None: "unknown"}[typed], pressed=pressed,
+                 steps=int(run.get("steps") or len(steps)), steps_done=int(run.get("steps_done") or 0))
+    stop = _stopped(run, app, acted=True)
+    if stop is not None:
+        stop.facts.update(facts)
+        stop.facts_ram = ram
+        stop.app = app
+        return stop
+    say = (SAY_SENT if send else SAY_DRAFT).format(name=name, where=where)
+    unverified = (LINE_SENT_UNCONFIRMED if pressed else LINE_NOT_TYPED if typed is False else
+                  LINE_TYPED_NOT_SENT if send else LINE_DRAFT_UNCONFIRMED).format(name=name)
+    return RouteResult(ran=True, outcome="sent" if pressed else "typed", app=app, say=say,
+                       unverified_line=unverified, facts=facts, facts_ram=ram)
+
+
+def route_open_link(call: RouteCall) -> RouteResult:
+    """``message``, rung A first way: the app's own deep link to the chat (see the module docstring)."""
+    app = str(call.args.get("app") or "")
+    data = app_data(app)
+    if not data:
+        return RouteResult(ran=False, outcome="no_app_data")
+    got = _target_route(call)
+    if isinstance(got, RouteResult):
+        return got
+    target, route = got
+    if route.app != app:
+        return RouteResult(ran=False, outcome="other_app")
+    uri = deep_link(data, route)
+    if not uri:
+        return RouteResult(ran=False, outcome="no_link")
+    text, _send = _text_mode(call.values)
+    if text and call.ctx.hands is None:
+        return RouteResult(ran=False, outcome="no_hands")      # typing needs the voice hands; the thinker does it
+    if _refused("open_url"):
+        return RouteResult(ran=False, held="game", outcome="refused")
+    since = time.time()
+    opened = _open_uri(uri)
+    if _held_by_game(opened):
+        return RouteResult(ran=False, held="game", outcome="refused")
+    if not getattr(opened, "ok", False):
+        return RouteResult(ran=False, outcome="not_opened")
+    return _after_open(call, app, data, target, route, via="link", since=since, hwnd=_app_hwnd(data))
+
+
+def route_switcher(call: RouteCall) -> RouteResult:
+    """``message``, rung A second way: the app's own quick switcher (or chat search), into its own window only."""
+    app = str(call.args.get("app") or "")
+    data = app_data(app)
+    if not data:
+        return RouteResult(ran=False, outcome="no_app_data")
+    got = _target_route(call)
+    if isinstance(got, RouteResult):
+        return got
+    target, route = got
+    if route.app != app:
+        return RouteResult(ran=False, outcome="other_app")
+    hands = call.ctx.hands
+    if hands is None:
+        return RouteResult(ran=False, outcome="no_hands")
+    steps, way_text = _switch_steps(call, data, route)
+    if not steps:
+        return RouteResult(ran=False, outcome="no_switcher")
+    hwnd, failed = _focus_app(data)
+    if failed is not None:
+        return failed
+    since = time.time()
+    ok, run = run_steps(hands, steps, words=call.ctx.words, apps=list(data.get("images") or []), key="message",
+                        way_text=way_text)
+    done = int(run.get("steps_done") or 0)
+    stop = _stopped(run, app, acted=done > 0)
+    if stop is not None:
+        return stop
+    if done == 0:
+        return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
+    return _after_open(call, app, data, target, route, via="switcher", since=since, hwnd=hwnd)
+
+
+def _switch_steps(call: RouteCall, data: Mapping[str, Any], route: ChatRoute) -> tuple[list[dict[str, Any]], str]:
+    """The quick switcher's steps (shortcut, the chat's name, open), or the chat search's (shortcut, the name, the
+    result row by the keyed digest of the name), and the route's own words that may be typed."""
+    name = _words(route.chat)
+    if not name:
+        return [], ""
+    if data.get("switcher"):
+        query = switcher_query(data, route)
+        return ([{"do": "keys", "keys": [str(k) for k in data["switcher"]]}, {"do": "type", "text": query},
+                 {"do": "keys", "keys": [str(k) for k in data.get("open") or ["enter"]]}], query)
+    pick = data.get("pick") if isinstance(data.get("pick"), Mapping) else None
+    if data.get("search") and pick and pick.get("role"):
+        from yuki.skills.engine import _mem
+
+        image = str((data.get("images") or [""])[0])
+        role = str(pick["role"])
+        digests = _mem(call.ctx.memory, "pick_digests", lambda c: c.name_digests(image, role, [name]),
+                       timeout_s=1.0) if call.ctx.memory is not None else None
+        if not isinstance(digests, list) or not digests or not digests[0]:
+            return [], ""
+        return ([{"do": "keys", "keys": [str(k) for k in data["search"]]}, {"do": "type", "text": name},
+                 {"do": "pick", "role": role, "in": {"role": str(pick.get("box_role") or "List")},
+                  "item": str(digests[0]), "app": image}], name)
+    return [], ""
+
+
+def probe_message_done(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
+    """``message``'s done-check. A send: memory captured the user's own message with that text in that app since the run
+    began (``message_sent``; none yet is "couldn't confirm", never "no"; send never pressed is "no" when nothing could
+    have gone). A draft: the chat was seen open and the text read back typed. Just opening: the chat seen open. With
+    ``live`` (the re-check) or after a hand-off (no route result) it reads the chat again now."""
+    app = str(args.get("app") or "")
+    send = str(args.get("send") or "") == "send"
+    text = _words(args.get("text"))
+    live = bool(args.get("live"))
+    result = getattr(ctx, "result", None)
+    ram = dict(getattr(result, "facts_ram", None) or {})
+    if ram.get("app") and ram.get("app") != app:
+        ram = {}
+    if send and text:
+        if ram and not live and not ram.get("pressed"):
+            if ram.get("chat") is False or ram.get("typed") is False:
+                return False, {"status": "not_sent"}
+            return None, {"status": "not_pressed"}
+        from yuki.skills.donecheck import probe_message_sent
+
+        data = app_data(ram.get("app") or app) if ram else {}
+        return probe_message_sent(ctx, {"text": text, "app": data.get("message_app") or None})
+    if ram and not live:
+        chat = ram.get("chat")
+        if chat is False:
+            return False, {"status": "other_chat"}
+        if text:
+            if chat is True and ram.get("typed") is True:
+                return True, {"status": "typed"}
+            return None, {"status": "unconfirmed"}
+        if chat is True:
+            return True, {"status": "open"}
+    store = _probe_store(ctx)
+    if store is None:
+        return None, {"status": "no_memory"}
+    thread_ids = list(ram.get("thread_ids") or [])
+    data = app_data(ram.get("app") or app)
+    if not thread_ids:
+        # after a hand-off: the person's route as memory ranks it (whatever app the thinker used)
+        target = find_target(store, str(args.get("person") or ""))
+        if isinstance(target, Asked):
+            return None, {"status": "no_target"}
+        route = pick_route(target, None)
+        if isinstance(route, Asked):
+            return None, {"status": "no_route"}
+        thread_ids, data = list(route.thread_ids), app_data(route.app)
+    verdict, ev = chat_state(store, thread_ids, data, float(getattr(ctx, "since", 0.0) or 0.0), _board_now())
+    if verdict is True and text and not ram:
+        return None, {"status": "draft_unread"}        # the thinker's draft: open, its text unreadable here
+    return verdict, ev
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# discord.voice
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _wait_mic(ctx: Any, image: str, before: bool | None, budget_s: float) -> bool:
+    """Whether the app took the microphone (an onset against ``before``) within ``budget_s`` (only while waiting)."""
+    if before is not False:
+        return False
+    deadline = ctx.clock() + budget_s
+    while True:
+        if _mic_held(image) is True:
+            return True
+        if ctx.clock() + POLL_S > deadline:
+            return False
+        ctx.sleep(POLL_S)
+
+
+def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | None:
+    """Yuki's own check on pressing the app's button (a join is judged like a send, rule 8): ``None`` allowed, else
+    what to ask or say."""
+    act_off = getattr(hands, "act_off", None)
+    if callable(act_off):
+        try:
+            off = act_off(image)
+        except Exception:  # noqa: BLE001
+            off = None
+        if off:
+            return LINE_ACT_OFF.format(app=str(off))
+    authorize = getattr(hands, "authorize", None)
+    if not callable(authorize):
+        return None
+    element = f'{role} "{name}"'
+    try:
+        verdict = authorize("click", {"hwnd": hwnd, "element": element}, {"hwnd": hwnd, "app": image,
+                                                                         "element": element}, [], force=True)
+    except Exception:  # noqa: BLE001 - fail closed
+        return LINE_HELD
+    if verdict is not None and not getattr(verdict, "allowed", False):
+        return str(getattr(verdict, "question", "") or "") or LINE_HELD
+    return None
+
+
+def route_voice_join(call: RouteCall) -> RouteResult:
+    """``discord.voice``'s rung A: the quick switcher with the voice filter and the channel's name, Enter, then
+    "Join Voice" if the microphone wasn't taken (see the module docstring)."""
+    app = str(call.args.get("app") or "")
+    data = app_data(app)
+    if not data:
+        return RouteResult(ran=False, outcome="no_app_data")
+    channel = call.values.get("channel")
+    name = _words(channel.get("name") if isinstance(channel, Mapping) else channel)
+    if not name:
+        return RouteResult(ran=False, ask="Which voice channel?", outcome="no_channel")
+    if call.values.get("leave_call") is False:
+        return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
+    hands = call.ctx.hands
+    if hands is None or not data.get("switcher"):
+        return RouteResult(ran=False, outcome="no_hands" if hands is None else "no_switcher")
+    image = str((data.get("images") or [""])[0])
+    hwnd, failed = _focus_app(data)
+    if failed is not None:
+        return failed
+    before = _mic_held(image)
+    prefix = str((data.get("prefix") or {}).get("voice") or "")
+    query = prefix + (name[len(prefix):].strip() if prefix and name.startswith(prefix) else name)
+    steps = [{"do": "keys", "keys": [str(k) for k in data["switcher"]]}, {"do": "type", "text": query},
+             {"do": "keys", "keys": [str(k) for k in data.get("open") or ["enter"]]}]
+    ok, run = run_steps(hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
+                        key="discord.voice", way_text=query)
+    done = int(run.get("steps_done") or 0)
+    stop = _stopped(run, app, acted=done > 0)
+    if stop is not None:
+        return stop
+    if done == 0:
+        return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
+    joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
+    pressed = ""
+    if not joined:
+        label = ((data.get("labels") or {}).get("en") or {}).get("join_voice")
+        if isinstance(label, list) and len(label) >= 2:
+            role, button = str(label[0]), str(label[1])
+            question = _judged(hands, hwnd, image, role, button)
+            if question is not None:
+                return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
+            if _refused("click", hwnd=hwnd):
+                return RouteResult(ran=True, held="game", outcome="refused", app=app)
+            pressed = _press(hwnd, role, button)
+            if pressed == "pressed":
+                joined = _wait_mic(call.ctx, image, before, JOIN_WAIT_S)
+    if joined:
+        _note_channel(call.ctx, name)
+    return RouteResult(ran=True, outcome="joined" if joined else "opened", app=app,
+                       say=SAY_JOINED.format(channel=name, app=_title(app)),
+                       unverified_line=LINE_VOICE_UNCONFIRMED.format(channel=name),
+                       facts={"onset": joined, "join_button": pressed or "not_needed", "steps_done": done,
+                              "mic_before": {True: "held", False: "free", None: "unknown"}[before]})
+
+
+def _note_channel(ctx: Any, name: str) -> None:
+    """A join that took: the channel (the user's words) noted in tastes, kind ``discord_voice`` (encrypted)."""
+    from yuki.skills import taste
+    from yuki.skills.engine import _mem, _store_of
+
+    if ctx.memory is None:
+        return
+    _mem(ctx.memory, "taste_note", lambda c: taste.note(_store_of(c), "discord_voice", name), timeout_s=0.5)
+
+
+ROUTES: dict[str, Callable[[RouteCall], RouteResult]] = {
+    "open_link": route_open_link, "switcher": route_switcher, "voice_join": route_voice_join,
+}
+PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message_done": probe_message_done}
+
+__all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
+           "pick_route", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
+           "route_switcher", "route_voice_join", "probe_message_done"]

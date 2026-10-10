@@ -1,0 +1,33 @@
+# WhatsApp: its own data for the `message` skill (message.toml) (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2;
+# map-skills S2.5).
+#
+# A chat whose stored handle is a phone number opens by WhatsApp's own link (whatsapp://send?phone=...); any other
+# chat through WhatsApp's chat search: its search shortcut, the chat's name as memory keeps it, then the result row
+# picked by the keyed digest of that name (never a title match). Both are unverified until the first live run (the
+# search shortcut and the result list's roles below are WhatsApp's, kept as data so a change is a data change). The chat
+# is checked open by memory's encrypted thread ids before anything is typed. Never with a game in front.
+#
+# Zero setup (D0): WhatsApp's own window, shortcuts and whatsapp:// links; nothing to link, no API.
+
+[connection]
+app = "whatsapp"
+
+[chat]
+title = "WhatsApp"
+# the desktop app's programs (the current build runs as WhatsApp.Root.exe; an older one as WhatsApp.exe)
+images = ["WhatsApp.Root.exe", "WhatsApp.exe"]
+processes = ["whatsapp.root", "whatsapp"]
+services = ["web.whatsapp.com", "whatsapp.root", "whatsapp"]
+message_app = "whatsapp"
+# its chat search (only ever sent into WhatsApp's own window, with no game in front)
+search = ["ctrl", "f"]
+send = ["enter"]
+
+# A chat's stored handle as a phone number (digits, an optional leading +; checked in code) -> WhatsApp's own link.
+[chat.phone]
+uri = "whatsapp://send?phone={phone}"
+
+# The search result row: picked by the keyed digest of the chat's name inside the result list.
+[chat.pick]
+role = "ListItem"
+box_role = "List"
