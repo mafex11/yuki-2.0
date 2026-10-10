@@ -666,7 +666,6 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory import acting as _acting_mod
                 from yuki.memory.nudges import NudgeWorker
                 from yuki.memory.watcher import session_locked
-                from yuki.memory.younow import focus_game
 
                 def live_state() -> dict[str, Any]:
                     # the recorder's open stretch (written to the store every 30 s) and Yuki's own marker
@@ -677,7 +676,7 @@ def run(args: argparse.Namespace) -> int:
                     # fGate (D9): a game in front holds the cards; behind, it doesn't. yState: the one rule
                     # (younow.focus_game, shared with the Now board and YouNow); [trace] game_gate = "running" (the
                     # rollback) holds them while one runs anywhere, as before
-                    game = focus_game(game_gate)
+                    game = _focus_game(game_gate)
                     if game["source"] == "gate":
                         out["game_front"] = game["front"]
                     return out          # no live gate: the cards' gate reads the open stretch's program instead
@@ -807,17 +806,24 @@ def run(args: argparse.Namespace) -> int:
         # worker's microphone holders and the timeline's playing apps (app keys only).
         if now_board is not None:
             if game_gate is not None:
-                from yuki.memory.younow import focus_game as _focus_game
+                _gate = game_gate
 
-                _gate = game_gate   # yState: the one rule (younow.focus_game): the game's name, None once the gate died
-                now_board.game_front_fn = lambda: _focus_game(_gate)["name"]
+                def _board_game() -> Any:
+                    # yState: the one rule (younow.focus_game): the game's name; True when only the rollback's running
+                    # game holds ([trace] game_gate = "running"), so the board and the cards agree; None once the
+                    # gate died
+                    g = _focus_game(_gate)
+                    return None if g["source"] != "gate" else (g["name"] or bool(g["front"]))
+
+                now_board.game_front_fn = _board_game
             now_board.signals_fn = lambda: {
                 "mic_holders": calls.mic_holders() if calls is not None else [],
                 "playing": timeline.playing_apps() if timeline is not None else []}
         if moments is not None:
             def _game_front() -> bool:
-                gg = game_gate
-                return gg is None or not gg.alive or bool(gg.front_game())   # no live gate: held (fails closed)
+                # yState: the one rule (younow.focus_game, the rollback included); no live gate: held (fails closed)
+                g = _focus_game(game_gate)
+                return g["source"] != "gate" or bool(g["front"])
 
             # [moments] enabled / volume_events: the volume watcher starts only when both are on, the Spotify reader
             # only when moments are on (both only feed the hub; it checks them again on every change, so turning them
@@ -1165,6 +1171,31 @@ def run(args: argparse.Namespace) -> int:
         ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(mutex))
         keep_alive()
     return code
+
+
+#: yState: ``yuki.memory.younow.focus_game``, imported once (False: the import failed, so the old inline rule runs).
+_FOCUS_GAME: Any = None
+
+
+def _focus_game(gate: Any) -> dict[str, Any]:
+    """The one "a game is in front" rule (``younow.focus_game``) for the cards' ``live_state()`` and the Now board.
+    If that module fails to import, the old inline rule (fGate D9, the ``[trace] game_gate = "running"`` rollback
+    included), so the card chain and the board keep working and ``[you] enabled = false`` is not needed to recover."""
+    global _FOCUS_GAME
+    if _FOCUS_GAME is None:
+        try:
+            from yuki.memory.younow import focus_game
+        except Exception:  # noqa: BLE001
+            _FOCUS_GAME = False
+        else:
+            _FOCUS_GAME = focus_game
+    if _FOCUS_GAME:
+        return _FOCUS_GAME(gate)
+    if gate is None or not getattr(gate, "alive", False):
+        return {"front": None, "name": None, "running": True, "source": "none"}
+    name = str(gate.front_game() or "")
+    return {"front": bool(name) or (gate.scope == "running" and bool(gate.game_running())), "name": name,
+            "running": None, "source": "gate"}
 
 
 def _follow_acting(

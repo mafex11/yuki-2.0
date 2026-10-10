@@ -7,16 +7,19 @@ something in that part changed. Until ``yConsumers`` the only reader is the in-p
 
 **Sections** (schema v1, §3.2; every list capped, every text clipped, ≤ 12 KB of JSON in all):
 
-* ``presence`` - present / away / locked / off; ``at_pc_since``, ``settled_at``, ``idle_since``, ``away_at``,
-  ``day_began`` (instants, never growing durations: readers compute "how long" when they read); the last break; time
-  at the PC today (``base_s`` + the live part since ``since``); the last 7 days; the current activity session.
+* ``presence`` - present / away / locked / off, and ``stretch`` (whether the timeline has an open stretch: False
+  with no user window in front); ``at_pc_since``, ``settled_at``, ``idle_since``, ``away_at``, ``day_began``
+  (instants, never growing durations: readers compute "how long" when they read); the last break; time at the PC
+  today (``base_s`` + the live part since ``since``); the last 7 days; the current activity session.
 * ``focus`` - hold facts only: the game (:func:`focus_game`), the return hold's end, full screen, the meeting, the
   call (a game's own voice chat is not a call, D8), Yuki acting, the hold names at build time. No Now-board field is
   copied: the record carries ``board_version`` (top level, read every beat) and nothing of the screen.
 * ``changed`` - what just changed (≤ 12, last 30 min): moments of the known kinds (``page`` left out, unknown kinds
   ignored) plus four transitions this module synthesises: ``call_end``, ``game_end``, ``sit_down``, ``switch``.
-* ``work`` - the thread now, ≤ 5 active threads, ≤ 5 goals, ≤ 6 items due in 24 h or overdue, the list's size, the
-  work board's counts (``board(replies=False)``), ≤ 3 plans in the next 24 h (the events scan's dated events).
+* ``work`` - the thread now (``stands``: where it stands), ≤ 5 active threads, ≤ 5 goals, ≤ 6 items due in 24 h or
+  overdue, the list's size, the work board's counts (``board(replies=False)``), ≤ 3 plans in the next 24 h (the
+  events scan's dated events). ``overdue`` is right as of the build (a rebuild is due when it turns); readers that
+  care compare ``due_at`` with their own now, as :func:`render` does.
 * ``usual``, ``prefs`` - empty until ``yUsual`` (after phase L) fills them.
 * ``about`` - the nightly brief by reference: how to be with them, routine, careful, how many people.
 * ``cards`` - the card on screen (the UI marked it shown, no reaction, within the card gap), the last card, today's
@@ -31,16 +34,24 @@ compares a few values held in RAM and rebuilds a section only when its inputs mo
   acting follower's event, a change of :meth:`TimelineRecorder.flags`, the gate dying, the set of open calls, and the
   meeting's audio (read at most every 15 s, only while a meeting row is within ``meeting_hold_min``, as
   ``NudgeWorker._meeting_held``); front changes only while the gate is dead (the fallback reads the open stretch);
-* ``presence`` - a state change in the timeline's flags (present / away / locked / paused), the stretch reaching its
-  projected ``settled_at``, a front app held past the hop rule with another key than the session's, a day boundary;
-* ``changed`` - the moments hub's counters moved (compared in RAM), a media change, a synthesised transition;
+* ``presence`` - a state change in the timeline's flags (present / away / locked / paused, and the open stretch
+  closing or opening: no user window in front, counted once it holds for a second beat, since the timeline swaps
+  stretches through "none open"), Yuki starting or stopping acting, the stretch reaching its projected
+  ``settled_at``, a front app held past the hop rule with another key than the session's, a day boundary, and the
+  timeline's next flush after a bridged hole (below);
+* ``changed`` - the moments hub's counters moved (compared in RAM), a media change, a synthesised transition, its
+  oldest item leaving the 30 min window;
 * ``work`` / ``cards`` / ``about`` - the database changed: ``total_changes()`` (the service's own connection) or
   ``PRAGMA data_version`` (the tray's writes), at most once per 2 s, then one probe query names the dirty sections.
   ``nudge_state`` keys of the judge (``judge_*``) are never probed, so the judge's bookkeeping never marks a section.
+  ``work`` also at the next instant one of its time windows changes (an item becomes due or overdue, enters or leaves
+  the 24 h window, a plan or a meeting passes);
+* every section - a gap in the beats longer than :data:`STALE_S` (the process was suspended, as in a sleep with no
+  lock on wake, or the loop stalled).
 
 A rebuilt section whose content did not change keeps its old object and version. Nothing is rebuilt because time
-passed: holds that end with time (the return hold, the card gap, away after ``presence_min``, settling) are
-timestamps that :func:`holds_now` compares when read.
+passed: holds that end with time (the return hold, the card gap, away after ``presence_min``, settling, the meeting's
+audio window) are timestamps that :func:`holds_now` compares when read, or one instant the beat compares.
 
 **The judge's wake** (:attr:`YouBuilder.wake`, an in-process ``threading.Event``) is set only on: a change of the
 hold set (as :func:`holds_now` derives it, so a hold's time running out counts), a breakpoint (``sit_down``,
@@ -66,18 +77,30 @@ prints it in full, to the user's own terminal only. It always runs on a read-onl
   last 36 h, Yuki's own stretches left out), ``break_min``, ``presence_min``, ``_break_between`` for the last break;
   ``day_began`` = ``checkins.day_began`` (the latest settled stretch after a break of
   ``max(DAY_BREAK_S, resume_after_h)``). Difference: the open stretch is not in the database until the timeline's next
-  30 s flush, so while the timeline says present, the time since the last row (or since the return) is counted as
-  presence (observe saw it up to 30 s late).
+  30 s flush, so while the timeline says present, the time since the last row (or since the return, or since Yuki
+  stopped acting) is counted as presence (observe saw it up to 30 s late). That live part never bridges more than a
+  flush: when the newest of those marks is older than ``ONGOING_S`` (the process was suspended, or the timeline
+  stalled), the live part starts now, as observe saw the hole in the rows, and presence is read again once the
+  timeline's next flush has landed. A live part that begins now counts as a sliver, so a return is seen unsettled
+  at once (``settling``, then ``sit_down`` at the projected ``settled_at``). With no open stretch (the desktop, the
+  taskbar or a shell list in front: the timeline records nothing and does no idle accounting), ``state`` is
+  ``away`` and ``stretch`` False: presence is the stored rows alone, ``idle_since`` their last presence and ``away``
+  held from ``presence_min`` after it, as observe; the stretch that just closed counts up to the moment it closed.
+  While Yuki acts, no live part is added (its rows are left out, as observe).
 * ``focus.call`` = ``NudgeWorker._call_open``: a call of kind ``call`` among the open statuses holds; a game's voice
   chat (kind ``game``) is reported (``kind = "game"``) but holds nothing; an unreadable store gives ``open = None``.
 * ``focus.meeting.audio_held`` = ``NudgeWorker._meeting_held``: the latest meeting row within ``meeting_hold_min``,
   its app with an active audio render session, read at most every 15 s; unreadable gives ``None`` (each reader
-  decides, as ``fail_closed`` did). ``focus.meeting.front`` = observe's meeting hold (the live flag, or a meeting row
-  within ``MEETING_GAP_S``, as the timestamp ``front_until``).
+  decides, as ``fail_closed`` did). The window's end re-reads focus once, so the hold ends with it. The meeting hold
+  (``meeting``) = observe's: ``focus.meeting.front`` (the live flag), or a meeting row within ``MEETING_GAP_S`` (the
+  timestamp ``front_until``, compared when read).
 * ``focus_game()`` = ``live_state()``'s rule (the gate's ``front_game()``, or with ``[trace] game_gate = "running"``
-  any game running) and the board's ``game_front_fn`` (the name, or None with no live gate); with no live gate the
-  card side falls back to the program in front (``nudges._game_front``), ``source = "fallback"``. Difference: that
-  program is the hub's latest front event when there is one (observe read the newest row, up to a flush behind).
+  any game running) and the board's ``game_front_fn`` (the name; True when only the rollback's running game holds;
+  None with no live gate); with no live gate the card side falls back to the program in front
+  (``nudges._game_front``), ``source = "fallback"``. Difference: that program is the hub's latest front event when
+  there is one (observe read the newest row, up to a flush behind). The Spotify reader's check is the same rule (no
+  live gate: held). Under the rollback the board's True also reaches the tray's input backstop (``board_front_source``),
+  so it refuses while a game runs behind: stricter, the rollback only.
 * ``focus.game.return_hold_until`` = observe's return hold (a full-screen or game stretch that ended less than
   ``return_hold_s`` ago), plus the instant the gate or the timeline saw the game or full screen end (the row may be
   up to 30 s behind).
@@ -138,7 +161,7 @@ from yuki.memory.nudges import (
     wide_rows,
 )
 from yuki.memory.store import CALL_OPEN_STATUSES, app_key
-from yuki.memory.timeline import MEETING_GAP_S, PrivacySection, _clip
+from yuki.memory.timeline import FLUSH_EVERY_S, MEETING_GAP_S, PrivacySection, _clip
 
 #: The record's schema version (a new field is additive; a removed field bumps it).
 SCHEMA_V = 1
@@ -583,6 +606,15 @@ class YouBuilder:
         self._on = True
         self._flags: dict[str, Any] | None = None
         self._flip_at: float | None = None            # when the timeline's flags turned present
+        self._gap_at: float | None = None             # when the open stretch closed (no user window in front)
+        self._gap_from_present = False                # ... and whether the user was present right before
+        self._gap_first: float | None = None          # a gap seen on one beat (it counts once seen on the next)
+        self._recheck_at: float | None = None         # presence re-read once the timeline's flush lands (a bridge)
+        self._record_clips: dict[str, int] = {}       # section -> what gave way to the whole-record cap
+        self._acting_end: float | None = None         # when Yuki last stopped acting
+        self._acting_checked = False                  # acting re-read once on the first beat (a change before wiring)
+        self._due: dict[str, float] = {}              # section -> the next instant it must be re-read
+        self._beat_last: float | None = None
         self._fullscreen_end: float | None = None
         self._meeting_live_end: float | None = None
         self._game_left_at: float | None = None
@@ -619,6 +651,8 @@ class YouBuilder:
         self.db_checks = 0
         self.probes = 0
         self.unchanged = 0
+        self.beat_gaps = 0
+        self.bridges = 0
         self.builds: Counter = Counter()
         self.wakes: Counter = Counter()
         self.clipped: Counter = Counter()
@@ -653,9 +687,13 @@ class YouBuilder:
         self._mark("focus")
 
     def on_acting(self, acting: bool) -> None:
-        """The acting follower's event: Yuki started or stopped acting for the user."""
-        self._acting = bool(acting)
-        self._mark("focus")
+        """The acting follower's event: Yuki started or stopped acting for the user (presence adds no live part while
+        Yuki acts, so it is re-read on both edges)."""
+        with self._lock:
+            if self._acting and not acting:
+                self._acting_end = float(self._clock())
+            self._acting = bool(acting)
+            self._dirty.update(("focus", "presence"))
 
     def on_front(self, prev_key: str, new_key: str, *, at: float | None = None, by_yuki: bool = False,
                  **_facts: Any) -> None:
@@ -706,6 +744,7 @@ class YouBuilder:
             if self._on:
                 self._on = False
                 self._you = None
+                self._beat_last = None   # turned off is no beat gap
                 self._log("you_off", enabled=False)
             return
         if not self._on:
@@ -717,6 +756,15 @@ class YouBuilder:
             self._round, self._dirty = self._dirty, set()
             front = self._front
         self._breaks = []
+        if self._beat_last is not None and now - self._beat_last > STALE_S:
+            # the process was suspended (a sleep with no lock on wake) or the loop stalled: nothing seen meanwhile
+            # (the timeline reopens its stretch with the same flags), so every section is read again
+            self.beat_gaps += 1
+            self._round.update(SECTIONS)
+        self._beat_last = now
+        if not self._acting_checked:
+            self._acting_checked = True
+            self._check_acting()
         self._watch_flags(now)
         self._watch_gate()
         self._watch_audio(now)
@@ -729,10 +777,13 @@ class YouBuilder:
         if isinstance(nw, (int, float)) and now >= nw and self._deadline_told != nw:
             self._deadline_told = float(nw)
             self._breaks.append("deadline")
+        version = self._version
         for name in SECTIONS:
             if name in self._round:
                 self._rebuild(name, now, cfg)
         self._publish(now)
+        if self._version != version:
+            self._fit_record(now)
         holds = frozenset(holds_now(self._you, now))
         if holds != self._holds:
             self._holds = holds
@@ -743,27 +794,61 @@ class YouBuilder:
             self.last_wake = (now, tuple(self._breaks))
             self.wake.set()
 
+    def _check_acting(self) -> None:
+        """Whether Yuki is acting, read once (the follower tells the changes; one before the wiring would be lost)."""
+        if not self._live or self.db_path is None:
+            return
+        try:
+            from yuki.memory import acting as _acting
+
+            acting = _acting.current(self.db_path) is not None
+        except Exception:  # noqa: BLE001 - the follower's next event decides
+            return
+        with self._lock:
+            if acting == self._acting:
+                return
+            if self._acting:
+                self._acting_end = float(self._clock())
+            self._acting = acting
+        self._round.update(("focus", "presence"))
+
     def _watch_flags(self, now: float) -> None:
-        """The timeline's live flags (one attribute read): a change marks focus; a state change marks presence."""
+        """The timeline's live flags (one attribute read): a change marks focus; a state change (the open stretch
+        closing or opening included) marks presence."""
         flags = self._read_flags(now)
         old = self._flags
-        if flags is not None and flags.get("state") is None and not flags.get("blocked"):
-            # no open stretch (the desktop or a shell window in front): the user's state carries over, nothing full
-            # screen and no meeting in front (as live_state() read it)
-            was = old.get("state") if old is not None else self._flags_from_rows(now).get("state")
-            flags = {**flags, "state": was, "fullscreen": False, "meeting": False}
+        gap = False
+        if flags is not None:
+            flags = {**flags, "stretch": flags.get("state") is not None}
+            gap = not flags["stretch"] and not flags.get("blocked")
+            if gap:
+                # no open stretch (the desktop, the taskbar or a shell list in front): the timeline records nothing
+                # and does no idle accounting, so presence is read from the stored rows alone (observe's view);
+                # nothing full screen and no meeting in front (as live_state() read it)
+                flags.update(fullscreen=False, meeting=False)
+        if not gap:
+            self._gap_first = None
+        elif old is not None and old.get("stretch", True) and not old.get("blocked") and self._gap_first is None:
+            # the timeline swaps stretches through "none open" (a window switch, a state flip, Yuki acting): a gap
+            # counts once it is still there on the next beat, so a swap or a pass over the taskbar rebuilds nothing
+            self._gap_first = now
+            return
         if flags == old:
             return
         self._flags = flags
         self._round.add("focus")
         old = old or {}
-        if old.get("state") != flags.get("state") or old.get("blocked") != flags.get("blocked"):
+        new = flags or {}
+        if old.get("state") != new.get("state") or old.get("blocked") != new.get("blocked"):
             self._round.add("presence")
-            if flags.get("state") == "present" and not flags.get("blocked"):
+            if new.get("state") == "present" and not new.get("blocked"):
                 self._flip_at = now
-        if old.get("meeting") and not flags.get("meeting"):
+            if gap:
+                self._gap_at = self._gap_first if self._gap_first is not None else now   # when it was first seen
+                self._gap_from_present = old.get("state") == "present" and not old.get("blocked")
+        if old.get("meeting") and not new.get("meeting"):
             self._meeting_live_end = now
-        if old.get("fullscreen") and not flags.get("fullscreen"):
+        if old.get("fullscreen") and not new.get("fullscreen"):
             self._fullscreen_end = now
 
     def _read_flags(self, now: float) -> dict[str, Any] | None:
@@ -778,9 +863,9 @@ class YouBuilder:
             return None
 
     def _flags_from_rows(self, now: float) -> dict[str, Any]:
-        """The newest stored row stands for the open stretch when it is still going (offline, the CLI; and the state at
-        start when no window is open); nothing going: away (nothing in front of the user is being recorded), so the
-        stored presence decides "away" after ``presence_min``, as observe did."""
+        """Offline (the CLI): the newest stored row stands for the open stretch when it is still going; nothing going:
+        away (nothing in front of the user is being recorded), so the stored presence decides "away" after
+        ``presence_min``, as observe did."""
         try:
             rows = recent_rows(self.store, now - ONGOING_S, now)
         except Exception:  # noqa: BLE001
@@ -799,8 +884,13 @@ class YouBuilder:
             self._round.add("focus")
 
     def _watch_audio(self, now: float) -> None:
-        """The meeting's audio, only while a meeting row is within ``meeting_hold_min`` (at most every 15 s)."""
-        if not self._live or self._audio_until is None or now >= self._audio_until:
+        """The meeting's audio, only while a meeting row is within ``meeting_hold_min`` (at most every 15 s). The
+        window's end re-reads focus once (``_meeting`` then clears it), so ``audio_held`` ends with the window."""
+        if not self._live or self._audio_until is None:
+            return
+        if now >= self._audio_until:
+            self._audio_until = None   # once: _meeting re-reads the rows (a newer meeting row opens a new window)
+            self._round.add("focus")
             return
         if self._audio_at is not None and now - self._audio_at < MEETING_AUDIO_EVERY_S:
             return
@@ -811,10 +901,15 @@ class YouBuilder:
             self._round.add("focus")
 
     def _watch_time(self, now: float, cfg: NudgeConfig, front: tuple[str, float] | None) -> None:
-        """Instants reached (timestamp compares): a day boundary, the stretch's projected settle, a front app held
-        long enough for a ``switch`` or for a new session."""
+        """Instants reached (timestamp compares): a day boundary, an instant a section asked for (``_due``: a time
+        window of ``work`` or ``changed`` moving, the second after a return), the stretch's projected settle, a front
+        app held long enough for a ``switch`` or for a new session."""
         if self._next_day_at is not None and now >= self._next_day_at:
             self._round.update(("presence", "cards"))
+        for name, at in list(self._due.items()):
+            if now >= at:
+                del self._due[name]
+                self._round.add(name)
         if self._sit_pending is not None and now >= self._sit_pending:
             self._sit_pending = None
             self._round.add("presence")
@@ -887,9 +982,18 @@ class YouBuilder:
 
     # -- rebuilding -------------------------------------------------------------------
 
+    def _due_at(self, name: str, at: float | None) -> None:
+        """Ask for ``name`` to be re-read at the instant ``at`` (the earliest asked wins until it is rebuilt)."""
+        if at is None:
+            return
+        cur = self._due.get(name)
+        if cur is None or at < cur:
+            self._due[name] = float(at)
+
     def _rebuild(self, name: str, now: float, cfg: NudgeConfig) -> None:
         t0 = time.perf_counter()
         known = True
+        self._due.pop(name, None)   # the builder asks again for its next instant
         try:
             value = getattr(self, f"_build_{name}")(now, cfg)
             if isinstance(value, tuple):
@@ -909,6 +1013,7 @@ class YouBuilder:
                 self._log("you_clipped", section=name, n=n)
             if value != self._plain.get(name):
                 self._version += 1
+                self._record_clips.pop(name, None)   # a fresh value: the whole-record cap is checked again
                 self._plain[name] = value
                 self._sections[name] = _freeze(value)
                 v = self._version
@@ -928,6 +1033,33 @@ class YouBuilder:
                "board_version": getattr(board, "version", None) if board is not None else None,
                "built": self._built_frozen, **self._sections}
         self._you = MappingProxyType(you)
+
+    def _fit_record(self, now: float) -> None:
+        """The whole published record within :data:`RECORD_CAP` (the section caps add up to about that before
+        ``built`` and the top level): when over, sections give way by their own clip rules, ``work`` first. Run only
+        on a beat that changed a section; ``you_clipped(section="record")`` (what gave way, in the sections as
+        published) is said when it starts, changes or stops."""
+        for name in ("work", "about", "changed", "presence", "usual", "prefs", "cards", "focus"):
+            over = _size(self._you) - RECORD_CAP
+            if over <= 0:
+                break
+            plain = self._plain.get(name)
+            if not plain:
+                continue
+            value, k = _clip_section(name, thaw(plain), max(2, _size(plain) - over))
+            if k:
+                self._record_clips[name] = self._record_clips.get(name, 0) + k
+                self.clipped["record"] += k
+                self._version += 1
+                self._plain[name] = value
+                self._sections[name] = _freeze(value)
+                self._built[name] = {**(self._built.get(name) or {}), "v": self._version}
+                self._built_frozen = _freeze(self._built)
+                self._publish(now)
+        n = sum(self._record_clips.values())
+        if n != self._clipped_last.get("record", 0):
+            self._clipped_last["record"] = n
+            self._log("you_clipped", section="record", n=n)
 
     # -- focus --------------------------------------------------------------------------
 
@@ -998,7 +1130,9 @@ class YouBuilder:
         else:
             self._audio_until, self._audio_process, self._audio_held, self._audio_at = None, "", False, None
             held = False
-        return {"front": live or (front_until is not None and now < front_until), "audio_held": held,
+        # front: the live flag only; a meeting row's tail is the timestamp front_until (compared when read, so the
+        # hold ends with time without a rebuild)
+        return {"front": live, "audio_held": held,
                 "front_until": _r(front_until) if front_until is not None and front_until > now else None}
 
     def _call(self, now: float) -> tuple[dict[str, Any], bool]:
@@ -1026,10 +1160,13 @@ class YouBuilder:
 
     def _build_presence(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
         flags = self._flags
+        stretch_open = bool(flags is not None and flags.get("stretch", True))
         if flags is None or flags.get("blocked") == "paused":
             state = "off"
         elif flags.get("blocked") == "locked":
             state = "locked"
+        elif not stretch_open:
+            state = "away"   # no user window in front: the stored rows alone (observe's view), away after presence_min
         elif flags.get("state") in ("present", "away"):
             state = flags["state"]
         else:
@@ -1037,13 +1174,30 @@ class YouBuilder:
         since = now - RESUME_SEARCH_S
         rows = wide_rows(self.store, now)
         clips: list[Any] = _clip(rows, since, now)
-        tail_start = None
-        if state == "present" and not self._acting:
+        tail_start = None                          # the live part (present, an open stretch): since then, going on
+        closed: _LiveClip | None = None            # the stretch that just closed, up to when it closed
+        with self._lock:
+            acting, acting_end = self._acting, self._acting_end
+        if not acting:   # while Yuki acts its rows are left out and nothing live is added (as observe)
             last_end = max((c.end for c in clips), default=None)
-            marks = [x for x in (last_end, self._flip_at) if x is not None]
-            tail_start = max(marks) if marks else now
-            if tail_start < now:
-                clips.append(_LiveClip(tail_start, now))
+            marks = [x for x in (last_end, self._flip_at, acting_end) if x is not None]
+            if state == "present":
+                tail_start = min(max(marks), now) if marks else now
+                if now - tail_start > ONGOING_S:
+                    # never bridge more than a flush: the process was suspended (a sleep with no lock on wake) or the
+                    # timeline stalled, so the live part starts now (observe saw the hole in the rows); read again
+                    # once the timeline's next flush has landed (a stall's rows then fill the hole)
+                    tail_start = self._flip_at = now
+                    self._recheck_at = now + FLUSH_EVERY_S + 5.0
+                    self.bridges += 1
+                # the live part; one that begins now holds a sliver, so a new stretch is seen (unsettled) at once
+                clips.append(_LiveClip(tail_start, max(now, tail_start + 0.01)))
+            elif state == "away" and not stretch_open and self._gap_from_present and self._gap_at is not None:
+                # the stretch closed while they were present; its last row may not have landed yet
+                start = max(marks) if marks else self._gap_at
+                if start < self._gap_at and self._gap_at - start <= ONGOING_S:
+                    closed = _LiveClip(start, self._gap_at)
+                    clips.append(closed)
         sessions = presence_sessions(clips, cfg)
         stretch = sessions[-1] if sessions else None
         brk = cfg.break_min * 60.0
@@ -1058,11 +1212,14 @@ class YouBuilder:
             if tail_start is None:
                 idle_since = stretch.end
         began = day_began(clips, cfg, since=since, sessions=sessions)
-        # time at the PC today: the stored part, plus the live part since tail_start
+        # time at the PC today: the stored part (and a just-closed stretch's unstored end), plus the live part since
+        # tail_start
         day_start = cfg.resume_day_start
         today = user_day(now, day_start)
         start_of_day = day_boundary(today, day_start)
         base_s = sum(c.present_s for c in _clip(rows, start_of_day, now) if c.row.state == "present")
+        if closed is not None:
+            base_s += max(0.0, closed.end - max(closed.start, start_of_day))
         self._next_day_at = start_of_day + 86400.0
         if self._days_for != today:
             self._days_for = today
@@ -1080,8 +1237,13 @@ class YouBuilder:
             self._sit_watch = self._sit_pending = None
         if self._switch_key is None and session is not None:
             self._switch_key = str(session["key"]).partition(":")[2] or None
+        if self._recheck_at is not None:   # kept until reached (any rebuild before it asks again)
+            if now >= self._recheck_at:
+                self._recheck_at = None
+            else:
+                self._due_at("presence", self._recheck_at)
         presence = {
-            "state": state, "idle_since": _r(idle_since),
+            "state": state, "stretch": stretch_open, "idle_since": _r(idle_since),
             "away_at": _r(idle_since + cfg.presence_min * 60.0) if idle_since is not None else None,
             "at_pc_since": _r(at_pc_since), "settled_at": _r(settled_at), "last_break": last_break,
             "day_began": _r(began[0]) if began else None, "day_gap_s": _r(began[1]) if began else None,
@@ -1136,7 +1298,10 @@ class YouBuilder:
             self._message_seen = max(newest_message, self._message_seen or 0.0)
         elif self._message_seen is None:
             self._message_seen = 0.0
-        return items[-CHANGED_MAX:]
+        items = items[-CHANGED_MAX:]
+        if items:   # the oldest kept item leaves the window then
+            self._due_at("changed", min(x["at"] or now for x in items) + CHANGED_S)
+        return items
 
     # -- work ---------------------------------------------------------------------------
 
@@ -1152,7 +1317,8 @@ class YouBuilder:
                 return float(t.importance or 5) / (1.0 + age_h / 24.0)
 
             def shape(t: Any) -> dict[str, Any]:
-                return {"id": t.id, "title": _text(t.title, TITLE_CHARS), "state": _text(t.shown or t.state, STATE_CHARS),
+                # "stands", not "state": where the thread stands is the user's own text (never a machine word)
+                return {"id": t.id, "title": _text(t.title, TITLE_CHARS), "stands": _text(t.shown or t.state, STATE_CHARS),
                         "next": _text(t.next, STATE_CHARS), "open_n": len(t.open_items or []), "last_at": _r(t.last_seen),
                         "importance": t.importance}
 
@@ -1171,10 +1337,13 @@ class YouBuilder:
             known = False
         due: list[dict[str, Any]] = []
         list_n = 0
+        turns: list[float] = []   # the instants a time window here changes (re-read then: _due)
         try:
             items = [i for i in todo_items(self.store, now=now) if i.status == "open"]
             list_n = len(items)
             for i in items:
+                if i.due_at is not None:   # enters the 24 h window, turns overdue, leaves the overdue window
+                    turns += [t for t in (i.due_at - DUE_AHEAD_S, i.due_at, i.due_at + OVERDUE_BACK_S) if t > now]
                 if i.due_at is None or not now - OVERDUE_BACK_S <= i.due_at <= now + DUE_AHEAD_S:
                     continue
                 due.append({"ref": i.ref, "title": _text(i.title, TITLE_CHARS), "due_at": _r(i.due_at),
@@ -1190,6 +1359,9 @@ class YouBuilder:
             board["waiting_on"] = sum(1 for d in (b.get("loops") or {}).values()
                                       if isinstance(d, dict) and d.get("kind") == "waiting")
             board["coming_up_n"] = len(b.get("meetings") or [])
+            for m in b.get("meetings") or []:   # a meeting leaves "coming up" when it ends (the board's own rule)
+                if isinstance(m, dict) and isinstance(m.get("at"), (int, float)):
+                    turns.append(float(m["at"]) + (86400.0 if m.get("all_day") else 3600.0))
             board["replies_owed"] = sum(1 for it in workboard._items(self.store, "reply").values()
                                         if isinstance(it.get("data"), dict) and it["data"].get("needs_reply")
                                         and it.get("mark") != "no_reply")
@@ -1201,12 +1373,17 @@ class YouBuilder:
             events = json.loads(self.store.cipher.decrypt(raw)) if raw else []
             for ev in events if isinstance(events, list) else []:
                 at = ev.get("at") if isinstance(ev, dict) else None
-                if not isinstance(at, (int, float)) or ev.get("asked") or not now <= at <= now + PLANS_AHEAD_S:
+                if not isinstance(at, (int, float)) or ev.get("asked"):
+                    continue
+                turns += [t for t in (at - PLANS_AHEAD_S, at) if t > now]   # enters the window, passes
+                if not now <= at <= now + PLANS_AHEAD_S:
                     continue
                 plans.append({"id": ev.get("id"), "at": _r(at), "title": _text(ev.get("what"), TITLE_CHARS)})
             plans = sorted(plans, key=lambda p: p["at"])[:PLANS_MAX]
         except Exception:  # noqa: BLE001
             known = False
+        if turns:
+            self._due_at("work", min(turns))
         return {"thread_now": thread_now, "threads": threads, "goals": goals, "due": due, "list_n": list_n,
                 "board": board, "plans": plans}, known
 
@@ -1275,7 +1452,8 @@ class YouBuilder:
                 "beat_ms": {"p50": pct(0.5), "p90": pct(0.9), "max": pct(1.0)},
                 "builds": dict(self.builds), "unchanged": self.unchanged, "wakes": dict(self.wakes),
                 "db_checks": self.db_checks, "probes": self.probes, "version": self._version, "bytes": size,
-                "clipped": dict(self.clipped), "errors": self.errors,
+                "clipped": dict(self.clipped), "errors": self.errors, "beat_gaps": self.beat_gaps,
+                "bridges": self.bridges,
                 "game_source": self._source, "call_unknown": self._call_unknown_since is not None}
 
 
@@ -1350,7 +1528,7 @@ def _render_cards(you: Any, now: float) -> list[tuple[int, str]]:
     work = you.get("work") or {}
     tn = work.get("thread_now")
     if tn:
-        lines.append((2, f"Thread now [W{tn['id']}]: {tn.get('title') or ''} - {tn.get('state') or ''}"
+        lines.append((2, f"Thread now [W{tn['id']}]: {tn.get('title') or ''} - {tn.get('stands') or ''}"
                          + (f"; next: {tn['next']}" if tn.get("next") else "")))
     for t in work.get("threads") or []:
         if tn and t["id"] == tn["id"]:
@@ -1362,11 +1540,13 @@ def _render_cards(you: Any, now: float) -> list[tuple[int, str]]:
     for d in work.get("due") or []:
         when = datetime.fromtimestamp(d["due_at"]).strftime("%a" if d.get("all_day") else "%a %H:%M")
         lines.append((3, f"Due [{d['ref']}]: {d.get('title') or '(untitled item)'}, {when}"
-                         + (" (overdue)" if d.get("overdue") else "")))
+                         + (" (overdue)" if d["due_at"] < now else "")))   # from the instant, not the built flag
     b = work.get("board") or {}
     lines.append((4, f"Their list: {work.get('list_n', 0)} open; replies owed {b.get('replies_owed', 0)}, "
                      f"waiting on others {b.get('waiting_on', 0)}, coming up {b.get('coming_up_n', 0)}."))
     for pl in work.get("plans") or []:
+        if pl["at"] < now:   # passed since the build
+            continue
         lines.append((4, f"Plan [event:{pl.get('id')}]: {pl.get('title') or ''}, "
                          f"{datetime.fromtimestamp(pl['at']):%a %H:%M}"))
     about = you.get("about") or {}
@@ -1412,19 +1592,26 @@ def render(you: Any, kind: str = "cards", *, now: float | None = None) -> str:
 # CLI: python -m yuki.memory.younow --show [--content]
 # ---------------------------------------------------------------------------
 
-#: Strings under these keys are machine words (enums, ids, app keys): shown as they are by ``--show``.
-_WORD_KEYS = frozenset({"state", "kind", "source", "by", "status", "scope", "owner", "type", "key", "ref", "app",
-                        "name"})
+#: Strings at these paths are machine words (enums, ids, app keys, a game's stem): shown as they are by ``--show``.
+#: Whitelisted by path, never by a bare key, so the user's own text under a like-named key is never printed.
+_WORD_PATHS = frozenset({
+    "presence.state", "presence.last_break.kind", "presence.session.key", "presence.session.prev.key",
+    "focus.game.name", "focus.game.source", "focus.call.kind",
+    "changed[].kind", "changed[].app", "changed[].by",
+    "work.goals[].scope", "work.goals[].status", "work.due[].ref", "work.due[].owner",
+    "cards.showing.type",
+})
 
 
-def content_free(value: Any, now: float, key: str = "") -> Any:
-    """The record with every text replaced by its length (machine words kept) and instants as seconds from ``now``."""
+def content_free(value: Any, now: float, path: str = "") -> Any:
+    """The record with every text replaced by its length (machine words at :data:`_WORD_PATHS` kept) and instants as
+    seconds from ``now``."""
     if isinstance(value, (dict, MappingProxyType)):
-        return {k: content_free(v, now, k) for k, v in value.items()}
+        return {k: content_free(v, now, f"{path}.{k}" if path else str(k)) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [content_free(v, now, key) for v in value]
+        return [content_free(v, now, f"{path}[]") for v in value]
     if isinstance(value, str):
-        return value if key in _WORD_KEYS and len(value) <= 40 else f"<{len(value)} chars>"
+        return value if path in _WORD_PATHS and len(value) <= 40 else f"<{len(value)} chars>"
     if isinstance(value, float) and value > 1e9:
         return f"{value - now:+.0f} s"
     return value
