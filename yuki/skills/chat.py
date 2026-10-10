@@ -458,6 +458,12 @@ def _stopped(facts: Mapping[str, Any], app: str, *, acted: bool) -> RouteResult 
     up), as the route's result; ``None`` otherwise."""
     if facts.get("act_off"):
         return RouteResult(ran=acted, ask=LINE_ACT_OFF.format(app=_title(app)), outcome="act_off")
+    if facts.get("to_planner"):
+        # bSkill (bTalk merge note 4): the consent rule handed over a step that would send or join (brain = "all");
+        # it did not run. The engine takes the run to rung C (the plan seed), never "Should I go ahead?"
+        from yuki.skills.engine import TO_PLANNER
+
+        return RouteResult(ran=acted, outcome=TO_PLANNER)
     if facts.get("held"):
         return RouteResult(ran=acted, ask=str(facts.get("question") or "") or LINE_HELD, outcome="held_by_check")
     if facts.get("took_over_at"):
@@ -1066,9 +1072,14 @@ def _wait_mic(ctx: Any, image: str, before: bool | None, budget_s: float) -> boo
         ctx.sleep(POLL_S)
 
 
+#: :func:`_judged`'s answer when the consent rule handed the press over (``brain = "all"``: a join no plan declared;
+#: bSkill, bTalk merge note 4): the engine's rung C, never "Should I go ahead?".
+HANDED_OVER = "to_planner"
+
+
 def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | None:
-    """Yuki's own check on pressing the app's button (a join is judged like a send, rule 8): ``None`` allowed, else
-    what to ask or say."""
+    """Yuki's own check on pressing the app's button (a join is judged like a send, rule 8): ``None`` allowed,
+    :data:`HANDED_OVER` when the consent rule handed it to the planner, else what to ask or say."""
     act_off = getattr(hands, "act_off", None)
     if callable(act_off):
         try:
@@ -1087,6 +1098,8 @@ def _judged(hands: Any, hwnd: int, image: str, role: str, name: str) -> str | No
     except Exception:  # noqa: BLE001 - fail closed
         return LINE_HELD
     if verdict is not None and not getattr(verdict, "allowed", False):
+        if getattr(verdict, "handover", False) is True:
+            return HANDED_OVER
         return str(getattr(verdict, "question", "") or "") or LINE_HELD
     return None
 
@@ -1181,6 +1194,10 @@ def route_voice_join(call: RouteCall) -> RouteResult:
         if isinstance(label, list) and len(label) >= 2:
             role, button = str(label[0]), str(label[1])
             question = _judged(hands, hwnd, image, role, button)
+            if question == HANDED_OVER:
+                from yuki.skills.engine import TO_PLANNER
+
+                return RouteResult(ran=True, outcome=TO_PLANNER, app=app)
             if question is not None:
                 return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
             if _refused("click", hwnd=hwnd):

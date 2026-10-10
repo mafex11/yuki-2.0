@@ -24,6 +24,11 @@ r2 L1; :func:`request_key`), and the headings say so. People are not listed (the
 skill with no usable rung and no hand-off is left out. The talker's menu is rebuilt nightly (it sits in the cached
 ``HANDS_PROMPT`` block; same-day changes go in its volatile ``skills_now``); the thinker's sits in its ``run_skill``
 tool's description and changes only with :func:`yuki.skills.registry.menu_version`.
+
+The new brain's planner (bSkill, brain-design 2.1 and 6) has its own audience, :data:`PLANNER`: the thinker's skills,
+headed by :data:`PLANNER_HEAD` (how a line is routed, ``route = "skill:<id>"``, and filled), in the planner's cached
+system block behind breakpoint 3 (:func:`planner_menu`). Skill ids never enter its tool schema: code checks the
+route's id against the live catalog.
 """
 
 from __future__ import annotations
@@ -37,6 +42,9 @@ from yuki.skills.connection import MENU_LINE_CHARS, Loaded, Skill, scope_value
 MENU_CHARS = 2400
 TALKER = "talker"
 THINKER = "thinker"
+#: The new brain's planner (bSkill, brain-design 2.1 / 6): its menu sits in the system block behind cache breakpoint 3.
+PLANNER = "planner"
+AUDIENCES: tuple[str, ...] = (TALKER, THINKER, PLANNER)
 #: The talker's menu holds every capability line plus at most this many learned skills (design §4.9).
 TALKER_LEARNED = 12
 #: A fixed value on a learned skill's line is cut to this.
@@ -56,10 +64,11 @@ def binds_key(skill: Skill) -> bool:
 
 def menu_skills(loaded: Loaded, audience: str = TALKER) -> list[Skill]:
     """The skills a menu lists, in order: every capability, then the learned skills that fix a key value (the talker's
-    top :data:`TALKER_LEARNED`; the thinker's all, at most the catalog's 20), in the catalog's order."""
+    top :data:`TALKER_LEARNED`; the thinker's and the planner's all, at most the catalog's 20), in the catalog's
+    order."""
     caps = [s for s in loaded.skills if not s.learned]
     named = [s for s in loaded.skills if binds_key(s)]
-    return caps + (named[:TALKER_LEARNED] if audience != THINKER else named)
+    return caps + (named if audience in (THINKER, PLANNER) else named[:TALKER_LEARNED])
 
 
 def _value(value: Any) -> str:
@@ -140,21 +149,59 @@ TALKER_HEAD = ("Skills (run_skill with the key; slots only from their words or a
                "one the user does often, its = values fixed; when they name another value, use the plain line:")
 
 
+#: The planner's heading (bSkill): what a line is and how its slots are filled. Generic: no app, no skill, no case.
+#: The route (``skill:<id>``) and the step value's shape are in the core prompt and the plan tool; a send slot left
+#: out is refused by the consent rule (bExec merge note 3), so the heading says to fill it.
+PLANNER_HEAD = ("Each line: - <id>: what it does [slot] or [slot: option | option]. A named line is a habit learned "
+                "from the user, its = values fixed: when their words name another value, use the plain line. Slots "
+                "only from their words or a listed name or option; leave the rest out (Yuki fills them). A skill that "
+                "sends: its send slot takes the sending option only with consent.commit send, else the other.")
+
+
 def menu_text(store: Any = None, *, audience: str = TALKER, loaded: Loaded | None = None, now: float | None = None,
               chars: int = MENU_CHARS, rank: str | None = None) -> str:
     """The menu block (``""`` when no skill is loaded). The talker's starts with its heading; the thinker's is the
     bare lines (its tool description carries the heading) with taste candidates most seen first, so its tool block
-    stays byte-stable through the day (review L2: an hour-ranked list changed the cached block every hour).
+    stays byte-stable through the day (review L2: an hour-ranked list changed the cached block every hour). The
+    planner's (bSkill) starts with :data:`PLANNER_HEAD` and lists what the thinker's lists, taste most seen first: it
+    sits in the planner's cached system block behind breakpoint 3, so it changes only when the catalog, the trust
+    ledger or the nightly taste does; ``chars`` covers the heading too.
     ``rank``: the taste order (``hour`` / ``n_obs``) when not the audience's own (the requests suite's eval prompt
     takes ``n_obs``, so its cached prefix holds across the fixtures' hours)."""
     loaded = loaded if loaded is not None else load()
-    rank = rank or ("n_obs" if audience == THINKER else "hour")
-    lines = menu_lines(loaded, store=store, now=now, chars=chars, rank=rank, audience=audience)
+    rank = rank or ("n_obs" if audience in (THINKER, PLANNER) else "hour")
+    room = max(0, chars - len(PLANNER_HEAD) - 1) if audience == PLANNER else chars
+    lines = menu_lines(loaded, store=store, now=now, chars=room, rank=rank, audience=audience)
     if not lines:
         return ""
     if audience == TALKER:
         return TALKER_HEAD + "\n" + "\n".join(lines)
+    if audience == PLANNER:
+        return PLANNER_HEAD + "\n" + "\n".join(lines)
     return "\n".join(lines)
+
+
+def planner_menu(client: Any = None, *, loaded: Loaded | None = None, now: float | None = None,
+                 chars: int = MENU_CHARS) -> str:
+    """The new brain's menu for its breakpoint-3 block (bSkill; :func:`menu_text` with :data:`PLANNER`). ``client``:
+    memory's client, as ``MemoryAccess.call`` hands it (``yuki.memory.api.MemoryClient``: its store-aware catalog,
+    the trust ledger and the user's taste; the learned skills come from there), or ``None`` for the shipped files
+    alone (no candidates; every skill with a rung). ``""`` when no skill is loaded. Never raises::
+
+        lines = memory.call("skill_menu", planner_menu, timeout_s=...)     # yuki.brain.context.read_menu
+    """
+    store = getattr(client, "store", None) if client is not None else None
+    if loaded is None and client is not None:
+        seeded = getattr(client, "_skills_seeded", None)
+        try:
+            got = seeded() if callable(seeded) else None
+        except Exception:  # noqa: BLE001 - the files alone
+            got = None
+        loaded = got if got is not None and hasattr(got, "skills") else None
+    try:
+        return menu_text(store, audience=PLANNER, loaded=loaded, now=now, chars=chars)
+    except Exception:  # noqa: BLE001 - a menu that can't be built is no menu (the planner routes steps)
+        return ""
 
 
 def request_key(loaded: Loaded, key: str, slots: Mapping[str, Any] | None) -> str:
@@ -221,5 +268,6 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
     }
 
 
-__all__ = ["MENU_CHARS", "TALKER", "THINKER", "TALKER_LEARNED", "TALKER_HEAD", "binds_key", "menu_skills",
-           "skill_line", "menu_lines", "menu_text", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]
+__all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "TALKER_LEARNED", "TALKER_HEAD", "PLANNER_HEAD",
+           "binds_key", "menu_skills", "skill_line", "menu_lines", "menu_text", "planner_menu", "request_key",
+           "talker_tool", "THINKER_HEAD", "thinker_tool"]

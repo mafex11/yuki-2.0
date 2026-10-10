@@ -21,6 +21,10 @@
    ``recheck="inline"`` in tests) and marks a false done in the ledger when it disagrees;
 5. when every rung failed or could not run, rung C: the request goes to the thinker with the skill pinned
    (``handoff`` dict: goal, slots with their sources, the done-check, what was tried), unless a game is in front.
+   On the new brain the same dict is the **plan seed** (bSkill, brain-design 2.1): the planner gets it in its request
+   turn and its done-check is fixed (the check of the routes this run took). A rung whose step the consent rule handed
+   over (``brain = "all"``: a step that would send or join with no plan behind it, ``TO_PLANNER``) goes to rung C at
+   once, never to the next rung and never to "exactly this?".
 
 Logs (D12, content-free through ``yuki.log.events.content_free``): ``skill_resolve``, ``route_try``, ``done_check``,
 ``done_recheck``, ``skill_run``, ``skill_handoff``. ``open_uri`` lives here (L14): an app URI opened by
@@ -55,6 +59,9 @@ LINE_ALREADY = "That's already how it is."
 LINE_MEMORY_SLOW = "I couldn't reach my memory just now, try again?"
 #: D24: a run that would itself do a step that is only ever the user's (a join on a calling site: they click Join).
 LINE_COMMIT_USER = "That step is yours to do, so I left it."
+#: A rung's outcome when the consent rule handed one of its steps over (bSkill; bTalk merge note 4): the step would
+#: send or join with no plan behind it, so it did not run and the run goes to the planner (rung C, the plan seed).
+TO_PLANNER = "to_planner"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -260,6 +267,9 @@ class SkillResult:
         if self.outcome == "held_game":
             return f"Held: a game is in front, nothing was sent. Say: {self.say}"
         if self.outcome == "handed_over":
+            if (self.handoff or {}).get("why") == TO_PLANNER:
+                return ("A step of it would send or join something, so that step was not done; the request goes to "
+                        "the planner with the skill pinned.")
             return "Its routes didn't get there; the request goes to the thinker with the skill pinned."
         if self.outcome == "unverified":
             return f"It ran, but the PC couldn't confirm the result. Say so plainly: {self.say}"
@@ -499,6 +509,11 @@ def v_uia_steps(call: RouteCall) -> RouteResult:
     done = int(facts.get("steps_done") or 0)
     if facts.get("refused") == "game" or facts.get("act_off"):
         return RouteResult(ran=done > 0, held="game" if facts.get("refused") == "game" else None, outcome="refused")
+    if facts.get("to_planner"):
+        # bSkill (bTalk merge note 4): the consent rule (brain = "all": hands.authorize -> brain.check.one) handed a
+        # step over that would send or join; it did not run. Rung C, never the talker's "exactly this?"
+        return RouteResult(ran=done > 0, outcome=TO_PLANNER, facts={"steps": int(facts.get("steps") or 0),
+                                                                   "done": done})
     if facts.get("held"):
         return RouteResult(ran=done > 0, ask=str(facts.get("question") or ""), outcome="held_by_check")
     verified = True if (ok and facts.get("verified") is True) else (False if facts.get("deviation") else None)
@@ -598,28 +613,45 @@ VERB_FUNCS: dict[str, Callable[[RouteCall], RouteResult]] = {
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _done_spec(skill: Skill, values: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The check the thinker's finish gate reads for a pinned skill: the first route done-check (else re-check) that
-    is not the route's own read-back, its templates filled."""
-    for r in skill.routes:
-        for c in (r.done, r.recheck):
-            if c is not None and c.probe != "read_back":
-                try:
-                    return fill_value(c.as_dict(), values)
-                except KeyError:
-                    continue
+def _done_spec(skill: Skill, values: Mapping[str, Any], routes: list[Route] | None = None) -> dict[str, Any] | None:
+    """The check a pinned skill is held to (the thinker's finish gate; the new brain's plan seed, where it is fixed):
+    the first route done-check (else re-check) that is not the route's own read-back, its templates filled. The routes
+    these values take come first (bSkill: ``routes``, the resolver's ladder for this run, else every route whose
+    ``when`` holds for them), so a hand-off of the PC's own level is held to that level's check and never to the first
+    route's (an app slider's); then any route, as before."""
+    from yuki.skills.resolve import _when_ok
+
+    try:
+        first = [r for r in routes if r.via != "agent"] if routes else [r for r in skill.routes if _when_ok(r, values)]
+    except Exception:  # noqa: BLE001 - the routes as listed
+        first = []
+    for group in (first, skill.routes):
+        for r in group:
+            for c in (r.done, r.recheck):
+                if c is not None and c.probe != "read_back":
+                    try:
+                        return fill_value(c.as_dict(), values)
+                    except KeyError:
+                        continue
     return None
 
 
 def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
-           *, why: str = "", baseline: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """The pinned skill handed to the thinker (rung C; map-skills S3.4): its goal, the slots with their sources, what
-    "done" means (words and the machine check), what was already tried, ``baseline``: the onset probes' states read
-    right before the hand-off (the finish gate compares with them; content-free booleans), and ``sends`` when running
-    it sends something to other people. At most :data:`PINNED_CHARS` as rendered."""
+           *, why: str = "", baseline: Mapping[str, Any] | None = None,
+           routes: list[Route] | None = None) -> dict[str, Any]:
+    """The pinned skill handed over at rung C (map-skills S3.4): its goal, the slots with their sources, what "done"
+    means (words and the machine check: :func:`_done_spec`, from ``routes`` when given), what was already tried,
+    ``baseline``: the onset probes' states read right before the hand-off (the finish gate compares with them;
+    content-free booleans), and ``sends`` when running it sends something to other people. At most
+    :data:`PINNED_CHARS` as rendered.
+
+    The same dict is the new brain's **plan seed** (brain-design 2.1, bSkill): ``skill`` names the skill for the
+    planner's seed block (``key`` stays for the old loop's frame and finish gate), and its ``done`` is the plan's fixed
+    done-check (``yuki.brain.plan`` takes it when the planner writes ``probe none``; ``yuki.brain.done.seed_done``
+    reads it). :func:`plan_seed` makes one from a pin kept elsewhere (a voice escalation's ``skill=``)."""
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
-           "done_words": fill(skill.done_line, values) or "", "done": _done_spec(skill, values),
+           "done_words": fill(skill.done_line, values) or "", "done": _done_spec(skill, values, routes),
            "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome")} for t in tried][:4],
            "why": why}
     if sends_with(skill, values):
@@ -629,7 +661,31 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
         out["baseline"] = dict(baseline)
     while len(json.dumps(out, ensure_ascii=False, default=str)) > PINNED_CHARS and out["tried"]:
         out["tried"] = out["tried"][:-1]
+    # bSkill: the planner's seed block names the skill by ``skill`` (added after the size fit, so the old loop's
+    # rendered block, which never shows it, keeps its size)
+    out["skill"] = skill.key
     return out
+
+
+#: The keys of a plan seed the brain reads (``yuki.brain.context.seed_block``: skill, goal, slots, done, tried;
+#: ``yuki.brain.done.seed_done``: done, done_words, baseline; the executor's run row: key).
+SEED_KEYS: tuple[str, ...] = ("skill", "key", "app", "goal", "slots", "done", "done_words", "tried", "why", "sends",
+                              "baseline")
+
+
+def plan_seed(pin: Any) -> dict[str, Any] | None:
+    """The new brain's plan seed (``Brain.run(plan_seed=)``) from a pinned skill (:func:`pinned`, or one kept across a
+    hand-off: a voice escalation's ``skill=``, the runtime job's ``skill``): the same keys, with ``skill`` set from
+    ``key`` when an older pin lacks it. ``None`` for anything that is not a pin (no skill named). Code data only: the
+    done-check is copied as the engine wrote it, never rewritten."""
+    if not isinstance(pin, Mapping):
+        return None
+    key = str(pin.get("skill") or pin.get("key") or "").strip()
+    if not key:
+        return None
+    seed = {k: pin[k] for k in SEED_KEYS if k in pin and pin[k] is not None}
+    seed["skill"], seed["key"] = key, str(pin.get("key") or key)
+    return seed
 
 
 def _app_title(app: str) -> str:
@@ -886,6 +942,15 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
                     return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                                    run_key=run_key, route=route.key)
             continue
+        if res.outcome == TO_PLANNER:
+            # bSkill (bTalk merge note 4): the consent rule stopped a step of this rung that would send or join, with
+            # no plan behind it, before that step ran: never "exactly this?" and never the next rung (it would reach
+            # the same step); rung C, the plan seed, where the planner's consent rule and send checks decide
+            acted = acted or bool(res.ran)
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": TO_PLANNER})
+            _ledger_try(ctx, run_key, route, None, "refused", route_ms)
+            _emit(ctx, "route_try", skill=skill.key, route=route.key, result=TO_PLANNER, ms=route_ms)
+            return _to_planner(skill, plan, tried, ctx, started, run_key=run_key, acted=acted)
         if res.ask:
             _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
                            acted=acted)
@@ -966,7 +1031,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
                        run_key=run_key)
     if plan.handoff and skill.handoff and ctx.origin != "eval":
         return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why="routes_failed", run_key=run_key,
-                        acted=acted)
+                        acted=acted, routes=list(plan.routes))
     # the run's own row names no rung: each rung's verdict is already in its try row (never counted twice)
     _ledger_finish(ctx, run_key, outcome="failed", checked=False if acted else None, route=None)
     return _simple(skill.key, "failed", ctx, started, say=LINE_FAILED, tried=tried, run_key=run_key)
@@ -1041,26 +1106,41 @@ def _after_done(ctx: RunContext, skill: Skill, route: Route, plan: Plan, probe_c
 
 
 def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
-             ctx: RunContext, started: float, *, why: str, run_key: str | None, acted: bool = False) -> SkillResult:
-    """Rung C: never with a game in front (D17(2)), re-read right here."""
+             ctx: RunContext, started: float, *, why: str, run_key: str | None, acted: bool = False,
+             routes: list[Route] | None = None) -> SkillResult:
+    """Rung C: never with a game in front (D17(2)), re-read right here. The pinned skill is the old loop's pin and the
+    new brain's plan seed alike (:func:`pinned`), held to the done-check of the routes this run took (``routes``)."""
     game = ctx.game_now()
     if game:
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                        run_key=run_key)
     # the onset probes' states right before the thinker acts (its finish gate compares with them, review M4)
-    spec = _done_spec(skill, values)
+    spec = _done_spec(skill, values, routes)
     try:
         from yuki.skills.donecheck import take_baseline
 
         base = take_baseline(spec, {}, readers=ctx.baselines) if spec else {}
     except Exception:  # noqa: BLE001 - no baseline: the gate can't show an onset (never a false done)
         base = {}
-    pin = pinned(skill, values, filled, tried, why=why, baseline=base)
+    pin = pinned(skill, values, filled, tried, why=why, baseline=base, routes=routes)
     _ledger_finish(ctx, run_key, outcome="handed_over", checked=False if acted else None)
     _emit(ctx, "skill_handoff", skill=skill.key, result="handed_over", reason=why, tried=len(tried))
     return _simple(skill.key, "handed_over", ctx, started, handoff=pin, tried=tried, run_key=run_key,
                    values=dict(values))
+
+
+def _to_planner(skill: Skill, plan: Plan, tried: list[dict[str, Any]], ctx: RunContext, started: float, *,
+                run_key: str | None, acted: bool) -> SkillResult:
+    """A rung whose step the consent rule handed over (:data:`TO_PLANNER`; that step did not run): rung C with the
+    plan seed when the skill's data lets it hand over (never with a game in front: :func:`_handoff` reads it again).
+    A skill whose data says it is never handed over (it would only search), or an eval run, stops there with the
+    user's-step line: nothing more is done, and no next rung tries the same step."""
+    if skill.handoff and ctx.origin != "eval":
+        return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why=TO_PLANNER, run_key=run_key,
+                        acted=acted, routes=list(plan.routes))
+    _ledger_finish(ctx, run_key, outcome="refused", checked=None, acted=acted)
+    return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER, tried=tried, run_key=run_key)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1187,6 +1267,7 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
-           "LINE_COMMIT_USER", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for", "run_commit", "served_commit",
-           "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult", "VERB_FUNCS", "open_uri", "pinned",
-           "run", "resolve_and_run", "run_for_voice", "run_for_thinker"]
+           "LINE_COMMIT_USER", "TO_PLANNER", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for", "run_commit",
+           "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult", "VERB_FUNCS",
+           "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
+           "run_for_thinker"]
