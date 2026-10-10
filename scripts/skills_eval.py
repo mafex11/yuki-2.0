@@ -13,17 +13,21 @@ your words; the console shows counts only, except ``fixtures label``, which you 
    a message sent). Left out: turns said to other people, the builders' live-check sessions (5 Oct ``-035305``,
    ``-144439``, ``-162122``, plus any session stamp in ``exclude-sessions.txt`` next to the fixtures file) and
    requests whose words are Yuki's own. Only then are the words decrypted, on this PC, into the fixtures file.
-2. ``fixtures label``: one phrasing at a time; you pick the skill from the menu of the seven skills (or none), the
-   details you named (the slots: closed choices such as whose volume, numbers, names as the app shows them), the end
-   state you wanted, and keep or drop. Collect lists candidates per session stamp, so a scripted live check's burst
-   can be dropped or its stamp added to ``exclude-sessions.txt``.
-3. ``fixtures add "..."``: phrasings written blind, before any resolver output is shown (``--skill meet.open`` labels
-   them at once). Needed for the meeting: only 4 real meeting turns exist.
-4. ``fixtures status``: counts per skill against the target set (meeting 4, YouTube 5, playlist 5, volume 6,
-   messages and voice channels 5).
+2. ``fixtures label``: one phrasing at a time; you pick the **end state** you wanted from the menu of Yuki's built-in
+   capabilities (phase L: one per end state, read from the capability files; or none), the details you named (the
+   slots: closed choices such as whose volume, numbers, names as the app shows them), and keep or drop. Collect lists
+   candidates per session stamp, so a scripted live check's burst can be dropped or its stamp added to
+   ``exclude-sessions.txt``. Labels written before phase L with the old hand-written skill keys are read as the
+   capability that replaced them (:data:`OLD_LABELS`).
+3. ``fixtures add "..."``: phrasings written blind, before any resolver output is shown (``--skill browser.site_tab``
+   labels them at once).
+4. ``fixtures status``: counts per end state against the target set (a site tab 4, a page 5, a playlist 5, a volume 6,
+   a message or a voice join 5).
 
-**Suites** (``run``): ``moments`` (phase F's backfill bars, $0), ``requests`` (phase S: the fixtures through the skill
-resolver, one cached talker call each, twice), ``cost`` (background spend). Every run is capped at 55 minutes and $3 in
+**Suites** (``run``): ``moments`` (phase F's backfill bars, $0), ``requests`` (phase S, scored by end state since
+phase L: the fixtures through the skill resolver, one cached talker call each, twice; a learned skill the resolver
+picks counts as its capability's end state, so "the right end, reached your way" is right whichever learned skill or
+capability ran it), ``cost`` (background spend). Every run is capped at 55 minutes and $3 in
 code: a larger ``--budget`` / ``--minutes`` is refused, the expected cost, the worst case and the expected time are
 checked before anything starts, each model call's worst case is checked before it is made (a call that reports no
 cost is counted at its worst case), and the moments rebuilds run under the same clock. ``--dry-run`` prints the
@@ -36,7 +40,7 @@ Usage::
 
     python scripts/skills_eval.py fixtures collect --copy-real [--dry-run]
     python scripts/skills_eval.py fixtures label
-    python scripts/skills_eval.py fixtures add "open my meeting" "get me into the standup" --skill meet.open
+    python scripts/skills_eval.py fixtures add "bring my call tab up" --skill browser.site_tab
     python scripts/skills_eval.py fixtures status
     python scripts/skills_eval.py run --copy-real --suite moments [--sample 50] [--memory-logs DIR]
     python scripts/skills_eval.py run --copy-real --suite requests [--dry-run] [--repeat 2] [--budget 3] [--minutes 55]
@@ -68,28 +72,129 @@ FIXTURES_NAME = "fixtures.json"
 EXCLUDE_NAME = "exclude-sessions.txt"
 FIXTURE_CHARS = 300
 
-#: The label menu: the seven skills of D2 (key, what it does in words). Machine keys, fixed by the plan. Their slots
-#: and how each is labelled come from ``habits_replay.SLOT_SPEC`` (the same table the score uses).
-SKILL_MENU: tuple[tuple[str, str], ...] = (
-    ("meet.open", "open the Meet tab in Zen (you click Join)"),
-    ("youtube.home", "open YouTube home in a browser"),
-    ("youtube.video", "play a YouTube video"),
-    ("spotify.playlist", "play one of your Spotify playlists"),
-    ("volume", "change a volume (Spotify's own, an app's, the PC's)"),
-    ("message", "message someone on Discord, WhatsApp or Slack"),
-    ("discord.voice", "join a Discord voice channel"),
-)
+#: The end state each built-in capability reaches, in words (phase L: labels are end states, never a user's habit).
+END_WORDS: dict[str, str] = {
+    "call_join": "a site's tab in front (a call: you click Join)", "site_front": "a site's tab in front",
+    "page": "a web page open", "media_play": "a video playing", "media_context": "a playlist playing",
+    "volume_change": "a volume changed", "message_sent": "a chat open with someone (a message)",
+}
+
+
+def _capabilities() -> tuple[Any, ...]:
+    try:
+        from yuki.skills.catalog import capabilities
+
+        return tuple(capabilities().capabilities)
+    except Exception:  # noqa: BLE001 - no capability files: an empty menu
+        return ()
+
+
+def skill_menu() -> tuple[tuple[str, str], ...]:
+    """The label menu: one entry per built-in capability (key, the end state it reaches and its neutral menu line),
+    read from the capability files. Machine keys; no user's habit in it."""
+    out = []
+    for cap in _capabilities():
+        end = str(cap.serves[0].end) if cap.serves else str(cap.end)
+        if end == "call_join" and cap.commit == "words":
+            words = "joined a voice channel (on your words)"
+        else:
+            words = END_WORDS.get(end, end.replace("_", " "))
+        out.append((cap.key, f"{words}: {cap.menu}"))
+    return tuple(out)
+
+
+#: The label menu (see :func:`skill_menu`) and its keys.
+SKILL_MENU: tuple[tuple[str, str], ...] = skill_menu()
 SKILL_KEYS = tuple(k for k, _w in SKILL_MENU)
+#: Labels written before phase L with the hand-written skill keys of D2, read as the capability that replaced them
+#: (lSplit's renames; the keys it kept read as themselves).
+OLD_LABELS: dict[str, str] = {"meet.open": "browser.site_tab", "youtube.home": "web.open_page",
+                              "youtube.video": "web.open_video"}
 #: What a closed choice's values mean, where the key alone doesn't say (shown when labelling).
 CHOICE_HELP: dict[tuple[str, str], str] = {
     ("volume", "target"): "spotify = Spotify's own volume, app = another app's, system = the whole PC, "
                           "own_voice = Yuki's voice",
-    # sSpotify §3.2 (sWire): audio.toml's control default is "in_app" for every target, meaning the target's own
-    # control; "mixer" is only for an app that has its own control as well (Spotify)
-    ("volume", "control"): "in_app = the target's own control (Spotify's slider; another app's level in the mixer; "
-                           "the PC's volume), mixer = the Windows volume mixer for an app with its own slider "
-                           "(Spotify)",
+    # phase L: the control slot ships no default; in_app is the target's own control, mixer the Windows mixer entry
+    ("volume", "control"): "in_app = the target's own control (an app's own slider; another app's level in the "
+                           "mixer; the PC's volume), mixer = the Windows volume mixer for an app with its own slider",
 }
+
+
+def label_key(skill: Any) -> str | None:
+    """A label's skill key as an end state: an old hand-written key read as its capability (:data:`OLD_LABELS`)."""
+    if skill in (None, ""):
+        return None
+    return OLD_LABELS.get(str(skill), str(skill))
+
+
+def slot_spec(skill: str | None) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """How each slot of an end state is labelled: ``habits_replay.SLOT_SPEC`` where it has the key (the score uses the
+    same table), else read from the capability's own slots (an enum: a closed choice; a number; points; the rest a
+    name; told and yes/no slots left out)."""
+    if str(skill) in H.SLOT_SPEC:
+        return H.SLOT_SPEC[str(skill)]
+    cap = next((c for c in _capabilities() if c.key == skill), None)
+    out: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for slot in getattr(cap, "slots", ()) or ():
+        if slot.told or slot.type == "bool":
+            continue
+        if slot.type == "enum" and slot.options:
+            out[slot.name] = ("choice", tuple(str(o) for o in slot.options))
+        elif slot.type in ("number", "points"):
+            out[slot.name] = (slot.type, ())
+        else:
+            out[slot.name] = ("name", ())
+    return out
+
+
+def end_of(key: Any, loaded: Any = None) -> str | None:
+    """A predicted skill key as an end state: a learned skill's capability (``<capability>#<digest>``, or the
+    catalog's own record of it), a capability as itself, ``None`` as none."""
+    if key in (None, ""):
+        return None
+    k = str(key)
+    if loaded is not None:
+        skill = loaded.get(k)
+        if skill is not None and getattr(skill, "capability", ""):
+            return str(skill.capability)
+    return k.split("#", 1)[0]
+
+
+class EndResolver:
+    """The requests suite's resolver, scored by end state: the resolver's answer with its skill read as its
+    capability (:func:`end_of`). Everything else (the cost estimate) is the wrapped resolver's."""
+
+    def __init__(self, inner: Any, loaded: Any = None) -> None:
+        self.inner = inner
+        self.loaded = loaded
+
+    def resolve(self, words: str, at: float) -> dict[str, Any]:
+        res = self.inner.resolve(words, at)
+        res = dict(res) if isinstance(res, dict) else {}
+        res["skill"] = end_of(res.get("skill"), self.loaded)
+        return res
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+def end_resolver(path: Path) -> Any:
+    """The resolver on the copy (``habits_replay.load_resolver``), with the copy's learned skills loaded into the
+    catalog first (so its menu holds them as the tray's would), wrapped to answer by end state. ``None`` when the
+    resolver isn't built on this branch."""
+    loaded = None
+    try:
+        from yuki.skills import catalog
+
+        store = dbcopy.open_copy(path)
+        try:
+            loaded = catalog.load(store=store)
+        finally:
+            store.close()
+    except Exception:  # noqa: BLE001 - the capabilities alone
+        loaded = None
+    inner = H.load_resolver(path)
+    return EndResolver(inner, loaded) if inner is not None else None
 #: The question for each kind of slot (``habits_replay.SLOT_SPEC``).
 SLOT_PROMPTS: dict[str, str] = {
     "choice": "{slot} ({options})",
@@ -98,13 +203,13 @@ SLOT_PROMPTS: dict[str, str] = {
     "name": "{slot}, as the app shows it",
     "free": "{slot}, as you said it (kept, not scored)",
 }
-#: The target set (PLAN C.4): a group of skills and how many fixtures it needs.
+#: The target set (PLAN C.4, by end state since phase L): a group of capabilities and how many fixtures it needs.
 TARGETS: tuple[tuple[str, tuple[str, ...], int], ...] = (
-    ("meeting", ("meet.open",), 4),
-    ("YouTube", ("youtube.home", "youtube.video"), 5),
-    ("Spotify playlist", ("spotify.playlist",), 5),
+    ("site tab", ("browser.site_tab",), 4),
+    ("page", ("web.open_page", "web.open_video"), 5),
+    ("playlist", ("spotify.playlist",), 5),
     ("volume", ("volume",), 6),
-    ("messages and voice channels", ("message", "discord.voice"), 5),
+    ("message or voice join", ("message", "discord.voice"), 5),
 )
 
 #: Tools of the skill domains, by machine name -> the candidate end state they point at.
@@ -317,7 +422,9 @@ def merge_candidates(data: dict[str, Any], candidates: Sequence[dict[str, Any]],
 
 def add_fixtures(data: dict[str, Any], texts: Sequence[str], *, skill: str | None = None,
                  now: float | None = None) -> int:
-    """Phrasings you wrote blind (``skill``: labelled at once, no slots, kept). Returns how many were added."""
+    """Phrasings you wrote blind (``skill``: an end state's capability key, labelled at once, no slots, kept).
+    Returns how many were added."""
+    skill = label_key(skill)
     if skill is not None and skill not in SKILL_KEYS:
         raise ValueError(f"unknown skill {skill!r}; the menu is {', '.join(SKILL_KEYS)}")
     at = time.time() if now is None else float(now)
@@ -339,7 +446,7 @@ def add_fixtures(data: dict[str, Any], texts: Sequence[str], *, skill: str | Non
 def _slot_value(skill: str, slot: str, raw: str) -> tuple[Any, str | None]:
     """A typed answer as the label keeps it (``habits_replay.SLOT_SPEC``): ``(value, None)``, or ``("", why)`` when it
     is not one the slot takes (left blank)."""
-    kind, options = H.slot_kind(skill, slot)
+    kind, options = slot_spec(skill).get(slot, ("name", ()))
     value = _fold(raw)
     if not value:
         return "", None
@@ -361,9 +468,9 @@ def _slot_value(skill: str, slot: str, raw: str) -> tuple[Any, str | None]:
 
 def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callable[[str], None], *,
                    relabel: bool = False, save: Callable[[], Any] | None = None) -> Counter:
-    """Ask, one phrasing at a time: the skill (the seven of D2, ``0`` none of these), its slots (closed choices,
-    numbers and names as the app shows them, so they compare with the resolver's; see ``habits_replay.SLOT_SPEC``),
-    the end state you wanted, keep or drop. ``s`` skips, ``q`` stops. Saved after each one. Returns what was done."""
+    """Ask, one phrasing at a time: the end state (one per built-in capability, ``0`` none of these), its slots
+    (closed choices, numbers and names as the app shows them, so they compare with the resolver's: :func:`slot_spec`),
+    keep or drop. ``s`` skips, ``q`` stops. Saved after each one. Returns what was done."""
     todo = [f for f in data["fixtures"] if relabel or not f.get("label")]
     done: Counter = Counter()
     say("This shows your own words: run it in your own terminal. s = skip, q = stop (your answers so far are kept).")
@@ -377,8 +484,8 @@ def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callabl
         say(f'  "{f.get("words")}"')
         for i, (key, words) in enumerate(SKILL_MENU, 1):
             say(f"  {i}. {key}: {words}")
-        say("  0. none of these skills")
-        choice = ask("Which skill did you want? ").strip().casefold()
+        say("  0. none of these")
+        choice = ask("Which end state did you want? ").strip().casefold()
         if choice == "q":
             break
         if choice == "s" or choice == "":
@@ -393,7 +500,7 @@ def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callabl
             done["skipped"] += 1
             continue
         slots: dict[str, Any] = {}
-        for slot, (kind, options) in H.SLOT_SPEC.get(str(skill), {}).items():
+        for slot, (kind, options) in slot_spec(skill).items():
             if (str(skill), slot) in CHOICE_HELP:
                 say(f"  ({CHOICE_HELP[(str(skill), slot)]})")
             q = SLOT_PROMPTS[kind].format(slot=slot, options=" / ".join(options))
@@ -412,6 +519,7 @@ def label_fixtures(data: dict[str, Any], ask: Callable[[str], str], say: Callabl
 
 
 def _target_of(skill: str | None) -> str | None:
+    skill = label_key(skill)
     return next((name for name, keys, _n in TARGETS if skill in keys), None)
 
 
@@ -420,7 +528,7 @@ def status(data: dict[str, Any]) -> dict[str, Any]:
     fx = data["fixtures"]
     labelled = [f for f in fx if f.get("label")]
     kept = [f for f in labelled if f["label"].get("keep") and not _late(data, f)]
-    per_skill = Counter(str(f["label"].get("skill")) for f in kept)
+    per_skill = Counter(str(label_key(f["label"].get("skill"))) for f in kept)
     groups = Counter(_target_of(f["label"].get("skill")) for f in kept)
     return {"total": len(fx), "by_origin": dict(Counter(str(f.get("origin")) for f in fx)),
             "unlabelled": len(fx) - len(labelled), "kept": len(kept),
@@ -439,7 +547,7 @@ def eval_fixtures(data: dict[str, Any]) -> list[H.Fixture]:
         if not lab or not lab.get("keep") or _late(data, f):
             continue
         out.append(H.Fixture(id=str(f["id"]), words=str(f.get("words") or ""), at=float(f.get("at") or 0.0),
-                             skill=lab.get("skill"), slots=dict(lab.get("slots") or {})))
+                             skill=label_key(lab.get("skill")), slots=dict(lab.get("slots") or {})))
     return out
 
 
@@ -447,7 +555,7 @@ def status_text(s: dict[str, Any]) -> list[str]:
     lines = [f"Fixtures: {s['total']} ({', '.join(f'{k} {v}' for k, v in s['by_origin'].items()) or 'none'}); "
              f"kept {s['kept']}, dropped {s['dropped']}, not labelled yet {s['unlabelled']}, late {s['late']}."]
     if s["per_skill"]:
-        lines.append("Kept per skill: " + ", ".join(f"{k} {v}" for k, v in s["per_skill"].items()) + ".")
+        lines.append("Kept per end state: " + ", ".join(f"{k} {v}" for k, v in s["per_skill"].items()) + ".")
     if s["candidates"]:
         lines.append("Not labelled, by where they ended: " + ", ".join(f"{k} {v}" for k, v in s["candidates"].items())
                      + ".")
@@ -604,7 +712,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             elif s == "requests":
                 fpath = Path(args.file) if args.file else None
                 data = load_fixtures(fpath)
-                out = H.run_requests(eval_fixtures(data), H.load_resolver(path), caps, repeat=args.repeat, say=print)
+                out = H.run_requests(eval_fixtures(data), end_resolver(path), caps, repeat=args.repeat, say=print)
                 for line in H.requests_text(out):
                     print(line)
                 if any(r.get("answered") for r in out.get("per_run") or []) and not data.get("shown_at"):

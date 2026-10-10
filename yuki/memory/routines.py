@@ -1,19 +1,23 @@
-"""Routines: the user's usual moments, per skill, mined nightly by code from the moments table (PLAN.md Phase R).
+"""Routines: the user's usual moments, per learned skill, mined nightly by code (PLAN.md Phase R; phase L D3).
 
 No model, no network, $0 (it replaces the Sonnet routines pass, whose prompt, evidence and model call are gone). A
-routine is "this skill's end state, through this app, usually happens around this time on these days": the weekday
-~08:58 Meet join in Zen (E1). Code finds it from the state changes memory already keeps
-(:mod:`yuki.memory.moments`), with fixed statistical bars, and keeps it true as the days go by.
+routine is "this learned skill's end state usually happens around this time on these days" (a weekday meeting tab
+around one time, say). Code finds it from the occasions the skill learner keeps (:mod:`yuki.skills.learn`, built from
+memory's moments), with fixed statistical bars, and keeps it true as the days go by.
 
-**Moments in, keys out** (D3, D7, D18; map-routines R1.3):
+**Occasions in, keys out** (D3 as phase L restates it, D7, D18; learner design §5, critique M1):
 
-* Each skill's connection file (``yuki/skills/connections/*.toml``) says which moments are its routine's onset
-  (``routine_on``: ``meet.open`` -> ``call_join`` in ``zen``). A moment is the skill's when exactly one skill lists its
-  (kind, app); any other moment is counted as *unmapped* (the de-noise evidence: Slack huddles, and no FL Studio,
-  Settings or VALORANT join ever reaches here).
-* key = ``skill|means app`` (+ ``|entity digest`` when one of the skill's slots says ``routine_key``). The service
-  ("Google Meet") is never part of a key.
-* Moments Yuki's own runs made (``by='yuki'``, D18) never count.
+* The learner gives every occasion of the user's one skill (``occasions.end_moment_id -> skill_id``, one skill per
+  moment by construction), so no key is ever ``ambiguous``. :func:`keyed_onsets` reads them through
+  ``yuki.skills.learn.routine_inputs``; an occasion of no learned skill is counted as *unmapped* (the de-noise
+  evidence: a call app no capability serves, a game, never reaches a routine).
+* key = ``skill:<learned skill id>`` (+ ``|entity key`` when its capability's fill slot says ``routine_key``: a
+  playlist), so a change of program (a means) keeps the routine. ``skill_id`` holds the learned skill's key. The
+  bound values (a site, a calling service) are the skill's, never part of the routine key.
+* Sends and joins never make a routine (their skills' runs commit: D24, ``message_sent`` left out); a usage record
+  (no key value bound) makes one only through a ``routine_key`` fill slot.
+* Moments Yuki's own runs made, Yuki's acting steps and the user's asked runs never count (D18: the learner's own
+  filter); a late chat capture's time is unknown, so it never counts either.
 * **Day-onsets** only: the first moment, or the first after 2 h without one, so a timeline row and a calls row of the
   same join count once.
 * **D7:** a join seen on screen or on the site (``evidence`` screen / meeting / site) is *seen*; a microphone hold
@@ -46,10 +50,12 @@ hits (retired unconfirmed after 28 days).
 **Outputs:**
 
 * :class:`RoutineMiner` ``(worker).run(reason=)``: the nightly pass (``yuki.memory.portrait`` calls it after the
-  nightly run, unchanged); it never runs during a game or a call because the nightly run doesn't.
+  nightly run, right after the skill learner); it never runs during a game or a call because the nightly run doesn't.
+  It loads the catalog on its own store (``catalog.load(store=, log=)``) and first feeds the user's observed program
+  choices to preferences (``yuki.skills.prefs.feed_observed``: design §5).
 * The portrait's Routines lines from counts (:func:`sync_facts`): one ``routine`` fact per active routine, written by
-  code (origin ``measured``) through the portrait's own operations, e.g. "On 7 of the last 9 weekdays the user joined a
-  Google Meet call in Zen at about 08:58 (25 Sep - 8 Oct 2026)." ("N of M" counts hits on the eligible days only, so
+  code (origin ``measured``) through the portrait's own operations, e.g. "On 7 of the last 9 weekdays the user joined
+  an Example call in BrowserX at about 09:00 (1 Sep - 12 Sep 2026)." ("N of M" counts hits on the eligible days only, so
   N never exceeds M.) The portrait's validator refuses model edits to them. The first run ends the routine facts the
   old Sonnet pass wrote. When something else ended or rewrote the line, the miner looks at who
   (:func:`fact_fate`): the user's review ("not right") or their correction turns the line off for good; a model's
@@ -159,7 +165,7 @@ HOLD_EVIDENCE = "hold"
 
 #: What the user did, per moment kind (D1's closed vocabulary, machine codes to wording, like the card titles):
 #: (third person past for the portrait fact, second person for the card and the "now" block). ``{service}`` is the
-#: calling service's product name the moments recorded (``"a Google Meet call"``), else the generic thing.
+#: calling service's product name the moments recorded (``"an Example call"``), else the generic thing.
 KIND_PHRASES: dict[str, tuple[str, str, str]] = {
     # kind: (fact verb phrase, user verb phrase, generic object)
     "call_join": ("joined {thing} in {app}", "join {thing} in {app}", "a call"),
@@ -206,7 +212,7 @@ def from_clock(clock_min: float) -> float:
 
 
 def hm(clock_min: float | None) -> str:
-    """``"08:58"`` (the minute begun, as the prototype printed it)."""
+    """``"09:05"`` (the minute begun, as the prototype printed it)."""
     if clock_min is None:
         return "--:--"
     m = int(float(clock_min) % 1440.0)
@@ -335,18 +341,23 @@ class Inputs:
     moments: int = 0
 
 
-def load_skills() -> tuple[Any, ...]:
-    """The loaded skills (``yuki.skills.connection.load``); empty when the skill files can't be read."""
+def load_skills(store: Any = None, log: LogFn | None = None) -> tuple[Any, ...]:
+    """The catalog (``yuki.skills.catalog.load``): the capabilities and the user's live learned skills. With
+    ``store`` its learned rows are read from that database (one count query when unchanged; phase L C.2: the memory
+    service's nightly passes load it with ``store=`` and ``log=``); ``log`` is told a skipped file or row once. Empty
+    when the skill files can't be read."""
     try:
         from yuki.skills.catalog import load
 
-        return tuple(load().skills)
+        return tuple(load(store=store, log=log).skills)
     except Exception:  # noqa: BLE001 - a broken connection folder means no routines, never a crash
         return ()
 
 
 def routine_map(skills: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
-    """``(moment kind, app) -> [skills whose routine_on lists it]`` (D3, data only)."""
+    """``(moment kind, app) -> [skills whose routine_on lists it]``: the pre-phase-L mapping, kept for old callers. No
+    shipped capability lists ``routine_on`` any more (the habit-key refusal), so this is empty; :func:`keyed_onsets`
+    reads the learner's occasions instead."""
     out: dict[tuple[str, str], list[Any]] = defaultdict(list)
     for s in skills:
         for kind, app in getattr(s, "routine_on", ()) or ():
@@ -357,6 +368,96 @@ def routine_map(skills: Iterable[Any]) -> dict[tuple[str, str], list[Any]]:
 
 def _routine_key_slot(skill: Any) -> bool:
     return any(getattr(sl, "routine_key", False) for sl in getattr(skill, "slots", ()) or ())
+
+
+def served_kind(skill: Any) -> str:
+    """The end kind a skill's habit ends in (its capability's first ``serves`` end: a meeting tab's ``call_join``),
+    else its own end (data, design §4.1)."""
+    serves = tuple(getattr(skill, "serves", ()) or ())
+    return str(serves[0].end) if serves else str(getattr(skill, "end", "") or "")
+
+
+def learned_id(store: Any, skill_key: str) -> int | None:
+    """The ``skills.id`` of a learned skill's key (``None``: not a learned row). Never raises."""
+    try:
+        rows = store._query("SELECT id FROM skills WHERE key = ? AND origin = 'learned' LIMIT 1", (str(skill_key),))
+    except Exception:  # noqa: BLE001
+        return None
+    return int(rows[0][0]) if rows else None
+
+
+def _moment_attrs(cap: Any, m: Mapping[str, Any]) -> dict[str, Any]:
+    """A moment's slot values under a capability's ``bind`` (the learner's own reading: ``occasions.Builder._src`` then
+    ``bind.attrs_for``; a chat send's thread is never needed here, sends never make a routine)."""
+    from types import SimpleNamespace
+
+    from yuki.skills.learn.bind import attrs_for
+    from yuki.skills.learn.occasions import Builder
+
+    src = Builder._src(SimpleNamespace(_threads={}), dict(m))   # type: ignore[arg-type]
+    return attrs_for(cap, src)
+
+
+def _matches(skill: Any, cap: Any, m: Mapping[str, Any], app: str | None) -> bool:
+    """A moment is the learned skill's end state: each bound key value matches the moment's (as one identity,
+    ``connection.scope_value``); a moment missing a key value counts in the skill's own means app (the learner's
+    missing-key rule: a microphone hold with no service)."""
+    from yuki.skills.connection import scope_value
+
+    bound = dict(getattr(skill, "bound", None) or {})
+    try:
+        attrs = _moment_attrs(cap, m)
+    except Exception:  # noqa: BLE001 - unreadable: not the skill's
+        return False
+    for slot in getattr(cap, "slots", ()) or ():
+        if slot.role != "key" or slot.name not in bound:
+            continue
+        got = attrs.get(slot.name)
+        if got in (None, ""):
+            if not app or str(m.get("app") or "") != app:
+                return False
+            continue
+        if scope_value(got) != scope_value(bound[slot.name]):
+            return False
+    return True
+
+
+def skill_onsets(store: Any, skill: Any, since: float, until: float, *, app: str | None = None,
+                 skills: Sequence[Any] | None = None) -> list[float]:
+    """When the user reached a learned skill's end state in ``[since, until]``, oldest first (D3, D18): the learner's
+    user occasions of that skill, and the user's own moments of its end kind whose bound key values match (the
+    occasions lag the moments by up to the learner's incremental pass, so a meeting joined minutes ago counts at once).
+    Never Yuki's own (``by='yuki'``). ``app``: the routine's means app (a moment with no key value counts there)."""
+    if skill is None or getattr(skill, "origin", "") != "learned":
+        return []
+    out: set[float] = set()
+    sid = learned_id(store, skill.key)
+    if sid is not None:
+        try:
+            for (at,) in store._query("SELECT at FROM occasions WHERE skill_id = ? AND by = 'user' AND at >= ? AND"
+                                      " at <= ?", (sid, float(since), float(until))):
+                out.add(float(at))
+        except Exception:  # noqa: BLE001 - a database before migration 43
+            pass
+    kind = served_kind(skill)
+    cap = None
+    try:
+        from yuki.skills.catalog import capabilities
+
+        cap = capabilities().get(str(getattr(skill, "capability", "") or ""))
+    except Exception:  # noqa: BLE001
+        cap = None
+    if kind and cap is not None:
+        try:
+            rows = store.moments_between(since, float(until) + 1.0, kinds=[kind])
+        except Exception:  # noqa: BLE001
+            rows = []
+        for m in rows:
+            if str(m.get("by") or "user") == "yuki":
+                continue
+            if _matches(skill, cap, m, app):
+                out.add(float(m["at"]))
+    return sorted(out)
 
 
 def _collapse(times: Iterable[float]) -> list[float]:
@@ -372,8 +473,20 @@ def _collapse(times: Iterable[float]) -> list[float]:
 
 def keyed_onsets(store: Any, since: float, until: float, *, skills: Sequence[Any] | None = None,
                  presence: Presence | None = None) -> Inputs:
-    """Day-onsets per routine key from the moments in ``[since, until)`` (D3, D7, D18), with the user's presence."""
-    skills = load_skills() if skills is None else tuple(skills)
+    """Day-onsets per routine key from the learner's occasions in ``[since, until)`` (phase L: D3, D7, D18; design §5),
+    with the user's presence: ``yuki.skills.learn.routine_inputs`` (one learned skill per occasion, so no key is ever
+    ``ambiguous``), each key's means app the one its occasions used most, and whether its skill passes the offer gate
+    (``yuki.memory.offers.skill_offerable``: trust and the routine itself are checked when a card is due). A database
+    the learner never wrote to falls back to the old ``routine_on`` mapping (empty for every shipped capability)."""
+    skills = load_skills(store) if skills is None else tuple(skills)
+    try:
+        from yuki.skills.learn import routine_inputs
+
+        got = routine_inputs(store, since, until)
+    except Exception:  # noqa: BLE001 - no learner tables yet
+        got = None
+    if got is not None and (got.keys or got.unmapped):
+        return _learned_inputs(store, got, skills, since, until, presence)
     mapping = routine_map(skills)
     kinds = sorted({k for k, _a in mapping})
     every: dict[str, list[float]] = defaultdict(list)
@@ -414,6 +527,52 @@ def keyed_onsets(store: Any, since: float, until: float, *, skills: Sequence[Any
     out.seen = {k: [t for t in _collapse(v) if since <= t < until] for k, v in seen.items()}
     out.presence = presence if presence is not None else Presence(store.presence_spans(since, until))
     return out
+
+
+def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float, until: float,
+                    presence: Presence | None) -> Inputs:
+    """The learner's inputs with each key's means app (its occasions' most used app; a key's first occasion otherwise)
+    and its offer gate, and ``presence`` when the caller has one. Never drops a key."""
+    from dataclasses import replace
+
+    from yuki.memory.offers import skill_offerable
+
+    by_key = {s.key: s for s in skills}
+    apps: dict[int, str] = {}
+    try:
+        for sid, app, _n in store._query(
+                "SELECT skill_id, app, count(*) AS n FROM occasions WHERE skill_id IS NOT NULL AND by = 'user' AND"
+                " at >= ? AND at < ? AND app IS NOT NULL GROUP BY skill_id, app ORDER BY n", (since, until)):
+            apps[int(sid)] = str(app)   # ordered by count: the most used app is written last
+    except Exception:  # noqa: BLE001
+        apps = {}
+    try:
+        gone = {int(r[0]) for r in store._query("SELECT id FROM skills WHERE origin = 'learned' AND (deleted_at IS NOT"
+                                                " NULL OR state IN ('deleted', 'not_mine'))")}
+    except Exception:  # noqa: BLE001
+        gone = set()
+    gate: dict[str, bool] = {}
+    for key, info in list(got.keys.items()):
+        try:
+            sid = int(key.split("|")[0].split(":", 1)[1])
+        except (IndexError, ValueError):
+            sid = -1
+        if sid in gone:
+            # the user's Forget this / Not mine: its occasions feed no routine (lPage's tombstone contract)
+            got.unmapped[f"{info.kind}|tombstone"] += len(got.onsets.get(key, ()))
+            got.keys.pop(key, None)
+            got.onsets.pop(key, None)
+            got.seen.pop(key, None)
+            continue
+        if info.skill not in gate:
+            try:
+                gate[info.skill] = bool(skill_offerable(store, by_key.get(info.skill))[0])
+            except Exception:  # noqa: BLE001
+                gate[info.skill] = False
+        got.keys[key] = replace(info, app=apps.get(sid, info.app), offerable=gate[info.skill])
+    if presence is not None:
+        got.presence = presence
+    return got
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -887,20 +1046,36 @@ def _date_text(t: float | None, *, year: bool = False) -> str:
     return f"{d.day} {d:%b}" + (f" {d:%Y}" if year else "")
 
 
+def _bound_thing(skill: Any) -> str | None:
+    """What a learned skill's habit is about, from its bound key values: the value of a key slot its capability reads
+    from a calling service or a site (a product name or a site's name, as memory kept it), else ``None``."""
+    bound = dict(getattr(skill, "bound", None) or {})
+    bind = dict(getattr(skill, "bind", None) or {})
+    for slot in getattr(skill, "slots", ()) or ():
+        if slot.role == "key" and bind.get(slot.name) in ("service", "site") and bound.get(slot.name):
+            return " ".join(str(bound[slot.name]).split())[:60] or None
+    return None
+
+
 def _things(store: Any, row: Mapping[str, Any], services: Mapping[str, Counter] | None,
             skills: Sequence[Any] | None = None) -> tuple[str, str, str]:
-    """(kind, thing, app name) for a routine's wording: the moment kind of its skill's routine_on for its app, the
-    calling service the moments named most (a product name, never a host), the app's display name."""
+    """(kind, thing, app name) for a routine's wording: the end kind its learned skill's habit ends in, what it is
+    about (the calling service the moments named most, else the skill's own bound service or site), the means app's
+    display name. A skill no longer loaded words as "did this"."""
     key = str(row["key"])
     kind = ""
-    for s in (load_skills() if skills is None else skills):
+    skill = None
+    for s in (load_skills(store) if skills is None else skills):
         if s.key == row.get("skill_id"):
-            kind = next((k for k, a in s.routine_on if a == row.get("app")), "")
+            skill = s
+            kind = next((k for k, a in getattr(s, "routine_on", ()) or () if a == row.get("app")), "") or served_kind(s)
             break
     generic = KIND_PHRASES.get(kind, ("", "", ""))[2]
     service = None
     if services and services.get(key):
         service = services[key].most_common(1)[0][0]
+    if not service and skill is not None:
+        service = _bound_thing(skill)
     thing = f"a {service} call" if service and kind == "call_join" else (service or generic)
     try:
         app = store.app_display_name(row.get("app"))
@@ -937,7 +1112,7 @@ def fact_texts(store: Any, row: Mapping[str, Any], stats: Stats, services: Mappi
 
 def why_line(store: Any, row: Mapping[str, Any], *, services: Mapping[str, Counter] | None = None,
              skills: Sequence[Any] | None = None) -> str:
-    """The card's why line, from counts (R2.4): "You've joined it around 08:58 on 7 of the last 9 weekdays."."""
+    """The card's why line, from counts (R2.4): "You've joined it around 09:00 on 7 of the last 9 weekdays."."""
     kind, _thing, _app = _things(store, row, services, skills)
     verbs = {"call_join": "joined it", "media_context": "started it", "media_play": "started it",
              "page": "opened it", "site_front": "opened it", "message_sent": "sent one", "volume_change": "changed it"}
@@ -1202,8 +1377,18 @@ class RoutineMiner:
         now = time.time() if now is None else float(now)
         result = RoutinesResult(None)
         store = self.store
+        prefs_fed: dict[str, Any] = {}
+        if not dry_run:
+            # design §5: one observed preference event per user occasion with a known program (never an asked one,
+            # never a late send's), the night after the learner wrote them; its own errors never stop the miner
+            try:
+                from yuki.skills.prefs import feed_observed
+
+                prefs_fed = feed_observed(store, now=now)
+            except Exception as exc:  # noqa: BLE001
+                prefs_fed = {"error": type(exc).__name__}
         try:
-            skills = load_skills() if self.skills is None else tuple(self.skills)
+            skills = load_skills(store, self._log_fn) if self.skills is None else tuple(self.skills)
             inputs = keyed_onsets(store, now - self.days * 86400.0, now, skills=skills)
             mined = mine(inputs, now)
             rows = store.routines()
@@ -1248,6 +1433,7 @@ class RoutineMiner:
                 "facts": {"added": facts.added, "updated": facts.updated, "invalidated": facts.invalidated,
                           "user_ended": facts.user_ended, "rewritten": facts.rewritten},
                 "first_run_invalidated": facts.old_invalidated,
+                "prefs_observed": prefs_fed,
             }
         except Exception as exc:  # noqa: BLE001 - logged; the next night tries again
             result.ok, result.error = False, f"{type(exc).__name__}: {exc}"
@@ -1291,12 +1477,11 @@ def offer_window(row: Mapping[str, Any], d: date, *, lead_min: float = OFFER_LEA
 
 
 def done_today(store: Any, row: Mapping[str, Any], now: float, *, skills: Sequence[Any] | None = None) -> bool:
-    """The routine's own end state already happened today (since 04:00): one of its routine_on moments for its app
-    (anyone's), or a run of its skill that ended done."""
+    """The routine's own end state already happened today (since 04:00): the user reached its learned skill's end
+    (:func:`skill_onsets`), or a run of its skill ended done."""
     since = day_start(day_of(now))
-    skill = next((s for s in (load_skills() if skills is None else skills) if s.key == row.get("skill_id")), None)
-    kinds = sorted({k for k, a in (getattr(skill, "routine_on", ()) or ()) if a == row.get("app")})
-    if kinds and store.moments_between(since, now, kinds=kinds, app=row.get("app")):
+    skill = next((s for s in (load_skills(store) if skills is None else skills) if s.key == row.get("skill_id")), None)
+    if skill is not None and skill_onsets(store, skill, since, now, app=row.get("app")):
         return True
     try:
         got = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND t0 >= ? AND t0 < ? AND outcome = 'done'"
@@ -1310,13 +1495,16 @@ def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | 
                trusted: Callable[[Any], bool] | None = None, per_day: int = OFFERS_PER_DAY,
                lead_min: float = OFFER_LEAD_MIN, lead_last_min: float = OFFER_LEAD_LAST_MIN,
                late_min: tuple[float, float] = OFFER_LATE_MIN) -> list[dict[str, Any]]:
-    """The routines whose card window is open now (R2.3 "when a routine is due"), first window first: active, of an
-    ``offerable`` skill whose route is trusted for offers (``registry.offer_ready``, D14, unless ``trusted`` says
-    otherwise), offer mode early or late, today in its day-set, ``now`` inside the mode's window, its end state not
-    yet happened today, not offered today, and fewer than ``per_day`` routine cards offered today. The card lane
-    (rLane) adds its own holds (game in front, calls, quiet hours, the tab census) on top. Content-free dicts."""
+    """The routines whose card window is open now (R2.3 "when a routine is due"), first window first: active, of a
+    learned skill that passes the offer gate (``offers.skill_offerable``) and whose route is trusted for offers
+    (``registry.offer_ready``, D14, unless ``trusted`` says otherwise), offer mode early or late, today in its day-set,
+    ``now`` inside the mode's window, its end state not yet happened today, not offered today, and fewer than
+    ``per_day`` routine cards offered today. The card lane (rLane) adds its own holds (game in front, calls, quiet
+    hours, the tab census) on top. Content-free dicts."""
+    from yuki.memory.offers import skill_offerable
+
     now = time.time() if now is None else float(now)
-    skills = load_skills() if skills is None else tuple(skills)
+    skills = load_skills(store) if skills is None else tuple(skills)
     by_key = {s.key: s for s in skills}
     today = day_of(now)
     since = day_start(today)
@@ -1332,7 +1520,7 @@ def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | 
     out: list[dict[str, Any]] = []
     for row in store.routines(states=["active"]):
         skill = by_key.get(row.get("skill_id"))
-        if skill is None or not getattr(skill, "offerable", False) or row["id"] in offered_ids:
+        if skill is None or row["id"] in offered_ids or not skill_offerable(store, skill)[0]:
             continue
         win = offer_window(row, today, lead_min=lead_min, lead_last_min=lead_last_min, late_min=late_min)
         if win is None or not win[0] <= now <= win[1]:
@@ -1358,13 +1546,16 @@ def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | 
 
 def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, limit: int = 2,
                 skills: Sequence[Any] | None = None) -> list[dict[str, Any]]:
-    """Active routines of an ``offerable`` skill whose time is within ``minutes`` of now on a day of their day-set
-    (the talker's "now" block), nearest first, at most ``limit``: content-free numbers plus the label when one was
-    told. Context routines (a skill that is not offerable, such as the voice channel) never reach it (R1.5)."""
+    """Active routines of a skill that passes the offer gate whose time is within ``minutes`` of now on a day of their
+    day-set (the talker's "now" block), nearest first, at most ``limit``: content-free numbers plus the label when one
+    was told. Context routines (a skill that is never offered, such as a voice channel) never reach it (R1.5)."""
+    from yuki.memory.offers import skill_offerable
+
     now = time.time() if now is None else float(now)
     today = day_of(now)
     dm_now = day_minute(now)
-    offerable = {s.key for s in (load_skills() if skills is None else skills) if getattr(s, "offerable", False)}
+    offerable = {s.key for s in (load_skills(store) if skills is None else skills)
+                 if getattr(s, "origin", "") == "learned" and skill_offerable(store, s)[0]}
     out = []
     for row in store.routines(states=["active"]):
         if row.get("skill_id") not in offerable:
@@ -1388,7 +1579,10 @@ def tell(store: Any, skill: str, app: str, dayset: str, at_min: float, *, label:
     if dayset not in DAYSETS:
         raise ValueError(f"dayset must be one of {', '.join(DAYSETS)}")
     now = time.time() if now is None else float(now)
-    row = {"key": f"{skill}|{app}", "skill_id": skill, "app": app, "trigger": "told", "dayset": dayset,
+    sid = learned_id(store, skill)
+    # a learned skill's routine key is its id (phase L, design §5), the key the miner's onsets carry
+    key = f"skill:{sid}" if sid is not None else f"{skill}|{app}"
+    row = {"key": key, "skill_id": skill, "app": app, "trigger": "told", "dayset": dayset,
            "at_min": float(at_min) % 1440.0, "state": "candidate", "offer_mode": "early", "told": 1, "told_at": now,
            "label_ciphertext": store.cipher.encrypt(label) if label else None, "created_at": now, "updated_at": now}
     return store.save_routine(row, events=[("told", now, {"dayset": dayset, "at": hm(at_min)})])
@@ -1440,8 +1634,9 @@ def show(db: str | None = None) -> int:
         def ready(key: str) -> str:
             s = skills.get(key)
             if s is None:
-                return "skill not loaded"
-            if not s.offerable:
+                # a learned skill lives in the database (encrypted spec): this read-only look decrypts nothing
+                return "learned skill" if "#" in key else "skill not loaded"
+            if getattr(s, "origin", "") != "learned" or s.offer_class == "never":
                 return "not offered (context only)"
             try:
                 n = conn.execute("SELECT count(*) FROM skill_runs WHERE skill = ? AND checked = 1 AND"
@@ -1464,13 +1659,13 @@ def report(store: Any, *, at: float | None = None) -> dict[str, Any]:
     window and its best near miss with all the bars, unmapped counts, and what the run would change."""
     now = time.time() if at is None else float(at)
     cpu0 = time.thread_time()
-    skills = load_skills()
+    skills = load_skills(store)
     inputs = keyed_onsets(store, now - WINDOW_DAYS * 86400.0, now, skills=skills)
     mined = mine(inputs, now)
     changes = plan(store.routines(), mined, inputs, now)
     return {
         "at": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
-        "skills_with_routine_on": sorted(s.key for s in skills if getattr(s, "routine_on", ())),
+        "learned_skills": sum(1 for s in skills if getattr(s, "origin", "") == "learned"),
         "keys": {_short_key(k): {"onsets": len(v), "seen": len(inputs.seen.get(k, ())),
                                  "offerable": inputs.keys[k].offerable} for k, v in sorted(inputs.onsets.items())},
         "unmapped": dict(sorted(inputs.unmapped.items())), "by_yuki": inputs.by_yuki,

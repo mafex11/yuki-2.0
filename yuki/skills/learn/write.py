@@ -334,6 +334,14 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
     counts: Counter = Counter()
     existing = _existing(store)
     out: list[Planned] = []
+    # phase L lWire: the fill-policy scorer (yuki.skills.prefs, design §5) gives each skill's program slot its policy,
+    # the catalog's spec "means" (lCore's report: "the fill-policy scorer ... is lWire's")
+    try:
+        from yuki.skills.prefs import FillPolicyScorer
+
+        scorer: Any = FillPolicyScorer(store, now)
+    except Exception:  # noqa: BLE001 - no policy this night: "most used" at run time
+        scorer = None
     for g in groups:
         cap = caps.get(g.capability)
         if cap is None or not g.bar.passes:
@@ -347,6 +355,14 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         bound = bound_values(g, cap)
         p.spec = {"v": 1, "bound": bound, "menu": menu_line(cap, bound), "routes": list(p.compiled.routes)}
         p.provenance = provenance(g, cap, p.compiled, store, now)
+        if scorer is not None:
+            try:
+                means, scored = scorer.score(g, cap)
+            except Exception:  # noqa: BLE001
+                means, scored = {}, {}
+            if means:
+                p.spec["means"] = means
+                p.provenance["fill_policy"] = scored
         if old is not None:
             for k in NAME_PROVENANCE:
                 if k in old["prov"]:
