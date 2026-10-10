@@ -1,0 +1,173 @@
+# Volume: Spotify's own, another app's, the whole PC's, or Yuki's voice (docs/research/audit-2026-10-09/PLAN.md D2,
+# D4, B.2; Phase S-1). One skill for every volume request.
+#
+# Zero setup: Spotify's own slider by UI Automation's RangeValue, the Windows mixer and the PC's volume by Core Audio.
+# The driver is yuki/skills/spotify_route.py; Spotify's labels are data in yuki/connect/sites/spotify.toml and the
+# Spotify data this file relies on (the mixer link, the request budgets) is in connections/spotify.toml.
+#
+# Spotify's own volume is never faked with the mixer: for an in-app request the mixer is used for Spotify only when
+# connections/spotify.toml records the slider and the mixer entry as one control both ways (M6). Spotify's keys
+# (Ctrl+Up / Ctrl+Down) run only with Spotify already in front and no game in front; with no game in front a minimised
+# Spotify may be restored for its slider, then the previous window is put back in front.
+#
+# The control slot: "in_app" (the default) is the target's own control: Spotify's slider; for an app without one, its
+# own mixer level; the PC's own level for system. "mixer" is the Windows mixer entry, chosen by the user (their usual
+# for that app: volume:control@<app>). Every route below except Spotify's own needs no window and takes no focus, so it
+# runs with a game in front too.
+
+[connection]
+app = "audio"
+state_reader = "spotify_route"
+
+[skill.volume]
+end = "volume_change"
+kind = "change"
+menu = "set Spotify's own, an app's, system (PC) or own_voice level"
+done_line = "Volume set."
+learn_from = [["volume_change", "spotify"], ["volume_change", "master"]]
+handoff = true
+
+# Whose volume: the app the user names (its key), else the one app playing (two playing: asked), else the whole PC.
+# A call live and no app named: asked (never the call's own app by guess).
+[[skill.volume.slot]]
+name = "target"
+type = "app"
+options = ["system", "own_voice"]
+live = "playing"
+ask_in_call = true
+default = "system"
+ask = "Whose volume: an app's or the whole PC's?"
+
+[[skill.volume.slot]]
+name = "change"
+type = "points"
+
+[[skill.volume.slot]]
+name = "level"
+type = "number"
+min = 0
+max = 100
+
+[[skill.volume.slot]]
+name = "mute"
+type = "enum"
+options = ["on", "off"]
+
+[[skill.volume.slot]]
+name = "control"
+type = "enum"
+options = ["in_app", "mixer"]
+pref = "volume:control@{target}"
+default = "in_app"
+
+# -- Spotify's own volume ---------------------------------------------------------------------------------------------
+# (args.app names the app each rung acts on, so the run's ledger row names it from the start: D18.)
+
+# Rung A, no focus, no keys, no pointer (H1): Slider "Change volume" inside the Now playing bar, by RangeValue only, read
+# back. With a game in front only in the window states the live checks proved (none yet). Not while Spotify plays on
+# another device.
+[[skill.volume.route]]
+rung = "A"
+variant = "spotify_in_app"
+via = "driver"
+driver = "spotify_route"
+args = { app = "spotify" }
+call = "volume_slider"
+needs_focus = false
+when = [{ slot = "target", in = ["spotify"] }, { slot = "control", in = ["in_app"] }]
+game = "states"
+game_states = []
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "slider_still", target = "{target}", after_s = 5, same_source = true }
+
+# Spotify's mixer entry as its own volume: only when connections/spotify.toml records the two as one control both ways
+# (else this route says "couldn't" and nothing is set). No window: runs with a game in front.
+[[skill.volume.route]]
+rung = "A"
+variant = "spotify_mixer"
+via = "driver"
+driver = "spotify_route"
+args = { app = "spotify" }
+call = "volume_spotify_mixer"
+needs_focus = false
+when = [{ slot = "target", in = ["spotify"] }, { slot = "control", in = ["in_app"] }]
+game = "always"
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "level_still", target = "{target}", after_s = 3 }
+
+# -- other apps, the PC, Yuki's voice -----------------------------------------------------------------------------------
+
+# The PC's own level and Yuki's voice (Core Audio): before the mixer, so the run's row names "master" from its start.
+[[skill.volume.route]]
+rung = "A"
+variant = "system"
+via = "driver"
+driver = "spotify_route"
+args = { app = "master" }
+call = "volume_system"
+needs_focus = false
+when = { slot = "target", in = ["system"] }
+game = "always"
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "level_still", target = "{target}", after_s = 3 }
+
+[[skill.volume.route]]
+rung = "A"
+variant = "own_voice"
+via = "driver"
+driver = "spotify_route"
+call = "volume_own_voice"
+needs_focus = false
+when = { slot = "target", in = ["own_voice"] }
+game = "always"
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "level_still", target = "{target}", after_s = 3 }
+
+# An app's own level in the Windows mixer. An app with its own control (own_control) gets the mixer only for a mute
+# or when the user's control for it is "mixer"; never as a stand-in for its own control.
+[[skill.volume.route]]
+rung = "A"
+variant = "mixer"
+via = "driver"
+driver = "spotify_route"
+call = "volume_mixer"
+needs_focus = false
+game = "always"
+args = { app = "{target}", own_control = ["spotify"], not_apps = ["system", "own_voice"] }
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "level_still", target = "{target}", after_s = 3 }
+
+# -- Spotify's own volume, the rungs that take focus (never with a game in front; after every no-focus rung) -------
+
+# Spotify's own Ctrl+Up / Ctrl+Down, only with Spotify already in front and no game in front, read back on the slider.
+# (PLAN.md B.2 lists the keys and the restore as rung B; they are the app's own controls, so they are rung A variants
+# here, after the no-focus ones: rung B is the recorded click path, which needs a verified run before it may run.)
+[[skill.volume.route]]
+rung = "A"
+variant = "spotify_keys"
+via = "driver"
+driver = "spotify_route"
+args = { app = "spotify" }
+call = "volume_keys"
+needs_focus = true
+when = [{ slot = "target", in = ["spotify"] }, { slot = "control", in = ["in_app"] }]
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "slider_still", target = "{target}", after_s = 5, same_source = true }
+
+# The window-state rule, no game in front: Spotify minimised and its slider couldn't be set -> restore, set, put the
+# previous window back in front.
+[[skill.volume.route]]
+rung = "A"
+variant = "spotify_restore"
+via = "driver"
+driver = "spotify_route"
+args = { app = "spotify" }
+call = "volume_restored"
+needs_focus = true
+when = [{ slot = "target", in = ["spotify"] }, { slot = "control", in = ["in_app"] }]
+retry_after_acting = false
+done = { probe = "read_back" }
+recheck = { probe = "driver", driver = "spotify_route", call = "slider_still", target = "{target}", after_s = 5, same_source = true }
