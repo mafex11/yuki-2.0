@@ -814,6 +814,11 @@ class Hands:
         self._judge_client: Any = None
         self._forced_memo: dict[str, Any] = {}
         self._acts_cache: tuple[Any, dict[str, bool]] | None = None
+        #: bTalk (``brain = "all"``): this user turn's commit check for the hands (``yuki.brain.check.CommitCheck``,
+        #: made on first use, fresh each turn), and the windows the type hand typed into with no send (hwnd -> when):
+        #: a later click there is told that Yuki's text waits, so a send control is judged as the send it would be.
+        self._commit_check: Any = None
+        self._typed_waiting: dict[int, float] = {}
         # -- Phase S: the skill path (yuki.skills; PLAN.md Phase S, map-skills S3.4) --------------------------------
         #: The keys of this conversation's Skills menu, set by the conversation with its tools (empty: the skill path
         #: is off, and run_skill is the old learned-way hand).
@@ -837,6 +842,7 @@ class Hands:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
         self.halted = None
         self._forced_memo = {}
+        self._commit_check = None   # bTalk: a user turn is one request for the commit check too
         judge = self._authorizer
         if judge:
             try:
@@ -883,7 +889,15 @@ class Hands:
         not send it there (34-review H1/H2: a click on a button, menu item or link can send, delete or buy; typing puts
         words in a field) - by the judge's own request and two-stage decision, memoized per user turn by call and
         window, never with a window grant. Blocking (~1 s when it asks the model); off every loop. A check that
-        raises or cannot run holds the call (fails closed)."""
+        raises or cannot run holds the call (fails closed).
+
+        bTalk (brain rebuild rev 2, design 3; ``brain = "all"``): ``yuki.brain.check.one`` instead of the judge: the
+        consent rule (rows 1-6: a game in front, the Act switch, joins, sends, lasting effects) with a one-step commit
+        check. It always answers (``allowed`` true for a step it lets through); one that would send or join comes back
+        ``handover`` and goes to the planner (:meth:`_held_refusal`), never refused silently. The same swap covers the
+        hands, voice skill sends and rung B (``uia_route`` calls this)."""
+        if self._on_brain():
+            return self._consent(tool, tool_input, target, earlier)
         judge = self._judge()
         if judge is None:
             return None
@@ -901,6 +915,89 @@ class Hands:
         except Exception as exc:  # noqa: BLE001 - fail closed
             return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error",
                                    why=f"the check could not run ({type(exc).__name__})")
+
+    # -- bTalk: the new brain's consent rule for the hands (brain = "all") -------------------------------------
+
+    def _on_brain(self) -> bool:
+        """Whether spoken requests run on the new brain (``brain = "all"``, the bridge's ``on_brain``)."""
+        return bool(getattr(self.bridge, "on_brain", False))
+
+    def _check_log(self, event_type: str, **fields: Any) -> None:
+        if self.log is not None:   # the commit check's own fields are content-free (counts, effects, ms)
+            try:
+                self.log.event(event_type, who="voice_hand", **fields)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _checker(self) -> Any:
+        """This user turn's commit check (one Haiku call per may-commit step at most, memo per turn), on the worker
+        agent's client and settings (``check_model``, else ``judge_model``); no client: every check fails closed."""
+        if self._commit_check is None:
+            from yuki.brain.check import CommitCheck
+
+            runtime = getattr(self.bridge, "runtime", None)
+            agent = getattr(getattr(runtime, "worker", None), "agent", None)
+            settings = getattr(agent, "settings", None) if agent is not None else None
+            settings = settings if settings is not None else self.skill_settings
+            client = (lambda: agent.client) if agent is not None else None
+            self._commit_check = CommitCheck(client, settings, self._check_log)
+        return self._commit_check
+
+    #: A window the type hand typed into counts as holding Yuki's unsent text for this long (s).
+    TYPED_WAIT_S = 600.0
+
+    def _consent(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None,
+                 earlier: list[str] | None) -> Any:
+        """``yuki.brain.check.one`` over one hand (design 2.5, 2.6): the user's latest heard words (their own, never the
+        talker's wording) and up to 3 earlier turns; the code facts of the target (window, app, title, the control's
+        role and name, Yuki's unsent text there). Fails closed: an error is an ask."""
+        try:
+            from yuki.brain.check import one
+        except Exception as exc:  # noqa: BLE001 - no brain in this build: held, never let through unchecked
+            return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error", handover=False,
+                                   act_off="", row=0, why=f"the check could not run ({type(exc).__name__})")
+        recent = [" ".join(str(w).split()) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
+        words = recent[-1:]
+        before = [*recent[-4:-1], *[" ".join(str(e).split()) for e in (earlier or []) if str(e).strip()]][-3:]
+        facts = dict(target or {})
+        raw = facts.get("hwnd")
+        hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
+        facts["hwnd"] = hwnd
+        now = time.monotonic()
+        self._typed_waiting = {h: at for h, at in self._typed_waiting.items() if now - at < self.TYPED_WAIT_S}
+        if hwnd is not None and hwnd in self._typed_waiting:
+            facts["typed_pending"] = True
+        try:
+            verdict = one(tool, tool_input, facts, words=words, checker=self._checker(), earlier=before,
+                          log=self._check_log)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            verdict = SimpleNamespace(allowed=False, decision="ask_user", question="", source="error", handover=False,
+                                      act_off="", row=0, why=f"the check could not run ({type(exc).__name__})")
+        if self.log is not None:
+            self.log.event("consent", who="voice_hand", tool=tool, allowed=bool(getattr(verdict, "allowed", False)),
+                           row=getattr(verdict, "row", None), source=getattr(verdict, "source", None),
+                           handover=bool(getattr(verdict, "handover", False)), typed=bool(facts.get("typed_pending")))
+        return verdict
+
+    def _held_refusal(self, verdict: Any) -> "_Refused":
+        """The refusal for a call the check did not let through. Under ``brain = "all"``: a step that would send or join
+        is handed over to the planner (``handover``: escalated by code, never refused silently, design 3 / L10); an app
+        whose Act switch is off says so; anything else is held with the check's question. Otherwise as before."""
+        why = getattr(verdict, "why", "") or "not plainly asked for"
+        if self._on_brain():
+            if getattr(verdict, "handover", False):
+                return _Refused(f"handed over: a step that could send or join something is planned from their own "
+                                f"words ({why}); nothing was done by the hand", handover=True)
+            off = getattr(verdict, "act_off", None)
+            if isinstance(off, str) and off:
+                return _Refused(f"Act is switched off for {off} in Yuki's settings, so Yuki does not click, type or "
+                                f"press keys there; nothing was done", act_off=off)
+            question = str(getattr(verdict, "question", "") or "")
+            if not question:
+                # a refusal of the rule's own (a game in front: "after the round?"), not a question: said as it is
+                return _Refused(f"not done, by Yuki's own rule: {why}; nothing was done")
+            return _Refused(f"held by Yuki's own check: {why}", held=question)
+        return _Refused(f"held by Yuki's own check: {why}", held=str(getattr(verdict, "question", "") or ""))
 
     def _force_judge(self, judge: Any, tool: str, tool_input: dict[str, Any], target: dict[str, Any],
                      words: list[dict[str, Any]], earlier: list[str], signature: str) -> Any:
@@ -1051,8 +1148,7 @@ class Hands:
             target["element"] = "tabs " + ", ".join(f'"{n}"' for n in tool_input.get("tabs") or [])
         verdict = self.authorize(tool, tool_input, target)
         if verdict is not None and not getattr(verdict, "allowed", False):
-            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
-                           held=str(getattr(verdict, "question", "") or ""))
+            raise self._held_refusal(verdict)
 
     # -- the desktop summary ------------------------------------------------------
 
@@ -1489,7 +1585,8 @@ class Hands:
             note, key = _UNCONFIRMED_NOTE, "not_verified"
         else:
             note, key = _FAILED_NOTE, "failed"
-        if ((((name in INSTANT_HANDS or name == SKILL_HAND) and not facts.get("refused")) or facts.get("stale"))
+        if ((((name in INSTANT_HANDS or name == SKILL_HAND) and not facts.get("refused")) or facts.get("stale")
+             or facts.get("handover"))
                 and not facts.get("settled")
                 and self.bridge is not None and callable(getattr(self.bridge, "escalate", None))):
             # Tried and did not take effect (not refused, not "already so"): the thinker gets the same request
@@ -1501,6 +1598,8 @@ class Hands:
             except Exception:  # noqa: BLE001
                 ack = False
             context = facts.get("skill_context") if name == SKILL_HAND else None
+            if facts.get("handover"):
+                context = HANDOVER_CONTEXT.format(hand=name)   # bTalk: what the planner is told, labelled
             try:
                 try:
                     if context:
@@ -1957,6 +2056,31 @@ class Hands:
                            keep_question=bool(facts.get("keep_question")), focus_taken=bool(facts.get("focus_taken")),
                            act_off=bool(facts.get("act_off")), memory_slow=bool(facts.get("memory_slow")),
                            unsure_focus=bool(facts.get("unsure_focus")))
+        if facts.get("handover") and self.bridge is not None and callable(getattr(self.bridge, "escalate", None)):
+            # bTalk (design 3, L10): a skill run that would send or join is handed to the planner with the user's exact
+            # words (its consent rule, commit check and send countdown decide), never refused silently
+            ack = False
+            try:
+                ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
+            except Exception:  # noqa: BLE001
+                ack = False
+            try:
+                passed = await self.bridge.escalate(params, name, args, report, acked=ack,
+                                                    context=HANDOVER_CONTEXT.format(hand=name))
+            except Exception as exc:  # noqa: BLE001
+                passed = False
+                if self.log is not None:
+                    self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
+            if passed:
+                if self.log is not None:
+                    self.log.event("hands", op=name, escalated=True, handover=True, acked=ack,
+                                   call=params.tool_call_id, request_id=hand_id)
+                if ack:
+                    self.bridge.acked()
+                await params.result_callback({"not_done": report[:700], "passed_on": True,
+                                              "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=ack))
+                return
         if outcome == "handed_over" and facts.get("handoff_skill") and self.bridge is not None \
                 and callable(getattr(self.bridge, "escalate", None)):
             # rung C: its routes didn't get there; the thinker does it with the skill pinned (never with a game in
@@ -2092,8 +2216,7 @@ class Hands:
         verdict = self.authorize(SKILL_HAND, {"skill": skill_key, "slots": dict(slots)}, {"app": skill.app},
                                  force=joins and not sends)
         if verdict is not None and not getattr(verdict, "allowed", False):
-            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
-                           held=str(getattr(verdict, "question", "") or ""))
+            raise self._held_refusal(verdict)
 
     def _skill_hand(self, args: dict[str, Any], hand_id: str | None = None,
                     turn: str | None = None) -> tuple[bool, str, dict[str, Any]]:
@@ -2115,6 +2238,10 @@ class Hands:
             self._judge_skill(skill_key, slots)
         except _Refused as exc:
             facts.update(refused=True, outcome="refused", held=exc.held is not None, question=exc.held or "")
+            if exc.handover:
+                facts["handover"] = True   # bTalk: a voice skill send (or join) goes to the planner by code
+            if exc.act_off is not None:
+                facts["act_off"] = exc.act_off
             return False, str(exc), facts
         from yuki.skills import engine
 
@@ -2434,6 +2561,8 @@ class Hands:
                 facts["question"] = exc.held
             if exc.act_off is not None:
                 facts["act_off"] = exc.act_off   # ... or says Act is off for that app in Settings (v3.18)
+            if exc.handover:
+                facts["handover"] = True   # ... or (bTalk) it goes to the planner by code: never refused silently
             if exc.stale:
                 # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
                 # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
@@ -2896,12 +3025,14 @@ class Hands:
         self._refuse_if_act_off(facts["app"])          # 34-review H5
         # 34-review H1/H2: a click on a button, a menu item or a link can send, delete or buy: Yuki's own check reads
         # the user's heard words and this call; other clicks only as the user's policy says
-        verdict = self.authorize("click", {"hwnd": hwnd, "element": role_name},
-                                 {"hwnd": hwnd, "app": facts["app"], "title": title, "element": role_name},
+        target = {"hwnd": hwnd, "app": facts["app"], "title": title, "element": role_name}
+        if self._on_brain():
+            # bTalk: the consent rule reads the control's own role and name (the read's, never the talker's word)
+            target.update(role=str(item.get("role") or ""), name=str(item.get("name") or ""))
+        verdict = self.authorize("click", {"hwnd": hwnd, "element": role_name}, target,
                                  force=str(item.get("role") or "") in RISKY_CLICK_ROLES)
         if verdict is not None and not getattr(verdict, "allowed", False):
-            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
-                           held=str(getattr(verdict, "question", "") or ""))
+            raise self._held_refusal(verdict)
         lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("click", {"element": item["id"], "read": items.read, "expect_hwnd": hwnd})
@@ -2973,10 +3104,11 @@ class Hands:
                                  {"hwnd": hwnd, "app": facts.get("app"), "title": self._title_shown(hwnd),
                                   "element": facts["target"]}, force=sends)
         if verdict is not None and not getattr(verdict, "allowed", False):
-            raise _Refused(f"held by Yuki's own check: {getattr(verdict, 'why', '') or 'not plainly asked for'}",
-                           held=str(getattr(verdict, "question", "") or ""))
+            raise self._held_refusal(verdict)
         facts["sent_at"] = time.monotonic()
         outcome = self._dispatcher.dispatch("type_text", {"text": text, "expect_hwnd": hwnd})
+        if self._on_brain() and str(hwnd).lstrip("-").isdigit():
+            self._typed_waiting[int(hwnd)] = time.monotonic()   # bTalk: Yuki's words wait there, unsent
         from yuki.agent.loop import action_verdict
 
         verified, why = action_verdict("type_text", outcome)
@@ -3598,6 +3730,12 @@ def hand_run(trace: dict[str, Any], *, session_id: Any, injected: list[int]) -> 
             "numbers": numbers, "app": trace.get("app"), "injected": list(injected)}
 
 
+#: bTalk (``brain = "all"``): what the planner is told, as labelled context, when a hand is handed over because it
+#: could send or join (design 3, L10): the user's exact words go with it as their words.
+HANDOVER_CONTEXT = ("Yuki's voice did not run its {hand} hand: the step could send, post or join something, which only "
+                    "a plan does, from the user's own words (the consent rule and the commit check decide).")
+
+
 class _Refused(Exception):
     """A hand refused before doing anything (the message is the report).
 
@@ -3606,8 +3744,10 @@ class _Refused(Exception):
     """
 
     def __init__(self, message: str, *, stale: bool = False, held: str | None = None,
-                 act_off: str | None = None) -> None:
+                 act_off: str | None = None, handover: bool = False) -> None:
         super().__init__(message)
+        #: bTalk (``brain = "all"``): the step could send or join: handed over to the planner by code (design 3, L10).
+        self.handover = handover
         self.stale = stale
         #: Held by the authorization check (v3.18): its question for the user (``""`` without one); ``None``: not held.
         self.held = held

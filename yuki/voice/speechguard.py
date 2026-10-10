@@ -149,12 +149,15 @@ class SpeechGuard:
         timeout_s: How long a verdict is waited for once the audio is ready, at most, before the line goes out.
         judge: A stand-in for the model call in tests: ``async (text, said, user) -> answer``.
         shadow: Score and log only, never block (v3.16, the marker channel; module docstring).
+        code_only: bTalk (brain rebuild rev 2, design 3; ``brain = "all"``): no model call at all; only the two code
+            rules stay (Yuki's own internal words, an exact repeat since the user last spoke), and every other line
+            goes out at once.
     """
 
     def __init__(self, client: Any, model: str, *, log: Any = None,
                  context: Callable[[], dict[str, Any]] | None = None, timeout_s: float = 2.5,
                  judge: Callable[[str, list[str], str], Any] | None = None, session: str = "",
-                 shadow: bool = False) -> None:
+                 shadow: bool = False, code_only: bool = False) -> None:
         self.client = client
         self.model = model
         self.log = log
@@ -163,6 +166,7 @@ class SpeechGuard:
         self.judge = judge
         self.session = session
         self.shadow = bool(shadow)
+        self.code_only = bool(code_only)
         #: ``()``: a line was dropped (the turn log keeps only what was heard); set by the conversation.
         self.on_drop: Callable[[], None] | None = None
         self._said: deque[tuple[float, str, str]] = deque(maxlen=12)   # (at, words, normalised) of lines let through
@@ -213,6 +217,12 @@ class SpeechGuard:
         said = self._recent(now)
         written = [t for at, t in self._written if now - at < REPEAT_S]
         self._written.append((now, text.strip()))
+        if self.code_only:
+            # bTalk: the model call is off (design 3); the two code rules above decided, and the line goes out
+            self.stats["free"] += 1
+            self.heard(text)
+            fut.set_result(Verdict(True, by="free"))
+            return fut
         if len(norm.split()) <= FREE_WORDS and (not first or known_ok or norm in _APPROVED_FIRST):
             self.stats["free"] += 1
             self.heard(text)   # short lines go straight out: remember them for the repeat check now
