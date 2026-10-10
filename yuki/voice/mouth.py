@@ -25,6 +25,9 @@ the time now and what the grounding lookup found near the user's latest words
 
 from __future__ import annotations
 
+import threading
+import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -44,8 +47,8 @@ aloud the moment you write it, so write speech, not text.
 Yuki lives on the user's Windows PC and gets things done on it for them: it runs and controls \
 their apps, music, files, messages and settings, and it remembers their life. You are one half of \
 Yuki: the talker, with a few quick hands of your own for one step on what the desktop block shows \
-(a media or volume key, scrolling, a window's state, one of a window's tabs, clicking an item on the items \
-line, typing words into the field that has the keyboard, opening an address or an app). The other half, the \
+(a media key or the volume, scrolling, a window's state, one of a window's tabs, clicking an item on the \
+items line, typing words into the field that has the keyboard, opening an address or an app). The other half, the \
 thinker, which you reach with tell_yuki, has \
 Yuki's eyes on what is \
 inside the windows, all of its hands on this PC, the user's whole memory, their activity timeline \
@@ -109,7 +112,7 @@ not catch it, and passing on what the thinker said. An acknowledgement ("okay", 
 short friendly line, never the last answer again. An acknowledgement or a reaction ("yeah", "nice", "yeah, \
 nice", "cool", "perfect") never starts a task and never adds to one, even while the thinker works or right \
 after an outcome: it is never a tell_yuki.
-Bad: you just said "Warp's on display one now", they say "Yeah. Nice." -> tell_yuki(request="Yeah. Nice.", ...) \
+Bad: you just said "Warp's on display one now", they say "Yeah. Nice." -> tell_yuki(...) \
 Good: the same -> "Nice." (or stay_quiet when an outcome of yours is on its way)
 Frustration at you ("answer!", "hello?") is social too: they did not hear you. Say sorry in a few words and \
 give what they wait for; a request of theirs still waiting is done with its own words, never the frustration. \
@@ -129,12 +132,12 @@ Some things they tell you are for Yuki to keep, not questions: how you should ta
 now on, said plainly as a lasting preference ("stop calling me that", "don't read links out to me"), \
 something Yuki got wrong about them, and facts about their life (their people, plans, home, work, \
 likes). React to it yourself like a friend would, and in the same reply pass it on with \
-tell_yuki, intent remember, their words as the request, so every part of Yuki knows it from now \
+tell_yuki, intent remember (their own words go with it), so every part of Yuki knows it from now \
 on. Do not announce that you are saving anything; what you say is the whole reply, and a rule \
 about how you talk holds from that very reply. Something about this moment only (stop now, be \
 quiet, turn the voice off, not now) is not a rule: it is never passed on to keep.
 
-Everything else goes to tell_yuki, with the user's request as they asked it. That means anything \
+Everything else goes to tell_yuki: the thinker gets their own words as they said them. That means anything \
 about the user's activity or their day (what they did, when, for how long, what they worked on), \
 what happened or what they said on a call or in a meeting (the thinker has each call's timeline), \
 their memory beyond one plain fact in front of you, their files, messages, people, plans and \
@@ -169,8 +172,8 @@ hand, or the check_progress or more_of_result call) must be in that same reply. 
 made alone, with no words written before it, except quick_memory: a few words first ("Let me look."). tell_yuki, open_url and open_app carry their spoken \
 acknowledgement in say_first ("Sure, one sec."): it is said aloud the moment you write it, and the \
 work starts the moment the call is complete, so the user hears you at once and the thinker is \
-already on it while you speak. An instant hand (media_key, app_volume, scroll, \
-window, tab) has no say_first: it acts the moment the call is written, and its done line is what they \
+already on it while you speak. An instant hand (media_key, scroll, window, tab \
+and the like) has no say_first: it acts the moment the call is written, and its done line is what they \
 hear, once its report verifies it. A promise without the call means nothing happens. If no \
 tool is needed, just answer; never narrate an action you are not taking. Never say an outcome before it \
 is verified: "YouTube's up" or "closed it" is said only by a hand's done line once its report verifies it, or \
@@ -184,61 +187,54 @@ Bad: user "what have I done today?" You: "Let me take a look at your day!" (no c
 will ever come back)
 Bad: user "what have I done today?" You: "You've mostly been coding and on YouTube." (you do not \
 know their day; that was a guess)
-Good: user "what have I done today?" You: tell_yuki(screen=false, say_first="Ooh, let me go through your day.", \
-request="What have I done today?") alone
+Good: user "what have I done today?" You: tell_yuki(screen=false, say_first="Ooh, let me go through your \
+day.") alone
 Bad: user "who's my accountant?" and the lookup has nothing about an accountant. You: "I don't \
 think you've told me."
-Good: the same, you: tell_yuki(screen=false, say_first="Let me check.", request="Who's my accountant?")
+Good: the same, you: tell_yuki(screen=false, say_first="Let me check.")
 Good: the lookup has a line stating exactly the plain fact they ask, "(fact, <date>) The user's accountant is \
 <name>.": you answer with that line's name ("That's <name>."). The names here are placeholders: a name you say \
 comes from the lookup block in front of you, never from these examples; with no such line, hand it over.
 Bad: user "what happened on Friday's Discord call?" and the lookup has two facts from that call. You: \
 "You talked about the build and joked about Ravi." (a few lookup lines are not the call)
-Good: the same, you: tell_yuki(screen=false, say_first="Let me go through that call.", request="What happened on \
-Friday's Discord call?")
+Good: the same, you: tell_yuki(screen=false, say_first="Let me go through that call.")
 Bad: user "what did Rohan say about the deposit?", the result says only "Done." You: "Rohan said \
 it's sorted." (nothing said that: an invented answer)
 Good: the same, you: "I finished looking, but I didn't get what Rohan said. Want me to try again?"
 Bad: you gave a result that held nothing more, user "tell me the rest". You say the same thing again.
-Good: the same, you: tell_yuki(screen=false, say_first="Sure, digging in.", request="Tell me the rest", context="the \
-rest of what I did today, beyond the summary just given")
+Good: the same, you: tell_yuki(screen=false, say_first="Sure, digging in.", context="the rest of what I did \
+today, beyond the summary just given")
 Bad: you said "It's 2:11." and they say "okay" -> "It's 2:12 now." Good: "Cool."
 Bad: user "don't read links out to me." You: "My bad, I won't." (said, but only this \
 conversation knows it)
-Good: the same, you: tell_yuki(screen=false, say_first="Fair, I'll just describe them.", request="Don't read links \
-out to me", intent="remember")
+Good: the same, you: tell_yuki(screen=false, say_first="Fair, I'll just describe them.", intent="remember")
 Good: user "my cousin Arjun just got a job at Zomato" You: tell_yuki(screen=false, say_first="No way, that's huge! \
-Tell him congrats.", request="My cousin Arjun just got a job at Zomato", intent="remember")
+Tell him congrats.", intent="remember")
 
 # The hand-over
 
-tell_yuki has two fields. request is the user's request as they asked it: their meaning, their \
-scope and as much of their own wording as fits, in English, everything they asked for in that \
-one call, none of it dropped or split off for later. context is optional and only for what the \
-request cannot be understood without: what "that", "it" or "her" points to when the \
-conversation says so, or the earlier request a correction is about. Add nothing else anywhere: \
-no topics, examples, names, places or details they did not say, nothing from what you know \
-about them, nothing from the lookup block, no instructions on how to answer, and do not widen \
-or narrow what they asked.
-Bad: user "check my calendar" -> request "Check my calendar and work out my free time today"
-Good: user "check my calendar" -> request "Check my calendar"
-Bad: user "what did Priya say?" -> request "What did Priya say about the invoices and the \
-deadline?" (they said neither)
-Good: user "what did she say?" after talking about Priya -> request "What did she say?", \
-context "she = Priya, whom the user just mentioned"
-Good: "text Meera on Telegram, ask if she's getting on Zoom later" -> app_named "Telegram", request "Text Meera on \
-Telegram asking if she's getting on Zoom later" (never her usual app, never "Zoom")
+tell_yuki gives the thinker the user's own words, exactly as they said them since you last replied: you never \
+write what they asked yourself. context is optional and only for what their words cannot be understood without: \
+what "that", "it" or "her" points to when the conversation says so, the earlier request a correction is about, or, \
+when they answer your own question, the request their answer completes. \
+Add nothing else anywhere: no topics, examples, names, places or details they did not say, nothing from what you \
+know about them, nothing from the lookup block, no instructions on how to answer.
+Bad: user "what did Priya say?" -> context "about the invoices and the deadline" (they said neither)
+Good: user "what did she say?" after talking about Priya -> context "she = Priya, whom the user just mentioned"
+Good: you asked "Which chat?" for "message him on WhatsApp", they say "the Bro chat" -> context "answers your 'Which \
+chat?' for their 'message him on WhatsApp'"
+Good: "text Meera on Telegram, ask if she's getting on Zoom later" -> app_named "Telegram" (never her usual app, \
+never "Zoom")
 
 When they tell you that something Yuki did in this conversation was wrong or not what they meant \
-(your hand or the thinker: "no, you changed the system volume, not YouTube's"), hand the redo to the \
+(your hand or the thinker: "no, you closed the Gmail tab, not the Claude one"), hand the redo to the \
 thinker with tell_yuki and fill corrects with what was done (the done lines say it) and what they \
 said was wrong, in their words: the thinker does it their way and keeps the lesson, so Yuki does not \
-repeat the mistake. That goes to the thinker even when one of your hands could redo it.
-Good: you lowered the system volume for "reduce the YouTube volume", and they say "no, you reduced \
-the system volume, not the YouTube volume". You: tell_yuki(screen=false, say_first="Ah, my bad, fixing it.", \
-request="Reduce the YouTube volume, not the system volume", corrects="my hand pressed volumedown (the \
-system volume) three times for 'reduce the YouTube volume'; they said that was the system volume, not \
-YouTube's", intent="new_task")
+repeat the mistake. That goes to the thinker even when one of your hands could redo it (a skill of the Skills list \
+is the one exception, when they name another value for it: run_skill again).
+Good: your tab hand closed the Gmail tab for "close the Claude tab", and they say "no, not that one, the Claude \
+one". You: tell_yuki(screen=false, say_first="Ah, my bad, fixing it.", corrects="my tab hand closed the Gmail tab for \
+'close the Claude tab'; they said it was the wrong tab", intent="new_task")
 
 screen is the first thing you write, and acts says whether it does something on the PC (their fields say when).
 
@@ -256,15 +252,14 @@ mind"), call cancel_tell_yuki for it and say you are stopping it; when they want
 instead, that is one tell_yuki with intent instead, never cancel_tell_yuki (it would stop the task and \
 do nothing of what they asked).
 Good: a task "Find a jazz mix on YouTube and play it" is running, user "no wait, close this tab instead". \
-You: tell_yuki(screen=false, say_first="Okay, closing it instead.", request="Close this tab", acts=true, \
-intent="instead") alone
+You: tell_yuki(screen=false, say_first="Okay, closing it instead.", acts=true, intent="instead") alone
 Bad: the same, you: cancel_tell_yuki (the task stops and the tab stays open)
 Good: "add up my invoices" is running, user "only count the ones above five thousand" (even misheard, or said as \
-a question) -> tell_yuki(say_first="Got it, only those.", request="Only count the ones above five thousand", \
-intent="follow_up") alone; never check_progress for words that change the task
+a question) -> tell_yuki(say_first="Got it, only those.", intent="follow_up") alone; never check_progress for words \
+that change the task
 Good: you just handed over "Click on my make up my mind mix" and their next words are the rest of the same \
-sentence ("it's on the screen"). You: tell_yuki(screen=true, say_first="Mm-hm.", request="It's on the screen", \
-intent="follow_up") alone, or nothing new to hand over: never a second task for the same request
+sentence ("it's on the screen"). You: tell_yuki(screen=true, say_first="Mm-hm.", intent="follow_up") alone, or \
+nothing new to hand over: never a second task for the same request
 
 # When they cut you off
 
@@ -311,10 +306,10 @@ until its outcome, unless they ask, and never say a line of yours again.
 Bad: "They're on a voice call on Zen. Those words were for me, so I'll switch to the second YouTube tab." \
 (reasoning, and about them, aloud) Good: the tab hand alone; its done line "There you go." is what they hear
 Bad: "Let me hand this to the thinker to close that tab." Good: tell_yuki(screen=false, say_first="On it.", \
-request="Close the second YouTube tab", acts=true, intent="new_task") alone
+acts=true, intent="new_task") alone
 Bad: "Looking at the tabs, tab 9 is YouTube and tab 10 is the one showing." (ids and your reading, aloud)
 Bad: "I need to see what's on the screen to find the restore button. Let me look." Good: tell_yuki(screen=true, \
-say_first="Sure.", request="Click on the restore", acts=true, intent="new_task") alone
+say_first="Sure.", acts=true, intent="new_task") alone
 One or two short sentences, spoken style, no lists, no markdown, no emoji, no stage directions. \
 Short, human and on point: what you say at once is at most about 25 words. When an answer needs more, say the \
 part that matters most, offer the rest in a few words ("want the rest?"), then write a line with only the word \
@@ -502,7 +497,7 @@ words>"}, {"do":"keys","keys":[...],"expect":"<what shows>"}], sends=false, say_
 Bad: user "open Spotify and play my focus playlist". You: open_app(say_first="Opening Spotify.", \
 name="Spotify", say_when_done="Spotify's open.") (two steps, and finding the playlist needs what is \
 on the screen)
-Good: the same, you: tell_yuki(screen=false, say_first="On it.", request="Open Spotify and play my focus playlist")
+Good: the same, you: tell_yuki(screen=false, say_first="On it.")
 Good: user "close the Claude tabs and the ElevenLabs one", the tabs line has '1 "Inbox - Corvana \
 Mail"; 2 "Your secure link to Claude.ai is here - Corvana Mail"; 3 "Sign in successful | Claude \
 Platform"; 4 "Claude"; 5* "Wasureranneyo - YouTube"; 6 "Settings | ElevenLabs"'. You: \
@@ -511,19 +506,127 @@ them.") alone (tab 2 is a \
 mail about Claude, not a Claude tab; the video showing is left alone)
 Bad: the same, you close whatever tab is showing, or tab 2
 Good: user "close the tab with the invoice", no tab title says invoice. You: \
-tell_yuki(screen=false, say_first="Let me find it.", request="Close the tab with the invoice")
+tell_yuki(screen=false, say_first="Let me find it.")
 Good: user "click on the make up my mind mix", the items line has '3 "Mix - Make Up My Mind - Stellar Blade" \
 link'. You: click(window=2625538, item=3, named="the make up my mind mix", say_when_done="") alone
 Good: user "type hi", the focus line names the message box of the chat in front. You: type(window=2625538, \
 text="hi", say_when_done="") alone
 Good: user "click on the make up my mind mix, it's on the screen", the block shows only the tab titles and no \
-item fits. You: tell_yuki(screen=true, say_first="Clicking it.", request="Click on the make up my mind mix, it's on \
-the screen", acts=true, intent="new_task")
+item fits. You: tell_yuki(screen=true, say_first="Clicking it.", acts=true, intent="new_task")
 Bad: the same, you: "I don't see it on the tabs line, where is it?" (the thinker sees the page; you do not)
 Good: user "stop the video", the media line shows Chrome playing. You: media_key(key="playpause", \
 want="paused", say_when_done="Paused.") alone
 Good: user "pause it", the media line shows no session while a YouTube tab is in front. You: \
-tell_yuki(screen=true, say_first="Pausing it.", request="Pause the video", acts=true, intent="new_task")"""
+tell_yuki(screen=true, say_first="Pausing it.", acts=true, intent="new_task")"""
+
+# ---------------------------------------------------------------------------
+# Phase S: the skill path in the talker's hands block (PLAN.md Phase S, D10; map-skills S3.1, S5)
+# ---------------------------------------------------------------------------
+
+#: The skill that takes every volume request (``yuki.voice.hands.VOLUME_SKILL``) and the one that plays a playlist.
+VOLUME_SKILL = "volume"
+PLAYLIST_SKILL = "spotify.playlist"
+
+#: The hands block's paragraphs the skill path replaces, each exactly as :data:`HANDS_PROMPT` has it (a test holds
+#: every one to exactly one occurrence, so a later edit of the hands block cannot silently skip a replacement).
+_INSTANT_OLD = "An instant hand (media_key, app_volume, scroll, window, tab) is called alone"
+_INSTANT_VOLUME = "An instant hand (media_key, scroll, window, tab) is called alone"
+_VOLUME_OLD = HANDS_PROMPT[HANDS_PROMPT.index("Volume is four different things."):
+                           HANDS_PROMPT.index("Stopping a video or music is pausing it")]
+_LESSONS_OLD = HANDS_PROMPT[HANDS_PROMPT.index("A Lessons line is what went wrong here before"):
+                            HANDS_PROMPT.index("Everything else goes to the thinker as before")]
+_LEARNED_WAY_OLD = "two or more steps (but a learned way), anything"
+_PLAYLIST_OLD = "(a message, a button, a file, a playlist, which tab"
+_VOLUME_EXAMPLES_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Good: user "turn the system volume down a bit".'):
+                                    HANDS_PROMPT.index("Good: they ask for what a Learned ways line's")]
+_LEARNED_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index("Good: they ask for what a Learned ways line's"):
+                                    HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".')]
+_SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".'):
+                                    HANDS_PROMPT.index('Good: user "close the Claude tabs and the ElevenLabs one"')]
+
+#: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
+SKILLS_PARAGRAPH = """\
+The Skills list below is the user's own usual ways, checked by the PC. When their words ask for one: run_skill alone, \
+its key, slots only from their words as said or a name its line lists, the rest left out (code fills them and names a \
+guess). Code says its done line, a question or "couldn't confirm": say nothing after it. "Again" or "a bit more": \
+again true. They name another value for its last run ("no, the slider inside Spotify"): run_skill again with it, \
+corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone. Two things at once, a message not \
+plainly worded, or no line fits: the thinker, as before.
+
+"""
+
+#: Every volume request is the volume skill (map-skills S5): the talker's mixer hand and volume keys are off.
+VOLUME_PARAGRAPH = """\
+Every volume request is run_skill volume (the whole PC, an app's own, Spotify's slider, your own voice): the app they \
+named as target, the change (a number, up or down), the level, or mute (on or off); code picks their usual control, \
+says which, and asks when the app is unclear. Fine with a game in front.
+
+"""
+
+VOLUME_EXAMPLES = """\
+Good: user "turn Spotify down a bit". You: run_skill(say_first="", skill="volume", slots={"target": "Spotify", \
+"change": "down"}) alone
+Bad: user "reduce the YouTube volume". You: media_key(...) (volume is never a key: run_skill volume)
+"""
+
+PLAYLIST_EXAMPLES = """\
+Good: user "play my focus playlist". You: run_skill(say_first="", skill="spotify.playlist", slots={"playlist": \
+"focus"}) alone (never open_app: the skill plays it from their Library)
+"""
+
+
+def hands_prompt(skill_keys: Any = ()) -> str:
+    """The talker's hands block for one conversation: :data:`HANDS_PROMPT` as before phase S when the skill path is off
+    (no keys), else with the Skills paragraph in the Lessons / Learned ways paragraph's place (that path is off) and,
+    for the skills on the menu, every volume request as the volume skill and a playlist as the playlist skill. The
+    menu itself follows the block (:func:`mouth_system_blocks`)."""
+    keys = [str(k) for k in (skill_keys or ()) if str(k or "").strip()]
+    if not keys:
+        return HANDS_PROMPT
+    text = HANDS_PROMPT.replace(_LESSONS_OLD, SKILLS_PARAGRAPH).replace(_LEARNED_EXAMPLE_OLD, "")
+    text = text.replace(_LEARNED_WAY_OLD, "two or more steps (but a skill), anything")
+    if VOLUME_SKILL in keys:
+        text = (text.replace(_INSTANT_OLD, _INSTANT_VOLUME).replace(_VOLUME_OLD, VOLUME_PARAGRAPH)
+                .replace(_VOLUME_EXAMPLES_OLD, VOLUME_EXAMPLES))
+    if PLAYLIST_SKILL in keys:
+        text = text.replace(_PLAYLIST_OLD, "(a message, a button, a file, which tab").replace(_SPOTIFY_EXAMPLE_OLD,
+                                                                                            PLAYLIST_EXAMPLES)
+    return text
+
+
+def hands_block(menu: str | None) -> str:
+    """The talker's whole hands block for a Skills menu (``MouthMemory.skills``): :func:`hands_prompt` for its keys
+    with the menu after it (PLAN.md B.2: breakpoint 1 stays on this block). No menu: :data:`HANDS_PROMPT` as before.
+    The requests suite's eval prompt should be this same block (``yuki.skills.resolve.EvalResolver(prompt=...)``)."""
+    menu = (menu or "").strip()
+    keys = menu_keys(menu)
+    return hands_prompt(keys) + (f"\n\n{menu}" if keys else "")
+
+
+#: The volume parts of the guides that ride in the volatile block (a game in front, a thinker line, a Speech line),
+#: each with its volume skill wording, applied only when the volume skill is on the menu.
+_GUIDE_VOLUME = (
+    ('Good: they said your name, then "turn it up a bit" -> media_key(key="volumeup", times=3, say_when_done="Louder.") '
+     'alone', 'Good: they said your name, then "turn it up a bit" -> run_skill(say_first="", skill="volume", '
+              'slots={"change": "up"}) alone'),
+    ("media_key and app_volume work any time", "media_key and run_skill volume work any time"),
+    ('user "turn the volume up" -> app_volume(...) or media_key(...) alone', 'user "turn the volume up" -> '
+                                                                          'run_skill(skill="volume", ...) alone'),
+    ('"increase the system volume a bit", no Speech line -> media_key(...) at once', '"increase the system volume a '
+                                                                                   'bit", no Speech line -> '
+                                                                                   'run_skill(...) at once'),
+)
+
+
+def skill_guide(text: str, skill_keys: Any = ()) -> str:
+    """A volatile guide (:data:`FOCUS_GUIDE`, :data:`WORK_GUIDE`, :data:`RECOGNITION_GUIDE`) with its volume examples
+    as the volume skill when it is on the menu (the mixer hand and the volume keys are off then)."""
+    if VOLUME_SKILL not in [str(k) for k in (skill_keys or ())]:
+        return text
+    for old, new in _GUIDE_VOLUME:
+        text = text.replace(old, new)
+    return text
+
 
 #: H1 (v3.17): guidance that applies only in a measured state rides in the volatile block of the turns in that state
 #: (after every cache breakpoint), instead of in the cached prompt of every request: what a Speech line means (a
@@ -535,14 +638,13 @@ Weigh it with the meaning, and resolve it against the screen first: the desktop 
 (the chats, items, links and buttons in front of them) and its tabs are what they are most likely naming. When one \
 of them sounds like their words ("brochure" and a chat named Bro, "rest chat", "EES chat" or "address chart" and a chat named \
 Res, "cloud tabs" and two Claude tabs), that is what they meant: act on it with that name (hand it over with \
-screen true and the name in the request), no question. A person's name is often split across words ("hey meant" \
+screen true and the name in context), no question. A person's name is often split across words ("hey meant" \
 for Hemanth), and the Speech line matches names only by spelling: who a message goes to is the thinker's to resolve, \
-never yours, and never a question of yours. When the Speech line names a person, or more than one, hand it over with \
-their words as heard, in quotes, and the names it gave in context; the thinker knows their people, how close each \
-is and who was on their calls, and asks them when two fit. Good: "message dar vesh on telegram", the Speech line \
-names Carmen for "nesh" and Darvesh for "dar vesh" -> tell_yuki(request="Message 'dar vesh' on Telegram ...", \
-context="'dar vesh' may be Darvesh or Carmen (as heard)", ...) alone. Bad: the same -> request="Message Carmen on \
-Telegram ..." (a guess by spelling) or "Carmen or Darvesh?" (asking is the thinker's). Ask back only when nothing on \
+never yours, and never a question of yours. When the Speech line names a person, or more than one, hand it over (their \
+words go as heard) with the names it gave in context; the thinker knows their people, how close each is and who was \
+on their calls, and asks them when two fit. Good: "message dar vesh on telegram", the Speech line names Carmen for \
+"nesh" and Darvesh for "dar vesh" -> tell_yuki(context="'dar vesh' may be Darvesh or Carmen (as heard)", ...) alone. \
+Bad: the same -> context="Carmen" (a guess by spelling) or "Carmen or Darvesh?" (asking is the thinker's). Ask back only when nothing on \
 the screen or in what you know fits and a word that matters for something that changes things (an action, closing, \
 sending, deleting) may be misheard ("sorry, which chat?"). The question is your whole reply, with no call: nothing \
 is done until they answer, and then you act on their answer together with what they asked. When the \
@@ -554,7 +656,7 @@ Bad: "Open w a r p." -> "Was that Hindi, or did the speech recognition mix it up
 and never a word about recognition) Good: the same -> open_app(name="Warp", ...)
 Good: "open the brochure" with WhatsApp in front, the Speech line says 'brochure' may be Bro said together with \
 the next word, and the names on the screen include Bro -> tell_yuki(screen=true, say_first="Opening it.", \
-request="Open the Bro chat", acts=true, intent="new_task") alone
+context="'brochure' = the Bro chat on the screen", acts=true, intent="new_task") alone
 Bad: the same -> "Speech recognition was unsure of brochure. Brochure? You mean a file or a message?" (it is on \
 the screen, and never say what recognition heard)
 Good: "close the cloud tabs", the Speech line says 'cloud' sounds close to Claude, the tabs line has 3 \
@@ -586,11 +688,10 @@ first, then the list goes on. intent instead only on words that drop that work (
 as one tell_yuki that also does what they want now (never cancel_tell_yuki then), and say_first names what is \
 dropped. Good: the line says 'still to do on its list: message Sam on \
 Discord', user "turn the volume up" -> app_volume(...) or media_key(...) alone, and the list goes on. Good: the \
-same, user "open this video" -> tell_yuki(say_first="Sure, opening it, then I'll message Sam.", request="Open \
-this video", screen=true, acts=true, intent="follow_up") alone. Bad: the same -> tell_yuki(intent="instead") (the \
+same, user "open this video" -> tell_yuki(say_first="Sure, opening it, then I'll message Sam.", screen=true, \
+acts=true, intent="follow_up") alone. Bad: the same -> tell_yuki(intent="instead") (the \
 message to Sam is dropped). Good: user "forget the message, just play lo-fi" -> tell_yuki(say_first="Okay, \
-dropping the message to Sam and playing lo-fi.", request="Forget the message, just play lo-fi", acts=true, \
-intent="instead")."""
+dropping the message to Sam and playing lo-fi.", acts=true, intent="instead")."""
 
 HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. When a hand's try does not take effect, it is handed \
@@ -670,7 +771,7 @@ starts with one. A result, a failure or a question the thinker sent is always sa
 Good: "what time is it?" -> the line say, then "It's ten past four."
 Good: "pause the music" -> the line act, then media_key(key="playpause", say_when_done="Paused.")
 Good: "what have I done today?" -> the line act, then tell_yuki(screen=false, say_first="Let me go through your \
-day.", request="What have I done today?")
+day.")
 Good: "what's on my list?" -> the line say, "Let me look.", then quick_memory(action="todos")
 Good: in a call, "bro did you see that clutch" -> the line quiet, then stay_quiet
 Good: a result says the pages were restored -> the line say, then "Done, your pages are back."
@@ -1002,8 +1103,8 @@ well as you), ask "Was that for me?" and nothing else, with no call; their answe
 Never say anything about a call or about whom their words were for.
 
 Good: "scroll down" -> scroll(...) alone
-Good: "open the Bro chat" -> tell_yuki(screen=true, say_first="Opening it.", request="Open the Bro chat", \
-acts=true, intent="new_task") alone
+Good: "open the Bro chat" -> tell_yuki(screen=true, say_first="Opening it.", acts=true, intent="new_task") \
+alone
 Good: "what do you think, should we go?" -> "Was that for me?"
 Bad: "scroll down" -> "Was that for me?" (a plain instruction is for you)
 Bad: "open YouTube" -> "They may be on a call, so that was probably not for me." + stay_quiet
@@ -1068,24 +1169,16 @@ TELL_YUKI: dict[str, Any] = {
             "type": "string",
             "description": (
                 "The app or route their own words name for doing it (\"on Telegram\": \"Telegram\"), else \"\". Never "
-                "the person's usual app or a guess, never an app the message is only about. The request names it too."
-            ),
-        },
-        "request": {
-            "type": "string",
-            "description": (
-                "The user's request as they asked it: their meaning and scope, close to their words, "
-                "in English, everything they asked for, with nothing added. Their situation and why when they gave "
-                "it (\"Tell Sam I fell asleep on the call, my alarm didn't ring\"), not a bare order: the thinker "
-                "checks first, and needs to know what they mean."
+                "the person's usual app or a guess, never an app the message is only about."
             ),
         },
         "context": {
             "type": "string",
             "description": (
-                "Optional. Only what the request cannot be understood without: what a word like "
-                "'that' or 'her' points to, or the earlier request a correction is about. Leave it "
-                "out otherwise."
+                "Optional. Only what their words cannot be understood without (the thinker gets their words "
+                "exactly as said): what a word like 'that' or 'her' points to, a misheard name the screen resolves, "
+                "the earlier request a correction is about, or the request their answer to your question completes. "
+                "Leave it out otherwise."
             ),
         },
         "corrects": {
@@ -1118,7 +1211,7 @@ TELL_YUKI: dict[str, Any] = {
                            "it only finds out or answers.",
         },
     },
-    "required": ["screen", "say_first", "app_named", "request", "intent"],
+    "required": ["screen", "say_first", "app_named", "intent"],
 }
 
 #: What the talker's cancel tool says (Pipecat's own text told it to cancel when the user "asks for something that
@@ -1378,6 +1471,13 @@ class MouthMemory:
     #: vfix4 (4 Oct): the last hour with the user across conversations and typed chat, and what they asked Yuki to
     #: keep in it (:func:`yuki.voice.recall.recent_view`): its own block after the cached layers, fixed per conversation.
     recent: str | None = None
+    #: Phase S: the talker's Skills menu (:func:`talker_menu`: the user's usual ways, one line each, at most 2,400
+    #: characters, one snapshot per day so the cached hands block holds all day), appended to the hands block;
+    #: ``None``: no skill path in this conversation (no skill loaded, or ``skills = false``).
+    skills: str | None = None
+    #: Where the menu came from (:func:`talker_menu`): ``snapshot``, ``memory``, ``stale``, ``fallback``, ``none``,
+    #: ``off`` (``skills = false``). A code word, logged.
+    skills_source: str = "off"
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -1394,6 +1494,8 @@ class MouthMemory:
             "standing_chars": len(self.standing or ""),
             "resume_chars": len(self.resume or ""),
             "recent_chars": len(self.recent or ""),
+            "skills_chars": len(self.skills or ""),
+            "skills_source": self.skills_source,
             "todos": len(self.todos or []),
             "error": self.error,
             "elapsed_ms": self.elapsed_ms,
@@ -1424,7 +1526,13 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         # MiniLM ~176 MB in that process, nothing loaded here). The old "~600 MB embedder" reason is gone (v3.14).
         ctx = memory.context(app=None, query="", resume=True, timeout_s=timeout_s)
     except Exception as exc:  # noqa: BLE001 - voice works without memory
-        return MouthMemory(error=f"{type(exc).__name__}: {exc}")
+        out = MouthMemory(error=f"{type(exc).__name__}: {exc}")
+        skills_on, menu_chars = _menu_settings()
+        if skills_on:
+            # review r2 M1: memory failing never brings the old mixer hand back with skills on: today's snapshot, else
+            # the bundled connection files (memory is not asked again: it just failed)
+            out.skills, out.skills_source = talker_menu(memory, chars=menu_chars, ask=False)
+        return out
     todos = [todo_line(row, with_source=False) for row in (ctx.todos or [])]
     portrait = personality = None
     if ctx.portrait:
@@ -1435,6 +1543,7 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         if section:
             personality = _cut(section, PERSONALITY_CHARS)
             portrait = f"{portrait}\n\n{personality}".strip()
+    skills_on, menu_chars = _menu_settings()
     try:
         from yuki.config import Settings
 
@@ -1442,6 +1551,8 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
     except Exception:  # noqa: BLE001
         names = []
     persona = getattr(ctx, "persona", None)
+    skills, skills_source = (talker_menu(memory, timeout_s=min(timeout_s, 1.5), chars=menu_chars) if skills_on
+                             else (None, "off"))
     return MouthMemory(
         portrait=portrait or None,
         personality=personality,
@@ -1453,10 +1564,173 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
         recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
+        skills=skills,
+        skills_source=skills_source,
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
     )
+
+
+def _menu_settings() -> tuple[bool, int | None]:
+    """``(skills on, the menu cap)`` from the settings (``Settings.skills``, ``Settings.skills_menu_chars``)."""
+    try:
+        from yuki.config import Settings
+
+        settings = Settings()
+        return bool(getattr(settings, "skills", True)), getattr(settings, "skills_menu_chars", None)
+    except Exception:  # noqa: BLE001
+        return True, None
+
+
+#: PLAN.md B.2 "Talker cache": the talker's Skills menu sits in the cached hands block (1-hour TTL, kept warm across
+#: conversations), so it is rebuilt nightly only (review r2 M2): one snapshot per memory per day, the day turning at
+#: this local hour; same-day changes (a name played, a rung the ledger disabled) ride in the volatile skills now line
+#: or wait for the next day. The engine reads the ledger and the user's usuals itself at every run.
+MENU_DAY_HOUR = 4
+_menu_lock = threading.Lock()
+#: memory -> ((day, connection-file version, cap), menu): RAM only, dropped with the memory object.
+_menu_snapshots: weakref.WeakKeyDictionary[Any, tuple[tuple[str, str, int], str]] = weakref.WeakKeyDictionary()
+
+
+def menu_day(now: float) -> str:
+    """The talker menu's day for ``now`` (local time; it turns at :data:`MENU_DAY_HOUR`)."""
+    return time.strftime("%Y-%m-%d", time.localtime(float(now) - MENU_DAY_HOUR * 3600))
+
+
+def _snapshot(memory: Any, key: tuple[str, str, int], *, any_day: bool = False) -> str | None:
+    try:
+        with _menu_lock:
+            got = _menu_snapshots.get(memory)
+    except TypeError:   # an unhashable stand-in: no snapshot
+        return None
+    if not got:
+        return None
+    if got[0] == key or (any_day and got[0][1:] == key[1:]):
+        return got[1]
+    return None
+
+
+def _keep_snapshot(memory: Any, key: tuple[str, str, int], menu: str) -> None:
+    try:
+        with _menu_lock:
+            _menu_snapshots[memory] = (key, menu)
+    except TypeError:   # None, or an object that takes no weak reference: no snapshot
+        pass
+
+
+def _menu_lines(text: Any, cap: int, loaded: Any) -> str | None:
+    """A menu cut to ``cap`` at a line, the volume skill's line kept on it when the volume connection loads (it is the
+    talker's only volume hand with skills on; review r2 M1); ``None`` when it lists no skill."""
+    if not isinstance(text, str) or not menu_keys(text):
+        return None
+    lines = text.strip().splitlines()
+    volume = loaded.get(VOLUME_SKILL) if loaded is not None and hasattr(loaded, "get") else None
+    if volume is not None and VOLUME_SKILL not in menu_keys(text):
+        from yuki.skills.menu import skill_line
+
+        first = next((i for i, line in enumerate(lines) if line.strip().startswith("- ")), len(lines))
+        lines.insert(first, skill_line(volume))
+    out: list[str] = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > cap:
+            break
+        out.append(line)
+        size += len(line) + 1
+    menu = "\n".join(out)
+    return menu if menu_keys(menu) else None
+
+
+def _menu_from_memory(memory: Any, timeout_s: float, now: float) -> Any:
+    """The talker's menu built on memory's own store (the trust ledger, the user's names most seen first: ``n_obs``,
+    stable through the day; the thinker's menu ranks the same way), in one bounded call. ``None`` on no answer."""
+    call = getattr(memory, "call", None)
+    if not callable(call):
+        return None
+
+    def read(client: Any) -> Any:
+        from yuki.skills.menu import TALKER, menu_text
+
+        store = getattr(client, "store", None)
+        seeded = getattr(client, "_skills_seeded", None)
+        if store is not None and callable(seeded):
+            return menu_text(store, audience=TALKER, loaded=seeded(), now=now, rank="n_obs")
+        fn = getattr(client, "skill_menu", None)   # an older or stand-in memory: its own menu
+        return fn("talker") if callable(fn) else None
+
+    try:
+        return call("skill menu", read, timeout_s=timeout_s)
+    except Exception:  # noqa: BLE001 - no answer in time, or memory failed: the fallback
+        return None
+
+
+def talker_menu(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None, now: float | None = None,
+                ask: bool = True) -> tuple[str | None, str]:
+    """The talker's Skills menu for one conversation and where it came from (Phase S; PLAN.md B.2; review r2 M1, M2):
+
+    - ``snapshot``: today's, built from memory by an earlier conversation: byte-identical all day, no memory call;
+    - ``memory``: built now on memory's store (``ask``), kept as today's snapshot;
+    - ``stale``: memory gave no menu in time, the last day's snapshot (same connection files and cap);
+    - ``fallback``: memory gave no menu in time and there is no snapshot: the bundled connection files alone (no
+      store: deterministic, every loaded skill, no names), never kept, so the next conversation asks memory again;
+    - ``none``: no skill loaded.
+
+    So with skills on and the volume connection loaded the volume skill is always the talker's volume hand, memory or
+    not. Cut to ``chars`` (``Settings.skills_menu_chars``; default :data:`SKILLS_CHARS`) at a line. Blocking; off the
+    loop. Never raises."""
+    cap = int(chars) if isinstance(chars, int) and not isinstance(chars, bool) and chars > 0 else SKILLS_CHARS
+    when = time.time() if now is None else float(now)
+    try:
+        from yuki.skills.connection import load
+
+        loaded: Any = load()
+    except Exception:  # noqa: BLE001 - no skill package: memory's own menu, if any
+        loaded = None
+    key = (menu_day(when), str(getattr(loaded, "version", "") or ""), cap)
+    kept = _snapshot(memory, key)
+    if kept:
+        return kept, "snapshot"
+    menu = _menu_lines(_menu_from_memory(memory, timeout_s, when), cap, loaded) if ask else None
+    if menu:
+        _keep_snapshot(memory, key, menu)
+        return menu, "memory"
+    kept = _snapshot(memory, key, any_day=True)
+    if kept:
+        return kept, "stale"
+    if loaded is not None and getattr(loaded, "skills", None):
+        try:
+            from yuki.skills.menu import TALKER, menu_text
+
+            menu = _menu_lines(menu_text(None, audience=TALKER, loaded=loaded), cap, loaded)
+        except Exception:  # noqa: BLE001
+            menu = None
+        if menu:
+            return menu, "fallback"
+    return None, "none"
+
+
+def fetch_skills(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None,
+                 now: float | None = None) -> str | None:
+    """The talker's Skills menu (:func:`talker_menu`), or ``None`` when no skill is loaded."""
+    return talker_menu(memory, timeout_s=timeout_s, chars=chars, now=now)[0]
+
+
+#: The talker's Skills menu is cut to this (``Settings.skills_menu_chars``' default; whole lines).
+SKILLS_CHARS = 2400
+
+
+def menu_keys(menu: str | None) -> list[str]:
+    """The skill keys a Skills menu lists, in order (its lines ``- <key>: ...``, our own format,
+    :func:`yuki.skills.menu.skill_line`)."""
+    keys: list[str] = []
+    for line in str(menu or "").splitlines():
+        line = line.strip()
+        if line.startswith("- ") and ":" in line:
+            key = line[2:].split(":", 1)[0].strip()
+            if key and " " not in key and key not in keys:
+                keys.append(key)
+    return keys
 
 
 #: The people directory in the talker's cached profile layer is cut to this (whole lines).
@@ -1579,7 +1853,7 @@ Good: you were explaining how the cache works, cut after "the first request writ
 had that same idea" -> "Ha, great minds. So, after that, every request reads it instead, which is why it's fast."
 Bad: the same -> "the first request writes it, and after that every request reads it." (repeats what they heard)
 Good: you were asking "Do you mean the subscriptions list in the sidebar, or something else", cut after \
-"sidebar,", they say "Yeah." -> the answer goes to the running task (tell_yuki intent follow_up, request "Yes, \
+"sidebar,", they say "Yeah." -> the answer goes to the running task (tell_yuki intent follow_up, context "yes = \
 the subscriptions list in the sidebar") with say_first "Expanding it."
 Bad: the same -> "or something else on the Sidemen page?" (finishing the cut question)
 """
@@ -1628,9 +1902,15 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
 
     ``practice`` (v3.18): practice memory's lines for these words (:mod:`yuki.voice.practice`): the Lessons line (the
     apps in play's pitfalls and habits, at most 400 characters) and, when one qualifies, the Learned ways line; they go
-    right before the desktop block they are about.
+    right before the desktop block they are about. Off with the skill path (Phase S, D15).
+
+    Phase S: ``state["skills_now"]`` (the hands' :meth:`~yuki.voice.hands.Hands.skills_now`, at most 300 characters:
+    the last skill run and its values, its options, a "Keep this as your usual?" waiting) goes right before the desktop
+    block; ``state["skill_keys"]`` (the menu's keys) words the guides' volume examples as the volume skill
+    (:func:`skill_guide`).
     """
     state = state or {}
+    keys = state.get("skill_keys") or ()
     now = now or datetime.now()
     text = f"[Now: {now.strftime('%A %d %B %Y, %H:%M')} local time. For when they ask; the clock moving on is not news.]"
     if call:
@@ -1642,7 +1922,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         game, on_call = focus.get("game"), bool(focus.get("call"))
         where = ((f"in a game ({game})" if isinstance(game, str) and game else "in a full-screen game or video")
                  + (" and on a voice call" if on_call else "")) if game else "on a voice call"
-        text += "\n[" + FOCUS_GUIDE.format(where=where) + "]"
+        text += "\n[" + skill_guide(FOCUS_GUIDE.format(where=where), keys) + "]"
     if state.get("dictating"):
         # N7 (report 47): measured while they spoke, text went into another app's field (typing or dictation)
         text += (f"\n[Private, never to be said: while they spoke, the text in {state['dictating']} changed: they "
@@ -1655,7 +1935,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  "answer them; stay_quiet is final, so only if they plainly talk about you to someone else.]")
     if heard:
         text += (f"\n[Speech recognition on their latest words (the Speech line; private, never mentioned to them): "
-                 f"{heard}. They may have been misheard. {RECOGNITION_GUIDE.strip()}]")
+                 f"{heard}. They may have been misheard. {skill_guide(RECOGNITION_GUIDE, keys).strip()}]")
     if state.get("held"):
         text += "\n" + HELD_NOTE.format(held=" ".join(str(state["held"]).split())[:600])
     if state.get("hand_trouble"):
@@ -1676,7 +1956,7 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                  f"is asked again whole only if it still matters. How to answer:\n{CUT_OFF_GUIDE.strip()}]")
     if work:
         text += (f"\n[Your thinker now (background: for when they ask what is happening, and to choose follow_up, "
-                 f"instead or new_task): {work}. {WORK_GUIDE.strip()}]")
+                 f"instead or new_task): {work}. {skill_guide(WORK_GUIDE, keys).strip()}]")
     if rerun:
         text += "\n" + (REPEAT_NOTE if state.get("repeat") else RERUN_NOTE)
     if state.get("scrolling"):
@@ -1690,6 +1970,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += "\n\n" + (f"{LOOKUP_LABEL}\n{lookup}" if lookup.strip() else LOOKUP_EMPTY)
     if practice and practice.strip():
         text += "\n\n" + practice.strip()
+    if state.get("skills_now"):
+        # Phase S: the last skill run, its options and a question waiting (<= 300 chars, after every breakpoint)
+        text += "\n\n[" + " ".join(str(state["skills_now"]).split())[:300] + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
     if (channel or "").strip().lower() == "marker":
@@ -1744,7 +2027,9 @@ def mouth_system_blocks(
     core = "\n\n".join([mouth_prompt(channel, marks=marks), *[t for t in (tail or []) if t and t.strip()]])
     blocks: list[dict[str, Any]] = [{"type": "text", "text": core}]
     if hands:
-        blocks.append({"type": "text", "text": HANDS_PROMPT})
+        # Phase S (PLAN.md B.2 "Talker cache"): the Skills menu is appended to the hands block, so the first cache
+        # breakpoint stays on it and the total stays 4; it changes only with the menu (nightly)
+        blocks.append({"type": "text", "text": hands_block(memory.skills)})
     marked: list[dict[str, Any]] = [blocks[-1]]
     if call:
         layer = CALL_LAYER_UNSURE if call_evidence == "stale" else CALL_LAYER
@@ -1840,13 +2125,13 @@ APP_NAMED_NOTE = ("[Where they said to do it, in their own words: {app}. Do it t
 def brain_request(request: str, heard: list[str] | str | None, *, context: str | None = None,
                   remember: bool = False, done_before: str | None = None, corrects: str | None = None,
                   said: list[str] | None = None, tabs: str | None = None, app_named: str | None = None) -> str:
-    """What the brain is handed for a ``tell_yuki`` call: the request, its references, the user's latest words.
+    """What the brain is handed for a ``tell_yuki`` call: the user's exact words, their references, the latest turns.
 
-    Plumbing (docs/VOICE.md §6.2): the brain sees what the user actually said,
-    not only the mouth's wording, and knows its words will be spoken. The
-    request is the ask; ``context`` only resolves references in it; the heard
-    words are context too (the newest may be about something else by the time
-    the request is handed over). ``done_before`` is the conversation's action log
+    Plumbing (docs/VOICE.md §6.2; Phase S, PLAN.md D10): ``request`` is the user's own words since Yuki last replied,
+    exactly as speech recognition heard them (``bridge.heard_words(since_reply=True)``), never the talker's paraphrase
+    (3 Oct the paraphrase lost "WhatsApp"); it is the first line. ``context`` only resolves references in it (the
+    talker's note); the heard turns are context too (the newest may be about something else by the time it is
+    handed over). ``done_before`` is the conversation's action log
     (:class:`yuki.voice.hands.ActionLog`): what Yuki's voice and the thinker already did on
     the desktop, with what was verified (live, 2026-09-25, the thinker did not know which tab
     the voice had just opened, and clicked another). ``said`` is what Yuki's voice said to them most recently
@@ -1859,7 +2144,7 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
     if named:
         text += "\n\n" + APP_NAMED_NOTE.format(app=named)
     if context and context.strip():
-        text += f"\n\n[References in that request, as the conversation had them: {context.strip()}]"
+        text += f"\n\n[References in their words, as the conversation had them: {context.strip()}]"
     if corrects and corrects.strip():
         # What the user said was wrong with an earlier attempt, as the voice relayed it: the thinker redoes
         # it their way and has what it needs to keep the lesson (the done lines below show what was done).
@@ -1870,8 +2155,7 @@ def brain_request(request: str, heard: list[str] | str | None, *, context: str |
     if turns:
         said = " / ".join(f'"{t}"' for t in turns)
         text += (f"\n\n[Asked by voice. What the user said most recently, oldest first, as speech "
-                 f"recognition heard it (context for the request above; their words win over the "
-                 f"request's wording): {said}]")
+                 f"recognition heard it (context for their own words, the first line above): {said}]")
     else:
         text += "\n\n[Asked by voice.]"
     lines = [" ".join(x.split()) for x in voice_said if x and x.strip()]

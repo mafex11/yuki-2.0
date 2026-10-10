@@ -152,9 +152,11 @@ class FakeRuntime(QObject):
 
 
 class Params:
-    def __init__(self, message: str, intent: str = "new_task", heard: str = "hey yuki do it",
+    def __init__(self, message: str, intent: str = "new_task", heard: str | None = None,
                  context: str | None = None) -> None:
-        self.arguments = {"request": message, "intent": intent, **({"context": context} if context else {})}
+        # Phase S (D10): tell_yuki has no request field; the thinker gets the user's own heard words
+        heard = heard if heard is not None else (message or "hey yuki do it")
+        self.arguments = {"intent": intent, **({"context": context} if context else {})}
         self.tool_call_id = "call-1"
         self.context = SimpleNamespace(get_messages=lambda: [{"role": "user", "content": heard}])
         self.results: list[tuple[dict, bool]] = []
@@ -189,7 +191,7 @@ def test_new_task_relays_say_then_final() -> None:
         task = asyncio.create_task(bridge.tell_yuki(params))
         await _settle()
         assert rt.submitted and rt.submitted[0][2] == "voice"
-        assert '"hey yuki do it"' in rt.submitted[0][1]
+        assert '"Add up the September invoices in Downloads"' in rt.submitted[0][1]
         job = rt.submitted[0][0]
         assert bridge.open_voice_jobs() == 1
         rt.started.emit("worker", job, "x")

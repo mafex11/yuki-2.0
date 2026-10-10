@@ -308,7 +308,7 @@ def test_v4_the_thinker_is_told_the_named_app_above_the_usual_route() -> None:
 
     assert "app_named" in TELL_YUKI["required"]
     props = list(TELL_YUKI["properties"])
-    assert props.index("app_named") < props.index("request")
+    assert "request" not in props   # Phase S (D10): the thinker gets the user's own words, never a paraphrase
     text = brain_request("Text Ravi on Chirp asking when he's getting on the huddle", ["text Ravi on Chirp"],
                          app_named="Chirp")
     assert "Where they said to do it, in their own words: Chirp" in text

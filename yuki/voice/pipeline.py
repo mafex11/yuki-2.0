@@ -41,7 +41,7 @@ from yuki.config import Settings
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.keyterms import vocabulary
-from yuki.voice.hands import HAND_TOOLS
+from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
@@ -872,8 +872,13 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
         async def run_function_calls(self, function_calls: Any) -> None:
             for fc in function_calls or []:
-                self._yuki_hold[str(getattr(fc, "tool_call_id", fc))] = bool(
-                    hook("would_hold", getattr(fc, "function_name", ""), default=False))
+                # review r1 L3: the call's arguments decide too (a sound-only skill runs like the sound hands); a
+                # stand-in without would_hold_call answers by the name alone
+                held = hook("would_hold_call", getattr(fc, "function_name", ""), getattr(fc, "arguments", None),
+                            default=None)
+                if held is None:
+                    held = hook("would_hold", getattr(fc, "function_name", ""), default=False)
+                self._yuki_hold[str(getattr(fc, "tool_call_id", fc))] = bool(held)
             if len(self._yuki_hold) > 64:
                 for old in list(self._yuki_hold)[:32]:
                     del self._yuki_hold[old]
@@ -1168,7 +1173,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             args += event.delta.partial_json or ""
                             if early_wait:
                                 flag = early_flag(args, "screen")
-                                if flag is not None or '"say_first"' in args or '"request"' in args:
+                                if flag is not None or '"say_first"' in args:
                                     early_wait = False
                                     if self._speculation_gate.is_speculating:
                                         self._yuki_early_pending = (tool_id, bool(flag))  # once the turn is confirmed
@@ -1188,6 +1193,22 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             return timed()
 
     return LayeredAnthropicLLMService
+
+
+def skills_on(settings: Any) -> bool:
+    """Phase S: whether the skill path is on (``Settings.skills``, default on)."""
+    try:
+        from yuki.skills import enabled
+
+        return enabled(settings)
+    except Exception:  # noqa: BLE001 - no skill package: the old path
+        return False
+
+
+def practice_on(settings: Any) -> bool:
+    """Whether the old talker learning path runs (the Lessons and Learned ways lines, D15): only with ``voice_practice``
+    on and the skill path off; never beside the Skills menu."""
+    return bool(getattr(settings, "voice_practice", False)) and not skills_on(settings)
 
 
 #: Marks that end a reply's first clause: the voice starts on it while the rest is still being written (v3.7).
@@ -2408,6 +2429,10 @@ class _Hooks:
         """Whether a call of the reply now ending will be held until the user answers (see ``Conversation._held``)."""
         return self.c._held(name)
 
+    def would_hold_call(self, name: str, args: Any = None) -> bool:
+        """:meth:`would_hold` with the call's arguments (a run_skill of a sound-only skill is never held)."""
+        return self.c._held(name, args=args)
+
     def words_dropped(self, frames: int) -> None:
         """A doubtful turn's reply made a call that is held: its words were never said (content-free log)."""
         self.c.log.event("held_words", op="dropped", frames=frames)
@@ -3488,6 +3513,15 @@ class Conversation:
             hands.shown = lambda: list(self._shown_ids)
             hands.user_turn = lambda: self.observer.user_turns
             hands.practice = self.practice
+            # Phase S: the skill path (its keys fixed with this conversation's tools), the engine's memory and settings
+            hands.skill_keys = tuple(self._skill_keys())
+            # review r2 L3: the volume skill runs unheld on unsure words, so then it takes no focus (the same state
+            # _held reads: a Speech line for the latest words)
+            hands.unsure = lambda: bool(self.observer.heard and not getattr(self.observer, "heard_plain", False))
+            hands.skill_memory = self.memory
+            hands.skill_settings = self.settings
+            hands.last_skill = None
+            hands.pending_keep = None
 
     def _awake(self) -> None:
         """What a live conversation starts with (built awake, or woken from standby): all in the background."""
@@ -3675,7 +3709,7 @@ class Conversation:
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
-            for tool in HAND_TOOLS:
+            for tool in self._talker_hand_tools():
                 llm.register_function(tool["name"], self._hand_or_hold, cancel_on_interruption=False,
                                       timeout_secs=30)
         if self.memory is not None:
@@ -3793,12 +3827,10 @@ class Conversation:
         self._llm = llm
         self._tts = tts
         self._llm_context: Any = None
-        hand_tools = HAND_TOOLS if (self.settings.voice_hands and getattr(self.bridge, "hands", None)) else []
-        if not (getattr(self.settings, "voice_skills", True) and getattr(self.settings, "voice_practice", True)
-                and self.memory is not None):
-            # v3.18: run_skill only where learned ways can be offered (fixed for the conversation: the tools head the
-            # cached prefix)
-            hand_tools = [t for t in hand_tools if t["name"] != "run_skill"]
+        # Phase S: the hands for this conversation, fixed (the tools head the cached prefix): with a Skills menu the
+        # skill hands (run_skill from its keys, keep_usual) and, with the volume skill, no mixer hand or volume keys;
+        # else as before phase S (the step-list run_skill only where the old learning path can offer ways)
+        hand_tools = self._talker_hand_tools()
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
@@ -3941,8 +3973,9 @@ class Conversation:
                                      source=str(getattr(s, "voice_grounding_source", "relevant") or "relevant"))
             self.grounder.warm()
             self.observer.grounder = self.grounder
-        if getattr(s, "voice_practice", True) and self.memory is not None:
-            # v3.18: practice memory for the talker (lessons from its mistakes, learned ways its hands can run)
+        if practice_on(s) and self.memory is not None:
+            # v3.18: practice memory for the talker (lessons from its mistakes, learned ways its hands can run); off
+            # since phase S (D15), back only with skills = false and voice_practice on
             from yuki.voice.practice import LESSONS_CHARS, SKILL_MIN_CONFIDENCE, SKILL_MIN_COSINE, PracticeLookup
 
             hands = getattr(self.bridge, "hands", None)
@@ -4308,8 +4341,48 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.log.event("warm", error=f"{type(exc).__name__}: {str(exc)[:200]}")
 
-    def _held(self, name: str, call_id: str | None = None) -> bool:
-        """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it."""
+    def _skill_keys(self) -> list[str]:
+        """Phase S: this conversation's skill keys, from the Skills menu memory gave it (``MouthMemory.skills``), when
+        the skill path is on (``Settings.skills``) and the talker has hands; else none, and the menu is dropped so the
+        hands block is as before phase S. Fixed for the conversation (read once, with its tools)."""
+        cached = getattr(self, "_skill_keys_cache", None)
+        if cached is not None:
+            return list(cached)
+        from yuki.voice.mouth import menu_keys
+
+        memory = getattr(self, "mouth_memory", None)
+        hands = getattr(self.bridge, "hands", None)
+        keys: list[str] = []
+        if skills_on(self.settings) and self.settings.voice_hands and hands is not None and memory is not None:
+            keys = menu_keys(getattr(memory, "skills", None))
+        if not keys and memory is not None and getattr(memory, "skills", None):
+            memory.skills = None
+        self._skill_keys_cache = tuple(keys)
+        return keys
+
+    def _talker_hand_tools(self) -> list[dict[str, Any]]:
+        """The talker's hands for this conversation (:func:`yuki.voice.hands.talker_hand_tools`), fixed once."""
+        cached = getattr(self, "_hand_tools_cache", None)
+        if cached is not None:
+            return cached
+        s = self.settings
+        tools: list[dict[str, Any]] = []
+        if s.voice_hands and getattr(self.bridge, "hands", None) is not None:
+            keys = self._skill_keys()
+            learned = bool(not keys and practice_on(s) and getattr(s, "voice_skills", False) and self.memory is not None)
+            tools = talker_hand_tools(keys, learned_ways=learned)
+        self._hand_tools_cache = tools
+        if self.log is not None:
+            mouth_memory = getattr(self, "mouth_memory", None)
+            # source: snapshot / memory / stale / fallback / none / off (review r2 M1: a fallback menu is logged)
+            self.log.event("skill_menu", session=self.session, skills=len(self._skill_keys()),
+                           chars=len(getattr(mouth_memory, "skills", None) or ""),
+                           source=str(getattr(mouth_memory, "skills_source", "") or "") or None, hands=len(tools))
+        return tools
+
+    def _held(self, name: str, call_id: str | None = None, args: Any = None) -> bool:
+        """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it. The sound
+        hands, ``keep_usual`` and a ``run_skill`` of a sound-only skill (:meth:`_sound_skill`) are never held."""
         from yuki.voice.hands import AUDIO_HANDS
 
         decided = getattr(getattr(self, "_llm", None), "_yuki_hold", None) or {}
@@ -4318,7 +4391,33 @@ class Conversation:
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
         spoke = call is not None and call.first_text is not None and call.user_turn
         return bool(spoke and self.observer.heard and not getattr(self.observer, "heard_plain", False)
-                    and name not in AUDIO_HANDS)
+                    and name not in AUDIO_HANDS and name != "keep_usual" and not self._sound_skill(name, args))
+
+    def _sound_skill(self, name: str, args: Any) -> bool:
+        """Review r1 L3: a ``run_skill`` that is a sound hand in effect, so it runs at once on unsure words as the old
+        ``app_volume`` and volume keys did: the volume skill (it replaced them), or a menu skill whose every rung
+        takes no focus (its data). Never on the old learned-way path (no Skills menu)."""
+        if name != "run_skill" or not isinstance(args, dict):
+            return False
+        key = str(args.get("skill") or "")
+        try:
+            keys = self._skill_keys()
+        except Exception:  # noqa: BLE001 - no menu known: held like any window hand
+            return False
+        if not key or key not in keys:
+            return False
+        from yuki.voice.hands import VOLUME_SKILL
+
+        if key == VOLUME_SKILL:
+            return True
+        try:
+            from yuki.skills.connection import load
+
+            skill = load().get(key)
+        except Exception:  # noqa: BLE001 - unknown: held like any window hand
+            return False
+        routes = [r for r in (getattr(skill, "routes", ()) or ()) if r.via != "agent"]
+        return bool(routes) and not any(r.needs_focus for r in routes)
 
     async def _hold(self, params: Any) -> None:
         self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
@@ -4367,8 +4466,13 @@ class Conversation:
 
         context = getattr(getattr(self, "_llm", None), "_yuki_context", None) or getattr(self, "_llm_context", None)
         heard = heard_words(context, skip=self.bridge.not_heard)
+        from yuki.voice.bridge import _takes, exact_words
+
+        # Phase S (D10): the request is the user's own words since Yuki last replied
+        words = ({"words": exact_words(context, skip=self.bridge.not_heard, heard=heard)}
+                 if _takes(self.bridge.begin_early, "words") else {})
         try:
-            started = self.bridge.begin_early(call_id, heard, screen=screen, said=spoken_words(context))
+            started = self.bridge.begin_early(call_id, heard, screen=screen, said=spoken_words(context), **words)
         except TypeError:  # a stand-in bridge without the v3.9 arguments
             started = self.bridge.begin_early(call_id, heard)
         if started:
@@ -4440,9 +4544,13 @@ class Conversation:
             return   # they spoke again, or the talker already handed it over
         begin = getattr(self.bridge, "begin_early", None)
         key = getattr(self.bridge, "ROUTE_KEY", "router")
+        from yuki.voice.bridge import _takes, exact_words
+
+        words = ({"words": exact_words(context, skip=getattr(self.bridge, "not_heard", None), heard=heard)}
+                 if _takes(begin, "words") else {})   # Phase S (D10): the user's own words since Yuki last replied
         try:
             started = bool(callable(begin) and begin(key, heard, screen=route.screen, said=spoken_words(context),
-                                                     routed=True))
+                                                     routed=True, **words))
         except TypeError:   # a stand-in bridge without routed starts
             started = False
         if not started:
@@ -4496,7 +4604,7 @@ class Conversation:
         the mouth to wait for the answer if it asked (stay_quiet), else to call it again, so nothing is
         lost. Sound hands touch no window and run. State only (the note, the stream, which hand), never what was said.
         """
-        if self._held(params.function_name, params.tool_call_id):
+        if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)
             return
         await self.bridge.hands.handle(params)
@@ -4860,6 +4968,13 @@ class Conversation:
         if self.focus:
             # vGame: a full-screen game in front or a call on: Yuki stays out of the way (mouth.FOCUS_GUIDE)
             state["focus"] = {"game": self.game_app or None, "call": self._call_focus}
+        if hands is not None and getattr(hands, "skill_keys", ()):
+            # Phase S: the menu's keys (the guides' volume wording) and the last skill run, its options and a question
+            # waiting (mouth.volatile_block; at most 300 characters, after every cache breakpoint)
+            state["skill_keys"] = tuple(hands.skill_keys)
+            now_line = hands.skills_now() if callable(getattr(hands, "skills_now", None)) else None
+            if now_line:
+                state["skills_now"] = now_line
         return state
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").

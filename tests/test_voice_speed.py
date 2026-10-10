@@ -66,7 +66,9 @@ def test_every_hand_off_passes_the_users_own_words_as_the_memory_query() -> None
         params = Params("Restore the pages", heard="restore the pages please")
         task = asyncio.create_task(bridge.tell_yuki(params))
         await _settle()
-        assert rt.submitted[-1][2]["memory_query"] == memory_words("Restore the pages", ["restore the pages please"])
+        # Phase S (D10): the hand-off's words are the user's own (no talker paraphrase)
+        assert rt.submitted[-1][2]["memory_query"] == memory_words("restore the pages please",
+                                                                   ["restore the pages please"])
         bridge.begin_early("call-e", ["what did I do today"])
         await _settle()
         assert rt.submitted[-1][2]["memory_query"] == "what did I do today"
@@ -77,7 +79,7 @@ def test_every_hand_off_passes_the_users_own_words_as_the_memory_query() -> None
         bridge.speak = None
         await bridge._run_held(("tell_yuki", dict(held.arguments), held.context))
         await _settle()
-        assert rt.submitted[-1][2]["memory_query"].startswith("Open the Bro chat")
+        assert rt.submitted[-1][2]["memory_query"].startswith("open the brochure")   # Phase S: their own words
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

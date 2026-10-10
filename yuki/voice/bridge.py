@@ -191,7 +191,8 @@ class Job:
 HEARD_TURNS = 3
 
 
-def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bool] | None = None) -> list[str]:
+def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bool] | None = None, *,
+                since_reply: bool = False) -> list[str]:
     """The user's latest spoken turns in a Pipecat ``LLMContext``, oldest first (plumbing for the brain).
 
     Several, not one: the mouth may hand a request over a turn or two after
@@ -199,6 +200,12 @@ def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bo
     see the words the request came from, not only the last thing said.
     ``skip`` leaves out user-role messages nobody said: Pipecat's context summary is
     one (live 2026-09-25 the thinker was told the user had said a whole summary).
+
+    ``since_reply`` (Phase S, D10): only the user's turns since Yuki last replied (the request's own words, exactly as
+    heard: the hand-off's first line, never the talker's paraphrase). The reply being written now (the call that asks,
+    its tool results) comes first from the end and is passed over; the next assistant message before the user's turns
+    (words, a hand, a hand-off or a stay_quiet) is Yuki's last reply and ends them. Async results ("developer" / "tool"
+    messages) are no reply. The context's own structure only, never the words.
     """
     try:
         messages = context.get_messages()
@@ -206,6 +213,8 @@ def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bo
         return []
     out: list[str] = []
     for message in reversed(messages or []):
+        if since_reply and isinstance(message, dict) and message.get("role") == "assistant" and out:
+            break   # Yuki's last reply before their words
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
         if skip is not None and skip(message):
@@ -218,9 +227,19 @@ def heard_words(context: Any, turns: int = HEARD_TURNS, skip: Callable[[Any], bo
             text = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
         if text.strip():  # async-tool results are "developer"/"tool" messages, so never picked up here
             out.append(text.strip())
-            if len(out) >= turns:
+            if len(out) >= turns and not since_reply:
                 break
     return list(reversed(out))
+
+
+def exact_words(context: Any, skip: Callable[[Any], bool] | None = None, heard: list[str] | None = None) -> str:
+    """The user's own words for a hand-off (Phase S, D10): their turns since Yuki last replied, joined, exactly as speech
+    recognition heard them; the latest heard turn when there is none (a re-run with no new words)."""
+    words = [w for w in heard_words(context, skip=skip, since_reply=True) if w.strip()]
+    if words:
+        return " ".join(" ".join(w.split()) for w in words)
+    heard = heard if heard is not None else heard_words(context, skip=skip)
+    return heard[-1].strip() if heard else ""
 
 
 def spoken_words(context: Any, turns: int = 2) -> list[str]:
@@ -684,14 +703,14 @@ class VoiceBridge(QObject):
     async def tell_yuki(self, params: Any) -> None:
         """Pipecat handler for ``tell_yuki`` (async: registered with ``cancel_on_interruption=False``)."""
         args = params.arguments if isinstance(params.arguments, dict) else {}
-        request = str(args.get("request") or args.get("message") or "").strip()
         context = str(args.get("context") or "").strip() or None
         corrects = str(args.get("corrects") or "").strip() or None
         # V4: the app or route the user named in their own words (the talker's structured field), else None
         app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
         intent = str(args.get("intent") or "new_task")
         heard = heard_words(params.context, skip=self.not_heard)
-        request = request or (heard[-1] if heard else "")
+        # Phase S (D10): the thinker gets the user's own words since Yuki last replied, never the talker's paraphrase
+        request = exact_words(params.context, skip=self.not_heard, heard=heard)
         remember = intent == "remember"
         screen = args.get("screen") is True
         acts = args.get("acts") is True
@@ -793,7 +812,7 @@ class VoiceBridge(QObject):
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=words,
                                        user_words=heard, needs_hands=False if reads else None, app_named=app_named))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent,
-                  request_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
+                  words_chars=len(request), context_chars=len(context or ""), origin_hwnd=origin,
                   done_before_chars=len(done_before), heard_turns=len(heard), corrects_chars=len(corrects or ""),
                   said_lines=len(said), tabs_chars=len(tabs or ""), screen=screen, acts=acts,
                   replaced=len(replaced), lane=lane, app_named=bool(app_named))
@@ -1052,11 +1071,11 @@ class VoiceBridge(QObject):
     # -- the early hand-off (v3.6) ------------------------------------------------
 
     def begin_early(self, call_id: str, heard: list[str], screen: bool = False,
-                    said: list[str] | None = None, *, routed: bool = False) -> bool:
+                    said: list[str] | None = None, *, routed: bool = False, words: str | None = None) -> bool:
         """The mouth's reply has just begun a tell_yuki: submit the request now, on the user's own words.
 
         On the voice loop, from the reply's stream (``Conversation._early_handoff``). The request is what the
-        user said (the thinker is told their words win over the mouth's wording anyway); when the call is
+        user said (Phase S: tell_yuki has no wording of its own any more, D10); when the call is
         complete, :meth:`tell_yuki` adopts this job, adding the call's ``context`` / ``corrects`` if it has
         them. ``screen``: the talker's mark (the call's first field) that the request is about something inside
         the window in front: the thinker gets that window read as it starts (v3.9). Returns whether a job was
@@ -1064,11 +1083,13 @@ class VoiceBridge(QObject):
 
         ``routed`` (E3a, v3.17): started by the router before the talker decided (``call_id`` is the router's own key,
         :data:`ROUTE_KEY`); the talker's tell_yuki adopts it (:meth:`adopt_routed`), anything else withdraws it unseen.
+        ``words`` (Phase S, D10): the user's turns since Yuki last replied (:func:`exact_words`), the request's first
+        line; the latest heard turn without them.
         """
         heard = [h for h in (heard or []) if h and h.strip()]
         if not heard or self._loop is None:
             return False
-        request = heard[-1].strip()
+        request = " ".join(str(words or "").split()) or heard[-1].strip()
         done_before = self.actions.text()
         said = [x for x in (said or []) if x and x.strip()]
         tabs = self.tabs_for_thinker()
@@ -1088,7 +1109,7 @@ class VoiceBridge(QObject):
         words = _memory_words(request, heard)
         self._gui(lambda: self._submit(job, text, origin, view=view, memory_query=words, user_words=heard))
         self._log("bridge", op="submit", token=job.token, call=call_id, intent="routed" if routed else "early",
-                  request_chars=len(request), context_chars=0, origin_hwnd=origin, done_before_chars=len(done_before),
+                  words_chars=len(request), context_chars=0, origin_hwnd=origin, done_before_chars=len(done_before),
                   heard_turns=len(heard), early=True, screen=bool(screen), tabs_chars=len(tabs or ""))
         if not routed:
             self._changed()
@@ -1166,7 +1187,7 @@ class VoiceBridge(QObject):
             extra.append(APP_NAMED_NOTE.format(app=app_named))
             self._gui(lambda: self._name_app(job, app_named))
         if context:
-            extra.append(f"[References in that request, as the conversation had them: {context}]")
+            extra.append(f"[References in their words, as the conversation had them: {context}]")
         if corrects:
             extra.append(f"{CORRECTION_MARK} What was done, and what they said about it: {corrects} "
                          f"Do it the way they want, not the way it was done.]")
@@ -1514,7 +1535,7 @@ class VoiceBridge(QObject):
     def _submit(self, job: Job, text: str, origin: int | None, *, lane: str | None = None,
                 view: int | None = None, memory_query: str | None = None,
                 user_words: list[str] | None = None, needs_hands: bool | None = None,
-                app_named: str | None = None) -> None:
+                app_named: str | None = None, skill: dict[str, Any] | None = None) -> None:
         extra: dict[str, Any] = {}
         if lane:
             extra["lane"] = lane
@@ -1541,6 +1562,9 @@ class VoiceBridge(QObject):
         if job.turn_id and self._takes("log_request_id"):
             # phase F (fPrivacy R1.3): the request's id in every log, next to its turn's hands (probed)
             extra["log_request_id"] = f"voice-{job.turn_id}-t{job.token}"
+        if skill and self._takes("skill"):
+            # Phase S: the user's usual way the code handed over (rung C), pinned in the thinker's frame
+            extra["skill"] = dict(skill)
         if memory_query:
             # 22 §4 (v3.17): memory is searched with the user's own words (``memory_words``), passed explicitly, so it
             # never depends on the hand-off's format.
@@ -2328,7 +2352,7 @@ class VoiceBridge(QObject):
             self._arm_wait(job, self._wait_again_s)   # the next one, after as much silence again
 
     async def escalate(self, params: Any, name: str, args: dict[str, Any], report: str,
-                       acked: bool = False, context: str | None = None) -> bool:
+                       acked: bool = False, context: str | None = None, skill: dict[str, Any] | None = None) -> bool:
         """A hand of the talker's did not take effect: hand the same request to the thinker now, by code (v3.9).
 
         Live 2026-09-27 14:18 the talker narrated every failed try ("The stop key didn't take. Let me pause it
@@ -2339,11 +2363,19 @@ class VoiceBridge(QObject):
 
         ``context`` (v3.18): what to tell the thinker instead of the one-step note: a learned way the talker ran that
         stopped at a step (what was done, where it deviated, the way's steps), so it carries on and never redoes them.
+
+        ``skill`` (Phase S, map-skills S3.4): one of the user's skills whose own routes didn't get there (rung C): the
+        pinned dict (``yuki.skills.engine.pinned``) goes with the request (``runtime.submit(skill=)``, probed), so the
+        thinker's frame shows it first and its done counts only on the skill's own check. The engine never hands over
+        with a game in front (D17(2)).
         """
         if self._loop is None:
             return False
         heard = heard_words(params.context, skip=self.not_heard)
-        request = heard[-1] if heard else _action_words(name, args)
+        request = exact_words(params.context, skip=self.not_heard, heard=heard) or _action_words(name, args)
+        if skill and not context:
+            context = (f"my own try of their usual way ({skill.get('key')}) did not get there: "
+                       f"{' '.join(str(report).split())[:300]}; it is pinned below, do it that way")
         context = (" ".join(str(context).split())[:1200] if context else
                    f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}")
         said = spoken_words(params.context)
@@ -2358,10 +2390,12 @@ class VoiceBridge(QObject):
         origin = self._foreground()
         self._pass_over_questions("worker")   # the talker acted on these words: not the answer to a question
         words = _memory_words(request, heard)
+        pin = dict(skill) if isinstance(skill, dict) and skill.get("key") else None
         self._gui(lambda: self._submit(job, text, origin, lane="worker", view=origin or self._desk_foreground(),
-                                       memory_query=words, user_words=heard))
+                                       memory_query=words, user_words=heard, skill=pin))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent="escalated", hand=name,
-                  request_chars=len(request), context_chars=len(context), origin_hwnd=origin, heard_turns=len(heard))
+                  words_chars=len(request), context_chars=len(context), origin_hwnd=origin, heard_turns=len(heard),
+                  skill=pin.get("key") if pin else None)
         self._changed()
         self._arm_wait(job)
         asyncio.ensure_future(self._relay_detached(job))
@@ -2371,7 +2405,7 @@ class VoiceBridge(QObject):
         """Do a held hand-off after all (the mouth stayed quiet twice on it): its words said by code, its job run."""
         _name, args, context = call
         heard = heard_words(context, skip=self.not_heard)
-        request = str(args.get("request") or "").strip() or (heard[-1] if heard else "")
+        request = exact_words(context, skip=self.not_heard, heard=heard)   # Phase S (D10): never a paraphrase
         if not request or self._loop is None:
             return False
         app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
@@ -2394,7 +2428,7 @@ class VoiceBridge(QObject):
         words = str(args.get("say_first") or "").strip()
         if words and self.speak is not None:
             await self.speak(words)
-        self._log("bridge", op="submit", token=job.token, intent="held_run", request_chars=len(request),
+        self._log("bridge", op="submit", token=job.token, intent="held_run", words_chars=len(request),
                   screen=view is not None, lane=lane)
         self._changed()
         self._arm_wait(job)
