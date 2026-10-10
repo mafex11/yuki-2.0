@@ -77,8 +77,10 @@ class Params:
     """A Pipecat function call's params for the bridge's handlers."""
 
     def __init__(self, request: str = "Play the make up my mind mix", call_id: str = "call-1",
-                 intent: str = "new_task", heard: str = "play the make up my mind mix", **extra: Any) -> None:
-        self.arguments = {"screen": False, "say_first": "On it.", "request": request, "intent": intent, **extra}
+                 intent: str = "new_task", heard: str | None = None, **extra: Any) -> None:
+        # Phase S (D10): tell_yuki has no request field; the thinker gets the user's own heard words
+        heard = heard if heard is not None else request
+        self.arguments = {"screen": False, "say_first": "On it.", "intent": intent, **extra}
         self.tool_call_id = call_id
         self.function_name = "tell_yuki"
         self.context = SimpleNamespace(get_messages=lambda: [
@@ -585,7 +587,7 @@ def test_a_hand_that_did_not_take_is_passed_to_the_thinker_without_a_talker_run(
         await _settle()
         job, text, kw = rt.submitted[0]
         assert kw.get("lane") == "worker" and kw.get("view_hwnd") == 42
-        assert "did not take effect" in text and "play the make up my mind mix" in text
+        assert "did not take effect" in text and "play the make up my mind mix" in text.lower()   # their own words
         # the thinker's own finishing line is the one outcome, said once, by code (v3.17 C1; v3.10: by the talker)
         rt.started.emit("worker", job, "x")
         rt.tool_called.emit("worker", job, "press", {"key": "k", "finishes_with": "Paused it."})

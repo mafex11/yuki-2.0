@@ -406,6 +406,22 @@ class Settings:
         voice_lessons_chars: The Lessons line's size in the talker's volatile block.
         voice_hand_traces: Every talker hand (and learned-way run) is kept as a run trace in practice memory so the
             learners see the hands too (v3.18; written off the voice loop).
+        voice_practice, voice_skills (Phase S, D15): the old talker learning path (the Lessons and Learned ways lines,
+            the step-list ``run_skill``) is off by default. It never runs beside the skill path: with ``skills`` on it
+            stays off whatever these say; with ``skills = false`` they work as before S (``voice_practice`` the lines,
+            ``voice_skills`` also the step-list hand). Deleted in phase P.
+        skills: The skill path (PLAN.md Phase S, docs/research/audit-2026-10-09): the talker's Skills menu and its
+            ``run_skill`` / ``keep_usual`` hands, the thinker's ``run_skill`` tool. With a ``volume`` skill loaded the
+            talker's own ``app_volume`` hand, its volume keys and the thinker's ``app_volume`` tool are off; ``false``
+            brings the old behaviour back everywhere (those hands and tools, no menu, no pinned skill).
+        skills_max: At most this many skills (one per app and end state).
+        skills_menu_chars: The menu's size cap (characters), in the talker's cached hands block and the thinker's
+            ``run_skill`` description.
+        skills_disable_after: Contradicted done-checks in a row before a rung is switched off (retried after 24 h or
+            when its connection file changes); "couldn't confirm" never counts.
+        skills_volume_step: The volume step for "a bit louder" until the user's own usual step is known.
+        youtube_feed_budget_s: Phase T: how long the fresh-uploads strip may take (public feeds, no key).
+        youtube_fresh_days: Phase T: an upload counts as fresh this many days.
     """
 
     model: str = DEFAULT_MODEL
@@ -556,13 +572,22 @@ class Settings:
     voice_stt_warm: bool = True
     voice_qos: bool = True
     voice_mmcss: bool = True
-    # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md)
-    voice_practice: bool = True
-    voice_skills: bool = True
+    # v3.18 practice memory for the talker (docs/research/revamp-2026-10-02/29-build-voice-procedures.md); off since
+    # phase S (D15): never beside the skill path, back only with skills = false (and these on)
+    voice_practice: bool = False
+    voice_skills: bool = False
     voice_skill_min_cosine: float = 0.56
     voice_skill_min_confidence: float = 0.70
     voice_lessons_chars: int = 400
     voice_hand_traces: bool = True
+    # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these)
+    skills: bool = True
+    skills_max: int = 20
+    skills_menu_chars: int = 2400
+    skills_disable_after: int = 2
+    skills_volume_step: int = 10
+    youtube_feed_budget_s: float = 1.5
+    youtube_fresh_days: int = 7
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --
     #: Model failover (yuki.agent.failover): per model id, the targets tried after it keeps failing
     #: (throttled, 5xx, overloaded, timed out, unreachable, model or profile not found), in order:
