@@ -1,0 +1,27 @@
+# Slack: its own data for the `message` skill (message.toml) (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2;
+# map-skills S2.5).
+#
+# A chat whose address memory captured (app.slack.com/client/{team}/{channel}) opens by Slack's own link
+# (slack://channel?team=...&id=..., which opens DMs too); any other chat through Slack's own quick switcher (Ctrl+K,
+# the chat's name, Enter). No Slack API and no app install: Slack's desktop window and its documented
+# deep links only. The chat is checked open by memory's encrypted thread ids before anything is typed. Never with a game
+# in front.
+#
+# Zero setup (D0): nothing to connect.
+
+[connection]
+app = "slack"
+
+[chat]
+title = "Slack"
+images = ["slack.exe"]
+processes = ["slack"]
+services = ["app.slack.com", "slack"]
+switcher = ["ctrl", "k"]
+open = ["enter"]
+send = ["enter"]
+
+# A chat's own address -> its deep link (Slack's documented URL and URI shapes; fixed machine formats).
+[[chat.links]]
+url = "https://app.slack.com/client/{team}/{channel}"
+uri = "slack://channel?team={team}&id={channel}"

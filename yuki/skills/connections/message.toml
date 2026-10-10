@@ -1,0 +1,243 @@
+# message: open a chat with someone in the app the user talks to them in, type the user's own words, and send them only
+# when the user plainly said so (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2; map-skills S2.5).
+#
+# One skill for every chat app, as `volume` is one skill for every volume control. The person (or a group chat or
+# channel, by its name) is found in memory's people index (yuki.memory.contacts: named_in, rank_routes); the app is the
+# one the user named, else that person's usual route (their own lasting choice first, then where they message most
+# lately). Each app's own data (its processes, its link and URI shapes, its shortcuts) sits in that app's connection
+# file (discord.toml, whatsapp.toml, slack.toml, table [chat]); the routes below only name the app.
+#
+# Routes, per app (all rung A: the app's own links and shortcuts, D0): a deep link built from the chat's own address
+# when memory has it (discord://, slack://, whatsapp://send?phone=), else the app's quick switcher or search. Each opens
+# the chat and checks it is open by memory's encrypted thread ids (never a window title) before anything is typed.
+# Rule 8: "send X to Y" types X and presses send (after Yuki's own check, the judge); naming only the person, or saying
+# what to write without "send", leaves a draft. A send is checked by memory's capture of the sent message. Never with a
+# game in front ("after the round?"). The code is yuki/skills/chat.py.
+
+[connection]
+app = "chat"
+
+[skill.message]
+end = "message_sent"
+kind = "change"
+menu = "message someone in their usual chat app; sends only if they said send"
+done_line = "Done."
+learn_from = [["message_sent", "discord"], ["message_sent", "whatsapp"], ["message_sent", "slack"]]
+handoff = true
+# rule 8: a send is judged as one (the thinker's authorizer) and never retried by a second rung
+sends_when = { slot = "send", in = ["send"] }
+
+# Whom: a person or a group chat or channel, exactly as the user said it.
+[[skill.message.slot]]
+name = "person"
+type = "text"
+required = true
+ask = "Who to?"
+
+# The app, only when the user named one: validated as said (no options list, so an app the talker supplies but the
+# user never said is dropped and the person's usual route stands). An app with no chat data here is a question.
+[[skill.message.slot]]
+name = "app"
+type = "app"
+
+# What to write: the user's own words only ("" = just open the chat).
+[[skill.message.slot]]
+name = "text"
+type = "text"
+default = ""
+
+# send: they plainly said to send it; draft: type it and leave it for them.
+[[skill.message.slot]]
+name = "send"
+type = "enum"
+options = ["send", "draft"]
+default = "draft"
+
+# Each route's done-check reads what it did (the chat seen open, the words read back, the send captured); its re-check
+# reads again live a few seconds later (the same sources: flagged as such).
+
+[[skill.message.route]]
+rung = "A"
+variant = "discord_link"
+via = "driver"
+driver = "chat"
+call = "open_link"
+needs_focus = true
+args = { app = "discord" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "discord"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "discord"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
+
+[[skill.message.route]]
+rung = "A"
+variant = "discord_switch"
+via = "driver"
+driver = "chat"
+call = "switcher"
+needs_focus = true
+args = { app = "discord" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "discord"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "discord"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
+
+[[skill.message.route]]
+rung = "A"
+variant = "whatsapp_link"
+via = "driver"
+driver = "chat"
+call = "open_link"
+needs_focus = true
+args = { app = "whatsapp" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "whatsapp"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "whatsapp"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
+
+[[skill.message.route]]
+rung = "A"
+variant = "whatsapp_search"
+via = "driver"
+driver = "chat"
+call = "switcher"
+needs_focus = true
+args = { app = "whatsapp" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "whatsapp"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "whatsapp"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
+
+[[skill.message.route]]
+rung = "A"
+variant = "slack_link"
+via = "driver"
+driver = "chat"
+call = "open_link"
+needs_focus = true
+args = { app = "slack" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "slack"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "slack"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
+
+[[skill.message.route]]
+rung = "A"
+variant = "slack_switch"
+via = "driver"
+driver = "chat"
+call = "switcher"
+needs_focus = true
+args = { app = "slack" }
+
+[skill.message.route.done]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "slack"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+within_s = 6
+
+[skill.message.route.recheck]
+probe = "driver"
+driver = "chat"
+call = "message_done"
+app = "slack"
+person = "{person}"
+text = "{text}"
+send = "{send}"
+live = true
+after_s = 3
+same_source = true
