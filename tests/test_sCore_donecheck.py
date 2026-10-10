@@ -106,25 +106,73 @@ def test_audio_active_and_mic_held_match_by_process(monkeypatch: pytest.MonkeyPa
     ctx = _ctx(Clock())
     assert D.probe_audio_active(ctx, {"process": "InventedPlayer.exe"})[0] is True
     assert D.probe_audio_active(ctx, {"process": "Other.exe"})[0] is False
-    assert D.probe_mic_held(ctx, {"process": "Other.exe"})[0] is True
-    assert D.probe_mic_held(ctx, {"process": "InventedPlayer.exe"})[0] is False
+    assert D.probe_mic_held(ctx, {"process": "InventedPlayer.exe"})[0] is False     # not held: contradicted
+    # review M4: held now proves nothing by itself; only an onset against the state before the rung acted does
+    assert D.probe_mic_held(ctx, {"process": "Other.exe"}) == (None, {"sessions": 1, "status": "no_baseline"})
+    before = D.take_baseline(Check(probe="mic_held", args={"process": "Other.exe"}), {})
+    assert before == {"mic_held:other.exe": True}
+    held_before = _ctx(Clock(), baseline=before)
+    assert D.probe_mic_held(held_before, {"process": "Other.exe"})[0] is None       # held before, still held
+    onset = _ctx(Clock(), baseline={"mic_held:other.exe": False})
+    assert D.probe_mic_held(onset, {"process": "Other.exe"})[0] is True             # taken after the run began
 
 
-def test_message_sent_and_moment_read_memory_since_the_run_began() -> None:
+def test_take_baseline_reads_only_onset_probes_and_all_parts(monkeypatch: pytest.MonkeyPatch) -> None:
+    reads: list = []
+    readers = {"mic_held": lambda args: reads.append(dict(args)) or False}
+    checks = [Check(probe="all", parts=(Check(probe="foreground", args={"process": "A.exe"}),
+                                        Check(probe="mic_held", args={"process": "{app}"}))),
+              Check(probe="mic_held", args={"process": "{app}"}), None]
+    got = D.take_baseline(checks, {"app": "Invented.exe"}, readers=readers)
+    assert got == {"mic_held:invented.exe": False} and reads == [{"process": "Invented.exe"}]   # read once
+    pinned_spec = {"probe": "mic_held", "process": "Invented.exe", "within_s": 2}
+    assert D.take_baseline(pinned_spec, {}, readers={"mic_held": lambda a: (_ for _ in ()).throw(OSError())}) == \
+        {"mic_held:invented.exe": None}                       # couldn't read: no onset can be shown
+
+
+def test_message_sent_needs_this_text_and_never_says_no(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list = []
+    rows: list = []
 
     class Client:
         def sent_messages(self, app: Any, since: float) -> list:
             calls.append((app, since))
-            return [{"thread": "x"}] if since <= 100.0 else []
+            return list(rows) if since <= 100.0 else []
 
         store = SimpleNamespace(moments_between=lambda lo, hi: [{"kind": "volume_change", "app": "demoplayer"}])
 
     ctx = _ctx(Clock(), memory_call=lambda what, fn: fn(Client()))
-    assert D.probe_message_sent(ctx, {"app": "discord"})[0] is True and calls == [("discord", 100.0)]
+    args = {"app": "discord", "text": "see you at  Seven"}
+    # review M3: nothing captured yet (the watcher lags, or memory failed and gave []) is None, never False
+    assert D.probe_message_sent(ctx, args) == (None, {"n": 0, "status": "not_seen_yet"})
+    rows.append({"text": "an older invented line", "thread": "x"})
+    assert D.probe_message_sent(ctx, args)[0] is None                    # another message of theirs: not this one
+    rows.append({"text": "See you at seven", "thread": "x"})
+    v, ev = D.probe_message_sent(ctx, args)
+    assert v is True and ev == {"n": 2, "matched": 1} and calls[0] == ("discord", 100.0)
+    assert "seven" not in repr(ev).casefold()                            # content-free evidence
+    assert D.probe_message_sent(ctx, {"app": "discord"})[0] is None      # no text to match: can't tie it to this run
     assert D.probe_moment(ctx, {"kind": "volume_change", "app": "demoplayer"})[0] is True
     assert D.probe_moment(ctx, {"kind": "page", "app": "demoplayer"})[0] is None    # moments lag: never "no"
-    assert D.probe_message_sent(_ctx(Clock()), {"app": "x"})[0] is None              # no memory: couldn't read
+    assert D.probe_message_sent(_ctx(Clock()), args)[0] is None          # no memory: couldn't read
+
+
+def test_uia_reads_that_timed_out_end_the_wait() -> None:
+    clock = Clock()
+    reads: list = []
+
+    def blocked(ctx: Any, args: Any) -> tuple:
+        reads.append(1)
+        return None, {"status": "timeout", "ms": 600.0}
+
+    got = D.wait(Check(probe="uia_name", within_s=4.0), _ctx(clock, probes={"uia_name": blocked}))
+    assert got.verdict is None and got.reads == D.MAX_LATE_READS == 2      # no thread pile-up on a blocked provider
+    nested = D.wait(Check(probe="all", within_s=4.0, parts=(Check(probe="uia_name"), Check(probe="foreground"))),
+                    _ctx(Clock(), probes={"uia_name": blocked, "foreground": lambda c, a: (False, {})}))
+    assert nested.reads == 2
+    answers = iter([(None, {"status": "timeout"}), (True, {"status": "found"})])   # a cold provider's second read
+    cold = D.wait(Check(probe="uia_name", within_s=4.0), _ctx(Clock(), probes={"uia_name": lambda c, a: next(answers)}))
+    assert cold.verdict is True and cold.reads == 2
 
 
 def test_chat_open_has_no_generic_reader_and_says_so() -> None:

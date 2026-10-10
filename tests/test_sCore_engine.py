@@ -26,6 +26,23 @@ FIXTURES = Path(__file__).with_name("skills_fixtures")
 SECRET_WORDS = ("Zanzibar", "Quillfeather", "Marigold Tapes")
 
 
+@pytest.fixture(autouse=True)
+def _no_live_verbs_or_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing in these tests reaches the desktop: every verb and live probe the engine would dispatch to by name is a
+    stand-in unless a test supplies its own (a test calling a verb function directly stubs that verb's internals)."""
+    from yuki.skills import donecheck
+    from yuki.skills import engine as engine_mod
+
+    for name in list(engine_mod.VERB_FUNCS):
+        monkeypatch.setitem(engine_mod.VERB_FUNCS, name,
+                            lambda call: engine_mod.RouteResult(ran=False, outcome="no_live_verb_in_tests"))
+    for name in list(donecheck.PROBE_FUNCS):
+        if name != "read_back":
+            monkeypatch.setitem(donecheck.PROBE_FUNCS, name, lambda ctx, args: (None, {"status": "test_stub"}))
+    for name in list(donecheck.BASELINES):
+        monkeypatch.setitem(donecheck.BASELINES, name, lambda args: None)
+
+
 @pytest.fixture()
 def demo() -> C.Loaded:
     C.clear_cache()
@@ -261,9 +278,14 @@ def test_every_focus_step_rereads_the_game_check(client, demo) -> None:
     res = E.run(plan, _ctx(client, verbs={"open_uri": Verb()}, game=game, probes={"foreground": Probe(True)}))
     assert res.outcome == "done" and res.focus_taken and calls["n"] == 1
     calls["n"] = 0
-    no_focus = _plan(client, demo, "demo.volume", {"level": 40}, ["forty"])
-    E.run(no_focus, _ctx(client, verbs={"uia_invoke": Verb()}, game=game, probes={"level": Probe(True)}))
-    assert calls["n"] == 0                                                 # a no-focus rung needs no re-read
+    always = _plan(client, demo, "demo.volume", {"level": 40, "control": "mixer"}, ["forty on the mixer"])
+    E.run(always, _ctx(client, verbs={"app_volume": Verb(E.RouteResult(ran=True, verified=True, outcome="set"))},
+                       game=game))
+    assert calls["n"] == 0                                    # a no-focus rung whose data says "always" reads nothing
+    states = _plan(client, demo, "demo.volume", {"level": 40, "control": "in_app"}, ["forty with in_app"])
+    assert [r.key for r in states.routes] == ["A:in_app:uia_invoke"]
+    E.run(states, _ctx(client, verbs={"uia_invoke": Verb()}, game=game, probes={"level": Probe(True)}))
+    assert calls["n"] == 1                                    # a "states" rung re-reads it too (review M5)
 
 
 def test_a_route_the_backstop_refused_is_held_never_handed_over(client, demo) -> None:
@@ -453,3 +475,338 @@ def test_a_contradicted_rung_is_counted_once(client, demo) -> None:
     E.run(plan, _ctx(client, verbs={"app_volume": Verb(E.RouteResult(ran=True, verified=False))}))
     assert R.trust(client.store, vol.key)["A:mixer:app_volume"].failed == 1
     assert len(_rows(client)) == 1 and _rows(client)[0]["rung"] is None   # the run's row names no rung
+
+
+# -- review round 1 ----------------------------------------------------------------------------------------------------
+
+
+def _load_one(tmp_path: Path, text: str) -> C.Loaded:
+    folder = tmp_path / "conn"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "one.toml").write_text(text, encoding="utf-8")
+    C.clear_cache()
+    loaded = C.load([folder])
+    assert loaded.errors == (), loaded.errors
+    return loaded
+
+
+def _client_for(tmp_path: Path, loaded: C.Loaded) -> MemoryClient:
+    c = MemoryClient(Store.open(tmp_path / "review.db"))
+    R.seed(c.store, loaded)
+    return c
+
+
+MIXER = """
+[connection]
+app = "audio"
+
+[skill."audio.level"]
+end = "volume_change"
+kind = "change"
+menu = "set an app's level in the mixer, or the whole PC's"
+done_line = "At {level}%."
+
+[[skill."audio.level".slot]]
+name = "target"
+type = "app"
+options = ["inventedplayer", "chatapp"]
+
+[[skill."audio.level".slot]]
+name = "level"
+type = "number"
+min = 0
+max = 100
+required = true
+
+[[skill."audio.level".route]]
+rung = "A"
+variant = "mixer"
+via = "app_volume"
+when = { slot = "target", present = true }
+args = { app = "{target}", level = "{level}" }
+recheck = { probe = "level", target = "{target}", value = "{level}", after_s = 1 }
+
+[[skill."audio.level".route]]
+rung = "A"
+variant = "whole"
+via = "endpoint_volume"
+when = { slot = "target", present = false }
+args = { level = "{level}" }
+recheck = { probe = "level", target = "system", value = "{level}", after_s = 1 }
+"""
+
+
+def test_the_run_records_the_app_it_acted_on_so_its_moment_is_yukis(tmp_path: Path) -> None:
+    """Review M2 (D18): a mixer level set on another app is that app's moment; the run's row names the acted app
+    (from t0 when the first rung's app is known, and at the finish), so fMoments' attribute() stamps by='yuki'."""
+    from yuki.memory.moments import Moment, attribute, skill_runs_between
+    from yuki.memory.volumewatch import MASTER
+
+    loaded = _load_one(tmp_path, MIXER)
+    client = _client_for(tmp_path, loaded)
+    try:
+        seen: list = []
+
+        def look(call: E.RouteCall) -> None:
+            seen.extend(r[0] for r in client.store._query("SELECT app FROM skill_runs WHERE outcome = 'running'"))
+
+        set_ok = E.RouteResult(ran=True, verified=True, outcome="set", value=40.0)
+        plan = resolve("audio.level", {"target": "inventedplayer", "level": 40}, ["inventedplayer to 40"],
+                       store=client.store, loaded=loaded, live=Live())
+        res = E.run(plan, _ctx(client, verbs={"app_volume": Verb(set_ok, on_call=look)}))
+        assert res.outcome == "done" and seen == ["inventedplayer"]          # named before the rung acted
+        row = dict(client.store._query("SELECT app, t0, t_done FROM skill_runs ORDER BY id DESC LIMIT 1")[0])
+        assert row["app"] == "inventedplayer"
+        runs = skill_runs_between(client.store, row["t0"] - 1, row["t_done"] + 5)
+        moment = Moment(kind="volume_change", at=row["t0"] + 0.5, source="volume", app="inventedplayer",
+                        value=40.0, means="session")
+        assert attribute(moment, runs, now=row["t_done"] + 1).by == "yuki"   # not "your habit"
+        other = Moment(kind="volume_change", at=row["t0"] + 0.5, source="volume", app="chatapp", value=40.0,
+                       means="session")
+        assert attribute(other, runs, now=row["t_done"] + 1).by == "user"
+        # the whole PC's level is the volume watcher's "master"
+        whole = resolve("audio.level", {"level": 30}, ["thirty"], store=client.store, loaded=loaded, live=Live())
+        E.run(whole, _ctx(client, verbs={"endpoint_volume": Verb(set_ok)}))
+        assert client.store._query("SELECT app FROM skill_runs ORDER BY id DESC LIMIT 1")[0][0] == MASTER
+        # a verb that says which app it acted on (a driver) wins
+        told = E.RouteResult(ran=True, verified=True, outcome="set", app="Discord.exe")
+        E.run(plan, _ctx(client, verbs={"app_volume": Verb(told)}))
+        assert client.store._query("SELECT app FROM skill_runs ORDER BY id DESC LIMIT 1")[0][0] == "discord"
+    finally:
+        client.close()
+
+
+CHAT = """
+[connection]
+app = "inventedchat"
+
+[skill."invented.say"]
+end = "message_sent"
+kind = "change"
+menu = "send a line in Invented Chat"
+done_line = "Sent."
+sends = true
+
+[[skill."invented.say".slot]]
+name = "text"
+type = "text"
+required = true
+
+[[skill."invented.say".route]]
+rung = "A"
+variant = "box"
+via = "uia_invoke"
+args = { window = "InventedChat.exe", role = "Button", name = "Send" }
+done = { probe = "message_sent", app = "inventedchat", text = "{text}", within_s = 1 }
+
+[[skill."invented.say".route]]
+rung = "A"
+variant = "again"
+via = "uia_invoke"
+args = { window = "InventedChat.exe", role = "Button", name = "Send now" }
+done = { probe = "message_sent", app = "inventedchat", text = "{text}", within_s = 1 }
+"""
+
+
+@pytest.mark.parametrize("verdict,outcome", [(False, "failed"), (None, "unverified")])
+def test_a_sending_skill_never_tries_another_rung_after_one_acted(tmp_path: Path, verdict: Any, outcome: str) -> None:
+    """Review M3: after a rung of a skill that sends acted, neither another acting rung nor the thinker is tried
+    (a second send); "couldn't confirm it landed" stays None."""
+    loaded = _load_one(tmp_path, CHAT)
+    client = _client_for(tmp_path, loaded)
+    try:
+        plan = resolve("invented.say", {"text": "see you at seven"}, ["tell them see you at seven"],
+                       store=client.store, loaded=loaded, live=Live())
+        assert isinstance(plan, Plan) and len(plan.routes) == 2
+        press = Verb(E.RouteResult(ran=True, outcome="pressed"))
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": press}, probes={"message_sent": Probe(verdict)}))
+        assert res.outcome == outcome and len(press.calls) == 1 and res.handoff is None and not res.done
+        if verdict is False:
+            assert res.say == E.LINE_SEND_FAILED
+        row = dict(client.store._query("SELECT outcome, checked, rung, variant FROM skill_runs")[0])
+        assert (row["outcome"], row["variant"]) == (outcome, "box")
+    finally:
+        client.close()
+
+
+def test_a_rung_whose_data_says_no_retry_after_acting_stops_too(tmp_path: Path) -> None:
+    loaded = _load_one(tmp_path, CHAT.replace("sends = true\n", "").replace(
+        'variant = "box"\n', 'variant = "box"\nretry_after_acting = false\n'))
+    client = _client_for(tmp_path, loaded)
+    try:
+        assert not loaded.skills[0].sends and not loaded.skills[0].routes[0].retry_after_acting
+        plan = resolve("invented.say", {"text": "see you at seven"}, ["see you at seven"], store=client.store,
+                       loaded=loaded, live=Live())
+        press = Verb(E.RouteResult(ran=True, outcome="pressed"))
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": press}, probes={"message_sent": Probe(False)}))
+        assert res.outcome == "failed" and len(press.calls) == 1 and res.say == E.LINE_FAILED
+        # a rung that did not act still passes to the next one
+        idle = Verb(E.RouteResult(ran=False, outcome="missing"))
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": idle}, probes={"message_sent": Probe(False)}))
+        assert len(idle.calls) == 2
+    finally:
+        client.close()
+
+
+VOICE = """
+[connection]
+app = "inventedvoice"
+
+[skill."invented.join"]
+end = "call_join"
+kind = "change"
+menu = "join the invented voice room"
+done_line = "You're in."
+
+[[skill."invented.join".route]]
+rung = "A"
+via = "uia_invoke"
+args = { window = "InventedVoice.exe", role = "Button", name = "Join" }
+done = { probe = "mic_held", process = "InventedVoice.exe", within_s = 0.5 }
+"""
+
+
+def _mic_script(monkeypatch: pytest.MonkeyPatch, *states: bool) -> list:
+    from yuki.skills import donecheck as D
+
+    answers = list(states)
+    reads: list = []
+
+    def held(want: str) -> tuple:
+        v = answers.pop(0) if len(answers) > 1 else answers[0]
+        reads.append(v)
+        return v, 1
+
+    monkeypatch.setattr(D, "_mic_held_by", held)
+    monkeypatch.setitem(D.PROBE_FUNCS, "mic_held", D.probe_mic_held)
+    monkeypatch.setitem(D.BASELINES, "mic_held", D.baseline_mic_held)
+    return reads
+
+
+def test_mic_held_needs_an_onset_after_the_run_began(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review M4: the microphone already held before the rung acted (another channel) is not this run's doing."""
+    loaded = _load_one(tmp_path, VOICE)
+    client = _client_for(tmp_path, loaded)
+    try:
+        plan = resolve("invented.join", {}, ["join"], store=client.store, loaded=loaded, live=Live())
+        reads = _mic_script(monkeypatch, True)                     # held before, still held
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": Verb()}))
+        assert res.outcome == "unverified" and not res.done and reads[0] is True
+        _mic_script(monkeypatch, False, True)                      # taken after the run began
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": Verb()}))
+        assert res.outcome == "done" and res.done
+        _mic_script(monkeypatch, False, False)                     # never taken: contradicted
+        res = E.run(plan, _ctx(client, verbs={"uia_invoke": Verb()}))
+        assert res.outcome == "handed_over"
+        # the hand-off carries the state read right before the thinker acts; its finish gate compares with it
+        assert res.handoff["baseline"] == {"mic_held:inventedvoice.exe": False}
+        from yuki.agent.finish import skill_gate
+
+        _mic_script(monkeypatch, True)
+        assert skill_gate(res.handoff, since=0.0, bounces=0)[0] == "ok"
+        assert skill_gate({**res.handoff, "baseline": {"mic_held:inventedvoice.exe": True}}, since=0.0,
+                          bounces=0)[0] == "hold"
+        assert skill_gate({k: v for k, v in res.handoff.items() if k != "baseline"}, since=0.0,
+                          bounces=0)[0] == "hold"
+    finally:
+        client.close()
+
+
+LADDER = """
+[connection]
+app = "demoplayer"
+
+[skill."demo.loud"]
+end = "volume_change"
+kind = "change"
+menu = "set Demo Player's level"
+done_line = "At {level}%."
+
+[[skill."demo.loud".slot]]
+name = "level"
+type = "number"
+min = 0
+max = 100
+required = true
+
+[[skill."demo.loud".route]]
+rung = "A"
+variant = "mixer"
+via = "app_volume"
+args = { app = "DemoPlayer.exe", level = "{level}" }
+recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1 }
+
+[[skill."demo.loud".route]]
+rung = "A"
+variant = "never"
+via = "uia_invoke"
+args = { window = "DemoPlayer.exe", role = "Slider", name = "Demo volume", pattern = "range", value = "{level}" }
+game = "never"
+done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
+
+[[skill."demo.loud".route]]
+rung = "A"
+variant = "states"
+via = "slider"
+args = { window = "DemoPlayer.exe", name = "Demo volume", to = "{level}" }
+game = "states"
+game_states = ["covered"]
+"""
+
+
+def test_a_game_that_came_up_during_an_earlier_rung_stops_a_never_rung(tmp_path: Path) -> None:
+    """Review M5: the route's game rule is applied again with a fresh read before every rung, not only at resolve."""
+    loaded = _load_one(tmp_path, LADDER)
+    client = _client_for(tmp_path, loaded)
+    try:
+        plan = resolve("demo.loud", {"level": 40}, ["forty"], store=client.store, loaded=loaded, live=Live())
+        assert [r.variant for r in plan.routes] == ["mixer", "never", "states"]
+        up = {"game": ""}
+        mixer = Verb(E.RouteResult(ran=True, verified=False, outcome="not_verified"),
+                     on_call=lambda call: up.update(game="invented-game"))
+        invoke, slider = Verb(), Verb(E.RouteResult(ran=True, verified=True, outcome="set"))
+        ctx = _ctx(client, verbs={"app_volume": mixer, "uia_invoke": invoke, "slider": slider},
+                   game=lambda: up["game"])
+        ctx.window_state = lambda app: "front"                   # not a proven state
+        res = E.run(plan, ctx)
+        assert invoke.calls == [] and slider.calls == [] and res.outcome == "held_game" and res.handoff is None
+        assert [t["outcome"] for t in res.tried] == ["contradicted", "game", "game"]
+        # in a proven state the "states" rung runs mid-game
+        up["game"] = ""
+        ctx = _ctx(client, verbs={"app_volume": mixer, "uia_invoke": invoke, "slider": slider},
+                   game=lambda: up["game"])
+        ctx.window_state = lambda app: "covered"
+        res = E.run(plan, ctx)
+        assert invoke.calls == [] and len(slider.calls) == 1 and res.outcome == "done"
+    finally:
+        client.close()
+
+
+def test_in_call_is_read_for_every_origin_and_already_has_its_own_words(tmp_path: Path) -> None:
+    """Review L7: a thinker-origin run reads memory's open calls when a slot asks in a call; an "already" no-op is
+    reported as nothing to change, never as a fresh done."""
+    skill = C.Skill(key="x.y", app="x", end="volume_change", kind="change", menu="m", done_line="d",
+                    slots=(C.Slot(name="target", type="app", ask_in_call=True),),
+                    routes=(C.Route(rung="A", via="app_volume", needs_focus=False, game="always"),))
+
+    class Mem:
+        store = None
+
+        def __init__(self, calls: list) -> None:
+            self.calls = calls
+
+        def current_calls(self) -> list:
+            return self.calls
+
+    assert E._live_now("", None, media=False, skill=skill, memory=Mem([{"app": "chatapp"}])).in_call is True
+    assert E._live_now("", None, media=False, skill=skill, memory=Mem([])).in_call is False
+    assert E._live_now("", SimpleHands(False), media=False, skill=skill, memory=Mem([{"app": "c"}])).in_call is False
+    plain = C.Skill(**{**skill.__dict__, "slots": (C.Slot(name="target", type="app"),)})
+    assert E._live_now("", None, media=False, skill=plain, memory=Mem([{"app": "c"}])).in_call is False   # not read
+    already = E.SkillResult(skill="x.y", outcome="already", verified=True, done_line="It's already at 40.")
+    assert already.report().startswith("Nothing to change") and "Done and checked" not in already.report()
+
+
+class SimpleHands:
+    def __init__(self, in_call: bool) -> None:
+        self.in_call = in_call

@@ -2835,6 +2835,10 @@ class Agent:
         left unbacked. Logged without words."""
         claims = getattr(self, "_done_claims", None)
         out, why = finish_gate.honest_text(text, verdict, claims)
+        if why is None and getattr(self, "_skill_unconfirmed", False):
+            # phase S (review L4): a pinned skill's own check never saw the result, so the brain's words never stand
+            # as they are, whatever they claim
+            out, why = finish_gate.LINE_SKILL_UNCONFIRMED, "skill_unconfirmed"
         if why is not None and out != text and isinstance(verdict, dict) and (text or "").strip():
             # second review V3: the card and the window get the line alone; the brain's own words stay on the verdict
             # (``words``) for the expanded run, never as the reply

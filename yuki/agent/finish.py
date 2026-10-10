@@ -797,6 +797,9 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
 SKILL_BOUNCES = 2
 #: The gap a pinned skill's unconfirmed check leaves on the outcome verdict (it caps it at "not confirmed").
 SKILL_UNCONFIRMED = "the skill's own check didn't see the result"
+#: Said when a pinned skill's gate ended unconfirmed and nothing else replaced the brain's words (review L4: with no
+#: action and an "answer" claim, "Set it to 40." stood although the skill's check said otherwise).
+LINE_SKILL_UNCONFIRMED = "I couldn't confirm that's done."
 
 
 def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
@@ -814,7 +817,9 @@ def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
         if check is None:
             from yuki.skills.donecheck import check as check_fn
 
-            got = check_fn(done, since=float(since))
+            base = pinned.get("baseline")
+            # the onset probes compare with the states the engine read right before the hand-off (review M4)
+            got = check_fn(done, since=float(since), baseline=base if isinstance(base, dict) else None)
         else:
             got = check(done, since=float(since))
         verdict = getattr(got, "verdict", got)
@@ -837,4 +842,5 @@ __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILE
            "SEND_CONFIRMED", "SEND_UNCHECKED", "SEND_UNCONFIRMED", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
            "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
            "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "did_other", "honest_text",
-           "last_windowless", "read_back", "SKILL_BOUNCES", "SKILL_UNCONFIRMED", "skill_gate"]
+           "last_windowless", "read_back", "SKILL_BOUNCES", "SKILL_UNCONFIRMED", "LINE_SKILL_UNCONFIRMED",
+           "skill_gate"]

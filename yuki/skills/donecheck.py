@@ -21,9 +21,13 @@ be replaced through ``ProbeContext.probes`` (tests, replays, a driver):
 * ``page_at``: the window in front shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates);
 * ``tab_shown``: the app's window is in front with the expected tab selected (identity, never a title template);
 * ``foreground``: the app's window is in front;
-* ``mic_held``: the app holds the microphone now;
+* ``mic_held``: the app took the microphone after t0: an onset against the state read right before the rung acted
+  (:func:`take_baseline`); held before and still held is ``None`` (nothing shows this run did it), never True;
 * ``chat_open``: no generic reader yet (``None``; the messaging builder supplies a driver probe);
-* ``message_sent``: memory captured a message the user sent in that app after t0;
+* ``message_sent``: memory captured the user's own message with this ``text`` in that app after t0 (the same text,
+  whitespace and case folded, or :func:`yuki.agent.finish.similar` over its threshold: the send confirmation the
+  thinker already uses); none yet is ``None`` ("pressed send; couldn't confirm it landed"), never False (the
+  watcher lags, and a False would let the ladder send again);
 * ``moment``: a moment of ``kind`` (and ``app``) was written after t0 (moments lag: none found is ``None``);
 * ``driver``: a probe of a driver module (``yuki/skills/<driver>.py``'s ``PROBES``);
 * ``all``: every part True -> True; any False -> False; else None.
@@ -43,6 +47,8 @@ POLL_S = 0.25
 MAX_WAIT_S = 6.0
 #: How far a level may be from the one asked (points of 0-100).
 LEVEL_TOLERANCE = 2.0
+#: A wait stops after this many reads whose UIA job missed its budget (each leaves a thread waiting on the provider).
+MAX_LATE_READS = 2
 
 Verdict = tuple[bool | None, dict[str, Any]]
 
@@ -60,6 +66,9 @@ class ProbeContext:
     probes: Mapping[str, Callable[["ProbeContext", Mapping[str, Any]], Verdict]] = field(default_factory=dict)
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
+    #: States read right before the rung acted (:func:`take_baseline`), by :func:`baseline_key`: an onset probe
+    #: compares with them (content-free booleans).
+    baseline: Mapping[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -211,7 +220,9 @@ def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
             shared["urls"] = [d.value for d in docs if d.value and "://" in d.value][:4]
 
         shared, late = run_uia(job, 0.5, name="yuki-skill-page")
-        urls = [] if late else list(shared.get("urls") or [])
+        if late:
+            return None, {"status": "timeout"}       # a blocked provider: the wait stops polling it (no pile-up)
+        urls = list(shared.get("urls") or [])
     except Exception:  # noqa: BLE001
         return None, {"status": "unread"}
     if not urls:
@@ -251,25 +262,71 @@ def probe_tab_shown(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     return None, {"status": "no_identity"}
 
 
-def probe_mic_held(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
-    want = _proc(args)
+def _mic_held_by(want: str) -> tuple[bool | None, int]:
+    """Whether the process image ``want`` holds an active capture session now (``None``: couldn't read), and how many
+    sessions it has."""
     try:
         from yuki.perception.audio import capture_sessions
 
         rows = capture_sessions()
     except Exception:  # noqa: BLE001
-        return None, {"status": "unread"}
+        return None, 0
     mine = [r for r in rows if _image_of(int(r.get("pid") or 0)).casefold() == want]
-    return any(str(r.get("state") or "") == "active" for r in mine), {"sessions": len(mine)}
+    return any(str(r.get("state") or "") == "active" for r in mine), len(mine)
+
+
+def baseline_mic_held(args: Mapping[str, Any]) -> bool | None:
+    """The microphone state before the rung acts (``None``: couldn't read)."""
+    return _mic_held_by(_proc(args))[0]
+
+
+def probe_mic_held(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
+    """An onset (review M4): True only when the app holds the microphone now and did not right before the rung acted.
+    Not held now: False. Held before and still held, or no state from before: ``None`` (this run may not have done
+    it: an "already in a call" switch that only opened a channel keeps the old hold)."""
+    want = _proc(args)
+    held, n = _mic_held_by(want)
+    if held is None:
+        return None, {"status": "unread"}
+    if not held:
+        return False, {"sessions": n}
+    before = (ctx.baseline or {}).get(baseline_key("mic_held", args))
+    if before is False:
+        return True, {"sessions": n, "onset": True}
+    return None, {"sessions": n, "status": "held_before" if before else "no_baseline"}
 
 
 def probe_chat_open(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     return None, {"status": "no_reader"}
 
 
+def _norm_text(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _same_text(want: str, got: str) -> bool:
+    """The captured message is the text this run sent: equal once whitespace and case are folded (a digest match),
+    else the thinker's own send confirmation rule (:func:`yuki.agent.finish.similar` >= its ``SIMILAR``)."""
+    if not want or not got:
+        return False
+    if _norm_text(want) == _norm_text(got):
+        return True
+    try:
+        from yuki.agent.finish import SIMILAR, similar
+
+        return similar(want, got) >= SIMILAR
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def probe_message_sent(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
+    """The user's own message with ``text`` captured in ``app`` since the run began: True. Nothing matching yet (the
+    watcher lags, or memory failed and gave ``[]``): ``None``, never False (review M3)."""
     if ctx.memory_call is None:
         return None, {"status": "no_memory"}
+    want = str(args.get("text") or "")
+    if not want.strip():
+        return None, {"status": "no_text"}
     app = args.get("app")
     try:
         got = ctx.memory_call("sent_messages", lambda c: c.sent_messages(app, since=float(ctx.since)))
@@ -277,7 +334,10 @@ def probe_message_sent(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
         return None, {"status": "unread"}
     if not isinstance(got, list):
         return None, {"status": "unread"}
-    return (True, {"n": len(got)}) if got else (False, {"n": 0})
+    hits = sum(1 for row in got if isinstance(row, Mapping) and _same_text(want, str(row.get("text") or "")))
+    if hits:
+        return True, {"n": len(got), "matched": hits}
+    return None, {"n": len(got), "status": "not_seen_yet"}
 
 
 def probe_moment(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
@@ -324,6 +384,63 @@ PROBE_FUNCS: dict[str, Callable[[ProbeContext, Mapping[str, Any]], Verdict]] = {
     "driver": probe_driver,
 }
 
+#: Onset probes: what each reads right before a rung acts (:func:`take_baseline`), so its check can tell a change
+#: this run made from a state that was already there.
+BASELINES: dict[str, Callable[[Mapping[str, Any]], Any]] = {"mic_held": baseline_mic_held}
+
+
+def baseline_key(probe: str, args: Mapping[str, Any]) -> str:
+    """Where a baseline is kept: the probe and the process it reads (``"mic_held:discord.exe"``)."""
+    return f"{probe}:{_proc(args)}"
+
+
+def take_baseline(checks: Any, values: Mapping[str, Any], *,
+                  readers: Mapping[str, Callable[[Mapping[str, Any]], Any]] | None = None) -> dict[str, Any]:
+    """The states the onset probes among ``checks`` (a :class:`Check`, a pinned dict's ``done`` spec, or a list of
+    them; ``all`` parts included) read now, right before a rung acts: ``{baseline_key: True / False / None}``.
+    Only probes with a baseline reader read anything (one Core Audio enumeration for ``mic_held``)."""
+    out: dict[str, Any] = {}
+    items = checks if isinstance(checks, (list, tuple)) else [checks]
+
+    def visit(c: Any) -> None:
+        if isinstance(c, Mapping):
+            c = _check_of(c)
+        if not isinstance(c, Check):
+            return
+        if c.probe == "all":
+            for p in c.parts:
+                visit(p)
+            return
+        fn = (readers or {}).get(c.probe) or BASELINES.get(c.probe)
+        if fn is None:
+            return
+        try:
+            args = fill_value(dict(c.args), values)
+        except KeyError:
+            return
+        key = baseline_key(c.probe, args)
+        if key in out:
+            return
+        try:
+            got = fn(args)
+            out[key] = got if isinstance(got, bool) else None
+        except Exception:  # noqa: BLE001 - couldn't read: the onset can't be shown (None)
+            out[key] = None
+
+    for item in items:
+        visit(item)
+    return out
+
+
+def _timed_out(evidence: Mapping[str, Any]) -> bool:
+    """A read whose UIA job missed its budget (a blocked provider; its thread is still waiting): polling it again
+    would only pile up threads, so the wait stops there."""
+    if not isinstance(evidence, Mapping):
+        return False
+    if evidence.get("status") == "timeout":
+        return True
+    return any(isinstance(v, Mapping) and _timed_out(v) for v in evidence.values())
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Reading a check
@@ -368,18 +485,20 @@ class Waited:
 def wait(check: Check, ctx: ProbeContext, *, deadline_s: float | None = None) -> Waited:
     """Read ``check`` every :data:`POLL_S` until it is True or its time (``within_s``, capped at
     :data:`MAX_WAIT_S`, and by ``deadline_s``: the request's time left) is up. A ``read_back`` check is read once
-    (the route already waited for its own read-back)."""
+    (the route already waited for its own read-back); :data:`MAX_LATE_READS` reads whose UIA job timed out end the
+    wait (a cold provider gets a second chance; a blocked one never piles up threads)."""
     start = ctx.clock()
     budget = min(float(check.within_s), MAX_WAIT_S)
     if deadline_s is not None:
         budget = max(0.0, min(budget, float(deadline_s)))
-    reads = 0
+    reads = late = 0
     verdict: bool | None = None
     evidence: dict[str, Any] = {}
     while True:
         verdict, evidence = read(check, ctx)
         reads += 1
-        if verdict is True or check.probe == "read_back":
+        late += int(_timed_out(evidence))
+        if verdict is True or check.probe == "read_back" or late >= MAX_LATE_READS:
             break
         if ctx.clock() - start + POLL_S > budget:
             break
@@ -398,9 +517,11 @@ def recheck(check: Check, ctx: ProbeContext, *, after_s: float | None = None) ->
 
 def check(done: Mapping[str, Any] | Check, *, since: float, values: Mapping[str, Any] | None = None,
           memory_call: Callable[[str, Callable[[Any], Any]], Any] | None = None, within_s: float = 2.0,
-          probes: Mapping[str, Callable[..., Verdict]] | None = None) -> Waited:
+          probes: Mapping[str, Callable[..., Verdict]] | None = None,
+          baseline: Mapping[str, Any] | None = None) -> Waited:
     """The thinker's finish gate for a pinned skill: its done-check (a :class:`Check` or the pinned dict's ``done``
-    spec, templates already filled) read for at most ``within_s``."""
+    spec, templates already filled) read for at most ``within_s``. ``baseline``: the states the engine read before
+    the hand-off (the pinned dict's ``baseline``), for onset probes."""
     spec = done if isinstance(done, Check) else _check_of(done)
     if spec is None:
         return Waited(None, {"status": "no_check"}, 0, 0.0)
@@ -409,7 +530,7 @@ def check(done: Mapping[str, Any] | Check, *, since: float, values: Mapping[str,
         # the thinker's own actions have no route read-back: that check can't be read here
         return Waited(None, {"status": "no_route"}, 0, 0.0)
     ctx = ProbeContext(since=float(since), values=dict(values or {}), memory_call=memory_call,
-                       probes=dict(probes or {}))
+                       probes=dict(probes or {}), baseline=dict(baseline or {}))
     return wait(spec, ctx)
 
 
@@ -425,5 +546,5 @@ def _check_of(raw: Mapping[str, Any] | None) -> Check | None:
     return Check(probe=str(raw["probe"]), args=args, within_s=within, parts=parts)
 
 
-__all__ = ["POLL_S", "MAX_WAIT_S", "LEVEL_TOLERANCE", "ProbeContext", "PROBE_FUNCS", "Waited", "read", "wait",
-           "recheck", "check"]
+__all__ = ["POLL_S", "MAX_WAIT_S", "LEVEL_TOLERANCE", "MAX_LATE_READS", "ProbeContext", "PROBE_FUNCS", "BASELINES",
+           "Waited", "read", "wait", "recheck", "check", "baseline_key", "take_baseline"]

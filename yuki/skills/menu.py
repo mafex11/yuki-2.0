@@ -47,9 +47,11 @@ def skill_line(skill: Skill, *, candidates: dict[str, list[str]] | None = None) 
     return _clip(line, MENU_LINE_CHARS)
 
 
-def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, chars: int = MENU_CHARS) -> list[str]:
+def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, chars: int = MENU_CHARS,
+               rank: str = "hour") -> list[str]:
     """The menu's lines in load order, within ``chars`` (later skills give way first). With ``store``: the taste
-    candidates of entity slots and only skills that have a usable rung or may hand over."""
+    candidates of entity slots (``rank``: ``hour``, best at this hour first, or ``n_obs``, most seen first: stable
+    between the nightly recomputes) and only skills that have a usable rung or may hand over."""
     from yuki.skills import registry, taste
 
     out: list[str] = []
@@ -62,7 +64,7 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
                 continue
             for slot in skill.slots:
                 if slot.taste:
-                    cands[slot.name] = taste.candidates(store, slot.taste, now=now)
+                    cands[slot.name] = taste.candidates(store, slot.taste, now=now, by=rank)
         line = skill_line(skill, candidates=cands)
         if used + len(line) + 1 > chars:
             break
@@ -74,9 +76,10 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
 def menu_text(store: Any = None, *, audience: str = TALKER, loaded: Loaded | None = None, now: float | None = None,
               chars: int = MENU_CHARS) -> str:
     """The menu block (``""`` when no skill is loaded). The talker's starts with its heading; the thinker's is the
-    bare lines (its tool description carries the heading)."""
+    bare lines (its tool description carries the heading) with taste candidates most seen first, so its tool block
+    stays byte-stable through the day (review L2: an hour-ranked list changed the cached block every hour)."""
     loaded = loaded if loaded is not None else load()
-    lines = menu_lines(loaded, store=store, now=now, chars=chars)
+    lines = menu_lines(loaded, store=store, now=now, chars=chars, rank="n_obs" if audience == THINKER else "hour")
     if not lines:
         return ""
     if audience == TALKER:

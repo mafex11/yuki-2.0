@@ -65,13 +65,29 @@ def has_tables(store: Any) -> bool:
 
 def seed(store: Any, loaded: Loaded, *, now: float | None = None) -> dict[str, int]:
     """One ``skills`` row per loaded skill and one ``skill_routes`` row per rung (upserted; a skill no file has any
-    more is retired, never deleted). A changed connection file clears the disabled mark of its routes (they get
-    another try). Returns counts (content-free). Never raises: ``{"error": 1}``."""
+    more is retired, never deleted). A changed connection file stamps ``hash_changed_at`` on its routes: the
+    contradiction streak that disables a rung counts only runs after it (:func:`trust`), so each gets another try
+    (``reenabled`` counts them). One transaction: skills no file has any more are retired first, so a renamed key or a
+    new skill for the same (app, end) takes the place without breaking the one-live-skill-per-(app, end) index.
+    Returns counts (content-free). Never raises: ``{"error": 1}``."""
     now = time.time() if now is None else float(now)
     counts = {"skills": 0, "routes": 0, "retired": 0, "reenabled": 0}
 
     def write(conn: Any) -> None:
         live = {s.key for s in loaded.skills}
+        # retire first (review M6): a key no file has any more frees its (app, end) before another takes it
+        for sid, key in conn.execute("SELECT id, key FROM skills WHERE retired_at IS NULL").fetchall():
+            if key not in live:
+                conn.execute("UPDATE skills SET retired_at = ?, state = 'retired', updated_at = ? WHERE id = ?",
+                             (now, now, sid))
+                counts["retired"] += 1
+        # a loaded skill whose (app, end) moved steps aside too, so two moving skills never collide mid-way (the
+        # loop below brings each back at its new place; load() keeps (app, end) unique among the loaded)
+        wanted = {s.key: (s.app, s.end) for s in loaded.skills}
+        for sid, key, app, end_kind in conn.execute(
+                "SELECT id, key, app, end_kind FROM skills WHERE retired_at IS NULL").fetchall():
+            if key in wanted and wanted[key] != (app, end_kind):
+                conn.execute("UPDATE skills SET retired_at = ? WHERE id = ?", (now, sid))
         for s in loaded.skills:
             row = conn.execute("SELECT id, connection, retired_at FROM skills WHERE key = ?", (s.key,)).fetchone()
             if row is None:
@@ -97,19 +113,17 @@ def seed(store: Any, loaded: Loaded, *, now: float | None = None) -> dict[str, i
                         (skill_id, r.rung, r.variant, r.via, int(r.needs_focus), s.hash, now, now))
                 else:
                     changed = (got[1] or "") != s.hash
-                    if changed and got[2] is not None:
+                    if changed:
                         counts["reenabled"] += 1
+                    # B.2: a changed file retries a disabled rung: its streak restarts from now (review M1)
                     conn.execute(
                         "UPDATE skill_routes SET needs_focus = ?, connection_hash = ?, updated_at = ?, "
+                        "hash_changed_at = CASE WHEN ? THEN ? ELSE hash_changed_at END, "
                         "disabled_at = CASE WHEN ? THEN NULL ELSE disabled_at END, "
                         "disabled_why = CASE WHEN ? THEN NULL ELSE disabled_why END WHERE id = ?",
-                        (int(r.needs_focus), s.hash, now, int(changed), int(changed), int(got[0])))
+                        (int(r.needs_focus), s.hash, now, int(changed), now, int(changed), int(changed),
+                         int(got[0])))
                 counts["routes"] += 1
-        for sid, key in conn.execute("SELECT id, key FROM skills WHERE retired_at IS NULL").fetchall():
-            if key not in live:
-                conn.execute("UPDATE skills SET retired_at = ?, state = 'retired', updated_at = ? WHERE id = ?",
-                             (now, now, sid))
-                counts["retired"] += 1
 
     try:
         store._write(write)
@@ -139,10 +153,11 @@ def start_run(store: Any, *, skill: Skill | str, origin: str, t0: float | None =
               request_id: str | None = None, session_id: str | None = None, app: str | None = None,
               end_kind: str | None = None, filled: Mapping[str, str] | None = None,
               slots_digest: str | None = None) -> str | None:
-    """Write the run's row at ``t0``, before its first step (D18). Returns the run key (``None`` when it could not be
-    written: the run still goes on)."""
+    """Write the run's row at ``t0``, before its first step (D18). ``app``: the app its first rung acts on (an app
+    key; default the connection's app). Returns the run key (``None`` when it could not be written: the run still
+    goes on)."""
     key = skill.key if isinstance(skill, Skill) else str(skill)
-    app = app if app is not None else (skill.app if isinstance(skill, Skill) else None)
+    app = _app_key(app) if app else (skill.app if isinstance(skill, Skill) else None)
     end_kind = end_kind if end_kind is not None else (skill.end if isinstance(skill, Skill) else None)
     t0 = time.time() if t0 is None else float(t0)
     run_key = run_key or new_run_key()
@@ -165,11 +180,14 @@ def start_run(store: Any, *, skill: Skill | str, origin: str, t0: float | None =
 def finish_run(store: Any, run_key: str, *, outcome: str, checked: bool | None, route: Route | None = None,
                t_done: float | None = None, ms: float | None = None, value: float | None = None,
                entity_digest: str | None = None, evidence: Mapping[str, Any] | None = None,
-               error: str | None = None) -> bool:
+               error: str | None = None, app: str | None = None) -> bool:
     """Finish the run's row: the route that ran last, the outcome word, the done-check's verdict (D19: 1 / 0 / NULL),
-    when it was done, and the D18 attribution facts (a level set, the entity started). Content-free."""
+    when it was done, and the D18 attribution facts (a level set, the entity started, and ``app``: the app the route
+    acted on, as an app key, when it is not the connection's own: a mixer level set on Spotify is Spotify's moment).
+    Content-free."""
     if outcome not in OUTCOMES:
         outcome = "error"
+    acted_app = _app_key(app)
 
     def write(conn: Any) -> None:
         route_id = None
@@ -183,18 +201,39 @@ def finish_run(store: Any, run_key: str, *, outcome: str, checked: bool | None, 
         idle = outcome in IDLE_OUTCOMES
         conn.execute(
             "UPDATE skill_runs SET outcome = ?, checked = ?, route_id = ?, rung = ?, variant = ?, via = ?, t_done = ?, "
-            "ms = ?, value = ?, entity_digest = ?, evidence = ?, error = ?, "
+            "ms = ?, value = ?, entity_digest = ?, evidence = ?, error = ?, app = coalesce(?, app), "
             + ("end_kind = NULL " if idle else "end_kind = end_kind ") + "WHERE run_key = ?",
             (outcome, None if checked is None else int(bool(checked)), route_id,
              route.rung if route else None, route.variant if route else None, route.via if route else None,
              time.time() if t_done is None else float(t_done), ms, value, entity_digest,
-             json.dumps(dict(evidence or {}), sort_keys=True, default=str), error, run_key))
+             json.dumps(dict(evidence or {}), sort_keys=True, default=str), error, acted_app, run_key))
         if outcome in ("done", "already"):
             conn.execute("UPDATE skills SET uses = uses + 1, last_used_at = ? WHERE id = (SELECT skill_id FROM "
                          "skill_runs WHERE run_key = ?)", (time.time(), run_key))
 
     try:
         store._write(write)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _app_key(app: Any) -> str | None:
+    if not app:
+        return None
+    from yuki.memory.store import app_key
+
+    return app_key(str(app))
+
+
+def set_run_app(store: Any, run_key: str, app: str | None) -> bool:
+    """D18: the app the next rung acts on, written before it acts (a moment that rung causes is matched on it while the
+    run is still going: ``yuki.memory.moments.attribute`` compares the run's app with the moment's)."""
+    key = _app_key(app)
+    if not key or not run_key:
+        return False
+    try:
+        store._write(lambda conn: conn.execute("UPDATE skill_runs SET app = ? WHERE run_key = ?", (key, run_key)))
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -257,6 +296,8 @@ class RouteTrust:
     disabled_at: float | None = None
     disabled_why: str | None = None
     connection_hash: str | None = None
+    #: When the connection file last changed for this rung: the streak counts only runs after it (B.2).
+    hash_changed_at: float | None = None
     ms: list[float] = field(default_factory=list)
 
     @property
@@ -279,17 +320,21 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
           disable_after: int = DISABLE_AFTER) -> dict[str, RouteTrust]:
     """``{route key: RouteTrust}`` for one skill, from its ledger rows (``until``: only runs before it, for replays and
     evals "as of that time"). A rung whose newest decided runs are ``disable_after`` contradictions in a row is
-    disabled (from the last one) unless it was retried since (24 h) or its file changed (``seed`` cleared the mark)."""
+    disabled (from the last one) unless it was retried since (24 h) or its connection file changed since: the streak
+    counts only runs after ``skill_routes.hash_changed_at`` (review M1)."""
     now = time.time() if now is None else float(now)
     out: dict[str, RouteTrust] = {}
     try:
         routes = store._query(
-            "SELECT r.rung, r.variant, r.via, r.seed_ok, r.disabled_at, r.disabled_why, r.connection_hash "
-            "FROM skill_routes r JOIN skills s ON s.id = r.skill_id WHERE s.key = ?", (skill_key,))
-        for rung, variant, via, seed_ok, dis_at, dis_why, chash in routes:
+            "SELECT r.rung, r.variant, r.via, r.seed_ok, r.disabled_at, r.disabled_why, r.connection_hash, "
+            "r.hash_changed_at FROM skill_routes r JOIN skills s ON s.id = r.skill_id WHERE s.key = ?", (skill_key,))
+        for rung, variant, via, seed_ok, dis_at, dis_why, chash, changed_at in routes:
             k = _route_key(rung, variant, via)
+            if until is not None and changed_at is not None and float(changed_at) >= float(until):
+                changed_at = None      # as of a time before the change: the file had not changed yet
             out[k] = RouteTrust(key=k, seed_ok=int(seed_ok or 0), disabled_at=dis_at, disabled_why=dis_why,
-                                connection_hash=chash)
+                                connection_hash=chash,
+                                hash_changed_at=float(changed_at) if changed_at is not None else None)
         hi = float(until) if until is not None else now + 1.0
         lo = now - TRUST_DAYS * 86400.0
         rows = store._query(
@@ -320,6 +365,8 @@ def trust(store: Any, skill_key: str, *, now: float | None = None, until: float 
             t.last_failed_at = max(t.last_failed_at or 0.0, float(t0))
         if len(t.last5) < CHANGE_WINDOW:
             t.last5.append(1 if good else 0)
+        if t.hash_changed_at is not None and float(t0) < t.hash_changed_at:
+            streak_open[k] = False      # runs before the file changed never count towards a disable
         if streak_open.get(k, True):
             if good:
                 streak_open[k] = False
@@ -446,6 +493,6 @@ def runs_between(store: Any, since: float, until: float) -> list[dict[str, Any]]
 
 
 __all__ = ["DISABLE_AFTER", "RETRY_AFTER_S", "OPEN_RUNS", "CHANGE_RUNS", "OUTCOMES", "RouteTrust", "has_tables", "seed",
-           "skill_ids", "new_run_key", "start_run", "finish_run", "record_route_try", "set_recheck",
+           "skill_ids", "new_run_key", "start_run", "finish_run", "set_run_app", "record_route_try", "set_recheck",
            "mark_false_done", "trust", "usable", "offer_ready", "menu_version", "last_runs", "import_evidence",
            "table_counts", "runs_between"]

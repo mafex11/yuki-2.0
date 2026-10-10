@@ -312,6 +312,21 @@ def _when_ok(route: Route, values: Mapping[str, Any]) -> bool:
     return True
 
 
+def _window_state(skill: Skill, live: Live) -> str | None:
+    """The app's window state for the ``states`` game rule: the caller's reader, else the skill's driver hook
+    (:func:`yuki.skills.connection.window_state_reader`); ``None`` when neither reads it (the rung stays off)."""
+    from yuki.skills.connection import WINDOW_STATES, window_state_reader
+
+    reader = live.window_state if live.window_state is not None else window_state_reader(skill)
+    if reader is None:
+        return None
+    try:
+        got = reader(skill.app)
+    except Exception:  # noqa: BLE001
+        return None
+    return got if isinstance(got, str) and got in WINDOW_STATES else None
+
+
 def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: Live | None = None,
            now: float | None = None, until: float | None = None,
            disable_after: int = 2) -> tuple[list[Route], dict[str, str]]:
@@ -337,7 +352,7 @@ def ladder(skill: Skill, values: Mapping[str, Any], *, store: Any = None, live: 
                 skipped[r.key] = "game"
                 continue
             if r.game == "states":
-                state = live.window_state(skill.app) if live.window_state is not None else None
+                state = _window_state(skill, live)
                 if state not in r.game_states:
                     skipped[r.key] = "game"
                     continue

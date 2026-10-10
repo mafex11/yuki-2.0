@@ -4772,14 +4772,16 @@ class MemoryClient:
     # -- (skills, skill_routes, skill_runs, prefs, pref_events, tastes) is ever exposed by the MCP.
 
     def _skills_seeded(self) -> Any:
-        """The loaded connection files, seeded into this database once per version per process (an upsert)."""
+        """The loaded connection files, seeded into this database once per version per process (an upsert). A seed
+        that failed is tried again on the next call (the version is marked seeded only on success)."""
         from yuki.skills import connection, registry
 
         loaded = connection.load()
         seen = getattr(self, "_skills_version", None)
         if seen != loaded.version and registry.has_tables(self.store):
-            registry.seed(self.store, loaded)
-            self._skills_version = loaded.version
+            got = registry.seed(self.store, loaded)
+            if isinstance(got, dict) and not got.get("error"):
+                self._skills_version = loaded.version
         return loaded
 
     def skill_menu(self, audience: str = "talker", *, now: float | None = None) -> str:

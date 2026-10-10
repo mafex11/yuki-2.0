@@ -12,6 +12,7 @@ File shape (abbreviated)::
 
     [connection]
     app = "demo"                          # the app key (yuki.memory.store.app_key form)
+    state_reader = "demo_route"           # optional: the driver module whose window_state(app) feeds game = "states"
 
     [skill."demo.lamp"]
     end = "volume_change"                 # D3: the moment kind its done-check proves (D1 vocabulary)
@@ -21,6 +22,8 @@ File shape (abbreviated)::
     learn_from = [["volume_change", "demo"]]
     routine_on = []
     handoff = true                        # rung C (the thinker) when every route failed; never with a game in front
+    sends = false                         # true for a skill that sends to people (rule 8; never a second acting rung);
+                                          # sends_when = { slot = "send", in = ["send"] } narrows it to some values
 
     [[skill."demo.lamp".slot]]
     name = "level"
@@ -34,8 +37,13 @@ File shape (abbreviated)::
     via = "uia_invoke"                    # the closed VERBS list
     args = { pattern = "range", window = "Demo.exe", role = "Slider", name = "Lamp", value = "{level}" }
     game = "always"                       # never | always | states (with game_states): may it run with a game in front
-    done = { probe = "read_back", within_s = 2 }
-    recheck = { probe = "level", after_s = 3, same_source = true }
+    done = { probe = "read_back", within_s = 2 }   # required unless the verb reads its own result back (D19)
+    recheck = { probe = "level", after_s = 3, same_source = true }   # missing: allowed, reported as a warning
+    # retry_after_acting = false          # after this rung acted and its check said "not so", try nothing else
+
+Driver modules (``via = "driver"``, ``probe = "driver"``, ``state_reader``) are found through the import system
+(``importlib.util.find_spec``), so they load from the installed app's archive too. A driver's ``RouteResult.app``
+names the app it acted on (D18).
 
 Templates in strings: ``{slot}`` (a slot's value) and ``{slot.field}`` (a field of an entity slot's value). A fixed
 machine format, parsed here without regular expressions; a brace that is not a template stays as it is.
@@ -45,11 +53,12 @@ Zero setup (D0): no field anywhere may carry or ask for an account, a key, a tok
 from __future__ import annotations
 
 import hashlib
+import importlib
 import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 #: The bundled connection files.
 CONNECTIONS_DIR = Path(__file__).with_name("connections")
@@ -64,10 +73,13 @@ MENU_LINE_CHARS = 140
 @dataclass(frozen=True)
 class VerbInfo:
     """What a route verb does to the desktop. ``focus``: it brings a window forward or sends input (``None``: the
-    route must declare it; a driver)."""
+    route must declare it; a driver). ``reads_back``: the verb measures its own result (a level read back, the window
+    in front, a selected tab, a checked recorded path), so a route may end on that read-back alone; every other verb
+    names its done-check (D19: every route ends on a machine check)."""
 
     focus: bool | None
     doc: str
+    reads_back: bool = False
 
 
 #: The closed list of route verbs (PLAN.md D.2). A verb that takes focus or sends input is never run with a game in
@@ -78,13 +90,15 @@ VERBS: dict[str, VerbInfo] = {
     "media_command": VerbInfo(False, "the media session's own play/pause/next/previous/stop on one app's session"),
     "open_url": VerbInfo(True, "open an address in a named app (launch arguments, nothing typed)"),
     "open_uri": VerbInfo(True, "an app URI (spotify:, discord://, whatsapp://, slack://) through launch.open_url"),
-    "focus": VerbInfo(True, "bring one app window forward"),
-    "tab_select": VerbInfo(False, "select one tab of a window's strip by its identity (no keys, no pointer)"),
-    "uia_steps": VerbInfo(True, "a recorded UI Automation path, each step checked (rung B)"),
-    "slider": VerbInfo(False, "a slider by RangeValue only (press, hover and hotkey are never passed)"),
-    "app_volume": VerbInfo(False, "one app's mixer level, read back (Core Audio)"),
-    "endpoint_volume": VerbInfo(False, "the whole PC's level, read back (Core Audio)"),
-    "agent": VerbInfo(True, "rung C: hand the request to the thinker with the skill pinned"),
+    "focus": VerbInfo(True, "bring one app window forward", reads_back=True),
+    "tab_select": VerbInfo(False, "select one tab of a window's strip by its identity (no keys, no pointer)",
+                           reads_back=True),
+    "uia_steps": VerbInfo(True, "a recorded UI Automation path, each step checked (rung B)", reads_back=True),
+    "slider": VerbInfo(False, "a slider by RangeValue only (press, hover and hotkey are never passed)",
+                       reads_back=True),
+    "app_volume": VerbInfo(False, "one app's mixer level, read back (Core Audio)", reads_back=True),
+    "endpoint_volume": VerbInfo(False, "the whole PC's level, read back (Core Audio)", reads_back=True),
+    "agent": VerbInfo(True, "rung C: hand the request to the thinker with the skill pinned", reads_back=True),
     "driver": VerbInfo(None, "a route function of a module under yuki.skills (its ROUTES table)"),
 }
 
@@ -99,9 +113,9 @@ PROBES: tuple[str, ...] = (
     "page_at",         # the window in front shows a page of this template, titled
     "tab_shown",       # the app's window is in front with a known tab identity selected
     "foreground",      # the app's window is in front
-    "mic_held",        # the app holds the microphone (an onset after the run began)
+    "mic_held",        # the app took the microphone after the run began (held before and still held: unconfirmed)
     "chat_open",       # the chat named by its stored digests is open
-    "message_sent",    # memory captured a message the user sent there after the run began
+    "message_sent",    # memory captured this text, sent by the user there, after the run began (none yet: None)
     "moment",          # a moment of this kind and app was written after the run began (yuki.memory.moments)
     "driver",          # a probe function of a driver module (its PROBES table)
     "all",             # every part True -> True; any False -> False; else None
@@ -320,6 +334,9 @@ class Route:
     say: str = ""
     driver: str = ""
     call: str = ""
+    #: Whether the next rung may run after this one acted and its check said "not so" (``false`` for a rung whose
+    #: action may have landed anyway). A skill that sends never moves on after an acting rung (it would send twice).
+    retry_after_acting: bool = True
 
     @property
     def key(self) -> str:
@@ -347,6 +364,16 @@ class Skill:
     preview: str = ""
     file: str = ""
     hash: str = ""
+    #: The skill may send something to other people (a message): judged as a send at the thinker's authorizer (rule
+    #: 8), and its ladder never moves to another acting rung once one acted. ``sends_when``: slot conditions (the
+    #: routes' ``when`` shape) under which it sends; none listed = whenever it runs.
+    sends: bool = False
+    sends_when: tuple[Mapping[str, Any], ...] = ()
+    #: A driver module under ``yuki.skills`` whose ``window_state(app)`` reads the app's window state for the
+    #: ``game = "states"`` rule (else the first driver its routes name that has one).
+    state_reader: str = ""
+    #: What the validator noticed and allowed (a route with no second re-check); reported, never fatal.
+    warnings: tuple[str, ...] = ()
 
     def slot(self, name: str) -> Slot | None:
         return next((s for s in self.slots if s.name == name), None)
@@ -464,6 +491,8 @@ def _check(raw: Any, where: str, *, recheck: bool = False) -> Check | None:
         _driver_name(raw.get("driver"), f"{where}.driver")
         if not str(raw.get("call") or "").isidentifier():
             raise ConnectionError_(f"{where}: a driver probe names its call")
+    if probe == "message_sent" and not str(raw.get("text") or ""):
+        raise ConnectionError_(f"{where}: a message_sent check names the text it matches (text = \"{{text}}\")")
     within = _number(raw.get("within_s"), f"{where}.within_s")
     after = _number(raw.get("after_s"), f"{where}.after_s")
     if within is not None and not 0.0 <= within <= 6.0:
@@ -476,12 +505,24 @@ def _check(raw: Any, where: str, *, recheck: bool = False) -> Check | None:
                  same_source=bool(raw.get("same_source", False)))
 
 
+def driver_exists(name: str) -> bool:
+    """Whether ``yuki.skills.<name>`` can be imported, asked of the import system (``importlib.util.find_spec``), not
+    of the file system: the installed app keeps its modules inside PyInstaller's archive, where no ``.py`` file
+    exists (review H1)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(f"yuki.skills.{name}") is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
 def _driver_name(raw: Any, where: str) -> str:
     name = str(raw or "")
     if not name.isidentifier() or name.startswith("_"):
         raise ConnectionError_(f"{where}: driver {name!r} is not a module name")
-    if not (Path(__file__).parent / f"{name}.py").exists():
-        raise ConnectionError_(f"{where}: no driver module yuki/skills/{name}.py")
+    if not driver_exists(name):
+        raise ConnectionError_(f"{where}: no driver module yuki.skills.{name}")
     return name
 
 
@@ -553,10 +594,14 @@ def _route(raw: Any, where: str, slots: Mapping[str, Slot]) -> Route:
         for name in template_names(text):
             if name.split(".")[0] not in slots:
                 raise ConnectionError_(f"{where}: template {{{name}}} names no slot")
+    done = _check(raw.get("done"), f"{where}.done")
+    if done is None and not info.reads_back:
+        # D19: every route ends on a machine check; only a verb that reads its own result back may rely on that
+        raise ConnectionError_(f"{where}: {via} has no read-back of its own; the route names its done-check")
     return Route(rung=rung, via=via, variant=str(raw.get("variant") or ""), needs_focus=needs_focus, args=args,
-                 when=tuple(when), game=game, game_states=states, done=_check(raw.get("done"), f"{where}.done"),
+                 when=tuple(when), game=game, game_states=states, done=done,
                  recheck=_check(raw.get("recheck"), f"{where}.recheck", recheck=True), say=str(raw.get("say") or ""),
-                 driver=driver, call=call)
+                 driver=driver, call=call, retry_after_acting=bool(raw.get("retry_after_acting", True)))
 
 
 def _template_strings(value: Any) -> Iterable[str]:
@@ -570,8 +615,17 @@ def _template_strings(value: Any) -> Iterable[str]:
             yield from _template_strings(v)
 
 
+def _address_like(text: str) -> bool:
+    """A URL or URI template (``https://...``, ``spotify:...``, ``...?x=1``): the values the setup guard reads too (a
+    question such as an ``ask`` line is not one)."""
+    head = text.split(":", 1)[0]
+    return "://" in text or ("?" in text and "=" in text and " " not in text) or (
+        ":" in text and " " not in text and head.isalpha() and head == head.casefold())
+
+
 def _no_setup(value: Any, where: str) -> None:
-    """D0: no key of any table in a connection file names an account, a key, a token or a sign-in."""
+    """D0: no key of any table in a connection file, and no URL or URI template among its values, names an account,
+    a key, a token or a sign-in (a ``?access_token=`` inside an address is refused like an ``api_key`` field)."""
     if isinstance(value, Mapping):
         for k, v in value.items():
             low = str(k).casefold()
@@ -581,9 +635,14 @@ def _no_setup(value: Any, where: str) -> None:
     elif isinstance(value, (list, tuple)):
         for i, v in enumerate(value):
             _no_setup(v, f"{where}[{i}]")
+    elif isinstance(value, str) and _address_like(value):
+        low = value.casefold()
+        if any(w in low for w in SETUP_WORDS):
+            raise ConnectionError_(f"{where}: an address that asks for setup; zero setup (D0) allows none")
 
 
-def parse_skill(key: str, raw: Mapping[str, Any], *, app: str, file: str = "", digest: str = "") -> Skill:
+def parse_skill(key: str, raw: Mapping[str, Any], *, app: str, file: str = "", digest: str = "",
+                state_reader: str = "") -> Skill:
     """One ``[skill."<key>"]`` table as a :class:`Skill`; raises :class:`ConnectionError_` naming what is wrong."""
     where = f"{file or 'connection'}:{key}"
     if not key or any(not part.isidentifier() for part in key.split(".")):
@@ -618,11 +677,63 @@ def parse_skill(key: str, raw: Mapping[str, Any], *, app: str, file: str = "", d
     order = [RUNGS.index(r.rung) for r in routes]
     if order != sorted(order):
         raise ConnectionError_(f"{where}: routes are listed in ladder order (A, then B, then C)")
+    sends_raw = raw.get("sends_when")
+    sends_when: list[Mapping[str, Any]] = []
+    for cond in ([sends_raw] if isinstance(sends_raw, Mapping) else sends_raw or []):
+        if not isinstance(cond, Mapping) or str(cond.get("slot") or "") not in by_name:
+            raise ConnectionError_(f"{where}: a sends_when condition names one of the skill's slots")
+        sends_when.append(dict(cond))
+    reader = str(raw.get("state_reader") or state_reader or "")
+    if reader:
+        reader = _driver_name(reader, f"{where}.state_reader")
+    # D19: a second probe re-checks each done; a route without one is allowed and reported
+    warnings = tuple(f"{where}.route[{i}]: no recheck (D19's second probe)" for i, r in enumerate(routes)
+                     if r.via != "agent" and r.recheck is None)
     return Skill(key=key, app=str(raw.get("app") or app), end=end, kind=kind, menu=menu, done_line=done_line,
                  slots=slots, routes=routes, learn_from=_pairs(raw.get("learn_from"), f"{where}.learn_from"),
                  routine_on=_pairs(raw.get("routine_on"), f"{where}.routine_on"),
                  offerable=bool(raw.get("offerable", False)), handoff=bool(raw.get("handoff", True)),
-                 wont=_strs(raw.get("wont")), preview=str(raw.get("preview") or ""), file=file, hash=digest)
+                 wont=_strs(raw.get("wont")), preview=str(raw.get("preview") or ""), file=file, hash=digest,
+                 sends=bool(raw.get("sends", False)) or bool(sends_when), sends_when=tuple(sends_when),
+                 state_reader=reader, warnings=warnings)
+
+
+def sends_with(skill: Skill, values: Mapping[str, Any], *, partial: bool = False) -> bool:
+    """Whether running ``skill`` with these slot values sends something to other people (its ``sends`` /
+    ``sends_when`` data). ``partial``: ``values`` are only what the model gave, so a condition on a slot it left out
+    still counts as met (the resolver may fill it with a sending value). Data only, never the words."""
+    if not skill.sends:
+        return False
+    for cond in skill.sends_when:
+        name = str(cond.get("slot") or "")
+        v = values.get(name)
+        if isinstance(v, Mapping):
+            v = v.get("name")
+        missing = v is None or v == ""
+        if partial and missing:
+            continue
+        if "in" in cond and (missing or str(v) not in [str(x) for x in cond.get("in") or []]):
+            return False
+        if "present" in cond and bool(cond.get("present")) == missing:
+            return False
+    return True
+
+
+def window_state_reader(skill: Skill | None) -> Callable[[str], str | None] | None:
+    """The ``window_state(app)`` hook of the skill's driver module (its ``state_reader``, else the first driver its
+    routes name that has one), for the ``game = "states"`` rule. ``None`` when none provides it (such rungs then stay
+    off with a game in front: fails safe)."""
+    if skill is None:
+        return None
+    names = [skill.state_reader] + [r.driver for r in skill.routes]
+    for name in dict.fromkeys(n for n in names if n):
+        try:
+            fn = getattr(importlib.import_module(f"yuki.skills.{name}"), "window_state", None)
+        except Exception:  # noqa: BLE001
+            continue
+        if callable(fn):
+            return fn
+    return None
 
 
 def parse_file(path: Path) -> tuple[list[Skill], list[str]]:
@@ -645,7 +756,8 @@ def parse_file(path: Path) -> tuple[list[Skill], list[str]]:
     errors: list[str] = []
     for key, raw in (data.get("skill") or {}).items():
         try:
-            skills.append(parse_skill(str(key), raw, app=app, file=path.name, digest=digest))
+            skills.append(parse_skill(str(key), raw, app=app, file=path.name, digest=digest,
+                                      state_reader=str(conn.get("state_reader") or "")))
         except ConnectionError_ as exc:
             errors.append(str(exc))
     return skills, errors
@@ -665,6 +777,11 @@ class Loaded:
     @property
     def keys(self) -> tuple[str, ...]:
         return tuple(s.key for s in self.skills)
+
+    @property
+    def warnings(self) -> tuple[str, ...]:
+        """What the validator allowed and reports (a route with no second re-check)."""
+        return tuple(w for s in self.skills for w in s.warnings)
 
 
 _cache_lock = threading.Lock()
@@ -728,4 +845,5 @@ def clear_cache() -> None:
 __all__ = ["CONNECTIONS_DIR", "MAX_SKILLS", "MENU_LINE_CHARS", "VERBS", "PROBES", "SLOT_TYPES", "LIVE_FILLS", "END_KINDS",
            "SKILL_KINDS", "RUNGS", "GAME_RULES", "WINDOW_STATES", "SETUP_WORDS", "ConnectionError_", "VerbInfo",
            "Slot", "Check", "Route", "Skill", "Loaded", "template_names", "lookup", "fill", "fill_value",
-           "site_label", "parse_skill", "parse_file", "load", "clear_cache"]
+           "site_label", "parse_skill", "parse_file", "load", "clear_cache", "driver_exists", "sends_with",
+           "window_state_reader"]

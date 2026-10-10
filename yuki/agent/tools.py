@@ -809,6 +809,23 @@ def _web_address(url: Any) -> bool:
         return False
 
 
+def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
+    """Phase S (review L3): whether a ``run_skill`` call may send something to other people, from the skill's own data
+    (``sends`` / ``sends_when`` in its connection file; :func:`yuki.skills.connection.sends_with`), never from slot
+    names. A slot the model left out counts as a sending value (the resolver may fill it so). An unknown key is not
+    a send (the engine refuses it)."""
+    if not isinstance(tool_input, dict):
+        return False
+    try:
+        from yuki.skills.connection import load, sends_with
+
+        skill = load().get(str(tool_input.get("skill") or ""))
+        slots = tool_input.get("slots") if isinstance(tool_input.get("slots"), dict) else {}
+        return bool(skill is not None and sends_with(skill, slots, partial=True))
+    except Exception:  # noqa: BLE001 - the files couldn't be read: judged as the plain tool
+        return False
+
+
 def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool). Text with
     a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme runs
@@ -825,10 +842,8 @@ def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
         # vfix3 review F1: the shortcut set_slider presses is a key combination like any hotkey (alt+f4 closes, enter
         # sends), so it is judged as one: the hotkey tool's own traits (the same object: keys by their tool alone)
         return TOOL_TRAITS["hotkey"]
-    elif name == "run_skill":
-        slots = tool_input.get("slots") if isinstance(tool_input.get("slots"), dict) else {}
-        if slots.get("text") and str(slots.get("send") or "") == "send":
-            return SKILL_SEND_TRAITS
+    elif name == "run_skill" and _skill_sends(tool_input):
+        return SKILL_SEND_TRAITS
     if op is not None and (name, op) in OP_TRAITS:
         return OP_TRAITS[(name, op)]
     return TOOL_TRAITS.get(name, Traits())

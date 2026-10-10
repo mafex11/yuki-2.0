@@ -31,6 +31,23 @@ PIN = {"key": "demo.volume", "app": "demoplayer", "goal": "set Demo Player's own
        "tried": [{"rung": "A", "via": "uia_invoke", "why": "missing"}]}
 
 
+@pytest.fixture(autouse=True)
+def _no_live_verbs_or_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nothing in these tests reaches the desktop: every verb and live probe the engine would dispatch to by name is a
+    stand-in unless a test supplies its own (a test calling a verb function directly stubs that verb's internals)."""
+    from yuki.skills import donecheck
+    from yuki.skills import engine as engine_mod
+
+    for name in list(engine_mod.VERB_FUNCS):
+        monkeypatch.setitem(engine_mod.VERB_FUNCS, name,
+                            lambda call: engine_mod.RouteResult(ran=False, outcome="no_live_verb_in_tests"))
+    for name in list(donecheck.PROBE_FUNCS):
+        if name != "read_back":
+            monkeypatch.setitem(donecheck.PROBE_FUNCS, name, lambda ctx, args: (None, {"status": "test_stub"}))
+    for name in list(donecheck.BASELINES):
+        monkeypatch.setitem(donecheck.BASELINES, name, lambda args: None)
+
+
 @pytest.fixture()
 def demo() -> C.Loaded:
     C.clear_cache()
@@ -147,6 +164,10 @@ def test_a_pinned_done_is_bounced_at_most_twice_then_said_as_couldnt_confirm(mon
     final = events[-1]
     assert isinstance(final, Final) and reads["n"] == 3 and len(client.calls) == 3
     assert final.outcome["level"] == "unverified"                          # never "done" past the gate
+    # review L4: nothing acted and the done gave no claim, yet "Set it to 40." never stands
+    from yuki.agent.finish import LINE_SKILL_UNCONFIRMED
+
+    assert final.text == LINE_SKILL_UNCONFIRMED
     notes = json.dumps(client.calls[1]["messages"], default=str)
     assert "not done yet" in notes
 
@@ -194,9 +215,61 @@ def test_run_skill_is_in_the_block_only_with_skills_and_the_volume_skill_drops_a
     assert "app_volume" not in with_volume
     again = T.tool_params(cacheable=False, skill_keys=["demo.volume", "demo.home"], skills_menu="- demo...")
     assert json.dumps(again) == json.dumps(with_demo)                     # byte-stable for the cache
-    assert T.tool_traits("run_skill", {"skill": "message", "slots": {"text": "hi", "send": "send"}}).reaches
     assert not T.tool_traits("run_skill", {"skill": "volume", "slots": {"level": 4}}).reaches
     assert "run_skill" in T.ACTION_TOOL_NAMES
+
+
+SENDING = """
+[connection]
+app = "inventedchat"
+
+[skill."invented.note"]
+end = "message_sent"
+kind = "change"
+menu = "send a note in Invented Chat"
+done_line = "Sent."
+sends_when = { slot = "mode", in = ["now"] }
+
+[[skill."invented.note".slot]]
+name = "words"
+type = "text"
+
+[[skill."invented.note".slot]]
+name = "mode"
+type = "enum"
+options = ["now", "draft"]
+default = "now"
+
+[[skill."invented.note".route]]
+rung = "A"
+via = "uia_invoke"
+args = { window = "InventedChat.exe", role = "Button", name = "Send" }
+done = { probe = "message_sent", app = "inventedchat", text = "{words}" }
+recheck = { probe = "message_sent", app = "inventedchat", text = "{words}", after_s = 2 }
+"""
+
+
+def test_a_send_is_judged_from_the_skill_data_not_slot_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review L3: ``sends`` / ``sends_when`` in the connection file decide whether ``run_skill`` is judged as a send
+    at the thinker's authorizer (rule 8), whatever the slots are called."""
+    from yuki.agent import tools as T
+
+    (tmp_path / "chat.toml").write_text(SENDING, encoding="utf-8")
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", tmp_path)
+    C.clear_cache()
+    try:
+        skill = C.load().get("invented.note")
+        assert skill is not None and skill.sends and skill.sends_when == ({"slot": "mode", "in": ["now"]},)
+        assert T.tool_traits("run_skill", {"skill": "invented.note", "slots": {"words": "hi", "mode": "now"}}).reaches
+        # a slot the model left out may still be filled with a sending value: judged as a send
+        assert T.tool_traits("run_skill", {"skill": "invented.note", "slots": {"words": "hi"}}).reaches
+        assert not T.tool_traits("run_skill", {"skill": "invented.note",
+                                               "slots": {"words": "hi", "mode": "draft"}}).reaches
+        # the old slot-name guess is gone: an unknown skill with "text"/"send" slots is not judged as a send
+        assert not T.tool_traits("run_skill", {"skill": "message", "slots": {"text": "hi", "send": "send"}}).reaches
+        assert C.sends_with(skill, {"words": "hi", "mode": "now"}) and not C.sends_with(skill, {"mode": "draft"})
+    finally:
+        C.clear_cache()
 
 
 def test_the_thinkers_run_skill_returns_a_checked_outcome_and_pins_a_hand_off(monkeypatch, tmp_path: Path,
@@ -385,3 +458,34 @@ def test_the_requests_row_columns_of_a_skill_run(tmp_path: Path) -> None:
     assert agent._skill_row() == {"skill": "demo.volume", "route": "A:in_app:uia_invoke", "done_check": "done"}
     agent._skill_last, agent._request_skill, agent._skill_unconfirmed = None, dict(PIN), True
     assert agent._skill_row() == {"skill": "demo.volume", "route": "C", "done_check": "unconfirmed"}
+
+
+def test_the_thinker_menu_is_byte_stable_through_the_day(tmp_path: Path, demo) -> None:
+    """Review L2: the thinker's run_skill description lists taste candidates most seen first (an order that changes
+    only with the nightly recompute), so its cached tool block doesn't change hour by hour; the talker's list stays
+    best-at-this-hour first."""
+    from datetime import datetime
+
+    from yuki.skills.menu import TALKER, THINKER, menu_text
+
+    store = Store.open(tmp_path / "memory.db")
+    try:
+        R.seed(store, demo)
+        morning, evening = [0.0] * 24, [0.0] * 24
+        morning[8], evening[20] = 9.0, 9.0
+        rows = [("Invented Dawn", morning, 3.0), ("Invented Dusk", evening, 7.0)]
+        for name, hist, n in rows:
+            h = json.dumps(hist)
+            store._write(lambda c, name=name, h=h, n=n: c.execute(
+                "INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
+                "hist_weekend, n_obs, updated_at) VALUES ('demo_list', ?, ?, ?, 'observed', ?, ?, ?, ?)",
+                (store.cipher.digest("taste", name), store._enc(name), store._enc(""), h, h, n, time.time() - 10)))
+        at8 = datetime(2026, 10, 7, 8, 30).timestamp()
+        at20 = datetime(2026, 10, 7, 20, 30).timestamp()
+        think8 = menu_text(store, audience=THINKER, loaded=demo, now=at8)
+        assert think8 == menu_text(store, audience=THINKER, loaded=demo, now=at20)
+        assert "[list: Invented Dusk | Invented Dawn]" in think8               # most seen first
+        talk8 = menu_text(store, audience=TALKER, loaded=demo, now=at8)
+        assert "[list: Invented Dawn | Invented Dusk]" in talk8               # the talker's: best at this hour
+    finally:
+        store.close()

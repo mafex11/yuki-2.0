@@ -146,20 +146,32 @@ def run_intake(store: Any, *, apply: bool = False, loaded: Loaded | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m yuki.skills.intake", description=__doc__.split("\n\n")[0])
-    parser.add_argument("--db", required=True, help="the memory database (a copy for a dry run is fine)")
+    parser.add_argument("--db", required=True, help="the memory database (a dry run reads a temporary copy of it)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="report only (the default)")
     mode.add_argument("--apply", action="store_true", help="seed and import (after the dry run was reviewed)")
     parser.add_argument("--connections", action="append", help="a folder of connection files (default: bundled)")
     args = parser.parse_args(argv)
-    from yuki.memory.store import Store
+    loaded = load(args.connections) if args.connections else load()
+    if not args.apply:
+        # a dry run writes nothing anywhere: it reads a temporary copy (yuki.eval.dbcopy; source opened ?mode=ro), so
+        # even the migrations Store.open applies touch only the copy, which is deleted afterwards (review L6)
+        from pathlib import Path
 
-    store = Store.open(args.db)
-    try:
-        loaded = load(args.connections) if args.connections else load()
-        report = run_intake(store, apply=bool(args.apply), loaded=loaded)
-    finally:
-        store.close()
+        from yuki.eval.dbcopy import working_copy
+
+        with working_copy(Path(args.db)) as (store, _path):
+            report = run_intake(store, apply=False, loaded=loaded)
+        report["read"] = "copy"
+    else:
+        from yuki.memory.store import Store
+
+        store = Store.open(args.db)
+        try:
+            report = run_intake(store, apply=True, loaded=loaded)
+        finally:
+            store.close()
+    report["warnings"] = len(loaded.warnings)
     print(json.dumps(report, sort_keys=True))
     return 0
 

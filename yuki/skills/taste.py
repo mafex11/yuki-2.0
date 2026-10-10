@@ -80,9 +80,15 @@ def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: f
     return scored[:max(0, int(n))]
 
 
-def candidates(store: Any, kind: str, *, now: float | None = None, limit: int = MENU_CANDIDATES) -> list[str]:
+def candidates(store: Any, kind: str, *, now: float | None = None, limit: int = MENU_CANDIDATES,
+               by: str = "hour") -> list[str]:
     """The names the menu lists for an entity slot of ``kind`` (the user's own names: their playlists, channels),
-    best at this hour first."""
+    best at this hour first; ``by="n_obs"``: most seen first, an order that changes only when the table is recomputed
+    (nightly), for a menu that sits in a cached prompt block (the thinker's ``run_skill`` description)."""
+    if by == "n_obs":
+        rows = top(store, kind, now=now, n=10_000)
+        rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
+        return [t.name for t in rows if t.name][:max(0, int(limit))]
     return [t.name for t in top(store, kind, now=now, n=limit) if t.name]
 
 

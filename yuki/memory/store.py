@@ -3276,8 +3276,10 @@ MIGRATIONS: tuple[str, ...] = (
     #   (app, end_kind) (partial unique index: a retired skill frees its place). The file is the spec; the row holds
     #   what is the user's: told values (encrypted), the state code computes, uses.
     # - skill_routes: one row per rung of a skill (A app connection, B recorded UIA path, C the full agent), with the
-    #   connection file's hash it was seeded from (a changed file retries a disabled rung) and the verified runs intake
-    #   imported from old procedures (seed_ok). Trust counters are computed from skill_runs by code, never stored.
+    #   connection file's hash it was seeded from and when that hash last changed (hash_changed_at: the contradiction
+    #   streak that disables a rung counts only runs after it, so a changed file retries a disabled rung) and the
+    #   verified runs intake imported from old procedures (seed_ok). Trust counters are computed from skill_runs by
+    #   code, never stored.
     # - skill_runs: the trust ledger, content-free. The tray writes the row at t0, before the first step (D18: moments
     #   of that app and kind inside [t0, t_done + lag] are Yuki's); checked is the done-check's verdict (1 seen, 0
     #   contradicted, NULL could not read: D19), recheck the second probe's (0 = a false done). One row per run.
@@ -3314,6 +3316,7 @@ MIGRATIONS: tuple[str, ...] = (
         needs_focus      INTEGER NOT NULL,
         source           TEXT NOT NULL,
         connection_hash  TEXT,
+        hash_changed_at  REAL,
         seed_ok          INTEGER NOT NULL DEFAULT 0,
         disabled_at      REAL,
         disabled_why     TEXT,

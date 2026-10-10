@@ -4,15 +4,19 @@
 
 1. writes the run's ledger row at ``t0``, before the first step (D18: what changes on screen from then until it is
    done is Yuki's doing, not the user's habit);
-2. tries each rung in order. **Right before every rung that takes focus or sends input it reads again whether a game
-   is in front** (D17(1)); with one, that rung is skipped, and when no rung that neither takes focus nor sends input is
-   left the run is held ("after the round?"), never handed to the thinker (D17(2));
+2. tries each rung in order. **Right before every rung it applies the rung's game rule again with a fresh read**
+   (D17(1)): one that takes focus or sends input, or whose data says ``never``, is skipped with a game in front; a
+   ``states`` one runs only while the app's window is in a proven state (the skill driver's ``window_state`` hook);
+   when no rung is left the run is held ("after the round?"), never handed to the thinker (D17(2)). The run's row
+   names the app each rung acts on before it acts (D18: a mixer level set on Spotify is Spotify's moment);
 3. runs the rung's verb (the closed list of :data:`yuki.skills.connection.VERBS`: UI Automation patterns by name
    inside containers, the media session, Core Audio, launch arguments and URIs through ``launch.open_url``'s guarded
    ``os.startfile``, a recorded path, a driver), then its done-check (:mod:`yuki.skills.donecheck`): **"done" only on
    True** (D19). A rung that could not run (its control missing, a cold window) passes to the next one; a contradicted
-   check counts against the rung and passes on; a check that couldn't read after the rung acted stops the ladder with
-   "couldn't confirm" said plainly (another rung would do it twice) and never counts against it;
+   check counts against the rung and passes on, except on a skill that sends (or a rung with ``retry_after_acting =
+   false``), where it stops: a second rung could send twice; a check that couldn't read after the rung acted stops
+   the ladder with "couldn't confirm" said plainly (another rung would do it twice) and never counts against it.
+   Onset probes (``mic_held``) compare with the state read right before the rung acted;
 4. after a "done", D19's second probe runs a few seconds later (on a short-lived thread while it waits, at most 6 s;
    ``recheck="inline"`` in tests) and marks a false done in the ledger when it disagrees;
 5. when every rung failed or could not run, rung C: the request goes to the thinker with the skill pinned
@@ -32,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from yuki.skills.connection import Check, Route, Skill, fill, fill_value
+from yuki.skills.connection import Check, Route, Skill, fill, fill_value, sends_with, window_state_reader
 from yuki.skills.resolve import HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
@@ -41,6 +45,9 @@ BUDGET_S = 5.0
 PINNED_CHARS = 900
 LINE_UNVERIFIED = "I did it, but I couldn't confirm it worked."
 LINE_FAILED = "That didn't work."
+#: A sending skill's rung acted and its check read "not so": said plainly, and nothing else is tried (a second rung
+#: could send it twice).
+LINE_SEND_FAILED = "I tried to send it, but the PC shows it didn't go through, so I stopped there."
 LINE_OTHER_DEVICE = "{app} is playing on another device, so I left it."
 LINE_ALREADY = "That's already how it is."
 
@@ -70,6 +77,9 @@ class RouteResult:
     facts_ram: dict[str, Any] = field(default_factory=dict)
     value: float | None = None
     entity_digest: str | None = None
+    #: The app the verb acted on (a driver says it: Spotify, Discord, the mixer's ``master``), when the route's own
+    #: arguments don't name it; D18 matches a moment's app with it (``skill_runs.app``).
+    app: str | None = None
 
 
 @dataclass
@@ -90,7 +100,10 @@ class RunContext:
     """Where a run comes from and what it may use. ``memory``: a ``MemoryAccess`` (``.call``) or a ``MemoryClient``;
     ``hands``: the voice hands (rung B's step runner); ``game``: D9's "which game is in front" (default the local read,
     ``yuki.memory.gamegate.game_in_front``); ``verbs`` / ``probes``: replacements by name (tests, replays);
-    ``on_focus``: called right before a rung that takes focus (the acting marker; sound-only rungs publish none)."""
+    ``baselines``: replacements of the onset probes' before-reads (:data:`yuki.skills.donecheck.BASELINES`);
+    ``window_state``: the app's window state now for the ``game = "states"`` rule (default the skill's driver hook,
+    :func:`window_state_reader`); ``on_focus``: called right before a rung that takes focus (the acting marker;
+    sound-only rungs publish none)."""
 
     origin: str = "voice"
     words: list[str] = field(default_factory=list)
@@ -107,6 +120,8 @@ class RunContext:
     on_focus: Callable[[], Any] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
+    baselines: Mapping[str, Callable[[Mapping[str, Any]], Any]] = field(default_factory=dict)
+    window_state: Callable[[str], str | None] | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -118,6 +133,13 @@ class RunContext:
             return str(game_in_front() or "")
         except Exception:  # noqa: BLE001
             return "unknown"
+
+    def window_state_now(self, skill: Skill) -> str | None:
+        """The skill's app window state now (one of ``WINDOW_STATES``), or ``None`` (no reader, or it couldn't
+        read: a ``game = "states"`` rung then stays off with a game in front)."""
+        from yuki.skills.resolve import _window_state
+
+        return _window_state(skill, Live(window_state=self.window_state))
 
 
 @dataclass
@@ -150,6 +172,8 @@ class SkillResult:
 
     def report(self) -> str:
         """For the model that called it (the talker or the thinker): what happened, in plain words."""
+        if self.outcome == "already" and self.verified is True:
+            return f"Nothing to change: the PC shows it was already so. Say: {self.done_line or self.say}"
         if self.done:
             return f"Done and checked: {self.done_line or self.say}"
         if self.outcome == "asked":
@@ -227,6 +251,31 @@ def _emit(ctx: RunContext, event: str, **fields: Any) -> None:
 def _numbers(values: Mapping[str, Any]) -> dict[str, float]:
     """The numeric slot values (content-free; the ledger keeps them for "again")."""
     return {k: float(v) for k, v in values.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+#: The app key the volume watcher writes for the whole PC's level (``yuki.memory.volumewatch.MASTER``).
+MASTER_APP = "master"
+
+
+def acted_app(skill: Skill, route: Route, args: Mapping[str, Any] | None, res: "RouteResult | None" = None) -> str:
+    """D18: the app a rung acts on, for ``skill_runs.app`` (a moment of that app and kind inside the run's window is
+    Yuki's): what the verb itself said (a driver's ``RouteResult.app``), the whole PC's level for
+    ``endpoint_volume``, the route's own ``app`` / ``process`` / ``window`` argument (filled: a mixer level set on
+    the app the user named), a recorded path's first app, else the connection's app. The registry keeps it as an
+    app key."""
+    if res is not None and res.app:
+        return str(res.app)
+    if route.via == "endpoint_volume":
+        return MASTER_APP
+    a = args if isinstance(args, Mapping) else {}
+    for k in ("app", "process", "window"):
+        v = a.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    apps = a.get("apps")
+    if isinstance(apps, (list, tuple)) and apps and isinstance(apps[0], str) and apps[0].strip():
+        return apps[0]
+    return skill.app
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -479,14 +528,18 @@ def _done_spec(skill: Skill, values: Mapping[str, Any]) -> dict[str, Any] | None
 
 
 def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
-           *, why: str = "") -> dict[str, Any]:
+           *, why: str = "", baseline: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The pinned skill handed to the thinker (rung C; map-skills S3.4): its goal, the slots with their sources, what
-    "done" means (words and the machine check), what was already tried. At most :data:`PINNED_CHARS` as rendered."""
+    "done" means (words and the machine check), what was already tried, and ``baseline``: the onset probes' states
+    read right before the hand-off (the finish gate compares with them; content-free booleans). At most
+    :data:`PINNED_CHARS` as rendered."""
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
            "done_words": fill(skill.done_line, values) or "", "done": _done_spec(skill, values),
            "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome")} for t in tried][:4],
            "why": why}
+    if baseline:
+        out["baseline"] = dict(baseline)
     while len(json.dumps(out, ensure_ascii=False, default=str)) > PINNED_CHARS and out["tried"]:
         out["tried"] = out["tried"][:-1]
     return out
@@ -515,15 +568,50 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
 
 
 def _ledger_start(ctx: RunContext, skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
-                  t0: float) -> str | None:
+                  t0: float, app: str | None = None) -> str | None:
     from yuki.skills import registry
 
     key = registry.new_run_key()
     got = _mem(ctx.memory, "skill_run_start",
                lambda c: registry.start_run(_store_of(c), skill=skill, origin=ctx.origin, t0=t0, run_key=key,
-                                            request_id=ctx.request_id, session_id=ctx.session_id, filled=filled),
+                                            request_id=ctx.request_id, session_id=ctx.session_id, filled=filled,
+                                            app=app),
                timeout_s=0.5)
     return got or (key if ctx.memory is not None else None)
+
+
+def _ledger_app(ctx: RunContext, run_key: str | None, app: str) -> None:
+    if not run_key:
+        return
+    from yuki.skills import registry
+
+    _mem(ctx.memory, "skill_run_app", lambda c: registry.set_run_app(_store_of(c), run_key, app), timeout_s=0.5)
+
+
+def _first_app(skill: Skill, routes: list[Route], values: Mapping[str, Any]) -> str:
+    """The app the plan's first rung acts on (D18: the run's row names it from t0)."""
+    for route in routes:
+        if route.via == "agent":
+            break
+        try:
+            return acted_app(skill, route, fill_value(dict(route.args), values))
+        except KeyError:
+            continue
+    return skill.app
+
+
+def _game_blocks(route: Route, skill: Skill, ctx: RunContext) -> bool:
+    """D17, per rung and read now (review M5): whether a game in front keeps this rung from running. A rung that takes
+    focus or sends input, or whose data says ``never``, never runs with one; a ``states`` rung only while the app's
+    window is in one of its proven states (read now; no reader: it doesn't run). An ``always`` rung that takes no
+    focus reads nothing."""
+    if not route.needs_focus and route.game == "always":
+        return False
+    if not ctx.game_now():
+        return False
+    if route.needs_focus or route.game != "states":
+        return True
+    return ctx.window_state_now(skill) not in route.game_states
 
 
 def _ledger_finish(ctx: RunContext, run_key: str | None, **kw: Any) -> None:
@@ -570,7 +658,8 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     plan = resolved
     skill = plan.skill
     t0 = time.time()
-    run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0)
+    run_app = _first_app(skill, plan.routes, plan.values)
+    run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)
     _emit(ctx, "skill_resolve", skill=skill.key, result="plan", routes=len(plan.routes),
           slot_source=sorted(set(plan.filled.values())), slots=len(plan.filled), named=len(plan.named),
           dropped=len(plan.dropped), skipped=len(plan.skipped), origin=ctx.origin)
@@ -578,60 +667,75 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     tried: list[dict[str, Any]] = []
     focus_taken = False
     acted = False
+    sends = sends_with(skill, plan.values)
     for route in plan.routes:
         if route.via == "agent":
             break
+        if _game_blocks(route, skill, ctx):
+            # D17(1): the route's game rule applied again with a fresh read right before every rung (a game may have
+            # come to the front during an earlier rung's wait): never focus, input or an unproven state with one
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "game"})
+            _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", gate="game")
+            continue
+        try:
+            args = fill_value(dict(route.args), plan.values)
+        except KeyError:
+            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "no_value"})
+            continue
         if route.needs_focus:
-            game = ctx.game_now()
-            if game:
-                # D17(1): read again right before a step that takes focus or sends input
-                tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "game"})
-                _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", gate="game")
-                continue
             if ctx.on_focus is not None:
                 try:
                     ctx.on_focus()
                 except Exception:  # noqa: BLE001
                     pass
             focus_taken = True
-        try:
-            args = fill_value(dict(route.args), plan.values)
-        except KeyError:
-            tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "no_value"})
-            continue
+        app_now = acted_app(skill, route, args)
+        if app_now != run_app:
+            # D18: the row names the app this rung acts on before it acts (a moment it causes is matched live)
+            _ledger_app(ctx, run_key, app_now)
+            run_app = app_now
         fn = ctx.verbs.get(route.via) or VERB_FUNCS.get(route.via)
         call = RouteCall(skill, route, args, dict(plan.values), ctx, deadline)
+        base = _baseline(route, plan.values, ctx)
         r0 = ctx.clock()
         try:
             res = fn(call) if fn is not None else RouteResult(ran=False, outcome="no_verb")
         except Exception as exc:  # noqa: BLE001
             res = RouteResult(ran=None, outcome="error", facts={"error_kind": type(exc).__name__})
         route_ms = round((ctx.clock() - r0) * 1000.0, 1)
+        app_done = acted_app(skill, route, args, res)
         if res.held:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
             if res.ran:
                 acted = True
+                if sends or not route.retry_after_acting:
+                    # it acted before the game check refused the rest: nothing else is tried (never twice)
+                    _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=route, ms=route_ms,
+                                   app=app_done)
+                    return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
+                                   run_key=run_key, route=route.key)
             continue
         if res.ask:
-            _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms)
+            _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="asked", ms=route_ms)
             return _simple(skill.key, "asked", ctx, started, ask=res.ask, options=list(res.options), say=res.ask,
                            run_key=run_key, route=route.key, tried=tried)
         if res.outcome == "other_device":
             say = res.say or LINE_OTHER_DEVICE.format(app=_app_title(skill.app))
-            _ledger_finish(ctx, run_key, outcome="other_device", checked=None, route=route, ms=route_ms)
+            _ledger_finish(ctx, run_key, outcome="other_device", checked=None, route=route, ms=route_ms,
+                           app=app_done)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="other_device", ms=route_ms)
             return _simple(skill.key, "other_device", ctx, started, say=say, run_key=run_key, route=route.key,
                            tried=tried)
-        probe_ctx = _probe_ctx(ctx, t0, plan.values, res)
+        probe_ctx = _probe_ctx(ctx, t0, plan.values, res, base)
         if res.already:
             # a true no-op: the end state was already there; still checked before it is said (never a fresh "done")
             waited = _wait(route.done, probe_ctx, deadline - ctx.clock(), ctx)
             if waited.verdict is True:
                 line = res.say or LINE_ALREADY
                 _ledger_finish(ctx, run_key, outcome="already", checked=None, route=route, ms=route_ms,
-                               evidence={"numbers": _numbers(plan.values)})
+                               evidence={"numbers": _numbers(plan.values)}, app=app_done)
                 _emit(ctx, "done_check", skill=skill.key, route=route.key, result="already", ms=waited.ms)
                 return _simple(skill.key, "already", ctx, started, verified=True, done_line=line, say=line,
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
@@ -652,7 +756,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         if waited.verdict is True:
             line = done_line(skill, plan.values, plan.named, route=route, say=res.say)
             _ledger_finish(ctx, run_key, outcome="done", checked=True, route=route, ms=route_ms,
-                           value=res.value, entity_digest=res.entity_digest,
+                           value=res.value, entity_digest=res.entity_digest, app=app_done,
                            evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             result = SkillResult(skill=skill.key, outcome="done", verified=True, done_line=line, say=line,
                                  route=route.key, tried=tried, ask_keep=plan.ask_keep, run_key=run_key,
@@ -666,10 +770,19 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
             # it acted and the PC couldn't confirm: said plainly, never counted against it; no second rung (twice)
             say = res.unverified_line or LINE_UNVERIFIED
             _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=route, ms=route_ms,
-                           value=res.value, evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
+                           value=res.value, app=app_done,
+                           evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
             return _simple(skill.key, "unverified", ctx, started, verified=None, say=say, route=route.key,
                            tried=tried, run_key=run_key, values=dict(plan.values), focus_taken=focus_taken)
         tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "contradicted"})
+        if sends or not route.retry_after_acting:
+            # review M3: a rung that acted on a skill that sends (or one whose data says so) is never followed by
+            # another acting rung or a hand-off: the message may have gone anyway, and a second try would send twice
+            _ledger_finish(ctx, run_key, outcome="failed", checked=False, route=route, ms=route_ms, app=app_done,
+                           evidence={"numbers": _numbers(plan.values), "check": waited.evidence})
+            return _simple(skill.key, "failed", ctx, started, say=LINE_SEND_FAILED if sends else LINE_FAILED,
+                           route=route.key, tried=tried, run_key=run_key, values=dict(plan.values),
+                           focus_taken=focus_taken)
         _ledger_try(ctx, run_key, route, False, "failed", route_ms)
     # every rung failed or could not run
     game = ctx.game_now()
@@ -685,7 +798,19 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     return _simple(skill.key, "failed", ctx, started, say=LINE_FAILED, tried=tried, run_key=run_key)
 
 
-def _probe_ctx(ctx: RunContext, t0: float, values: Mapping[str, Any], res: RouteResult) -> Any:
+def _baseline(route: Route, values: Mapping[str, Any], ctx: RunContext) -> dict[str, Any]:
+    """The onset probes' states right before this rung acts (review M4: a microphone already held is not this run's
+    doing). Reads nothing unless the rung's checks include such a probe."""
+    from yuki.skills.donecheck import take_baseline
+
+    try:
+        return take_baseline([route.done, route.recheck], values, readers=ctx.baselines)
+    except Exception:  # noqa: BLE001 - no baseline: an onset can't be shown (None, never a false done)
+        return {}
+
+
+def _probe_ctx(ctx: RunContext, t0: float, values: Mapping[str, Any], res: RouteResult,
+               baseline: Mapping[str, Any] | None = None) -> Any:
     from yuki.skills.donecheck import ProbeContext
 
     def memory_call(what: str, fn: Callable[[Any], Any]) -> Any:
@@ -693,7 +818,7 @@ def _probe_ctx(ctx: RunContext, t0: float, values: Mapping[str, Any], res: Route
 
     return ProbeContext(since=t0, values=dict(values), result=res,
                         memory_call=memory_call if ctx.memory is not None else None, probes=dict(ctx.probes),
-                        clock=ctx.clock, sleep=ctx.sleep)
+                        clock=ctx.clock, sleep=ctx.sleep, baseline=dict(baseline or {}))
 
 
 def _wait(check: Check | None, probe_ctx: Any, left_s: float, ctx: RunContext) -> Any:
@@ -746,7 +871,15 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                        run_key=run_key)
-    pin = pinned(skill, values, filled, tried, why=why)
+    # the onset probes' states right before the thinker acts (its finish gate compares with them, review M4)
+    spec = _done_spec(skill, values)
+    try:
+        from yuki.skills.donecheck import take_baseline
+
+        base = take_baseline(spec, {}, readers=ctx.baselines) if spec else {}
+    except Exception:  # noqa: BLE001 - no baseline: the gate can't show an onset (never a false done)
+        base = {}
+    pin = pinned(skill, values, filled, tried, why=why, baseline=base)
     _ledger_finish(ctx, run_key, outcome="handed_over", checked=False if acted else None)
     _emit(ctx, "skill_handoff", skill=skill.key, result="handed_over", reason=why, tried=len(tried))
     return _simple(skill.key, "handed_over", ctx, started, handoff=pin, tried=tried, run_key=run_key,
@@ -758,9 +891,22 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _live_now(game: str, hands: Any = None, *, media: bool = True) -> Live:
+def _in_call(hands: Any, memory: Any) -> bool:
+    """Whether a call is live now, for any origin (review L7): the voice's own picture when its hands carry one, else
+    memory's open calls (an app holding the microphone as a call: ``MemoryClient.current_calls``)."""
+    if hands is not None and hasattr(hands, "in_call"):
+        return bool(getattr(hands, "in_call", False))
+    if memory is None:
+        return False
+    calls = _mem(memory, "current_calls", lambda c: c.current_calls(), timeout_s=0.3)
+    return bool(calls) if isinstance(calls, list) else False
+
+
+def _live_now(game: str, hands: Any = None, *, media: bool = True, skill: Skill | None = None,
+              memory: Any = None) -> Live:
     """The live facts at request time, read once on request (no polling): the game in front, the media sessions
-    playing (only when a slot of the skill fills from them), whether the voice knows of a live call."""
+    playing (only when a slot of the skill fills from them), whether a call is live (only when a slot asks in a
+    call), and the skill's window-state reader for the ``game = "states"`` rule (its driver's hook)."""
     playing: tuple[str, ...] = ()
     try:
         if not media:
@@ -772,8 +918,11 @@ def _live_now(game: str, hands: Any = None, *, media: bool = True) -> Live:
                                       if str(s.get("status") or "") == "playing" and s.get("app_id")))
     except Exception:  # noqa: BLE001 - nothing known playing
         playing = ()
-    in_call = bool(getattr(hands, "in_call", False)) if hands is not None else False
-    return Live(game=game, playing=playing, in_call=in_call)
+    wants_call = skill is not None and any(s.ask_in_call for s in skill.slots)
+    in_call = _in_call(hands, memory) if wants_call else False
+    states = skill is not None and any(r.game == "states" for r in skill.routes)
+    return Live(game=game, playing=playing, in_call=in_call,
+                window_state=window_state_reader(skill) if states else None)
 
 
 def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list[str], ctx: RunContext, *,
@@ -790,7 +939,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
 
         skill = load().get(str(skill_key or ""))
         wants_media = bool(skill and any(s.live == "playing" for s in skill.slots))
-        live = _live_now(ctx.game_now(), ctx.hands, media=wants_media)
+        live = _live_now(ctx.game_now(), ctx.hands, media=wants_media, skill=skill, memory=ctx.memory)
     step = float(setting(settings, "skills_volume_step") or 10)
     disable_after = int(setting(settings, "skills_disable_after") or 2)
 
