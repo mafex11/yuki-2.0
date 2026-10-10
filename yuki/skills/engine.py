@@ -1126,10 +1126,18 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     disable_after = int(setting(settings, "skills_disable_after") or 2)
 
     def go(client: Any) -> Any:
+        from yuki.skills.catalog import load
+        from yuki.skills.menu import request_key
+
         seeded = getattr(client, "_skills_seeded", None)
-        if callable(seeded):
-            seeded()   # the tray's MemoryClient seeds the registry once per connection version
-        return res_mod.resolve(skill_key, slots, words, store=_store_of(client) if client is not None else None,
+        # the tray's MemoryClient seeds the registry once per connection version and returns the store-aware catalog
+        loaded = seeded() if callable(seeded) else None
+        if loaded is None or not hasattr(loaded, "get"):
+            loaded = load()
+        # lPage merge note 5 (lSplit review r2 L1): words naming another value for a learned skill's bound key slot
+        # run its capability (the learned routes carry the bound value in their arguments), never the learned skill
+        key = request_key(loaded, str(skill_key or ""), slots)
+        return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after)
 
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)

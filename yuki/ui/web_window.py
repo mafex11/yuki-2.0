@@ -1428,6 +1428,8 @@ class WebWindow:
         "ai_test": "a_ai_test",
         # capC2 (decision D5): a task inside a Day session corrected (renamed, not one task, not what you did), Undo
         "task_correct": "a_task_correct", "task_correct_undo": "a_task_correct_undo",
+        # phase L (lPage merge note 2): Rename / Forget this / Not mine on a skill Yuki learned
+        "skill_edit": "a_skill_edit",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
@@ -1837,6 +1839,18 @@ class WebWindow:
         self.refresh("home")
         return {"ok": bool(result.get("ok")), "error": result.get("error") or "", "state": result.get("state"),
                 "queued": bool(result.get("queued"))}
+
+    def a_skill_edit(self, m: dict[str, Any]) -> dict[str, Any]:
+        """Playbook: Rename / Forget this / Not mine on a learned skill, through memory's own ``skill_edit`` (one write
+        on its row, no model; phase L lPage). The page sends the button as ``verb``."""
+        verb = str(m.get("verb") or "")
+        if verb not in ("rename", "forget", "not_mine"):
+            return {"ok": False, "error": "Unknown choice."}
+        r = self._memory_op("skill_edit")(str(m.get("ref") or ""), verb,
+                                          " ".join(str(m.get("words") or "").split())) or {}
+        self.refresh("playbook")
+        return {"ok": bool(r.get("ok")), "error": r.get("error") or "", "state": r.get("state"),
+                "name": r.get("name") or ""}
 
     def a_task_correct(self, m: dict[str, Any]) -> dict[str, Any]:
         """capC2 (decision D5): the user's correction of one task inside a Day session, to memory's ``task_correct``

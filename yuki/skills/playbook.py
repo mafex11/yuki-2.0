@@ -9,7 +9,7 @@ preference or a routine: the learner does, from what the user does.
 **What an entry shows** (design §4.9), all from data, said plainly:
 
 * its name: the naming call's (lName), the user's own after a Rename, else a nameless line built from its capability
-  and its fixed values (design §4.6: nameless skills run on request and are never offered);
+  and its fixed values (design §4.6; a nameless page-like skill is never offered, lName merge note 5);
 * where it came from: "Seen 5 times on 3 weekdays, last Mon 08:30" (the learner's ``occasions`` rows of the user,
   else the row's content-free ``provenance``);
 * how it runs: its capability's neutral line, what stays the same each time (its bound values), the program the user
@@ -432,17 +432,19 @@ def _static_offer(cap: Any, prov: Mapping[str, Any], spec: Mapping[str, Any]) ->
 def _offer_line(*, cap: Any, skill: Any, spec: Mapping[str, Any], prov: Mapping[str, Any], state: str,
                 routine: Mapping[str, Any] | None, nameless: bool, skipped: bool, ok: int, store: Any,
                 now: float) -> tuple[str, bool]:
-    """Whether it may be offered on a card, and if not why (design §4.6, §4.7): never a nameless skill; the learner's
-    static part (:func:`_static_offer`); the card's Won't words known (``offers.skill_wont_line``); live; trusted by
-    D14 (``registry.offer_ready``, called only when everything before it holds); an active routine. ``skill``: the
-    catalog's live entry, ``None`` when it is not live (resting, over the cap, or skipped by the catalog:
+    """Whether it may be offered on a card, and if not why (design §4.6, §4.7): never a nameless ``judged`` skill; the
+    learner's static part (:func:`_static_offer`); the card's Won't words known (``offers.skill_wont_line``); live;
+    trusted by D14 (``registry.offer_ready``, called only when everything before it holds); an active routine.
+    ``skill``: the catalog's live entry, ``None`` when it is not live (resting, over the cap, or skipped by the catalog:
     ``skipped``). ``ok``: its requests that worked. ``(line, maybe)``; the routine lane decides each card itself
     (offers.py), this only says what the page knows."""
     from yuki.skills import registry
 
     if str(getattr(cap, "offer_class", "") or "never") == "never":
         return "Never offered: it runs when you ask.", False
-    if nameless:
+    if nameless and str(getattr(cap, "offer_class", "") or "") == "judged":
+        # the routine lane's gate (yuki.memory.offers.skill_offerable, lName merge note 5): only a page-like skill
+        # needs the naming call's name and its everyday judgement; logistics and everyday ones offer by trust alone
         return "Not offered: it has no name yet, so it runs when you ask.", False
     why = _static_offer(cap, prov, spec)
     if why:
@@ -549,8 +551,12 @@ def learned_section(store: Any, *, now: float | None = None) -> dict[str, Any]:
             else:   # resting or over the cap: its spec's bound values, the ones that name a slot of its capability
                 raw = spec.get("bound") if isinstance(spec.get("bound"), Mapping) else {}
                 bound = {k: v for k, v in raw.items() if cap.slot(str(k)) is not None and v not in (None, "")}
-            name = _text(store, r["name_ct"])
             prov = _prov(r["provenance"])
+            name = _text(store, r["name_ct"])
+            # lName writes a nameless skill's code-built label as its name with provenance.named false (merge fix):
+            # that label is shown as the nameless line, never taken for a name
+            if name and prov.get("named") is False and prov.get(NAMED_BY) != NAMED_BY_USER:
+                name = ""
             got = seen.get(sid) or _from_provenance(prov)
             ok, failed = runs.get(key, (0, 0))
             routine = routines.get(sid)
