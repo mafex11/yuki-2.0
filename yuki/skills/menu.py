@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from yuki.skills.connection import MENU_LINE_CHARS, Loaded, Skill, load
+from yuki.skills.catalog import load
+from yuki.skills.connection import MENU_LINE_CHARS, Loaded, Skill
 
 #: The talker's and the thinker's menu size cap (``Settings.skills_menu_chars``).
 MENU_CHARS = 2400

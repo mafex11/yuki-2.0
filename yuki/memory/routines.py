@@ -338,7 +338,7 @@ class Inputs:
 def load_skills() -> tuple[Any, ...]:
     """The loaded skills (``yuki.skills.connection.load``); empty when the skill files can't be read."""
     try:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         return tuple(load().skills)
     except Exception:  # noqa: BLE001 - a broken connection folder means no routines, never a crash

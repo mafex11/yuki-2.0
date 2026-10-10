@@ -1,9 +1,11 @@
 """The skill registry: skills as data in the database, the trust ledger and the counters code computes from it.
 
-PLAN.md Phase S, decisions D2, D3, D14, D18, D19; map-skills S1.3. The connection files are the spec
-(:mod:`yuki.skills.connection`); the tables of migration 41 hold what is the user's:
+PLAN.md Phase S, decisions D2, D3, D14, D18, D19; map-skills S1.3; phase L design §4.9. The connection files are the
+capabilities (:mod:`yuki.skills.connection`); the tables of migration 41 hold what is the user's:
 
-* ``skills``: one row per loaded skill (told values encrypted, the state code computes, uses);
+* ``skills``: one row per capability (``origin = 'capability'``, seeded from the files by :func:`seed`) and, from the
+  learner (phase L), one per learned skill (``origin = 'learned'``, never seeded here): told values encrypted, the
+  state code computes, uses;
 * ``skill_routes``: one row per rung, with the connection hash it was seeded from and the verified runs intake
   imported from old procedures (``seed_ok``);
 * ``skill_runs``: the trust ledger, content-free. A row is written at ``t0``, before the first step (D18: the moments
@@ -63,44 +65,62 @@ def has_tables(store: Any) -> bool:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+#: The ``skills.origin`` of a row seeded from a shipped file (phase L: a capability). ``seed`` is the old word (phase
+#: S's hand-written skills): such rows are re-seeded as capabilities or retired, never left live. ``learned`` rows are
+#: the learner's (phase L) and are never touched here.
+CAPABILITY_ORIGIN = "capability"
+SEEDED_ORIGINS: tuple[str, ...] = ("seed", CAPABILITY_ORIGIN)
+
+
 def seed(store: Any, loaded: Loaded, *, now: float | None = None) -> dict[str, int]:
-    """One ``skills`` row per loaded skill and one ``skill_routes`` row per rung (upserted; a skill no file has any
-    more is retired, never deleted). A changed connection file stamps ``hash_changed_at`` on its routes: the
+    """One ``skills`` row per capability (``origin = 'capability'``) and one ``skill_routes`` row per rung (upserted;
+    a capability no file has any more is retired, never deleted). Learned skills (``origin = 'learned'``, written by
+    the learner) are never seeded, retired or moved here, whatever ``loaded`` holds: the files seed capabilities, not
+    skills (phase L design §4.9, §9.1). A changed connection file stamps ``hash_changed_at`` on its routes: the
     contradiction streak that disables a rung counts only runs after it (:func:`trust`), so each gets another try
-    (``reenabled`` counts them). One transaction: skills no file has any more are retired first, so a renamed key or a
-    new skill for the same (app, end) takes the place without breaking the one-live-skill-per-(app, end) index.
-    Returns counts (content-free). Never raises: ``{"error": 1}``."""
+    (``reenabled`` counts them). One transaction: seeded rows no file has any more (phase S's hand-written skills too)
+    are retired first, so a renamed key or a new capability for the same (app, end) takes the place without breaking
+    the one-live-row-per-(app, end) index. A row kept under the same key keeps its id (and its ledger). Returns counts
+    (content-free). Never raises: ``{"error": 1}``."""
     now = time.time() if now is None else float(now)
     counts = {"skills": 0, "routes": 0, "retired": 0, "reenabled": 0}
+    caps = [s for s in loaded.skills if getattr(s, "origin", CAPABILITY_ORIGIN) == CAPABILITY_ORIGIN]
+    marks = ",".join("?" * len(SEEDED_ORIGINS))
 
     def write(conn: Any) -> None:
-        live = {s.key for s in loaded.skills}
+        live = {s.key for s in caps}
         # retire first (review M6): a key no file has any more frees its (app, end) before another takes it
-        for sid, key in conn.execute("SELECT id, key FROM skills WHERE retired_at IS NULL").fetchall():
+        for sid, key in conn.execute(f"SELECT id, key FROM skills WHERE retired_at IS NULL AND origin IN ({marks})",
+                                     SEEDED_ORIGINS).fetchall():
             if key not in live:
                 conn.execute("UPDATE skills SET retired_at = ?, state = 'retired', updated_at = ? WHERE id = ?",
                              (now, now, sid))
                 counts["retired"] += 1
-        # a loaded skill whose (app, end) moved steps aside too, so two moving skills never collide mid-way (the
-        # loop below brings each back at its new place; load() keeps (app, end) unique among the loaded)
-        wanted = {s.key: (s.app, s.end) for s in loaded.skills}
+        # a capability whose (app, end) moved steps aside too, so two moving rows never collide mid-way (the loop
+        # below brings each back at its new place; connection.load keeps (app, end) unique among the capabilities)
+        wanted = {s.key: (s.app, s.end) for s in caps}
         for sid, key, app, end_kind in conn.execute(
-                "SELECT id, key, app, end_kind FROM skills WHERE retired_at IS NULL").fetchall():
+                f"SELECT id, key, app, end_kind FROM skills WHERE retired_at IS NULL AND origin IN ({marks})",
+                SEEDED_ORIGINS).fetchall():
             if key in wanted and wanted[key] != (app, end_kind):
                 conn.execute("UPDATE skills SET retired_at = ? WHERE id = ?", (now, sid))
-        for s in loaded.skills:
-            row = conn.execute("SELECT id, connection, retired_at FROM skills WHERE key = ?", (s.key,)).fetchone()
+        for s in caps:
+            row = conn.execute("SELECT id, connection, retired_at, origin FROM skills WHERE key = ?",
+                               (s.key,)).fetchone()
+            if row is not None and str(row[3] or "") not in SEEDED_ORIGINS:
+                continue    # a learned row holds this key: the learner's, never overwritten by a file
             if row is None:
-                # a retired skill of the same (app, end) keeps its row; this one takes the place
+                # a retired row of the same (app, end) keeps its row; this one takes the place
                 conn.execute(
                     "INSERT INTO skills (key, app, end_kind, connection, origin, state, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, 'seed', 'active', ?, ?)", (s.key, s.app, s.end, s.connection, now, now))
+                    "VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+                    (s.key, s.app, s.end, s.connection, CAPABILITY_ORIGIN, now, now))
                 skill_id = conn.execute("SELECT id FROM skills WHERE key = ?", (s.key,)).fetchone()[0]
             else:
                 skill_id = int(row[0])
-                conn.execute("UPDATE skills SET app = ?, end_kind = ?, connection = ?, retired_at = NULL, "
+                conn.execute("UPDATE skills SET app = ?, end_kind = ?, connection = ?, origin = ?, retired_at = NULL, "
                              "state = CASE WHEN state = 'retired' THEN 'active' ELSE state END, updated_at = ? "
-                             "WHERE id = ?", (s.app, s.end, s.connection, now, skill_id))
+                             "WHERE id = ?", (s.app, s.end, s.connection, CAPABILITY_ORIGIN, now, skill_id))
             counts["skills"] += 1
             for r in s.routes:
                 got = conn.execute(
@@ -542,6 +562,7 @@ def runs_between(store: Any, since: float, until: float) -> list[dict[str, Any]]
 
 
 __all__ = ["DISABLE_AFTER", "RETRY_AFTER_S", "OPEN_RUNS", "CHANGE_RUNS", "OUTCOMES", "RouteTrust", "has_tables", "seed",
+           "CAPABILITY_ORIGIN", "SEEDED_ORIGINS",
            "skill_ids", "new_run_key", "start_run", "finish_run", "set_run_app", "record_route_try", "set_recheck",
            "mark_false_done", "trust", "usable", "offer_ready", "menu_version", "last_runs", "import_evidence",
            "table_counts", "runs_between"]

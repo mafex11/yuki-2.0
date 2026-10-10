@@ -2079,7 +2079,8 @@ class Hands:
         :class:`_Refused` with ``held``). Any other skill is not judged here (its routes are the user's own usual ways).
         Data only, never the words."""
         try:
-            from yuki.skills.connection import load, sends_with
+            from yuki.skills.catalog import load
+            from yuki.skills.connection import sends_with
 
             skill = load().get(skill_key)
             sends = bool(skill is not None and sends_with(skill, slots, partial=True))

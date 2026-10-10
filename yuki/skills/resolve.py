@@ -39,7 +39,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.skills.connection import Loaded, Route, Skill, Slot, fill, load
+from yuki.skills.catalog import load
+from yuki.skills.connection import Loaded, Route, Skill, Slot, fill
 
 #: "again" repeats a run of the same skill at most this old.
 AGAIN_S = 600.0

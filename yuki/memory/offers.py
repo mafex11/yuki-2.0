@@ -478,7 +478,7 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
         if skills is not None:
             loaded = skills()
         else:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             loaded = load()
         skill = loaded.get(key) if key else None
@@ -665,7 +665,7 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
     if r is None or not r.offering or r.skill_id != offer.get("skill"):
         return {"ok": False, "why": "gone", "do": do}
     try:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
         from yuki.skills.registry import offer_ready
 
         skill = load().get(str(offer["skill"]))

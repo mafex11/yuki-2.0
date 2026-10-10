@@ -564,7 +564,7 @@ class RoutineLane:
     def _loaded(self) -> Any:
         if self._skills is not None:
             return self._skills()
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         return load()
 
@@ -1136,7 +1136,7 @@ def card_still_due(store: Any, nudge_id: int, *, now: float | None = None,
     if r is None or not r.offering or (offer.get("skill") and r.skill_id != offer.get("skill")):
         return {"due": False, "why": "gone", "final": True}
     try:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         skill = load().get(str(r.skill_id))
     except Exception:

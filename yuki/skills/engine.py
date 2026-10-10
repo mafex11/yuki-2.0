@@ -1008,7 +1008,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # the off switch (Settings.skills = false): the old paths run instead; nothing here acts
         return run(Refused(str(skill_key or ""), "skills_off"), ctx)
     if live is None:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         skill = load().get(str(skill_key or ""))
         wants_media = bool(skill and any(s.live == "playing" for s in skill.slots))

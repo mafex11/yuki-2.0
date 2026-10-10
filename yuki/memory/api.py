@@ -4813,7 +4813,7 @@ class MemoryClient:
     def _skills_seeded(self) -> Any:
         """The loaded connection files, seeded into this database once per version per process (an upsert). A seed
         that failed is tried again on the next call (the version is marked seeded only on success)."""
-        from yuki.skills import connection, registry
+        from yuki.skills import catalog as connection, registry
 
         loaded = connection.load()
         seen = getattr(self, "_skills_version", None)

@@ -1682,7 +1682,7 @@ def talker_menu(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None
     cap = int(chars) if isinstance(chars, int) and not isinstance(chars, bool) and chars > 0 else SKILLS_CHARS
     when = time.time() if now is None else float(now)
     try:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         loaded: Any = load()
     except Exception:  # noqa: BLE001 - no skill package: memory's own menu, if any

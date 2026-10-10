@@ -1,0 +1,118 @@
+# web.open_page and web.open_video: a web page, or one picked video, in a browser (phase L design §6, §4.4-§4.5;
+# PLAN.md D0, D16, D17, D19). Capabilities: what any user's browser can do. Which sites and pages the user opens, in
+# which browser and when, are learned (moments of kind page, the timeline), never written here.
+#
+# The site: a site file's name (yuki/connect/sites/<site>.toml: its documented URL shapes, the page kinds and their
+# addresses) or a registrable domain (a host-scope page: its front page, https://<domain>/). The page: one of that
+# site's page kinds (a channel page, a watch page); none is the site's front page. The page's own value (a video's id,
+# a channel's handle) is the item: from the user's words or an offered option (phase T), never guessed. The address is
+# a launch argument (nothing typed); nothing plays until the user picks.
+#
+# The browser is a means, with no ranked rule shipped (design §5, critique M8): the one the user named, else their
+# usual (preference web.open_page:browser@<site>, or the learned skill's fill policy), else the browser they use most,
+# else Windows' default handler. "A browser" is measured, never a list: a program whose timeline rows carried pages of
+# at least 3 hosts (yuki/skills/web_route.py). Never with a game in front ("after the round?").
+#
+# Zero setup (D0): nothing to connect, no API; the browser's own window.
+
+[connection]
+app = "web"
+
+[capability."web.open_page"]
+end = "page"
+kind = "open"
+menu = "open a site's front page or one of its pages in a browser; nothing plays until they pick"
+done_line = "{site} is up."
+offer_class = "judged"
+handoff = true
+serves = [{ end = "page", target = "page", needs = "browser" }]
+bind = { site = "site", page = "page", item = "entity", browser = "app" }
+
+# A site file's name or a registrable domain, as the user said it (a learned skill binds it).
+[[capability."web.open_page".slot]]
+name = "site"
+type = "text"
+role = "key"
+required = true
+ask = "Which site?"
+
+# One of the site file's page kinds; none: the site's front page.
+[[capability."web.open_page".slot]]
+name = "page"
+type = "text"
+role = "key"
+
+# The page's own value (a video's id, a channel's handle): the user's words or an offered option's link.
+[[capability."web.open_page".slot]]
+name = "item"
+type = "entity"
+role = "fill"
+
+[[capability."web.open_page".slot]]
+name = "browser"
+type = "app"
+role = "means"
+scope = "site"
+say = "in {browser}"
+
+[[capability."web.open_page".route]]
+rung = "A"
+variant = "browser"
+via = "driver"
+driver = "web_route"
+call = "open_page"
+needs_focus = true
+means = "browser"
+# the page in front is the one opened (by template value, or by host for a host-scope page)
+done = { probe = "driver", driver = "web_route", call = "page_shown", within_s = 6 }
+# the watcher's own read of the window in front (memory's Now board), a second source
+recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s = 3 }
+
+[capability."web.open_video"]
+end = "media_play"
+kind = "change"
+menu = "open one video they picked from offered options in a browser (it plays)"
+done_line = "Playing it."
+offer_class = "never"
+handoff = true
+
+# The picked video: one of the offered options (phase T gives them with their link), or the user's own words (no link:
+# the thinker finds it, with this capability pinned). No entity kind on purpose: a video nobody picked never plays.
+[[capability."web.open_video".slot]]
+name = "video"
+type = "entity"
+role = "fill"
+required = true
+ask = "Which video?"
+
+[[capability."web.open_video".slot]]
+name = "browser"
+type = "app"
+role = "means"
+say = "in {browser}"
+
+[[capability."web.open_video".route]]
+rung = "A"
+variant = "browser"
+via = "driver"
+driver = "web_route"
+call = "open_video"
+needs_focus = true
+means = "browser"
+when = { slot = "video", field = "ref", has = true }
+# Done only when both are seen (review r1 M2): the page in front is that very video's page, and the browser's own media
+# session says playing. Autoplay blocked or the tab behind: "couldn't confirm".
+[capability."web.open_video".route.done]
+probe = "all"
+within_s = 6
+parts = [
+  { probe = "driver", driver = "web_route", call = "video_shown" },
+  { probe = "driver", driver = "web_route", call = "video_playing" },
+]
+# a later re-read: the media session still playing (a source the done-check also read: flagged as such)
+[capability."web.open_video".route.recheck]
+probe = "driver"
+driver = "web_route"
+call = "video_playing"
+after_s = 4
+same_source = true

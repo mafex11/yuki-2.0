@@ -4411,7 +4411,7 @@ class Conversation:
         if key == VOLUME_SKILL:
             return True
         try:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             skill = load().get(key)
         except Exception:  # noqa: BLE001 - unknown: held like any window hand

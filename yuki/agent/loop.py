@@ -2752,7 +2752,7 @@ class Agent:
         prev = getattr(self, "_skills_block", None) or ((), "")
         try:
             from yuki.skills import enabled
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
             from yuki.skills.menu import THINKER, menu_text
 
             if not enabled(self.settings) or getattr(self, "reader", False):

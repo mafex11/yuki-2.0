@@ -335,7 +335,7 @@ def usual_choices(loaded: Any = None, *, store: Any = None, cap: int = CHOICES_M
     are never listed (their options are digests, or live in ``contact_prefs``). In load order, at most ``cap``."""
     if loaded is None:
         try:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             loaded = load()
         except Exception:  # noqa: BLE001
@@ -506,7 +506,7 @@ def after_voice_run(store: Any, skill_key: str, *, values: dict[str, Any], previ
     out: dict[str, Any] = {"corrected": [], "still_card": None}
     try:
         if loaded is None:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             loaded = load()
         skill = loaded.get(str(skill_key or ""))

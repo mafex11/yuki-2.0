@@ -990,7 +990,7 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
     Meet tab. Read-only (the database ``mode=ro``), content-free (code words and counts). No account or key."""
     try:
         from yuki import skills as skills_pkg
-        from yuki.skills import connection
+        from yuki.skills import catalog as connection
     except Exception as exc:
         return Check(SKILLS_CHECK, SKIP, f"not available ({type(exc).__name__})")
     if not skills_pkg.enabled(settings):

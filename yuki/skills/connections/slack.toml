@@ -1,5 +1,5 @@
-# Slack: its own data for the `message` skill (message.toml) (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2;
-# map-skills S2.5).
+# Slack: its own data for the `message` capability (message.toml) (phase L design §6; PLAN.md D0, D17, D19, Q3/rule 8).
+# Driver data only: true for anyone's Slack; whom the user messages there is learned, never written here.
 #
 # A chat whose address memory captured (app.slack.com/client/{team}/{channel}) opens by Slack's own link
 # (slack://channel?team=...&id=..., which opens DMs too); any other chat through Slack's own quick switcher (Ctrl+K,
