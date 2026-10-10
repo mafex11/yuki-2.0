@@ -218,6 +218,18 @@ def _open_url(url: str, app: str | None) -> Any:
     return launch.open_url(url, app=app or None)
 
 
+def _handler_key(url: str) -> str:
+    """The app key of the program Windows opens ``url`` with (its registered handler, read from the registry: no
+    window read, nothing launched); ``""`` when unknown. Review r2 L3 (D18): a page opened with Windows' default
+    handler (no browser measured yet: a fresh install) still names its browser on the run's row before it acts."""
+    try:
+        from yuki.actions.launch import _default_handler
+
+        return _app_key(_default_handler(url))
+    except Exception:  # noqa: BLE001 - an unreadable association: nothing to claim
+        return ""
+
+
 def _held_by_game(result: Any) -> bool:
     details = getattr(result, "details", None) or {}
     return isinstance(details, Mapping) and details.get("refused") == "game"
@@ -411,6 +423,8 @@ def route_told_link(call: RouteCall) -> RouteResult:
         name, key, source = choose_browser(call)
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
+    if source == "default" and not key:
+        key = _handler_key(link)
     _claim_app(call, key)
     result = _open_url(link, name if source != "default" else None)
     if _held_by_game(result):
@@ -690,6 +704,8 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (),
     name, key, source = choose_browser(call, hosts=hosts, policy=policy)
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused"), name, key, source
+    if source == "default" and not key:
+        key = _handler_key(url)
     _claim_app(call, key)
     result = _open_url(url, name if source != "default" else None)
     if _held_by_game(result):

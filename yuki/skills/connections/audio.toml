@@ -11,9 +11,10 @@
 # Spotify may be restored for its slider, then the previous window is put back in front.
 #
 # The control slot is a means: "in_app" is the target's own control (Spotify's slider; for an app without one, its own
-# mixer level; the PC's own level for system), "mixer" the Windows mixer entry. It ships no default: the user's usual
-# for that app (preference volume:control@<app>, from their words, confirmed once) or the learned fill policy picks it;
-# with neither, the ask_control rung asks the slot's question once (an app with its own control only).
+# mixer level; the PC's own level for system), "mixer" the Windows mixer entry. It ships no default: the user's words
+# or their usual for that app (preference volume:control@<app>, from their words, confirmed once) fill it; with
+# neither, the ask_control rung asks the slot's question once (an app with its own control only). A learned fill
+# policy doesn't reach this slot yet (it reaches driver arguments only; filling a means slot from it is lWire's scorer).
 # Every route below except Spotify's own needs no window and takes no focus, so it runs with a game in front too.
 
 [connection]

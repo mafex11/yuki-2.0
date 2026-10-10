@@ -624,10 +624,13 @@ def site_label(ref: str, *, lang: str = "en") -> dict[str, Any]:
 
 
 def _literal(value: Any) -> bool:
-    """A value that names something itself rather than through a slot: a non-empty string with no template, or a
-    number / list / table holding one."""
+    """A value that names something itself rather than through a slot: a string with any text outside its templates
+    (``"zen.exe"``, and ``"zen.exe{pick}"`` too: review r2 L6), or a number / list / table holding one."""
     if isinstance(value, str):
-        return bool(value.strip()) and not template_names(value)
+        rest = value
+        for name in template_names(value):
+            rest = rest.replace("{" + name + "}", "")
+        return bool(rest.strip())
     if isinstance(value, Mapping):
         return any(_literal(v) for v in value.values())
     if isinstance(value, (list, tuple)):
@@ -661,8 +664,9 @@ def _habit_keys_in(value: Any, where: str) -> None:
 def refuse_habits(data: Mapping[str, Any], name: str) -> None:
     """The habit-key refusal over one parsed shipped file (raises :class:`ConnectionError_` with ``habit_key`` in
     its message; the whole file is then skipped): a ``[skill.*]`` table; a ``routine_on``, ``offerable``,
-    ``learn_from`` or ``preview`` key anywhere; a default on a ``means`` or ``key`` slot; a process or service literal
-    in a route's arguments, or a service literal in a route's checks."""
+    ``learn_from`` or ``preview`` key anywhere; an ``app`` key on a capability (its app is its file's ``[connection]``
+    app: a capability pinned to one program is a habit, review r2 L6); a default on a ``means`` or ``key`` slot; a
+    process or service literal in a route's arguments, or a service literal in a route's checks."""
     if "skill" in data:
         raise ConnectionError_(f"{name}: habit_key: [skill.*] tables are learned (phase L); a file declares "
                                f"[capability.*]")
@@ -674,6 +678,9 @@ def refuse_habits(data: Mapping[str, Any], name: str) -> None:
         if not isinstance(raw, Mapping):
             continue
         where = f"{name}:{key}"
+        if "app" in raw:
+            raise ConnectionError_(f"{where}: habit_key: a capability's app is its file's [connection] app, never "
+                                   f"a program of its own")
         for i, slot in enumerate(raw.get("slot") or []):
             if isinstance(slot, Mapping) and str(slot.get("role") or "") == "means" and "default" in slot:
                 raise ConnectionError_(f"{where}.slot[{i}]: habit_key: a means slot ships no default (a preference "

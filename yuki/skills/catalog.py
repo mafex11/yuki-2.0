@@ -31,9 +31,17 @@ memory service's nightly passes) passes ``store=`` so the cache follows the data
 
 * ``name_ciphertext``: the learned name (the naming call's, validated).
 
-A means slot is never bound (app and means are never part of a skill's identity: design §4.2); a learned rung is never
-rung A (rung A is the capability's own); ``wont`` and ``commit`` only ever get stricter. A row that breaks any of these
-is skipped and reported (``learned_error``, content-free: its row id and a code word), never guessed.
+A means slot is never bound (app and means are never part of a skill's identity: design §4.2); a slot is bound only
+when its capability names a ``bind`` source for it (an occasion's attribute), and never when it is a slot a
+``sends_when`` condition reads, a ``told`` slot or a ``bool`` slot (code word ``not_bindable``: a learned spec can't
+turn a draft into a send or join a channel nobody named, review r2 M1); a learned rung is never rung A (rung A is the
+capability's own); ``wont`` and ``commit`` only ever get stricter. A row that breaks any of these is skipped and
+reported (``learned_error``, content-free: its row id and a code word), never guessed.
+
+A bound value runs as the skill's own: on the learned skill's copy of the slot it is the default and the slot's live
+fill, taste fill and in-call question are cleared, so only the user's words replace it (review r2 L1). The contract
+for the callers (lCore's run ledger, lPage's menu): a word value that differs from a bound key slot's value is the
+capability's run, not the learned skill's (it never counts on the learned skill's ``skill_id``, D14).
 """
 
 from __future__ import annotations
@@ -150,6 +158,7 @@ def specialise(cap: Skill, *, key: str, spec: Mapping[str, Any], name: str = "")
     if not key or len(key) > KEY_CHARS or any(ch.isspace() for ch in key):
         raise ConnectionError_(f"{where}: bad_key")
     by_name = {s.name: s for s in cap.slots}
+    sends_slots = {str(cond.get("slot") or "") for cond in cap.sends_when}
     bound: dict[str, Any] = {}
     raw_bound = spec.get("bound") or {}
     if not isinstance(raw_bound, Mapping):
@@ -161,6 +170,11 @@ def specialise(cap: Skill, *, key: str, spec: Mapping[str, Any], name: str = "")
         if slot.role == "means":
             # design §4.2: app and means are attributes, never a skill's identity (a means change moves a preference)
             raise ConnectionError_(f"{where}: bound {slot_name!r} is a means slot")
+        if slot.name not in cap.bind or slot.told or slot.type == "bool" or slot.name in sends_slots:
+            # review r2 M1: a value is bound only from an occasion's attributes (the capability's ``bind`` sources,
+            # design §4.2). Never a slot that decides a send (rule 8's draft default stays code), a told value (the
+            # user's own words, kept encrypted apart) or a yes/no switch (discord.voice's join_in_call: D10)
+            raise ConnectionError_(f"{where}: bound {slot_name!r} not_bindable")
         if value is not None and value != "":
             bound[slot.name] = value
     policies: dict[str, str] = {}
@@ -173,7 +187,11 @@ def specialise(cap: Skill, *, key: str, spec: Mapping[str, Any], name: str = "")
         if slot is None or slot.role != "means" or not policy.isidentifier():
             raise ConnectionError_(f"{where}: means {slot_name!r} is not a means slot with a policy")
         policies[slot.name] = policy
-    slots = tuple(replace(s, default=bound[s.name]) if s.name in bound else s for s in cap.slots)
+    # review r2 L1: a bound value is the skill's identity, not a guess, so nothing below the user's words replaces it
+    # (resolve's order is words > again > told > live > pref > taste > default): its live fill, its taste fill and
+    # its in-call question are cleared on the learned skill's copy of the slot
+    slots = tuple(replace(s, default=bound[s.name], live="", taste="", ask_in_call=False) if s.name in bound else s
+                  for s in cap.slots)
     slot_table = {s.name: s for s in slots}
     routes = [_bind_route(r, bound, policies) for r in cap.routes]
     for i, raw in enumerate(spec.get("routes") or []):
@@ -218,7 +236,7 @@ def _code(error: str) -> str:
     """A content-free code word for an error line (``connection_error`` / ``learned_error`` log fields)."""
     low = error.casefold()
     for word in ("habit_key", "zero setup", "undecryptable", "spec_version", "no_capability", "key_taken",
-                 "unreadable"):
+                 "unreadable", "not_bindable"):
         if word in low:
             return word.replace(" ", "_")
     return "invalid"
