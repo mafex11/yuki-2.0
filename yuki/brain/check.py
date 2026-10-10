@@ -7,7 +7,8 @@ revision, for its new may-commit steps only: the rest come from the memo). Plans
 
 **What it sees.** The user's own words for this request (runtime or bridge provenance, never card text) and at most
 three earlier turns of theirs; the may-commit steps, one line each (the verb, the app, the window's title, the
-element's role and name, the keys, a send's text and recipient, a shell's command). Never screen text, tool results or
+element's role and name, the keys, a send's text and recipient, a shell's command; for a click or a key, the text Yuki
+typed in that window and has not sent, since Enter or a click there may send it). Never screen text, tool results or
 the planner's reasoning. Titles and names are text an app wrote: they say what the target is, never what the user
 asked (the old judge's principle, so a page or a chat message can't talk it into anything).
 
@@ -16,8 +17,9 @@ asked (the old judge's principle, so a page or a chat message can't talk it into
 app, no worked incident) and under 2,500 characters. A step it gave no verdict for, a call that failed or timed out:
 ``failed`` (the consent rule then fails closed: ask for a lasting step, draft for a send).
 
-**Memo.** Per request, keyed by (window, verb, element role and name, a digest of the step's other input): a verdict is
-never reused on another window. No review stage, no window grants, no denial counters.
+**Memo.** Per request, keyed by (window, verb, element role and name, a digest of the step's other input, whether
+Yuki's unsent text waits there): a verdict is never reused on another window, nor across typing. No review stage, no
+window grants, no denial counters.
 
 **Logs** (content-free): steps checked, effects counted, asks, ms, the model's usage.
 """
@@ -119,18 +121,30 @@ def _clip(text: Any, cap: int) -> str:
 _POINTERS = frozenset({"element", "read", "expect_hwnd", "hwnd", "x", "y"})
 
 
-def memo_key(call: Call) -> str:
-    """A step's identity for the memo: its window, verb, element role and name, and a digest of its other input."""
+def memo_key(call: Call, *, typed: bool = False) -> str:
+    """A step's identity for the memo: its window, verb, element role and name, a digest of its other input, and
+    whether Yuki's unsent text waits in that window (a key or click there may send it: never the same step)."""
     rest = {k: v for k, v in (call.input or {}).items() if k not in _POINTERS}
     digest = hashlib.sha1(json.dumps(rest, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:12]
     return json.dumps([int(call.hwnd or 0), call.tool, call.role.casefold(), _clip(call.name, NAME_CHARS).casefold(),
-                       digest], ensure_ascii=False)
+                       digest, bool(typed)], ensure_ascii=False)
 
 
-def step_line(call: Call, *, plan: Any = None, typed: bool = False) -> str:
+#: The steps a waiting unsent text changes: a click, or a key (Enter, ctrl+Enter, a slider's keys) may send it.
+_TYPED_MATTERS = frozenset({"click", "press", "hotkey", "set_slider"})
+
+
+def _pending(typed_pending: Mapping[int, str] | frozenset[int] | set[int]) -> dict[int, str]:
+    """Windows where Yuki's typed text waits, with that text when known (``""``: not known)."""
+    if isinstance(typed_pending, Mapping):
+        return {int(h): str(t or "") for h, t in typed_pending.items() if h}
+    return {int(h): "" for h in typed_pending or () if h}
+
+
+def step_line(call: Call, *, plan: Any = None, typed: bool = False, typed_text: str = "") -> str:
     """One step as the check reads it: the verb, the app, the window's title, the element's role and name, the keys,
-    a send's text and recipient, a shell's command, a non-web address, a close. Plain facts; app-written text is
-    marked as such."""
+    a send's text and recipient, a shell's command, a non-web address, a close, and, for a click or a key, the text
+    Yuki typed there and has not sent (``typed``, ``typed_text``). Plain facts; app-written text is marked as such."""
     parts = [call.tool]
     inp = call.input or {}
     if call.tool == "run_skill":
@@ -171,8 +185,10 @@ def step_line(call: Call, *, plan: Any = None, typed: bool = False) -> str:
             parts.append("after this request read a file, the clipboard or memory")
     elif call.tool in ("window_action", "tab"):
         parts.append(f'action {_clip(inp.get("action"), 20)}')
-    if call.tool == "click" and typed:
-        parts.append("text Yuki typed and has not sent is waiting in this window")
+    if typed and call.tool in _TYPED_MATTERS and (call.tool != "set_slider" or isinstance(inp.get("keys"), list)):
+        parts.append("text Yuki typed and has not sent is waiting in this window" +
+                     (f' ("{_clip(typed_text, VALUE_CHARS)}"): this step may send it' if typed_text.strip()
+                      else ": this step may send it"))
     return "; ".join(parts)
 
 
@@ -246,24 +262,39 @@ class CommitCheck:
             self.cost_usd = 0.0
             self.ms: list[float] = []
 
-    def cached(self, call: Call) -> CheckVerdict | None:
-        """The memo's verdict for this very step on this very window, or ``None``."""
+    def cached(self, call: Call, *, typed: bool = False) -> CheckVerdict | None:
+        """The memo's verdict for this very step on this very window (with Yuki's unsent text waiting there or not,
+        ``typed``), or ``None``."""
         with self._lock:
-            got = self.memo.get(memo_key(call))
+            got = self.memo.get(memo_key(call, typed=typed))
         if got is None or (got.hwnd or 0) != int(call.hwnd or 0):
             return None
         return CheckVerdict(i=call.index, effect=got.effect, asked=got.asked, question=got.question, source="memo",
                             hwnd=got.hwnd)
 
     def run(self, user_words: Sequence[str], calls: Sequence[Call], *, earlier: Sequence[str] = (),
-            plan: Any = None, typed_pending: frozenset[int] = frozenset()) -> dict[int, CheckVerdict]:
+            plan: Any = None, typed_pending: Mapping[int, str] | frozenset[int] = frozenset(),
+            typed_by_step: Mapping[int, str] | None = None) -> dict[int, CheckVerdict]:
         """Verdicts for ``calls`` (by ``call.index``): the memo's, then one model call for the rest. Never raises; a
-        step with no verdict comes back ``failed``. ``typed_pending``: windows where Yuki's typed text waits (a click
-        there can send it: said on its line)."""
+        step with no verdict comes back ``failed``. ``typed_pending``: windows where Yuki's typed text waits now,
+        with the text when known (a click or a key there can send it: said on its line). ``typed_by_step``: instead,
+        per step (by ``call.index``), the unsent text in its window at that step's own moment (a plan's batch: a
+        step before the typing and one after it in the same window differ); a step not in it has none."""
+        pending = _pending(typed_pending)
+
+        def typed_text(c: Call) -> str | None:
+            if typed_by_step is not None:
+                got = typed_by_step.get(c.index)
+                return None if got is None else str(got)
+            return pending.get(int(c.hwnd)) if c.hwnd and int(c.hwnd) in pending else None
+
+        def typed_in(c: Call) -> bool:
+            return typed_text(c) is not None
+
         out: dict[int, CheckVerdict] = {}
         todo: list[Call] = []
         for call in calls:
-            hit = self.cached(call)
+            hit = self.cached(call, typed=typed_in(call))
             if hit is not None:
                 out[call.index] = hit
             else:
@@ -272,7 +303,7 @@ class CommitCheck:
             return out
         started = time.perf_counter()
         numbered = list(enumerate(todo, 1))
-        lines = [(n, step_line(c, plan=plan, typed=bool(c.hwnd) and int(c.hwnd) in typed_pending))
+        lines = [(n, step_line(c, plan=plan, typed=typed_in(c), typed_text=typed_text(c) or ""))
                  for n, c in numbered]
         got, usage, error = self._ask(list(user_words), lines, earlier)
         ms = round((time.perf_counter() - started) * 1000, 1)
@@ -286,7 +317,7 @@ class CommitCheck:
                 verdict = CheckVerdict(i=call.index, effect=v.effect, asked=v.asked, question=v.question,
                                        hwnd=call.hwnd)
                 with self._lock:
-                    self.memo[memo_key(call)] = verdict
+                    self.memo[memo_key(call, typed=typed_in(call))] = verdict
                 effects[v.effect] = effects.get(v.effect, 0) + 1
                 asks += int(not v.asked)
             out[call.index] = verdict

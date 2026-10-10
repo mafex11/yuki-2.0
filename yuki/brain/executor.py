@@ -14,7 +14,10 @@ How a request's plans run (one :class:`Executor` per request; every call on the 
 closes; reads of one plan run side by side (window reads one at a time on the dispatcher, memory and fetches in
 parallel), acts in order. At the first may-commit step everything after it waits for the plan block to complete;
 then the **commit check** (``yuki.brain.check``) runs once over every may-commit step left in the plan, and the rest
-runs in order. ``max_tokens`` or ``refusal`` runs no further step (the steps already run committed nothing).
+runs in order. ``max_tokens`` or ``refusal`` runs no further step (the steps already run committed nothing). A web
+fetch after a file, clipboard or memory read in this request (M9) is may-commit in every plan kind: in an act plan it
+waits as above; in an answer plan it passes the commit check and the consent rule at the end of the block (asked about
+or refused as row 5 says; no lease, no marker); an ask plan sets it aside.
 
 **Every act step** passes, in order: the steer / cancel / pause checkpoint (between steps, never mid-step); its window
 and element resolved by name in a read of that window (the Dispatcher acts only on ids from its own reads; UI
@@ -29,7 +32,10 @@ expectation still false after 1.5 s, is a **mismatch**: the planner gets the pla
 (at most 1.5k characters) and that window's view.
 
 **One desk lease** (``yuki.actions.leases.input_lease``) per act run: taken at the first act step, held across replans,
-freed only while an ask waits; an answer plan never takes it.
+freed only while an ask waits (a consent question, or an ask plan's own question); an answer plan never takes it.
+
+**Outside text** (a command's output, a file, a page, a window's view) reaches the planner only fenced as untrusted
+data (``yuki.agent.untrusted``), capped before the fence goes on; it never goes into a line said to the user.
 
 **The done-check** (``yuki.brain.done``): the required probe for the plan's class, the code line from its evidence,
 coverage, and a background re-check for probes that can flip.
@@ -49,14 +55,16 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from yuki.agent.tools import tool_traits
 from yuki.brain import consent, done, util
 from yuki.brain.check import CheckVerdict, CommitCheck
 from yuki.brain.consent import Call, Live, field_of, words
-from yuki.brain.plan import ExecHost
 from yuki.log.events import Paused, Say, SendPending, ToolCall, ToolResult
+
+if TYPE_CHECKING:   # an annotation only: the branch imports without bCore's plan.py
+    from yuki.brain.plan import ExecHost
 
 #: The plan's verbs: the Dispatcher's own tool names, plus the reads and ``wait`` (§2.2).
 ACT_VERBS: tuple[str, ...] = ("launch_app", "focus_window", "open_url", "window_action", "tab", "click", "type_text",
@@ -112,6 +120,7 @@ LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stop
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
 LINE_CUT_SHORT = "I lost my train of thought partway through, so I stopped there."
+LINE_DRAFT_HELD = "I opened the chat but didn't type the text in."
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -142,8 +151,9 @@ class StepStatus:
 @dataclass
 class Mismatch:
     """What the planner gets back when a step didn't go as planned: the step, what it expected, what showed (at most
-    :data:`DIFF_CHARS`), that window's view, why (a code word), and a skill hand-off's plan seed when a capability's
-    routes didn't get there (rung C)."""
+    :data:`DIFF_CHARS`; fenced as untrusted data when it is text from outside Yuki, ``seen_fenced``), that window's
+    view (fenced, its body capped at :data:`VIEW_CHARS`), why (a code word), and a skill hand-off's plan seed when a
+    capability's routes didn't get there (rung C)."""
 
     step: int
     verb: str
@@ -153,15 +163,17 @@ class Mismatch:
     why: str = ""
     refused: bool = False
     seed: dict[str, Any] | None = None
+    seen_fenced: bool = False
 
     def as_text(self) -> str:
         parts = [f"Step {self.step + 1} ({self.verb}) did not go as planned ({self.why or 'mismatch'})."]
         if self.expected:
             parts.append(f"Expected: {self.expected}")
         if self.seen:
-            parts.append(f"What showed: {self.seen[:DIFF_CHARS]}")
+            # fenced text was capped before its fence went on: cutting it now would cut the fence's end off
+            parts.append(f"What showed: {self.seen if self.seen_fenced else self.seen[:DIFF_CHARS]}")
         if self.view:
-            parts.append(f"That window now:\n{self.view[:VIEW_CHARS]}")
+            parts.append(f"That window now:\n{self.view}")
         return "\n".join(parts)
 
 
@@ -190,6 +202,20 @@ class RunResult:
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
         return json.dumps([s.as_dict() for s in self.statuses], ensure_ascii=False)
+
+
+@dataclass
+class _SkillRun:
+    """One ``run_skill`` step that ran: its outcome, the capability and slots it ran with, whether it was a draft, and
+    for a draft with Yuki's wording typed after the chat was seen open, that typing's own verdict."""
+
+    index: int
+    outcome: Any
+    key: str
+    slots: dict[str, Any]
+    drafted: bool = False
+    type_after: bool = False
+    typed: bool | None = None
 
 
 class _Lease:
@@ -286,6 +312,7 @@ class Executor:
         self._skill_key: str | None = None
         self._swap_words: list[str] = []
         self._done_replan = False
+        self._last_overview: dict[str, Any] = {}
         self._reset_plan()
         self._skill_context()
 
@@ -299,8 +326,9 @@ class Executor:
         self.holding = False
         self.pending_reads: list[tuple[int, Future]] = []
         self.read_results: list[dict[str, Any]] = []
-        self.skill_outcomes: list[tuple[int, Any, bool]] = []   # (step, run_skill outcome, drafted)
+        self.skill_outcomes: list[_SkillRun] = []
         self.batch: dict[int, CheckVerdict] = {}
+        self._batch_typed: dict[int, bool] = {}
         self.stopped: RunResult | None = None
         self.plan_since = time.time()
 
@@ -329,7 +357,9 @@ class Executor:
         if self.stopped is not None or self.holding:
             return self.stopped
         if str(field_of(self.head, "kind", "act")) in ("answer", "ask"):
-            if self._verb(step) in READ_VERBS:
+            # a web fetch after a file, clipboard or memory read could carry what was read out (M9): it waits for
+            # finish(), where it passes the commit check and the consent rule (answer) or is set aside (ask)
+            if self._verb(step) in READ_VERBS and not self._fetch_commits(step):
                 self._start_read(index, step)
             return None
         verb = self._verb(step)
@@ -367,15 +397,29 @@ class Executor:
                     s.state, s.why = "skipped", f"the plan was cut short ({stop_reason})"
             return self._finished(RunResult("stopped", line=LINE_CUT_SHORT, final=True))
         kind = str(field_of(self.head, "kind", "act"))
-        if kind == "ask":
-            self._join_reads()
-            return self._finished(RunResult("ask", line=words(field_of(self.head, "question", ""))))
-        if kind == "answer":
+        if kind in ("ask", "answer"):
+            started = {j for j, _f in self.pending_reads} | {int(r.get("i", -1)) for r in self.read_results}
+            gated: list[int] = []
             for i, step in enumerate(self.steps):
-                if self.statuses[i].state == "pending" and self._verb(step) in READ_VERBS and not any(
-                        j == i for j, _f in self.pending_reads):
+                if self.statuses[i].state != "pending" or self._verb(step) not in READ_VERBS or i in started:
+                    continue
+                if not self._fetch_commits(step):
                     self._start_read(i, step)
+                elif kind == "ask":
+                    s = self.statuses[i]
+                    s.state, s.why = "skipped", "a fetch after a file, clipboard or memory read runs only in an act " \
+                                                "or answer plan, after the commit check"
+                else:
+                    gated.append(i)
+            if gated:
+                stop = self._gate_fetches(gated)
+                if stop is not None:
+                    self._join_reads()
+                    return self._finished(stop)
             self._join_reads()
+            if kind == "ask":
+                self.lease.release()   # the desk is free while the user answers; the next act step takes it again
+                return self._finished(RunResult("ask", line=words(field_of(self.head, "question", ""))))
             return self._finished(RunResult("answer", reads=list(self.read_results)))
         result = self._run_rest()
         if result is not None:
@@ -516,14 +560,16 @@ class Executor:
         now, their elements as the plan names them; at run time a step whose window or element turns out different is
         checked again on its own)."""
         payload = done.overview(self.dispatcher)
+        self._last_overview = payload or self._last_overview
         calls: list[Call] = []
-        typed = set(self.typed_pending)
+        typed_by_step: dict[int, str] = {}   # each may-commit step: Yuki's unsent text in its window at its moment
+        typed: dict[int, str] = dict(self.typed_pending)
         reads = set(self.reads_seen)
         for i in pending:
             step = self.steps[i]
             verb = self._verb(step)
-            if verb in READ_VERBS and verb != "fetch":
-                kind = self._read_kind(step)
+            kind = self._read_kind(step)
+            if verb in READ_VERBS and (verb != "fetch" or kind):
                 if kind:
                     reads.add(kind)
                 continue
@@ -535,11 +581,61 @@ class Executor:
             live = Live(typed_pending=frozenset(typed), reads=frozenset(reads), join_controls=self.join_controls)
             if consent.may_commit(call, live, self.head):
                 calls.append(call)
-            if verb == "type_text" and not field_of(step, "submit", False) and call.hwnd:
-                typed.add(int(call.hwnd))
+                if call.hwnd and int(call.hwnd) in typed:
+                    typed_by_step[i] = typed[int(call.hwnd)]
+            if verb == "type_text" and call.hwnd:
+                if field_of(step, "submit", False):
+                    typed.pop(int(call.hwnd), None)
+                else:
+                    held = "" if call.input.get("clear") else typed.get(int(call.hwnd), "")
+                    typed[int(call.hwnd)] = held + str(call.input.get("text") or "")
+            elif verb in ("press", "hotkey") and call.hwnd:
+                typed.pop(int(call.hwnd), None)
         if calls:
+            # one call; each step's line says whether Yuki's unsent text waits in its window at its own moment
             self.batch = self.checker.run(self._all_words(), calls, earlier=self.earlier, plan=self.head,
-                                          typed_pending=frozenset(typed))
+                                          typed_by_step=typed_by_step)
+            self._batch_typed = {c.index: c.index in typed_by_step for c in calls}
+
+    def _gate_fetches(self, indices: Sequence[int]) -> RunResult | None:
+        """An answer plan's web fetches that come after a file, clipboard or memory read (M9): one commit check over
+        them, then the consent rule for each (row 5: the check's ``none`` or ``asked`` allows, else ask; a failed
+        check asks; an undeclared send is refused). An allowed or confirmed fetch runs as a read (fenced). A fetch
+        takes no input, so no desk lease and no acting marker; the lease, if an earlier act holds it, is freed while
+        the user is asked. ``None`` when every gated fetch ran."""
+        calls: dict[int, Call | None] = {i: self._fetch_call(i, self.steps[i]) for i in indices}
+        live0 = Live(reads=frozenset(self.reads_seen), join_controls=self.join_controls)
+        todo = [c for c in calls.values() if c is not None and consent.may_commit(c, live0, self.head)]
+        if todo:
+            self.batch.update(self.checker.run(self._all_words(), todo, earlier=self.earlier, plan=self.head))
+        for i in indices:
+            call, status = calls[i], self.statuses[i]
+            if call is None:
+                status.state, status.why = "failed", "a fetch needs an address or a path"
+                continue
+            live = self._live(call)
+            verdict = consent.check(call, self.head, self._all_words(), live, self._verdict_for(call, live))
+            self._emit_log("consent", verb=call.tool, row=verdict.row, result=verdict.result, why=verdict.why)
+            if verdict.result == consent.ASK:
+                self.lease.release()
+                try:
+                    yes = bool(self.host.ask(verdict.question))
+                except Exception:  # noqa: BLE001 - no answer is a no
+                    yes = False
+                if not yes:
+                    status.state, status.why = "declined", "the user said no"
+                    self._trace_step(call, None, ok=False, verdict=False, why="declined", kind="ask")
+                    return RunResult("declined", line=LINE_DECLINED, final=True)
+                verdict = consent.after_ask(verdict)
+            if verdict.result != consent.ALLOW:   # a refusal (a draft can't come of a fetch: it is refused too)
+                status.state, status.why = "refused", verdict.why
+                self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {verdict.why}", kind="control",
+                                 refused=True)
+                if verdict.final:
+                    return RunResult("refused", line=verdict.line, final=True)
+                return self._mismatch_result(i, verdict.why, refused=True, seen=verdict.line or verdict.why)
+            self._start_read(i, self.steps[i])
+        return None
 
     def _predicted(self, index: int, step: Any, payload: Mapping[str, Any]) -> Call | None:
         """A step's call as planned, before it runs (its window from the overview, its element as the plan names it)."""
@@ -649,7 +745,9 @@ class Executor:
                 return self._mismatch_result(index, why)
             if again.hwnd != call.hwnd or again.role != call.role or again.name != call.name:
                 return self._mismatch_result(index, "the window changed while you were asked")
-            call, verdict = again, consent.after_ask(verdict)
+            # rows 1-2 again: a game may have come to the front, or a switch changed, while the user was asked
+            gate = consent.screen_gate(again, self._live(again))
+            call, verdict = again, (gate if gate is not None else consent.after_ask(verdict))
         if verdict.result == consent.REFUSE:
             status.state, status.why = "refused", verdict.why
             self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {verdict.why}", kind="control",
@@ -670,6 +768,19 @@ class Executor:
             if went == "swapped":
                 status.state, status.why = "skipped", "swapped in the countdown"
                 return RunResult("steer", words=list(self._swap_words))
+            # the countdown ran: a takeover, a cancel, a game or a switch since then stops the send here
+            held = self._hold_pause()
+            if held is not None or self.host.cancelled():
+                status.state, status.why = "skipped", "stopped after the countdown"
+                self._trace_step(call, None, ok=False, verdict=False, why="send countdown", kind="control")
+                return held if held is not None and held.status == "stopped" else RunResult(
+                    "stopped", line=LINE_STOPPED_SEND, final=True)
+            gate = consent.screen_gate(call, self._live(call))
+            if gate is not None:
+                status.state, status.why = "refused", gate.why
+                self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {gate.why}", kind="control",
+                                 refused=True)
+                return RunResult("refused", line=gate.line, final=True)
         return self._dispatch_act(index, step, call)
 
     def _dispatch_act(self, index: int, step: Any, call: Call, *, speak: bool = True) -> RunResult | None:
@@ -685,6 +796,8 @@ class Executor:
         if say and getattr(self.host, "channel", "") == "voice":
             self._emit(Say(say[:120]))
         about = self._about(call)
+        if call.tool == "run_skill":
+            self._skill_context()   # the engine checks slot values against the user's words as they stand now
         self._emit(ToolCall(call.tool, {**call.input, "_about": about}))
         started_at, t0 = time.time(), time.perf_counter()
         with self._dispatch_lock:
@@ -709,24 +822,35 @@ class Executor:
                     verdict = got
                     why = "its expectation was seen" if got else done.seen_words(probe, got, evidence)
         status.tool, status.ms, status.verdict = call.tool, ms, verdict
-        status.result = self._result_text(outcome)
-        if call.tool in ("fetch_url", "read_file"):
-            # a fetch the commit check let through (M9): what it read goes back to the planner, fenced
-            from yuki.agent.untrusted import source_for, wrap
+        # text from outside Yuki (a command's output, a file, a page) is fenced as untrusted data, as the old loop
+        # fences run_powershell even when it failed; capped before the fence goes on, so the fence stays whole
+        from yuki.agent.untrusted import EXTERNAL_TEXT_TOOLS, source_for, wrap
 
-            self.read_results.append({"i": index, "verb": "fetch", "tool": call.tool, "ok": bool(outcome.ok), "ms": ms,
+        external = call.tool in EXTERNAL_TEXT_TOOLS
+        body = self._result_text(outcome)
+        shown = wrap(body, source=source_for(call.tool, call.input), nonce=self.nonce) if external and body else body
+        status.result = shown
+        if call.tool in ("fetch_url", "read_file") or (call.tool == "run_powershell" and outcome.ok):
+            # a fetch the commit check let through (M9), or a command that ran: what it read or printed goes back to
+            # the planner, fenced (a failed command's output goes back fenced in its mismatch)
+            self.read_results.append({"i": index, "verb": "fetch" if call.tool != "run_powershell" else call.tool,
+                                      "tool": call.tool, "ok": bool(outcome.ok), "ms": ms,
                                       "text": wrap(self._result_text(outcome, READ_CHARS),
                                                    source=source_for(call.tool, call.input), nonce=self.nonce)})
-        send_state = None
+        send_state, send_sig = None, None
         if call.tool == "run_skill":
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
-            self.skill_outcomes.append((index, outcome, False))
-            self._skill_key = str(payload.get("skill") or consent.skill_input(call, self.head)[0] or "") or None
             key, slots = consent.skill_input(call, self.head)
-            if consent.skill_sends(util.skill(key), slots):
+            self.skill_outcomes.append(_SkillRun(index, outcome, key, slots))
+            self._skill_key = str(payload.get("skill") or key or "") or None
+            sk = util.skill(key)
+            if consent.skill_sends(sk, slots, partial=False):   # what ran sends for sure (an allowed send fills it)
                 send_state = "confirmed" if verdict is True else "unconfirmed"
+                text = words(slots.get(consent.text_slot(sk))) if consent.text_slot(sk) else ""
+                if text:   # which message (a fingerprint only, never the text): a retry is the same message
+                    send_sig = hashlib.sha1(text.casefold().encode("utf-8", "replace")).hexdigest()[:12]
         self._trace_step(call, outcome, ok=bool(outcome.ok), verdict=verdict, why=why, ms=ms, started=started_at,
-                         send=send_state)
+                         send=send_state, send_sig=send_sig)
         self._after_act(call, outcome)
         self.last_act = {"hwnd": call.hwnd, "app": call.app, "title": call.title, "verdict": verdict}
         if call.tool == "run_skill":
@@ -736,7 +860,7 @@ class Executor:
             payload = outcome.payload if isinstance(outcome.payload, dict) else {}
             if payload.get("refused") == "game" or (payload.get("details") or {}).get("refused") == "game":
                 return RunResult("refused", line=consent.LINE_GAME, final=True)
-            return self._mismatch_result(index, why, seen=self._result_text(outcome), call=call)
+            return self._mismatch_result(index, why, seen=shown, call=call, seen_fenced=external and bool(body))
         status.state, status.why = "ok", why
         return None
 
@@ -773,14 +897,13 @@ class Executor:
         status = self.statuses[index]
         drafted = Call(tool="run_skill", input=dict(verdict.draft_input or {}), index=index)
         result = self._dispatch_act(index, step, drafted)
-        if self.skill_outcomes and self.skill_outcomes[-1][0] == index:
-            i, outcome, _d = self.skill_outcomes[-1]
-            self.skill_outcomes[-1] = (i, outcome, True)
+        run = self.skill_outcomes[-1] if self.skill_outcomes and self.skill_outcomes[-1].index == index else None
+        if run is not None:
+            run.drafted, run.type_after = True, bool(verdict.type_after)
         if result is not None:
             return result
         if verdict.type_after:
-            last = self.skill_outcomes[-1][1] if self.skill_outcomes else None
-            payload = getattr(last, "payload", None) or {}
+            payload = getattr(run.outcome, "payload", None) if run is not None else None
             opened = (payload.get("details") or {}).get("verified") is True if isinstance(payload, dict) else False
             if not opened:
                 status.state, status.why = "failed", "chat_not_confirmed"
@@ -788,15 +911,37 @@ class Executor:
                                  final=True)
             payload_now = done.overview(self.dispatcher)
             front = done.as_hwnd(payload_now.get("foreground_hwnd"))
+            entry = next((w for w in payload_now.get("windows") or [] if isinstance(w, dict)
+                          and done.as_hwnd(w.get("hwnd")) == front), {}) if front else {}
             typed = Call(tool="type_text", input={"text": verdict.type_after, "press_enter": False,
                                                   **({"expect_hwnd": front} if front else {})},
-                         index=index, hwnd=front)
+                         index=index, hwnd=front, app=str(entry.get("process_name") or ""),
+                         title=str(entry.get("title") or ""))
             typed_live = self._live(typed)
             gate = consent.check(typed, None, self._all_words(), typed_live, None)
+            self._emit_log("consent", verb=typed.tool, row=gate.row, result=gate.result, why=gate.why)
+            if gate.result == consent.ASK:
+                # a kind the user's settings hold for asking (typing): their yes, with the desk free while asked
+                self.lease.release()
+                try:
+                    yes = bool(self.host.ask(gate.question))
+                except Exception:  # noqa: BLE001 - no answer is a no
+                    yes = False
+                if not self.lease.take():
+                    return RunResult("busy", line=LINE_BUSY, final=True)
+                if not yes:
+                    status.state, status.why = "declined", "the user said no"
+                    self._trace_step(typed, None, ok=False, verdict=False, why="declined", kind="ask")
+                    return RunResult("declined", line=LINE_DECLINED, final=True)
+                gate = consent.screen_gate(typed, self._live(typed)) or consent.after_ask(gate)
             if not gate.allowed:
                 status.state, status.why = "refused", gate.why
-                return RunResult("refused", line=gate.line or consent.LINE_GAME, final=True)
+                self._trace_step(typed, None, ok=False, verdict=False, why=f"refused: {gate.why}", kind="control",
+                                 refused=True)
+                return RunResult("refused", line=gate.line or LINE_DRAFT_HELD, final=True)
             result = self._dispatch_act(index, step, typed, speak=False)
+            if run is not None:
+                run.typed = self.statuses[index].verdict   # the typing's own check (None: couldn't read it back)
             if result is not None:
                 return result
         status.state, status.why = "ok", "drafted"
@@ -885,6 +1030,7 @@ class Executor:
         except ValueError as exc:
             return None, str(exc)
         payload = done.overview(self.dispatcher)
+        self._last_overview = payload or self._last_overview
         ref = field_of(step, "window", None)
         hwnd, entry = done.window_of(self.dispatcher, ref, payload=payload) if ref else (None, {})
         if ref and hwnd is None:
@@ -1114,16 +1260,18 @@ class Executor:
         on this very window and element, the memo, else a one-step check now. ``None`` when the step can't commit."""
         if not consent.may_commit(call, live, self.head):
             return None
+        typed = bool(call.hwnd) and int(call.hwnd) in self.typed_pending
         got = self.batch.get(call.index)
-        if got is not None and not got.failed and int(got.hwnd or 0) == int(call.hwnd or 0):
+        if got is not None and not got.failed and int(got.hwnd or 0) == int(call.hwnd or 0) and \
+                self._batch_typed.get(call.index, typed) == typed:
             planned = self._predicted_key(call.index)
             if planned is None or planned == (call.role.casefold(), words(call.name).casefold()):
                 return got
-        cached = self.checker.cached(call)
+        cached = self.checker.cached(call, typed=typed)
         if cached is not None:
             return cached
         return self.checker.run(self._all_words(), [call], earlier=self.earlier, plan=self.head,
-                                typed_pending=frozenset(self.typed_pending)).get(call.index)
+                                typed_pending=dict(self.typed_pending)).get(call.index)
 
     def _predicted_key(self, index: int) -> tuple[str, str] | None:
         if not 0 <= index < len(self.steps):
@@ -1204,7 +1352,7 @@ class Executor:
                 self.typed_pending.pop(int(call.hwnd), None)
             else:
                 held = "" if call.input.get("clear") else self.typed_pending.get(int(call.hwnd), "")
-                self.typed_pending[int(call.hwnd)] = held + str(call.input.get("text") or "")
+                self.typed_pending[int(call.hwnd)] = (held + str(call.input.get("text") or ""))[-2000:]
         elif call.tool in ("press", "hotkey") or (call.tool == "click" and call.role in ("Button", "MenuItem",
                                                                                           "SplitButton")):
             self.typed_pending.pop(int(call.hwnd), None)
@@ -1244,8 +1392,9 @@ class Executor:
             if 0 <= index < len(self.statuses):
                 s = self.statuses[index]
                 s.state = "ok" if got.get("ok") else "failed"
+                # the read's text as returned (capped at READ_CHARS before any fence went on: cut it no further)
                 s.tool, s.ms, s.result = str(got.get("tool") or ""), float(got.get("ms") or 0.0), str(
-                    got.get("text") or "")[:DIFF_CHARS]
+                    got.get("text") or "")
 
     def _read(self, index: int, step: Any) -> dict[str, Any]:
         """One read step on its own thread: ``{"i", "verb", "tool", "ok", "text", "ms"}`` (outside text fenced as
@@ -1287,14 +1436,14 @@ class Executor:
         ms = round((time.perf_counter() - t0) * 1000, 1)
         text = "\n".join(str(b.get("text") or "") for b in getattr(outcome, "content", None) or []
                          if isinstance(b, dict) and b.get("type") == "text")
-        text = text or str(getattr(outcome, "summary", "") or "")
-        if tool in EXTERNAL_TEXT_TOOLS:
-            text = wrap(text[:READ_CHARS], source=source_for(tool, tool_input), nonce=self.nonce)
+        text = (text or str(getattr(outcome, "summary", "") or ""))[:READ_CHARS]
+        if tool in EXTERNAL_TEXT_TOOLS:   # capped first, so the fence stays whole
+            text = wrap(text, source=source_for(tool, tool_input), nonce=self.nonce)
         ok = bool(getattr(outcome, "ok", False))
         self._trace_step(Call(tool=tool, input=dict(tool_input), index=index, hwnd=done.as_hwnd(tool_input.get("hwnd"))),
                          outcome, ok=ok, verdict=None, why="", ms=ms, started=started_at,
                          kind="memory" if verb == "memory" else "read")
-        return {"i": index, "verb": verb, "tool": tool, "ok": ok, "text": text[:READ_CHARS], "ms": ms}
+        return {"i": index, "verb": verb, "tool": tool, "ok": ok, "text": text, "ms": ms}
 
     def _wait(self, index: int, step: Any) -> RunResult | None:
         """A ``wait`` step: a pause of at most :data:`WAIT_MAX_S` (its value in seconds), ended early by a cancel."""
@@ -1317,20 +1466,26 @@ class Executor:
     def _done_check(self) -> RunResult:
         """Every step went as planned: the plan's one done-check, the code line, coverage, the background re-check."""
         cls = done.plan_class(self.head, self.seed)
+        acted = {"hwnd": self.last_act.get("hwnd"), "title": self.last_act.get("title") or "",
+                 "process_name": self.last_act.get("app") or ""} if self.last_act.get("hwnd") else {}
         env = done.ProbeEnv(since=self.started, dispatcher=self.dispatcher,
                             memory=self.host.memory, last_verdict=self.last_act.get("verdict"),
-                            baseline=dict((self.seed or {}).get("baseline") or {}))
+                            baseline=dict((self.seed or {}).get("baseline") or {}), acted=acted)
         if cls == "skill" and self.seed and self.seed.get("done") and not str(
                 field_of(self.head, "route", "")).startswith("skill:"):
             result = done.seed_done(self.seed, env)
         elif cls in ("skill", "send", "join"):
             deciding = self._deciding_skill(cls)
             if deciding is None:
-                result = done.DoneResult(None, util.UNVERIFIED, done.skill_done(None).line,
+                # nothing was done by the capability that decides this plan: never "I did it"
+                acted_any = any(s.get("kind") == "action" for s in self.trace)
+                result = done.DoneResult(None, util.UNVERIFIED,
+                                         done.LINE_NO_CAPABILITY[cls] if acted_any else util.LINE_NOTHING_DONE,
                                          seen="its capability didn't run", probe="skill")
             else:
-                _i, outcome, drafted = deciding
-                result = done.skill_done(outcome, drafted=drafted, sends=cls == "send")
+                sends = consent.skill_sends(util.skill(deciding.key), deciding.slots, partial=False)
+                result = done.skill_done(deciding.outcome, drafted=deciding.drafted, sends=sends,
+                                         type_after=deciding.type_after, typed=deciding.typed)
         else:
             entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
             result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
@@ -1352,17 +1507,25 @@ class Executor:
         return RunResult("done", plan_id=self.plan_id, statuses=list(self.statuses), done=result, line=result.line,
                          final=True, outcome=final, reads=list(self.read_results))
 
-    def _deciding_skill(self, cls: str) -> tuple[int, Any, bool] | None:
-        """The ``run_skill`` step whose capability's own check decides the plan: the route's skill, else the last
-        sending (send) or joining (join) one, else the last one."""
+    def _deciding_skill(self, cls: str) -> _SkillRun | None:
+        """The ``run_skill`` step whose capability's own check decides the plan. A send plan: the last one that sent
+        for sure with its slots, or was the send's draft. A join plan: the last one whose capability ends in joining
+        a call. A skill plan: the route's skill, else the last one. ``None`` when no such step ran (the line is then
+        "couldn't confirm", never another capability's done)."""
         if not self.skill_outcomes:
             return None
+        if cls == "send":
+            return next((r for r in reversed(self.skill_outcomes) if r.drafted or consent.skill_sends(
+                util.skill(r.key), r.slots, partial=False)), None)
+        if cls == "join":
+            return next((r for r in reversed(self.skill_outcomes) if consent.skill_joins(util.skill(r.key))), None)
         route = words(field_of(self.head, "route", ""))
         key = route.split(":", 1)[1].strip() if route.startswith("skill:") else ""
-        for item in reversed(self.skill_outcomes):
-            payload = getattr(item[1], "payload", None) or {}
-            if key and isinstance(payload, dict) and str(payload.get("skill") or "") == key:
-                return item
+        for run in reversed(self.skill_outcomes):
+            payload = getattr(run.outcome, "payload", None) or {}
+            ran = str(payload.get("skill") or "") if isinstance(payload, dict) else ""
+            if key and key in (ran, run.key):
+                return run
         return self.skill_outcomes[-1]
 
     def _start_recheck(self, result: done.DoneResult, env: done.ProbeEnv) -> None:
@@ -1379,23 +1542,27 @@ class Executor:
     # -- mismatches --------------------------------------------------------------------------------------------------
 
     def _mismatch_result(self, index: int, why: str, *, refused: bool = False, seen: str = "",
-                         call: Call | None = None, seed: dict[str, Any] | None = None) -> RunResult:
+                         call: Call | None = None, seed: dict[str, Any] | None = None,
+                         seen_fenced: bool = False) -> RunResult:
         """A step that didn't go as planned: its status, the planner's mismatch (with that window's view), and the
-        failed step kept for the "same step again" rejection."""
+        failed step kept for the "same step again" rejection. ``seen_fenced``: ``seen`` is outside text already
+        capped and fenced (it is not cut again)."""
         status = self.statuses[index] if 0 <= index < len(self.statuses) else None
         if status is not None and status.state == "pending":
             status.state, status.why = ("refused" if refused else "failed"), why
         step = self.steps[index] if 0 <= index < len(self.steps) else {}
         hwnd = call.hwnd if call is not None else None
-        self.last_failed = {"step": step, "verb": self._verb(step), "seen": seen or why,
+        # the stuck line is said to the user: outside text (fenced) never goes into it, only the reason
+        self.last_failed = {"step": step, "verb": self._verb(step), "seen": why if seen_fenced else (seen or why),
                             "words": words(field_of(step, "say", "")) or self._verb(step)}
         expected = ""
         expect = field_of(step, "expect", None)
         if expect is not None:
             expected = f"{field_of(expect, 'probe', '')} {field_of(expect, 'args', '')}".strip()
+        fenced = seen_fenced and bool(seen)
         mismatch = Mismatch(step=index, verb=self._verb(step), expected=expected,
-                            seen=(seen or why)[:DIFF_CHARS], view=self._view(hwnd) if hwnd else "", why=why,
-                            refused=refused, seed=seed)
+                            seen=seen if fenced else (seen or why)[:DIFF_CHARS], view=self._view(hwnd) if hwnd else "",
+                            why=why, refused=refused, seed=seed, seen_fenced=fenced)
         self._emit_log("brain_mismatch", verb=self._verb(step), why=_code(why), refused=refused)
         return RunResult("mismatch", plan_id=self.plan_id, statuses=list(self.statuses), mismatch=mismatch,
                          reads=list(self.read_results))
@@ -1476,38 +1643,61 @@ class Executor:
 
     def _trace_step(self, call: Call, outcome: Any, *, ok: bool | None, verdict: bool | None, why: str = "",
                     ms: float = 0.0, started: float | None = None, kind: str | None = None, send: str | None = None,
-                    refused: bool = False) -> None:
+                    send_sig: str | None = None, refused: bool = False) -> None:
         """One step of the run row, in the old loop's ``_trace_step`` shape: ``tool`` the Dispatcher name that ran,
-        ``kind``, ``app``, ``target`` (the control's role and name and the window's title; never a window number),
-        ``input``, ``ok``, ``verdict``, ``why``, ``expected``, ``result``, ``ms``, ``sig``, ``at``, with its start and
-        end. Never raises."""
+        ``kind``, ``app`` (a windowless action's: the app in front), ``target`` (the control's role and name and the
+        window's title; never a window number), ``input`` (a ``launch_app``'s launcher facts and ``no_window`` mark
+        added), ``ok``, ``verdict``, ``why``, ``expected``, ``result``, ``ms``, ``call`` (the model calls so far),
+        ``sig``, ``at``, with its start and end; a send's ``send``, ``send_sig`` and chat ``window``. Never raises."""
         try:
             if kind is None:
                 kind = "action" if call.tool in ACT_VERBS else "read"
+            payload = getattr(outcome, "payload", None)
+            payload = payload if isinstance(payload, dict) else {}
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            acted_hwnd = call.hwnd or done.as_hwnd(details.get("hwnd"))
+            window = next((w for w in self._last_overview.get("windows") or [] if isinstance(w, dict)
+                           and acted_hwnd and done.as_hwnd(w.get("hwnd")) == acted_hwnd), {})
+            title = call.title or str(window.get("title") or "")
+            app = call.app or str(window.get("process_name") or "") or None
+            windowless = kind == "action" and not acted_hwnd and _windowless_tool(call.tool)
+            if app is None and kind == "action":
+                app = _front_app(self._last_overview)   # the old loop's rule: a windowless step's app is the front one
             parts = []
             if call.name:
                 parts.append(f"{call.role or 'element'} \"{call.name[:80]}\"")
-            if call.title:
-                parts.append(f"window \"{call.title[:80]}\"")
+            if title:
+                parts.append(f"window \"{title[:80]}\"")
             acting = {k: v for k, v in (call.input or {}).items() if k not in ("_about",)}
             sig = hashlib.sha1(json.dumps(acting, sort_keys=True, default=str).encode("utf-8", "replace")).hexdigest()[:12]
             now = time.time()
-            step = {"tool": call.tool, "kind": kind, "app": call.app or None, "target": ", ".join(parts),
+            calls = getattr(self.host, "model_calls", None)
+            step = {"tool": call.tool, "kind": kind, "app": app, "target": ", ".join(parts),
                     "input": acting, "ok": ok, "verdict": verdict, "why": why,
                     "expected": why in (util.EXPECTED_UNVERIFIABLE, util.PAGE_SCROLL_UNVERIFIABLE),
                     "result": " ".join(str(getattr(outcome, "summary", "") or "").split())[:400],
-                    "ms": round(float(ms or 0.0), 1), "sig": sig, "playbook": None, "at": started or now,
-                    "started_at": started or now, "ended_at": now}
+                    "ms": round(float(ms or 0.0), 1), "call": calls if isinstance(calls, int) else None, "sig": sig,
+                    "playbook": None, "at": started or now, "started_at": started or now, "ended_at": now}
             if call.name or call.role:
                 step["control"] = f"{call.role}|{call.name[:80]}"
             if refused:
                 step["refused"] = True
             if send:
                 step["send"] = send
-            if kind == "action" and call.tool in ("run_powershell",):
+                if send_sig:
+                    step["send_sig"] = send_sig   # which message (a fingerprint): a retry is the same message
+                if title:
+                    step["window"] = title[:80]   # which chat, when no text was known
+            if windowless:
                 step["windowless"] = True
-            payload = getattr(outcome, "payload", None)
-            if isinstance(payload, dict) and isinstance(payload.get("saved"), bool):
+            launcher = details.get("launcher") if call.tool == "launch_app" else None
+            if isinstance(launcher, dict):
+                # which launcher took it and when (practice memory tells a game this launch started from the user's
+                # own doing); the old loop's launch watch stays with the loop
+                step["input"] = {**acting, **{k: launcher[k] for k in ("handed_to", "handed_at") if launcher.get(k)}}
+            if call.tool == "launch_app" and ok and verdict is None and details and not details.get("hwnd"):
+                step["input"] = {**step["input"], "no_window": True}   # no window of it came at all
+            if isinstance(payload.get("saved"), bool):
                 step["saved"] = payload["saved"]
             self.trace.append(step)
         except Exception:  # noqa: BLE001 - the trace never breaks a run
@@ -1647,6 +1837,18 @@ def _front_app(payload: Mapping[str, Any]) -> str | None:
         if isinstance(w, dict) and done.as_hwnd(w.get("hwnd")) == front:
             return str(w.get("process_name") or "") or None
     return None
+
+
+def _windowless_tool(name: str) -> bool:
+    """A tool with no window of its own: its schema takes no ``expect_hwnd``, ``hwnd`` or ``element`` (a schema fact,
+    the old loop's ``_windowless`` rule)."""
+    try:
+        from yuki.agent.tools import TOOLS_BY_NAME
+
+        props = ((TOOLS_BY_NAME.get(name) or {}).get("input_schema") or {}).get("properties") or {}
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(props) and not any(k in props for k in ("expect_hwnd", "hwnd", "element"))
 
 
 def _board() -> Mapping[str, Any] | None:

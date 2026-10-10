@@ -22,7 +22,9 @@ applies decides:
    itself a span of the user's words (decision 2), (d) the commit check says ``asked``, (e) the user's recent messages
    to that person hold no near-duplicate of the text (``util.similar``, last 3 hours). (c) or (d) failing is **draft**:
    the capability runs with its send slot on a non-sending option, or, for Yuki's own wording, opens the chat with no
-   text and the wording is typed without Enter. (e) failing is **ask**. An allowed send runs the countdown first.
+   text and the wording is typed without Enter. (e) failing is **ask**. An allowed send runs the countdown first, and
+   only with every ``sends_when`` slot on a sending value (a slot left out would be filled with its default, a draft:
+   refused so the planner fills it, never counted down or reported as sent).
 5. **Lasting**: any other may-commit step (its traits destroy or reach: a committing-role click, a key, a shell, a
    close, a non-web open, a fetch after a file, clipboard or memory read, M9), and a step of a kind the user's policy
    holds below "do it and tell me": the commit check decides (``effect = none`` allow; lasting and asked allow; lasting
@@ -63,6 +65,10 @@ LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_DUPLICATE = "You sent that to {to} at {at}. Send it again?"
 LINE_DUPLICATE_PLAIN = "You sent that recently. Send it again?"
 LINE_CHECK_FAILED = "Should I go ahead with that? I couldn't check it was what you asked for."
+#: The same question naming the step (``describe_step``'s running words for it: "Closing Slack").
+LINE_CHECK_FAILED_STEP = "Should I go ahead with {step}? I couldn't check it was what you asked for."
+LINE_SEND_SLOT = ("the send leaves its send slot ({slots}) out: fill it with its sending value, or leave it as a "
+                  "draft")
 
 #: A near-duplicate send counts within this many seconds (the user's messages to that person, §2.3).
 DUPLICATE_WINDOW_S = 3 * 3600.0
@@ -218,17 +224,25 @@ def person_slot(skill: Any) -> str:
     return _templated_slot(skill, "person")
 
 
-def skill_sends(skill: Any, slots: Mapping[str, Any]) -> bool:
-    """Whether running ``skill`` with these slots sends to people (its own ``sends`` / ``sends_when`` data; a slot left
-    out counts as sending, the resolver may fill it so). Never raises: unreadable data counts as a send."""
+def skill_sends(skill: Any, slots: Mapping[str, Any], *, partial: bool = True) -> bool:
+    """Whether running ``skill`` with these slots sends to people (its own ``sends`` / ``sends_when`` data). With
+    ``partial`` (the default: is this step a send?) a slot left out counts as sending, the resolver may fill it so;
+    without it (does this step send for sure?) every ``sends_when`` slot must hold a sending value. Never raises:
+    unreadable data counts as a send when ``partial``, as not sending for sure otherwise."""
     if skill is None:
         return False
     try:
         from yuki.skills.connection import sends_with
 
-        return bool(sends_with(skill, slots, partial=True))
-    except Exception:  # noqa: BLE001 - fail closed
-        return bool(getattr(skill, "sends", False))
+        return bool(sends_with(skill, slots, partial=partial))
+    except Exception:  # noqa: BLE001 - fail closed both ways
+        return bool(getattr(skill, "sends", False)) if partial else False
+
+
+def send_slots(skill: Any) -> list[str]:
+    """The slots a capability's ``sends_when`` data names (``send``): code words for a mismatch line."""
+    return [str(c.get("slot")) for c in getattr(skill, "sends_when", ()) or () if isinstance(c, Mapping)
+            and c.get("slot")]
 
 
 def skill_joins(skill: Any) -> bool:
@@ -424,17 +438,32 @@ def check(step: Call, plan: Any, user_words: Sequence[str], live: Live, check_ve
     try:
         return _check(step, plan, list(user_words or []), live, check_verdict)
     except Exception:  # noqa: BLE001 - fail closed
-        return Verdict(ASK, 0, "error", question=LINE_CHECK_FAILED)
+        return Verdict(ASK, 0, "error", question=failed_question(step))
 
 
-def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) -> Verdict:
-    consent = plan_consent(plan)
-    traits = traits_of(step, live)
-    committing = may_commit(step, live, plan)
-    effect = str(getattr(cv, "effect", "") or "") if cv is not None else ""
-    failed = cv is None or bool(getattr(cv, "failed", False))
-    asked = bool(getattr(cv, "asked", False)) and not failed
+def failed_question(step: Call) -> str:
+    """The fail-closed question, naming the step in code words (``describe_step``'s running line: the verb, the
+    control's role and name, the app), so a yes is a yes to that step. Never raises."""
+    try:
+        from yuki.ui.step_words import describe_step
 
+        about = {k: v for k, v in (("element", step.name[:80]), ("role", step.role), ("app", step.app)) if v}
+        line = words(describe_step(step.tool, {**(step.input or {}), "_about": about}, done=False))
+    except Exception:  # noqa: BLE001 - the plain question
+        line = ""
+    if not line:
+        return LINE_CHECK_FAILED
+    return LINE_CHECK_FAILED_STEP.format(step=line[:1].lower() + line[1:])
+
+
+def screen_gate(step: Call, live: Live) -> Verdict | None:
+    """Rows 1-2 alone (a game in front; the app's Act switch off or a kind on "just suggest"): the refusal, or
+    ``None``. Re-run after an ask was answered and after the send countdown, since the screen may have changed while
+    the user was asked or the countdown ran."""
+    return _rows_1_2(step, live, traits_of(step, live))
+
+
+def _rows_1_2(step: Call, live: Live, traits: Traits) -> Verdict | None:
     # row 1: a game in front
     if takes_screen(step) and (live.game is None or live.game):
         return Verdict(REFUSE, 1, "game", line=LINE_GAME, final=True)
@@ -456,6 +485,21 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
             kind = util.KIND_WORDS.get(only, only)
             return Verdict(REFUSE, 2, "suggest", final=True,
                            line=f"Your settings say only suggest for {kind.lower()}, so I'll leave that to you.")
+    return None
+
+
+def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) -> Verdict:
+    consent = plan_consent(plan)
+    traits = traits_of(step, live)
+    committing = may_commit(step, live, plan)
+    effect = str(getattr(cv, "effect", "") or "") if cv is not None else ""
+    failed = cv is None or bool(getattr(cv, "failed", False))
+    asked = bool(getattr(cv, "asked", False)) and not failed
+
+    # rows 1-2: a game in front; the app's Act switch off or a kind on "just suggest"
+    gate = _rows_1_2(step, live, traits)
+    if gate is not None:
+        return gate
 
     # row 3: joins are the user's click
     sk = None
@@ -481,12 +525,12 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
     # row 5: anything else that could last
     if committing:
         if failed:
-            return Verdict(ASK, 5, "check_failed", question=LINE_CHECK_FAILED)
+            return Verdict(ASK, 5, "check_failed", question=failed_question(step))
         if effect in ("none", "") and cv is not None:
             return Verdict(ALLOW, 5, "none")
         if asked:
             return Verdict(ALLOW, 5, "asked")
-        question = words(getattr(cv, "question", "")) or LINE_CHECK_FAILED
+        question = words(getattr(cv, "question", "")) or failed_question(step)
         return Verdict(ASK, 5, "lasting", question=question)
 
     # row 6
@@ -508,7 +552,7 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     if not _named(to, quote, live):
         return Verdict(REFUSE, 4, "recipient", line="the send's recipient is not named in the user's quote")
     who = words(slots.get(person_slot(sk))) if person_slot(sk) else ""
-    if who and not _same_person(who, to):
+    if who and not _same_person(who, to, live):
         return Verdict(REFUSE, 4, "recipient_slot", line=LINE_RECIPIENT)
     name = text_slot(sk)
     step_text = words(slots.get(name)) if name else ""
@@ -521,6 +565,10 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
         return Verdict(DRAFT, 4, "not_asked" if own else "text", line=LINE_DRAFTED,
                        draft_input={**step.input, "slots": drafted},
                        type_after="" if keep else (step_text or text))
+    if not skill_sends(sk, slots, partial=False):
+        # a send slot left out: the resolver would fill its default (a draft), so this step would not send for sure;
+        # it is never counted down or reported as sent (the planner fills the slot, or the plan drafts)
+        return Verdict(REFUSE, 4, "send_slot", line=LINE_SEND_SLOT.format(slots=", ".join(send_slots(sk)) or "send"))
     seen = near_duplicate(step_text, live)                                                 # (e)
     if seen is not None:
         at = _clock(float(seen.get("at") or 0.0))
@@ -529,12 +577,23 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     return Verdict(ALLOW, 4, "send", countdown=True)
 
 
-def _same_person(slot_value: str, to: str) -> bool:
-    """The capability's person slot names the plan's recipient (the same words, or one a whole-words span of the
-    other: a first name for the full name)."""
-    from yuki.memory.contacts import span_in, tokens
+def _same_person(slot_value: str, to: str, live: Live) -> bool:
+    """The capability's person slot names the plan's recipient: the same words, or one of the names memory's people
+    index gives the one person ``to`` names (a first name for the full name). A part of a name alone ("Iyer" for
+    "Hemanth Iyer") is not enough, and with memory unable to say only the same words pass."""
+    from yuki.memory.contacts import tokens
 
-    return tokens(slot_value) == tokens(to) or span_in(slot_value, to) or span_in(to, slot_value)
+    want, slot = tokens(to), tokens(slot_value)
+    if not want or not slot:
+        return False
+    if slot == want:
+        return True
+    try:
+        people = live.people_in(to) if live.people_in is not None else None
+    except Exception:  # noqa: BLE001
+        people = None
+    fits = [names for names in people or [] if any(tokens(n) == want for n in names)]
+    return len(fits) == 1 and any(tokens(n) == slot for n in fits[0])
 
 
 def after_ask(verdict: Verdict) -> Verdict:
@@ -543,7 +602,7 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 
 __all__ = ["ALLOW", "ASK", "COMMITS", "DRAFT", "EFFECTS", "LINE_DRAFTED", "LINE_GAME", "REFUSE", "RESULTS", "Call",
-           "Live", "Verdict", "after_ask", "calling_windows", "check", "draft_slots", "field_of", "game_now",
-           "in_words", "is_join_control", "join_controls", "may_commit", "near_duplicate", "person_slot",
-           "plan_consent", "policy_holds", "skill_commit", "skill_input", "skill_joins", "skill_sends",
-           "takes_screen", "text_slot", "traits_of"]
+           "Live", "Verdict", "after_ask", "calling_windows", "check", "draft_slots", "failed_question", "field_of",
+           "game_now", "in_words", "is_join_control", "join_controls", "may_commit", "near_duplicate", "person_slot",
+           "plan_consent", "policy_holds", "screen_gate", "send_slots", "skill_commit", "skill_input", "skill_joins",
+           "skill_sends", "takes_screen", "text_slot", "traits_of"]

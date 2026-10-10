@@ -141,6 +141,16 @@ LINE_NOT_CONFIRMED = "I couldn't confirm {goal}: {seen}."
 LINE_NOT_CONFIRMED_PLAIN = "I couldn't confirm it: {seen}."
 LINE_STUCK = "I got stuck at {step}: {seen}. Try another way?"
 LINE_RECHECK = "Looking again, I can't see that any more."
+#: A draft whose text can't be shown to be in: the chat was seen open and Yuki's wording typed, but the typing's own
+#: check couldn't read it back; or the capability's draft wasn't confirmed by its own check.
+LINE_DRAFT_UNCONFIRMED = "I opened the chat but couldn't confirm the text is in."
+LINE_DRAFT_UNCHECKED = "I couldn't confirm the text is typed in."
+#: A skill, send or join plan whose deciding capability never ran (nothing was done by it), by plan class.
+LINE_NO_CAPABILITY: dict[str, str] = {
+    "send": "I couldn't confirm it went: no step sent it.",
+    "join": "I couldn't confirm you're in: no step joined it.",
+    "skill": "I couldn't confirm it: the step that does it didn't run.",
+}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -252,30 +262,42 @@ def window_of(dispatcher: Any, ref: Any, *, payload: Mapping[str, Any] | None = 
     """The window a plan's ``window`` field names: an hwnd as given (if it is on the window list), else the one window
     whose title holds the hint's words or whose app is the hint (string identity: whole-word spans, the app's key).
     ``(hwnd, its window-list entry)``; ``(None, {})`` when none or several fit."""
-    from yuki.memory.contacts import span_in
-
     payload = payload if payload is not None else overview(dispatcher)
     windows = [w for w in (payload or {}).get("windows") or [] if isinstance(w, dict) and w.get("hwnd")]
     hwnd = as_hwnd(ref)
     if hwnd is not None:
         entry = next((w for w in windows if int(w.get("hwnd") or 0) == hwnd), None)
         return (hwnd, dict(entry)) if entry is not None or not windows else (None, {})
+    hits = fitting(windows, ref)
+    if len(hits) > 1:
+        front = int((payload or {}).get("foreground_hwnd") or 0)
+        hits = [w for w in hits if int(w.get("hwnd") or 0) == front] or hits
+    return (int(hits[0]["hwnd"]), dict(hits[0])) if len(hits) == 1 else (None, {})
+
+
+def fitting(windows: Sequence[Mapping[str, Any]], ref: Any) -> list[dict[str, Any]]:
+    """Every window-list entry a title hint fits: its words a whole-words span of the title, else (no title fits) the
+    hint naming the window's app (the app's key). String identity only."""
+    from yuki.memory.contacts import span_in
+
     hint = " ".join(str(ref or "").split())
     if not hint:
-        return None, {}
+        return []
     try:
         from yuki.memory.store import app_key
 
         key = app_key(hint)
     except Exception:  # noqa: BLE001
         key = ""
-    hits = [w for w in windows if span_in(hint, str(w.get("title") or ""))]
+    hits = [dict(w) for w in windows if isinstance(w, Mapping) and span_in(hint, str(w.get("title") or ""))]
     if not hits and key:
-        hits = [w for w in windows if _app_key(w.get("process_name")) == key]
-    if len(hits) > 1:
-        front = int((payload or {}).get("foreground_hwnd") or 0)
-        hits = [w for w in hits if int(w.get("hwnd") or 0) == front] or hits
-    return (int(hits[0]["hwnd"]), dict(hits[0])) if len(hits) == 1 else (None, {})
+        hits = [dict(w) for w in windows if isinstance(w, Mapping) and _app_key(w.get("process_name")) == key]
+    return hits
+
+
+def fits(ref: Any, entry: Mapping[str, Any] | None) -> bool:
+    """Whether a title hint fits one window entry (``{"title", "process_name"}``), by :func:`fitting`'s rule."""
+    return bool(entry) and bool(fitting([dict(entry or {}, hwnd=1)], ref))
 
 
 def _app_key(name: Any) -> str:
@@ -310,13 +332,15 @@ def find_named(elements: Sequence[Mapping[str, Any]], name: str, role: str = "")
 @dataclass
 class ProbeEnv:
     """What a probe read may use: when the run began, the dispatcher (generic probes), the memory (engine probes that
-    read it), the last act step's own verdict (``read_back``), and onset baselines."""
+    read it), the last act step's own verdict (``read_back``), onset baselines, and the window the last act step acted
+    on as it was then (``acted``: ``hwnd``, ``title``, ``process_name``; ``gone`` follows that very window)."""
 
     since: float
     dispatcher: Any = None
     memory: Any = None
     last_verdict: bool | None = None
     baseline: Mapping[str, Any] = field(default_factory=dict)
+    acted: Mapping[str, Any] = field(default_factory=dict)
 
 
 def _memory_call(memory: Any) -> Callable[[str, Callable[[Any], Any]], Any] | None:
@@ -484,12 +508,32 @@ def probe_window_state(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None
 
 
 def probe_gone(args: dict[str, Any], env: ProbeEnv) -> tuple[bool | None, dict[str, Any]]:
-    """The window is gone; with ``name``: that control is gone from it (UI Automation's by-name search)."""
-    hwnd = as_hwnd(args.get("window"))
-    if hwnd is None and env.dispatcher is not None:
-        hwnd, _entry = window_of(env.dispatcher, args.get("window"))
-        if hwnd is None and not args.get("name"):
-            return True, {"status": "no_window"}   # no window by that hint any more
+    """The window is gone; with ``name``: that control is gone from it (UI Automation's by-name search).
+
+    A title hint is followed to the window the last act step acted on when that window fit the hint then (its very
+    hwnd: closed or not). Otherwise the window list decides, and only a list that was read counts: no window fits the
+    hint any more is gone; several fit, or the list couldn't be read, is ``None`` (never a done)."""
+    ref = args.get("window")
+    hwnd = as_hwnd(ref)
+    if hwnd is None:
+        if env.dispatcher is None:
+            return None, {"status": "no_window"}
+        acted = dict(env.acted or {})
+        acted_hwnd = as_hwnd(acted.get("hwnd"))
+        if acted_hwnd is not None and fits(ref, acted):
+            hwnd = acted_hwnd
+        else:
+            payload = overview(env.dispatcher)
+            if not isinstance(payload.get("windows"), list):
+                return None, {"status": "unread"}
+            hits = fitting([w for w in payload["windows"] if isinstance(w, dict) and w.get("hwnd")], ref)
+            if not hits:
+                if args.get("name"):
+                    return None, {"status": "no_window"}
+                return True, {"status": "no_window"}   # the list was read and no window fits the hint any more
+            if len(hits) > 1:
+                return None, {"status": "ambiguous", "n": len(hits)}
+            hwnd = int(hits[0]["hwnd"])
     if hwnd is None:
         return None, {"status": "no_window"}
     backend = getattr(env.dispatcher, "backend", None)
@@ -698,8 +742,13 @@ def engine_line(outcome: Any) -> str:
     return ""
 
 
-def skill_done(outcome: Any, *, drafted: bool = False, sends: bool = False) -> DoneResult:
-    """A capability's own done-check, from its ``run_skill`` outcome (the engine ran it and its D19 re-check)."""
+def skill_done(outcome: Any, *, drafted: bool = False, sends: bool = False, type_after: bool = False,
+               typed: bool | None = None) -> DoneResult:
+    """A capability's own done-check, from its ``run_skill`` outcome (the engine ran it and its D19 re-check).
+
+    A draft (``drafted``) says "It's typed in" only on proof: the capability's own check (its draft with the user's
+    text), or, when Yuki's wording was typed after the chat was seen open (``type_after``), that typing's own verdict
+    (``typed``). ``None`` is never "typed in"."""
     from yuki.skills.engine import LINE_UNVERIFIED
 
     payload = getattr(outcome, "payload", None) if outcome is not None else None
@@ -710,8 +759,13 @@ def skill_done(outcome: Any, *, drafted: bool = False, sends: bool = False) -> D
     if drafted:
         from yuki.brain.consent import LINE_DRAFTED
 
-        return DoneResult(verified, util.VERIFIED if verified else util.UNVERIFIED, LINE_DRAFTED,
-                          seen="typed, not sent", probe="skill")
+        proof = typed if type_after else verified
+        if proof is True:
+            return DoneResult(True, util.VERIFIED, LINE_DRAFTED, seen="typed, not sent", probe="skill")
+        if proof is False:
+            return DoneResult(False, util.FAILED, util.LINE_FAILED, seen="the text isn't in", probe="skill")
+        return DoneResult(None, util.UNVERIFIED, LINE_DRAFT_UNCONFIRMED if type_after else LINE_DRAFT_UNCHECKED,
+                          seen="the PC couldn't confirm the text is in", probe="skill")
     if verified is True:
         return DoneResult(True, util.VERIFIED, line or LINE_UNVERIFIED, probe="skill",
                           send="confirmed" if sends else None)
