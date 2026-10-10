@@ -266,6 +266,9 @@ class Lane(QThread):
         #: the brain (``None``: the old loop agent, :attr:`agent`).
         self._brain: Any = None
         self._active: Any = None
+        #: bTalk: the brain is made once, under this lock: the voice reads ahead on the worker's brain
+        #: (``Brain.begin_early``) from a worker thread while the lane thread may be making it for a job.
+        self._brain_lock = threading.Lock()
 
     @property
     def active(self) -> Any:
@@ -273,22 +276,38 @@ class Lane(QThread):
         (the old loop agent, which also keeps the lane's model and effort switches)."""
         return self._active or self.agent
 
-    def _agent_for(self, job: "Job") -> Any:
-        """Who drives ``job``: the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all`` (read
-        now, at the request's start: flipping it back to ``loop`` is the rollback), else the old loop agent. Spoken
-        requests stay on the old loop here (the voice's own wiring moves them). Never raises: a brain that can't be
-        made leaves the old loop driving (logged)."""
+    def _brain_mode(self) -> str:
+        """``Settings.brain`` now: ``loop`` | ``typed`` | ``all`` (anything else reads as ``loop``)."""
         mode = str(getattr(getattr(self.runtime, "settings", None), "brain", "loop") or "loop")
-        if mode not in ("typed", "all") or job.source == "voice":
+        return mode if mode in ("loop", "typed", "all") else "loop"
+
+    def _agent_for(self, job: "Job") -> Any:
+        """Who drives ``job``: the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all``, and
+        for a spoken one only under ``all`` (bTalk; read now, at the request's start: flipping it back is the
+        rollback), else the old loop agent. Never raises: a brain that can't be made leaves the old loop driving
+        (logged)."""
+        if job.source == "voice" and self._brain_mode() != "all":
             return self.agent
-        if self._brain is None:
-            try:
-                self._brain = self._make_brain()
-            except Exception as exc:  # noqa: BLE001 - the old loop goes on driving
-                self.runtime.ui_log.event("brain", lane=self.name, state="unavailable", error=type(exc).__name__)
-                return self.agent
-            self.runtime.ui_log.event("brain", lane=self.name, state="ready", mode=mode)
-        return self._brain
+        brain = self.brain()
+        return brain if brain is not None else self.agent
+
+    def brain(self) -> Any:
+        """This lane's new brain under ``brain = typed / all`` (made once, under a lock), else ``None`` (``loop``, or
+        it can't be made: logged once per try). bTalk reads ahead on the worker's (``Brain.begin_early``) from a
+        worker thread, so this may run off the lane thread."""
+        mode = self._brain_mode()
+        if mode not in ("typed", "all"):
+            return None
+        with self._brain_lock:
+            if self._brain is None:
+                try:
+                    self._brain = self._make_brain()
+                except Exception as exc:  # noqa: BLE001 - the old loop goes on driving
+                    self.runtime.ui_log.event("brain", lane=self.name, state="unavailable",
+                                              error=type(exc).__name__)
+                    return None
+                self.runtime.ui_log.event("brain", lane=self.name, state="ready", mode=mode)
+            return self._brain
 
     def _make_brain(self) -> Any:
         """This lane's brain, sharing the loop agent's settings (so the model switch reaches it), its session log and
@@ -576,11 +595,14 @@ class Lane(QThread):
         framed = False
         agent = self.active
         if agent is not self.agent:
-            # bWire: the new brain takes this typed request (brain-design.md 2): the user's own typed words only, the
-            # card / coach-note / where-typed text as labelled context (never quotable), the log id when it has one,
-            # and the window that was in front when the user called Yuki up (Yuki's own box is in front by now)
-            events = agent.run(job.request, user_words=list(job.typed_words or ()), context=job.context or "",
-                               channel="typed", request_id=job.log_request_id or "", origin_hwnd=job.origin_hwnd)
+            # bWire: the new brain takes this request (brain-design.md 2): the user's own words only (typed: what they
+            # typed; voice under brain = "all", bTalk: the heard turns, each exactly as heard), the card / coach-note /
+            # where-typed text or the voice's code-built context as labelled context (never quotable), the log id when
+            # it has one, and the window that was in front when the user called Yuki up
+            words = job.user_words if voice else job.typed_words
+            events = agent.run(job.request, user_words=list(words or ()), context=job.context or "",
+                               channel="voice" if voice else "typed", request_id=job.log_request_id or "",
+                               origin_hwnd=job.origin_hwnd)
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
@@ -1218,9 +1240,15 @@ class AgentRuntime(QObject):
         # text only when no words come, and the answer is a word now, so its subject goes in the context here
         asked = f"The request as it came: {job.request}" if job.typed_words == () and job.request else ""
         context = "\n\n".join(part for part in (asked, job.context or "", note) if part)
+        # bTalk: a spoken request set aside under brain = "all" goes on with its heard turns and now the spoken answer
+        # as the user's words (else it would come back with none, and every send in it would end as a draft)
+        heard = None
+        if job.source == "voice" and lane._brain_mode() == "all":
+            heard = (*(job.user_words or ()), text)
         _lane, new_id = self.submit(request, origin_hwnd=job.origin_hwnd, source=job.source,
                                     lane=WORKER if lane_name == WORKER else None, typed_words=typed,
-                                    context=context if typed is not None else None)
+                                    context=context if (typed is not None or heard is not None) else None,
+                                    **({"user_words": heard} if heard is not None else {}))
         self.ui_log.event("answer", lane=lane_name, text=text, resumed=job.id, new_id=new_id)
         self.resumed.emit(job.id, new_id)
 

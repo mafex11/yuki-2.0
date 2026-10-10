@@ -826,6 +826,18 @@ def run(args: argparse.Namespace) -> int:
                 g = _focus_game(game_gate)
                 return g["source"] != "gate" or bool(g["front"])
 
+            def _learn_quiet(now: float) -> str | None:
+                # Phase L (design §9.1): the incremental learner rides on the hub's beat when the user is idle, no game
+                # is in front and no call is open (yuki.skills.learn.quiet); here the game part also asks the gate's
+                # one rule, so a game only this service's gate learned (borderless, on no list) holds it too
+                from yuki.skills.learn import quiet
+                from yuki.memory.moments import LEARN_IDLE_S
+
+                why = quiet(store, now, idle_s=LEARN_IDLE_S)
+                return why or ("a game is in front" if _game_front() else None)
+
+            moments.learn_quiet_fn = _learn_quiet
+
             # [moments] enabled / volume_events: the volume watcher starts only when both are on, the Spotify reader
             # only when moments are on (both only feed the hub; it checks them again on every change, so turning them
             # off later writes nothing). fWire review r1 L4: with moments off, nothing reads Spotify's window.

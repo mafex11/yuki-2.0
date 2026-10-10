@@ -331,6 +331,8 @@ class MemoryAccess:
         self._path = path
         self.portrait_ttl_s = portrait_ttl_s
         self._client: Any = None
+        #: Phase L: the skills catalog's log for this process (:meth:`set_skills_log`), handed to the client on open.
+        self._skills_log: Callable[..., Any] | None = None
         self._open_lock = threading.Lock()
         self._cache_lock = threading.Lock()
         #: ``(text, monotonic time fetched)`` of the last portrait fetched.
@@ -389,7 +391,29 @@ class MemoryAccess:
         with self._open_lock:
             if self._client is None:
                 self._client = self._open()
+                self._give_skills_log(self._client)
             return self._client
+
+    def set_skills_log(self, log: Callable[..., Any] | None) -> None:
+        """Phase L (lPage note 4): where the skills catalog tells what it skipped in this process (``log(type,
+        **fields)``, content-free: ``connection_error`` with the file and a code word, ``learned_error`` with the row
+        id and a code word): handed to the client's ``set_skills_log`` now if it is open, else when it opens. Without
+        one nothing is told. Never raises."""
+        self._skills_log = log if callable(log) else None
+        with self._open_lock:
+            client = self._client
+        if client is not None:
+            self._give_skills_log(client)
+
+    def _give_skills_log(self, client: Any) -> None:
+        setter = getattr(client, "set_skills_log", None)
+        log = getattr(self, "_skills_log", None)
+        if log is None or not callable(setter):
+            return
+        try:
+            setter(log)
+        except Exception:  # noqa: BLE001 - a log never breaks memory
+            pass
 
     def call(self, what: str, fn: Callable[[Any], T], *, timeout_s: float) -> T:
         """Run ``fn(client)`` with a bound on how long the caller waits.
