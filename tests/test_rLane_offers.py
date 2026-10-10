@@ -259,6 +259,39 @@ def test_a_hand_written_run_skill_card_without_its_routine_is_no_offer(store):
     assert offers.act(store, nid)["why"] == "no_offer"
 
 
+def test_a_run_skill_offer_on_any_card_but_the_routine_card_is_refused(store, monkeypatch):
+    """Review round 2 L4 (defence in depth): a hand-written card of another channel carrying a well-formed run_skill
+    offer for a live routine is never granted ``running``."""
+    monkeypatch.setattr("yuki.skills.registry.offer_ready", lambda *a, **k: True)
+    rid = add_routine(store)
+    now = time.time()
+    offer, why = offers.routine_offer(store, routine_offers.routine(store, rid), now, expires_at=now + 600, why="x",
+                                      ready=lambda s, k: True)
+    assert offer is not None, why
+    for kind, trigger in (("notice", "thread"), ("notice", "plans"), ("resume", None), ("question", "checkin")):
+        _cid, nid = store.record_checkin(NudgeCheckin(at=now, trigger=trigger or kind, outcome=kind, model="m"),
+                                         NewNudge(kind=kind, text="x", trigger=trigger,
+                                                  inputs={"offer": dict(offer), "routine_id": rid}))
+        got = offers.act(store, nid, now=now + 5)
+        assert got["ok"] is False and got["why"] == "no_offer", (kind, trigger)
+        assert store.nudge(nid).outcome is None
+    assert offers.act(store, routine_card(store, rid, at=now), now=now + 5)["state"] == "running"
+
+
+def test_undo_after_a_run_the_pc_couldnt_confirm_keeps_it_failed(store, monkeypatch):
+    """Review round 2 L9: a failed run may have brought a window forward: Undo is allowed (the UI brings the window
+    back) and the outcome stays ``failed``, so nothing is learned against the routine or the offer kind."""
+    monkeypatch.setattr("yuki.skills.registry.offer_ready", lambda *a, **k: True)
+    rid = add_routine(store)
+    nid = routine_card(store, rid)
+    client = MemoryClient(store)
+    client.offer_act(nid)
+    assert client.offer_result(nid, False, {"outcome": "asked", "focus": True})
+    assert client.offer_undo(nid) == {"ok": True, "do": "run_skill", "state": "undone"}
+    n = store.nudge(nid)
+    assert n.outcome == "failed" and offers.signal(n, time.time()) is None
+
+
 # -- learning: the routine channel is the lane's, never the models' --------------------------------------------------
 
 

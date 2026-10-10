@@ -2126,6 +2126,19 @@ class MemoryClient:
         except Exception as exc:
             return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
 
+    def routine_card_due(self, nudge_id: int) -> dict:
+        """Whether a routine card that waited in the tray's queue may still show now
+        (:func:`yuki.memory.routine_offers.card_still_due`): ``{"due": True}`` or ``{"due": False, "why", "final"}``
+        (final: its outcome, a reaction, its own expiry, its routine no longer offering, the user already joined: the
+        tray drops it; not final: an open call or a game in front: it stays queued). Code only; a failure says not due,
+        not final."""
+        from yuki.memory import routine_offers
+
+        try:
+            return routine_offers.card_still_due(self.store, int(nudge_id))
+        except Exception as exc:
+            return {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
+
     def recap_keep(self, nudge_id: int, ref: Any, answer: str) -> dict:
         """The user's answer to one line of a call's keep list (the recap card, yuki.memory.admission): ``keep`` (into
         memory as said), ``joke`` (kept as a joke of theirs, never a fact), ``not_true`` (stays out) or ``undo`` (the

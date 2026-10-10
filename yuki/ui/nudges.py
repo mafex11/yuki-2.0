@@ -38,8 +38,13 @@ Join."). Open it (``run_skill``): memory checks it again and answers ``running``
 then the tray runs the skill itself (:func:`run_card_skill`: the desk lease, Yuki's
 marker, the engine's game re-check before every rung, never an agent run), reports
 the outcome (``offer_result``) and the card shows what the PC saw, with Undo, which
-brings back the window that was in front. Less of these steps the routine down
-(``routine_feedback``: early -> "started a minute ago" -> quiet).
+brings back the window that was in front (also after a run the PC couldn't confirm,
+when it took focus). Less of these steps the routine down (``routine_feedback``:
+early -> "started a minute ago" -> quiet). A routine card waits in the queue like
+any card; right before it shows, memory is asked whether it is still due
+(``routine_card_due``, off the GUI thread): one that expired, already ran, or whose
+meeting the user already joined is dropped; one held by an open call or a game in
+front waits for a later look.
 
 While the overlay is open, nudges go into its conversation instead of the
 corner (the ``in_overlay`` signal), and when it opens the recent ones
@@ -539,6 +544,9 @@ RUN_LINES: dict[str, str] = {
     "busy": "I'm busy on your desktop right now. Nothing ran.",
     "error": "That didn't work.",
 }
+#: How long memory's "still due?" answer for a queued routine card holds before the tray asks again (s): a "due" is
+#: used at once; a hold (a call, a game in front) is asked again on the next look (:data:`RETRY_MS`) after this long.
+ROUTINE_DUE_FRESH_S = 10.0
 #: The UI's reasons (``blocked``) that mean Yuki's hands are on the desktop now: a routine card's skill waits for them
 #: (the desk lease: one actor at a time, as the voice hands wait for the thinker's job).
 DESK_BUSY_REASONS: frozenset[str] = frozenset({"worker_busy", "status_strip"})
@@ -956,8 +964,9 @@ class NudgeCard(LatticeCard):
             linger = EXPANDED_LINGER_MS
         else:
             text = str(result.get("message") or "Done.")
-        self.undo_button.setVisible(bool(result.get("ok")) and do not in ("draft", "show_memory")
-                                    and bool(result.get("undo")))
+        # Undo after a done offer; after a routine card's run the PC couldn't confirm too, when it took focus
+        self.undo_button.setVisible((bool(result.get("ok")) or do == "run_skill")
+                                    and do not in ("draft", "show_memory") and bool(result.get("undo")))
         self.result.set_text(text, icon)
         self.result.setVisible(True)
         self.result_gap.setVisible(True)
@@ -1203,6 +1212,8 @@ class NudgeController(QObject):
     _undone = Signal(object, object)
     #: ``(nudge, run, via)``: a routine card's skill run finished (its outcome), back on the GUI thread.
     _ran = Signal(object, object, str)
+    #: ``(nudge, answer)``: memory's "still due?" for a queued routine card (``routine_card_due``), on the GUI thread.
+    _due_checked = Signal(object, object)
     #: ``(nudge, ref, answer, result)``: memory's answer to a line of a keep list, back on the GUI thread.
     _kept = Signal(object, str, str, object)
 
@@ -1243,6 +1254,8 @@ class NudgeController(QObject):
         #: The last deferral reason logged, so a busy screen is logged once.
         self._deferred: str | None = None
         self._ack_threads: list[threading.Thread] = []
+        #: The routine card whose "still due?" question to memory is out (one at a time), by id.
+        self._due_asking: str | None = None
 
         self._logged.connect(self._write_log)
         self.watcher.arrived.connect(self.offer)
@@ -1264,6 +1277,7 @@ class NudgeController(QObject):
         self._acted.connect(self._on_acted)
         self._undone.connect(self._on_undone)
         self._ran.connect(self._on_ran)
+        self._due_checked.connect(self._on_due_checked)
         self.card.faded_out.connect(self.try_show)
         self._retry = QTimer(self)
         self._retry.setInterval(RETRY_MS)
@@ -1353,7 +1367,11 @@ class NudgeController(QObject):
                 self._retry.start()
             return
         self._deferred = None
-        nudge = self.record_delivery(self.queue.pop(0), "card")
+        if routine_card(self.queue[0]) and not self._routine_ready(self.queue[0]):
+            return
+        head = self.queue.pop(0)
+        head.pop("_due", None)   # memory's "still due?" answer stays in the queue, never on the shown card
+        nudge = self.record_delivery(head, "card")
         self.queue_changed.emit(len(self.queue))
         self.card.show_nudge(nudge)
         self.ui_log.event(
@@ -1362,6 +1380,68 @@ class NudgeController(QObject):
         )
         if not self.queue:
             self._retry.stop()
+
+    def _routine_ready(self, head: dict[str, Any]) -> bool:
+        """Whether the routine card at the head of the queue may show now. It may have waited (behind another card,
+        the task strip, a reply) since the lane wrote it: past its own expiry it is dropped here; otherwise memory is
+        asked once, off the GUI thread (``routine_card_due``: its outcome, the end state, an open call, a game in
+        front), and the answer, fresh for :data:`ROUTINE_DUE_FRESH_S`, says show, drop or wait. False until it may
+        show."""
+        if offer_expired(head):
+            self._drop_queued(head, "expired")
+            return False
+        answer = head.get("_due")
+        if isinstance(answer, tuple) and time.monotonic() - answer[0] < ROUTINE_DUE_FRESH_S:
+            if answer[1].get("due"):
+                return True
+            if not self._retry.isActive():   # held (a call, a game in front): asked again on a later look
+                self._retry.start()
+            return False
+        if self._due_asking is None:
+            self._ask_due(head)
+        return False
+
+    def _ask_due(self, head: dict[str, Any]) -> threading.Thread:
+        self._due_asking = _nudge_id(head)
+        nudge_id = head.get("id")
+
+        def work() -> None:
+            try:
+                got = self.memory.call_method("routine_card_due", nudge_id, timeout_s=TRAY_TIMEOUT_S)
+            except Exception as exc:  # never take the UI down; never a routine card memory couldn't clear
+                got = {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
+            self._due_checked.emit(head, got if isinstance(got, dict) else {"due": False, "why": "error",
+                                                                             "final": False})
+
+        thread = threading.Thread(target=work, name="yuki-ui-routine-due", daemon=True)
+        thread.start()
+        self._ack_threads = [t for t in self._ack_threads if t.is_alive()] + [thread]
+        return thread
+
+    def _on_due_checked(self, head: dict[str, Any], answer: dict[str, Any]) -> None:
+        """Memory's "still due?" (GUI thread): show it now, drop it (final: over, expired, already joined) or keep it
+        queued (an open call, a game in front, memory unreadable) for a later look."""
+        self._due_asking = None
+        head["_due"] = (time.monotonic(), dict(answer))
+        due = bool(answer.get("due"))
+        self.ui_log.event("nudge_routine_check", id=head.get("id"), due=due, why=answer.get("why"),
+                          final=answer.get("final"))
+        if not due and answer.get("final"):
+            self._drop_queued(head, str(answer.get("why") or "not_due"))
+            return
+        self.try_show()
+
+    def _drop_queued(self, nudge: dict[str, Any], why: str) -> None:
+        """Take a queued card out for good (it is over); then the next one may show."""
+        key = _nudge_id(nudge)
+        before = len(self.queue)
+        self.queue = [n for n in self.queue if _nudge_id(n) != key]
+        if len(self.queue) == before:
+            return
+        self.ui_log.event("nudge_dropped", id=nudge.get("id"), kind=nudge.get("kind"), why=why,
+                          queued=len(self.queue))
+        self.queue_changed.emit(len(self.queue))
+        self.try_show()
 
     def bring_into_overlay(self) -> list[dict[str, Any]]:
         """Hand the corner card (if up) and everything queued to the open overlay.
@@ -1375,6 +1455,8 @@ class NudgeController(QObject):
             if up is not None:
                 moved.append((up, "card_moved"))
         moved.extend((nudge, "arrived") for nudge in self.queue)
+        for nudge, _via in moved:
+            nudge.pop("_due", None)
         self.queue = []
         self._retry.stop()
         self._deferred = None
@@ -1608,6 +1690,7 @@ class NudgeController(QObject):
         every rung; never handed to the thinker), report the outcome to memory (``offer_result``) and show it on the
         card (:meth:`_on_ran`). Nothing runs while Yuki's hands are on the desktop (the desk lease)."""
         stored["_prev_hwnd"] = _foreground_hwnd()   # read on the GUI thread, before anything comes forward
+        busy = self._desk_busy_now()                # the UI's own widgets: read here, on the GUI thread
         nudge_id = stored.get("id")
 
         def log(event: str, **fields: Any) -> None:
@@ -1615,7 +1698,6 @@ class NudgeController(QObject):
 
         def work() -> None:
             t0 = time.perf_counter()
-            busy = self._desk_busy_now()
             if busy:
                 run: dict[str, Any] = {"ok": False, "outcome": "busy", "why": busy}
             else:
@@ -1648,7 +1730,8 @@ class NudgeController(QObject):
         outcome = str(run.get("outcome") or ("done" if ok else "error"))
         message = " ".join(str(run.get("say") or "").split()) or (
             "Done." if ok else RUN_LINES.get(outcome, RUN_LINES["error"]))
-        undo = bool(ok and run.get("focus") and stored.get("_prev_hwnd"))
+        # Undo whenever the run brought a window forward, also when the PC couldn't confirm the end state
+        undo = bool(run.get("focus") and stored.get("_prev_hwnd"))
         result = {"ok": True, "do": "run_skill", "state": state, "message": message, "undo": undo}
         stored["_offer_result"] = {**result, "ok": ok}
         self.ui_log.event("nudge_skill_result", id=stored.get("id"), via=via, ok=ok, outcome=outcome,
@@ -1656,7 +1739,7 @@ class NudgeController(QObject):
                           error=run.get("error") or run.get("report_error"))
         if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
             self.card.show_result(result if ok else {"ok": False, "do": "run_skill", "why": outcome,
-                                                     "message": message, "undo": False})
+                                                     "message": message, "undo": undo})
         self.offer_state.emit(stored, state)
 
     def keep_answer(self, nudge: dict[str, Any], ref: str, answer: str, via: str = "card") -> threading.Thread:
@@ -1701,8 +1784,10 @@ class NudgeController(QObject):
         what it did (``offer_undo``: a to-do added ends as a wrong capture) and records it (the learning counts it)."""
         stored = self.record_delivery(nudge, str(nudge.get("_via") or "card"))
         offer = card_offer(stored) or {}
-        if stored.get("_offer_state") != "done" or offer.get("do") not in ("todo_add", "bring_back", "run_skill"):
+        done = ("done", "failed") if offer.get("do") == "run_skill" else ("done",)
+        if stored.get("_offer_state") not in done or offer.get("do") not in ("todo_add", "bring_back", "run_skill"):
             return None
+        stored["_undo_from"] = stored.get("_offer_state")
         stored["_offer_state"] = "undoing"
         # the window that was in front before the page or the routine's skill came forward (the guarded focus_window:
         # never a game's window)
@@ -1729,7 +1814,7 @@ class NudgeController(QObject):
         return thread
 
     def _on_undone(self, stored: dict[str, Any], result: dict[str, Any]) -> None:
-        state = "undone" if result.get("ok") else "done"
+        state = "undone" if result.get("ok") else str(stored.get("_undo_from") or "done")
         stored["_offer_state"] = state
         stored["_undo_result"] = dict(result)
         if result.get("ok"):

@@ -12,14 +12,19 @@ model and no cost:
   time, 8 to 1 min; ``late``: 1 to 3 min after it), its end state not reached today (a ``routine_on`` moment of the
   user's own, or a skill run of it that ended done), not offered today, fewer than ``routine_per_day`` routine cards
   today. ``offer-now <id> [--in N]`` (:func:`request_offer_now`, a request file the worker reads each pass) makes one
-  routine due at once, through the same card gates (it skips only the window, day-set, once-a-day and day budget);
+  routine due at once, through the same card gates (it skips only the window and the day-set; its card counts
+  against the day's 2, never uses up the routine's once-a-day slot, and is never learned from but for an explicit
+  Less of these: its events say ``forced``);
 * **held by itself (D11)**: it passes only the coach's gates None, ``settling`` (once ``routine_settle_s`` past
   sitting down) and ``meeting``, and holds whatever the gate says on a game or a full screen in front, the 120 s return
   hold, any open call (a game's voice chat with the game behind is no call here: D8, map-routines R2.3), the last
   meeting's app still playing (meeting audio), away, and Yuki acting. Screen sharing happens inside a call (D10). The
-  coarse gates (off, paused, locked, snoozed, quiet hours) give it no view at all;
-* **the shared gates** (:mod:`yuki.core.attention`, channel ``routine``): never over a card showing, at most 2 in 24 h;
-  it skips the 10-minute card gap (critique M20) and moves it for every other card;
+  coarse gates (off, paused, locked, snoozed, quiet hours) give it no view at all. A calls or meeting-audio read that
+  fails counts as a hold (fail closed);
+* **the shared gates** (:mod:`yuki.core.attention`, channel ``routine``): at most 2 a day; it skips the 10-minute card
+  gap (critique M20) and moves it for every other card. A card on screen is the tray's to see (memory learns of it
+  only when it fades): the tray's queue shows one card at a time, and a routine card that waited asks
+  :func:`card_still_due` before it shows;
 * **the offer** (:func:`yuki.memory.offers.routine_offer`): the skill is loaded, ``offerable``, never sends, its route
   trusted (``yuki.skills.registry.offer_ready``, D14), and available: for ``meet.open`` the Meet tab census
   (:class:`yuki.memory.callevidence.SiteTabs`, at most once a day per routine; one tab found by identity, never two,
@@ -28,10 +33,13 @@ model and no cost:
   ("Your 9:00 meeting is coming up. Open the Meet tab in Zen?"; late: "... started a minute ago ..."), the why line
   from the counts ("You've joined it around 08:58 on 7 of the last 9 weekdays.") and the skill's own "Won't" line
   ("Won't join, unmute, type or send anything. You click Join."). Buttons are today's: Open it, Not now, Less of these.
-  It expires ``routine_expire_after_min`` after the usual time, or at once when the end state lands;
+  It expires ``routine_expire_after_min`` after the usual time, or at once when the end state lands. The tray asks
+  :func:`card_still_due` right before it shows a card that waited in its queue (expiry, end state, outcome, an open
+  call, a game in front) and drops or keeps it;
 * **learning** (:meth:`RoutineLane.learn`, :func:`feedback`; B.3), in ``routine_events``: Open it and done
   -> ``accepted`` (``joined`` when the join followed within 10 min); Not now -> ``declined``; shown or not, no
-  reaction -> ``ignored``; joined within 15 min without it -> also ``self_served``; Less of these -> a mode step
+  reaction -> ``ignored``; pressed but refused (no trusted route any more, gone, expired) -> ``accepted`` with
+  ``run: refused``; joined within 15 min without a card it showed -> also ``self_served``; Less of these -> a mode step
   (early -> late -> quiet; on quiet, off); >= 3 ``self_served`` in 10 days with <= 1 accept -> late; >= 3 ignores or
   declines of the late card in 10 days, or acceptance under 30% after 10 meeting days -> quiet (pre-declared). A run
   the PC couldn't confirm counts against the route only (the skill ledger), never against the routine.
@@ -44,6 +52,7 @@ Public API::
     RoutineLane(worker).tick(now, config, view, gate) -> dict | None;  .due(...);  .learn(now, config)
     routines(store) / routine(store, id) -> Routine;  record_event(store, id, kind, at=, nudge_id=, detail=)
     feedback(store, nudge_id, kind, now=None) -> dict;  why_line(r);  card_text(r, skill, mode)
+    card_still_due(store, nudge_id, now=None, game=None) -> {"due", "why", "final"}
     request_offer_now(db_path, routine_id, in_s=0) -> Path;  read_request(db_path) -> dict | None
     python -m yuki.memory.routine_offers offer-now <id> [--in N] [--db PATH] [--wait S] | status [--db PATH]
 """
@@ -233,11 +242,13 @@ def record_event(store: Any, routine_id: int, kind: str, *, at: float | None = N
     if kind not in EVENT_KINDS or not has_tables(store):
         return None
     when = float(at) if at is not None else time.time()
-    body = json.dumps(detail, separators=(",", ":"), sort_keys=True) if detail else None
+
+    def op(conn: Any) -> int:
+        _insert_event(conn, routine_id, kind, when, nudge_id, detail)
+        return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
     try:
-        return int(store._write(lambda conn: conn.execute(
-            "INSERT INTO routine_events(routine_id, at, kind, nudge_id, detail) VALUES (?,?,?,?,?)",
-            (int(routine_id), when, kind, nudge_id, body)).lastrowid))
+        return int(store._write(op))
     except sqlite3.Error:
         return None
 
@@ -277,24 +288,42 @@ def events(store: Any, *, routine_id: int | None = None, since: float | None = N
     return out
 
 
+def _insert_event(conn: Any, routine_id: int, kind: str, at: float, nudge_id: int | None,
+                  detail: dict[str, Any] | None) -> None:
+    """One ``routine_events`` row inside the caller's transaction."""
+    body = json.dumps(detail, separators=(",", ":"), sort_keys=True) if detail else None
+    conn.execute("INSERT INTO routine_events(routine_id, at, kind, nudge_id, detail) VALUES (?,?,?,?,?)",
+                 (int(routine_id), float(at), kind, nudge_id, body))
+
+
 def set_mode(store: Any, routine_id: int, mode: str, *, at: float | None = None, why: str = "",
-             nudge_id: int | None = None) -> bool:
+             nudge_id: int | None = None, only_from: str | None = None) -> bool:
     """Move a routine's ``offer_mode`` (the miner keeps it when it updates the row) and record ``mode_change`` (or
-    ``never`` for ``off``). False when the routine is gone or already in that mode."""
+    ``never`` for ``off``), the read, the update and the event in one transaction (the tray's Less of these and the
+    learning pass never step it twice). ``only_from``: only while the routine is still in that mode (the ladder's
+    reading). False when the routine is gone, already in that mode, or no longer in ``only_from``."""
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, not {mode!r}")
-    r = routine(store, routine_id)
-    if r is None or r.offer_mode == mode:
+    if not has_tables(store):
         return False
     when = float(at) if at is not None else time.time()
+
+    def op(conn: Any) -> bool:
+        row = conn.execute("SELECT offer_mode FROM routines WHERE id=?", (int(routine_id),)).fetchone()
+        if row is None:
+            return False
+        cur = str(row[0] or "early")
+        if cur == mode or (only_from is not None and cur != only_from):
+            return False
+        conn.execute("UPDATE routines SET offer_mode=?, updated_at=? WHERE id=?", (mode, when, int(routine_id)))
+        _insert_event(conn, routine_id, "never" if mode == "off" else "mode_change", when, nudge_id,
+                      {"from": cur, "to": mode, "why": why})
+        return True
+
     try:
-        store._write(lambda conn: conn.execute("UPDATE routines SET offer_mode=?, updated_at=? WHERE id=?",
-                                               (mode, when, int(routine_id))))
+        return bool(store._write(op))
     except sqlite3.Error:
         return False
-    record_event(store, routine_id, "never" if mode == "off" else "mode_change", at=when, nudge_id=nudge_id,
-                 detail={"from": r.offer_mode, "to": mode, "why": why})
-    return True
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -453,8 +482,10 @@ def request_path(db_path: str | Path | None) -> Path:
 def request_offer_now(db_path: str | Path | None, routine_id: int, in_s: float = 0.0, *,
                       now: float | None = None) -> Path:
     """Ask the memory service for the routine's card in ``in_s`` seconds, through the real card gates (``routines
-    offer-now <id> [--in N]``). The worker answers in the same file (``state``: pending, shown, expired,
-    unknown_routine, plus the last hold ``reason``). Returns the file."""
+    offer-now <id> [--in N]``; the card counts against the day's 2 routine cards and is never learned from but for
+    an explicit Less of these). The worker answers in the same file (``state``: pending, shown, expired, budget,
+    unknown_routine, ``not_offering:...``, off, or the offer's own refusal such as not_ready / unavailable, plus the
+    last hold ``reason``). Returns the file."""
     now = time.time() if now is None else float(now)
     at = now + max(0.0, float(in_s))
     path = request_path(db_path)
@@ -621,7 +652,11 @@ class RoutineLane:
         if not windowed:
             return out
         cards = self._today_cards(now, config)
-        offered = {int((n.inputs or {}).get("routine_id") or 0) for n in cards}
+        # once a day per routine: its natural card; an offer-now card (a test) never uses up the day's slot, but no
+        # second card comes while one of the routine's cards is still live (unanswered, not expired). Every card on
+        # screen counts against the day's budget, offer-now's included (Phase R: "its own limit of 2 a day")
+        offered = {int((n.inputs or {}).get("routine_id") or 0) for n in cards
+                   if not (n.inputs or {}).get("forced") or _live(n, now)}
         if len(cards) >= int(getattr(config, "routine_per_day", 2)):
             return out
         for r, at, end in windowed:
@@ -645,9 +680,9 @@ class RoutineLane:
                 return reason
         if gate not in (None, "settling", "meeting"):
             return str(gate)
-        if self.w._call_open():
+        if self.w._call_open(fail_closed=True):   # a read that failed counts as a call
             return "call"
-        if self.w._meeting_held(now, view, config):
+        if self.w._meeting_held(now, view, config, fail_closed=True):
             return "meeting_audio"
         if "settling" in held or gate == "settling":
             since = getattr(view, "at_pc_since", None)
@@ -657,7 +692,8 @@ class RoutineLane:
         return None
 
     def _attention(self, now: float, config: Any, forced: bool) -> str | None:
-        """The shared gates (channel ``routine``): a card showing, the budget (``offer-now`` skips the budget only)."""
+        """The shared gates (channel ``routine``): a card showing, the day's budget of 2 (``offer-now`` cards
+        included: it goes through the real card gates)."""
         try:
             att = self.w._attention(now, config)
             att.load(TRIGGER, [n.at for n in self._today_cards(now, config)
@@ -665,7 +701,7 @@ class RoutineLane:
             decision = att.check(TRIGGER, now=now, facts={})
         except Exception:
             return "attention:error"   # fail closed: never a card that might jump one showing
-        if decision.allowed or (forced and decision.reason == "budget"):
+        if decision.allowed:
             return None
         return f"attention:{decision.reason}"
 
@@ -683,7 +719,12 @@ class RoutineLane:
             record_event(self.store, rid, "held", at=now, detail={"reason": reason, "mode": d.mode,
                                                                   "forced": d.forced})
         if d.forced and self._request is not None:
-            if now > float(self._request.get("until") or 0.0):
+            if reason == "attention:budget":
+                # the day's 2 routine cards are spent: final for this request (the screen holds come first, so a
+                # call or a game in front still says "call" / "game" while it lasts)
+                self._request["reason"] = reason
+                self._finish_request(self._request, "budget")
+            elif now > float(self._request.get("until") or 0.0):
                 self._request["reason"] = reason
                 self._finish_request(self._request, "expired")
             elif self._request.get("reason") != reason:   # the CLI's status shows why it waits (written on change)
@@ -845,15 +886,18 @@ class RoutineLane:
         offer = offers.stored_offer(n) or {}
         recorded = {e["kind"]: e for e in events(self.store, nudge_id=n.id)}
         skill = self._skill(r.skill_id)
+        forced = bool((n.inputs or {}).get("forced"))
         changed = False
         if n.reaction == "less" and not any(e["kind"] in ("mode_change", "never")
                                             and e["detail"].get("why") == "less" for e in recorded.values()):
-            feedback(self.store, n.id, "less", now=now)
+            feedback(self.store, n.id, "less", now=now)   # an explicit press counts, on an offer-now card too
             changed = True
         joined_at = first_onset(self.store, skill, n.at, min(now, n.at + SELF_SERVED_WITHIN_S)) if skill else None
         if n.outcome is None and joined_at is not None and n.reaction not in ("accepted",):
-            # the end state landed while the card waited: its button stops (expires when the join lands)
+            # the end state landed while the card waited: its button stops (expires when the join lands), and a card
+            # never shown leaves the pending list (the tray asks again before it shows a queued one: card_still_due)
             offers._set_outcome(self.store, n.id, "expired", at=now, only_if=(None,))
+            _expire_unshown(self.store, n.id, now)
         if any(k in recorded for k in SETTLE_KINDS):
             return changed
         expires = float(offer.get("expires_at") or (n.at + 600.0))
@@ -863,7 +907,11 @@ class RoutineLane:
             return changed   # the tray is still reporting (a run that never reported settles as pressed)
         mode = str((n.inputs or {}).get("mode") or offer.get("mode") or "")
         detail: dict[str, Any] = {"mode": mode}
+        if forced:
+            # an offer-now card (the user's test): recorded, but never in the ladder or the acceptance rule
+            detail["forced"] = True
         if n.outcome in ("done", "failed", "running"):
+            # a run the PC couldn't confirm counts against the route only (an Undo after it keeps it "failed")
             kind = "accepted"
             detail["run"] = n.outcome
             run_at = float(n.outcome_at or n.at)
@@ -871,21 +919,33 @@ class RoutineLane:
         elif n.outcome == "undone" or n.reaction in ("dismissed", "less"):
             kind = "declined"
             detail["how"] = "undone" if n.outcome == "undone" else str(n.reaction)
+        elif n.reaction == "accepted":
+            # pressed, but memory refused the run (no trusted route any more, the routine gone, its own expiry) or the
+            # press never reached it: the user said yes; nothing ran. Never a miss
+            kind = "accepted"
+            detail["run"] = "refused"
+            press_at = float(n.reacted_at or n.at)
+            detail["joined"] = bool(joined_at is not None and joined_at - press_at <= JOINED_WITHIN_S)
         else:
             kind = "ignored"
             detail["seen"] = n.shown_at is not None
         record_event(self.store, r.id, kind, at=now, nudge_id=n.id, detail=detail)
-        if kind != "accepted" and joined_at is not None:
-            record_event(self.store, r.id, "self_served", at=now, nudge_id=n.id,
-                         detail={"mode": mode, "after_s": round(joined_at - n.at)})
+        if kind != "accepted" and joined_at is not None and n.shown_at is not None:
+            # joined without the card, only for a card the screen showed (one never shown says nothing about it)
+            served: dict[str, Any] = {"mode": mode, "after_s": round(joined_at - n.at)}
+            if forced:
+                served["forced"] = True
+            record_event(self.store, r.id, "self_served", at=now, nudge_id=n.id, detail=served)
         return True
 
     def ladder(self, routine_id: int, now: float, config: Any) -> str | None:
-        """The pre-declared mode ladder (B.3) over the last 10 days; returns the new mode, if it moved."""
+        """The pre-declared mode ladder (B.3) over the last 10 days; returns the new mode, if it moved. Cards forced
+        by ``offer-now`` (the user's tests) never count here (their explicit Less of these still does, at once)."""
         r = routine(self.store, routine_id)
         if r is None or r.offer_mode not in ("early", "late"):
             return None
-        recent = events(self.store, routine_id=routine_id, since=now - LADDER_WINDOW_S)
+        recent = [e for e in events(self.store, routine_id=routine_id, since=now - LADDER_WINDOW_S)
+                  if not e["detail"].get("forced")]
 
         def count(kind: str, mode: str | None = None) -> int:
             # a card the screen never showed (busy all through its window) was not ignored by the user
@@ -894,30 +954,34 @@ class RoutineLane:
 
         if r.offer_mode == "early" and count("self_served") >= LATE_AFTER_SELF_SERVED \
                 and count("accepted") <= LATE_MAX_ACCEPTS:
-            set_mode(self.store, routine_id, "late", at=now, why="self_served")
-            self._log("routine_mode", routine=routine_id, mode_from="early", mode_to="late", why="self_served")
-            return "late"
+            if set_mode(self.store, routine_id, "late", at=now, why="self_served", only_from="early"):
+                self._log("routine_mode", routine=routine_id, mode_from="early", mode_to="late", why="self_served")
+                return "late"
+            return None
         if r.offer_mode == "late" and count("ignored", "late") + count("declined", "late") >= QUIET_AFTER_LATE_MISSES:
-            set_mode(self.store, routine_id, "quiet", at=now, why="late_ignored")
-            self._log("routine_mode", routine=routine_id, mode_from="late", mode_to="quiet", why="late_ignored")
-            return "quiet"
+            if set_mode(self.store, routine_id, "quiet", at=now, why="late_ignored", only_from="late"):
+                self._log("routine_mode", routine=routine_id, mode_from="late", mode_to="quiet", why="late_ignored")
+                return "quiet"
+            return None
         days, offered, accepted = self.acceptance(routine_id, now, config)
         if days >= QUIET_MEETING_DAYS and offered and accepted / offered < QUIET_BELOW_ACCEPTANCE:
-            set_mode(self.store, routine_id, "quiet", at=now, why="acceptance")
-            self._log("routine_mode", routine=routine_id, mode_from=r.offer_mode, mode_to="quiet",
-                      why="acceptance", days=days, offered=offered, accepted=accepted)
-            return "quiet"
+            if set_mode(self.store, routine_id, "quiet", at=now, why="acceptance", only_from=r.offer_mode):
+                self._log("routine_mode", routine=routine_id, mode_from=r.offer_mode, mode_to="quiet",
+                          why="acceptance", days=days, offered=offered, accepted=accepted)
+                return "quiet"
         return None
 
     def acceptance(self, routine_id: int, now: float, config: Any) -> tuple[int, int, int]:
-        """``(meeting days, cards seen, cards accepted)`` since the routine's first card: meeting days are the days
-        its end state happened (the user's own onsets), counted from the day of its first card; a card the screen
-        never showed is not counted as seen."""
-        first_card = events(self.store, routine_id=routine_id, kinds=("offered",))
+        """``(meeting days, cards seen, cards accepted)`` since the routine's first natural card: meeting days are the
+        days its end state happened (the user's own onsets), counted from the day of that card; a card the screen
+        never showed is not counted as seen; cards forced by ``offer-now`` (the user's tests) never count."""
+        first_card = [e for e in events(self.store, routine_id=routine_id, kinds=("offered",))
+                      if not e["detail"].get("forced")]
         if not first_card:
             return 0, 0, 0
         first = first_card[0]["at"]
-        settled = events(self.store, routine_id=routine_id, kinds=SETTLE_KINDS)
+        settled = [e for e in events(self.store, routine_id=routine_id, kinds=SETTLE_KINDS)
+                   if not e["detail"].get("forced")]
         accepted = sum(1 for e in settled if e["kind"] == "accepted")
         offered = sum(1 for e in settled if not (e["kind"] == "ignored" and e["detail"].get("seen") is False))
         r = routine(self.store, routine_id)
@@ -984,21 +1048,118 @@ def feedback(store: Any, nudge_id: int, kind: str, *, now: float | None = None) 
     if n.kind != "notice" or n.trigger != TRIGGER:
         return {"ok": False, "why": "not_routine"}
     rid = int((n.inputs or {}).get("routine_id") or 0)
-    r = routine(store, rid) if rid else None
-    if r is None:
+    if not rid or not has_tables(store):
         return {"ok": False, "why": "gone"}
-    if any(e["kind"] in ("mode_change", "never") and e["detail"].get("why") == kind
-           for e in events(store, nudge_id=n.id)):
-        return {"ok": False, "why": "already", "routine": rid, "mode": r.offer_mode}
-    if kind == "never" or r.offer_mode in ("quiet", "off"):
-        to = "off"
-    else:
-        to = MODES[min(MODES.index(r.offer_mode) + 1, MODES.index("quiet"))] if r.offer_mode in MODES else "quiet"
-    moved = set_mode(store, rid, to, at=now, why=kind, nudge_id=n.id)
-    if not moved:   # already there: the press is still recorded once, so it is never applied again
-        record_event(store, rid, "never" if to == "off" else "mode_change", at=now, nudge_id=n.id,
-                     detail={"from": r.offer_mode, "to": r.offer_mode, "why": kind})
-    return {"ok": True, "routine": rid, "mode_from": r.offer_mode, "mode_to": to if moved else r.offer_mode}
+
+    def op(conn: Any) -> dict[str, Any]:
+        # the check, the step and its event in one transaction: the tray's press and the learning pass (which reads
+        # the same reaction) never step the routine twice
+        row = conn.execute("SELECT offer_mode FROM routines WHERE id=?", (rid,)).fetchone()
+        if row is None:
+            return {"ok": False, "why": "gone"}
+        cur = str(row[0] or "early")
+        for (body,) in conn.execute("SELECT detail FROM routine_events WHERE nudge_id=? AND kind IN"
+                                    " ('mode_change', 'never')", (int(n.id),)).fetchall():
+            try:
+                why = (json.loads(body) if body else {}).get("why")
+            except ValueError:
+                why = None
+            if why == kind:
+                return {"ok": False, "why": "already", "routine": rid, "mode": cur}
+        if kind == "never" or cur in ("quiet", "off"):
+            to = "off"
+        else:
+            to = MODES[min(MODES.index(cur) + 1, MODES.index("quiet"))] if cur in MODES else "quiet"
+        moved = to != cur
+        if moved:
+            conn.execute("UPDATE routines SET offer_mode=?, updated_at=? WHERE id=?", (to, now, rid))
+        # already there: the press is still recorded once, so it is never applied again
+        _insert_event(conn, rid, "never" if to == "off" else "mode_change", now, int(n.id),
+                      {"from": cur, "to": to if moved else cur, "why": kind})
+        return {"ok": True, "routine": rid, "mode_from": cur, "mode_to": to if moved else cur}
+
+    try:
+        return dict(store._write(op))
+    except sqlite3.Error as exc:
+        return {"ok": False, "why": "error", "error": type(exc).__name__}
+
+
+def _live(n: Any, now: float) -> bool:
+    """A routine card still live: no outcome, no reaction (queued or on screen), its own offer not expired."""
+    if n.outcome is not None or n.reaction is not None:
+        return False
+    from yuki.memory import offers
+
+    offer = offers.stored_offer(n) or {}
+    return now <= float(offer.get("expires_at") or (n.at + 600.0))
+
+
+def _expire_unshown(store: Any, nudge_id: int, now: float) -> None:
+    """A card the screen never showed leaves the pending list (reaction ``expired``, as the coach's own expiry)."""
+    try:
+        store._write(lambda conn: conn.execute(
+            "UPDATE nudges SET reaction='expired', reacted_at=? WHERE id=? AND shown_at IS NULL AND reaction IS NULL",
+            (float(now), int(nudge_id))))
+    except sqlite3.Error:
+        pass
+
+
+def card_still_due(store: Any, nudge_id: int, *, now: float | None = None,
+                   game: Callable[[], str] | None = None) -> dict[str, Any]:
+    """The tray's question right before it shows a queued routine card (it may have waited behind another card or a
+    busy screen since the lane wrote it): ``{"due": True}`` or ``{"due": False, "why", "final"}``.
+
+    Final (the tray drops the card): ``unknown``, an ``outcome`` or a ``reaction`` already recorded, its own expiry
+    (``expired``), its routine no longer offering (``gone``: Less of these elsewhere, quieted, retired), the end state
+    reached since the card (``done``: the user joined, or said "open my meeting"). Not final (the tray keeps it queued
+    and asks again): an open call (``call``; a read that failed counts as one) or a game in front (``game``; D9's local
+    read, ``game`` replaces it; a read that failed counts as one). Full screen is the tray's own check. Never raises."""
+    now = time.time() if now is None else float(now)
+    try:
+        n = store.nudge(int(nudge_id))
+    except Exception:   # unreadable now: not shown, asked again later
+        return {"due": False, "why": "error", "final": False}
+    if n is None:
+        return {"due": False, "why": "unknown", "final": True}
+    if n.kind != "notice" or n.trigger != TRIGGER:
+        return {"due": True}
+    if n.outcome is not None:
+        return {"due": False, "why": f"outcome:{n.outcome}", "final": True}
+    if n.reaction is not None:
+        return {"due": False, "why": f"reaction:{n.reaction}", "final": True}
+    from yuki.memory import offers
+
+    offer = offers.stored_offer(n) or {}
+    if now > float(offer.get("expires_at") or (n.at + 600.0)):
+        return {"due": False, "why": "expired", "final": True}
+    r = routine(store, (n.inputs or {}).get("routine_id"))
+    if r is None or not r.offering or (offer.get("skill") and r.skill_id != offer.get("skill")):
+        return {"due": False, "why": "gone", "final": True}
+    try:
+        from yuki.skills.connection import load
+
+        skill = load().get(str(r.skill_id))
+    except Exception:
+        skill = None
+    if skill is not None and first_onset(store, skill, n.at, now, include_runs=True) is not None:
+        return {"due": False, "why": "done", "final": True}
+    try:
+        from yuki.memory.store import CALL_OPEN_STATUSES
+
+        in_call = any(getattr(c, "kind", "call") != "game" for c in store.calls(statuses=CALL_OPEN_STATUSES))
+    except Exception:
+        in_call = True   # fail closed: never a card into a call it couldn't rule out
+    if in_call:
+        return {"due": False, "why": "call", "final": False}
+    try:
+        if game is None:
+            from yuki.memory.gamegate import game_in_front as game
+        in_game = bool(game())
+    except Exception:
+        in_game = True   # fail closed
+    if in_game:
+        return {"due": False, "why": "game", "final": False}
+    return {"due": True}
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1023,7 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "offer-now":
         path = request_offer_now(args.db, args.routine_id, args.in_s)
         print(f"requested routine {args.routine_id} in {args.in_s:g} s ({path.name}); the card comes through the usual "
-              f"gates (no game or full screen in front, no call, not away) within a pass (~15 s) of that time.")
+              f"gates (no game or full screen in front, no call, not away, at most 2 routine cards a day with this "
+              f"one) within a pass (~15 s) of that time.")
         deadline = time.monotonic() + max(0.0, args.wait)
         while args.wait and time.monotonic() < deadline:
             got = read_request(args.db) or {}
@@ -1046,5 +1208,5 @@ if __name__ == "__main__":   # pragma: no cover
 __all__ = ["TRIGGER", "ONSET_WORDS", "DAY_WORDS", "MODES", "EVENT_KINDS", "REQUEST_FILE", "Routine", "Due",
            "RoutineLane", "has_tables", "routines", "routine", "record_event", "events", "set_mode", "routine_day",
            "day_start_at", "usual_at", "in_dayset", "window", "why_line", "card_text", "routine_title", "available",
-           "AVAILABILITY", "onsets", "first_onset", "feedback", "request_offer_now", "read_request", "request_path",
-           "main"]
+           "AVAILABILITY", "onsets", "first_onset", "feedback", "card_still_due", "request_offer_now", "read_request",
+           "request_path", "main"]

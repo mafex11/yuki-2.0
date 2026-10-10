@@ -646,8 +646,12 @@ def _set_outcome(store: Any, nudge_id: int, outcome: str, *, at: float | None = 
 
 
 def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dict[str, Any]:
-    """:func:`act` for ``run_skill`` (see there): checks, then ``running``; nothing runs in memory."""
+    """:func:`act` for ``run_skill`` (see there): checks, then ``running``; nothing runs in memory. Only the routine
+    card (channel ``routine``: kind ``notice``, trigger ``routine``) may carry it: any other card is refused
+    (``no_offer``), whatever its offer says."""
     do = "run_skill"
+    if channel_of(n) != ROUTINE_CHANNEL:
+        return {"ok": False, "why": "no_offer", "do": do}
     if now > float(offer["expires_at"]):
         _set_outcome(store, n.id, "expired", at=now, only_if=(None,))
         return {"ok": False, "why": "expired", "do": do}
@@ -712,8 +716,10 @@ def offer_result(store: Any, nudge_id: int, ok: bool, detail: dict[str, Any] | N
 
 def undo(store: Any, nudge_id: int, *, now: float | None = None) -> dict[str, Any]:
     """Take back what a card's offer did (``todo_add``: the to-do ends as a wrong capture; ``bring_back`` and
-    ``run_skill``: the UI brings back what was in front, memory records it): ``{"ok": True, "state": "undone"}`` or
-    ``{"ok": False, "why"}`` (``unknown``, ``no_undo``, ``not_done``, ``too_late``)."""
+    ``run_skill``: the UI brings back what was in front, memory records it; a ``run_skill`` run the PC couldn't
+    confirm (``failed``) may have brought a window forward too, so it can be undone as well, and its outcome stays
+    ``failed``: a route failure is never learned against the routine or the offer kind): ``{"ok": True, "state":
+    "undone"}`` or ``{"ok": False, "why"}`` (``unknown``, ``no_undo``, ``not_done``, ``too_late``)."""
     now = time.time() if now is None else float(now)
     n = store.nudge(int(nudge_id))
     if n is None:
@@ -721,10 +727,13 @@ def undo(store: Any, nudge_id: int, *, now: float | None = None) -> dict[str, An
     offer = stored_offer(n)
     if offer is None or offer["do"] not in UNDOABLE:
         return {"ok": False, "why": "no_undo"}
-    if n.outcome != "done":
+    undoable = ("done", "failed") if offer["do"] == "run_skill" else ("done",)
+    if n.outcome not in undoable:
         return {"ok": False, "why": "not_done", "state": n.outcome}
     if n.outcome_at is not None and now - n.outcome_at > UNDO_WITHIN_S:
         return {"ok": False, "why": "too_late"}
+    if n.outcome == "failed":   # run_skill only (undoable): the UI brought the window back; nothing to record
+        return {"ok": True, "do": offer["do"], "state": "undone"}
     if offer["do"] == "todo_add":
         info = _undo_map(store).get(str(n.id)) or {}
         todo_id = info.get("todo")

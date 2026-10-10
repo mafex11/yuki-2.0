@@ -2152,7 +2152,7 @@ class NudgeWorker:
         #: A long session went on in full screen: look at the first calm moment after it.
         self._calm_pending = False
         #: (when, held): the last meeting-hold reading of the audio sessions.
-        self._meeting_hold: tuple[float, bool] | None = None
+        self._meeting_hold: tuple[float, bool | None] | None = None
         #: The observation cards (yuki.memory.presence); ``screen_fn``: the service's screen recall cache.
         self.presence = PresenceWorker(self, screen_fn=screen_fn)
         #: The shared embedder (the check-in vetting ranks memory near a question; None: the core profile only).
@@ -2273,7 +2273,7 @@ class NudgeWorker:
             self._log("nudge_gate", gate=gate, was=self._gate)
             self._gate = gate
 
-    def _meeting_held(self, now: float, view: View, config: NudgeConfig) -> bool:
+    def _meeting_held(self, now: float, view: View, config: NudgeConfig, *, fail_closed: bool = False) -> bool:
         """A meeting whose app still plays sound after the microphone went quiet (Meet mutes it on mute).
 
         Measured, not timed: on 2026-09-25 a Google Meet meeting in Zen became nine
@@ -2281,7 +2281,8 @@ class NudgeWorker:
         at 09:11 while the user was in the meeting. The app of the latest meeting row
         (within ``meeting_hold_min``) still having an active audio render session is the
         sign the meeting goes on. Read at most every 15 s and only in that window
-        (~7 ms, session state only).
+        (~7 ms, session state only). A read that failed answers ``fail_closed`` (the
+        routine lane: True, D11; the coach's gate: False, as before).
         """
         hold = config.meeting_hold_min * 60.0
         meetings = [r for r in view.rows if r.meeting and r.ended_at >= now - hold]
@@ -2291,8 +2292,9 @@ class NudgeWorker:
         if not process:
             return False
         if self._meeting_hold is not None and now - self._meeting_hold[0] < 15.0:
-            return self._meeting_hold[1]
-        held = False
+            got = self._meeting_hold[1]
+            return fail_closed if got is None else got
+        held: bool | None = False
         try:
             sessions = self.render_fn() if self.render_fn is not None else None
             if sessions is None:
@@ -2312,9 +2314,9 @@ class NudgeWorker:
                     held = True
                     break
         except Exception:
-            held = False
+            held = None   # unreadable: each caller decides (fail_closed)
         self._meeting_hold = (now, held)
-        return held
+        return fail_closed if held is None else held
 
     # -- one pass ------------------------------------------------------------------
 
@@ -2463,16 +2465,17 @@ class NudgeWorker:
         except Exception:
             return False
 
-    def _call_open(self) -> bool:
+    def _call_open(self, *, fail_closed: bool = False) -> bool:
         """A call (kind ``call``: a meeting, a Discord call, a voice channel) is going on; a game's voice chat (kind
         ``game``) is not one here: the routine lane holds on a game in front by its own check, and a game open behind
         lets cards run (D8, D11; map-routines R2.3). On 8 Oct 08:51 VALORANT's voice session, open behind Zen since
-        07:01, would otherwise have held the morning card."""
+        07:01, would otherwise have held the morning card. A read that failed answers ``fail_closed`` (the routine
+        lane passes True: never a card into a call it couldn't rule out)."""
         try:
             return any(getattr(c, "kind", "call") != "game"
                        for c in self.store.calls(statuses=CALL_OPEN_STATUSES))
         except Exception:
-            return False
+            return fail_closed
 
     def _rate_ok(self, now: float, config: NudgeConfig) -> bool:
         checkins = self.store.nudge_checkins(now - 3600.0)

@@ -185,17 +185,20 @@ def test_offers_off_or_the_lane_off_shows_nothing(store):
 # -- the shared gates: the card gap is skipped, a card showing never jumped ----------------------------------------
 
 
-def test_it_skips_the_card_gap_but_never_jumps_a_card_showing(store):
+def test_it_skips_the_card_gap(store):
+    """The card gap is skipped. A card on screen is the tray's to see: the UI records nothing until the card fades
+    (``react_to_nudge('shown')``), so memory writes the routine card and the tray's queue keeps it behind the card
+    showing, then asks memory "still due?" before it shows (test_rLane_cards: the real guarantee)."""
     add_routine(store)
     sat_down(store, "08:30", "09:00")
     card(store, at("08:48"), trigger="resume", kind="resume", shown=True, reaction="shown")   # faded at 08:48
     clock = Clock(at("08:52"))
     w = lane_worker(store, clock)
     assert len(run_ticks(w, clock, at("08:52"), at("08:52"))) == 1          # 4 min after another card: still shown
-    other = routine_offers.routine(store, add_routine(store, at_min=545.0, key="meet.open|chrome"))   # 09:05
-    card(store, at("08:57"), trigger="thread", shown=True)                  # on screen now, nobody reacted
-    assert run_ticks(w, clock, at("08:57:30"), at("09:00")) == []
-    assert "attention:card_pending" in held(w) and other is not None
+    add_routine(store, at_min=545.0, key="meet.open|chrome")                # 09:05
+    card(store, at("08:57"))                                                # on screen now: as the UI leaves its row
+    got = run_ticks(w, clock, at("08:57:30"), at("08:57:30"))
+    assert len(got) == 1 and store.nudge(got[0]["nudge_id"]).shown_at is None   # queued in the tray, not shown
 
 
 # -- once a day, two a day at most, never when it happened already ---------------------------------------------------
@@ -339,7 +342,7 @@ def test_joining_without_it_three_times_moves_it_late(store):
     w = lane_worker(store, clock)
     for k in range(3):
         day = days_later(k if k < 3 else k + 2)
-        nid = _day_card(store, w, clock, day)
+        nid = _day_card(store, w, clock, day, reaction="shown")      # on screen, faded with no reaction
         assert nid is not None
         join(store, at("08:56", day))                                 # walked to Zen themselves
         _settle(w, clock, day)
@@ -525,3 +528,203 @@ def test_a_press_whose_run_never_reported_settles_as_pressed(store):
     _settle(w, clock, DAY)   # 09:30: past the card's time and the 10-minute report wait
     ev = routine_offers.events(store, routine_id=rid, kinds=("accepted",))
     assert len(ev) == 1 and ev[0]["detail"]["run"] == "running"
+
+
+# -- review round 2 ---------------------------------------------------------------------------------------------------
+
+
+def _learn_at(w, clock, t: float) -> None:
+    clock.t = t
+    w.routines._learned_at = 0.0
+    w.routines.learn(t, w.config())
+
+
+def _forced(store, w, clock, rid: int, t: float) -> int:
+    routine_offers.request_offer_now(store.path, rid, now=t)
+    got = run_ticks(w, clock, t, t)
+    assert len(got) == 1 and got[0]["forced"] is True
+    return got[0]["nudge_id"]
+
+
+def test_offer_now_cards_are_never_learned_from_and_never_use_up_the_day(store):
+    """M1: an offer-now card is the user's test. Its settle and self_served events say ``forced``; the ladder and the
+    acceptance rule never count it; it never takes the routine's once-a-day slot; its explicit Less of these counts."""
+    rid = add_routine(store)
+    sat_down(store, "07:00", "09:20")
+    clock = Clock(at("08:05"))
+    w = lane_worker(store, clock)
+    test_card = _forced(store, w, clock, rid, at("08:05"))   # after quiet hours
+    store.react_to_nudge(test_card, "shown", at=at("08:06"))               # seen, faded, no reaction
+    _learn_at(w, clock, at("08:25"))
+    evs = {e["kind"]: e for e in routine_offers.events(store, nudge_id=test_card)}
+    assert evs["ignored"]["detail"] == {"mode": "early", "seen": True, "forced": True}
+    assert w.routines.acceptance(rid, clock.t, w.config()) == (0, 0, 0)   # no natural card yet: nothing counts
+    got = run_ticks(w, clock, at("08:52"), at("08:52"))                    # the test didn't use up the day
+    assert len(got) == 1 and got[0]["forced"] is False
+    # a test card the user then joined after: self_served, marked forced
+    thu = days_later(1)
+    sat_down(store, "14:00", "15:40", day=thu)
+    served = _forced(store, w, clock, rid, at("14:10", thu))
+    store.react_to_nudge(served, "shown", at=at("14:11", thu))
+    join(store, at("14:13", thu))
+    _learn_at(w, clock, at("14:30", thu))
+    assert routine_offers.events(store, nudge_id=served, kinds=("self_served",))[0]["detail"]["forced"] is True
+    # three forced cards on a late routine, each ignored: the ladder never moves
+    late = add_routine(store, key="meet.open|chrome", mode="late")
+    for k in (1, 2, 3):
+        day = days_later(k)
+        sat_down(store, "15:00", "15:40", day=day)
+        nid = _forced(store, w, clock, late, at("15:10", day))
+        store.react_to_nudge(nid, "shown", at=at("15:10:30", day))
+        _learn_at(w, clock, at("15:35", day))
+    assert routine_offers.routine(store, late).offer_mode == "late"
+    assert all(e["detail"].get("forced") for e in routine_offers.events(store, routine_id=late, kinds=("ignored",)))
+    assert routine_offers.feedback(store, nid, "less", now=clock.t)["mode_to"] == "quiet"   # an explicit press counts
+
+
+def test_offer_now_counts_against_the_two_a_day_but_a_call_says_call_first(store):
+    """L1: offer-now goes through the real card gates, the day's 2 included; the screen holds come first."""
+    rid = add_routine(store)
+    sat_down(store, "07:00", "09:20")
+    clock = Clock(at("08:10"))
+    w = lane_worker(store, clock)
+    for t in ("08:10", "08:15"):
+        nid = _forced(store, w, clock, rid, at(t))
+        store.react_to_nudge(nid, "dismissed", at=at(t) + 20)
+    call = store.start_call(app="Discord", process="Discord.exe", via="mic", at=at("08:19"), status="recording")
+    routine_offers.request_offer_now(store.path, rid, now=at("08:20"))
+    assert run_ticks(w, clock, at("08:20"), at("08:20")) == []
+    req = routine_offers.read_request(store.path)
+    assert req["state"] == "pending" and req["reason"] == "call"
+    store.update_call(call, status="ended")
+    assert run_ticks(w, clock, at("08:21"), at("08:21")) == []
+    req = routine_offers.read_request(store.path)
+    assert req["state"] == "budget" and req["reason"] == "attention:budget"
+    assert run_ticks(w, clock, at("08:52"), at("08:59")) == []             # the day's 2 are spent
+    assert len(routine_cards(store)) == 2
+
+
+def test_a_failed_calls_or_meeting_audio_read_holds_the_card(store, monkeypatch):
+    """L3: a calls read that raised counts as a call for the lane; a render-session read that raised counts as
+    meeting audio. The coach's own reads keep their old answer."""
+    add_routine(store)
+    sat_down(store, "08:30", "09:00")
+    clock = Clock(at("08:52"))
+    w = lane_worker(store, clock)
+
+    def broken(*a, **k):
+        raise RuntimeError("calls table locked")
+
+    monkeypatch.setattr(store, "calls", broken)
+    assert run_ticks(w, clock, at("08:52"), at("08:53")) == [] and "call" in held(w)
+    assert w._call_open() is False
+    monkeypatch.undo()
+    store.save_timeline(TimelineRow(None, at("08:40"), at("08:42"), "present", "python", "Python", active_s=120,
+                                    meeting="Google Meet"))
+
+    def no_audio():
+        raise OSError("no audio endpoint")
+
+    w2 = lane_worker(store, Clock(at("08:54")))
+    w2.render_fn = no_audio
+    assert run_ticks(w2, w2.clock, at("08:54"), at("08:55")) == [] and "meeting_audio" in held(w2)
+    assert routine_cards(store) == []
+
+
+def test_a_press_memory_refused_is_accepted_never_a_miss(store):
+    """L5: pressed, but memory refused (or the press never reached it): accepted with run "refused", never counted
+    toward "3 late misses -> quiet"."""
+    rid = add_routine(store, mode="late")
+    clock = Clock(at("09:01"))
+    w = lane_worker(store, clock)
+    for k in (0, 1, 2):
+        day = days_later(k)
+        assert _day_card(store, w, clock, day, start="09:01", end="09:03", reaction="accepted") is not None
+        _settle(w, clock, day)
+    evs = routine_offers.events(store, routine_id=rid, kinds=("accepted", "ignored"))
+    assert [e["kind"] for e in evs] == ["accepted"] * 3 and all(e["detail"]["run"] == "refused" for e in evs)
+    assert routine_offers.routine(store, rid).offer_mode == "late"
+
+
+def test_a_card_never_shown_is_never_self_served_and_leaves_the_pending_list(store):
+    """L6 and L2: the user joined while the card was still queued in the tray: no self_served, and the card leaves
+    the pending list (reaction expired) besides its button stopping (outcome expired)."""
+    rid = add_routine(store)
+    clock = Clock(at("08:52"))
+    w = lane_worker(store, clock)
+    nid = _day_card(store, w, clock, DAY)
+    assert [n.id for n in store.nudges(pending=True)] == [nid]             # pending_nudges' own filter
+    join(store, at("08:55"))
+    _learn_at(w, clock, at("08:56"))
+    n = store.nudge(nid)
+    assert n.outcome == "expired" and n.reaction == "expired" and n.shown_at is None
+    assert store.nudges(pending=True) == []
+    _settle(w, clock, DAY)
+    kinds = [e["kind"] for e in routine_offers.events(store, routine_id=rid)]
+    assert "self_served" not in kinds and "ignored" in kinds
+
+
+def test_less_of_these_steps_the_mode_once_under_a_race(store):
+    """L7: the check, the step and its event are one transaction: many presses at once step it once; the ladder steps
+    only from the mode it read."""
+    rid = add_routine(store)
+    clock = Clock(at("08:52"))
+    w = lane_worker(store, clock)
+    nid = _day_card(store, w, clock, DAY)
+    gate = threading.Barrier(8)
+    answers: list[dict] = []
+
+    def press() -> None:
+        gate.wait(5)
+        answers.append(routine_offers.feedback(store, nid, "less", now=at("08:53")))
+
+    threads = [threading.Thread(target=press) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(answers) == 8 and sum(1 for a in answers if a.get("ok")) == 1
+    assert routine_offers.routine(store, rid).offer_mode == "late"
+    assert len(routine_offers.events(store, routine_id=rid, kinds=("mode_change",))) == 1
+    assert routine_offers.set_mode(store, rid, "quiet", why="self_served", only_from="early") is False
+    assert routine_offers.routine(store, rid).offer_mode == "late"
+
+
+def test_card_still_due_answers_the_trays_question(store, monkeypatch):
+    """L2: right before the tray shows a queued routine card: due, or why not (final, or a hold that waits)."""
+    rid = add_routine(store)
+    clock = Clock(at("08:52"))
+    w = lane_worker(store, clock)
+    nid = _day_card(store, w, clock, DAY)
+    due = routine_offers.card_still_due
+    no_game = lambda: ""   # noqa: E731
+
+    def game_raises():
+        raise OSError("no foreground window")
+
+    assert due(store, nid, now=at("08:53"), game=no_game) == {"due": True}
+    assert due(store, nid, now=at("08:53"), game=lambda: "valorant-win64-shipping") == {
+        "due": False, "why": "game", "final": False}
+    assert due(store, nid, now=at("08:53"), game=game_raises)["why"] == "game"          # fail closed
+    call = store.start_call(app="Discord", process="Discord.exe", via="mic", at=at("08:52"), status="recording")
+    assert due(store, nid, now=at("08:53"), game=no_game) == {"due": False, "why": "call", "final": False}
+    store.update_call(call, status="ended")
+
+    def calls_raise(*a, **k):
+        raise RuntimeError("locked")
+
+    monkeypatch.setattr(store, "calls", calls_raise)
+    assert due(store, nid, now=at("08:53"), game=no_game)["why"] == "call"              # fail closed
+    monkeypatch.undo()
+    assert due(store, nid, now=at("09:11"), game=no_game) == {"due": False, "why": "expired", "final": True}
+    join(store, at("08:54"))
+    assert due(store, nid, now=at("08:55"), game=no_game) == {"due": False, "why": "done", "final": True}
+    fri = days_later(2)
+    other = _day_card(store, w, clock, fri)
+    routine_offers.set_mode(store, rid, "quiet", why="test")
+    assert due(store, other, now=at("08:53", fri), game=no_game)["why"] == "gone"
+    routine_offers.set_mode(store, rid, "early", why="test")
+    store.react_to_nudge(other, "dismissed", at=at("08:53", fri))
+    assert due(store, other, now=at("08:53", fri), game=no_game) == {
+        "due": False, "why": "reaction:dismissed", "final": True}
+    assert due(store, 999_999, game=no_game)["final"] is True

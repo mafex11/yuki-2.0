@@ -205,6 +205,108 @@ def test_less_of_these_on_a_routine_card_steps_its_routine(qapp):
     other.card.close()
 
 
+# -- review round 2: the queue's real guarantee, the desk read, Undo after an unconfirmed run -------------------------
+
+
+OTHER = {"id": 90, "kind": "notice", "trigger": "thread", "at": None, "offer": None, "text": "Another card."}
+
+
+def test_a_routine_card_waits_behind_a_card_showing_and_asks_memory_before_it_shows(qapp):
+    """L2: the tray's queue is what keeps a routine card from jumping a card on screen; once that card is gone,
+    memory is asked "still due?" (off the GUI thread): due -> shown; over -> dropped, the next card shows; held (a
+    call, a game in front) -> it waits; past its own expiry -> dropped without asking."""
+    answers = {80: {"due": True}, 81: {"due": False, "why": "done", "final": True},
+               82: {"due": False, "why": "call", "final": False}}
+    memory = Memory({"routine_card_due": lambda nid: answers[nid]})
+    ctl = _controller(memory)
+    ctl.offer([dict(OTHER)])
+    assert ctl.showing is not None and ctl.showing["id"] == 90
+    ctl.offer([{**CARD, "id": 80}])
+    _settle(qapp, ctl, rounds=5)
+    assert ctl.showing["id"] == 90 and [n["id"] for n in ctl.queue] == [80]   # never over the card showing
+    assert not [c for c in memory.calls if c[0] == "routine_card_due"]
+    ctl.card.withdraw()   # gone at once (the fade is a 240 ms animation)
+    ctl.try_show()
+    _settle(qapp, ctl)
+    assert ("routine_card_due", 80) in memory.calls and ctl.showing["id"] == 80 and ctl.queue == []
+    assert "_due" not in ctl.showing
+    ctl.card.withdraw()   # gone at once (the fade is a 240 ms animation)
+    # the user joined while it waited: dropped, and the card behind it shows
+    ctl.offer([{**CARD, "id": 81}, {**OTHER, "id": 91}])
+    _settle(qapp, ctl)
+    assert ("routine_card_due", 81) in memory.calls and ctl.showing["id"] == 91 and ctl.queue == []
+    ctl.card.withdraw()   # gone at once (the fade is a 240 ms animation)
+    # held by an open call: it stays queued, nothing shows, a later look asks again
+    ctl.offer([{**CARD, "id": 82}])
+    _settle(qapp, ctl)
+    assert ctl.showing is None and [n["id"] for n in ctl.queue] == [82] and ctl._retry.isActive()
+    answers[82] = {"due": True}
+    ctl.queue[0]["_due"] = (0.0, {"due": False})   # the answer went stale (ROUTINE_DUE_FRESH_S)
+    ctl.try_show()
+    _settle(qapp, ctl)
+    assert ctl.showing["id"] == 82
+    ctl.card.withdraw()   # gone at once (the fade is a 240 ms animation)
+    # past its own expiry: dropped at once, memory not asked
+    asked = len(memory.calls)
+    ctl.offer([{**CARD, "id": 83, "offer": {**OFFER, "expires_at": _soon(-1)}}])
+    _settle(qapp, ctl, rounds=5)
+    assert ctl.showing is None and ctl.queue == [] and len(memory.calls) == asked
+    ctl.card.close()
+
+
+def test_a_routine_card_memory_cannot_clear_never_shows(qapp):
+    """Memory unreachable or without an answer: the card waits (fail closed) and never shows."""
+    memory = Memory({})   # routine_card_due answers None
+    ctl = _controller(memory)
+    ctl.offer([{**CARD, "id": 84}])
+    _settle(qapp, ctl)
+    assert ctl.showing is None and [n["id"] for n in ctl.queue] == [84]
+    ctl.card.close()
+
+
+def test_the_desk_busy_reason_is_read_on_the_gui_thread(qapp):
+    """L8: the UI's widgets are read on the GUI thread before the run's thread starts."""
+    import threading
+
+    seen: list[bool] = []
+    memory = Memory({"offer_act": lambda nid: dict(GRANTED), "offer_result": lambda *a: True})
+    ctl = _controller(memory, lambda *a, **k: {"ok": True, "outcome": "done"},
+                      desk_busy=lambda: seen.append(threading.current_thread() is threading.main_thread()) or None)
+    ctl.card.show_nudge(ctl.record_delivery({**CARD, "id": 85}, "card"))
+    ctl.card._on_do()
+    _settle(qapp, ctl)
+    assert seen == [True]
+    ctl.card.close()
+
+
+def test_undo_after_a_run_that_took_focus_but_couldnt_confirm(qapp, monkeypatch):
+    """L9: Zen came forward but the Meet tab couldn't be confirmed: the card says so, with Undo back to the window
+    that was in front."""
+    import yuki.actions.launch as launch
+    import yuki.ui.nudges as un
+
+    monkeypatch.setattr(un, "_foreground_hwnd", lambda: 4343)
+    focused: list[int] = []
+    monkeypatch.setattr(launch, "focus_window", lambda hwnd, **kw: focused.append(hwnd))
+
+    def runner(memory, granted, **kw):
+        return {"ok": False, "outcome": "unverified", "say": "Zen is up, but I couldn't see the Meet tab.",
+                "focus": True}
+
+    memory = Memory({"offer_act": lambda nid: dict(GRANTED), "offer_result": lambda *a: True,
+                     "offer_undo": lambda nid: {"ok": True, "do": "run_skill", "state": "undone"}})
+    ctl = _controller(memory, runner)
+    ctl.card.show_nudge(ctl.record_delivery({**CARD, "id": 86}, "card"))
+    ctl.card._on_do()
+    _settle(qapp, ctl)
+    assert ctl.card.result.text() == "Zen is up, but I couldn't see the Meet tab."
+    assert not ctl.card.undo_button.isHidden()
+    ctl.card._on_undo()
+    _settle(qapp, ctl)
+    assert focused == [4343] and ("offer_undo", 86) in memory.calls and ctl.card.result.text() == "Undone."
+    ctl.card.close()
+
+
 # -- run_card_skill: the voice run's safety ---------------------------------------------------------------------------
 
 
@@ -378,8 +480,15 @@ def test_end_to_end_the_lane_writes_the_card_the_tray_runs_it_and_the_lane_learn
             return {"ok": True, "outcome": "done", "verified": True, "route": "a:census:driver",
                     "say": "Your Meet tab is up in Zen.", "focus": True, "ms": 700.0}
 
+        # the queue's path: memory's own "still due?" (no game in front, no call, not joined yet) clears it
+        import yuki.memory.gamegate as gamegate
+
+        monkeypatch.setattr(routine_offers, "time", SimpleNamespace(time=lambda: at("08:53")))
+        monkeypatch.setattr(gamegate, "game_in_front", lambda *a, **k: "")
         ctl = _controller(Access(), runner)
-        ctl.card.show_nudge(ctl.record_delivery(row, "card"))
+        ctl.offer([row])
+        _settle(qapp, ctl)
+        assert ctl.showing is not None and ctl.showing["id"] == row["id"]
         assert ctl.card.title.text() == "Your usual"
         ctl.card._on_do()
         _settle(qapp, ctl)
