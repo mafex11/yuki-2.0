@@ -397,6 +397,13 @@ warm_budget_s = 3.0
 # Once a day per window state (covered, on another screen, minimised), one counts-only read. Off once S-1 settled them.
 state_probe = true
 
+[you]
+# The one "you right now" record (yuki.memory.younow): what just changed, what you're working on, whether you're at
+# the PC, in a game, on a call or in a meeting. Kept in memory's RAM only (never written to disk, never in the MCP),
+# rebuilt only when something in it changed; read by the card judge. false = it isn't built, and the judge then holds
+# every card (read again while memory runs).
+enabled = true
+
 [calls]
 # Calls, both sides (yuki.memory.calls; your decision of 3 Oct 2026 - from
 # 24 Sept to 3 Oct only your own microphone was recorded).  If you say yes on

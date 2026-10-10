@@ -320,6 +320,7 @@ def run(args: argparse.Namespace) -> int:
     transcriber_thread: threading.Thread | None = None
     screen_recall = None
     game_gate = None
+    you_builder = None    # yuki.memory.younow.YouBuilder (yState: the "you right now" record; built after phase F)
     trace = None
     moments = None   # yuki.memory.moments.MomentHub (built after the AV signals)
     volume_watch = None   # yuki.memory.volumewatch.VolumeWatch (phase F, fLive; needs the moments hub)
@@ -510,9 +511,15 @@ def run(args: argparse.Namespace) -> int:
             from yuki.memory import acting as _acting
 
             acting_event = _acting.ActingEvent(db_path)
+
+            def _acting_changed(acting: bool) -> None:
+                yb = you_builder   # yState: read late (built after phase F)
+                if yb is not None:
+                    yb.on_acting(acting)
+
             acting_thread = threading.Thread(
                 target=_guarded(_follow_acting, log, "acting"),
-                args=(stop, acting_event, db_path, watcher, lambda: timeline, log),
+                args=(stop, acting_event, db_path, watcher, lambda: timeline, log, _acting_changed),
                 name="yuki-memory-acting", daemon=True,
             )
             acting_thread.start()
@@ -659,6 +666,7 @@ def run(args: argparse.Namespace) -> int:
                 from yuki.memory import acting as _acting_mod
                 from yuki.memory.nudges import NudgeWorker
                 from yuki.memory.watcher import session_locked
+                from yuki.memory.younow import focus_game
 
                 def live_state() -> dict[str, Any]:
                     # the recorder's open stretch (written to the store every 30 s) and Yuki's own marker
@@ -666,10 +674,12 @@ def run(args: argparse.Namespace) -> int:
                     st = tl.stats() if tl is not None and tl.alive else {}
                     out = {"meeting": bool(st.get("meeting")), "fullscreen": bool(st.get("fullscreen")),
                            "acting": _acting_mod.current(db_path) is not None}
-                    gg = game_gate      # fGate (D9): a game in front holds the cards; behind, it doesn't
-                    if gg is not None and gg.alive:
-                        # [trace] game_gate = "running" (the rollback) holds them while one runs anywhere, as before
-                        out["game_front"] = bool(gg.front_game()) or (gg.scope == "running" and gg.game_running())
+                    # fGate (D9): a game in front holds the cards; behind, it doesn't. yState: the one rule
+                    # (younow.focus_game, shared with the Now board and YouNow); [trace] game_gate = "running" (the
+                    # rollback) holds them while one runs anywhere, as before
+                    game = focus_game(game_gate)
+                    if game["source"] == "gate":
+                        out["game_front"] = game["front"]
                     return out          # no live gate: the cards' gate reads the open stretch's program instead
 
                 from yuki.core.attention import shared as shared_attention
@@ -721,9 +731,17 @@ def run(args: argparse.Namespace) -> int:
                     tl = timeline
                     return tl.current_meeting() if tl is not None and tl.alive else None
 
+                def _call_changed(source: str = "calls") -> None:
+                    # a call or game voice chat started or ended: the moments hub refreshes, and (yState) the
+                    # you-right-now record re-reads the call status (read late: it is built after phase F)
+                    if moments is not None:
+                        moments.nudge(source)
+                    yb = you_builder
+                    if yb is not None:
+                        yb.on_call_change(source)
+
                 calls = CallWorker(store, db_path=db_path, privacy=privacy, log=log, meeting_fn=meeting_now,
-                                   signals=av_signals, evidence=call_evidence,
-                                   on_call_change=moments.nudge if moments is not None else None)
+                                   signals=av_signals, evidence=call_evidence, on_call_change=_call_changed)
                 calls_thread = threading.Thread(
                     target=_guarded(calls.run, log, "calls"), args=(stop, pause_path),
                     name="yuki-memory-calls", daemon=True,
@@ -789,8 +807,10 @@ def run(args: argparse.Namespace) -> int:
         # worker's microphone holders and the timeline's playing apps (app keys only).
         if now_board is not None:
             if game_gate is not None:
-                _gate = game_gate
-                now_board.game_front_fn = lambda: _gate.front_game() if _gate.alive else None
+                from yuki.memory.younow import focus_game as _focus_game
+
+                _gate = game_gate   # yState: the one rule (younow.focus_game): the game's name, None once the gate died
+                now_board.game_front_fn = lambda: _focus_game(_gate)["name"]
             now_board.signals_fn = lambda: {
                 "mic_holders": calls.mic_holders() if calls is not None else [],
                 "playing": timeline.playing_apps() if timeline is not None else []}
@@ -831,6 +851,30 @@ def run(args: argparse.Namespace) -> int:
             except Exception as exc:   # memory runs on without it
                 log("error", where="spotify_watch_start", error=f"{type(exc).__name__}: {exc}")
                 spotify = None
+
+        # yState (state-design.md §3): the one "you right now" record, in RAM only, built on this loop's beat (no thread
+        # of its own) and rebuilt a part at a time when its inputs move: the game gate's and the call worker's change
+        # hooks, the acting follower, the timeline's flags, the hub's front and media changes, database changes. Read
+        # in-process by the card judge (jCore); [you] enabled = false keeps it unbuilt (the judge then holds).
+        try:
+            from yuki.memory import acting as _acting_now
+            from yuki.memory.younow import YouBuilder
+
+            try:
+                acting_at_start = _acting_now.current(db_path) is not None   # the follower tells changes after this
+            except Exception:  # noqa: BLE001
+                acting_at_start = False
+            you_builder = YouBuilder(store, privacy=privacy, log=log, db_path=db_path, timeline_fn=lambda: timeline,
+                                     gate_fn=lambda: game_gate, board=now_board, hub=moments,
+                                     acting_now=acting_at_start)
+            if game_gate is not None:
+                game_gate.on_change(you_builder.on_gate_change)
+            if moments is not None:
+                moments.subscribe_front(you_builder.on_front)
+                moments.subscribe_media(you_builder.on_media)
+        except Exception as exc:   # memory runs on without it (the judge then holds)
+            log("error", where="you_start", error=f"{type(exc).__name__}: {exc}")
+            you_builder = None
 
         # The action trace (report 78 C1, shadow; yuki.memory.trace): nothing runs until the user turns on Settings ->
         # Record how I work; then it shares presence's one Raw Input reader, obeys the game gate (a gate that failed
@@ -917,6 +961,8 @@ def run(args: argparse.Namespace) -> int:
                     moments.beat()
                 except Exception as exc:
                     log("error", where="moments_beat", error=type(exc).__name__)
+            if you_builder is not None:
+                you_builder.beat()   # yState: RAM compares; a part rebuilt only when its inputs moved (never raises)
             if spotify is not None:
                 try:   # the daily state probe's one-shot timer (a timer compare; no loop of its own)
                     spotify.beat()
@@ -985,7 +1031,8 @@ def run(args: argparse.Namespace) -> int:
                     moments=moments.stats() if moments is not None else None,
                     volume=volume_watch.stats() if volume_watch is not None else None,
                     spotify=spotify.stats() if spotify is not None else None,
-                    site_tabs=site_tabs.stats() if site_tabs is not None else None)
+                    site_tabs=site_tabs.stats() if site_tabs is not None else None,
+                    you=you_builder.stats() if you_builder is not None else None)   # yState: beat p50/p90, builds, wakes
                 if moments is not None:
                     moments.log_sources()
                 if trace is not None and trace.sink is not None:
@@ -1122,12 +1169,15 @@ def run(args: argparse.Namespace) -> int:
 
 def _follow_acting(
     stop: threading.Event, event: Any, db_path: Path, watcher: Watcher, timeline_now: Callable[[], Any], log: _Log,
+    on_change: Callable[[bool], None] | None = None,
 ) -> None:
     """Keep the watcher and the timeline told whether Yuki is acting (yuki.memory.acting).
 
     Wakes on Yuki's event, or every 2 s at the latest (a missed signal, an
     agent that died mid-request: :func:`yuki.memory.acting.current` ignores
-    entries whose process is gone).
+    entries whose process is gone). ``on_change(acting)`` (yState: the
+    you-right-now record) hears each change too, so nothing else reads the
+    marker file every second.
     """
     from yuki.memory import acting as _acting
 
@@ -1153,6 +1203,11 @@ def _follow_acting(
         timeline = timeline_now()
         if timeline is not None:
             timeline.set_acting(now)
+        if on_change is not None:
+            try:
+                on_change(now is not None)
+            except Exception:  # noqa: BLE001 - a listener never stops the follower
+                pass
         # phase F (fPrivacy): the request's id, so the memory log links to its session log and moments (no words)
         log("acting", acting=now is not None, lane=now.lane if now is not None else None,
             request_id=(getattr(now, "request_id", "") or None) if now is not None else None)

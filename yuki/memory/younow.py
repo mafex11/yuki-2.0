@@ -1,0 +1,1493 @@
+"""One live "you right now" record (YouNow), built once, in the memory service (yState; state-design.md §3).
+
+Every part of Yuki used to work out "what is the user doing right now?" on its own: the card worker every 15 s
+(``nudges.observe``), each card maker again for its own model call, the thinker per request. This module keeps one
+typed, capped record in the memory service's RAM, next to the Now board, and rebuilds a part of it only when
+something in that part changed. Until ``yConsumers`` the only reader is the in-process card judge (``jCore``, shadow).
+
+**Sections** (schema v1, §3.2; every list capped, every text clipped, ≤ 12 KB of JSON in all):
+
+* ``presence`` - present / away / locked / off; ``at_pc_since``, ``settled_at``, ``idle_since``, ``away_at``,
+  ``day_began`` (instants, never growing durations: readers compute "how long" when they read); the last break; time
+  at the PC today (``base_s`` + the live part since ``since``); the last 7 days; the current activity session.
+* ``focus`` - hold facts only: the game (:func:`focus_game`), the return hold's end, full screen, the meeting, the
+  call (a game's own voice chat is not a call, D8), Yuki acting, the hold names at build time. No Now-board field is
+  copied: the record carries ``board_version`` (top level, read every beat) and nothing of the screen.
+* ``changed`` - what just changed (≤ 12, last 30 min): moments of the known kinds (``page`` left out, unknown kinds
+  ignored) plus four transitions this module synthesises: ``call_end``, ``game_end``, ``sit_down``, ``switch``.
+* ``work`` - the thread now, ≤ 5 active threads, ≤ 5 goals, ≤ 6 items due in 24 h or overdue, the list's size, the
+  work board's counts (``board(replies=False)``), ≤ 3 plans in the next 24 h (the events scan's dated events).
+* ``usual``, ``prefs`` - empty until ``yUsual`` (after phase L) fills them.
+* ``about`` - the nightly brief by reference: how to be with them, routine, careful, how many people.
+* ``cards`` - the card on screen (the UI marked it shown, no reaction, within the card gap), the last card, today's
+  shown cards per ``kind/trigger`` and their reactions, and the judge's own facts (modes, Today queue, next wake,
+  budget left) published in RAM through :meth:`YouBuilder.judge_facts` (never written, so they never mark a part
+  dirty).
+
+**Refresh** (§3.3): :meth:`YouBuilder.beat` runs on the service's existing 1 s loop, after ``moments.beat()``. It
+compares a few values held in RAM and rebuilds a section only when its inputs moved:
+
+* ``focus`` - the game gate's ``on_change``, the call worker's change hook (fanned out with ``moments.nudge``), the
+  acting follower's event, a change of :meth:`TimelineRecorder.flags`, the gate dying, the set of open calls, and the
+  meeting's audio (read at most every 15 s, only while a meeting row is within ``meeting_hold_min``, as
+  ``NudgeWorker._meeting_held``); front changes only while the gate is dead (the fallback reads the open stretch);
+* ``presence`` - a state change in the timeline's flags (present / away / locked / paused), the stretch reaching its
+  projected ``settled_at``, a front app held past the hop rule with another key than the session's, a day boundary;
+* ``changed`` - the moments hub's counters moved (compared in RAM), a media change, a synthesised transition;
+* ``work`` / ``cards`` / ``about`` - the database changed: ``total_changes()`` (the service's own connection) or
+  ``PRAGMA data_version`` (the tray's writes), at most once per 2 s, then one probe query names the dirty sections.
+  ``nudge_state`` keys of the judge (``judge_*``) are never probed, so the judge's bookkeeping never marks a section.
+
+A rebuilt section whose content did not change keeps its old object and version. Nothing is rebuilt because time
+passed: holds that end with time (the return hold, the card gap, away after ``presence_min``, settling) are
+timestamps that :func:`holds_now` compares when read.
+
+**The judge's wake** (:attr:`YouBuilder.wake`, an in-process ``threading.Event``) is set only on: a change of the
+hold set (as :func:`holds_now` derives it, so a hold's time running out counts), a breakpoint (``sit_down``,
+``switch``, ``call_end``, ``game_end``, a new ``message_sent``), a reaction on a card, and the judge's own deadline
+(``cards.next_wake``). Changes to ``work``, ``about`` or ``usual`` never wake it.
+
+**Freshness** is judged by the reader: every beat publishes a new top-level mapping with ``beat_at`` (the sections
+are shared by reference; this bumps no version). :func:`holds_now` answers ``["unknown"]`` when ``now - beat_at >
+STALE_S``, so a stalled loop never leaves a stale "no game" in force.
+
+**Publishing** swaps an immutable snapshot by reference: sections are frozen (``MappingProxyType`` and tuples) and
+never changed after publishing; :func:`thaw` gives plain dicts and lists (JSON).
+
+**Privacy**: RAM only, never written to disk and never in the MCP. Logs are content-free: ``you_built`` (section,
+version, ms, bytes), ``you_clipped`` (section, n), ``focus_unknown`` (source, state, duration), ``you_source``,
+``you_off``; the service's stats line carries :meth:`YouBuilder.stats` (beat cost p50/p90, builds, wakes).
+``python -m yuki.memory.younow --show`` prints the record content-free (sizes, counts, flags, times); ``--content``
+prints it in full, to the user's own terminal only. It always runs on a read-only copy of the database.
+
+**Equivalence with what it replaces** (state-design.md §7, yState item 3), and the differences:
+
+* ``presence`` = ``nudges.observe()``'s stretch rules on the same rows: ``presence_sessions`` over ``wide_rows`` (the
+  last 36 h, Yuki's own stretches left out), ``break_min``, ``presence_min``, ``_break_between`` for the last break;
+  ``day_began`` = ``checkins.day_began`` (the latest settled stretch after a break of
+  ``max(DAY_BREAK_S, resume_after_h)``). Difference: the open stretch is not in the database until the timeline's next
+  30 s flush, so while the timeline says present, the time since the last row (or since the return) is counted as
+  presence (observe saw it up to 30 s late).
+* ``focus.call`` = ``NudgeWorker._call_open``: a call of kind ``call`` among the open statuses holds; a game's voice
+  chat (kind ``game``) is reported (``kind = "game"``) but holds nothing; an unreadable store gives ``open = None``.
+* ``focus.meeting.audio_held`` = ``NudgeWorker._meeting_held``: the latest meeting row within ``meeting_hold_min``,
+  its app with an active audio render session, read at most every 15 s; unreadable gives ``None`` (each reader
+  decides, as ``fail_closed`` did). ``focus.meeting.front`` = observe's meeting hold (the live flag, or a meeting row
+  within ``MEETING_GAP_S``, as the timestamp ``front_until``).
+* ``focus_game()`` = ``live_state()``'s rule (the gate's ``front_game()``, or with ``[trace] game_gate = "running"``
+  any game running) and the board's ``game_front_fn`` (the name, or None with no live gate); with no live gate the
+  card side falls back to the program in front (``nudges._game_front``), ``source = "fallback"``. Difference: that
+  program is the hub's latest front event when there is one (observe read the newest row, up to a flush behind).
+* ``focus.game.return_hold_until`` = observe's return hold (a full-screen or game stretch that ended less than
+  ``return_hold_s`` ago), plus the instant the gate or the timeline saw the game or full screen end (the row may be
+  up to 30 s behind).
+* ``focus.fullscreen`` is the open stretch's flag (the timeline's ``flags()``, as ``live_state()``); observe also held
+  on the newest row's flag for up to ``ONGOING_S`` after it ended, which the return hold covers anyway (a snapshot
+  would otherwise keep that until its next rebuild).
+* ``focus.yuki_acting`` comes from the acting follower's event alone; observe also held while the newest row was
+  Yuki's for up to ``ONGOING_S`` after it ended.
+* ``board_version`` sits at the top level, read every beat like ``beat_at`` (in ``focus`` it would be stale between
+  rebuilds, or bump the version on every rebuild).
+* Focus reads the last minutes of the timeline raw (:func:`recent_rows`, by the ``ended_at`` index) without
+  ``Store._apply_proof``, which only re-reads rows written before the live call-evidence gate.
+
+Public API::
+
+    YouBuilder(store, privacy=, log=, db_path=, timeline_fn=, gate_fn=, board=, hub=, acting_now=, live=)
+        .beat(now=None)                      # the service loop, after moments.beat()
+        .on_gate_change(decision) / .on_call_change(source) / .on_acting(bool)   # change hooks, any thread
+        .on_front(prev_key, new_key, **facts) / .on_media(started, stopped, **facts)   # moments.subscribe_*
+        .judge_facts(modes=, digest_queued=, next_wake=, budget_left=)   # the judge's own facts, RAM only
+        .snapshot() -> mapping | None        # the current immutable record (None: [you] enabled = false)
+        .wake                                # threading.Event for the judge
+        .stats() -> dict                     # content-free, for the service's stats line
+    focus_game(gate, fallback=None) -> {"front", "name", "running", "source"}
+    holds_now(you, now) -> [hold names]      # ["unknown"] when stale or absent
+    presence_now(you, now) -> {"present", "away", "settled", "at_pc_s", "idle_s", "today_s"}
+    day_began(clips, config, since=, sessions=None) -> (start, gap) | None
+    day_began_from(store, now, config) -> (start, gap) | None
+    render(you, "cards", now=None) -> str    # <= 2,500 characters, for the card writer (content: RAM only)
+    thaw(you) -> plain dicts and lists
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import threading
+import time
+from collections import Counter, deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from types import MappingProxyType
+from typing import Any
+
+from yuki.memory.checkins import DAY_BREAK_S, day_boundary, day_totals, user_day
+from yuki.memory.nudges import (
+    ONGOING_S,
+    RESUME_SEARCH_S,
+    NudgeConfig,
+    _break_between,
+    _game_process,
+    activity_sessions,
+    game_row,
+    presence_sessions,
+    todo_items,
+    wide_rows,
+)
+from yuki.memory.store import CALL_OPEN_STATUSES, app_key
+from yuki.memory.timeline import MEETING_GAP_S, PrivacySection, _clip
+
+#: The record's schema version (a new field is additive; a removed field bumps it).
+SCHEMA_V = 1
+#: A record whose last beat is older than this is "not known" (every reader checks it).
+STALE_S = 5.0
+#: The database is asked whether it changed at most this often (then one probe query names the dirty sections).
+DB_EVERY_S = 2.0
+#: A new front app held this long is a ``switch`` (a breakpoint for the judge).
+SWITCH_HELD_S = 60.0
+#: ``changed`` keeps this much history, at most this many items.
+CHANGED_S = 30 * 60.0
+CHANGED_MAX = 12
+#: The moment kinds ``changed`` keeps (``page`` is left out: derived late, after a dwell; unknown kinds are ignored).
+CHANGED_KINDS: tuple[str, ...] = ("call_join", "game_voice", "site_front", "media_play", "media_context",
+                                  "volume_change", "message_sent")
+#: The transitions this module synthesises from its own state.
+SYNTH_KINDS: tuple[str, ...] = ("call_end", "game_end", "sit_down", "switch")
+#: The meeting's audio is read at most this often (as NudgeWorker._meeting_held), only while a meeting row is recent.
+MEETING_AUDIO_EVERY_S = 15.0
+#: The current activity session is cut from this much of the timeline (as observe's 4 h window).
+SESSION_LOOKBACK_S = 4 * 3600.0
+#: A moment's entity digest is kept this short: enough to tell two entities apart (equality only), never content.
+ENTITY_CHARS = 16
+#: Past days kept for the care and evening inputs.
+DAYS_KEPT = 7
+#: List and text caps.
+THREADS_MAX, GOALS_MAX, DUE_MAX, PLANS_MAX, CAREFUL_MAX = 5, 5, 6, 3, 6
+TITLE_CHARS, STATE_CHARS, GOAL_CHARS, LABEL_CHARS = 100, 160, 160, 60
+WITH_HIM_CHARS, ROUTINE_CHARS, CAREFUL_CHARS = 600, 300, 80
+#: ``due``: items due within this long, or overdue by at most this long.
+DUE_AHEAD_S = 86400.0
+OVERDUE_BACK_S = 7 * 86400.0
+#: ``plans``: dated events within this long.
+PLANS_AHEAD_S = 86400.0
+#: Section caps (bytes of compact JSON, §3.6) and the whole record's.
+SECTION_CAPS: dict[str, int] = {"presence": 1536, "focus": 614, "changed": 1229, "work": 4096, "usual": 1536,
+                                "prefs": 1229, "about": 1536, "cards": 614}
+RECORD_CAP = 12 * 1024
+#: The renderers' caps (characters). ``thinker`` and ``talker`` come with yConsumers.
+RENDER_CAPS: dict[str, int] = {"cards": 2500}
+#: The sections, in the order a beat rebuilds them (focus and presence synthesise transitions ``changed`` shows).
+SECTIONS: tuple[str, ...] = ("focus", "presence", "changed", "work", "usual", "prefs", "about", "cards")
+#: The sections the database probe can mark.
+DB_SECTIONS: tuple[str, ...] = ("focus", "work", "cards", "about")
+#: The judge's own facts it may publish into ``cards``.
+JUDGE_FACTS: tuple[str, ...] = ("modes", "digest_queued", "next_wake", "budget_left")
+#: Beat timings kept for the stats line's percentiles (about ten minutes of beats).
+BEAT_SAMPLES = 600
+
+#: One probe query: per section, values that move when its source tables change (content-free columns only).
+_PROBE_SQL = (
+    "SELECT"
+    " (SELECT group_concat(id || ':' || ifnull(kind, '')) FROM calls WHERE status IN (%s)),"
+    " (SELECT max(updated_at) FROM goals),"
+    " (SELECT max(updated_at) FROM work_threads),"
+    " (SELECT max(updated_at) FROM todos),"
+    " (SELECT ifnull(max(updated_at), 0) || ':' || ifnull(max(id), 0) FROM open_loops),"
+    " (SELECT count(*) || ':' || ifnull(max(id), 0) || ':' || ifnull(max(valid_to), 0) || ':' || count(title_ciphertext)"
+    "   FROM conversation_facts WHERE kind = 'commitment'),"
+    " (SELECT max(updated_at) FROM work_items),"
+    " (SELECT updated_at FROM nudge_state WHERE name = 'presence_events'),"
+    " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(shown_at), 0) || ':' || ifnull(max(outcome_at), 0) FROM nudges),"
+    " (SELECT max(reacted_at) FROM nudges),"
+    " (SELECT ifnull(max(id), 0) || ':' || ifnull(max(at), 0) FROM portraits)"
+) % ",".join("'%s'" % s for s in CALL_OPEN_STATUSES)
+
+
+@dataclass(frozen=True)
+class YouConfig:
+    """The privacy file's ``[you]`` table (defaults when the file has none)."""
+
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, table: dict | None) -> YouConfig:
+        return cls(enabled=bool((table or {}).get("enabled", True)))
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: the game in front, the day, holds, freezing
+# ---------------------------------------------------------------------------
+
+
+def focus_game(gate: Any, fallback: Callable[[], bool] | None = None) -> dict[str, Any]:
+    """The one rule for "a game is in front", shared by ``live_state()`` (the cards' gate), the Now board's
+    ``game_front_fn`` and YouNow.
+
+    With a live gate: ``name`` = ``GameGate.front_game()`` (the game's stem, ``"d3d"`` in exclusive full screen, or
+    ""), ``front`` = a name, or with ``[trace] game_gate = "running"`` (the rollback) any game running anywhere;
+    ``running`` = ``game_running()``; ``source = "gate"``. With no gate or a dead one: ``name`` None (the board's "not
+    known"), ``front`` = ``fallback()`` (the open stretch's program, as ``nudges._game_front``) or None with no
+    fallback, ``running`` True (fails closed, as ``running_holds``), ``source`` "fallback" or "none"."""
+    if gate is not None and getattr(gate, "alive", False):
+        name = str(gate.front_game() or "")
+        running = bool(gate.game_running())
+        return {"front": bool(name) or (gate.scope == "running" and running), "name": name, "running": running,
+                "source": "gate"}
+    front = None
+    if fallback is not None:
+        try:
+            front = bool(fallback())
+        except Exception:  # noqa: BLE001 - unknown, never raised into a reader
+            front = None
+    return {"front": front, "name": None, "running": True, "source": "fallback" if fallback is not None else "none"}
+
+
+def day_began(clips: Sequence[Any], config: Any, *, since: float,
+              sessions: Sequence[Any] | None = None) -> tuple[float, float] | None:
+    """``(start, gap)``: when the user's day at the PC began - the latest settled stretch after a break of at least
+    ``max(DAY_BREAK_S, resume_after_h)`` (their night) - and how long that break was; None when there is none
+    (checkins.day_began's rule, pure: clipped timeline rows in, the window's start ``since``). ``sessions``: the
+    rows' ``presence_sessions`` already computed."""
+    if sessions is None:
+        sessions = presence_sessions(clips, config)
+    settled = [s for s in sessions if s.settled]
+    need = max(DAY_BREAK_S, float(getattr(config, "resume_after_h", 3.0)) * 3600.0)
+    found = None
+    for i, s in enumerate(settled):
+        gap = s.start - (settled[i - 1].end if i else since)
+        if gap >= need:
+            found = (s.start, gap)
+    return found
+
+
+def day_began_from(store: Any, now: float, config: Any) -> tuple[float, float] | None:
+    """:func:`day_began` over the store's content-free rows of the last 36 h (Yuki's own left out); None on a read
+    failure (for the history readers: ``checkins.day_began``, ``api.day_context``, ``journal.user_day_line``)."""
+    since = now - 36 * 3600.0
+    try:
+        clips = _clip([r for r in store.timeline_states(since, now) if not r.by_yuki], since, now)
+    except Exception:  # noqa: BLE001
+        return None
+    return day_began(clips, config, since=since)
+
+
+def focus_holds(focus: Any, now: float) -> list[str]:
+    """The hold names the focus facts give at ``now`` (the policy maps them to its classes): ``game`` /
+    ``game_unknown``, ``return_hold``, ``fullscreen`` / ``fullscreen_unknown``, ``call`` / ``call_unknown``,
+    ``meeting_audio`` / ``meeting_audio_unknown``, ``meeting``, ``yuki_acting``."""
+    if not focus:
+        return ["focus_unknown"]
+    out: list[str] = []
+    game = focus.get("game") or {}
+    if game.get("front") is None:
+        out.append("game_unknown")
+    elif game.get("front"):
+        out.append("game")
+    until = game.get("return_hold_until")
+    if until is not None and now < until:
+        out.append("return_hold")
+    full = focus.get("fullscreen")
+    if full is None:
+        out.append("fullscreen_unknown")
+    elif full:
+        out.append("fullscreen")
+    call = focus.get("call") or {}
+    if call.get("open") is None:
+        out.append("call_unknown")
+    elif call.get("open") and call.get("kind") == "call":
+        out.append("call")
+    meeting = focus.get("meeting") or {}
+    if meeting.get("audio_held") is None:
+        out.append("meeting_audio_unknown")
+    elif meeting.get("audio_held"):
+        out.append("meeting_audio")
+    front_until = meeting.get("front_until")
+    if meeting.get("front") or (front_until is not None and now < front_until):
+        out.append("meeting")
+    if focus.get("yuki_acting"):
+        out.append("yuki_acting")
+    return out
+
+
+def holds_now(you: Any, now: float) -> list[str]:
+    """Every hold true at ``now``, re-derived from the record's facts and timestamps (staleness checked here):
+    ``["unknown"]`` when there is no record or its last beat is older than :data:`STALE_S`. Besides
+    :func:`focus_holds`: ``locked``, ``presence_unknown`` (memory paused or the timeline not running), ``away`` (no
+    presence for ``presence_min``, as observe), ``settling`` (back, not yet ``break_min`` of presence), and
+    ``card_showing`` (a card the UI shows, within the card gap)."""
+    if not you:
+        return ["unknown"]
+    try:
+        if now - float(you["beat_at"]) > STALE_S:
+            return ["unknown"]
+    except (KeyError, TypeError, ValueError):
+        return ["unknown"]
+    out = focus_holds(you.get("focus"), now)
+    pres = you.get("presence") or {}
+    state = pres.get("state")
+    if state == "locked":
+        out.append("locked")
+    elif state not in ("present", "away"):
+        out.append("presence_unknown")
+    else:
+        away_at = pres.get("away_at")
+        if state != "present" and (away_at is None or now >= away_at):
+            out.append("away")
+        elif pres.get("settled_at") is None or now < pres["settled_at"]:
+            out.append("settling")
+    showing = (you.get("cards") or {}).get("showing")
+    if showing and now < float(showing.get("until") or 0.0):
+        out.append("card_showing")
+    return out
+
+
+def presence_now(you: Any, now: float) -> dict[str, Any]:
+    """Durations computed at read time from the record's instants: ``present``, ``away`` (as :func:`holds_now`),
+    ``settled``, ``at_pc_s`` (None while away), ``idle_s`` (None while present), ``today_s``."""
+    pres = (you or {}).get("presence") or {}
+    state = pres.get("state")
+    present = state == "present"
+    away_at = pres.get("away_at")
+    away = not present and (away_at is None or now >= away_at)
+    since = pres.get("at_pc_since")
+    settled_at = pres.get("settled_at")
+    today = pres.get("today_at_pc") or {}
+    live = today.get("since")
+    return {"present": present, "away": away,
+            "settled": bool(not away and settled_at is not None and now >= settled_at),
+            "at_pc_s": round(now - since, 1) if since is not None and not away else None,
+            "idle_s": round(now - pres["idle_since"], 1) if not present and pres.get("idle_since") else None,
+            "today_s": round(float(today.get("base_s") or 0.0) + (now - live if live is not None else 0.0), 1)}
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, (dict, MappingProxyType)):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def thaw(value: Any) -> Any:
+    """A frozen record (or part) as plain dicts and lists (JSON)."""
+    if isinstance(value, (dict, MappingProxyType)):
+        return {k: thaw(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [thaw(v) for v in value]
+    return value
+
+
+def _size(value: Any) -> int:
+    return len(json.dumps(thaw(value), ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+
+
+def _text(value: Any, cap: int) -> str | None:
+    """Whitespace squashed and clipped (None for nothing)."""
+    s = " ".join(str(value or "").split())
+    if not s:
+        return None
+    return s if len(s) <= cap else s[:cap - 1].rstrip() + "…"
+
+
+def _r(value: float | None, nd: int = 1) -> float | None:
+    return None if value is None else round(float(value), nd)
+
+
+def _num(value: Any) -> float | int | None:
+    """A number the judge published (anything else: None)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if isinstance(value, int) else round(float(value), 1)
+
+
+#: Which lists give way first when a section is over its cap (index 0: the oldest; -1: the last).
+_CLIP_ORDER: dict[str, tuple[tuple[tuple[str, ...], int], ...]] = {
+    "presence": ((("days",), 0),),
+    "changed": (((), 0),),
+    "work": ((("plans",), -1), (("threads",), -1), (("goals",), -1), (("due",), -1)),
+    "about": ((("careful",), -1),),
+    "cards": ((("modes",), -1), (("today",), -1), (("reactions",), -1)),
+    "usual": ((("today",), -1), (("now",), -1)),
+    "prefs": ((("usuals",), -1),),
+}
+
+
+def _clip_section(name: str, value: Any, cap: int) -> tuple[Any, int]:
+    """Drop list items (or dict entries) in :data:`_CLIP_ORDER` until the section fits ``cap`` bytes; then shorten its
+    longest texts. Returns the section and how many things gave way (the builder logs ``you_clipped``)."""
+    n = 0
+    if _size(value) <= cap:
+        return value, 0
+    for path, index in _CLIP_ORDER.get(name, ()):
+        while _size(value) > cap:
+            target = value
+            for key in path:
+                target = target.get(key) if isinstance(target, dict) else None
+            if isinstance(target, list) and target:
+                target.pop(index)
+            elif isinstance(target, dict) and target:
+                target.pop(list(target)[index])
+            else:
+                break
+            n += 1
+    while _size(value) > cap:   # still over: the longest text in the section loses half
+        best: tuple[int, Any, Any] | None = None
+        stack = [value]
+        while stack:
+            node = stack.pop()
+            items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+            for k, v in items:
+                if isinstance(v, str) and (best is None or len(v) > best[0]):
+                    best = (len(v), node, k)
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        if best is None or best[0] < 8:
+            break
+        best[1][best[2]] = best[1][best[2]][: best[0] // 2] + "…"
+        n += 1
+    return value, n
+
+
+class _LiveRow:
+    """The open present stretch the timeline has not flushed yet (it writes every 30 s)."""
+
+    state = "present"
+    by_yuki = False
+    fullscreen = False
+    meeting = None
+    process = None
+
+
+@dataclass
+class _LiveClip:
+    start: float
+    end: float
+    row: Any = _LiveRow()
+
+    @property
+    def present_s(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass(frozen=True)
+class _Row:
+    """The content-free columns of one recent timeline row (what focus reads)."""
+
+    started_at: float
+    ended_at: float
+    state: str
+    process: str | None
+    host: str | None
+    fullscreen: bool
+    meeting: str | None
+    by_yuki: bool
+
+
+#: The last minutes of the timeline by the ``ended_at`` index (``ORDER BY started_at + 0`` keeps the planner off the
+#: ``started_at`` index, which would walk the whole table: ~9 ms against ~0.1 ms on 12k rows).
+_RECENT_SQL = ("SELECT started_at, ended_at, state, process, host, fullscreen, meeting, by_yuki FROM timeline"
+               " WHERE ended_at > ? AND started_at < ? ORDER BY started_at + 0, id")
+
+
+def recent_rows(store: Any, since: float, until: float) -> list[_Row]:
+    """The timeline's rows that end after ``since`` (content-free; nothing decrypted). Read raw, without
+    ``Store._apply_proof``: the proof only re-reads rows written before the live call-evidence gate (migration 27),
+    and rows of the last minutes were all judged live, so for them it changes nothing."""
+    return [_Row(float(r[0]), float(r[1]), str(r[2] or ""), r[3], r[4], bool(r[5]), r[6], bool(r[7]))
+            for r in store._query(_RECENT_SQL, (since, until))]
+
+
+def meeting_audio(process: str, render_fn: Callable[[], Any] | None = None) -> bool | None:
+    """Whether the meeting's app (an app key) has an active audio render session now: ``NudgeWorker._meeting_held``'s
+    read (session state only, ~7 ms). None when it could not be read."""
+    if not process:
+        return False
+    try:
+        sessions = render_fn() if render_fn is not None else None
+        if sessions is None:
+            from yuki.perception.audio import render_sessions
+
+            sessions = render_sessions()
+        import psutil
+
+        for sess in sessions or []:
+            if sess.get("state") != "active" or not sess.get("pid"):
+                continue
+            try:
+                name = psutil.Process(int(sess["pid"])).name()
+            except Exception:  # noqa: BLE001 - the process is gone
+                continue
+            if app_key(name) == process:
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ---------------------------------------------------------------------------
+# The builder
+# ---------------------------------------------------------------------------
+
+
+class YouBuilder:
+    """Builds and publishes the record on the memory service's beat (no thread of its own).
+
+    Args:
+        store: the service's store (read only: existing readers and ``store._query``; nothing is written).
+        privacy: the service's ``PrivacyConfig`` (``[you]`` and ``[nudges]`` are read from it).
+        log: ``log(type, **fields)``, content-free.
+        timeline_fn / gate_fn: the timeline recorder and the game gate, read late (either may be None or die).
+        board: the Now board (only its ``version`` is read). hub: the moments hub (its counters are read).
+        acting_now: whether Yuki was acting when this was built (the follower tells changes after that).
+        live: False for the offline CLI: no audio read, no live timeline (its flags come from the newest row).
+    """
+
+    def __init__(
+        self, store: Any, *, privacy: Any = None, log: Callable[..., Any] | None = None, db_path: Any = None,
+        timeline_fn: Callable[[], Any] | None = None, gate_fn: Callable[[], Any] | None = None, board: Any = None,
+        hub: Any = None, acting_now: bool = False, live: bool = True, render_fn: Callable[[], Any] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.store = store
+        self.db_path = db_path
+        self._log_fn = log
+        self._clock = clock
+        self._live = bool(live)
+        self._timeline_fn = timeline_fn or (lambda: None)
+        self._gate_fn = gate_fn or (lambda: None)
+        self._board = board
+        self._hub = hub
+        self._render_fn = render_fn
+        self._you_cfg = PrivacySection(privacy, "you", YouConfig.from_dict)
+        self._nudge_cfg = PrivacySection(privacy, "nudges", NudgeConfig.from_dict)
+        #: Set for the card judge on hold changes, breakpoints, reactions and its deadline (never on work/about).
+        self.wake = threading.Event()
+        self.last_wake: tuple[float, tuple[str, ...]] | None = None
+        self._lock = threading.Lock()                 # guards what the change hooks set from other threads
+        self._dirty: set[str] = set(SECTIONS)
+        self._acting = bool(acting_now)
+        self._front: tuple[str, float] | None = None  # (app key, since) of the user's own front app
+        self._judge: dict[str, Any] = {}
+        # beat state (the service loop's thread only)
+        self._round: set[str] = set()
+        self._breaks: list[str] = []
+        self._sections: dict[str, Any] = {s: MappingProxyType({}) for s in SECTIONS}
+        self._plain: dict[str, Any] = {}
+        self._built: dict[str, Any] = {}
+        self._built_frozen: Any = MappingProxyType({})
+        self._version = 0
+        self._you: Any = None
+        self._on = True
+        self._flags: dict[str, Any] | None = None
+        self._flip_at: float | None = None            # when the timeline's flags turned present
+        self._fullscreen_end: float | None = None
+        self._meeting_live_end: float | None = None
+        self._game_left_at: float | None = None
+        self._game_was: tuple[bool | None, str | None] = (None, None)
+        self._gate_alive: bool | None = None
+        self._fallback = False
+        self._source: str | None = None
+        self._audio_until: float | None = None
+        self._audio_process = ""
+        self._audio_at: float | None = None
+        self._audio_held: bool | None = False
+        self._call_was: tuple[bool, str | None] = (False, None)
+        self._call_unknown_since: float | None = None
+        self._sit_watch: float | None = None          # the stretch seen unsettled (its start)
+        self._sit_pending: float | None = None        # its projected settled_at
+        self._switch_told: float | None = None
+        self._switch_key: str | None = None
+        self._session_checked: float | None = None
+        self._next_day_at: float | None = None
+        self._days_for: str | None = None
+        self._days: list[dict[str, Any]] = []
+        self._synth: deque[dict[str, Any]] = deque(maxlen=64)
+        self._message_seen: float | None = None
+        self._hub_seen: tuple | None = None
+        self._db_at = float("-inf")
+        self._db_sig: tuple | None = None
+        self._probe_seen: dict[str, Any] = {}
+        self._reacted_seen: Any = ...           # max(reacted_at) last seen (... before the first probe)
+        self._deadline_told: float | None = None
+        self._holds: frozenset[str] | None = None
+        # counters (content-free)
+        self.beats = 0
+        self.errors = 0
+        self.db_checks = 0
+        self.probes = 0
+        self.unchanged = 0
+        self.builds: Counter = Counter()
+        self.wakes: Counter = Counter()
+        self.clipped: Counter = Counter()
+        self._clipped_last: dict[str, int] = {}
+        self._beat_ms: deque[float] = deque(maxlen=BEAT_SAMPLES)
+
+    # -- plumbing -----------------------------------------------------------------
+
+    def _log(self, type: str, **fields: Any) -> None:
+        if self._log_fn is not None:
+            try:
+                self._log_fn(type, **fields)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _mark(self, *sections: str) -> None:
+        with self._lock:
+            self._dirty.update(sections)
+
+    def snapshot(self) -> Any:
+        """The current record (immutable; ``None`` while ``[you] enabled = false``). Readers check ``beat_at``."""
+        return self._you
+
+    # -- change hooks (any thread; cheap; never raise) ------------------------------
+
+    def on_gate_change(self, decision: Any = None) -> None:
+        """``GameGate.on_change``: the game in front, D3D full screen or the running set changed."""
+        self._mark("focus")
+
+    def on_call_change(self, source: str = "calls") -> None:
+        """The call worker's change hook (a call or game voice chat detected or ended)."""
+        self._mark("focus")
+
+    def on_acting(self, acting: bool) -> None:
+        """The acting follower's event: Yuki started or stopped acting for the user."""
+        self._acting = bool(acting)
+        self._mark("focus")
+
+    def on_front(self, prev_key: str, new_key: str, *, at: float | None = None, by_yuki: bool = False,
+                 **_facts: Any) -> None:
+        """``MomentHub.subscribe_front``: another app came to the front (app keys only; Yuki's own fronts ignored)."""
+        if by_yuki:
+            return
+        key = str(new_key or "")
+        try:
+            at = float(at) if at else float(self._clock())
+        except (TypeError, ValueError):
+            at = float(self._clock())
+        with self._lock:
+            if self._front is None or self._front[0] != key:
+                self._front = (key, at)
+            if self._fallback:   # a dead gate: the open stretch's program decides the game
+                self._dirty.add("focus")
+
+    def on_media(self, started: Sequence[Any], stopped: Sequence[Any], **_facts: Any) -> None:
+        """``MomentHub.subscribe_media``: a media session started or stopped (titles are never read here)."""
+        self._mark("changed")
+
+    def judge_facts(self, **facts: Any) -> None:
+        """The judge's own facts for ``cards`` (``modes``, ``digest_queued``, ``next_wake``, ``budget_left``), kept in
+        RAM only (never a database write, so they never mark a section through the probe)."""
+        with self._lock:
+            for k in JUDGE_FACTS:
+                if k in facts:
+                    self._judge[k] = facts[k]
+            self._dirty.add("cards")
+
+    # -- the beat -------------------------------------------------------------------
+
+    def beat(self, now: float | None = None) -> None:
+        """Called from the service's 1 s loop (after ``moments.beat()``). Compares RAM values, rebuilds the sections
+        whose inputs moved, publishes the record and wakes the judge on its events. Never raises."""
+        t0 = time.perf_counter()
+        try:
+            self._beat(float(self._clock()) if now is None else float(now))
+        except Exception as exc:  # noqa: BLE001 - the service loop must never stop here
+            self.errors += 1
+            self._log("error", where="younow.beat", error=type(exc).__name__)
+        finally:
+            self.beats += 1
+            self._beat_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    def _beat(self, now: float) -> None:
+        if not self._you_cfg.get().enabled:
+            if self._on:
+                self._on = False
+                self._you = None
+                self._log("you_off", enabled=False)
+            return
+        if not self._on:
+            self._on = True
+            self._mark(*SECTIONS)
+            self._log("you_off", enabled=True)
+        cfg = self._nudge_cfg.get()
+        with self._lock:
+            self._round, self._dirty = self._dirty, set()
+            front = self._front
+        self._breaks = []
+        self._watch_flags(now)
+        self._watch_gate()
+        self._watch_audio(now)
+        self._watch_time(now, cfg, front)
+        self._watch_hub()
+        if now - self._db_at >= DB_EVERY_S:
+            self._db_at = now
+            self._watch_db(now)
+        nw = self._judge.get("next_wake")
+        if isinstance(nw, (int, float)) and now >= nw and self._deadline_told != nw:
+            self._deadline_told = float(nw)
+            self._breaks.append("deadline")
+        for name in SECTIONS:
+            if name in self._round:
+                self._rebuild(name, now, cfg)
+        self._publish(now)
+        holds = frozenset(holds_now(self._you, now))
+        if holds != self._holds:
+            self._holds = holds
+            self._breaks.append("holds")
+        if self._breaks:
+            for b in self._breaks:
+                self.wakes[b] += 1
+            self.last_wake = (now, tuple(self._breaks))
+            self.wake.set()
+
+    def _watch_flags(self, now: float) -> None:
+        """The timeline's live flags (one attribute read): a change marks focus; a state change marks presence."""
+        flags = self._read_flags(now)
+        old = self._flags
+        if flags is not None and flags.get("state") is None and not flags.get("blocked"):
+            # no open stretch (the desktop or a shell window in front): the user's state carries over, nothing full
+            # screen and no meeting in front (as live_state() read it)
+            was = old.get("state") if old is not None else self._flags_from_rows(now).get("state")
+            flags = {**flags, "state": was, "fullscreen": False, "meeting": False}
+        if flags == old:
+            return
+        self._flags = flags
+        self._round.add("focus")
+        old = old or {}
+        if old.get("state") != flags.get("state") or old.get("blocked") != flags.get("blocked"):
+            self._round.add("presence")
+            if flags.get("state") == "present" and not flags.get("blocked"):
+                self._flip_at = now
+        if old.get("meeting") and not flags.get("meeting"):
+            self._meeting_live_end = now
+        if old.get("fullscreen") and not flags.get("fullscreen"):
+            self._fullscreen_end = now
+
+    def _read_flags(self, now: float) -> dict[str, Any] | None:
+        if not self._live:
+            return self._flags if self._flags is not None else self._flags_from_rows(now)
+        tl = self._timeline_fn()
+        if tl is None or not getattr(tl, "alive", False):
+            return None
+        try:
+            return dict(tl.flags())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _flags_from_rows(self, now: float) -> dict[str, Any]:
+        """The newest stored row stands for the open stretch when it is still going (offline, the CLI; and the state at
+        start when no window is open); nothing going: away (nothing in front of the user is being recorded), so the
+        stored presence decides "away" after ``presence_min``, as observe did."""
+        try:
+            rows = recent_rows(self.store, now - ONGOING_S, now)
+        except Exception:  # noqa: BLE001
+            rows = []
+        last = rows[-1] if rows else None
+        if last is None or last.ended_at < now - ONGOING_S or last.state not in ("present", "away"):
+            return {"state": "away", "blocked": None, "fullscreen": False, "meeting": False}
+        return {"state": last.state, "blocked": None, "fullscreen": bool(last.fullscreen),
+                "meeting": bool(last.meeting)}
+
+    def _watch_gate(self) -> None:
+        gate = self._gate_fn()
+        alive = bool(gate is not None and getattr(gate, "alive", False))
+        if alive != self._gate_alive:
+            self._gate_alive = alive
+            self._round.add("focus")
+
+    def _watch_audio(self, now: float) -> None:
+        """The meeting's audio, only while a meeting row is within ``meeting_hold_min`` (at most every 15 s)."""
+        if not self._live or self._audio_until is None or now >= self._audio_until:
+            return
+        if self._audio_at is not None and now - self._audio_at < MEETING_AUDIO_EVERY_S:
+            return
+        self._audio_at = now
+        held = meeting_audio(self._audio_process, self._render_fn)
+        if held != self._audio_held:
+            self._audio_held = held
+            self._round.add("focus")
+
+    def _watch_time(self, now: float, cfg: NudgeConfig, front: tuple[str, float] | None) -> None:
+        """Instants reached (timestamp compares): a day boundary, the stretch's projected settle, a front app held
+        long enough for a ``switch`` or for a new session."""
+        if self._next_day_at is not None and now >= self._next_day_at:
+            self._round.update(("presence", "cards"))
+        if self._sit_pending is not None and now >= self._sit_pending:
+            self._sit_pending = None
+            self._round.add("presence")
+        if front is None:
+            return
+        key, since = front
+        if self._switch_told != since and now - since >= SWITCH_HELD_S:
+            self._switch_told = since
+            if key != self._switch_key:
+                self._switch_key = key
+                self._add_synth("switch", since, app=key or None)
+        if self._session_checked != since and now - since >= cfg.session_excursion_min * 60.0:
+            self._session_checked = since
+            session = (self._plain.get("presence") or {}).get("session") or {}
+            if key and session.get("key") != f"app:{key}":
+                self._round.add("presence")
+
+    def _watch_hub(self) -> None:
+        hub = self._hub
+        if hub is None:
+            return
+        try:
+            sig = (int(hub.writer.written), sum(v for k, v in dict(hub.by_kind).items() if k != "page"))
+        except Exception:  # noqa: BLE001
+            return
+        if sig != self._hub_seen:
+            self._hub_seen = sig
+            self._round.add("changed")
+
+    def _watch_db(self, now: float) -> None:
+        """``total_changes()`` + ``data_version`` (one query); when either moved, one probe query names the sections
+        whose source tables changed. The judge's ``nudge_state`` keys are never probed."""
+        try:
+            row = self.store._query("SELECT total_changes(), (SELECT data_version FROM pragma_data_version())")
+            sig = tuple(row[0]) if row else None
+        except Exception:  # noqa: BLE001
+            self.errors += 1
+            return
+        self.db_checks += 1
+        if sig == self._db_sig:
+            return
+        self._db_sig = sig
+        self.probes += 1
+        try:
+            p = tuple(self.store._query(_PROBE_SQL)[0])
+        except Exception as exc:  # noqa: BLE001 - an older database: rebuild them all, at most once a minute, said once
+            failed = self._probe_seen.get("error")
+            if failed is None:
+                self._log("error", where="younow.probe", error=type(exc).__name__)
+            if failed is None or now - failed >= 60.0:
+                self._probe_seen["error"] = now
+                self._round.update(DB_SECTIONS)
+            self._db_sig = None   # asked again at the next check
+            return
+        probes = {"focus": p[0], "work": p[1:8], "cards": p[8:10], "about": p[10]}
+        for section, value in probes.items():
+            if self._probe_seen.get(section, ...) != value:
+                self._probe_seen[section] = value
+                self._round.add(section)
+        if p[9] != self._reacted_seen:
+            if self._reacted_seen is not ...:
+                self._breaks.append("reaction")
+            self._reacted_seen = p[9]
+
+    def _add_synth(self, kind: str, at: float, *, app: str | None = None) -> None:
+        """A transition this module saw itself: kept for ``changed`` and a breakpoint for the judge."""
+        self._synth.append({"kind": kind, "synth": True, "at": _r(at, 0), "app": app, "entity": None, "by": "user"})
+        self._round.add("changed")
+        self._breaks.append(kind)
+
+    # -- rebuilding -------------------------------------------------------------------
+
+    def _rebuild(self, name: str, now: float, cfg: NudgeConfig) -> None:
+        t0 = time.perf_counter()
+        known = True
+        try:
+            value = getattr(self, f"_build_{name}")(now, cfg)
+            if isinstance(value, tuple):
+                value, known = value
+        except Exception as exc:  # noqa: BLE001 - the section keeps its last value, marked not known
+            self.errors += 1
+            self._log("error", where=f"younow.{name}", error=type(exc).__name__)
+            value, known = None, False
+        ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        self.builds[name] += 1
+        if value is not None:
+            value, n = _clip_section(name, value, SECTION_CAPS.get(name, RECORD_CAP))
+            if n:
+                self.clipped[name] += n
+            if n != self._clipped_last.get(name, 0):   # said when it starts, changes or stops, not on every rebuild
+                self._clipped_last[name] = n
+                self._log("you_clipped", section=name, n=n)
+            if value != self._plain.get(name):
+                self._version += 1
+                self._plain[name] = value
+                self._sections[name] = _freeze(value)
+                v = self._version
+                self._log("you_built", section=name, version=v, ms=ms, bytes=_size(value))
+            else:
+                self.unchanged += 1
+                v = (self._built.get(name) or {}).get("v", self._version)
+        else:
+            v = (self._built.get(name) or {}).get("v", 0)
+        self._built[name] = {"at": _r(now), "v": v, "ms": ms, "known": bool(known and value is not None)}
+        self._built_frozen = _freeze(self._built)
+
+    def _publish(self, now: float) -> None:
+        """A new top-level mapping each beat (``beat_at``, the board's version), the sections by reference."""
+        board = self._board
+        you = {"v": SCHEMA_V, "version": self._version, "beat_at": _r(now, 3),
+               "board_version": getattr(board, "version", None) if board is not None else None,
+               "built": self._built_frozen, **self._sections}
+        self._you = MappingProxyType(you)
+
+    # -- focus --------------------------------------------------------------------------
+
+    def _build_focus(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        hold_s = cfg.meeting_hold_min * 60.0
+        window = max(hold_s, MEETING_GAP_S, cfg.return_hold_s) + 60.0
+        rows = recent_rows(self.store, now - window, now)   # every row: Yuki's own count for the return hold
+        last = rows[-1] if rows else None
+        ongoing = last is not None and last.ended_at >= now - ONGOING_S
+        with self._lock:
+            front_key = self._front[0] if self._front is not None else None
+
+        def fallback() -> bool:   # a dead gate: the program in front (the hub's front event, else the newest row)
+            return bool(_game_process(front_key)) if front_key else bool(ongoing and game_row(last))
+
+        game = focus_game(self._gate_fn(), fallback=fallback)
+        self._fallback = game["source"] != "gate"
+        if game["source"] != self._source:
+            if self._source is not None:
+                self._log("you_source", part="game", source=game["source"], was=self._source)
+            self._source = game["source"]
+        was_front, was_name = self._game_was
+        if was_front and game["front"] is False:
+            self._game_left_at = now
+            self._add_synth("game_end", now, app=was_name or None)
+        self._game_was = (game["front"], game["name"] or was_name if game["front"] else None)
+        # the return hold: a full-screen or game stretch that ended less than return_hold_s ago (observe), or the
+        # moment the gate / the timeline saw it end (the row may be up to a flush behind)
+        ends = [r.ended_at for r in rows if (r.fullscreen or game_row(r)) and r.ended_at >= now - cfg.return_hold_s]
+        ends += [x for x in (self._game_left_at, self._fullscreen_end) if x is not None]
+        until = max(ends) + cfg.return_hold_s if ends else None
+        game["return_hold_until"] = _r(until) if until is not None and until > now else None
+        flags = self._flags
+        if flags is not None and flags.get("fullscreen") is not None:
+            fullscreen: bool | None = bool(flags["fullscreen"])   # the open stretch; one that just ended: return hold
+        elif self._live:
+            fullscreen = None   # no live timeline: not known (a hold)
+        else:
+            fullscreen = bool(ongoing and last.fullscreen) if rows else None
+        meeting = self._meeting(now, rows, flags, hold_s)
+        call, call_known = self._call(now)
+        focus = {"game": game, "fullscreen": fullscreen, "meeting": meeting, "call": call,
+                 "call_unknown_since": _r(self._call_unknown_since), "yuki_acting": self._acting}
+        focus["holds"] = focus_holds(focus, now)
+        return focus, bool(call_known and (game["front"] is not None) and fullscreen is not None)
+
+    def _meeting(self, now: float, rows: Sequence[Any], flags: dict[str, Any] | None, hold_s: float) -> dict[str, Any]:
+        live = bool(flags and flags.get("meeting"))
+        meets = [r for r in rows if r.meeting and not r.by_yuki]
+        ends = [max(r.ended_at for r in meets)] if meets else []
+        if live:
+            ends.append(now)
+        if self._meeting_live_end is not None:
+            ends.append(self._meeting_live_end)
+        end = max(ends) if ends else None
+        front_until = end + MEETING_GAP_S if end is not None and not live else None
+        if end is not None and now - end < hold_s:
+            recent = [r for r in meets if r.ended_at >= now - hold_s]
+            latest = max(recent, key=lambda r: r.started_at) if recent else None
+            process = app_key(latest.process or "") if latest is not None else ""
+            if process != self._audio_process or self._audio_until is None:
+                self._audio_at = None
+            self._audio_process, self._audio_until = process, end + hold_s
+            if self._live and process and (self._audio_at is None or now - self._audio_at >= MEETING_AUDIO_EVERY_S):
+                self._audio_at = now
+                self._audio_held = meeting_audio(process, self._render_fn)
+            held = (self._audio_held if self._live else None) if process else False
+        else:
+            self._audio_until, self._audio_process, self._audio_held, self._audio_at = None, "", False, None
+            held = False
+        return {"front": live or (front_until is not None and now < front_until), "audio_held": held,
+                "front_until": _r(front_until) if front_until is not None and front_until > now else None}
+
+    def _call(self, now: float) -> tuple[dict[str, Any], bool]:
+        try:
+            calls = list(self.store.calls(statuses=CALL_OPEN_STATUSES))
+        except Exception:  # noqa: BLE001 - unreadable: unknown (the policy fails closed on it)
+            if self._call_unknown_since is None:
+                self._call_unknown_since = now
+                self._log("focus_unknown", source="call", state="start")
+            return {"open": None, "kind": None, "since": None}, False
+        if self._call_unknown_since is not None:
+            self._log("focus_unknown", source="call", state="end", duration_s=round(now - self._call_unknown_since, 1))
+            self._call_unknown_since = None
+        call = next((c for c in calls if getattr(c, "kind", "call") != "game"), None)
+        voice = next((c for c in calls if getattr(c, "kind", "call") == "game"), None)
+        chosen = call or voice
+        was_open, was_app = self._call_was
+        if was_open and call is None:
+            self._add_synth("call_end", now, app=was_app)
+        self._call_was = (call is not None, (getattr(call, "process", None) or None) if call is not None else None)
+        return {"open": chosen is not None, "kind": ("call" if call is not None else "game") if chosen else None,
+                "since": _r(getattr(chosen, "detected_at", None)) if chosen is not None else None}, True
+
+    # -- presence -----------------------------------------------------------------------
+
+    def _build_presence(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        flags = self._flags
+        if flags is None or flags.get("blocked") == "paused":
+            state = "off"
+        elif flags.get("blocked") == "locked":
+            state = "locked"
+        elif flags.get("state") in ("present", "away"):
+            state = flags["state"]
+        else:
+            state = "off"
+        since = now - RESUME_SEARCH_S
+        rows = wide_rows(self.store, now)
+        clips: list[Any] = _clip(rows, since, now)
+        tail_start = None
+        if state == "present" and not self._acting:
+            last_end = max((c.end for c in clips), default=None)
+            marks = [x for x in (last_end, self._flip_at) if x is not None]
+            tail_start = max(marks) if marks else now
+            if tail_start < now:
+                clips.append(_LiveClip(tail_start, now))
+        sessions = presence_sessions(clips, cfg)
+        stretch = sessions[-1] if sessions else None
+        brk = cfg.break_min * 60.0
+        at_pc_since = settled_at = idle_since = None
+        last_break = None
+        if stretch is not None:
+            at_pc_since = stretch.start
+            settled_at = self._settled_at(clips, stretch, brk, now, live=tail_start is not None)
+            prev = sessions[-2] if len(sessions) >= 2 else None
+            b = _break_between(clips, prev.end if prev is not None else since, stretch.start)
+            last_break = {"kind": b["kind"], "s": b["seconds"], "reaches_back": prev is None}
+            if tail_start is None:
+                idle_since = stretch.end
+        began = day_began(clips, cfg, since=since, sessions=sessions)
+        # time at the PC today: the stored part, plus the live part since tail_start
+        day_start = cfg.resume_day_start
+        today = user_day(now, day_start)
+        start_of_day = day_boundary(today, day_start)
+        base_s = sum(c.present_s for c in _clip(rows, start_of_day, now) if c.row.state == "present")
+        self._next_day_at = start_of_day + 86400.0
+        if self._days_for != today:
+            self._days_for = today
+            self._days = [{"day": d.day, "at_pc_s": round(d.present_s, 1), "end": _r(d.last)}
+                          for d in day_totals(self.store, now, DAYS_KEPT + 1, cfg) if d.day != today][-DAYS_KEPT:]
+        session = self._session(rows, now, cfg)
+        # the judge's sit_down: a stretch seen unsettled that has now settled (never one already settled at start)
+        if stretch is not None and (settled_at is None or settled_at > now):
+            self._sit_watch = stretch.start
+            self._sit_pending = settled_at if tail_start is not None else None
+        elif stretch is not None and self._sit_watch is not None and abs(self._sit_watch - stretch.start) < 60.0:
+            self._sit_watch = self._sit_pending = None
+            self._add_synth("sit_down", settled_at, app=None)
+        else:
+            self._sit_watch = self._sit_pending = None
+        if self._switch_key is None and session is not None:
+            self._switch_key = str(session["key"]).partition(":")[2] or None
+        presence = {
+            "state": state, "idle_since": _r(idle_since),
+            "away_at": _r(idle_since + cfg.presence_min * 60.0) if idle_since is not None else None,
+            "at_pc_since": _r(at_pc_since), "settled_at": _r(settled_at), "last_break": last_break,
+            "day_began": _r(began[0]) if began else None, "day_gap_s": _r(began[1]) if began else None,
+            "today_at_pc": {"base_s": round(base_s, 1), "since": _r(tail_start)},
+            "days": list(self._days), "session": session}
+        return presence, state != "off"
+
+    @staticmethod
+    def _settled_at(clips: Sequence[Any], stretch: Any, need: float, now: float, *, live: bool) -> float | None:
+        """When the stretch held ``break_min`` of presence (interpolated in the clip that crossed it); while present
+        and not there yet, when it will (projected); None when it never settled and they are away."""
+        got = 0.0
+        for c in clips:
+            if c.end <= stretch.start or c.start > stretch.end or c.row.state != "present" or c.row.by_yuki:
+                continue
+            p = c.present_s
+            if p <= 0:
+                continue
+            if got + p >= need:
+                return c.start + (c.end - c.start) * max(0.0, need - got) / p
+            got += p
+        return now + (need - got) if live else None
+
+    def _session(self, rows: Sequence[Any], now: float, cfg: NudgeConfig) -> dict[str, Any] | None:
+        """The current activity session and the one before (``activity_sessions``: app runs, short hops folded in)."""
+        sessions = activity_sessions(rows, now - SESSION_LOOKBACK_S, now, cfg)
+        if not sessions:
+            return None
+        cur = sessions[-1]
+        prev = sessions[-2] if len(sessions) >= 2 else None
+        return {"key": cur.key, "label": _text(cur.label, LABEL_CHARS), "start": _r(cur.start),
+                "prev": None if prev is None else {"key": prev.key, "label": _text(prev.label, LABEL_CHARS),
+                                                   "start": _r(prev.start), "end": _r(prev.end),
+                                                   "present_s": round(prev.present_s, 1)}}
+
+    # -- changed ------------------------------------------------------------------------
+
+    def _build_changed(self, now: float, cfg: NudgeConfig) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        newest_message = None
+        for m in self.store.moments_between(now - CHANGED_S, now + 1.0, kinds=CHANGED_KINDS):
+            if m.get("kind") == "message_sent":
+                newest_message = max(newest_message or 0.0, float(m["at"]))
+            items.append({"kind": m.get("kind"), "synth": False, "at": _r(m.get("at"), 0), "app": m.get("app") or None,
+                          "entity": (m.get("entity_digest") or "")[:ENTITY_CHARS] or None,
+                          "by": m.get("by") or "user"})
+        items += [dict(s) for s in self._synth if s["at"] is not None and s["at"] >= now - CHANGED_S]
+        items.sort(key=lambda x: (x["at"] or 0.0))
+        if newest_message is not None:
+            if self._message_seen is not None and newest_message > self._message_seen:
+                self._breaks.append("message_sent")
+            self._message_seen = max(newest_message, self._message_seen or 0.0)
+        elif self._message_seen is None:
+            self._message_seen = 0.0
+        return items[-CHANGED_MAX:]
+
+    # -- work ---------------------------------------------------------------------------
+
+    def _build_work(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        known = True
+        threads: list[dict[str, Any]] = []
+        thread_now = None
+        try:
+            active = list(self.store.work_threads(("active",), limit=40))
+
+            def rank(t: Any) -> float:   # recency x importance
+                age_h = max(0.0, now - float(t.last_seen or 0.0)) / 3600.0
+                return float(t.importance or 5) / (1.0 + age_h / 24.0)
+
+            def shape(t: Any) -> dict[str, Any]:
+                return {"id": t.id, "title": _text(t.title, TITLE_CHARS), "state": _text(t.shown or t.state, STATE_CHARS),
+                        "next": _text(t.next, STATE_CHARS), "open_n": len(t.open_items or []), "last_at": _r(t.last_seen),
+                        "importance": t.importance}
+
+            if active:
+                thread_now = shape(max(active, key=lambda t: float(t.last_seen or 0.0)))
+            threads = [shape(t) for t in sorted(active, key=rank, reverse=True)[:THREADS_MAX]]
+        except Exception:  # noqa: BLE001
+            known = False
+        goals: list[dict[str, Any]] = []
+        try:
+            for g in self.store.goals(("open", "unknown"), limit=GOALS_MAX):
+                goals.append({"id": g.id, "text": _text(g.text, GOAL_CHARS), "scope": g.scope, "status": g.status,
+                              "thread_id": g.work_thread_id, "due_at": _r(g.due_at),
+                              "next_checkin_at": _r(g.next_checkin_at)})
+        except Exception:  # noqa: BLE001
+            known = False
+        due: list[dict[str, Any]] = []
+        list_n = 0
+        try:
+            items = [i for i in todo_items(self.store, now=now) if i.status == "open"]
+            list_n = len(items)
+            for i in items:
+                if i.due_at is None or not now - OVERDUE_BACK_S <= i.due_at <= now + DUE_AHEAD_S:
+                    continue
+                due.append({"ref": i.ref, "title": _text(i.title, TITLE_CHARS), "due_at": _r(i.due_at),
+                            "all_day": bool(i.all_day), "owner": i.owner, "overdue": i.due_at < now})
+            due = sorted(due, key=lambda d: d["due_at"])[:DUE_MAX]
+        except Exception:  # noqa: BLE001
+            known = False
+        board = {"replies_owed": 0, "waiting_on": 0, "coming_up_n": 0}
+        try:
+            from yuki.memory import workboard
+
+            b = workboard.board(self.store, now, replies=False)
+            board["waiting_on"] = sum(1 for d in (b.get("loops") or {}).values()
+                                      if isinstance(d, dict) and d.get("kind") == "waiting")
+            board["coming_up_n"] = len(b.get("meetings") or [])
+            board["replies_owed"] = sum(1 for it in workboard._items(self.store, "reply").values()
+                                        if isinstance(it.get("data"), dict) and it["data"].get("needs_reply")
+                                        and it.get("mark") != "no_reply")
+        except Exception:  # noqa: BLE001
+            known = False
+        plans: list[dict[str, Any]] = []
+        try:
+            raw = self.store.nudge_state("presence_events")
+            events = json.loads(self.store.cipher.decrypt(raw)) if raw else []
+            for ev in events if isinstance(events, list) else []:
+                at = ev.get("at") if isinstance(ev, dict) else None
+                if not isinstance(at, (int, float)) or ev.get("asked") or not now <= at <= now + PLANS_AHEAD_S:
+                    continue
+                plans.append({"id": ev.get("id"), "at": _r(at), "title": _text(ev.get("what"), TITLE_CHARS)})
+            plans = sorted(plans, key=lambda p: p["at"])[:PLANS_MAX]
+        except Exception:  # noqa: BLE001
+            known = False
+        return {"thread_now": thread_now, "threads": threads, "goals": goals, "due": due, "list_n": list_n,
+                "board": board, "plans": plans}, known
+
+    # -- usual / prefs (yUsual, after phase L) -------------------------------------------------
+
+    def _build_usual(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        return {"now": [], "today": [], "skills": {}}, False
+
+    def _build_prefs(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        return {"usuals": []}, False
+
+    # -- about ----------------------------------------------------------------------------
+
+    def _build_about(self, now: float, cfg: NudgeConfig) -> tuple[dict[str, Any], bool]:
+        portrait = self.store.latest_portrait()
+        brief = portrait.brief if portrait is not None and isinstance(portrait.brief, dict) else None
+        if not brief:
+            return {"brief_at": None, "with_him": None, "routine": None, "careful": [], "people_n": 0}, False
+        careful = [c for c in (_text(x, CAREFUL_CHARS) for x in (brief.get("careful") or [])) if c][:CAREFUL_MAX]
+        return {"brief_at": _r(portrait.at), "with_him": _text(brief.get("with_him"), WITH_HIM_CHARS),
+                "routine": _text(brief.get("routine"), ROUTINE_CHARS), "careful": careful,
+                "people_n": len([p for p in brief.get("people") or [] if isinstance(p, dict)])}, True
+
+    # -- cards ----------------------------------------------------------------------------
+
+    def _build_cards(self, now: float, cfg: NudgeConfig) -> dict[str, Any]:
+        gap = cfg.card_gap_min * 60.0
+        start_of_day = day_boundary(user_day(now, cfg.resume_day_start), cfg.resume_day_start)
+        since = min(start_of_day, now - gap)
+        rows = self.store._query("SELECT id, at, kind, trigger, shown_at, reaction FROM nudges WHERE at >= ? AND at < ?"
+                                 " ORDER BY at, id", (since, now + 1.0))
+        up = [r for r in rows if r["at"] >= now - gap and r["shown_at"] is not None and not r["reaction"]]
+        showing = None
+        if up:   # NudgeWorker._attention's card on screen: shown by the UI, no reaction, written within the card gap
+            n = up[-1]
+            showing = {"id": n["id"], "type": f"{n['kind']}/{n['trigger'] or ''}", "since": _r(n["shown_at"]),
+                       "until": _r(float(n["at"]) + gap)}
+        shown = [r for r in rows if r["shown_at"] is not None and r["shown_at"] >= start_of_day]
+        newest = self.store._query("SELECT max(coalesce(shown_at, at)) FROM nudges")
+        with self._lock:
+            judge = dict(self._judge)
+        modes = judge.get("modes")
+        return {"showing": showing, "last_at": _r(newest[0][0]) if newest and newest[0][0] is not None else None,
+                "today": dict(Counter(f"{r['kind']}/{r['trigger'] or ''}" for r in shown)),
+                "reactions": dict(Counter(r["reaction"] for r in shown if r["reaction"])),
+                "budget_left": _num(judge.get("budget_left")),
+                "modes": {str(k)[:40]: str(v)[:8] for k, v in modes.items()} if isinstance(modes, dict) else {},
+                "digest_queued": _num(judge.get("digest_queued")), "next_wake": _num(judge.get("next_wake"))}
+
+    # -- stats ------------------------------------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        """Content-free counters for the service's stats line: the beat's cost (p50 / p90 / max over the last ~10
+        minutes), builds per section, wakes per reason, database checks and probes, the record's version and size."""
+        ms = sorted(self._beat_ms)
+
+        def pct(p: float) -> float | None:
+            return round(ms[min(len(ms) - 1, int(p * len(ms)))], 3) if ms else None
+
+        you = self._you
+        try:
+            size = _size({k: v for k, v in you.items()}) if you is not None else 0
+        except Exception:  # noqa: BLE001
+            size = 0
+        return {"on": you is not None, "beats": self.beats,
+                "beat_ms": {"p50": pct(0.5), "p90": pct(0.9), "max": pct(1.0)},
+                "builds": dict(self.builds), "unchanged": self.unchanged, "wakes": dict(self.wakes),
+                "db_checks": self.db_checks, "probes": self.probes, "version": self._version, "bytes": size,
+                "clipped": dict(self.clipped), "errors": self.errors,
+                "game_source": self._source, "call_unknown": self._call_unknown_since is not None}
+
+
+# ---------------------------------------------------------------------------
+# Renderers (pure)
+# ---------------------------------------------------------------------------
+
+
+def _hm(at: float | None) -> str:
+    return datetime.fromtimestamp(at).strftime("%H:%M") if at else "?"
+
+
+def _dur(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    m = int(max(0.0, seconds) // 60)
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def _focus_words(you: Any, now: float) -> str:
+    focus = you.get("focus") or {}
+    held = set(holds_now(you, now))
+    words = []
+    game = focus.get("game") or {}
+    if "game" in held:
+        from yuki.memory.gamegate import game_name
+
+        words.append(f"in {game_name(game['name'])}" if game.get("name") else "in a game")
+    elif "return_hold" in held:
+        words.append("just left a game or full screen")
+    if "fullscreen" in held and "game" not in held:
+        words.append("something full screen in front")
+    call = focus.get("call") or {}
+    if "call" in held:
+        words.append(f"on a call since {_hm(call.get('since'))}")
+    elif call.get("open") and call.get("kind") == "game":
+        words.append("a game's voice chat open")
+    if held & {"meeting", "meeting_audio"}:
+        words.append("in a meeting")
+    if "yuki_acting" in held:
+        words.append("Yuki is acting for them")
+    if "unknown" in held:
+        return "not known (the record is stale)"
+    return "; ".join(words) or "nothing holding"
+
+
+def _render_cards(you: Any, now: float) -> list[tuple[int, str]]:
+    """(priority, line): lower priority numbers survive the cap first."""
+    lines: list[tuple[int, str]] = [(0, f"[You now, {_hm(now)}]"), (0, f"Focus: {_focus_words(you, now)}.")]
+    pres = you.get("presence") or {}
+    p = presence_now(you, now)
+    parts = []
+    if p["away"]:
+        parts.append(f"away for {_dur(p['idle_s'])}" if p["idle_s"] is not None else "away")
+    elif pres.get("at_pc_since"):
+        parts.append(f"at the PC since {_hm(pres['at_pc_since'])} ({_dur(p['at_pc_s'])})"
+                     + ("" if p["settled"] else ", just back"))
+    lb = pres.get("last_break")
+    if lb and lb.get("s"):
+        parts.append(f"last break {_dur(lb['s'])} ({lb.get('kind')})")
+    if pres.get("day_began"):
+        parts.append(f"day began {_hm(pres['day_began'])} after {_dur(pres.get('day_gap_s'))} away")
+    parts.append(f"today at the PC {_dur(p['today_s'])}")
+    lines.append((1, "Presence: " + "; ".join(parts) + "."))
+    s = pres.get("session")
+    if s:
+        text = f"Session: {s.get('label') or s.get('key')} since {_hm(s.get('start'))}"
+        if s.get("prev"):
+            pv = s["prev"]
+            text += f"; before: {pv.get('label') or pv.get('key')} {_hm(pv.get('start'))}-{_hm(pv.get('end'))}"
+        lines.append((2, text + "."))
+    work = you.get("work") or {}
+    tn = work.get("thread_now")
+    if tn:
+        lines.append((2, f"Thread now [W{tn['id']}]: {tn.get('title') or ''} - {tn.get('state') or ''}"
+                         + (f"; next: {tn['next']}" if tn.get("next") else "")))
+    for t in work.get("threads") or []:
+        if tn and t["id"] == tn["id"]:
+            continue
+        lines.append((5, f"Thread [W{t['id']}]: {t.get('title') or ''}" + (f"; next: {t['next']}" if t.get("next") else "")))
+    for g in work.get("goals") or []:
+        due = f" (due {datetime.fromtimestamp(g['due_at']):%a %H:%M})" if g.get("due_at") else ""
+        lines.append((3, f"Goal [G{g['id']}] ({g.get('status')}): {g.get('text') or ''}{due}"))
+    for d in work.get("due") or []:
+        when = datetime.fromtimestamp(d["due_at"]).strftime("%a" if d.get("all_day") else "%a %H:%M")
+        lines.append((3, f"Due [{d['ref']}]: {d.get('title') or '(untitled item)'}, {when}"
+                         + (" (overdue)" if d.get("overdue") else "")))
+    b = work.get("board") or {}
+    lines.append((4, f"Their list: {work.get('list_n', 0)} open; replies owed {b.get('replies_owed', 0)}, "
+                     f"waiting on others {b.get('waiting_on', 0)}, coming up {b.get('coming_up_n', 0)}."))
+    for pl in work.get("plans") or []:
+        lines.append((4, f"Plan [event:{pl.get('id')}]: {pl.get('title') or ''}, "
+                         f"{datetime.fromtimestamp(pl['at']):%a %H:%M}"))
+    about = you.get("about") or {}
+    if about.get("with_him"):
+        lines.append((3, f"How to be with them: {about['with_him']}"))
+    if about.get("routine"):
+        lines.append((4, f"Routine: {about['routine']}"))
+    if about.get("careful"):
+        lines.append((4, "Careful (private to them): " + "; ".join(about["careful"])))
+    cards = you.get("cards") or {}
+    today = cards.get("today") or {}
+    if today:
+        reacts = ", ".join(f"{k} {v}" for k, v in (cards.get("reactions") or {}).items())
+        lines.append((4, "Cards today: " + ", ".join(f"{k} {v}" for k, v in today.items())
+                         + (f"; reactions: {reacts}" if reacts else "") + "."))
+    return lines
+
+
+def render(you: Any, kind: str = "cards", *, now: float | None = None) -> str:
+    """The record in words for one reader (content: RAM only, never logged). ``cards``: the card writer's context
+    (focus, presence and session, work, plans, about, today's cards), at most :data:`RENDER_CAPS` characters; lines
+    give way by priority. ``thinker`` and ``talker`` come with yConsumers. ``""`` with no record."""
+    if kind not in RENDER_CAPS:
+        raise ValueError(f"kind must be one of {', '.join(RENDER_CAPS)}, not {kind!r}")
+    if not you:
+        return ""
+    now = time.time() if now is None else float(now)
+    cap = RENDER_CAPS[kind]
+    lines = _render_cards(you, now)
+    order = sorted(range(len(lines)), key=lambda i: (lines[i][0], i))
+    keep: set[int] = set()
+    total = 0
+    for i in order:
+        text = lines[i][1]
+        if total + len(text) + 1 > cap:
+            continue
+        keep.add(i)
+        total += len(text) + 1
+    return "\n".join(lines[i][1] for i in range(len(lines)) if i in keep)[:cap]
+
+
+# ---------------------------------------------------------------------------
+# CLI: python -m yuki.memory.younow --show [--content]
+# ---------------------------------------------------------------------------
+
+#: Strings under these keys are machine words (enums, ids, app keys): shown as they are by ``--show``.
+_WORD_KEYS = frozenset({"state", "kind", "source", "by", "status", "scope", "owner", "type", "key", "ref", "app",
+                        "name"})
+
+
+def content_free(value: Any, now: float, key: str = "") -> Any:
+    """The record with every text replaced by its length (machine words kept) and instants as seconds from ``now``."""
+    if isinstance(value, (dict, MappingProxyType)):
+        return {k: content_free(v, now, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [content_free(v, now, key) for v in value]
+    if isinstance(value, str):
+        return value if key in _WORD_KEYS and len(value) <= 40 else f"<{len(value)} chars>"
+    if isinstance(value, float) and value > 1e9:
+        return f"{value - now:+.0f} s"
+    return value
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m yuki.memory.younow", description=__doc__.split("\n")[0])
+    parser.add_argument("--show", action="store_true", help="build the record once and print it (content-free)")
+    parser.add_argument("--content", action="store_true", help="print it in full (to your own terminal only)")
+    parser.add_argument("--db", default=None, help="database to copy and read (default: Yuki's own, read-only copy)")
+    parser.add_argument("--privacy", default=None, help="privacy file (default: the packaged defaults)")
+    parser.add_argument("--at", default=None, help="'now' for the build: an ISO local time, or 'last' (the newest row)")
+    args = parser.parse_args(argv)
+    if not args.show:
+        parser.print_help()
+        return 0
+    from pathlib import Path
+
+    from yuki.eval.dbcopy import copy_db, open_copy, remove_copy
+
+    copy = copy_db(Path(args.db) if args.db else None)   # the source is opened ?mode=ro; the copy is deleted below
+    store = None
+    try:
+        store = open_copy(copy)
+        privacy = None
+        if args.privacy:
+            from yuki.memory.privacy import PrivacyConfig
+
+            privacy = PrivacyConfig(Path(args.privacy))
+        if args.at == "last":
+            got = store._query("SELECT max(ended_at) FROM timeline")
+            now = float(got[0][0]) if got and got[0][0] else time.time()
+        elif args.at:
+            now = datetime.fromisoformat(args.at).timestamp()
+        else:
+            now = time.time()
+        builder = YouBuilder(store, privacy=privacy, live=False, clock=lambda: now)
+        builder.beat(now)
+        you = builder.snapshot()
+        out: dict[str, Any] = {"at": datetime.fromtimestamp(now).isoformat(timespec="seconds"),
+                               "holds": holds_now(you, now), "presence_now": presence_now(you, now),
+                               "build_ms": {k: v.get("ms") for k, v in (you or {}).get("built", {}).items()},
+                               "stats": builder.stats()}
+        if args.content:
+            out["you"] = thaw(you)
+            out["render_cards"] = render(you, "cards", now=now)
+        else:
+            out["you"] = content_free(thaw(you), now)
+            out["render_cards_chars"] = len(render(you, "cards", now=now))
+        sys.stdout.write(json.dumps(out, indent=1, ensure_ascii=False, default=str) + "\n")
+    finally:
+        if store is not None:
+            store.close()
+        remove_copy(copy)
+    return 0
+
+
+__all__ = [
+    "SCHEMA_V", "STALE_S", "SECTIONS", "SECTION_CAPS", "RECORD_CAP", "RENDER_CAPS", "CHANGED_KINDS", "SYNTH_KINDS",
+    "YouConfig", "YouBuilder", "focus_game", "focus_holds", "holds_now", "presence_now", "day_began",
+    "day_began_from", "meeting_audio", "render", "thaw", "content_free",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
