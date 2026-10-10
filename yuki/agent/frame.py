@@ -103,6 +103,8 @@ class TaskFrame:
     playbooks: list[int] = field(default_factory=list)
     ms: float = 0.0
     error: str | None = None
+    #: Phase S: the pinned skill's key (for the log), ``None`` when none was pinned.
+    skill: str | None = None
 
     def info(self) -> dict[str, Any]:
         """Content-free facts for the request log."""
@@ -325,10 +327,50 @@ def named_app_line(app: str | None) -> str:
             f"the name it knows them by); it wins over the usual route below, and over the request's wording.")
 
 
+#: Phase S (sCore, map-skills S3.5): the user's usual way the code handed over with the request (a skill whose own
+#: routes didn't get there). Placed first and never cut; its app's usual-path, go-to and pitfall lines are left out
+#: (the 4 Oct B2 trace failed because a procedure, a pitfall and a session lesson pointed three ways).
+PINNED_HEAD = "The user's usual way to do this (skill {key}): follow it; it is done only when {done}."
+#: The pinned block's size cap, set when it is built (never by the frame's own fitting).
+PINNED_CHARS = 900
+
+
+def pinned_lines(pinned: dict[str, Any] | None) -> list[str]:
+    """The pinned skill as frame lines (at most :data:`PINNED_CHARS` in all): the goal, each slot with where its value
+    came from, what "done" means, and what was already tried (not to be redone)."""
+    if not isinstance(pinned, dict) or not pinned.get("key"):
+        return []
+    done = _one(pinned.get("done_words") or "the PC shows the result", 160).rstrip(". ")
+    lines = [PINNED_HEAD.format(key=_one(pinned.get("key"), 40), done=done)]
+    if pinned.get("goal"):
+        lines.append(f"- Goal: {_one(pinned.get('goal'), 160)}")
+    slots = pinned.get("slots") if isinstance(pinned.get("slots"), dict) else {}
+    if slots:
+        parts = []
+        for name, s in list(slots.items())[:6]:
+            value = s.get("value") if isinstance(s, dict) else s
+            src = s.get("from") if isinstance(s, dict) else ""
+            parts.append(f"{_one(name, 20)} = {_one(value, 60)}" + (f" ({_one(src, 12)})" if src else ""))
+        lines.append("- With: " + "; ".join(parts))
+    tried = [t for t in pinned.get("tried") or [] if isinstance(t, dict)]
+    if tried:
+        lines.append("- Already tried (do not redo): " + "; ".join(
+            f"rung {_one(t.get('rung'), 2)} {_one(t.get('via'), 20)} - {_one(t.get('why'), 30)}" for t in tried[:4]))
+    out: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > PINNED_CHARS:
+            break
+        out.append(line)
+        used += len(line) + 1
+    return out
+
+
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
           knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
           chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
-          named_app: str | None = None, lessons: Sequence[str] = (), lately: Sequence[str] = ()) -> TaskFrame:
+          named_app: str | None = None, lessons: Sequence[str] = (), lately: Sequence[str] = (),
+          pinned: dict[str, Any] | None = None) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
     metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
     words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
@@ -337,12 +379,18 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
 
     ``lessons`` (N8, report 47): what went wrong in this session's troubled runs on the apps in play, written by code
     from their traces (:func:`session_lessons`) until practice memory's post-mortem learns it; kept whole with the
-    pitfalls. ``lately`` (N9): :func:`people_lately`'s lines, for a spoken request (who a misheard name may be)."""
+    pitfalls. ``lately`` (N9): :func:`people_lately`'s lines, for a spoken request (who a misheard name may be).
+    ``pinned`` (phase S): a skill the code handed over (:func:`pinned_lines`): first, never cut; that app's usual
+    path, go-tos, ways and pitfalls are left out."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
     try:
         facts = facts or {}
+        pin = pinned_lines(pinned)
+        frame.skill = str(pinned.get("key")) if pin and isinstance(pinned, dict) else None
+        if pin and isinstance(practice, dict):
+            practice = _without_app(practice, str((pinned or {}).get("app") or ""))
         people, things = referents(facts, focus=focus, clip=clip, now=now)
         frame.people, frame.things = people[:MAX_CANDIDATES], things[:MAX_CANDIDATES]
         frame.close_people, frame.close_things = close_call(people), close_call(things)
@@ -397,8 +445,8 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
         if fresh:   # N8: this session's lessons, kept whole with the pitfalls
             tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         # an action request (the caller's measure for the related ranking): a person named or in front, a selection
-        frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"])
-        frame.text = _fit(lines, chars, keep=tail)
+        frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"]) or bool(pin)
+        frame.text = _fit(lines, chars, keep=tail, pinned=pin)
         # what was shown, as the ledger records it (our own "[pb:N]" marks in the text that survived the size limit)
         frame.playbooks = [i for i in frame.playbooks if f"[pb:{i}]" in frame.text]
     except Exception as exc:
@@ -628,27 +676,55 @@ def path_lines(practice: dict[str, Any] | None) -> list[str]:
     return lines
 
 
-def _fit(lines: list[str], chars: int, keep: Sequence[str] = ()) -> str:
+def _fit(lines: list[str], chars: int, keep: Sequence[str] = (), pinned: Sequence[str] = ()) -> str:
     """The frame within ``chars`` (the label and end line included); when it is over, the last lines of ``lines`` go
-    first and ``keep`` (placed after them) only once ``lines`` are gone, its own last lines first. ``""`` for no lines."""
-    body, tail = list(lines), list(keep)
-    if not body and not tail:
+    first and ``keep`` (placed after them) only once ``lines`` are gone, its own last lines first. ``pinned`` (phase S)
+    goes first after the label and is **never popped**: the others share what it leaves (it is capped when built,
+    :data:`PINNED_CHARS`). ``""`` for no lines."""
+    body, tail, pin = list(lines), list(keep), [str(x) for x in pinned]
+    if not body and not tail and not pin:
         return ""
 
     def trim(xs: list[str]) -> None:
         while xs and xs[-1].rstrip().endswith(":"):   # a heading whose items were cut goes with them
             xs.pop()
 
-    while body or tail:
+    while True:
         trim(body)
         trim(tail)
-        if not body and not tail:
+        if not body and not tail and not pin:
             break
-        text = LABEL + "\n" + "\n".join(body + tail) + "\n" + END
-        if len(text) <= chars:
-            return text
+        text = LABEL + "\n" + "\n".join(pin + body + tail) + "\n" + END
+        if len(text) <= chars or not (body or tail):
+            return text if (len(text) <= chars or pin) else ""
         (body if body else tail).pop()
     return ""
+
+
+def _without_app(practice: dict[str, Any], app: str) -> dict[str, Any]:
+    """Practice memory for the frame with the pinned skill's app left out of the usual path, the go-tos, the ways
+    and the pitfalls (phase S: one way, the skill's)."""
+    key = _app_key(app)
+    if not key:
+        return practice
+
+    def other(item: Any) -> bool:
+        apps = item.get("apps") if isinstance(item, dict) else None
+        if isinstance(apps, list) and apps:
+            return all(_app_key(a) != key for a in apps)
+        return _app_key((item or {}).get("app") if isinstance(item, dict) else "") != key
+
+    out = dict(practice)
+    out["ways"] = [w for w in practice.get("ways") or [] if other(w)]
+    out["pitfalls"] = [p for p in practice.get("pitfalls") or [] if other(p)]
+    out["go_tos"] = [g for g in practice.get("go_tos") or [] if other(g)]
+    path = practice.get("path")
+    if isinstance(path, dict) and not other(path):
+        out["path"] = None
+    example = practice.get("example")
+    if isinstance(example, dict) and not other(example):
+        out["example"] = None
+    return out
 
 
 #: The label the voice bridge puts on its own note to a running request (``yuki.voice.bridge``: the app they named,

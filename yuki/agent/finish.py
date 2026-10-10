@@ -787,9 +787,54 @@ def confirm_send(lookup: Callable[[float], list[dict[str, Any]]], text: str, *, 
         sleep(min(POLL_S, max(0.0, within_s - elapsed)))
 
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase S (sCore): the finish gate of a pinned skill (map-skills S3.5, PLAN.md D19)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: How many times a done is sent back for a pinned skill whose own check doesn't see the result yet; then the request
+#: finishes as "couldn't confirm" (never as done).
+SKILL_BOUNCES = 2
+#: The gap a pinned skill's unconfirmed check leaves on the outcome verdict (it caps it at "not confirmed").
+SKILL_UNCONFIRMED = "the skill's own check didn't see the result"
+
+
+def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
+               check: Callable[..., Any] | None = None) -> tuple[str, str | None]:
+    """A done on a request with a pinned skill: ``("ok", None)`` when its done-check sees the result (or the skill has
+    no machine check the thinker's own steps could raise: the outcome verdict of its trace decides), ``("hold",
+    note)`` to send the done back ("not done yet", at most :data:`SKILL_BOUNCES` times), ``("unconfirmed", gap)``
+    after that: the request ends, said as "couldn't confirm". Data only (the probe's verdict), never the words."""
+    if not isinstance(pinned, dict) or not pinned.get("key"):
+        return "ok", None
+    done = pinned.get("done")
+    if not isinstance(done, dict) or not done.get("probe"):
+        return "ok", None
+    try:
+        if check is None:
+            from yuki.skills.donecheck import check as check_fn
+
+            got = check_fn(done, since=float(since))
+        else:
+            got = check(done, since=float(since))
+        verdict = getattr(got, "verdict", got)
+        evidence = getattr(got, "evidence", {}) or {}
+    except Exception:  # noqa: BLE001 - a check that broke couldn't read
+        verdict, evidence = None, {}
+    if verdict is True:
+        return "ok", None
+    seen = "the PC shows otherwise" if verdict is False else "the PC couldn't read it"
+    status = str(evidence.get("status") or "") if isinstance(evidence, dict) else ""
+    if int(bounces) < SKILL_BOUNCES:
+        words = str(pinned.get("done_words") or "what they asked")
+        return "hold", (f"not done yet: {seen}" + (f" ({status})" if status.replace("_", "").isalpha() else "")
+                        + f". The usual way ({pinned.get('key')}) is done only when: {words}. Check the screen and "
+                        f"finish it, or say plainly that it couldn't be confirmed.")
+    return "unconfirmed", SKILL_UNCONFIRMED
+
 __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
            "LEARNED_UNVERIFIABLE", "LEVELS", "LEVEL_LABELS", "LIKELY", "PAGE_SCROLL_UNVERIFIABLE", "SAYABLE",
            "SEND_CONFIRMED", "SEND_UNCHECKED", "SEND_UNCONFIRMED", "UNVERIFIED", "VERIFIED", "app_name", "classify", "confirm_send", "finish_line", "finish_request",
            "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
            "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "did_other", "honest_text",
-           "last_windowless", "read_back"]
+           "last_windowless", "read_back", "SKILL_BOUNCES", "SKILL_UNCONFIRMED", "skill_gate"]

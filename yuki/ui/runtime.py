@@ -174,6 +174,9 @@ class Job:
     #: V4: the app or route the user named for this request in their own words (``Agent.run(app_named=)``; voice: the
     #: talker's ``app_named``); ``None``: none named.
     app_named: str | None = None
+    #: Phase S: the user's usual way the code handed over with this request (``Agent.run(skill=)``: a skill whose own
+    #: routes didn't get there; ``yuki.skills.engine.pinned``); ``None``: none.
+    skill: dict[str, Any] | None = None
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -498,6 +501,8 @@ class Lane(QThread):
             # V4: the app the user named (the job's own, or one named after it was queued: AgentRuntime.name_app)
             **({"app_named": named} if (named := job.app_named or getattr(runtime, "_apps_named", {}).get(job.id))
                else {}),
+            # phase S: the pinned skill (kept across a front-desk hand-off like the named app)
+            **({"skill": pin} if (pin := job.skill or getattr(runtime, "_skills", {}).get(job.id)) else {}),
         )
         begun = False
         while True:
@@ -744,6 +749,7 @@ class AgentRuntime(QObject):
         self._memory_queries: dict[int, str] = {}
         self._user_words: dict[int, tuple[str, ...]] = {}   # front-desk requests' heard words, kept for a hand-off
         self._apps_named: dict[int, str] = {}   # front-desk requests' named app (V4), kept for a hand-off
+        self._skills: dict[int, dict[str, Any]] = {}   # phase S: front-desk requests' pinned skill, kept for a hand-off
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -860,7 +866,7 @@ class AgentRuntime(QObject):
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
-        app_named: str | None = None,
+        app_named: str | None = None, skill: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -892,6 +898,8 @@ class AgentRuntime(QObject):
                 as before. ``None`` / ``True``: as before.
             app_named: The app or route the user named in their own words (V4; voice: the talker's ``app_named``):
                 kept across a front-desk hand-off and given to ``Agent.run(app_named=)``.
+            skill: Phase S: the pinned skill the code handed over (``yuki.skills.engine.pinned``): kept across a
+                front-desk hand-off and given to ``Agent.run(skill=)``.
 
         Returns:
             ``(lane name, request id)``.
@@ -918,9 +926,12 @@ class AgentRuntime(QObject):
         named = " ".join(str(app_named or "").split()) or None
         if named and lane is not self.worker:
             self._apps_named[request_id] = named
+        pin = dict(skill) if isinstance(skill, dict) and skill.get("key") else None
+        if pin and lane is not self.worker:
+            self._skills[request_id] = pin
         fresh = pack if (lane is self.worker and worker_idle) else None
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words, fresh, named))
+                                   previous_query, words, fresh, named, pin))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -930,7 +941,7 @@ class AgentRuntime(QObject):
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
-                         app_named: str | None = None) -> int:
+                         app_named: str | None = None, skill: dict[str, Any] | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -946,7 +957,9 @@ class AgentRuntime(QObject):
         self._worker_outstanding.append(request_id)
         waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
                                           user_words=_words_tuple(user_words),
-                                          app_named=" ".join(str(app_named or "").split()) or None))
+                                          app_named=" ".join(str(app_named or "").split()) or None,
+                                          skill=dict(skill) if isinstance(skill, dict) and skill.get("key")
+                                          else None))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
         )
@@ -1138,6 +1151,7 @@ class AgentRuntime(QObject):
             if request_id in self._worker_outstanding:
                 self._worker_outstanding.remove(request_id)
             self._apps_named.pop(request_id, None)
+            self._skills.pop(request_id, None)
             return
         if needed_hands:
             self.ui_log.event("handoff", id=request_id, refused=list(refused))
@@ -1145,12 +1159,14 @@ class AgentRuntime(QObject):
                                            source=self._sources.pop(request_id, "text"),
                                            memory_query=self._memory_queries.pop(request_id, None),
                                            user_words=self._user_words.pop(request_id, None),
-                                           app_named=self._apps_named.pop(request_id, None))
+                                           app_named=self._apps_named.pop(request_id, None),
+                                           skill=self._skills.pop(request_id, None))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
         else:
             self._sources.pop(request_id, None)
             self._user_words.pop(request_id, None)
             self._apps_named.pop(request_id, None)
+            self._skills.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
 
 
