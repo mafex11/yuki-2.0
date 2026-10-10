@@ -634,7 +634,7 @@
   document.addEventListener('pointerdown', (e) => {
     if (!e.target.closest || !e.target.closest('#main')) return;
     S.touched = performance.now();
-    S.pressed = e.target.closest('[data-item], [data-fact], [data-learned], [data-card], [data-row], .lrow, .srow, .approw, .dial-r') || null;
+    S.pressed = e.target.closest('[data-item], [data-fact], [data-learned], [data-skill], [data-card], [data-row], .lrow, .srow, .approw, .dial-r') || null;
   }, true);
   document.addEventListener('click', (e) => {
     const t = e.target.closest('button, a, [data-do]');

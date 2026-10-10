@@ -106,8 +106,9 @@ Practice memory (migration 29, yuki.memory.practice; learned by the service's pr
     memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=,
                              injected=, cited=, control=) -> dict
     memory.practice(words, apps=, open_apps=, detail=False) -> dict    # ways / habits and pitfalls for the apps in play
-    memory.workflows() -> dict                           # the window's Playbook page
+    memory.workflows() -> dict                           # the window's Playbook page (+ "skills": what Yuki learned)
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
+    memory.skill_edit("skill:N", "rename" | "forget" | "not_mine", words="") -> dict   # a learned skill (phase L)
     memory.run_ledger(since=None, until=None) -> list[dict]   # what Yuki did: requests and their acting steps
 
 The 3 Oct feedback (migration 33; docs/research/revamp-2026-10-02/38 and 43-build-appA-memory.md). Direct ops, no model
@@ -4446,14 +4447,39 @@ class MemoryClient:
         out["ms"] = round((time.perf_counter() - started) * 1000, 1)
         return out
 
-    def workflows(self) -> dict:
+    def workflows(self, *, skills: bool = True) -> dict:
         """The Yuki window's Playbook page (``yuki.memory.practice.workflows``): ``{"available", "procedures",
         "lessons", "proposals", "workflows", "learning"}`` - what Yuki learned to do on this PC, the lessons from its
         mistakes and what it is not sure of yet (tentative objects, teach-back questions), each with its uses, last use,
-        confidence and state. Never raises."""
+        confidence and state - and, with ``skills``, ``"skills"``: the section "Skills Yuki learned from you" (phase L
+        design §4.9, :func:`yuki.skills.playbook.learned_section`: each learned skill with where it came from, how it
+        runs, when, its trust and whether it is offered; its own ``available`` is False before the learner's
+        migration). A caller that reads only the practice part (the run card's chips) passes ``skills=False``. Never
+        raises."""
         from yuki.memory import practice as _p
 
-        return _p.workflows(self.store)
+        out = _p.workflows(self.store)
+        if skills:
+            try:
+                from yuki.skills.playbook import learned_section
+
+                out["skills"] = learned_section(self.store)
+            except Exception as exc:  # noqa: BLE001 - the practice part still shows
+                out["skills"] = {"available": False, "items": [], "error": type(exc).__name__}
+        return out
+
+    def skill_edit(self, ref: Any, action: str, words: str = "") -> dict:
+        """The user's say over one learned skill on the Playbook page (phase L design §4.9, Q12;
+        :func:`yuki.skills.playbook.skill_edit`): ``rename`` (their ``words`` become its name, kept as told so no naming
+        pass replaces them), ``forget`` (never in the menu, never offered, never proposed again) or ``not_mine`` (as
+        forget, and what it was learned from is not theirs). One write on the skill's row, never a model call and never
+        a hand edit; the catalog follows on its next load. Never raises."""
+        from yuki.skills.playbook import skill_edit
+
+        try:
+            return skill_edit(self.store, ref, action, words)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"Memory didn't take that ({type(exc).__name__})."}
 
     def launch_identities(self) -> dict:
         """What practice memory learned the apps of Start entries run as (``yuki.memory.practice.launch_identities``,
@@ -4811,17 +4837,39 @@ class MemoryClient:
     # -- (skills, skill_routes, skill_runs, prefs, pref_events, tastes) is ever exposed by the MCP.
 
     def _skills_seeded(self) -> Any:
-        """The loaded connection files, seeded into this database once per version per process (an upsert). A seed
-        that failed is tried again on the next call (the version is marked seeded only on success)."""
-        from yuki.skills import catalog as connection, registry
+        """The catalog on this database (:func:`yuki.skills.catalog.load` with ``store=``: the capabilities from the
+        shipped files, then the user's live learned skills, read again only when their rows changed: one count query),
+        with the capabilities seeded into the database once per version per process (an upsert; learned rows are never
+        seeded). A seed that failed is tried again on the next call (the version is marked seeded only on success).
+        A file the habit-key refusal skipped, or a learned row the catalog could not read, is told to the skills log
+        once (:meth:`set_skills_log`; lSplit review r1 L1: without the store no learned skill reaches a request)."""
+        from yuki.skills import catalog, registry
 
-        loaded = connection.load()
+        # no log set yet: none passed, so the catalog keeps each error to tell once a log is set (it marks one told
+        # only when it hands it to a log)
+        loaded = catalog.load(store=self.store,
+                              log=self._skills_log if getattr(self, "_skills_log_fn", None) is not None else None)
         seen = getattr(self, "_skills_version", None)
         if seen != loaded.version and registry.has_tables(self.store):
             got = registry.seed(self.store, loaded)
             if isinstance(got, dict) and not got.get("error"):
                 self._skills_version = loaded.version
         return loaded
+
+    def set_skills_log(self, log: Any) -> None:
+        """Where the catalog tells what it skipped (``log(type, **fields)``, content-free: ``connection_error`` with
+        the file and a code word, ``learned_error`` with the row id and a code word). The process that owns a log
+        (the tray's UI log, the memory service's) sets it once; without one nothing is told."""
+        self._skills_log_fn = log if callable(log) else None
+
+    def _skills_log(self, type: str, **fields: Any) -> None:
+        fn = getattr(self, "_skills_log_fn", None)
+        if fn is None:
+            return
+        try:
+            fn(type, **fields)
+        except Exception:  # noqa: BLE001 - a log never breaks a load
+            pass
 
     def skill_menu(self, audience: str = "talker", *, now: float | None = None, rank: str | None = "n_obs") -> str:
         """The skill menu for the talker (its cached prompt block) or the thinker (its ``run_skill`` tool), built by
@@ -4956,6 +5004,8 @@ _STAMP_SQL: dict[str, str] = {
     # Needs your reply clears when your reply is captured (a newer message in that chat)
     "messages": "SELECT max(id) FROM messages",
     "playbooks": "SELECT max(id), max(updated_at) FROM playbooks",
+    # the Playbook's "Skills Yuki learned from you" (phase L): a learned row written, renamed or forgotten
+    "skills": "SELECT max(id), max(updated_at) FROM skills WHERE origin = 'learned'",
     "standing_requests": "SELECT max(id), max(updated_at) FROM standing_requests",
     "knowhow": "SELECT max(id), max(valid_to) FROM knowhow",
     "runs": "SELECT max(id) FROM runs",
