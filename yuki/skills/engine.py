@@ -770,6 +770,17 @@ def _simple(skill_key: str, outcome: str, ctx: RunContext, started: float, **kw:
     return res
 
 
+def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult | None:
+    """D24 before anything runs, a plan or a hand-over to the general agent alike (review r1 L6): a step that is only
+    the user's is never Yuki's; an offer (a card) never commits (sends and joins stay the user's, rule 8). Refused:
+    nothing runs, nothing is written to the ledger. ``None``: it may run."""
+    commit = run_commit(skill)
+    if commit == "user" or (commit != "none" and ctx.origin == "card"):
+        _emit(ctx, "skill_resolve", skill=skill.key, result="refused", reason=f"commit_{commit}")
+        return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER if commit == "user" else LINE_FAILED)
+    return None
+
+
 def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     if isinstance(resolved, Ask):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
@@ -782,6 +793,10 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="refused", reason=resolved.why)
         return _simple(resolved.skill, "refused", ctx, started,
                        say=LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED)
+    if isinstance(resolved, (Handoff, Plan)):
+        refused = _commit_gate(resolved.skill, ctx, started)
+        if refused is not None:
+            return refused
     if isinstance(resolved, Handoff):
         return _handoff(resolved.skill, resolved.values, resolved.filled, [], ctx, started, why=resolved.why,
                         run_key=None)
@@ -789,12 +804,6 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         return _simple(str(resolved or ""), "refused", ctx, started, say=LINE_FAILED)
     plan = resolved
     skill = plan.skill
-    commit = run_commit(skill)
-    if commit == "user" or (commit != "none" and ctx.origin == "card"):
-        # D24: a step that is only the user's is never Yuki's; an offer (a card) never commits (sends and joins stay
-        # the user's, rule 8). Nothing runs, nothing is written to the ledger
-        _emit(ctx, "skill_resolve", skill=skill.key, result="refused", reason=f"commit_{commit}")
-        return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER if commit == "user" else LINE_FAILED)
     t0 = time.time()
     run_app = _first_app(skill, plan.routes, plan.values)
     run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)

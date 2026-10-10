@@ -3,11 +3,15 @@
 ::
 
     python -m yuki.skills.learn rebuild [--db PATH] [--dry-run] [--report] [--show] [--no-name]
+    python -m yuki.skills.learn backfill-usuals --db PATH [--dry-run] [--force]
 
 * ``rebuild`` recomputes the occasions and the learned skills (the night pass, by hand).
+* ``backfill-usuals`` is lName's one-time back-fill of the user's stated usuals (``yuki.skills.learn.backfill``; the
+  learner runs it by itself after its first written pass).
 * ``--dry-run`` copies the database first (``yuki.eval.dbcopy.copy_db``, source opened read-only), brings its moments
   to the current rule (``yuki.memory.moments.RULE_VERSION``) when they are older, runs the full pass and one
-  incremental pass on the copy, prints, and deletes the copy. The source is never written.
+  incremental pass on the copy, prints, and deletes the copy. The source is never written. The naming step makes no
+  model call in a dry run (lName's dry run): the report shows what a real night would ask (``name.plan``).
 * ``--report`` prints the content-free report: counts, drops, browsers (app keys), groups (capability, key digests,
   counts, means app keys, rung, executable end, commit), groups no capability serves, the routine preview keyed by
   skill id, timings. No name, title, site, person or value.
@@ -131,7 +135,8 @@ def report(store: Any, res: Any, *, now: float, inc: dict[str, Any] | None = Non
                    "pre_commit_skills": len(pre_commit), **{k: int(v) for k, v in res.counts.items()}},
         "routines": _routines(store, res, now) if res.planned else {},
         "timing": {"full_cpu_s": res.cpu_s, "full_wall_s": res.wall_s, "incremental": inc,
-                   "naming_calls": res.named},
+                   "naming_called": bool((res.naming or {}).get("called"))},
+        "naming": res.naming,
         "ok": res.ok, "error": res.error,
     }
 
@@ -165,6 +170,7 @@ def _text(rep: dict[str, Any]) -> str:
     lines.append(f"catalog (store-aware load): {rep['catalog']}")
     lines.append(f"routines (A6): {json.dumps(rep['routines'], default=str)}")
     lines.append(f"timing (A9): {json.dumps(rep['timing'], default=str)}")
+    lines.append(f"naming (lName): {json.dumps(rep.get('naming') or {}, default=str)}")
     if rep.get("moments_rebuild"):
         lines.append(f"moments rebuild (RULE_VERSION): {json.dumps(rep['moments_rebuild'], default=str)}")
     return "\n".join(lines)
@@ -199,8 +205,13 @@ def _moments_current(store: Any) -> dict[str, Any] | None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "backfill-usuals":
+        from yuki.skills.learn import backfill   # lName's module: its own arguments (--db, --dry-run, --force)
+
+        return int(backfill.main(argv[1:]) or 0)
     parser = argparse.ArgumentParser(prog="python -m yuki.skills.learn", description=__doc__.split("\n")[0])
-    parser.add_argument("cmd", nargs="?", default="rebuild", choices=["rebuild"])
+    parser.add_argument("cmd", nargs="?", default="rebuild", choices=["rebuild", "backfill-usuals"])
     parser.add_argument("--db", type=Path, default=None, help="database (default: Yuki's own)")
     parser.add_argument("--dry-run", action="store_true", help="run on a temporary copy and print what it gives")
     parser.add_argument("--report", action="store_true", help="print the content-free report")
@@ -223,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         moments = _moments_current(store) if args.dry_run else None
         now = time.time()
-        res = learn.run(store, now=now, name=not args.no_name, write_rows=True)
+        res = learn.run(store, now=now, name=not args.no_name, write_rows=True, name_dry_run=args.dry_run)
         inc = learn.incremental(store, now=time.time()) if args.dry_run else None
         if args.report or args.json:
             rep = report(store, res, now=now, inc=inc, moments=moments)

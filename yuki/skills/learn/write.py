@@ -15,14 +15,15 @@ content-free provenance, and the hook for the naming call (phase L ``lName``: ``
   ``not_mine`` with ``deleted_at``: the user's tombstone (Forget this / Not mine, written by the Playbook), never
   proposed, updated or revived here.
 * **The cap** ranks by recency-weighted distinct days, uses and verified runs.
-* **Names** come from one batched cheap call a night (``yuki.skills.learn.name.name_groups``, phase L lName), for new
-  or changed groups only (a signature per group); a name the user gave (``provenance.named_by = "user"``) is never
-  replaced. With no name the skill is nameless: it runs on request (its menu line is code-built) and is never offered.
+* **Names** come from lName's batched cheap call (``yuki.skills.learn.name.name_groups``: at most one call a night,
+  the rest from its signature cache), fed by :func:`name_input` (RAM only: what may be sent, and the values that must
+  never come back); a name the user gave (``provenance.named_by = "user"``) is never asked for or replaced. A nameless
+  skill carries lName's code-built label and ``provenance.named = false``: it runs on request (its menu line is
+  code-built); which offer classes need a name is the offer gate's call (lName's merge note 5).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import statistics
 import time
@@ -40,10 +41,10 @@ RETIRE_DAYS = 60.0
 TOMBSTONES: tuple[str, ...] = ("deleted", "not_mine")
 #: Over the cap: in the Playbook only.
 LISTED = "listed"
-#: The naming call names at most this many groups a night (design §4.6).
-NAME_BATCH = 10
-NAME_WORDS = 6
-NAME_CHARS = 60
+#: The naming facts carried over from a row's last pass (the user's rename, the model's name and its flags).
+NAME_PROVENANCE: tuple[str, ...] = ("named_by", "named", "everyday", "name_source", "name_why")
+#: The naming fields of a spec carried over with an earlier name (``name.Named.spec_fields``).
+NAME_SPEC_FIELDS: tuple[str, ...] = ("menu", "ask", "use_when")
 DAY_S = 86400.0
 
 
@@ -150,101 +151,157 @@ def provenance(group: Group, cap: Any, compiled: Any, store: Any, now: float) ->
     }
 
 
-def name_signature(planned: Planned) -> str:
-    """What a name depends on (content-free): the capability, the key digests, the rung and the slots left open."""
-    g = planned.group
-    open_slots = sorted(s.name for s in planned.cap.slots if s.name not in planned.spec.get("bound", {}))
-    raw = json.dumps([planned.cap.key, list(g.keys), planned.compiled.rung, open_slots], separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def naming_input(planned: Planned, store: Any) -> dict[str, Any]:
-    """One group as the naming call reads it (design §4.6; critique L7, M8; Q13): the capability's neutral line, the
-    app's display name, a calling service's product name, a site file's name and page kind or a registrable domain
-    (never a path or title), the slots left open with their kinds (never a value), a time summary and the asked runs'
-    keys (the request words are read by the naming module itself, encrypted at rest)."""
-    from yuki.memory.moments import registrable_domain
-
-    g, cap, prov = planned.group, planned.cap, planned.provenance
-    bound = planned.spec.get("bound") or {}
-    site_slot = next((s for s, src in cap.bind.items() if src == "site"), "")
-    page_slot = next((s for s, src in cap.bind.items() if src == "page"), "")
-    service_slot = next((s for s, src in cap.bind.items() if src == "service"), "")
-    site = str(bound.get(site_slot) or "") if site_slot else ""
-    try:
-        from yuki.connect.templates import sites
-
-        templated = site in sites()
-    except Exception:  # noqa: BLE001
-        templated = False
-    means = prov.get("means") or {}
-    keys = list(next(iter(means.values()), {}) or {}) or ([prov["app"]] if prov.get("app") else [])
-    apps = []
-    for app in keys:
+def _app_names(store: Any, keys: Sequence[str]) -> dict[str, str]:
+    """``{app key: display name}`` (the timeline's names; the key itself when there is none)."""
+    out: dict[str, str] = {}
+    for key in keys:
+        if not key or key in out:
+            continue
         try:
-            apps.append(store.app_display_name(app) or app)
+            out[key] = str(store.app_display_name(key) or key)
         except Exception:  # noqa: BLE001
-            apps.append(app)
-    return {
-        "signature": name_signature(planned), "capability": cap.key, "menu": cap.menu, "apps": apps[:3],
-        "service": str(bound.get(service_slot) or "") if service_slot else "",
-        "site": site if templated else "", "page": str(bound.get(page_slot) or "") if (page_slot and templated) else "",
-        "domain": registrable_domain(site) if (site and not templated) else "",
-        "slots": [{"name": s.name, "role": s.role, "kind": s.kind or s.type} for s in cap.slots
-                  if s.name not in bound and not s.told],
-        "weekdays": prov.get("weekdays"), "minute": prov.get("minute"), "n": prov.get("n"), "days": prov.get("days"),
-        "rung": planned.compiled.rung, "asked_runs": [o.asked_run for o in g.occasions if o.by == "asked"][-3:],
-        "offer_class": cap.offer_class, "usage": g.usage,
-    }
+            out[key] = key
+    return out
 
 
-def _call_naming(store: Any, inputs: list[dict[str, Any]], *, worker: Any, log: Callable[..., Any] | None
-                 ) -> dict[str, dict[str, Any]]:
-    """The naming call (phase L lName: ``yuki.skills.learn.name.name_groups(store, inputs, worker=, log=)`` ->
-    ``{signature: {"name", "menu", "ask", "everyday", "use_when"}}``, batched, cached by signature). ``{}`` when the
-    module is not there or it fails: the groups stay nameless."""
-    if not inputs:
-        return {}
-    try:
-        from yuki.skills.learn import name as naming
-    except ImportError:
-        return {}
-    fn = getattr(naming, "name_groups", None)
-    if not callable(fn):
-        return {}
-    try:
-        got = fn(store, inputs[:NAME_BATCH], worker=worker, log=log)
-    except Exception as exc:  # noqa: BLE001 - nameless this night
-        if log is not None:
+def _contact_names(store: Any, ids: Sequence[Any]) -> list[str]:
+    """The names and aliases of these contacts (a ``contact`` bind source holds the people index's id), decrypted in
+    RAM for the naming call's withheld check only: the whole name and each of its words."""
+    wanted = sorted({int(i) for i in ids if isinstance(i, int) or str(i).isdigit()})
+    if not wanted:
+        return []
+    out: list[str] = []
+    for start in range(0, len(wanted), 200):
+        part = wanted[start:start + 200]
+        try:
+            rows = store._query(f"SELECT name_ciphertext, aliases_ciphertext FROM contacts WHERE id IN"
+                                f" ({','.join('?' * len(part))})", tuple(part))
+        except Exception:  # noqa: BLE001 - no people index: nothing to add
+            return out
+        for name_ct, aliases_ct in rows:
+            names: list[str] = []
             try:
-                log("error", where="learn.name", error=type(exc).__name__)
+                names.append(str(store._dec(name_ct) or ""))
+                raw = store._dec(aliases_ct) if aliases_ct else ""
+                got = json.loads(raw) if raw else []
+                names += [str(a) for a in got if a] if isinstance(got, list) else [str(raw)]
             except Exception:  # noqa: BLE001
                 pass
-        return {}
-    return got if isinstance(got, dict) else {}
+            for n in names:
+                n = " ".join(n.split())
+                if n:
+                    out.append(n)
+                    out += [w for w in n.split() if len(w) >= 2]
+    return out
 
 
-def _valid_name(out: Any, bound: dict[str, Any]) -> tuple[str, str, list[str], bool | None]:
-    """``(name, menu, use_when, everyday)`` from one naming answer, checked by code (lName validates first): a short
-    name, a menu line of at most 140 characters, a list of short strings; anything off: nameless."""
-    from yuki.skills.connection import MENU_LINE_CHARS
+def _run_words(store: Any, run_keys: Sequence[str]) -> dict[str, str]:
+    """The user's own request words of these runs (the run head's encrypted words), decrypted in RAM."""
+    keys = sorted({str(k) for k in run_keys if k})
+    out: dict[str, str] = {}
+    for start in range(0, len(keys), 200):
+        part = keys[start:start + 200]
+        try:
+            rows = store._query(f"SELECT run_key, input_ciphertext FROM runs WHERE step = 0 AND run_key IN"
+                                f" ({','.join('?' * len(part))})", tuple(part))
+        except Exception:  # noqa: BLE001
+            return out
+        for key, ct in rows:
+            try:
+                words = " ".join(str(store._dec(ct) or "").split()) if ct else ""
+            except Exception:  # noqa: BLE001
+                words = ""
+            if words:
+                out[str(key)] = words
+    return out
 
-    if not isinstance(out, dict):
-        return "", "", [], None
-    name = " ".join(str(out.get("name") or "").split())
-    menu = " ".join(str(out.get("menu") or "").split())
-    if not name or len(name) > NAME_CHARS or len(name.split()) > NAME_WORDS or len(menu) > MENU_LINE_CHARS:
-        return "", "", [], None
-    use_when = [_clip(u, 120) for u in out.get("use_when") or [] if isinstance(u, str) and u.strip()][:6]
-    everyday = out.get("everyday") if isinstance(out.get("everyday"), bool) else None
-    return name, menu, use_when, everyday
+
+def name_input(store: Any, p: Planned, naming: Any) -> Any:
+    """One planned group as the naming call's input (``yuki.skills.learn.name.NameInput``; design §4.6, Q13; lName's
+    merge note 2), built in RAM only:
+
+    * ``bound`` (the key values; ``name.py`` sends only those its capability reads from an app, a service, a site cut
+      to its registrable domain, or a page kind), ``means`` (the user's own means counts), ``apps`` (display names),
+      the kept control names of a rung-B path, the user occasions' times and how often;
+    * ``withhold``: every value the group's occasions carried in a slot read from a source the call never sends (an
+      entity, a value, a contact: playlists, videos, levels, people, the people index's ids resolved to their names
+      and aliases), decrypted in RAM;
+    * ``phrasings``: the user's own words of the asked runs (newest first; a corrected run's never) and of a request he
+      then did himself (``facts.after_ask``). When a slot that names a person or a thing still varies, only an asked
+      run that carried a value for every such slot gives its words (those values are withheld with the rest), so a
+      name in the words is always one the check knows."""
+    g, cap, compiled = p.group, p.cap, p.compiled
+    bind = dict(cap.bind or {})
+    bound = dict(p.spec.get("bound") or {})
+    sent_sources = tuple(getattr(naming, "SENT_SOURCES", ()) or ())
+    naming_types = tuple(getattr(naming, "NAMING_TYPES", ()) or ())
+    hide = {s.name: bind[s.name] for s in cap.slots if s.name in bind and bind[s.name] not in sent_sources}
+    varies_naming = [s for s in cap.slots if s.role in ("key", "fill") and s.name not in bound and not s.told
+                     and s.type != "bool" and s.type in naming_types]
+    withhold: list[str] = []
+    contacts: list[Any] = []
+
+    def keep(slot: str, value: Any) -> None:
+        if value in (None, "") or isinstance(value, bool):
+            return
+        if hide.get(slot) == "contact":
+            contacts.append(value)
+        else:
+            withhold.append(" ".join(str(value).split()))
+
+    for o in sorted(g.occasions, key=lambda o: -o.at):
+        for slot in hide:
+            keep(slot, (o.attrs or {}).get(slot))
+    for slot, value in bound.items():
+        if slot in hide:
+            keep(slot, value)
+    withhold += _contact_names(store, contacts)
+    withhold = list(dict.fromkeys(v for v in withhold if v))[:400]
+    # the user's own words: asked runs (never a corrected one), and a request he then did himself
+    sources: list[tuple[float, str, Any]] = []
+    for o in g.occasions:
+        if o.by == "asked" and o.asked_run and not o.facts.get("corrected"):
+            sources.append((o.at, str(o.asked_run), o))
+        elif o.by == "user" and o.facts.get("after_ask"):
+            sources.append((o.at, str(o.facts["after_ask"]), o))
+    usable: list[str] = []
+    for _at, key, o in sorted(sources, key=lambda x: -x[0]):
+        if varies_naming:
+            vals = [(o.attrs or {}).get(s.name) for s in varies_naming]
+            if o.by != "asked" or any(v in (None, "") for v in vals):
+                continue
+            withhold += [" ".join(str(v).split()) for v in vals]
+        if key not in usable:
+            usable.append(key)
+        if len(usable) >= 6:
+            break
+    words = _run_words(store, usable)
+    phrasings = [words[k] for k in usable if words.get(k)]
+    means = {str(slot): {str(v): int(n) for v, n in counts.items()} for slot, counts in (compiled.means or {}).items()}
+    app_keys = [str(v) for s in cap.slots if s.type == "app" for v in (means.get(s.name) or {})]
+    app_keys += [str(v) for slot, v in bound.items() if bind.get(slot) == "app" and v]
+    app_keys += [str(next((o.app for o in g.occasions if o.app), "") or "")]
+    steps: list[str] = []
+    for route in compiled.routes or ():
+        for step in ((route.get("args") or {}).get("steps") or []) if isinstance(route, dict) else ():
+            if isinstance(step, dict) and step.get("do") in ("click", "open_app") and isinstance(step.get("name"), str):
+                steps.append(step["name"])
+    times = [o.at for o in g.occasions if o.by == "user" and o.counts and o.context_known]
+    return naming.NameInput(
+        key=p.key, capability=cap.key, end=g.end, bound=bound, means=means, apps=_app_names(store, app_keys),
+        steps=tuple(steps), times=tuple(times), n=int(g.bar.n or 0), days=int(g.bar.days or 0),
+        phrasings=tuple(phrasings), withhold=tuple(dict.fromkeys(withhold)))
 
 
-def offer_static(cap: Any, compiled: Any, everyday: bool | None) -> bool:
+def offer_static(cap: Any, compiled: Any, everyday: bool | None, *, usage: bool = False) -> bool:
     """The parts of "offerable" the learner decides (design §4.7): the run's end is not a commit, the rung is A (or a
     verified B: decided at offer time), and the capability's offer class allows it (``judged``: only when the naming
-    call said everyday). Trusted (D14) and an active routine are the routine lane's (phase L lWire)."""
+    call said everyday). A usage record (no key value bound) is offerable only through a ``routine_key`` fill slot (a
+    playlist: §4.2), never as itself (review r1 L1: "volume" with nothing bound). Trusted (D14) and an active routine
+    are the routine lane's (phase L lWire)."""
     if compiled.commit != "none" or compiled.rung not in ("A-link", "A-capability", "B"):
+        return False
+    if usage and not any(s.role == "fill" and s.routine_key for s in cap.slots):
         return False
     cls = str(cap.offer_class or "never")
     return cls in ("logistics", "everyday") or (cls == "judged" and everyday is True)
@@ -291,7 +348,7 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         p.spec = {"v": 1, "bound": bound, "menu": menu_line(cap, bound), "routes": list(p.compiled.routes)}
         p.provenance = provenance(g, cap, p.compiled, store, now)
         if old is not None:
-            for k in ("name_sig", "named_by", "everyday"):
+            for k in NAME_PROVENANCE:
                 if k in old["prov"]:
                     p.provenance[k] = old["prov"][k]
             try:
@@ -299,8 +356,12 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
                     "name_ciphertext") else ""
             except Exception:  # noqa: BLE001
                 p.name = ""
-            if p.name:
-                p.spec["menu"] = _old_menu(store, old) or ""
+            if p.name and (old["prov"].get("named") is True or old["prov"].get("named_by") == "user"):
+                # a real name (the model's or the user's) keeps its menu line, questions and phrasings until replaced
+                old_spec = _old_spec(store, old)
+                for k in NAME_SPEC_FIELDS:
+                    if old_spec.get(k):
+                        p.spec[k] = old_spec[k]
         try:
             specialise(cap, key=key, spec=p.spec, name=p.name)
         except ConnectionError_ as exc:
@@ -332,44 +393,97 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
     return out, counts
 
 
-def _old_menu(store: Any, old: dict[str, Any]) -> str:
+def _old_spec(store: Any, old: dict[str, Any]) -> dict[str, Any]:
     try:
         spec = json.loads(store._dec(old["spec_ciphertext"]) or "{}") if old.get("spec_ciphertext") else {}
     except Exception:  # noqa: BLE001
-        return ""
-    return str(spec.get("menu") or "") if isinstance(spec, dict) else ""
+        return {}
+    return spec if isinstance(spec, dict) else {}
 
 
-def name_planned(store: Any, planned: list[Planned], *, worker: Any = None,
-                 log: Callable[..., Any] | None = None) -> int:
-    """Names for the new or changed groups (one batched call; design §4.6). Returns how many got a name."""
-    todo: list[tuple[Planned, dict[str, Any]]] = []
+def name_planned(store: Any, planned: list[Planned], *, settings: Any = None, client: Any = None,
+                 log: Callable[..., Any] | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """Names for the planned groups (design §4.6; lName's ``name.name_groups``: one batched call a night at most, the
+    rest from its signature cache), best first; a name the user gave (``provenance.named_by = "user"``) is never
+    asked for or replaced. Applied to each plan: ``Named.label`` as the name, ``Named.spec_fields()`` into the spec
+    (``menu``, ``ask``, ``use_when``) and ``Named.provenance()`` into the provenance (``named``, ``everyday``). A
+    nameless answer keeps an earlier model name (a night with no call budget, a failed call) until a new name comes.
+    ``dry_run``: no call and no write (lName's own dry run), plus ``plan`` (``name.plan``: what a real night would
+    ask). The naming call logs to its own memory file (``learn-YYYYMMDD.jsonl``: the cost view counts it there);
+    ``log`` gets this step's errors. Returns content-free counts (``NamingRun.as_fields()`` + ``named``)."""
+    try:
+        from yuki.skills.learn import name as naming
+    except ImportError:
+        naming = None
+    out: dict[str, Any] = {"named": 0}
+    todo = [p for p in planned if p.provenance.get("named_by") != "user"]
+    if naming is None or not hasattr(naming, "name_groups") or not hasattr(naming, "NameInput"):
+        out["error"] = "no_naming_module"
+    elif todo:
+        inputs = []
+        for p in todo:
+            try:
+                inputs.append(name_input(store, p, naming))
+            except Exception as exc:  # noqa: BLE001 - that group stays as it was this night
+                out["input_errors"] = int(out.get("input_errors", 0)) + 1
+                if log is not None:
+                    try:
+                        log("error", where="learn.name_input", error=type(exc).__name__)
+                    except Exception:  # noqa: BLE001
+                        pass
+        # content-free sizes of what the call reads (the values themselves stay in RAM)
+        out["inputs"] = {"groups": len(inputs), "withheld": sum(len(i.withhold) for i in inputs),
+                         "phrasings": sum(len(i.phrasings) for i in inputs),
+                         "with_phrasings": sum(1 for i in inputs if i.phrasings),
+                         "steps": sum(len(i.steps) for i in inputs), "timed": sum(1 for i in inputs if i.times)}
+        try:
+            if dry_run:
+                out["plan"] = naming.plan(store, inputs)
+            results, run = naming.name_groups(store, inputs, settings=settings, client=client, dry_run=dry_run)
+            out.update(run.as_fields())
+        except Exception as exc:  # noqa: BLE001 - nameless (or as they were) this night
+            results = {}
+            out["error"] = type(exc).__name__
+            if log is not None:
+                try:
+                    log("error", where="learn.name", error=type(exc).__name__)
+                except Exception:  # noqa: BLE001
+                    pass
+        for p in todo:
+            got = results.get(p.key)
+            if got is None:
+                continue
+            if got.named:
+                spec = {**p.spec, **got.spec_fields()}
+                try:
+                    from yuki.skills.catalog import specialise
+
+                    specialise(p.cap, key=p.key, spec=spec, name=got.label)   # the catalog must still take it
+                except Exception:  # noqa: BLE001 - the name is not used; the row stays as it was planned
+                    out["refused_names"] = int(out.get("refused_names", 0)) + 1
+                    continue
+                p.name, p.spec = got.label, spec
+                p.use_when = list(got.use_when)
+                p.provenance.update(got.provenance())
+                p.provenance["named_by"] = "model"
+                out["named"] += 1
+            elif p.name and p.provenance.get("named") is True and p.provenance.get("named_by") == "model":
+                p.provenance["name_kept"] = got.why or None      # the earlier model name stays (its spec fields too)
+            else:
+                p.name = got.label                                 # the code-built label (the Playbook shows it)
+                p.provenance.update(got.provenance())
+                p.provenance.pop("named_by", None)
     for p in planned:
-        sig = name_signature(p)
-        if p.provenance.get("named_by") == "user":
-            continue
-        if p.name and p.provenance.get("name_sig") == sig:
-            continue
-        todo.append((p, naming_input(p, store)))
-    answers = _call_naming(store, [i for _p, i in todo], worker=worker, log=log)
-    named = 0
-    for p, inp in todo:
-        got = answers.get(inp["signature"])
-        nm, menu, use_when, everyday = _valid_name(got, p.spec.get("bound") or {})
-        if not nm:
-            continue
-        p.name, p.use_when = nm, use_when
-        p.spec["menu"] = menu
-        p.provenance.update(name_sig=inp["signature"], named_by="model", everyday=everyday)
-        named += 1
-    for p in planned:
-        p.provenance["offer_static"] = offer_static(p.cap, p.compiled, p.provenance.get("everyday"))
-    return named
+        p.provenance["offer_static"] = offer_static(p.cap, p.compiled, p.provenance.get("everyday"),
+                                                    usage=p.group.usage)
+    return out
 
 
 def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, int]) -> Counter:
     """Upsert the planned rows and move the learned rows that no longer pass, in one transaction; sets each group's
-    ``skill_id``. Returns counts (content-free)."""
+    ``skill_id``. Each existing row is read again inside the transaction (review r1 L7): a Forget / Not mine the
+    Playbook wrote since :func:`plan` leaves the row alone, and a rename it wrote keeps the user's name. Returns counts
+    (content-free)."""
     counts: Counter = Counter()
     existing = _existing(store)
     keep = {p.key for p in planned}
@@ -380,12 +494,31 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
             if cid is None:
                 counts["no_capability_row"] += 1
                 continue
+            old = existing.get(p.key)
+            if old is not None:
+                now_row = conn.execute("SELECT state, deleted_at, provenance, name_ciphertext FROM skills WHERE id = ?",
+                                       (int(old["id"]),)).fetchone()
+                if now_row is None or now_row[1] is not None or now_row[0] in TOMBSTONES:
+                    counts["tombstoned_meanwhile"] += 1     # the user's button won: never revived or rewritten
+                    continue
+                try:
+                    now_prov = json.loads(now_row[2] or "{}")
+                except (TypeError, ValueError):
+                    now_prov = {}
+                if isinstance(now_prov, dict) and now_prov.get("named_by") == "user":
+                    try:
+                        user_name = " ".join(str(store._dec(now_row[3]) or "").split()) if now_row[3] else ""
+                    except Exception:  # noqa: BLE001
+                        user_name = ""
+                    if user_name:
+                        p.name = user_name
+                        p.provenance["named_by"] = "user"
             spec_json = json.dumps(p.spec, sort_keys=True, ensure_ascii=False, default=str)
             prov_json = json.dumps(p.provenance, sort_keys=True, separators=(",", ":"), default=str)
             name_ct = store.cipher.encrypt(p.name) if p.name else None
             use_ct = store.cipher.encrypt(json.dumps(p.use_when, ensure_ascii=False)) if p.use_when else None
-            old = existing.get(p.key)
-            conn_text = "learned#" + hashlib.sha256(spec_json.encode("utf-8")).hexdigest()[:16]
+            # a keyed digest (review r1 L4): the spec holds bound values, so its plain hash could confirm a guess
+            conn_text = "learned#" + str(store.cipher.digest("learn-spec", spec_json))[:16]
             if old is None:
                 cur = conn.execute(
                     "INSERT INTO skills (key, app, end_kind, connection, origin, state, capability_id, spec_ciphertext,"
@@ -399,22 +532,23 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
                 p.row_id = int(old["id"])
                 try:
                     old_spec = store._dec(old["spec_ciphertext"]) if old.get("spec_ciphertext") else ""
-                    old_name = store._dec(old["name_ciphertext"]) if old.get("name_ciphertext") else ""
+                    old_name = store._dec(now_row[3]) if now_row[3] else ""
                 except Exception:  # noqa: BLE001
                     old_spec, old_name = "", ""
-                changed = (old_spec != spec_json or (old_name or "") != (p.name or "") or old.get("state") != p.state
+                changed = (old_spec != spec_json or (old_name or "") != (p.name or "") or now_row[0] != p.state
                            or old.get("retired_at") is not None)
                 if changed:
                     conn.execute(
                         "UPDATE skills SET state = ?, capability_id = ?, spec_ciphertext = ?, name_ciphertext = ?,"
                         " use_when_ciphertext = coalesce(?, use_when_ciphertext), provenance = ?, connection = ?,"
-                        " retired_at = NULL, updated_at = ? WHERE id = ?",
+                        " retired_at = NULL, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
                         (p.state, cid, store.cipher.encrypt(spec_json), name_ct, use_ct, prov_json, conn_text, now,
                          p.row_id))
                     counts["updated"] += 1
                 else:
                     # provenance (counts, days) only: the catalog's version is not moved (updated_at kept)
-                    conn.execute("UPDATE skills SET provenance = ? WHERE id = ?", (prov_json, p.row_id))
+                    conn.execute("UPDATE skills SET provenance = ? WHERE id = ? AND deleted_at IS NULL",
+                                 (prov_json, p.row_id))
                     counts["unchanged"] += 1
             p.group.skill_id = p.row_id
         for key, old in existing.items():
@@ -425,9 +559,11 @@ def write(store: Any, planned: list[Planned], *, now: float, cap_ids: dict[str, 
             state = "retired" if idle_days >= RETIRE_DAYS else "dormant"
             if old.get("state") == state:
                 continue
-            conn.execute("UPDATE skills SET state = ?, retired_at = CASE WHEN ? = 'retired' THEN ? ELSE retired_at END,"
-                         " updated_at = ? WHERE id = ?", (state, state, now, now, int(old["id"])))
-            counts[state] += 1
+            cur = conn.execute("UPDATE skills SET state = ?, retired_at = CASE WHEN ? = 'retired' THEN ? ELSE retired_at"
+                               " END, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND state NOT IN (?, ?)",
+                               (state, state, now, now, int(old["id"]), *TOMBSTONES))
+            if cur.rowcount:
+                counts[state] += 1
 
     store._write(op)
     return counts
@@ -449,6 +585,6 @@ def capability_ids(store: Any) -> dict[str, int]:
         return {}
 
 
-__all__ = ["DORMANT_DAYS", "RETIRE_DAYS", "TOMBSTONES", "LISTED", "NAME_BATCH", "Planned", "WriteResult",
-           "bound_values", "menu_line", "provenance", "name_signature", "naming_input", "offer_static", "plan",
+__all__ = ["DORMANT_DAYS", "RETIRE_DAYS", "TOMBSTONES", "LISTED", "NAME_PROVENANCE", "NAME_SPEC_FIELDS", "Planned",
+           "WriteResult", "bound_values", "menu_line", "provenance", "name_input", "offer_static", "plan",
            "name_planned", "write", "capability_ids"]

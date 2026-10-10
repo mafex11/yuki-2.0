@@ -18,7 +18,7 @@ Segmentation (design §3.2; rebuildable, code only):
    template pages passed on the way.
 5. **Exclusions**: Yuki's own moments; any end inside an acting step of one of Yuki's runs of the same app (``runs``
    kind action / control, from the step's start to its end plus the kind's attribution lag) or inside a skill run's
-   window (D18: such a moment is the asked occasion of that run when the run verified, never a user occasion); ends in
+   window, any app (D18: such a moment is the asked occasion of that run when the run verified, never a user occasion); ends in
    a game's app; ends inside a task the user said was not theirs (kept in :data:`NOT_MINE_STATE`, so the verdicts
    outlive the trace tables); pages outside a browser; untemplated single pages (their host-scope visit stands for
    them).
@@ -176,9 +176,9 @@ class Spans:
 
     def overlapping(self, lo: float, hi: float, lag: float = 0.0) -> list[tuple[float, float, Any]]:
         """The spans with ``a <= hi`` and ``b + lag >= lo``."""
-        i = bisect.bisect_right(self.starts, hi)
         out = []
-        for a, b, p in reversed(self.items[:i]):
+        for i in range(bisect.bisect_right(self.starts, hi) - 1, -1, -1):
+            a, b, p = self.items[i]
             if b + lag >= lo:
                 out.append((a, b, p))
             if hi - a > 2 * DAY_S:
@@ -314,10 +314,12 @@ class Builder:
             per[d["process"]].append(d)
         return per, {k: [float(x["at"]) for x in v] for k, v in per.items()}, trace_from
 
-    def _acting(self) -> tuple[dict[str, Spans], list[dict[str, Any]]]:
+    def _acting(self) -> tuple[dict[str, Spans], Spans, list[dict[str, Any]]]:
         """Yuki's acting steps per app (D18): ``runs`` steps of kind action / control, from their start to their end
-        (start + duration when no end was kept), and the skill runs' windows."""
+        (start + duration when no end was kept); and the skill runs' windows, which hold for an end moment of **any**
+        app (design §3.2: "any end moment inside a ``skill_runs`` window"; review r1 L3)."""
         per: dict[str, list[tuple[float, float, Any]]] = defaultdict(list)
+        skill_windows: list[tuple[float, float, Any]] = []
         steps: list[dict[str, Any]] = []
         acting = ",".join("?" * len(ACTING_KINDS))
         for r in _q(self.store, f"SELECT id, run_key, at, ended_at, ms, tool, kind, app, ok, verdict, input_ciphertext"
@@ -340,9 +342,8 @@ class Builder:
             a = float(d["t0"])
             b = float(d["t_done"]) if d.get("t_done") is not None else a
             d["t1"] = b
-            if d["app"]:
-                per[d["app"]].append((a, b, d))
-        return {k: Spans(v) for k, v in per.items()}, steps
+            skill_windows.append((a, b, d))
+        return {k: Spans(v) for k, v in per.items()}, Spans(skill_windows), steps
 
     # -- the pass ------------------------------------------------------------------------------------------------------
 
@@ -352,7 +353,7 @@ class Builder:
         moments = self._moments()
         visits, front = self._visits()
         trace, trace_at, trace_from = self._trace()
-        acting, run_steps = self._acting()
+        acting, skill_windows, run_steps = self._acting()
         not_mine = not_mine_spans(self.store)
         calls = Spans((float(a), float(b or c or self.until), None) for a, b, c in _q(
             self.store, "SELECT detected_at, ended_at, last_alive_at FROM calls WHERE kind = 'call' AND detected_at <= ?",
@@ -414,6 +415,14 @@ class Builder:
             if any(a <= at <= b and (not apps or app in apps) for a, b, apps in not_mine):
                 self.dropped["not_mine"] += 1
                 continue
+            if kind == "page":
+                # the page drops come first (review r1 L2): a page that is no occasion anyway never counts as acted
+                if app not in self.browsers:
+                    self.dropped["page_not_browser"] += 1
+                    continue
+                if facts.get("scope") != "host" and not facts.get("template"):
+                    self.dropped["page_untemplated"] += 1     # its host-scope visit stands for it
+                    continue
             lag = float(ATTRIBUTION_LAG_S.get(kind, 20.0))
             hit = None
             spans = acting.get(app)
@@ -421,30 +430,32 @@ class Builder:
                 if a <= at <= b + lag:
                     hit = d
                     break
+            if hit is None:
+                for a, b, d in skill_windows.overlapping(at, at, lag):
+                    if a <= at <= b + lag:
+                        hit = d
+                        break
             if hit is not None:
-                # D18 (critique M2): inside one of Yuki's acting steps of this app: that run's, never the user's
+                # D18 (critique M2): inside one of Yuki's acting steps of this app, or inside a skill run's window
+                # (any app): that run's, never the user's
                 self.dropped["yuki_acting"] += 1
                 self.dropped[f"yuki_acting:{kind}"] += 1
                 self.dropped[f"yuki_acting:{kind}:{app}"] += 1
-                acted_moments.setdefault(("s:" if hit.get("skill_run") else "r:") + str(hit["id"]), mid)
+                if not hit.get("skill_run") or not hit.get("app") or hit.get("app") == app:
+                    # the moment is that run's own end only in the run's app (or a run with no app kept)
+                    acted_moments.setdefault(("s:" if hit.get("skill_run") else "r:") + str(hit["id"]), mid)
                 continue
             src: dict[str, Any] = {"app": app, "service": m.get("service"), "value": m.get("value"),
                                    "means": m.get("means")}
             if kind == "page":
-                if app not in self.browsers:
-                    self.dropped["page_not_browser"] += 1
-                    continue
                 if facts.get("scope") == "host":
                     src["site"] = facts.get("host")
                     src["page"] = None
                     src["top_host"] = facts.get("top_host")
                     src["host"] = facts.get("host")
-                elif facts.get("template"):
+                else:
                     site, _, page = str(facts["template"]).partition(".")
                     src["site"], src["page"], src["host"] = site, page or None, facts.get("host")
-                else:
-                    self.dropped["page_untemplated"] += 1     # its host-scope visit stands for it
-                    continue
             if kind == "message_sent":
                 tid = facts.get("thread_id")
                 host, url_ct = threads.get(int(tid), ("", None)) if isinstance(tid, int) else ("", None)

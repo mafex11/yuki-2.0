@@ -1110,7 +1110,8 @@ class Extractor:
         for r in span:
             last = groups[-1][-1] if groups else None
             ident = same(r)
-            if last is not None and ident is not None and same(last) == ident and                     float(r["started_at"]) - float(last["ended_at"]) <= VISIT_GAP_S:
+            if last is not None and ident is not None and same(last) == ident and \
+                    float(r["started_at"]) - float(last["ended_at"]) <= VISIT_GAP_S:
                 groups[-1].append(r)
             else:
                 groups.append([r])
