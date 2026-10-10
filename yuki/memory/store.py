@@ -11104,6 +11104,58 @@ class Store:
                            " ORDER BY count(*) DESC, max(started_at) DESC LIMIT 1", (str(app),))
         return str(rows[0][0]) if rows else None
 
+    def fact_trail(self, fact_id: int, *, limit: int = 32) -> list[dict[str, Any]]:
+        """A portrait fact version and the versions that replaced it (following ``superseded_by`` while a version is
+        ended), oldest first, content-free (nothing decrypted): ``{id, kind, origin, pinned, reviewed_at, valid_to,
+        expired_at, superseded_by, run_id, run_kind}`` (``run_kind``: the kind of the portrait run that wrote the
+        version, None for a write of no run). The routine miner asks it who ended or rewrote its measured line."""
+        out: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        nxt: int | None = int(fact_id)
+        while nxt is not None and nxt not in seen and len(out) < limit:
+            seen.add(nxt)
+            rows = self._query(
+                "SELECT f.id, f.kind, f.origin, f.pinned, f.reviewed_at, f.valid_to, f.expired_at, f.superseded_by,"
+                " f.run_id, r.kind AS run_kind FROM portrait_facts f LEFT JOIN portrait_runs r ON r.id = f.run_id"
+                " WHERE f.id = ?", (nxt,))
+            if not rows:
+                break
+            version = dict(rows[0])
+            out.append(version)
+            nxt = int(version["superseded_by"]) if version["valid_to"] is not None and version["superseded_by"] \
+                else None
+        return out
+
+    def fact_ended_by(self, fact_id: int, *, slack_s: float = 120.0) -> list[dict[str, Any]]:
+        """The memory diary's lines that say who ended a portrait fact version (an INVALIDATE leaves no other trace):
+        lines listing it in ``fact_ids`` whose run's span holds the version's end (a line of no run, such as the
+        review queue's: within ``slack_s`` of it), latest first, content-free: ``{pass, action, run_id, run_kind,
+        new_fact_ids}``. Empty when the version is current or no line says."""
+        rows = self._query("SELECT expired_at, valid_to FROM portrait_facts WHERE id = ?", (int(fact_id),))
+        if not rows or rows[0]["valid_to"] is None:
+            return []
+        end = float(rows[0]["expired_at"] if rows[0]["expired_at"] is not None else rows[0]["valid_to"])
+        out = []
+        for r in self._query(
+                "SELECT m.at, m.run_id, m.pass, m.action, m.new_fact_ids, r.kind AS run_kind, r.at AS run_at,"
+                " r.finished_at FROM memory_changelog m JOIN json_each(m.fact_ids) j LEFT JOIN portrait_runs r"
+                " ON r.id = m.run_id WHERE j.value = ? AND m.at <= ? ORDER BY m.at DESC, m.id DESC",
+                (int(fact_id), end + slack_s)):
+            if r["run_id"] is not None and r["run_at"] is not None:
+                hi = float(r["finished_at"]) if r["finished_at"] is not None else float(r["at"]) + 6 * 3600.0
+                held = float(r["run_at"]) - slack_s <= end <= hi + slack_s
+            else:
+                held = abs(float(r["at"]) - end) <= slack_s
+            if not held:
+                continue
+            try:
+                news = [int(i) for i in json.loads(r["new_fact_ids"] or "[]")]
+            except (ValueError, TypeError):
+                news = []
+            out.append({"pass": r["pass"], "action": r["action"], "run_id": r["run_id"], "run_kind": r["run_kind"],
+                        "new_fact_ids": news})
+        return out
+
 
 def _split_sql(script: str) -> list[str]:
     """Split a migration script into statements (the scripts contain no ';' in literals)."""

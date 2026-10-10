@@ -29,13 +29,16 @@ a window is a centre time on a day-set (weekdays, weekends, all days); a hit is 
 * lift >= 3 against same-width windows at other hours on days the user was present then;
 * spread: median absolute deviation <= 10 min;
 * permutation p < 0.05: each day's onsets moved to random present minutes of that day, 200 draws, scored with the
-  best window anywhere (so the search for the best window is paid for), on at most 3 candidates per key;
+  best window anywhere (so the search for the best window is paid for), on at most 3 candidates per key, each a
+  different window (a candidate under 90 min from one already tested, on any day-set, is skipped);
 * stability: the medians of the first and second half of the hit days within 15 min;
 * windows of one key >= 90 min apart, each its own row.
 
 **State** (R1.6): a window that passes every bar becomes an ``active`` routine row (matched to an existing row of the
 same key within 45 min). An active row goes ``dormant`` after 5 eligible days in a row without a hit or a weighted
-rate under 0.6, and ``retired`` after 28 days without a hit; a dormant row passing the bars again is active again. A
+rate under 0.6, both at the best window within 45 min of its time (the hysteresis: becoming active takes every bar,
+staying active only the rate and the misses near it, so a routine whose best centre wobbles doesn't flap), and
+``retired`` after 28 days without a hit; a dormant row passing the bars again is active again. A
 new window of a key while an older one of the same key sits under 90 min away and no longer passes moves it to
 dormant ("the meeting moved"). A ``told`` row (the user said it; :func:`tell`) is active after 2 confirming seen
 hits (retired unconfirmed after 28 days).
@@ -46,10 +49,15 @@ hits (retired unconfirmed after 28 days).
   nightly run, unchanged); it never runs during a game or a call because the nightly run doesn't.
 * The portrait's Routines lines from counts (:func:`sync_facts`): one ``routine`` fact per active routine, written by
   code (origin ``measured``) through the portrait's own operations, e.g. "On 7 of the last 9 weekdays the user joined a
-  Google Meet call in Zen at about 08:58 (25 Sep - 8 Oct 2026)." The portrait's validator refuses model edits to them.
-  The first run ends the routine facts the old Sonnet pass wrote.
-* :func:`due_offers` (which offerable routines' card window is open now, for the card lane), :func:`active_near` (the
-  talker's "now" block), :func:`why_line` (the card's why line, from counts), :func:`tell`.
+  Google Meet call in Zen at about 08:58 (25 Sep - 8 Oct 2026)." ("N of M" counts hits on the eligible days only, so
+  N never exceeds M.) The portrait's validator refuses model edits to them. The first run ends the routine facts the
+  old Sonnet pass wrote. When something else ended or rewrote the line, the miner looks at who
+  (:func:`fact_fate`): the user's review ("not right") or their correction turns the line off for good; a model's
+  tidy-up (dreaming's merge or retire, the admission bar) is undone the next night: its version ends and the line is
+  written again from counts.
+* :func:`due_offers` (which offerable routines' card window is open now, for the card lane, never more than the day's
+  cards left), :func:`active_near` (the talker's "now" block: offerable routines only, R1.5), :func:`why_line` (the
+  card's why line, from counts), :func:`tell`.
 * Logs: ``routines_mined`` (content-free: keys, unmapped counts, candidates, states, cpu ms) in the portrait log.
 
 CLI: ``python -m yuki.memory.routines --show`` (the routines, read-only), ``--report`` (mine now on a temporary copy
@@ -123,6 +131,11 @@ FACT_MOVE_MIN = 5.0
 FACT_REFRESH_S = 7 * 86400.0
 #: The origin of the portrait facts this module writes (the portrait's validator refuses model edits to them).
 MEASURED_ORIGIN = "measured"
+#: Who may end or rewrite a measured routine line for good: the memory diary's passes of the user's own verdicts (the
+#: review queue's "not right" / "not mine", a correction) and the portrait runs of the user's corrections. Any other
+#: writer (dreaming, the admission bar, a recheck) is a tidy-up the miner undoes from the counts.
+USER_PASSES = ("review", "correct")
+USER_RUN_KINDS = ("correct",)
 #: The card lane's windows (PLAN B.3 triggers; the lane's settings may narrow them): early [at - 8, at - 1] min,
 #: late [at + 1, at + 3] min.
 OFFER_LEAD_MIN = 8.0
@@ -423,6 +436,8 @@ class Window:
     rate: float
     hit_days: list[date]
     hit_at: dict[date, float]         # each hit day's onset nearest the centre (day minutes)
+    elig_hits: int = 0                # hits on eligible days (what the rate counts, and "N of M" says)
+    elig_seen: int = 0                # seen hits on eligible days
     lift: float | None = None
     p: float | None = None
     stable: bool | None = None
@@ -439,7 +454,8 @@ class Window:
     def summary(self) -> dict[str, Any]:
         """Content-free numbers (the report, the log)."""
         return {"key": _short_key(self.key), "dayset": self.dayset, "at": hm(self.at_min), "hits": self.hits,
-                "seen_hits": self.seen_hits, "eligible": self.eligible, "rate": round(self.rate, 2),
+                "seen_hits": self.seen_hits, "eligible": self.eligible, "hits_on_eligible": self.elig_hits,
+                "rate": round(self.rate, 2),
                 "lift": None if self.lift is None else round(self.lift, 1), "mad": round(self.mad, 1),
                 "p": None if self.p is None else round(self.p, 3), "stable": self.stable, "pass": self.passed,
                 "failed": list(self.failed)}
@@ -579,10 +595,18 @@ def mine(inputs: Inputs, until: float, *, keys: Iterable[str] | None = None) -> 
                     continue
                 wts = {d: _weight(until, d) for d in elig}
                 rate = sum(wts[d] for d in hit_at if d in wts) / sum(wts.values())
+                misses = 0   # eligible days in a row without a hit, most recent first (R1.6's dormant rule)
+                for d in reversed(elig):
+                    if d in hit_at:
+                        break
+                    misses += 1
                 out.candidates += 1
                 cand = Window(key, ds_name, c, med, mad, len(hit_at), len(seen_days), len(elig), rate,
-                              sorted(hit_at), hit_at, first_hit=first_hit)
-                ok = rate >= MIN_RATE and mad <= MAX_MAD_MIN
+                              sorted(hit_at), hit_at, elig_hits=sum(1 for d in hit_at if d in wts),
+                              elig_seen=sum(1 for d in seen_days if d in wts), first_hit=first_hit)
+                # a window whose last 5 eligible days all missed is dormant by R1.6, so it never passes (else a
+                # long-held routine that stopped would stay active on its old hits, matched night after night)
+                ok = rate >= MIN_RATE and mad <= MAX_MAD_MIN and misses < DORMANT_MISSES
                 if ok:
                     cand.lift = _lift(byday, days, presence, med, rate)
                     ok = cand.lift >= MIN_LIFT
@@ -590,17 +614,23 @@ def mine(inputs: Inputs, until: float, *, keys: Iterable[str] | None = None) -> 
                     cheap.append(cand)
                 else:
                     cand.failed = [n for n, bad in (("rate", rate < MIN_RATE), ("mad", mad > MAX_MAD_MIN),
+                                                    ("misses", misses >= DORMANT_MISSES),
                                                     ("lift", cand.lift is not None and cand.lift < MIN_LIFT)) if bad]
                     note_fail(cand)
         chosen: list[Window] = []
+        tested: list[Window] = []
         permuted = 0
         for cand in sorted(cheap, key=lambda x: (-x.rate * x.hits, x.mad)):
-            if any(min(abs(cand.median - ch.median), 1440.0 - abs(cand.median - ch.median)) < WINDOW_GAP_MIN
-                   for ch in chosen):
+            # windows of one key stay 90 min apart, and the permutation slots go to different windows: a candidate
+            # under 90 min from one already tested (passed or failed, any day-set) is a near duplicate of it and is
+            # skipped (review L1), so one failing window can't use up the slots of another; the best candidate of a
+            # neighbourhood is its test (a weekday-only routine sorts its weekdays window first: same hits, higher rate)
+            if any(_gap(cand.median, t.median) < WINDOW_GAP_MIN for t in tested):
                 continue
             if permuted >= PERMUTED_PER_KEY:
                 break
             permuted += 1
+            tested.append(cand)
             days = [d for d in days_obs if DAYSETS[cand.dayset](d)]
             rng = np.random.default_rng(_seed(key, cand.dayset, cand.centre, until))
             cand.p = _permutation_p(days, {d: len(v) for d, v in byday.items()}, presence, cand.hits, rng)
@@ -640,6 +670,8 @@ class Stats:
     eligible: int = 0
     rate: float = 0.0
     misses_in_row: int = 0
+    elig_hits: int = 0            # hits on eligible days ("N of M" says these)
+    elig_seen: int = 0
     hit_days: list[date] = field(default_factory=list)
     first_hit_at: float | None = None
     last_hit_at: float | None = None
@@ -679,6 +711,8 @@ def window_stats(inputs: Inputs, key: str, dayset: str, at_min: float, until: fl
     if elig:
         wts = {d: _weight(until, d) for d in elig}
         out.rate = sum(wts[d] for d in hit_times if d in wts) / sum(wts.values())
+        out.elig_hits = sum(1 for d in hit_times if d in wts)
+        out.elig_seen = sum(1 for d in hit_times if d in wts and d in seen)
         for d in reversed(elig):
             if d in hit_times:
                 break
@@ -708,9 +742,38 @@ def _gap(a: float | None, b: float | None) -> float:
 
 
 def _window_numbers(w: Window) -> dict[str, Any]:
-    return {"at_min": round(w.at_min, 3), "mad_min": round(w.mad, 3), "hits": w.hits, "seen_hits": w.seen_hits,
+    # the row says "N of M": hits on its eligible days (the raw hit count is the bar's, kept in the report)
+    return {"at_min": round(w.at_min, 3), "mad_min": round(w.mad, 3), "hits": w.elig_hits, "seen_hits": w.elig_seen,
             "eligible": w.eligible, "rate": round(w.rate, 4), "lift": None if w.lift is None else round(w.lift, 2),
             "p": None if w.p is None else round(w.p, 4), "stable": None if w.stable is None else int(w.stable)}
+
+
+def _near_best(inputs: Inputs, key: str, dayset: str, at_min: float, until: float, *,
+               since: float | None = None) -> Stats | None:
+    """Decay's numbers (review L3, the hysteresis): over windows centred within :data:`MATCH_MIN` of a row's time
+    (its own time and each onset of its key near it), the best weighted rate and the fewest eligible misses in a row
+    (a :class:`Stats` holding just those), or None when no such window has a hit. A row is matched to a passing window
+    within the same distance, so it stays active while the routine still holds near its time."""
+    lo = until - WINDOW_DAYS * 86400.0
+    if since is not None:
+        lo = max(lo, since)
+    dm = from_clock(at_min)
+    centres = {round(float(at_min) % 1440.0, 1)}
+    for t in inputs.onsets.get(key, ()):
+        if lo <= t < until and dayset_has(dayset, day_of(t)) and _gap(day_minute(t), dm) <= MATCH_MIN:
+            centres.add(round(clock_minute(day_minute(t)), 1))
+    best: Stats | None = None
+    for c in sorted(centres):
+        st = window_stats(inputs, key, dayset, c, until, since=since)
+        if not st.hits:
+            continue
+        if best is None:
+            best = Stats(eligible=st.eligible, rate=st.rate, misses_in_row=st.misses_in_row)
+            continue
+        best.eligible = max(best.eligible, st.eligible)
+        best.rate = max(best.rate, st.rate)
+        best.misses_in_row = min(best.misses_in_row, st.misses_in_row)
+    return best
 
 
 def plan(rows: Sequence[Mapping[str, Any]], mined: Mined, inputs: Inputs, now: float) -> list[Change]:
@@ -768,11 +831,15 @@ def plan(rows: Sequence[Mapping[str, Any]], mined: Mined, inputs: Inputs, now: f
     for row in live:
         if row["id"] in matched:
             continue
+        since = row.get("told_at") if row.get("trigger") == "told" else None
         ch_stats = window_stats(inputs, row["key"], row["dayset"], float(row.get("at_min") or 0.0), mined.until,
-                                since=row.get("told_at") if row.get("trigger") == "told" else None)
-        upd: dict[str, Any] = {"hits": ch_stats.hits, "seen_hits": ch_stats.seen_hits,
+                                since=since)
+        upd: dict[str, Any] = {"hits": ch_stats.elig_hits, "seen_hits": ch_stats.elig_seen,
                                "eligible": ch_stats.eligible, "rate": round(ch_stats.rate, 4),
                                "misses_in_row": ch_stats.misses_in_row, "mined_at": now}
+        # an active row decays on the best window near its time (the hysteresis), never on its stored centre alone
+        near = (_near_best(inputs, row["key"], row["dayset"], float(row.get("at_min") or 0.0), mined.until,
+                           since=since) if row["state"] == "active" else None) or ch_stats
         if ch_stats.last_hit_at is not None:
             upd["last_hit_at"] = max(ch_stats.last_hit_at, float(row.get("last_hit_at") or 0.0))
         last_hit = upd.get("last_hit_at", row.get("last_hit_at"))
@@ -786,9 +853,9 @@ def plan(rows: Sequence[Mapping[str, Any]], mined: Mined, inputs: Inputs, now: f
         elif state in ("active", "dormant") and (last_hit is None or mined.until - float(last_hit)
                                                   >= RETIRE_DAYS * 86400.0):
             new_state, why = "retired", "no_hit_28_days"
-        elif state == "active" and ch_stats.misses_in_row >= DORMANT_MISSES:
+        elif state == "active" and near.misses_in_row >= DORMANT_MISSES:
             new_state, why = "dormant", "misses_in_row"
-        elif state == "active" and ch_stats.eligible and ch_stats.rate < MIN_RATE:
+        elif state == "active" and near.eligible and near.rate < MIN_RATE:
             new_state, why = "dormant", "rate"
         elif state == "active" and any(
                 w.key == row["key"] and _gap(w.at_min, row.get("at_min")) < WINDOW_GAP_MIN for w in mined.passed):
@@ -891,12 +958,24 @@ class FactsResult:
     updated: int = 0
     invalidated: int = 0
     old_invalidated: int = 0
-    ended_elsewhere: int = 0
+    user_ended: int = 0          # lines the user ended or rewrote (review, correction): off for good
+    rewritten: int = 0           # lines a model's tidy-up ended or rewrote, written again from counts
     rows: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
 def _fact_sig(row: Mapping[str, Any]) -> str:
-    return f"{row.get('dayset')}|{round(float(row.get('at_min') or 0.0) / FACT_MOVE_MIN)}"
+    """What a routine's line was written for: its day-set and its time (a clock minute, to 0.1)."""
+    return f"{row.get('dayset')}|{float(row.get('at_min') or 0.0) % 1440.0:.1f}"
+
+
+def _sig_holds(sig: Any, row: Mapping[str, Any]) -> bool:
+    """The line written for ``sig`` still says ``row``: the same day-set and its time under :data:`FACT_MOVE_MIN`
+    away (a distance, not a rounding, so a time sitting on a boundary never rewrites the line night after night)."""
+    try:
+        dayset, at = str(sig).split("|", 1)
+        return dayset == str(row.get("dayset")) and _gap(float(at), float(row.get("at_min") or 0.0)) < FACT_MOVE_MIN
+    except (TypeError, ValueError):
+        return False
 
 
 def model_routine_facts(store: Any) -> list[Any]:
@@ -910,31 +989,95 @@ def model_routine_facts(store: Any) -> list[Any]:
     return [f for f in store.portrait_facts(("routine",)) if f.id in ids]
 
 
+@dataclass
+class Fate:
+    """What happened to a routine's line that is no longer current (:func:`fact_fate`)."""
+
+    by_user: bool
+    #: The current versions a model's tidy-up wrote in its place (the newest of its rewrites, a lasting line), which
+    #: the miner replaces with the line from counts.
+    replaced_by: list[int] = field(default_factory=list)
+
+
+def fact_fate(store: Any, fact_id: int) -> Fate:
+    """Who ended or rewrote a routine's measured line (review M1), from the fact's own history and the memory diary:
+
+    * the user (``by_user``): a version on the way was written by their correction (a ``correct`` run, or origin
+      ``user``), or the last version was ended by their review ("not right" / "not mine") or a correction (the diary
+      pass ``review`` / ``correct`` at its end). The line stays off;
+    * anyone else (dreaming's merge or retire, the admission bar, a recheck, or nothing on record): a tidy-up. The
+      current version that replaced it (the end of its ``superseded_by`` chain) and any current line the tidy-up wrote
+      in its place (the bar's lasting part) are ``replaced_by``; the miner ends them and writes its line again."""
+    trail = store.fact_trail(int(fact_id))
+    if not trail:
+        return Fate(False)
+    for version in trail[1:]:   # each rewrite: who wrote the new version
+        if version.get("run_kind") in USER_RUN_KINDS or version.get("origin") == "user":
+            return Fate(True)
+    tail = trail[-1]
+    if tail.get("valid_to") is None:
+        return Fate(False, [int(tail["id"])])
+    lines = store.fact_ended_by(int(tail["id"]))
+    if lines and (lines[0]["pass"] in USER_PASSES or lines[0].get("run_kind") in USER_RUN_KINDS):
+        return Fate(True)
+    kind = tail.get("kind") or "routine"
+    news: list[int] = []
+    for line in lines[:1]:
+        for i in line.get("new_fact_ids") or ():
+            f = store.portrait_fact(int(i))
+            if f is not None and f.valid_to is None and f.kind == kind and f.origin != "user" and int(i) not in news:
+                news.append(int(i))
+    return Fate(False, news)
+
+
 def sync_facts(store: Any, now: float, rows: Sequence[Mapping[str, Any]], stats: Mapping[int, Stats], *,
                services: Mapping[str, Counter] | None = None, skills: Sequence[Any] | None = None,
                dry_run: bool = False) -> FactsResult:
     """One ``routine`` portrait fact per active routine, written by code (origin ``measured``) through
     ``Store.commit_portrait_changes`` in a ``routines`` portrait run of model ``code`` (cost 0): ADD for a new one,
     UPDATE when its day-set or time moved (or weekly, for its counts), INVALIDATE when the routine stops being active.
-    The live routine facts the old Sonnet pass wrote are ended (the first run ends them all). A fact something else
-    ended or rewrote (the user's review, a correction) is left alone and never written again for that routine."""
-    from yuki.memory.store import FactChange, PortraitRunStats
+    The live routine facts the old Sonnet pass wrote are ended (the first run ends them all).
+
+    A line something else ended or rewrote (:func:`fact_fate`): the user's review or correction turns it off for that
+    routine (``fact_off``); a model's tidy-up (dreaming merges look-alikes and keeps the fact's origin, so its merged
+    words would pass for counts) is undone: the version it wrote in the line's place becomes the line from counts
+    again (an UPDATE, so its history, pin and review carry over), any other current line it wrote there ends, and a
+    line it simply ended is written again (an ADD). For a routine no longer active its versions just end."""
+    from yuki.memory.store import FactChange
 
     out = FactsResult()
     current = {f.id: f for f in store.portrait_facts(("routine",))}
+    owned = {int(r["fact_id"]) for r in rows if r.get("fact_id") is not None and int(r["fact_id"]) in current}
+    claimed: set[int] = set()
     changes: list[FactChange] = []
     targets: list[tuple[int | None, str]] = []   # (routine id, what) per change, in order
     for f in model_routine_facts(store):
         changes.append(FactChange("INVALIDATE", f.id, f.kind, f.subject, "", None, [], now, MEASURED_ORIGIN))
         targets.append((None, "old"))
+        claimed.add(f.id)
     for row in rows:
         rid = int(row["id"])
         fid = row.get("fact_id")
         active = row.get("state") == "active"
-        if fid is not None and fid not in current:   # ended or rewritten by something else: leave it be
-            out.rows[rid] = {"fact_id": None, "fact_off": 1, "fact_sig": None}
-            out.ended_elsewhere += 1
-            continue
+        forced = False
+        if fid is not None and fid not in current:   # ended or rewritten by something else: by whom?
+            fate = fact_fate(store, int(fid))
+            if fate.by_user:
+                out.rows[rid] = {"fact_id": None, "fact_off": 1, "fact_sig": None}
+                out.user_ended += 1
+                continue
+            out.rewritten += 1
+            theirs = [i for i in fate.replaced_by if i in current and i not in claimed and i not in owned]
+            claimed.update(theirs)
+            keep = theirs[0] if active and not row.get("fact_off") and theirs else None
+            for i in theirs:
+                if i != keep:
+                    changes.append(FactChange("INVALIDATE", i, "routine", "", "", None, [], now, MEASURED_ORIGIN))
+                    targets.append((None, "tidy_end"))
+            out.rows[rid] = {"fact_id": None, "fact_sig": None, "fact_at": now}
+            fid, forced = keep, True
+            if not active or row.get("fact_off"):
+                continue
         if not active:
             if fid is not None:
                 changes.append(FactChange("INVALIDATE", fid, "routine", "", "", None, [], now, MEASURED_ORIGIN))
@@ -944,12 +1087,12 @@ def sync_facts(store: Any, now: float, rows: Sequence[Mapping[str, Any]], stats:
             continue
         st = stats.get(rid) or Stats()
         sig = _fact_sig(row)
-        fresh = (fid is not None and row.get("fact_sig") == sig
+        fresh = (not forced and fid is not None and _sig_holds(row.get("fact_sig"), row)
                  and now - float(row.get("fact_at") or 0.0) < FACT_REFRESH_S)
         if fresh:
             continue
         text, summary, shown = fact_texts(store, row, st, services, skills)
-        if fid is not None and current[fid].text == text:
+        if not forced and fid is not None and current[fid].text == text:
             out.rows[rid] = {"fact_sig": sig, "fact_at": now}
             continue
         episodes: list[int] = []
@@ -974,8 +1117,10 @@ def sync_facts(store: Any, now: float, rows: Sequence[Mapping[str, Any]], stats:
     if not changes or dry_run:
         out.added = sum(1 for _r, what in targets if what == "add")
         out.updated = sum(1 for _r, what in targets if what == "update")
-        out.invalidated = sum(1 for _r, what in targets if what == "invalidate")
+        out.invalidated = sum(1 for _r, what in targets if what in ("invalidate", "tidy_end"))
         return out
+    from yuki.memory.store import PortraitRunStats
+
     run_id = store.start_portrait_run("routines", "code", at=now)
     run_stats = PortraitRunStats(kind="routines", model="code", window_since=now - WINDOW_DAYS * 86400.0,
                                  window_until=now)
@@ -988,8 +1133,8 @@ def sync_facts(store: Any, now: float, rows: Sequence[Mapping[str, Any]], stats:
                 out.added += 1
             elif what == "update":
                 out.updated += 1
-            else:
-                out.invalidated += 1 if what == "invalidate" else 0
+            elif what in ("invalidate", "tidy_end"):
+                out.invalidated += 1
             if rid is None:
                 continue
             row = next(r for r in rows if int(r["id"]) == rid)
@@ -1101,7 +1246,7 @@ class RoutineMiner:
                 "retired": states.get("retired", 0), "candidate": states.get("candidate", 0),
                 "offerable": offerable,
                 "facts": {"added": facts.added, "updated": facts.updated, "invalidated": facts.invalidated,
-                          "ended_elsewhere": facts.ended_elsewhere},
+                          "user_ended": facts.user_ended, "rewritten": facts.rewritten},
                 "first_run_invalidated": facts.old_invalidated,
             }
         except Exception as exc:  # noqa: BLE001 - logged; the next night tries again
@@ -1208,17 +1353,22 @@ def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | 
                                                                                   + 10.0) * 60.0,
                     "hits": row.get("hits"), "eligible": row.get("eligible"), "rate": row.get("rate")})
     out.sort(key=lambda o: o["window"][0])
-    return out
+    return out[:max(0, per_day - len(offered_ids))]   # never more than the day's routine cards left (review L5)
 
 
-def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, limit: int = 2) -> list[dict[str, Any]]:
-    """Active routines whose time is within ``minutes`` of now on a day of their day-set (the talker's "now" block),
-    nearest first, at most ``limit``: content-free numbers plus the label when one was told."""
+def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, limit: int = 2,
+                skills: Sequence[Any] | None = None) -> list[dict[str, Any]]:
+    """Active routines of an ``offerable`` skill whose time is within ``minutes`` of now on a day of their day-set
+    (the talker's "now" block), nearest first, at most ``limit``: content-free numbers plus the label when one was
+    told. Context routines (a skill that is not offerable, such as the voice channel) never reach it (R1.5)."""
     now = time.time() if now is None else float(now)
     today = day_of(now)
     dm_now = day_minute(now)
+    offerable = {s.key for s in (load_skills() if skills is None else skills) if getattr(s, "offerable", False)}
     out = []
     for row in store.routines(states=["active"]):
+        if row.get("skill_id") not in offerable:
+            continue
         if not dayset_has(str(row["dayset"]), today) or row.get("at_min") is None:
             continue
         delta = from_clock(float(row["at_min"])) - dm_now

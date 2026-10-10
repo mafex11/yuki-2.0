@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from yuki.memory import routines as R
-from yuki.memory.store import MIGRATIONS, FactChange, ModelCall, NewFact, Store, TimelineRow
+from yuki.memory.store import MIGRATIONS, FactChange, ModelCall, NewFact, PortraitRunStats, Store, TimelineRow
 
 MON = date(2026, 9, 14)   # a Monday
 
@@ -341,7 +341,9 @@ def test_a_routine_moved_an_hour_is_relearned_as_a_new_row(store):
     assert old and new and old[0]["id"] != new[0]["id"]
     assert old[0]["state"] in ("dormant", "retired") and new[0]["state"] == "active"
     became = min(e["at"] for e in store.routine_events(new[0]["id"], kinds=["state"]))
-    assert R.day_of(became) <= MON + timedelta(days=21 + 9)   # eligible days start at its first hit
+    # eligible days start at its first hit; one permutation test per window a night (review L1) and the 15 old
+    # onsets still in the 28 days make it the night after its 8th hit day here
+    assert R.day_of(became) <= MON + timedelta(days=21 + 10)
 
 
 def test_a_dormant_routine_passing_again_is_active_again(store):
@@ -434,17 +436,141 @@ def test_the_first_run_ends_the_old_sonnet_routine_facts_only(store):
     assert R.model_routine_facts(store) == []
 
 
-def test_a_fact_ended_elsewhere_is_never_written_again(store):
+def _measured_routine(store):
+    """An active E1 routine with its measured line, and two more weeks of joins to keep it active."""
     setup_presence(store, MON, 42)
     e1(store, weeks=3)
     e1(store, first=MON + timedelta(days=21), weeks=2, minute=59)
     run_days(store, MON + timedelta(days=21), MON + timedelta(days=21))
-    fid = store.routines()[0]["fact_id"]
-    store.commit_portrait_changes(None, [FactChange("INVALIDATE", fid, "routine", "", "", None, [], time.time(),
-                                                    "user")])   # the user's "not right" in the review queue
+    [row] = store.routines()
+    assert row["state"] == "active" and row["fact_id"] is not None
+    return row["fact_id"]
+
+
+def test_a_line_the_user_said_is_not_right_is_never_written_again(store):
+    from yuki.memory.api import MemoryClient
+
+    fid = _measured_routine(store)
+    got = MemoryClient(store).review_mark(f"fact:{fid}", "wrong")   # the review queue's "not right"
+    assert got["ok"]
     run_days(store, MON + timedelta(days=22), MON + timedelta(days=36))
     row = store.routines()[0]
-    assert row["fact_off"] == 1 and row["fact_id"] is None and store.portrait_facts(("routine",)) == []
+    assert row["fact_off"] == 1 and row["fact_id"] is None
+    assert [f for f in store.portrait_facts(("routine",)) if f.origin == R.MEASURED_ORIGIN] == []
+
+
+def test_a_line_the_users_correction_rewrote_stays_theirs(store):
+    fid = _measured_routine(store)
+    run = store.start_portrait_run("correct", "test", at=time.time())
+    [(ok, new)] = store.commit_portrait_changes(run, [FactChange(
+        "UPDATE", fid, "routine", "", "The user's standup is at nine.", 0.9, [], time.time(), R.MEASURED_ORIGIN)])
+    assert ok
+    run_days(store, MON + timedelta(days=22), MON + timedelta(days=29))
+    row = store.routines()[0]
+    assert row["fact_off"] == 1 and row["fact_id"] is None
+    assert [f.id for f in store.portrait_facts(("routine",))] == [new]   # the corrected words stand
+
+
+def _dream(store, change):
+    """dreaming.py's own apply (the model's judgement stubbed by the change it would have made): a merge UPDATEs the
+    kept fact with the model's words and keeps its origin, INVALIDATEs the others and points them at it; a retire
+    INVALIDATEs; one diary line each."""
+    from types import SimpleNamespace
+
+    from yuki.memory.dreaming import Dreamer, DreamResult
+
+    run = store.start_portrait_run("dream", "test", at=time.time())
+    result = DreamResult(run)
+    Dreamer(SimpleNamespace(store=store)).apply(run, [change], [], store.portrait_facts(), time.time(), result)
+    assert result.applied == 1 and not result.rejected
+    return result
+
+
+def _dream_merge(store, keep, other, text):
+    result = _dream(store, {"action": "merge", "ids": [keep, other], "keep": keep, "text": text, "importance": None,
+                            "reason": "look-alikes"})
+    return result.diary[0]["new_fact_ids"][0]
+
+
+def _model_routine_fact(store, text="The user is usually on a call in the mornings."):
+    run = store.start_portrait_run("nightly", "test", at=time.time())
+    [(ok, fid)] = store.commit_portrait_changes(run, [FactChange("ADD", None, "routine", "", text, 0.6, [],
+                                                                 time.time())])
+    assert ok
+    return fid
+
+
+def test_a_dreaming_merge_that_keeps_the_measured_fact_is_replaced_by_counts_the_next_night(store):
+    fid = _measured_routine(store)
+    model = _model_routine_fact(store)
+    merged = _dream_merge(store, fid, model, "The user joins a morning call most weekdays, often running late.")
+    assert store.portrait_fact(merged).origin == R.MEASURED_ORIGIN   # the model's words posing as counts
+    run_days(store, MON + timedelta(days=22), MON + timedelta(days=22))
+    row = store.routines()[0]
+    assert not row["fact_off"] and row["fact_id"] not in (None, merged)
+    [line] = store.portrait_facts(("routine",))
+    assert line.id == row["fact_id"] and line.origin == R.MEASURED_ORIGIN
+    assert line.text.startswith("On ") and "of the last" in line.text and "running late" not in line.text
+    assert store.portrait_fact(merged).superseded_by == line.id    # the merged version's history leads here
+    run = store.portrait_runs(1)[0]
+    assert (run["kind"], run["model"], run["cost_usd"]) == ("routines", "code", 0.0)
+    # it stays the miner's: a later night leaves it alone, and it still ends when the routine stops
+    run_days(store, MON + timedelta(days=23), MON + timedelta(days=23))
+    assert [f.id for f in store.portrait_facts(("routine",))] == [line.id]
+
+
+def test_a_dreaming_merge_that_keeps_the_other_fact_gets_the_line_back(store):
+    fid = _measured_routine(store)
+    model = _model_routine_fact(store)
+    merged = _dream_merge(store, model, fid, "The user is on calls in the mornings.")
+    assert store.portrait_fact(merged).origin == "model"
+    run_days(store, MON + timedelta(days=22), MON + timedelta(days=22))
+    row = store.routines()[0]
+    [line] = store.portrait_facts(("routine",))
+    assert line.id == row["fact_id"] and line.origin == R.MEASURED_ORIGIN and line.text.startswith("On ")
+    assert store.portrait_fact(merged).valid_to is not None
+
+
+def test_a_dreaming_retire_and_the_bars_lasting_line_are_undone(store):
+    fid = _measured_routine(store)
+    run = store.start_portrait_run("bar", "test", at=time.time())
+    written = store.commit_portrait_changes(run, [
+        FactChange("INVALIDATE", fid, "routine", "", "", None, [], time.time()),
+        FactChange("ADD", None, "routine", "", "The user has morning calls.", 0.6, [], time.time(), "model")])
+    lasting = written[1][1]
+    store.add_diary(run, [{"pass": "bar", "action": "retire", "fact_ids": [fid], "new_fact_ids": [lasting],
+                           "text": "retired"}])
+    store.finish_portrait_run(run, PortraitRunStats(kind="bar", model="test", outcome="ok"))
+    run_days(store, MON + timedelta(days=22), MON + timedelta(days=22))
+    [line] = store.portrait_facts(("routine",))
+    assert line.origin == R.MEASURED_ORIGIN and line.id == store.routines()[0]["fact_id"]
+    assert store.portrait_fact(lasting).superseded_by == line.id
+    # a plain retire (no lasting line) is written again as a new line
+    _dream(store, {"action": "retire", "ids": [line.id], "cites": [], "reason": "a one-off", "lasting": None})
+    run_days(store, MON + timedelta(days=23), MON + timedelta(days=23))
+    [again] = store.portrait_facts(("routine",))
+    assert again.id != line.id and again.origin == R.MEASURED_ORIGIN and not store.routines()[0]["fact_off"]
+
+
+def test_a_merged_line_of_a_routine_gone_dormant_just_ends(store):
+    setup_presence(store, MON, 42)
+    e1(store, weeks=3)
+    run_days(store, MON + timedelta(days=21), MON + timedelta(days=21))
+    fid = store.routines()[0]["fact_id"]
+    model = _model_routine_fact(store)
+    merged = _dream_merge(store, fid, model, "The user joins a morning call.")
+    run_days(store, MON + timedelta(days=22), MON + timedelta(days=35))
+    assert store.routines()[0]["state"] == "dormant"
+    assert store.portrait_facts(("routine",)) == [] and store.portrait_fact(merged).valid_to is not None
+
+
+def test_a_time_on_a_rounding_boundary_does_not_rewrite_the_line(store):
+    row = {"dayset": "weekdays", "at_min": 537.4}
+    sig = R._fact_sig(row)
+    for at_min in (537.6, 535.0, 539.9, 532.5):   # 537.5 was a 5-minute boundary of the old rounding
+        assert R._sig_holds(sig, dict(row, at_min=at_min))
+    assert not R._sig_holds(sig, dict(row, at_min=542.4)) and not R._sig_holds(sig, dict(row, dayset="all"))
+    assert not R._sig_holds("weekdays|108", row)   # an old-style signature: written again once
 
 
 def test_the_portrait_validator_refuses_model_edits_to_measured_facts(store):
@@ -689,3 +815,152 @@ def test_cli_report_runs_on_a_copy_and_the_pass_runs_dry(tmp_path, capsys, monke
     assert R.main(["--db", str(path), "--dry-run"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["cost_usd"] == 0.0
+
+
+# -- review round 1 ------------------------------------------------------------------------------------------------
+
+
+def test_a_failing_window_never_uses_up_the_permutation_slots_of_another(tmp_path):
+    """Review L1's probe: a drifting 09:00 window (fails stability) beside a clean 14:00 window of the same key."""
+    def build(name, with_morning):
+        s = Store.open(tmp_path / name)
+        setup_presence(s, MON, 29, spans=((7, 0, 13, 0), (13, 30, 17, 0), (18, 0, 23, 30)))
+        wk = days(MON, 28, weekdays=True)
+        for i, d in enumerate(wk):
+            if with_morning:   # first half ~08:45, second half ~09:05: rate, spread and lift pass; stability fails
+                base = 45 if i < len(wk) // 2 else 65
+                moment(s, at(d, 8, 0) + 60 * (base + (i % 3) - 1))
+            if i % 4 != 3:     # 14:00 on 3 of 4 weekdays, tight
+                moment(s, at(d, 14, 0) + 60 * ((i % 3) - 1))
+        return s
+
+    for name, morning in (("alone.db", False), ("both.db", True)):
+        s = build(name, morning)
+        try:
+            got = _mine(s, MON + timedelta(days=28))
+            assert [(R.hm(w.at_min)[:2], w.dayset) for w in got.passed] == [("14", "weekdays")], name
+            assert got.passed[0].hits == 15
+        finally:
+            s.close()
+
+
+def test_n_of_m_never_counts_a_hit_on_a_day_that_was_not_eligible(store):
+    setup_presence(store, MON, 28)
+    e1(store, weeks=3)
+    tue = MON + timedelta(days=15)
+    # a hit day with the user away around the window's centre (a join on another device): a hit for the bars, but
+    # not an eligible day, so the line never says more hits than days
+    store._write(lambda c: c.execute("DELETE FROM timeline WHERE started_at >= ? AND started_at < ?",
+                                     (R.day_start(tue), R.day_start(tue + timedelta(days=1)))))
+    present(store, tue, spans=((9, 40, 13, 0),))
+    got = _mine(store, MON + timedelta(days=21))
+    [w] = got.passed
+    assert w.hits == 15 and w.eligible == 14 and w.elig_hits == 14
+    run_days(store, MON + timedelta(days=21), MON + timedelta(days=21))
+    [row] = store.routines()
+    assert (row["hits"], row["eligible"]) == (14, 14)
+    [f] = store.portrait_facts(("routine",))
+    assert f.text.startswith("On 14 of the last 14 weekdays")
+    assert R.why_line(store, row, skills=SKILLS).endswith("on 14 of the last 14 weekdays.")
+
+
+def test_a_routine_whose_best_centre_wobbles_stays_active(store):
+    """Review L3: becoming active takes every bar; staying active only the rate and the misses near its time. Two
+    tight weeks at ~19:20, then a month of joins 15-55 min earlier: some nights the best window fails a bar (spread,
+    stability) while the stored centre has lost hits; the routine still holds near its time, so it never flaps (the
+    decay at the stored centre alone went dormant and back three nights running on these rows)."""
+    setup_presence(store, MON, 56)
+    rng = random.Random(1)
+    for d in days(MON, 14, weekdays=True):
+        moment(store, at(d, 19, 20) + rng.uniform(-4, 4) * 60, app="discord", service="Discord")
+    for d in days(MON + timedelta(days=14), 28, weekdays=True):
+        moment(store, at(d, 19, 20) + rng.uniform(-55, -15) * 60, app="discord", service="Discord")
+    voice = Skill("discord.voice", (("call_join", "discord"),), True, "change")
+    states = []
+    for i in range(14, 42):
+        res = R.RoutineMiner(store=store, skills=(MEET, voice)).run(now=R.day_start(MON + timedelta(days=i)))
+        assert res.ok, res.error
+        states.append(tuple(r["state"] for r in store.routines()))
+    assert set(states) == {("active",)}, states
+    [row] = store.routines()
+    assert [e["detail"]["state_to"] for e in store.routine_events(row["id"], kinds=["state"])] == ["active"]
+
+
+def test_active_near_leaves_out_context_routines(store):
+    rid = _routine(store, at_min=8 * 60 + 40)
+    _routine(store, at_min=8 * 60 + 50, key="discord.voice|discord", skill="discord.voice", app="discord")
+    near = R.active_near(store, at(WED, 8, 30), skills=SKILLS)
+    assert [r["id"] for r in near] == [rid]
+
+
+def test_due_offers_never_returns_more_than_the_cards_left_today(store):
+    yes = lambda s: True   # noqa: E731
+    a = _routine(store, at_min=8 * 60)
+    _routine(store, at_min=12 * 60, key="meet.open|zen|x", app="zen")
+    _routine(store, at_min=12 * 60 + 1, key="meet.open|zen|y", app="zen")
+    store.add_routine_event(a, "offered", at(WED, 7, 53))
+    store._write(lambda c: c.execute("DELETE FROM moments"))
+    got = R.due_offers(store, at(WED, 11, 54), skills=SKILLS, trusted=yes)
+    assert len(got) == 1   # 1 offered today, 2 due at once: 1 card left
+
+
+def test_t6_a_moved_routine_offers_at_most_twice_then_the_new_time(store):
+    """Appendix E's T6 on invented rows shaped like E1 (7 hits on the 10 weekdays before a Friday, then the meeting
+    moves +60 min), through due_offers as the lane calls it (every minute, one card per routine a day, each offer
+    recorded): the old window offers at most twice more and never once it went dormant; the new window is active the
+    night after its 5th hit day and offered from then on."""
+    setup_presence(store, MON, 70, spans=((7, 0, 13, 0), (14, 0, 17, 0), (18, 0, 23, 59)))
+    shift = MON + timedelta(days=25)                                                  # a Friday
+    old_days = [d for d in days(MON + timedelta(days=11), 14, weekdays=True) if d < shift]
+    assert len(old_days) == 10
+    for i, d in enumerate(old_days):
+        if i not in (3, 7, 8):
+            moment(store, at(d, 8, 58) + 60 * (0, 2, -1, 1, -2)[i % 5])
+    new_days = days(shift, 28, weekdays=True)
+    for i, d in enumerate(new_days):
+        moment(store, at(d, 9, 58) + 60 * (0, 2, -1, 1, -2)[i % 5])
+    yes = lambda s: True   # noqa: E731
+    offers = []
+    for i in range(11, 49):
+        d = MON + timedelta(days=i)
+        assert miner(store).run(now=R.day_start(d)).ok
+        t = at(d, 8, 0)
+        while t <= at(d, 10, 30):
+            for o in R.due_offers(store, t, skills=SKILLS, trusted=yes):
+                store.add_routine_event(o["id"], "offered", t)
+                offers.append((d, o["id"]))
+            t += 60
+    rows = store.routines()
+    [old] = [r for r in rows if abs(r["at_min"] - 538) < 30]
+    [new] = [r for r in rows if abs(r["at_min"] - 598) < 30]
+    false = [d for d, rid in offers if rid == old["id"] and d >= shift]
+    dormant = [R.day_of(e["at"]) for e in store.routine_events(old["id"], kinds=["state"])
+               if e["detail"]["state_to"] == "dormant"]
+    assert [d for d, rid in offers if rid == old["id"] and d < shift]   # it was offered before the move
+    after = [d for d in dormant if d > shift]
+    assert len(false) <= 2 and after and all(d < after[0] for d in false)
+    assert not [e for e in store.routine_events(old["id"], kinds=["state"])
+                if e["detail"]["state_to"] == "active" and R.day_of(e["at"]) > after[0]]   # and stays down
+    became = [R.day_of(e["at"]) for e in store.routine_events(new["id"], kinds=["state"])
+              if e["detail"]["state_to"] == "active"]
+    assert became[0] == new_days[4] + timedelta(days=1)                   # the night after its 5th hit day
+    new_offers = [d for d, rid in offers if rid == new["id"]]
+    assert new_offers[0] == became[0] and new["state"] == "active"
+    assert all(d in new_offers for d in new_days if became[0] <= d < MON + timedelta(days=49))
+    assert len(offers) == len(set(offers))                                # one card per routine a day
+
+
+def test_a_long_held_routine_that_stopped_fails_the_bars_after_five_eligible_misses(store):
+    """R1.6 for a routine that still passes on its old hits: 15 weekday joins, then none. Before the 5th eligible
+    miss it still passes (a hit rate of 0.67 from the old hits); at 5 misses in a row it fails ('misses') and the row
+    goes dormant that night, even though the rate alone would keep it for days."""
+    setup_presence(store, MON, 35)
+    e1(store, weeks=3)
+    assert _mine(store, MON + timedelta(days=21 + 4)).passed            # Friday 04:00: 4 misses (Mon-Thu)
+    got = _mine(store, MON + timedelta(days=21 + 5))                     # Saturday: the 5th (Friday)
+    assert got.passed == [] and "misses" in got.near["meet.open|zen"].failed
+    assert got.near["meet.open|zen"].rate >= R.MIN_RATE
+    run_days(store, MON + timedelta(days=21), MON + timedelta(days=21 + 5))
+    [row] = store.routines()
+    [ev] = [e for e in store.routine_events(row["id"], kinds=["state"]) if e["detail"]["state_to"] == "dormant"]
+    assert R.day_of(ev["at"]) == MON + timedelta(days=21 + 5) and ev["detail"]["why"] == "misses_in_row"
