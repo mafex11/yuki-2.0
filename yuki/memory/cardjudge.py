@@ -443,7 +443,9 @@ class Ledger:
         mode = cur.get("mode") if cur.get("mode") in ladder else ladder[0]
         if mode == "off":
             return False
-        nxt = "off" if (by == "user" and cur.get("by") == "user") else ladder[ladder.index(mode) + 1]
+        # a second "Less of these" in a row turns it off; a Settings "Back up" (by user, why raised) is no lowering
+        again = by == "user" and cur.get("by") == "user" and cur.get("why") == "less"
+        nxt = "off" if again else ladder[ladder.index(mode) + 1]
         st[t] = {"mode": nxt, "by": by, "since": round(at, 1), "why": why}
         self._note(t, mode, nxt, by, why)
         return True
@@ -1296,6 +1298,8 @@ class CardJudge:
         jcfg = self._jcfg.get()
         self.last_pile = []
         hist = self._hist(live)
+        if self._written:
+            self._expire_written(now)
         you = builder.snapshot() if builder is not None else None
         if you is None:
             self.book.evals(now, cfg)
@@ -1437,7 +1441,8 @@ class CardJudge:
                 if e.cand.key != chosen.get("key") and e.cand.key not in self.waiting:
                     self._wait(now, cfg, e.cand, "rank")
         elif live:
-            self._maybe_scan(now, cfg, None, idle)
+            # a routine possible lets a meeting in front (or settling) past the common hold: the scan still skips H1-H5
+            self._maybe_scan(now, cfg, None if first.allow else first.reason, idle)
         if live:
             deadlines.append(self._scan_at + SCAN_EVERY_S)
         summary["chosen"] = chosen
@@ -1578,10 +1583,18 @@ class CardJudge:
         if head is not None and type_on(head.type, cfg) and self.ledger.mode(head.type) != "off" \
                 and not (head.info.frame and head.info.frame in frames):
             cap = head.info.look_cap
-            head_ok = bool(live and self._cached(head.key, now)) or (
-                writer_budget(hist.writer_calls(now), now).allow
-                and (cap is None or hist.looks_today(now, cfg, head.type) < cap)
-                and (not live or self._writer_retry(head.key, now) is None))
+            retry = self._writer_retry(head.key, now) if live else None
+            room = (writer_budget(hist.writer_calls(now), now).allow
+                    and (cap is None or hist.looks_today(now, cfg, head.type) < cap))
+            head_ok = bool(live and self._cached(head.key, now)) or (room and retry is None)
+            errors = (self._writer_errors.get(head.key) or (0, now))[0]
+            if not head_ok and room and retry is not None and errors < WRITER_ERRORS_MAX \
+                    and retry < began + DAY_START_WITHIN_S:
+                # the head's writer call failed once: the card waits for its retry (the head is the point of the
+                # card; §4.7 writes it headless only when the writer says none), within the day's window
+                deadlines.append(retry)
+                self._note_today_wait(now, cfg, "writer_error")
+                return None
         lines = self._lines(now, cfg)
         if not head_ok and not lines:
             return None
@@ -1675,9 +1688,34 @@ class CardJudge:
         if hit is None:
             return None
         if now - hit[0] > WRITTEN_KEEP_S:
-            self._written.pop(key, None)
+            self._unwritten(key)
             return None
         return hit[1]
+
+    def _unwritten(self, key: str) -> None:
+        """A writer's card the commit-time check held that aged out unwritten: its call still gets its accounting row
+        (outcome ``skipped:held``: a call, never a writer "none"), so B4, the look caps and the cost ledger count it."""
+        hit = self._written.pop(key, None)
+        checkin = (hit[1] or {}).get("checkin") if hit is not None else None
+        if checkin is None or getattr(checkin, "model", None) is None:
+            return
+        checkin.outcome = "skipped:held"
+        try:
+            checkin_id, _ = self.store.record_checkin(checkin)
+        except Exception as exc:  # noqa: BLE001
+            self._log("nudge_error", where="judge_held_account", error=type(exc).__name__)
+            return
+        if self.worker is not None and checkin_id is not None:
+            try:
+                self.worker._log_checkin(checkin_id, checkin, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _expire_written(self, now: float) -> None:
+        """Held writer cards past :data:`WRITTEN_KEEP_S` (their candidate may never come back to ask)."""
+        for key, (at, _r) in list(self._written.items()):
+            if now - at > WRITTEN_KEEP_S:
+                self._unwritten(key)
 
     def _writer_retry(self, key: str, now: float) -> float | None:
         """When a candidate whose writer call failed may be tried again (None: it may be now)."""
@@ -1958,8 +1996,9 @@ class CardJudge:
         """Live: the Today card (``kind = "today"``: the check-in head from the writer, when it gives one, and the
         queued lines) or the "While you were away" list (``"away"``: lines only). Each line is code text with its id
         (``inputs.lines``: ``{"n", "type", "ref", "text"}``; ``judge_digest`` keeps the ids only); the head is the
-        card's own question (``Store.record_checkin_question``, moment ``day_start``, trigger ``today``). The asking
-        lines' questions are marked asked with this card (a card that expires unshown reopens them), the weekly
+        card's own question (``Store.record_checkin_question``, moment ``day_start``, trigger ``today``). An asking
+        check-in line gets its own check-in question row (:meth:`_checkin_questions`, ``Q<id>``). The asking lines'
+        questions are marked asked with this card (a card that expires unshown reopens them), the weekly
         review is marked delivered with it. Nothing in it offers work: lines inform or ask."""
         from yuki.memory.store import NewNudge, NewQuestion, NudgeCheckin
 
@@ -1988,7 +2027,9 @@ class CardJudge:
                 self._note_today_wait(now, cfg, cc.reason or "commit")
                 return None
         head_text = " ".join(str(head_r["text"]).split()) if head_r is not None else ""
-        meta = [{"n": i + 1, "type": c.type, "ref": line_ref(c), "text": t} for i, (c, t) in enumerate(texts)]
+        asked = self._checkin_questions(now, texts)   # each asking check-in line's own question row (§4.3, §4.7)
+        meta = [{"n": i + 1, "type": c.type, "ref": f"Q{asked[c.key]}" if c.key in asked else line_ref(c), "text": t}
+                for i, (c, t) in enumerate(texts)]
         lead = head_text or (TODAY_LEAD if kind == "today" else AWAY_LEAD)
         text = "\n".join([lead, *(f"{m['n']}) {m['text']}" for m in meta)])
         inputs = {"judge": kind, "key": key, "class": klass, "head": head_text, "lines": meta,
@@ -1998,25 +2039,31 @@ class CardJudge:
             f"{len(meta)} line(s), each with its id; when they answer a question line, save it with answer_question "
             "on its id, in their words. A reply that answers no line records nothing.")
         qid = None
-        if head_r is not None:
-            checkin = head_r.get("checkin") or NudgeCheckin(at=now, trigger="judge:checkin:day_start", outcome="",
-                                                            model=None)
-            checkin.outcome = "question"
-            nudge = NewNudge(kind="question", text=text, trigger="today", reason=reason, inputs=inputs)
-            question = NewQuestion(at=now, kind="fact", subject="today", question=head_text, evidence=head.why,  # type: ignore[union-attr]
-                                   reason=f"present check-in: {MOMENT_WORDS.get('day_start', 'day_start')}",
-                                   importance=7, origin="checkin")
-            checkin_id, nudge_id, qid, _gid = self.store.record_checkin_question(checkin, nudge, question,
-                                                                                 moment="day_start", goal=None)
-        else:
-            checkin = NudgeCheckin(at=now, trigger=f"judge:{kind}", outcome="notice", model=None,
-                                   reason=f"{kind}: {len(meta)} line(s)")
-            nudge = NewNudge(kind="notice", text=text, trigger=kind, ref=key, reason=reason, inputs=inputs)
-            checkin_id, nudge_id = self.store.record_checkin(checkin, nudge)
+        try:
+            if head_r is not None:
+                checkin = head_r.get("checkin") or NudgeCheckin(at=now, trigger="judge:checkin:day_start", outcome="",
+                                                                model=None)
+                checkin.outcome = "question"
+                nudge = NewNudge(kind="question", text=text, trigger="today", reason=reason, inputs=inputs)
+                question = NewQuestion(at=now, kind="fact", subject="today", question=head_text, evidence=head.why,  # type: ignore[union-attr]
+                                       reason=f"present check-in: {MOMENT_WORDS.get('day_start', 'day_start')}",
+                                       importance=7, origin="checkin")
+                checkin_id, nudge_id, qid, _gid = self.store.record_checkin_question(checkin, nudge, question,
+                                                                                     moment="day_start", goal=None)
+            else:
+                checkin = NudgeCheckin(at=now, trigger=f"judge:{kind}", outcome="notice", model=None,
+                                       reason=f"{kind}: {len(meta)} line(s)")
+                nudge = NewNudge(kind="notice", text=text, trigger=kind, ref=key, reason=reason, inputs=inputs)
+                checkin_id, nudge_id = self.store.record_checkin(checkin, nudge)
+        except Exception:
+            self._forget_questions(asked)
+            raise
         self._after_write(checkin_id, checkin, nudge_id)
         if nudge_id is None:
+            self._forget_questions(asked)   # nothing was shown: nothing was asked
             return None
-        self._mark_lines(now, nudge_id, meta)
+        self._mark_lines(now, nudge_id, meta)   # the check-in lines' rows too: asked with this card
+        self._checkin_goals(now, texts, asked)
         digest = [{"n": m["n"], "type": m["type"], "ref": m["ref"]} for m in meta]
         if head_r is not None and head is not None:
             digest.insert(0, {"n": 0, "type": head.type, "ref": f"Q{qid}" if qid else "head"})
@@ -2073,6 +2120,82 @@ class CardJudge:
         except Exception as exc:  # noqa: BLE001
             self._queue_keys = None
             self._log("nudge_error", where="judge_queue", error=type(exc).__name__)
+
+    def _checkin_questions(self, now: float, texts: Sequence[tuple[Candidate, str]]) -> dict[str, int]:
+        """§4.3 / §4.7: an asking check-in line on a Today or away card is a check-in like any other, with its own
+        question row (origin ``checkin``, its moment, its goal; never deduped, as ``Store.record_checkin_question``),
+        so a reply to that line is saved with answer_question on its ``Q`` id, folds into the goals
+        (``checkins.fold``) and counts as use in the ledger. Written ``open`` before the card (the card carries the
+        ids); :meth:`_mark_lines` marks them asked with the card. ``{candidate key: question id}``; empty when no line
+        asks or the write failed (those lines keep their own ids)."""
+        from yuki.memory.store import question_subject_key
+
+        rows = []
+        for c, t in texts:
+            refs = c.refs or {}
+            if c.asks != "checkin" or not c.type.startswith("checkin:") or refs.get("question") is not None:
+                continue
+            moment = c.type.split(":", 1)[1]
+            gid = int(refs["goal"]) if refs.get("goal") else None
+            sources = sorted({int(e[1:]) for e in map(str, c.evidence) if e[:1] == "J" and e[1:].isdigit()})
+            rows.append((c.key, moment, self._subject(c), " ".join(t.split()), gid, sources, c.why,
+                         f"{c.info.frame} check-in: {MOMENT_WORDS.get(moment, moment)}"))
+        if not rows:
+            return {}
+        cipher = self.store.cipher
+
+        def op(conn: Any) -> dict[str, int]:
+            out: dict[str, int] = {}
+            stamp = time.time()
+            for key, moment, subject, text, gid, sources, why, reason in rows:
+                if not subject or not text:
+                    continue
+                if gid is not None and conn.execute("SELECT 1 FROM goals WHERE id=?", (gid,)).fetchone() is None:
+                    gid = None
+                cur = conn.execute(
+                    "INSERT INTO questions(at, created_at, kind, subject_ciphertext, subject_key, question_ciphertext,"
+                    " evidence_ciphertext, reason_ciphertext, importance, origin, source_ids, fact_ids, status, seen,"
+                    " updated_at, moment, goal_id) VALUES (?,?,'fact',?,?,?,?,?,7,'checkin',?,'[]','open',1,?,?,?)",
+                    (float(now), float(now), cipher.encrypt(subject),
+                     question_subject_key(cipher, f"checkin:{subject}"), cipher.encrypt(text),
+                     cipher.encrypt(why) if why else None, cipher.encrypt(reason), json.dumps(sources), stamp,
+                     moment, gid))
+                out[key] = int(cur.lastrowid)
+            return out
+
+        try:
+            return self.store._write(op)
+        except Exception as exc:  # noqa: BLE001 - the card still goes; its check-in lines keep their own ids
+            self._log("nudge_error", where="judge_digest_checkins", error=type(exc).__name__)
+            return {}
+
+    def _forget_questions(self, asked: dict[str, int]) -> None:
+        """The card was not written: its check-in lines' rows go (they were never asked)."""
+        ids = [int(q) for q in asked.values()]
+        if not ids:
+            return
+        try:
+            self.store._write(lambda conn: conn.execute(
+                "DELETE FROM questions WHERE status='open' AND origin='checkin' AND id IN (%s)" % ",".join("?" * len(ids)),
+                ids))
+        except Exception as exc:  # noqa: BLE001
+            self._log("nudge_error", where="judge_digest_checkins_forget", error=type(exc).__name__)
+
+    def _checkin_goals(self, now: float, texts: Sequence[tuple[Candidate, str]], asked: dict[str, int]) -> None:
+        """A check-in line about a goal checks in on it, as the check-in card does (``record_checkin_question``): the
+        goal's check-in count and event, and - for the check-in the user asked for - its next time cleared."""
+        for c, _t in texts:
+            qid = asked.get(c.key)
+            gid = (c.refs or {}).get("goal")
+            if qid is None or not gid:
+                continue
+            kw: dict[str, Any] = {"next_checkin_at": None} if "because=next" in c.why else {}
+            ev = [str(e) for e in c.evidence if str(e) not in ("DAY", "HOURS", "BREAK", "S", "PLAN")]
+            try:
+                self.store.update_goal(int(gid), type="checked_in", at=now, checked_in=True, question_id=int(qid),
+                                       evidence=ev, **kw)
+            except Exception as exc:  # noqa: BLE001
+                self._log("nudge_error", where="judge_digest_goal", error=type(exc).__name__)
 
     def _mark_lines(self, now: float, nudge_id: int, meta: Sequence[dict[str, Any]]) -> None:
         """The digest's asking lines (stored questions) are asked with this card, the weekly review delivered with it:

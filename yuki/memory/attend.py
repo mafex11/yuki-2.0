@@ -445,24 +445,29 @@ class RowHistory:
 
 def fresh_check(store: Any, *, db_path: Any, config: Any, now: float, type: str, urgency: str = "any",
                 game_fn: Callable[[], Any] | None = None, locked_fn: Callable[[], bool] | None = None,
-                acting_fn: Callable[[], bool] | None = None, render_fn: Callable[[], Any] | None = None) -> Decision:
+                acting_fn: Callable[[], bool] | None = None, render_fn: Callable[[], Any] | None = None,
+                asked: bool = False) -> Decision:
     """The policy's hard holds with fresh reads and no YouNow (the tray's ``card_due`` before it shows a queued card,
     jSwitch): H0 (``[nudges] enabled``, the pause flag, the lock, the snooze), H1 the game in front (``game_fn``:
     ``gamegate.game_in_front``, D9's local read; a read that fails holds), H3 an open call (kind ``call``; unreadable
     holds), H4 the meeting's app still playing (the latest meeting row within ``meeting_hold_min``; unreadable holds)
     and the meeting in front (a meeting row within ``MEETING_GAP_S``; not for ``routine``), H5 Yuki acting, H7 quiet
-    hours. Full screen, away and a card showing are the tray's own checks. Never raises (a failure holds)."""
+    hours. Full screen, away and a card showing are the tray's own checks. Never raises (a failure holds).
+
+    ``asked``: a card the user asked for just now (an on-demand weekly review, review.py's unchanged path): the
+    switches that path skips (``[nudges] enabled``, the pause, the snooze) and quiet hours don't hold it; the lock,
+    a game, a call, a meeting and Yuki acting still do."""
     try:
         sw = read_switches(store, db_path, config, now, locked_fn=locked_fn)
     except Exception:  # noqa: BLE001
         return Decision(False, "H0:unknown")
-    if sw.disabled:
+    if sw.disabled and not asked:
         return Decision(False, "H0:disabled")
-    if sw.paused:
+    if sw.paused and not asked:
         return Decision(False, "H0:paused")
     if sw.locked:
         return Decision(False, "H0:locked")
-    if sw.snoozed_until is not None and sw.snoozed_until > now:
+    if sw.snoozed_until is not None and sw.snoozed_until > now and not asked:
         return Decision(False, "H0:snoozed", sw.snoozed_until)
     try:
         if game_fn is None:
@@ -503,7 +508,7 @@ def fresh_check(store: Any, *, db_path: Any, config: Any, now: float, type: str,
             return Decision(False, "H5:yuki_acting")
     except Exception:  # noqa: BLE001
         pass   # as observe: an unreadable marker is not a hold (the card's own buttons never act)
-    if sw.quiet:
+    if sw.quiet and not asked:
         return Decision(False, "H7:quiet_hours", sw.quiet_end_at)
     return ALLOW
 

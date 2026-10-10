@@ -3195,8 +3195,9 @@ class NudgeWorker:
 
     def judge_live(self) -> bool:
         """Whether the card judge writes the cards (``[judge] mode = "on"``, jSwitch): then :meth:`tick` (the old
-        first-writer chain) does not run. False when the judge could not be built or its mode is unreadable."""
-        if self.judge is None:
+        first-writer chain) does not run. False when the judge could not be built, has no YouNow builder to read (a
+        worker built outside the memory service: the old chain runs) or its mode is unreadable."""
+        if self.judge is None or not getattr(self.judge, "_has_you", False):
             return False
         try:
             return self.judge.mode() == "on"

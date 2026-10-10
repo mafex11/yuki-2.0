@@ -2212,8 +2212,14 @@ class MemoryClient:
             t = "checkin:day_start" if (n.trigger == "today" and n.kind == "question") else type_of(n.kind, n.trigger,
                                                                                                     ctrig)
             info = TYPES.get(t) if t else None
+            # a weekly review the user asked for (review.py's on-demand path, unchanged by §4.4): their switches and
+            # quiet hours don't hold it, a game, a call or a meeting still do
+            asked = False
+            if n.kind == "review" and inputs.get("review_id") is not None:
+                rows = self.store._query("SELECT trigger FROM weekly_reviews WHERE id = ?", (int(inputs["review_id"]),))
+                asked = bool(rows) and rows[0][0] == "demand"
             d = fresh_check(self.store, db_path=self.store.path, config=self._nudges_config(), now=now,
-                            type=t or "*", urgency=info.urgency if info is not None else "any")
+                            type=t or "*", urgency=info.urgency if info is not None else "any", asked=asked)
         except Exception as exc:
             return {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
         if d.allow:

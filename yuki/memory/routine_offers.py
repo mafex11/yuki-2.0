@@ -721,10 +721,12 @@ class RoutineLane:
     def held(self, cand: Any, now: float, config: Any, reason: str) -> None:
         """The judge held this routine's candidate (``reason``: the policy's, content-free): logged and recorded as
         :meth:`tick`'s holds are (``routine_held`` on change, one ``held`` event a day per reason, an offer-now
-        request's state)."""
+        request's state). The judge's day budget (``B2:routine_day``) is the old ``attention:budget``: final for an
+        offer-now request, as before."""
         d = (getattr(self, "_pending", None) or {}).get(getattr(cand, "key", ""))
         if d is not None:
-            self._hold(d, now, config, str(reason))
+            reason = str(reason)
+            self._hold(d, now, config, "attention:budget" if reason == "B2:routine_day" else reason)
 
     # -- what is due ---------------------------------------------------------------------------------------------------
 
