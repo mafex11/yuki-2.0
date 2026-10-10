@@ -769,8 +769,9 @@ class NowServer:
     def _you(self, request: dict[str, Any], rid: Any) -> dict[str, Any]:
         """Op ``you`` (state-design.md §3.4): ``{op: "you", since: <version>|null, sections: [...]|null,
         with_board: bool, stats: bool}``. ``{ok: false, error: "off"}`` with no record (``[you] enabled = false``, or no
-        builder in this process): the reader falls back to its own reads. ``{ok, unchanged: true, version, beat_at}``
-        when ``since`` is the record's version; else ``{ok, version, beat_at, you}`` (only the sections asked for, plus
+        builder in this process): the reader falls back to its own reads. ``{ok, unchanged: true, version, epoch,
+        beat_at}`` when ``since`` is ``[epoch, version]`` (the builder's start and the record's version); else
+        ``{ok, version, epoch, beat_at, you}`` (only the sections asked for, plus
         the top level). ``board`` (the ``now`` op's reused snapshot) with ``with_board``; ``stats`` (the builder's
         content-free counters) with ``stats``. The plain copy is reused while the record's version and build marks
         are the same (``beat_at`` alone moves every beat)."""
@@ -792,14 +793,16 @@ class NowServer:
         if you is None:
             return {**out, "ok": False, "error": "off"}
         version, beat_at = you.get("version"), you.get("beat_at")
-        out.update(ok=True, version=version, beat_at=beat_at)
+        epoch = getattr(builder, "epoch", None)
+        out.update(ok=True, version=version, epoch=epoch, beat_at=beat_at)
         if request.get("stats"):
             try:
                 out["stats"] = builder.stats()
             except Exception:  # noqa: BLE001
                 out["stats"] = None
         since = request.get("since")
-        if since is not None and since == version:
+        # [epoch, version]: a version alone restarts at 0 with the service, so a copy from the old process could match
+        if since is not None and since == [epoch, version]:
             self.stats["you_unchanged"] += 1
             out["unchanged"] = True
             return out
@@ -849,7 +852,7 @@ class NowClient:
         self._next_try = 0.0
         self.absent = False
         self.stats = {"ok": 0, "timeout": 0, "absent": 0, "ms_max": 0.0, "last_ms": 0.0}
-        #: The last "you right now" copy per set of sections: ``(version, record without beat_at)``.
+        #: The last "you right now" copy per set of sections: ``([epoch, version], record without beat_at)``.
         self._you_cache: dict[tuple[str, ...] | None, tuple[Any, Any]] = {}
         self._you_lock = threading.Lock()
         #: Why the last :meth:`you` gave no record: ``"off"`` (``[you] enabled = false``: fall back to your own reads),
@@ -976,7 +979,7 @@ class NowClient:
             plain = {k: v for k, v in reply["you"].items() if k != "beat_at"}
             record = _frozen(plain)
             with self._you_lock:
-                self._you_cache[key] = (reply.get("version"), record)
+                self._you_cache[key] = ([reply.get("epoch"), reply.get("version")], record)
         else:   # "unchanged" for a copy this client no longer holds: asked again next time
             self.you_error = "error"
             with self._you_lock:
@@ -1005,28 +1008,39 @@ _clients: dict[str, NowClient | None] = {}
 _clients_lock = threading.Lock()
 
 
+def own_client(db_path: str | Path | None = None) -> NowClient | None:
+    """A new :class:`NowClient` (its own pipe connection and lock), or ``None`` when memory has no key yet. For a
+    background reader whose waits must not queue the process's shared client (``voice.pipeline.TalkerYou``); the
+    caller keeps it. Reads memory's DPAPI-protected key (it never creates one: a missing key means no memory service
+    has ever run for this database)."""
+    from yuki.memory.store import KEY_FILENAME, default_db_path
+
+    db = Path(db_path) if db_path is not None else default_db_path()
+    key_path = db.parent / KEY_FILENAME
+    if not key_path.exists():
+        return None
+    try:
+        from yuki.memory.crypto import FieldCipher, load_or_create_key
+
+        return NowClient(FieldCipher(load_or_create_key(key_path)), db)
+    except Exception:  # noqa: BLE001 - no Now then; everything else goes on
+        return None
+
+
 def shared_client(db_path: str | Path | None = None) -> NowClient | None:
     """One :class:`NowClient` per database for this process, or ``None`` when memory has no key yet.
 
     Reads memory's DPAPI-protected key once (it never creates one: a missing key
     means no memory service has ever run for this database).
     """
-    from yuki.memory.store import KEY_FILENAME, default_db_path
+    from yuki.memory.store import default_db_path
 
     db = Path(db_path) if db_path is not None else default_db_path()
     key = str(db.resolve()).lower()
     with _clients_lock:
         if key in _clients:
             return _clients[key]
-        client: NowClient | None = None
-        key_path = db.parent / KEY_FILENAME
-        if key_path.exists():
-            try:
-                from yuki.memory.crypto import FieldCipher, load_or_create_key
-
-                client = NowClient(FieldCipher(load_or_create_key(key_path)), db)
-            except Exception:  # noqa: BLE001 - no Now then; everything else goes on
-                client = None
+        client = own_client(db)
         if client is not None:  # no key yet (the service has never run): asked again next time
             _clients[key] = client
         return client
@@ -1105,4 +1119,4 @@ def board_front_source(client_fn: Callable[[], Any] | None = None, *, max_age_s:
 
 __all__ = ["APP_DATA_READERS", "FRONT_SOURCE_REUSE_S", "NamedEvent", "NowBoard", "NowClient", "NowServer", "NowTiming",
            "YOU_READERS", "YOU_SECTIONS", "app_data_for", "board_front_source", "format_now", "game_in_front", "gist_of",
-           "pipe_name", "shared_client", "timing_of", "wait_any", "you_event_name"]
+           "own_client", "pipe_name", "shared_client", "timing_of", "wait_any", "you_event_name"]

@@ -167,7 +167,7 @@ import sys
 import threading
 import time
 import weakref
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -649,6 +649,9 @@ class YouBuilder:
     ) -> None:
         self.store = store
         self.db_path = db_path
+        #: This builder's start (wall clock, ms): with ``version`` the Now pipe's "unchanged" token, so a reader's copy
+        #: from an earlier service process (whose version count started at 0 too) is never taken for the current one.
+        self.epoch = round(time.time(), 3)
         self._log_fn = log
         self._clock = clock
         self._live = bool(live)
@@ -720,10 +723,10 @@ class YouBuilder:
         self._holds: frozenset[str] | None = None
         # yUsual / yConsumers
         self._registered = False                      # live_builder() serves this one from its first beat
-        self._labels: dict[str, str | None] = {}      # app key -> display name (store.app_display_name, else tidied)
+        self._labels: OrderedDict[str, str | None] = OrderedDict()   # app key -> display name (LRU, LABELS_KEPT)
         self._usual_open = False                      # a routine of usual.now not yet done today (moments re-read it)
         self._usual_done: set[tuple[int, Any]] = set()   # (routine id, routines day) seen done (stays done that day)
-        self._usual_words: dict[tuple[Any, Any], tuple[str | None, str | None]] = {}   # routine -> (name, what)
+        self._usual_words: OrderedDict[tuple[Any, ...], tuple[str | None, str | None]] = OrderedDict()   # (LRU)
         self._push: Any = None                        # the readers' named hold events (None: not made yet; False: none)
         self.pushes = 0
         # counters (content-free)
@@ -1094,11 +1097,13 @@ class YouBuilder:
     def _label(self, key: Any) -> str | None:
         """An app key's display name for the renderers ("Zen" for ``zen``, "VALORANT" for its stem): the name the
         user's own timeline rows show it under most (``store.app_display_name``), else the key tidied
-        (``appnames.prettify``, structural). Read once per key per run (the cache is bounded)."""
+        (``appnames.prettify``, structural). Read once per key per run (the cache is bounded, least recently used out
+        first, so the keys of every beat stay)."""
         key = str(key or "").strip()
         if not key:
             return None
         if key in self._labels:
+            self._labels.move_to_end(key)
             return self._labels[key]
         try:
             name = self.store.app_display_name(key)
@@ -1111,8 +1116,8 @@ class YouBuilder:
                 name = prettify(key)
             except Exception:  # noqa: BLE001
                 name = key
-        if len(self._labels) >= LABELS_KEPT:
-            self._labels.clear()
+        while len(self._labels) >= LABELS_KEPT:
+            self._labels.popitem(last=False)
         self._labels[key] = _text(name, LABEL_CHARS)
         return self._labels[key]
 
@@ -1157,7 +1162,14 @@ class YouBuilder:
                 v = (self._built.get(name) or {}).get("v", self._version)
         else:
             v = (self._built.get(name) or {}).get("v", 0)
-        self._built[name] = {"at": _r(now), "v": v, "ms": ms, "known": bool(known and value is not None)}
+        known = bool(known and value is not None)
+        prev = self._built.get(name)
+        if prev is not None and bool(prev.get("known")) != known:
+            # readers trust built[*].known (api.day_context): a flip is a change, so the Now pipe's "unchanged"
+            # answer never hands back a copy with the old flag (at / ms move on every rebuild and are not readers')
+            self._version += 1
+            v = self._version
+        self._built[name] = {"at": _r(now), "v": v, "ms": ms, "known": known}
         self._built_frozen = _freeze(self._built)
 
     def _publish(self, now: float) -> None:
@@ -1436,9 +1448,15 @@ class YouBuilder:
             items.append(item)
         items += [dict(s) for s in self._synth if s["at"] is not None and s["at"] >= now - CHANGED_S]
         items.sort(key=lambda x: (x["at"] or 0.0))
-        for item in items[-CHANGED_MAX:]:   # the app's display name, for the thinker's and the talker's words
+        # the app's display name, for the thinker's and the talker's words: kept only when it says more than the key
+        # tidied (the renderers fall back to that, _app_words), so the record's byte cap keeps more items
+        from yuki.core.appnames import prettify
+
+        for item in items[-CHANGED_MAX:]:
             if item.get("app"):
-                item["label"] = self._label(item["app"])
+                label = self._label(item["app"])
+                if label and label != _text(prettify(str(item["app"])) or str(item["app"]), LABEL_CHARS):
+                    item["label"] = label
         if newest_message is not None:
             if self._message_seen is not None and newest_message > self._message_seen:
                 self._breaks.append("message_sent")
@@ -1626,10 +1644,13 @@ class YouBuilder:
     def _usual_words_of(self, row: dict[str, Any], names: dict[str, str],
                         skills: Sequence[Any]) -> tuple[str | None, str | None]:
         """``(name, what)`` of a routine: the user's told label, else its learned skill's name; and what it is in
-        plain words (``routines.KIND_PHRASES``: "join a Meet call in Zen"). Cached per routine row version."""
-        key = (row.get("id"), row.get("updated_at"))
+        plain words (``routines.KIND_PHRASES``: "join a Meet call in Zen"). Cached per routine row version and its
+        skill's current name (a Playbook rename shows at the next rebuild, not at the next mining)."""
+        learned = names.get(str(row.get("skill_id") or ""))
+        key = (row.get("id"), row.get("updated_at"), learned)
         hit = self._usual_words.get(key)
         if hit is not None:
+            self._usual_words.move_to_end(key)
             return hit
         from yuki.memory import routines as R
 
@@ -1637,7 +1658,7 @@ class YouBuilder:
             label = self.store.routine_label(row)
         except Exception:  # noqa: BLE001
             label = None
-        name = _text(label or names.get(str(row.get("skill_id") or "")), USUAL_NAME_CHARS)
+        name = _text(label or learned, USUAL_NAME_CHARS)
         what = None
         try:
             kind, thing, app = R._things(self.store, row, None, skills)
@@ -1645,8 +1666,8 @@ class YouBuilder:
             what = _text(verb2.format(thing=thing or "it", app=app or "an app"), USUAL_WHAT_CHARS)
         except Exception:  # noqa: BLE001
             what = None
-        if len(self._usual_words) >= 64:
-            self._usual_words.clear()
+        while len(self._usual_words) >= 64:
+            self._usual_words.popitem(last=False)
         self._usual_words[key] = (name, what)
         return name, what
 
@@ -1788,6 +1809,9 @@ def _focus_words(you: Any, now: float) -> str:
         words.append("Yuki is acting for them")
     if "unknown" in held:
         return "not known (the record is stale)"
+    if "focus_unknown" in held:
+        return "not known (the focus facts are not built yet)"
+    words += _unknown_words(held)
     return "; ".join(words) or "nothing holding"
 
 
@@ -1921,6 +1945,21 @@ def _call_words(call: Any) -> str:
     return f"on a {service or where} call" if (service or where) else "on a call"
 
 
+#: A focus fact that could not be read, in words for the thinker and the card writer: unknown counts as held (state
+#: design §3.1, §11), so each says what to assume. Machine hold names to wording; the talker leaves them out.
+UNKNOWN_WORDS: dict[str, str] = {
+    "game_unknown": "whether a game is in front is not known: treat a game as in front",
+    "fullscreen_unknown": "whether something is full screen is not known: treat it as full screen",
+    "call_unknown": "call status not known: treat as on a call",
+    "meeting_audio_unknown": "meeting audio not known: treat as in a meeting",
+}
+
+
+def _unknown_words(held: set[str]) -> list[str]:
+    """The ``*_unknown`` focus holds in words, in :data:`UNKNOWN_WORDS` order."""
+    return [words for name, words in UNKNOWN_WORDS.items() if name in held]
+
+
 def _focus_phrase(you: Any, held: set[str], *, talker: bool = False) -> str:
     """The focus in words from the hold names (labels the builder kept: "in VALORANT", "on a Discord call"). The
     talker gets only a game, a call, a game's voice chat and a meeting."""
@@ -1955,15 +1994,18 @@ def _render_thinker(you: Any, now: float) -> list[tuple[int, str]]:
     confirmed usuals. Ids in brackets are memory's own (``W`` threads, due refs)."""
     lines: list[tuple[int, str]] = []
     held = set(holds_now(you, now))
-    if "unknown" in held:
+    if held & {"unknown", "focus_unknown"}:   # a stale record, or a focus section never built: fail closed
         try:
-            age = f" (its last beat was {_ago(now - float(you['beat_at']))})"
+            age = (f" (its last beat was {_ago(now - float(you['beat_at']))})" if "unknown" in held
+                   else " (the focus facts are not built yet)")
         except (KeyError, TypeError, ValueError):
             age = ""
         lines.append((0, f"Focus: not known just now{age}: treat a game or a call as in front until a look shows "
                          f"otherwise."))
     else:
-        lines.append((0, f"Focus: {_focus_phrase(you, held) or 'no game, call or meeting'}."))
+        # "no game, call or meeting" only when no focus hold at all is present, the unknown ones included
+        words = [w for w in (_focus_phrase(you, held),) if w] + _unknown_words(held)
+        lines.append((0, f"Focus: {'; '.join(words) or 'no game, call or meeting'}."))
     pres = you.get("presence") or {}
     p = presence_now(you, now)
     parts = []

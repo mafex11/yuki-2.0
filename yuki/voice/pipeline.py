@@ -2791,6 +2791,7 @@ class TalkerYou:
         self._thread: Any = None
         self._kick: Any = None
         self._hold: Any = None
+        self._own: Any = None   # its own NowClient (the refresh thread only)
         self.stats: dict[str, int] = {"asks": 0, "changed": 0, "failed": 0, "off": 0, "holds": 0, "kicks": 0,
                                       "lines": 0}
 
@@ -2839,12 +2840,17 @@ class TalkerYou:
         return text
 
     def _client(self) -> Any:
+        """Its own ``NowClient`` (its own pipe connection and lock, made once by this thread): an ask waits up to
+        :attr:`ASK_WAIT_S`, and on the process-wide client that wait would hold the lock the hands' desk read
+        (``prefetch_desk``, 50 ms) needs right after a wake."""
         try:
             if self._client_fn is not None:
                 return self._client_fn()
-            from yuki.memory.now import shared_client
+            if self._own is None:   # no key yet (the service never ran): tried again next time
+                from yuki.memory.now import own_client
 
-            return shared_client()
+                self._own = own_client()
+            return self._own
         except Exception:  # noqa: BLE001
             return None
 
@@ -3011,6 +3017,7 @@ class Conversation:
         #: block, from :class:`TalkerYou`'s background cache; the full talker is byte-for-byte as before.
         self._you_on = self.talker == "lean"
         self._you_attached = False
+        self._you_stats0: dict[str, int] = {}   # TalkerYou's counters when this conversation attached (deltas logged)
         #: Every outcome handed to the talker until it is heard (:class:`yuki.voice.narrator.OwedLedger`), made in run.
         self.ledger: Any = None
         #: ``(kind)``: play an earcon (:func:`yuki.voice.echo.tone`) through this conversation's output; set by the
@@ -3736,7 +3743,9 @@ class Conversation:
         if self._you_on and not self._you_attached:
             # yConsumers: the talker's you-line cache refreshes now, in the background (a SetEvent, no pipe read here)
             self._you_attached = True
-            talker_you().attach(self, True)
+            you_cache = talker_you()
+            self._you_stats0 = dict(you_cache.stats)
+            you_cache.attach(self, True)
         if self.on_awake is not None:
             try:
                 self.on_awake({"woken": self.woken_at is not None})
@@ -4212,6 +4221,11 @@ class Conversation:
         try:
             await runner.run()
         finally:
+            you_cache = None
+            if self._you_attached:   # first: a raise below must not leave the refresh thread asking every 3 s
+                self._you_attached = False
+                you_cache = talker_you()
+                you_cache.attach(self, False)
             self._scroll_hold(False)
             self._cancel_route()
             self._unboost()
@@ -4259,11 +4273,10 @@ class Conversation:
                 if self._bound and hands is not None and getattr(hands, "practice", None) is self.practice:
                     hands.practice = None
             self.log.event("narrator", op="summary", **self.gate.stats)
-            if self._you_attached:
-                self._you_attached = False
-                you_cache = talker_you()
-                you_cache.attach(self, False)
-                self.log.event("you_line", op="summary", session=self.session, **you_cache.stats)   # counts only
+            if you_cache is not None:   # this conversation's counts only (the cache is the process's)
+                base = self._you_stats0
+                self.log.event("you_line", op="summary", session=self.session,
+                               **{k: v - base.get(k, 0) for k, v in you_cache.stats.items()})
             cache = getattr(self, "_tts_cache", None)
             if cache is not None:
                 self.log.event("tts_cache", op="summary", **cache.stats)   # counts only (v3.14)
