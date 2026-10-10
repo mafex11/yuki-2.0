@@ -105,6 +105,7 @@ LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_ANSWER_BUDGET = "I couldn't finish looking that up."
 LINE_REFUSAL = "I can't help with that one."
 LINE_NO_EXECUTOR = "I can't act on the screen in this build yet, so I didn't do anything."
+LINE_NEEDS_HANDS = "Another task is using the mouse and keyboard, so this one comes right after it."
 LINE_NO_REPLY = "I couldn't work that out."
 LINE_CANCELLED = "Cancelled by the user."
 LINE_WITHDRAWN = "Withdrawn: replaced by the user's newer request."
@@ -477,6 +478,11 @@ class Brain:
         self.takeover_ok: Any = None
         #: A correcting line after a request ended (``on_late(text)``; the voice and the island), or ``None``.
         self.on_late: Callable[[str], None] | None = None
+        #: ``False`` on a lane that only looks (the runtime's front desk while the worker holds the desk): an act plan
+        #: runs nothing there; the request ends with :data:`LINE_NEEDS_HANDS` and :attr:`needed_hands` is set, so the
+        #: runtime queues it for the lane that acts. Answer plans run as anywhere (they never take the desk lease).
+        self.hands = True
+        self.needed_hands = False
         self.pause_timeout_s = float(getattr(settings, "takeover_idle_stop_s", 600.0) or 600.0)
         self._paused = threading.Event()
         self._pause_wake = threading.Event()
@@ -1120,6 +1126,14 @@ class Brain:
         total = len(plan.steps) or max(self._status_done, 1)
         done = min(self._status_done, total)
         now = STEP_WORDS.get(self._status_verb, "")
+        if done < len(plan.steps):
+            try:   # the plan's step in the island's words (ui/step_words.py): "clicking Send in WhatsApp"
+                from yuki.ui.step_words import describe_plan_step
+
+                words = describe_plan_step(plan.steps[done], app=plan.target.app)
+                now = words[:1].lower() + words[1:] if words else now
+            except Exception:  # noqa: BLE001 - presentation only
+                pass
         return f"{plan.goal}: {done} of {total} steps done" + (f", now {now}" if now and done < total else "") + "."
 
     # -- the request --------------------------------------------------------------------------------------------------
@@ -1138,14 +1152,15 @@ class Brain:
         if not words and asked:
             # the request may be composed with card text: shown as labelled context, never as the user's words
             context = f"The request as it came: {asked}" + (f"\n\n{context}" if context.strip() else "")
+        self.logger.reset_usage()
+        self.logger.begin_turn()
+        # no id from the caller: the log's own (``<session id>-<n>``), as the old loop's acting marker carries it
+        rid = self.logger.begin_request(str(request_id) if request_id else None)
         req = _Request(request=str(request or ""), words=words, context=context,
-                       channel="voice" if channel == "voice" else "typed", request_id=str(request_id),
+                       channel="voice" if channel == "voice" else "typed", request_id=str(rid or request_id or ""),
                        seed=dict(plan_seed) if isinstance(plan_seed, Mapping) else None, number=self._requests)
         self._req = req
         self._acting_words = req.shown
-        self.logger.reset_usage()
-        self.logger.begin_turn()
-        self.logger.begin_request(req.request_id)
         if not words:
             self.logger.log("brain_no_user_words", request_chars=len(asked))
         outcome, reply = "abandoned", ""
@@ -1236,6 +1251,7 @@ class Brain:
         self._checker = None
         self._checks_seen = 0
         self._final_text = ""
+        self.needed_hands = False
         self._reset_accounting()
         self.last_summary = None
 
@@ -1432,6 +1448,12 @@ class Brain:
             source.complete()
             return ExecResult(status="invalid")
         self._status_plan = header
+        if header.kind == "act" and not self.hands:
+            # a lane that only looks: nothing acts here; the runtime hands the request to the lane that acts
+            source.complete()
+            self.needed_hands = True
+            self.logger.log("brain_needs_hands", lane=self.lane)
+            return ExecResult(status="refused", reason="needs_hands", line=LINE_NEEDS_HANDS, final=True)
         if header.kind == "act":
             state.kind = "act"
         if header.kind == "ask":

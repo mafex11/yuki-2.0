@@ -180,6 +180,21 @@ class Job:
     #: Phase S: the user's usual way the code handed over with this request (``Agent.run(skill=)``: a skill whose own
     #: routes didn't get there; ``yuki.skills.engine.pinned``); ``None``: none.
     skill: dict[str, Any] | None = None
+    #: bWire (brain-design.md 2, M2): exactly what the user typed, for the new brain's ``user_words`` (``None``: not
+    #: given; ``()``: none of the request is theirs, e.g. one the window built from a click). The old loop never
+    #: reads it (it takes ``request``, as before).
+    typed_words: tuple[str, ...] | None = None
+    #: The card, coach-note and where-typed text that came with a typed request: the new brain's labelled ``context``,
+    #: never quotable as the user's words. The old loop gets the same text inside ``request``, as before.
+    context: str | None = None
+
+
+def _typed_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
+    """bWire: the user's typed words as a tuple (``None``: not given; ``()``: given, and none of it is theirs)."""
+    if words is None:
+        return None
+    items = [words] if isinstance(words, str) else list(words)
+    return tuple(str(w).strip() for w in items if str(w or "").strip())
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -246,6 +261,62 @@ class Lane(QThread):
         self._paused_job: int | None = None
         if hasattr(agent, "on_pause"):
             agent.on_pause = self._on_pause
+        #: bWire: the new brain (``yuki.brain.Brain``) for this lane's typed requests while ``Settings.brain`` is
+        #: ``typed`` or ``all``: made on first use (never under ``loop``), and the agent driving the job now when it is
+        #: the brain (``None``: the old loop agent, :attr:`agent`).
+        self._brain: Any = None
+        self._active: Any = None
+
+    @property
+    def active(self) -> Any:
+        """The agent driving this lane's current job: the new brain for a typed request it took, else :attr:`agent`
+        (the old loop agent, which also keeps the lane's model and effort switches)."""
+        return self._active or self.agent
+
+    def _agent_for(self, job: "Job") -> Any:
+        """Who drives ``job``: the new brain for a typed request when ``Settings.brain`` is ``typed`` or ``all`` (read
+        now, at the request's start: flipping it back to ``loop`` is the rollback), else the old loop agent. Spoken
+        requests stay on the old loop here (the voice's own wiring moves them). Never raises: a brain that can't be
+        made leaves the old loop driving (logged)."""
+        mode = str(getattr(getattr(self.runtime, "settings", None), "brain", "loop") or "loop")
+        if mode not in ("typed", "all") or job.source == "voice":
+            return self.agent
+        if self._brain is None:
+            try:
+                self._brain = self._make_brain()
+            except Exception as exc:  # noqa: BLE001 - the old loop goes on driving
+                self.runtime.ui_log.event("brain", lane=self.name, state="unavailable", error=type(exc).__name__)
+                return self.agent
+            self.runtime.ui_log.event("brain", lane=self.name, state="ready", mode=mode)
+        return self._brain
+
+    def _make_brain(self) -> Any:
+        """This lane's brain, sharing the loop agent's settings (so the model switch reaches it), its session log and
+        the runtime's memory. The worker's acts (one desk lease per act run) with the send countdown and the takeover
+        pause; the front desk only looks: its dispatcher is on the hands-blocked backend and an act plan is handed to
+        the worker (``Brain.hands`` false)."""
+        from yuki.brain import Brain
+
+        loop_agent = self.agent
+        settings = getattr(loop_agent, "settings", None) or self.runtime.settings
+        dispatcher = None
+        acts = self.name == WORKER
+        if not acts:
+            dispatcher = Dispatcher(self.blocked if self.blocked is not None else HandsBlockedBackend(),
+                                    screenshot_policy="never",
+                                    tool_timeout_s=float(getattr(settings, "tool_timeout_s", 20.0)))
+        brain = Brain(settings, getattr(loop_agent, "logger", None), dispatcher=dispatcher,
+                      memory=self.runtime.memory, lane=self.name)
+        brain.hands = acts
+        if acts:
+            brain.send_countdown_s = float(getattr(loop_agent, "send_countdown_s", 0.0) or 0.0)
+            brain.takeover = getattr(loop_agent, "takeover", None)
+            brain.takeover_ok = getattr(loop_agent, "takeover_ok", None)
+        brain.on_pause = self._on_pause
+        # the done-check's second look disagreed after the request ended ("Looking again, I can't see that any
+        # more."): told once, on a card (Qt queues the signal to the GUI thread)
+        brain.on_late = lambda text: self.runtime.notice.emit("brain", str(text or ""))
+        return brain
 
     # -- appTakeover: the user took over -------------------------------------------------------------------
 
@@ -266,7 +337,7 @@ class Lane(QThread):
         """The id of the job paused because the user took over, else ``None``."""
         with self._state:
             paused = self._paused_job
-        return paused if paused is not None and paused == self.current_id and getattr(self.agent, "paused", False) \
+        return paused if paused is not None and paused == self.current_id and getattr(self.active, "paused", False) \
             else None
 
     def resume_job(self, job_id: int, words: str | None = None, *, by: str = "") -> bool:
@@ -274,7 +345,7 @@ class Lane(QThread):
         at its next step). ``False`` when that job is not the one paused here."""
         if self.paused_job() != int(job_id):
             return False
-        resume = getattr(self.agent, "resume", None)
+        resume = getattr(self.active, "resume", None)
         return bool(resume(words, by=by)) if callable(resume) else False
 
     @property
@@ -343,7 +414,7 @@ class Lane(QThread):
             if self.resume_job(job_id, text, by="words"):
                 # appTakeover: words typed or said to a request paused because the user took over: it goes on with them
                 return True
-            self.agent.steer(text)
+            self.active.steer(text)
         return running or queued
 
     def holds_steers(self, job_id: int) -> bool:
@@ -360,7 +431,7 @@ class Lane(QThread):
             running = self._current is not None and self._current.id == job_id
             if running:
                 self._named_late[job_id] = app
-        setter = getattr(self.agent, "set_app_named", None)
+        setter = getattr(self.active, "set_app_named", None)
         if running and callable(setter):
             setter(app)
             return True
@@ -401,13 +472,16 @@ class Lane(QThread):
         Takes effect at the agent's next checkpoint (a streaming response is dropped at its next
         event). A request paused on a question is released straight away with a cancellation answer.
         """
-        self.agent.cancel(reason)
-        if self.agent.awaiting_answer:
+        agent = self.active
+        agent.cancel(reason)
+        if agent.awaiting_answer:
             self._answers.put(None)
 
     def shutdown(self) -> None:
         """Cancel, release any pause, and let the thread's loop end."""
         self.agent.cancel()
+        if self._active is not None:
+            self._active.cancel()
         self._answers.put(None)
         self._jobs.put(None)
 
@@ -418,11 +492,15 @@ class Lane(QThread):
             job = self._jobs.get()
             if job is None:
                 return
+            # bWire: who drives it, chosen at its start (Settings.brain read now); set with the job, under the lock,
+            # so a cancel or a steer that finds the job running also finds its agent
+            agent = self._agent_for(job)
             with self._state:
                 if job.id in self._waiting:
                     self._waiting.remove(job.id)
                 skipped = self._skip.pop(job.id, None)
                 self._current = None if skipped else job
+                self._active = agent if not skipped and agent is not self.agent else None
                 if skipped:   # words added while it waited go with it: you stopped (or replaced) that request
                     self._early_steers.pop(job.id, None)
             if skipped:
@@ -440,19 +518,19 @@ class Lane(QThread):
                 reached_for_hands = self._drive(job)
                 # phase F (fPrivacy R1.3): the session-log id this request ended with, kept for a hand-off (read on
                 # the GUI thread in _on_lane_done, after this lane may already have begun its next request)
-                ended = getattr(getattr(self.agent, "logger", None), "last_request_id", None)
+                ended = getattr(getattr(self.active, "logger", None), "last_request_id", None)
                 log_ids = getattr(self.runtime, "_log_ids", None)
                 if isinstance(ended, str) and ended and isinstance(log_ids, dict):
                     log_ids[job.id] = ended
                 # The agent writes its summary in the generator's finally, which
                 # has run by now: the final/failed signal went out first, so the
                 # UI can label the message that is already on screen.
-                summary = self.agent.last_summary
+                summary = self.active.last_summary
                 if summary is not None:
                     self.runtime.summarized.emit(self.name, job.id, dict(summary))
                 with self._state:   # held for a run that ended before its first step (review F1): never dropped
                     late = self._early_steers.pop(job.id, [])
-                late = late + self.agent.take_steers()
+                late = late + self.active.take_steers()
                 if late:
                     # Said after the request's last step: the caller decides what
                     # to do with it (voice passes it on as a new request).
@@ -460,6 +538,7 @@ class Lane(QThread):
             finally:
                 with self._state:
                     self._current = None
+                    self._active = None
                     self._begun = None
                     self._paused_job = None
                     self._named_late.pop(job.id, None)
@@ -495,6 +574,13 @@ class Lane(QThread):
         escalate = ((getattr(settings, "voice_brain_escalate_effort", "") or None,
                      getattr(settings, "voice_brain_escalate_thinking", None)) if voice else None)
         framed = False
+        agent = self.active
+        if agent is not self.agent:
+            # bWire: the new brain takes this typed request (brain-design.md 2): the user's own typed words only, the
+            # card / coach-note / where-typed text as labelled context (never quotable), the log id when it has one
+            events = agent.run(job.request, user_words=list(job.typed_words or ()), context=job.context or "",
+                               channel="typed", request_id=job.log_request_id or "")
+            return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,
             model=(getattr(settings, "voice_brain_model", "") or None) if voice else None,
@@ -617,6 +703,93 @@ class Lane(QThread):
             refused.extend(name for name in self.blocked.attempted if name not in refused)
         if self.agent.cancelled:
             return []  # stopped or withdrawn: a request the user dropped is never handed to the worker
+        return refused
+
+    def _relay(self, job: Job, agent: Any, events: Any, allowed: tuple[str, ...] | None,
+               refused: list[str]) -> list[str]:
+        """bWire: the new brain's events as this lane's signals, the same signals the old loop's give (the island,
+        the window, the done card, the voice and the ledger read them unchanged). Returns the tools this lane asked
+        for but may not use; on the front desk (it only looks) an act plan comes back as ``plan``, so
+        :meth:`AgentRuntime._on_lane_done` hands the request to the worker as before."""
+        runtime = self.runtime
+        begun = False
+        while True:
+            try:
+                event = next(events)
+            except StopIteration:
+                break
+            except Exception as exc:  # the brain handles its own; this is ours
+                runtime.failed.emit(self.name, job.id, f"{type(exc).__name__}: {exc}")
+                break
+            if not begun:
+                begun = True
+                with self._state:
+                    self._named_late.pop(job.id, None)   # the new brain takes the exact words only (D10)
+                    self._begun = job.id
+                    early = self._early_steers.pop(job.id, [])
+                for text in early:   # added while it waited: read at its next step
+                    agent.steer(text)
+            if isinstance(event, Partial):
+                runtime.partial.emit(self.name, job.id, event.what, event.text)
+            elif isinstance(event, Thinking):
+                runtime.thought.emit(self.name, job.id, event.text)
+            elif isinstance(event, ToolCall):
+                if allowed is not None and event.name not in allowed:
+                    refused.append(event.name)
+                runtime.tool_called.emit(self.name, job.id, event.name, dict(event.input))
+            elif isinstance(event, ToolResult):
+                runtime.tool_finished.emit(self.name, job.id, event.name, event.ok, event.summary)
+                if event.ok and event.payload:
+                    from yuki.ui.status import describe_result
+
+                    try:
+                        better = describe_result(event.name, getattr(event, "about", None), event.payload)
+                    except Exception:   # presentation only: never in the way of the run
+                        better = ""
+                    if better:
+                        runtime.tool_labelled.emit(self.name, job.id, event.name, better)
+            elif isinstance(event, AskUser):
+                self._drain_answers()
+                runtime.asked.emit(self.name, job.id, event.question)
+                answer = self._wait_answer(job)
+                if answer is _PARK:
+                    with self._state:
+                        self._parked = (job, event.question)
+                    agent.cancel(PARKED)
+                    agent.answer("")
+                elif answer is None:
+                    agent.cancel()
+                    agent.answer("")
+                else:
+                    agent.answer(answer)
+            elif isinstance(event, Say):
+                runtime.said.emit(self.name, job.id, event.text)
+            elif isinstance(event, SendPending):
+                runtime.send_pending.emit(self.name, job.id, {
+                    "state": event.state, "who": event.who, "where": event.where, "app": event.app,
+                    "text": event.text, "seconds": event.seconds, "who_alts": list(event.who_alts),
+                    "where_alts": list(event.where_alts), "typed": event.typed, "from_memory": event.from_memory,
+                    "window": event.window})
+            elif isinstance(event, Final):
+                verdict = getattr(event, "outcome", None)
+                signal = getattr(runtime, "outcome", None)
+                if isinstance(verdict, dict) and signal is not None:
+                    signal.emit(self.name, job.id, dict(verdict))   # before the words, so all repeat it
+                runtime.finished.emit(self.name, job.id, event.text)
+            elif isinstance(event, ErrorEvent):
+                reason = getattr(agent, "cancel_reason", CANCELLED)
+                if agent.cancelled and reason == PARKED:
+                    runtime.parked.emit(self.name, job.id, event.text)
+                elif agent.cancelled and reason == WITHDRAWN:
+                    runtime.withdrawn.emit(self.name, job.id, self._withdrawn_text(job.id, event.text))
+                else:
+                    runtime.failed.emit(self.name, job.id, event.text)
+        if self.blocked is not None:
+            refused.extend(name for name in self.blocked.attempted if name not in refused)
+        if agent.cancelled:
+            return []  # stopped or withdrawn: a request the user dropped is never handed to the worker
+        if getattr(agent, "needed_hands", False) and "plan" not in refused:
+            refused.append("plan")
         return refused
 
     def _withdrawn_text(self, job_id: int, text: str) -> str:
@@ -764,6 +937,8 @@ class AgentRuntime(QObject):
         #: _on_lane_done), so a front desk's request handed to the worker keeps one id in every log.
         self._log_ids: dict[int, str] = {}
         self._skills: dict[int, dict[str, Any]] = {}   # phase S: front-desk requests' pinned skill, kept for a hand-off
+        #: bWire: front-desk requests' typed words and labelled context (the new brain's), kept for a hand-off.
+        self._typed: dict[int, tuple[tuple[str, ...] | None, str | None]] = {}
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -881,6 +1056,7 @@ class AgentRuntime(QObject):
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
         app_named: str | None = None, log_request_id: str | None = None, skill: dict[str, Any] | None = None,
+        typed_words: "Iterable[str] | str | None" = None, context: str | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -916,6 +1092,10 @@ class AgentRuntime(QObject):
                 kept by the lane's run and across a front-desk hand-off; ``None``: the lane's log begins one.
             skill: Phase S: the pinned skill the code handed over (``yuki.skills.engine.pinned``): kept across a
                 front-desk hand-off and given to ``Agent.run(skill=)``.
+            typed_words: bWire (brain-design.md 2, M2): exactly what the user typed (``()``: none of the request is
+                theirs), the new brain's ``user_words``; the old loop never reads it.
+            context: The card / coach-note / where-typed text that came with it: the new brain's labelled context,
+                never quotable. Both are kept across a front-desk hand-off.
 
         Returns:
             ``(lane name, request id)``.
@@ -946,10 +1126,15 @@ class AgentRuntime(QObject):
         if pin and lane is not self.worker:
             self._skills[request_id] = pin
         fresh = pack if (lane is self.worker and worker_idle) else None
+        typed = _typed_tuple(typed_words)
+        context = str(context) if context else None
+        if lane is not self.worker and (typed is not None or context):
+            self._typed[request_id] = (typed, context)
         # review r2 L1: the newer fields by keyword (a field added beside them can never take the pin's place)
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
                                    previous_query, words, fresh, app_named=named,
-                                   log_request_id=log_request_id or None, skill=pin))
+                                   log_request_id=log_request_id or None, skill=pin, typed_words=typed,
+                                   context=context))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -960,7 +1145,8 @@ class AgentRuntime(QObject):
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
                          app_named: str | None = None, log_request_id: str | None = None,
-                         skill: dict[str, Any] | None = None) -> int:
+                         skill: dict[str, Any] | None = None, typed_words: "Iterable[str] | str | None" = None,
+                         context: str | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -970,6 +1156,7 @@ class AgentRuntime(QObject):
             memory_query: The user's own words for the memory lookup, kept across the hand-off.
             log_request_id: The id the request already has in the logs (the front desk's session-log id), kept by
                 the worker's run (phase F: one request id from the words to the result).
+            typed_words / context: bWire: the user's typed words and the labelled context, for the new brain.
 
         Returns:
             The new request id.
@@ -981,7 +1168,8 @@ class AgentRuntime(QObject):
                                           app_named=" ".join(str(app_named or "").split()) or None,
                                           log_request_id=log_request_id or None,
                                           skill=dict(skill) if isinstance(skill, dict) and skill.get("key")
-                                          else None))
+                                          else None, typed_words=_typed_tuple(typed_words),
+                                          context=str(context) if context else None))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request,
             **({"request_id": log_request_id} if log_request_id else {}),
@@ -1001,7 +1189,7 @@ class AgentRuntime(QObject):
             text: The user's answer.
         """
         lane = self.lane(lane_name)
-        parked = None if lane.agent.awaiting_answer else lane.take_parked()
+        parked = None if lane.active.awaiting_answer else lane.take_parked()
         if parked is None:
             lane.answer(text)
             self.ui_log.event("answer", lane=lane_name, text=text)
@@ -1010,8 +1198,15 @@ class AgentRuntime(QObject):
         request = (f"{job.request}\n\n[This request was set aside on your question, which went unanswered for a "
                    f"while: \"{question}\". The user has now answered: \"{text}\". Carry on with it from where you "
                    f"stopped.]")
+        # bWire: for the new brain, the user's own words are their typed words and now their answer; the set-aside
+        # note is Yuki's, labelled context (the old loop reads the request above, as before)
+        typed = None if job.typed_words is None else (*job.typed_words, text)
+        note = (f"This request was set aside on Yuki's question, which went unanswered for a while: \"{question}\". "
+                f"The user has now answered (the last of their words). Carry on with it from where it stopped.")
+        context = "\n\n".join(part for part in (job.context or "", note) if part)
         _lane, new_id = self.submit(request, origin_hwnd=job.origin_hwnd, source=job.source,
-                                    lane=WORKER if lane_name == WORKER else None)
+                                    lane=WORKER if lane_name == WORKER else None, typed_words=typed,
+                                    context=context if typed is not None else None)
         self.ui_log.event("answer", lane=lane_name, text=text, resumed=job.id, new_id=new_id)
         self.resumed.emit(job.id, new_id)
 
@@ -1099,7 +1294,7 @@ class AgentRuntime(QObject):
         ok = False
         for lane in (self.worker, self.front_desk):
             if lane.current_id == int(request_id):
-                choose = getattr(lane.agent, "send_choice", None)
+                choose = getattr(lane.active, "send_choice", None)
                 ok = bool(choose(kind, value)) if callable(choose) else False
                 break
         self.ui_log.event("send_choice", id=request_id, kind=kind, delivered=ok)
@@ -1177,6 +1372,7 @@ class AgentRuntime(QObject):
             self._apps_named.pop(request_id, None)
             self._skills.pop(request_id, None)
             return
+        typed, context = self._typed.pop(request_id, (None, None))
         if needed_hands:
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
@@ -1184,7 +1380,8 @@ class AgentRuntime(QObject):
                                            user_words=self._user_words.pop(request_id, None),
                                            app_named=self._apps_named.pop(request_id, None),
                                            log_request_id=log_id,
-                                           skill=self._skills.pop(request_id, None))
+                                           skill=self._skills.pop(request_id, None),
+                                           typed_words=typed, context=context)
             # both runtime ids (the front desk's, the worker's) and the one log id they share from here on
             self.ui_log.event("handoff", id=request_id, worker_id=new_id, refused=list(refused),
                               **({"request_id": log_id} if log_id else {}))

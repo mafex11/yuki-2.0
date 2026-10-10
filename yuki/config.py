@@ -18,6 +18,28 @@ from yuki.core.paths import state_root as _state_root
 
 ScreenshotPolicy = Literal["never", "ask", "auto"]
 
+#: Which requests the new brain (``yuki.brain``: one plan call, the executor, one done-check) takes: ``loop`` none
+#: (today's ``yuki.agent.loop`` for everything), ``typed`` the typed ones (the ask bar, the chat page: release 17a),
+#: ``all`` typed and spoken (release 17b, with the voice wiring). The one rollback switch (brain-design.md 10.1, M10).
+BRAIN_MODES: tuple[str, ...] = ("loop", "typed", "all")
+
+
+def _brain_default() -> str:
+    """``YUKI_BRAIN``, else ``brain`` in ``%LOCALAPPDATA%/Yuki/settings.json``, else ``loop`` (read once, at start)."""
+    forced = (os.environ.get("YUKI_BRAIN") or "").strip().lower()
+    if forced in BRAIN_MODES:
+        return forced
+    try:
+        import json
+
+        from yuki.core.models import prefs_path
+
+        data = json.loads(prefs_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError, ImportError):
+        return "loop"
+    value = str(data.get("brain") or "").strip().lower() if isinstance(data, dict) else ""
+    return value if value in BRAIN_MODES else "loop"
+
 #: Short aliases the user (and the CLI's ``/model`` command) can type.
 MODEL_ALIASES: dict[str, str] = {
     "sonnet": "global.anthropic.claude-sonnet-5",
@@ -155,16 +177,9 @@ class Settings:
         project_root: Base directory that ``log_dir`` is resolved against.
         log_dir: Directory holding one JSONL file (and one screenshot folder)
             per session.
-        screenshot_policy: ``never`` refuses screenshots, ``ask`` requires the
-            user to approve one, ``auto`` takes them whenever the model asks.
-            This is a safety/consent gate, not behaviour steering. Defaults to
-            ``never`` for now, deliberately and temporarily: with the tree-waking
-            fix in place the UIA tree is usable even on the Chromium/Electron
-            apps that used to come back empty, and the point of the current
-            testing phase is to find out where the tree really is not enough
-            rather than let a screenshot paper over it. Screenshots are not going
-            away -- expect this back at ``auto`` once the tree path has been
-            exercised properly.
+        screenshot_policy: Always ``never``: screenshots are refused (the user's rule: tree capture only, no
+            screenshots). Any other value given is clamped to ``never`` at construction (brain-design.md 5, L1);
+            the setting itself goes with the old brain (bPrune).
         max_tokens: ``max_tokens`` for every request.
         thinking_display: ``summarized`` returns readable reasoning; ``omitted``
             (the API default on Sonnet 5 / Opus 5) returns empty thinking text.
@@ -679,10 +694,31 @@ class Settings:
     takeover_idle_stop_s: float = 600.0
     #: A request pack (Agent.build_pack) older than this is rebuilt for its screen half (the memory half is kept).
     pack_max_age_s: float = 20.0
+    # -- the brain rebuild (docs/research/audit-2026-10-09/next/brain-design.md rev 2, release 17a) --
+    #: Which requests the new brain takes (:data:`BRAIN_MODES`): ``loop`` (the default: nothing changes), ``typed``,
+    #: ``all``. Read at each request's start, so flipping it back is the rollback (``YUKI_BRAIN`` or ``brain`` in
+    #: ``settings.json`` at start).
+    brain: str = field(default_factory=_brain_default)
+    #: The planner's effort per channel (adaptive thinking on both; pinned for a whole request, tuned from the
+    #: request logs).
+    brain_effort_voice: str = "low"
+    brain_effort_typed: str = "low"
+    #: Act plans: replans after a step did not match (the call budget bounds the rest).
+    brain_max_replans: int = 3
+    #: The commit check's model (one small yes/no call per plan, only on steps that could send, delete, buy, close or
+    #: join; also the read of the user's reply to Yuki's yes/no question): ``judge_model`` renamed.
+    check_model: str = DEFAULT_VOICE_MOUTH_MODEL
 
     def __post_init__(self) -> None:
         if self.model_backend not in ("bedrock", "anthropic"):
             raise ValueError(f"model_backend must be 'bedrock' or 'anthropic', not {self.model_backend!r}")
+        # screenshots never (brain-design.md 5, L1): the ask and auto values are gone; bPrune removes the setting
+        self.screenshot_policy = "never"
+        mode = str(self.brain or "").strip().lower()
+        self.brain = mode if mode in BRAIN_MODES else "loop"
+        self.brain_effort_voice = _soft_effort(self.brain_effort_voice)
+        self.brain_effort_typed = _soft_effort(self.brain_effort_typed)
+        self.brain_max_replans = max(0, int(self.brain_max_replans or 0))
         self.model = resolve_model(self.model)
         self.effort = resolve_effort(self.effort)
         self.voice_brain_effort = resolve_effort(self.voice_brain_effort) if self.voice_brain_effort else ""
@@ -772,6 +808,12 @@ def resolve_model(name: str) -> str:
     without a code change.
     """
     return MODEL_ALIASES.get(name.strip().lower(), name.strip())
+
+
+def _soft_effort(level: object) -> str:
+    """A brain effort level, normalised; an unknown or empty one is ``low`` (the brain's default, never a crash)."""
+    text = str(level or "").strip().lower()
+    return text if text in EFFORT_LEVELS else "low"
 
 
 def resolve_effort(level: str) -> str:

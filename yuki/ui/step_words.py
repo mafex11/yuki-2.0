@@ -476,6 +476,13 @@ DONE_WORDS: dict[str, str] = {
 #: Running words for Yuki's own steps when the agent's registry is not loaded in this process (the HTML window's):
 #: the situation check before a step that lasts and the kept list (report 47 N0, N10; appPT).
 RUNNING_WORDS: dict[str, str] = {"check_situation": "Checking first", "tasks": "Keeping your list"}
+#: The new brain's plan verbs that are no Dispatcher tool (brain-design.md 2.2), running and done: its reads and its
+#: wait (its other verbs are the Dispatcher's own tool names, read by the builders above).
+PLAN_WORDS: dict[str, tuple[str, str]] = {
+    "look": ("Looking at the screen", "Looked at the screen"),
+    "fetch": ("Reading it", "Read it"),
+    "wait": ("Waiting a moment", "Waited a moment"),
+}
 TODO_DONE: dict[str, str] = {"add": "Added to your list", "done": "Marked done on your list",
                              "not_needed": "Took off your list", "wrong": "Took off your list",
                              "list": "Checked your list"}
@@ -516,6 +523,8 @@ def describe_step(name: str, tool_input: dict[str, Any] | None = None, *, done: 
         line = say_what(what, done=done)
     elif name in ACTION_WORDS:
         line = ACTION_WORDS[name](args, about, done)
+    elif name in PLAN_WORDS:
+        line = PLAN_WORDS[name][1 if done else 0]
     elif done:
         line = TODO_DONE.get(str(args.get("action") or ""), "") if name == "todo" else ""
         line = line or DONE_WORDS.get(name, "") or "Did a step"
@@ -524,6 +533,44 @@ def describe_step(name: str, tool_input: dict[str, Any] | None = None, *, done: 
         when = _when_words([(k, d) for k, v in args.items() if (d := _iso(v)) is not None])
         line = f"{phrase} {when}" if when else phrase
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
+
+
+#: A plan step's fixed values the words may use (closed enums of the verbs, never the step's free text).
+PLAN_CLICKS: dict[str, dict[str, Any]] = {"right": {"button": "right"}, "middle": {"button": "middle"},
+                                          "double": {"clicks": 2}}
+PLAN_ACTIONS = frozenset({"minimize", "maximize", "fullscreen", "restore", "focus", "close", "select"})
+
+
+def describe_plan_step(step: Any, *, app: Any = None, done: bool = False, limit: int = 60) -> str:
+    """A step of the new brain's plan (``yuki.brain.plan.Step``, or the same as a dict) in the words a step that runs
+    gets (the island's step line, the status answer), before or after it runs.
+
+    Built from the step's verb (the Dispatcher's own tool name, or a plan read), its element's role and name (the
+    control), ``app`` (the plan's target app, as people say it) and the verb's closed values only (a click's button,
+    a window's or tab's action, Enter after typing). Never the step's free text: no typed text, address, command or
+    keys reach the words."""
+    def get(key: str) -> Any:
+        return step.get(key) if isinstance(step, dict) else getattr(step, key, None)
+
+    verb = str(get("verb") or "")
+    element = get("element")
+    role = element.get("role") if isinstance(element, dict) else getattr(element, "role", None)
+    name = element.get("name") if isinstance(element, dict) else getattr(element, "name", None)
+    about = {k: v for k, v in (("role", _squash(role)), ("element", _squash(name)), ("app", _squash(app))) if v}
+    args: dict[str, Any] = {ABOUT: about} if about else {}
+    value = _squash(get("value")).casefold()
+    if verb == "click" and value in PLAN_CLICKS:
+        args.update(PLAN_CLICKS[value])
+    elif verb in ("window_action", "tab") and value in PLAN_ACTIONS:
+        args["action"] = value
+    elif verb == "type_text" and get("submit") is True:
+        args["press_enter"] = True
+    return describe_step(verb, args, done=done, limit=limit)
+
+
+def plan_lines(steps: Any, *, app: Any = None, done_count: int = 0) -> list[str]:
+    """A plan's steps as lines: the first ``done_count`` in the past tense, the rest as they will run."""
+    return [describe_plan_step(s, app=app, done=i < done_count) for i, s in enumerate(list(steps or []))]
 
 
 # -- dates in a memory tool's arguments (the tools' fixed ISO format) --------------------------------------------------

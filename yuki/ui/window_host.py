@@ -899,7 +899,9 @@ class WindowHost(QObject):
             paused = runtime.paused_id() if callable(getattr(runtime, "paused_id", None)) else None
             if paused is not None:
                 return {"ok": False, "error": "A request is paused for you. Let it go on or stop it, then try again."}
-            lane, request_id = runtime.submit(text, origin_hwnd=getattr(ui, "_origin_hwnd", None))
+            # bWire (brain-design.md 2, M2): the window built this request from a click (it carries fenced data), so
+            # none of it is the user's own words for the new brain: it goes as context only (the old loop: unchanged)
+            lane, request_id = runtime.submit(text, origin_hwnd=getattr(ui, "_origin_hwnd", None), typed_words=())
             self.user_message(request_id, shown)
             ui.cards[request_id] = ui.overlay.add_card(shown)
             ui.ui_log.event("submit", id=request_id, lane=lane, text=shown, via="window_start")
