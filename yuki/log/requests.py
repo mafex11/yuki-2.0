@@ -50,10 +50,22 @@ REQUEST_CSV_FIELDS: tuple[str, ...] = (
     "done_check",
     "recheck",
     "moments_after",
+    # the brain rebuild (brain-design.md 8, 10.1): a request the new brain ran, code words and numbers only (empty
+    # on the old loop's rows): the plan's kind (act / answer / ask), the steps handed to the executor, the replans,
+    # the done-check's probe, the outcome level, ms from the call to the plan's header, model calls, commit checks
+    "plan_kind",
+    "plan_steps",
+    "replans",
+    "probe",
+    "verdict",
+    "plan_ms",
+    "plan_calls",
+    "check_calls",
 )
 #: Cells that must be one code word (a skill key, a route, a check's outcome) or a number; anything else is left empty
 #: (never a sentence or a name in the ledger).
-CODE_COLUMNS: tuple[str, ...] = ("request_id", "skill", "route", "done_check", "recheck")
+CODE_COLUMNS: tuple[str, ...] = ("request_id", "skill", "route", "done_check", "recheck", "plan_kind", "probe",
+                                 "verdict")
 
 #: The token keys shared by ``request_summary``, ``startup_cost`` and the CSV.
 TOKEN_KEYS: tuple[str, ...] = (
