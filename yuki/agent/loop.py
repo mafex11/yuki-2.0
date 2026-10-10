@@ -2752,7 +2752,7 @@ class Agent:
         prev = getattr(self, "_skills_block", None) or ((), "")
         try:
             from yuki.skills import enabled
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
             from yuki.skills.menu import THINKER, menu_text
 
             if not enabled(self.settings) or getattr(self, "reader", False):
@@ -2762,6 +2762,9 @@ class Agent:
                 return ((), "")
             if self.memory.installed:
                 menu = self.memory.call("skill_menu", lambda c: c.skill_menu(THINKER), timeout_s=1.0)
+                # lPage merge note 10: memory's menu read the catalog on its store, so the process cache now holds the
+                # learned skills it lists; the enum keys come from that same catalog
+                loaded = load()
             else:
                 menu = menu_text(None, audience=THINKER, loaded=loaded)
             menu = str(menu or "")

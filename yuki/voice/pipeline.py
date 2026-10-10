@@ -44,8 +44,9 @@ from yuki.voice.keyterms import vocabulary
 from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
-    CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, MORE_OF_RESULT, MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory,
-    ReplyChannel, mouth_system_blocks, volatile_block, with_markers,
+    CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, HAND_OVER, HANDOFF_TOOLS, LEAN_MOUTH_PROMPT, MORE_OF_RESULT,
+    MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel, mouth_system_blocks, router_on, talker_kind,
+    voice_on_brain, volatile_block, with_markers,
 )
 
 #: The speech channels (``Settings.voice_speech_channel``, v3.16).
@@ -448,7 +449,7 @@ class LlmCall:
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
-SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation", "run_skill"})
+SAY_FIRST_TOOLS = frozenset({"tell_yuki", "open_url", "open_app", "end_conversation", "run_skill", "hand_over"})
 
 
 def early_words(partial_json: str) -> str | None:
@@ -994,14 +995,17 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 if ordered != messages:
                     context = LLMContext(messages=ordered, tools=context.tools, tool_choice=context.tool_choice)
             params = super()._get_llm_invocation_params(context)
-            composed = self._settings.system_instruction or MOUTH_PROMPT
-            tail = composed[len(MOUTH_PROMPT):] if composed.startswith(MOUTH_PROMPT) else composed
+            # bTalk: the lean talker's core (design 3) when the conversation has one; else the full one, as before
+            talker = "lean" if hook("talker", default="full") == "lean" else "full"
+            base = LEAN_MOUTH_PROMPT if talker == "lean" else MOUTH_PROMPT
+            composed = self._settings.system_instruction or base
+            tail = composed[len(base):] if composed.startswith(base) else composed
             call = hooks.call()
             channel = hook("channel", default="guard")
             params["system"] = mouth_system_blocks(memory, tail=[tail.strip()], call=call,
                                                    call_evidence=hook("call_evidence", default=None),
                                                    channel=channel, hands=bool(hook("hands", default=True)),
-                                                   marks=bool(hook("marks", default=True)))
+                                                   marks=bool(hook("marks", default=True)), talker=talker)
             messages = params.get("messages")
             if channel == "marker":
                 messages = with_markers(messages)   # its earlier replies as the channel writes them (v3.16)
@@ -1010,7 +1014,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                 named=bool(hook("named", default=False)), work=hook("work", default=None),
                 cut=hook("cut", default=None), after_goodbye=bool(hook("after_goodbye", default=False)),
                 channel=channel, rerun=bool(hook("rerun", default=False)), state=hook("state", default=None),
-                practice=getattr(self._yuki_call, "practice_block", None)))
+                practice=getattr(self._yuki_call, "practice_block", None), talker=talker))
             return params
 
         def _sync_cancel_tools(self) -> None:
@@ -1018,13 +1022,15 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             super()._sync_cancel_tools()
             from pipecat.adapters.schemas.function_schema import FunctionSchema
 
-            from yuki.voice.mouth import CANCEL_TELL_YUKI_DESCRIPTION
+            from yuki.voice.mouth import CANCEL_HAND_OVER_DESCRIPTION, CANCEL_TELL_YUKI_DESCRIPTION
 
             tools = getattr(getattr(self, "_adapter", None), "builtin_tools", None)
             for name in list(getattr(self, "_cancel_tool_names", ()) or ()):
                 old = tools.get(name) if isinstance(tools, dict) else None
-                if old is not None and getattr(old, "description", None) != CANCEL_TELL_YUKI_DESCRIPTION:
-                    tools[name] = FunctionSchema(name=old.name, description=CANCEL_TELL_YUKI_DESCRIPTION,
+                # bTalk: the lean talker's cancel_hand_over gets its own words (it names hand_over)
+                wanted = CANCEL_HAND_OVER_DESCRIPTION if name == "cancel_hand_over" else CANCEL_TELL_YUKI_DESCRIPTION
+                if old is not None and getattr(old, "description", None) != wanted:
+                    tools[name] = FunctionSchema(name=old.name, description=wanted,
                                                  properties=old.properties, required=old.required)
 
         async def _cancel_tool_handler(self, params: Any) -> None:
@@ -1168,6 +1174,13 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             # the call is still being written (v3.6), as soon as its first field says whether the
                             # window in front is to be read for it (v3.9, a few tokens in).
                             early_wait = name == "tell_yuki" and call.user_turn
+                            if name == "hand_over" and call.user_turn:
+                                # bTalk (design 2, 8): hand_over has no screen field to wait for; the request starts on
+                                # the block's first bytes, as tell_yuki's does on its first field
+                                if self._speculation_gate.is_speculating:
+                                    self._yuki_early_pending = (tool_id, False)   # once the turn is confirmed
+                                else:
+                                    hook("handoff_began", tool_id, False)
                         elif (kind == "content_block_delta" and tool_id is not None
                               and hasattr(event.delta, "partial_json")):
                             args += event.delta.partial_json or ""
@@ -2202,7 +2215,7 @@ class TurnObserver:
             if self.turn is not None and call not in self._calls:
                 self._calls.add(call)
                 self.turn.tools.append(frame.function_name)
-                if frame.function_name == "tell_yuki" and self.turn.handoff_at is None:
+                if frame.function_name in HANDOFF_TOOLS and self.turn.handoff_at is None:
                     self.turn.handoff_at = now
                 if frame.function_name != "stay_quiet":
                     self._took_part(now)
@@ -2524,6 +2537,10 @@ class _Hooks:
 
     # -- v3.17: the prompt by measured state (H1) and the answer's length (H2) --------------------------------
 
+    def talker(self) -> str:
+        """bTalk: the talker in force this conversation, ``"full"`` or ``"lean"`` (``mouth.talker_kind``)."""
+        return str(getattr(self.c, "talker", "full") or "full")
+
     def hands(self) -> bool:
         """Whether the talker has hands this conversation (its hands block is in the prompt only then)."""
         return bool(self.c.settings.voice_hands and getattr(self.c.bridge, "hands", None) is not None)
@@ -2828,6 +2845,10 @@ class Conversation:
         # -- v3.16 -------------------------------------------------------------------------------------------
         #: Which of the talker's words are spoken: ``"marker"`` or ``"guard"`` (``Settings.voice_speech_channel``).
         self.channel = speech_channel(settings)
+        #: bTalk (design 10.1): spoken requests run on the new brain (``brain = "all"``), and the talker in force
+        #: (``full`` / ``lean``); fixed for the conversation with its tools and prompt.
+        self.brain_voice = voice_on_brain(settings)
+        self.talker = talker_kind(settings)
         #: Every outcome handed to the talker until it is heard (:class:`yuki.voice.narrator.OwedLedger`), made in run.
         self.ledger: Any = None
         #: ``(kind)``: play an earcon (:func:`yuki.voice.echo.tone`) through this conversation's output; set by the
@@ -3633,7 +3654,8 @@ class Conversation:
         # Pipecat's standing async-tool paragraph says a result must be added to whatever
         # reply is in progress and is "owed whatever the conversation moved on to"; here the
         # narrator gate decides when a result is said, and the user's rules ban em dashes.
-        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = async_tool_instructions()
+        lean = getattr(self, "talker", "full") == "lean"
+        llm_service_module.ASYNC_TOOL_INSTRUCTIONS = async_tool_instructions(lean=lean)
         # Pipecat's final-result note says a result must be spoken whatever the
         # conversation moved on to. Here the narrator gate decides that, and a
         # stale result arrives marked held_back; the note defers to the payload.
@@ -3693,12 +3715,18 @@ class Conversation:
                 thinking=AnthropicLLMService.ThinkingConfig(type="disabled"),
                 # The core layer: Pipecat composes its async-tool paragraphs onto it; the
                 # service subclass sends the result as the first of the prompt's layers.
-                system_instruction=MOUTH_PROMPT,
+                system_instruction=LEAN_MOUTH_PROMPT if lean else MOUTH_PROMPT,
             ),
         )
-        llm.register_function("tell_yuki", self._tell_or_hold, cancel_on_interruption=False,
-                              cancellable_by_llm=True, timeout_secs=None)
-        llm.register_function("check_progress", self.bridge.check_progress)
+        if lean:
+            # bTalk (design 3): the lean talker hands over with hand_over (the exact words go by code); no
+            # check_progress (its model call is gone: "how's it going?" is answered from the work line)
+            llm.register_function("hand_over", self._tell_or_hold, cancel_on_interruption=False,
+                                  cancellable_by_llm=True, timeout_secs=None)
+        else:
+            llm.register_function("tell_yuki", self._tell_or_hold, cancel_on_interruption=False,
+                                  cancellable_by_llm=True, timeout_secs=None)
+            llm.register_function("check_progress", self.bridge.check_progress)
         llm.register_function("more_of_result", self.bridge.more_of_result)
         llm.register_function("stay_quiet", self.bridge.stay_quiet)
         llm.register_function("end_conversation", self.bridge.end_conversation)
@@ -3802,10 +3830,12 @@ class Conversation:
             # Every line passes one cheap check before it is heard (v3.10): only what a person says to the user.
             from yuki.voice.speechguard import SpeechGuard
 
+            # bTalk (design 3): under brain = "all" the check makes no model call; its two code rules stay
+            code_only = {"code_only": True} if getattr(self, "brain_voice", False) else {}
             guard = SpeechGuard(self._client, s.voice_mouth_model, log=self.log, session=self.session,
                                 timeout_s=float(getattr(s, "voice_speech_guard_timeout_s", 2.5)),
                                 context=lambda: {"user": self.observer.last_user_text},
-                                shadow=self.channel == "marker")   # v3.16: with the marker channel it only measures
+                                shadow=self.channel == "marker", **code_only)   # v3.16: marker: it only measures
             guard.on_drop = self.observer.guarded
             self.guard = guard
             self.observer.guard = guard
@@ -3831,10 +3861,12 @@ class Conversation:
         # skill hands (run_skill from its keys, keep_usual) and, with the volume skill, no mixer hand or volume keys;
         # else as before phase S (the step-list run_skill only where the old learning path can offer ways)
         hand_tools = self._talker_hand_tools()
+        # bTalk (design 3): the lean talker's hand_over in tell_yuki's place, and no check_progress
+        head = ((HAND_OVER,) if getattr(self, "talker", "full") == "lean" else (TELL_YUKI, CHECK_PROGRESS))
         tools = ToolsSchema(standard_tools=[
             FunctionSchema(name=t["name"], description=t["description"], properties=t["properties"],
                            required=t["required"])
-            for t in (TELL_YUKI, CHECK_PROGRESS, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET,
+            for t in (*head, MORE_OF_RESULT, STAY_QUIET, END_CONVERSATION, GO_QUIET,
                       *([QUICK_MEMORY] if self.memory is not None else []), *hand_tools)
         ])
         self._tools = tools
@@ -4411,7 +4443,7 @@ class Conversation:
         if key == VOLUME_SKILL:
             return True
         try:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             skill = load().get(key)
         except Exception:  # noqa: BLE001 - unknown: held like any window hand
@@ -4420,7 +4452,7 @@ class Conversation:
         return bool(routes) and not any(r.needs_focus for r in routes)
 
     async def _hold(self, params: Any) -> None:
-        self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
+        self.log.event("hands" if params.function_name not in HANDOFF_TOOLS else "bridge", op=params.function_name,
                        held="asked_first")
         self.bridge.held_at = time.monotonic()
         self.bridge.held_call = (params.function_name, dict(params.arguments or {}), params.context)
@@ -4435,8 +4467,10 @@ class Conversation:
             "If their words were clear after all, call it again now, alone, with its say_first.")})
 
     async def _tell_or_hold(self, params: Any) -> None:
-        """tell_yuki, held like a hand when the mouth asked and handed over in one reply on doubtful words."""
-        if self._held("tell_yuki", params.tool_call_id):
+        """tell_yuki (or the lean talker's hand_over), held like a hand when the mouth asked and handed over in one reply
+        on doubtful words."""
+        name = params.function_name if params.function_name in HANDOFF_TOOLS else "tell_yuki"
+        if self._held(name, params.tool_call_id):
             self.bridge.drop_early(str(params.tool_call_id))
             await self._hold(params)
             return
@@ -4471,6 +4505,11 @@ class Conversation:
         # Phase S (D10): the request is the user's own words since Yuki last replied
         words = ({"words": exact_words(context, skip=self.bridge.not_heard, heard=heard)}
                  if _takes(self.bridge.begin_early, "words") else {})
+        if getattr(self, "brain_voice", False) and _takes(self.bridge.begin_early, "turns"):
+            # bTalk: the new brain's user words are the turns since Yuki last replied, each as heard (design 3), and
+            # the conversation goes along for the labelled context built from it (never quotable as their words)
+            words["turns"] = heard_words(context, skip=self.bridge.not_heard, since_reply=True)
+            words["convo"] = context
         try:
             started = self.bridge.begin_early(call_id, heard, screen=screen, said=spoken_words(context), **words)
         except TypeError:  # a stand-in bridge without the v3.9 arguments
@@ -4484,7 +4523,7 @@ class Conversation:
         """The talker's call for the user's turn begins: the router decides alongside it whether the turn needs the
         thinker (``voice_router``; yuki.voice.router). Not on words recognition was unsure of (a call may be held until
         they answer), not while a voice task is open (a follow-up routes by that task's state), not while dormant."""
-        if not getattr(self.settings, "voice_router", False) or self.dormant or not getattr(call, "user_turn", False):
+        if not router_on(self.settings) or self.dormant or not getattr(call, "user_turn", False):
             return
         if self.focus and not self._utterance_named():
             return   # vGame: in a game or a call only words said to Yuki by name start the thinker early (review F4)
@@ -5330,8 +5369,13 @@ def _preimport() -> None:
         pass
 
 
-def async_tool_instructions() -> str:
-    """The standing async-tool paragraph composed into the mouth's prompt (replaces Pipecat's)."""
+def async_tool_instructions(lean: bool = False) -> str:
+    """The standing async-tool paragraph composed into the mouth's prompt (replaces Pipecat's). ``lean`` (bTalk): the
+    lean talker's, which names hand_over."""
+    if lean:
+        from yuki.voice.mouth import LEAN_ASYNC_TOOL_INSTRUCTIONS
+
+        return LEAN_ASYNC_TOOL_INSTRUCTIONS
     return (
         "ASYNC TOOLS:\n"
         "tell_yuki keeps running after you have replied. What it sends back (progress, questions, "

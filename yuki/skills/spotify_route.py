@@ -164,7 +164,7 @@ def proven(loaded: Any = None) -> dict[str, Any]:
     """What the live checks proved, from the data (the doctor's "Spotify routes proven" line): per skill, the window
     states its no-focus Spotify rung may run in with a game in front, and whether the mixer is linked both ways."""
     if loaded is None:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         loaded = load()
     out: dict[str, Any] = {}

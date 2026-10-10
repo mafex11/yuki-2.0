@@ -1,0 +1,96 @@
+# browser.site_tab: a site's tab that is already open comes forward in its browser; the user does the act themselves
+# (a meeting tab: they click Join) (phase L design §6, §4.3; PLAN.md D3, D8, D17, D19, D24). A capability: what any
+# user's browser can do. Which site's tab the user brings up, in which browser and when, are learned (moments of kind
+# call_join, the tab identities memory keeps), never written here.
+#
+# The tab is found by identity only, never by its title: the RuntimeId, name digests and pinned place memory learned on
+# every sighting of the site (nudge_state['site_tabs:<service>'], yuki.memory.callevidence.SiteTabs), through the tab
+# census (yuki.perception.tabs) of the browser it was seen in. Selecting the tab is a UI Automation pattern call (no
+# key, no pointer); bringing the browser forward is the guarded focus_window. If the strip can't be read, Yuki says so
+# and does nothing. Never with a game in front ("after the round?"), never handed to the thinker (it would only
+# search), never a click on Join: the join is the user's (commit = "user", wont = ["join"]).
+#
+# Zero setup (D0): the browser's own window and tabs; no calendar, nothing to connect.
+
+[connection]
+app = "browser"
+
+[capability."browser.site_tab"]
+end = "site_front"
+kind = "open"
+menu = "bring forward a site's tab already open in a browser (a meeting: they click Join)"
+done_line = "{service} is up."
+offer_class = "logistics"
+commit = "user"
+pre_commit_end = "site_front"
+wont = ["join"]
+handoff = false
+# a call joined in a browser on a calling site: the skill stops at the tab in front (its pre-commit end)
+serves = [{ end = "call_join", target = "call", needs = ["browser", "calling_site"] }]
+bind = { service = "service", browser = "app" }
+
+# The site, by the product name memory keeps for it (a learned skill binds it; the user's words name it otherwise).
+[[capability."browser.site_tab".slot]]
+name = "service"
+type = "text"
+role = "key"
+required = true
+ask = "Which site's tab?"
+
+# The browser: where memory saw that tab, else the user's usual (also where a told link opens).
+[[capability."browser.site_tab".slot]]
+name = "browser"
+type = "app"
+role = "means"
+scope = "service"
+
+# Which of two equal tabs, counted along the strip (1 = the first). Asked only when the census finds two that match
+# equally (D8: two equal -> ask).
+[[capability."browser.site_tab".slot]]
+name = "pick"
+type = "number"
+role = "fill"
+min = 1
+max = 4
+
+# A link the user told Yuki once ("my standup link is ..."), kept encrypted in skills.told_ciphertext; used only when
+# no tab of the site is open.
+[[capability."browser.site_tab".slot]]
+name = "link"
+type = "text"
+role = "fill"
+told = true
+
+# Rung A: the tab census, select the tab by identity, then bring its browser forward (yuki/skills/web_route.py).
+[[capability."browser.site_tab".route]]
+rung = "A"
+variant = "census"
+via = "driver"
+driver = "web_route"
+call = "site_tab"
+needs_focus = true
+means = "browser"
+args = { service = "{service}" }
+# a wrong tab or a browser that would not come forward is never followed by opening the told link (a second tab)
+retry_after_acting = false
+# the browser in front on the very tab the route selected (by RuntimeId)
+done = { probe = "driver", driver = "web_route", call = "site_tab_shown", within_s = 2 }
+# memory's own sighting of the site in front in that browser since the run began (a site_front moment: a second
+# source that tells the site's tab from any other tab; review r1 L2)
+recheck = { probe = "driver", driver = "web_route", call = "site_front", service = "{service}", after_s = 3 }
+
+# Rung A, second: no tab of the site open and a told link -> open it in the means browser (launch arguments, nothing
+# typed).
+[[capability."browser.site_tab".route]]
+rung = "A"
+variant = "told_link"
+via = "driver"
+driver = "web_route"
+call = "told_link"
+needs_focus = true
+means = "browser"
+when = { slot = "link", present = true }
+args = { service = "{service}" }
+# done only when memory saw the site itself in front in that browser (review r1 L2), not just the browser in front
+done = { probe = "driver", driver = "web_route", call = "site_front", service = "{service}", within_s = 6 }
+recheck = { probe = "driver", driver = "web_route", call = "browser_front", after_s = 3 }

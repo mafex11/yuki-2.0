@@ -7,11 +7,23 @@ taste entity key (a keyed digest, never a name in clear). The quote behind ``sai
 **The choice rule** (:func:`choose`, code only):
 
 1. a ``usual`` option (the user's statement, confirmed once with "Keep this as your usual?") wins until at least 3
-   later observed choices in the same context contradict it (then one "still your usual?" card goes out,
-   :func:`still_usual_question`);
+   later choices the user made about Yuki's own runs in the same context ("just this time" answers) contradict it
+   (then one "still your usual?" card goes out, :func:`still_usual_question`);
 2. otherwise the top observed option when its share is at least 0.8 with an effective count of at least 3 (observed
    events decay with a 30-day half-life);
-3. otherwise the most recent choice in this context, **named aloud** when used, so one word corrects it.
+3. otherwise the most recent choice in this context, **named aloud** when used, so one word corrects it. A choice
+   memory only watched the user make (:func:`feed_observed`, source ``occasion:``) counts in rule 2 only: it never
+   counts against a confirmed usual (design §5: "a confirmed usual still wins first"), so it informs the choice only
+   while no usual is confirmed (or after the user's own choices outvoted it), and never here: below rule 2's bar a
+   learned skill's fill policy picks the program (design §5, critique M8: "last used" is one candidate policy, never
+   shipped ahead of the scorer), and an unknown means slot asks once.
+
+**Observed choices** (phase L design §5): every night, one ``observed`` event per occasion of the user's own with a
+known program (the learner's ``occasions``: never an asked run, never a late chat capture's, never a Not mine skill's),
+keyed at capability level (``<capability>:<slot>@<scope>``), so it exists before any skill is learned and survives a
+re-learn. **Fill policies** (:class:`FillPolicyScorer`): per learned skill, the candidate policies for its program slot
+(``yuki.skills.web_route.BROWSER_POLICIES``) are scored on its own occasions in time order, each with only what came
+before it; the best is kept when it beats "most used" by 5 points, else "most used".
 
 **Where a usual comes from** (the user's words only, each confirmed once, never applied silently):
 
@@ -48,6 +60,9 @@ EVENT_WEIGHTS: dict[str, float] = {"observed": 1.0, "said": 1.0, "confirmed": 1.
                                    "corrected": 3.0, "rejected": -1.0, "asked": 0.0}
 #: asked (sVoice) only ties a question card to the preference it asks about (its source names the card); it is
 #: never a choice and never weighs.
+#: The source prefix of an observed event the nightly feed wrote from one of the user's own occasions (its end moment's
+#: id follows): rule 2 counts it; a usual's contradiction and rule 3 never do.
+OBSERVED_SOURCE = "occasion:"
 
 
 @dataclass(frozen=True)
@@ -82,18 +97,19 @@ def choose(store: Any, slot: str, *, context: str = "", now: float | None = None
         ids = [int(p[0]) for p in prefs]
         marks = ",".join("?" * len(ids))
         events = store._query(
-            f"SELECT pref_id, at, type, weight FROM pref_events WHERE pref_id IN ({marks}) AND at < ? ORDER BY at",
-            (*ids, hi))
+            f"SELECT pref_id, at, type, weight, source FROM pref_events WHERE pref_id IN ({marks}) AND at < ? "
+            "ORDER BY at", (*ids, hi))
     except Exception:  # noqa: BLE001
         return None
     option_of = {int(p[0]): str(p[1]) for p in prefs}
     observed: dict[str, float] = {}
     latest: tuple[float, str] | None = None
-    for pid, at, typ, weight in events:
+    for pid, at, typ, weight, source in events:
         opt = option_of.get(int(pid))
         if opt is None:
             continue
-        if typ in ("observed", "said", "corrected", "confirmed"):
+        watched = typ == "observed" and str(source or "").startswith(OBSERVED_SOURCE)
+        if typ in ("observed", "said", "corrected", "confirmed") and not watched:
             if latest is None or float(at) >= latest[0]:
                 latest = (float(at), opt)
         if typ == "observed":
@@ -103,8 +119,12 @@ def choose(store: Any, slot: str, *, context: str = "", now: float | None = None
     if usual:
         u = max(usual, key=lambda p: float(p[3] or 0.0))
         confirmed = float(u[3] or 0.0)
-        against = sum(1 for pid, at, typ, _w in events if typ == "observed" and float(at) > confirmed
-                      and option_of.get(int(pid)) != str(u[1]))
+        # only the user's choices about Yuki's own runs ("just this time") contradict a confirmed usual; a choice memory
+        # only watched them make (a mixer drag in a game) never does (lWire review r1 M2: "a confirmed usual still
+        # wins first", design §5)
+        against = sum(1 for pid, at, typ, _w, source in events if typ == "observed" and float(at) > confirmed
+                      and option_of.get(int(pid)) != str(u[1])
+                      and not str(source or "").startswith(OBSERVED_SOURCE))
         if against < CONTRADICT_N:
             return Choice(option=str(u[1]), source="usual", named=False)
         still = True
@@ -329,29 +349,58 @@ def _scopes(skill: Any, slot: Any, store: Any = None) -> list[dict[str, Any]]:
     return scopes
 
 
+def route_scopes(skill: Any, scope_slot: str) -> list[str]:
+    """The values of ``scope_slot`` that the capability's own routes name in their ``when`` conditions (driver data: a
+    route that runs only for one app's own control names that app; lName's ``backfill._route_scopes``, adopted here so
+    the live extractor lists them from day one: lName merge note 6). Content of shipped files only."""
+    out: list[str] = []
+    for route in getattr(skill, "routes", ()) or ():
+        for cond in getattr(route, "when", ()) or ():
+            if str(cond.get("slot") or "") != scope_slot:
+                continue
+            values = cond.get("in")
+            for value in values if isinstance(values, (list, tuple)) else ():
+                text = str(value or "").strip()
+                if text and text not in out:
+                    out.append(text)
+    return out
+
+
 def usual_choices(loaded: Any = None, *, store: Any = None, cap: int = CHOICES_MAX) -> list[UsualChoice]:
-    """The closed list the conversation extractor picks a ``usual`` from: every preference slot of a loaded skill that
-    takes a fixed option (an enum, or an app slot with options), with each scope its key can take. Entities and people
-    are never listed (their options are digests, or live in ``contact_prefs``). In load order, at most ``cap``."""
+    """The closed list the conversation extractor picks a ``usual`` from: every preference slot of a capability that
+    takes a fixed option (an enum, or an app slot with options), with each scope its key can take: its options, the
+    scopes already kept in ``prefs``, and the scopes its own routes name (:func:`route_scopes`). Preference keys live
+    at capability level (phase L design §5), so a learned skill adds no entry of its own. Entities and people are never
+    listed (their options are digests, or live in ``contact_prefs``). Deduplicated, in load order, at most ``cap``."""
     if loaded is None:
         try:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import capabilities
 
-            loaded = load()
+            loaded = capabilities()
         except Exception:  # noqa: BLE001
             return []
     out: list[UsualChoice] = []
+    seen: set[str] = set()
     for skill in getattr(loaded, "skills", ()) or ():
+        if getattr(skill, "origin", "capability") != "capability":
+            continue
         for slot in skill.slots:
             if not slot.pref or slot.type not in ("enum", "app") or not slot.options:
                 continue
-            for scope in _scopes(skill, slot, store):
+            scopes = _scopes(skill, slot, store)
+            if slot.scope:
+                scopes += [{slot.scope: v} for v in route_scopes(skill, slot.scope) if {slot.scope: v} not in scopes]
+            for scope in scopes:
                 key = slot.pref_key(skill.key, scope)
                 if "{" in key:
                     continue
                 where = f" ({', '.join(str(v) for v in scope.values())})" if scope else ""
                 for option in slot.options:
-                    out.append(UsualChoice(text=f"{key}={option}", skill=skill.key, slot=slot.name, pref=key,
+                    text = f"{key}={option}"
+                    if text in seen:
+                        continue
+                    seen.add(text)
+                    out.append(UsualChoice(text=text, skill=skill.key, slot=slot.name, pref=key,
                                            option=str(option), words=f"{option} for {skill.menu}{where}",
                                            menu=f"{skill.menu}{where}"))
                     if len(out) >= cap:
@@ -506,7 +555,7 @@ def after_voice_run(store: Any, skill_key: str, *, values: dict[str, Any], previ
     out: dict[str, Any] = {"corrected": [], "still_card": None}
     try:
         if loaded is None:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
             loaded = load()
         skill = loaded.get(str(skill_key or ""))
@@ -545,8 +594,366 @@ def after_voice_run(store: Any, skill_key: str, *, values: dict[str, Any], previ
     return out
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Observed choices: the user's own occasions, fed nightly (phase L design §5)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: Where the nightly feed keeps the time it has fed up to (content-free: one number).
+OBSERVED_STATE = "prefs:observed_until"
+#: On a database the feed never ran on, it reads this far back (the occasions' own window: the moments' retention).
+OBSERVED_BACK_S = 90 * 86400.0
+#: The kept cursor stays this far behind the feed's time (lWire review r1 L1): an occasion dated before the night pass
+#: but written after it (a visit still open then) is read the next night; the ``source`` dedupe keeps it single.
+OBSERVED_MARGIN_S = 12 * 3600.0
+#: How a measured means word (the moments' own closed vocabulary, ``moments.volume_change``'s ``means``) reads as an
+#: option of a means slot whose options don't hold it: a mixer session is the Windows mixer. Machine codes on both
+#: sides (a fixed map between two of Yuki's own vocabularies, never words); a word in neither is no observation (the
+#: PC's master level says nothing about an app's control).
+MEANS_WORDS: dict[str, str] = {"session": "mixer"}
+
+
+def _means_option(slot: Any, value: Any) -> str | None:
+    """A measured means value as an option of ``slot`` (its options, :data:`MEANS_WORDS`, or an app key for an app
+    slot with no options), else ``None``."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    options = tuple(str(o) for o in (getattr(slot, "options", ()) or ()))
+    if options:
+        if text in options:
+            return text
+        mapped = MEANS_WORDS.get(text)
+        return mapped if mapped in options else None
+    return text if getattr(slot, "type", "") == "app" else None
+
+
+def _pref_means_slot(cap: Any) -> Any:
+    """The capability's means slot that reads a preference and is filled from an occasion (``bind``), else ``None``."""
+    for slot in getattr(cap, "slots", ()) or ():
+        if slot.role == "means" and slot.pref and slot.name in (getattr(cap, "bind", None) or {}):
+            return slot
+    return None
+
+
+def feed_observed(store: Any, *, now: float | None = None, since: float | None = None) -> dict[str, Any]:
+    """One ``observed`` preference event per occasion of the user's own with a known program since the last feed
+    (design §5; the routine miner's night pass calls it, right after the learner wrote the night's occasions):
+
+    * from the learner's ``occasions``: ``by = 'user'`` (never an asked run: D22), ``context_known`` (never a late chat
+      capture's), a ``means`` value, an end moment; never one of a skill the user marked Not mine;
+    * keyed at capability level (``<capability>:<slot>@<scope>``, the scope read from the end moment as the learner
+      reads it), the option from the means value (:func:`_means_option`);
+    * dated at the occasion, source ``occasion:<end moment id>``, written in one transaction; the time fed up to is kept
+      (:data:`OBSERVED_STATE`, :data:`OBSERVED_MARGIN_S` behind), and an event already written for that moment is never
+      written again, so a re-run or a learner rebuild never writes one twice;
+    * a skill marked Not mine keeps its occasions (the learner leaves them on the tombstone's id): the events fed from
+      them before the button are removed (``unfed``), and none is fed again.
+
+    Content-free counts; never raises."""
+    now = time.time() if now is None else float(now)
+    out: dict[str, Any] = {"occasions": 0, "written": 0}
+    try:
+        kept = store.nudge_state(OBSERVED_STATE)
+        lo = float(since) if since is not None else (float(kept) if kept else now - OBSERVED_BACK_S)
+    except (TypeError, ValueError):
+        lo = now - OBSERVED_BACK_S
+    except Exception:  # noqa: BLE001
+        return {"error": "state"}
+    try:
+        rows = store._query(
+            "SELECT o.end_moment_id, o.capability, o.means, o.at, o.skill_id FROM occasions o WHERE o.by = 'user' AND"
+            " o.context_known = 1 AND o.means IS NOT NULL AND o.means != '' AND o.end_moment_id IS NOT NULL AND"
+            " o.at > ? AND o.at <= ? ORDER BY o.at", (lo, now))
+        not_mine = {int(r[0]) for r in store._query("SELECT id FROM skills WHERE origin = 'learned' AND state ="
+                                                     " 'not_mine'")}
+    except Exception:  # noqa: BLE001 - a database before migration 43: nothing to feed
+        return {"skipped": "no_occasions"}
+    if not_mine:
+        out["unfed"] = _unfeed(store, not_mine)
+    from collections import Counter
+
+    from yuki.skills.catalog import capabilities
+
+    caps = {c.key: c for c in capabilities().capabilities}
+    skipped: Counter = Counter()
+    events: list[tuple[str, str, float, str]] = []
+    ids = [int(r[0]) for r in rows]
+    moments: dict[int, dict[str, Any]] = {}
+    for start in range(0, len(ids), 400):
+        part = ids[start:start + 400]
+        try:
+            got = store._query(f"SELECT * FROM moments WHERE id IN ({','.join('?' * len(part))})", tuple(part))
+        except Exception:  # noqa: BLE001
+            got = []
+        for r in got:
+            d = dict(r)
+            try:
+                import json
+
+                d["facts"] = json.loads(d["facts"]) if d.get("facts") else {}
+            except (TypeError, ValueError):
+                d["facts"] = {}
+            moments[int(d["id"])] = d
+    from yuki.memory.routines import _moment_attrs
+
+    for mid, cap_key, means, at, sid in rows:
+        out["occasions"] += 1
+        if sid is not None and int(sid) in not_mine:
+            skipped["not_mine"] += 1
+            continue
+        cap = caps.get(str(cap_key))
+        slot = _pref_means_slot(cap) if cap is not None else None
+        if slot is None:
+            skipped["no_pref_slot"] += 1
+            continue
+        option = _means_option(slot, means)
+        m = moments.get(int(mid))
+        if option is None or m is None:
+            skipped["no_option" if option is None else "no_moment"] += 1
+            continue
+        try:
+            attrs = _moment_attrs(cap, m)
+        except Exception:  # noqa: BLE001
+            skipped["unreadable"] += 1
+            continue
+        key = slot.pref_key(cap.key, attrs)
+        if "{" in key or (slot.scope and attrs.get(slot.scope) in (None, "")):
+            skipped["no_scope"] += 1    # a scoped choice with its scope unknown (a hold with no service) says nothing
+            continue
+        events.append((key, option, float(at), f"{OBSERVED_SOURCE}{int(mid)}"))
+    if events:
+        def write(conn: Any) -> int:
+            had = {str(s) for (s,) in conn.execute(
+                "SELECT source FROM pref_events WHERE type = 'observed' AND at >= ? AND source LIKE ?",
+                (min(e[2] for e in events), OBSERVED_SOURCE + "%")).fetchall()}
+            n = 0
+            for key, option, at, source in events:
+                if source in had:
+                    continue
+                conn.execute("INSERT OR IGNORE INTO prefs (slot, option, context, state, created_at, updated_at) "
+                             "VALUES (?, ?, '', 'seen', ?, ?)", (key, option, at, at))
+                pid = int(conn.execute("SELECT id FROM prefs WHERE slot = ? AND option = ? AND context = ''",
+                                       (key, option)).fetchone()[0])
+                conn.execute("UPDATE prefs SET last_at = max(coalesce(last_at, 0), ?), updated_at = ? WHERE id = ?",
+                             (at, now, pid))
+                conn.execute("INSERT INTO pref_events (at, pref_id, type, weight, source, quote_ciphertext) "
+                             "VALUES (?, ?, 'observed', ?, ?, NULL)", (at, pid, EVENT_WEIGHTS["observed"], source))
+                n += 1
+            return n
+
+        try:
+            out["written"] = int(store._write(write))
+        except Exception as exc:  # noqa: BLE001 - nothing moved: the next night tries the same span again
+            out["error"] = type(exc).__name__
+            return out
+    try:
+        store.set_nudge_state(OBSERVED_STATE, f"{max(lo, now - OBSERVED_MARGIN_S):.3f}")
+    except Exception:  # noqa: BLE001
+        pass
+    if skipped:
+        out["skipped"] = dict(skipped)
+    return out
+
+
+def _unfeed(store: Any, skill_ids: set[int]) -> int:
+    """Remove the ``observed`` events the feed wrote from the occasions of these skills (the user marked them Not mine:
+    what they were learned from is not the user's). Returns how many went; never raises."""
+    marks = ",".join("?" * len(skill_ids))
+
+    def op(conn: Any) -> int:
+        mids = [int(r[0]) for r in conn.execute(
+            f"SELECT DISTINCT end_moment_id FROM occasions WHERE skill_id IN ({marks}) AND end_moment_id IS NOT NULL",
+            tuple(sorted(skill_ids))).fetchall()]
+        n = 0
+        for start in range(0, len(mids), 400):
+            part = [f"{OBSERVED_SOURCE}{m}" for m in mids[start:start + 400]]
+            cur = conn.execute("DELETE FROM pref_events WHERE type = 'observed' AND source IN"
+                               f" ({','.join('?' * len(part))})", tuple(part))
+            n += max(0, int(cur.rowcount or 0))
+        return n
+
+    try:
+        return int(store._write(op))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Fill policies: which program a learned skill's means slot takes when nothing above it (words, usual) says
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: A slot is scored only with this many timed occasions of the user's own and at least two programs among them.
+POLICY_MIN_OCCASIONS = 6
+#: The best policy is kept only when it beats "most used" by this much (accuracy points: design §5).
+POLICY_MARGIN = 0.05
+#: "Most used" looks back this far before each occasion (web_route's measured browsers: 14 days).
+POLICY_MOST_DAYS = 14.0
+#: How far back the scorer loads the timeline (the band policy's 28 days before the oldest occasion it scores).
+POLICY_LOOKBACK_DAYS = 28.0
+
+
+class FillPolicyScorer:
+    """Scores the candidate fill policies of a learned skill's program slot on its own occasions (design §5, critique
+    M8), one instance per learner pass (the timeline loaded once, on first use):
+
+    * the candidates are ``yuki.skills.web_route.BROWSER_POLICIES`` (``front_or_recent``: the program in front, or the
+      last in front at most 30 min before; ``band``: the most used in this weekday/weekend hour band over 28 days;
+      ``site``: the one the occasion's site was last shown in; ``most``: the most used over 14 days); the confirmed
+      usual wins before any of them at run time (rule 1), so it is no candidate here;
+    * each occasion is predicted with only what came before its visit (an occasion with no visit is left out), among the
+      programs the user used for this skill;
+    * the best is kept when it beats ``most`` by :data:`POLICY_MARGIN`, else ``most``.
+
+    :meth:`score` gives ``(spec means, content-free summary)``; ``({}, {})`` when the slot isn't scored."""
+
+    def __init__(self, store: Any, now: float) -> None:
+        self.store = store
+        self.now = float(now)
+        self._loaded = False
+        self._starts: dict[str, list[float]] = {}
+        self._cum: dict[str, list[float]] = {}
+        self._band: dict[tuple[str, bool, int], tuple[list[float], list[float]]] = {}
+        self._rows: list[tuple[float, float, str]] = []
+        self._row_starts: list[float] = []
+        self._site: dict[str, tuple[list[float], list[str]]] = {}
+
+    def _load(self, since: float) -> None:
+        from datetime import datetime
+
+        from yuki.memory.moments import registrable_domain
+        from yuki.memory.store import app_key
+
+        self._loaded = True
+        try:
+            rows = self.store._query(
+                "SELECT process, started_at, ended_at, active_s + passive_s, host FROM timeline WHERE state ="
+                " 'present' AND by_yuki = 0 AND process IS NOT NULL AND started_at >= ? AND started_at <= ? ORDER BY"
+                " started_at", (since, self.now))
+        except Exception:  # noqa: BLE001
+            rows = []
+        band: dict[tuple[str, bool, int], tuple[list[float], list[float]]] = {}
+        site: dict[str, tuple[list[float], list[str]]] = {}
+        for process, started, ended, seconds, host in rows:
+            key = app_key(str(process or "")) or ""
+            if not key or started is None:
+                continue
+            s, e, sec = float(started), float(ended or started), float(seconds or 0.0)
+            starts = self._starts.setdefault(key, [])
+            cum = self._cum.setdefault(key, [])
+            starts.append(s)
+            cum.append((cum[-1] if cum else 0.0) + sec)
+            stamp = datetime.fromtimestamp(s)
+            b = band.setdefault((key, stamp.weekday() >= 5, stamp.hour), ([], []))
+            b[0].append(s)
+            b[1].append((b[1][-1] if b[1] else 0.0) + sec)
+            self._rows.append((s, e, key))
+            if host:
+                dom = registrable_domain(str(host))
+                if dom:
+                    site.setdefault(dom, ([], []))
+                    site[dom][0].append(s)
+                    site[dom][1].append(key)
+        self._band = band
+        self._site = site
+        self._row_starts = [r[0] for r in self._rows]
+
+    @staticmethod
+    def _sum(starts: list[float], cum: list[float], lo: float, hi: float) -> float:
+        import bisect
+
+        i, j = bisect.bisect_left(starts, lo), bisect.bisect_left(starts, hi)
+        if j <= i:
+            return 0.0
+        return cum[j - 1] - (cum[i - 1] if i > 0 else 0.0)
+
+    def _predict(self, policy: str, t0: float, keys: list[str], dom: str | None) -> str | None:
+        import bisect
+        from datetime import datetime
+
+        from yuki.skills.web_route import BAND_H, RECENT_S
+
+        if policy == "most":
+            got = {k: self._sum(self._starts.get(k, []), self._cum.get(k, []), t0 - POLICY_MOST_DAYS * 86400.0, t0)
+                   for k in keys}
+        elif policy == "band":
+            stamp = datetime.fromtimestamp(t0)
+            weekend = stamp.weekday() >= 5
+            got = {}
+            for k in keys:
+                total = 0.0
+                for d in range(-BAND_H, BAND_H + 1):
+                    starts, cum = self._band.get((k, weekend, (stamp.hour + d) % 24), ([], []))
+                    total += self._sum(starts, cum, t0 - POLICY_LOOKBACK_DAYS * 86400.0, t0)
+                got[k] = total
+        elif policy == "front_or_recent":
+            i = bisect.bisect_left(self._row_starts, t0) - 1
+            best: tuple[float, str] | None = None
+            for s, e, k in reversed(self._rows[max(0, i - 60): i + 1]):
+                if k in keys and e >= t0 - RECENT_S and (best is None or e > best[0]):
+                    best = (e, k)
+            return best[1] if best else None
+        elif policy == "site":
+            if not dom or dom not in self._site:
+                return None
+            starts, owners = self._site[dom]
+            i = bisect.bisect_left(starts, t0) - 1
+            while i >= 0:
+                if owners[i] in keys:
+                    return owners[i]
+                i -= 1
+            return None
+        else:
+            return None
+        got = {k: v for k, v in got.items() if v > 0}
+        return max(got, key=lambda k: (got[k], k)) if got else None
+
+    def score(self, group: Any, cap: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        """``({slot: {"policy": name}}, {slot: {"policy", "n", "points": {policy: accuracy points}}})`` for the
+        capability's program slots (a preference-filled means slot of type ``app``); ``({}, {})`` when none is
+        scored (too few occasions, one program only)."""
+        from yuki.memory.moments import registrable_domain
+        from yuki.skills.web_route import BROWSER_POLICIES
+
+        means: dict[str, Any] = {}
+        summary: dict[str, Any] = {}
+        bind = dict(getattr(cap, "bind", None) or {})
+        for slot in getattr(cap, "slots", ()) or ():
+            # a program slot the preferences fill (a browser); a means another driver picks (a chat's app, from the
+            # people index) takes no fill policy
+            if slot.role != "means" or slot.type != "app" or slot.name not in bind or slot.fill != "prefs":
+                continue
+            cases = []
+            for o in getattr(group, "occasions", ()) or ():
+                if getattr(o, "by", "") != "user" or not getattr(o, "context_known", False):
+                    continue
+                actual = str((getattr(o, "attrs", None) or {}).get(slot.name) or "")
+                visit_at = getattr(o, "visit_at", None)
+                if not actual or visit_at is None:
+                    continue    # no visit of its own: what came before it can't be told from the visit itself
+                t0 = float(visit_at) - 1.0
+                host = (getattr(o, "src", None) or {}).get("host")
+                cases.append((t0, actual, registrable_domain(str(host)) if host else None))
+            keys = sorted({c[1] for c in cases})
+            if len(cases) < POLICY_MIN_OCCASIONS or len(keys) < 2:
+                continue
+            if not self._loaded:
+                self._load(min(c[0] for c in cases) - POLICY_LOOKBACK_DAYS * 86400.0)
+            points = {}
+            for policy in BROWSER_POLICIES:
+                hits = sum(1 for t0, actual, dom in cases if self._predict(policy, t0, keys, dom) == actual)
+                points[policy] = hits / len(cases)
+            best = max(BROWSER_POLICIES, key=lambda p: (points[p], p == "most"))
+            winner = best if points[best] - points.get("most", 0.0) >= POLICY_MARGIN else "most"
+            means[slot.name] = {"policy": winner}
+            summary[slot.name] = {"policy": winner, "n": len(cases),
+                                  "points": {p: round(v * 100) for p, v in points.items()}}
+        return means, summary
+
+
 __all__ = ["HALF_LIFE_DAYS", "SHARE", "MIN_N", "CONTRADICT_N", "EVENT_WEIGHTS", "Choice", "choose", "usual", "record",
            "keep_usual", "KEEP_QUESTION", "KEEP_PENDING_S", "CORRECTION_S", "QUESTION_ORIGIN", "QUESTION_IMPORTANCE",
            "CHOICES_MAX", "keep_line", "run_sources", "note_correction", "UsualChoice", "usual_choices",
            "parse_choice", "usual_question", "propose", "question_target", "pending_question", "confirm_question",
-           "still_usual_question", "ask_card", "after_voice_run"]
+           "still_usual_question", "ask_card", "after_voice_run", "OBSERVED_SOURCE", "OBSERVED_STATE",
+           "OBSERVED_MARGIN_S", "MEANS_WORDS", "route_scopes", "feed_observed", "POLICY_MIN_OCCASIONS", "POLICY_MARGIN",
+           "FillPolicyScorer"]

@@ -594,8 +594,14 @@ class YukiUi(QObject):
         if asked is not None:
             unchanged = " ".join(text.split()) == " ".join(str(asked.get("text") or "").split())
             request = suggestion_request(asked["nudge"], text) if unchanged else text
-            request = f"{request}\n\n{WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])}"
-            lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
+            where = WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])
+            request = f"{request}\n\n{where}"
+            # bWire (brain-design.md 2, M2): for the new brain a suggestion sent unchanged is Yuki's words, so nothing
+            # of it is the user's (it goes as context only); edited, the typed text is theirs (the old loop reads the
+            # request above, as before)
+            lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd,
+                                                        typed_words=() if unchanged else (text,),
+                                                        context=None if unchanged else where)
             self._ask_runs[request_id] = (asked["nudge"], time.monotonic())
             self.window_host.user_message(request_id, text)
             self.cards[request_id] = self.overlay.add_card(text)
@@ -610,13 +616,20 @@ class YukiUi(QObject):
         request = (
             nudge_reply_request(nudge, text, certain=how != "implicit") if nudge is not None else text
         )
+        # bWire (brain-design.md 2, M2): the new brain gets the typed words alone as the user's; the card replied to,
+        # the coach note and where it was typed go with them as labelled context, never quotable as their words
+        context = [nudge_reply_request(nudge, "", certain=how != "implicit").strip()] if nudge is not None else []
         nudge_id = nudge.get("id") if nudge is not None else None
         lane_guess = FRONT_DESK if self.runtime.worker_busy else WORKER  # as runtime.submit picks
         note, note_ids = self.nudges.coach_note_for(lane_guess, exclude=nudge_id)
         if note:
             request = f"{request}\n\n{note}"
-        request = f"{request}\n\n{WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])}"
-        lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd)
+            context.append(note)
+        where = WHERE_TYPED.get(via, WHERE_TYPED['ask_bar'])
+        request = f"{request}\n\n{where}"
+        context.append(where)
+        lane_name, request_id = self.runtime.submit(request, origin_hwnd=self._origin_hwnd, typed_words=(text,),
+                                                    context="\n\n".join(context))
         self.window_host.user_message(request_id, text)
         self.cards[request_id] = self.overlay.add_card(text)
         self.overlay.expand_input()

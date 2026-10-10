@@ -1,4 +1,5 @@
-# Spotify through its own desktop window (docs/research/audit-2026-10-09/PLAN.md D0, D4; Phase S-1).
+# Spotify through its own desktop window (phase L design §6; PLAN.md D0, D4). A capability: what any user's Spotify can
+# do. Which playlists the user plays, and when, are learned (moments of kind media_context), never written here.
 #
 # Zero setup: nothing here asks for a developer app, a key or a sign-in. Yuki drives Spotify's own window through UI
 # Automation patterns (Invoke, RangeValue, Value), Windows' media session (play only, never a toggle), Spotify's own
@@ -34,28 +35,33 @@ launch_args = ["--minimized"]
 slider_moves_mixer = false
 mixer_moves_slider = false
 
-# -- play one of the user's playlists from Your Library -----------------------------------------------------------------
+# -- play a playlist from Your Library, by its name ---------------------------------------------------------------------
 
-[skill."spotify.playlist"]
+[capability."spotify.playlist"]
 end = "media_context"
 kind = "change"
-menu = "play one of their Spotify playlists by its name"
+menu = "play a playlist, album or liked songs from Spotify's Your Library, by its name"
 done_line = "Playing {playlist.name} on Spotify."
-learn_from = [["media_context", "spotify"], ["media_play", "spotify"]]
-routine_on = [["media_context", "spotify"]]
+offer_class = "everyday"
 handoff = true
+serves = [{ end = "media_context", target = "playlist", needs = "spotify" }]
+bind = { playlist = "entity" }
 
-[[skill."spotify.playlist".slot]]
+# The playlist: a fill slot of kind "playlist" (the taste rows spotify_playlist: the user's own picks by hour, learned
+# from their moments); a routine is keyed per playlist (routine_key).
+[[capability."spotify.playlist".slot]]
 name = "playlist"
 type = "entity"
-taste = "spotify_playlist"
+role = "fill"
+kind = "playlist"
+routine_key = true
 required = true
 ask = "Which playlist?"
 
 # Rung A, no focus: the row of DataGrid "Your Library" whose name is the one asked; its "Play {name}" button by Invoke.
 # "Pause {name}" with the session playing on this PC: already playing. "Pause {name}" with the session paused: the
 # session's play. Not while Spotify plays on another device.
-[[skill."spotify.playlist".route]]
+[[capability."spotify.playlist".route]]
 rung = "A"
 variant = "library"
 via = "driver"
@@ -68,7 +74,7 @@ done = { probe = "driver", driver = "spotify_route", call = "playing_here", name
 recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", name = "{playlist.name}", after_s = 4 }
 
 # The window-state rule, no game in front: Spotify minimised and the no-focus route couldn't read or press it.
-[[skill."spotify.playlist".route]]
+[[capability."spotify.playlist".route]]
 rung = "A"
 variant = "restore"
 via = "driver"
@@ -78,10 +84,10 @@ needs_focus = true
 done = { probe = "driver", driver = "spotify_route", call = "playing_here", name = "{playlist.name}", within_s = 4 }
 recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", name = "{playlist.name}", after_s = 4 }
 
-# Out of view: the spotify:playlist: link Yuki learned for it (brings Spotify forward), then the page's own
-# "Play {name}". (PLAN.md B.2 lists this as rung B; it is the app's own link, so it is a rung A variant here: rung B is
-# the recorded click path, which needs a verified run before it may run.)
-[[skill."spotify.playlist".route]]
+# Out of view: the spotify:playlist: link Yuki learned for it from a link Spotify showed (brings Spotify forward), then
+# the page's own "Play {name}". (The app's own link, so a rung A variant: rung B is the recorded click path, which needs
+# a verified run before it may run.)
+[[capability."spotify.playlist".route]]
 rung = "A"
 variant = "link"
 via = "driver"
@@ -93,7 +99,7 @@ recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", 
 
 # No learned link: "Search in Your Library" (unverified; patterns only; the filter is cleared afterwards). Needs the
 # search labels in yuki/connect/sites/spotify.toml; without them it says "couldn't".
-[[skill."spotify.playlist".route]]
+[[capability."spotify.playlist".route]]
 rung = "A"
 variant = "search"
 via = "driver"
@@ -106,7 +112,7 @@ done = { probe = "driver", driver = "spotify_route", call = "playing_here", name
 recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", name = "{playlist.name}", after_s = 4 }
 
 # Spotify not running: started with its own --minimized argument (never with a game in front), then its row.
-[[skill."spotify.playlist".route]]
+[[capability."spotify.playlist".route]]
 rung = "A"
 variant = "launch"
 via = "driver"

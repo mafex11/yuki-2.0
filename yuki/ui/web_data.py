@@ -2033,7 +2033,9 @@ def build_playbook(memory: Any) -> dict[str, Any]:
         if text:
             standing.append({"ref": r.get("ref"), "text": text, "since": short_day(epoch_of(r.get("created_at")))})
     return {"proposals": props, "procedures": procs, "choices": choices, "know_how": know, "lessons": lessons, "rules": rules,
-            "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None}
+            "standing": standing, "workflows_available": available, "learning": wf.get("learning") or None,
+            # phase L (lPage merge note 1): "Skills Yuki learned from you" (yuki.skills.playbook.learned_section)
+            "skills": wf.get("skills") if isinstance(wf.get("skills"), dict) else None}
 
 
 # -- Activity ------------------------------------------------------------------------------------------------------
@@ -2662,7 +2664,7 @@ PAGE_TABLES: dict[str, tuple[str, ...]] = {
     "work": ("timeline", *TODO_TABLES, "work_items", "messages", "ui_tasks"),
     "day": ("timeline", "calls", "ui_tasks"),
     "me": ("contacts", "portraits", "portrait_facts", "conversation_facts", "journal"),
-    "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts"),
+    "playbook": ("playbooks", "questions", "standing_requests", "knowhow", "conversation_facts", "skills"),
     "activity": ("runs", "nudges", "todos", "calls", "timeline"),
     "shell": ("questions",),
 }

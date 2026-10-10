@@ -1,5 +1,5 @@
-# WhatsApp: its own data for the `message` skill (message.toml) (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2;
-# map-skills S2.5).
+# WhatsApp: its own data for the `message` capability (message.toml) (phase L design §6; PLAN.md D0, D17, D19, Q3/rule
+# 8). Driver data only: true for anyone's WhatsApp; whom the user messages there is learned, never written here.
 #
 # A chat whose stored handle is a phone number opens by WhatsApp's own link (whatsapp://send?phone=...); any other
 # chat through WhatsApp's chat search: its search shortcut, the chat's name as memory keeps it, then the result row

@@ -27,13 +27,14 @@ rule about anyone's words) - of things that are plainly Yuki's own small job:
   (:mod:`yuki.memory.routine_offers`) writes it, from what the user measurably does at that time (the "Your usual"
   card: their meeting tab, never their work); it is never in a model's schema or the judge's enum
   (:data:`MODEL_DOS`), :func:`validate_offer` refuses it from any model dict, and :func:`allowed_dos` gives it to
-  the ``routine`` channel only. Only a skill whose data says ``offerable``, that never sends, with a trusted route
-  (``yuki.skills.registry.offer_ready``, D14: 2 verified runs for opening things) is offered
-  (:func:`routine_offer`). Pressing it (:func:`act`) re-checks the offer's own expiry, that the routine is still on
-  and the route still trusted, and answers ``running``: **memory never runs it**. The tray runs the skill (its
-  hands live there, as for ``bring_back``) under the voice run's safety (desk lease, Yuki's marker, the game
-  re-check) and reports back (:func:`offer_result`: ``done`` / ``failed``). Undo brings back the window that was in
-  front. It never joins, unmutes, types or sends anything: the user clicks Join.
+  the ``routine`` channel only. Only a skill the learner wrote from what the user does (phase L) that passes the offer
+  gate (:func:`skill_offerable`: never sends, never commits, rung A or a verified rung B, its capability's offer class,
+  its Won't words known) with a trusted route (``yuki.skills.registry.offer_ready``, D14: 2 verified runs for opening
+  things) is offered (:func:`routine_offer`). Pressing it (:func:`act`) re-checks the offer's own expiry, that the
+  routine is still on and the route still trusted, and answers ``running``: **memory never runs it**. The tray runs
+  the skill (its hands live there, as for ``bring_back``) under the voice run's safety (desk lease, Yuki's marker, the
+  game re-check) and reports back (:func:`offer_result`: ``done`` / ``failed``). Undo brings back the window that was
+  in front. It never joins, unmutes, types or sends anything: the step that commits stays the user's.
 
 The model fills the fields; code validates ids and enums (never words) twice - when the card is written
 (:func:`validate_offer`: an unknown ``do``, an id the request did not offer, a ref that does not resolve, empty
@@ -87,11 +88,21 @@ WONT_LINES: dict[str, str] = {
     # a routine card carries its skill's own line (SKILL_WONT_LINES); this one only when the skill names none
     "run_skill": "Won't type, click or send anything.",
 }
-#: A routine card's "Won't:" line per code word of its skill's ``wont`` list (the connection file's data, e.g.
-#: ``meet.open``: ``wont = ["join"]``): fixed UI copy. A skill naming a word not here is never offered (fail closed).
+#: A routine card's "Won't:" line per code word: the words of its skill's ``wont`` list (the capability's data, e.g.
+#: ``browser.site_tab``: ``wont = ["join"]``), and, for a skill that names none, its commit word (D24, the engine's
+#: table; phase L design §9.1 "SKILL_WONT_LINES by commit word"). Fixed UI copy. A ``wont`` word not here, or the
+#: commit word ``words`` (a send or a join on the user's own words: never offered, rule 8), means no card (fail
+#: closed).
 SKILL_WONT_LINES: dict[str, str] = {
     "join": "Won't join, unmute, type or send anything. You click Join.",
+    # by commit word: the last step is the user's (Yuki stops before it), or there is no such step
+    "user": "Won't do the last step, type or send anything. That step is yours.",
+    "none": "Won't type or send anything.",
 }
+#: The commit words a routine card may carry (``words``: never offered).
+OFFER_COMMITS: tuple[str, ...] = ("none", "user")
+#: The learner's rungs an offered run may use (design §4.7: rung A, or a rung B verified at offer time).
+OFFER_RUNGS: tuple[str, ...] = ("A-link", "A-capability", "B")
 #: What each kind's refs must resolve to (``None``: refs are context only, any offered id).
 NEEDS: dict[str, str | None] = {"todo_add": None, "show_memory": "item", "bring_back": "url", "draft": None,
                                 "ask": None, "run_skill": "routine"}
@@ -443,32 +454,213 @@ def card_offer_view(nudge: Any) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _commit_word(skill: Any) -> str:
+    """The skill's commit word for its card (D24): the strictest of the engine's table for the end its run reaches and
+    the skill's own declared ``commit`` (a declared ``user`` stays on the card even when the run stops before it)."""
+    try:
+        from yuki.skills.connection import strictest
+        from yuki.skills.engine import run_commit
+
+        return strictest(run_commit(skill), str(getattr(skill, "commit", "") or "")) or "user"
+    except Exception:  # noqa: BLE001 - unknown: the strictest reading
+        return "user"
+
+
 def skill_wont_line(skill: Any) -> str | None:
-    """The routine card's "Won't:" line for ``skill`` (its ``wont`` code words through :data:`SKILL_WONT_LINES`), the
-    generic line when it names none, or None when it names a word without a line (never offered: fail closed)."""
+    """The routine card's "Won't:" line for ``skill``: its ``wont`` code words through :data:`SKILL_WONT_LINES`, else
+    its commit word's line (D24); None when a word has no line or the commit is ``words`` (never offered: fail
+    closed)."""
     words = [str(w) for w in getattr(skill, "wont", ()) or ()]
     if not words:
-        return WONT_LINES["run_skill"]
+        commit = _commit_word(skill)
+        if commit not in OFFER_COMMITS:
+            return None
+        return SKILL_WONT_LINES.get(commit) or WONT_LINES["run_skill"]
     lines = [SKILL_WONT_LINES.get(w) for w in words]
     if any(line is None for line in lines):
         return None
     return " ".join(dict.fromkeys(lines))   # type: ignore[arg-type]
 
 
+def skill_meta(store: Any, skill: Any) -> dict[str, Any]:
+    """A learned skill's row as the offer gate reads it (phase L lCore's ``skills`` columns): ``{"id", "state",
+    "deleted", "prov"}``, ``prov`` its content-free provenance JSON; ``{}`` for a capability, an unknown key or a
+    database before migration 43. Never raises."""
+    key = str(getattr(skill, "key", "") or "")
+    if not key or getattr(skill, "origin", "capability") != "learned":
+        return {}
+    try:
+        rows = store._query("SELECT id, state, deleted_at, provenance FROM skills WHERE key = ? AND origin = 'learned'"
+                            " LIMIT 1", (key,))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not rows:
+        return {}
+    rid, state, deleted, raw = tuple(rows[0])[:4]
+    try:
+        prov = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        prov = {}
+    return {"id": int(rid), "state": str(state or ""), "deleted": deleted is not None,
+            "prov": prov if isinstance(prov, dict) else {}}
+
+
+def named(meta: dict[str, Any]) -> bool:
+    """The learned skill carries a real name: the naming call's (``provenance.named``) or the user's own Rename."""
+    prov = meta.get("prov") or {}
+    return prov.get("named") is True or prov.get("named_by") == "user"
+
+
+def usage_capability(skill: Any) -> str:
+    """The capability key of a learned usage record, else ``""``: a learned row whose capability binds no key slot (a
+    playlist record). The menu gives it no line (lPage), so every request of that capability runs, and is ledgered,
+    on the capability, and every one of those runs is that record's habit (lWire review r1 M3)."""
+    if getattr(skill, "origin", "") != "learned":
+        return ""
+    bind = getattr(skill, "bind", None) or {}
+    if any(getattr(s, "role", "") == "key" and s.name in bind for s in getattr(skill, "slots", ()) or ()):
+        return ""
+    return str(getattr(skill, "capability", "") or "")
+
+
+def habit_keys(skill: Any) -> tuple[str, ...]:
+    """The ledger keys whose runs are the skill's own habit: its own key, and a usage record's capability
+    (:func:`usage_capability`)."""
+    return tuple(k for k in dict.fromkeys((str(getattr(skill, "key", "") or ""), usage_capability(skill))) if k)
+
+
+def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
+    """The newest ``n`` decided runs and rung tries of these ledger keys together, newest first (1 verified, 0 not):
+    the registry's own "last 5" read, over two keys."""
+    marks = ",".join("?" * len(keys))
+    try:
+        rows = store._query(
+            f"SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs WHERE"
+            f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL UNION ALL SELECT checked, NULL, at, id"
+            f" FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL) ORDER BY t DESC, id DESC"
+            " LIMIT ?", (*keys, *keys, int(n)))
+    except Exception:  # noqa: BLE001
+        return []
+    return [1 if int(c) == 1 and r != 0 else 0 for c, r in rows]
+
+
+def offer_trusted(store: Any, skill: Any, *, now: float | None = None) -> bool:
+    """D14 for a routine card's skill: ``yuki.skills.registry.offer_ready`` on the skill's own runs. A usage record's
+    runs are pooled with its capability's (:func:`habit_keys`; lWire review r1 M3: "play my X playlist" is ledgered on
+    the capability, so the record's own key alone could never reach the bar): the same bar and numbers (the
+    registry's), on the verified runs of both keys, the newest 5 read across both by time. Never raises."""
+    from yuki.skills import registry
+
+    keys = habit_keys(skill)
+    try:
+        if len(keys) < 2:
+            return bool(registry.offer_ready(store, skill, now=now))
+        total_ok = sum(sum(t.ok for t in registry.trust(store, k, now=now).values()) for k in keys)
+        if str(getattr(skill, "kind", "") or "change") == "open":
+            return total_ok >= registry.OPEN_RUNS
+        newest = _pooled_last(store, keys, registry.CHANGE_WINDOW)
+        return (total_ok >= registry.CHANGE_RUNS and len(newest) >= registry.CHANGE_WINDOW
+                and 0 not in newest[:registry.CHANGE_WINDOW])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _rung_b_verified(store: Any, keys: tuple[str, ...] | str) -> bool:
+    """A learned rung B has a verified run of its own (design §4.4: a run on the B path that passed its check; the
+    ledger's rung ``B`` rows, checked and not contradicted by the re-check); ``keys``: the skill's habit keys."""
+    keys = (keys,) if isinstance(keys, str) else tuple(keys)
+    if not keys:
+        return False
+    try:
+        rows = store._query(f"SELECT 1 FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND rung = 'B' AND"
+                            " checked = 1 AND coalesce(recheck, 1) != 0 LIMIT 1", keys)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(rows)
+
+
+def skill_offerable(store: Any, skill: Any, *, meta: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """The offer gate of a routine card's skill (phase L design §4.7; D14's trust and the routine are checked by the
+    caller), by code from data: ``(True, "ok")`` or ``(False, why)``:
+
+    * ``no_skill``; ``not_learned`` (a capability is never offered: only what the learner saw the user doing);
+      ``not_live`` (resting, over the cap, or a tombstone: the user's Forget this / Not mine);
+    * ``sends`` (rule 8); ``commit`` (the run's own end is a commit, D24: joins and sends stay the user's);
+    * ``offer_class`` (``never``: messages, voice joins, capability ``none``); ``static`` (the learner's own part,
+      ``provenance.offer_static``: commit, rung, class); ``rung`` (C only, or a rung B with no verified run yet);
+    * ``nameless`` / ``may_be_work``: a ``judged`` capability (a page can be anything, work included) needs the naming
+      call's name and its ``everyday``; ``logistics`` and ``everyday`` ones never depend on the model (lName note 5);
+    * ``unknown_wont`` (a card that can't say what Yuki won't do)."""
+    if skill is None:
+        return False, "no_skill"
+    if getattr(skill, "origin", "capability") != "learned":
+        return False, "not_learned"
+    meta = skill_meta(store, skill) if meta is None else meta
+    if not meta or meta.get("deleted"):
+        return False, "not_live"
+    try:
+        from yuki.skills.catalog import LIVE_STATES
+    except Exception:  # noqa: BLE001
+        LIVE_STATES = ("candidate", "trusted")   # noqa: N806
+    if meta.get("state") not in LIVE_STATES:
+        return False, "not_live"
+    if getattr(skill, "sends", False) or getattr(skill, "sends_when", ()):
+        return False, "sends"
+    try:
+        from yuki.skills.engine import run_commit
+
+        if run_commit(skill) != "none":
+            return False, "commit"
+    except Exception:  # noqa: BLE001
+        return False, "commit"
+    cls = str(getattr(skill, "offer_class", "") or "never")
+    if cls not in ("logistics", "everyday", "judged"):
+        return False, "offer_class"
+    prov = meta.get("prov") or {}
+    if prov.get("offer_static") is False:
+        return False, "static"
+    rung = str(prov.get("rung") or "")
+    if rung not in OFFER_RUNGS:
+        return False, "rung"
+    if rung == "B" and not _rung_b_verified(store, habit_keys(skill)):
+        return False, "rung"
+    if cls == "judged":
+        if not named(meta):
+            return False, "nameless"
+        if prov.get("everyday") is not True:
+            return False, "may_be_work"
+    if skill_wont_line(skill) is None:
+        return False, "unknown_wont"
+    return True, "ok"
+
+
+def card_question(store: Any, skill: Any, *, fallback: str = "", meta: dict[str, Any] | None = None) -> str:
+    """The routine card's question: the learned skill's own name as a question ("<name>?") when it has a real one
+    (the naming call's or the user's), else ``fallback`` (the lane's fixed words for its end kind); ``""``: none."""
+    meta = skill_meta(store, skill) if meta is None else meta
+    name = " ".join(str(getattr(skill, "name", "") or "").split())
+    if name and named(meta):
+        name = name[:1].upper() + name[1:]
+        return name if name.endswith("?") else f"{name.rstrip('.')}?"
+    return " ".join(str(fallback or "").split())
+
+
 def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires_at: float, why: str,
                   available: Callable[[Any], bool | None] | None = None,
                   ready: Callable[[Any, Any], bool] | None = None,
-                  skills: Callable[[], Any] | None = None) -> tuple[dict[str, Any] | None, str]:
+                  skills: Callable[[], Any] | None = None,
+                  question: str = "") -> tuple[dict[str, Any] | None, str]:
     """The ``run_skill`` offer of a routine card, built by code (no model), or ``(None, why)``:
 
-    * ``no_skill`` (the routine's skill isn't loaded), ``not_offerable`` (its data doesn't say ``offerable``),
-      ``sends`` (a skill that may send something is never offered: sends are the user's, rule 8), ``no_preview``
-      (no card question in its data), ``unknown_wont`` (a ``wont`` word without a line), ``bad_params`` (a bound
-      parameter the skill has no slot for);
-    * ``not_ready``: its route isn't trusted for offers (``yuki.skills.registry.offer_ready``, D14: 2 verified runs
-      for opening things, 5 and none failed in the last 5 for changing things; never re-implemented here);
+    * ``no_skill`` (the routine's skill isn't loaded); the offer gate's own words (:func:`skill_offerable`:
+      ``not_learned``, ``not_live``, ``sends``, ``commit``, ``offer_class``, ``static``, ``rung``, ``nameless``,
+      ``may_be_work``, ``unknown_wont``); ``no_preview`` (no card question: ``question``, else
+      :func:`card_question` with no fallback); ``bad_params`` (a bound parameter the skill has no slot for);
+    * ``not_ready``: its route isn't trusted for offers (:func:`offer_trusted`: ``yuki.skills.registry.offer_ready``,
+      D14: 2 verified runs for opening things, 5 and none failed in the last 5 for changing things; a usage record's
+      runs pooled with its capability's);
     * ``unavailable``: the skill's own availability check, last because it reads the screen (``available(skill)``:
-      the Meet tab census; ``None`` = couldn't read counts as not available).
+      a site tab census; ``None`` = couldn't read counts as not available).
 
     ``routine``: a :class:`yuki.memory.routine_offers.Routine` (``id``, ``skill_id``, ``params``, ``offer_mode``).
     ``ready`` / ``skills`` replace the registry check and the skill loader (tests, replays)."""
@@ -478,19 +670,19 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
         if skills is not None:
             loaded = skills()
         else:
-            from yuki.skills.connection import load
+            from yuki.skills.catalog import load
 
-            loaded = load()
+            loaded = load(store=store)   # this database's learned rows (one count query when unchanged)
         skill = loaded.get(key) if key else None
     except Exception:
         skill = None
     if skill is None:
         return None, "no_skill"
-    if not getattr(skill, "offerable", False):
-        return None, "not_offerable"
-    if getattr(skill, "sends", False) or getattr(skill, "sends_when", ()):
-        return None, "sends"
-    preview = _squash(getattr(skill, "preview", ""), STEP_MAX)
+    meta = skill_meta(store, skill)
+    ok, why_not = skill_offerable(store, skill, meta=meta)
+    if not ok:
+        return None, why_not
+    preview = _squash(question or card_question(store, skill, meta=meta), STEP_MAX)
     if not preview:
         return None, "no_preview"
     wont = skill_wont_line(skill)
@@ -502,12 +694,7 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
                                            for k, v in params.items()):
         return None, "bad_params"
     try:
-        if ready is not None:
-            trusted = bool(ready(store, skill))
-        else:
-            from yuki.skills.registry import offer_ready
-
-            trusted = bool(offer_ready(store, skill, now=now))
+        trusted = bool(ready(store, skill)) if ready is not None else offer_trusted(store, skill, now=now)
     except Exception:
         trusted = False
     if not trusted:
@@ -519,8 +706,8 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
             ok = None
         if ok is not True:
             return None, "unavailable"
-    # the card's one step: the skill's own question as a plain line ("Open the Meet tab in Zen?" -> "Open the Meet
-    # tab in Zen"; a fixed data field, not the user's words)
+    # the card's one step: the card's question as a plain line ("Open the example tab?" -> "Open the example tab"; the
+    # learned name or the lane's fixed words, never the user's own words)
     step = preview[:-1].rstrip() if preview.endswith("?") else preview
     offer = {"do": "run_skill", "label": DEFAULT_LABELS["run_skill"], "steps": [step],
              "refs": [f"R{int(routine.id)}"], "text": "", "due": None, "skill": skill.key, "slots": dict(params),
@@ -665,12 +852,10 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
     if r is None or not r.offering or r.skill_id != offer.get("skill"):
         return {"ok": False, "why": "gone", "do": do}
     try:
-        from yuki.skills.connection import load
-        from yuki.skills.registry import offer_ready
+        from yuki.skills.catalog import load
 
-        skill = load().get(str(offer["skill"]))
-        ready = bool(skill is not None and skill.offerable and not skill.sends and not skill.sends_when
-                     and offer_ready(store, skill, now=now))
+        skill = load(store=store).get(str(offer["skill"]))
+        ready = bool(skill is not None and skill_offerable(store, skill)[0] and offer_trusted(store, skill, now=now))
     except Exception:
         ready = False
     if not ready:
@@ -895,7 +1080,9 @@ __all__ = [
     "OFFER_DOS", "CODE_ONLY_DOS", "MODEL_DOS", "ROUTINE_CHANNEL", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS",
     "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
-    "stored_offer", "card_offer_view", "skill_wont_line", "routine_offer", "act", "offer_result", "undo",
+    "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "usage_capability", "habit_keys",
+    "offer_trusted", "skill_offerable", "card_question",
+    "OFFER_COMMITS", "OFFER_RUNGS", "routine_offer", "act", "offer_result", "undo",
     "record_outcome", "channel_of", "signal", "offer_scores", "allowed_dos", "offer_allowed", "outcome_words",
     "feedback_lines",
 ]

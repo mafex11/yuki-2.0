@@ -817,7 +817,8 @@ def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
     if not isinstance(tool_input, dict):
         return False
     try:
-        from yuki.skills.connection import load, sends_with
+        from yuki.skills.catalog import load
+        from yuki.skills.connection import sends_with
 
         skill = load().get(str(tool_input.get("skill") or ""))
         slots = tool_input.get("slots") if isinstance(tool_input.get("slots"), dict) else {}

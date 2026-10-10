@@ -79,9 +79,10 @@ from yuki.memory.store import app_key
 MOMENT_KINDS: tuple[str, ...] = (
     "call_join", "game_voice", "site_front", "media_play", "media_context", "page", "volume_change", "message_sent",
 )
-#: Kinds computed from existing rows (rebuildable) and the sources they come from.
+#: Kinds computed from existing rows (rebuildable) and the sources they come from. ``timeline_host``: a host-scope page
+#: visit (RULE_VERSION 3, phase L design §3.3), apart from ``timeline`` so a page and its host visit can share a first row.
 DERIVED_KINDS: tuple[str, ...] = ("call_join", "game_voice", "page", "message_sent")
-DERIVED_SOURCES: tuple[str, ...] = ("calls", "timeline", "messages")
+DERIVED_SOURCES: tuple[str, ...] = ("calls", "timeline", "messages", "timeline_host")
 #: Kinds written once, live, when the change is seen.
 LIVE_KINDS: tuple[str, ...] = ("site_front", "media_play", "media_context", "volume_change")
 LIVE_SOURCES: tuple[str, ...] = ("site", "media", "spotify", "volume")
@@ -90,8 +91,12 @@ SEEN_VIAS: tuple[str, ...] = ("screen", "screen_stale", "meeting")
 #: ``evidence`` values of a seen join (``hold`` is the other one).
 SEEN_EVIDENCE: tuple[str, ...] = ("screen", "meeting", "site")
 #: Bumped whenever a derived rule changes: the service rebuilds the derived moments once on its next start. 2 (fWire,
-#: 10 Oct): page moments take their entity from the sites' URL templates (``yuki.connect.templates.page_entity``).
-RULE_VERSION = 2
+#: 10 Oct): page moments take their entity from the sites' URL templates (``yuki.connect.templates.page_entity``). 3
+#: (lCore, 10 Oct; phase L design §3.3, D23): every moment with an entity carries ``entity_key`` (one identity across
+#: apps: the same page in two browsers is one entity), and a browser's stretch on one registrable domain whose dwell
+#: reaches ``[moments] host_dwell_s`` is a host-scope ``page`` moment (source ``timeline_host``, ``facts.scope =
+#: "host"``, entity = the domain) for hosts no site file covers.
+RULE_VERSION = 3
 #: Join candidates of one app closer than this are one join (the timeline's own "one meeting" gap,
 #: ``yuki.memory.timeline.MEETING_GAP_S``).
 JOIN_GAP_S = 300.0
@@ -110,6 +115,14 @@ PRUNE_EVERY_S = 6 * 3600.0
 REBUILD_RETRY_S = 600.0
 #: The checkpoint names (``source_checkpoints``, prefix ``moments.``).
 CURSORS = ("calls", "timeline", "messages", "rule", "context")
+#: Phase L (design §9.1, critique L9): after a refresh that wrote occasion-end moments, the skill learner's incremental
+#: pass runs off the loop, at most this often (s), and only while the user is idle (:data:`LEARN_IDLE_S` without input),
+#: with no game in front and no call (``yuki.skills.learn.quiet``). Never polls: it rides on the existing beat.
+LEARN_EVERY_S = 600.0
+LEARN_IDLE_S = 120.0
+#: The moment kinds an occasion can end on (``yuki.skills.connection.SERVE_ENDS``): a refresh or a flush that wrote one
+#: makes the learner's incremental pass due.
+LEARN_END_KINDS: tuple[str, ...] = ("call_join", "page", "message_sent", "media_context", "volume_change")
 
 
 @dataclass(frozen=True)
@@ -121,6 +134,8 @@ class MomentsConfig:
     media_titles: bool = False     # True: a media title is kept encrypted (unless its app was private lately)
     refresh_s: float = 60.0
     page_dwell_s: float = 300.0
+    #: A host-scope page visit counts from this dwell (s; design §3.3, Q14: 60 s, tuned after the Playbook review).
+    host_dwell_s: float = 60.0
     keep_days: float = 90.0
 
     @classmethod
@@ -138,7 +153,7 @@ class MomentsConfig:
                    volume_events=bool(table.get("volume_events", d.volume_events)),
                    media_titles=bool(table.get("media_titles", d.media_titles)),
                    refresh_s=num("refresh_s", d.refresh_s, 5.0), page_dwell_s=num("page_dwell_s", d.page_dwell_s, 0.0),
-                   keep_days=num("keep_days", d.keep_days, 1.0))
+                   host_dwell_s=num("host_dwell_s", d.host_dwell_s, 10.0), keep_days=num("keep_days", d.keep_days, 1.0))
 
 
 def log_digest(digest: str | None) -> str | None:
@@ -181,6 +196,9 @@ class Moment:
     #: RAM only: ``service`` is a product name a call or a verdict gave, so the ``moment`` log line may carry it (a
     #: user's own label for a site never goes to a log).
     log_service: bool = True
+    #: D23 (RULE_VERSION 3): the entity's identity across apps, ``digest("entity", place, entity)``; computed at
+    #: :meth:`row` when the entity is in RAM (:func:`entity_key`), or set by the writer that had it (a media title).
+    entity_key: str | None = None
 
     def key(self) -> tuple[str, int | None, str]:
         return (self.source, self.source_id, self.kind)
@@ -190,24 +208,90 @@ class Moment:
             self.entity_digest = cipher.digest("moment", self.kind, self.app or "", self.entity)
         return self.entity_digest
 
+    def place(self) -> str:
+        """Where the entity lives, for :func:`entity_key`: a site's or service's name (a page's template site, a
+        host-scope page's domain, a chat's thread space), else the app (a player's playlist, a title)."""
+        facts = self.facts if isinstance(self.facts, dict) else {}
+        if self.kind == "page":
+            return str(facts.get("host") if facts.get("scope") == "host" else (self.service or facts.get("host") or ""))
+        if self.kind == "message_sent":
+            return "thread"
+        return str(self.service or self.app or "")
+
     def row(self, cipher: Any) -> dict[str, Any]:
         """The store row (``Store.save_moments``): the entity encrypted only when kept; never plaintext."""
         if self.partial:
             return {"partial": True, "source": self.source, "source_id": self.source_id, "kind": self.kind,
                     "ended_at": self.ended_at, "value": self.value, "facts": dict(self.facts) or None}
         digest = self.digest_with(cipher)
+        if self.entity_key is None and self.entity:
+            self.entity_key = entity_key(cipher, self.place(), self.entity)
         facts = dict(self.facts)
         for k, v in self.secret_facts.items():
             if v:
                 facts[f"{k}_ciphertext"] = cipher.encrypt(v)
         return {
             "at": float(self.at), "ended_at": self.ended_at, "seen_at": self.seen_at, "kind": self.kind,
-            "app": self.app, "service": self.service, "entity_digest": digest,
+            "app": self.app, "service": self.service, "entity_digest": digest, "entity_key": self.entity_key,
             "entity_ciphertext": cipher.encrypt(self.entity) if (self.keep_entity and self.entity) else None,
             "value": self.value, "value_from": self.value_from, "means": self.means, "by": self.by or "user",
             "request_id": self.request_id, "source": self.source, "source_id": self.source_id,
             "evidence": self.evidence, "facts": facts or None,
         }
+
+
+def entity_key(cipher: Any, place: str | None, entity: str | None) -> str | None:
+    """D23: one entity's identity across apps (``moments.entity_key``): the keyed digest of where it lives and what it
+    is, case-folded and spaced once (the same page in two browsers, one playlist read twice, is one key). ``None``
+    with no entity."""
+    if not entity:
+        return None
+    norm = " ".join(str(entity).split()).casefold()
+    return str(cipher.digest("entity", " ".join(str(place or "").split()).casefold(), norm))
+
+
+def registrable_domain(host: str | None) -> str:
+    """A host's registrable domain as a fixed format (phase L design §3.3, critique L6): lower case, no leading
+    ``www.``, its last two labels, or its last three when the last is a two-letter country label and the one before it
+    is a second-level label of three letters or fewer (``a.b.co.uk`` -> ``b.co.uk``). An address of digits stays
+    whole. ``""`` for no host. A machine-format rule, never a list of sites."""
+    host = str(host or "").strip().strip(".").casefold()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return ""
+    labels = host.split(".")
+    if len(labels) <= 2 or all(part.isdigit() for part in labels):
+        return host
+    if len(labels[-1]) == 2 and len(labels[-2]) <= 3:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+_templated_lock = threading.Lock()
+_templated: frozenset[str] | None = None
+
+
+def templated_hosts() -> frozenset[str]:
+    """The hosts a site file covers (``yuki/connect/sites/*.toml`` ``[site] hosts``), lower case, no ``www.``: their
+    pages are template pages, never host-scope ones (cached; ``frozenset()`` when there is no site data)."""
+    global _templated
+    with _templated_lock:
+        if _templated is not None:
+            return _templated
+    out: set[str] = set()
+    try:
+        from yuki.connect.templates import site, sites
+
+        for name in sites():
+            for h in (site(name).get("site") or {}).get("hosts") or []:
+                h = str(h).strip().casefold()
+                out.add(h[4:] if h.startswith("www.") else h)
+    except Exception:  # noqa: BLE001 - no site data: every host is untemplated
+        out = set()
+    with _templated_lock:
+        _templated = frozenset(out)
+    return _templated
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +881,7 @@ class Extractor:
                     windows[app].append((at - JOIN_GAP_S, float(end) + JOIN_GAP_S))
         tl_top = None
         visits_before: dict[int, tuple] = {}
+        hosts_before: dict[int, tuple] = {}
         counts["page"] += 0
         for rows, tl_top in self._changed("timeline", floor, now, full=full):
             pages: list[Any] = []
@@ -809,6 +894,9 @@ class Extractor:
                     pages.append(r)
             written, visits_before = self._pages(pages, now, skip=visits_before)   # this chunk's pages, then gone
             counts["page"] += written
+            written, hosts_before = self._host_pages(pages, now, skip=hosts_before)   # RULE_VERSION 3
+            counts["page"] += written
+            counts["page_host"] += written
             for app in list(windows):
                 windows[app] = _merge_spans(windows[app])
         for app in rebuild_apps:
@@ -948,51 +1036,71 @@ class Extractor:
     #: A visit's rows: the columns the page rule reads (the path is read per visit, only when a template is asked).
     _ROW = "SELECT " + _VISIT_COLS + " FROM timeline"
 
-    def _step(self, r: Any, *, back: bool) -> Any | None:
+    @staticmethod
+    def _page_of(r: Any) -> Any:
+        """A page visit's identity: its page key (one page, one app)."""
+        return r["page_key"]
+
+    @staticmethod
+    def _host_of(r: Any) -> Any:
+        """A host-scope visit's identity (RULE_VERSION 3): one browser on one registrable domain; a row of a meeting,
+        a withheld page or one begun while Yuki acted, or with no host, belongs to none (it breaks the stretch)."""
+        if not r["host"] or r["meeting"] or r["withheld"] or r["by_yuki"]:
+            return None
+        host = str(r["host"]).casefold()
+        if (host[4:] if host.startswith("www.") else host) in templated_hosts():
+            return None    # a site file's host: its pages are template pages (unchanged)
+        return (r["process"], registrable_domain(host))
+
+    def _step(self, r: Any, *, back: bool, same: Callable[[Any], Any] | None = None) -> Any | None:
         """The present/away row (any app) right before (``back``) or after ``r`` in time, when it goes on with
-        ``r``'s page visit (the same page key, touching); else None."""
+        ``r``'s visit (the same ``same(row)`` identity, default the page key; touching); else None."""
+        same = same or self._page_of
         start = float(r["started_at"])
+        want = same(r)
+        if want is None:
+            return None
         if back:
             got = self.store._query(self._ROW + " WHERE started_at < ? AND state IN ('present', 'away')"
                                     " ORDER BY started_at DESC, id DESC LIMIT 1", (start,))
-            if got and got[0]["page_key"] == r["page_key"] and start - float(got[0]["ended_at"]) <= VISIT_GAP_S:
+            if got and same(got[0]) == want and start - float(got[0]["ended_at"]) <= VISIT_GAP_S:
                 return got[0]
             return None
         got = self.store._query(self._ROW + " WHERE started_at >= ? AND (started_at > ? OR id > ?)"   # an index range
                                 " AND state IN ('present', 'away') ORDER BY started_at, id LIMIT 1",
                                 (start, start, int(r["id"])))
-        if got and got[0]["page_key"] == r["page_key"] and float(got[0]["started_at"]) - float(r["ended_at"]) <= \
-                VISIT_GAP_S:
+        if got and same(got[0]) == want and float(got[0]["started_at"]) - float(r["ended_at"]) <= VISIT_GAP_S:
             return got[0]
         return None
 
-    def _extend(self, rows: Sequence[Any]) -> list[Any]:
+    def _extend(self, rows: Sequence[Any], same: Callable[[Any], Any] | None = None) -> list[Any]:
         """A run of rows of one visit walked back past its first row and on past its last (at most 500 each way)."""
         before: list[Any] = []
         cur = rows[0]
         for _ in range(500):
-            cur = self._step(cur, back=True)
+            cur = self._step(cur, back=True, same=same)
             if cur is None:
                 break
             before.append(cur)
         out = before[::-1] + list(rows)
         for _ in range(500):
-            nxt = self._step(out[-1], back=False)
+            nxt = self._step(out[-1], back=False, same=same)
             if nxt is None:
                 break
             out.append(nxt)
         return out
 
-    def _visit(self, r: Any) -> list[Any]:
-        """The rows of the page visit ``r`` is in: neighbours (in time, any app) of the same page, touching."""
-        return self._extend([r])
+    def _visit(self, r: Any, same: Callable[[Any], Any] | None = None) -> list[Any]:
+        """The rows of the visit ``r`` is in: neighbours (in time, any app) of the same identity, touching."""
+        return self._extend([r], same)
 
     #: Above this many changed page rows (a rebuild's chunk), visits are grouped in one ordered pass, not row by row.
     SEQUENTIAL_PAGES = 64
 
-    def _visits_span(self, rows: Sequence[Any]) -> list[list[Any]]:
+    def _visits_span(self, rows: Sequence[Any], same: Callable[[Any], Any] | None = None) -> list[list[Any]]:
         """The visits touching ``rows``, grouped in one ordered pass over their time span; the first visit is walked
         back past the span's start and the last one on past its end, so a visit cut by a chunk's edge is whole."""
+        same = same or self._page_of
         lo = min(float(r["started_at"]) for r in rows) - VISIT_GAP_S
         hi = max(float(r["ended_at"]) for r in rows) + VISIT_GAP_S
         # the rows that start inside the span (an index range); a visit begun before it is the first group, walked back
@@ -1001,15 +1109,16 @@ class Extractor:
         groups: list[list[Any]] = []
         for r in span:
             last = groups[-1][-1] if groups else None
-            if last is not None and last["page_key"] == r["page_key"] and \
+            ident = same(r)
+            if last is not None and ident is not None and same(last) == ident and \
                     float(r["started_at"]) - float(last["ended_at"]) <= VISIT_GAP_S:
                 groups[-1].append(r)
             else:
                 groups.append([r])
         if groups:
-            groups[0] = self._extend(groups[0])
+            groups[0] = self._extend(groups[0], same)
             if len(groups) > 1:
-                groups[-1] = self._extend(groups[-1])
+                groups[-1] = self._extend(groups[-1], same)
         wanted = {int(r["id"]) for r in rows}
         return [g for g in groups if any(int(x["id"]) in wanted for x in g)]
 
@@ -1069,6 +1178,51 @@ class Extractor:
                 m.entity_digest = first["page_key"]
             m.facts = facts
             out.append(m)
+        if out:
+            runs = self._runs(min(m.at for m in out), max(m.at for m in out) + ATTRIBUTION_LAG_S["page"])
+            out = [attribute(m, runs, now=now) for m in out]
+            self.store.save_moments([m.row(self.store.cipher) for m in out])
+        return len(out), done
+
+    def _host_pages(self, rows: Sequence[Any], now: float, *, skip: dict[int, tuple] | None = None
+                    ) -> tuple[int, dict[int, tuple]]:
+        """Host-scope page moments (RULE_VERSION 3; phase L design §3.3, H3) of the visits touching ``rows``: one
+        browser's touching rows on one registrable domain no site file covers, whose dwell reaches ``[moments]
+        host_dwell_s``. Entity: the domain (encrypted, ``entity_key`` across browsers); ``facts.host`` the domain and
+        ``facts.top_host`` the host the visit dwelt on most (hosts are kept in clear on page moments, as today); no
+        path, no title. Source ``timeline_host``. Returns (written, {visit's first row id: its shape})."""
+        cfg = self._config()
+        rows = [r for r in rows if self._host_of(r) is not None]
+        if not rows:
+            return 0, {}
+        if len(rows) > self.SEQUENTIAL_PAGES:
+            visits = self._visits_span(rows, self._host_of)
+        else:
+            visits = [self._visit(r, self._host_of) for r in rows]
+        skip = skip or {}
+        done: dict[int, tuple] = {}
+        out: list[Moment] = []
+        for visit in visits:
+            first = visit[0]
+            if int(first["id"]) in done or self._host_of(first) is None:
+                continue
+            dwell = sum(float(v["active_s"] or 0.0) + float(v["passive_s"] or 0.0) for v in visit)
+            shape = (len(visit), int(visit[-1]["id"]), float(visit[-1]["ended_at"]), dwell)
+            done[int(first["id"])] = shape
+            if skip.get(int(first["id"])) == shape or dwell < cfg.host_dwell_s:
+                continue
+            domain = registrable_domain(first["host"])
+            if not domain:
+                continue
+            by_host: Counter = Counter()
+            for v in visit:
+                h = str(v["host"] or "").casefold()
+                by_host[h[4:] if h.startswith("www.") else h] += float(v["active_s"] or 0.0) + float(v["passive_s"] or 0.0)
+            top = by_host.most_common(1)[0][0] if by_host else domain
+            out.append(Moment(kind="page", at=float(first["started_at"]), ended_at=float(visit[-1]["ended_at"]),
+                              source="timeline_host", source_id=int(first["id"]), app=app_key(first["process"]) or None,
+                              value=round(dwell, 1), evidence="timeline", entity=domain, keep_entity=True,
+                              facts={"host": domain, "top_host": top, "scope": "host", "rows": len(visit)}))
         if out:
             runs = self._runs(min(m.at for m in out), max(m.at for m in out) + ATTRIBUTION_LAG_S["page"])
             out = [attribute(m, runs, now=now) for m in out]
@@ -1338,6 +1492,14 @@ class MomentHub:
         self.errors = 0
         self.by_kind: Counter = Counter()
         self.inputs: Counter = Counter()
+        #: Phase L: the skill learner's incremental pass (``yuki.skills.learn.incremental``) and when it may run
+        #: (``yuki.skills.learn.quiet``: idle, no game in front, no call); replaceable (``None``: the defaults).
+        self.learn_fn: Callable[[float], Any] | None = None
+        self.learn_quiet_fn: Callable[[float], str | None] | None = None
+        self._learn_due = False
+        self._learn_next = 0.0
+        self._learn_thread: threading.Thread | None = None
+        self.learn_runs = 0
 
     # -- plumbing -----------------------------------------------------------------
 
@@ -1444,6 +1606,8 @@ class MomentHub:
                 for m in batch:
                     if not m.partial:
                         self.by_kind[m.kind] += 1
+                        if m.kind in LEARN_END_KINDS and m.by != "yuki":
+                            self._learn_due = True
                         if m.kind != "page":
                             _log_moment(self._log, m, now)
             except Exception as exc:  # noqa: BLE001
@@ -1464,10 +1628,14 @@ class MomentHub:
                     for k in DERIVED_KINDS:
                         if counts.get(k):
                             self.by_kind[k] += max(0, counts[k])
+                            if k in LEARN_END_KINDS:
+                                self._learn_due = True
                 except Exception as exc:  # noqa: BLE001
                     self.errors += 1
                     self._log("error", where="moments.refresh", error=type(exc).__name__)
                 self.refresh_ms.append((time.perf_counter() - p0) * 1000.0)
+            if not running:
+                self._maybe_learn(now)
             if not running and now >= self._next_prune:
                 self._next_prune = now + PRUNE_EVERY_S
                 try:
@@ -1479,6 +1647,46 @@ class MomentHub:
                     self._log("error", where="moments.prune", error=type(exc).__name__)
         finally:
             self.cpu_s += time.thread_time() - t0
+
+    def _maybe_learn(self, now: float) -> None:
+        """Phase L's incremental pass (design §9.1): due after a refresh or flush that wrote an occasion-end moment;
+        runs on a short-lived thread (never the 1 s loop), at most every :data:`LEARN_EVERY_S`, only when
+        ``yuki.skills.learn.quiet`` says the user is idle with no game in front and no call. Never raises."""
+        if not self._learn_due or now < self._learn_next:
+            return
+        if self._learn_thread is not None and self._learn_thread.is_alive():
+            return
+        try:
+            if self.learn_quiet_fn is not None:
+                why = self.learn_quiet_fn(now)
+            else:
+                from yuki.skills.learn import quiet
+
+                why = quiet(self.store, now, idle_s=LEARN_IDLE_S)
+        except Exception:  # noqa: BLE001 - unknown: not quiet (fails closed)
+            why = "unknown"
+        if why:
+            self._learn_next = now + 60.0    # asked again in a minute, never every beat
+            return
+        self._learn_due = False
+        self._learn_next = now + LEARN_EVERY_S
+        fn = self.learn_fn
+
+        def run() -> None:
+            try:
+                if fn is not None:
+                    fn(now)
+                else:
+                    from yuki.skills.learn import incremental
+
+                    incremental(self.store, now=now, log=self._log_fn)
+                self.learn_runs += 1
+            except Exception as exc:  # noqa: BLE001
+                self.errors += 1
+                self._log("error", where="moments.learn", error=type(exc).__name__)
+
+        self._learn_thread = threading.Thread(target=run, name="yuki-memory-learn", daemon=True)
+        self._learn_thread.start()
 
     def stop(self, now: float | None = None) -> None:
         """The service is stopping: the open live spans (media playing, a calling site in front) end now, marked
@@ -1510,7 +1718,7 @@ class MomentHub:
             "refresh_ms": {"p50": pct(0.5), "p90": pct(0.9), "max": pct(1.0)}, "written_live": self.writer.written,
             "queued": self.writer.pending(), "dropped": self.writer.dropped, "errors": self.errors,
             "kinds": dict(self.by_kind), "inputs": dict(self.inputs), "rebuild": self._backfill_state,
-            "media_open": len(self._media_open), "site_open": len(self._site_open),
+            "media_open": len(self._media_open), "site_open": len(self._site_open), "learn_runs": self.learn_runs,
         }
 
     def log_sources(self) -> None:
@@ -1566,7 +1774,8 @@ class MomentHub:
                 key = self.writer.key(at)
                 f: dict[str, Any] = {"initial": True} if facts.get("initial") else {}
                 m = Moment(kind="media_play", at=at, source="media", source_id=key, app=app, entity=title if keep else None,
-                           keep_entity=keep, entity_digest=digest, evidence="poll", facts=dict(f))
+                           keep_entity=keep, entity_digest=digest, evidence="poll", facts=dict(f),
+                           entity_key=entity_key(cipher, app, title) if title else None)
                 if by_yuki:
                     m.by, m.request_id = "yuki", request_id
                 m = attribute(m, runs, now=at)
@@ -1892,6 +2101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "MOMENT_KINDS", "DERIVED_KINDS", "LIVE_KINDS", "SEEN_VIAS", "SEEN_EVIDENCE", "RULE_VERSION", "JOIN_GAP_S",
+    "LEARN_EVERY_S", "LEARN_IDLE_S", "LEARN_END_KINDS", "entity_key", "registrable_domain", "templated_hosts",
     "ATTRIBUTION_LAG_S", "MomentsConfig", "Moment", "RunWindow", "attribute", "skill_runs_between", "call_at",
     "is_call_join", "is_game_voice", "game_judge", "AppIdentity", "CallingSites", "persisted_site_verdicts",
     "cluster_joins", "join_moment", "Extractor", "MomentWriter", "MomentHub", "default_page_entity", "log_digest",

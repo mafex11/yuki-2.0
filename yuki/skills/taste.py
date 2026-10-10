@@ -1,20 +1,28 @@
-"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T; map-routines T1). Read skeleton (sCore) and the
-seeds that exist before phase T (sWeb).
+"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T; map-routines T1). Read skeleton (sCore), the
+seeds that exist before phase T (sWeb), and the taste kinds of phase L (lWire; learner design §5).
 
-Table ``tastes`` (migration 41, T1.1's schema): one row per ``(kind, entity_key)`` (``yt_channel``,
-``spotify_playlist``, ``discord_voice``, ...), the display name and its link encrypted, and two hour-of-day
-histograms (weekday / weekend; 24 decayed counts, content-free). Phase T (``tTaste``) recomputes it nightly from the
-moments and adds ``recompute`` / ``options``; the read side here serves the resolver's slot fill and the menu's
-candidate names. Names are decrypted in-process and never logged.
+Table ``tastes`` (migration 41, T1.1's schema): one row per ``(kind, entity_key)``, the display name and its link
+encrypted, and two hour-of-day histograms (weekday / weekend; 24 decayed counts, content-free). Phase T (``tTaste``)
+recomputes it nightly from the moments and adds ``recompute`` / ``options``; the read side here serves the resolver's
+slot fill and the menu's candidate names. Names are decrypted in-process and never logged.
 
-**Seeds (phase S, no fetching; fresh uploads are phase T):**
+**Taste kinds come from data, never a list here** (design §5: "fill-slot kinds come from capability and site data"):
 
-* :func:`seed_youtube`: the YouTube channels the user visits, from their own ``page`` moments on YouTube's
-  channel-handle template (``youtube.handle``, ``yuki/connect/sites/youtube.toml``; Yuki's own visits never count),
-  recomputed from the last 60 days with a 21-day half-life (map-routines T1.2, T1.3), never incremented, so a rerun
-  changes nothing. No network: a handle's channel id is phase T's (one public read per channel).
-* :func:`note`: one choice the user made in their own words that a skill then saw done (a Discord voice channel joined,
-  kind ``discord_voice``: map-routines T1.2 "his words only").
+* a capability's fill slot that declares an entity ``kind``: ``<connection app>_<kind>`` (``connection.py`` derives it:
+  a playlist slot's kind);
+* a site file's page kind whose template has a speakable variable (``yuki/connect/sites/*.toml`` ``[pages]``; a
+  variable named ``id`` is an opaque id, opened only from a link: lSplit's ``page_address`` rule): ``<site>_<page>``
+  (:func:`site_kinds`); a learned skill bound to that site and page fills its entity slot from it (:func:`slot_kind`);
+* the same entity seen in two browsers is one row: the key is a keyed digest of the kind and the value, never of the
+  program (moments' ``entity_key`` joins them the same way, D23).
+
+**Seeds (no fetching; fresh uploads are phase T):**
+
+* :func:`seed_sites`: per site page kind of :func:`site_kinds`, the entities the user visits, from their own ``page``
+  moments on that template (Yuki's own visits never count), recomputed from the last 60 days with a 21-day half-life
+  (map-routines T1.2, T1.3), never incremented, so a rerun changes nothing. No network.
+* :func:`note`: one choice the user made in their own words that a skill then saw done (a voice channel joined:
+  map-routines T1.2 "his words only").
 
 ``seed(store)`` runs every seed (the nightly intake's hook). Content-free counts back; names only encrypted.
 """
@@ -122,8 +130,13 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
 #: How far back the seeds look, and the half-life of an observation (map-routines T1.3).
 SEED_DAYS = 60.0
 HALF_LIFE_DAYS = 21.0
-#: The page template whose value is a YouTube channel's handle (``yuki/connect/sites/youtube.toml``'s ``handle``).
-YT_HANDLE_TEMPLATE = "youtube.handle"
+#: A page template variable with this name is an opaque id (a video's), opened only from a link or an offered option's
+#: ref, never said (lSplit review r1 L5): its pages make no taste kind.
+OPAQUE_VAR = "id"
+#: Kinds an earlier seed wrote that no seed writes any more (sWeb's YouTube-only seed: now ``youtube_handle`` from the
+#: site data): their ``observed`` rows are removed by :func:`seed_sites` (lWire review r1 L4). Our own old codes, never
+#: the user's.
+RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
 
 
 def _norm(value: Any) -> str:
@@ -141,32 +154,73 @@ def _slot_of(at: float) -> tuple[bool, int]:
     return stamp.weekday() >= 5, stamp.hour
 
 
-def seed_youtube(store: Any, *, now: float | None = None, days: float = SEED_DAYS) -> dict[str, int]:
-    """Recompute the ``yt_channel`` tastes (source ``observed``) from the user's own ``page`` moments on YouTube's
-    handle template in the last ``days``: per handle, two hour histograms of visits decayed with a
-    :data:`HALF_LIFE_DAYS` half-life, its name (the handle) and link (the handle page) encrypted. Rows no visit
-    supports any more are removed. Idempotent; never raises (``{"error": 1}`` on failure). Content-free counts."""
+def site_kinds() -> list[tuple[str, str, str, str]]:
+    """``(taste kind, site, page kind, variable)`` for every site file's page kind whose template has one speakable
+    variable (``[pages]``; :data:`OPAQUE_VAR` left out), in file order: data only."""
+    from yuki.connect.templates import site, sites
+    from yuki.skills.connection import template_names
+
+    out: list[tuple[str, str, str, str]] = []
+    for name in sites():
+        for kind, template in (site(name).get("pages") or {}).items():
+            names = template_names(str(template))
+            if len(names) != 1 or names[0] == OPAQUE_VAR:
+                continue
+            out.append((f"{name}_{kind}", name, str(kind), names[0]))
+    return out
+
+
+def slot_kind(skill: Any, slot: Any) -> str:
+    """The taste kind a slot of a catalog entry fills from: the slot's own (``connection.py``: a capability's fill slot
+    with an entity ``kind``), else, for a learned skill whose bound site and page are a page kind of
+    :func:`site_kinds`, that kind (its entity slot: a channel on a site's channel pages). ``""``: none."""
+    own = str(getattr(slot, "taste", "") or "")
+    if own or getattr(slot, "type", "") != "entity":
+        return own
+    bound = dict(getattr(skill, "bound", None) or {})
+    bind = dict(getattr(skill, "bind", None) or {})
+    site_v = next((bound[s] for s, src in bind.items() if src == "site" and bound.get(s)), None)
+    page_v = next((bound[s] for s, src in bind.items() if src == "page" and bound.get(s)), None)
+    if not site_v or not page_v:
+        return ""
+    want = (str(site_v).casefold(), str(page_v).casefold())
+    return next((k for k, s, p, _v in site_kinds() if (s.casefold(), p.casefold()) == want), "")
+
+
+def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS) -> dict[str, Any]:
+    """Recompute the site tastes (source ``observed``) of every :func:`site_kinds` kind from the user's own ``page``
+    moments on that template in the last ``days``: per entity, two hour histograms of visits decayed with a
+    :data:`HALF_LIFE_DAYS` half-life, its name (the template's value) and link (the site's ``[urls]`` of that kind)
+    encrypted. Rows no visit supports any more are removed (per seeded kind only), and so are the ``observed`` rows of
+    :data:`RETIRED_KINDS`. Idempotent; never raises
+    (``{"error": 1}`` on failure). Content-free counts."""
     now = time.time() if now is None else float(now)
+    kinds = {f"{s}.{p}": (k, s, p, v) for k, s, p, v in site_kinds()}
+    if not kinds:
+        return {"kinds": 0, "entities": 0, "visits": 0}
     try:
         rows = store.moments_between(now - float(days) * 86400.0, now + 1.0, kinds=["page"])
     except Exception:  # noqa: BLE001 - no moments table yet
-        return {"channels": 0, "visits": 0, "error": 1}
+        return {"kinds": len(kinds), "entities": 0, "visits": 0, "error": 1}
     from yuki.connect.templates import fill
 
-    found: dict[str, dict[str, Any]] = {}
+    found: dict[tuple[str, str], dict[str, Any]] = {}
     visits = 0
     for r in rows:
         facts = r.get("facts") or {}
-        if r.get("by") != "user" or r.get("service") != "youtube" or facts.get("template") != YT_HANDLE_TEMPLATE:
+        hit = kinds.get(str(facts.get("template") or ""))
+        if r.get("by") != "user" or hit is None:
             continue
+        kind, site_name, page_kind, var = hit
         try:
-            handle = " ".join(str(store.moment_entity(r) or "").split()).lstrip("@")
+            value = " ".join(str(store.moment_entity(r) or "").split())
         except Exception:  # noqa: BLE001 - a row the key can't read
             continue
-        if not handle:
+        if not value:
             continue
-        key = entity_key(store, "yt_channel", handle)
-        entry = found.setdefault(key, {"name": handle, "wd": [0.0] * 24, "we": [0.0] * 24, "n": 0.0, "last": 0.0})
+        key = entity_key(store, kind, value)
+        entry = found.setdefault((kind, key), {"name": value, "ref": fill(site_name, page_kind, **{var: value}) or "",
+                                               "wd": [0.0] * 24, "we": [0.0] * 24, "n": 0.0, "last": 0.0})
         at = float(r["at"])
         weight = math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
         weekend, hour = _slot_of(at)
@@ -174,33 +228,35 @@ def seed_youtube(store: Any, *, now: float | None = None, days: float = SEED_DAY
         entry["n"] += weight
         entry["last"] = max(entry["last"], at)
         visits += 1
+    seeded = sorted({k for k, _s, _p, _v in kinds.values()})
 
     def write(conn: Any) -> int:
-        old = {str(k) for (k,) in conn.execute(
-            "SELECT entity_key FROM tastes WHERE kind = 'yt_channel' AND source = 'observed'").fetchall()}
-        for key, e in found.items():
-            ref = fill("youtube", "handle", handle=e["name"]) or ""
+        marks = ",".join("?" * len(seeded))
+        old = {(str(k), str(e)) for k, e in conn.execute(
+            f"SELECT kind, entity_key FROM tastes WHERE source = 'observed' AND kind IN ({marks})", seeded).fetchall()}
+        for (kind, key), e in found.items():
             conn.execute(
                 "INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
-                "hist_weekend, n_obs, last_at, updated_at) VALUES ('yt_channel', ?, ?, ?, 'observed', ?, ?, ?, ?, ?) "
+                "hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, ?, 'observed', ?, ?, ?, ?, ?) "
                 "ON CONFLICT(kind, entity_key) DO UPDATE SET name_ciphertext = excluded.name_ciphertext, "
                 "ref_ciphertext = excluded.ref_ciphertext, source = 'observed', hist_weekday = excluded.hist_weekday, "
                 "hist_weekend = excluded.hist_weekend, n_obs = excluded.n_obs, last_at = excluded.last_at, "
                 "updated_at = excluded.updated_at",
-                (key, store._enc(e["name"]), store._enc(ref) if ref else None,
+                (kind, key, store._enc(e["name"]), store._enc(e["ref"]) if e["ref"] else None,
                  json.dumps([round(x, 4) for x in e["wd"]]), json.dumps([round(x, 4) for x in e["we"]]),
                  round(e["n"], 4), e["last"], now))
         gone = sorted(old - set(found))
-        for key in gone:
-            conn.execute("DELETE FROM tastes WHERE kind = 'yt_channel' AND source = 'observed' AND entity_key = ?",
-                         (key,))
-        return len(gone)
+        for kind, key in gone:
+            conn.execute("DELETE FROM tastes WHERE kind = ? AND source = 'observed' AND entity_key = ?", (kind, key))
+        retired = conn.execute("DELETE FROM tastes WHERE source = 'observed' AND kind IN"
+                               f" ({','.join('?' * len(RETIRED_KINDS))})", RETIRED_KINDS).rowcount
+        return len(gone) + max(0, int(retired or 0))
 
     try:
         removed = store._write(write)
     except Exception:  # noqa: BLE001
-        return {"channels": 0, "visits": visits, "error": 1}
-    return {"channels": len(found), "visits": visits, "removed": int(removed)}
+        return {"kinds": len(seeded), "entities": 0, "visits": visits, "error": 1}
+    return {"kinds": len(seeded), "entities": len(found), "visits": visits, "removed": int(removed)}
 
 
 def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float | None = None,
@@ -240,9 +296,12 @@ def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float 
 
 
 def seed(store: Any, *, now: float | None = None) -> dict[str, Any]:
-    """Every phase S seed (the nightly intake's hook): content-free counts per seed."""
-    return {"yt_channel": seed_youtube(store, now=now)}
+    """Every seed (the memory service's daily hook): content-free counts per seed. The memory service's
+    ``taste_seed`` log line reads the counts under the seed's first key (sWeb's), kept as an alias."""
+    pages = seed_sites(store, now=now)
+    return {"pages": pages, "yt_channel": pages}
 
 
 __all__ = ["SIGMA_MIN", "MENU_CANDIDATES", "Taste", "hour_score", "top", "candidates", "find", "SEED_DAYS",
-           "HALF_LIFE_DAYS", "YT_HANDLE_TEMPLATE", "entity_key", "seed_youtube", "note", "seed"]
+           "HALF_LIFE_DAYS", "OPAQUE_VAR", "RETIRED_KINDS", "entity_key", "site_kinds", "slot_kind", "seed_sites",
+           "note", "seed"]

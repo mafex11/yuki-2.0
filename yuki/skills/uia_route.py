@@ -593,6 +593,208 @@ def site(host: Any) -> str:
     return str(host or "").strip().lower().removeprefix("www.")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Ported from yuki.memory.trace_replay (phase L design section 7, critique L5): the A/B switch, the recorded path of a
+# way (way_path with way_steps and _summary), and the recorded path of a learned rung-B route (recorded_path). Phase P
+# deletes trace_replay once nothing imports it; until then the old memory call (MemoryClient.way_path) still works.
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The privacy file's key for the A/B switch (``[trace]`` table) and its default (``trace_replay.SWITCH_KEY``).
+SWITCH_KEY = "use_learned"
+SWITCH_DEFAULT = True
+#: The trace's outcome classes that mean the window changed after a step, a dialog came up, or an owned window did.
+WINDOW_CLASSES = ("window_changed",)
+DIALOG_CLASS = "dialog"
+OWNED_CLASS = "owned_window"
+#: Row kinds that move to another app or page by themselves (never "the same window" as the step before).
+MOVING_KINDS = ("switch", "nav")
+
+_SWITCH_LOCK = threading.Lock()
+_SWITCH_FILE: dict[str, Any] = {"key": None, "on": None}
+_SWITCH_OVERRIDE: dict[str, Any] = {"on": None}
+
+
+def set_use_learned(value: bool | None) -> None:
+    """Force the A/B switch (``None``: read the settings file again). Ported from ``trace_replay.set_use_learned``."""
+    with _SWITCH_LOCK:
+        _SWITCH_OVERRIDE["on"] = None if value is None else bool(value)
+
+
+def use_learned(path: Any = None) -> bool:
+    """Whether Yuki uses what it learned from how the user works (``[trace] use_learned``, default on). Read live:
+    one ``stat`` of the privacy file a call, parsed again only when it changed. Never raises. Ported from
+    ``trace_replay.use_learned`` (the old voice path's switch; the engine's routes never consult it)."""
+    with _SWITCH_LOCK:
+        if _SWITCH_OVERRIDE["on"] is not None:
+            return bool(_SWITCH_OVERRIDE["on"])
+    try:
+        from pathlib import Path
+
+        from yuki.memory.privacy import user_config_path
+
+        p = Path(path) if path is not None else user_config_path()
+        try:
+            st = p.stat()
+            key = (str(p), st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = (str(p), 0, 0)
+        with _SWITCH_LOCK:
+            if _SWITCH_FILE["key"] == key and _SWITCH_FILE["on"] is not None:
+                return bool(_SWITCH_FILE["on"])
+        on = SWITCH_DEFAULT
+        if key[1]:
+            import tomllib
+
+            with p.open("rb") as fh:
+                table = tomllib.load(fh).get("trace")
+            if isinstance(table, dict) and isinstance(table.get(SWITCH_KEY), bool):
+                on = bool(table[SWITCH_KEY])
+        with _SWITCH_LOCK:
+            _SWITCH_FILE.update(key=key, on=on)
+        return on
+    except Exception:  # noqa: BLE001 - unreadable settings: the last good value, else the default
+        with _SWITCH_LOCK:
+            return bool(_SWITCH_FILE["on"]) if _SWITCH_FILE["on"] is not None else SWITCH_DEFAULT
+
+
+def _summary(store: Any, row: Any) -> dict[str, Any]:
+    """A trace row's outcome summary (decrypted counts of what changed after it), ``{}`` when it has none."""
+    raw = row["outcome_ciphertext"] if "outcome_ciphertext" in row.keys() else None
+    if not raw:
+        return {}
+    try:
+        import json
+
+        data = json.loads(store._dec(raw) or "{}")
+    except Exception:  # noqa: BLE001 - another key, a broken value: nothing known
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _page_site(store: Any, page_key: Any, cache: dict[str, str]) -> str:
+    """The site of a page key when the timeline kept it as a web page (its host, cleartext), else ``""``."""
+    if not page_key:
+        return ""
+    key = str(page_key)
+    if key not in cache:
+        try:
+            rows = store._query("SELECT host FROM timeline WHERE page_key = ? AND host IS NOT NULL AND host != ''"
+                                " ORDER BY id DESC LIMIT 1", (key,))
+            cache[key] = site(rows[0][0]) if rows else ""
+        except Exception:  # noqa: BLE001
+            cache[key] = ""
+    return cache[key]
+
+
+def way_steps(o: Any) -> list[dict[str, Any]]:
+    """A way's executable steps in order: its parts' steps, else its run (ported from ``trace_replay.way_steps``)."""
+    parts = getattr(o, "parts", None) or []
+    if parts:
+        return [st for p in parts for st in p.get("run") or [] if isinstance(st, dict)]
+    return [st for st in getattr(o, "run", None) or [] if isinstance(st, dict)]
+
+
+def recorded_path(store: Any, actions: list[int]) -> dict[str, Any]:
+    """The recorded path of a sequence of the user's trace actions, one entry per action: ``{"steps": [{"known",
+    "app", "host", "same_window", "dialog", "new_window"}, ...], "recorded": bool}``. Machine facts only (the app key,
+    the timeline's host for a web page, whether the window changed or a dialog came up after it), never words. The
+    replay guard holds a step to it (a learned rung B carries it per step as ``rec``). Never raises."""
+    empty: dict[str, Any] = {"steps": [], "dialog_apps": [], "recorded": False}
+    try:
+        from yuki.memory.store import app_key
+
+        if not actions:
+            return empty
+        marks = ",".join("?" * len(actions))
+        rows = {int(r["id"]): r for r in store._query(
+            f"SELECT id, at, process, page_key, kind, source, outcome, outcome_ciphertext FROM ui_actions WHERE id IN"
+            f" ({marks})", list(actions))}
+        hosts: dict[str, str] = {}
+        steps: list[dict[str, Any]] = []
+        prev: Any = None
+        prev_summary: dict[str, Any] = {}
+        for aid in actions:
+            r = rows.get(int(aid))
+            if r is None or r["source"] not in ("user", "user_injected"):
+                steps.append({"known": False})
+                prev, prev_summary = None, {}
+                continue
+            summary = _summary(store, r)
+            moved = any(int(prev_summary.get(c) or 0) > 0 for c in (*WINDOW_CLASSES, DIALOG_CLASS))
+            same = (prev is not None and str(prev["process"] or "") == str(r["process"] or "")
+                    and str(r["kind"] or "") not in MOVING_KINDS
+                    and (str(prev["kind"] or "") in MOVING_KINDS or not moved))
+            owned = int(summary.get(OWNED_CLASS) or 0) > 0
+            steps.append({"known": True, "app": app_key(str(r["process"] or "")) or "",
+                          "host": _page_site(store, r["page_key"], hosts), "same_window": bool(same),
+                          "dialog": int(summary.get(DIALOG_CLASS) or 0) > 0 or owned,
+                          "new_window": any(int(summary.get(c) or 0) > 0 for c in WINDOW_CLASSES) and not owned})
+            prev, prev_summary = r, summary
+        return {"steps": steps, "dialog_apps": [], "recorded": True}
+    except Exception:  # noqa: BLE001 - no path: the runner checks only what the way names
+        return empty
+
+
+def _demo_tasks(store: Any, pid: int) -> list[int]:
+    out: list[int] = []
+    try:
+        for r in store._query("SELECT run_key FROM playbook_events WHERE playbook_id = ? AND type = 'demonstrated'"
+                              " AND run_key LIKE 'demo:%'", (int(pid),)):
+            part = str(r[0]).split(":")
+            if len(part) >= 2 and part[1].isdigit() and int(part[1]) not in out:
+                out.append(int(part[1]))
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def _dialog_apps(store: Any, tasks: list[int]) -> list[str]:
+    apps: list[str] = []
+    for tid in tasks:
+        try:
+            spans = store._query("SELECT first_action, last_action FROM ui_task_actions WHERE task_id = ?", (int(tid),))
+        except Exception:  # noqa: BLE001
+            return apps
+        for lo, hi in spans:
+            for r in store._query("SELECT process, outcome_ciphertext FROM ui_actions WHERE id BETWEEN ? AND ?"
+                                  " AND outcome = 'changed' AND source IN ('user', 'user_injected')"
+                                  " AND outcome_ciphertext IS NOT NULL", (int(lo), int(hi))):
+                if int(_summary(store, r).get(DIALOG_CLASS) or 0) > 0 and r["process"] and r["process"] not in apps:
+                    apps.append(str(r["process"]))
+    return apps
+
+
+def way_path(store: Any, pid: Any) -> dict[str, Any]:
+    """The recorded path of one way of practice memory (ported from ``trace_replay.way_path``, which phase P deletes):
+    ``{"steps": [...one per executable step...], "dialog_apps": [...], "recorded": bool}``; ``recorded`` False for a
+    way not learned from the trace or whose cited actions do not line up one per step. Never raises."""
+    empty: dict[str, Any] = {"steps": [], "dialog_apps": [], "recorded": False}
+    try:
+        from yuki.memory import practice as P
+        from yuki.memory.store import app_key
+
+        o = P.get(store, pid)
+        if o is None or o.kind != "procedure":
+            return empty
+        trace = (o.body or {}).get("trace") if isinstance(o.body, dict) else None
+        if not isinstance(trace, dict):
+            return empty
+        actions = [int(a) for a in trace.get("actions") or [] if str(a).isdigit()]
+        run = way_steps(o)
+        if not actions or len(actions) != len(run):
+            return empty
+        got = recorded_path(store, actions)
+        if not got.get("recorded"):
+            return empty
+        tasks = _demo_tasks(store, int(o.id))
+        if trace.get("task") and int(trace["task"]) not in tasks:
+            tasks.append(int(trace["task"]))
+        got["dialog_apps"] = [app_key(a) or a for a in _dialog_apps(store, tasks)]
+        return got
+    except Exception:  # noqa: BLE001
+        return empty
+
+
 def page_host(tree: dict[str, Any] | None) -> str:
     """The site of the web page a read shows (its Document's address, host only, ``www.`` off), ``""`` when none:
     a machine fact of the window, compared host to host (never titles)."""
@@ -613,8 +815,11 @@ def page_host(tree: dict[str, Any] | None) -> str:
 class SkillRunner:
     """Runs one learned way through a :class:`yuki.voice.hands.Hands`' backend, step by step (blocking: off the loop)."""
 
-    def __init__(self, hands: Any, *, takeover: Any = None) -> None:
+    def __init__(self, hands: Any, *, takeover: Any = None, held_all: bool = False) -> None:
         self.hands = hands
+        #: Phase L (design section 4.4, critique H4): a learned recorded path holds every step for Yuki's consent
+        #: check, not only the ones the user's policy holds back.
+        self._held_all = bool(held_all)
         #: This run's earlier steps as calls (what the authorization check reads beside the user's words).
         self._earlier: list[str] = []
         #: capC5: the dispatcher the steps run through (report 58's before/after account on for the real hands).
@@ -1049,8 +1254,11 @@ class SkillRunner:
                                    why=f'Act is switched off for {off} in Yuki\'s settings')
         authorize = getattr(self.hands, "authorize", None)
         if not callable(authorize):
+            # a learned recorded path never runs a step its consent check can't see (design section 4.4)
+            if self._held_all:
+                return SimpleNamespace(allowed=False, question="", source="no_check", why="no consent check")
             return None
-        verdict = authorize(tool, tool_input, target, list(self._earlier), force=force)
+        verdict = authorize(tool, tool_input, target, list(self._earlier), force=force or self._held_all)
         if verdict is not None and not getattr(verdict, "allowed", False):
             return verdict
         return None
@@ -1352,8 +1560,6 @@ class SkillRunner:
 
         Raises :class:`SkillRefused` before any step runs when the call cannot be run as written."""
         if item.get("trace") or item.get("demo"):
-            from yuki.memory.trace_replay import use_learned
-
             if not use_learned():
                 # capC5: the A/B switch (read live): off, nothing the action trace taught is used
                 raise SkillRefused("using what Yuki learned from how you work is switched off, so that way is not "
@@ -1544,10 +1750,10 @@ class SkillRunner:
         from yuki.memory.store import app_key
 
         way_apps = frozenset(k for k in (app_key(str(a)) for a in item.get("apps") or [] if a) if k)
-        path: dict[str, Any] = {}
+        path: dict[str, Any] = item.get("path") if isinstance(item.get("path"), dict) else {}
         pid = item.get("id")
         memory = getattr(self.hands, "memory", None)
-        if (item.get("trace") or item.get("demo")) and memory is not None and pid is not None:
+        if not path and (item.get("trace") or item.get("demo")) and memory is not None and pid is not None:
             try:
                 got = memory.call("way_path", lambda c: c.way_path(int(pid)), timeout_s=1.5)
                 path = got if isinstance(got, dict) else {}
@@ -2050,17 +2256,25 @@ def run_route(hands: Any, steps: list[dict[str, Any]], *, words: list[str], apps
     when the steps send what they type (rule 8: both must be the user's own words, :func:`check_sends`). The A/B
     switch is not consulted (the route is the skill's, not a trace demo). ``(ok, report, facts)``; raises
     :class:`SkillRefused` before any step runs when the route can't run as written."""
-    item: dict[str, Any] = {"run": [dict(s) for s in steps], "apps": list(apps), "ref": f"skill:{key}",
+    # phase L: a learned path carries each step's recorded path (``rec``, from :func:`recorded_path`); the replay
+    # guard holds the steps to it
+    recs = [s.get("rec") if isinstance(s.get("rec"), dict) else {"known": False} for s in steps]
+    clean = [{k: v for k, v in s.items() if k != "rec"} for s in steps]
+    item: dict[str, Any] = {"run": [dict(s) for s in clean], "apps": list(apps), "ref": f"skill:{key}",
                             "intent": key, "text": ""}
-    args: dict[str, Any] = {"steps": [dict(s) for s in steps], "sends": bool(sends)}
+    if any(r.get("known") for r in recs):
+        item["path"] = {"steps": recs, "dialog_apps": [], "recorded": True}
+    args: dict[str, Any] = {"steps": [dict(s) for s in clean], "sends": bool(sends)}
     if sends:
         item["sends"] = True
         args.update(to=str(sends.get("to") or ""), what=str(sends.get("what") or ""))
-    return SkillRunner(hands, takeover=takeover).run(args, item=item, words=list(words))
+    # every rung B the engine runs is a learned path (capabilities ship rung A only): each step is held for the
+    # consent check (design section 4.4: "every click and key is a held step"; critique H4)
+    return SkillRunner(hands, takeover=takeover, held_all=True).run(args, item=item, words=list(words))
 
 
 __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_steps", "check_sends", "check_texts",
            "check_picks_for_send",
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS", "site",
            "PATTERNS", "Found", "Pressed", "app_window", "search", "find_in", "apply_pattern", "press", "route_steps",
-           "run_route"]
+           "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path"]

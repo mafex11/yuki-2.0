@@ -982,26 +982,92 @@ SKILLS_CHECK = "Skills"
 _SKILL_STATES = {"covered": "covered", "visible": "other screen", "minimised": "minimised"}
 
 
+class _ReadOnlyStore:
+    """Just enough of a memory store for the catalog's learned rows (``catalog.load(store=...)``: one count query, then
+    the live rows decrypted in RAM), on a read-only connection with the memory key that already exists (never created
+    here). Nothing is written."""
+
+    def __init__(self, conn: sqlite3.Connection, cipher: Any) -> None:
+        self._conn = conn
+        self.cipher = cipher
+
+    def _query(self, sql: str, params: Any = ()) -> list[Any]:
+        return self._conn.execute(sql, params).fetchall()
+
+    def _dec(self, stored: str | None) -> str | None:
+        return None if stored is None else self.cipher.decrypt(stored)
+
+
+def _skills_catalog(db: Path | None) -> tuple[Any, dict[str, int]]:
+    """``(catalog, learned counts)``: the catalog loaded on the memory database read-only (phase L C.2: the doctor
+    loads it with ``store=``) when the database and its key exist, else the capabilities alone; the counts are the
+    learned rows by state, read with SQL (no decryption). The problems are counted from the catalog's own ``errors``,
+    with no ``log``: the catalog tells each problem once per process, and a throwaway log here would use that up before
+    the process's real skills log (lWire review r1 L3)."""
+    from yuki.skills import catalog
+
+    counts: dict[str, int] = {}
+    if db is None or not Path(db).exists():
+        return catalog.load(), counts
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    try:
+        try:
+            counts = {str(s): int(n) for s, n in conn.execute(
+                "SELECT state, count(*) FROM skills WHERE origin = 'learned' AND deleted_at IS NULL GROUP BY state")}
+        except sqlite3.Error:   # a database before migration 43: nothing learned yet
+            counts = {}
+        store = None
+        key_file = Path(db).parent / "memory.key"
+        if counts and key_file.exists():
+            try:
+                from yuki.memory.crypto import FieldCipher, load_or_create_key
+
+                store = _ReadOnlyStore(conn, FieldCipher(load_or_create_key(key_file)))
+            except Exception:  # noqa: BLE001 - the key can't be read here: the capabilities alone
+                store = None
+        loaded = catalog.load(store=store)
+    finally:
+        conn.close()
+    return loaded, counts
+
+
 def check_skills(db: Path | None = None, *, settings: Any = None, now: float | None = None,
                  days: float = 7.0) -> Check:
-    """PLAN.md D.2 (Phase S): "skills: n loaded, 0 invalid connection files", the last week's runs (done, couldn't
-    confirm, false done: the bar is 0), "Spotify routes proven: covered yes/no, other screen yes/no, minimised yes/no;
-    mixer linked both ways yes/no" (from the connection data the live checks edit), and whether Yuki has learned the
-    Meet tab. Read-only (the database ``mode=ro``), content-free (code words and counts). No account or key."""
+    """PLAN.md D.2 (Phase S) as phase L restates it: "skills: n capabilities / n learned / n trusted" with the invalid
+    connection files and skipped learned rows, the last week's runs (done, couldn't confirm, false done: the bar is 0),
+    and "Spotify routes proven: covered yes/no, other screen yes/no, minimised yes/no; mixer linked both ways yes/no"
+    (from the connection data the live checks edit). Read-only (the database ``mode=ro``), content-free (code words and
+    counts). No account or key."""
     try:
         from yuki import skills as skills_pkg
-        from yuki.skills import connection
     except Exception as exc:
         return Check(SKILLS_CHECK, SKIP, f"not available ({type(exc).__name__})")
     if not skills_pkg.enabled(settings):
         return Check(SKILLS_CHECK, SKIP, "switched off (skills = false): Yuki uses its older ways")
     try:
-        loaded = connection.load()
+        from yuki.memory.store import default_db_path
+
+        db = db or default_db_path()
+    except Exception:  # noqa: BLE001
+        db = None
+    try:
+        loaded, learned_rows = _skills_catalog(db)
     except Exception as exc:
         return Check(SKILLS_CHECK, WARN, f"the skill files could not be read ({type(exc).__name__})",
                      "Reinstall Yuki; if it stays, send logs\\memory-*.jsonl to whoever maintains Yuki.")
-    errors = len(loaded.errors)
-    parts = [f"{len(loaded.skills)} loaded, {errors} invalid connection file{'s' if errors != 1 else ''}"]
+    caps = loaded.capabilities
+    learned = loaded.learned
+    live_rows = sum(n for s, n in learned_rows.items() if s in ("candidate", "trusted"))
+    trusted = int(learned_rows.get("trusted", 0))
+    file_errors = sum(1 for e in loaded.errors if not str(e).startswith("learned"))
+    row_errors = sum(1 for e in loaded.errors if str(e).startswith("learned"))
+    errors = file_errors
+    # the learned skills in use (the catalog read them); with no key to read them here, the live rows memory holds
+    head = f"skills: {len(caps)} capabilities / {len(learned) or live_rows} learned / {trusted} trusted"
+    if not learned and live_rows:
+        head += " (the learned ones not read here)"
+    parts = [head, f"{file_errors} invalid connection file{'s' if file_errors != 1 else ''}"
+             + (f", {row_errors} learned skill{'s' if row_errors != 1 else ''} skipped" if row_errors else "")]
     false_done = 0
     try:
         from yuki.skills.spotify_route import proven
@@ -1015,12 +1081,6 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
                      + f"; mixer linked both ways {'yes' if got.get('mixer_linked') else 'no'}")
     except Exception:  # noqa: BLE001 - a line left out, never a failed check
         pass
-    try:
-        from yuki.memory.store import default_db_path
-
-        db = db or default_db_path()
-    except Exception:  # noqa: BLE001
-        db = None
     if db is not None and Path(db).exists():
         now = time.time() if now is None else float(now)
         try:
@@ -1032,7 +1092,6 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
                     "sum(CASE WHEN outcome='unverified' THEN 1 ELSE 0 END), "
                     "sum(CASE WHEN recheck=0 THEN 1 ELSE 0 END) FROM skill_runs WHERE t0 >= ?",
                     (now - days * 86400.0,)).fetchone() if has else None
-                meet = conn.execute("SELECT value FROM nudge_state WHERE name='site_tabs:Google Meet'").fetchone()
             finally:
                 conn.close()
             if row is not None:
@@ -1040,12 +1099,6 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
                 span = f"the last {days:g} days" if days != 7 else "the last week"
                 parts.append(f"{runs} run{'s' if runs != 1 else ''} in {span}: {done} done, {unconfirmed} couldn't "
                              f"confirm, {false_done} false done")
-            try:
-                learned = json.loads(meet[0]) if meet and meet[0] else {}
-            except ValueError:
-                learned = {}
-            known = isinstance(learned, dict) and bool(learned.get("runtime_ids") or learned.get("names"))
-            parts.append(f"Meet tab learned: {'yes' if known else 'no'}")
         except Exception as exc:  # noqa: BLE001
             parts.append(f"the run ledger could not be read ({type(exc).__name__})")
     detail = "; ".join(parts)

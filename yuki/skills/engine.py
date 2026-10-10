@@ -36,7 +36,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from yuki.skills.connection import Check, Route, Skill, fill, fill_value, sends_with, window_state_reader
+from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, scope_value, sends_with, strictest,
+                                    window_state_reader)
 from yuki.skills.resolve import HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
 
 #: The time a request may take from the words to the done line (PLAN.md §5: p90 <= 5 s).
@@ -52,6 +53,79 @@ LINE_OTHER_DEVICE = "{app} is playing on another device, so I left it."
 LINE_ALREADY = "That's already how it is."
 #: Memory didn't answer the resolve in time (the voice's ``hands.MEMORY_SLOW_LINE``, the same words): nothing ran.
 LINE_MEMORY_SLOW = "I couldn't reach my memory just now, try again?"
+#: D24: a run that would itself do a step that is only ever the user's (a join on a calling site: they click Join).
+LINE_COMMIT_USER = "That step is yours to do, so I left it."
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# D24: commit is engine code, keyed on the end kind (phase L design section 4.3; critique H4)
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: Who may reach each end kind (the moments' D1 vocabulary): ``user`` never Yuki's step (the skill stops before it);
+#: ``words`` only on the user's own plain words, through the consent check (rule 8); ``none`` Yuki may reach it. An end
+#: kind not in the table is ``user`` (:func:`commit_for`). A capability's own ``commit`` may only make it stricter.
+COMMIT_BY_END: dict[str, str] = {
+    "call_join": "user", "game_voice": "user", "message_sent": "words", "volume_change": "none",
+    "media_context": "none", "page": "none", "site_front": "none", "media_play": "none",
+}
+#: The end kinds whose commit depends on what serves them (PLAN D24, lSplit review r1 L2): a join of a chat app's voice
+#: channel (the serve needs ``chat_voice``) is the user's own "join X" (rule 8, Q3), so ``words``, where a calling
+#: site's join stays ``user``. When a serve's needs map to different words, the strictest holds (lCore review r2 L7:
+#: a calling site's join beside a chat's voice need stays ``user``).
+COMMIT_BY_NEED: dict[tuple[str, str], str] = {("call_join", "chat_voice"): "words", ("call_join", "calling_site"): "user"}
+
+
+def commit_for(end: str, needs: tuple[str, ...] | list[str] = (), declared: str = "") -> str:
+    """D24: the commit word of reaching ``end`` (:data:`COMMIT_BY_END`, or the strictest of :data:`COMMIT_BY_NEED`
+    for the serve's needs when any is listed); an unknown end kind is ``user``; a capability's ``declared`` commit only
+    ever makes it stricter."""
+    end = str(end or "")
+    base = COMMIT_BY_END.get(end, "user")
+    by_need = [COMMIT_BY_NEED[(end, str(n))] for n in needs or () if (end, str(n)) in COMMIT_BY_NEED]
+    if by_need:
+        base = strictest(*by_need) or base
+    return strictest(base, str(declared or "")) or "user"
+
+
+def run_commit(skill: Skill) -> str:
+    """The commit of the end a run of ``skill`` reaches. A capability that serves a commit end and stops at its
+    ``pre_commit_end`` (``browser.site_tab``: the tab in front, the user clicks Join) reaches only that end: its own
+    ``commit`` governs the commit end it serves, never the run (PLAN D24, lSplit review r2 L4), but only when that
+    end is itself no commit (lCore review r2 L7: a ``pre_commit_end`` that is a commit kind keeps the declared commit).
+    Anything else reaches its own end, whose commit its serve's needs and its own ``commit`` (stricter only) decide."""
+    needs = tuple(n for serve in skill.serves if serve.end == skill.end for n in serve.needs)
+    if skill.pre_commit_end and skill.pre_commit_end == skill.end and commit_for(skill.end, needs) == "none":
+        return "none"
+    return commit_for(skill.end, needs, skill.commit)
+
+
+def served_commit(skill: Skill, end: str) -> str:
+    """The commit of an end ``skill`` serves (the learner's "is the habit's own end a commit", design section 4.3)."""
+    needs = tuple(n for serve in skill.serves if serve.end == end for n in serve.needs)
+    return commit_for(end, needs, skill.commit)
+
+
+def ledger_skill(skill: Skill, values: Mapping[str, Any]) -> Skill:
+    """The catalog entry a run is counted on (D14; lSplit review r2 L1): a learned skill's run whose words named
+    another value for one of its bound key slots is its capability's run, never the learned skill's (its trust and
+    offers count only its own habit). Compared as one identity (:func:`yuki.skills.connection.scope_value`)."""
+    bound = getattr(skill, "bound", None) or {}
+    if getattr(skill, "origin", "") != "learned" or not bound:
+        return skill
+    for slot in skill.slots:
+        if slot.role != "key" or slot.name not in bound:
+            continue
+        got = values.get(slot.name)
+        if got in (None, "") or scope_value(got) == scope_value(bound[slot.name]):
+            continue
+        try:
+            from yuki.skills.catalog import load
+
+            cap = load().get(skill.capability)
+        except Exception:  # noqa: BLE001
+            cap = None
+        return cap if cap is not None else skill
+    return skill
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -598,11 +672,12 @@ def _ledger_start(ctx: RunContext, skill: Skill, values: Mapping[str, Any], fill
 
     key = registry.new_run_key()
     absolute = _absolute_values(skill, values)
+    counted = ledger_skill(skill, values)   # a learned skill run with another key value is its capability's run
     got = _mem(ctx.memory, "skill_run_start",
-               lambda c: registry.start_run(_store_of(c), skill=skill, origin=ctx.origin, t0=t0, run_key=key,
+               lambda c: registry.start_run(_store_of(c), skill=counted, origin=ctx.origin, t0=t0, run_key=key,
                                             request_id=ctx.request_id, session_id=ctx.session_id, filled=filled,
                                             app=app,
-                                            slots_digest=registry.values_digest(_store_of(c), skill.key, absolute)),
+                                            slots_digest=registry.values_digest(_store_of(c), counted.key, absolute)),
                timeout_s=0.5)
     return got or (key if ctx.memory is not None else None)
 
@@ -626,12 +701,30 @@ def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool, again: b
         absolute = _absolute_values(skill, getattr(resolved, "values", None))
         if absolute is None:
             return None
+        # a repeat is ledgered where its run would be (lCore review r2 L9): a learned skill asked with another key
+        # value counts on its capability (:func:`ledger_skill`)
+        key = ledger_skill(skill, absolute).key
     from yuki.skills import registry
+
+    # a correction may follow a run of the learned skill or one its capability took (another key value): the newest
+    # of the two is the run corrected (lCore review r2 L9)
+    keys = [key]
+    if corrects and isinstance(skill, Skill) and getattr(skill, "origin", "") == "learned" and skill.capability \
+            and skill.capability != key:
+        keys.append(str(skill.capability))
 
     def go(client: Any) -> Any:
         store = _store_of(client)
-        digest = None if corrects else registry.values_digest(store, key, absolute)
-        return registry.false_done_after(store, key, digest=digest, corrects=corrects, request_id=ctx.request_id)
+        target = key
+        if len(keys) > 1:
+            newest = -1.0
+            for k in keys:
+                rows = registry.last_runs(store, k, since=time.time() - registry.FALSE_DONE_S - 30.0, limit=1)
+                at = float(rows[0].get("t0") or 0.0) if rows else -1.0
+                if at > newest:
+                    target, newest = k, at
+        digest = None if corrects else registry.values_digest(store, target, absolute)
+        return registry.false_done_after(store, target, digest=digest, corrects=corrects, request_id=ctx.request_id)
 
     marked = _mem(ctx.memory, "skill_false_done", go, timeout_s=0.5)
     if not marked:
@@ -700,6 +793,17 @@ def _simple(skill_key: str, outcome: str, ctx: RunContext, started: float, **kw:
     return res
 
 
+def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult | None:
+    """D24 before anything runs, a plan or a hand-over to the general agent alike (review r1 L6): a step that is only
+    the user's is never Yuki's; an offer (a card) never commits (sends and joins stay the user's, rule 8). Refused:
+    nothing runs, nothing is written to the ledger. ``None``: it may run."""
+    commit = run_commit(skill)
+    if commit == "user" or (commit != "none" and ctx.origin == "card"):
+        _emit(ctx, "skill_resolve", skill=skill.key, result="refused", reason=f"commit_{commit}")
+        return _simple(skill.key, "refused", ctx, started, say=LINE_COMMIT_USER if commit == "user" else LINE_FAILED)
+    return None
+
+
 def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     if isinstance(resolved, Ask):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
@@ -712,6 +816,10 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="refused", reason=resolved.why)
         return _simple(resolved.skill, "refused", ctx, started,
                        say=LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED)
+    if isinstance(resolved, (Handoff, Plan)):
+        refused = _commit_gate(resolved.skill, ctx, started)
+        if refused is not None:
+            return refused
     if isinstance(resolved, Handoff):
         return _handoff(resolved.skill, resolved.values, resolved.filled, [], ctx, started, why=resolved.why,
                         run_key=None)
@@ -1008,7 +1116,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # the off switch (Settings.skills = false): the old paths run instead; nothing here acts
         return run(Refused(str(skill_key or ""), "skills_off"), ctx)
     if live is None:
-        from yuki.skills.connection import load
+        from yuki.skills.catalog import load
 
         skill = load().get(str(skill_key or ""))
         wants_media = bool(skill and any(s.live == "playing" for s in skill.slots))
@@ -1018,10 +1126,18 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     disable_after = int(setting(settings, "skills_disable_after") or 2)
 
     def go(client: Any) -> Any:
+        from yuki.skills.catalog import load
+        from yuki.skills.menu import request_key
+
         seeded = getattr(client, "_skills_seeded", None)
-        if callable(seeded):
-            seeded()   # the tray's MemoryClient seeds the registry once per connection version
-        return res_mod.resolve(skill_key, slots, words, store=_store_of(client) if client is not None else None,
+        # the tray's MemoryClient seeds the registry once per connection version and returns the store-aware catalog
+        loaded = seeded() if callable(seeded) else None
+        if loaded is None or not hasattr(loaded, "get"):
+            loaded = load()
+        # lPage merge note 5 (lSplit review r2 L1): words naming another value for a learned skill's bound key slot
+        # run its capability (the learned routes carry the bound value in their arguments), never the learned skill
+        key = request_key(loaded, str(skill_key or ""), slots)
+        return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after)
 
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)
@@ -1071,5 +1187,6 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
-           "RouteResult", "RouteCall", "RunContext", "SkillResult", "VERB_FUNCS", "open_uri", "pinned", "run",
-           "resolve_and_run", "run_for_voice", "run_for_thinker"]
+           "LINE_COMMIT_USER", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for", "run_commit", "served_commit",
+           "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult", "VERB_FUNCS", "open_uri", "pinned",
+           "run", "resolve_and_run", "run_for_voice", "run_for_thinker"]

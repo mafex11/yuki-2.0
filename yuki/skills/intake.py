@@ -1,4 +1,5 @@
-"""Skill intake: seed the registry and turn old procedures into route evidence (PLAN.md B.2; map-skills S1.6).
+"""Skill intake: seed the capabilities and turn old procedures into route evidence (PLAN.md B.2; map-skills S1.6;
+phase L design §4.9 "Old procedures", §7).
 
 Pipeline code, never a hand edit of the database (the user's rule: fix the pipeline, not the memory)::
 
@@ -7,17 +8,22 @@ Pipeline code, never a hand edit of the database (the user's rule: fix the pipel
 
 It does two things:
 
-1. **Seed:** one ``skills`` row per loaded connection skill and one ``skill_routes`` row per rung
-   (:func:`yuki.skills.registry.seed`; a skill no file has any more is retired, never deleted).
-2. **Old procedures as route evidence:** a live executable procedure (``playbooks`` kind ``procedure`` with a ``run``)
-   maps onto a rung when its app is the skill's app (``app_key`` identity) and its last step acts on the control the
-   rung names: the same role and the same name (string identity, never meaning). Its verified runs (``n_ran_ok``)
-   become the rung's ``seed_ok`` (rung B needs one verified run before it may run), and the procedure gets a
-   ``superseded`` event with ``refs = skill:<key>`` through ``practice.add_events``, so the old learners stop offering
-   it. Nothing else of the procedure is copied (its names stay where they are).
+1. **Seed:** one ``skills`` row per capability of the shipped files and one ``skill_routes`` row per rung
+   (:func:`yuki.skills.registry.seed`; a capability no file has any more is retired, never deleted; learned skills
+   are the learner's and are never seeded).
+2. **Old procedures onto rungs:** a live executable procedure (``playbooks`` kind ``procedure`` with a ``run``) maps
+   onto a rung of a learned skill or of a capability (:func:`yuki.skills.catalog.load`: the learned skills first,
+   being the more specific) by role-and-name identity: an app the rung itself acts on is one of the procedure's
+   (``app_key`` identity: the rung's own ``app`` / ``window`` / ``process`` argument, a recorded path's step apps, a
+   learned skill's bound value of an ``app`` slot), and the rung's last control is the procedure's last one, the same
+   role and the same name (string identity, never meaning). A procedure maps onto the most specific tier that
+   matches it (a learned skill's rungs before any capability's). Its verified runs (``n_ran_ok``) become the rung's
+   ``seed_ok`` (rung B needs one verified run before it may run), and the procedure gets a ``superseded`` event with
+   ``refs = skill:<key>`` through ``practice.add_events``, so the old learners stop offering it. Nothing else of the
+   procedure is copied (its names stay where they are).
 
-The report holds counts, skill keys, route keys and procedure ids only. ``--prefs`` (one model batch proposing the
-user's stated usuals) is the voice builder's (sVoice) and is not run here.
+The report holds counts, catalog keys, route keys and procedure ids only. ``--prefs`` (one model batch proposing the
+user's stated usuals) is the learner's install pass (``learn backfill-usuals``) and is not run here.
 """
 
 from __future__ import annotations
@@ -28,7 +34,8 @@ import sys
 import time
 from typing import Any
 
-from yuki.skills.connection import Loaded, Route, Skill, load
+from yuki.skills.catalog import load
+from yuki.skills.connection import Loaded, Route, Skill
 
 
 def _app(name: Any) -> str:
@@ -60,23 +67,41 @@ def route_target(route: Route) -> tuple[str, str] | None:
     return _norm(role), _norm(name)
 
 
-def procedure_target(run: list[dict[str, Any]]) -> tuple[str, str] | None:
-    """The control a procedure's last acting step names, as ``(role, name)`` (its executable ``run``)."""
-    last = next((s for s in reversed(run or []) if isinstance(s, dict) and s.get("do") in ("click", "pick", "slider")
-                 and s.get("name")), None)
-    if last is None:
-        return None
-    return _norm(last.get("role")), _norm(last.get("name"))
+def route_apps(skill: Skill, route: Route) -> set[str]:
+    """The apps (app keys) a rung itself acts on, from data only: its own ``app`` / ``window`` / ``process``
+    argument (a literal, or a template a learned skill's bound value filled), a recorded path's step apps, and a
+    learned skill's bound value of an ``app`` slot. Never the connection's own key alone (a capability's ``web`` or
+    ``browser`` is no app)."""
+    out: set[str] = set()
+    a = route.args
+    for k in ("app", "window", "process"):
+        v = a.get(k)
+        if isinstance(v, str) and v.strip() and "{" not in v:
+            out.add(_app(v))
+    for v in a.get("apps") or []:
+        if isinstance(v, str) and v.strip() and "{" not in v:
+            out.add(_app(v))
+    for step in a.get("steps") or []:
+        if isinstance(step, dict) and isinstance(step.get("app"), str) and "{" not in step["app"]:
+            out.add(_app(step["app"]))
+    for name, value in (getattr(skill, "bound", None) or {}).items():
+        slot = skill.slot(name)
+        if slot is not None and slot.type == "app" and isinstance(value, str):
+            out.add(_app(value))
+    out.discard("")
+    return out
 
 
 def matches(store: Any, loaded: Loaded) -> list[dict[str, Any]]:
-    """Every (procedure, skill, rung) pairing by the rule above: ``{"procedure", "skill", "route", "ok"}``."""
+    """Every (procedure, catalog entry, rung) pairing by the rule above, each procedure on its most specific tier
+    only: ``{"procedure", "skill", "route", "ok", "tier"}`` (``tier``: ``learned`` or ``capability``)."""
     from yuki.memory import practice
 
     try:
         procs = practice.live(store, ["procedure"])
     except Exception:  # noqa: BLE001
         return []
+    tiers = (("learned", list(loaded.learned)), ("capability", list(loaded.capabilities)))
     out: list[dict[str, Any]] = []
     for pb in procs:
         try:
@@ -86,20 +111,33 @@ def matches(store: Any, loaded: Loaded) -> list[dict[str, Any]]:
         target = procedure_target(run)
         if target is None:
             continue
-        apps = {_app(a) for a in pb.apps or [] if a}
-        for skill in loaded.skills:
-            if _app(skill.app) not in apps and not any(_app(skill.app) == _app(s.get("app")) for s in run
-                                                        if isinstance(s, dict)):
-                continue
-            for route in skill.routes:
-                rt = route_target(route)
-                if rt is None:
-                    continue
-                role_ok = not rt[0] or not target[0] or rt[0] == target[0]
-                if role_ok and rt[1] == target[1]:
-                    out.append({"procedure": int(pb.id), "skill": skill.key, "route": route.key,
-                                "ok": int(getattr(pb, "n_ran_ok", 0) or 0)})
+        apps = {_app(a) for a in pb.apps or [] if a} | {_app(s.get("app")) for s in run
+                                                        if isinstance(s, dict) and s.get("app")}
+        apps.discard("")
+        for tier, skills in tiers:
+            found = []
+            for skill in skills:
+                for route in skill.routes:
+                    rt = route_target(route)
+                    if rt is None or not (route_apps(skill, route) & apps):
+                        continue
+                    role_ok = not rt[0] or not target[0] or rt[0] == target[0]
+                    if role_ok and rt[1] == target[1]:
+                        found.append({"procedure": int(pb.id), "skill": skill.key, "route": route.key,
+                                      "ok": int(getattr(pb, "n_ran_ok", 0) or 0), "tier": tier})
+            if found:
+                out.extend(found)
+                break
     return out
+
+
+def procedure_target(run: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """The control a procedure's last acting step names, as ``(role, name)`` (its executable ``run``)."""
+    last = next((s for s in reversed(run or []) if isinstance(s, dict) and s.get("do") in ("click", "pick", "slider")
+                 and s.get("name")), None)
+    if last is None:
+        return None
+    return _norm(last.get("role")), _norm(last.get("name"))
 
 
 def run_intake(store: Any, *, apply: bool = False, loaded: Loaded | None = None,
@@ -108,16 +146,17 @@ def run_intake(store: Any, *, apply: bool = False, loaded: Loaded | None = None,
     from yuki.skills import registry
 
     now = time.time() if now is None else float(now)
-    loaded = loaded if loaded is not None else load()
-    report: dict[str, Any] = {"at": now, "applied": bool(apply), "skills": list(loaded.keys),
-                              "errors": len(loaded.errors), "tables": registry.has_tables(store)}
+    loaded = loaded if loaded is not None else load(store=store)
+    report: dict[str, Any] = {"at": now, "applied": bool(apply), "capabilities": [s.key for s in loaded.capabilities],
+                              "learned": len(loaded.learned), "errors": len(loaded.errors),
+                              "tables": registry.has_tables(store)}
     if not report["tables"]:
         report["result"] = "no_tables"
         return report
     if apply:
         report["seed"] = registry.seed(store, loaded, now=now)
     found = matches(store, loaded)
-    report["matches"] = [{k: m[k] for k in ("procedure", "skill", "route", "ok")} for m in found]
+    report["matches"] = [{k: m[k] for k in ("procedure", "skill", "route", "ok", "tier")} for m in found]
     if apply and found:
         from yuki.memory import practice
 
@@ -152,7 +191,6 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--apply", action="store_true", help="seed and import (after the dry run was reviewed)")
     parser.add_argument("--connections", action="append", help="a folder of connection files (default: bundled)")
     args = parser.parse_args(argv)
-    loaded = load(args.connections) if args.connections else load()
     if not args.apply:
         # a dry run writes nothing anywhere: it reads a temporary copy (yuki.eval.dbcopy; source opened ?mode=ro), so
         # even the migrations Store.open applies touch only the copy, which is deleted afterwards (review L6)
@@ -161,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         from yuki.eval.dbcopy import working_copy
 
         with working_copy(Path(args.db)) as (store, _path):
+            loaded = load(args.connections, store=store)
             report = run_intake(store, apply=False, loaded=loaded)
         report["read"] = "copy"
     else:
@@ -168,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
 
         store = Store.open(args.db)
         try:
+            loaded = load(args.connections, store=store)
             report = run_intake(store, apply=True, loaded=loaded)
         finally:
             store.close()
@@ -180,4 +220,4 @@ if __name__ == "__main__":  # pragma: no cover
     sys.exit(main())
 
 
-__all__ = ["route_target", "procedure_target", "matches", "run_intake", "main"]
+__all__ = ["route_target", "route_apps", "procedure_target", "matches", "run_intake", "main"]

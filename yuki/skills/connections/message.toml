@@ -1,71 +1,85 @@
-# message: open a chat with someone in the app the user talks to them in, type the user's own words, and send them only
-# when the user plainly said so (PLAN.md D0, D2, D17, D19, Q3/rule 8; B.2; map-skills S2.5).
+# message: open a chat with someone in a chat app, type the user's own words, and send them only when the user plainly
+# said so (phase L design §6, §4.4; PLAN.md D0, D17, D19, Q3/rule 8). A capability: what any user's chat apps can do.
+# Whom the user messages, in which app and when, are learned (moments of kind message_sent, memory's people index),
+# never written here.
 #
-# One skill for every chat app, as `volume` is one skill for every volume control. The person (or a group chat or
-# channel, by its name) is found in memory's people index (yuki.memory.contacts: named_in, rank_routes); the app is the
-# one the user named, else that person's usual route (their own lasting choice first, then where they message most
-# lately). Each app's own data (its processes, its link and URI shapes, its shortcuts) sits in that app's connection
-# file (discord.toml, whatsapp.toml, slack.toml, table [chat]); the routes below only name the app.
+# One capability for every chat app, as `volume` is one for every volume control. The person (or a group chat or
+# channel, by its name) is found in memory's people index (yuki.memory.contacts: named_in, rank_routes); the app is a
+# means: the one the user named, else that person's own route as the people index ranks it (their lasting choice
+# first, then where they message most lately), filled by the route at run time (fill = "driver"), never a preference
+# key and never a default. Each app's own data (its processes, its link and URI shapes, its shortcuts) sits in that
+# app's connection file (discord.toml, whatsapp.toml, slack.toml, table [chat]); the routes below only name the app.
 #
 # Routes, per app (all rung A: the app's own links and shortcuts, D0): a deep link built from the chat's own address
-# when memory has it (discord://, slack://, whatsapp://send?phone=), else the app's quick switcher or search. Each opens
-# the chat and checks it is open by memory's encrypted thread ids (never a window title) before anything is typed.
-# Rule 8: "send X to Y" types X and presses send (after Yuki's own check, the judge); naming only the person, or saying
-# what to write without "send", leaves a draft. A send is checked by memory's capture of the sent message. Never with a
-# game in front ("after the round?"). The code is yuki/skills/chat.py.
+# when the app's link data can build one (discord://, slack://, whatsapp://send?phone=), else the app's quick switcher
+# or search; last, a chat whose address is a web page the app's link data matches opens at that address in a browser
+# (web_link: the chat only, nothing typed there). Each opens the chat and checks it is open by memory's encrypted
+# thread ids or its address (never a window title) before anything is typed. Rule 8: "send X to Y" types X and presses
+# send (after Yuki's own check, the judge); naming only the person, or saying what to write without "send", leaves a
+# draft. A send is checked by memory's capture of the sent message. Never offered (offer_class = "never"). Never with a
+# game in front ("after the round?"). The code is yuki/skills/chat.py and yuki/skills/web_route.py.
 
 [connection]
 app = "chat"
 
-[skill.message]
+[capability.message]
 end = "message_sent"
 kind = "change"
-menu = "message someone in their usual chat app; sends only if they said send"
+menu = "message a person, group or channel in a chat app; sends only if they said send"
 done_line = "Done."
-learn_from = [["message_sent", "discord"], ["message_sent", "whatsapp"], ["message_sent", "slack"]]
+commit = "words"
+offer_class = "never"
 handoff = true
 # rule 8: a send is judged as one (the thinker's authorizer) and never retried by a second rung
 sends_when = { slot = "send", in = ["send"] }
+serves = [{ end = "message_sent", target = "chat", needs = "chat" }]
+bind = { person = "contact", app = "app" }
 
 # Whom: a person or a group chat or channel, exactly as the user said it.
-[[skill.message.slot]]
+[[capability.message.slot]]
 name = "person"
 type = "text"
+role = "fill"
 required = true
 ask = "Who to?"
 
 # The app, only when the user named one: validated as said (no options list, so an app the talker supplies but the
-# user never said is dropped and the person's usual route stands). An app with no chat data here is a question.
-[[skill.message.slot]]
+# user never said is dropped and the person's own route stands). An app with no chat data here is a question.
+[[capability.message.slot]]
 name = "app"
 type = "app"
+role = "means"
+fill = "driver"
 
 # What to write: the user's own words only ("" = just open the chat).
-[[skill.message.slot]]
+[[capability.message.slot]]
 name = "text"
 type = "text"
+role = "fill"
 default = ""
 
 # send: they plainly said to send it; draft: type it and leave it for them.
-[[skill.message.slot]]
+[[capability.message.slot]]
 name = "send"
 type = "enum"
+role = "fill"
 options = ["send", "draft"]
 default = "draft"
 
 # Each route's done-check reads what it did (the chat seen open, the words read back, the send captured); its re-check
 # reads again live a few seconds later (the same sources: flagged as such).
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "discord_link"
 via = "driver"
 driver = "chat"
 call = "open_link"
 needs_focus = true
+means = "app"
 args = { app = "discord" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -75,7 +89,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -87,16 +101,17 @@ live = true
 after_s = 3
 same_source = true
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "discord_switch"
 via = "driver"
 driver = "chat"
 call = "switcher"
 needs_focus = true
+means = "app"
 args = { app = "discord" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -106,7 +121,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -118,16 +133,17 @@ live = true
 after_s = 3
 same_source = true
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "whatsapp_link"
 via = "driver"
 driver = "chat"
 call = "open_link"
 needs_focus = true
+means = "app"
 args = { app = "whatsapp" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -137,7 +153,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -149,16 +165,17 @@ live = true
 after_s = 3
 same_source = true
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "whatsapp_search"
 via = "driver"
 driver = "chat"
 call = "switcher"
 needs_focus = true
+means = "app"
 args = { app = "whatsapp" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -168,7 +185,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -180,16 +197,17 @@ live = true
 after_s = 3
 same_source = true
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "slack_link"
 via = "driver"
 driver = "chat"
 call = "open_link"
 needs_focus = true
+means = "app"
 args = { app = "slack" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -199,7 +217,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -211,16 +229,17 @@ live = true
 after_s = 3
 same_source = true
 
-[[skill.message.route]]
+[[capability.message.route]]
 rung = "A"
 variant = "slack_switch"
 via = "driver"
 driver = "chat"
 call = "switcher"
 needs_focus = true
+means = "app"
 args = { app = "slack" }
 
-[skill.message.route.done]
+[capability.message.route.done]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -230,7 +249,7 @@ text = "{text}"
 send = "{send}"
 within_s = 6
 
-[skill.message.route.recheck]
+[capability.message.route.recheck]
 probe = "driver"
 driver = "chat"
 call = "message_done"
@@ -241,3 +260,18 @@ send = "{send}"
 live = true
 after_s = 3
 same_source = true
+
+# The chat's own web address (critique L4): a chat whose captured address the app's [chat.links] data matches (Slack
+# and Discord in a browser) opens at that address in the browser it was last shown in. Opening only: with words to
+# type it never runs (typing into a web page is not this route's), so it can never send.
+[[capability.message.route]]
+rung = "A"
+variant = "web_link"
+via = "driver"
+driver = "web_route"
+call = "chat_web_link"
+needs_focus = true
+means = "browser"
+when = { slot = "text", present = false }
+done = { probe = "driver", driver = "web_route", call = "chat_page_shown", within_s = 6 }
+recheck = { probe = "driver", driver = "web_route", call = "chat_page_shown", after_s = 3, same_source = true }

@@ -1223,6 +1223,17 @@ class TimelineRecorder:
                 out.add(key)
         return sorted(out)
 
+    def flags(self) -> dict[str, Any]:
+        """The open stretch's live flags, for the you-right-now builder's one-second beat (yuki.memory.younow, yState):
+        ``state`` (present / away; None with no open stretch), ``blocked`` (paused / locked / None), ``fullscreen``
+        and ``meeting`` (None with no open stretch). One attribute read of the open stretch and no sorting (unlike
+        :meth:`stats`, which sorts the page-probe timings); safe from any thread."""
+        st = self._current
+        if st is None:
+            return {"state": None, "blocked": self._blocked, "fullscreen": None, "meeting": None}
+        return {"state": st.state, "blocked": self._blocked, "fullscreen": bool(st.fullscreen),
+                "meeting": bool(st.meeting)}
+
     def stats(self) -> dict[str, Any]:
         """Counters (content-free)."""
         probe = self._probe
