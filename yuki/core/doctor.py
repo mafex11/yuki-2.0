@@ -1111,6 +1111,125 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
     return Check(SKILLS_CHECK, OK, detail)
 
 
+YOU_CHECK = "You-state"
+JUDGE_CHECK = "Card judge"
+#: The call status unknown for longer than this is a warning (state-design.md §4.4 H3: after 10 min unknown, reminders
+#: and "tell me when" cards pass while the rest stay held).
+YOU_UNKNOWN_WARN_S = 600.0
+
+
+def check_you_state(*, now: float | None = None, client: Any = None) -> Check:
+    """yUsual (state-design.md §6.1): "you-state: fresh, beat p90 ms" from the memory service's "you right now" record
+    over the Now pipe (op ``you`` with the builder's content-free counters), and a warning when the call status has
+    been unknown for more than 10 minutes (cards then hold, except reminders and "tell me when" cards). Read-only;
+    nothing of the record's content is shown."""
+    now = time.time() if now is None else float(now)
+    if _privacy_table("you").get("enabled") is False:
+        return Check(YOU_CHECK, SKIP, "switched off ([you] enabled = false in the privacy file): the card judge holds")
+    try:
+        if client is None:
+            from yuki.memory.now import shared_client
+
+            client = shared_client()
+    except Exception as exc:  # noqa: BLE001
+        return Check(YOU_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    if client is None:
+        return Check(YOU_CHECK, SKIP, "memory has not run on this PC yet")
+    reply = client.you_stats(wait_s=1.0) if callable(getattr(client, "you_stats", None)) else None
+    if reply is None and getattr(client, "absent", False):
+        return Check(YOU_CHECK, SKIP, "the memory service is not running (see its line above)")
+    if reply is None:
+        return Check(YOU_CHECK, WARN, "the memory service did not answer",
+                     "If the memory service check above is ok, restart Yuki from the tray.")
+    if not reply.get("ok"):
+        return Check(YOU_CHECK, WARN, "the memory service is running without it",
+                     "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    stats = reply.get("stats") or {}
+    beat_ms = (stats.get("beat_ms") or {}).get("p90")
+    try:
+        age = max(0.0, now - float(reply.get("beat_at")))
+    except (TypeError, ValueError):
+        age = None
+    size = stats.get("bytes")
+    bits = [f"beat p90 {beat_ms:.2f} ms" if isinstance(beat_ms, (int, float)) else "beat p90 not measured yet",
+            f"version {reply.get('version')}"]
+    if isinstance(size, int) and size:
+        bits.append(f"{size / 1024:.1f} KB")
+    if stats.get("errors"):
+        bits.append(f"{int(stats['errors'])} errors")
+    focus = (reply.get("you") or {}).get("focus") or {}
+    unknown_since = focus.get("call_unknown_since")
+    if age is None or age > 5.0:
+        when = f"{age:.0f} s ago" if age is not None else "never"
+        return Check(YOU_CHECK, WARN, f"stale: its last beat was {when}; " + ", ".join(bits),
+                     "Restart Yuki from the tray; until then cards hold.")
+    head = f"fresh (beat {age:.1f} s ago), " + ", ".join(bits)
+    if isinstance(unknown_since, (int, float)) and now - float(unknown_since) > YOU_UNKNOWN_WARN_S:
+        return Check(YOU_CHECK, WARN, head + f"; the call status has not been readable for "
+                                             f"{int((now - float(unknown_since)) // 60)} min (cards hold, except "
+                                             f"reminders and \"tell me when\" cards)",
+                     "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl to whoever maintains Yuki.")
+    return Check(YOU_CHECK, OK, head)
+
+
+def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
+    """yUsual (state-design.md §6.1): "judge: mode, shown / would-show today". The mode from the privacy file's
+    ``[judge]`` table (default shadow); the cards shown today (the ``nudges`` table's content-free columns, the user's
+    day from ``[nudges] resume_day_start``); in shadow, what the judge would have shown today from its own book
+    (``nudge_state['judge_shadow']``: code text apart from writer asks, the Today card's times). Read-only."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:  # noqa: BLE001
+        return Check(JUDGE_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    table = _privacy_table("judge")
+    mode = str(table.get("mode", "shadow")).strip().casefold()
+    mode = mode if mode in ("off", "shadow", "on") else "shadow"
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(JUDGE_CHECK, SKIP, "no memory database yet")
+    # the user's day (checkins.user_day / day_boundary: days start at [nudges] resume_day_start, 02:00 belongs to the
+    # day before), worked out here so the doctor imports none of the card modules
+    try:
+        hh, _, mm = str(_privacy_table("nudges").get("resume_day_start", "04:00") or "04:00").partition(":")
+        shift = timedelta(minutes=int(hh) * 60 + int(mm or 0))
+        today = (datetime.fromtimestamp(now) - shift).strftime("%Y-%m-%d")
+        start = (datetime.strptime(today, "%Y-%m-%d") + shift).timestamp()
+    except (TypeError, ValueError) as exc:
+        return Check(JUDGE_CHECK, WARN, f"could not work out the day ({type(exc).__name__})")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            shown = int(conn.execute("SELECT count(*) FROM nudges WHERE shown_at >= ? AND shown_at <= ?",
+                                     (start, now + 60.0)).fetchone()[0])
+            row = conn.execute("SELECT value FROM nudge_state WHERE name = 'judge_shadow'").fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return Check(JUDGE_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    shown_words = f"{shown} card{'s' if shown != 1 else ''} shown today"
+    if mode == "off":
+        return Check(JUDGE_CHECK, OK, f"off: the old card makers only; {shown_words}")
+    if mode == "on":
+        return Check(JUDGE_CHECK, OK, f"on: {shown_words}")
+    try:
+        book = json.loads(row[0]) if row and row[0] else {}
+    except (TypeError, ValueError):
+        book = {}
+    day = ((book.get("days") or {}).get(today) or {}) if isinstance(book, dict) else {}
+    would = day.get("would") or {}
+    code = sum(int(v.get("code", 0) or 0) for v in would.values() if isinstance(v, dict))
+    writer = sum(int(v.get("writer", 0) or 0) for v in would.values() if isinstance(v, dict))
+    total = sum(int(n or 0) for v in would.values() if isinstance(v, dict) for n in v.values())
+    detail = (f"shadow: {shown_words} by the old card makers; the judge would have shown {total} "
+              f"({code} in code text, {writer} asking the writer)")
+    if day.get("today"):
+        detail += f"; its Today card at {', '.join(str(t) for t in day['today'][:3])}"
+    if not book:
+        detail += "; no shadow notes yet"
+    return Check(JUDGE_CHECK, OK, detail)
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -1226,6 +1345,8 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         (MOMENTS_CHECK, check_moments),
         (SPOTIFY_CHECK, check_spotify_desktop),
         (SKILLS_CHECK, lambda: check_skills(settings=settings)),
+        (YOU_CHECK, check_you_state),
+        (JUDGE_CHECK, check_judge),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

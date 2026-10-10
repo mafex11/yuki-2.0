@@ -12,9 +12,12 @@
 * **Append-only.** :class:`Conversation` keeps one request's messages; it appends, never edits or deletes an earlier
   message (preserved thinking binds thinking blocks to unedited history). Each request starts a fresh list.
 * **Nothing channel- or effort-specific above breakpoint 3**: the channel is a line of the request turn.
-* **The "you right now" record** comes through the state design's section 11 interface
-  (``shared_client().you(with_board=True)`` and ``render(you, "thinker")``) when ``yuki.memory.younow`` exists, else
-  the Now board stands in (``format_now``). It is text for the planner only; the consent rule reads its facts itself.
+* **The "you right now" record** comes through the state design's section 11 interface: the request turn's provider
+  (:func:`read_you`) asks ``shared_client().you(sections=THINKER_SECTIONS)`` (version-cached in the client, one small
+  answer when nothing changed) and renders ``render(you, "thinker")`` (≤ 1,200 characters, inside the overview slot;
+  a stale record says "not known", fail closed). The board is not asked for here: the overview (``Dispatcher``) reads
+  it already. With ``[you] enabled = false`` (or a service without the record) the Now board stands in
+  (``format_now``), as before. It is text for the planner only; the consent rule reads its facts itself.
 * **People named** in the user's words: memory's people index (``frame_facts`` names them, ``contact`` gives routes
   and the user's own last messages, dated), so the planner can ask about a reworded repeat (M12).
 * Window text, the Now picture and memory captures are fenced as untrusted data.
@@ -146,9 +149,11 @@ YOU_UNKNOWN = ("(Not known just now. Treat a game or a call as in front, and so 
 
 
 def read_you(dispatcher: Any, *, limit: int) -> str:
-    """The "you right now" record for the thinker (state design 11), else the Now board as a stand-in when the
-    overview does not already carry it. :data:`YOU_UNKNOWN` when neither answers in time (fail closed: unknown counts
-    as held). Never raises."""
+    """The "you right now" record for the thinker (state design 11: ``render(you, "thinker")``, the provider of the
+    request turn's you-now slot). When the record is switched off (``[you] enabled = false``: the client's
+    ``you_error`` is ``"off"``) or the client has no ``you`` (an older memory package), the Now board stands in when
+    the overview does not already carry it. :data:`YOU_UNKNOWN` when nothing answers in time (fail closed: unknown
+    counts as held). Never raises."""
     try:
         from yuki.memory.now import shared_client
 
@@ -157,17 +162,19 @@ def read_you(dispatcher: Any, *, limit: int) -> str:
         client = None
     if client is None:
         return YOU_UNKNOWN
-    try:
-        from yuki.memory.younow import render  # type: ignore[import-not-found]
+    you_fn = getattr(client, "you", None)
+    if callable(you_fn):
+        try:
+            from yuki.memory.younow import THINKER_SECTIONS, render
 
-        you_fn = getattr(client, "you", None)
-        if callable(you_fn):
-            got = you_fn(with_board=True, wait_s=YOU_WAIT_S)
-            you = got.get("you") if isinstance(got, Mapping) and "you" in got else got
-            text = str(render(you, "thinker") or "") if you else ""
-            return clip(text, limit) if text.strip() else YOU_UNKNOWN
-    except Exception:  # noqa: BLE001 - yState not merged (or no answer): the Now board stands in
-        pass
+            you = you_fn(sections=THINKER_SECTIONS, wait_s=YOU_WAIT_S)
+            if you:
+                text = str(render(you, "thinker") or "")
+                return clip(text, limit) if text.strip() else YOU_UNKNOWN
+            if getattr(client, "you_error", None) != "off":
+                return YOU_UNKNOWN   # no answer in time: fail closed
+        except Exception:  # noqa: BLE001 - the record could not be read or rendered: fail closed
+            return YOU_UNKNOWN
     if getattr(dispatcher, "include_now", False):
         return ""   # the overview already carries the Now picture (and says when it could not read it)
     try:

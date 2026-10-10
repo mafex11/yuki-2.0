@@ -2744,6 +2744,170 @@ def fast_path_processor(conversation: Any) -> Any:
     return FastPath(name="yuki-fast-path")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# yConsumers (state-design.md §3.5): the talker's "you right now" line, from a background-refreshed cache
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class TalkerYou:
+    """The voice talker's one "you right now" line (yConsumers; state-design.md §3.5, §7 yConsumers items 1-2).
+
+    One per process (:func:`talker_you`). A daemon thread keeps a copy of the memory service's record (the ``focus``
+    and ``changed`` sections only, through ``NowClient.you``: version-cached, an unchanged answer is ~100 bytes) and
+    refreshes it
+
+    * when the service sets the ``talk`` hold event (``yuki.memory.now.you_event_name``: only when the set of holds
+      changes, a game or a call starting or ending),
+    * when a conversation goes live (a kick: one ``SetEvent`` from the voice loop, microseconds, never a pipe read),
+    * every :attr:`POLL_S` while a conversation is live (so "Spotify started 2 min ago" is there).
+
+    :meth:`line` renders the cached copy in RAM (``younow.render(you, "talker")``, at most 300 characters): no fetch per
+    turn and never a pipe read on the wake path (``voice/session.py`` is untouched). It is ``""`` when the copy is older
+    than :attr:`FRESH_S` (a hint: better none than an old "in VALORANT"), before the thread has imported the renderer
+    (an import on the voice loop stalls it), with ``[you] enabled = false`` (the service answers "off"), or with
+    nothing to say. The thread is started by :meth:`start` before a conversation is live (a thread started from the
+    loop stalled it, v3.14). Counters are content-free (:attr:`stats`).
+    """
+
+    #: While a conversation is live, the record is asked again this often (s).
+    POLL_S = 3.0
+    #: The cached copy is used for at most this long after its last answer (s).
+    FRESH_S = 10.0
+    #: One ask's wait (s; the background thread's, never the loop's).
+    ASK_WAIT_S = 0.3
+    #: With no conversation live the thread waits for the hold event or a kick at most this long between checks (s).
+    IDLE_WAIT_S = 60.0
+
+    def __init__(self, client_fn: Callable[[], Any] | None = None) -> None:
+        import threading
+
+        self._client_fn = client_fn
+        self._lock = threading.Lock()
+        self._live: set[int] = set()
+        self._you: Any = None
+        self._version: Any = None
+        self._at: float | None = None
+        self._render: Callable[..., str] | None = None
+        self._thread: Any = None
+        self._kick: Any = None
+        self._hold: Any = None
+        self._own: Any = None   # its own NowClient (the refresh thread only)
+        self.stats: dict[str, int] = {"asks": 0, "changed": 0, "failed": 0, "off": 0, "holds": 0, "kicks": 0,
+                                      "lines": 0}
+
+    def start(self) -> None:
+        """Start the refresh thread once (call it before anything is live). Never raises."""
+        import threading
+
+        with self._lock:
+            if self._thread is not None:
+                return
+            try:
+                from yuki.memory.now import NamedEvent, you_event_name
+
+                self._kick = NamedEvent(None)
+                hold = NamedEvent(you_event_name(None, "talk"))   # the default database, as shared_client()'s
+                self._hold = hold if hold.handle else None
+            except Exception:  # noqa: BLE001 - no events: it polls while live, and stays idle otherwise
+                self._kick, self._hold = None, None
+            self._thread = threading.Thread(target=self._run, name="yuki-voice-you", daemon=True)
+            self._thread.start()
+
+    def attach(self, owner: Any, live: bool) -> None:
+        """A conversation went live (``True``: a refresh is kicked at once) or ended (``False``). Cheap; never
+        raises."""
+        with self._lock:
+            if live:
+                self._live.add(id(owner))
+            else:
+                self._live.discard(id(owner))
+            kick = self._kick if live else None
+        if kick is not None and kick.set():
+            self.stats["kicks"] += 1
+
+    def line(self, now: float | None = None) -> str:
+        """The talker's line from the cached copy (RAM only), or ``""``."""
+        with self._lock:
+            you, at, render = self._you, self._at, self._render
+        if you is None or at is None or render is None or time.monotonic() - at > self.FRESH_S:
+            return ""
+        try:
+            text = str(render(you, "talker", now=time.time() if now is None else float(now)) or "")
+        except Exception:  # noqa: BLE001 - a hint: none rather than a broken turn
+            return ""
+        if text:
+            self.stats["lines"] += 1
+        return text
+
+    def _client(self) -> Any:
+        """Its own ``NowClient`` (its own pipe connection and lock, made once by this thread): an ask waits up to
+        :attr:`ASK_WAIT_S`, and on the process-wide client that wait would hold the lock the hands' desk read
+        (``prefetch_desk``, 50 ms) needs right after a wake."""
+        try:
+            if self._client_fn is not None:
+                return self._client_fn()
+            if self._own is None:   # no key yet (the service never ran): tried again next time
+                from yuki.memory.now import own_client
+
+                self._own = own_client()
+            return self._own
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _run(self) -> None:
+        try:
+            import yuki.core.appnames  # noqa: F401 - the renderer's lazy import, done here too
+            from yuki.memory.now import wait_any
+            from yuki.memory.younow import TALKER_SECTIONS, render   # here, never on the voice loop
+        except Exception:  # noqa: BLE001 - no record to read: the line stays empty
+            return
+        with self._lock:
+            self._render = render
+        events = [e for e in (self._hold, self._kick) if e is not None]
+        while True:
+            with self._lock:
+                live = bool(self._live)
+            got = wait_any(events, self.POLL_S if live else self.IDLE_WAIT_S)
+            fired = events[got] if got is not None else None
+            if fired is not None and fired is self._hold:
+                self.stats["holds"] += 1
+            if fired is None and not live:
+                continue   # idle and nothing happened: nothing to read
+            self._refresh(TALKER_SECTIONS)
+
+    def _refresh(self, sections: tuple[str, ...]) -> None:
+        client = self._client()
+        if client is None or not callable(getattr(client, "you", None)):
+            return
+        self.stats["asks"] += 1
+        try:
+            you = client.you(sections=sections, wait_s=self.ASK_WAIT_S)
+        except Exception:  # noqa: BLE001
+            you = None
+        if you is None:
+            off = getattr(client, "you_error", None) == "off"
+            self.stats["off" if off else "failed"] += 1
+            if off:
+                with self._lock:
+                    self._you, self._at = None, None
+            return
+        with self._lock:
+            if you.get("version") != self._version:
+                self.stats["changed"] += 1
+            self._you, self._version, self._at = you, you.get("version"), time.monotonic()
+
+
+_talker_you: TalkerYou | None = None
+
+
+def talker_you() -> TalkerYou:
+    """This process's :class:`TalkerYou` (one cache for every conversation)."""
+    global _talker_you
+    if _talker_you is None:
+        _talker_you = TalkerYou()
+    return _talker_you
+
+
 class Conversation:
     """One conversation's pipeline, run on the current asyncio loop.
 
@@ -2849,6 +3013,11 @@ class Conversation:
         #: (``full`` / ``lean``); fixed for the conversation with its tools and prompt.
         self.brain_voice = voice_on_brain(settings)
         self.talker = talker_kind(settings)
+        #: yConsumers: the lean talker (voice on the new brain) gets memory's one "you right now" line in its volatile
+        #: block, from :class:`TalkerYou`'s background cache; the full talker is byte-for-byte as before.
+        self._you_on = self.talker == "lean"
+        self._you_attached = False
+        self._you_stats0: dict[str, int] = {}   # TalkerYou's counters when this conversation attached (deltas logged)
         #: Every outcome handed to the talker until it is heard (:class:`yuki.voice.narrator.OwedLedger`), made in run.
         self.ledger: Any = None
         #: ``(kind)``: play an earcon (:func:`yuki.voice.echo.tone`) through this conversation's output; set by the
@@ -3571,6 +3740,12 @@ class Conversation:
             # The talker's connection is cold after a quiet spell (its client lets idle connections go): one cached
             # one-token call opens it while they are still talking, and reads the cache (keeping it warm).
             asyncio.ensure_future(self._warm())
+        if self._you_on and not self._you_attached:
+            # yConsumers: the talker's you-line cache refreshes now, in the background (a SetEvent, no pipe read here)
+            self._you_attached = True
+            you_cache = talker_you()
+            self._you_stats0 = dict(you_cache.stats)
+            you_cache.attach(self, True)
         if self.on_awake is not None:
             try:
                 self.on_awake({"woken": self.woken_at is not None})
@@ -3983,6 +4158,8 @@ class Conversation:
 
         executor_ms = await prestart_default_executor(self._loop)
         self.log.event("session", state="executor", session=self.session, ms=round(executor_ms))
+        if self._you_on:
+            talker_you().start()   # yConsumers: its thread exists before anything is live (once per process)
         self.gate = NarratorGate(self._gate_state, settle_s=s.voice_settle_s, settle_max_s=s.voice_settle_max_s,
                                  cooldown_s=s.voice_cooldown_s, stale_turns=s.voice_stale_turns, log=self.log,
                                  final_gap_s=s.voice_final_gap_s, progress_pause_s=s.voice_progress_pause_s)
@@ -4044,6 +4221,11 @@ class Conversation:
         try:
             await runner.run()
         finally:
+            you_cache = None
+            if self._you_attached:   # first: a raise below must not leave the refresh thread asking every 3 s
+                self._you_attached = False
+                you_cache = talker_you()
+                you_cache.attach(self, False)
             self._scroll_hold(False)
             self._cancel_route()
             self._unboost()
@@ -4091,6 +4273,10 @@ class Conversation:
                 if self._bound and hands is not None and getattr(hands, "practice", None) is self.practice:
                     hands.practice = None
             self.log.event("narrator", op="summary", **self.gate.stats)
+            if you_cache is not None:   # this conversation's counts only (the cache is the process's)
+                base = self._you_stats0
+                self.log.event("you_line", op="summary", session=self.session,
+                               **{k: v - base.get(k, 0) for k, v in you_cache.stats.items()})
             cache = getattr(self, "_tts_cache", None)
             if cache is not None:
                 self.log.event("tts_cache", op="summary", **cache.stats)   # counts only (v3.14)
@@ -5017,6 +5203,11 @@ class Conversation:
             now_line = hands.skills_now() if callable(getattr(hands, "skills_now", None)) else None
             if now_line:
                 state["skills_now"] = now_line
+        if self._you_on:
+            # yConsumers: memory's one "you right now" line, rendered in RAM from the background cache (no pipe read)
+            you_line = talker_you().line()
+            if you_line:
+                state["you"] = you_line
         return state
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").
