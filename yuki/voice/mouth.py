@@ -2184,6 +2184,66 @@ REPEAT_NOTE = ("[Your last reply to these words was, word for word, the line you
                "past four.\" Good: you said \"The music's paused.\", they say \"cool, thanks\" -> \"Anytime.\"]")
 
 
+# tTaste (PLAN.md Phase T): the skills-now options. The fresh uploads a request for YouTube's home brought
+# (yuki.skills.youtube_feed: up to 3, named by their channels' own names from the user's data; nothing plays until they
+# pick one), for the talker to offer once and to match "the Deji one" against.
+#: The options line's cap (after every breakpoint, only in the minutes after an offer) and each title's share of it.
+SKILLS_OPTIONS_CHARS = 360
+OPTION_TITLE_CHARS = 28
+#: The skill that plays a picked option (``yuki/skills/connections/web.toml``: its ``video`` slot takes only an offered
+#: name, never a guess).
+PICK_SKILL = "web.open_video"
+
+
+def _option_parts(option: Any) -> tuple[str, str]:
+    """``(name, title)`` of one offered option: a mapping, an object with those attributes, or a bare name."""
+    if isinstance(option, dict):
+        return " ".join(str(option.get("name") or "").split()), " ".join(str(option.get("title") or "").split())
+    if hasattr(option, "name"):
+        return " ".join(str(getattr(option, "name", "") or "").split()), \
+            " ".join(str(getattr(option, "title", "") or "").split())
+    return " ".join(str(option or "").split()), ""
+
+
+def skills_options_line(options: Any) -> str | None:
+    """The talker's options line for the fresh uploads offered on request (at most 3, names only from the user's
+    data), at most :data:`SKILLS_OPTIONS_CHARS`; ``None`` with none. It says the question once ("New from NDL, Deji and
+    Sidemen: want one?" when the done line did not already say it), how a pick runs (:data:`PICK_SKILL` with the name
+    exactly as listed) and that nothing plays otherwise."""
+    parts = [_option_parts(o) for o in (options or [])]
+    parts = [(n, t) for n, t in parts if n][:3]
+    if not parts:
+        return None
+    names = [n for n, _t in parts]
+    said = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    listed = " | ".join(n + (f" ({t[:OPTION_TITLE_CHARS].rstrip()})" if t else "") for n, t in parts)
+    text = (f"Offered on request, nothing plays: new uploads from {listed}. Unless said already, ask once: \"New "
+            f"from {said}: want {'it' if len(names) == 1 else 'one'}?\" Their pick (\"the {min(names, key=len)} "
+            f"one\"): run_skill {PICK_SKILL}, video = its name as listed.")
+    return text if len(text) <= SKILLS_OPTIONS_CHARS else text[: SKILLS_OPTIONS_CHARS - 1].rstrip() + "…"
+
+
+def fetch_skills_options(memory: Any, *, timeout_s: float = 0.3, now: float | None = None) -> list[dict[str, str]]:
+    """The options offered in the last minutes (:func:`yuki.skills.youtube_feed.offered`: a read of memory's own
+    store, no network), as ``[{"name", "title"}]`` for ``state["skills_options"]``, in one bounded call; ``[]`` on no
+    answer. Blocking; off the loop. Never raises."""
+    def read(client: Any) -> list[dict[str, str]]:
+        from yuki.skills import youtube_feed
+
+        store = getattr(client, "store", None)
+        if store is None:
+            return []
+        return [{"name": o.name, "title": o.title} for o in youtube_feed.offered(store, now=now)]
+
+    call = getattr(memory, "call", None)
+    try:
+        if callable(call) and not hasattr(memory, "store"):
+            return list(call("taste options", read, timeout_s=timeout_s) or [])
+        return read(memory) if memory is not None else []
+    except Exception:  # noqa: BLE001 - no answer in time: no options line
+        return []
+
+
 def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
                    desk: str | None = None, call: str | None = None, heard: str | None = None,
                    named: bool = False, work: str | None = None,
@@ -2220,7 +2280,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     Phase S: ``state["skills_now"]`` (the hands' :meth:`~yuki.voice.hands.Hands.skills_now`, at most 300 characters:
     the last skill run and its values, its options, a "Keep this as your usual?" waiting) goes right before the desktop
     block; ``state["skill_keys"]`` (the menu's keys) words the guides' volume examples as the volume skill
-    (:func:`skill_guide`).
+    (:func:`skill_guide`). tTaste: ``state["skills_options"]`` (the fresh uploads offered on request,
+    :func:`fetch_skills_options`) adds :func:`skills_options_line` right after it.
 
     bTalk: ``talker`` ``"lean"`` (design 3) carries the lean guides (:data:`LEAN_FOCUS_GUIDE`,
     :data:`LEAN_RECOGNITION_GUIDE`, :data:`LEAN_WORK_GUIDE`, ...) in the same places; ``"full"`` is as before.
@@ -2303,6 +2364,10 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     if state.get("skills_now"):
         # Phase S: the last skill run, its options and a question waiting (<= 300 chars, after every breakpoint)
         text += "\n\n[" + " ".join(str(state["skills_now"]).split())[:300] + "]"
+    options_line = skills_options_line(state.get("skills_options"))
+    if options_line:
+        # tTaste: the fresh uploads offered on request (names from the user's data; nothing plays until they pick)
+        text += ("\n" if state.get("skills_now") else "\n\n") + "[" + options_line + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
     if (channel or "").strip().lower() == "marker":

@@ -3532,6 +3532,68 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE moments ADD COLUMN entity_key TEXT;
     CREATE INDEX IF NOT EXISTS moments_entity ON moments(entity_key) WHERE entity_key IS NOT NULL;
     """,
+    # 44 (2026-10-10, tTaste; docs/research/audit-2026-10-09/PLAN.md Phase T with the Phase L amendment, D0, D16;
+    # spec round3/map-routines.md T1.1, T1.4): YouTube's fresh uploads (yuki.skills.youtube_feed) and the offers'
+    # outcomes. ``tastes`` itself is migration 41's (recomputed nightly by yuki.skills.taste.recompute).
+    # - yt_channels: one row per channel the user picks (channel_key = the taste row's entity_key of the channel's
+    #   handle page kind), its handle, channel id (one public read of its page, the canonical link: no API key) and
+    #   display name (the feed's author, oEmbed's author_name), all encrypted; resolved_at / tries / error (a code
+    #   word) for the one-time lookup.
+    # - yt_videos: a video seen in a feed or attributed to a channel by oEmbed (video_key = the moments' entity_key of
+    #   its watch page, D23, so the unwatched test is an index lookup); its id and title encrypted; published_at,
+    #   watched_at (the first page moment of it), offered_at (named aloud after a request).
+    # - yt_feed_cache: when each channel's public feed was last read and how it went (status, bytes).
+    # - yt_reads: every network read this module made (kind = page | feed | oembed, status, bytes, ms): the <= 8 an
+    #   hour cap is counted here, across processes. Content-free; pruned after 2 days.
+    # - taste_events: what happened to an offer (offered, outcome; detail content-free JSON: digests, counts, code
+    #   words), for the live check (the user's pick among the three on >= half of the times).
+    # None of these is exposed by the MCP. Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS yt_channels (
+        channel_key            TEXT PRIMARY KEY,
+        handle_ciphertext      TEXT,
+        channel_id_ciphertext  TEXT,
+        name_ciphertext        TEXT,
+        resolved_at            REAL,
+        tries                  INTEGER NOT NULL DEFAULT 0,
+        error                  TEXT,
+        updated_at             REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS yt_videos (
+        video_key            TEXT PRIMARY KEY,
+        channel_key          TEXT,
+        video_id_ciphertext  TEXT,
+        title_ciphertext     TEXT,
+        published_at         REAL,
+        watched_at           REAL,
+        offered_at           REAL,
+        source               TEXT NOT NULL,
+        fetched_at           REAL
+    );
+    CREATE INDEX IF NOT EXISTS yt_videos_channel ON yt_videos(channel_key, published_at);
+    CREATE TABLE IF NOT EXISTS yt_feed_cache (
+        channel_key  TEXT PRIMARY KEY,
+        fetched_at   REAL,
+        status       INTEGER,
+        bytes        INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS yt_reads (
+        id      INTEGER PRIMARY KEY,
+        at      REAL NOT NULL,
+        kind    TEXT NOT NULL,
+        status  INTEGER,
+        bytes   INTEGER,
+        ms      REAL
+    );
+    CREATE INDEX IF NOT EXISTS yt_reads_at ON yt_reads(at);
+    CREATE TABLE IF NOT EXISTS taste_events (
+        id      INTEGER PRIMARY KEY,
+        at      REAL NOT NULL,
+        kind    TEXT NOT NULL,
+        detail  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS taste_events_at ON taste_events(at, kind);
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -11224,6 +11286,259 @@ class Store:
             out.append({"pass": r["pass"], "action": r["action"], "run_id": r["run_id"], "run_kind": r["run_kind"],
                         "new_fact_ids": news})
         return out
+
+    # -- taste: YouTube's fresh uploads and the offers (migration 44, yuki.skills.youtube_feed, yuki.skills.taste) ----
+    # Names, handles, ids and titles are decrypted here in-process only and never logged; everything else is numbers,
+    # keyed digests and code words.
+
+    def yt_read_reserve(self, kind: str, *, cap: int, window_s: float = 3600.0, now: float | None = None) -> int | None:
+        """Reserve one network read of ``kind`` (``page`` / ``feed`` / ``oembed``) under the cap of ``cap`` reads in
+        any ``window_s``, counted across processes in one IMMEDIATE transaction: the new row's id, or None when the
+        cap is reached (nothing is read then)."""
+        when = time.time() if now is None else float(now)
+
+        def op(conn: sqlite3.Connection) -> int | None:
+            used = conn.execute("SELECT count(*) FROM yt_reads WHERE at > ?", (when - float(window_s),)).fetchone()[0]
+            if int(used) >= int(cap):
+                return None
+            return int(conn.execute("INSERT INTO yt_reads(at, kind) VALUES (?, ?)", (when, str(kind))).lastrowid)
+
+        return self._write(op)
+
+    def yt_read_done(self, read_id: int, *, status: int, nbytes: int, ms: float) -> None:
+        """How a reserved read went (HTTP status, 0 for no answer; bytes read; milliseconds)."""
+        self._write(lambda conn: conn.execute("UPDATE yt_reads SET status = ?, bytes = ?, ms = ? WHERE id = ?",
+                                              (int(status), int(nbytes), round(float(ms), 1), int(read_id))))
+
+    def yt_reads_since(self, since: float) -> dict[str, Any]:
+        """Content-free counts of the reads since ``since``: per kind, how many answered 200, and the bytes."""
+        out: dict[str, Any] = {"reads": 0, "ok": 0, "bytes": 0, "kinds": {}}
+        for kind, n, ok, nbytes in self._query(
+                "SELECT kind, count(*), sum(status = 200), coalesce(sum(bytes), 0) FROM yt_reads WHERE at >= ?"
+                " GROUP BY kind", (float(since),)):
+            out["kinds"][str(kind)] = int(n)
+            out["reads"] += int(n)
+            out["ok"] += int(ok or 0)
+            out["bytes"] += int(nbytes or 0)
+        return out
+
+    def yt_channels(self, keys: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+        """``{channel_key: {handle, channel_id, name, resolved_at, tries, error, updated_at}}`` (decrypted, in-process
+        only) for ``keys`` (all rows when None)."""
+        wanted = None if keys is None else sorted({str(k) for k in keys if k})
+        if wanted is not None and not wanted:
+            return {}
+        sql = "SELECT * FROM yt_channels"
+        rows = self._query(sql + (f" WHERE channel_key IN ({','.join('?' * len(wanted))})" if wanted else ""),
+                           wanted or ())
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            try:
+                out[str(r["channel_key"])] = {
+                    "handle": self._dec(r["handle_ciphertext"]), "channel_id": self._dec(r["channel_id_ciphertext"]),
+                    "name": self._dec(r["name_ciphertext"]), "resolved_at": r["resolved_at"],
+                    "tries": int(r["tries"] or 0), "error": r["error"], "updated_at": r["updated_at"]}
+            except Exception:  # noqa: BLE001 - a row the key can't read is left out
+                continue
+        return out
+
+    def save_yt_channel(self, channel_key: str, *, handle: str | None = None, channel_id: str | None = None,
+                        name: str | None = None, error: str | None = None, tried: bool = False,
+                        at: float | None = None) -> None:
+        """Upsert one channel: the values given replace the kept ones (None keeps them); ``tried`` counts one more
+        lookup; a ``channel_id`` given marks it resolved and clears the error, an ``error`` (a code word) records why
+        the lookup failed."""
+        when = time.time() if at is None else float(at)
+
+        def op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "INSERT INTO yt_channels(channel_key, handle_ciphertext, channel_id_ciphertext, name_ciphertext,"
+                " resolved_at, tries, error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(channel_key) DO UPDATE SET"
+                " handle_ciphertext = coalesce(excluded.handle_ciphertext, handle_ciphertext),"
+                " channel_id_ciphertext = coalesce(excluded.channel_id_ciphertext, channel_id_ciphertext),"
+                " name_ciphertext = coalesce(excluded.name_ciphertext, name_ciphertext),"
+                " resolved_at = coalesce(excluded.resolved_at, resolved_at),"
+                " tries = tries + excluded.tries,"
+                " error = CASE WHEN excluded.channel_id_ciphertext IS NOT NULL THEN NULL"
+                "              ELSE coalesce(excluded.error, error) END,"
+                " updated_at = excluded.updated_at",
+                (str(channel_key), self._enc(handle) if handle else None,
+                 self._enc(channel_id) if channel_id else None, self._enc(name) if name else None,
+                 when if channel_id else None, 1 if tried else 0, None if channel_id else error, when))
+
+        self._write(op)
+
+    def save_yt_videos(self, rows: Sequence[dict[str, Any]], *, at: float | None = None) -> int:
+        """Upsert videos: ``{video_key, channel_key, video_id, title?, published_at?, source}``. A kept row keeps its
+        watched and offered times; a channel, title or publish time given fills one it lacked. Returns how many rows
+        were written."""
+        when = time.time() if at is None else float(at)
+        if not rows:
+            return 0
+
+        def op(conn: sqlite3.Connection) -> int:
+            n = 0
+            for r in rows:
+                if not r.get("video_key"):
+                    continue
+                n += conn.execute(
+                    "INSERT INTO yt_videos(video_key, channel_key, video_id_ciphertext, title_ciphertext, published_at,"
+                    " source, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(video_key) DO UPDATE SET"
+                    " channel_key = coalesce(excluded.channel_key, channel_key),"
+                    " video_id_ciphertext = coalesce(video_id_ciphertext, excluded.video_id_ciphertext),"
+                    " title_ciphertext = coalesce(excluded.title_ciphertext, title_ciphertext),"
+                    " published_at = coalesce(excluded.published_at, published_at),"
+                    " fetched_at = excluded.fetched_at",
+                    (str(r["video_key"]), r.get("channel_key"),
+                     self._enc(str(r["video_id"])) if r.get("video_id") else None,
+                     self._enc(str(r["title"])) if r.get("title") else None,
+                     float(r["published_at"]) if r.get("published_at") is not None else None,
+                     str(r.get("source") or "feed"), when)).rowcount
+            return n
+
+        return self._write(op)
+
+    def yt_videos(self, *, channel_keys: Iterable[str] | None = None, video_keys: Iterable[str] | None = None,
+                  published_since: float | None = None, offered_since: float | None = None,
+                  unwatched: bool = False) -> list[dict[str, Any]]:
+        """Video rows as dicts with ``video_id`` and ``title`` decrypted (in-process only), newest first. Filters:
+        their channels, their keys, published at or after, offered at or after, never watched."""
+        clauses, params = [], []
+        for column, values in (("channel_key", channel_keys), ("video_key", video_keys)):
+            if values is not None:
+                values = sorted({str(v) for v in values if v})
+                clauses.append(f"{column} IN ({','.join('?' * len(values))})" if values else "0")
+                params.extend(values)
+        if published_since is not None:
+            clauses.append("published_at >= ?")
+            params.append(float(published_since))
+        if offered_since is not None:
+            clauses.append("offered_at >= ?")
+            params.append(float(offered_since))
+        if unwatched:
+            clauses.append("watched_at IS NULL")
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        out = []
+        for r in self._query("SELECT * FROM yt_videos" + where + " ORDER BY coalesce(published_at, fetched_at) DESC",
+                             params):
+            d = dict(r)
+            try:
+                d["video_id"] = self._dec(d.pop("video_id_ciphertext", None))
+                d["title"] = self._dec(d.pop("title_ciphertext", None))
+            except Exception:  # noqa: BLE001
+                continue
+            out.append(d)
+        return out
+
+    def yt_unwatched_keys(self) -> list[str]:
+        """The keys of the videos never marked watched (nothing decrypted)."""
+        return [str(r[0]) for r in self._query("SELECT video_key FROM yt_videos WHERE watched_at IS NULL")]
+
+    def yt_watch_ages(self) -> dict[str, list[float]]:
+        """``{channel_key: [hours]}``: how old each video with a known publish time (a feed listed it) was when the
+        user first watched it (the measured freshness of their picks, T1.1's ``fresh_age_h``). Content-free."""
+        out: dict[str, list[float]] = {}
+        for key, age in self._query(
+                "SELECT channel_key, watched_at - published_at FROM yt_videos WHERE channel_key IS NOT NULL AND"
+                " watched_at IS NOT NULL AND published_at IS NOT NULL AND watched_at >= published_at"):
+            out.setdefault(str(key), []).append(float(age) / 3600.0)
+        return out
+
+    def mark_yt_videos(self, keys: Iterable[str], column: str, at: float) -> int:
+        """Set ``offered_at`` (always the latest offer) or ``watched_at`` (the first time only) on these videos."""
+        if column not in ("offered_at", "watched_at"):
+            raise ValueError(column)
+        wanted = sorted({str(k) for k in keys if k})
+        if not wanted:
+            return 0
+        guard = "" if column == "offered_at" else " AND watched_at IS NULL"
+        return self._write(lambda conn: conn.execute(
+            f"UPDATE yt_videos SET {column} = ? WHERE video_key IN ({','.join('?' * len(wanted))}){guard}",
+            (float(at), *wanted)).rowcount)
+
+    def yt_feed_cache(self, keys: Iterable[str]) -> dict[str, tuple[float, int]]:
+        """``{channel_key: (fetched_at, status)}`` of the feeds read before."""
+        wanted = sorted({str(k) for k in keys if k})
+        if not wanted:
+            return {}
+        return {str(r[0]): (float(r[1] or 0.0), int(r[2] or 0)) for r in self._query(
+            f"SELECT channel_key, fetched_at, status FROM yt_feed_cache WHERE channel_key IN"
+            f" ({','.join('?' * len(wanted))})", wanted)}
+
+    def save_yt_feed_cache(self, channel_key: str, *, at: float, status: int, nbytes: int) -> None:
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO yt_feed_cache(channel_key, fetched_at, status, bytes) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(channel_key) DO UPDATE SET fetched_at = excluded.fetched_at, status = excluded.status,"
+            " bytes = excluded.bytes", (str(channel_key), float(at), int(status), int(nbytes))))
+
+    def page_entity_keys_seen(self, keys: Iterable[str], *, since: float | None = None,
+                              by: str | None = None) -> dict[str, float]:
+        """``{entity_key: first at}`` of the ``page`` moments whose ``entity_key`` (D23) is one of ``keys`` (a video
+        shown: the unwatched test), optionally since a time and by one side (``user`` / ``yuki``)."""
+        wanted = sorted({str(k) for k in keys if k})
+        out: dict[str, float] = {}
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            sql = (f"SELECT entity_key, min(at) FROM moments WHERE kind = 'page' AND entity_key IN"
+                   f" ({','.join('?' * len(chunk))})")
+            params: list[Any] = list(chunk)
+            if since is not None:
+                sql += " AND at >= ?"
+                params.append(float(since))
+            if by is not None:
+                sql += " AND by = ?"
+                params.append(str(by))
+            for key, at in self._query(sql + " GROUP BY entity_key", params):
+                out[str(key)] = float(at)
+        return out
+
+    def add_taste_event(self, kind: str, detail: dict[str, Any] | None = None, at: float | None = None) -> int:
+        """One taste event (``offered``, ``outcome``, ``offers_off``; ``detail`` content-free: digests, counts, code
+        words); returns its id."""
+        when = time.time() if at is None else float(at)
+        text = json.dumps(detail, sort_keys=True, separators=(",", ":")) if detail else None
+        return self._write(lambda conn: int(conn.execute(
+            "INSERT INTO taste_events(at, kind, detail) VALUES (?, ?, ?)", (when, str(kind), text)).lastrowid))
+
+    def taste_events(self, *, since: TimeArg = None, until: TimeArg = None,
+                     kinds: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        """Taste events with ``at`` in ``[since, until)``, oldest first (``detail`` parsed)."""
+        clauses, params = [], []
+        if (s := _ts(since)) is not None:
+            clauses.append("at >= ?")
+            params.append(s)
+        if (u := _ts(until)) is not None:
+            clauses.append("at < ?")
+            params.append(u)
+        if kinds is not None:
+            kinds = list(kinds)
+            clauses.append(f"kind IN ({','.join('?' * len(kinds))})" if kinds else "0")
+            params.extend(kinds)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        out = []
+        for r in self._query("SELECT * FROM taste_events" + where + " ORDER BY at, id", params):
+            d = dict(r)
+            try:
+                d["detail"] = json.loads(d["detail"]) if d.get("detail") else {}
+            except ValueError:
+                d["detail"] = {}
+            out.append(d)
+        return out
+
+    def prune_yt(self, *, videos_before: float, reads_before: float) -> dict[str, int]:
+        """Drop videos neither published nor watched nor offered since ``videos_before`` (the 60-day window) and the
+        read log before ``reads_before``; channel rows stay (a lookup is made once)."""
+
+        def op(conn: sqlite3.Connection) -> dict[str, int]:
+            videos = conn.execute(
+                "DELETE FROM yt_videos WHERE coalesce(published_at, 0) < ? AND coalesce(watched_at, 0) < ?"
+                " AND coalesce(offered_at, 0) < ? AND coalesce(fetched_at, 0) < ?",
+                (float(videos_before),) * 4).rowcount
+            reads = conn.execute("DELETE FROM yt_reads WHERE at < ?", (float(reads_before),)).rowcount
+            return {"videos": int(videos or 0), "reads": int(reads or 0)}
+
+        return self._write(op)
 
 
 def _split_sql(script: str) -> list[str]:

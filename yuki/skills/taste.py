@@ -1,45 +1,67 @@
-"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T; map-routines T1). Read skeleton (sCore), the
-seeds that exist before phase T (sWeb), and the taste kinds of phase L (lWire; learner design §5).
+"""Taste: what the user picks by hour of day (PLAN.md D5, Phase T with the Phase L amendment; map-routines T1).
+
+Read side (sCore), the seeds (sWeb, lWire) and phase T's nightly recompute (tTaste).
 
 Table ``tastes`` (migration 41, T1.1's schema): one row per ``(kind, entity_key)``, the display name and its link
-encrypted, and two hour-of-day histograms (weekday / weekend; 24 decayed counts, content-free). Phase T (``tTaste``)
-recomputes it nightly from the moments and adds ``recompute`` / ``options``; the read side here serves the resolver's
-slot fill and the menu's candidate names. Names are decrypted in-process and never logged.
+encrypted, two hour-of-day histograms (weekday / weekend; 24 decayed counts, content-free), ``n_obs`` (the decayed
+count) and, for a YouTube channel, ``fresh_age_h`` (how old the videos the user watched from it were: measured).
+Names are decrypted in-process and never logged; logs and returned counts are numbers only.
 
-**Taste kinds come from data, never a list here** (design §5: "fill-slot kinds come from capability and site data"):
+**Taste kinds come from data, never a list here** (learner design §5: "fill-slot kinds come from capability and site
+data"):
 
 * a capability's fill slot that declares an entity ``kind``: ``<connection app>_<kind>`` (``connection.py`` derives it:
-  a playlist slot's kind);
+  Spotify's playlist slot is ``spotify_playlist``), observed on the capability's end moments of that app
+  (:func:`capability_kinds`: ``media_context`` for the playlist);
 * a site file's page kind whose template has a speakable variable (``yuki/connect/sites/*.toml`` ``[pages]``; a
   variable named ``id`` is an opaque id, opened only from a link: lSplit's ``page_address`` rule): ``<site>_<page>``
-  (:func:`site_kinds`); a learned skill bound to that site and page fills its entity slot from it (:func:`slot_kind`);
-* the same entity seen in two browsers is one row: the key is a keyed digest of the kind and the value, never of the
-  program (moments' ``entity_key`` joins them the same way, D23).
+  (:func:`site_kinds`: a YouTube channel's handle page is ``youtube_handle``), observed on the user's ``page`` moments
+  on that template; a learned skill bound to that site and page fills its entity slot from it (:func:`slot_kind`);
+* a watched video counts for its channel once :mod:`yuki.skills.youtube_feed` knows whose it is (a feed listed it, or
+  one oEmbed read): :func:`youtube_feed.attributed <yuki.skills.youtube_feed.attributed>`;
+* one entity seen in two browsers is one row: observations are grouped by the moments' ``entity_key`` (D23: the keyed
+  digest of where the entity lives and what it is, never of the program), and the row's own key is a keyed digest of
+  the kind and the value (:func:`entity_key`), never the value in clear.
 
-**Seeds (no fetching; fresh uploads are phase T):**
+**The nightly recompute** (:func:`recompute`, run by :func:`seed`, the memory service's daily hook): per kind, from the
+last 60 days of moments, each pick weighted ``0.5 ** (age / 21 days)``; the same entity again within 30 minutes is
+the same pick (a pause and resume, a channel page then one of its videos). A pick is the user's: their own moments,
+or a request of Yuki's whose values came from their words (its runs' ``filled``: ``words`` / ``again`` / ``told``,
+never a taste guess, so a guess never feeds itself; a usual only picks the browser). Never a skill the user marked Not
+mine. Recomputed, never
+incremented: a rerun changes nothing and nothing drifts; an entity whose weight fell under :data:`FLOOR` drops out.
+Never with a game in front or a call: then it is tried again later (a one-shot timer, :data:`RETRY_S`).
 
-* :func:`seed_sites`: per site page kind of :func:`site_kinds`, the entities the user visits, from their own ``page``
-  moments on that template (Yuki's own visits never count), recomputed from the last 60 days with a 21-day half-life
-  (map-routines T1.2, T1.3), never incremented, so a rerun changes nothing. No network.
-* :func:`note`: one choice the user made in their own words that a skill then saw done (a voice channel joined:
-  map-routines T1.2 "his words only").
+**Scoring** (T1.3): ``score(entity | now)`` = the histogram of today's kind of day (weekday / weekend) smoothed by a
+Gaussian of :data:`SIGMA_MIN` around the clock time; when that kernel mass is under :data:`FALLBACK_MASS` the all-days
+sum is used. No fixed bands. :func:`top` fills a slot in code when the words name nothing ("play something": the
+usual playlist for this hour, named in the done line); :func:`options` gives the names the talker may match words
+against; :func:`offered` the fresh uploads named aloud after a request (``youtube_feed``), for "the Deji one".
 
-``seed(store)`` runs every seed (the nightly intake's hook). Content-free counts back; names only encrypted.
+Seeds kept from before phase T: :func:`seed_sites` (the site kinds alone) and :func:`note` (one choice the user named
+and a skill saw done: a voice channel joined, map-routines T1.2 "his words only").
 """
 
 from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
-#: The smoothing of the hour histograms when scoring an hour (minutes; map-routines T: sigma = 90 min).
+#: The smoothing of the hour histograms when scoring an hour (minutes; map-routines T1.3: sigma = 90 min).
 SIGMA_MIN = 90.0
+#: Under this kernel mass on today's kind of day, the all-days histogram scores the hour (T1.3).
+FALLBACK_MASS = 1.0
 #: Candidates the menu lists per slot at most (map-skills S3.1).
 MENU_CANDIDATES = 5
+#: Names :func:`options` gives at most (T1.3).
+OPTIONS_N = 8
+
+LogFn = Callable[..., None]
 
 
 @dataclass(frozen=True)
@@ -73,9 +95,21 @@ def hour_score(hist: list[float], hour: float) -> float:
     return total
 
 
+def score_at(weekday: list[float], weekend: list[float], now: float) -> float:
+    """T1.3's score at ``now``: today's kind of day (weekday / weekend) around the clock time, or the all-days sum
+    when today's kernel mass is under :data:`FALLBACK_MASS`."""
+    stamp = datetime.fromtimestamp(float(now))
+    hour = stamp.hour + stamp.minute / 60.0
+    today = weekend if stamp.weekday() >= 5 else weekday
+    s = hour_score(today, hour)
+    if s < FALLBACK_MASS:
+        s = hour_score([a + b for a, b in zip(weekday, weekend)], hour)
+    return s
+
+
 def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: float | None = None) -> list[Taste]:
-    """The ``n`` entities of ``kind`` the user picks most at this hour (weekday or weekend histogram), best first.
-    ``until``: rows last updated before it only (replays). Read only; never raises (``[]``)."""
+    """The ``n`` entities of ``kind`` the user picks most at this hour (:func:`score_at`), best first. ``until``: rows
+    last updated before it only (replays). Read only; never raises (``[]``)."""
     now = time.time() if now is None else float(now)
     try:
         rows = store._query(
@@ -84,12 +118,9 @@ def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: f
             (kind, float(until)) if until is not None else (kind,))
     except Exception:  # noqa: BLE001
         return []
-    stamp = datetime.fromtimestamp(now)
-    hour = stamp.hour + stamp.minute / 60.0
-    weekend = stamp.weekday() >= 5
     scored = []
     for key, name_ct, ref_ct, wd, we, n_obs in rows:
-        score = hour_score(_hist(we if weekend else wd), hour)
+        score = score_at(_hist(wd), _hist(we), now)
         try:
             name = store._dec(name_ct) or ""
             ref = store._dec(ref_ct) or ""
@@ -112,6 +143,12 @@ def candidates(store: Any, kind: str, *, now: float | None = None, limit: int = 
     return [t.name for t in top(store, kind, now=now, n=limit) if t.name]
 
 
+def options(store: Any, kind: str, *, now: float | None = None, n: int = OPTIONS_N) -> list[str]:
+    """T1.3: the names the talker or the model may match the user's words against (their own playlist or channel
+    names, best at this hour first). Never raises."""
+    return candidates(store, kind, now=now, limit=n)
+
+
 def find(store: Any, kind: str, name: str) -> Taste | None:
     """The taste row whose name equals ``name`` (case and spacing folded: identity, never meaning)."""
     want = " ".join(str(name or "").split()).casefold()
@@ -123,20 +160,81 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
     return None
 
 
+def offered(store: Any, *, now: float | None = None) -> list[Taste]:
+    """The fresh uploads named aloud after a request in the last minutes (:func:`yuki.skills.youtube_feed.offered`), as
+    tastes: the name said (the channel's), the video's link, its key. What "the Deji one" is matched against, for a
+    slot that :func:`takes_offers` (``web.open_video``'s ``video``: a video nobody picked never plays). Never raises
+    (``[]``)."""
+    try:
+        from yuki.skills import youtube_feed
+
+        return [Taste(o.key, o.name, o.ref, round(o.score, 4), 1.0) for o in youtube_feed.offered(store, now=now)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def find_offered(store: Any, name: Any, *, now: float | None = None) -> dict[str, Any] | None:
+    """The offered video a picked name means (``{"name", "key", "ref"}``: the slot value with its link), by identity
+    with the name said, the channel's handle or the video's title (:func:`yuki.skills.youtube_feed.pick`), or None."""
+    try:
+        from yuki.skills import youtube_feed
+
+        return youtube_feed.pick(store, name, now=now)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def takes_offers(skill: Any, slot: Any) -> bool:
+    """Whether ``slot`` is filled from the offered options (:func:`offered`, "the Deji one"): an entity slot with no
+    taste kind that every route of ``skill`` runs only with a value carrying a field an offered option's value has and
+    a spoken name lacks (:data:`OFFER_FIELDS`: ``when = { slot = "video", field = "ref", has = true }`` on
+    ``web.open_video``). A name alone can never run such a slot, so the offers are what it picks from. Data only (the
+    routes' own conditions, read through ``connection.py``): ``web.open_page``'s ``item`` (a handle opens by name) and
+    a voice channel are not (tTaste r1 M3). Never raises (False)."""
+    try:
+        if getattr(slot, "type", "") != "entity" or getattr(slot, "taste", ""):
+            return False
+        name = str(getattr(slot, "name", "") or "")
+        routes = tuple(getattr(skill, "routes", None) or ())
+        if not name or not routes:
+            return False
+        return all(any(str(cond.get("slot") or "") == name and str(cond.get("field") or "") in OFFER_FIELDS
+                       and bool(cond.get("has", True)) for cond in (getattr(r, "when", None) or ()))
+                   for r in routes)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ---------------------------------------------------------------------------------------------------------------------
-# Seeds (sWeb): what exists before phase T's nightly recompute
+# Kinds from data
 # ---------------------------------------------------------------------------------------------------------------------
 
-#: How far back the seeds look, and the half-life of an observation (map-routines T1.3).
+#: How far back the recompute looks, and the half-life of a pick (map-routines T1.3).
 SEED_DAYS = 60.0
 HALF_LIFE_DAYS = 21.0
+#: The same entity picked again within this long is one pick (a pause and resume, a page then its video).
+SESSION_GAP_S = 1800.0
+#: An entity whose decayed weight is under this drops out (about one pick seven weeks ago).
+FLOOR = 0.2
 #: A page template variable with this name is an opaque id (a video's), opened only from a link or an offered option's
 #: ref, never said (lSplit review r1 L5): its pages make no taste kind.
 OPAQUE_VAR = "id"
 #: Kinds an earlier seed wrote that no seed writes any more (sWeb's YouTube-only seed: now ``youtube_handle`` from the
-#: site data): their ``observed`` rows are removed by :func:`seed_sites` (lWire review r1 L4). Our own old codes, never
-#: the user's.
+#: site data): their ``observed`` rows are removed by the recompute (lWire review r1 L4). Our own old codes, never the
+#: user's.
 RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
+#: A request of Yuki's counts as the user's pick when its runs' values came from these fill sources
+#: (``skill_runs.filled``), and never when any came from :data:`GUESS_FILLS` (a guess must not feed itself). Only the
+#: taste guess: ``pref`` fills means slots only (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which
+#: browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
+ASKED_FILLS: frozenset[str] = frozenset({"words", "again", "told"})
+GUESS_FILLS: frozenset[str] = frozenset({"taste"})
+#: The fields an offered option's value carries beyond its name (``youtube_feed.Offer.value``): a slot every route of
+#: which needs one of them is filled from the offers (:func:`takes_offers`).
+OFFER_FIELDS: frozenset[str] = frozenset({"key", "ref"})
+#: A recompute held back by a game or a call is tried again this long after, at most :data:`RETRIES` times.
+RETRY_S = 1800.0
+RETRIES = 8
 
 
 def _norm(value: Any) -> str:
@@ -144,7 +242,7 @@ def _norm(value: Any) -> str:
 
 
 def entity_key(store: Any, kind: str, value: Any) -> str:
-    """A taste's ``entity_key``: the store's keyed digest of the kind and the normalised id (a handle, a channel's
+    """A taste's ``entity_key``: the store's keyed digest of the kind and the normalised id (a handle, a playlist's
     name), never the value in clear."""
     return str(store.cipher.digest("taste", str(kind), _norm(value)))
 
@@ -170,6 +268,29 @@ def site_kinds() -> list[tuple[str, str, str, str]]:
     return out
 
 
+def capability_kinds(loaded: Any = None) -> list[tuple[str, str, str]]:
+    """``(taste kind, app, end kind)`` for every capability fill slot that declares an entity kind and is read from its
+    end moment's entity (``bind = { <slot> = "entity" }``): Spotify's ``playlist`` slot is ``("spotify_playlist",
+    "spotify", "media_context")``. Data only (the shipped connection files); ``[]`` when they can't be read."""
+    try:
+        if loaded is None:
+            from yuki.skills.connection import load
+
+            loaded = load()
+        caps = loaded.capabilities
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple[str, str, str]] = []
+    for cap in caps:
+        bind = dict(getattr(cap, "bind", None) or {})
+        for slot in cap.slots:
+            if slot.taste and slot.type == "entity" and bind.get(slot.name) == "entity" and cap.app and cap.end:
+                hit = (slot.taste, cap.app, cap.end)
+                if hit not in out:
+                    out.append(hit)
+    return out
+
+
 def slot_kind(skill: Any, slot: Any) -> str:
     """The taste kind a slot of a catalog entry fills from: the slot's own (``connection.py``: a capability's fill slot
     with an entity ``kind``), else, for a learned skill whose bound site and page are a page kind of
@@ -187,64 +308,197 @@ def slot_kind(skill: Any, slot: Any) -> str:
     return next((k for k, s, p, _v in site_kinds() if (s.casefold(), p.casefold()) == want), "")
 
 
-def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS) -> dict[str, Any]:
-    """Recompute the site tastes (source ``observed``) of every :func:`site_kinds` kind from the user's own ``page``
-    moments on that template in the last ``days``: per entity, two hour histograms of visits decayed with a
-    :data:`HALF_LIFE_DAYS` half-life, its name (the template's value) and link (the site's ``[urls]`` of that kind)
-    encrypted. Rows no visit supports any more are removed (per seeded kind only), and so are the ``observed`` rows of
-    :data:`RETIRED_KINDS`. Idempotent; never raises
-    (``{"error": 1}`` on failure). Content-free counts."""
-    now = time.time() if now is None else float(now)
-    kinds = {f"{s}.{p}": (k, s, p, v) for k, s, p, v in site_kinds()}
-    if not kinds:
-        return {"kinds": 0, "entities": 0, "visits": 0}
+# ---------------------------------------------------------------------------------------------------------------------
+# The nightly recompute (tTaste)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _asked_runs(store: Any, since: float) -> dict[str, bool]:
+    """``{request_id: the user named its values}`` of Yuki's runs since ``since`` (``skill_runs.filled``): True when a
+    run's value came from their words (:data:`ASKED_FILLS`) and no run of that request took a guess
+    (:data:`GUESS_FILLS`). Keyed on the request alone, so a moment counts whatever end its run declared: the watch page
+    of "the Deji one" belongs to a ``web.open_video`` run whose end is ``media_play`` (tTaste r1 L3)."""
     try:
-        rows = store.moments_between(now - float(days) * 86400.0, now + 1.0, kinds=["page"])
+        rows = store._query("SELECT request_id, filled FROM skill_runs WHERE t0 >= ? AND request_id IS NOT NULL",
+                            (float(since) - 3600.0,))
+    except Exception:  # noqa: BLE001 - no ledger yet
+        return {}
+    named: set[str] = set()
+    guessed: set[str] = set()
+    for request_id, filled in rows:
+        try:
+            sources = {str(v) for v in (json.loads(filled or "{}") or {}).values()}
+        except (TypeError, ValueError, AttributeError):
+            sources = set()
+        key = str(request_id)
+        if sources & GUESS_FILLS:
+            guessed.add(key)
+        elif sources & ASKED_FILLS:
+            named.add(key)
+    return {key: key not in guessed for key in named | guessed}
+
+
+def _not_mine_moments(store: Any) -> set[int]:
+    """The end moments of the occasions of skills the user marked Not mine or Forget this (lPage's tombstones): they
+    feed no taste (the learner keeps their occasions on the tombstone's id)."""
+    try:
+        return {int(r[0]) for r in store._query(
+            "SELECT o.end_moment_id FROM occasions o JOIN skills s ON s.id = o.skill_id WHERE o.end_moment_id IS NOT "
+            "NULL AND (s.deleted_at IS NOT NULL OR s.state IN ('deleted', 'not_mine'))")}
+    except Exception:  # noqa: BLE001 - no learner tables yet
+        return set()
+
+
+class _Picks:
+    """The picks gathered per ``(kind, group)``: ``(at, value, ref)``, later collapsed into sessions and decayed."""
+
+    def __init__(self) -> None:
+        self.by: dict[tuple[str, str], list[tuple[float, str, str]]] = {}
+
+    def add(self, kind: str, group: str, at: float, value: str, ref: str) -> None:
+        self.by.setdefault((kind, group), []).append((float(at), value, ref))
+
+    def rows(self, store: Any, now: float) -> dict[tuple[str, str], dict[str, Any]]:
+        """``{(kind, entity_key): row}``: two decayed hour histograms, the decayed count, the newest name and link."""
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for (kind, _group), picks in self.by.items():
+            picks.sort(key=lambda p: p[0])
+            wd, we = [0.0] * 24, [0.0] * 24
+            total, last, kept = 0.0, None, 0
+            name, ref = "", ""
+            for at, value, link in picks:
+                if last is not None and at - last < SESSION_GAP_S:
+                    last = at
+                    continue
+                last = at
+                weight = math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
+                weekend, hour = _slot_of(at)
+                (we if weekend else wd)[hour] += weight
+                total += weight
+                kept += 1
+                name, ref = value or name, link or ref
+            if total < FLOOR or not name:
+                continue
+            key = entity_key(store, kind, name)
+            row = out.get((kind, key))
+            if row is not None:   # two groups, one name (a digest-only entity met its named twin): one row
+                row["wd"] = [a + b for a, b in zip(row["wd"], wd)]
+                row["we"] = [a + b for a, b in zip(row["we"], we)]
+                row["n"] += total
+                row["picks"] += kept
+                row["last"] = max(row["last"], picks[-1][0])
+                continue
+            out[(kind, key)] = {"name": name, "ref": ref, "wd": wd, "we": we, "n": total, "picks": kept,
+                                "last": picks[-1][0]}
+        return out
+
+
+def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, only: str | None = None,
+              loaded: Any = None) -> dict[str, Any]:
+    """Recompute the ``observed`` taste rows of every kind from data (:func:`capability_kinds`, :func:`site_kinds`, and
+    the watched videos :mod:`~yuki.skills.youtube_feed` attributed to a channel) from the last ``days`` of moments (see
+    the module docstring). ``only="site"``: the site kinds alone (:func:`seed_sites`). Rows of a computed kind that no
+    pick supports any more are removed, and so are the ``observed`` rows of :data:`RETIRED_KINDS`; ``said`` rows of
+    other kinds (:func:`note`) are left alone. Idempotent; content-free counts back; never raises (``{"error": 1}``)."""
+    now = time.time() if now is None else float(now)
+    started = time.perf_counter()
+    since = now - float(days) * 86400.0
+    caps = [] if only == "site" else capability_kinds(loaded)
+    sites = {f"{s}.{p}": (k, s, p, v) for k, s, p, v in site_kinds()}
+    kinds = sorted({k for k, _a, _e in caps} | {k for k, _s, _p, _v in sites.values()})
+    counts: dict[str, Any] = {"kinds": len(kinds), "entities": 0, "picks": 0, "visits": 0, "removed": 0}
+    if not kinds:
+        return counts
+    ends = sorted({e for _k, _a, e in caps} | ({"page"} if sites else set()))
+    try:
+        rows = store.moments_between(since, now + 1.0, kinds=ends)
     except Exception:  # noqa: BLE001 - no moments table yet
-        return {"kinds": len(kinds), "entities": 0, "visits": 0, "error": 1}
+        return {**counts, "error": 1}
+    asked = _asked_runs(store, since)
+    skip = _not_mine_moments(store)
+
+    def users(r: dict[str, Any]) -> bool:
+        if r.get("id") is not None and int(r["id"]) in skip:
+            return False
+        if r.get("by", "user") == "user":
+            return True
+        return asked.get(str(r.get("request_id") or ""), False)
+
     from yuki.connect.templates import fill
 
-    found: dict[tuple[str, str], dict[str, Any]] = {}
-    visits = 0
+    picks = _Picks()
+    cap_of = {(a, e): k for k, a, e in caps}
+    page_rows: list[dict[str, Any]] = []
     for r in rows:
-        facts = r.get("facts") or {}
-        hit = kinds.get(str(facts.get("template") or ""))
-        if r.get("by") != "user" or hit is None:
+        if r.get("kind") == "page":
+            page_rows.append(r)
+        if not users(r):
             continue
-        kind, site_name, page_kind, var = hit
+        if r.get("kind") == "page":
+            hit = sites.get(str((r.get("facts") or {}).get("template") or ""))
+            if hit is None:
+                continue
+            kind, site_name, page_kind, var = hit
+            try:
+                value = " ".join(str(store.moment_entity(r) or "").split())
+            except Exception:  # noqa: BLE001 - a row the key can't read
+                continue
+            if not value:
+                continue
+            group = str(r.get("entity_key") or _norm(value))
+            picks.add(kind, group, float(r["at"]), value, fill(site_name, page_kind, **{var: value}) or "")
+            counts["visits"] += 1
+            continue
+        kind = cap_of.get((str(r.get("app") or ""), str(r.get("kind") or "")))
+        if kind is None:
+            continue
         try:
             value = " ".join(str(store.moment_entity(r) or "").split())
-        except Exception:  # noqa: BLE001 - a row the key can't read
+            facts = r.get("facts") or {}
+            ref = store._dec(facts["uri_ciphertext"]) if facts.get("uri_ciphertext") else ""
+        except Exception:  # noqa: BLE001
             continue
-        if not value:
+        if not value:   # a digest-only entity (a Spotify-owned list): nothing to say or fill by name
             continue
-        key = entity_key(store, kind, value)
-        entry = found.setdefault((kind, key), {"name": value, "ref": fill(site_name, page_kind, **{var: value}) or "",
-                                               "wd": [0.0] * 24, "we": [0.0] * 24, "n": 0.0, "last": 0.0})
-        at = float(r["at"])
-        weight = math.pow(0.5, max(0.0, now - at) / (HALF_LIFE_DAYS * 86400.0))
-        weekend, hour = _slot_of(at)
-        entry["we" if weekend else "wd"][hour] += weight
-        entry["n"] += weight
-        entry["last"] = max(entry["last"], at)
-        visits += 1
-    seeded = sorted({k for k, _s, _p, _v in kinds.values()})
+        if facts.get("initial"):   # already playing when the reader started: when it was picked is unknown
+            continue
+        # the reader's own fact: when the media read saw the music start (the pick), else the moment's time
+        since_at = facts.get("since")
+        ok_since = isinstance(since_at, (int, float)) and not isinstance(since_at, bool) and since_at <= float(r["at"])
+        at = float(since_at) if ok_since else float(r["at"])
+        picks.add(kind, str(r.get("entity_key") or _norm(value)), at, value, ref or "")
+        counts["picks"] += 1
+    channel_kind = ""
+    fresh: dict[str, float] = {}
+    if page_rows:
+        try:
+            from yuki.skills import youtube_feed
+
+            channel_kind = youtube_feed.CHANNEL_KIND if youtube_feed.CHANNEL_KIND in kinds else ""
+            if channel_kind:
+                for at, handle, ref, group in youtube_feed.attributed(store, page_rows, users):
+                    picks.add(channel_kind, group, at, handle, ref)
+                    counts["picks"] += 1
+                fresh = youtube_feed.fresh_ages(store)
+        except Exception:  # noqa: BLE001 - the channel picks from pages alone
+            channel_kind = ""
+    found = picks.rows(store, now)
 
     def write(conn: Any) -> int:
-        marks = ",".join("?" * len(seeded))
+        marks = ",".join("?" * len(kinds))
         old = {(str(k), str(e)) for k, e in conn.execute(
-            f"SELECT kind, entity_key FROM tastes WHERE source = 'observed' AND kind IN ({marks})", seeded).fetchall()}
+            f"SELECT kind, entity_key FROM tastes WHERE source = 'observed' AND kind IN ({marks})", kinds).fetchall()}
         for (kind, key), e in found.items():
             conn.execute(
                 "INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
-                "hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, ?, 'observed', ?, ?, ?, ?, ?) "
-                "ON CONFLICT(kind, entity_key) DO UPDATE SET name_ciphertext = excluded.name_ciphertext, "
-                "ref_ciphertext = excluded.ref_ciphertext, source = 'observed', hist_weekday = excluded.hist_weekday, "
-                "hist_weekend = excluded.hist_weekend, n_obs = excluded.n_obs, last_at = excluded.last_at, "
-                "updated_at = excluded.updated_at",
+                "hist_weekend, n_obs, last_at, fresh_age_h, updated_at) VALUES (?, ?, ?, ?, 'observed', ?, ?, ?, ?, ?, "
+                "?) ON CONFLICT(kind, entity_key) DO UPDATE SET name_ciphertext = excluded.name_ciphertext, "
+                "ref_ciphertext = coalesce(excluded.ref_ciphertext, ref_ciphertext), source = 'observed', "
+                "hist_weekday = excluded.hist_weekday, hist_weekend = excluded.hist_weekend, n_obs = excluded.n_obs, "
+                "last_at = excluded.last_at, fresh_age_h = excluded.fresh_age_h, updated_at = excluded.updated_at",
                 (kind, key, store._enc(e["name"]), store._enc(e["ref"]) if e["ref"] else None,
                  json.dumps([round(x, 4) for x in e["wd"]]), json.dumps([round(x, 4) for x in e["we"]]),
-                 round(e["n"], 4), e["last"], now))
+                 round(e["n"], 4), e["last"], fresh.get(key) if kind == channel_kind else None, now))
         gone = sorted(old - set(found))
         for kind, key in gone:
             conn.execute("DELETE FROM tastes WHERE kind = ? AND source = 'observed' AND entity_key = ?", (kind, key))
@@ -255,8 +509,14 @@ def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS)
     try:
         removed = store._write(write)
     except Exception:  # noqa: BLE001
-        return {"kinds": len(seeded), "entities": 0, "visits": visits, "error": 1}
-    return {"kinds": len(seeded), "entities": len(found), "visits": visits, "removed": int(removed)}
+        return {**counts, "error": 1}
+    counts.update(entities=len(found), removed=int(removed), ms=round((time.perf_counter() - started) * 1000, 1))
+    return counts
+
+
+def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS) -> dict[str, Any]:
+    """The site kinds alone (:func:`recompute` with ``only="site"``): kept for the callers from before phase T."""
+    return recompute(store, now=now, days=days, only="site")
 
 
 def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float | None = None,
@@ -295,13 +555,91 @@ def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float 
         return False
 
 
-def seed(store: Any, *, now: float | None = None) -> dict[str, Any]:
-    """Every seed (the memory service's daily hook): content-free counts per seed. The memory service's
-    ``taste_seed`` log line reads the counts under the seed's first key (sWeb's), kept as an alias."""
-    pages = seed_sites(store, now=now)
-    return {"pages": pages, "yt_channel": pages}
+def busy(store: Any, now: float | None = None) -> str | None:
+    """A code word when the nightly pass must wait, else None: ``game`` (a game in front, D9's local read),
+    ``call`` (a call or a game's voice chat open: :func:`yuki.memory.portrait.scheduled_busy`, the nightly portrait's
+    own rule), ``unknown`` (the game check failed: fails closed). The learner's ``quiet`` without its idle rule."""
+    now = time.time() if now is None else float(now)
+    try:
+        from yuki.memory.gamegate import game_in_front
+
+        if game_in_front():
+            return "game"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    try:
+        from yuki.memory.portrait import scheduled_busy
+
+        if scheduled_busy(store, None, now):
+            return "call"
+    except Exception:  # noqa: BLE001 - a store without calls: nothing holds it
+        pass
+    return None
 
 
-__all__ = ["SIGMA_MIN", "MENU_CANDIDATES", "Taste", "hour_score", "top", "candidates", "find", "SEED_DAYS",
-           "HALF_LIFE_DAYS", "OPAQUE_VAR", "RETIRED_KINDS", "entity_key", "site_kinds", "slot_kind", "seed_sites",
-           "note", "seed"]
+_retry_lock = threading.Lock()
+_retry: dict[str, Any] = {"timer": None, "left": RETRIES}
+
+
+def _retry_later(store: Any, log: LogFn | None) -> bool:
+    """One one-shot timer (no loop) that runs :func:`seed` again in :data:`RETRY_S`, at most :data:`RETRIES` times in a
+    row. False when none is left or one is already set."""
+    with _retry_lock:
+        if _retry["timer"] is not None or int(_retry["left"]) <= 0:
+            return False
+        _retry["left"] = int(_retry["left"]) - 1
+
+        def again() -> None:
+            with _retry_lock:
+                _retry["timer"] = None
+            got = seed(store, log=log)
+            if log is not None:
+                try:
+                    log("taste_seed", retry=1, **_numbers(got.get("yt_channel") or {}))
+                except Exception:  # noqa: BLE001
+                    pass
+
+        timer = threading.Timer(RETRY_S, again)
+        timer.daemon = True
+        timer.name = "yuki-taste-retry"
+        _retry["timer"] = timer
+    timer.start()
+    return True
+
+
+def _numbers(d: dict[str, Any]) -> dict[str, float]:
+    return {k: v for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retry: bool = True,
+         network: bool = True) -> dict[str, Any]:
+    """The nightly taste pass (the memory service's daily hook): never with a game in front or a call (then a one-shot
+    retry, :data:`RETRY_S`); else :func:`recompute`, then YouTube's nightly part
+    (:func:`yuki.skills.youtube_feed.nightly`: channel ids and watched videos' channels, within the shared cap of
+    reads; the offers' outcomes; pruning). ``network=False``: no reads (a copy, a replay). Content-free counts; the
+    memory service's ``taste_seed`` log line reads the numbers under ``yt_channel`` (the first key sWeb's, kept as
+    an alias for the whole pass)."""
+    hold = busy(store, now)
+    if hold is not None:
+        retried = _retry_later(store, log) if retry else False
+        flat = {"held": 1, "retry_set": int(retried)}
+        return {"held": hold, "yt_channel": flat}
+    with _retry_lock:
+        _retry["left"] = RETRIES
+    got = recompute(store, now=now)
+    yt: dict[str, Any] = {}
+    try:
+        from yuki.skills import youtube_feed
+
+        yt = youtube_feed.nightly(store, now=now, log=log, network=network)
+    except Exception:  # noqa: BLE001 - the tastes stand without YouTube's part
+        yt = {"error": 1}
+    flat = {**_numbers(got), **{f"yt_{k}": v for k, v in _numbers(yt).items()}}
+    return {"pages": got, "youtube": yt, "yt_channel": flat}
+
+
+__all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "Taste", "hour_score", "score_at", "top",
+           "candidates", "options", "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
+           "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
+           "entity_key", "site_kinds",
+           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "busy", "seed"]
