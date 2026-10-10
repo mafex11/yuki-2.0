@@ -2059,17 +2059,33 @@ class MemoryClient:
         # a typed offer only (yuki.memory.offers): what the card shows and its button runs, by code; a free-text
         # offer from before 2026-10-03 gets no button (a sentence is not something code can run)
         inputs = getattr(n, "inputs", None)
-        # a check-in card's moment (day_start, followup, ...), as Yuki wrote it: the card's title comes from it
-        moment = inputs.get("moment") if isinstance(inputs, dict) and n.trigger == "checkin" else None
+        trigger = str(n.trigger or "")
+        # a check-in card's moment (day_start, followup, ...), as Yuki wrote it: the card's title comes from it. The
+        # card judge's check-ins carry it in their trigger (``checkin:<moment>``, jSwitch: the ledger counts them
+        # without decrypting); its Today card asks the day's question (``today``, a question card: ``day_start``)
+        moment = None
+        if isinstance(inputs, dict) and trigger == "checkin":
+            moment = inputs.get("moment")
+        elif trigger.startswith("checkin:"):
+            moment = trigger.split(":", 1)[1]
+        elif trigger == "today" and n.kind == "question":
+            moment = "day_start"
         # a call's keep list (report 76 item 5, yuki.memory.admission): its lines, each answered with recap_keep
-        keep = inputs.get("keep") if isinstance(inputs, dict) and n.trigger == "recap" else None
+        keep = inputs.get("keep") if isinstance(inputs, dict) and trigger == "recap" else None
         keep = [{"ref": str(k.get("ref")), "text": str(k.get("text") or ""),
                  "who": "others" if k.get("who") == "others" else "user"} for k in keep or []
                 if isinstance(k, dict) and k.get("ref")] or None
+        # the Today card / "While you were away" (the card judge, jSwitch): its numbered lines with their ids, so a
+        # reply keeps which line it answers (nudge_reply_request) and the window's per-line Open / Not useful work
+        lines = None
+        if isinstance(inputs, dict) and trigger in ("today", "away") and isinstance(inputs.get("lines"), list):
+            lines = [{"n": int(ln.get("n") or 0), "type": str(ln.get("type") or ""), "ref": str(ln.get("ref") or ""),
+                      "text": str(ln.get("text") or "")} for ln in inputs["lines"] if isinstance(ln, dict)]
         return {"id": n.id, "at": _iso(n.at), "kind": n.kind, "text": n.text, "reason": n.reason, "ref": n.ref,
                 "trigger": n.trigger, "offer": card_offer_view(n), "outcome": getattr(n, "outcome", None),
                 "moment": moment, "outcome_at": _iso(getattr(n, "outcome_at", None)),
-                **({"keep": keep, "head": str(inputs.get("head") or "")} if keep else {})}
+                **({"keep": keep, "head": str(inputs.get("head") or "")} if keep else {}),
+                **({"lines": lines, "head": str(inputs.get("head") or "")} if lines is not None else {})}
 
     def _nudges_config(self) -> Any:
         """The user's ``[nudges]`` table (read only; the service applies the same), defaults when unreadable."""
@@ -2128,17 +2144,184 @@ class MemoryClient:
             return {"ok": False, "why": "error", "error": f"{type(exc).__name__}: {exc}"}
 
     def routine_card_due(self, nudge_id: int) -> dict:
-        """Whether a routine card that waited in the tray's queue may still show now
-        (:func:`yuki.memory.routine_offers.card_still_due`): ``{"due": True}`` or ``{"due": False, "why", "final"}``
-        (final: its outcome, a reaction, its own expiry, its routine no longer offering, the user already joined: the
-        tray drops it; not final: an open call or a game in front: it stays queued). Code only; a failure says not due,
-        not final."""
-        from yuki.memory import routine_offers
+        """Whether a routine card that waited in the tray's queue may still show now: an alias of :meth:`card_due`
+        (for a routine card, :func:`yuki.memory.routine_offers.card_still_due`, unchanged), kept for an older tray."""
+        return self.card_due(nudge_id)
+
+    def _judge_config(self) -> Any:
+        """The user's ``[judge]`` table (read only; the service applies the same), defaults when unreadable."""
+        from yuki.memory.cardjudge import JudgeConfig
 
         try:
-            return routine_offers.card_still_due(self.store, int(nudge_id))
+            from types import SimpleNamespace
+
+            from yuki.memory.privacy import user_config_path
+            from yuki.memory.timeline import PrivacySection
+
+            if getattr(self, "_judge_section", None) is None:
+                self._judge_section = PrivacySection(SimpleNamespace(path=user_config_path()), "judge",
+                                                     JudgeConfig.from_dict)
+            return self._judge_section.get()
+        except Exception:
+            return JudgeConfig()
+
+    def card_due(self, nudge_id: int) -> dict:
+        """The tray's question right before it shows **any** queued card (jSwitch, state-design §4.4 M1): ``{"due":
+        True}`` or ``{"due": False, "why", "final"}``. A routine card: :func:`yuki.memory.routine_offers.card_still_due`
+        (unchanged). Any other card: with the card judge live (``[judge] mode = "on"``) the policy runs again with
+        fresh reads (:func:`yuki.memory.attend.fresh_check`: the switches, the game in front, an open call, the
+        meeting, Yuki acting, quiet hours; a read that fails holds) - held is not final (the tray asks again on a later
+        look); an outcome, a reaction or the card's own expiry is final (the tray drops it). With the judge off or in
+        shadow every other card is due (the old chain's tray, exactly). Code only, never raises."""
+        from yuki.memory import routine_offers
+
+        now = time.time()
+        try:
+            n = self.store.nudge(int(nudge_id))
+        except Exception:
+            return {"due": False, "why": "error", "final": False}
+        if n is None:
+            return {"due": False, "why": "unknown", "final": True}
+        if n.kind == "notice" and n.trigger == routine_offers.TRIGGER:
+            try:
+                return routine_offers.card_still_due(self.store, int(n.id), now=now)
+            except Exception as exc:
+                return {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
+        if self._judge_config().mode != "on":
+            return {"due": True}
+        if getattr(n, "outcome", None) is not None:
+            return {"due": False, "why": f"outcome:{n.outcome}", "final": True}
+        if n.reaction is not None:
+            return {"due": False, "why": f"reaction:{n.reaction}", "final": True}
+        inputs = n.inputs if isinstance(n.inputs, dict) else {}
+        try:
+            expires = float(inputs.get("expires_at")) if inputs.get("expires_at") is not None else None
+        except (TypeError, ValueError):
+            expires = None
+        if expires is not None and now > expires:
+            return {"due": False, "why": "expired", "final": True}
+        try:
+            from yuki.memory.attend import fresh_check
+            from yuki.memory.candidates import TYPES
+            from yuki.memory.cardjudge import type_of
+
+            ctrig = None
+            if n.checkin_id is not None:
+                rows = self.store._query("SELECT trigger FROM nudge_checkins WHERE id = ?", (int(n.checkin_id),))
+                ctrig = rows[0][0] if rows else None
+            t = "checkin:day_start" if (n.trigger == "today" and n.kind == "question") else type_of(n.kind, n.trigger,
+                                                                                                    ctrig)
+            info = TYPES.get(t) if t else None
+            d = fresh_check(self.store, db_path=self.store.path, config=self._nudges_config(), now=now,
+                            type=t or "*", urgency=info.urgency if info is not None else "any")
         except Exception as exc:
             return {"due": False, "why": "error", "final": False, "error": type(exc).__name__}
+        if d.allow:
+            return {"due": True}
+        return {"due": False, "why": d.reason, "final": False}
+
+    def card_queue(self) -> dict:
+        """What's waiting (§4.7, the user's "what's waiting?": they pick the moment): the Today queue the card judge
+        keeps while live, best first - ``{"mode", "at", "lines": [{"type", "ref", "asks", "text", "queued_at"}]}``
+        (``ref``: the line's id, ``Q12`` a question to answer with ``answer_question("question:12", ...)``, ``W9`` a
+        thread, ``R2`` the weekly review, ``C41`` a call). Empty with the judge off or in shadow. Never raises."""
+        cfg = self._judge_config()
+        out: dict[str, Any] = {"mode": cfg.mode, "at": None, "lines": []}
+        if cfg.mode != "on":
+            return out
+        try:
+            from yuki.memory.cardjudge import QUEUE_STATE
+
+            raw = self.store.nudge_state(QUEUE_STATE)
+            data = json.loads(self.store.cipher.decrypt(raw)) if raw else {}
+        except Exception:
+            return out
+        if not isinstance(data, dict):
+            return out
+        now = time.time()
+        lines = []
+        for ln in data.get("lines") or []:
+            if not isinstance(ln, dict):
+                continue
+            exp = ln.get("expires_at")
+            if exp is not None and float(exp) <= now:
+                continue
+            lines.append({"type": str(ln.get("type") or ""), "ref": str(ln.get("ref") or ""),
+                          "asks": bool(ln.get("asks")), "text": str(ln.get("text") or ""),
+                          "queued_at": _iso(ln.get("queued_at"))})
+        out.update(at=_iso(data.get("at")), lines=lines)
+        return out
+
+    def digest_line_reaction(self, nudge_id: int, n: int, reaction: str) -> dict:
+        """One line of a Today card (or a "While you were away" list) answered from the window (question 7): ``open``
+        (the user opened what it points at) or ``not_useful``. Recorded content-free (``judge_digest_reactions``: card
+        id, line number, the reaction), once per line (a later press replaces it); the card judge's ledger reads it
+        (an opened line is used, a not-useful one is not). Returns ``{"ok", "card", "n", "reaction", "type", "ref"}``
+        (the line's type and id, so the window can open it) or ``{"ok": False, "why"}`` (``bad_reaction``,
+        ``unknown``, ``not_on_card``). Code only."""
+        reaction = str(reaction or "").strip().lower()
+        if reaction not in ("open", "not_useful"):
+            return {"ok": False, "why": "bad_reaction"}
+        try:
+            card = self.store.nudge(int(nudge_id))
+        except Exception:
+            card = None
+        if card is None:
+            return {"ok": False, "why": "unknown"}
+        lines = card.inputs.get("lines") if isinstance(card.inputs, dict) else None
+        try:
+            num = int(n)
+        except (TypeError, ValueError):
+            return {"ok": False, "why": "not_on_card"}
+        line = next((ln for ln in lines or [] if isinstance(ln, dict) and int(ln.get("n") or -1) == num), None)
+        if line is None:
+            return {"ok": False, "why": "not_on_card"}
+        from yuki.memory.cardjudge import DIGEST_REACTIONS_STATE, STATE_KEEP
+
+        try:
+            data = json.loads(self.store.nudge_state(DIGEST_REACTIONS_STATE) or "{}")
+            data = data if isinstance(data, dict) else {}
+        except Exception:
+            data = {}
+        per = data.get(str(card.id)) if isinstance(data.get(str(card.id)), dict) else {}
+        per[str(num)] = reaction
+        data[str(card.id)] = per
+        if len(data) > STATE_KEEP:
+            keep = sorted(data, key=lambda k: int(k) if str(k).isdigit() else -1)[-STATE_KEEP:]
+            data = {k: data[k] for k in keep}
+        try:
+            self.store.set_nudge_state(DIGEST_REACTIONS_STATE, json.dumps(data, separators=(",", ":")))
+        except Exception as exc:
+            return {"ok": False, "why": "error", "error": type(exc).__name__}
+        return {"ok": True, "card": card.id, "n": num, "reaction": reaction, "type": str(line.get("type") or ""),
+                "ref": str(line.get("ref") or "")}
+
+    def card_kinds(self) -> dict:
+        """The window's Settings list of card kinds (question 7): ``{"mode": the judge's (off | shadow | on), "kinds":
+        [{"kind", "words", "mode", "mode_words", "why", "why_words", "by", "shown", "used", "can_raise",
+        "can_lower"}]}`` - each kind, where it is (a card at a good moment, a line on the Today card, only at the best
+        moments, off) and why (where it starts, you said less of these, the last ones went unused, ...). Content-free
+        counts; never raises."""
+        try:
+            from yuki.memory.cardjudge import kind_list
+
+            return {"mode": self._judge_config().mode, "kinds": kind_list(self.store, time.time(),
+                                                                           self._nudges_config())}
+        except Exception as exc:
+            return {"mode": None, "kinds": [], "error": type(exc).__name__}
+
+    def card_kind_set(self, kind: str, action: str) -> dict:
+        """The user moves one kind from the Settings list (question 7): ``up`` (back one step towards where it starts;
+        the ledger counts its use afresh from now) or ``down`` (one step towards off, as "Less of these"). The user's
+        word: recorded as theirs, and the ledger never raises a kind they lowered. Reminders, standing requests and the
+        routine card keep their own rules. ``{"ok", "kind", "mode"}`` or ``{"ok": False, "why"}``. The memory
+        service's judge reads it at its next ledger read (within five minutes)."""
+        try:
+            from yuki.memory.cardjudge import set_kind_mode
+
+            return set_kind_mode(self.store, str(kind or ""), str(action or ""))
+        except Exception as exc:
+            return {"ok": False, "why": "error", "error": type(exc).__name__}
 
     def recap_keep(self, nudge_id: int, ref: Any, answer: str) -> dict:
         """The user's answer to one line of a call's keep list (the recap card, yuki.memory.admission): ``keep`` (into

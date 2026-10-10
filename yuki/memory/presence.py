@@ -375,9 +375,9 @@ specific: what, where, when, how many, exactly as the data gives it.
 - An offer is optional and only your own small job (the rules below). Keep the decision's kind or drop it \
 (offer null); never another kind. With an offer, end the text with a short question naming exactly that \
 action ("want it on your list for Monday?"), and fill the offer: do; label (2-4 words naming the action: \
-"Add to list", "Show the notes", "Open the page", "Show draft", "Edit in ask bar"); steps (1-3 plain lines \
+"Add to list", "Show the notes", "Open the page", "Edit in ask bar"); steps (1-3 plain lines \
 of exactly what the button will do, shown under "Will:"); refs (the ids it acts on); text (todo_add: the \
-to-do in the user's words; draft: the whole draft, never sent; ask: the request as the user would type \
+to-do in the user's words; ask: the request as the user would type \
 it; else ""); due (todo_add: "YYYY-MM-DD HH:MM" or "YYYY-MM-DD" when the data gives its time, else ""). \
 No offer: offer is null and the text asks nothing of them.
 - Never write an internal id (W12, J1234, CALL41, L7, todo:3, N50) in the text, the label or the steps: \
@@ -1322,6 +1322,13 @@ class PresenceWorker:
             if ev.get("id") == ev_id:
                 ev["asked"] = True
         self._save_events(events)
+
+    def scan_events(self, now: float) -> bool:
+        """The events scan as the card judge runs it (jSwitch: with ``[judge] mode = "on"`` :meth:`tick` no longer
+        runs, so ``cardjudge`` calls this from its own schedule, at a held or idle moment, never in a game or a call):
+        :meth:`_scan_events`, unchanged (its own pace, budget and accounting). True when it made a model call."""
+        self._now = now
+        return self._scan_events(now)
 
     def _scan_events(self, now: float) -> bool:
         """Read the facts written since the last scan for the user's dated personal events (one Haiku call,

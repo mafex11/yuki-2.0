@@ -15,9 +15,9 @@ import time
 from datetime import datetime
 from typing import Any
 
-#: Heading per nudge kind.
+#: Heading per nudge kind (no "Praise": Yuki never praises, 26 Sept; an old praise row gets the plain "Yuki").
 KIND_TITLES: dict[str, str] = {
-    "praise": "Praise", "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
+    "nudge": "Nudge", "reminder": "Reminder", "review": "Weekly review",
     "resume": "Welcome back", "question": "Getting to know you", "notice": "Noticed",
 }
 #: An observation card's heading by its channel (the nudge's ``trigger``, yuki.memory.presence).
@@ -26,7 +26,12 @@ NOTICE_TITLES: dict[str, str] = {
     "recall": "From memory", "thread": "Your work", "plans": "Coming up",
     # the routine card (yuki.memory.routine_offers, PLAN.md Phase R): the user's usual moment, offered by code
     "routine": "Your usual",
+    # the card judge's digests (yuki.memory.cardjudge, jSwitch): the Today card without a head question, and the
+    # "While you were away" list
+    "today": "Today", "away": "While you were away",
 }
+#: The card judge's digest cards (their trigger): numbered lines, each with its id (``lines``).
+DIGEST_TRIGGERS: tuple[str, ...] = ("today", "away")
 #: The routine card's trigger (its heading is :data:`NOTICE_TITLES` ``routine``).
 ROUTINE_TRIGGER = "routine"
 #: A check-in's heading by the moment Yuki itself wrote on its card (``yuki.memory.checkins.MOMENTS``; the card's
@@ -79,22 +84,54 @@ def kind_title(kind: Any) -> str:
 
 def checkin_moment(nudge: dict[str, Any] | None) -> str | None:
     """A check-in card's moment (``day_start``, ``followup``, ...) as Yuki wrote it on the card (the row's ``moment``,
-    or its ``inputs``); ``""`` for a check-in without one; ``None`` for a card that is not a check-in (its trigger)."""
+    or its ``inputs``); the card judge's check-ins carry it in their trigger (``checkin:<moment>``) and its Today card
+    with a head question is ``day_start``; ``""`` for a check-in without one; ``None`` for a card that is not a
+    check-in (its trigger)."""
     n = nudge or {}
-    if str(n.get("trigger") or "") != "checkin":
+    trigger = str(n.get("trigger") or "")
+    if trigger.startswith("checkin:"):
+        return trigger.split(":", 1)[1]
+    if trigger == "today" and str(n.get("kind") or "") == "question":
+        return "day_start"
+    if trigger != "checkin":
         return None
     inputs = n.get("inputs") if isinstance(n.get("inputs"), dict) else {}
     return str(n.get("moment") or inputs.get("moment") or "")
 
 
+def digest_card(nudge: dict[str, Any] | None) -> bool:
+    """Whether a card is one of the card judge's digests: the Today card or "While you were away" (its numbered
+    ``lines``, each with its id)."""
+    return str((nudge or {}).get("trigger") or "") in DIGEST_TRIGGERS
+
+
+def digest_lines(nudge: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """A digest card's lines as memory gave them (``{"n", "type", "ref", "text"}``, numbered from 1); ``[]`` for any
+    other card."""
+    if not digest_card(nudge):
+        return []
+    out = []
+    for ln in (nudge or {}).get("lines") or []:
+        if isinstance(ln, dict) and int(ln.get("n") or 0) > 0 and str(ln.get("text") or "").strip():
+            out.append({"n": int(ln["n"]), "type": str(ln.get("type") or ""), "ref": str(ln.get("ref") or ""),
+                        "text": " ".join(str(ln["text"]).split())})
+    return out
+
+
 def card_title(nudge: dict[str, Any]) -> str:
-    """The heading of one card: its kind's, for an observation card its channel's, for a check-in its moment's."""
+    """The heading of one card: its kind's, for an observation card its channel's, for a check-in its moment's, for
+    the card judge's digests "Today" / "While you were away"."""
     kind = str(nudge.get("kind") or "")
+    trigger = str(nudge.get("trigger") or "")
+    if trigger in DIGEST_TRIGGERS:
+        return NOTICE_TITLES[trigger]
     moment = checkin_moment(nudge)
     if moment is not None:
         return CHECKIN_TITLES.get(moment, CHECKIN_TITLE)
     if kind == "notice":
-        return NOTICE_TITLES.get(str(nudge.get("trigger") or ""), KIND_TITLES["notice"])
+        return NOTICE_TITLES.get(trigger, KIND_TITLES["notice"])
+    if kind == "nudge" and trigger == "session:callback":
+        return "What you were on"
     return kind_title(kind)
 
 
@@ -167,7 +204,8 @@ def offer_open(nudge: dict[str, Any] | None, now: float | None = None) -> bool:
     return str(n.get("reaction") or "") not in ("dismissed", "less", "snoozed")
 
 
-__all__ = ["CHECKIN_ICONS", "CHECKIN_TITLE", "CHECKIN_TITLES", "KIND_TITLES", "NOTICE_TITLES", "ROUTINE_TRIGGER",
-           "OFFER_DOS", "UNDOABLE_DOS", "OFFER_FAILED", "epoch_of", "kind_title", "card_title", "checkin_moment",
+__all__ = ["CHECKIN_ICONS", "CHECKIN_TITLE", "CHECKIN_TITLES", "DIGEST_TRIGGERS", "KIND_TITLES", "NOTICE_TITLES",
+           "ROUTINE_TRIGGER", "OFFER_DOS", "UNDOABLE_DOS", "OFFER_FAILED", "epoch_of", "kind_title", "card_title",
+           "checkin_moment", "digest_card", "digest_lines",
            "card_offer", "offer_label", "offer_steps", "offer_lines", "routine_card", "offer_why", "offer_expired",
            "offer_open"]

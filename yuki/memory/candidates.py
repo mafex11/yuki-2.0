@@ -19,9 +19,10 @@ does not need to decide.
 **Types** (:data:`TYPES`; the ledger key is ``type``): ``reminder``, ``confirm``, ``asked`` (deadline and user-asked);
 ``checkin:day_start`` (the Today card's head), ``checkin:followup``, ``checkin:evening``, ``checkin:care``,
 ``checkin:new_thread``; ``session:break``, ``session:callback``; ``stuck``, ``recap``, ``followup``, ``plans``;
-``thread``, ``question``, ``work``, ``review`` (lasting: the Today card's lines); and the judge's own ``today`` and
-``away``. ``routine`` comes with jSwitch. Not ported (question 2): ``notice`` (milestone: "you just finished X") and
-``recall`` (the screen meets something memory holds: screen trivia).
+``thread``, ``question``, ``work``, ``review`` (lasting: the Today card's lines); the judge's own ``today`` and
+``away``; and ``routine`` (jSwitch: the "Your usual" card, :meth:`yuki.memory.routine_offers.RoutineLane.candidates`,
+live only - the lane's due rule, words, ladder and learning unchanged). Not ported (question 2): ``notice`` (milestone:
+"you just finished X") and ``recall`` (the screen meets something memory holds: screen trivia).
 
 **The check-in guard** (:func:`guard_ok`): a check-in rests on a goal or thread id, or a measured day anchor (``DAY`` /
 ``HOURS``) - never on screen content. ``checkin:followup``'s "a day they named passed" rule rests on the user's own
@@ -32,7 +33,7 @@ Public API::
     TYPES: {type: TypeInfo};  BEST_CLASSES;  DIGEST_LINE_CHARS
     Candidate(...);  resolve(value) -> str | None
     Seen(store) .get / .looked / .mark / .flush          # nudge_state['judge_seen']
-    Context(store, you, now, config, seen, *, live=False, memo=None)
+    Context(store, you, now, config, seen, *, live=False, memo=None, lane=None)
     generate(ctx, *, only=None) -> list[Candidate]       # every generator, each wrapped (an error logs, never raises)
     guard_ok(candidate) -> bool
     evidence_lines(store, candidate, now, safe) -> (lines, ids)   # the writer's evidence (live only)
@@ -300,8 +301,10 @@ class Context:
     generator wants to be looked at again (an item becoming due, a window opening)."""
 
     def __init__(self, store: Any, you: Any, now: float, config: Any, seen: Seen, *, live: bool = False,
-                 memo: Memo | None = None) -> None:
+                 memo: Memo | None = None, lane: Any = None) -> None:
         self.store = store
+        #: The routine lane (:class:`yuki.memory.routine_offers.RoutineLane`), live only (jSwitch); None: no routine.
+        self.lane = lane
         self.you = you
         self.now = float(now)
         self.config = config
@@ -439,7 +442,8 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
             said = "You said on a call" if item.source == "call" else "You told me"
             out.append(Candidate(
                 "confirm", key, created_at=float(item.since or now), expires_at=at - lead, home="card", time_bound=True,
-                confidence=0.8, refs={"item": item.ref}, evidence={item.ref: float(item.since or now)},
+                confidence=0.8, refs={"item": item.ref, "due_at": float(item.due_at), "source": item.source},
+                evidence={item.ref: float(item.since or now)},
                 text=(f"{said}: {title} ({when}). Want a reminder?" if title else None), needs_writer=not title,
                 offer_channel="reminder", why=f"confirm lead_h={(at - now) / 3600.0:.1f} titled={int(bool(title))}"))
         elif at <= now:
@@ -449,13 +453,32 @@ def gen_reminders(ctx: Context) -> list[Candidate]:
             hm = "today" if item.all_day else datetime.fromtimestamp(item.due_at).strftime("%H:%M")
             out.append(Candidate(
                 "reminder", key, created_at=at, expires_at=at + late, urgency="deadline", home="card",
-                window=(at, at + late), confidence=1.0, refs={"item": item.ref},
+                window=(at, at + late), confidence=1.0,
+                refs={"item": item.ref, "due_at": float(item.due_at), "source": item.source,
+                      "all_day": bool(item.all_day)},
                 evidence={item.ref: float(item.since or at)},
                 text=(f"Reminder ({hm}): {title}" if title else None), needs_writer=not title,
                 offer_channel="reminder", why=f"reminder late_min={(now - at) / 60.0:.0f} titled={int(bool(title))}"))
         else:
             ctx.deadline(at)
     return out
+
+
+def gen_routine(ctx: Context) -> list[Candidate]:
+    """``routine`` (jSwitch) - the "Your usual" card, from :meth:`yuki.memory.routine_offers.RoutineLane.candidates`
+    (``RoutineLane.due`` :663: an active routine in its window, its end state not reached today, not offered today, at
+    most ``routine_per_day`` routine cards; an ``offer-now`` request first). Urgency ``deadline`` (B2: it skips B1 and
+    keeps its own ``routine_per_day``), time-bound (its window closes). Code text: the lane's fixed template and the
+    learned name (``card_text``); the offer, its why line and the capability's Won't line are built by the lane when it
+    writes (``RoutineLane.write``).
+
+    Live only: in shadow the lane's own pass shows the routine card (``RoutineLane.tick``), and its offer-now request
+    file is the lane's to read. The policy replaces the lane's own holds (``RoutineLane.holds`` / ``_attention``):
+    a meeting in front passes this type, meeting audio and a call fail closed, settling needs only
+    ``routine_settle_s``, and a card showing holds it (it never jumps one)."""
+    if not ctx.live or ctx.lane is None:
+        return []
+    return list(ctx.lane.candidates(ctx.now, ctx.config, deadline=ctx.deadline))
 
 
 def gen_asked(ctx: Context) -> list[Candidate]:
@@ -1171,6 +1194,7 @@ def gen_review(ctx: Context) -> list[Candidate]:
 #: (name, generator, minimum seconds between two runs; 0 = every evaluation). A reused result is filtered again by its
 #: seen-marks and expiry.
 GENERATORS: tuple[tuple[str, Callable[[Context], list[Candidate]], float], ...] = (
+    ("routine", gen_routine, 0.0),
     ("reminder", gen_reminders, 0.0),
     ("asked", gen_asked, 0.0),
     ("checkin", gen_checkins, 60.0),
@@ -1241,6 +1265,30 @@ def guard_ok(c: Candidate) -> bool:
     return c.type == "checkin:followup" and item.split(":", 1)[0] in ("todo", "commit")
 
 
+def line_ref(c: Candidate) -> str:
+    """A Today line's id (content-free): ``Q<id>`` for a stored question, ``W<id>`` a thread, ``C<id>`` a call, ``R<id>``
+    the weekly review, ``G<id>`` a goal, an item's own ref, ``E<id>`` a personal event, else the candidate's type."""
+    refs = c.refs or {}
+    if refs.get("question") is not None:
+        return f"Q{int(refs['question'])}"
+    if refs.get("thread") is not None:
+        return f"W{int(refs['thread'])}"
+    if refs.get("review") is not None:
+        return f"R{int(refs['review'])}"
+    calls = refs.get("call")
+    if isinstance(calls, (list, tuple)) and calls:
+        return f"C{int(calls[0])}"
+    if refs.get("goal") is not None:
+        return f"G{int(refs['goal'])}"
+    if refs.get("item"):
+        return str(refs["item"])
+    if refs.get("plan"):
+        return str(refs["plan"])
+    if refs.get("event"):
+        return f"event:{refs['event']}"
+    return c.type
+
+
 # ---------------------------------------------------------------------------
 # The writer's evidence lines (live only: the writer is not called in shadow)
 # ---------------------------------------------------------------------------
@@ -1309,5 +1357,6 @@ def evidence_lines(store: Any, c: Candidate, now: float, safe: Callable[[Any, in
 
 __all__ = [
     "BEST_CLASSES", "CALL_UNKNOWN_GENERATORS", "Candidate", "Context", "DIGEST_LINE_CHARS", "GENERATORS", "Memo",
-    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "evidence_lines", "generate", "guard_ok", "remind_at", "resolve",
+    "SEEN_STATE", "Seen", "TYPES", "TypeInfo", "evidence_lines", "gen_routine", "generate", "guard_ok", "line_ref",
+    "remind_at", "resolve",
 ]
