@@ -290,5 +290,33 @@ def clear_cache() -> None:
     connection.clear_cache()
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The generic means question (a driver route any capability may name: ``driver = "catalog"``, ``call = "ask_means"``)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def route_ask_means(call: Any) -> Any:
+    """A means slot's one question, as a rung (design §5: "with no usual and no observation, it asks once"). A means
+    slot ships no default, so when nothing filled it (not the user's words, a usual, an observed preference or a learned
+    fill policy) and the rungs that would act need it, this rung asks the slot's own ``ask`` line with its options and
+    acts on nothing. The answer runs the request again with the slot filled, and the resolver's "Keep this as your
+    usual?" follows; once that usual is kept, this rung's ``when`` no longer holds. ``args.slot`` names the means
+    slot; the route's ``when`` says where it applies (data). No app, target or answer is written here."""
+    from yuki.skills.engine import RouteResult
+
+    name = str(call.args.get("slot") or "")
+    slot = call.skill.slot(name) if name else None
+    if slot is None or slot.role != "means":
+        return RouteResult(ran=False, outcome="not_a_means_slot")
+    if call.values.get(name) not in (None, ""):
+        return RouteResult(ran=False, outcome="means_given")
+    return RouteResult(ran=False, ask=slot.ask or f"Which {name}?", options=list(slot.options), outcome="ask_means",
+                       facts={"slot": name})
+
+
+#: Driver routes (``yuki.skills.engine.v_driver`` reads this table).
+ROUTES: dict[str, Callable[[Any], Any]] = {"ask_means": route_ask_means}
+
+
 __all__ = ["SPEC_VERSION", "LIVE_STATES", "KEY_CHARS", "capabilities", "learned_version", "specialise", "load", "get",
-           "clear_cache"]
+           "clear_cache", "route_ask_means", "ROUTES"]

@@ -254,6 +254,46 @@ def template_names(text: str) -> list[str]:
             i = a + 1
 
 
+def domain_like(text: str) -> bool:
+    """Whether ``text`` is written as a domain name (``github.com``): labels of letters, digits and hyphens joined by
+    dots, the last one letters. A fixed machine format, never a reading of meaning."""
+    text = str(text or "").strip().casefold()
+    if not text or len(text) > 253 or "." not in text:
+        return False
+    labels = text.split(".")
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+           or not all(ch.isascii() and (ch.isalnum() or ch == "-") for ch in label) for label in labels):
+        return False
+    return labels[-1].isalpha() and len(labels[-1]) >= 2
+
+
+def scope_value(value: Any) -> str:
+    """A preference scope's value as one identity (review r1 L4), so a usual or an observed preference kept under a
+    scope is found however the value came in: its name, case-folded and spaced once; a site said by its site file's
+    name or by an address of one of that file's hosts, as the site file's name (``yuki/connect/sites``); any other
+    domain without a leading ``www.``. Fixed formats only, never a reading of meaning; ``""`` for no value."""
+    if isinstance(value, Mapping):
+        value = value.get("name") or ""
+    text = " ".join(str(value if value is not None else "").split()).casefold()
+    if not text or not (domain_like(text) or text.replace("_", "").isalnum()):
+        return text
+    try:
+        from yuki.connect.templates import site as site_data, sites
+    except Exception:  # noqa: BLE001 - no site data: the folded value
+        return text
+    names = sites()
+    if text in names:
+        return text
+    if not domain_like(text):
+        return text
+    host = text[4:] if text.startswith("www.") and domain_like(text[4:]) else text
+    for name in names:
+        hosts = {str(h).casefold() for h in (site_data(name).get("site") or {}).get("hosts") or []}
+        if text in hosts or host in hosts:
+            return name
+    return host
+
+
 def lookup(values: Mapping[str, Any], name: str) -> Any:
     """A template name's value: ``"level"`` -> ``values["level"]``; ``"playlist.name"`` -> the ``name`` field of the
     playlist slot's value (a dict) or, for a plain value, the value itself when the field is ``name``. ``None`` when
@@ -399,8 +439,11 @@ class Slot:
     fill: str = ""
 
     def pref_key(self, skill: str, values: Mapping[str, Any]) -> str:
-        """``"volume:control@spotify"``: the preference slot this one reads, its scope filled from ``values``."""
+        """``"volume:control@spotify"``: the preference slot this one reads, its scope filled from ``values`` as one
+        identity (:func:`scope_value`: "YouTube", "youtube.com" and a learned skill's bound ``youtube`` read one key)."""
         base = self.pref or f"{skill}:{self.name}"
+        if self.scope and values.get(self.scope) not in (None, ""):
+            values = {**values, self.scope: scope_value(values[self.scope]) or values[self.scope]}
         return fill(base, values) or base
 
 
@@ -618,8 +661,8 @@ def _habit_keys_in(value: Any, where: str) -> None:
 def refuse_habits(data: Mapping[str, Any], name: str) -> None:
     """The habit-key refusal over one parsed shipped file (raises :class:`ConnectionError_` with ``habit_key`` in
     its message; the whole file is then skipped): a ``[skill.*]`` table; a ``routine_on``, ``offerable``,
-    ``learn_from`` or ``preview`` key anywhere; a default on a ``means`` slot; a process or service literal in a
-    route's arguments, or a service literal in a route's checks."""
+    ``learn_from`` or ``preview`` key anywhere; a default on a ``means`` or ``key`` slot; a process or service literal
+    in a route's arguments, or a service literal in a route's checks."""
     if "skill" in data:
         raise ConnectionError_(f"{name}: habit_key: [skill.*] tables are learned (phase L); a file declares "
                                f"[capability.*]")
@@ -635,6 +678,10 @@ def refuse_habits(data: Mapping[str, Any], name: str) -> None:
             if isinstance(slot, Mapping) and str(slot.get("role") or "") == "means" and "default" in slot:
                 raise ConnectionError_(f"{where}.slot[{i}]: habit_key: a means slot ships no default (a preference "
                                        f"or a learned fill policy picks it)")
+            if isinstance(slot, Mapping) and str(slot.get("role") or "") == "key" and "default" in slot:
+                # review r1 L3: a key slot's value is the habit itself (a service, a site); a learned skill binds it
+                raise ConnectionError_(f"{where}.slot[{i}]: habit_key: a key slot ships no default (a learned skill "
+                                       f"binds it)")
         for i, route in enumerate(raw.get("route") or []):
             if not isinstance(route, Mapping):
                 continue
@@ -680,8 +727,8 @@ def _slot(raw: Any, where: str, *, capability: str, app: str) -> Slot:
     if typ == "enum" and not options:
         raise ConnectionError_(f"{where}.{name}: an enum slot lists its options")
     default = raw.get("default")
-    if role == "means" and default is not None:
-        raise ConnectionError_(f"{where}.{name}: a means slot ships no default")
+    if role in ("means", "key") and default is not None:
+        raise ConnectionError_(f"{where}.{name}: a {role} slot ships no default")
     if typ == "enum" and default is not None and str(default) not in options:
         raise ConnectionError_(f"{where}.{name}: default {default!r} is not one of its options")
     live = str(raw.get("live") or "")

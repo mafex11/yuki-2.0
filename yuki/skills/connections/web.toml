@@ -4,9 +4,10 @@
 #
 # The site: a site file's name (yuki/connect/sites/<site>.toml: its documented URL shapes, the page kinds and their
 # addresses) or a registrable domain (a host-scope page: its front page, https://<domain>/). The page: one of that
-# site's page kinds (a channel page, a watch page); none is the site's front page. The page's own value (a video's id,
-# a channel's handle) is the item: from the user's words or an offered option (phase T), never guessed. The address is
-# a launch argument (nothing typed); nothing plays until the user picks.
+# site's page kinds (a channel page, a watch page); none is the site's front page. The page's own value is the item: a
+# name (a channel's handle) from the user's words or an offered option; an opaque id (a template value named "id": a
+# video's, a channel's) only from an offered option's link (phase T), never from words and never guessed. The address
+# is a launch argument (nothing typed); nothing plays until the user picks.
 #
 # The browser is a means, with no ranked rule shipped (design §5, critique M8): the one the user named, else their
 # usual (preference web.open_page:browser@<site>, or the learned skill's fill policy), else the browser they use most,
@@ -42,7 +43,8 @@ name = "page"
 type = "text"
 role = "key"
 
-# The page's own value (a video's id, a channel's handle): the user's words or an offered option's link.
+# The page's own value: a name (a channel's handle) from the user's words or an offered option; an id (a video's, a
+# channel's) only from an offered option's link (web_route.page_address).
 [[capability."web.open_page".slot]]
 name = "item"
 type = "entity"

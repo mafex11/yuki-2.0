@@ -56,6 +56,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from yuki.skills.connection import domain_like
 from yuki.skills.engine import RouteCall, RouteResult
 
 #: What Yuki says when it does nothing for a site's tab (asked or told plainly; never a "done"). Templates: the service
@@ -707,19 +708,6 @@ def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (),
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def domain_like(text: str) -> bool:
-    """Whether ``text`` is written as a domain name (``github.com``): labels of letters, digits and hyphens joined by
-    dots, the last one letters. A fixed machine format, never a reading of meaning."""
-    text = str(text or "").strip().casefold()
-    if not text or len(text) > 253 or "." not in text:
-        return False
-    labels = text.split(".")
-    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
-           or not all(ch.isascii() and (ch.isalnum() or ch == "-") for ch in label) for label in labels):
-        return False
-    return labels[-1].isalpha() and len(labels[-1]) >= 2
-
-
 def _plain_value(value: str) -> bool:
     return bool(value) and not any(ch in value for ch in "/?&=# ")
 
@@ -748,7 +736,12 @@ def page_address(site_word: Any, page_word: Any = None, item: Any = None) -> tup
     if not page or page == "home":
         hosts = [str(h) for h in info.get("hosts") or []]
         home = str(info.get("home") or "") or (f"https://{hosts[0]}/" if hosts else "")
-        return (home or None), {"site": name, "kind": "home"}
+        if "home" in (data.get("pages") or {}):
+            return (home or None), {"site": name, "kind": "home"}
+        # review r1 L5: a site file with no "home" page kind: its front page is matched by host (any of its pages)
+        if not (home and hosts):
+            return None, {"why": "no_address"}
+        return home, {"site": name, "host": min(hosts, key=len)}
     template = str((data.get("urls") or {}).get(page) or "")
     if not template or page not in (data.get("pages") or {}):
         return None, {"why": "no_template"}
@@ -759,9 +752,15 @@ def page_address(site_word: Any, page_word: Any = None, item: Any = None) -> tup
         if m is not None and m.site == name and m.kind == page and m.entity:
             return str(ref), {"site": name, "kind": page, "entity": str(m.entity)}
         return None, {"why": "other_link"}
-    value = _words(ref) or _words(item)
+    if names == ["id"]:
+        # review r1 L5: a template value named "id" (a video's, a channel's) is an opaque identifier the site gave a
+        # page; it comes only from a link or an offered option's ref, never from spoken words (a made-up id opens the
+        # site's "unavailable" page, which a URL-only check would call done)
+        value = _words(ref)
+    else:
+        value = _words(ref) or _words(item)
     if len(names) != 1 or not _plain_value(value):
-        return None, {"why": "no_value"}
+        return None, {"why": "needs_link" if names == ["id"] and not ref else "no_value"}
     url = fill_url(name, page, **{names[0]: value})
     return (url, {"site": name, "kind": page, "entity": value}) if url else (None, {"why": "no_template"})
 
@@ -796,10 +795,12 @@ def _site_title(expect: Mapping[str, Any], said: str) -> str:
 
 
 def _hosts_of(expect: Mapping[str, Any]) -> list[str]:
+    if expect.get("site"):
+        return site_hosts(str(expect["site"]))
     if expect.get("host"):
         domain = str(expect["host"])
         return [domain, f"www.{domain}"]
-    return site_hosts(str(expect.get("site") or ""))
+    return []
 
 
 def route_open_page(call: RouteCall) -> RouteResult:

@@ -12,7 +12,8 @@
 #
 # The control slot is a means: "in_app" is the target's own control (Spotify's slider; for an app without one, its own
 # mixer level; the PC's own level for system), "mixer" the Windows mixer entry. It ships no default: the user's usual
-# for that app (preference volume:control@<app>, from their words, confirmed once) or the learned fill policy picks it.
+# for that app (preference volume:control@<app>, from their words, confirmed once) or the learned fill policy picks it;
+# with neither, the ask_control rung asks the slot's question once (an app with its own control only).
 # Every route below except Spotify's own needs no window and takes no focus, so it runs with a game in front too.
 
 [connection]
@@ -133,6 +134,26 @@ when = { slot = "target", in = ["own_voice"] }
 game = "always"
 done = { probe = "read_back" }
 recheck = { probe = "driver", driver = "spotify_route", call = "level_still", target = "{target}", after_s = 3 }
+
+# The control asked once (design §5, PLAN S-1): a level or a change for an app with its own control, and nothing has
+# picked the control yet (no words, no usual, nothing observed). Every rung above that acts on Spotify's own control
+# needs control = "in_app", and the mixer rung below refuses Spotify without "mixer", so with no usual this asks the
+# slot's question instead of handing off or guessing. The answer re-runs the request with the control, and "Keep this
+# as your usual?" follows. A mute never asks (the mixer rung mutes it). Speaks only: no window, no focus, no input.
+[[capability.volume.route]]
+rung = "A"
+variant = "ask_control"
+via = "driver"
+driver = "catalog"
+args = { app = "spotify", slot = "control" }
+call = "ask_means"
+needs_focus = false
+when = [{ slot = "target", in = ["spotify"] }, { slot = "control", present = false }, { slot = "mute", present = false }]
+game = "always"
+retry_after_acting = false
+# never reached: the rung asks and acts on nothing (the loader needs a driver route's check declared; no recheck, so
+# the loader lists this one rung under its warnings)
+done = { probe = "read_back" }
 
 # An app's own level in the Windows mixer. An app with its own control (own_control: driver data, true for every
 # Spotify) gets the mixer only for a mute or when the user's control for it is "mixer"; never as a stand-in for its own
