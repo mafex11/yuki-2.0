@@ -68,6 +68,8 @@ LATE_TO_MIN = 3.0
 #: joining without the card is ``self_served`` (B.3).
 JOINED_WITHIN_S = 10 * 60.0
 SELF_SERVED_WITHIN_S = 15 * 60.0
+#: A pressed card whose run never reported back (the tray closed mid-run) settles as pressed after this long (s).
+RUN_STUCK_S = 10 * 60.0
 #: The mode ladder (B.3): its window, and its thresholds.
 LADDER_WINDOW_S = 10 * 86400.0
 LATE_AFTER_SELF_SERVED = 3
@@ -662,7 +664,7 @@ class RoutineLane:
                                if n.at >= now - 86400.0])
             decision = att.check(TRIGGER, now=now, facts={})
         except Exception:
-            return None
+            return "attention:error"   # fail closed: never a card that might jump one showing
         if decision.allowed or (forced and decision.reason == "budget"):
             return None
         return f"attention:{decision.reason}"
@@ -855,11 +857,13 @@ class RoutineLane:
         if any(k in recorded for k in SETTLE_KINDS):
             return changed
         expires = float(offer.get("expires_at") or (n.at + 600.0))
-        if now < max(expires, n.at + SELF_SERVED_WITHIN_S) or n.outcome == "running":
+        if now < max(expires, n.at + SELF_SERVED_WITHIN_S):
             return changed
+        if n.outcome == "running" and now - float(n.outcome_at or n.at) < RUN_STUCK_S:
+            return changed   # the tray is still reporting (a run that never reported settles as pressed)
         mode = str((n.inputs or {}).get("mode") or offer.get("mode") or "")
         detail: dict[str, Any] = {"mode": mode}
-        if n.outcome in ("done", "failed"):
+        if n.outcome in ("done", "failed", "running"):
             kind = "accepted"
             detail["run"] = n.outcome
             run_at = float(n.outcome_at or n.at)

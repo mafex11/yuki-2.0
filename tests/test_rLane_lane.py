@@ -513,3 +513,15 @@ def test_the_lane_never_calls_a_model(store):
     assert len(run_ticks(w, clock, at("08:52"), at("08:59"))) == 1
     checkin = store.nudge_checkins(at("08:00"))[-1]
     assert checkin["trigger"] == "routine" and checkin["model"] is None and not checkin["cost_usd"]
+
+
+def test_a_press_whose_run_never_reported_settles_as_pressed(store):
+    rid = add_routine(store)
+    clock = Clock(at("08:52"))
+    w = lane_worker(store, clock)
+    nid = _day_card(store, w, clock, DAY)
+    store.react_to_nudge(nid, "accepted", at=at("08:53"))
+    assert offers._set_outcome(store, nid, "running", at=at("08:53"), only_if=(None,))   # the tray closed mid-run
+    _settle(w, clock, DAY)   # 09:30: past the card's time and the 10-minute report wait
+    ev = routine_offers.events(store, routine_id=rid, kinds=("accepted",))
+    assert len(ev) == 1 and ev[0]["detail"]["run"] == "running"

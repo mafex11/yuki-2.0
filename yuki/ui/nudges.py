@@ -935,7 +935,8 @@ class NudgeCard(LatticeCard):
         icon = "check"
         if not result.get("ok"):
             why = str(result.get("why") or "error")
-            text = OFFER_FAILED.get(why, OFFER_FAILED["error"])
+            # a routine card's skill run says what the PC saw in its own words ("There's no Meet tab open in Zen.")
+            text = " ".join(str(result.get("message") or "").split()) or OFFER_FAILED.get(why, OFFER_FAILED["error"])
             if why == "already" and result.get("state") == "undone":
                 text = "Already undone."
             icon = "x"
@@ -1654,8 +1655,8 @@ class NudgeController(QObject):
                           route=run.get("route"), ms=run.get("ms"), verified=run.get("verified"),
                           error=run.get("error") or run.get("report_error"))
         if self.card.isVisible() and self.card.nudge is not None and _nudge_id(self.card.nudge) == _nudge_id(stored):
-            self.card.show_result(result if ok else {"ok": True, "do": "run_skill", "message": message,
-                                                     "undo": False})
+            self.card.show_result(result if ok else {"ok": False, "do": "run_skill", "why": outcome,
+                                                     "message": message, "undo": False})
         self.offer_state.emit(stored, state)
 
     def keep_answer(self, nudge: dict[str, Any], ref: str, answer: str, via: str = "card") -> threading.Thread:
