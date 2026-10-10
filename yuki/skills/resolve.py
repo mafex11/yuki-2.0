@@ -544,7 +544,9 @@ class EvalResolver:
     def system(self, at: float) -> str:
         from yuki.skills.menu import TALKER, menu_text
 
-        menu = menu_text(self.store, audience=TALKER, loaded=self.loaded, now=at)
+        # review r2 L7: taste most seen first (not best at the fixture's hour), so the cached prefix stays the same
+        # from one phrasing to the next (fewer cache writes against the suite's cost cap)
+        menu = menu_text(self.store, audience=TALKER, loaded=self.loaded, now=at, rank="n_obs")
         if self._prompt is not None:
             return self._prompt(menu)
         try:

@@ -477,6 +477,9 @@ def v_endpoint_volume(call: RouteCall) -> RouteResult:
         else None
     mute = a.get("mute")
     want_mute = (mute == "on" or mute is True) if mute is not None else None
+    if level is None and change is None and want_mute is None:
+        # review r2 L3: nothing to set is no action, so never a done (set_app_volume refuses the same case)
+        return RouteResult(ran=False, outcome="no_value")
     got = set_master_volume(level=level, change=change, mute=want_mute)
     if not got:
         return RouteResult(ran=False, outcome="unavailable")
@@ -530,14 +533,17 @@ def _done_spec(skill: Skill, values: Mapping[str, Any]) -> dict[str, Any] | None
 def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
            *, why: str = "", baseline: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """The pinned skill handed to the thinker (rung C; map-skills S3.4): its goal, the slots with their sources, what
-    "done" means (words and the machine check), what was already tried, and ``baseline``: the onset probes' states
-    read right before the hand-off (the finish gate compares with them; content-free booleans). At most
-    :data:`PINNED_CHARS` as rendered."""
+    "done" means (words and the machine check), what was already tried, ``baseline``: the onset probes' states read
+    right before the hand-off (the finish gate compares with them; content-free booleans), and ``sends`` when running
+    it sends something to other people. At most :data:`PINNED_CHARS` as rendered."""
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
            "done_words": fill(skill.done_line, values) or "", "done": _done_spec(skill, values),
            "tried": [{"rung": t.get("rung"), "via": t.get("via"), "why": t.get("outcome")} for t in tried][:4],
            "why": why}
+    if sends_with(skill, values):
+        # review r2 M1: the finish gate never sends a pressed send back to "finish it" (rule 8: a second send)
+        out["sends"] = True
     if baseline:
         out["baseline"] = dict(baseline)
     while len(json.dumps(out, ensure_ascii=False, default=str)) > PINNED_CHARS and out["tried"]:
@@ -567,17 +573,65 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
                            ms=round((ctx.clock() - started) * 1000.0, 1))
 
 
+def _absolute_values(skill: Skill, values: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The run's slot values when they name an end state outright (D19's "the same skill asked again with the same
+    values"); ``None`` when a ``points`` slot carries a relative change ("a bit quieter" asked twice is a further
+    change, never a correction). Slot types only, never the words."""
+    if not isinstance(values, Mapping):
+        return None
+    for slot in skill.slots:
+        if slot.type == "points" and values.get(slot.name) not in (None, ""):
+            return None
+    return dict(values)
+
+
 def _ledger_start(ctx: RunContext, skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
                   t0: float, app: str | None = None) -> str | None:
     from yuki.skills import registry
 
     key = registry.new_run_key()
+    absolute = _absolute_values(skill, values)
     got = _mem(ctx.memory, "skill_run_start",
                lambda c: registry.start_run(_store_of(c), skill=skill, origin=ctx.origin, t0=t0, run_key=key,
                                             request_id=ctx.request_id, session_id=ctx.session_id, filled=filled,
-                                            app=app),
+                                            app=app,
+                                            slots_digest=registry.values_digest(_store_of(c), skill.key, absolute)),
                timeout_s=0.5)
     return got or (key if ctx.memory is not None else None)
+
+
+def _note_false_done(resolved: Any, ctx: RunContext, *, corrects: bool, again: bool) -> str | None:
+    """D19's other false-done source (review r2 M2), before the new run starts: the user corrected the skill's last
+    run (``corrects``), or asked the same skill again with the same absolute values (not ``again``, in another
+    request) within :data:`yuki.skills.registry.FALSE_DONE_S` of a run that ended "done": that run is marked a false
+    done in the ledger (``recheck = 0``: the scorecard's false-done count and the rung's trust see it) and logged.
+    Returns the run key marked."""
+    if ctx.memory is None or ctx.origin == "eval" or isinstance(resolved, Refused):
+        return None
+    skill = getattr(resolved, "skill", None)
+    key = skill.key if isinstance(skill, Skill) else str(skill or "")
+    if not key:
+        return None
+    absolute = None
+    if not corrects:
+        if again or not isinstance(skill, Skill):
+            return None
+        absolute = _absolute_values(skill, getattr(resolved, "values", None))
+        if absolute is None:
+            return None
+    from yuki.skills import registry
+
+    def go(client: Any) -> Any:
+        store = _store_of(client)
+        digest = None if corrects else registry.values_digest(store, key, absolute)
+        return registry.false_done_after(store, key, digest=digest, corrects=corrects, request_id=ctx.request_id)
+
+    marked = _mem(ctx.memory, "skill_false_done", go, timeout_s=0.5)
+    if not marked:
+        return None
+    _emit(ctx, "done_recheck", skill=key, result="false_done", recheck="user",
+          reason="correction" if corrects else "repeat", origin=ctx.origin)
+    return str(marked)
 
 
 def _ledger_app(ctx: RunContext, run_key: str | None, app: str) -> None:
@@ -712,19 +766,20 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
                 if sends or not route.retry_after_acting:
                     # it acted before the game check refused the rest: nothing else is tried (never twice)
                     _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=route, ms=route_ms,
-                                   app=app_done)
+                                   app=app_done, acted=True)
                     return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                                    run_key=run_key, route=route.key)
             continue
         if res.ask:
-            _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done)
+            _ledger_finish(ctx, run_key, outcome="asked", checked=None, route=route, ms=route_ms, app=app_done,
+                           acted=acted)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="asked", ms=route_ms)
             return _simple(skill.key, "asked", ctx, started, ask=res.ask, options=list(res.options), say=res.ask,
                            run_key=run_key, route=route.key, tried=tried)
         if res.outcome == "other_device":
             say = res.say or LINE_OTHER_DEVICE.format(app=_app_title(skill.app))
             _ledger_finish(ctx, run_key, outcome="other_device", checked=None, route=route, ms=route_ms,
-                           app=app_done)
+                           app=app_done, acted=acted)
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="other_device", ms=route_ms)
             return _simple(skill.key, "other_device", ctx, started, say=say, run_key=run_key, route=route.key,
                            tried=tried)
@@ -735,7 +790,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
             if waited.verdict is True:
                 line = res.say or LINE_ALREADY
                 _ledger_finish(ctx, run_key, outcome="already", checked=None, route=route, ms=route_ms,
-                               evidence={"numbers": _numbers(plan.values)}, app=app_done)
+                               evidence={"numbers": _numbers(plan.values)}, app=app_done, acted=acted)
                 _emit(ctx, "done_check", skill=skill.key, route=route.key, result="already", ms=waited.ms)
                 return _simple(skill.key, "already", ctx, started, verified=True, done_line=line, say=line,
                                run_key=run_key, route=route.key, tried=tried, values=dict(plan.values))
@@ -746,7 +801,10 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
                   observed=res.facts)
             continue
         acted = True
-        waited = _wait(route.done, probe_ctx, deadline - ctx.clock(), ctx)
+        # review r2 M3: once a rung acted, its check gets its own within_s (<= MAX_WAIT_S) even past the request
+        # budget: a check cut short before the app could react is no contradiction (a False there would count against
+        # a working rung and run the next one, doing a relative change twice)
+        waited = _wait(route.done, probe_ctx, None, ctx)
         _emit(ctx, "route_try", skill=skill.key, route=route.key, result=res.outcome or "ran", ms=route_ms,
               observed=res.facts)
         _emit(ctx, "done_check", skill=skill.key, route=route.key,
@@ -787,7 +845,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
     # every rung failed or could not run
     game = ctx.game_now()
     if game:
-        _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=None)
+        _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                        run_key=run_key)
     if plan.handoff and skill.handoff and ctx.origin != "eval":
@@ -821,10 +879,13 @@ def _probe_ctx(ctx: RunContext, t0: float, values: Mapping[str, Any], res: Route
                         clock=ctx.clock, sleep=ctx.sleep, baseline=dict(baseline or {}))
 
 
-def _wait(check: Check | None, probe_ctx: Any, left_s: float, ctx: RunContext) -> Any:
+def _wait(check: Check | None, probe_ctx: Any, left_s: float | None, ctx: RunContext) -> Any:
+    """A rung's done-check, read until True or its own ``within_s`` (<= ``MAX_WAIT_S``) is up; ``left_s``: also no
+    longer than the request's time left (``None``: the check's own time only, for a rung that acted)."""
     from yuki.skills.donecheck import wait
 
-    return wait(check or Check(probe="read_back", within_s=0.0), probe_ctx, deadline_s=max(0.0, left_s))
+    return wait(check or Check(probe="read_back", within_s=0.0), probe_ctx,
+                deadline_s=None if left_s is None else max(0.0, left_s))
 
 
 def _after_done(ctx: RunContext, skill: Skill, route: Route, plan: Plan, probe_ctx: Any, result: SkillResult) -> None:
@@ -868,7 +929,7 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
     """Rung C: never with a game in front (D17(2)), re-read right here."""
     game = ctx.game_now()
     if game:
-        _ledger_finish(ctx, run_key, outcome="held_game", checked=None)
+        _ledger_finish(ctx, run_key, outcome="held_game", checked=None, acted=acted)
         return _simple(skill.key, "held_game", ctx, started, held="game", say=HELD_LINE, tried=tried,
                        run_key=run_key)
     # the onset probes' states right before the thinker acts (its finish gate compares with them, review M4)
@@ -926,8 +987,12 @@ def _live_now(game: str, hands: Any = None, *, media: bool = True, skill: Skill 
 
 
 def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list[str], ctx: RunContext, *,
-                    again: bool = False, live: Live | None = None, settings: Any = None) -> SkillResult:
-    """Resolve (on the memory's own store, in one bounded call) and run. Live facts default to a fresh read."""
+                    again: bool = False, live: Live | None = None, settings: Any = None, corrects: bool = False,
+                    game_answer: str | None = None) -> SkillResult:
+    """Resolve (on the memory's own store, in one bounded call) and run, for every origin. Live facts default to a
+    fresh read (``game_answer``: the caller's own D9 answer for them; every rung still reads the game again).
+    ``corrects``: the user corrected the skill's last run; with it, or the same skill and absolute values asked again
+    within 60 s of a "done" (not ``again``), that run is marked a false done first (D19, review r2 M2)."""
     from yuki.skills import enabled, setting
     from yuki.skills import resolve as res_mod
 
@@ -939,7 +1004,8 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
 
         skill = load().get(str(skill_key or ""))
         wants_media = bool(skill and any(s.live == "playing" for s in skill.slots))
-        live = _live_now(ctx.game_now(), ctx.hands, media=wants_media, skill=skill, memory=ctx.memory)
+        live = _live_now(str(game_answer) if game_answer is not None else ctx.game_now(), ctx.hands,
+                         media=wants_media, skill=skill, memory=ctx.memory)
     step = float(setting(settings, "skills_volume_step") or 10)
     disable_after = int(setting(settings, "skills_disable_after") or 2)
 
@@ -953,6 +1019,7 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)
     if resolved is None:
         resolved = go(None)
+    _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
     return run(resolved, ctx)
 
 
@@ -961,26 +1028,16 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
                   settings: Any = None, live: Live | None = None,
                   on_focus: Callable[[], Any] | None = None) -> tuple[bool, str, dict[str, Any]]:
     """The talker's ``run_skill`` (sVoice wires it into ``Hands._skill`` inside ``_acting_run``): ``(ok, report,
-    facts)`` (see :meth:`SkillResult.as_voice`). ``game``: the voice's own D9 answer when it has one (else read
-    here); the engine still re-reads it before every focus step. ``on_focus``: the acting marker, published only
-    right before a rung that takes focus (sound-only rungs publish none, D18)."""
+    facts)`` (see :meth:`SkillResult.as_voice`). ``game``: the voice's own D9 answer when it has one, used only for
+    the live facts at resolve time (review r2 L5: every rung's D17 re-check reads the game itself, fresh). The
+    talker's ``corrects`` flag marks the skill's last "done" false (D19). ``on_focus``: the acting marker, published
+    only right before a rung that takes focus (sound-only rungs publish none, D18)."""
     ctx = RunContext(origin="voice", words=[str(w) for w in words or []], memory=getattr(hands, "memory", None),
                      hands=hands, log=log, request_id=request_id, on_focus=on_focus,
                      session_id=getattr(getattr(hands, "memory", None), "session_id", None))
-    if game is not None:
-        first = {"used": False}
-
-        def game_fn() -> str:
-            if not first["used"]:
-                first["used"] = True
-                return str(game or "")
-            from yuki.memory.gamegate import game_in_front
-
-            return str(game_in_front() or "")
-
-        ctx.game = game_fn
     result = resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
-                             else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live)
+                             else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings, live=live,
+                             corrects=bool(args.get("corrects")), game_answer=game)
     ok, report, facts = result.as_voice()
     facts["corrects"] = bool(args.get("corrects"))
     return ok, report, facts
@@ -994,7 +1051,8 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
                      request_id=request_id, game=game)
     return resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
-                           else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings)
+                           else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings,
+                           corrects=bool(args.get("corrects")))
 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",

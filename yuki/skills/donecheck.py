@@ -146,6 +146,8 @@ def probe_media_session(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 
 def probe_audio_active(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     want = _proc(args)
+    if not want:
+        return None, {"status": "no_process"}     # review r2 L4: none named, an unreadable image ("") would match
     try:
         from yuki.perception.audio import render_sessions
 
@@ -197,8 +199,10 @@ def _front() -> tuple[int, str]:
 
 
 def probe_foreground(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
+    if not _proc(args):
+        return None, {"status": "no_process"}
     hwnd, image = _front()
-    if not hwnd:
+    if not hwnd or not image:
         return None, {"status": "unread"}
     return image.casefold() == _proc(args), {"front": bool(image)}
 
@@ -238,8 +242,10 @@ def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 def probe_tab_shown(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     """The app's window is in front and the selected tab is the expected one: ``tab_id`` (a RuntimeId text), else
     ``name`` (exact, the name kept in RAM for this request only)."""
+    if not _proc(args):
+        return None, {"status": "no_process"}
     hwnd, image = _front()
-    if not hwnd:
+    if not hwnd or not image:
         return None, {"status": "unread"}
     if image.casefold() != _proc(args):
         return False, {"status": "other_app"}
@@ -265,6 +271,8 @@ def probe_tab_shown(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 def _mic_held_by(want: str) -> tuple[bool | None, int]:
     """Whether the process image ``want`` holds an active capture session now (``None``: couldn't read), and how many
     sessions it has."""
+    if not want:
+        return None, 0                            # review r2 L4: no process named, nothing to compare with
     try:
         from yuki.perception.audio import capture_sessions
 

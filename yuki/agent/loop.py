@@ -1443,6 +1443,7 @@ class Agent:
         self._request_wall = time.time()
         self._skill_bounces = 0
         self._skill_unconfirmed = False
+        self._skill_sent_unconfirmed = False
         self._requests += 1
         # phase S: this request's run_skill tool (its menu, refreshed when the registry changed) and what it needs
         self._skills_block = self._skills_tools()
@@ -2612,6 +2613,13 @@ class Agent:
                     f"{CHECK_LABEL}: your reply above was not sent: finish with done (its claims no stronger than "
                     f"your steps showed), not plain text.")
                 continue
+            if text and getattr(self, "_request_skill", None):
+                # phase S (review r2 H1): a plain-text reply ends a pinned request like a done, so the skill's own
+                # done-check gates it the same way: at most SKILL_BOUNCES "not done yet", then "couldn't confirm"
+                state, note = self._skill_gate_now()
+                if state == "hold":
+                    self.context.add_note(f"{CHECK_LABEL}: your reply above was not sent: {note}")
+                    continue
             if text:
                 self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
                 verdict = self._outcome_verdict()
@@ -2663,17 +2671,12 @@ class Agent:
         if ending and not turn.failed and getattr(self, "_request_skill", None):
             # phase S: a pinned skill's done (or finishing action) counts only when its own done-check sees the result
             # (D19); at most SKILL_BOUNCES "not done yet", then it ends as "couldn't confirm"
-            state, note = finish_gate.skill_gate(self._request_skill, since=self._skill_since(),
-                                                 bounces=self._skill_bounces)
-            self.logger.log("skill_gate", skill=str(self._request_skill.get("key") or ""), result=state,
-                            bounces=self._skill_bounces)
+            state, note = self._skill_gate_now()
             if state == "hold":
-                self._skill_bounces += 1
                 turn.finished.clear()
                 turn.finishing.clear()
                 held.append(({"type": "text", "text": f"{CHECK_LABEL}: {note}"}, "the skill's check didn't see it"))
                 return held
-            self._skill_unconfirmed = state == "unconfirmed"
         if not turn.finished and turn.finishing and not turn.failed and not turn.stop_after:
             _message, verified, why, tool = turn.finishing[-1]
             if verified is not True:
@@ -2736,7 +2739,9 @@ class Agent:
                 menu = menu_text(None, audience=THINKER, loaded=loaded)
             menu = str(menu or "")
             keys = tuple(s.key for s in loaded.skills if f"- {s.key}:" in menu)
-            return (keys, menu) if keys else ((), "")
+            # review r2 L2: files are loaded, so an empty menu is memory's hiccup (skill_menu gives "" on a failure):
+            # the last block stands rather than run_skill vanishing (and app_volume coming back) for this request
+            return (keys, menu) if keys else prev
         except Exception:  # noqa: BLE001 - the block as it was
             return prev
 
@@ -2774,6 +2779,30 @@ class Agent:
         gate = "unconfirmed" if getattr(self, "_skill_unconfirmed", False) else None
         return {"skill": str(key), "route": str(last.get("route") or ("C" if pin else "")),
                 "done_check": str(gate or last.get("done_check") or "")}
+
+    def _skill_gate_now(self) -> tuple[str, str | None]:
+        """Phase S: the pinned skill's finish gate (:func:`yuki.agent.finish.skill_gate`) on every way this request can
+        end: a ``done``, a finishing action, or a plain-text reply (review r2 H1). Reads the skill's own done-check
+        with this agent's memory (the memory-backed probes, review r2 M1) and whether a send was pressed this request;
+        counts a bounce on ``hold`` and records an unconfirmed end (it caps the verdict and replaces the words). Logged
+        with code words only."""
+        pin = getattr(self, "_request_skill", None)
+        if not pin:
+            return "ok", None
+        memory_call = None
+        if self.memory.installed:
+            def memory_call(what: str, fn: Any) -> Any:
+                return self.memory.call(what, fn, timeout_s=0.8)
+        sent = bool(getattr(self, "_sends", None))
+        state, note = finish_gate.skill_gate(pin, since=self._skill_since(), bounces=self._skill_bounces,
+                                             memory_call=memory_call, sent=sent)
+        self.logger.log("skill_gate", skill=str(pin.get("key") or ""), result=state, bounces=self._skill_bounces)
+        if state == "hold":
+            self._skill_bounces += 1
+            return state, note
+        self._skill_unconfirmed = state in ("unconfirmed", "sent_unconfirmed")
+        self._skill_sent_unconfirmed = state == "sent_unconfirmed"
+        return state, note
 
     def _skill_since(self) -> float:
         """Phase S: when this request began, on the wall clock (a pinned skill's done-check reads what changed since)."""
@@ -2837,8 +2866,10 @@ class Agent:
         out, why = finish_gate.honest_text(text, verdict, claims)
         if why is None and getattr(self, "_skill_unconfirmed", False):
             # phase S (review L4): a pinned skill's own check never saw the result, so the brain's words never stand
-            # as they are, whatever they claim
-            out, why = finish_gate.LINE_SKILL_UNCONFIRMED, "skill_unconfirmed"
+            # as they are, whatever they claim; a sending skill whose send was pressed says so (review r2 M1)
+            out, why = ((finish_gate.LINE_SKILL_SENT_UNCONFIRMED, "skill_sent_unconfirmed")
+                        if getattr(self, "_skill_sent_unconfirmed", False)
+                        else (finish_gate.LINE_SKILL_UNCONFIRMED, "skill_unconfirmed"))
         if why is not None and out != text and isinstance(verdict, dict) and (text or "").strip():
             # second review V3: the card and the window get the line alone; the brain's own words stay on the verdict
             # (``words``) for the expanded run, never as the reply

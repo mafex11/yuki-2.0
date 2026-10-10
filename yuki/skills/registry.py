@@ -180,10 +180,11 @@ def start_run(store: Any, *, skill: Skill | str, origin: str, t0: float | None =
 def finish_run(store: Any, run_key: str, *, outcome: str, checked: bool | None, route: Route | None = None,
                t_done: float | None = None, ms: float | None = None, value: float | None = None,
                entity_digest: str | None = None, evidence: Mapping[str, Any] | None = None,
-               error: str | None = None, app: str | None = None) -> bool:
+               error: str | None = None, app: str | None = None, acted: bool = False) -> bool:
     """Finish the run's row: the route that ran last, the outcome word, the done-check's verdict (D19: 1 / 0 / NULL),
     when it was done, and the D18 attribution facts (a level set, the entity started, and ``app``: the app the route
     acted on, as an app key, when it is not the connection's own: a mixer level set on Spotify is Spotify's moment).
+    ``acted``: a rung of this run acted before it ended (its end kind stays even on an idle outcome, review r2 L6).
     Content-free."""
     if outcome not in OUTCOMES:
         outcome = "error"
@@ -197,8 +198,9 @@ def finish_run(store: Any, run_key: str, *, outcome: str, checked: bool | None, 
                 "AND r.rung = ? AND r.variant = ? AND r.via = ?", (run_key, route.rung, route.variant, route.via)
             ).fetchone()
             route_id = int(got[0]) if got else None
-        # D18: a run that changed nothing (asked, held, refused, playing elsewhere, already so) claims no moment
-        idle = outcome in IDLE_OUTCOMES
+        # D18: a run that changed nothing (asked, held, refused, playing elsewhere, already so) claims no moment; one
+        # whose earlier rung acted keeps it (that rung's moment is Yuki's, review r2 L6)
+        idle = outcome in IDLE_OUTCOMES and not acted
         conn.execute(
             "UPDATE skill_runs SET outcome = ?, checked = ?, route_id = ?, rung = ?, variant = ?, via = ?, t_done = ?, "
             "ms = ?, value = ?, entity_digest = ?, evidence = ?, error = ?, app = coalesce(?, app), "
@@ -273,6 +275,53 @@ def set_recheck(store: Any, run_key: str, agrees: bool | None) -> bool:
 def mark_false_done(store: Any, run_key: str) -> bool:
     """The user corrected or repeated the skill within 60 s of its "done" (D19's other false-done source)."""
     return set_recheck(store, run_key, False)
+
+
+#: D19: a correction, or the same skill asked again with the same values, this soon after its "done" is a false done.
+FALSE_DONE_S = 60.0
+
+
+def values_digest(store: Any, skill_key: str, values: Mapping[str, Any] | None) -> str | None:
+    """A keyed digest of a run's slot values (``skill_runs.slots_digest``: "the same values as last time", never the
+    values in clear). ``None`` with no values given (a relative change has none: the engine passes ``None``) or no
+    key to digest with."""
+    if values is None:
+        return None
+    try:
+        canon = {str(k): (v.get("key") or v.get("name")) if isinstance(v, Mapping) else v
+                 for k, v in values.items() if v is not None}
+        blob = json.dumps(canon, sort_keys=True, ensure_ascii=False, default=str)
+        return str(store.cipher.digest("skill-slots", str(skill_key), blob))[:32]
+    except Exception:  # noqa: BLE001 - no digest: no repeat can be matched (never a false mark)
+        return None
+
+
+def false_done_after(store: Any, skill_key: str, *, now: float | None = None, digest: str | None = None,
+                     corrects: bool = False, within_s: float = FALSE_DONE_S,
+                     request_id: str | None = None) -> str | None:
+    """D19's other false-done source: the newest run of ``skill_key`` that ended "done" within ``within_s`` of
+    ``now`` is marked a false done (:func:`mark_false_done`) when the user corrected it (``corrects``) or asked the
+    same skill again with the same absolute values (``digest`` equal to its ``slots_digest``) in another request
+    (``request_id``: a model calling the skill twice inside one request is not the user repeating it). Returns the run
+    key marked, else ``None``. Only the newest finished run counts (an older done was already followed by another
+    run)."""
+    now = time.time() if now is None else float(now)
+    if not corrects and not digest:
+        return None
+    rows = last_runs(store, skill_key, since=now - within_s - 30.0, limit=3)
+    if not rows:
+        return None
+    row = rows[0]
+    if row.get("outcome") != "done" or row.get("checked") != 1 or row.get("recheck") == 0:
+        return None
+    t_done = row.get("t_done") if row.get("t_done") is not None else row.get("t0")
+    if t_done is None or now - float(t_done) > within_s:
+        return None
+    if not corrects and (row.get("slots_digest") != digest
+                         or (request_id is not None and row.get("request_id") == request_id)):
+        return None
+    key = str(row.get("run_key") or "")
+    return key if key and mark_false_done(store, key) else None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -440,13 +489,13 @@ def last_runs(store: Any, skill_key: str, *, since: float, limit: int = 5) -> li
     the resolver's "again" and the voice's "a bit more")."""
     try:
         rows = store._query(
-            "SELECT run_key, origin, outcome, checked, rung, variant, via, t0, t_done, value FROM skill_runs "
-            "WHERE skill = ? AND t0 >= ? AND outcome != 'running' "
+            "SELECT run_key, origin, outcome, checked, rung, variant, via, t0, t_done, value, slots_digest, recheck, "
+            "request_id FROM skill_runs WHERE skill = ? AND t0 >= ? AND outcome != 'running' "
             "ORDER BY t0 DESC LIMIT ?", (skill_key, float(since), int(limit)))
     except Exception:  # noqa: BLE001
         return []
-    return [dict(zip(("run_key", "origin", "outcome", "checked", "rung", "variant", "via", "t0", "t_done", "value"),
-                     tuple(r))) for r in rows]
+    return [dict(zip(("run_key", "origin", "outcome", "checked", "rung", "variant", "via", "t0", "t_done", "value",
+                      "slots_digest", "recheck", "request_id"), tuple(r))) for r in rows]
 
 
 def import_evidence(store: Any, skill_key: str, route: Route, *, ok: int, source: str,

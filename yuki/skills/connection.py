@@ -120,6 +120,8 @@ PROBES: tuple[str, ...] = (
     "driver",          # a probe function of a driver module (its PROBES table)
     "all",             # every part True -> True; any False -> False; else None
 )
+#: The probes that compare a process image: their check must name ``process`` (or ``window``).
+PROCESS_PROBES: tuple[str, ...] = ("foreground", "tab_shown", "audio_active", "mic_held")
 
 #: The closed list of slot types (map-skills S3.2).
 SLOT_TYPES: tuple[str, ...] = ("enum", "number", "points", "bool", "entity", "text", "person", "app")
@@ -493,6 +495,9 @@ def _check(raw: Any, where: str, *, recheck: bool = False) -> Check | None:
             raise ConnectionError_(f"{where}: a driver probe names its call")
     if probe == "message_sent" and not str(raw.get("text") or ""):
         raise ConnectionError_(f"{where}: a message_sent check names the text it matches (text = \"{{text}}\")")
+    if probe in PROCESS_PROBES and not str(raw.get("process") or raw.get("window") or "").strip():
+        # review r2 L4: these compare process images; with none named an unreadable image ("") would match ""
+        raise ConnectionError_(f"{where}: a {probe} check names the process it reads (process = \"App.exe\")")
     within = _number(raw.get("within_s"), f"{where}.within_s")
     after = _number(raw.get("after_s"), f"{where}.after_s")
     if within is not None and not 0.0 <= within <= 6.0:
@@ -846,4 +851,4 @@ __all__ = ["CONNECTIONS_DIR", "MAX_SKILLS", "MENU_LINE_CHARS", "VERBS", "PROBES"
            "SKILL_KINDS", "RUNGS", "GAME_RULES", "WINDOW_STATES", "SETUP_WORDS", "ConnectionError_", "VerbInfo",
            "Slot", "Check", "Route", "Skill", "Loaded", "template_names", "lookup", "fill", "fill_value",
            "site_label", "parse_skill", "parse_file", "load", "clear_cache", "driver_exists", "sends_with",
-           "window_state_reader"]
+           "window_state_reader", "PROCESS_PROBES"]

@@ -800,14 +800,23 @@ SKILL_UNCONFIRMED = "the skill's own check didn't see the result"
 #: Said when a pinned skill's gate ended unconfirmed and nothing else replaced the brain's words (review L4: with no
 #: action and an "answer" claim, "Set it to 40." stood although the skill's check said otherwise).
 LINE_SKILL_UNCONFIRMED = "I couldn't confirm that's done."
+#: Said when a pinned skill that sends ended with send pressed and its own check unable to see the message land (review
+#: r2 M1): never sent back to "finish it" (rule 8: a second send), never said as done.
+LINE_SKILL_SENT_UNCONFIRMED = "I pressed send, but I couldn't confirm it landed."
 
 
 def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
-               check: Callable[..., Any] | None = None) -> tuple[str, str | None]:
-    """A done on a request with a pinned skill: ``("ok", None)`` when its done-check sees the result (or the skill has
-    no machine check the thinker's own steps could raise: the outcome verdict of its trace decides), ``("hold",
-    note)`` to send the done back ("not done yet", at most :data:`SKILL_BOUNCES` times), ``("unconfirmed", gap)``
-    after that: the request ends, said as "couldn't confirm". Data only (the probe's verdict), never the words."""
+               check: Callable[..., Any] | None = None,
+               memory_call: Callable[[str, Callable[[Any], Any]], Any] | None = None,
+               sent: bool = False) -> tuple[str, str | None]:
+    """A done (or a plain-text ending) on a request with a pinned skill: ``("ok", None)`` when its done-check sees the
+    result (or the skill has no machine check the thinker's own steps could raise: the outcome verdict of its trace
+    decides), ``("hold", note)`` to send it back ("not done yet", at most :data:`SKILL_BOUNCES` times),
+    ``("unconfirmed", gap)`` after that: the request ends, said as "couldn't confirm". ``memory_call(what, fn)``: the
+    agent's memory, for the memory-backed probes (``message_sent``, ``moment``; review r2 M1). ``sent``: a send was
+    pressed in this request: for a skill that sends (``pinned["sends"]``) a check that didn't see it is
+    ``("sent_unconfirmed", gap)`` at once, never a "finish it" note (a second send). Data only (the probe's verdict),
+    never the words."""
     if not isinstance(pinned, dict) or not pinned.get("key"):
         return "ok", None
     done = pinned.get("done")
@@ -819,7 +828,8 @@ def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
 
             base = pinned.get("baseline")
             # the onset probes compare with the states the engine read right before the hand-off (review M4)
-            got = check_fn(done, since=float(since), baseline=base if isinstance(base, dict) else None)
+            got = check_fn(done, since=float(since), baseline=base if isinstance(base, dict) else None,
+                           memory_call=memory_call)
         else:
             got = check(done, since=float(since))
         verdict = getattr(got, "verdict", got)
@@ -828,10 +838,13 @@ def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
         verdict, evidence = None, {}
     if verdict is True:
         return "ok", None
+    if pinned.get("sends") and sent:
+        # send was pressed: the message may have gone whatever the check read, so it is never sent back (rule 8)
+        return "sent_unconfirmed", SKILL_UNCONFIRMED
     seen = "the PC shows otherwise" if verdict is False else "the PC couldn't read it"
     status = str(evidence.get("status") or "") if isinstance(evidence, dict) else ""
     if int(bounces) < SKILL_BOUNCES:
-        words = str(pinned.get("done_words") or "what they asked")
+        words = str(pinned.get("done_words") or "what they asked").rstrip(". ") or "what they asked"
         return "hold", (f"not done yet: {seen}" + (f" ({status})" if status.replace("_", "").isalpha() else "")
                         + f". The usual way ({pinned.get('key')}) is done only when: {words}. Check the screen and "
                         f"finish it, or say plainly that it couldn't be confirmed.")
@@ -843,4 +856,4 @@ __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILE
            "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
            "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "did_other", "honest_text",
            "last_windowless", "read_back", "SKILL_BOUNCES", "SKILL_UNCONFIRMED", "LINE_SKILL_UNCONFIRMED",
-           "skill_gate"]
+           "LINE_SKILL_SENT_UNCONFIRMED", "skill_gate"]

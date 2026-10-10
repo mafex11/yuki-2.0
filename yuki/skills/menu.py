@@ -74,12 +74,15 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
 
 
 def menu_text(store: Any = None, *, audience: str = TALKER, loaded: Loaded | None = None, now: float | None = None,
-              chars: int = MENU_CHARS) -> str:
+              chars: int = MENU_CHARS, rank: str | None = None) -> str:
     """The menu block (``""`` when no skill is loaded). The talker's starts with its heading; the thinker's is the
     bare lines (its tool description carries the heading) with taste candidates most seen first, so its tool block
-    stays byte-stable through the day (review L2: an hour-ranked list changed the cached block every hour)."""
+    stays byte-stable through the day (review L2: an hour-ranked list changed the cached block every hour).
+    ``rank``: the taste order (``hour`` / ``n_obs``) when not the audience's own (the requests suite's eval prompt
+    takes ``n_obs``, so its cached prefix holds across the fixtures' hours)."""
     loaded = loaded if loaded is not None else load()
-    lines = menu_lines(loaded, store=store, now=now, chars=chars, rank="n_obs" if audience == THINKER else "hour")
+    rank = rank or ("n_obs" if audience == THINKER else "hour")
+    lines = menu_lines(loaded, store=store, now=now, chars=chars, rank=rank)
     if not lines:
         return ""
     if audience == TALKER:

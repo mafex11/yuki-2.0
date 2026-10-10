@@ -534,3 +534,83 @@ def test_a_drivers_window_state_hook_feeds_the_states_rule(tmp_path: Path, archi
     _write(tmp_path / "c", "c.toml", text.replace('app = "inventedapp"',
                                                   f'app = "inventedapp"\nstate_reader = "{archived_driver}"'))
     assert C.load([tmp_path / "c"]).get("invented.lvl").state_reader == archived_driver
+
+
+# -- review round 2 ----------------------------------------------------------------------------------------------------
+
+
+def test_a_run_whose_earlier_rung_acted_keeps_its_end_kind(store: Store, demo: C.Loaded) -> None:
+    """Review r2 L6 (D18): held / asked / elsewhere after an earlier rung of the same run acted keeps the end kind, so
+    that rung's moment is still Yuki's."""
+    from yuki.memory.moments import skill_runs_between
+
+    skill = demo.get("demo.volume")
+    for outcome in ("held_game", "asked", "other_device"):
+        key = R.start_run(store, skill=skill, origin="voice", t0=3000.0)
+        R.finish_run(store, key, outcome=outcome, checked=None, t_done=3000.5, acted=True)
+    windows = skill_runs_between(store, 2990.0, 3010.0)
+    assert len(windows) == 3 and all(w.end_kind == "volume_change" for w in windows)
+
+
+@pytest.mark.parametrize("probe", list(C.PROCESS_PROBES))
+def test_a_probe_comparing_process_images_names_its_process(tmp_path: Path, probe: str) -> None:
+    """Review r2 L4: with no process named, an image that couldn't be read ("") would match the empty name."""
+    _write(tmp_path, "noproc.toml", SKILL.format(app="inventedapp", key="invented.thing", end="page", via="open_uri",
+                                                 extra=f'args = {{ uri = "inventedapp://home" }}\n'
+                                                       f'done = {{ probe = "{probe}" }}'))
+    C.clear_cache()
+    got = C.load([tmp_path])
+    assert got.keys == () and "names the process" in got.errors[0]
+    _write(tmp_path, "noproc.toml", SKILL.format(app="inventedapp", key="invented.thing", end="page", via="open_uri",
+                                                 extra=f'args = {{ uri = "inventedapp://home" }}\n'
+                                                       f'done = {{ probe = "{probe}", process = "InventedApp.exe" }}'))
+    C.clear_cache()
+    assert C.load([tmp_path]).keys == ("invented.thing",)
+
+
+def test_a_false_done_is_marked_on_a_correction_or_the_same_values_within_60_s(store: Store, demo: C.Loaded) -> None:
+    """Review r2 M2 (D19): the newest run that ended done, within 60 s, is marked false (recheck 0) on a correction,
+    or on the same absolute values asked again; different values, an older done or a later run don't."""
+    skill = demo.get("demo.volume")
+    R.seed(store, demo)
+    d40 = R.values_digest(store, skill.key, {"level": 40.0, "control": "in_app"})
+    d30 = R.values_digest(store, skill.key, {"level": 30.0, "control": "in_app"})
+    assert d40 and d30 and d40 != d30 and len(d40) == 32 and set(d40) <= set("0123456789abcdef")   # keyed, not clear
+    assert R.values_digest(store, skill.key, None) is None
+
+    def done_run(t: float, digest: str | None) -> str:
+        key = R.start_run(store, skill=skill, origin="voice", t0=t, slots_digest=digest)
+        R.finish_run(store, key, outcome="done", checked=True, route=skill.routes[0], t_done=t + 0.5)
+        return key
+
+    def recheck(key: str) -> Any:
+        return store._query("SELECT recheck FROM skill_runs WHERE run_key = ?", (key,))[0][0]
+
+    first = done_run(5000.0, d40)
+    assert R.false_done_after(store, skill.key, now=5010.0, digest=d30) is None        # other values
+    assert recheck(first) is None
+    assert R.false_done_after(store, skill.key, now=5070.0, digest=d40) is None        # past 60 s
+    assert R.false_done_after(store, skill.key, now=5010.0, digest=d40) == first       # the same values again
+    assert recheck(first) == 0
+    second = done_run(5100.0, d30)
+    assert R.false_done_after(store, skill.key, now=5110.0, corrects=True) == second   # a correction, any values
+    assert recheck(second) == 0
+    assert R.false_done_after(store, skill.key, now=5111.0, corrects=True) is None     # already marked
+    third = done_run(5200.0, d30)
+    later = R.start_run(store, skill=skill, origin="voice", t0=5205.0, slots_digest=d30)
+    R.finish_run(store, later, outcome="unverified", checked=None, t_done=5205.5)
+    assert R.false_done_after(store, skill.key, now=5210.0, digest=d30) is None        # not the newest run
+    assert recheck(third) is None
+    t = R.trust(store, skill.key, now=5300.0)["A:in_app:uia_invoke"]
+    assert t.failed == 2 and t.ok == 1                                                 # counted against the rung
+
+
+def test_the_same_values_twice_inside_one_request_is_no_false_done(store: Store, demo: C.Loaded) -> None:
+    """Review r2 M2: a model calling the skill twice in one request is not the user repeating it; a correction is."""
+    skill = demo.get("demo.volume")
+    R.seed(store, demo)
+    digest = R.values_digest(store, skill.key, {"level": 40.0})
+    key = R.start_run(store, skill=skill, origin="thinker", t0=7000.0, request_id="req-1", slots_digest=digest)
+    R.finish_run(store, key, outcome="done", checked=True, route=skill.routes[0], t_done=7000.5)
+    assert R.false_done_after(store, skill.key, now=7010.0, digest=digest, request_id="req-1") is None
+    assert R.false_done_after(store, skill.key, now=7010.0, digest=digest, request_id="req-2") == key

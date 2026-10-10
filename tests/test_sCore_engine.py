@@ -41,6 +41,10 @@ def _no_live_verbs_or_probes(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setitem(donecheck.PROBE_FUNCS, name, lambda ctx, args: (None, {"status": "test_stub"}))
     for name in list(donecheck.BASELINES):
         monkeypatch.setitem(donecheck.BASELINES, name, lambda args: None)
+    # D9's local read of the window in front is never made from a test: no game unless a test says so (RunContext.game)
+    from yuki.memory import gamegate
+
+    monkeypatch.setattr(gamegate, "game_in_front", lambda: "")
 
 
 @pytest.fixture()
@@ -810,3 +814,135 @@ def test_in_call_is_read_for_every_origin_and_already_has_its_own_words(tmp_path
 class SimpleHands:
     def __init__(self, in_call: bool) -> None:
         self.in_call = in_call
+
+
+# -- review round 2 ----------------------------------------------------------------------------------------------------
+
+
+def test_a_check_after_a_slow_earlier_rung_still_gets_its_own_time(client, demo) -> None:
+    """Review r2 M3: rung A spends 4.9 s of the 5 s budget and can't run; rung B acts and the level shows 0.25 s later,
+    inside its own within_s = 1: done, and rung B is never counted as contradicted (no hand-off, nothing redone)."""
+    vol = demo.get("demo.volume")
+    R.import_evidence(client.store, vol.key, vol.routes[2], ok=1, source="procedure:1")
+    plan = _plan(client, demo, "demo.volume", {"level": 40}, ["forty"])
+
+    def slow_fail(call: E.RouteCall) -> E.RouteResult:
+        call.ctx.sleep(4.9)                      # a cold window: the rung spent its time and found nothing
+        return E.RouteResult(ran=False, outcome="not_built")
+
+    level = Probe(False, True)
+    steps = Verb()
+    res = E.run(plan, _ctx(client, verbs={"uia_invoke": slow_fail, "uia_steps": steps}, probes={"level": level}))
+    assert res.outcome == "done" and res.done and res.handoff is None and len(steps.calls) == 1
+    assert level.reads == [False, True]
+    t = R.trust(client.store, "demo.volume")["B:steps:uia_steps"]
+    assert (t.ok, t.failed, t.streak) == (1, 0, 0)
+    # a check that stays False through its own time is still a contradiction, counted once
+    level = Probe(False)
+    res = E.run(plan, _ctx(client, verbs={"uia_invoke": slow_fail, "uia_steps": Verb()}, probes={"level": level}))
+    assert not res.done and len(level.reads) == 5                # 0 to 1 s at 0.25 s steps: never cut by the budget
+
+
+def test_a_correction_or_the_same_values_again_marks_the_last_done_false(client, demo,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 M2 (D19): through resolve_and_run, for the voice and the thinker: the talker's ``corrects`` flag, or
+    the same skill with the same absolute values within 60 s of a done, marks that done false (recheck 0) and logs
+    it; ``again`` and other values don't."""
+    from types import SimpleNamespace
+
+    from yuki.skills import donecheck
+
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", FIXTURES)
+    C.clear_cache()
+    log: list = []
+
+    def go(slots: dict, **kw: Any) -> E.SkillResult:
+        ctx = _ctx(client, verbs={"uia_invoke": Verb()}, probes={"level": Probe(True)}, log=log)
+        return E.resolve_and_run("demo.volume", slots, ["invented words"], ctx, live=Live(), **kw)
+
+    def rechecks() -> list:
+        return [r["recheck"] for r in _rows(client)]
+
+    assert go({"level": 40}).done
+    assert go({"level": 30}).done
+    assert rechecks() == [1, 1]                                  # other values: nothing marked
+    assert go({"level": 30}).done                                # the same values again within 60 s
+    assert rechecks() == [1, 0, 1]
+    marks = [f for e, f in log if e == "done_recheck" and f.get("result") == "false_done"]
+    assert len(marks) == 1 and marks[0]["reason"] == "repeat" and marks[0]["recheck"] == "user"
+    assert go({"level": 30}, again=True).done                    # "again" is a further change, never a correction
+    assert rechecks() == [1, 0, 1, 1]
+    # the voice's correction flag marks the newest done whatever the values
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", Verb())
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", Probe(True))
+    ok, _r, facts = E.run_for_voice(SimpleNamespace(memory=client), {"skill": "demo.volume", "slots": {"level": 25},
+                                                                     "corrects": True}, ["no, twenty five"], game="",
+                                    log=lambda event, **f: log.append((event, f)))
+    assert ok and facts["corrects"] is True
+    assert rechecks()[:4] == [1, 0, 1, 0]
+    assert [f["reason"] for e, f in log if e == "done_recheck" and f.get("result") == "false_done"] == \
+        ["repeat", "correction"]
+    # the thinker's flag too (its run then hands over: the stand-in verbs can't run)
+    E.run_for_thinker({"skill": "demo.volume", "slots": {"level": 20}, "corrects": True}, ["twenty"], memory=client,
+                      game=lambda: "")
+    assert rechecks()[4] == 0
+    # a relative change asked twice is never a repeat of the same values
+    amp = SimpleNamespace(slots=(C.Slot(name="level", type="number"), C.Slot(name="change", type="points")))
+    assert E._absolute_values(amp, {"level": None, "change": -10.0}) is None
+    assert E._absolute_values(amp, {"level": 40.0, "change": None}) == {"level": 40.0, "change": None}
+
+
+def test_the_voices_game_answer_is_for_resolving_and_every_rung_reads_the_game_itself(
+        client, demo, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 L5: run_for_voice's ``game`` feeds the live facts only; the D17 re-check before a rung reads fresh."""
+    from types import SimpleNamespace
+
+    from yuki.memory import gamegate
+    from yuki.skills import donecheck
+
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", FIXTURES)
+    C.clear_cache()
+    reads: list[str] = []
+
+    def front() -> str:
+        reads.append("read")
+        return ""
+
+    monkeypatch.setattr(gamegate, "game_in_front", front)
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", Verb())
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", Probe(True))
+    ok, _r, _f = E.run_for_voice(SimpleNamespace(memory=client), {"skill": "demo.volume", "slots": {"level": 40}},
+                                 ["forty"], game="")
+    assert ok and reads == ["read"]                              # the "states" rung's own fresh read, not the answer
+
+
+def test_the_whole_pc_level_with_nothing_to_set_is_no_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 L3: no level, no change and no mute: nothing set, never a done."""
+    from yuki.perception import audio
+
+    calls: list = []
+    monkeypatch.setattr(audio, "set_master_volume", lambda **kw: calls.append(kw) or {"level": 50.0, "before": 50.0})
+    skill = C.Skill(key="x.pc", app="x", end="volume_change", kind="change", menu="m", done_line="d", slots=(),
+                    routes=(C.Route(rung="A", via="endpoint_volume", needs_focus=False, game="always"),))
+    call = E.RouteCall(skill, skill.routes[0], {}, {}, E.RunContext(), 0.0)
+    got = E.v_endpoint_volume(call)
+    assert (got.ran, got.verified, got.outcome) == (False, None, "no_value") and calls == []
+    got = E.v_endpoint_volume(E.RouteCall(skill, skill.routes[0], {"level": 50}, {}, E.RunContext(), 0.0))
+    assert got.ran is True and got.verified is True and calls == [{"level": 50, "change": None, "mute": None}]
+
+
+def test_the_process_probes_never_match_an_unread_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 L4: no process named, or the image of the window in front couldn't be read: couldn't read, never
+    True."""
+    from yuki.perception import audio
+    from yuki.skills import donecheck as D
+
+    monkeypatch.setattr(D, "_front", lambda: (77, ""))
+    monkeypatch.setattr(D, "_image_of", lambda pid: "")
+    monkeypatch.setattr(audio, "capture_sessions", lambda: [{"pid": 5, "state": "active"}])
+    monkeypatch.setattr(audio, "render_sessions", lambda: [{"pid": 5, "state": "active"}])
+    ctx = D.ProbeContext(since=0.0, baseline={"mic_held:": False})
+    for fn in (D.probe_foreground, D.probe_tab_shown, D.probe_audio_active, D.probe_mic_held):
+        assert fn(ctx, {})[0] is None, fn.__name__
+    assert D.probe_foreground(ctx, {"process": "InventedApp.exe"})[0] is None      # the image in front unread
+    assert D.probe_tab_shown(ctx, {"process": "InventedApp.exe"})[0] is None

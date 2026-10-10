@@ -46,6 +46,10 @@ def _no_live_verbs_or_probes(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setitem(donecheck.PROBE_FUNCS, name, lambda ctx, args: (None, {"status": "test_stub"}))
     for name in list(donecheck.BASELINES):
         monkeypatch.setitem(donecheck.BASELINES, name, lambda args: None)
+    # D9's local read of the window in front is never made from a test: no game unless a test says so (RunContext.game)
+    from yuki.memory import gamegate
+
+    monkeypatch.setattr(gamegate, "game_in_front", lambda: "")
 
 
 @pytest.fixture()
@@ -487,5 +491,171 @@ def test_the_thinker_menu_is_byte_stable_through_the_day(tmp_path: Path, demo) -
         assert "[list: Invented Dusk | Invented Dawn]" in think8               # most seen first
         talk8 = menu_text(store, audience=TALKER, loaded=demo, now=at8)
         assert "[list: Invented Dawn | Invented Dusk]" in talk8               # the talker's: best at this hour
+        # review r2 L7: the requests suite's eval prompt keeps one cached prefix across the fixtures' hours
+        from yuki.skills.resolve import EvalResolver
+
+        ev = EvalResolver(store, prompt=lambda menu: menu, loaded=demo)
+        assert ev.system(at8) == ev.system(at20) and "[list: Invented Dusk | Invented Dawn]" in ev.system(at8)
+        assert ev.system(at8).startswith("Skills (")                           # still the talker's block
     finally:
         store.close()
+
+
+# -- review round 2 ----------------------------------------------------------------------------------------------------
+
+
+def _plain(text: str) -> SimpleNamespace:
+    return _response(_block("text", text=text), stop="end_turn")
+
+
+@pytest.fixture()
+def gate_reads(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """The pinned skill's done-check as a stub that never sees the result, counting its reads."""
+    from yuki.skills import donecheck
+
+    reads = {"n": 0, "memory_call": []}
+
+    def never(done: Any, *, since: float, **kw: Any) -> Any:
+        reads["n"] += 1
+        reads["memory_call"].append(kw.get("memory_call"))
+        return donecheck.Waited(False, {"status": "stub"}, 1, 1.0)
+
+    monkeypatch.setattr(donecheck, "check", never)
+    return reads
+
+
+def test_a_plain_text_reply_on_a_pinned_request_goes_through_the_skill_gate(gate_reads: dict, tmp_path: Path) -> None:
+    """Review r2 H1: with nothing done, a plain-text "Done, ... at 40%." never stands: the skill's own check is read,
+    the reply is sent back at most twice, then it ends as "couldn't confirm"."""
+    from yuki.agent.finish import LINE_SKILL_UNCONFIRMED
+    from yuki.log.events import Final
+
+    client = Scripted([_plain("Done, Demo Player is at 40%.")] * 3)
+    agent = _agent(client, tmp_path)
+    final = list(agent.run("set Demo Player to 40", skill=dict(PIN)))[-1]
+    assert isinstance(final, Final) and gate_reads["n"] == 3 and len(client.calls) == 3
+    assert final.text == LINE_SKILL_UNCONFIRMED and final.outcome["level"] != "answer"
+    notes = json.dumps(client.calls[1]["messages"], default=str)
+    assert "your reply above was not sent: not done yet" in notes
+
+
+def test_a_plain_text_reply_after_steps_is_gated_too(gate_reads: dict, tmp_path: Path) -> None:
+    """Review r2 H1: steps ran, then plain text twice: the first is sent back for done (as before), the next ones go
+    through the skill's gate, never standing unchecked."""
+    from yuki.agent.finish import LINE_SKILL_UNCONFIRMED
+    from yuki.log.events import Final
+
+    look = _response(_block("tool_use", id="l1", name="look_at_desktop", input={}))
+    client = Scripted([look] + [_plain("It's at 40% now.")] * 4)
+    agent = _agent(client, tmp_path)
+    final = list(agent.run("set Demo Player to 40", skill=dict(PIN)))[-1]
+    assert isinstance(final, Final) and len(client.calls) == 5
+    assert gate_reads["n"] == 3                                   # after the one plain_held: hold, hold, unconfirmed
+    assert final.text == LINE_SKILL_UNCONFIRMED
+
+
+def test_a_plain_text_reply_the_check_sees_stands(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from yuki.log.events import Final
+    from yuki.skills import donecheck
+
+    monkeypatch.setattr(donecheck, "check", lambda done, *, since, **kw: donecheck.Waited(True, {}, 1, 1.0))
+    client = Scripted([_plain("It was already at 40%.")])
+    final = list(_agent(client, tmp_path).run("set Demo Player to 40", skill=dict(PIN)))[-1]
+    assert isinstance(final, Final) and len(client.calls) == 1 and final.text == "It was already at 40%."
+
+
+NOTE_PIN = {"key": "invented.note", "app": "inventedchat", "goal": "send a note in Invented Chat",
+            "slots": {"words": {"value": "on my way", "from": "words"}}, "done_words": "Sent.",
+            "done": {"probe": "message_sent", "app": "inventedchat", "text": "on my way", "within_s": 0.3},
+            "tried": [], "sends": True}
+
+
+def test_the_gate_reads_memory_backed_probes_with_the_agents_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 M1: memory reaches message_sent through the gate; a sending skill whose send was pressed is never sent
+    back to "finish it" (rule 8), whatever its check read; before any send it is."""
+    from yuki.agent.finish import skill_gate
+    from yuki.skills import donecheck
+
+    # the real probe (it reads memory only, through the memory_call given)
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "message_sent", donecheck.probe_message_sent)
+
+    captured: list = []
+    client = SimpleNamespace(sent_messages=lambda app, since=0.0, **kw: list(captured))
+    asked: list = []
+
+    def memory_call(what: str, fn: Any) -> Any:
+        asked.append(what)
+        return fn(client)
+
+    assert skill_gate(NOTE_PIN, since=0.0, bounces=0, memory_call=memory_call, sent=True)[0] == "sent_unconfirmed"
+    assert asked and set(asked) == {"sent_messages"}
+    state, note = skill_gate(NOTE_PIN, since=0.0, bounces=0, memory_call=memory_call, sent=False)
+    assert state == "hold" and "Sent.." not in note and "(not_seen_yet)" in note   # nothing sent yet: finish it
+    captured.append({"text": "On my  way"})
+    assert skill_gate(NOTE_PIN, since=0.0, bounces=0, memory_call=memory_call, sent=True) == ("ok", None)
+
+
+def _chat_memory(captured: list) -> Any:
+    from test_d_brain import _send_memory
+
+    from yuki.agent.memory import MemoryUnavailable
+
+    base = type(_send_memory(captured))
+
+    class Memory(base):  # type: ignore[misc, valid-type]
+        def call(self, what: str, fn: Any, *, timeout_s: float) -> Any:
+            if what == "sent_messages":
+                return fn(SimpleNamespace(sent_messages=lambda app, since=0.0, **kw: list(captured)))
+            raise MemoryUnavailable("not in this test")
+
+    return Memory()
+
+
+@pytest.mark.parametrize("captured,level", [([], None), ([{"text": "on my way"}], "verified")])
+def test_a_pinned_message_hand_off_is_never_sent_back_after_its_send(tmp_path: Path, captured: list, level: Any,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 M1, through the real loop: the thinker sends on a pinned sending skill. Seen in memory's capture: it
+    ends verified at once; not seen: it ends at once as not confirmed, never with a "not done yet ... finish it" note
+    (a second send)."""
+    from test_d_brain import CHROME, Client, _agent as brain_agent, _block as b, _response as r, _run
+
+    from yuki.agent.finish import LINE_SKILL_SENT_UNCONFIRMED, LINE_SEND_UNCONFIRMED
+    from yuki.log.events import Final
+    from yuki.skills import donecheck
+
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "message_sent", donecheck.probe_message_sent)   # reads memory only
+
+    sends = lambda p: {"decision": "allow", "sends": True, "scope": "call", "why": "dictated"}  # noqa: E731
+    client = Client([
+        r(b("tool_use", id="t0", name="check_situation", input={"action": "send the message", "hwnd": CHROME})),
+        r(b("tool_use", id="t1", name="type_text", input={"text": "on my way", "press_enter": True,
+                                                         "expect_hwnd": CHROME})),
+        r(b("tool_use", id="t2", name="done", input={"message": "Sent.", "about": []})),
+    ], judge=sends)
+    agent = brain_agent(client, tmp_path, memory=_chat_memory(captured))
+    final = _run(agent, "tell sam on my way", skill=dict(NOTE_PIN))[-1]
+    assert isinstance(final, Final) and len(client.brain_calls) == 3
+    assert not any("not done yet" in json.dumps(c["messages"], default=str) for c in client.brain_calls)
+    if level == "verified":
+        assert final.outcome["level"] == "verified" and agent._skill_unconfirmed is False
+    else:
+        assert agent._skill_sent_unconfirmed is True and final.outcome["level"] != "verified"
+        assert final.text in (LINE_SEND_UNCONFIRMED, LINE_SKILL_SENT_UNCONFIRMED)
+
+
+def test_the_skill_tool_block_stands_through_a_memory_hiccup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            demo) -> None:
+    """Review r2 L2: files loaded and the menu comes back empty (memory's failure): the last block stands."""
+    from yuki.skills import connection as conn
+
+    monkeypatch.setattr(conn, "load", lambda *a, **k: demo)
+    agent = _agent(Scripted([]), tmp_path)
+    monkeypatch.setattr(type(agent.memory), "installed", property(lambda self: True))
+    menu = "- demo.volume: set it\n- demo.home: open it"
+    monkeypatch.setattr(agent.memory, "call", lambda what, fn, timeout_s: menu)
+    agent._skills_block = None
+    first = agent._skills_tools()
+    assert first == (("demo.volume", "demo.home"), menu)
+    agent._skills_block = first
+    monkeypatch.setattr(agent.memory, "call", lambda what, fn, timeout_s: "")
+    assert agent._skills_tools() == first

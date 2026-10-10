@@ -930,8 +930,9 @@ class AgentRuntime(QObject):
         if pin and lane is not self.worker:
             self._skills[request_id] = pin
         fresh = pack if (lane is self.worker and worker_idle) else None
+        # review r2 L1: the newer fields by keyword (a field added beside them can never take the pin's place)
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words, fresh, named, pin))
+                                   previous_query, words, fresh, app_named=named, skill=pin))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
