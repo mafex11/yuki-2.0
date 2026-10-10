@@ -415,6 +415,10 @@ class StepResult:
     question: str = ""            # held: the authorization check's question for the user
     #: capC5: what was different from the way's path, in plain words for the handover ("a dialog came up ...")
     different: str = ""
+    #: held: the consent rule handed the step over (``brain = "all"``: ``hands.authorize`` -> ``brain.check.one``
+    #: says ``handover`` for a step that would send or join with no plan behind it): the planner takes the request
+    #: (bSkill; bTalk merge note 4), the user is never asked "exactly this?"
+    to_planner: bool = False
 
 
 @dataclass
@@ -1341,7 +1345,8 @@ class SkillRunner:
             return done(ok=False, verdict=False, kind="control", tool="authorize", target=target,
                         why=f"Yuki's own check held it back ({getattr(verdict, 'why', '') or 'not plainly asked'})",
                         report="held by Yuki's own check; nothing was done", deviation="held",
-                        question=str(getattr(verdict, "question", "") or ""))
+                        question=str(getattr(verdict, "question", "") or ""),
+                        to_planner=getattr(verdict, "handover", False) is True)
 
         if step.do == "click":
             wait = AFTER_OPEN_WAIT_S if after_open else (FIRST_FIND_WAIT_S if first else FIND_WAIT_S)
@@ -1971,6 +1976,10 @@ class SkillRunner:
             else:
                 facts["held"] = True
                 facts["question"] = deviation.question
+                if deviation.to_planner:
+                    # bSkill (bTalk merge note 4): a send or join the consent rule handed over; the engine and the
+                    # chat driver take it to rung C (the plan seed), never "exactly this?"
+                    facts["to_planner"] = True
             report = (f"stopped the learned way {ref} (\"{intent}\") before step {deviation.step.i} "
                       f"({deviation.step.what()}): {deviation.why}. "
                       + (("Done before it: " + " ".join(done_lines)) if done_lines else "Nothing was done."))
