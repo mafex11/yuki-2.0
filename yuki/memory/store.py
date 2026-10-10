@@ -3479,6 +3479,59 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS routine_events_r ON routine_events(routine_id, at);
     CREATE INDEX IF NOT EXISTS routine_events_at ON routine_events(at, kind);
     """,
+    # 43 (2026-10-10, lCore; docs/research/audit-2026-10-09/learner/design.md §3.4, §4.9, decisions D21-D24): the skill
+    # learner (yuki.skills.learn).
+    # - occasions: one row per occasion, rebuildable (`python -m yuki.skills.learn rebuild`): one user state change (an
+    #   end moment) plus the visit that led to it, or one of Yuki's runs the user asked for that reached a checked end
+    #   (by = 'asked', asked_run = its run key; end_moment_id NULL or the moment it made). Content-free: kinds,
+    #   capability keys, app keys, keyed digests (key_value_digest: the group's key values; entity_key: the end's
+    #   entity), times, cover words, identity tokens (element keys and machine forms, never names), counts. skill_id:
+    #   the learned skill the occasion counts for (one per moment by construction: end_moment_id is unique), which the
+    #   routine miner reads (phase L lWire). Windowed to the moments' retention; ~70 rows a day.
+    # - skills gets the learner's columns: capability_id (a learned row's capability row), spec_ciphertext (its bound
+    #   values, slots, means policy and compiled routes: encrypted, bound values can be names), name_ciphertext (its
+    #   learned name), provenance (content-free JSON: counts, days, first/last, cover, rung, means counts), deleted_at
+    #   (the user's Forget this / Not mine: a tombstone keyed by the skill key, never proposed again).
+    # - skills_app_end (one live skill per (app, end_kind)) is dropped: learned skills share their capability's app and
+    #   end. Capabilities stay one per (app, end) in yuki.skills.connection.load.
+    # - moments gets entity_key (RULE_VERSION 3, D23: an entity's identity across apps) and an index on it.
+    # None of this is exposed by the MCP. Additive, plus the index swap; one self-contained entry.
+    """
+    CREATE TABLE IF NOT EXISTS occasions (
+        id                 INTEGER PRIMARY KEY,
+        end_moment_id      INTEGER UNIQUE,
+        kind               TEXT NOT NULL,
+        capability         TEXT NOT NULL,
+        key_value_digest   TEXT,
+        app                TEXT,
+        means              TEXT,
+        at                 REAL NOT NULL,
+        anchor_at          REAL,
+        weekday            INTEGER,
+        minute             REAL,
+        context_known      INTEGER NOT NULL DEFAULT 1,
+        cover              TEXT NOT NULL,
+        steps              TEXT,
+        opaque_n           INTEGER NOT NULL DEFAULT 0,
+        entity_key         TEXT,
+        asked_run          TEXT,
+        by                 TEXT NOT NULL DEFAULT 'user',
+        skill_id           INTEGER,
+        facts              TEXT,
+        built_at           REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS occasions_at ON occasions(at);
+    CREATE INDEX IF NOT EXISTS occasions_skill ON occasions(skill_id, at);
+    ALTER TABLE skills ADD COLUMN capability_id INTEGER;
+    ALTER TABLE skills ADD COLUMN spec_ciphertext TEXT;
+    ALTER TABLE skills ADD COLUMN name_ciphertext TEXT;
+    ALTER TABLE skills ADD COLUMN provenance TEXT;
+    ALTER TABLE skills ADD COLUMN deleted_at REAL;
+    DROP INDEX IF EXISTS skills_app_end;
+    CREATE INDEX IF NOT EXISTS skills_capability ON skills(capability_id);
+    ALTER TABLE moments ADD COLUMN entity_key TEXT;
+    CREATE INDEX IF NOT EXISTS moments_entity ON moments(entity_key) WHERE entity_key IS NOT NULL;
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`
@@ -10840,7 +10893,7 @@ class Store:
     #: The columns of a moment row, in the order :meth:`save_moments` writes them.
     MOMENT_COLUMNS: tuple[str, ...] = (
         "at", "ended_at", "seen_at", "kind", "app", "service", "entity_digest", "entity_ciphertext", "value",
-        "value_from", "means", "by", "request_id", "source", "source_id", "evidence", "facts",
+        "value_from", "means", "by", "request_id", "source", "source_id", "evidence", "facts", "entity_key",
     )
 
     def save_moments(self, rows: Sequence[dict[str, Any]]) -> int:

@@ -3837,9 +3837,9 @@ class PortraitScheduler:
         nothing did), the day digests of the last completed days are written (yuki.memory.daydigest: the line that
         connects one day's chat to the next), then the persona pass writes how Yuki talks. Each logs and never
         raises (a failure waits for the next night)."""
-        for name, fn in (("dream", self._dream), ("routines", self._routines), ("threads", self._threads),
-                         ("contacts", self._contacts), ("daydigest", self._daydigest), ("persona", self._persona),
-                         ("personal", self._personal)):
+        for name, fn in (("dream", self._dream), ("learn", self._learn), ("routines", self._routines),
+                         ("threads", self._threads), ("contacts", self._contacts), ("daydigest", self._daydigest),
+                         ("persona", self._persona), ("personal", self._personal)):
             try:
                 fn(kind)
             except Exception as exc:
@@ -3852,6 +3852,15 @@ class PortraitScheduler:
         result = Dreamer(self.worker).run(reason=f"after the {kind} run")
         self._log("portrait_run", kind="dream", ok=result.ok, run_id=result.run_id, changes=result.applied,
                   rejected=len(result.rejected), cost_usd=round(result.cost_usd, 6), error=result.error)
+
+    def _learn(self, kind: str) -> None:
+        """Phase L: the skill learner's night pass (yuki.skills.learn.nightly), just before the routine miner so the
+        miner reads this night's skill ids; it holds back by itself with a game in front or a call open, and makes at
+        most one batched naming call."""
+        from yuki.skills.learn import nightly
+
+        with self.worker._run_lock:   # one portrait run at a time, like the routine miner
+            nightly(self.store, now=self.clock(), worker=self.worker, log=self._log)
 
     def _routines(self, kind: str) -> None:
         from yuki.memory.routines import RoutineMiner
