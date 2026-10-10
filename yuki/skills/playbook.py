@@ -464,7 +464,15 @@ def _offer_line(*, cap: Any, skill: Any, spec: Mapping[str, Any], prov: Mapping[
     if skill is None:
         return "Not in use now, so not offered.", False
     kind = str(skill.kind or "change")
-    if not registry.offer_ready(store, skill, kind=kind, now=now):
+    try:
+        # lWire left open: the routine lane's own D14 read (``offers.offer_trusted``: a usage record's runs pooled with
+        # its capability's), so the page and the card agree
+        from yuki.memory.offers import offer_trusted
+
+        trusted = offer_trusted(store, skill, now=now)
+    except Exception:  # noqa: BLE001 - the registry's own read
+        trusted = registry.offer_ready(store, skill, kind=kind, now=now)
+    if not trusted:
         if kind == "open":
             return (f"Not offered yet: first it has to work {registry.OPEN_RUNS} times when you ask ({ok} so far).",
                     False)

@@ -2278,7 +2278,7 @@ class Hands:
         """Rule 8 for a skill that sends (its data's ``sends`` / ``sends_when``) or joins a call (its end state is
         ``call_join``, a voice channel): Yuki's own check reads the user's heard words and the policy, as for the
         thinker's send (a join is judged even where the policy would let it through); held, nothing runs (raises
-        :class:`_Refused` with ``held``). Any other skill is not judged here (its routes are the user's own usual ways).
+        :class:`_Refused` with ``held``). Any other skill is not judged here (its data says it neither sends nor joins).
         Data only, never the words."""
         self._join_grant = None   # a grant is this skill's own, never one left by an earlier run
         try:
@@ -2484,6 +2484,17 @@ class Hands:
             if isinstance(got, dict):
                 out["corrected"] = len(got.get("corrected") or [])
                 out["still_card"] = bool(got.get("still_card"))
+        if memory is not None and result.done and result.options:
+            # tTaste merge note 3: the fresh uploads this run named aloud ("New from A, B and C: want one?"), read once
+            # here, after the line was said and off the loop (a store read, no network), so the talker's next calls
+            # carry them (mouth.skills_options_line) without a read on the loop
+            from yuki.voice.mouth import fetch_skills_options
+
+            offers = fetch_skills_options(memory, timeout_s=0.3)
+            last = self.last_skill
+            if offers and last is not None and last.get("run_key") == result.run_key:
+                last["offers"] = offers
+                out["offers"] = len(offers)
         return out
 
     @staticmethod

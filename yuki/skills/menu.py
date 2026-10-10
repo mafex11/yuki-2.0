@@ -212,13 +212,23 @@ def request_key(loaded: Loaded, key: str, slots: Mapping[str, Any] | None) -> st
     skill = loaded.get(str(key or ""))
     if skill is None or not skill.learned or not skill.capability:
         return str(key or "")
+    return skill.capability if names_other_key(skill, slots) else skill.key
+
+
+def names_other_key(skill: Any, slots: Mapping[str, Any] | None) -> bool:
+    """The one rule behind :func:`request_key` and the engine's ledger (``engine.ledger_skill``; lCore review L11):
+    whether ``slots`` name another value for one of a learned skill's bound key slots (compared as one identity,
+    :func:`yuki.skills.connection.scope_value`). False for a capability or a skill with nothing bound."""
+    bound = getattr(skill, "bound", None) or {}
+    if not bound or not callable(getattr(skill, "slot", None)):
+        return False
     for name, value in (slots or {}).items():
         slot = skill.slot(str(name))
-        if slot is None or slot.role != "key" or slot.name not in skill.bound or value in (None, ""):
+        if slot is None or slot.role != "key" or slot.name not in bound or value in (None, ""):
             continue
-        if scope_value(value) != scope_value(skill.bound[slot.name]):
-            return skill.capability
-    return skill.key
+        if scope_value(value) != scope_value(bound[slot.name]):
+            return True
+    return False
 
 
 def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
@@ -269,5 +279,5 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
 
 
 __all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "TALKER_LEARNED", "TALKER_HEAD", "PLANNER_HEAD",
-           "binds_key", "menu_skills", "skill_line", "menu_lines", "menu_text", "planner_menu", "request_key",
-           "talker_tool", "THINKER_HEAD", "thinker_tool"]
+           "names_other_key", "binds_key", "menu_skills", "skill_line", "menu_lines", "menu_text", "planner_menu",
+           "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]

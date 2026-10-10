@@ -583,8 +583,16 @@ def _seed_probe(seed: Mapping[str, Any] | None) -> Probe | None:
     if name not in PROBES:
         return None
     args = raw.get("args")
+    if args is None:
+        # bSkill finding 3: the engine writes its check flat (``connection.Check.as_dict``: the probe, its arguments,
+        # ``within_s``), so the arguments are its other keys
+        args = {k: v for k, v in raw.items() if k not in _SEED_CHECK_KEYS}
     args = _json_object(args) if not isinstance(args, Mapping) else dict(args)
     return Probe(name=name, args=args or {}, raw=json.dumps(args or {}, ensure_ascii=False, sort_keys=True))
+
+
+#: The keys of the engine's flat done-check that are not the probe's arguments (``connection.Check``).
+_SEED_CHECK_KEYS = frozenset({"probe", "within_s", "after_s", "parts", "same_source", "live"})
 
 
 def _check_done(plan: Plan, checks: Checks) -> Plan:

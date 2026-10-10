@@ -2269,6 +2269,8 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
     for s in _safe(lambda: memory.standing_requests(include_ended=True), []) or []:
         if isinstance(s, dict) and s.get("ref"):
             standing[str(s["ref"])] = " ".join(str(s.get("quote") or s.get("condition") or "").split())
+    line_said = _safe(lambda: memory.digest_line_reactions() if callable(getattr(memory, "digest_line_reactions",
+                                                                                  None)) else {}, {}) or {}
     for n in _safe(lambda: memory.recent_nudges(hours=24 * days), []) or []:
         at = epoch_of(n.get("shown_at")) or epoch_of(n.get("at"))
         if not at:
@@ -2291,6 +2293,14 @@ def build_activity(memory: Any, *, requests_csv: Path | None = None, now: float 
                "result": result, "status": "failed" if outcome in ("expired", "gone") else "done"}
         if c and c["undo_until"] and c["undo_until"] > now:
             row["undo"] = {"card": c["card"], "until": c["undo_until"], "label": "Undo"}
+        if isinstance(n.get("lines"), list) and n["lines"]:
+            # jSwitch merge note: a Today card's (or an away list's) numbered lines, each with Open / Not useful
+            row["lines"] = [{"n": int(ln.get("n") or 0), "text": str(ln.get("text") or "")[:240],
+                             "type": str(ln.get("type") or ""), "ref": str(ln.get("ref") or "")}
+                            for ln in n["lines"] if isinstance(ln, dict)]
+            said = line_said.get(str(n.get("id"))) if isinstance(line_said, dict) else None
+            if isinstance(said, dict) and said:
+                row["line_reactions"] = {str(k): str(v) for k, v in said.items()}
         rows.append(row)
     midnight = datetime.combine(datetime.fromtimestamp(now).date(), datetime.min.time()).timestamp()
     act = _safe(lambda: memory.activity(since=midnight, until=now, group_by="app", limit=20), {}) or {}
@@ -2382,6 +2392,10 @@ def ledger_groups(rows: list[dict[str, Any]], runs: list[dict[str, Any]],
                      "took": "", "cost": row.get("cost") or "", "status": row.get("status") or "", "steps": 0, "failed": 0,
                      "where": row.get("where") or "", "why": row.get("why") or "", "card": row.get("card"),
                      "wrong_text": row.get("wrong_text") or ""}
+                if row.get("lines"):
+                    g["lines"] = row["lines"]
+                    if row.get("line_reactions"):
+                        g["line_reactions"] = row["line_reactions"]
             groups[gid] = g
         if row.get("kind") == "action":
             g["steps"] += 1
@@ -2558,6 +2572,10 @@ def build_settings(memory: Any, *, live: dict[str, Any] | None = None, devices: 
         # Settings → AI (report 67): each job's service and model, each service's key status (never a key); no
         # network here (the page asks for model lists with the ai_models action, off the UI thread)
         "ai": _safe(_ai_page, None),
+        # the card judge (jSwitch merge note): each kind of card, where it is and why (Back up / Fewer); drawn only
+        # when memory answers
+        "card_kinds": _safe(lambda: memory.card_kinds() if callable(getattr(memory, "card_kinds", None)) else None,
+                            None),
     }
 
 

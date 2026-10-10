@@ -336,7 +336,9 @@ where they are from or live, what they are like and into, how the user talks wit
 apps) and what is going on with them now - a few sentences, folding new evidence into the \
 summary rather than adding events to it. Anything owed between them and the user is an \
 open_loop fact, never part of the person text.
-- routine: when they do what - time-of-day and weekday patterns, recurring sessions.
+- routine: when they do what - time-of-day and weekday patterns, recurring sessions. A routine fact with \
+origin=measured is written by code from counted days (a usual thing done at a usual time): never change it, and \
+never add one that says the same thing.
 - preference: how they like things: the apps, tools, sites and settings they choose, \
 languages, formats, tastes.
 - behaviour: a pattern in how the user spends their time and moves between things, \
@@ -3836,10 +3838,11 @@ class PortraitScheduler:
         renamed, asked about), the people index is refreshed from what changed (yuki.memory.contacts: no call when
         nothing did), the day digests of the last completed days are written (yuki.memory.daydigest: the line that
         connects one day's chat to the next), then the persona pass writes how Yuki talks. Each logs and never
-        raises (a failure waits for the next night)."""
+        raises (a failure waits for the next night). Phase T: after the routine miner, the taste pass
+        (:meth:`_taste`)."""
         for name, fn in (("dream", self._dream), ("learn", self._learn), ("routines", self._routines),
-                         ("threads", self._threads), ("contacts", self._contacts), ("daydigest", self._daydigest),
-                         ("persona", self._persona), ("personal", self._personal)):
+                         ("taste", self._taste), ("threads", self._threads), ("contacts", self._contacts),
+                         ("daydigest", self._daydigest), ("persona", self._persona), ("personal", self._personal)):
             try:
                 fn(kind)
             except Exception as exc:
@@ -3869,6 +3872,24 @@ class PortraitScheduler:
             result = RoutineMiner(self.worker).run(reason=f"after the {kind} run")
         self._log("portrait_run", kind="routines", ok=result.ok, run_id=result.run_id, changes=result.applied,
                   rejected=len(result.rejected), cost_usd=round(result.cost_usd, 6), error=result.error)
+
+    def _taste(self, kind: str) -> None:
+        """Phase T (tTaste merge note 8, design D.4): the nightly taste pass (:func:`yuki.skills.taste.seed`: the taste
+        recompute from the user's own moments, then YouTube's nightly part within its own share of the hourly read
+        cap). It holds back by itself with a game in front or a call (a one-shot retry), and runs only with the skill
+        path on (``Settings.skills``). Its content-free ``yt_lookup`` / ``yt_oembed`` / ``taste_offers_off`` lines and
+        the ``taste_seed`` counts go to this log (tTaste merge note 5)."""
+        from yuki import skills
+        from yuki.config import Settings
+
+        if not skills.enabled(Settings()):
+            return
+        from yuki.skills import taste
+
+        started = time.monotonic()
+        got = taste.seed(self.store, now=self.clock(), log=self._log)
+        counts = {k: v for k, v in (got.get("yt_channel") or {}).items() if isinstance(v, (int, float))}
+        self._log("taste_seed", ms=round((time.monotonic() - started) * 1000, 1), **counts)
 
     def _threads(self, kind: str) -> None:
         from yuki.memory.workthreads import Consolidator

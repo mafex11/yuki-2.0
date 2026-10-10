@@ -377,9 +377,8 @@ def run(args: argparse.Namespace) -> int:
             log("error", where="power_start", error=f"{type(exc).__name__}: {exc}")
             power = None
         power_recheck_at: float | None = None
-        #: Phase S (sWeb merge note, sWire): the taste seeds (yuki.skills.taste.seed: the YouTube channels from your own
-        #: page moments), recomputed once a day on a short thread of their own, the first time 5 min after start.
-        taste_seed_at: float | None = time.monotonic() + TASTE_SEED_FIRST_S
+        # The taste pass (yuki.skills.taste.seed) runs in the portrait's night pass (tTaste merge note 8, design D.4:
+        # PortraitScheduler._night), held with a game in front or a call; no timer of its own here.
 
         # The one embedder on this PC: Yuki's tray asks this process for vectors over a
         # local, user-only pipe instead of loading its own ~550 MB copy (yuki.memory.embed_ipc).
@@ -411,8 +410,9 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.now import NowServer
 
+                # yUC merge note: op ``you`` answers from this service's own builder, read late (it is made below)
                 now_server = NowServer(now_board, store.cipher, db_path, on_refresh=watcher.request_refresh,
-                                       log=log).start()
+                                       log=log, you_fn=lambda: you_builder).start()
             except Exception as exc:   # Yuki then reads the screen itself, as before
                 log("error", where="now_ipc_start", error=f"{type(exc).__name__}: {exc}")
         paused = pause_path.exists()
@@ -987,9 +987,6 @@ def run(args: argparse.Namespace) -> int:
                     spotify.beat()
                 except Exception as exc:
                     log("error", where="spotify_beat", error=type(exc).__name__)
-            if moments is not None and taste_seed_at is not None and now >= taste_seed_at:
-                taste_seed_at = now + TASTE_SEED_EVERY_S   # a timer compare; the seed runs on its own short thread
-                _start_taste_seed(store, log)
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
@@ -1255,37 +1252,6 @@ def _follow_acting(
         # phase F (fPrivacy): the request's id, so the memory log links to its session log and moments (no words)
         log("acting", acting=now is not None, lane=now.lane if now is not None else None,
             request_id=(getattr(now, "request_id", "") or None) if now is not None else None)
-
-
-#: Phase S: the taste seeds run this long after the service starts, then once every this many seconds.
-TASTE_SEED_FIRST_S = 300.0
-TASTE_SEED_EVERY_S = 86400.0
-
-
-def _start_taste_seed(store: Any, log: _Log) -> threading.Thread | None:
-    """Phase S (sWeb merge note): :func:`yuki.skills.taste.seed` (idempotent recomputes from the user's own moments;
-    content-free counts logged as ``taste_seed``) on a short daemon thread, so the service's 1 s loop never waits on
-    it. Only with the skill path on (``Settings.skills``). Never raises."""
-    try:
-        from yuki import skills
-        from yuki.config import Settings
-
-        if store is None or not skills.enabled(Settings()):
-            return None
-    except Exception:  # noqa: BLE001
-        return None
-
-    def run() -> None:
-        from yuki.skills import taste
-
-        started = time.monotonic()
-        got = taste.seed(store)
-        counts = {k: v for k, v in (got.get("yt_channel") or {}).items() if isinstance(v, (int, float))}
-        log("taste_seed", ms=round((time.monotonic() - started) * 1000, 1), **counts)
-
-    thread = threading.Thread(target=_guarded(run, log, "taste_seed"), name="yuki-memory-taste-seed", daemon=True)
-    thread.start()
-    return thread
 
 
 def _guarded(fn: Callable[..., Any], log: _Log, where: str) -> Callable[..., None]:

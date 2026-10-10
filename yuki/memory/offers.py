@@ -112,9 +112,8 @@ OFFER_RUNGS: tuple[str, ...] = ("A-link", "A-capability", "B")
 #: What each kind's refs must resolve to (``None``: refs are context only, any offered id).
 NEEDS: dict[str, str | None] = {"todo_add": None, "show_memory": "item", "bring_back": "url", "draft": None,
                                 "ask": None, "run_skill": "routine"}
-#: Outcomes of a ``run_skill`` card beyond ``yuki.memory.store.NUDGE_OUTCOMES``: ``running`` (pressed; the tray runs
-#: the skill) and ``failed`` (it ran and the PC didn't show it done, or it couldn't run). Written by
-#: :func:`_set_outcome` (the store's own setter takes the older outcomes).
+#: Outcomes of a ``run_skill`` card (in ``yuki.memory.store.NUDGE_OUTCOMES`` since the rLane merge note): ``running``
+#: (pressed; the tray runs the skill) and ``failed`` (it ran and the PC didn't show it done, or it couldn't run).
 RUN_OUTCOMES: tuple[str, ...] = ("running", "failed")
 #: Field caps (characters).
 LABEL_MAX = 28
@@ -813,26 +812,15 @@ def act(store: Any, nudge_id: int, *, now: float | None = None, enabled: bool = 
 
 def _set_outcome(store: Any, nudge_id: int, outcome: str, *, at: float | None = None,
                  only_if: Iterable[str | None] | None = None) -> bool:
-    """``store.set_nudge_outcome`` for every outcome, :data:`RUN_OUTCOMES` included (the store's own list predates
-    them: written here with the same compare-and-set, one transaction). False when the card is unknown or its outcome
-    is not one of ``only_if``."""
+    """``store.set_nudge_outcome`` (its compare-and-set, one transaction) for every outcome; the store's list now holds
+    :data:`RUN_OUTCOMES` too (rLane merge note). False when the card is unknown or its outcome is not one of
+    ``only_if``."""
     from yuki.memory import store as store_mod
 
-    if outcome in store_mod.NUDGE_OUTCOMES:
-        return bool(store.set_nudge_outcome(int(nudge_id), outcome, at=at, only_if=only_if))
-    if outcome not in RUN_OUTCOMES:
-        raise ValueError(f"outcome must be one of {store_mod.NUDGE_OUTCOMES + RUN_OUTCOMES}, not {outcome!r}")
-    when = float(at) if at is not None else time.time()
-    allowed = None if only_if is None else tuple(only_if)
-
-    def op(conn: Any) -> bool:
-        row = conn.execute("SELECT outcome FROM nudges WHERE id=?", (int(nudge_id),)).fetchone()
-        if row is None or (allowed is not None and row["outcome"] not in allowed):
-            return False
-        conn.execute("UPDATE nudges SET outcome=?, outcome_at=? WHERE id=?", (outcome, when, int(nudge_id)))
-        return True
-
-    return bool(store._write(op))
+    if outcome not in store_mod.NUDGE_OUTCOMES:
+        raise ValueError(f"outcome must be one of {store_mod.NUDGE_OUTCOMES}, not {outcome!r}")
+    return bool(store.set_nudge_outcome(int(nudge_id), outcome, at=at,
+                                        only_if=None if only_if is None else tuple(only_if)))
 
 
 def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dict[str, Any]:

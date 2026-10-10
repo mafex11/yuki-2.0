@@ -14,7 +14,8 @@ fields of the same ``save_portrait`` call: no new model call, about +600 output 
 * ``own_bits`` - the user's own jokes (each cites the personality fact it is, a joke of theirs), the only teasing
   material there is;
 * ``now`` - at most :data:`NOW_MAX` dated live items, each citing the goal, thread, loop, plan or event it is;
-* ``routine`` - bed, wake, meals, the game window, as the facts give them;
+* ``routine`` - bed, wake, meals, the game window and their usual moments (a meeting, music), as the facts give
+  them;
 * ``careful`` - topics they treat as private, labelled by the model at render time (never a word list).
 
 Code checks the answer the way the render's other fields are checked: budgets measured, ids equal to ids the request
@@ -189,7 +190,8 @@ loop:4, E7) goes in any text: ids belong only in a live item's ref.
 They are the only teasing material Yuki has; nothing true about the user's life is a bit.
 - now: what is live this week with a date - from LIVE ITEMS only, most pressing first, each citing its id; a work \
 deadline and a plan with a friend alike. Nothing past and finished.
-- routine: when they sleep, wake, eat and play, as the routine and behaviour facts give it.
+- routine: when they sleep, wake, eat and play, and their usual moments (a meeting, music), as the routine and \
+behaviour facts give it.
 - careful: topics the facts show they keep private or that would hurt to joke about (family arrangements, health, \
 money, a loss), as short labels. Judge it from the facts; when nothing shows it, [].
 Within each budget, whole sentences; nothing a fact does not say."""

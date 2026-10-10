@@ -394,14 +394,24 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     last = _again(store, skill.key, now) if again else {}
     for slot in skill.slots:
         menu_names = taste.candidates(store, slot.taste, now=now) if (slot.taste and store is not None) else []
+        # tTaste merge note 2 (phase T): a slot every route of which runs only with a value an offered option carries
+        # (``taste.takes_offers``: today ``web.open_video``'s ``video``) lists the names just offered aloud, and a value
+        # that is one of them takes the offer's link ("the Deji one" plays it). Any other span is still accepted as for
+        # any entity slot; with no link, rung A's ``when`` skips it and the run hands off with the capability pinned
+        offered = [t.name for t in taste.offered(store, now=now)] \
+            if (store is not None and taste.takes_offers(skill, slot)) else []
         if slot.name in given:
-            ok, value = check_value(slot, given[slot.name], heard, menu_names=menu_names, told=told.get(slot.name),
-                                    people=people)
+            ok, value = check_value(slot, given[slot.name], heard, menu_names=menu_names or offered,
+                                    told=told.get(slot.name), people=people)
             if ok:
                 if slot.taste and isinstance(value, dict) and store is not None:
                     hit = taste.find(store, slot.taste, value.get("name", ""))
                     if hit is not None:
                         value = {"name": hit.name, "key": hit.entity_key, "ref": hit.ref}
+                elif offered and isinstance(value, dict):
+                    pick = taste.find_offered(store, value.get("name", ""), now=now)
+                    if pick is not None:
+                        value = pick          # {"name", "key", "ref"}: rung A's ``when ref has`` passes
                 values[slot.name], filled[slot.name] = value, "words"
                 option = pref_option(slot, value)
                 if slot.pref and store is not None and option is not None:

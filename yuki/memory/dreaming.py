@@ -75,6 +75,10 @@ MERGE_TOGETHER: tuple[frozenset[str], ...] = (frozenset({"behaviour", "routine"}
 STALE_DAYS = 14
 #: Kinds dreaming never touches: open loops (the loop check and expiry own them) and corrections.
 UNTOUCHED_KINDS = ("open_loop", CORRECTION_KIND)
+#: The origin of the routine facts code writes from counts (``yuki.memory.routines.MEASURED_ORIGIN``, rMiner merge
+#: note): dreaming never merges, retires, promotes or demotes one, and never shows one in a look-alike pair (the routine
+#: miner keeps it true to the counts each night); it may still be rated (rating changes no word of it).
+MEASURED_ORIGIN = "measured"
 DREAM_MAX_TOKENS = 16_000
 
 DREAM_SYSTEM_PROMPT = """\
@@ -121,7 +125,8 @@ to them, 9-10 critical.
 
 At most {max_changes} merges, retirements, promotions and demotions in all, most important \
 first; nothing at all is a fine answer when the portrait is already tidy. Never touch a fact \
-marked pinned (the user pinned it). Say why in reason, in a short clause a person reading the diary understands.
+marked pinned (the user pinned it), nor one with origin=measured (code keeps it from the counts; only rate it). \
+Say why in reason, in a short clause a person reading the diary understands.
 
 {admission_bar}
 
@@ -239,8 +244,11 @@ class Dreamer:
                         out[fid]["recurring"] = int(counts[i])
                 S = F @ F.T
                 kinds = {f.id: f.kind for f in facts}
+                measured = {f.id for f in facts if f.origin == MEASURED_ORIGIN}
                 for a in range(len(ids)):
                     for b in range(a + 1, len(ids)):
+                        if ids[a] in measured or ids[b] in measured:
+                            continue   # a measured routine is code's (rMiner merge note): never a merge candidate
                         if S[a, b] >= LOOKALIKE_COSINE and mergeable({kinds[ids[a]], kinds[ids[b]]}):
                             pairs.append((ids[a], ids[b], round(float(S[a, b]), 2)))
         except Exception:
@@ -314,6 +322,9 @@ class Dreamer:
                 continue
             if action != "rate" and any(current[i].pinned for i in ids):   # rating changes no word of it
                 no("a pinned fact (the user's pin)")
+                continue
+            if action != "rate" and any(current[i].origin == MEASURED_ORIGIN for i in ids):
+                no("a measured routine: code keeps it from the counts")
                 continue
             if any(i in touched for i in ids):
                 no("a fact already changed tonight")
@@ -644,6 +655,10 @@ class BarPass:
         for v in verdicts:
             f = current.get(int(v.ref[1:]))
             if f is None:
+                continue
+            if f.origin == MEASURED_ORIGIN:
+                # a measured routine is code's from the counts (rMiner merge note): the bar never retires one
+                result.rejected.append(f"F{f.id}: a measured routine: code keeps it from the counts")
                 continue
             if f.pinned:
                 result.pinned.append({"id": f.id, "kind": f.kind, "category": v.category})

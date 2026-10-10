@@ -586,7 +586,7 @@ _SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify 
 
 #: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
 SKILLS_PARAGRAPH = """\
-The Skills list below is the user's own usual ways, checked by the PC. When their words ask for one: run_skill alone, \
+The Skills list below is what Yuki can do, each checked by the PC. When their words ask for one: run_skill alone, \
 its key, slots only from their words as said or a name its line lists, the rest left out (code fills them and names a \
 guess). Code says its done line, a question or "couldn't confirm": say nothing after it. "Again" or "a bit more": \
 again true. They name another value for its last run ("no, the slider inside Spotify"): run_skill again with it, \
@@ -942,7 +942,7 @@ _LEAN_INSTANT = "An instant hand (media_key, app_volume, scroll, window, tab)"
 _LEAN_INSTANT_VOLUME = "An instant hand (media_key, scroll, window, tab)"
 
 LEAN_SKILLS_PARAGRAPH = """\
-The Skills list below is the user's own usual ways, checked by the PC. When their words ask for one: run_skill alone, \
+The Skills list below is what Yuki can do, each checked by the PC. When their words ask for one: run_skill alone, \
 its key, slots only from their words or a name its line lists (code fills the rest). Code says its done line, a \
 question or "couldn't confirm": say nothing after it. "Again" or "a bit more": again true. Another value for its last \
 run: run_skill again with it, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone."""
@@ -1778,7 +1778,7 @@ class MouthMemory:
     #: vfix4 (4 Oct): the last hour with the user across conversations and typed chat, and what they asked Yuki to
     #: keep in it (:func:`yuki.voice.recall.recent_view`): its own block after the cached layers, fixed per conversation.
     recent: str | None = None
-    #: Phase S: the talker's Skills menu (:func:`talker_menu`: the user's usual ways, one line each, at most 2,400
+    #: Phase S: the talker's Skills menu (:func:`talker_menu`: what Yuki can do, one line each, at most 2,400
     #: characters, one snapshot per day so the cached hands block holds all day), appended to the hands block;
     #: ``None``: no skill path in this conversation (no skill loaded, or ``skills = false``).
     skills: str | None = None

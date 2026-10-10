@@ -786,10 +786,16 @@ class _ItemWidget(QWidget):
             self.do.setEnabled(state is None)
         if self.undo is not None:
             # phase R: a routine card's run puts back the window that was in front, after a failed run too (as the
-            # corner card's Undo, ui.nudges.undo_offer)
+            # corner card's Undo, ui.nudges.undo_offer), and only when the run brought a window forward (zNotes review
+            # L1: an Undo with nothing to put back would only record the run as undone)
             do = offer.get("do")
-            self.undo.setVisible((state == "done" and do in ("todo_add", "bring_back", "run_skill"))
-                                 or (state == "failed" and do == "run_skill"))
+            if do == "run_skill":
+                took = item.offer_undo if getattr(item, "offer_undo", None) is not None else bool(
+                    (nudge.get("_offer_result") or {}).get("undo") if isinstance(nudge.get("_offer_result"), dict)
+                    else False)
+                self.undo.setVisible(state in ("done", "failed") and bool(took))
+            else:
+                self.undo.setVisible(state == "done" and do in ("todo_add", "bring_back"))
         if self.offer_result is not None:
             shown = ""
             if state == "done" and offer.get("do") == "draft":

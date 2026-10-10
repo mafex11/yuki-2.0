@@ -88,6 +88,9 @@ class Item:
     expanded: bool | None = None       # the user's own choice; None follows the default
     nudge: dict[str, Any] | None = None
     reply_state: str = "open"          # a nudge's Reply: open | replying | replied
+    #: A routine card's run (``run_skill``): whether its Undo can put a window back (the run brought one forward;
+    #: ``nudge_state``'s ``undo``, the corner card's own rule); ``None`` until a state says.
+    offer_undo: bool | None = None
     turn: str | None = None            # the voice turn it belongs to ("<session>-<n>")
     question: str = ""                 # what Yuki asked (status question)
     ended_at: float | None = None      # when the response settled
@@ -800,6 +803,8 @@ class ChatModel:
         item = self._by_id.get(f"nudge:{ev.get('id')}")
         if item is not None:
             item.reply_state = str(ev.get("state") or "open")
+            if "undo" in ev:
+                item.offer_undo = bool(ev.get("undo"))
             self._changed(item)
 
     def _on_notice(self, ev: dict[str, Any], at: float) -> None:

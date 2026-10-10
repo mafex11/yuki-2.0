@@ -424,7 +424,9 @@ enabled = true
 # away, quiet hours), shown only at a natural pause, the things that can wait gathered into one "Today" card when you
 # first sit down after your night. "shadow" (this release): the old card makers still show the cards; the judge only
 # notes what it would have shown (no model call, no card, content-free log) so its choices can be checked before it
-# goes live. "off" = not run at all. "on" comes with a later release (until then it acts as "shadow").
+# goes live. "on" = the judge alone writes the cards (the old card makers stop; the things that can wait go into one
+# Today card at your first sit-down after your night); set it after the shadow week's go-live gate
+# (python -m yuki.memory.cardjudge --report). "off" = not run at all.
 mode = "shadow"
 # false = no Today card: the morning check-in becomes an ordinary card and Today-only items are dropped.
 digest = true

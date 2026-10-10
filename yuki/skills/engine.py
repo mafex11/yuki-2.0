@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
-from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, scope_value, sends_with, strictest,
+from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest,
                                     window_state_reader)
 from yuki.skills.resolve import HELD_LINE, Ask, Handoff, Held, Live, Plan, Refused, canonical, done_line
 
@@ -116,23 +116,18 @@ def ledger_skill(skill: Skill, values: Mapping[str, Any]) -> Skill:
     """The catalog entry a run is counted on (D14; lSplit review r2 L1): a learned skill's run whose words named
     another value for one of its bound key slots is its capability's run, never the learned skill's (its trust and
     offers count only its own habit). Compared as one identity (:func:`yuki.skills.connection.scope_value`)."""
-    bound = getattr(skill, "bound", None) or {}
-    if getattr(skill, "origin", "") != "learned" or not bound:
-        return skill
-    for slot in skill.slots:
-        if slot.role != "key" or slot.name not in bound:
-            continue
-        got = values.get(slot.name)
-        if got in (None, "") or scope_value(got) == scope_value(bound[slot.name]):
-            continue
-        try:
-            from yuki.skills.catalog import load
+    from yuki.skills.menu import names_other_key
 
-            cap = load().get(skill.capability)
-        except Exception:  # noqa: BLE001
-            cap = None
-        return cap if cap is not None else skill
-    return skill
+    if getattr(skill, "origin", "") != "learned" or not names_other_key(skill, values):
+        return skill
+    # one rule with ``menu.request_key`` (lCore review L11): the capability's run
+    try:
+        from yuki.skills.catalog import load
+
+        cap = load().get(skill.capability)
+    except Exception:  # noqa: BLE001
+        cap = None
+    return cap if cap is not None else skill
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -496,7 +491,9 @@ def v_uia_steps(call: RouteCall) -> RouteResult:
     from yuki.skills.uia_route import SkillRefused, route_steps, run_route
 
     hands = call.ctx.hands
-    if hands is None:
+    if hands is None or getattr(hands, "rung_b", True) is False:
+        # the new brain's desk hands carry a capability's own driver steps only: a learned recorded path stays the
+        # planner's there (rung C, the skill as its plan seed), as before (zFinal)
         return RouteResult(ran=False, outcome="no_hands")
     a = call.args
     try:
@@ -1229,7 +1226,32 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     if resolved is None:
         resolved = go(None)
     _note_false_done(resolved, ctx, corrects=bool(corrects), again=bool(again))
-    return run(resolved, ctx)
+    # tTaste merge note 1 (phase T): a run that opens YouTube's home with no game in front ranks the fresh uploads on a
+    # short thread of their own while the page opens; they are named (and noted, so "the B one" can pick one) only
+    # after the run's checked done and a non-empty wait; a run that fails, asks or times out names nothing. A card's
+    # run never offers. Nothing plays here.
+    pending = None
+    if isinstance(resolved, Plan) and (resolved.skill.capability or resolved.skill.key) == "web.open_page" \
+            and ctx.origin != "card":
+        try:
+            from yuki.skills import youtube_feed
+
+            pending = youtube_feed.start(ctx.memory, resolved.values, game=live.game or None, log=ctx.log,
+                                         settings=settings)
+        except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
+            pending = None
+    result = run(resolved, ctx)
+    if pending is not None and result.done:
+        try:
+            offers = pending.wait()          # at most Settings.youtube_feed_budget_s
+            if offers and pending.confirm(offers):
+                from yuki.skills import youtube_feed
+
+                result.options = [o.name for o in offers]
+                result.done_line = f"{result.done_line} {youtube_feed.offer_line(offers)}".strip()
+        except Exception:  # noqa: BLE001 - no offer named
+            pass
+    return result
 
 
 def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game: str | None = None,
@@ -1255,12 +1277,15 @@ def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game
 def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = None,
                     log: Callable[..., Any] | None = None, request_id: str | None = None,
                     settings: Any = None, game: Callable[[], str] | None = None,
-                    verbs: Mapping[str, Callable[[RouteCall], RouteResult]] | None = None) -> SkillResult:
+                    verbs: Mapping[str, Callable[[RouteCall], RouteResult]] | None = None,
+                    hands: Any = None) -> SkillResult:
     """The thinker's ``run_skill`` tool (``agent/tools.py``). A hand-off here means the thinker does it itself with
     the skill pinned (the loop pins it); with a game in front the run is held (D17). ``verbs``: the dispatcher's
-    wrappers (sWire: a window-touching rung in an app whose "Act" switch is off is refused, as the voice does)."""
+    wrappers (sWire: a window-touching rung in an app whose "Act" switch is off is refused, as the voice does).
+    ``hands``: the new brain's desk hands (``yuki.skills.uia_route.DeskHands``, zFinal): the chat driver's own steps
+    type and press through them, each through the consent rule; the old loop passes none."""
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
-                     request_id=request_id, game=game, verbs=dict(verbs or {}))
+                     request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands)
     return resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
                            else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings,
                            corrects=bool(args.get("corrects")))

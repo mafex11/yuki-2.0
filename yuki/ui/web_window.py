@@ -1430,11 +1430,13 @@ class WebWindow:
         "task_correct": "a_task_correct", "task_correct_undo": "a_task_correct_undo",
         # phase L (lPage merge note 2): Rename / Forget this / Not mine on a skill Yuki learned
         "skill_edit": "a_skill_edit",
+        # the card judge (jSwitch merge note): a Today line's Open / Not useful, and Settings' card kinds
+        "digest_line": "a_digest_line", "card_kind": "a_card_kind",
     }
     #: Settings' own controls (each changes what the Settings page shows).
     SETTINGS_ACTIONS = frozenset({"permissions_set", "app_look", "app_act", "voice", "offers", "coach", "questions",
                                   "pause", "accent", "motion", "call_pref", "quiet", "ai_role", "ai_key", "ai_custom",
-                                  "takeover_move", "record_actions", "record_leave_out"})
+                                  "takeover_move", "record_actions", "record_leave_out", "card_kind"})
     OFFLINE = "Yuki isn't running, so that can't happen right now. Start Yuki and try again."
 
     def _tray(self, op: str, wait_s: float = OP_WAIT_S, **args: Any) -> dict[str, Any]:
@@ -1851,6 +1853,34 @@ class WebWindow:
         self.refresh("playbook")
         return {"ok": bool(r.get("ok")), "error": r.get("error") or "", "state": r.get("state"),
                 "name": r.get("name") or ""}
+
+    def a_digest_line(self, m: dict[str, Any]) -> dict[str, Any]:
+        """jSwitch: one numbered line of a Today card (or a "While you were away" list) answered from Activity: Open or
+        Not useful, recorded by memory by card id and line number (``digest_line_reaction``, content-free; the card
+        judge's ledger reads it). The reply carries the line's type and id so the page can open what it points at."""
+        try:
+            card, n = int(str(m.get("card"))), int(m.get("n"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "That line isn't there any more."}
+        reaction = str(m.get("reaction") or "")
+        if reaction not in ("open", "not_useful"):
+            return {"ok": False, "error": "Unknown choice."}
+        r = self._memory_op("digest_line_reaction")(card, n, reaction) or {}
+        self.refresh("activity")
+        if not r.get("ok"):
+            return {"ok": False, "error": "Couldn't record that.", "why": str(r.get("why") or "")}
+        return {"ok": True, "type": str(r.get("type") or ""), "ref": str(r.get("ref") or "")}
+
+    def a_card_kind(self, m: dict[str, Any]) -> dict[str, Any]:
+        """jSwitch: Settings' "Cards, by kind": Back up (``up``, one step towards where the kind starts) or Fewer
+        (``down``, one step towards off, as "Less of these"), through memory's ``card_kind_set`` (recorded as the
+        user's own; the memory service's judge reads it at its next ledger read)."""
+        kind, way = str(m.get("kind") or ""), str(m.get("way") or "")
+        if way not in ("up", "down"):
+            return {"ok": False, "error": "Unknown choice."}
+        r = self._memory_op("card_kind_set")(kind, way) or {}
+        return {"ok": bool(r.get("ok")), "why": str(r.get("why") or ""), "mode": r.get("mode"),
+                "mode_words": str(r.get("mode_words") or "")}
 
     def a_task_correct(self, m: dict[str, Any]) -> dict[str, Any]:
         """capC2 (decision D5): the user's correction of one task inside a Day session, to memory's ``task_correct``

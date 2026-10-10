@@ -76,6 +76,8 @@ FRONT_DESK = "front_desk"
 #: A question nobody answers sets its request aside after this long (s), freeing the lane (v3.14b: the six answered
 #: questions in the live logs of 27-29 Sept took 3-43 s; the one never answered held the worker until the app quit).
 ASK_PARK_S = 120.0
+#: A new brain that could not be made is tried again at most this often (s; zNotes review L2).
+BRAIN_RETRY_S = 60.0
 _PARK = object()
 
 #: The tools the front desk may use: everything that only looks.
@@ -269,6 +271,8 @@ class Lane(QThread):
         #: bTalk: the brain is made once, under this lock: the voice reads ahead on the worker's brain
         #: (``Brain.begin_early``) from a worker thread while the lane thread may be making it for a job.
         self._brain_lock = threading.Lock()
+        #: When making the brain last failed (monotonic; ``None``: never, or it was made since).
+        self._brain_failed_at: float | None = None
 
     @property
     def active(self) -> Any:
@@ -300,12 +304,20 @@ class Lane(QThread):
             return None
         with self._brain_lock:
             if self._brain is None:
+                # zNotes review L2: a brain that could not be made is tried again at most once a minute (the voice
+                # asks at the end of every user turn, on top of every job), so a broken build costs one failed try and
+                # one log line a minute, never one per turn
+                now = time.monotonic()
+                if self._brain_failed_at is not None and now - self._brain_failed_at < BRAIN_RETRY_S:
+                    return None
                 try:
                     self._brain = self._make_brain()
                 except Exception as exc:  # noqa: BLE001 - the old loop goes on driving
+                    self._brain_failed_at = now
                     self.runtime.ui_log.event("brain", lane=self.name, state="unavailable",
                                               error=type(exc).__name__)
                     return None
+                self._brain_failed_at = None
                 self.runtime.ui_log.event("brain", lane=self.name, state="ready", mode=mode)
             return self._brain
 
@@ -600,9 +612,14 @@ class Lane(QThread):
             # where-typed text or the voice's code-built context as labelled context (never quotable), the log id when
             # it has one, and the window that was in front when the user called Yuki up
             words = job.user_words if voice else job.typed_words
+            # bSkill merge note 1: a pinned skill (a voice escalation's rung C, or a front-desk request's pin kept
+            # across the hand-off) reaches the brain as its plan seed, its done-check fixed; typed runs carry none
+            from yuki.skills.engine import plan_seed
+
+            seed = plan_seed(job.skill or getattr(runtime, "_skills", {}).get(job.id))
             events = agent.run(job.request, user_words=list(words or ()), context=job.context or "",
                                channel="voice" if voice else "typed", request_id=job.log_request_id or "",
-                               origin_hwnd=job.origin_hwnd)
+                               origin_hwnd=job.origin_hwnd, plan_seed=seed)
             return self._relay(job, agent, events, allowed, refused)
         events = self.agent.run(
             job.request, origin_hwnd=job.origin_hwnd, effort=effort if voice else None,

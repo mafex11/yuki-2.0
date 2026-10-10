@@ -277,9 +277,10 @@ def read_profile(memory: Any, names: Sequence[str], *, limit: int) -> str:
 
 
 def read_menu(memory: Any, settings: Any, *, limit: int) -> tuple[str, str, frozenset[str] | None]:
-    """Breakpoint 3: ``(block text, the bare menu lines, the live catalog's skill ids)``. The lines come from memory's
-    thinker menu (skills with a usable rung) or the files; the ids from the catalog (``yuki.skills.catalog`` when
-    phase L has merged, else ``connection``). ``None`` ids: the catalog could not be read. Never raises."""
+    """Breakpoint 3: ``(block text, the bare menu lines, the live catalog's skill ids)``. The lines come from the
+    planner's menu (``yuki.skills.menu.planner_menu``: its heading, then every skill with a usable rung) through
+    memory's client, or the files; the ids from the catalog (``yuki.skills.catalog`` when phase L has merged, else
+    ``connection``). ``None`` ids: the catalog could not be read. Never raises."""
     loaded = None
     try:
         from yuki.skills import enabled
@@ -293,36 +294,35 @@ def read_menu(memory: Any, settings: Any, *, limit: int) -> tuple[str, str, froz
         return menu_text("", limit=limit), "", None
     keys = frozenset(str(getattr(s, "key", "")) for s in getattr(loaded, "skills", ()) if getattr(s, "key", ""))
     lines = ""
+    chars = max(0, int(limit))
     try:
-        from yuki.skills.menu import THINKER, menu_text as skills_menu
+        # bSkill merge note 2: the planner's own menu (its heading first: what a learned line means, slots only from
+        # the user's words or a listed name, a send slot's sending option only with ``consent.commit send``), built
+        # from memory's client (store-aware catalog, trust, taste) or from the files alone
+        from yuki.skills.menu import planner_menu
 
         if memory is not None and getattr(memory, "installed", False):
-            lines = str(memory.call("skill_menu", lambda c: c.skill_menu(THINKER), timeout_s=MENU_WAIT_S) or "")
+            lines = str(memory.call("skill_menu", lambda c: planner_menu(c, chars=chars), timeout_s=MENU_WAIT_S)
+                        or "")
         else:
-            lines = str(skills_menu(None, audience=THINKER, loaded=loaded) or "")
+            lines = str(planner_menu(None, loaded=loaded, chars=chars) or "")
     except Exception:  # noqa: BLE001 - the files alone
         try:
-            from yuki.skills.menu import THINKER, menu_text as skills_menu
+            from yuki.skills.menu import planner_menu
 
-            lines = str(skills_menu(None, audience=THINKER, loaded=loaded) or "")
+            lines = str(planner_menu(None, loaded=loaded, chars=chars) or "")
         except Exception:  # noqa: BLE001
             lines = ""
     return menu_text(lines, limit=limit), lines, keys
 
 
 def load_catalog() -> Any:
-    """The skills catalog through one shim (design 10.1): ``yuki.skills.catalog.load()`` when phase L's catalog exists,
-    else ``yuki.skills.connection.load()``; ``None`` when neither can be read."""
+    """The skills catalog through the brain's one shim (design 10.1; bCore merge note: folded into
+    :func:`yuki.brain.util.load_skills`); ``None`` when it can't be read."""
     try:
-        from yuki.skills import catalog  # type: ignore[attr-defined]
+        from yuki.brain.util import load_skills
 
-        return catalog.load()
-    except Exception:  # noqa: BLE001 - phase L not merged
-        pass
-    try:
-        from yuki.skills.connection import load
-
-        return load()
+        return load_skills()
     except Exception:  # noqa: BLE001
         return None
 

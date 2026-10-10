@@ -1154,8 +1154,14 @@ class YukiUi(QObject):
         self.ui_log.event("nudge_offer_prefilled", id=nudge.get("id"), chars=len(text))
 
     def _on_offer_state(self, nudge: dict, state: str) -> None:
-        """A card's offer changed state: the chat thread's button (here and in the window) says so honestly."""
-        self.window_host.emit({"type": "nudge_state", "id": nudge.get("id"), "state": f"offer:{state}"})
+        """A card's offer changed state: the chat thread's button (here and in the window) says so honestly. A routine
+        card's run also says whether its Undo can put a window back (zNotes review L1: the corner card's own rule, the
+        run brought a window forward)."""
+        result = nudge.get("_offer_result") if isinstance(nudge.get("_offer_result"), dict) else {}
+        event: dict[str, Any] = {"type": "nudge_state", "id": nudge.get("id"), "state": f"offer:{state}"}
+        if result.get("do") == "run_skill":
+            event["undo"] = bool(result.get("undo"))
+        self.window_host.emit(event)
 
     def snooze_nudges(self, minutes: int) -> None:
         """Quiet nudges for ``minutes`` (``0``: back on), then re-read the tray's status line."""

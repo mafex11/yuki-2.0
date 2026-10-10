@@ -441,7 +441,8 @@ class Settings:
             when its connection file changes); "couldn't confirm" never counts.
         skills_volume_step: The volume step for "a bit louder" until the user's own usual step is known.
         youtube_feed_budget_s: Phase T: how long the fresh-uploads strip may take (public feeds, no key).
-        youtube_fresh_days: Phase T: an upload counts as fresh this many days.
+        youtube_fresh_days: Phase T: an upload counts as fresh this many days (14: map-routines T1.4; picks 7 and 9
+            days old were seen).
     """
 
     model: str = DEFAULT_MODEL
@@ -608,7 +609,7 @@ class Settings:
     skills_disable_after: int = 2
     skills_volume_step: int = 10
     youtube_feed_budget_s: float = 1.5
-    youtube_fresh_days: int = 7
+    youtube_fresh_days: int = 14
     # -- reliability (docs/research/openclaw-harness-features.md, the reliability group) --
     #: Model failover (yuki.agent.failover): per model id, the targets tried after it keeps failing
     #: (throttled, 5xx, overloaded, timed out, unreachable, model or profile not found), in order:

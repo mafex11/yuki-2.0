@@ -5161,6 +5161,9 @@ class Conversation:
     CLOSED_S = 900.0
     #: Held words of a reply are offered for this many user turns after it.
     HELD_TURNS = 2
+    #: tTaste: the fresh uploads a run named stay in the talker's calls this long (s; ``youtube_feed.OFFER_KEEP_S``:
+    #: what "the B one" is matched against).
+    OFFER_KEEP_S = 900.0
 
     def _prompt_state(self) -> dict[str, Any]:
         """Measured states for the talker's volatile block (``mouth.volatile_block``): never the words."""
@@ -5203,6 +5206,12 @@ class Conversation:
             now_line = hands.skills_now() if callable(getattr(hands, "skills_now", None)) else None
             if now_line:
                 state["skills_now"] = now_line
+            # tTaste merge note 3: the options the last run offered aloud (read by the hands after its line was said,
+            # never on this loop), while the offer can still be picked
+            last = getattr(hands, "last_skill", None) or {}
+            offers = last.get("offers") if isinstance(last, dict) else None
+            if offers and time.time() - float(last.get("at") or 0.0) <= self.OFFER_KEEP_S:
+                state["skills_options"] = list(offers)
         if self._you_on:
             # yConsumers: memory's one "you right now" line, rendered in RAM from the background cache (no pipe read)
             you_line = talker_you().line()

@@ -54,9 +54,12 @@ question says what will happen (review r2 M2): "Switch to {channel}?" when the c
 {channel} on Discord as well?" (nothing leaves another app's call); the answer comes back as the ``join_in_call`` slot.
 
 Every route takes focus: never with a game in front (the engine holds the run: "after the round?"), each focus and
-opened link asks ``gamegate.refuse_input`` here, and the input layer refuses again. Without the voice hands (the
-thinker's own run, a card) a route that must type or press keys doesn't run; the thinker then does it itself with the
-skill pinned. Logs and facts are content-free (code words, counts); names, chat names, links and text stay in RAM.
+opened link asks ``gamegate.refuse_input`` here, and the input layer refuses again. The steps run through the hands
+the run was given: the voice hands, or on the new brain its desk hands (``uia_route.DeskHands``, zFinal: told each
+run's steps by :func:`run_steps`, they let the capability's own steps through and the send key only when the brain's
+consent rule allowed this very send and counted it down). Without hands (the old loop's own run, a card) a route that
+must type or press keys doesn't run; the thinker then does it itself with the skill pinned. Logs and facts are
+content-free (code words, counts); names, chat names, links and text stay in RAM.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ from __future__ import annotations
 import threading
 import time
 import tomllib
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -446,8 +450,14 @@ def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], 
     if sends:
         item["sends"] = True
         args.update(to=str(sends.get("to") or ""), what=str(sends.get("what") or ""))
+    # zFinal: hands that check a capability's own steps by what its driver declared (the new brain's desk hands,
+    # ``uia_route.DeskHands.driver_steps``) are told this run's steps, the route's own words and what it sends
+    declare = getattr(hands, "driver_steps", None)
+    scope = (declare(key=key, steps=[dict(s) for s in steps], way_text=way_text, sends=sends) if callable(declare)
+             else nullcontext())
     try:
-        ok, _report, facts = SkillRunner(hands).run(args, item=item, words=[str(w) for w in words if w])
+        with scope:
+            ok, _report, facts = SkillRunner(hands).run(args, item=item, words=[str(w) for w in words if w])
     except SkillRefused:
         return False, {"refused_steps": True, "steps_done": 0}
     return bool(ok), dict(facts or {})
@@ -465,6 +475,10 @@ def _stopped(facts: Mapping[str, Any], app: str, *, acted: bool) -> RouteResult 
 
         return RouteResult(ran=acted, outcome=TO_PLANNER)
     if facts.get("held"):
+        short = int(facts.get("steps_done") or 0) < int(facts.get("steps") or 0)
+        if not str(facts.get("question") or "") and short and _refused("keys"):
+            # a rule's refusal with no question while a game is in front: "after the round?", never "go ahead?"
+            return RouteResult(ran=acted, held="game", outcome="refused")
         return RouteResult(ran=acted, ask=str(facts.get("question") or "") or LINE_HELD, outcome="held_by_check")
     if facts.get("took_over_at"):
         return RouteResult(ran=acted, ask=LINE_TOOK_OVER, outcome="taken_over")
@@ -889,7 +903,7 @@ def route_open_link(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, outcome="no_link")
     text, _send = _text_mode(call.values)
     if text and call.ctx.hands is None:
-        return RouteResult(ran=False, outcome="no_hands")      # typing needs the voice hands; the thinker does it
+        return RouteResult(ran=False, outcome="no_hands")      # typing needs hands (the voice's or the brain's desk)
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
     since = time.time()

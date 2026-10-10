@@ -2302,6 +2302,21 @@ class MemoryClient:
         return {"ok": True, "card": card.id, "n": num, "reaction": reaction, "type": str(line.get("type") or ""),
                 "ref": str(line.get("ref") or "")}
 
+    def digest_line_reactions(self) -> dict:
+        """What :meth:`digest_line_reaction` recorded, for the window's Activity rows (jSwitch merge note):
+        ``{card id: {line number: "open" | "not_useful"}}`` (strings), content-free. ``{}`` on none or an unreadable
+        state. Never raises."""
+        try:
+            from yuki.memory.cardjudge import DIGEST_REACTIONS_STATE
+
+            data = json.loads(self.store.nudge_state(DIGEST_REACTIONS_STATE) or "{}")
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(card): {str(n): str(r) for n, r in per.items()} for card, per in data.items()
+                if isinstance(per, dict)}
+
     def card_kinds(self) -> dict:
         """The window's Settings list of card kinds (question 7): ``{"mode": the judge's (off | shadow | on), "kinds":
         [{"kind", "words", "mode", "mode_words", "why", "why_words", "by", "shown", "used", "can_raise",
@@ -5021,12 +5036,17 @@ class MemoryClient:
         return trace_graph.done_evidence(self.store, float(since), float(until), limit=limit)
 
     def way_path(self, pid: Any) -> dict:
-        """capC5: the recorded path a learned way is replayed against (``yuki.memory.trace_replay.way_path``): per
-        step the app it acted in, the site when it was a web page, whether it stayed in the window of the step before,
-        whether a dialog came up after it. Machine facts only, no names. Read only; never raises."""
-        from yuki.memory import trace_replay
+        """capC5: the recorded path a learned way is replayed against (``yuki.skills.uia_route.way_path``, lCore's port
+        of ``trace_replay.way_path``, so phase P can delete that module): per step the app it acted in, the site when it
+        was a web page, whether it stayed in the window of the step before, whether a dialog came up after it. Machine
+        facts only, no names. Read only; never raises."""
+        try:
+            from yuki.skills.uia_route import way_path
+        except Exception:  # noqa: BLE001 - the old module while it still ships
+            from yuki.memory import trace_replay
 
-        return trace_replay.way_path(self.store, pid)
+            return trace_replay.way_path(self.store, pid)
+        return way_path(self.store, pid)
 
     def trace_replay_health(self) -> dict:
         """capC5: learned ways the skill runner ran this week, the deviations it stopped at, the handovers and

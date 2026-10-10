@@ -1230,6 +1230,57 @@ def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
     return Check(JUDGE_CHECK, OK, detail)
 
 
+TASTE_CHECK = "Taste"
+
+
+def check_taste(db: Path | None = None, *, now: float | None = None) -> Check:
+    """tTaste merge note 4 (phase T): what the nightly taste pass knows and how the YouTube offers do, read-only and
+    content-free: the taste rows per kind, the channels picked (how many have their id), whether the offers are on and
+    how many picks were among the three named (the last 30 days), and the public reads this hour (the cap is 8)."""
+    try:
+        from yuki.memory.store import default_db_path
+    except Exception as exc:  # noqa: BLE001
+        return Check(TASTE_CHECK, SKIP, f"not available ({type(exc).__name__})")
+    db = db or default_db_path()
+    now = time.time() if now is None else float(now)
+    if not db.exists():
+        return Check(TASTE_CHECK, SKIP, "no memory database yet")
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+        try:
+            kinds = {str(k): int(n) for k, n in conn.execute("SELECT kind, count(*) FROM tastes GROUP BY kind")}
+            channels, with_id = conn.execute(
+                "SELECT count(*), count(channel_id_ciphertext) FROM yt_channels").fetchone()
+            reads = int(conn.execute("SELECT count(*) FROM yt_reads WHERE at >= ?", (now - 3600.0,)).fetchone()[0])
+            off = conn.execute("SELECT value FROM nudge_state WHERE name = 'taste.youtube_offers'").fetchone()
+            events = conn.execute("SELECT kind, detail FROM taste_events WHERE at >= ? AND kind IN ('offered', "
+                                  "'outcome')", (now - 30 * 86400.0,)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return Check(TASTE_CHECK, SKIP, f"not set up yet ({type(exc).__name__})")
+    except Exception as exc:  # noqa: BLE001
+        return Check(TASTE_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
+    offers = sum(1 for kind, _d in events if kind == "offered")
+    results: dict[str, int] = {}
+    for kind, detail in events:
+        if kind != "outcome":
+            continue
+        try:
+            result = str((json.loads(detail) if detail else {}).get("result") or "")
+        except (TypeError, ValueError, AttributeError):
+            result = ""
+        results[result] = results.get(result, 0) + 1
+    picks = results.get("hit", 0) + results.get("channel", 0) + results.get("miss", 0)
+    among = results.get("hit", 0) + results.get("channel", 0)
+    rows = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) or "no taste rows yet"
+    state = "off (fewer than half the picks were among the three)" if off and str(off[0] or "").startswith("off") \
+        else "on"
+    return Check(TASTE_CHECK, OK, f"{rows}; {int(channels or 0)} YouTube channels ({int(with_id or 0)} with ids); "
+                                  f"offers {state}, {among} of {picks} picks among the three ({offers} offers); "
+                                  f"{reads} reads this hour")
+
+
 def check_gpu() -> Check:
     try:
         from yuki.memory.calls import Gpu
@@ -1347,6 +1398,7 @@ def run_checks(settings: Any = None, *, offline: bool = False, timeout_s: float 
         (SKILLS_CHECK, lambda: check_skills(settings=settings)),
         (YOU_CHECK, check_you_state),
         (JUDGE_CHECK, check_judge),
+        (TASTE_CHECK, check_taste),
         ("GPU", check_gpu),
         ("Start with Windows", check_startup),
         ("Log size", lambda: check_logs(settings)),

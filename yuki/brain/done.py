@@ -821,8 +821,9 @@ def seed_done(seed: Mapping[str, Any], env: ProbeEnv) -> DoneResult:
     if verdict is True:
         return DoneResult(True, util.VERIFIED, words or LINE_UNVERIFIED, probe=probe, evidence=evidence,
                           recheck=probe in FLIPPABLE, args=dict(seed.get("done") or {}))
+    # bSkill finding 2: a seeded replan the check can't confirm (it may only have left a draft) never says "I did it"
     return DoneResult(verdict, util.FAILED if verdict is False else util.UNVERIFIED,
-                      LINE_UNVERIFIED if verdict is None else util.LINE_FAILED,
+                      util.LINE_UNVERIFIED if verdict is None else util.LINE_FAILED,
                       seen=seen_words(probe, verdict, evidence), probe=probe, evidence=evidence)
 
 

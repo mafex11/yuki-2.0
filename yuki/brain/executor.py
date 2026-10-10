@@ -318,6 +318,9 @@ class Executor:
         self._result: RunResult | None = None
         self._last_done: done.DoneResult | None = None
         self._skill_key: str | None = None
+        #: zFinal: the request's desk hands for ``run_skill`` (``None`` until a run_skill needs them; ``False``: they
+        #: couldn't be made).
+        self._desk: Any = None
         self._swap_words: list[str] = []
         self._done_replan = False
         self._last_overview: dict[str, Any] = {}
@@ -815,12 +818,43 @@ class Executor:
                 self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {gate.why}", kind="control",
                                  refused=True)
                 return RunResult("refused", line=gate.line, final=True)
-        return self._dispatch_act(index, step, call, effect=effect)
+        grant = self._skill_grant(call, verdict) if call.tool == "run_skill" else None
+        return self._dispatch_act(index, step, call, effect=effect, grant=grant)
+
+    def _skill_grant(self, call: Call, verdict: consent.Verdict | None) -> dict[str, Any]:
+        """What the consent rule allowed this ``run_skill`` step (zFinal, bSkill finding 1: the desk hands read it for
+        that one step): a send (row 4 allowed it and its countdown ran), a join on the user's plain words (row 3,
+        decision 7), and the step's own text and person slots (code facts: the capability's checks name its slots)."""
+        key, slots = consent.skill_input(call, self.head)
+        sk = util.skill(key)
+        tname = consent.text_slot(sk) if sk is not None else ""
+        pname = consent.person_slot(sk) if sk is not None else ""
+        allowed = verdict is not None and verdict.allowed
+        send = bool(allowed and verdict.row == 4 and verdict.countdown and sk is not None
+                    and consent.skill_sends(sk, slots, partial=False))
+        join = bool(allowed and verdict.row == 3 and verdict.why == "join_words")
+        return {"skill": key, "text": words(slots.get(tname)) if tname else "",
+                "person": words(slots.get(pname)) if pname else "", "send": send, "join": join}
+
+    def _desk_hands(self) -> Any:
+        """The request's desk hands (``yuki.skills.uia_route.DeskHands``, made once): the hands the message and
+        voice-join capabilities type and press through when a ``run_skill`` runs here, with the same consent and commit
+        checks (``None`` when they can't be made: those capabilities then hand back, as before)."""
+        if self._desk is None:
+            try:
+                from yuki.skills.uia_route import DeskHands
+
+                self._desk = DeskHands(self.dispatcher, memory=self.host.memory, words=self.words,
+                                       earlier=self.earlier, checker=self.checker, log=self._emit_log)
+            except Exception:  # noqa: BLE001
+                self._desk = False
+        return self._desk or None
 
     def _dispatch_act(self, index: int, step: Any, call: Call, *, speak: bool = True,
-                      effect: str = "") -> RunResult | None:
+                      effect: str = "", grant: Mapping[str, Any] | None = None) -> RunResult | None:
         """The Dispatcher call of an allowed step, its acting marker, step line, events, trace and check. ``effect``:
-        the commit check's effect for this step (``""``: none was had), for what the step leaves waiting."""
+        the commit check's effect for this step (``""``: none was had), for what the step leaves waiting. ``grant``:
+        a ``run_skill``'s consent grant (:meth:`_skill_grant`) for the desk hands, this step only."""
         status = self.statuses[index]
         if self._takes_marker(call):
             try:
@@ -832,12 +866,22 @@ class Executor:
         if say and getattr(self.host, "channel", "") == "voice":
             self._emit(Say(say[:120]))
         about = self._about(call)
+        desk = None
         if call.tool == "run_skill":
             self._skill_context()   # the engine checks slot values against the user's words as they stand now
+            desk = self._desk_hands()
+            if desk is not None:
+                # this step's grant only (the send key passes only for what the consent rule allowed and counted down)
+                desk.grant = dict(grant or {})
+                desk.words = list(self.words)
         self._emit(ToolCall(call.tool, {**call.input, "_about": about}))
         started_at, t0 = time.time(), time.perf_counter()
-        with self._dispatch_lock:
-            outcome = self.dispatcher.dispatch(call.tool, call.input)
+        try:
+            with self._dispatch_lock:
+                outcome = self.dispatcher.dispatch(call.tool, call.input)
+        finally:
+            if desk is not None:
+                desk.grant = {}
         ms = round((time.perf_counter() - t0) * 1000, 1)
         self._emit(ToolResult(call.tool, bool(outcome.ok), str(outcome.summary or "")[:300], payload=outcome.payload,
                               about=about))
@@ -932,7 +976,8 @@ class Executor:
         without Enter once the capability saw the chat open (nothing is typed into a chat not confirmed open)."""
         status = self.statuses[index]
         drafted = Call(tool="run_skill", input=dict(verdict.draft_input or {}), index=index)
-        result = self._dispatch_act(index, step, drafted)
+        # a draft never sends: its grant carries only its own text (typed without Enter by the capability)
+        result = self._dispatch_act(index, step, drafted, grant=self._skill_grant(drafted, None))
         run = self.skill_outcomes[-1] if self.skill_outcomes and self.skill_outcomes[-1].index == index else None
         if run is not None:
             run.drafted, run.type_after = True, bool(verdict.type_after)
@@ -1989,9 +2034,15 @@ class Executor:
         """What the Dispatcher's ``run_skill`` needs from the request (``Dispatcher.skill_context``: memory, the user's
         words, the request id, the log, settings), set the way the old loop sets it at a request's start."""
         try:
-            self.dispatcher.skill_context = {"memory": self.host.memory, "words": list(self.words),
-                                             "request_id": getattr(self.host, "request_id", None),
-                                             "log": self._log_fn, "settings": self.settings}
+            context = {"memory": self.host.memory, "words": list(self.words),
+                       "request_id": getattr(self.host, "request_id", None), "log": self._log_fn,
+                       "settings": self.settings}
+            # zFinal (bSkill finding 1): the capability's own steps type and press through the desk hands here (a
+            # plain object until a step uses it; the front desk never runs an act step, so it never does)
+            desk = self._desk_hands()
+            if desk is not None:
+                context["hands"] = desk
+            self.dispatcher.skill_context = context
         except Exception:  # noqa: BLE001
             pass
 

@@ -109,7 +109,7 @@ import time
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 #: What a skill step may do: the talker's own verified hands (``pick``: capC4, an item of a list by its name's digest).
 SKILL_DOS = ("click", "type", "keys", "scroll", "open_app", "open_url", "pick")
@@ -2282,8 +2282,341 @@ def run_route(hands: Any, steps: list[dict[str, Any]], *, words: list[str], apps
     return SkillRunner(hands, takeover=takeover, held_all=True).run(args, item=item, words=list(words))
 
 
+# =====================================================================================================================
+# The desk hands: a capability's own driver steps on the new brain (zFinal; bSkill finding 1)
+# =====================================================================================================================
+
+
+def _element_words(element: Any) -> tuple[str, str]:
+    """``(role, name)`` from the element words Yuki's own code builds for a check (``role "name"``, a pick's ``role
+    "name" in the list``), else ``("", "")``. Plumbing of Yuki's own format, never a reading of meaning (the voice
+    hands' ``_element_parts``)."""
+    text = _words(element)
+    head, sep, rest = text.partition(' "')
+    if not sep or '"' not in rest or " " in head.strip():
+        return "", ""
+    role = head.strip()
+    return ("" if role.casefold() in ("control", "field", "item") else role), rest[:rest.rindex('"')].strip()
+
+
+#: :meth:`DeskHands._own`'s answer for a run's send key the brain's consent rule did not allow and count down.
+NOT_GRANTED = "not_granted"
+
+
+def _folded(text: Any) -> str:
+    """A string compared with a string: whitespace and case folded (identity, never meaning)."""
+    return _words(text).casefold()
+
+
+class DeskHands:
+    """The hands the engine's chat driver (``yuki.skills.chat``: the message and voice-join capabilities) runs its own
+    steps through when the new brain runs a ``run_skill`` (``Dispatcher._do_run_skill``; bSkill finding 1). Without
+    them the message capability can't type or press send on the brain path (``no_hands``), so every typed or spoken
+    message would end as a draft or "couldn't confirm".
+
+    It is the voice hands' surface that :class:`SkillRunner` and the chat driver read (``_dispatcher`` / ``backend``
+    for :func:`skill_dispatcher`, ``memory``, ``_focus``, ``_now_board``, ``_read_tree``, ``_front``, ``act_off``,
+    ``authorize``), over the request's own desktop, with the same consent and commit checks:
+
+    * **Rows 1-2 on every step** (``consent.screen_gate``): a game in front, the app's Act switch off, a kind on
+      "just suggest": refused, nothing done.
+    * **The capability's own steps pass** (the steps its driver built from its data, declared for one run through
+      :meth:`driver_steps` by ``chat.run_steps``): its data-built keys (the quick switcher, its open key), the chat's
+      name memory keeps (the route's own words), the pick of the chat's row by its keyed digest, and the text of this
+      ``run_skill`` step (typing without Enter: the user's words the consent rule let through, or a draft's).
+    * **The send key only after the countdown**: in a run that declares a send, its key passes only when the brain's
+      consent rule allowed this very ``run_skill`` as a send (row 4: the plan declared ``consent.commit = send``, the
+      quote, the recipient and the text are the user's own words, the commit check said they asked for it, no
+      near-duplicate) and its countdown ran (:attr:`grant`, set by the executor for that one step), and only for the
+      same text and person. ``SkillRunner`` checks again that both whom and what are spans of the user's words, and the
+      driver presses nothing when the chat's composer holds other text or can't be read.
+    * **A join's button only on plain words**: the capability's declared join control (catalog data) passes only when
+      the consent rule allowed this ``run_skill`` as a join on the user's plain words (row 3, decision 7).
+    * **Anything else** goes to ``yuki.brain.check.one`` (rows 1-6 with a one-step commit check, the request's own
+      checker), as rung B's steps do on the voice: a step that would send or join is handed over to the planner.
+
+    A learned recorded path (rung B) is never run through these hands (:attr:`rung_b`): on the brain it stays the
+    planner's, with the skill as the plan seed. Logs are content-free (tool, row, source, allowed). One per request;
+    every call on the request's own thread.
+    """
+
+    #: The engine's rung B (a learned recorded path, ``v_uia_steps``) does not run on these hands.
+    rung_b = False
+
+    def __init__(self, dispatcher: Any, *, memory: Any = None, words: Any = (), earlier: Any = (), checker: Any = None,
+                 log: Any = None) -> None:
+        self._dispatcher = dispatcher
+        self.backend = getattr(dispatcher, "backend", None)
+        self.memory = memory
+        #: The user's own words for this request (typed, or the heard turns), never the planner's wording.
+        self.words: list[str] = [str(w) for w in words or () if str(w).strip()]
+        self.earlier: list[str] = [str(w) for w in earlier or () if str(w).strip()]
+        self.checker = checker
+        self._log = log
+        #: The consent rule's verdict for the ``run_skill`` step running now (the executor sets it for that one step):
+        #: ``{"skill", "text", "person", "send": bool, "join": bool}``; empty: nothing was granted.
+        self.grant: dict[str, Any] = {}
+        self._scopes: list[dict[str, Any]] = []
+        #: Windows this run typed Yuki's text into with no send yet (hwnd -> monotonic): a later key or click there is
+        #: judged as one that may send it.
+        self._typed: dict[int, float] = {}
+
+    # -- what the step runner and the chat driver read ---------------------------------------------------------------
+
+    def _focus(self, timeout_s: float = 0.25) -> Any:
+        """What has the keyboard (the backend's ``focus_snapshot``), or ``None`` when it can't say."""
+        read = getattr(self.backend, "focus_snapshot", None)
+        if not callable(read):
+            return None
+        try:
+            snap = read(timeout_s=timeout_s)
+        except TypeError:
+            snap = read()
+        except Exception:  # noqa: BLE001
+            return None
+        return snap if getattr(snap, "ok", False) else None
+
+    def _now_board(self) -> dict[str, Any] | None:
+        """Memory's Now picture of the real screen (a stand-in desk's own ``now_board``; else none)."""
+        own = getattr(self.backend, "now_board", None)
+        try:
+            if callable(own):
+                board = own()
+                return board if isinstance(board, dict) else None
+            from yuki.agent.tools import _LazyRealBackend
+
+            if not isinstance(self.backend, _LazyRealBackend):
+                return None
+            from yuki.memory.now import shared_client
+
+            client = shared_client()
+            board = client.now(wait_s=0.05) if client is not None else None
+            return board if isinstance(board, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @property
+    def skill_dispatcher(self) -> Any:
+        """The dispatcher the capability's steps run through (made once, read by :func:`skill_dispatcher`): report 58's
+        before/after account on, over the request's own backend, with the request dispatcher's quieter-hands gate (it
+        waits for the user to stop typing, and a stop ends the wait) and its notices. Never the request's dispatcher
+        itself: that one is in the middle of the ``run_skill`` call."""
+        made = getattr(self, "_skill_disp", None)
+        if made is not None:
+            return made or None
+        self._skill_disp = False
+        try:
+            from yuki.agent.tools import Dispatcher
+
+            if self.backend is None or not isinstance(self._dispatcher, Dispatcher):
+                return None
+            made = Dispatcher(self.backend, max_tree_elements=SKILL_TREE_ELEMENTS,
+                              tree_timeout_s=SKILL_TREE_TIMEOUT_S, verify_outcomes=True)
+            for name in ("input_gate", "cancel_check", "notices"):
+                value = getattr(self._dispatcher, name, None)
+                if value is not None:
+                    setattr(made, name, value)
+            self._skill_disp = made
+        except Exception:  # noqa: BLE001 - no steps run through the request's own dispatcher mid-call
+            return None
+        return made
+
+    def _disp(self) -> Any:
+        disp = self.skill_dispatcher
+        if disp is None:
+            raise RuntimeError("the desk hands have no dispatcher of their own")
+        return disp
+
+    def _read_tree(self, hwnd: int) -> tuple[dict[str, Any], int, float] | None:
+        """One read of ``hwnd`` through the steps' own dispatcher (never the request's, which is mid-call)."""
+        try:
+            disp = self._disp()
+            outcome = disp.dispatch("look_at_window", {"hwnd": int(hwnd)})
+        except Exception:  # noqa: BLE001
+            return None
+        if not getattr(outcome, "ok", False) or not isinstance(getattr(outcome, "payload", None), dict):
+            return None
+        latest = getattr(disp, "_latest_trees", {}).get(int(hwnd))
+        return outcome.payload, (int(latest[0]) if latest else 0), float(getattr(outcome, "elapsed_ms", 0) or 0.0)
+
+    def _front(self, hwnd: int) -> str:
+        """Bring ``hwnd`` forward unless it is in front (through the steps' dispatcher: its game guard and the desk
+        lease); raises when it can't."""
+        disp = self._disp()
+        try:
+            _text, payload, _ms = disp.overview_text()
+            if int(payload.get("foreground_hwnd") or 0) == int(hwnd):
+                return ""
+        except Exception:  # noqa: BLE001 - then it is brought forward
+            pass
+        outcome = disp.dispatch("focus_window", {"hwnd": int(hwnd)})
+        if not getattr(outcome, "ok", False):
+            raise RuntimeError(f"could not bring window {hwnd} to the front: {getattr(outcome, 'summary', '')}")
+        return "brought it to the front; "
+
+    def snapshot(self) -> Any:
+        raise RuntimeError("not on the brain's desk hands")
+
+    def _act(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> Any:
+        raise RuntimeError("not on the brain's desk hands: the planner does it")
+
+    def _open_url(self, args: dict[str, Any], facts: dict[str, Any]) -> Any:
+        raise RuntimeError("not on the brain's desk hands: the planner does it")
+
+    def act_off(self, app: str | None) -> str | None:
+        """The name Settings switched "Act" off for when ``app`` is that app (the brain's policy reader), else
+        ``None``. An unreadable policy never blocks here (rows 1-2 read it again on every step)."""
+        if not app:
+            return None
+        try:
+            from yuki.brain import util
+
+            policy = getattr(self._dispatcher, "act_policy", None) or util._shared_reader()
+            return policy.app_off(str(app)) or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    # -- one run's declared steps ------------------------------------------------------------------------------------
+
+    def driver_steps(self, *, key: str, steps: list[dict[str, Any]], way_text: str = "",
+                     sends: Mapping[str, Any] | None = None) -> Any:
+        """A context for one ``chat.run_steps`` run: the steps its driver built from the capability's data, the
+        route's own words, and what it sends (``{"to", "what"}``) when it sends."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def scope() -> Any:
+            self._scopes.append({
+                "key": str(key or ""),
+                "keys": [[_folded(k) for k in s.get("keys") or [] if _words(k)] for s in steps
+                         if isinstance(s, dict) and s.get("do") == "keys"],
+                "texts": [_folded(s.get("text")) for s in steps if isinstance(s, dict) and s.get("do") == "type"],
+                "picks": sum(1 for s in steps if isinstance(s, dict) and s.get("do") == "pick"),
+                "way_text": _folded(way_text),
+                "sends": dict(sends) if sends else None})
+            try:
+                yield self
+            finally:
+                self._scopes.pop()
+
+        return scope()
+
+    def _own(self, tool: str, tool_input: Mapping[str, Any], facts: Mapping[str, Any]) -> str | None:
+        """Which of the capability's own steps this is (``key``, ``name``, ``text``, ``pick``, ``send``, ``join``), or
+        ``None``. Strings compared with strings and catalog data only."""
+        scope = self._scopes[-1] if self._scopes else None
+        grant = self.grant or {}
+        if scope is not None:
+            if tool == "hotkey":
+                keys = [_folded(k) for k in tool_input.get("keys") or [] if _words(k)]
+                if keys and keys in scope["keys"]:
+                    if not scope["sends"]:
+                        return "key"
+                    sends = scope["sends"]
+                    if grant.get("send") is True and _folded(sends.get("what")) \
+                            and _folded(sends.get("what")) == _folded(grant.get("text")) \
+                            and _folded(sends.get("to")) == _folded(grant.get("person")):
+                        return "send"
+                    return NOT_GRANTED   # a send key the consent rule didn't allow and count down: never pressed
+            elif tool == "type_text":
+                text = _folded(tool_input.get("text"))
+                if text and text in scope["texts"]:
+                    if text == scope["way_text"]:
+                        return "name"
+                    if text == _folded(grant.get("text")):
+                        return "text"
+            elif tool == "click" and scope["picks"] and not scope["sends"]:
+                return "pick"
+            return None
+        if tool == "click" and grant.get("join") is True:
+            from yuki.brain import consent
+
+            role, name = str(facts.get("role") or ""), _words(facts.get("name"))
+            if (role.casefold(), name.casefold()) in consent.join_controls():
+                return "join"
+        return None
+
+    # -- the check -----------------------------------------------------------------------------------------------------
+
+    def authorize(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None = None,
+                  earlier: list[str] | None = None, *, force: bool = False) -> Any:
+        """The verdict for one step (class docstring): rows 1-2 first, then the capability's own step, else
+        ``yuki.brain.check.one``. Always answers (``allowed`` true for a step it lets through); fails closed."""
+        from yuki.brain import consent
+
+        facts = dict(target or {})
+        if not facts.get("role") and not facts.get("name"):
+            role, name = _element_words(facts.get("element"))
+            if role or name:
+                facts.update(role=role, name=name)
+        if tool == "click" and force and not facts.get("role"):
+            facts["role"] = "Button"   # the caller's own signal: a role that can send, delete or buy
+        raw = facts.get("hwnd")
+        hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
+        facts["hwnd"] = hwnd
+        now = time.monotonic()
+        self._typed = {h: at for h, at in self._typed.items() if now - at < 600.0}
+        if hwnd is not None and hwnd in self._typed:
+            facts["typed_pending"] = True
+        try:
+            from yuki.brain.check import _board
+
+            call = consent.Call(tool=str(tool), input=dict(tool_input or {}), index=0, hwnd=hwnd,
+                                app=str(facts.get("app") or ""), title=str(facts.get("title") or ""),
+                                role=str(facts.get("role") or ""), name=_words(facts.get("name")))
+            board = _board()
+            live = consent.Live(game=consent.game_now(board), calling=consent.calling_windows(board),
+                                typed_pending=frozenset({hwnd}) if hwnd is not None and facts.get("typed_pending")
+                                else frozenset(), join_controls=consent.join_controls())
+            gate = consent.screen_gate(call, live)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            return self._said(tool, SimpleNamespace(allowed=False, decision="ask_user", question="", source="error",
+                                                    handover=False, act_off="", row=0,
+                                                    why=f"the check could not run ({type(exc).__name__})"))
+        if gate is not None:
+            off = self.act_off(call.app) if gate.why == "act_off" else None
+            return self._said(tool, SimpleNamespace(allowed=False, decision="refuse", question="",
+                                                    source=f"row{gate.row}", handover=False, act_off=off or "",
+                                                    row=gate.row, why=gate.line or gate.why))
+        own = self._own(str(tool), dict(tool_input or {}), facts)
+        if own == NOT_GRANTED:
+            # never pressed: the text stays in the chat as a draft (the driver says so); the planner may take it on
+            return self._said(tool, SimpleNamespace(allowed=False, decision="refuse", question="", source="row4",
+                                                    handover=True, act_off="", row=4, why="send_not_granted"))
+        if own is not None:
+            if tool == "type_text" and hwnd is not None:
+                self._typed[hwnd] = now   # Yuki's words wait there, unsent
+            if own == "send" and hwnd is not None:
+                self._typed.pop(hwnd, None)
+            return self._said(tool, SimpleNamespace(allowed=True, decision="allow", question="", source="capability",
+                                                    handover=False, act_off="", row=0, why=own))
+        try:
+            from yuki.brain.check import one
+
+            before = [*self.earlier[-2:], *[_words(e) for e in earlier or [] if _words(e)]][-3:]
+            verdict = one(str(tool), dict(tool_input or {}), facts, words=list(self.words), checker=self.checker,
+                          earlier=before, log=self._log)
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            verdict = SimpleNamespace(allowed=False, decision="ask_user", question="", source="error", handover=False,
+                                      act_off="", row=0, why=f"the check could not run ({type(exc).__name__})")
+        if tool == "type_text" and hwnd is not None and getattr(verdict, "allowed", False):
+            self._typed[hwnd] = now
+        return self._said(tool, verdict)
+
+    def _said(self, tool: str, verdict: Any) -> Any:
+        """The verdict, logged content-free."""
+        if self._log is not None:
+            try:
+                self._log("desk_hands", tool=str(tool), allowed=bool(getattr(verdict, "allowed", False)),
+                          row=getattr(verdict, "row", None), source=str(getattr(verdict, "source", "") or ""),
+                          handover=bool(getattr(verdict, "handover", False)))
+            except Exception:  # noqa: BLE001
+                pass
+        return verdict
+
+
 __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_steps", "check_sends", "check_texts",
            "check_picks_for_send",
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS", "site",
            "PATTERNS", "Found", "Pressed", "app_window", "search", "find_in", "apply_pattern", "press", "route_steps",
-           "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path"]
+           "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path", "DeskHands"]

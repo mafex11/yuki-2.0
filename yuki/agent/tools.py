@@ -4626,9 +4626,12 @@ class Dispatcher:
 
         ctx = self.skill_context or {}
         state: dict[str, Any] = {}
+        # zFinal (bSkill finding 1): on the new brain the request's desk hands (``uia_route.DeskHands``) let the message
+        # and voice-join capabilities type and press through the same consent and commit checks; the old loop passes
+        # none (its capability steps hand back to it, as before)
         result = run_for_thinker(tool_input, list(ctx.get("words") or []), memory=ctx.get("memory"),
                                  log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"),
-                                 verbs=self._skill_act_verbs(state))
+                                 verbs=self._skill_act_verbs(state), hands=ctx.get("hands"))
         off = state.get("act_off")
         acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
         if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):
@@ -4645,6 +4648,10 @@ class Dispatcher:
         ok = result.outcome in ("done", "already", "unverified", "handed_over", "asked", "other_device")
         payload: dict[str, Any] = {"details": details, "skill": result.skill, "outcome": result.outcome,
                                    "route": result.route, "handoff": result.handoff}
+        if result.done:
+            # bExec merge note 7: the engine's own done line whole (the summary is cut at 200 characters; a done line
+            # with the fresh uploads named can be longer), read by ``brain.done.engine_line``
+            payload["done_line"] = result.done_line or result.say
         if result.held:
             payload["refused"] = "game"
         return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],

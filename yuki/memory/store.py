@@ -1250,8 +1250,10 @@ class NudgeRecord:
 #: ``nudges.outcome``: what came of a card's typed offer (yuki.memory.offers) - ``done`` (it ran), ``undone`` (the
 #: user pressed Undo), ``prefilled`` (an ``ask`` suggestion went into the ask bar), ``stopped`` (the request sent
 #: from it was stopped within a minute), ``abandoned`` (the ask bar closed without sending it), ``expired`` (a click
-#: after the offer's time ran out: nothing ran).
-NUDGE_OUTCOMES: tuple[str, ...] = ("done", "undone", "prefilled", "stopped", "abandoned", "expired")
+#: after the offer's time ran out: nothing ran); a routine card's ``run_skill`` (rLane): ``running`` (pressed; the tray
+#: runs the skill) and ``failed`` (it ran and the PC didn't show it done, or it couldn't run).
+NUDGE_OUTCOMES: tuple[str, ...] = ("done", "undone", "prefilled", "stopped", "abandoned", "expired", "running",
+                                   "failed")
 
 
 @dataclass
