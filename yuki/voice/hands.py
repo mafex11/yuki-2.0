@@ -104,6 +104,11 @@ _JUDGE_HELD_NOTE = (
     "Not done: Yuki's own check held it back, because their words did not plainly ask for this. Nothing was done. Ask "
     "them in a few words, the question alone with no call: {question} If they say yes, call it again."
 )
+#: Review r2 L3: a volume skill run on unsure words (never held) that would need a window for the rest.
+_UNSURE_FOCUS_NOTE = (
+    "Not done: recognition was unsure of their words, and the rest of this would take a window, so nothing was done. "
+    "Ask them in a few words whether they meant it, the question alone with no call. If they say yes, call it again."
+)
 #: What the talker reads when the app's "Act" switch is off in Settings (v3.18, 34-review H5).
 _ACT_OFF_NOTE = (
     "Not done: in Yuki's settings Act is switched off for {app}, so Yuki does not click, type or press keys there; "
@@ -391,10 +396,11 @@ from yuki.skills.prefs import CORRECTION_S as _CORRECTION_S, KEEP_PENDING_S as _
 #: and the media_key volume keys are off (back with ``skills = false``); media_key keeps playpause, next, previous, stop.
 VOLUME_SKILL = "volume"
 #: media_key with the volume keys gone (its transport goes through the media session first, fGate): the volume is the
-#: volume skill's.
+#: volume skill's. The session wording is fWire's (review r2 L4), so the two descriptions agree after the merge.
 MEDIA_KEY_TRANSPORT_DESCRIPTION = (
-    "Your hand: a media key (playpause, nexttrack, prevtrack, stop) for the media session the desktop block marks, "
-    "through Windows' media controls. Volume is run_skill volume. Verified from the session's status." + _NOW
+    "Your hand: a media key (playpause, nexttrack, prevtrack, stop) for the media session that is playing, else the "
+    "current one (through Windows' media controls; never a game's). Volume is run_skill volume. Verified from the "
+    "session's status." + _NOW
 )
 
 
@@ -782,6 +788,10 @@ class Hands:
         self.turn_key: Any = None
         self.shown: Any = None
         self.user_turn: Any = None
+        #: ``() -> bool``: recognition was unsure of the user's latest words (a Speech line), set by the conversation:
+        #: a volume skill run then takes no focus (review r2 L3: it is never held on unsure words, as the old sound
+        #: hands were not, so its focus rungs and a hand-off are left out on that run).
+        self.unsure: Any = None
         #: :class:`yuki.voice.practice.PracticeLookup`: the learned ways the talker was offered (run_skill runs only
         #: those), set by the conversation.
         self.practice: Any = None
@@ -1901,10 +1911,11 @@ class Hands:
                 from yuki.skills.prefs import keep_line
 
                 line = keep_line(line)
-        elif outcome in self.SKILL_SAID or facts.get("held") or facts.get("act_off"):
+        elif outcome in self.SKILL_SAID or facts.get("held") or facts.get("act_off") or facts.get("memory_slow"):
             line = str(facts.get("say") or "")
         if outcome in ("failed", "error") or (facts.get("refused") and not facts.get("held")
-                                               and not facts.get("act_off")):
+                                               and not facts.get("act_off") and not facts.get("memory_slow")
+                                               and not facts.get("unsure_focus")):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=facts.get("verified"))
         if self.on_step is not None:
@@ -1916,7 +1927,8 @@ class Hands:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            skill_outcome=outcome or None, verified=facts.get("verified"), done_line=bool(line),
                            keep_question=bool(facts.get("keep_question")), focus_taken=bool(facts.get("focus_taken")),
-                           act_off=bool(facts.get("act_off")))
+                           act_off=bool(facts.get("act_off")), memory_slow=bool(facts.get("memory_slow")),
+                           unsure_focus=bool(facts.get("unsure_focus")))
         if outcome == "handed_over" and facts.get("handoff_skill") and self.bridge is not None \
                 and callable(getattr(self.bridge, "escalate", None)):
             # rung C: its routes didn't get there; the thinker does it with the skill pinned (never with a game in
@@ -1951,6 +1963,9 @@ class Hands:
                                           "how_to_handle_it": self._SKILL_SAID_NOTE.format(line=line)},
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
+        if facts.get("unsure_focus"):
+            await params.result_callback({"held": report[:700], "how_to_handle_it": _UNSURE_FOCUS_NOTE})
+            return
         if facts.get("held") and not line:
             question = str(facts.get("question") or "").strip() or "Ask whether they want exactly this."
             await params.result_callback({"held": report[:700],
@@ -1974,10 +1989,18 @@ class Hands:
 
     #: The skill verbs that touch an app's window (press a control in it, set its own slider, bring it forward, pick
     #: its tab): refused in an app whose Settings "Act" switch is off, as the old click and type hands are (34-review
-    #: H5, review r1 M2). A driver may do any of these, so it is refused there too. The sound-only verbs (the mixer,
-    #: the PC's level, the media session) and openings stay free, as the old sound and open hands were; ``uia_steps``
-    #: checks each of its own steps (``uia_route``).
+    #: H5, review r1 M2). A driver may do any of these, so it is refused there too, unless its route's data marks it
+    #: window-free (:meth:`_window_free`). The sound-only verbs (the mixer, the PC's level, the media session) and
+    #: openings stay free, as the old sound and open hands were; ``uia_steps`` checks each of its own steps.
     ACT_VIAS = ("uia_invoke", "slider", "focus", "tab_select", "driver")
+
+    @staticmethod
+    def _window_free(route: Any) -> bool:
+        """Review r2 L1: a route whose data says it neither takes focus nor sends input (``game = "always"`` with
+        ``needs_focus = false``: the connection format's own marker, the same one the engine's D17 check reads), e.g.
+        sSpotify's mixer, system and Spotify-mixer driver rungs. The Act switch is about clicking and typing in an app,
+        so such a rung runs with it off, as the old app_volume did."""
+        return getattr(route, "game", None) == "always" and not getattr(route, "needs_focus", True)
 
     def _skill_verbs(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         """The engine's verbs, each refusing a focus-taking rung while the thinker works on the desktop (two hands at
@@ -1992,7 +2015,11 @@ class Hands:
 
         def wrap(via: str) -> Any:
             def run(call: Any) -> Any:
-                if via in self.ACT_VIAS:
+                if state.get("sound_only") and getattr(call.route, "needs_focus", False):
+                    # review r2 L3: unsure words and an unheld volume run: no focus rung on this run
+                    state["unsure_refused"] = True
+                    return engine.RouteResult(ran=False, outcome="unsure_words")
+                if via in self.ACT_VIAS and not self._window_free(call.route):
                     try:
                         off = self.act_off(engine.acted_app(call.skill, call.route, call.args))
                     except Exception:  # noqa: BLE001 - an unreadable policy is the judge's and the backstop's
@@ -2046,6 +2073,9 @@ class Hands:
         facts: dict[str, Any] = {"sent_at": None, "verified": None}
         skill_key = str(args.get("skill") or "").strip()
         slots = dict(args.get("slots")) if isinstance(args.get("slots"), dict) else {}
+        # review r2 L3: the volume skill is never held on unsure words (pipeline._sound_skill), so on that run it
+        # takes no focus
+        sound_only = skill_key == VOLUME_SKILL and bool(self._call_safely(self.unsure, False))
         if self.halted:
             facts.update(refused=True, outcome="refused")
             return False, (f"your last hand did not show the effect it was for ({self.halted}); your hands stay still "
@@ -2063,8 +2093,8 @@ class Hands:
         begin = getattr(memory, "acting_begin", None) if memory is not None else None
 
         def on_focus() -> None:
-            if marker["token"] is not None or not callable(begin):
-                return
+            if marker["token"] is not None or not callable(begin) or sound_only:
+                return   # sound_only: the focus rung is refused by its verb, nothing takes focus (D18)
             token = f"voice-skill-{id(self)}-{time.monotonic_ns()}"
             try:
                 if begin(token, " / ".join(words[-2:]) or skill_key, lane="voice"):
@@ -2075,10 +2105,17 @@ class Hands:
         previous = self.last_skill if (self.last_skill and self.last_skill.get("skill") == skill_key and
                                        time.time() - float(self.last_skill.get("at") or 0.0) <= _CORRECTION_S) else None
         state: dict[str, Any] = {}
+        if sound_only:
+            state["sound_only"] = True
+        # review r2 M3: a resolve memory doesn't answer in time refuses the run (no hand moves before the user's
+        # usuals are known); a memory reached directly (it holds the store) has no wait to miss
+        resolve_wait = _ResolveWait(memory, skill_key) if memory is not None and callable(getattr(memory, "call", None)) \
+            and not hasattr(memory, "store") else None
         # review r1 L2: the engine's own D9 read fails closed ("unknown" holds), so its reader may raise
-        ctx = engine.RunContext(origin="voice", words=words, memory=memory, hands=self, log=self._skill_log,
-                                request_id=self._skill_request_id(), session_id=getattr(memory, "session_id", None),
-                                on_focus=on_focus, verbs=self._skill_verbs(state), game=self._game_strict)
+        ctx = engine.RunContext(origin="voice", words=words, memory=resolve_wait or memory, hands=self,
+                                log=self._skill_log, request_id=self._skill_request_id(),
+                                session_id=getattr(memory, "session_id", None), on_focus=on_focus,
+                                verbs=self._skill_verbs(state), game=self._game_strict)
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
@@ -2095,6 +2132,12 @@ class Hands:
         facts["sent_at"] = state.get("sent_at")
         if facts.get("held") == "game":
             facts["game_front"] = True
+        if resolve_wait is not None and resolve_wait.slow:
+            # review r2 M3: memory didn't answer the resolve in time: nothing ran (no rung, no ledger row), said plainly
+            facts.update(outcome="refused", refused=True, memory_slow=True, say=MEMORY_SLOW_LINE, settled=True,
+                         verified=False, handoff_skill=None)
+            return False, (f"Not done: Yuki's memory didn't answer in time, so the skill was not run and nothing "
+                           f"moved. Said aloud by code: {MEMORY_SLOW_LINE}"), facts
         off = state.get("act_off")
         acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
         if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):
@@ -2102,6 +2145,16 @@ class Hands:
             # said plainly (the judge's own line), never handed to the thinker (it would not act there either). A
             # failure after a rung that did act keeps its own plain line
             report = self._skill_act_off(result, off, facts, memory)
+        elif sound_only and (result.outcome == "handed_over"
+                             or (state.get("unsure_refused") and result.outcome == "failed" and not acted)):
+            # review r2 L3: on unsure words the volume skill runs unheld, so only its no-focus rungs ran; what is left
+            # would take a window (a focus rung or the thinker, whose tell_yuki would be held on these words too):
+            # nothing more runs, the talker asks first
+            self._refinish(memory, result, "refused")
+            facts.update(outcome="refused", refused=True, unsure_focus=True, handoff_skill=None, settled=True,
+                         verified=False, say="")
+            report = ("Not done: recognition was unsure of their words, and the rest of this would take a window, so "
+                      "nothing was done.")
         facts.update(self._keep_from_run(skill_key, result))
         # review r1 L4: the preference side (a bounded memory call) runs after the line is said (_handle_skill)
         facts["_prefs"] = (skill_key, dict(args), dict(slots), result, previous, list(words))
@@ -3521,6 +3574,42 @@ class _Refused(Exception):
         self.held = held
         #: The app whose "Act" switch is off in Settings (v3.18, 34-review H5), or ``None``.
         self.act_off = act_off
+
+
+#: Review r2 M3: how long a voice skill run waits for memory's resolve (the user's usuals, the trust ledger, the
+#: "again" numbers): longer than the engine's own 1 s (the run is off the loop), and no answer refuses the run.
+SKILL_RESOLVE_WAIT_S = 2.0
+#: Said by code when memory didn't answer the resolve in time: nothing ran.
+MEMORY_SLOW_LINE = "I couldn't reach my memory just now, try again?"
+
+
+class _ResolveWait:
+    """The engine's memory for one voice skill run (review r2 M3): ``skill_resolve`` waits
+    :data:`SKILL_RESOLVE_WAIT_S`, and when memory doesn't answer (a timeout or a failure) the run is refused
+    (``Refused(skill, "memory_slow")``: nothing runs, no ledger row) instead of resolving with no store, which would
+    ignore the confirmed usual, run rungs the ledger disabled and lose the "again" numbers. Every other call and
+    attribute is the memory's own (it holds no ``store``, so the engine keeps calling through it)."""
+
+    def __init__(self, inner: Any, skill_key: str, wait_s: float = SKILL_RESOLVE_WAIT_S) -> None:
+        self._inner = inner
+        self._skill_key = skill_key
+        self._wait_s = float(wait_s)
+        #: Whether the resolve got no answer (the run was refused for it).
+        self.slow = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def call(self, what: str, fn: Any, timeout_s: float = 1.0) -> Any:
+        if what != "skill_resolve":
+            return self._inner.call(what, fn, timeout_s=timeout_s)
+        try:
+            return self._inner.call(what, fn, timeout_s=max(float(timeout_s), self._wait_s))
+        except Exception:  # noqa: BLE001 - no answer in time, or memory failed: refused, never resolved blind
+            from yuki.skills.resolve import Refused
+
+            self.slow = True
+            return Refused(self._skill_key, "memory_slow")
 
 
 def _step_key(name: str, args: dict[str, Any]) -> str:

@@ -508,3 +508,153 @@ def test_keep_usual_without_an_answer_in_time_is_worded_as_unsure(rig: Any, monk
     keep = _run(rig.hands, {"answer": "yes"}, name="keep_usual")
     result, _props = keep.results[-1]
     assert result.get("not_sure") == "I'm not sure that saved." and "couldn't" not in str(result)
+
+
+# -- review round 2 ------------------------------------------------------------------------------------------------------
+
+
+def test_a_resolve_memory_doesnt_answer_in_time_refuses_the_run_and_no_hand_moves(
+        rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 M3 (the reviewer's test_r2_memslow.py): the usual is the mixer and memory doesn't answer the resolve
+    in time: nothing runs (neither the in-app rung the data defaults to nor the mixer), no ledger row, the plain line is
+    said by code, nothing goes to the thinker. The voice waits longer than the engine's own 1 s for this one call."""
+    P.record(rig.client.store, "demo.volume:control", "mixer", "confirmed")
+    orig = rig.mem.call
+    waits: list[float] = []
+
+    def call(what: str, fn: Any, timeout_s: float = 1.0) -> Any:
+        if what == "skill_resolve":
+            waits.append(timeout_s)
+            raise TimeoutError("memory did not answer in time")
+        return orig(what, fn, timeout_s)
+
+    rig.mem.call = call
+    slider = Verb(E.RouteResult(ran=True, outcome="set", verified=True, value=40.0))
+    mixer = Verb(E.RouteResult(ran=True, outcome="set", verified=True, value=40.0))
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", slider)
+    monkeypatch.setitem(E.VERB_FUNCS, "app_volume", mixer)
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(True))
+    trouble = rig.hands.trouble_at
+    rig.hands.words = lambda: ["set demo player to 40"]
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40}})
+    assert not slider.calls and not mixer.calls
+    assert params.said == [H.MEMORY_SLOW_LINE]
+    assert waits == [H.SKILL_RESOLVE_WAIT_S] and H.SKILL_RESOLVE_WAIT_S > 1.0
+    assert rig.client.store._query("SELECT count(*) FROM skill_runs")[0][0] == 0
+    assert rig.bridge.escalated == [] and rig.hands.trouble_at == trouble and rig.hands.last_skill is None
+    result, props = params.results[-1]
+    assert result["said"] == H.MEMORY_SLOW_LINE and props.run_llm is False
+    # memory answering again: the confirmed usual decides (the mixer), as the user set it
+    rig.mem.call = orig
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40}})
+    assert mixer.calls and not slider.calls and params.said[0].startswith("Demo Player at 40%")
+
+
+def test_a_window_free_driver_rung_runs_with_act_off_and_a_window_rung_does_not(
+        rig: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 L1: sSpotify's mixer, system and Spotify-mixer rungs are drivers marked ``game = "always"`` (no focus,
+    no input): Act switched off for the app doesn't refuse them, as it never refused the old app_volume; a driver rung
+    that may touch the window (``game = "states"``) is still refused."""
+    _act_off(rig, tmp_path)
+    ran: list[Any] = []
+
+    def driver(call: Any) -> E.RouteResult:
+        ran.append(call)
+        return E.RouteResult(ran=True, outcome="set", verified=True)
+
+    monkeypatch.setitem(E.VERB_FUNCS, "driver", driver)
+    monkeypatch.setattr(E, "acted_app", lambda skill, route, args, res=None: "DemoPlayer.exe")
+    state: dict[str, Any] = {}
+    verbs = rig.hands._skill_verbs(state)
+    free = SimpleNamespace(skill=None, route=SimpleNamespace(game="always", needs_focus=False), args={})
+    assert verbs["driver"](free).ran and len(ran) == 1
+    window = SimpleNamespace(skill=None, route=SimpleNamespace(game="states", needs_focus=False), args={})
+    res = verbs["driver"](window)
+    assert res.ran is False and res.outcome == "act_off" and len(ran) == 1 and state["act_off"]
+
+
+#: An invented volume skill (key "volume"): its default control has a focus rung (A), an untrusted rung B and a
+#: hand-off; the mixer control a no-focus rung.
+_VOLUME_TOML = """\
+[connection]
+app = "demoaudio"
+
+[skill.volume]
+end = "volume_change"
+kind = "change"
+menu = "set an invented app's level"
+done_line = "Volume set."
+handoff = true
+
+[[skill.volume.slot]]
+name = "level"
+type = "number"
+min = 0
+max = 100
+required = true
+ask = "What level?"
+
+[[skill.volume.slot]]
+name = "control"
+type = "enum"
+options = ["in_app", "mixer"]
+default = "in_app"
+
+[[skill.volume.route]]
+rung = "A"
+variant = "mixer"
+via = "app_volume"
+when = { slot = "control", in = ["mixer"] }
+args = { app = "DemoAudio.exe", level = "{level}" }
+game = "always"
+done = { probe = "read_back" }
+
+[[skill.volume.route]]
+rung = "A"
+variant = "keys"
+via = "focus"
+when = { slot = "control", in = ["in_app"] }
+args = { window = "DemoAudio.exe" }
+done = { probe = "read_back" }
+
+[[skill.volume.route]]
+rung = "B"
+variant = "steps"
+via = "uia_steps"
+args = { apps = ["DemoAudio.exe"], steps = [{ do = "click", role = "Button", name = "Demo level up" }] }
+done = { probe = "level", target = "DemoAudio.exe", value = "{level}", within_s = 1 }
+"""
+
+
+def test_an_unheld_volume_run_on_unsure_words_takes_no_focus_and_hands_nothing_over(
+        rig: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r2 L3: the volume skill runs unheld on unsure words (pipeline._sound_skill), so on that run its focus
+    rungs are left out, and what would need a window (the thinker too) waits for the user's answer to one question;
+    its no-focus rungs still run at once. Sure words: the focus rung runs as before."""
+    folder = tmp_path / "connections"
+    folder.mkdir()
+    (folder / "audio.toml").write_text(_VOLUME_TOML, encoding="utf-8")
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", folder)
+    C.clear_cache()
+    R.seed(rig.client.store, C.load())
+    rig.hands.skill_keys = ("volume",)
+    steps = Verb(E.RouteResult(ran=True, outcome="focused", verified=True, value=40.0))
+    mixer = Verb(E.RouteResult(ran=True, outcome="set", verified=True, value=40.0))
+    monkeypatch.setitem(E.VERB_FUNCS, "focus", steps)
+    monkeypatch.setitem(E.VERB_FUNCS, "app_volume", mixer)
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(True))
+    rig.hands.unsure = lambda: True
+    trouble = rig.hands.trouble_at
+    params = _run(rig.hands, {"say_first": "", "skill": "volume", "slots": {"level": 40}})
+    assert not steps.calls and rig.bridge.escalated == [] and params.said == [] and rig.mem.marks == []
+    result, _props = params.results[-1]
+    assert "held" in result and result["how_to_handle_it"] == H._UNSURE_FOCUS_NOTE
+    assert rig.hands.trouble_at == trouble
+    assert rig.client.store._query("SELECT outcome FROM skill_runs")[0][0] == "refused"
+    # the no-focus rung still runs at once on unsure words
+    params = _run(rig.hands, {"say_first": "", "skill": "volume", "slots": {"level": 40, "control": "mixer"}})
+    assert mixer.calls and params.said == ["Volume set."]
+    # sure words: the focus rung runs
+    rig.hands.unsure = lambda: False
+    params = _run(rig.hands, {"say_first": "", "skill": "volume", "slots": {"level": 30}})
+    assert steps.calls and params.said == ["Volume set."]

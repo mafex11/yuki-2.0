@@ -3514,6 +3514,9 @@ class Conversation:
             hands.practice = self.practice
             # Phase S: the skill path (its keys fixed with this conversation's tools), the engine's memory and settings
             hands.skill_keys = tuple(self._skill_keys())
+            # review r2 L3: the volume skill runs unheld on unsure words, so then it takes no focus (the same state
+            # _held reads: a Speech line for the latest words)
+            hands.unsure = lambda: bool(self.observer.heard and not getattr(self.observer, "heard_plain", False))
             hands.skill_memory = self.memory
             hands.skill_settings = self.settings
             hands.last_skill = None
@@ -4369,9 +4372,11 @@ class Conversation:
             tools = talker_hand_tools(keys, learned_ways=learned)
         self._hand_tools_cache = tools
         if self.log is not None:
+            mouth_memory = getattr(self, "mouth_memory", None)
+            # source: snapshot / memory / stale / fallback / none / off (review r2 M1: a fallback menu is logged)
             self.log.event("skill_menu", session=self.session, skills=len(self._skill_keys()),
-                           chars=len(getattr(getattr(self, "mouth_memory", None), "skills", None) or ""),
-                           hands=len(tools))
+                           chars=len(getattr(mouth_memory, "skills", None) or ""),
+                           source=str(getattr(mouth_memory, "skills_source", "") or "") or None, hands=len(tools))
         return tools
 
     def _held(self, name: str, call_id: str | None = None, args: Any = None) -> bool:

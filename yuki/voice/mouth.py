@@ -25,6 +25,9 @@ the time now and what the grounding lookup found near the user's latest words
 
 from __future__ import annotations
 
+import threading
+import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -212,11 +215,14 @@ Tell him congrats.", intent="remember")
 
 tell_yuki gives the thinker the user's own words, exactly as they said them since you last replied: you never \
 write what they asked yourself. context is optional and only for what their words cannot be understood without: \
-what "that", "it" or "her" points to when the conversation says so, or the earlier request a correction is about. \
+what "that", "it" or "her" points to when the conversation says so, the earlier request a correction is about, or, \
+when they answer your own question, the request their answer completes. \
 Add nothing else anywhere: no topics, examples, names, places or details they did not say, nothing from what you \
 know about them, nothing from the lookup block, no instructions on how to answer.
 Bad: user "what did Priya say?" -> context "about the invoices and the deadline" (they said neither)
 Good: user "what did she say?" after talking about Priya -> context "she = Priya, whom the user just mentioned"
+Good: you asked "Which chat?" for "message him on WhatsApp", they say "the Bro chat" -> context "answers your 'Which \
+chat?' for their 'message him on WhatsApp'"
 Good: "text Meera on Telegram, ask if she's getting on Zoom later" -> app_named "Telegram" (never her usual app, \
 never "Zoom")
 
@@ -1171,7 +1177,8 @@ TELL_YUKI: dict[str, Any] = {
             "description": (
                 "Optional. Only what their words cannot be understood without (the thinker gets their words "
                 "exactly as said): what a word like 'that' or 'her' points to, a misheard name the screen resolves, "
-                "or the earlier request a correction is about. Leave it out otherwise."
+                "the earlier request a correction is about, or the request their answer to your question completes. "
+                "Leave it out otherwise."
             ),
         },
         "corrects": {
@@ -1464,10 +1471,13 @@ class MouthMemory:
     #: vfix4 (4 Oct): the last hour with the user across conversations and typed chat, and what they asked Yuki to
     #: keep in it (:func:`yuki.voice.recall.recent_view`): its own block after the cached layers, fixed per conversation.
     recent: str | None = None
-    #: Phase S: the talker's Skills menu (``MemoryClient.skill_menu("talker")``: the user's usual ways, one line each,
-    #: at most 2,400 characters, rebuilt nightly), appended to the hands block; ``None``: no skill path in this
-    #: conversation (no skill loaded, ``skills = false``, or an older memory).
+    #: Phase S: the talker's Skills menu (:func:`talker_menu`: the user's usual ways, one line each, at most 2,400
+    #: characters, one snapshot per day so the cached hands block holds all day), appended to the hands block;
+    #: ``None``: no skill path in this conversation (no skill loaded, or ``skills = false``).
     skills: str | None = None
+    #: Where the menu came from (:func:`talker_menu`): ``snapshot``, ``memory``, ``stale``, ``fallback``, ``none``,
+    #: ``off`` (``skills = false``). A code word, logged.
+    skills_source: str = "off"
     source: str = "unavailable"
     error: str | None = None
     elapsed_ms: float = 0.0
@@ -1485,6 +1495,7 @@ class MouthMemory:
             "resume_chars": len(self.resume or ""),
             "recent_chars": len(self.recent or ""),
             "skills_chars": len(self.skills or ""),
+            "skills_source": self.skills_source,
             "todos": len(self.todos or []),
             "error": self.error,
             "elapsed_ms": self.elapsed_ms,
@@ -1515,7 +1526,13 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         # MiniLM ~176 MB in that process, nothing loaded here). The old "~600 MB embedder" reason is gone (v3.14).
         ctx = memory.context(app=None, query="", resume=True, timeout_s=timeout_s)
     except Exception as exc:  # noqa: BLE001 - voice works without memory
-        return MouthMemory(error=f"{type(exc).__name__}: {exc}")
+        out = MouthMemory(error=f"{type(exc).__name__}: {exc}")
+        skills_on, menu_chars = _menu_settings()
+        if skills_on:
+            # review r2 M1: memory failing never brings the old mixer hand back with skills on: today's snapshot, else
+            # the bundled connection files (memory is not asked again: it just failed)
+            out.skills, out.skills_source = talker_menu(memory, chars=menu_chars, ask=False)
+        return out
     todos = [todo_line(row, with_source=False) for row in (ctx.todos or [])]
     portrait = personality = None
     if ctx.portrait:
@@ -1526,18 +1543,16 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         if section:
             personality = _cut(section, PERSONALITY_CHARS)
             portrait = f"{portrait}\n\n{personality}".strip()
-    skills_on = True
-    menu_chars: int | None = None
+    skills_on, menu_chars = _menu_settings()
     try:
         from yuki.config import Settings
 
-        settings = Settings()
-        names = list(settings.user_names)
-        skills_on = bool(getattr(settings, "skills", True))
-        menu_chars = getattr(settings, "skills_menu_chars", None)
+        names = list(Settings().user_names)
     except Exception:  # noqa: BLE001
         names = []
     persona = getattr(ctx, "persona", None)
+    skills, skills_source = (talker_menu(memory, timeout_s=min(timeout_s, 1.5), chars=menu_chars) if skills_on
+                             else (None, "off"))
     return MouthMemory(
         portrait=portrait or None,
         personality=personality,
@@ -1549,42 +1564,156 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
         recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
-        skills=fetch_skills(memory, timeout_s=min(timeout_s, 1.5), chars=menu_chars) if skills_on else None,
+        skills=skills,
+        skills_source=skills_source,
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
     )
 
 
-def fetch_skills(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None) -> str | None:
-    """The talker's Skills menu (``MemoryClient.skill_menu("talker")``, Phase S), when memory has skills, else ``None``.
+def _menu_settings() -> tuple[bool, int | None]:
+    """``(skills on, the menu cap)`` from the settings (``Settings.skills``, ``Settings.skills_menu_chars``)."""
+    try:
+        from yuki.config import Settings
 
-    Probed, never assumed: an older memory without it, a failure or an empty menu give ``None`` and the hands block stays
-    as before phase S. Cut to ``chars`` (``Settings.skills_menu_chars``; default :data:`SKILLS_CHARS`) at a line.
-    Blocking; off the loop."""
-    cap = int(chars) if isinstance(chars, int) and not isinstance(chars, bool) and chars > 0 else SKILLS_CHARS
+        settings = Settings()
+        return bool(getattr(settings, "skills", True)), getattr(settings, "skills_menu_chars", None)
+    except Exception:  # noqa: BLE001
+        return True, None
+
+
+#: PLAN.md B.2 "Talker cache": the talker's Skills menu sits in the cached hands block (1-hour TTL, kept warm across
+#: conversations), so it is rebuilt nightly only (review r2 M2): one snapshot per memory per day, the day turning at
+#: this local hour; same-day changes (a name played, a rung the ledger disabled) ride in the volatile skills now line
+#: or wait for the next day. The engine reads the ledger and the user's usuals itself at every run.
+MENU_DAY_HOUR = 4
+_menu_lock = threading.Lock()
+#: memory -> ((day, connection-file version, cap), menu): RAM only, dropped with the memory object.
+_menu_snapshots: weakref.WeakKeyDictionary[Any, tuple[tuple[str, str, int], str]] = weakref.WeakKeyDictionary()
+
+
+def menu_day(now: float) -> str:
+    """The talker menu's day for ``now`` (local time; it turns at :data:`MENU_DAY_HOUR`)."""
+    return time.strftime("%Y-%m-%d", time.localtime(float(now) - MENU_DAY_HOUR * 3600))
+
+
+def _snapshot(memory: Any, key: tuple[str, str, int], *, any_day: bool = False) -> str | None:
+    try:
+        with _menu_lock:
+            got = _menu_snapshots.get(memory)
+    except TypeError:   # an unhashable stand-in: no snapshot
+        return None
+    if not got:
+        return None
+    if got[0] == key or (any_day and got[0][1:] == key[1:]):
+        return got[1]
+    return None
+
+
+def _keep_snapshot(memory: Any, key: tuple[str, str, int], menu: str) -> None:
+    try:
+        with _menu_lock:
+            _menu_snapshots[memory] = (key, menu)
+    except TypeError:   # None, or an object that takes no weak reference: no snapshot
+        pass
+
+
+def _menu_lines(text: Any, cap: int, loaded: Any) -> str | None:
+    """A menu cut to ``cap`` at a line, the volume skill's line kept on it when the volume connection loads (it is the
+    talker's only volume hand with skills on; review r2 M1); ``None`` when it lists no skill."""
+    if not isinstance(text, str) or not menu_keys(text):
+        return None
+    lines = text.strip().splitlines()
+    volume = loaded.get(VOLUME_SKILL) if loaded is not None and hasattr(loaded, "get") else None
+    if volume is not None and VOLUME_SKILL not in menu_keys(text):
+        from yuki.skills.menu import skill_line
+
+        first = next((i for i, line in enumerate(lines) if line.strip().startswith("- ")), len(lines))
+        lines.insert(first, skill_line(volume))
+    out: list[str] = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > cap:
+            break
+        out.append(line)
+        size += len(line) + 1
+    menu = "\n".join(out)
+    return menu if menu_keys(menu) else None
+
+
+def _menu_from_memory(memory: Any, timeout_s: float, now: float) -> Any:
+    """The talker's menu built on memory's own store (the trust ledger, the user's names most seen first: ``n_obs``,
+    stable through the day; the thinker's menu ranks the same way), in one bounded call. ``None`` on no answer."""
     call = getattr(memory, "call", None)
     if not callable(call):
         return None
 
     def read(client: Any) -> Any:
-        fn = getattr(client, "skill_menu", None)
+        from yuki.skills.menu import TALKER, menu_text
+
+        store = getattr(client, "store", None)
+        seeded = getattr(client, "_skills_seeded", None)
+        if store is not None and callable(seeded):
+            return menu_text(store, audience=TALKER, loaded=seeded(), now=now, rank="n_obs")
+        fn = getattr(client, "skill_menu", None)   # an older or stand-in memory: its own menu
         return fn("talker") if callable(fn) else None
 
     try:
-        got = call("skill menu", read, timeout_s=timeout_s)
-    except Exception:  # noqa: BLE001 - the talker goes without skills
+        return call("skill menu", read, timeout_s=timeout_s)
+    except Exception:  # noqa: BLE001 - no answer in time, or memory failed: the fallback
         return None
-    if not isinstance(got, str) or not menu_keys(got):
-        return None
-    out: list[str] = []
-    size = 0
-    for line in got.strip().splitlines():
-        if size + len(line) + 1 > cap:
-            break
-        out.append(line)
-        size += len(line) + 1
-    return "\n".join(out) if menu_keys("\n".join(out)) else None
+
+
+def talker_menu(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None, now: float | None = None,
+                ask: bool = True) -> tuple[str | None, str]:
+    """The talker's Skills menu for one conversation and where it came from (Phase S; PLAN.md B.2; review r2 M1, M2):
+
+    - ``snapshot``: today's, built from memory by an earlier conversation: byte-identical all day, no memory call;
+    - ``memory``: built now on memory's store (``ask``), kept as today's snapshot;
+    - ``stale``: memory gave no menu in time, the last day's snapshot (same connection files and cap);
+    - ``fallback``: memory gave no menu in time and there is no snapshot: the bundled connection files alone (no
+      store: deterministic, every loaded skill, no names), never kept, so the next conversation asks memory again;
+    - ``none``: no skill loaded.
+
+    So with skills on and the volume connection loaded the volume skill is always the talker's volume hand, memory or
+    not. Cut to ``chars`` (``Settings.skills_menu_chars``; default :data:`SKILLS_CHARS`) at a line. Blocking; off the
+    loop. Never raises."""
+    cap = int(chars) if isinstance(chars, int) and not isinstance(chars, bool) and chars > 0 else SKILLS_CHARS
+    when = time.time() if now is None else float(now)
+    try:
+        from yuki.skills.connection import load
+
+        loaded: Any = load()
+    except Exception:  # noqa: BLE001 - no skill package: memory's own menu, if any
+        loaded = None
+    key = (menu_day(when), str(getattr(loaded, "version", "") or ""), cap)
+    kept = _snapshot(memory, key)
+    if kept:
+        return kept, "snapshot"
+    menu = _menu_lines(_menu_from_memory(memory, timeout_s, when), cap, loaded) if ask else None
+    if menu:
+        _keep_snapshot(memory, key, menu)
+        return menu, "memory"
+    kept = _snapshot(memory, key, any_day=True)
+    if kept:
+        return kept, "stale"
+    if loaded is not None and getattr(loaded, "skills", None):
+        try:
+            from yuki.skills.menu import TALKER, menu_text
+
+            menu = _menu_lines(menu_text(None, audience=TALKER, loaded=loaded), cap, loaded)
+        except Exception:  # noqa: BLE001
+            menu = None
+        if menu:
+            return menu, "fallback"
+    return None, "none"
+
+
+def fetch_skills(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None,
+                 now: float | None = None) -> str | None:
+    """The talker's Skills menu (:func:`talker_menu`), or ``None`` when no skill is loaded."""
+    return talker_menu(memory, timeout_s=timeout_s, chars=chars, now=now)[0]
 
 
 #: The talker's Skills menu is cut to this (``Settings.skills_menu_chars``' default; whole lines).
