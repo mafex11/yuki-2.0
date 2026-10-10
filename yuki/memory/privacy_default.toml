@@ -404,6 +404,16 @@ state_probe = true
 # every card (read again while memory runs).
 enabled = true
 
+[judge]
+# The one card judge (yuki.memory.cardjudge): every card idea in one pile, one set of holds (game, call, meeting,
+# away, quiet hours), shown only at a natural pause, the things that can wait gathered into one "Today" card when you
+# first sit down after your night. "shadow" (this release): the old card makers still show the cards; the judge only
+# notes what it would have shown (no model call, no card, content-free log) so its choices can be checked before it
+# goes live. "off" = not run at all. "on" comes with a later release (until then it acts as "shadow").
+mode = "shadow"
+# false = no Today card: the morning check-in becomes an ordinary card and Today-only items are dropped.
+digest = true
+
 [calls]
 # Calls, both sides (yuki.memory.calls; your decision of 3 Oct 2026 - from
 # 24 Sept to 3 Oct only your own microphone was recorded).  If you say yes on

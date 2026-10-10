@@ -690,7 +690,8 @@ def run(args: argparse.Namespace) -> int:
                 nudges = NudgeWorker(store, db_path=db_path, privacy=privacy, locked_fn=session_locked,
                                      attention=shared_attention(),
                                      live_fn=live_state, log=log, screen_fn=recall_cache,
-                                     embedder=_nudge_embedder())
+                                     embedder=_nudge_embedder(),
+                                     you_fn=lambda: you_builder)   # jCore: the judge reads it late (built after phase F)
                 nudges_thread = threading.Thread(
                     target=_guarded(nudges.run, log, "nudges"), args=(stop, pause_path),
                     name="yuki-memory-nudges", daemon=True,
