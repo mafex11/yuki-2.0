@@ -161,7 +161,7 @@ def request_key(loaded: Loaded, key: str, slots: Mapping[str, Any] | None) -> st
     """The skill a request runs (lSplit review r2 L1): a learned skill runs only for its own fixed key values, so when
     the request's slots name another value for one of them it is its capability's run (and never counts on the
     learned skill's ledger, D14). Values compare as one identity (:func:`yuki.skills.connection.scope_value`:
-    "YouTube" and "youtube.com" are the same site). Any other key comes back as it is."""
+    "Example" and "example.com" are the same site). Any other key comes back as it is."""
     skill = loaded.get(str(key or ""))
     if skill is None or not skill.learned or not skill.capability:
         return str(key or "")

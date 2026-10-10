@@ -1,5 +1,5 @@
 /* Playbook: "Skills Yuki learned from you" (phase L, lPage; design §4.9). The learner turns what you do again and
-   again into skills; each one here says where it came from ("Seen 17 times on 8 weekdays, last Thu 8 Oct 08:56"), how
+   again into skills; each one here says where it came from ("Seen 5 times on 3 weekdays, last Mon 5 Oct 08:30"), how
    it runs (its built-in way, what stays the same, which program you use, what changes each time, the step that stays
    yours), when you usually do it, how it went when you asked, and whether it may be offered. Three buttons: Rename
    (your words become its name), Forget this (never suggested again) and Not mine (left out, with what it was learned
