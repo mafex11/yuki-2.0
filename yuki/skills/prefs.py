@@ -7,14 +7,16 @@ taste entity key (a keyed digest, never a name in clear). The quote behind ``sai
 **The choice rule** (:func:`choose`, code only):
 
 1. a ``usual`` option (the user's statement, confirmed once with "Keep this as your usual?") wins until at least 3
-   later observed choices in the same context contradict it (then one "still your usual?" card goes out,
-   :func:`still_usual_question`);
+   later choices the user made about Yuki's own runs in the same context ("just this time" answers) contradict it
+   (then one "still your usual?" card goes out, :func:`still_usual_question`);
 2. otherwise the top observed option when its share is at least 0.8 with an effective count of at least 3 (observed
    events decay with a 30-day half-life);
 3. otherwise the most recent choice in this context, **named aloud** when used, so one word corrects it. A choice
-   memory only watched the user make (:func:`feed_observed`, source ``occasion:``) counts in rule 2 and against a
-   usual, never here: below rule 2's bar a learned skill's fill policy picks the program (design §5, critique M8:
-   "last used" is one candidate policy, never shipped ahead of the scorer), and an unknown means slot asks once.
+   memory only watched the user make (:func:`feed_observed`, source ``occasion:``) counts in rule 2 only: it never
+   counts against a confirmed usual (design §5: "a confirmed usual still wins first"), so it informs the choice only
+   while no usual is confirmed (or after the user's own choices outvoted it), and never here: below rule 2's bar a
+   learned skill's fill policy picks the program (design §5, critique M8: "last used" is one candidate policy, never
+   shipped ahead of the scorer), and an unknown means slot asks once.
 
 **Observed choices** (phase L design §5): every night, one ``observed`` event per occasion of the user's own with a
 known program (the learner's ``occasions``: never an asked run, never a late chat capture's, never a Not mine skill's),
@@ -59,7 +61,7 @@ EVENT_WEIGHTS: dict[str, float] = {"observed": 1.0, "said": 1.0, "confirmed": 1.
 #: asked (sVoice) only ties a question card to the preference it asks about (its source names the card); it is
 #: never a choice and never weighs.
 #: The source prefix of an observed event the nightly feed wrote from one of the user's own occasions (its end moment's
-#: id follows): rule 2 and a usual's contradiction count it, rule 3 never does.
+#: id follows): rule 2 counts it; a usual's contradiction and rule 3 never do.
 OBSERVED_SOURCE = "occasion:"
 
 
@@ -117,8 +119,12 @@ def choose(store: Any, slot: str, *, context: str = "", now: float | None = None
     if usual:
         u = max(usual, key=lambda p: float(p[3] or 0.0))
         confirmed = float(u[3] or 0.0)
-        against = sum(1 for pid, at, typ, _w, _s in events if typ == "observed" and float(at) > confirmed
-                      and option_of.get(int(pid)) != str(u[1]))
+        # only the user's choices about Yuki's own runs ("just this time") contradict a confirmed usual; a choice memory
+        # only watched them make (a mixer drag in a game) never does (lWire review r1 M2: "a confirmed usual still
+        # wins first", design §5)
+        against = sum(1 for pid, at, typ, _w, source in events if typ == "observed" and float(at) > confirmed
+                      and option_of.get(int(pid)) != str(u[1])
+                      and not str(source or "").startswith(OBSERVED_SOURCE))
         if against < CONTRADICT_N:
             return Choice(option=str(u[1]), source="usual", named=False)
         still = True
@@ -596,6 +602,9 @@ def after_voice_run(store: Any, skill_key: str, *, values: dict[str, Any], previ
 OBSERVED_STATE = "prefs:observed_until"
 #: On a database the feed never ran on, it reads this far back (the occasions' own window: the moments' retention).
 OBSERVED_BACK_S = 90 * 86400.0
+#: The kept cursor stays this far behind the feed's time (lWire review r1 L1): an occasion dated before the night pass
+#: but written after it (a visit still open then) is read the next night; the ``source`` dedupe keeps it single.
+OBSERVED_MARGIN_S = 12 * 3600.0
 #: How a measured means word (the moments' own closed vocabulary, ``moments.volume_change``'s ``means``) reads as an
 #: option of a means slot whose options don't hold it: a mixer session is the Windows mixer. Machine codes on both
 #: sides (a fixed map between two of Yuki's own vocabularies, never words); a word in neither is no observation (the
@@ -635,7 +644,10 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
     * keyed at capability level (``<capability>:<slot>@<scope>``, the scope read from the end moment as the learner
       reads it), the option from the means value (:func:`_means_option`);
     * dated at the occasion, source ``occasion:<end moment id>``, written in one transaction; the time fed up to is kept
-      (:data:`OBSERVED_STATE`), so a re-run or a learner rebuild never writes one twice.
+      (:data:`OBSERVED_STATE`, :data:`OBSERVED_MARGIN_S` behind), and an event already written for that moment is never
+      written again, so a re-run or a learner rebuild never writes one twice;
+    * a skill marked Not mine keeps its occasions (the learner leaves them on the tombstone's id): the events fed from
+      them before the button are removed (``unfed``), and none is fed again.
 
     Content-free counts; never raises."""
     now = time.time() if now is None else float(now)
@@ -656,6 +668,8 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
                                                      " 'not_mine'")}
     except Exception:  # noqa: BLE001 - a database before migration 43: nothing to feed
         return {"skipped": "no_occasions"}
+    if not_mine:
+        out["unfed"] = _unfeed(store, not_mine)
     from collections import Counter
 
     from yuki.skills.catalog import capabilities
@@ -733,12 +747,35 @@ def feed_observed(store: Any, *, now: float | None = None, since: float | None =
             out["error"] = type(exc).__name__
             return out
     try:
-        store.set_nudge_state(OBSERVED_STATE, f"{now:.3f}")
+        store.set_nudge_state(OBSERVED_STATE, f"{max(lo, now - OBSERVED_MARGIN_S):.3f}")
     except Exception:  # noqa: BLE001
         pass
     if skipped:
         out["skipped"] = dict(skipped)
     return out
+
+
+def _unfeed(store: Any, skill_ids: set[int]) -> int:
+    """Remove the ``observed`` events the feed wrote from the occasions of these skills (the user marked them Not mine:
+    what they were learned from is not the user's). Returns how many went; never raises."""
+    marks = ",".join("?" * len(skill_ids))
+
+    def op(conn: Any) -> int:
+        mids = [int(r[0]) for r in conn.execute(
+            f"SELECT DISTINCT end_moment_id FROM occasions WHERE skill_id IN ({marks}) AND end_moment_id IS NOT NULL",
+            tuple(sorted(skill_ids))).fetchall()]
+        n = 0
+        for start in range(0, len(mids), 400):
+            part = [f"{OBSERVED_SOURCE}{m}" for m in mids[start:start + 400]]
+            cur = conn.execute("DELETE FROM pref_events WHERE type = 'observed' AND source IN"
+                               f" ({','.join('?' * len(part))})", tuple(part))
+            n += max(0, int(cur.rowcount or 0))
+        return n
+
+    try:
+        return int(store._write(op))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -917,5 +954,6 @@ __all__ = ["HALF_LIFE_DAYS", "SHARE", "MIN_N", "CONTRADICT_N", "EVENT_WEIGHTS", 
            "keep_usual", "KEEP_QUESTION", "KEEP_PENDING_S", "CORRECTION_S", "QUESTION_ORIGIN", "QUESTION_IMPORTANCE",
            "CHOICES_MAX", "keep_line", "run_sources", "note_correction", "UsualChoice", "usual_choices",
            "parse_choice", "usual_question", "propose", "question_target", "pending_question", "confirm_question",
-           "still_usual_question", "ask_card", "after_voice_run", "OBSERVED_SOURCE", "OBSERVED_STATE", "MEANS_WORDS",
-           "route_scopes", "feed_observed", "POLICY_MIN_OCCASIONS", "POLICY_MARGIN", "FillPolicyScorer"]
+           "still_usual_question", "ask_card", "after_voice_run", "OBSERVED_SOURCE", "OBSERVED_STATE",
+           "OBSERVED_MARGIN_S", "MEANS_WORDS", "route_scopes", "feed_observed", "POLICY_MIN_OCCASIONS", "POLICY_MARGIN",
+           "FillPolicyScorer"]

@@ -366,8 +366,10 @@ def _incremental(store: Any, *, now: float, log: LogFn | None) -> dict[str, Any]
         built = O.build(store, now=now, since=lo, browsers=idx.browsers, index=idx)
         B.bind(built.occasions, idx)
         try:
-            rows = store._query("SELECT id, key FROM skills WHERE origin = 'learned' AND deleted_at IS NULL AND state"
-                                " NOT IN ('deleted', 'not_mine', 'retired')")
+            # a tombstone (Forget this / Not mine) keeps its occasions, as the full pass does (lWire review r1 M1): the
+            # preference feed and the routine miner leave them out by its id
+            rows = store._query("SELECT id, key FROM skills WHERE origin = 'learned' AND (deleted_at IS NOT NULL OR"
+                                " state != 'retired')")
         except Exception:  # noqa: BLE001 - a database before migration 43
             rows = []
         ids = {str(k): int(i) for i, k in rows}

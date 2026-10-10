@@ -339,6 +339,29 @@ class Inputs:
     unmapped: Counter = field(default_factory=Counter)
     by_yuki: int = 0
     moments: int = 0
+    #: The learned skills the user marked Forget this / Not mine (``skills.id``): their routines end at once.
+    gone: set[int] = field(default_factory=set)
+
+
+def tombstoned_ids(store: Any) -> set[int]:
+    """The ``skills.id`` of the learned rows the user marked Forget this / Not mine (lPage's tombstones). Never
+    raises."""
+    try:
+        return {int(r[0]) for r in store._query("SELECT id FROM skills WHERE origin = 'learned' AND (deleted_at IS NOT"
+                                                 " NULL OR state IN ('deleted', 'not_mine'))")}
+    except Exception:  # noqa: BLE001 - a database before migration 43
+        return set()
+
+
+def key_skill_id(key: Any) -> int | None:
+    """The learned ``skills.id`` of a routine key (``skill:<id>|...``), else ``None``."""
+    head = str(key or "").split("|", 1)[0]
+    if not head.startswith("skill:"):
+        return None
+    try:
+        return int(head.split(":", 1)[1])
+    except ValueError:
+        return None
 
 
 def load_skills(store: Any = None, log: LogFn | None = None) -> tuple[Any, ...]:
@@ -422,20 +445,57 @@ def _matches(skill: Any, cap: Any, m: Mapping[str, Any], app: str | None) -> boo
     return True
 
 
+def key_entity(key: Any) -> str | None:
+    """The entity part of a learned routine key (``skill:<id>|<entity key>``: a playlist routine), else ``None``."""
+    parts = str(key or "").split("|")
+    if len(parts) == 2 and parts[0].startswith("skill:") and parts[1]:
+        return parts[1]
+    return None
+
+
+def _learned_browsers(store: Any) -> set[str] | None:
+    """The programs the learner's last full pass measured as browsers (``yuki.skills.learn.BROWSERS_STATE``), else
+    ``None`` (no pass yet: no page is left out on that ground)."""
+    try:
+        from yuki.skills.learn import BROWSERS_STATE
+
+        kept = json.loads(store.nudge_state(BROWSERS_STATE) or "{}")
+        got = kept.get("browsers") if isinstance(kept, dict) else None
+        return {str(k) for k in got} if isinstance(got, dict) and got else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _page_counts(m: Mapping[str, Any], browsers: set[str] | None) -> bool:
+    """A ``page`` moment the learner would take as an occasion (its page drops, ``occasions.Builder``): shown in a
+    measured browser, and a host-scope visit or a site template's page."""
+    if browsers is not None and str(m.get("app") or "") not in browsers:
+        return False
+    facts = m.get("facts") or {}
+    if not isinstance(facts, Mapping):
+        return False
+    return facts.get("scope") == "host" or bool(facts.get("template"))
+
+
 def skill_onsets(store: Any, skill: Any, since: float, until: float, *, app: str | None = None,
-                 skills: Sequence[Any] | None = None) -> list[float]:
+                 skills: Sequence[Any] | None = None, entity: str | None = None) -> list[float]:
     """When the user reached a learned skill's end state in ``[since, until]``, oldest first (D3, D18): the learner's
     user occasions of that skill, and the user's own moments of its end kind whose bound key values match (the
     occasions lag the moments by up to the learner's incremental pass, so a meeting joined minutes ago counts at once).
-    Never Yuki's own (``by='yuki'``). ``app``: the routine's means app (a moment with no key value counts there)."""
+    Never Yuki's own (``by='yuki'``). ``app``: the routine's means app (a moment with no key value counts there).
+    ``entity``: a ``routine_key`` routine's entity (:func:`key_entity`: one playlist), so another playlist never
+    counts; a page moment counts only as the learner would take it (:func:`_page_counts`; lWire review r1 L2)."""
     if skill is None or getattr(skill, "origin", "") != "learned":
         return []
     out: set[float] = set()
+    ent = str(entity or "")[:16]
     sid = learned_id(store, skill.key)
     if sid is not None:
         try:
-            for (at,) in store._query("SELECT at FROM occasions WHERE skill_id = ? AND by = 'user' AND at >= ? AND"
-                                      " at <= ?", (sid, float(since), float(until))):
+            for (at,) in store._query(
+                    "SELECT at FROM occasions WHERE skill_id = ? AND by = 'user' AND at >= ? AND at <= ?"
+                    + (" AND substr(entity_key, 1, 16) = ?" if ent else ""),
+                    (sid, float(since), float(until), *((ent,) if ent else ()))):
                 out.add(float(at))
         except Exception:  # noqa: BLE001 - a database before migration 43
             pass
@@ -452,12 +512,50 @@ def skill_onsets(store: Any, skill: Any, since: float, until: float, *, app: str
             rows = store.moments_between(since, float(until) + 1.0, kinds=[kind])
         except Exception:  # noqa: BLE001
             rows = []
+        browsers = _learned_browsers(store) if kind == "page" else None
         for m in rows:
             if str(m.get("by") or "user") == "yuki":
+                continue
+            if ent and str(m.get("entity_key") or "")[:16] != ent:
+                continue
+            if kind == "page" and not _page_counts(m, browsers):
                 continue
             if _matches(skill, cap, m, app):
                 out.add(float(m["at"]))
     return sorted(out)
+
+
+def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity: str | None = None) -> float | None:
+    """The first time in ``[since, until]`` a run of the skill's habit ended done (``done`` / ``already``): its own key,
+    and a usage record's capability (``offers.habit_keys``: "play my X playlist" runs on the capability; lWire review
+    r1 M3). ``entity``: a ``routine_key`` routine's entity; a run counts only when its played entity
+    (``skill_runs.entity_digest``, the moments' own digest) is that one, read through the moments that carry both.
+    Never raises."""
+    from yuki.memory.offers import habit_keys
+
+    keys = habit_keys(skill)
+    if not keys:
+        return None
+    ent = str(entity or "")[:16]
+    digests: list[str] = []
+    if ent:
+        try:
+            rows = store.moments_between(float(since) - ONSET_GAP_S, float(until) + 1.0, kinds=[served_kind(skill)])
+        except Exception:  # noqa: BLE001
+            rows = []
+        digests = sorted({str(m["entity_digest"]) for m in rows if m.get("entity_digest")
+                          and str(m.get("entity_key") or "")[:16] == ent})
+        if not digests:
+            return None
+    try:
+        rows = store._query(
+            f"SELECT min(coalesce(t_done, t0)) FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND"
+            " t0 >= ? AND t0 <= ? AND outcome IN ('done', 'already')"
+            + (f" AND entity_digest IN ({','.join('?' * len(digests))})" if digests else ""),
+            (*keys, float(since), float(until) + 1.0, *digests))
+    except Exception:  # noqa: BLE001 - no skill ledger yet
+        return None
+    return float(rows[0][0]) if rows and rows[0][0] is not None else None
 
 
 def _collapse(times: Iterable[float]) -> list[float]:
@@ -526,6 +624,7 @@ def keyed_onsets(store: Any, since: float, until: float, *, skills: Sequence[Any
     out.onsets = {k: [t for t in _collapse(v) if since <= t < until] for k, v in every.items()}
     out.seen = {k: [t for t in _collapse(v) if since <= t < until] for k, v in seen.items()}
     out.presence = presence if presence is not None else Presence(store.presence_spans(since, until))
+    out.gone = tombstoned_ids(store)
     return out
 
 
@@ -546,17 +645,12 @@ def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float
             apps[int(sid)] = str(app)   # ordered by count: the most used app is written last
     except Exception:  # noqa: BLE001
         apps = {}
-    try:
-        gone = {int(r[0]) for r in store._query("SELECT id FROM skills WHERE origin = 'learned' AND (deleted_at IS NOT"
-                                                " NULL OR state IN ('deleted', 'not_mine'))")}
-    except Exception:  # noqa: BLE001
-        gone = set()
+    gone = got.gone if got.gone else tombstoned_ids(store)
+    got.gone = gone
     gate: dict[str, bool] = {}
     for key, info in list(got.keys.items()):
-        try:
-            sid = int(key.split("|")[0].split(":", 1)[1])
-        except (IndexError, ValueError):
-            sid = -1
+        sid = key_skill_id(key)
+        sid = -1 if sid is None else sid
         if sid in gone:
             # the user's Forget this / Not mine: its occasions feed no routine (lPage's tombstone contract)
             got.unmapped[f"{info.kind}|tombstone"] += len(got.onsets.get(key, ()))
@@ -1003,7 +1097,11 @@ def plan(rows: Sequence[Mapping[str, Any]], mined: Mined, inputs: Inputs, now: f
             upd["last_hit_at"] = max(ch_stats.last_hit_at, float(row.get("last_hit_at") or 0.0))
         last_hit = upd.get("last_hit_at", row.get("last_hit_at"))
         state, new_state, why = row["state"], row["state"], None
-        if row.get("trigger") == "told" and state == "candidate":
+        if key_skill_id(row["key"]) in inputs.gone:
+            # the user marked its skill Forget this / Not mine (lWire review r1 M1): the routine ends now, and with it
+            # its portrait line (sync_facts ends the fact of a routine no longer active) and its cards
+            new_state, why = "retired", "skill_removed"
+        elif row.get("trigger") == "told" and state == "candidate":
             if ch_stats.seen_hits >= TOLD_HITS:   # D7: a microphone hold alone never confirms anything
                 new_state, why = "active", "told_confirmed"
                 upd["confirmed_at"] = now
@@ -1478,11 +1576,15 @@ def offer_window(row: Mapping[str, Any], d: date, *, lead_min: float = OFFER_LEA
 
 def done_today(store: Any, row: Mapping[str, Any], now: float, *, skills: Sequence[Any] | None = None) -> bool:
     """The routine's own end state already happened today (since 04:00): the user reached its learned skill's end
-    (:func:`skill_onsets`), or a run of its skill ended done."""
+    (:func:`skill_onsets`), or a run of its skill's habit ended done (:func:`habit_run_done`); a playlist routine
+    counts only its own playlist (:func:`key_entity`)."""
     since = day_start(day_of(now))
     skill = next((s for s in (load_skills(store) if skills is None else skills) if s.key == row.get("skill_id")), None)
-    if skill is not None and skill_onsets(store, skill, since, now, app=row.get("app")):
-        return True
+    entity = key_entity(row.get("key"))
+    if skill is not None:
+        if skill_onsets(store, skill, since, now, app=row.get("app"), entity=entity):
+            return True
+        return habit_run_done(store, skill, since, now, entity=entity) is not None
     try:
         got = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND t0 >= ? AND t0 < ? AND outcome = 'done'"
                            " LIMIT 1", (str(row.get("skill_id")), since, now))
@@ -1514,9 +1616,9 @@ def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | 
     offered_ids = {e["routine_id"] for e in offered}
     if trusted is None:
         def trusted(skill: Any) -> bool:
-            from yuki.skills.registry import offer_ready
+            from yuki.memory.offers import offer_trusted
 
-            return offer_ready(store, skill)
+            return offer_trusted(store, skill)   # D14; a usage record's runs pooled with its capability's
     out: list[dict[str, Any]] = []
     for row in store.routines(states=["active"]):
         skill = by_key.get(row.get("skill_id"))

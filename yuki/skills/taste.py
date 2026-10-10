@@ -133,6 +133,10 @@ HALF_LIFE_DAYS = 21.0
 #: A page template variable with this name is an opaque id (a video's), opened only from a link or an offered option's
 #: ref, never said (lSplit review r1 L5): its pages make no taste kind.
 OPAQUE_VAR = "id"
+#: Kinds an earlier seed wrote that no seed writes any more (sWeb's YouTube-only seed: now ``youtube_handle`` from the
+#: site data): their ``observed`` rows are removed by :func:`seed_sites` (lWire review r1 L4). Our own old codes, never
+#: the user's.
+RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
 
 
 def _norm(value: Any) -> str:
@@ -187,7 +191,8 @@ def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS)
     """Recompute the site tastes (source ``observed``) of every :func:`site_kinds` kind from the user's own ``page``
     moments on that template in the last ``days``: per entity, two hour histograms of visits decayed with a
     :data:`HALF_LIFE_DAYS` half-life, its name (the template's value) and link (the site's ``[urls]`` of that kind)
-    encrypted. Rows no visit supports any more are removed (per seeded kind only). Idempotent; never raises
+    encrypted. Rows no visit supports any more are removed (per seeded kind only), and so are the ``observed`` rows of
+    :data:`RETIRED_KINDS`. Idempotent; never raises
     (``{"error": 1}`` on failure). Content-free counts."""
     now = time.time() if now is None else float(now)
     kinds = {f"{s}.{p}": (k, s, p, v) for k, s, p, v in site_kinds()}
@@ -243,7 +248,9 @@ def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS)
         gone = sorted(old - set(found))
         for kind, key in gone:
             conn.execute("DELETE FROM tastes WHERE kind = ? AND source = 'observed' AND entity_key = ?", (kind, key))
-        return len(gone)
+        retired = conn.execute("DELETE FROM tastes WHERE source = 'observed' AND kind IN"
+                               f" ({','.join('?' * len(RETIRED_KINDS))})", RETIRED_KINDS).rowcount
+        return len(gone) + max(0, int(retired or 0))
 
     try:
         removed = store._write(write)
@@ -296,4 +303,5 @@ def seed(store: Any, *, now: float | None = None) -> dict[str, Any]:
 
 
 __all__ = ["SIGMA_MIN", "MENU_CANDIDATES", "Taste", "hour_score", "top", "candidates", "find", "SEED_DAYS",
-           "HALF_LIFE_DAYS", "OPAQUE_VAR", "entity_key", "site_kinds", "slot_kind", "seed_sites", "note", "seed"]
+           "HALF_LIFE_DAYS", "OPAQUE_VAR", "RETIRED_KINDS", "entity_key", "site_kinds", "slot_kind", "seed_sites",
+           "note", "seed"]

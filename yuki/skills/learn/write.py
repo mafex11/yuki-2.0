@@ -344,12 +344,18 @@ def plan(store: Any, groups: Sequence[Group], caps: dict[str, Any], compiled: di
         scorer = None
     for g in groups:
         cap = caps.get(g.capability)
-        if cap is None or not g.bar.passes:
+        if cap is None:
             continue
         key = skill_key(store.cipher, cap.key, g.keys)
         old = existing.get(key)
         if old is not None and (old.get("deleted_at") is not None or old.get("state") in TOMBSTONES):
-            counts["tombstoned"] += 1          # Forget this / Not mine: never proposed again
+            # Forget this / Not mine: never proposed again. Its occasions keep the tombstone's id (nothing is written to
+            # the row), so the preference feed and the routine miner can leave them out (lPage's tombstone contract;
+            # lWire review r1 M1)
+            g.skill_id = int(old["id"])
+            counts["tombstoned"] += 1
+            continue
+        if not g.bar.passes:
             continue
         p = Planned(group=g, cap=cap, compiled=compiled[g.gid], key=key, row_id=int(old["id"]) if old else None)
         bound = bound_values(g, cap)

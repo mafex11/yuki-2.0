@@ -658,7 +658,7 @@ class RoutineLane:
         """When the routine's end state was reached today (the user reached its learned skill's end, or a skill run of
         it ended done: :func:`first_onset`), or None. ``since`` narrows the start (a card's time)."""
         start = since if since is not None else day_start_at(now, getattr(config, "resume_day_start", "04:00"))
-        return first_onset(self.store, skill, start, now, include_runs=True)
+        return first_onset(self.store, skill, start, now, include_runs=True, entity=_entity(r))
 
     def due(self, now: float, config: Any, *, request: dict[str, Any] | None = None) -> list[Due]:
         """The routines due now (see the module docstring), by window start; a forced one (``offer-now``) first."""
@@ -933,7 +933,8 @@ class RoutineLane:
                                             and e["detail"].get("why") == "less" for e in recorded.values()):
             feedback(self.store, n.id, "less", now=now)   # an explicit press counts, on an offer-now card too
             changed = True
-        joined_at = first_onset(self.store, skill, n.at, min(now, n.at + SELF_SERVED_WITHIN_S)) if skill else None
+        joined_at = (first_onset(self.store, skill, n.at, min(now, n.at + SELF_SERVED_WITHIN_S), entity=_entity(r))
+                     if skill else None)
         if n.outcome is None and joined_at is not None and n.reaction not in ("accepted",):
             # the end state landed while the card waited: its button stops (expires when the join lands), and a card
             # never shown leaves the pending list (the tray asks again before it shows a queued one: card_still_due)
@@ -1058,15 +1059,24 @@ def routine_params(store: Any, r: Routine, skill: Any) -> dict[str, Any]:
     return {slot.name: name} if name else {}
 
 
-def onsets(store: Any, skill: Any, since: float, until: float, *, app: str | None = None) -> list[float]:
+def _entity(r: Any) -> str | None:
+    """A routine's one entity (a playlist routine's key part), else ``None``."""
+    from yuki.memory.routines import key_entity
+
+    return key_entity(getattr(r, "key", None))
+
+
+def onsets(store: Any, skill: Any, since: float, until: float, *, app: str | None = None,
+           entity: str | None = None) -> list[float]:
     """When the user reached the skill's end state, oldest first, never Yuki's own (D18): a learned skill's
-    (:func:`yuki.memory.routines.skill_onsets`: its occasions and the user's matching moments), or an old skill's
-    ``routine_on`` (kind, app) moments."""
+    (:func:`yuki.memory.routines.skill_onsets`: its occasions and the user's matching moments; ``entity``: a
+    ``routine_key`` routine's one entity, :func:`yuki.memory.routines.key_entity`), or an old skill's ``routine_on``
+    (kind, app) moments."""
     if getattr(skill, "origin", "") == "learned":
         from yuki.memory.routines import skill_onsets
 
         try:
-            return skill_onsets(store, skill, since, until, app=app)
+            return skill_onsets(store, skill, since, until, app=app, entity=entity)
         except Exception:
             return []
     pairs = [(str(k), str(a)) for k, a in (getattr(skill, "routine_on", ()) or ())]
@@ -1081,18 +1091,27 @@ def onsets(store: Any, skill: Any, since: float, until: float, *, app: str | Non
             and str(m.get("by") or "user") != "yuki"]
 
 
-def first_onset(store: Any, skill: Any, since: float, until: float, *, include_runs: bool = False) -> float | None:
+def first_onset(store: Any, skill: Any, since: float, until: float, *, include_runs: bool = False,
+                entity: str | None = None) -> float | None:
     """The first time in ``[since, until]`` the routine's end state was reached: the user's own onset, or (with
-    ``include_runs``) a run of the skill that ended done (said "open my meeting" already)."""
-    got = onsets(store, skill, since, until)
+    ``include_runs``) a run of the skill's habit that ended done (said "open my meeting" already; a usage record's
+    capability runs too: :func:`yuki.memory.routines.habit_run_done`). ``entity``: a ``routine_key`` routine's one
+    entity (a playlist): another one never counts."""
+    got = onsets(store, skill, since, until, entity=entity)
     first = got[0] if got else None
     if include_runs and getattr(skill, "key", None):
-        try:
-            rows = store._query("SELECT min(coalesce(t_done, t0)) FROM skill_runs WHERE skill=? AND t0 >= ? AND t0 <= ?"
-                                " AND outcome IN ('done', 'already')", (skill.key, float(since), float(until) + 1.0))
-            ran = rows[0][0] if rows else None
-        except sqlite3.Error:
-            ran = None
+        if getattr(skill, "origin", "") == "learned":
+            from yuki.memory.routines import habit_run_done
+
+            ran = habit_run_done(store, skill, since, until, entity=entity)
+        else:
+            try:
+                rows = store._query("SELECT min(coalesce(t_done, t0)) FROM skill_runs WHERE skill=? AND t0 >= ? AND"
+                                    " t0 <= ? AND outcome IN ('done', 'already')",
+                                    (skill.key, float(since), float(until) + 1.0))
+                ran = rows[0][0] if rows else None
+            except sqlite3.Error:
+                ran = None
         if ran is not None and (first is None or float(ran) < first):
             first = float(ran)
     return first
@@ -1210,7 +1229,7 @@ def card_still_due(store: Any, nudge_id: int, *, now: float | None = None,
         skill = load(store=store).get(str(r.skill_id))
     except Exception:
         skill = None
-    if skill is not None and first_onset(store, skill, n.at, now, include_runs=True) is not None:
+    if skill is not None and first_onset(store, skill, n.at, now, include_runs=True, entity=_entity(r)) is not None:
         return {"due": False, "why": "done", "final": True}
     try:
         from yuki.memory.store import CALL_OPEN_STATUSES

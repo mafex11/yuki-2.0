@@ -998,20 +998,17 @@ class _ReadOnlyStore:
         return None if stored is None else self.cipher.decrypt(stored)
 
 
-def _skills_catalog(db: Path | None) -> tuple[Any, list[str], dict[str, int]]:
-    """``(catalog, content-free problems told by it, learned counts)``: the catalog loaded on the memory database
-    read-only (phase L C.2: the doctor loads it with ``store=`` and ``log=``) when the database and its key exist, else
-    the capabilities alone; the counts are the learned rows by state, read with SQL (no decryption)."""
+def _skills_catalog(db: Path | None) -> tuple[Any, dict[str, int]]:
+    """``(catalog, learned counts)``: the catalog loaded on the memory database read-only (phase L C.2: the doctor
+    loads it with ``store=``) when the database and its key exist, else the capabilities alone; the counts are the
+    learned rows by state, read with SQL (no decryption). The problems are counted from the catalog's own ``errors``,
+    with no ``log``: the catalog tells each problem once per process, and a throwaway log here would use that up before
+    the process's real skills log (lWire review r1 L3)."""
     from yuki.skills import catalog
-
-    told: list[str] = []
-
-    def log(type: str, **fields: Any) -> None:
-        told.append(f"{type}:{fields.get('why') or ''}")
 
     counts: dict[str, int] = {}
     if db is None or not Path(db).exists():
-        return catalog.load(log=log), told, counts
+        return catalog.load(), counts
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
     try:
         try:
@@ -1028,10 +1025,10 @@ def _skills_catalog(db: Path | None) -> tuple[Any, list[str], dict[str, int]]:
                 store = _ReadOnlyStore(conn, FieldCipher(load_or_create_key(key_file)))
             except Exception:  # noqa: BLE001 - the key can't be read here: the capabilities alone
                 store = None
-        loaded = catalog.load(store=store, log=log)
+        loaded = catalog.load(store=store)
     finally:
         conn.close()
-    return loaded, told, counts
+    return loaded, counts
 
 
 def check_skills(db: Path | None = None, *, settings: Any = None, now: float | None = None,
@@ -1054,7 +1051,7 @@ def check_skills(db: Path | None = None, *, settings: Any = None, now: float | N
     except Exception:  # noqa: BLE001
         db = None
     try:
-        loaded, told, learned_rows = _skills_catalog(db)
+        loaded, learned_rows = _skills_catalog(db)
     except Exception as exc:
         return Check(SKILLS_CHECK, WARN, f"the skill files could not be read ({type(exc).__name__})",
                      "Reinstall Yuki; if it stays, send logs\\memory-*.jsonl to whoever maintains Yuki.")

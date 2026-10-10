@@ -511,12 +511,69 @@ def named(meta: dict[str, Any]) -> bool:
     return prov.get("named") is True or prov.get("named_by") == "user"
 
 
-def _rung_b_verified(store: Any, key: str) -> bool:
-    """A learned rung B has a verified run of its own (design §4.4: a run on the B path that passed its check; the
-    ledger's rung ``B`` rows, checked and not contradicted by the re-check)."""
+def usage_capability(skill: Any) -> str:
+    """The capability key of a learned usage record, else ``""``: a learned row whose capability binds no key slot (a
+    playlist record). The menu gives it no line (lPage), so every request of that capability runs, and is ledgered,
+    on the capability, and every one of those runs is that record's habit (lWire review r1 M3)."""
+    if getattr(skill, "origin", "") != "learned":
+        return ""
+    bind = getattr(skill, "bind", None) or {}
+    if any(getattr(s, "role", "") == "key" and s.name in bind for s in getattr(skill, "slots", ()) or ()):
+        return ""
+    return str(getattr(skill, "capability", "") or "")
+
+
+def habit_keys(skill: Any) -> tuple[str, ...]:
+    """The ledger keys whose runs are the skill's own habit: its own key, and a usage record's capability
+    (:func:`usage_capability`)."""
+    return tuple(k for k in dict.fromkeys((str(getattr(skill, "key", "") or ""), usage_capability(skill))) if k)
+
+
+def _pooled_last(store: Any, keys: tuple[str, ...], n: int) -> list[int]:
+    """The newest ``n`` decided runs and rung tries of these ledger keys together, newest first (1 verified, 0 not):
+    the registry's own "last 5" read, over two keys."""
+    marks = ",".join("?" * len(keys))
     try:
-        rows = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND rung = 'B' AND checked = 1 AND"
-                            " coalesce(recheck, 1) != 0 LIMIT 1", (key,))
+        rows = store._query(
+            f"SELECT checked, recheck FROM (SELECT checked, recheck, coalesce(t_done, t0) AS t, id FROM skill_runs WHERE"
+            f" skill IN ({marks}) AND checked IS NOT NULL AND rung IS NOT NULL UNION ALL SELECT checked, NULL, at, id"
+            f" FROM skill_route_tries WHERE skill IN ({marks}) AND checked IS NOT NULL) ORDER BY t DESC, id DESC"
+            " LIMIT ?", (*keys, *keys, int(n)))
+    except Exception:  # noqa: BLE001
+        return []
+    return [1 if int(c) == 1 and r != 0 else 0 for c, r in rows]
+
+
+def offer_trusted(store: Any, skill: Any, *, now: float | None = None) -> bool:
+    """D14 for a routine card's skill: ``yuki.skills.registry.offer_ready`` on the skill's own runs. A usage record's
+    runs are pooled with its capability's (:func:`habit_keys`; lWire review r1 M3: "play my X playlist" is ledgered on
+    the capability, so the record's own key alone could never reach the bar): the same bar and numbers (the
+    registry's), on the verified runs of both keys, the newest 5 read across both by time. Never raises."""
+    from yuki.skills import registry
+
+    keys = habit_keys(skill)
+    try:
+        if len(keys) < 2:
+            return bool(registry.offer_ready(store, skill, now=now))
+        total_ok = sum(sum(t.ok for t in registry.trust(store, k, now=now).values()) for k in keys)
+        if str(getattr(skill, "kind", "") or "change") == "open":
+            return total_ok >= registry.OPEN_RUNS
+        newest = _pooled_last(store, keys, registry.CHANGE_WINDOW)
+        return (total_ok >= registry.CHANGE_RUNS and len(newest) >= registry.CHANGE_WINDOW
+                and 0 not in newest[:registry.CHANGE_WINDOW])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _rung_b_verified(store: Any, keys: tuple[str, ...] | str) -> bool:
+    """A learned rung B has a verified run of its own (design §4.4: a run on the B path that passed its check; the
+    ledger's rung ``B`` rows, checked and not contradicted by the re-check); ``keys``: the skill's habit keys."""
+    keys = (keys,) if isinstance(keys, str) else tuple(keys)
+    if not keys:
+        return False
+    try:
+        rows = store._query(f"SELECT 1 FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND rung = 'B' AND"
+                            " checked = 1 AND coalesce(recheck, 1) != 0 LIMIT 1", keys)
     except Exception:  # noqa: BLE001
         return False
     return bool(rows)
@@ -565,7 +622,7 @@ def skill_offerable(store: Any, skill: Any, *, meta: dict[str, Any] | None = Non
     rung = str(prov.get("rung") or "")
     if rung not in OFFER_RUNGS:
         return False, "rung"
-    if rung == "B" and not _rung_b_verified(store, str(skill.key)):
+    if rung == "B" and not _rung_b_verified(store, habit_keys(skill)):
         return False, "rung"
     if cls == "judged":
         if not named(meta):
@@ -599,8 +656,9 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
       ``not_learned``, ``not_live``, ``sends``, ``commit``, ``offer_class``, ``static``, ``rung``, ``nameless``,
       ``may_be_work``, ``unknown_wont``); ``no_preview`` (no card question: ``question``, else
       :func:`card_question` with no fallback); ``bad_params`` (a bound parameter the skill has no slot for);
-    * ``not_ready``: its route isn't trusted for offers (``yuki.skills.registry.offer_ready``, D14: 2 verified runs
-      for opening things, 5 and none failed in the last 5 for changing things; never re-implemented here);
+    * ``not_ready``: its route isn't trusted for offers (:func:`offer_trusted`: ``yuki.skills.registry.offer_ready``,
+      D14: 2 verified runs for opening things, 5 and none failed in the last 5 for changing things; a usage record's
+      runs pooled with its capability's);
     * ``unavailable``: the skill's own availability check, last because it reads the screen (``available(skill)``:
       a site tab census; ``None`` = couldn't read counts as not available).
 
@@ -636,12 +694,7 @@ def routine_offer(store: Any, routine: Any, now: float | None = None, *, expires
                                            for k, v in params.items()):
         return None, "bad_params"
     try:
-        if ready is not None:
-            trusted = bool(ready(store, skill))
-        else:
-            from yuki.skills.registry import offer_ready
-
-            trusted = bool(offer_ready(store, skill, now=now))
+        trusted = bool(ready(store, skill)) if ready is not None else offer_trusted(store, skill, now=now)
     except Exception:
         trusted = False
     if not trusted:
@@ -800,10 +853,9 @@ def _act_run_skill(store: Any, n: Any, offer: dict[str, Any], now: float) -> dic
         return {"ok": False, "why": "gone", "do": do}
     try:
         from yuki.skills.catalog import load
-        from yuki.skills.registry import offer_ready
 
         skill = load(store=store).get(str(offer["skill"]))
-        ready = bool(skill is not None and skill_offerable(store, skill)[0] and offer_ready(store, skill, now=now))
+        ready = bool(skill is not None and skill_offerable(store, skill)[0] and offer_trusted(store, skill, now=now))
     except Exception:
         ready = False
     if not ready:
@@ -1028,7 +1080,8 @@ __all__ = [
     "OFFER_DOS", "CODE_ONLY_DOS", "MODEL_DOS", "ROUTINE_CHANNEL", "UNDOABLE", "OFFER_TTL_S", "DEFAULT_LABELS",
     "WONT_LINES", "SKILL_WONT_LINES", "RUN_OUTCOMES", "OFFER_SCHEMA", "JUDGE_OFFER_PROPERTIES",
     "OFFER_RULES", "WEIGHTS", "OFF_AT", "LEARN_WINDOW_S", "STOP_WITHIN_S", "resolve_ref", "validate_offer",
-    "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "skill_offerable", "card_question",
+    "stored_offer", "card_offer_view", "skill_wont_line", "skill_meta", "named", "usage_capability", "habit_keys",
+    "offer_trusted", "skill_offerable", "card_question",
     "OFFER_COMMITS", "OFFER_RUNGS", "routine_offer", "act", "offer_result", "undo",
     "record_outcome", "channel_of", "signal", "offer_scores", "allowed_dos", "offer_allowed", "outcome_words",
     "feedback_lines",
