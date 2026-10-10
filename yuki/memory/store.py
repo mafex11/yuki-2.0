@@ -3270,6 +3270,148 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS timeline_updated ON timeline(updated_at);
     CREATE INDEX IF NOT EXISTS timeline_meeting_rows ON timeline(process, ended_at) WHERE meeting IS NOT NULL;
     """,
+    # 41 (2026-10-10, sCore; docs/research/audit-2026-10-09/PLAN.md Phase S, decisions D2, D3, D5, D6, D13, D14, D18,
+    # D19; spec round3/map-skills.md S1.3, S4.1, round3/map-routines.md T1.1): the skill engine's tables.
+    # - skills: one row per skill of a shipped connection file (yuki/skills/connections/*.toml), one live skill per
+    #   (app, end_kind) (partial unique index: a retired skill frees its place). The file is the spec; the row holds
+    #   what is the user's: told values (encrypted), the state code computes, uses.
+    # - skill_routes: one row per rung of a skill (A app connection, B recorded UIA path, C the full agent), with the
+    #   connection file's hash it was seeded from and when that hash last changed (hash_changed_at: the contradiction
+    #   streak that disables a rung counts only runs after it, so a changed file retries a disabled rung) and the
+    #   verified runs intake imported from old procedures (seed_ok). Trust counters are computed from skill_runs by
+    #   code, never stored.
+    # - skill_runs: the trust ledger, content-free. The tray writes the row at t0, before the first step (D18: moments
+    #   of that app and kind inside [t0, t_done + lag] are Yuki's); checked is the done-check's verdict (1 seen, 0
+    #   contradicted, NULL could not read: D19), recheck the second probe's (0 = a false done). One row per run.
+    # - skill_route_tries: a rung of a run that ran (or could not) and was not its last: its verdict, so every rung's
+    #   trust is counted while skill_runs keeps one row per run (the scorecard counts runs).
+    # - prefs / pref_events: the user's usuals and the choices behind them (S4; names and quotes only encrypted).
+    # - tastes: what the user picks by hour of day (T1.1's schema, created here per D5; T recomputes it nightly).
+    # None of these tables is exposed by the MCP. Additive only; one self-contained entry (renumber freely at a merge).
+    """
+    CREATE TABLE IF NOT EXISTS skills (
+        id                   INTEGER PRIMARY KEY,
+        key                  TEXT NOT NULL UNIQUE,
+        app                  TEXT NOT NULL,
+        end_kind             TEXT NOT NULL,
+        connection           TEXT NOT NULL,
+        told_ciphertext      TEXT,
+        use_when_ciphertext  TEXT,
+        origin               TEXT NOT NULL DEFAULT 'seed',
+        state                TEXT NOT NULL DEFAULT 'candidate',
+        uses                 INTEGER NOT NULL DEFAULT 0,
+        last_used_at         REAL,
+        created_at           REAL NOT NULL,
+        updated_at           REAL NOT NULL,
+        retired_at           REAL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS skills_app_end ON skills(app, end_kind) WHERE retired_at IS NULL;
+    CREATE TABLE IF NOT EXISTS skill_routes (
+        id               INTEGER PRIMARY KEY,
+        skill_id         INTEGER NOT NULL REFERENCES skills(id),
+        rung             TEXT NOT NULL,
+        variant          TEXT NOT NULL DEFAULT '',
+        via              TEXT NOT NULL,
+        spec_ciphertext  TEXT,
+        needs_focus      INTEGER NOT NULL,
+        source           TEXT NOT NULL,
+        connection_hash  TEXT,
+        hash_changed_at  REAL,
+        seed_ok          INTEGER NOT NULL DEFAULT 0,
+        disabled_at      REAL,
+        disabled_why     TEXT,
+        created_at       REAL NOT NULL,
+        updated_at       REAL NOT NULL,
+        UNIQUE(skill_id, rung, variant, via)
+    );
+    CREATE INDEX IF NOT EXISTS skill_routes_skill ON skill_routes(skill_id, rung);
+    CREATE TABLE IF NOT EXISTS skill_runs (
+        id             INTEGER PRIMARY KEY,
+        at             REAL NOT NULL,
+        skill_id       INTEGER,
+        skill          TEXT NOT NULL,
+        route_id       INTEGER,
+        rung           TEXT,
+        variant        TEXT,
+        via            TEXT,
+        origin         TEXT NOT NULL,
+        session_id     TEXT,
+        request_id     TEXT,
+        run_key        TEXT,
+        app            TEXT,
+        end_kind       TEXT,
+        t0             REAL NOT NULL,
+        t_done         REAL,
+        slots_digest   TEXT,
+        filled         TEXT,
+        outcome        TEXT,
+        checked        INTEGER,
+        recheck        INTEGER,
+        value          REAL,
+        entity_digest  TEXT,
+        evidence       TEXT,
+        ms             REAL,
+        error          TEXT
+    );
+    CREATE INDEX IF NOT EXISTS skill_runs_skill ON skill_runs(skill, t0);
+    CREATE INDEX IF NOT EXISTS skill_runs_t0 ON skill_runs(t0);
+    CREATE TABLE IF NOT EXISTS skill_route_tries (
+        id        INTEGER PRIMARY KEY,
+        run_key   TEXT NOT NULL,
+        skill     TEXT NOT NULL,
+        rung      TEXT NOT NULL,
+        variant   TEXT NOT NULL DEFAULT '',
+        via       TEXT NOT NULL,
+        at        REAL NOT NULL,
+        outcome   TEXT,
+        checked   INTEGER,
+        ms        REAL
+    );
+    CREATE INDEX IF NOT EXISTS skill_route_tries_skill ON skill_route_tries(skill, at);
+    CREATE TABLE IF NOT EXISTS prefs (
+        id                INTEGER PRIMARY KEY,
+        slot              TEXT NOT NULL,
+        option            TEXT NOT NULL,
+        context           TEXT NOT NULL DEFAULT '',
+        observed          REAL NOT NULL DEFAULT 0,
+        said              INTEGER NOT NULL DEFAULT 0,
+        corrected         INTEGER NOT NULL DEFAULT 0,
+        rejected          INTEGER NOT NULL DEFAULT 0,
+        state             TEXT NOT NULL DEFAULT 'seen',
+        quote_ciphertext  TEXT,
+        last_at           REAL,
+        confirmed_at      REAL,
+        created_at        REAL NOT NULL,
+        updated_at        REAL NOT NULL,
+        ended_at          REAL,
+        UNIQUE(slot, option, context)
+    );
+    CREATE TABLE IF NOT EXISTS pref_events (
+        id                INTEGER PRIMARY KEY,
+        at                REAL NOT NULL,
+        pref_id           INTEGER NOT NULL REFERENCES prefs(id),
+        type              TEXT NOT NULL,
+        weight            REAL NOT NULL,
+        source            TEXT,
+        quote_ciphertext  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS pref_events_pref ON pref_events(pref_id, at);
+    CREATE TABLE IF NOT EXISTS tastes (
+        id               INTEGER PRIMARY KEY,
+        kind             TEXT NOT NULL,
+        entity_key       TEXT NOT NULL,
+        name_ciphertext  TEXT,
+        ref_ciphertext   TEXT,
+        source           TEXT NOT NULL,
+        hist_weekday     TEXT NOT NULL,
+        hist_weekend     TEXT NOT NULL,
+        n_obs            REAL NOT NULL DEFAULT 0,
+        last_at          REAL,
+        fresh_age_h      REAL,
+        updated_at       REAL NOT NULL,
+        UNIQUE(kind, entity_key)
+    );
+    """,
 )
 
 #: Python steps that run right after a migration's SQL, in the same transaction (index into :data:`MIGRATIONS`

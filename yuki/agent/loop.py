@@ -1345,6 +1345,7 @@ class Agent:
         memory_apps: Iterable[str] | None = None, pack: "RequestPack | None" = None,
         user_words: Iterable[str] | str | None = None, app_named: str | None = None,
         request_id: str | None = None,
+        skill: dict[str, Any] | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -1405,6 +1406,10 @@ class Agent:
             request_id: The id this request already has in the logs (phase F, fPrivacy R1.3: a front desk's request
                 handed to the worker keeps the front desk's id, so the user's words and the actions are one request in
                 ``python -m yuki.log.follow``); ``None``: the session log begins a new one (``<session id>-<n>``).
+            skill: Phase S: the user's usual way the code handed over with this request (a skill whose own routes
+                didn't get there; :func:`yuki.skills.engine.pinned`): pinned first in the task frame and never cut,
+                and the request's ``done`` is accepted only once the skill's own done-check sees the result (at most
+                :data:`yuki.agent.finish.SKILL_BOUNCES` "not done yet", then it ends as "couldn't confirm").
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -1435,7 +1440,18 @@ class Agent:
         self._request_text = request
         #: V4: the app or route the user named for this request (the voice's structured field), or None.
         self._request_app_named = " ".join(str(app_named or "").split())[:80] or None
+        #: Phase S: the pinned skill (``skill=``, or one the thinker's own run_skill handed back), its finish gate's
+        #: bounces, and whether it ended unconfirmed (caps the outcome verdict at "not confirmed").
+        self._request_skill = dict(skill) if isinstance(skill, dict) and skill.get("key") else None
+        self._skill_last: dict[str, Any] | None = None
+        self._request_wall = time.time()
+        self._skill_bounces = 0
+        self._skill_unconfirmed = False
+        self._skill_sent_unconfirmed = False
         self._requests += 1
+        # phase S: this request's run_skill tool (its menu, refreshed when the registry changed) and what it needs
+        self._skills_block = self._skills_tools()
+        self._set_skill_context(request, user_words)
         self._actions = []
         #: What this request's actions measured (v3.15 counters; the done's optional learned note is a hint for practice
         #: memory's distiller, which reads the run trace).
@@ -1512,6 +1528,11 @@ class Agent:
         if request_id:
             self.logger.begin_request(str(request_id))   # user_message then begins no other
         self.logger.user_message(request)
+        # phase S x F: the thinker's run_skill runs carry this request's log id (begun just above: a hand-off's own
+        # ``request_id``, else the session log's new one), so the skill ledger, D19's "asked again" and follow agree
+        context = getattr(self.dispatcher, "skill_context", None)
+        if isinstance(context, dict):
+            context["request_id"] = getattr(self.logger, "request_id", None)
         if stale:
             # Added after the previous request's last step: the caller hears of
             # it through take_steers() at the end of a request, so this is rare.
@@ -1748,6 +1769,8 @@ class Agent:
                         **self._tokens,
                         "cost_usd": cost,
                         "outcome": outcome,
+                        # phase S: the skill that ran or was pinned (code words; {} when none)
+                        **self._skill_row(),
                     },
                 )
         except Exception as exc:  # accounting must never break a request
@@ -2613,6 +2636,13 @@ class Agent:
                     f"{CHECK_LABEL}: your reply above was not sent: finish with done (its claims no stronger than "
                     f"your steps showed), not plain text.")
                 continue
+            if text and getattr(self, "_request_skill", None):
+                # phase S (review r2 H1): a plain-text reply ends a pinned request like a done, so the skill's own
+                # done-check gates it the same way: at most SKILL_BOUNCES "not done yet", then "couldn't confirm"
+                state, note = self._skill_gate_now()
+                if state == "hold":
+                    self.context.add_note(f"{CHECK_LABEL}: your reply above was not sent: {note}")
+                    continue
             if text:
                 self._done_claims = None   # a plain-text reply classes nothing: below likely, the verdict's line
                 verdict = self._outcome_verdict()
@@ -2661,6 +2691,15 @@ class Agent:
                 f"so in done; when all is done, mark it done in tasks alongside done.")},
                 "the kept list still had items to do"))
             return held
+        if ending and not turn.failed and getattr(self, "_request_skill", None):
+            # phase S: a pinned skill's done (or finishing action) counts only when its own done-check sees the result
+            # (D19); at most SKILL_BOUNCES "not done yet", then it ends as "couldn't confirm"
+            state, note = self._skill_gate_now()
+            if state == "hold":
+                turn.finished.clear()
+                turn.finishing.clear()
+                held.append(({"type": "text", "text": f"{CHECK_LABEL}: {note}"}, "the skill's check didn't see it"))
+                return held
         if not turn.finished and turn.finishing and not turn.failed and not turn.stop_after:
             _message, verified, why, tool = turn.finishing[-1]
             if verified is not True:
@@ -2701,6 +2740,97 @@ class Agent:
         held.append(({"type": "text", "text": text}, "a claim about the screen had no evidence"))
         return held
 
+    def _skills_tools(self) -> tuple[tuple[str, ...], str]:
+        """Phase S: ``(skill keys, thinker menu)`` for the tool block (:func:`yuki.agent.tools.tool_params`):
+        ``((), "")`` with ``Settings.skills`` off, on the reader lane, or with no skill loaded (the block is then as
+        before). Read from memory (the menu lists only skills with a usable rung); on a failure the last block stands,
+        so the cached block never flips on a hiccup. Never raises."""
+        prev = getattr(self, "_skills_block", None) or ((), "")
+        try:
+            from yuki.skills import enabled
+            from yuki.skills.connection import load
+            from yuki.skills.menu import THINKER, menu_text
+
+            if not enabled(self.settings) or getattr(self, "reader", False):
+                return ((), "")
+            loaded = load()
+            if not loaded.skills:
+                return ((), "")
+            if self.memory.installed:
+                menu = self.memory.call("skill_menu", lambda c: c.skill_menu(THINKER), timeout_s=1.0)
+            else:
+                menu = menu_text(None, audience=THINKER, loaded=loaded)
+            menu = str(menu or "")
+            keys = tuple(s.key for s in loaded.skills if f"- {s.key}:" in menu)
+            # review r2 L2: files are loaded, so an empty menu is memory's hiccup (skill_menu gives "" on a failure):
+            # the last block stands rather than run_skill vanishing (and app_volume coming back) for this request
+            return (keys, menu) if keys else prev
+        except Exception:  # noqa: BLE001 - the block as it was
+            return prev
+
+    def _set_skill_context(self, request: str, user_words: Any) -> None:
+        """Phase S: what the thinker's run_skill needs (memory, the user's own words, the request id, the log)."""
+        try:
+            from yuki.memory.store import split_envelope
+
+            raw = [user_words] if isinstance(user_words, str) else list(user_words or [])
+            words = [str(w.get("text") if isinstance(w, dict) else w) for w in raw]
+            words = [w for w in words if w.strip()] or [split_envelope(request or "")[0]]
+            self.dispatcher.skill_context = {
+                "memory": self.memory if self.memory.installed else None, "words": words,
+                "request_id": getattr(self.logger, "request_id", None), "log": self.logger.log,
+                "settings": self.settings}
+        except Exception:  # noqa: BLE001 - run_skill then runs on the files alone
+            pass
+
+    def _skills_block_now(self) -> tuple[tuple[str, ...], str]:
+        """The skills block for a model call (the warm-up's too, so its cache entry is the real requests')."""
+        block = getattr(self, "_skills_block", None)
+        if block is None:
+            block = self._skills_block = self._skills_tools()
+        return block
+
+    def _skill_row(self) -> dict[str, Any]:
+        """Phase S: this request's ``requests.csv`` skill columns (``yuki.log.requests``: ``skill``, ``route``,
+        ``done_check``; fPrivacy's ledger columns), code words only; ``{}`` when no skill ran or was pinned. Merge note:
+        ``_summarize`` adds ``**self._skill_row()`` to its row."""
+        last = getattr(self, "_skill_last", None) or {}
+        pin = getattr(self, "_request_skill", None) or {}
+        key = last.get("skill") or pin.get("key")
+        if not key:
+            return {}
+        gate = "unconfirmed" if getattr(self, "_skill_unconfirmed", False) else None
+        return {"skill": str(key), "route": str(last.get("route") or ("C" if pin else "")),
+                "done_check": str(gate or last.get("done_check") or "")}
+
+    def _skill_gate_now(self) -> tuple[str, str | None]:
+        """Phase S: the pinned skill's finish gate (:func:`yuki.agent.finish.skill_gate`) on every way this request can
+        end: a ``done``, a finishing action, or a plain-text reply (review r2 H1). Reads the skill's own done-check
+        with this agent's memory (the memory-backed probes, review r2 M1) and whether a send was pressed this request;
+        counts a bounce on ``hold`` and records an unconfirmed end (it caps the verdict and replaces the words). Logged
+        with code words only."""
+        pin = getattr(self, "_request_skill", None)
+        if not pin:
+            return "ok", None
+        memory_call = None
+        if self.memory.installed:
+            def memory_call(what: str, fn: Any) -> Any:
+                return self.memory.call(what, fn, timeout_s=0.8)
+        sent = bool(getattr(self, "_sends", None))
+        state, note = finish_gate.skill_gate(pin, since=self._skill_since(), bounces=self._skill_bounces,
+                                             memory_call=memory_call, sent=sent)
+        self.logger.log("skill_gate", skill=str(pin.get("key") or ""), result=state, bounces=self._skill_bounces)
+        if state == "hold":
+            self._skill_bounces += 1
+            return state, note
+        self._skill_unconfirmed = state in ("unconfirmed", "sent_unconfirmed")
+        self._skill_sent_unconfirmed = state == "sent_unconfirmed"
+        return state, note
+
+    def _skill_since(self) -> float:
+        """Phase S: when this request began, on the wall clock (a pinned skill's done-check reads what changed since)."""
+        return float(getattr(self, "_request_wall", None) or time.time())
+
     def _outcome_verdict(self) -> dict[str, Any] | None:
         """honest (87): this request's one outcome verdict (:func:`yuki.agent.finish.outcome_verdict`) from its run
         trace and the closing message's unbacked claims, logged (counts and levels only) and carried on its ``Final``.
@@ -2708,7 +2838,9 @@ class Agent:
         try:
             by_action = bool(getattr(self, "_finished_by_action", False))
             verdict = finish_gate.outcome_verdict(getattr(self, "_trace", None) or [],
-                                                  unbacked=list(getattr(self, "_unbacked", None) or []),
+                                                  unbacked=list(getattr(self, "_unbacked", None) or [])
+                                                  + ([finish_gate.SKILL_UNCONFIRMED]
+                                                     if getattr(self, "_skill_unconfirmed", False) else []),
                                                   finished_by_action=by_action,
                                                   # small8: the done's own claim (none for a finishing action)
                                                   claims=None if by_action else getattr(self, "_done_claims", None))
@@ -2755,6 +2887,12 @@ class Agent:
         left unbacked. Logged without words."""
         claims = getattr(self, "_done_claims", None)
         out, why = finish_gate.honest_text(text, verdict, claims)
+        if why is None and getattr(self, "_skill_unconfirmed", False):
+            # phase S (review L4): a pinned skill's own check never saw the result, so the brain's words never stand
+            # as they are, whatever they claim; a sending skill whose send was pressed says so (review r2 M1)
+            out, why = ((finish_gate.LINE_SKILL_SENT_UNCONFIRMED, "skill_sent_unconfirmed")
+                        if getattr(self, "_skill_sent_unconfirmed", False)
+                        else (finish_gate.LINE_SKILL_UNCONFIRMED, "skill_unconfirmed"))
         if why is not None and out != text and isinstance(verdict, dict) and (text or "").strip():
             # second review V3: the card and the window get the line alone; the brain's own words stay on the verdict
             # (``words``) for the expanded run, never as the reply
@@ -3389,6 +3527,14 @@ class Agent:
             learned = " ".join(str(tool_input.get("learned") or "").split())
             if learned and hasattr(self, "_learning"):
                 self._learning["note"] = learned
+        if name == "run_skill" and isinstance(outcome.payload, dict):
+            # phase S: the request's last skill run, for its requests.csv columns (code words only)
+            self._skill_last = {"skill": outcome.payload.get("skill"), "route": outcome.payload.get("route"),
+                                "done_check": outcome.payload.get("outcome")}
+            if isinstance(outcome.payload.get("handoff"), dict):
+                # its routes didn't get there: the thinker does it itself, the skill pinned (its done gate holds)
+                self._request_skill = dict(outcome.payload["handoff"])
+                self._skill_bounces = 0
         if (name == "remember_how" and outcome.ok and hasattr(self, "_learning")
                 and not (isinstance(outcome.payload, dict) and outcome.payload.get("held"))):
             self._learning["saved"] = True   # it already kept what it learned
@@ -4009,7 +4155,8 @@ class Agent:
                 # frame has a person, a route or a referent in play (or a spoken hand-off) is an action request, for
                 # which Yuki's own past exchanges from other days weigh less in the whole-memory ranking
                 facts, focus, clip = self._frame_inputs(query, screen, list(apps or ()))
-            frame = task_frame.build(facts, focus=focus, clip=clip, overview=self._overview_payload)
+            frame = task_frame.build(facts, focus=focus, clip=clip, overview=self._overview_payload,
+                                     pinned=getattr(self, "_request_skill", None))
             action = bool(self._request_voice or frame.action)
             if prefetched is not None and prefetched.get("fetched") is not None:
                 fetched = prefetched["fetched"]
@@ -4018,6 +4165,7 @@ class Agent:
                                              apps=apps or (), screen=screen, action=action,
                                              payload=self._overview_payload)
             frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
+                                     pinned=getattr(self, "_request_skill", None),
                                      overview=self._overview_payload, practice=getattr(fetched, "practice", None),
                                      named_app=getattr(self, "_request_app_named", None),
                                      lessons=self._lessons_for(self._overview_payload),
@@ -4201,7 +4349,8 @@ class Agent:
                 board = getattr(self.dispatcher, "last_now_board", None)
                 screen = self._live_screen(origin_hwnd, board=board, payload=payload)
                 inputs = self._frame_inputs(query, screen, list(memory_apps or ()))
-                frame = task_frame.build(inputs[0], focus=inputs[1], clip=inputs[2], overview=payload)
+                frame = task_frame.build(inputs[0], focus=inputs[1], clip=inputs[2], overview=payload,
+                                         pinned=getattr(self, "_request_skill", None))
                 fetched = self._fetch_memory(
                     app=_foreground_app(payload), query=query, first=self._requests == 0, lean=lean,
                     previous=" ".join(str(previous_query or "").split()) or self._previous_query,
@@ -4876,6 +5025,9 @@ class Agent:
             ),
             memory=self.memory.installed,
             lane_tools=READER_LANE_TOOLS if getattr(self, "reader", False) else (),
+            # phase S: the run_skill tool with the thinker menu (left out with skills off or none loaded)
+            skill_keys=self._skills_block_now()[0],
+            skills_menu=self._skills_block_now()[1],
         )
         if warmup:
             # No conversation breakpoint: the placeholder must never be cached.

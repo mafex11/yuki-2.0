@@ -1,0 +1,107 @@
+# sCore's tiny test connection: an invented "Demo Player" app (no real app, no real names). The engine's tests load it
+# with yuki.skills.connection.load([this folder]); it is never bundled (the shipped files are in yuki/skills/connections).
+
+[connection]
+app = "demoplayer"
+
+# -- a "change" skill with a no-focus rung A (two variants), a recorded rung B and the implicit rung C -------------------
+
+[skill."demo.volume"]
+end = "volume_change"
+kind = "change"
+menu = "set Demo Player's own volume"
+done_line = "Demo Player at {level}%."
+learn_from = [["volume_change", "demoplayer"]]
+handoff = true
+
+[[skill."demo.volume".slot]]
+name = "level"
+type = "number"
+min = 0
+max = 100
+required = true
+ask = "What level?"
+
+[[skill."demo.volume".slot]]
+name = "control"
+type = "enum"
+options = ["in_app", "mixer"]
+pref = "demo.volume:control"
+default = "in_app"
+say = "with its {control} control"
+
+[[skill."demo.volume".route]]
+rung = "A"
+variant = "in_app"
+via = "uia_invoke"
+when = { slot = "control", in = ["in_app"] }
+args = { window = "DemoPlayer.exe", role = "Slider", name = "Demo volume", container = [["Group", "Demo bar"]], pattern = "range", value = "{level}" }
+game = "states"
+game_states = ["covered"]
+done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
+recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1, same_source = true }
+
+[[skill."demo.volume".route]]
+rung = "A"
+variant = "mixer"
+via = "app_volume"
+when = { slot = "control", in = ["mixer"] }
+args = { app = "DemoPlayer.exe", level = "{level}" }
+game = "always"
+done = { probe = "read_back" }
+recheck = { probe = "level", target = "DemoPlayer.exe", value = "{level}", after_s = 1 }
+
+[[skill."demo.volume".route]]
+rung = "B"
+variant = "steps"
+via = "uia_steps"
+args = { apps = ["DemoPlayer.exe"], steps = [{ do = "click", role = "Button", name = "Demo louder" }] }
+done = { probe = "level", target = "DemoPlayer.exe", value = "{level}", within_s = 1 }
+
+# -- an "open" skill: a URI (focus-taking), no hand-off ------------------------------------------------------------------
+
+[skill."demo.home"]
+end = "site_front"
+kind = "open"
+menu = "open Demo Player's home"
+done_line = "Demo home is up."
+handoff = false
+
+[[skill."demo.home".route]]
+rung = "A"
+via = "open_uri"
+args = { uri = "demoplayer://home" }
+done = { probe = "foreground", process = "DemoPlayer.exe", within_s = 2 }
+
+# -- an entity slot filled from the user's words or their taste ----------------------------------------------------------
+
+[skill."demo.play"]
+end = "media_context"
+kind = "change"
+menu = "play one of their Demo Player lists"
+done_line = "Playing {list.name} in Demo Player."
+
+[[skill."demo.play".slot]]
+name = "list"
+type = "entity"
+taste = "demo_list"
+required = true
+ask = "Which list?"
+
+[[skill."demo.play".route]]
+rung = "A"
+variant = "library"
+via = "uia_invoke"
+args = { window = "DemoPlayer.exe", role = "Button", name = "Play {list.name}", container = [["DataGrid", "Demo lists"]], pattern = "invoke" }
+game = "states"
+game_states = ["covered"]
+done = { probe = "all", parts = [{ probe = "uia_name", window = "DemoPlayer.exe", role = "Button", name = "Pause {list.name}", container = [["DataGrid", "Demo lists"]] }, { probe = "media_session", app = "demoplayer", status = "playing" }], within_s = 2 }
+recheck = { probe = "audio_active", process = "DemoPlayer.exe", after_s = 2 }
+
+[[skill."demo.play".route]]
+rung = "B"
+variant = "link"
+via = "open_uri"
+when = { slot = "list", field = "ref", has = true }
+args = { uri = "{list.ref}" }
+done = { probe = "media_session", app = "demoplayer", status = "playing", within_s = 3 }

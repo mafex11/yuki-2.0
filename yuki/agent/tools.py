@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Literal, Protocol, Sequence, runtime_checkable
@@ -673,7 +674,14 @@ ABOUT_HEARD_AS: dict[str, Any] = {
                    "your own first guess: the words as heard, kept as that person's misheard form.",
 }
 
-TOOL_SCHEMAS.extend([dict(_SITUATION_TOOL), dict(_SLIDER_TOOL), TASKS_TOOL])
+#: Phase S (sCore, map-skills S3.5): the thinker's ``run_skill``, one of the user's usual ways (yuki.skills). Its
+#: description carries the thinker menu, set per request by ``tool_params(skill_keys=, skills_menu=)``; with skills
+#: off or none loaded it is left out of the block (and ``app_volume`` stays), so the cached block is unchanged.
+from yuki.skills.menu import thinker_tool as _thinker_tool  # noqa: E402
+
+RUN_SKILL_TOOL: dict[str, Any] = _thinker_tool("", ())
+
+TOOL_SCHEMAS.extend([dict(_SITUATION_TOOL), dict(_SLIDER_TOOL), TASKS_TOOL, RUN_SKILL_TOOL])
 for _t in TOOL_SCHEMAS:
     if _t.get("name") == "about":
         _t["input_schema"]["properties"]["heard_as"] = ABOUT_HEARD_AS
@@ -703,6 +711,7 @@ ACTION_TOOL_NAMES: tuple[str, ...] = (
     "window_action",
     "write_clipboard",
     "set_slider",
+    "run_skill",
 )
 
 
@@ -751,7 +760,12 @@ TOOL_TRAITS: dict[str, Traits] = {
     "window_action": Traits(("open_apps",), "window"),
     "write_clipboard": Traits(("click_type",), "none"),
     "set_slider": Traits(("click_type",), "input"),
+    # phase S: a skill's rungs are gated by the engine itself (no focus or input with a game in front); a message
+    # skill with text that sends is judged as a send (:func:`tool_traits`)
+    "run_skill": Traits(("open_apps",), "input"),
 }
+#: Phase S: a ``run_skill`` that sends a message (the user's plain words, rule 8).
+SKILL_SEND_TRAITS = Traits(("click_type", "send_messages"), "input", reaches=True)
 #: Per operation, where one tool's operations differ (the fixed enum or boolean argument that names it).
 OP_TRAITS: dict[tuple[str, str], Traits] = {
     ("window_action", "close"): Traits(("open_apps",), "window", destroys=True),
@@ -795,6 +809,23 @@ def _web_address(url: Any) -> bool:
         return False
 
 
+def _skill_sends(tool_input: dict[str, Any] | None) -> bool:
+    """Phase S (review L3): whether a ``run_skill`` call may send something to other people, from the skill's own data
+    (``sends`` / ``sends_when`` in its connection file; :func:`yuki.skills.connection.sends_with`), never from slot
+    names. A slot the model left out counts as a sending value (the resolver may fill it so). An unknown key is not
+    a send (the engine refuses it)."""
+    if not isinstance(tool_input, dict):
+        return False
+    try:
+        from yuki.skills.connection import load, sends_with
+
+        skill = load().get(str(tool_input.get("skill") or ""))
+        slots = tool_input.get("slots") if isinstance(tool_input.get("slots"), dict) else {}
+        return bool(skill is not None and sends_with(skill, slots, partial=True))
+    except Exception:  # noqa: BLE001 - the files couldn't be read: judged as the plain tool
+        return False
+
+
 def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
     """The traits of one call: its operation's, else its tool's, else none (a read, a note, a memory tool). Text with
     a line break types as Enter, so it submits like ``press_enter``; ``open_url`` of a file or a non-web scheme runs
@@ -811,6 +842,8 @@ def tool_traits(name: str, tool_input: dict[str, Any] | None = None) -> Traits:
         # vfix3 review F1: the shortcut set_slider presses is a key combination like any hotkey (alt+f4 closes, enter
         # sends), so it is judged as one: the hotkey tool's own traits (the same object: keys by their tool alone)
         return TOOL_TRAITS["hotkey"]
+    elif name == "run_skill" and _skill_sends(tool_input):
+        return SKILL_SEND_TRAITS
     if op is not None and (name, op) in OP_TRAITS:
         return OP_TRAITS[(name, op)]
     return TOOL_TRAITS.get(name, Traits())
@@ -1371,6 +1404,8 @@ def tool_params(
     screenshot_policy: str | None = None,
     memory: bool = True,
     lane_tools: Iterable[str] = (),
+    skill_keys: Sequence[str] | None = None,
+    skills_menu: str = "",
 ) -> list[dict[str, Any]]:
     """Return the tool definitions for a request.
 
@@ -1386,6 +1421,11 @@ def tool_params(
         memory: Whether Yuki's memory is installed. Without it the memory tools
             are left out the same way. Fixed per process, so the block stays
             byte-stable.
+        skill_keys: Phase S: the skills loaded (``Settings.skills`` on). Empty or ``None``: no ``run_skill`` (the
+            block is as before). With a ``volume`` skill the thinker's ``app_volume`` is left out (the volume skill
+            covers the mixer too); it comes back with ``skills = false``.
+        skills_menu: The thinker menu, the ``run_skill`` description's tail (it changes only with the menu's
+            version, so the block stays byte-stable between requests).
 
     Returns:
         A fresh list of tool dicts in registry order, carrying only what the API
@@ -1396,8 +1436,14 @@ def tool_params(
     allowed = set(
         available_tool_names(names, screenshot_policy=screenshot_policy, memory=memory, lane_tools=lane_tools)
     )
+    keys = [str(k) for k in (skill_keys or ()) if str(k)]
+    if not keys:
+        allowed.discard("run_skill")
+    elif "volume" in keys:
+        allowed.discard("app_volume")
     tools = [
-        {k: v for k, v in t.items() if k != "label"}
+        {k: v for k, v in (_skill_schema(t, keys, skills_menu) if t["name"] == "run_skill" else t).items()
+         if k != "label"}
         for t in TOOL_SCHEMAS
         if t["name"] in allowed
     ]
@@ -1406,6 +1452,16 @@ def tool_params(
 
         tools[-1] = {**tools[-1], "cache_control": dict(STABLE_CACHE_CONTROL)}
     return tools
+
+
+def _skill_schema(base: dict[str, Any], keys: Sequence[str], menu: str) -> dict[str, Any]:
+    """The ``run_skill`` schema of this request: the registry's one (with the fields added to every action tool at
+    import, such as ``say_now``), its skill enum and description from the loaded skills and the thinker menu."""
+    fresh = _thinker_tool(menu, list(keys))
+    schema = json.loads(json.dumps(base.get("input_schema") or {}))
+    props = schema.setdefault("properties", {})
+    props["skill"] = fresh["input_schema"]["properties"]["skill"]
+    return {**base, "description": fresh["description"], "input_schema": schema}
 
 
 #: The phrase for each kind of the one memory tool (and for its old tool names, which the voice and the UI may still
@@ -2056,6 +2112,14 @@ class Dispatcher:
         #: Refuse a click at raw x,y on a window that is opaque, was never read, or changed since its latest
         #: read (the element click's staleness rule, for coordinates). On for every dispatcher.
         self.guard_raw_clicks = True
+        #: Phase S (D17(1), fGate's hand-on L5): re-read "is a game in front?" right before every action that takes
+        #: focus or sends input (``run_powershell`` too: a script may start a window), and refuse it then (nothing is
+        #: sent; ``refused = "game"``). ``None``: on for the real desktop only (a stand-in desk never reads the live
+        #: foreground); a test turns it on with the game check stubbed.
+        self.game_guard: bool | None = None
+        #: Phase S: what the thinker's ``run_skill`` needs from the request (``memory``, the user's ``words``,
+        #: ``request_id``, ``log``, ``settings``), set by the agent loop at each request's start.
+        self.skill_context: dict[str, Any] = {}
         #: Append the live picture of the screen (yuki.memory.now: what the windows on screen show, popups,
         #: the focus line) to :meth:`overview_text`, i.e. the brain's per-turn situation block. Off unless the
         #: owner of the dispatcher turns it on (the agent loop, from ``Settings.now_in_situation``).
@@ -2186,6 +2250,11 @@ class Dispatcher:
         except ToolError as exc:
             return ToolOutcome(name=name, ok=False, summary=str(exc), content=[{"type": "text", "text": str(exc)}],
                                payload={"error": str(exc), "window_gone": True},
+                               elapsed_ms=(time.perf_counter() - started) * 1000)
+        refused = self._game_refusal(name, tool_input)
+        if refused is not None:
+            return ToolOutcome(name=name, ok=False, summary=refused, content=[{"type": "text", "text": refused}],
+                               payload={"error": refused, "refused": "game", "details": {"refused": "game"}},
                                elapsed_ms=(time.perf_counter() - started) * 1000)
         try:
             outcome = handler(tool_input)
@@ -4518,6 +4587,57 @@ class Dispatcher:
                 "words how it stops (say stop, or press any key).")
         return dataclasses.replace(first, summary=f"{first.summary}; {note}",
                                    content=[*first.content, {"type": "text", "text": note}])
+
+    def _game_refusal(self, name: str, tool_input: dict[str, Any]) -> str | None:
+        """D17(1) on the thinker's side: why this action may not run now (a game is in front, or it is aimed at a
+        game's window), else ``None``. ``run_skill`` gates its own rungs (its no-focus ones may run mid-game)."""
+        guard = self.game_guard if self.game_guard is not None else isinstance(self.backend, _LazyRealBackend)
+        if not guard or name not in ACTION_TOOL_NAMES or name == "run_skill":
+            return None
+        from yuki.memory import gamegate
+
+        traits = tool_traits(name, tool_input)
+        if traits.needs in ("input", "focus") or name == "run_powershell":
+            return gamegate.refuse_input(f"tool_{name}")
+        hwnd = tool_input.get("hwnd") or tool_input.get("expect_hwnd")
+        if traits.needs == "window" and hwnd:
+            try:
+                return gamegate.refuse_input(f"tool_{name}", hwnd=int(hwnd), front_ok=True)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _do_run_skill(self, tool_input: dict[str, Any]) -> ToolOutcome:
+        """Phase S: one of the user's usual ways (yuki.skills.engine.run_for_thinker): its own rungs, checked by its
+        done-check; verified only when that check saw the result (D19). A hand-off (its rungs didn't get there) comes
+        back as the pinned skill: the thinker does it itself, the loop pins it. Held with a game in front (D17)."""
+        key = tool_input.get("skill")
+        if not isinstance(key, str) or not key.strip():
+            raise ToolError("give the skill's key from the list")
+        slots = tool_input.get("slots")
+        if slots is not None and not isinstance(slots, dict):
+            raise ToolError("slots must be an object of slot names and values")
+        from yuki.skills.engine import run_for_thinker
+
+        ctx = self.skill_context or {}
+        result = run_for_thinker(tool_input, list(ctx.get("words") or []), memory=ctx.get("memory"),
+                                 log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"))
+        verified = True if result.done else (False if result.outcome == "failed" else None)
+        details: dict[str, Any] = {"verified": verified}
+        if result.held:
+            details["refused"] = "game"
+        text = result.report()
+        if result.handoff:
+            from yuki.agent.frame import pinned_lines
+
+            text += "\n" + "\n".join(pinned_lines(result.handoff))
+        ok = result.outcome in ("done", "already", "unverified", "handed_over", "asked", "other_device")
+        payload: dict[str, Any] = {"details": details, "skill": result.skill, "outcome": result.outcome,
+                                   "route": result.route, "handoff": result.handoff}
+        if result.held:
+            payload["refused"] = "game"
+        return ToolOutcome(name="run_skill", ok=ok, summary=text.split("\n", 1)[0][:200],
+                           content=[{"type": "text", "text": text}], payload=payload)
 
     def _do_run_powershell(self, tool_input: dict[str, Any]) -> ToolOutcome:
         return self._from_action(

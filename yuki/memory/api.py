@@ -4768,6 +4768,122 @@ class MemoryClient:
         except Exception as exc:  # noqa: BLE001
             return {"error": type(exc).__name__}
 
+    # -- phase S: skills (yuki.skills; PLAN.md D13). The tray uses its own Store through these; none of the new tables
+    # -- (skills, skill_routes, skill_runs, prefs, pref_events, tastes) is ever exposed by the MCP.
+
+    def _skills_seeded(self) -> Any:
+        """The loaded connection files, seeded into this database once per version per process (an upsert). A seed
+        that failed is tried again on the next call (the version is marked seeded only on success)."""
+        from yuki.skills import connection, registry
+
+        loaded = connection.load()
+        seen = getattr(self, "_skills_version", None)
+        if seen != loaded.version and registry.has_tables(self.store):
+            got = registry.seed(self.store, loaded)
+            if isinstance(got, dict) and not got.get("error"):
+                self._skills_version = loaded.version
+        return loaded
+
+    def skill_menu(self, audience: str = "talker", *, now: float | None = None) -> str:
+        """The skill menu for the talker (its cached prompt block) or the thinker (its ``run_skill`` tool), built by
+        code from the connection files, the trust ledger and the user's taste (:func:`yuki.skills.menu.menu_text`).
+        ``""`` when no skill is loaded. Never raises."""
+        from yuki.skills.menu import THINKER, TALKER, menu_text
+
+        try:
+            loaded = self._skills_seeded()
+            return menu_text(self.store, audience=THINKER if audience == THINKER else TALKER, loaded=loaded, now=now)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def skill_menu_version(self) -> str:
+        """What the menu depends on (it changes only when the registry does). Never raises (``""``)."""
+        from yuki.skills import registry
+
+        try:
+            return registry.menu_version(self.store, self._skills_seeded())
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def skill_inputs(self, skill_key: str) -> dict:
+        """One skill's trust as the ledger says it, per rung, and whether it may be offered (D14). Content-free; the
+        resolver itself reads the same store in-process (:meth:`skill_resolve`). Never raises."""
+        from yuki.skills import registry
+
+        try:
+            loaded = self._skills_seeded()
+            skill = loaded.get(str(skill_key))
+            if skill is None:
+                return {"skill": str(skill_key), "known": False}
+            table = registry.trust(self.store, skill.key)
+            routes = {}
+            for r in skill.routes:
+                t = table.get(r.key)
+                usable, why = registry.usable(r, t)
+                routes[r.key] = {"ok": t.ok if t else 0, "failed": t.failed if t else 0,
+                                 "unverified": t.unverified if t else 0, "streak": t.streak if t else 0,
+                                 "seed_ok": t.seed_ok if t else 0, "usable": usable, "why": why}
+            return {"skill": skill.key, "known": True, "kind": skill.kind, "routes": routes,
+                    "offer_ready": registry.offer_ready(self.store, skill)}
+        except Exception as exc:  # noqa: BLE001
+            return {"skill": str(skill_key), "error": type(exc).__name__}
+
+    def skill_resolve(self, skill_key: str, slots: Any, words: Any, *, live: Any = None, again: bool = False,
+                      now: float | None = None) -> Any:
+        """Code fills a skill's slots and picks its rungs on this store (:func:`yuki.skills.resolve.resolve`)."""
+        from yuki.skills.resolve import resolve
+
+        self._skills_seeded()
+        return resolve(str(skill_key), slots if isinstance(slots, dict) else {}, words, store=self.store, live=live,
+                       again=again, now=now)
+
+    def record_skill_run(self, op: str, **fields: Any) -> Any:
+        """The trust ledger (D18, D19): ``op`` ``start`` (the row at t0, before the first step: returns the run key),
+        ``finish`` (outcome and the done-check's verdict), ``try`` (a rung that ran and was not the last), ``recheck``
+        (the second probe's verdict; ``False`` marks a false done) or ``false_done`` (corrected or repeated within
+        60 s). Content-free; never raises (``None``)."""
+        from yuki.skills import registry
+
+        try:
+            if op == "start":
+                return registry.start_run(self.store, **fields)
+            if op == "finish":
+                return registry.finish_run(self.store, **fields)
+            if op == "try":
+                return registry.record_route_try(self.store, **fields)
+            if op == "recheck":
+                return registry.set_recheck(self.store, fields["run_key"], fields.get("agrees"))
+            if op == "false_done":
+                return registry.mark_false_done(self.store, fields["run_key"])
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def keep_usual(self, slot: str, option: str, answer: str, *, context: str = "", quote: str | None = None,
+                   source: str | None = None) -> dict:
+        """The user's answer to "Keep this as your usual?" (``yes`` / ``just_this_time``; S4.2). Never raises."""
+        from yuki.skills.prefs import keep_usual
+
+        try:
+            return keep_usual(self.store, str(slot), str(option), str(answer), context=context, quote=quote,
+                              source=source)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": type(exc).__name__}
+
+    def prefs_choose(self, slot: str, *, context: str = "") -> dict | None:
+        """The option the choice rule picks for a preference slot (usual > observed share >= 0.8 with n >= 3 > most
+        recent, named aloud), or ``None`` (:func:`yuki.skills.prefs.choose`). Never raises."""
+        from yuki.skills.prefs import choose
+
+        try:
+            got = choose(self.store, str(slot), context=context)
+        except Exception:  # noqa: BLE001
+            return None
+        if got is None:
+            return None
+        return {"option": got.option, "source": got.source, "named": got.named, "share": got.share, "n": got.n,
+                "still_usual": got.still_usual}
+
 
 __all__ = [
     "MemoryClient", "service_running", "KNOWHOW_DUPLICATE_COSINE", "RULE_DUPLICATE_COSINE",

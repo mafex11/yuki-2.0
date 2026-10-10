@@ -177,6 +177,9 @@ class Job:
     #: Phase F (fPrivacy R1.3): the id this request already has in the logs (``Agent.run(request_id=)``): a front
     #: desk's request handed to the worker keeps the front desk's session-log id; ``None``: the lane's log begins one.
     log_request_id: str | None = None
+    #: Phase S: the user's usual way the code handed over with this request (``Agent.run(skill=)``: a skill whose own
+    #: routes didn't get there; ``yuki.skills.engine.pinned``); ``None``: none.
+    skill: dict[str, Any] | None = None
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -509,6 +512,8 @@ class Lane(QThread):
                else {}),
             # phase F: one request id across the front desk's hand-off (the user's words and the worker's actions)
             **({"request_id": job.log_request_id} if job.log_request_id else {}),
+            # phase S: the pinned skill (kept across a front-desk hand-off like the named app)
+            **({"skill": pin} if (pin := job.skill or getattr(runtime, "_skills", {}).get(job.id)) else {}),
         )
         begun = False
         while True:
@@ -758,6 +763,7 @@ class AgentRuntime(QObject):
         #: Phase F (fPrivacy R1.3): the session-log id each request ended with (written by its lane's thread, popped in
         #: _on_lane_done), so a front desk's request handed to the worker keeps one id in every log.
         self._log_ids: dict[int, str] = {}
+        self._skills: dict[int, dict[str, Any]] = {}   # phase S: front-desk requests' pinned skill, kept for a hand-off
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -874,7 +880,7 @@ class AgentRuntime(QObject):
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
-        app_named: str | None = None, log_request_id: str | None = None,
+        app_named: str | None = None, log_request_id: str | None = None, skill: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -908,6 +914,8 @@ class AgentRuntime(QObject):
                 kept across a front-desk hand-off and given to ``Agent.run(app_named=)``.
             log_request_id: The id the request already has in the logs (phase F; voice: ``voice-<turn>-t<n>``),
                 kept by the lane's run and across a front-desk hand-off; ``None``: the lane's log begins one.
+            skill: Phase S: the pinned skill the code handed over (``yuki.skills.engine.pinned``): kept across a
+                front-desk hand-off and given to ``Agent.run(skill=)``.
 
         Returns:
             ``(lane name, request id)``.
@@ -934,9 +942,14 @@ class AgentRuntime(QObject):
         named = " ".join(str(app_named or "").split()) or None
         if named and lane is not self.worker:
             self._apps_named[request_id] = named
+        pin = dict(skill) if isinstance(skill, dict) and skill.get("key") else None
+        if pin and lane is not self.worker:
+            self._skills[request_id] = pin
         fresh = pack if (lane is self.worker and worker_idle) else None
+        # review r2 L1: the newer fields by keyword (a field added beside them can never take the pin's place)
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words, fresh, named, log_request_id=log_request_id or None))
+                                   previous_query, words, fresh, app_named=named,
+                                   log_request_id=log_request_id or None, skill=pin))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -946,7 +959,8 @@ class AgentRuntime(QObject):
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
-                         app_named: str | None = None, log_request_id: str | None = None) -> int:
+                         app_named: str | None = None, log_request_id: str | None = None,
+                         skill: dict[str, Any] | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -965,7 +979,9 @@ class AgentRuntime(QObject):
         waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
                                           user_words=_words_tuple(user_words),
                                           app_named=" ".join(str(app_named or "").split()) or None,
-                                          log_request_id=log_request_id or None))
+                                          log_request_id=log_request_id or None,
+                                          skill=dict(skill) if isinstance(skill, dict) and skill.get("key")
+                                          else None))
         self.ui_log.event(
             "queued", id=request_id, origin=origin_id, waiting=waiting, request=request,
             **({"request_id": log_request_id} if log_request_id else {}),
@@ -1159,6 +1175,7 @@ class AgentRuntime(QObject):
             if request_id in self._worker_outstanding:
                 self._worker_outstanding.remove(request_id)
             self._apps_named.pop(request_id, None)
+            self._skills.pop(request_id, None)
             return
         if needed_hands:
             new_id = self.queue_for_worker(request, origin_id=request_id,
@@ -1166,7 +1183,8 @@ class AgentRuntime(QObject):
                                            memory_query=self._memory_queries.pop(request_id, None),
                                            user_words=self._user_words.pop(request_id, None),
                                            app_named=self._apps_named.pop(request_id, None),
-                                           log_request_id=log_id)
+                                           log_request_id=log_id,
+                                           skill=self._skills.pop(request_id, None))
             # both runtime ids (the front desk's, the worker's) and the one log id they share from here on
             self.ui_log.event("handoff", id=request_id, worker_id=new_id, refused=list(refused),
                               **({"request_id": log_id} if log_id else {}))
@@ -1175,6 +1193,7 @@ class AgentRuntime(QObject):
             self._sources.pop(request_id, None)
             self._user_words.pop(request_id, None)
             self._apps_named.pop(request_id, None)
+            self._skills.pop(request_id, None)
             self._memory_queries.pop(request_id, None)
 
 
