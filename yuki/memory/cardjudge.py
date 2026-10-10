@@ -68,7 +68,7 @@ import sys
 import time
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Sequence, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -148,7 +148,7 @@ DIGEST_REACTIONS_STATE = "judge_digest_reactions"
 SHADOW_STATE = "judge_shadow"
 #: The user-wanted types the go-live gate checks (§4.5).
 WANTED: tuple[str, ...] = ("checkin:followup", "checkin:evening", "checkin:care", "checkin:day_start",
-                           "session:break", "followup", "confirm")
+                           "session:break", "followup", "plans", "confirm")
 #: Old rows that were the same card as a judge type (§2.1's last column): seeds per (kind, trigger).
 SEEDS: dict[tuple[str, str], str] = {
     ("question", "question"): "question", ("notice", "thread"): "thread", ("notice", "recap"): "recap",
@@ -237,6 +237,12 @@ def _ladder(t: str) -> tuple[str, ...]:
     return ("card", "best", "off") if info.time_bound else ("card", "digest", "off")
 
 
+def _generator_of(t: str) -> str:
+    """The name of the generator (``candidates.GENERATORS``) that makes a type: ``confirm`` comes with the reminders,
+    ``checkin:*`` and ``session:*`` from one generator each, every other type from its own."""
+    return "reminder" if t == "confirm" else t.split(":", 1)[0]
+
+
 def type_of(kind: str | None, trigger: str | None, checkin_trigger: str | None = None) -> str | None:
     """The judge type a stored card counts toward (content-free columns): a judge card's trigger is its type; an old
     card counts only when it was the same card (:data:`SEEDS`; a check-in's moment comes from its check-in row's trigger,
@@ -258,6 +264,7 @@ class _TypeStats:
     dismissed: int = 0
     writer_calls: int = 0
     writer_none: int = 0
+    writer: list[tuple[float, bool]] = field(default_factory=list)  # (at, none or suppressed) of writer calls
 
     def shown(self, since: float = 0.0, *, cards: bool = True, lines: bool = True) -> list[tuple[float, bool]]:
         rows = (self.cards if cards else []) + (self.lines if lines else [])
@@ -309,7 +316,7 @@ class Ledger:
             answered_q = {int(r[0]) for r in self.store._query(
                 "SELECT id FROM questions WHERE status = 'answered' AND coalesce(answered_at, updated_at) >= ?",
                 (since,))}
-            writer = self.store._query("SELECT trigger, outcome FROM nudge_checkins WHERE at >= ?"
+            writer = self.store._query("SELECT trigger, outcome, at FROM nudge_checkins WHERE at >= ?"
                                        " AND trigger LIKE 'judge:%' AND model IS NOT NULL", (since,))
         except Exception:  # noqa: BLE001 - an older database: no history (every type at its home mode)
             rows, answered_cards, answered_q, writer = [], set(), set(), []
@@ -346,12 +353,13 @@ class Ledger:
                 said = per.get(str(ln.get("n"))) if isinstance(per, dict) else None
                 engaged = said == "open" or (ref[:1] == "Q" and ref[1:].isdigit() and int(ref[1:]) in answered_q)
                 stats[ln["type"]].lines.append((sat, engaged))
-        for trig, outcome in writer:
+        for trig, outcome, at in writer:
             t = str(trig)[len("judge:"):]
             if t in TYPES:
+                none = outcome == "none" or str(outcome or "").startswith("suppressed")
                 stats[t].writer_calls += 1
-                if outcome == "none" or str(outcome or "").startswith("suppressed"):
-                    stats[t].writer_none += 1
+                stats[t].writer_none += int(none)
+                stats[t].writer.append((float(at or 0.0), none))
         self._stats = dict(stats)
         self._mult = self._multipliers(shown_by_id, engaged_by_id)
         self._apply_modes(now)
@@ -419,21 +427,22 @@ class Ledger:
             cur = st.get(t) or {"mode": ladder[0]}
             mode = cur.get("mode") if cur.get("mode") in ladder else ladder[0]
             if mode == ladder[0]:
-                shown = s.shown()
+                # counted from the last mode change: after an up-step, the old ignored cards don't step it down again
+                since = float(cur.get("since") or 0.0)
+                shown = s.shown(since)
+                calls = [none for at, none in s.writer if at >= since]
                 if len(shown) >= STEP_MIN_SHOWN and _rate(shown) < STEP_DOWN_RATE:
                     self._step(st, t, now, "ledger", "ignored")
-                elif (ladder[0] == "card" and s.writer_calls >= NONE_MIN_CALLS
-                      and s.writer_none / s.writer_calls >= NONE_RATE):
+                elif (ladder[0] == "card" and len(calls) >= NONE_MIN_CALLS
+                      and sum(calls) / len(calls) >= NONE_RATE):
                     self._step(st, t, now, "ledger", "writer_none")
             elif mode != "off":
                 since = float(cur.get("since") or 0.0)
                 shown = s.shown(since, cards=mode != "digest", lines=mode == "digest")
                 if cur.get("by") != "user" and len(shown) >= UP_MIN_SHOWN and _rate(shown) >= UP_RATE:
                     up = ladder[ladder.index(mode) - 1]
-                    if up == ladder[0]:
-                        st.pop(t, None)
-                    else:
-                        st[t] = {"mode": up, "by": "ledger", "since": round(now, 1), "why": "engaged"}
+                    # kept even at the home mode: its "since" starts the next down-step's count afresh
+                    st[t] = {"mode": up, "by": "ledger", "since": round(now, 1), "why": "engaged"}
                     self._note(t, mode, up, "ledger", "engaged")
                 elif len(shown) >= STEP_MIN_SHOWN and not any(e for _at, e in shown):
                     st[t] = {"mode": "off", "by": cur.get("by") or "ledger", "since": round(now, 1), "why": "ignored"}
@@ -920,6 +929,7 @@ class CardJudge:
         self._published: dict[str, Any] | None = None
         self._errors_told: dict[str, float] = {}
         self._ledger_stale = False
+        self._reactions_seen: int | None = None
         self._today_wait: str | None = None   # why a due Today card waits (this evaluation), and the last one's
         self._today_prev: str | None = None
         #: The last evaluation's pile (RAM; the dry run reads it).
@@ -952,6 +962,15 @@ class CardJudge:
     def _builder(self) -> Any:
         try:
             return self.you_fn()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _reactions(builder: Any) -> int | None:
+        """The builder's count of card-reaction wakes (None: no builder or no count)."""
+        try:
+            wakes = getattr(builder, "wakes", None)
+            return int(wakes.get("reaction", 0)) if wakes is not None else None
         except Exception:  # noqa: BLE001
             return None
 
@@ -1000,9 +1019,12 @@ class CardJudge:
         if builder is not None and builder.wake.is_set():
             builder.wake.clear()
             woke = True
-            last = getattr(builder, "last_wake", None)
-            if last and "reaction" in (last[1] or ()):
-                self._ledger_stale = True   # a card reaction: the ledger is read again at once (modes, "Less of these")
+        reactions = self._reactions(builder)
+        if reactions is not None and reactions != self._reactions_seen:
+            # a card reaction (latched by the builder's count, so a later wake can't hide it): the ledger is read
+            # again at once (modes, "Less of these")
+            self._reactions_seen = reactions
+            self._ledger_stale = True
         if not woke and now < self._next_eval:
             return None
         self.counters["wake" if woke else "deadline"] += 1
@@ -1025,18 +1047,19 @@ class CardJudge:
             summary["error"] = type(exc).__name__
         finally:
             try:
-                self.seen.flush(now)
-                self.book.flush(now, force=bool(summary.get("chosen")))
+                if not summary.get("quiet"):   # paused, cards off, locked or snoozed: nothing is written (kept in RAM)
+                    self.seen.flush(now)
+                    self.book.flush(now, force=bool(summary.get("chosen")))
             except Exception:  # noqa: BLE001
                 pass
         return summary
 
     def _evaluate(self, now: float, builder: Any, cfg: Any, summary: dict[str, Any]) -> None:
         jcfg = self._jcfg.get()
-        self.book.evals(now, cfg)
         self.last_pile = []
         you = builder.snapshot() if builder is not None else None
         if you is None:
+            self.book.evals(now, cfg)
             self._note_held(now, cfg, "no_state")   # [you] enabled = false, or not built yet: everything held
             summary["held"] = "no_state"
             self._schedule(now, [], waiting=False)   # the builder's first beat wakes the judge
@@ -1048,12 +1071,18 @@ class CardJudge:
             sw = read_switches(self.store, self.db_path, cfg, now, locked_fn=self.locked_fn)
             common = common_hold(you, now, sw, cfg)
         if common is not None:
+            reason = str(common.reason or "")
+            if reason.startswith("H0:") or reason == "H6:presence_unknown":
+                summary["quiet"] = True   # the user's own switches or memory paused: count nothing, write nothing
+            else:
+                self.book.evals(now, cfg)
             self._note_held(now, cfg, common.reason)
             summary["held"] = common.reason
             self._expire_waiting(now, cfg, present=None)
             self._schedule(now, [common.retry_at, *self._waiting_deadlines()], waiting=False)
             self._publish(now, cfg)
             return
+        self.book.evals(now, cfg)
         self._note_held(now, cfg, None)
         self._today_prev, self._today_wait = self._today_wait, None
         first = holds(you, now, sw, cfg, type="*")
@@ -1075,6 +1104,7 @@ class CardJudge:
         frames = self.book.frames_today(now, cfg)
         self.probes = {}
         present = {c.key for c in pile}
+        queued_now: set[str] = set()
         for c in pile:
             if not type_on(c.type, cfg):
                 self._drop(now, cfg, c, "B3:toggle")
@@ -1108,6 +1138,7 @@ class CardJudge:
                     self._drop(now, cfg, c, "digest_off")
                 else:
                     self._queue(now, cfg, c)
+                    queued_now.add(c.key)
                 continue
             fit = c.confidence * timing
             if mode == "best" and (klass not in BEST_CLASSES or self.book.shown_today(now, cfg, c.type)):
@@ -1125,6 +1156,14 @@ class CardJudge:
                 deadlines.append(b.retry_at)
                 continue
             eligible.append(_Eligible(1, self.ledger.prior(c.type) * fit, c, fit, mode))
+        # §4.5: a queued item shows only while it is still true. After a run of every generator, an item not queued
+        # again this time (gone from the pile, its counts changed, toggled off, lowered to off, back to a card) leaves
+        # the queue before any Today or away list is built. A restricted run (call status unknown) can't tell, so it
+        # keeps the queue and the waiting list as they are; so does a generator that failed this time, for its types.
+        full = only is None
+        failed = {str(k).split(":", 1)[0] for k in ctx.errors}
+        if full:
+            self._prune_queue(now, keep=queued_now, present=present, failed=failed)
         chosen = None
         eligible.sort(key=lambda e: (-e.tier, -e.rank, e.cand.created_at))
         deadline_first = [e for e in eligible if e.tier == 2]
@@ -1142,7 +1181,7 @@ class CardJudge:
                 if e.cand.key != chosen.get("key") and e.cand.key not in self.waiting:
                     self._wait(now, cfg, e.cand, "rank")
         summary["chosen"] = chosen
-        self._expire_waiting(now, cfg, present=present)
+        self._expire_waiting(now, cfg, present=present if full else None, failed=failed)
         self._expire_queue(now)
         self._schedule(now, deadlines + self._waiting_deadlines(),
                        waiting=bool(self.waiting) or self._today_wait is not None)
@@ -1192,7 +1231,8 @@ class CardJudge:
         """The Today card's lines: up to :data:`TODAY_LINES` from the queue by rank (prior x confidence), at most
         :data:`TODAY_ASKING` of them asking, plus one weekly probe line of a type the ledger turned off."""
         ranked = sorted((c for c, _first in self.queue.values()
-                         if (c.expires_at is None or c.expires_at > now) and c.digest_line is not None),
+                         if (c.expires_at is None or c.expires_at > now) and c.digest_line is not None
+                         and type_on(c.type, cfg) and self.ledger.mode(c.type) != "off"),   # B3, §4.8: the switch now
                         key=lambda c: (-self.ledger.prior(c.type) * c.confidence, c.created_at))
         out: list[Candidate] = []
         asking = 0
@@ -1360,12 +1400,25 @@ class CardJudge:
             self.book.bump(now, cfg, "dropped", c.type)
             self._log("judge_decision", decision="dropped", reason=reason, **c.fields())
         self.waiting.pop(c.key, None)
+        self.queue.pop(c.key, None)   # toggled off or lowered to off after it was queued: no Today or away line
 
-    def _expire_waiting(self, now: float, cfg: Any, present: set[str] | None) -> None:
+    def _prune_queue(self, now: float, *, keep: set[str], present: set[str], failed: set[str]) -> None:
+        """Queued items this full evaluation did not queue again leave the queue (content-free log, not counted),
+        except those whose generator failed this time."""
+        for key, (c, _first) in list(self.queue.items()):
+            if key in keep or _generator_of(c.type) in failed:
+                continue
+            self.queue.pop(key, None)
+            self._log("judge_decision", decision="unqueued", reason="gone" if key not in present else "moved",
+                      **c.fields())
+
+    def _expire_waiting(self, now: float, cfg: Any, present: set[str] | None, failed: Set[str] = frozenset()
+                        ) -> None:
         """A waiting candidate gone from the pile (or past its expiry while held) is let go; a time-bound one that
-        expired before a good moment is logged as dropped (§4.5)."""
+        expired before a good moment is logged as dropped (§4.5). ``present`` None: the pile wasn't complete (a hold,
+        or a restricted run); a type whose generator failed this time isn't "gone" either."""
         for key, (t, first, expires, reason, time_bound) in list(self.waiting.items()):
-            gone = present is not None and key not in present
+            gone = present is not None and key not in present and _generator_of(t) not in failed
             past = expires is not None and expires <= now
             if not (gone or past):
                 continue

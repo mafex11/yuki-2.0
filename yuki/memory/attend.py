@@ -271,6 +271,8 @@ def common_hold(you: Any, now: float, sw: Switches, config: Any, *, routine: boo
             return None
         if exempt.reason != "H3:call_unknown":
             return exempt   # past the call hold, another hold still holds every class
+        # still held: look again when the 10 minutes pass (no YouNow hold changes then, so nothing else wakes us)
+        return Decision(False, d.reason, exempt.retry_at)
     if routine and d.reason in ("H4:meeting", "H6:settling"):
         return None
     return d
