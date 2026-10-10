@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -168,6 +169,9 @@ class Job:
     #: then nothing more is said until its outcome (v3.10, "acknowledge once, then stay quiet until the outcome").
     acked: bool = False
     wait_handle: Any = None
+    #: bTalk review r1 M1: seen running on the new brain (the runtime lane's driving agent was the Brain while it ran
+    #: this job): only then are its words code's own line, said word for word with the honesty gate off.
+    brain_run: bool = False
 
     @property
     def unadopted(self) -> bool:
@@ -952,7 +956,7 @@ class VoiceBridge(QObject):
                 # alone is ~1.6 s), no rewording. Longer results, questions, failures, late outcomes and "nothing was
                 # done" still go to the talker, which says them once, merged with whatever it is saying. The narrator
                 # releases a final with only a short gap, the moment the user may be spoken to.
-                held = self._held_verdict(job, kind)   # honest (87): below likely, never said as written
+                held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
                 head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
@@ -1777,6 +1781,7 @@ class VoiceBridge(QObject):
     def _on_started(self, lane: str, job_id: int, request: str) -> None:
         job = self._job(job_id) or self._typed(lane, job_id, request)
         job.lane, job.state = lane, RUNNING
+        self._note_runner(job, lane)
         if job.log is not None:
             job.log.add("started", f"on the {lane.replace('_', ' ')}")
         steers, job.pending_steers = job.pending_steers, []
@@ -1883,6 +1888,7 @@ class VoiceBridge(QObject):
             self.closed_at = time.monotonic()   # v3.17: the talker gets its guidance on getting a closed tab back
         if job is None:
             return
+        self._note_runner(job, lane)
         if name == "tasks" and isinstance((tool_input or {}).get("items"), list):
             # N10: the kept list rides on the thinker line (what is left), so an interjection never loses it
             job.tasks = [dict(i) for i in tool_input["items"] if isinstance(i, dict)][:12]
@@ -1966,6 +1972,7 @@ class VoiceBridge(QObject):
         job = self._job(job_id)
         if job is None or not isinstance(verdict, dict):
             return
+        self._note_runner(job, lane)
         job.verdict = dict(verdict)
         if job.log is not None and verdict.get("label"):
             job.log.add("checked", f"{verdict.get('label')}: {verdict.get('seen') or ''}".rstrip(": "))
@@ -1981,12 +1988,17 @@ class VoiceBridge(QObject):
         self._log("bridge", op="outcome", job_id=job_id, level=verdict.get("level"), acted=verdict.get("acted"),
                   send=verdict.get("send"))
 
-    def _held_verdict(self, job: Job, kind: str) -> dict[str, Any] | None:
-        """honest (87): the verdict of a done whose words may not be said as written (below likely), else ``None``."""
+    def _held_verdict(self, job: Job, kind: str, text: str | None = None) -> dict[str, Any] | None:
+        """honest (87): the verdict of a done whose words may not be said as written (below likely), else ``None``.
+
+        bTalk (review r1 M1): under ``brain = "all"`` the gate is off only for words that are code's own line: a job
+        seen running on the new brain (its words after an act are the probe's line, never a claim), or words that are
+        the outcome's own ``line`` word for word. The old loop serving voice (before the runtime patch, or its
+        fallback) keeps the gate: its closing words are the model's."""
         from yuki.agent.finish import sayable
 
-        if self.on_brain:
-            return None   # bTalk: the new brain's words after an act are code's line from the probe, never a claim
+        if self.on_brain and (job.brain_run or verdict_line(job.verdict, text)):
+            return None
         if kind != "done" or sayable(job.verdict):
             return None
         return job.verdict
@@ -1997,7 +2009,7 @@ class VoiceBridge(QObject):
         never the thinker's claim (honest, report 87)."""
         from yuki.agent.finish import LINE_NOT_CHECKED, LINE_NOTHING_DONE
 
-        held = self._held_verdict(job, kind)
+        held = self._held_verdict(job, kind, head)
         line = " ".join(str((held or {}).get("line") or "").split())
         if held is None or not line:
             return head
@@ -2046,6 +2058,7 @@ class VoiceBridge(QObject):
             job = self._jobs.pop(origin_id, None)
             if job is not None:
                 job.job_id, job.lane, job.state, job.closing, job.step = new_id, "worker", QUEUED, None, None
+                job.brain_run = False   # a new run: who drives it is seen again
                 self._jobs[new_id] = job
         if job is None:
             return
@@ -2067,6 +2080,7 @@ class VoiceBridge(QObject):
             job = self._jobs.pop(origin_id, None)
             if job is not None:
                 job.job_id, job.state, job.question, job.closing = new_id, QUEUED, None, None
+                job.brain_run = False   # a new run: who drives it is seen again
                 self._jobs[new_id] = job
         if job is not None:
             self._log("bridge", op="resumed", job_id=origin_id, new_id=new_id)
@@ -2193,7 +2207,7 @@ class VoiceBridge(QObject):
         job's record and the text's own punctuation and machine formats, never what the words mean.
         """
         if self.on_brain and self._results_by_code and kind == "done" and not job.remember and not job.superseded \
-                and code_line(job.verdict):
+                and ((job.brain_run and code_line(job.verdict)) or verdict_line(job.verdict, f"{head} {rest}")):
             # bTalk (design 3, "narrator re-voice off for code lines"): the brain's line after an act, or its own code
             # line, is voice-shaped and says no more than the check saw: said by code word for word, late or not
             text = " ".join((head or "").split())
@@ -2530,7 +2544,7 @@ class VoiceBridge(QObject):
                 # Like a tell_yuki call's own result: a short or verified one said by code (C1, v3.17), anything else
                 # by the talker, once.
                 late = self._moved_on(job)
-                held = self._held_verdict(job, kind)   # honest (87): below likely, never said as written
+                held = self._held_verdict(job, kind, payload)   # honest (87): below likely, never said as written
                 verified = bool(kind == "done" and job.finished_by_action
                                 and payload.strip() == job.finished_by_action) and held is None
                 head, rest = condense(payload, max_sentences=self._max_sentences, max_chars=self._max_chars)
@@ -2677,7 +2691,8 @@ class VoiceBridge(QObject):
             # Started on the block's first bytes as a new task, but it adds to an open task, or it is something to
             # keep (that goes with its own labelled note, never a note steered in as their words): void
             dropped = early
-            self._gui(lambda: self._cancel(dropped))
+            # review r1 L2: a quiet end ("replaced"), never "Stopped" by the user for a request they never saw
+            self._gui(lambda: self._withdraw(dropped, words=request))
             self._drop_items(dropped)
             self._log("bridge", op="early_dropped", why="remember" if remember else "follow_up", call=params.tool_call_id)
             early = None
@@ -2832,6 +2847,26 @@ class VoiceBridge(QObject):
         asyncio.ensure_future(self._relay_detached(job))
         return True
 
+    def _note_runner(self, job: Job, lane: str) -> None:
+        """bTalk (review r1 M1): mark ``job`` as running on the new brain when the runtime's lane is driving it with a
+        :class:`yuki.brain.Brain` now (its ``active`` agent, read before its ``current_id``, so a run that changed in
+        between is never taken for this one). Called from the job's own signals while it runs; a run seen by none of
+        them stays unmarked, and its words keep the old rules (the honesty gate on). Identity of objects only."""
+        if not self.on_brain or job.brain_run or job.job_id is None:
+            return
+        try:
+            get = getattr(self.runtime, "lane", None)
+            obj = get(lane) if callable(get) else getattr(self.runtime, str(lane), None)
+            agent = getattr(obj, "active", None)
+            if agent is None or getattr(obj, "current_id", None) != job.job_id:
+                return
+            # no Brain was ever made when its module is not loaded (never imported here, on the GUI thread)
+            brain = getattr(sys.modules.get("yuki.brain"), "Brain", None)
+            if isinstance(brain, type) and isinstance(agent, brain):
+                job.brain_run = True
+        except Exception:  # noqa: BLE001 - unknown: unmarked
+            return
+
     def _lane_brain(self, name: str = "worker") -> Any:
         """The new brain of the runtime's lane ``name`` (the runtime's ``Lane.brain()``, made there on first use under
         ``brain = typed / all``), or ``None`` (no such lane, an older runtime, or none can be made). Blocking on its
@@ -2966,6 +3001,15 @@ def code_line(verdict: dict[str, Any] | None) -> bool:
         return False
     level = str(verdict.get("level") or "")
     return level not in ("", "answer") or bool(str(verdict.get("line") or "").strip())
+
+
+def verdict_line(verdict: dict[str, Any] | None, text: str | None) -> bool:
+    """bTalk (review r1 M1): whether ``text`` is the outcome's own code ``line``, word for word (whitespace aside):
+    code's sentence in either brain, never a model's claim. String identity only."""
+    if not isinstance(verdict, dict) or text is None:
+        return False
+    line = " ".join(str(verdict.get("line") or "").split())
+    return bool(line) and " ".join(str(text).split()) == line
 
 
 def _message_text(message: Any) -> str:

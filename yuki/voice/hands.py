@@ -131,6 +131,17 @@ _FAILED_NOTE = (
     "with the user's request as they asked it and this report as context. If the report says why nothing "
     "more can happen (already at the end), say that and stop."
 )
+#: bTalk review r1 L1: the lean talker's versions (``brain = "all"``): its one hand-off is ``hand_over``, which takes
+#: no request, screen or context (their exact words go by code).
+_UNCONFIRMED_NOTE_LEAN = (
+    "The report does not show that it took effect. Say so honestly in a few words from the report, never that it is "
+    "done. If the report says why nothing more can happen (already at the end, already showing), say that and stop. "
+    "Otherwise call hand_over in this same reply, intent new_task, with those few words as its say_first."
+)
+_FAILED_NOTE_LEAN = (
+    "It did not work. If the report says why nothing more can happen (already at the end), say that and stop. "
+    "Otherwise call hand_over in this same reply, intent new_task, saying so in a few words as its say_first."
+)
 #: N1 (report 47): a level asked to move that cannot (already at its top or bottom, or already there). Live 3 Oct
 #: "increase the Spotify volume" at 100% was said as "Turned it up" twice while nothing changed.
 _NOOP_NOTE = (
@@ -181,6 +192,10 @@ _KEYS_NOTE = (
     "more than it shows. If it shows the keys did nothing they wanted, say so and hand it to the thinker "
     "with tell_yuki (their request, and this report as context)."
 )
+_KEYS_NOTE_LEAN = (
+    "The keys went out; this is what the report saw. Say in a few words what it shows happened, never more than it "
+    "shows. If it shows the keys did nothing they wanted, call hand_over, intent new_task, saying so as its say_first."
+)
 #: Every hand's done line: said the moment its report verifies the step, with no second model call. v3.14b: the
 #: schemas are the hands' contracts only; when to leave it empty and every worked example are in the prompt's "# Your
 #: hands" (the same words in nine schemas were ~1.3k tokens of the talker's prefix, measured +250-300 ms of first token
@@ -215,6 +230,13 @@ _THEN_NOTE = (
     "otherwise hand it to the thinker now with tell_yuki (screen true, that part as they said it, and in context what "
     "you opened and what the block shows now for it, or that it shows nothing for it). Never say again that it is "
     "open, never say it is done before a hand verified it."
+)
+_THEN_NOTE_LEAN = (
+    "It is open, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your desktop block "
+    "now shows the screen as it is: when one of your hands does that on what it shows (an item of a popup or of the "
+    "window in front, a tab, a learned way's remaining steps), do it now, alone, with say_when_done for the whole; "
+    "otherwise call hand_over now, intent new_task (their words go with it by code). Never say again that it is open, "
+    "never say it is done before a hand verified it."
 )
 #: After an opening with a rest, the screen is read again once it has settled: its windows, the window in front and
 #: the popups unchanged for SETTLE_QUIET_S, at most SETTLE_MAX_S (a launch is verified once its window takes input; a
@@ -819,6 +841,9 @@ class Hands:
         #: a later click there is told that Yuki's text waits, so a send control is judged as the send it would be.
         self._commit_check: Any = None
         self._typed_waiting: dict[int, float] = {}
+        #: Review r1 H1.3 (decision 7): ``(thread, app id, skill)`` while a voice capability whose join the consent
+        #: rule allowed on plain words runs: its own steps in its app pass row 3 (:meth:`_join_granted`).
+        self._join_grant: tuple[int, str, str] | None = None
         # -- Phase S: the skill path (yuki.skills; PLAN.md Phase S, map-skills S3.4) --------------------------------
         #: The keys of this conversation's Skills menu, set by the conversation with its tools (empty: the skill path
         #: is off, and run_skill is the old learned-way hand).
@@ -843,6 +868,7 @@ class Hands:
         self.halted = None
         self._forced_memo = {}
         self._commit_check = None   # bTalk: a user turn is one request for the commit check too
+        self._join_grant = None
         judge = self._authorizer
         if judge:
             try:
@@ -897,7 +923,7 @@ class Hands:
         ``handover`` and goes to the planner (:meth:`_held_refusal`), never refused silently. The same swap covers the
         hands, voice skill sends and rung B (``uia_route`` calls this)."""
         if self._on_brain():
-            return self._consent(tool, tool_input, target, earlier)
+            return self._consent(tool, tool_input, target, earlier, force=force)
         judge = self._judge()
         if judge is None:
             return None
@@ -921,6 +947,14 @@ class Hands:
     def _on_brain(self) -> bool:
         """Whether spoken requests run on the new brain (``brain = "all"``, the bridge's ``on_brain``)."""
         return bool(getattr(self.bridge, "on_brain", False))
+
+    def _lean(self) -> bool:
+        """Whether the talker is the lean one (its one hand-off is ``hand_over``; the bridge's ``_lean``)."""
+        return bool(getattr(self.bridge, "_lean", False))
+
+    def _note(self, full: str, lean: str) -> str:
+        """A tool result's note for the talker in use (review r1 L1): the lean one names ``hand_over`` alone."""
+        return lean if self._lean() else full
 
     def _check_log(self, event_type: str, **fields: Any) -> None:
         if self.log is not None:   # the commit check's own fields are content-free (counts, effects, ms)
@@ -947,10 +981,17 @@ class Hands:
     TYPED_WAIT_S = 600.0
 
     def _consent(self, tool: str, tool_input: dict[str, Any], target: dict[str, Any] | None,
-                 earlier: list[str] | None) -> Any:
+                 earlier: list[str] | None, *, force: bool = False) -> Any:
         """``yuki.brain.check.one`` over one hand (design 2.5, 2.6): the user's latest heard words (their own, never the
         talker's wording) and up to 3 earlier turns; the code facts of the target (window, app, title, the control's
-        role and name, Yuki's unsent text there). Fails closed: an error is an ask."""
+        role and name, Yuki's unsent text there). Fails closed: an error is an ask.
+
+        Review r1 H1: a caller that gives no ``role`` / ``name`` (rung B, the chat capability's join press) has them
+        read from the element words its own code built (``role "name"``, :func:`_element_parts`); a click the caller
+        marks ``force`` (its role is one that can send or delete) whose role is still unknown is judged as a committing
+        click. An allowed ``type_text`` marks its window as holding Yuki's unsent text, whoever typed (rung B types
+        through its own dispatcher). A declared join a voice capability was allowed on plain words (decision 7,
+        :meth:`_judge_skill`) lets that capability's own steps in its app through row 3, in that run only."""
         try:
             from yuki.brain.check import one
         except Exception as exc:  # noqa: BLE001 - no brain in this build: held, never let through unchecked
@@ -960,6 +1001,12 @@ class Hands:
         words = recent[-1:]
         before = [*recent[-4:-1], *[" ".join(str(e).split()) for e in (earlier or []) if str(e).strip()]][-3:]
         facts = dict(target or {})
+        if not facts.get("role") and not facts.get("name") and not facts.get("element_name"):
+            role, name = _element_parts(facts.get("element"))
+            if role or name:
+                facts.update(role=role, name=name)
+        if tool == "click" and force and not facts.get("role"):
+            facts["role"] = "Button"   # the caller's own signal: a role that can send, delete or buy
         raw = facts.get("hwnd")
         hwnd = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
         facts["hwnd"] = hwnd
@@ -973,11 +1020,40 @@ class Hands:
         except Exception as exc:  # noqa: BLE001 - fail closed
             verdict = SimpleNamespace(allowed=False, decision="ask_user", question="", source="error", handover=False,
                                       act_off="", row=0, why=f"the check could not run ({type(exc).__name__})")
+        granted = False
+        if not getattr(verdict, "allowed", False) and getattr(verdict, "row", None) == 3 \
+                and self._join_granted(tool, tool_input, facts):
+            granted = True
+            verdict = SimpleNamespace(allowed=True, decision="allow", question="", source="row3", handover=False,
+                                      act_off="", row=3, why="join_words")
+        if tool == "type_text" and hwnd is not None and getattr(verdict, "allowed", False):
+            self._typed_waiting[hwnd] = time.monotonic()   # Yuki's words will wait there, unsent
         if self.log is not None:
             self.log.event("consent", who="voice_hand", tool=tool, allowed=bool(getattr(verdict, "allowed", False)),
                            row=getattr(verdict, "row", None), source=getattr(verdict, "source", None),
-                           handover=bool(getattr(verdict, "handover", False)), typed=bool(facts.get("typed_pending")))
+                           handover=bool(getattr(verdict, "handover", False)), typed=bool(facts.get("typed_pending")),
+                           role_read=bool(facts.get("role")), join_grant=granted)
         return verdict
+
+    def _join_granted(self, tool: str, tool_input: dict[str, Any], facts: dict[str, Any]) -> bool:
+        """Decision 7 carried into a capability's own steps (review r1 H1.3): this thread is running the voice
+        capability whose join the consent rule allowed on the user's plain words (row 3, ``join_words``) this turn, the
+        step is in that capability's app, and it is no sure send (typed with Enter, a click while Yuki's text waits on a
+        control that is not a button). Rows 1-2 (a game in front, the Act switch) were applied already: only a row-3
+        refusal comes here. App identity and tool metadata only."""
+        grant = self._join_grant
+        if not grant or grant[0] != threading.get_ident() or tool == SKILL_HAND:
+            return False
+        if not facts.get("app") or _app_id(facts.get("app")) != grant[1]:
+            return False
+        try:
+            from yuki.agent.tools import call_traits, sends_for_certain
+
+            traits = call_traits(tool, dict(tool_input or {}), role=str(facts.get("role") or "") or None,
+                                 typed_pending=bool(facts.get("typed_pending")))
+            return not sends_for_certain(traits)
+        except Exception:  # noqa: BLE001 - unsure: not granted (the planner takes it)
+            return False
 
     def _held_refusal(self, verdict: Any) -> "_Refused":
         """The refusal for a call the check did not let through. Under ``brain = "all"``: a step that would send or join
@@ -1542,7 +1618,8 @@ class Hands:
                 self.log.event("hands", op="open_settle", hand=name, rest_chars=len(rest), call=params.tool_call_id,
                                **settle)
             await params.result_callback({"done": report[:700], "then": rest[:200],
-                                          "how_to_handle_it": _THEN_NOTE.format(rest=rest[:200])})
+                                          "how_to_handle_it": self._note(_THEN_NOTE, _THEN_NOTE_LEAN).format(
+                                              rest=rest[:200])})
             return
         if confirmed and not line:
             from pipecat.frames.frames import FunctionCallResultProperties
@@ -1580,11 +1657,11 @@ class Hands:
             await params.result_callback({"no_change": report[:700], "how_to_say_it": _NOOP_NOTE})
             return
         if name == "press_keys" and ok:
-            note, key = _KEYS_NOTE, "report"
+            note, key = self._note(_KEYS_NOTE, _KEYS_NOTE_LEAN), "report"
         elif ok:
-            note, key = _UNCONFIRMED_NOTE, "not_verified"
+            note, key = self._note(_UNCONFIRMED_NOTE, _UNCONFIRMED_NOTE_LEAN), "not_verified"
         else:
-            note, key = _FAILED_NOTE, "failed"
+            note, key = self._note(_FAILED_NOTE, _FAILED_NOTE_LEAN), "failed"
         if ((((name in INSTANT_HANDS or name == SKILL_HAND) and not facts.get("refused")) or facts.get("stale")
              or facts.get("handover"))
                 and not facts.get("settled")
@@ -2124,7 +2201,8 @@ class Hands:
             await params.result_callback({"held": report[:700],
                                           "how_to_handle_it": _JUDGE_HELD_NOTE.format(question=question)})
             return
-        note = _FAILED_NOTE if not ok else _UNCONFIRMED_NOTE
+        note = self._note(_FAILED_NOTE, _FAILED_NOTE_LEAN) if not ok else self._note(_UNCONFIRMED_NOTE,
+                                                                                      _UNCONFIRMED_NOTE_LEAN)
         await params.result_callback({"failed" if not ok else "not_verified": report[:700], "how_to_say_it": note})
 
     def _skill_request_id(self) -> str | None:
@@ -2202,6 +2280,7 @@ class Hands:
         thinker's send (a join is judged even where the policy would let it through); held, nothing runs (raises
         :class:`_Refused` with ``held``). Any other skill is not judged here (its routes are the user's own usual ways).
         Data only, never the words."""
+        self._join_grant = None   # a grant is this skill's own, never one left by an earlier run
         try:
             from yuki.skills.catalog import load
             from yuki.skills.connection import sends_with
@@ -2213,10 +2292,21 @@ class Hands:
             return
         if not (sends or joins):
             return
+        if sends and self._on_brain():
+            # review r1 L3: with no plan nothing declares the send, so the consent rule's row 4 always refuses it
+            # (rows 1-2 do not apply to run_skill): handed to the planner at once, with no commit check to wait for
+            if self.log is not None:
+                self.log.event("consent", who="voice_hand", tool=SKILL_HAND, allowed=False, row=4,
+                               source="skill_send", handover=True, typed=False, role_read=False, join_grant=False)
+            raise self._held_refusal(SimpleNamespace(allowed=False, handover=True, why="a send no plan declared",
+                                                     question="", act_off="", row=4))
         verdict = self.authorize(SKILL_HAND, {"skill": skill_key, "slots": dict(slots)}, {"app": skill.app},
                                  force=joins and not sends)
         if verdict is not None and not getattr(verdict, "allowed", False):
             raise self._held_refusal(verdict)
+        if joins and self._on_brain() and verdict is not None and getattr(verdict, "row", None) == 3:
+            # decision 7: the join was allowed on their plain words; this run's own steps in its app pass row 3
+            self._join_grant = (threading.get_ident(), _app_id(skill.app), skill_key)
 
     def _skill_hand(self, args: dict[str, Any], hand_id: str | None = None,
                     turn: str | None = None) -> tuple[bool, str, dict[str, Any]]:
@@ -2282,6 +2372,7 @@ class Hands:
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
                                             game_answer=ctx.game_now())
         finally:
+            self._join_grant = None   # review r1 H1.3: decision 7's grant lasts this run only
             if marker["token"] is not None:
                 try:
                     memory.acting_end(marker["token"])
@@ -2501,10 +2592,18 @@ class Hands:
             return
         busy = self.bridge.desk_job() if self.bridge is not None and hasattr(self.bridge, "desk_job") else None
         if busy:
+            if self._lean():   # bTalk review r1 L1: the lean talker's one hand-off
+                raise _Refused(f"Yuki is working on the desktop right now ({busy}); two hands at once would collide, "
+                               f"so nothing was done. Tell the user it will be done after that, or pass it to the "
+                               f"running task with hand_over intent follow_up")
             raise _Refused(f"the thinker is working on the desktop right now ({busy}); two hands at once would "
                            f"collide, so nothing was done. Tell the user it will be done after that, or pass it to "
                            f"the running task with tell_yuki intent follow_up")
         if self.halted:
+            if self._lean():
+                raise _Refused(f"your last hand did not show the effect it was for ({self.halted}); your hands stay "
+                               f"still until the user speaks again. Nothing was done. Tell them in a few words what "
+                               f"the report showed, or call hand_over; never repeat it blindly")
             raise _Refused(f"your last hand did not show the effect it was for ({self.halted}); your hands stay "
                            f"still until the user speaks again. Nothing was done. Tell them in a few words what the "
                            f"report showed, or hand it to the thinker with the state; never repeat it blindly")
@@ -3664,6 +3763,31 @@ def _what(name: str, args: dict[str, Any]) -> str:
         if args.get(key) not in (None, "", []):
             parts.append(f"{key}={args[key]}")
     return " ".join(str(p) for p in parts)
+
+
+#: The role words Yuki's own code writes when a control's role is not known (``control "x"``, ``field "x"``,
+#: ``item "x"``): no role.
+_NO_ROLE = frozenset({"control", "field", "item"})
+
+
+def _element_parts(element: Any) -> tuple[str, str]:
+    """``(role, name)`` of a control from the element words Yuki's own code builds for the check (``role "name"``, as
+    the hands, rung B and the chat capability write them; a pick's ``role "name" in the list`` too), else ``("", "")``.
+    Plumbing of Yuki's own format (review r1 H1), never a reading of what the words mean."""
+    text = " ".join(str(element or "").split())
+    head, sep, rest = text.partition(' "')
+    if not sep or '"' not in rest or " " in head.strip():
+        return "", ""
+    role = head.strip()
+    name = rest[:rest.rindex('"')].strip()
+    return ("" if role.casefold() in _NO_ROLE else role), name
+
+
+def _app_id(app: Any) -> str:
+    """An app's identity for comparing a capability's app with a window's process, as memory's ``app_key`` forms it
+    (stripped, casefolded, no ``.exe``: ``Discord.exe`` and ``discord`` are one app); ``""`` for none."""
+    key = str(app or "").strip().casefold()
+    return key[:-4].rstrip() if key.endswith(".exe") else key
 
 
 def _takes_kw(fn: Any, name: str) -> bool:
