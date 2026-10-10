@@ -190,6 +190,7 @@ class FakeDesk:
         self.on_open: Callable[[str], None] | None = None
         self.on_media: Callable[[str], None] | None = None
         self.ignore_when: Callable[[], bool] = lambda: False
+        self.launch_timeouts: list[float] = []
 
     # reads
     def window(self) -> Any:
@@ -257,6 +258,9 @@ class FakeDesk:
         before = self.mixer[app]
         new = before if level is None and change is None else max(0.0, min(100.0, level if level is not None
                                                                            else before + change))
+        if (level is not None or change is not None) and mute is None and abs(new - before) <= 0.6:
+            # set_app_volume's N1: a level that can't move is reported as a no-op, nothing set
+            return _Result(True, {"verified": True, "noop": True, "before": before, "after": before})
         self.mixer[app] = new
         return _Result(True, {"verified": True, "before": before, "after": new})
 
@@ -310,10 +314,11 @@ class FakeDesk:
             self.on_open(uri)
         return _Result(True, {"via": "startfile"})
 
-    def launch(self, args: list[str]) -> Any:
+    def launch(self, args: list[str], timeout_s: float = 8.0) -> Any:
         if (no := self._refused("launch")) is not None:
             return no
         self.launched.append(list(args))
+        self.launch_timeouts.append(float(timeout_s))
         return _Result(True, {})
 
 
@@ -718,8 +723,9 @@ def test_spotify_not_running_is_launched_only_with_no_game_in_front(client, load
     desk = FakeDesk(None)
     w = Window()
 
-    def launched(args: list[str]) -> Any:
+    def launched(args: list[str], timeout_s: float = 8.0) -> Any:
         desk.launched.append(list(args))
+        desk.launch_timeouts.append(timeout_s)
         desk.w = w
         return _Result(True, {})
 
@@ -1168,3 +1174,249 @@ def test_d18_the_run_names_the_app_it_acts_on_from_its_start(loaded) -> None:
         assert E._first_app(plan.skill, plan.routes, plan.values) == want
     plan = resolve("spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"], loaded=loaded, live=Live())
     assert E._first_app(plan.skill, plan.routes, plan.values) == "spotify"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Review round 1
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def test_r1_m1_closed_to_the_tray_with_the_phone_playing_is_another_device_before_anything(client, loaded,
+                                                                                          monkeypatch) -> None:
+    """Spotify has no window (closed to the tray) and its session reports the phone's playback: "another device",
+    with 0 presses, 0 opens and 0 launches, for a playlist (with and without a learned link) and for Spotify's
+    volume (review r1 M1, B.2 M2, Q11)."""
+    w = Window()
+    desk = FakeDesk(None, status="playing", audio=False)
+
+    def launched(args: list[str], timeout_s: float = 8.0) -> Any:
+        desk.launched.append(list(args))
+        desk.w = w
+        return _Result(True, {})
+
+    desk.launch = launched                              # type: ignore[method-assign]
+    playing_after_press(desk, w, audio=False)
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"],
+              monkeypatch=monkeypatch)
+    assert res.outcome == "other_device" and res.say == S.LINE_OTHER and not res.done
+    assert desk.pressed == [] and desk.opened == [] and desk.launched == [] and desk.media_calls == []
+    # with a learned link: never opened
+    _learn_link(client, "Paper Comets")
+    desk2 = FakeDesk(None, status="playing", audio=False)
+    desk2.on_open = lambda u: setattr(desk2, "w", Window(home_cards=(), page=("Paper Comets", "play")))
+    res2 = run(client, loaded, desk2, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+               monkeypatch=monkeypatch)
+    assert res2.outcome == "other_device" and desk2.opened == [] and desk2.pressed == [] and desk2.launched == []
+    # Spotify's volume: "another device", never a hand-off, nothing set
+    desk3 = FakeDesk(None, status="playing", audio=False)
+    res3 = run(client, loaded, desk3, "volume", {"target": "Spotify", "change": "down"}, ["Spotify down"],
+               monkeypatch=monkeypatch)
+    assert res3.outcome == "other_device" and res3.say == S.LINE_OTHER_VOLUME
+    assert desk3.sets == [] and desk3.volumes == [] and desk3.hotkeys == [] and desk3.focused == []
+    # never counted against a rung
+    for key in ("spotify.playlist", "volume"):
+        assert all(t.failed == 0 and t.streak == 0 for t in R.trust(client.store, key).values())
+
+
+def test_r1_m1_a_spotify_started_by_the_run_is_checked_again_before_its_press(client, loaded, monkeypatch) -> None:
+    """Not running (no session) before; once the launch or the learned link starts it, its session reports the
+    phone's playback with no sound here: "another device", nothing pressed (review r1 M1)."""
+    w = Window()
+    desk = FakeDesk(None, status="none", audio=False)
+
+    def launched(args: list[str], timeout_s: float = 8.0) -> Any:
+        desk.launched.append(list(args))
+        desk.launch_timeouts.append(timeout_s)
+        desk.w, desk.status = w, "playing"             # the phone was playing all along
+        return _Result(True, {})
+
+    desk.launch = launched                              # type: ignore[method-assign]
+    playing_after_press(desk, w, audio=False)
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"],
+              monkeypatch=monkeypatch)
+    assert desk.launched == [["--minimized"]] and res.outcome == "other_device" and desk.pressed == []
+    assert desk.launch_timeouts and 0 < desk.launch_timeouts[0] <= E.BUDGET_S      # bounded by the time left (L4)
+    uri = _learn_link(client, "Paper Comets")
+    page = Window(home_cards=(), page=("Paper Comets", "play"))
+    desk2 = FakeDesk(None, status="none", audio=False)
+
+    def opened(u: str) -> None:
+        desk2.w, desk2.status = page, "playing"
+
+    desk2.on_open = opened
+    playing_after_press(desk2, page, audio=False)
+    res2 = run(client, loaded, desk2, "spotify.playlist", {"playlist": "Paper Comets"}, ["play Paper Comets"],
+               monkeypatch=monkeypatch)
+    assert desk2.opened == [uri] and desk2.pressed == [] and res2.outcome == "other_device"
+
+
+def _minimised_ignoring(w: Window, *, lands_after_reads: int | None = None) -> FakeDesk:
+    """Spotify minimised: a no-focus Invoke is ignored (or, with ``lands_after_reads``, lands that many reads later);
+    once restored to the front a press lands at once."""
+    desk = FakeDesk(w, state="minimised")
+    pending: dict[str, Any] = {"node": None, "reads": 0}
+
+    def flip(node: Node) -> None:
+        node.name = "Pause " + node.name[len("Play "):]
+        desk.status, desk.audio = "playing", True
+
+    def hook(pattern: str, node: Node, value: Any) -> None:
+        if pattern != "invoke" or not node.name.startswith("Play "):
+            return
+        if desk.state_ == "front":
+            flip(node)
+        elif lands_after_reads is not None:
+            pending["node"] = node
+
+    real_uia = desk.uia
+
+    def uia(job: Any, budget_s: float) -> Any:
+        if pending["node"] is not None:
+            pending["reads"] += 1
+            if pending["reads"] >= int(lands_after_reads or 0):
+                flip(pending["node"])
+                pending["node"] = None
+        return real_uia(job, budget_s)
+
+    desk.on_press = hook
+    desk.uia = uia                                      # type: ignore[method-assign]
+    return desk
+
+
+def test_r1_m2_an_ignored_no_focus_press_is_not_taken_and_never_disables_the_library_rung(client, loaded,
+                                                                                        monkeypatch) -> None:
+    """Two plays with Spotify minimised where the no-focus Invoke is ignored: each time the row is re-read (bounded),
+    the press counts as not taken, restore plays it, and the Library rung isn't charged; a later play with Spotify in
+    front still uses the Library rung (review r1 M2)."""
+    for _ in range(2):
+        w = Window()
+        desk = _minimised_ignoring(w)
+        S.forget_warm()
+        res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"],
+                  monkeypatch=monkeypatch)
+        assert res.done and res.route == "A:restore:driver"
+        assert res.tried[0]["route"] == "A:library:driver" and res.tried[0]["outcome"] == "not_taken"
+        assert desk.focused == [HWND, PREV]
+        assert res.clock.t - 1000.0 <= E.BUDGET_S + 4.0                       # the flip wait is bounded
+    lib = R.trust(client.store, "spotify.playlist")["A:library:driver"]
+    assert lib.failed == 0 and lib.streak == 0 and lib.disabled_at is None
+    w = Window()
+    desk = FakeDesk(w, state="front")
+    playing_after_press(desk, w)
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"],
+              monkeypatch=monkeypatch)
+    assert res.done and res.route == "A:library:driver" and len(desk.pressed) == 1
+
+
+def test_r1_m2_a_no_focus_press_that_flips_within_the_wait_is_the_library_rungs_done(client, loaded,
+                                                                                   monkeypatch) -> None:
+    w = Window()
+    desk = _minimised_ignoring(w, lands_after_reads=2)
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Copper Kites"}, ["play Copper Kites"],
+              monkeypatch=monkeypatch)
+    assert res.done and res.route == "A:library:driver" and desk.focused == [] and len(desk.pressed) == 1
+
+
+def test_r1_l1_a_mixer_or_pc_level_that_cannot_move_is_said_as_a_no_op(client, loaded, monkeypatch) -> None:
+    desk = FakeDesk(Window())
+    desk.mixer["chrome"] = 100.0
+    res = run(client, loaded, desk, "volume", {"target": "Chrome", "change": 10}, ["Chrome louder"],
+              monkeypatch=monkeypatch)
+    assert res.outcome == "already" and res.done_line == "Chrome's volume is already at 100%."
+    row = rows_of(client, "volume")[-1]
+    assert row["outcome"] == "already" and row["checked"] is None
+    desk.master_now = 100.0
+    res2 = run(client, loaded, desk, "volume", {"target": "system", "change": 10}, ["the PC louder"],
+               monkeypatch=monkeypatch)
+    assert res2.outcome == "already" and res2.done_line == "The PC's volume is already at 100%."
+    assert desk.masters == []                                              # nothing set
+    desk.mixer["pythonw.exe"] = 0.0
+    res3 = run(client, loaded, desk, "volume", {"target": "own_voice", "change": -10}, ["your voice quieter"],
+               monkeypatch=monkeypatch)
+    assert res3.outcome == "already" and res3.done_line == "My voice is already at 0%."
+
+
+class _LateDesk(FakeDesk):
+    """A UIA job that overruns its budget in the middle of the Invoke: the caller stops waiting while the press is
+    still going (released by the test afterwards)."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        import threading
+
+        self.release = threading.Event()
+        self.started = threading.Event()
+
+    def uia(self, job: Callable[[Any, dict], None], budget_s: float) -> tuple[dict, bool]:
+        import threading
+
+        shared: dict = {}
+        t = threading.Thread(target=job, args=(FakeAutomation({HWND: self.w.root}), shared), daemon=True)
+        t.start()
+        self.started.wait(1.0)
+        t.join(0.05)
+        return shared, t.is_alive()
+
+    def press(self, ref: Any, pattern: str, value: Any = None) -> bool:
+        self.started.set()
+        self.release.wait(2.0)
+        return super().press(ref, pattern, value)
+
+
+def test_r1_l2_a_press_still_going_when_the_read_overran_is_ran_none_never_a_second_rung(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    desk = _LateDesk(Window())
+    look = S._look(desk, HWND, "Copper Kites", learned=None, press=True)
+    try:
+        assert look.status == "ok" and look.details.get("press_late") is True
+        monkeypatch.setattr(S, "DESK", desk)
+        call = SimpleNamespace(ctx=SimpleNamespace(memory=None, log=None))
+        got = S._after_look(call, look, "paused", STORE_ID, {})
+        assert got.ran is None and got.outcome == "press_late"
+    finally:
+        desk.release.set()
+    # a media "timeout" may have gone through too: ran None (the done-check decides)
+    stale = S.Look("ok", name="Velvet Harbour", state="pause", where="grid")
+    desk2 = FakeDesk(Window())
+    desk2.media = lambda verb, app_id, log=None: _Media("timeout")         # type: ignore[method-assign]
+    monkeypatch.setattr(S, "DESK", desk2)
+    got2 = S._after_look(SimpleNamespace(ctx=SimpleNamespace(memory=None, log=None)), stale, "paused", STORE_ID, {})
+    assert got2.ran is None
+
+
+def test_r1_l3_the_answer_to_the_two_rows_question_plays_the_row_it_names(client, loaded, monkeypatch) -> None:
+    w = Window(rows=[("Lantern Rain", "Tamsin Reyes", "play"), ("Lantern Rain", "Odile Fenn", "play")])
+    desk = FakeDesk(w)
+    playing_after_press(desk, w)
+    res = run(client, loaded, desk, "spotify.playlist", {"playlist": "Lantern Rain"}, ["play Lantern Rain"],
+              monkeypatch=monkeypatch)
+    assert res.outcome == "asked" and desk.pressed == []
+    answer = res.options[1]
+    res2 = run(client, loaded, desk, "spotify.playlist", {"playlist": answer}, [answer], monkeypatch=monkeypatch)
+    assert res2.done and res2.route == "A:library:driver"
+    assert [n for _p, n, _v in desk.pressed] == [w.row_buttons["Lantern Rain"][1]]
+    assert res2.done_line == "Playing Lantern Rain on Spotify."
+    # two rows with one owner too: no options offered (none could be acted on)
+    w3 = Window(rows=[("Lantern Rain", "Tamsin Reyes", "play"), ("Lantern Rain", "Tamsin Reyes", "play")])
+    res3 = run(client, loaded, FakeDesk(w3), "spotify.playlist", {"playlist": "Lantern Rain"}, ["play Lantern Rain"],
+               monkeypatch=monkeypatch)
+    assert res3.outcome == "asked" and res3.options == []
+
+
+def test_r1_l4_spotifys_keys_stop_when_the_request_time_is_up(client, loaded, monkeypatch) -> None:
+    monkeypatch.setattr(S, "KEY_WAIT_S", 0.5)
+    desk = FakeDesk(Window(volume=0.10), state="front")
+    desk.ignore_when = lambda: True                    # the slider ignores RangeValue: the keys rung runs
+    res = run(client, loaded, desk, "volume", {"target": "Spotify", "level": 100}, ["Spotify to 100"],
+              monkeypatch=monkeypatch)
+    assert res.route == "A:spotify_keys:driver" and res.outcome == "unverified" and not res.done
+    assert 0 < len(desk.hotkeys) < S.KEYS_MAX and "ran out of time" in res.say
+    assert res.clock.t - 1000.0 <= E.BUDGET_S
+
+
+def test_r1_l4_a_slider_set_job_is_bounded_by_the_time_left() -> None:
+    desk = FakeDesk(Window(volume=0.42))
+    S._set_slider(desk, HWND, to=30.0, by=None, budget_s=0.4)
+    S._set_slider(desk, HWND, to=50.0, by=None, budget_s=30.0)
+    assert [b for c, *rest in desk.calls if c == "uia" for b in rest] == [S.SET_FLOOR_S, S.SET_S]
