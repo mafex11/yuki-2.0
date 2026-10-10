@@ -552,8 +552,8 @@ plainly worded, or no line fits: the thinker, as before.
 #: Every volume request is the volume skill (map-skills S5): the talker's mixer hand and volume keys are off.
 VOLUME_PARAGRAPH = """\
 Every volume request is run_skill volume (the whole PC, an app's own, Spotify's slider, your own voice): the app they \
-named as target, the change (a number, up or down) or the level; code picks their usual control, says which, and asks \
-when the app is unclear. Fine with a game in front.
+named as target, the change (a number, up or down), the level, or mute (on or off); code picks their usual control, \
+says which, and asks when the app is unclear. Fine with a game in front.
 
 """
 
@@ -1527,12 +1527,14 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
             personality = _cut(section, PERSONALITY_CHARS)
             portrait = f"{portrait}\n\n{personality}".strip()
     skills_on = True
+    menu_chars: int | None = None
     try:
         from yuki.config import Settings
 
         settings = Settings()
         names = list(settings.user_names)
         skills_on = bool(getattr(settings, "skills", True))
+        menu_chars = getattr(settings, "skills_menu_chars", None)
     except Exception:  # noqa: BLE001
         names = []
     persona = getattr(ctx, "persona", None)
@@ -1547,18 +1549,20 @@ def fetch_memory(memory: Any, *, timeout_s: float = 3.0) -> MouthMemory:
         people=fetch_people(memory, timeout_s=min(timeout_s, 1.5)),
         brief=fetch_brief(memory, timeout_s=min(timeout_s, 1.5)),
         recent=fetch_recent(memory, timeout_s=min(timeout_s, RECENT_TIMEOUT_S)),
-        skills=fetch_skills(memory, timeout_s=min(timeout_s, 1.5)) if skills_on else None,
+        skills=fetch_skills(memory, timeout_s=min(timeout_s, 1.5), chars=menu_chars) if skills_on else None,
         source=ctx.source,
         error=ctx.error,
         elapsed_ms=ctx.elapsed_ms,
     )
 
 
-def fetch_skills(memory: Any, *, timeout_s: float = 1.5) -> str | None:
+def fetch_skills(memory: Any, *, timeout_s: float = 1.5, chars: int | None = None) -> str | None:
     """The talker's Skills menu (``MemoryClient.skill_menu("talker")``, Phase S), when memory has skills, else ``None``.
 
     Probed, never assumed: an older memory without it, a failure or an empty menu give ``None`` and the hands block stays
-    as before phase S. Cut to :data:`SKILLS_CHARS` at a line. Blocking; off the loop."""
+    as before phase S. Cut to ``chars`` (``Settings.skills_menu_chars``; default :data:`SKILLS_CHARS`) at a line.
+    Blocking; off the loop."""
+    cap = int(chars) if isinstance(chars, int) and not isinstance(chars, bool) and chars > 0 else SKILLS_CHARS
     call = getattr(memory, "call", None)
     if not callable(call):
         return None
@@ -1576,7 +1580,7 @@ def fetch_skills(memory: Any, *, timeout_s: float = 1.5) -> str | None:
     out: list[str] = []
     size = 0
     for line in got.strip().splitlines():
-        if size + len(line) + 1 > SKILLS_CHARS:
+        if size + len(line) + 1 > cap:
             break
         out.append(line)
         size += len(line) + 1

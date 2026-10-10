@@ -171,3 +171,57 @@ def test_the_conversation_builds_its_hands_from_the_menu(monkeypatch: pytest.Mon
     assert off.mouth_memory.skills is None            # the menu is dropped: the hands block as before phase S
     old = conv(Settings(skills=False, voice_practice=True, voice_skills=True), None)
     assert "run_skill" in [t["name"] for t in Conversation._talker_hand_tools(old)]   # the step-list hand, old path
+
+
+# -- review round 1 ------------------------------------------------------------------------------------------------------
+
+
+def test_a_sound_only_run_skill_is_never_held_on_unsure_words(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 L3: the volume skill (it replaced app_volume and the volume keys, which were never held) and a menu
+    skill whose every rung takes no focus run at once on unsure words; a skill with a focus rung, a skill not on the
+    menu and the old learned-way hand are held as before."""
+    from pathlib import Path
+
+    from yuki.skills import connection as C
+    from yuki.voice.pipeline import Conversation
+
+    monkeypatch.setattr(C, "CONNECTIONS_DIR", Path(__file__).with_name("skills_fixtures"))
+    C.clear_cache()
+    try:
+        c = SimpleNamespace(_skill_keys=lambda: ["volume", "demo.volume", "demo.home"])
+        quiet = lambda args: Conversation._sound_skill(c, "run_skill", args)   # noqa: E731
+        assert quiet({"skill": "volume"})                       # the volume skill
+        assert not quiet({"skill": "demo.home"})                # its rung opens a URI (takes focus)
+        assert not quiet({"skill": "demo.volume"})              # its rung B clicks
+        assert not quiet({"skill": "demo.play"})                # not on this conversation's menu
+        assert not Conversation._sound_skill(c, "click", {"skill": "volume"})
+        assert not quiet(None)
+        c_none = SimpleNamespace(_skill_keys=lambda: [])          # no menu: the old learned-way hand stays held
+        assert not Conversation._sound_skill(c_none, "run_skill", {"skill": "volume"})
+    finally:
+        C.clear_cache()
+
+
+def test_the_menu_cap_reads_the_setting_and_volume_wording_names_mute() -> None:
+    class Mem:
+        def call(self, what: str, fn: Any, timeout_s: float = 1.0) -> Any:
+            return fn(SimpleNamespace(skill_menu=lambda audience: MENU))
+
+    assert M.fetch_skills(Mem()) == MENU
+    first_two = "\n".join(MENU.splitlines()[:2])
+    assert M.fetch_skills(Mem(), chars=len(first_two) + 2) == first_two   # Settings.skills_menu_chars, whole lines
+    assert "mute (on or off)" in M.VOLUME_PARAGRAPH
+
+
+def test_held_lets_the_volume_skill_through_and_holds_a_window_skill() -> None:
+    from yuki.voice.pipeline import Conversation
+
+    call = SimpleNamespace(first_text=0.1, user_turn=True)
+    c = SimpleNamespace(_llm=SimpleNamespace(_yuki_hold={}, _yuki_call=call),
+                        observer=SimpleNamespace(heard=True, heard_plain=False),
+                        _skill_keys=lambda: ["volume", "no.such.skill"])
+    c._sound_skill = lambda name, args: Conversation._sound_skill(c, name, args)
+    assert not Conversation._held(c, "run_skill", None, {"skill": "volume", "slots": {"change": "down"}})
+    assert Conversation._held(c, "run_skill", None, {"skill": "no.such.skill", "slots": {}})   # unknown: held
+    assert Conversation._held(c, "click", None, {"element": 3})
+    assert not Conversation._held(c, "keep_usual", None, {"answer": "yes"})

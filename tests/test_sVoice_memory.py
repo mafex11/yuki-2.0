@@ -79,6 +79,7 @@ def test_a_usual_from_their_words_is_proposed_and_asked_once_never_applied(store
     qid = P.pending_question(store, CONTROL, "mixer")
     assert qid is not None and store.question(qid).origin == "usual"
     assert w.usual_pass(ops, turns, {}, set())["already"] == 1   # one card per proposal
+    assert store._query("SELECT count(*) FROM pref_events WHERE type = 'asked'")[0][0] == 1
     # their words answering that very card confirm it
     card = (SimpleNamespace(id=5, ref=f"question:{qid}", kind="question"), True)
     answer = [_turn(2, "yes keep the mixer")]
@@ -116,14 +117,24 @@ def test_a_request_that_ran_a_skill_gets_no_text_pass(store: Store) -> None:
     mode, reasons = L.decide(signals, [], [], skill="demo.volume")
     assert mode is None and "skill run" in reasons[0]
     assert L.decide(signals, [], [])[0] == "postmortem"   # without a skill the old learner is unchanged
+    # review r1 L1: a rung C hand-off runs under the thinker's own request id with no skill_runs row; the run
+    # header's own skill signal (the pinned key, once the loop records it) names it
+    pinned = SimpleNamespace(request_id="t-9", signals={"skill": "demo.volume", "actions": 2})
+    assert L.skill_of_run(store, pinned) == "demo.volume"
+    assert L.skill_of_run(store, SimpleNamespace(request_id="t-9", signals={"actions": 2})) is None
 
 
 def test_no_pitfall_is_written_for_an_app_a_trusted_skill_covers(store: Store) -> None:
     from yuki.memory import practice_learn as L
 
     assert L.skill_covered_apps(store) == set()          # no verified run yet: nothing is covered
-    key = R.start_run(store, skill=C.load().get("demo.volume"), origin="voice")
-    R.finish_run(store, key, outcome="done", checked=True)
+    skill = C.load().get("demo.volume")
+    mixer = next(r for r in skill.routes if r.variant == "mixer")
+    for n in range(5):
+        # review r1 L6: D14's bar (registry.offer_ready): a "change" skill needs 5 verified, none failed in the last 5
+        assert L.skill_covered_apps(store) == set(), n
+        key = R.start_run(store, skill=skill, origin="voice")
+        R.finish_run(store, key, outcome="done", checked=True, route=mixer)
     assert L.skill_covered_apps(store) == {"demoplayer"}
     checked = L.Checked(outcome="failed", ops=[{"op": "ADD", "kind": "pitfall", "intent": "change the volume",
                                                 "apps": ["DemoPlayer.exe"], "body": {"text": "x"}}])
@@ -131,3 +142,23 @@ def test_no_pitfall_is_written_for_an_app_a_trusted_skill_covers(store: Store) -
     written = L.apply(store, checked, ctx, embedder=None, origin="postmortem", now=time.time())
     assert written["added"] == [] and written["skipped"] == ["skill_covered"]
     assert store._query("SELECT count(*) FROM playbooks")[0][0] == 0
+
+
+def test_a_usual_said_again_after_its_card_was_answered_gets_a_new_card(store: Store) -> None:
+    """Review r1 M1: each card has its own subject (the words' own moment), so an answered card never swallows a
+    later proposal of the same option; the same words processed again never ask twice."""
+    w = _worker(store)
+    first = [_turn(1, "always use the mixer for demo player")]
+    ops = [{"op": "ADD", "kind": "preference", "quote": "always use the mixer for demo player", "exchanges": [1],
+            "usual": f"{CONTROL}=mixer"}]
+    assert w.usual_pass(ops, first, {}, set())["proposed"] == 1
+    qid = P.pending_question(store, CONTROL, "mixer")
+    store._write(lambda c: c.execute("UPDATE questions SET status = 'answered' WHERE id = ?", (qid,)))   # declined
+    assert w.usual_pass(ops, first, {}, set())["proposed"] == 0          # the same words again: no second card
+    later = [_turn(9, "no really, always use the mixer for demo player")]
+    ops2 = [{"op": "ADD", "kind": "preference", "quote": "always use the mixer for demo player", "exchanges": [1],
+             "usual": f"{CONTROL}=mixer"}]
+    assert w.usual_pass(ops2, later, {}, set())["proposed"] == 1         # said again later: a new card goes out
+    new = P.pending_question(store, CONTROL, "mixer")
+    assert new is not None and new != qid
+    assert store._query("SELECT count(*) FROM pref_events WHERE type = 'asked'")[0][0] == 2   # one tie per card

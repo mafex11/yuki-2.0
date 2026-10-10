@@ -368,19 +368,35 @@ def parse_choice(text: Any, choices: list[UsualChoice]) -> UsualChoice | None:
     return next((c for c in choices if c.text == want), None)
 
 
-def usual_question(choice: UsualChoice, *, quote: str, at: float, still: bool = False) -> Any:
+def _stamp(at: float | None) -> str:
+    """A card's own moment in its subject, local time to the second (``10 Oct 2026 14:02:33``)."""
+    try:
+        return time.strftime("%d %b %Y %H:%M:%S", time.localtime(float(at or 0.0)))
+    except (OverflowError, OSError, ValueError):
+        return str(round(float(at or 0.0)))
+
+
+def usual_question(choice: UsualChoice, *, quote: str, at: float, still: bool = False,
+                   since: float | None = None) -> Any:
     """The question card that confirms a proposed usual once (origin :data:`QUESTION_ORIGIN`; the questions pipeline
     asks it at a calm moment, phrased in the user's register). ``still``: the "still your usual?" card after three
-    later choices went the other way."""
+    later choices went the other way.
+
+    Each card has its own subject (the questions table dedupes by subject, review r1 M1): a proposal is keyed by when
+    the user said it (``at``), a "still your usual?" card by when the usual was confirmed (``since``), so a card
+    answered once never swallows a later one for the same option, and the same words or the same confirmation never
+    ask twice."""
     from yuki.memory.store import NewQuestion
 
     if still:
         question = f"Is {choice.option} still the user's usual way to {choice.menu}?"
         evidence = "Since they confirmed it, the user picked another way three times."
+        subject = f"still usual (kept {_stamp(since if since is not None else at)}): {choice.words}"
     else:
         question = f"Should Yuki keep {choice.option} as the user's usual way to {choice.menu}?"
         evidence = f'The user said: "{" ".join(str(quote or "").split())[:300]}"'
-    return NewQuestion(at=float(at), kind="fact", subject=f"usual: {choice.words}"[:200], question=question[:400],
+        subject = f"usual (said {_stamp(at)}): {choice.words}"
+    return NewQuestion(at=float(at), kind="fact", subject=subject[:200], question=question[:400],
                        evidence=evidence[:400], reason="Yuki keeps a usual only after the user confirms it once.",
                        importance=QUESTION_IMPORTANCE, origin=QUESTION_ORIGIN)
 
@@ -430,34 +446,51 @@ def confirm_question(store: Any, question_id: int, choice: UsualChoice, *, quote
                   at=at) is not None
 
 
+def _confirmed_at(store: Any, pref: str, option: str) -> float | None:
+    """When ``option`` became the usual of ``pref`` (``prefs.confirmed_at``), else ``None``. Read only."""
+    try:
+        rows = store._query("SELECT confirmed_at FROM prefs WHERE slot = ? AND option = ? AND context = '' AND "
+                            "state = 'usual' AND ended_at IS NULL LIMIT 1", (pref, option))
+    except Exception:  # noqa: BLE001
+        return None
+    return float(rows[0][0]) if rows and rows[0][0] is not None else None
+
+
 def still_usual_question(store: Any, pref: str, option: str, *, choices: list[UsualChoice] | None = None,
                          at: float | None = None) -> Any:
     """The "still your usual?" card for a usual that three later choices went against (:func:`choose`'s
-    ``still_usual``): ``None`` when one is already open or asked for it, or the option isn't a listed choice."""
+    ``still_usual``): ``None`` when one is already open or asked for it, or the option isn't a listed choice. Keyed by
+    the usual's confirmation time: one card per confirmation (answered, it never goes out again until the user
+    confirms a usual anew)."""
     if pending_question(store, pref, option) is not None:
         return None
     pool = choices if choices is not None else usual_choices(store=store)
     choice = next((c for c in pool if c.pref == pref and c.option == option), None)
     if choice is None:
         return None
-    return usual_question(choice, quote="", at=time.time() if at is None else float(at), still=True)
+    return usual_question(choice, quote="", at=time.time() if at is None else float(at), still=True,
+                          since=_confirmed_at(store, pref, option))
 
 
 def ask_card(store: Any, question: Any, choice: UsualChoice, *, at: float | None = None) -> int | None:
-    """Store one ``usual`` card (deduped by the questions table) and tie it to its preference: an ``asked`` event
-    whose source names the card, so its answer finds the preference (:func:`question_target`). Returns the card's id,
-    else ``None``. The proposal itself (a ``said`` event, :func:`propose`) is written by the caller."""
+    """Store one ``usual`` card and tie it to its preference: an ``asked`` event whose source names the card, so its
+    answer finds the preference (:func:`question_target`). Returns the card's id only when a card goes out now (the
+    questions table ``added`` it, or ``reopened`` one that expired unasked), else ``None``: a card with this subject
+    already answered, skipped or dropped is ``known`` and never asked again (review r1 M1), one still open is that
+    card. The ``asked`` tie is written once per card. The proposal itself (a ``said`` event, :func:`propose`) is
+    written by the caller."""
     if pending_question(store, choice.pref, choice.option) is not None:
         return None
     try:
         got = store.add_questions([question])
     except Exception:  # noqa: BLE001
         return None
-    qid = got[0][0] if got else None
-    if qid is None:
+    qid, outcome = (got[0][0], str(got[0][1])) if got else (None, "")
+    if qid is None or outcome not in ("added", "reopened", "merged"):
         return None
-    record(store, choice.pref, choice.option, "asked", source=f"question:{int(qid)}", at=at)
-    return int(qid)
+    if outcome == "added" or question_target(store, int(qid)) is None:
+        record(store, choice.pref, choice.option, "asked", source=f"question:{int(qid)}", at=at)
+    return int(qid) if outcome in ("added", "reopened") else None
 
 
 def after_voice_run(store: Any, skill_key: str, *, values: dict[str, Any], previous: dict[str, Any] | None,

@@ -872,8 +872,13 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
 
         async def run_function_calls(self, function_calls: Any) -> None:
             for fc in function_calls or []:
-                self._yuki_hold[str(getattr(fc, "tool_call_id", fc))] = bool(
-                    hook("would_hold", getattr(fc, "function_name", ""), default=False))
+                # review r1 L3: the call's arguments decide too (a sound-only skill runs like the sound hands); a
+                # stand-in without would_hold_call answers by the name alone
+                held = hook("would_hold_call", getattr(fc, "function_name", ""), getattr(fc, "arguments", None),
+                            default=None)
+                if held is None:
+                    held = hook("would_hold", getattr(fc, "function_name", ""), default=False)
+                self._yuki_hold[str(getattr(fc, "tool_call_id", fc))] = bool(held)
             if len(self._yuki_hold) > 64:
                 for old in list(self._yuki_hold)[:32]:
                     del self._yuki_hold[old]
@@ -2423,6 +2428,10 @@ class _Hooks:
     def would_hold(self, name: str) -> bool:
         """Whether a call of the reply now ending will be held until the user answers (see ``Conversation._held``)."""
         return self.c._held(name)
+
+    def would_hold_call(self, name: str, args: Any = None) -> bool:
+        """:meth:`would_hold` with the call's arguments (a run_skill of a sound-only skill is never held)."""
+        return self.c._held(name, args=args)
 
     def words_dropped(self, frames: int) -> None:
         """A doubtful turn's reply made a call that is held: its words were never said (content-free log)."""
@@ -4365,8 +4374,9 @@ class Conversation:
                            hands=len(tools))
         return tools
 
-    def _held(self, name: str, call_id: str | None = None) -> bool:
-        """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it."""
+    def _held(self, name: str, call_id: str | None = None, args: Any = None) -> bool:
+        """Whether this call is held: recognition was unsure of the latest words and the mouth spoke with it. The sound
+        hands, ``keep_usual`` and a ``run_skill`` of a sound-only skill (:meth:`_sound_skill`) are never held."""
         from yuki.voice.hands import AUDIO_HANDS
 
         decided = getattr(getattr(self, "_llm", None), "_yuki_hold", None) or {}
@@ -4375,7 +4385,33 @@ class Conversation:
         call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
         spoke = call is not None and call.first_text is not None and call.user_turn
         return bool(spoke and self.observer.heard and not getattr(self.observer, "heard_plain", False)
-                    and name not in AUDIO_HANDS and name != "keep_usual")
+                    and name not in AUDIO_HANDS and name != "keep_usual" and not self._sound_skill(name, args))
+
+    def _sound_skill(self, name: str, args: Any) -> bool:
+        """Review r1 L3: a ``run_skill`` that is a sound hand in effect, so it runs at once on unsure words as the old
+        ``app_volume`` and volume keys did: the volume skill (it replaced them), or a menu skill whose every rung
+        takes no focus (its data). Never on the old learned-way path (no Skills menu)."""
+        if name != "run_skill" or not isinstance(args, dict):
+            return False
+        key = str(args.get("skill") or "")
+        try:
+            keys = self._skill_keys()
+        except Exception:  # noqa: BLE001 - no menu known: held like any window hand
+            return False
+        if not key or key not in keys:
+            return False
+        from yuki.voice.hands import VOLUME_SKILL
+
+        if key == VOLUME_SKILL:
+            return True
+        try:
+            from yuki.skills.connection import load
+
+            skill = load().get(key)
+        except Exception:  # noqa: BLE001 - unknown: held like any window hand
+            return False
+        routes = [r for r in (getattr(skill, "routes", ()) or ()) if r.via != "agent"]
+        return bool(routes) and not any(r.needs_focus for r in routes)
 
     async def _hold(self, params: Any) -> None:
         self.log.event("hands" if params.function_name != "tell_yuki" else "bridge", op=params.function_name,
@@ -4562,7 +4598,7 @@ class Conversation:
         the mouth to wait for the answer if it asked (stay_quiet), else to call it again, so nothing is
         lost. Sound hands touch no window and run. State only (the note, the stream, which hand), never what was said.
         """
-        if self._held(params.function_name, params.tool_call_id):
+        if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)
             return
         await self.bridge.hands.handle(params)

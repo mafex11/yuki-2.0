@@ -205,3 +205,39 @@ def test_scoped_preference_keys_take_each_option_of_their_scope_slot(tmp_path: P
     texts = [c.text for c in P.usual_choices(loaded)]
     assert texts == ["demo.loud:control@demoplayer=in_app", "demo.loud:control@demoplayer=mixer",
                      "demo.loud:control@demochat=in_app", "demo.loud:control@demochat=mixer"]
+
+
+def test_an_answered_card_never_swallows_the_still_your_usual_card(store: Store, demo: C.Loaded) -> None:
+    """Review r1 M1 (the reviewer's still_card.py): the proposal card was answered and the usual confirmed; three later
+    choices went the other way: the "still your usual?" card goes out once (a new question row, one asked tie), and
+    later voice runs while it stays outvoted add nothing. A card already answered for the same subject is "known":
+    no id back, no asked row."""
+    mixer = next(c for c in P.usual_choices(demo, store=store) if c.option == "mixer")
+    q1 = P.ask_card(store, P.usual_question(mixer, quote="use the mixer", at=1000.0), mixer, at=1000.0)
+    assert isinstance(q1, int)
+    store._write(lambda c: c.execute("UPDATE questions SET status = 'answered' WHERE id = ?", (q1,)))
+    assert P.confirm_question(store, q1, mixer, quote="yes", at=time.time() - 100)
+    # the very same card again (same subject): known, nothing written
+    assert P.ask_card(store, P.usual_question(mixer, quote="use the mixer", at=1000.0), mixer, at=1000.0) is None
+    for i in range(3):
+        P.record(store, CONTROL, "in_app", "observed", at=time.time() - 50 + i)
+    assert P.choose(store, CONTROL).still_usual
+    key = _run(store, demo, {"level": "words", "control": "pref"})
+    ids = [P.after_voice_run(store, "demo.volume", values={"level": 40, "control": "mixer"}, previous=None,
+                             run_key=key, given=["level"], loaded=demo)["still_card"] for _ in range(3)]
+    assert isinstance(ids[0], int) and ids[0] != q1 and ids[1:] == [None, None]
+    assert "still" in store.question(ids[0]).question
+    assert store._query("SELECT count(*) FROM questions")[0][0] == 2
+    assert store._query("SELECT count(*) FROM pref_events WHERE type = 'asked'")[0][0] == 2   # one tie per card
+    # answered too: the same confirmation never asks again ...
+    store._write(lambda c: c.execute("UPDATE questions SET status = 'answered' WHERE id = ?", (ids[0],)))
+    assert P.after_voice_run(store, "demo.volume", values={"level": 40, "control": "mixer"}, previous=None,
+                             run_key=key, given=["level"], loaded=demo)["still_card"] is None
+    assert store._query("SELECT count(*) FROM pref_events WHERE type = 'asked'")[0][0] == 2
+    # ... and a new confirmation is a new card when it is outvoted again
+    P.record(store, CONTROL, "mixer", "confirmed", at=time.time() - 40)
+    for i in range(3):
+        P.record(store, CONTROL, "in_app", "observed", at=time.time() - 30 + i)
+    again = P.after_voice_run(store, "demo.volume", values={"level": 40, "control": "mixer"}, previous=None,
+                              run_key=key, given=["level"], loaded=demo)["still_card"]
+    assert isinstance(again, int) and again not in (q1, ids[0])

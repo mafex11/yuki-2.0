@@ -397,3 +397,114 @@ def test_a_skill_that_sends_or_joins_a_call_passes_yukis_own_check_first(rig: An
     asked.clear()
     params = _run(rig.hands, {"say_first": "", "skill": "demo.home", "slots": {}})
     assert asked and asked[0][3] is True and not uri.calls
+
+
+# -- review round 1 ------------------------------------------------------------------------------------------------------
+
+
+def _act_off(rig: Any, tmp_path: Path) -> None:
+    import json
+
+    policy = tmp_path / "autonomy.json"
+    policy.write_text(json.dumps({"apps": {"DemoPlayer": {"name": "DemoPlayer", "act": False}}}), encoding="utf-8")
+    rig.hands.policy_path = policy
+
+
+def test_a_skill_never_touches_a_window_in_an_app_whose_act_switch_is_off(rig: Any, tmp_path: Path,
+                                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 M2 (the reviewer's act_off.py): Settings switched "Act" off for Demo Player: the in-app rung
+    (uia_invoke) is refused, the judge's plain line is said, nothing goes to the thinker and the ledger says refused;
+    the mixer rung (sound only) still runs there, as the old sound hands did."""
+    from yuki.agent.judge import app_off_line
+
+    _act_off(rig, tmp_path)
+    off = rig.hands.act_off("DemoPlayer.exe")
+    assert off and off.casefold() == "demoplayer"
+    trouble = rig.hands.trouble_at
+    invoke = Verb(E.RouteResult(ran=True, outcome="pressed", verified=True, value=40.0))
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", invoke)
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(True))
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
+    assert not invoke.calls
+    assert params.said == [app_off_line(off)]
+    assert rig.bridge.escalated == []
+    assert rig.client.store._query("SELECT outcome FROM skill_runs")[0][0] == "refused"
+    assert rig.hands.trouble_at == trouble           # Act off is the user's setting, not hand trouble
+    mixer = Verb(E.RouteResult(ran=True, outcome="set", verified=True))
+    monkeypatch.setitem(E.VERB_FUNCS, "app_volume", mixer)
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 30, "control": "mixer"}})
+    assert mixer.calls and params.said[0].startswith("Demo Player at 30%")
+
+
+def test_a_game_that_comes_to_the_front_before_the_hand_off_holds_it(rig: Any,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 L2: D17(2) is read again right before the hand-off goes out: a game in front by then holds it
+    ("after the round?"), nothing goes to the thinker, and the ledger says held_game."""
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke", Verb(E.RouteResult(ran=False, outcome="not_found")))
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_steps", Verb(E.RouteResult(ran=False, outcome="not_found")))
+    real = E.pinned
+
+    def pinned(*a: Any, **kw: Any) -> Any:
+        rig.desk.game = "VALORANT.exe"   # the engine read no game; the game comes forward right after
+        return real(*a, **kw)
+
+    monkeypatch.setattr(E, "pinned", pinned)
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
+    assert params.said == ["You're in a game: after the round?"] and rig.bridge.escalated == []
+    assert rig.client.store._query("SELECT outcome FROM skill_runs")[0][0] == "held_game"
+
+
+def test_a_game_read_that_fails_holds_like_a_game(rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 L2: the engine's game read fails closed ("unknown"), so the voice passes a reader that raises."""
+    uri = Verb(E.RouteResult(ran=True, outcome="opened"))
+    monkeypatch.setitem(E.VERB_FUNCS, "open_uri", uri)
+
+    def broken() -> str:
+        raise OSError("no foreground read")
+
+    rig.desk.game_front = broken
+    params = _run(rig.hands, {"say_first": "", "skill": "demo.home", "slots": {}})
+    assert not uri.calls and params.said == ["You're in a game: after the round?"]
+    assert rig.hands._game_front() == ""          # the old hands' own read is unchanged (the backstop still checks)
+
+
+def test_the_done_line_is_said_before_the_preference_memory_call(rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 L4: the preference side (a bounded memory call) runs after the line was said; L8: on_action gets the
+    moment the rung acted (the turn log's speech-to-action time)."""
+    order: list[str] = []
+    real_call = rig.mem.call
+
+    def call(what: str, fn: Any, timeout_s: float = 1.0) -> Any:
+        order.append(what)
+        return real_call(what, fn, timeout_s)
+
+    rig.mem.call = call
+    acted: list[float] = []
+    rig.hands.on_action = acted.append
+    monkeypatch.setitem(E.VERB_FUNCS, "app_volume", Verb(E.RouteResult(ran=True, outcome="set", verified=True)))
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(True))
+    params = Params("run_skill", {"say_first": "", "skill": "demo.volume", "slots": {"level": 40, "control": "mixer"}})
+    original = params._push
+
+    async def push(frame: Any, direction: Any = None) -> None:
+        order.append("said")
+        await original(frame, direction)
+
+    params.llm = SimpleNamespace(push_frame=push)
+    asyncio.run(rig.hands.handle(params))
+    assert "said" in order and "skill_prefs" in order and order.index("said") < order.index("skill_prefs")
+    assert len(acted) == 1 and isinstance(acted[0], float)
+
+
+def test_keep_usual_without_an_answer_in_time_is_worded_as_unsure(rig: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review r1 L4: no answer from memory in time is "not sure it saved" (the write may still land), never "couldn't
+    save"."""
+    monkeypatch.setitem(E.VERB_FUNCS, "app_volume", Verb(E.RouteResult(ran=True, outcome="set", verified=True)))
+    monkeypatch.setitem(donecheck.PROBE_FUNCS, "level", _level_probe(True))
+    _run(rig.hands, {"say_first": "", "skill": "demo.volume", "slots": {"level": 40, "control": "mixer"}})
+    assert rig.hands.pending_keep
+    real_call = rig.mem.call
+    rig.mem.call = lambda what, fn, timeout_s=1.0: None if what == "keep_usual" else real_call(what, fn, timeout_s)
+    keep = _run(rig.hands, {"answer": "yes"}, name="keep_usual")
+    result, _props = keep.results[-1]
+    assert result.get("not_sure") == "I'm not sure that saved." and "couldn't" not in str(result)

@@ -1813,7 +1813,13 @@ class Hands:
             if self.log is not None:
                 answer = str(args.get("answer") or "")
                 self.log.event("hands", op=name, ok=ok, answer=answer if answer in ("yes", "just_this_time") else "other",
-                               pending=bool(facts.get("pending")), call=params.tool_call_id)
+                               pending=bool(facts.get("pending")), unsure=bool(facts.get("unsure")),
+                               call=params.tool_call_id)
+            if facts.get("unsure") and line:
+                await params.result_callback({"not_sure": line, "how_to_say_it": (
+                    f"Memory didn't answer in time, so it may or may not be kept. Say this plainly, nothing more: "
+                    f"{line}")})
+                return
             if ok and line:
                 await params.llm.push_frame(TTSSpeakFrame(text=line))
                 await params.result_callback({"done": line, "said": line, "how_to_handle_it": _SAID_NOTE},
@@ -1848,6 +1854,44 @@ class Hands:
                 if self.bridge.gate is not None:
                     self.bridge.gate.poke()
         ms = round((time.monotonic() - started) * 1000)
+        prefs = facts.pop("_prefs", None)
+        if self.on_action is not None and facts.get("sent_at") is not None:
+            self.on_action(facts["sent_at"])   # review r1 L8: a rung acted (the turn log's speech -> action)
+        if str(facts.get("outcome") or "") == "handed_over" and facts.get("handoff_skill"):
+            # review r1 L2: D17(2) read again right before the hand-off goes out (the engine read it before the
+            # ledger and preference work); a game in front now holds it, and a read that fails holds it too
+            game = await asyncio.to_thread(self._game_closed)
+            if game:
+                result = prefs[3] if prefs else None
+                if result is not None:
+                    memory = self.skill_memory if self.skill_memory is not None else self.memory
+                    await asyncio.to_thread(self._refinish, memory, result, "held_game")
+                from yuki.skills.resolve import HELD_LINE
+
+                facts.update(outcome="held_game", held="game", refused="game", say=HELD_LINE, handoff_skill=None,
+                             settled=True, game_front=True)
+                if self.last_skill and self.last_skill.get("run_key") == getattr(result, "run_key", None):
+                    self.last_skill["outcome"] = "held_game"
+                report = f"Held: a game is in front, nothing was sent. Say: {HELD_LINE}"
+        try:
+            await self._skill_reply(params, name, args, ok, report, facts, ms)
+        finally:
+            if prefs is not None:
+                # review r1 L4: the preference side runs after the line was said (a bounded memory call)
+                try:
+                    learned = await asyncio.to_thread(self._learn_from_run, *prefs)
+                except Exception:  # noqa: BLE001 - the preference side never breaks a hand
+                    learned = {}
+                if self.log is not None and learned:
+                    self.log.event("hands", op=name, prefs=True, corrected=int(learned.get("corrected") or 0),
+                                   still_card=bool(learned.get("still_card")), call=params.tool_call_id)
+
+    async def _skill_reply(self, params: Any, name: str, args: dict[str, Any], ok: bool, report: str,
+                           facts: dict[str, Any], ms: float) -> None:
+        """The result of one ``run_skill``: the line code says (done only when verified), the hand-off with the skill
+        pinned, or the report for the talker."""
+        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
         outcome = str(facts.get("outcome") or "")
         verified = facts.get("verified") is True
         line = ""
@@ -1859,7 +1903,8 @@ class Hands:
                 line = keep_line(line)
         elif outcome in self.SKILL_SAID or facts.get("held") or facts.get("act_off"):
             line = str(facts.get("say") or "")
-        if outcome in ("failed", "error") or (facts.get("refused") and not facts.get("held")):
+        if outcome in ("failed", "error") or (facts.get("refused") and not facts.get("held")
+                                               and not facts.get("act_off")):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=facts.get("verified"))
         if self.on_step is not None:
@@ -1871,11 +1916,11 @@ class Hands:
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
                            skill_outcome=outcome or None, verified=facts.get("verified"), done_line=bool(line),
                            keep_question=bool(facts.get("keep_question")), focus_taken=bool(facts.get("focus_taken")),
-                           corrected=int(facts.get("corrected") or 0))
+                           act_off=bool(facts.get("act_off")))
         if outcome == "handed_over" and facts.get("handoff_skill") and self.bridge is not None \
                 and callable(getattr(self.bridge, "escalate", None)):
             # rung C: its routes didn't get there; the thinker does it with the skill pinned (never with a game in
-            # front: the engine re-read that right before handing over, D17(2))
+            # front: read again just before this, D17(2))
             ack = False
             try:
                 ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
@@ -1927,21 +1972,46 @@ class Hands:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _skill_verbs(self) -> dict[str, Any]:
+    #: The skill verbs that touch an app's window (press a control in it, set its own slider, bring it forward, pick
+    #: its tab): refused in an app whose Settings "Act" switch is off, as the old click and type hands are (34-review
+    #: H5, review r1 M2). A driver may do any of these, so it is refused there too. The sound-only verbs (the mixer,
+    #: the PC's level, the media session) and openings stay free, as the old sound and open hands were; ``uia_steps``
+    #: checks each of its own steps (``uia_route``).
+    ACT_VIAS = ("uia_invoke", "slider", "focus", "tab_select", "driver")
+
+    def _skill_verbs(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         """The engine's verbs, each refusing a focus-taking rung while the thinker works on the desktop (two hands at
         once would collide): a no-focus rung (a pattern, the media session, Core Audio) still runs beside it (map-skills
-        S3.4). Looked up when called, so the engine's own table stays the one source."""
+        S3.4). A window-touching rung (:data:`ACT_VIAS`) in an app whose "Act" switch is off is refused
+        (``act_off``, the app's name kept in ``state["act_off"]``). ``state["sent_at"]``: when the first rung that
+        acted went out (the turn log's speech-to-action time). Looked up when called, so the engine's own table stays
+        the one source."""
         from yuki.skills import engine
+
+        state = state if state is not None else {}
 
         def wrap(via: str) -> Any:
             def run(call: Any) -> Any:
+                if via in self.ACT_VIAS:
+                    try:
+                        off = self.act_off(engine.acted_app(call.skill, call.route, call.args))
+                    except Exception:  # noqa: BLE001 - an unreadable policy is the judge's and the backstop's
+                        off = None
+                    if off:
+                        state.setdefault("act_off", off)
+                        return engine.RouteResult(ran=False, outcome="act_off")
                 if getattr(call.route, "needs_focus", False):
                     busy = self.bridge.desk_job() if self.bridge is not None and hasattr(self.bridge, "desk_job") \
                         else None
                     if busy:
                         return engine.RouteResult(ran=False, outcome="desk_busy")
                 fn = engine.VERB_FUNCS.get(via)
-                return fn(call) if fn is not None else engine.RouteResult(ran=False, outcome="no_verb")
+                if fn is None:
+                    return engine.RouteResult(ran=False, outcome="no_verb")
+                res = fn(call)
+                if getattr(res, "ran", False) is not False and state.get("sent_at") is None:
+                    state["sent_at"] = time.monotonic()
+                return res
             return run
 
         return {via: wrap(via) for via in list(engine.VERB_FUNCS)}
@@ -2004,13 +2074,15 @@ class Hands:
 
         previous = self.last_skill if (self.last_skill and self.last_skill.get("skill") == skill_key and
                                        time.time() - float(self.last_skill.get("at") or 0.0) <= _CORRECTION_S) else None
+        state: dict[str, Any] = {}
+        # review r1 L2: the engine's own D9 read fails closed ("unknown" holds), so its reader may raise
         ctx = engine.RunContext(origin="voice", words=words, memory=memory, hands=self, log=self._skill_log,
                                 request_id=self._skill_request_id(), session_id=getattr(memory, "session_id", None),
-                                on_focus=on_focus, verbs=self._skill_verbs(), game=self._game_front)
+                                on_focus=on_focus, verbs=self._skill_verbs(state), game=self._game_strict)
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),
-                                            game_answer=self._game_front())
+                                            game_answer=ctx.game_now())
         finally:
             if marker["token"] is not None:
                 try:
@@ -2020,21 +2092,76 @@ class Hands:
         ok, report, more = result.as_voice()
         facts.update(more)
         facts["focus_taken"] = bool(result.focus_taken)
+        facts["sent_at"] = state.get("sent_at")
         if facts.get("held") == "game":
             facts["game_front"] = True
-        learned = self._learn_from_run(skill_key, args, slots, result, previous, words)
-        facts.update(learned)
+        off = state.get("act_off")
+        acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
+        if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):
+            # review r1 M2: a rung would have touched an app whose "Act" switch is off and nothing else got there:
+            # said plainly (the judge's own line), never handed to the thinker (it would not act there either). A
+            # failure after a rung that did act keeps its own plain line
+            report = self._skill_act_off(result, off, facts, memory)
+        facts.update(self._keep_from_run(skill_key, result))
+        # review r1 L4: the preference side (a bounded memory call) runs after the line is said (_handle_skill)
+        facts["_prefs"] = (skill_key, dict(args), dict(slots), result, previous, list(words))
         if result.outcome not in ("refused",):
-            self.last_skill = {"skill": skill_key, "values": dict(result.values or {}), "outcome": result.outcome,
+            self.last_skill = {"skill": skill_key, "values": dict(result.values or {}),
+                               "outcome": str(facts.get("outcome") or result.outcome),
                                "options": list(result.options or []), "run_key": result.run_key, "at": time.time()}
         return ok, report, facts
 
+    def _skill_act_off(self, result: Any, off: str, facts: dict[str, Any], memory: Any) -> str:
+        """A run refused in an app whose Settings "Act" switch is off (review r1 M2): the judge's plain line, no
+        hand-off, and the ledger row says ``refused`` (no hand-off went out; a rung that acted before keeps it).
+        Returns the report for the talker."""
+        try:
+            from yuki.agent.judge import app_off_line
+
+            line = app_off_line(off)
+        except Exception:  # noqa: BLE001 - an older brain: the same words
+            line = (f"You turned off clicking and typing in {off} (Settings, App access), so I won't click or type "
+                    f"there.")
+        self._refinish(memory, result, "refused")
+        facts.update(outcome="refused", act_off=off, refused=True, say=line, handoff_skill=None, settled=True,
+                     verified=False)
+        return (f"Not done: Act is switched off for {off} in Yuki's settings, so Yuki does not click, type or press "
+                f"keys there; nothing was done there and the thinker will not do it either.")
+
+    def _refinish(self, memory: Any, result: Any, outcome: str) -> None:
+        """The run's ledger row rewritten when the voice did not do what the engine ended with (a hand-off that never
+        went out: Act off, or a game came to the front). Content-free; never raises."""
+        run_key = getattr(result, "run_key", None)
+        if not run_key or memory is None:
+            return
+        acted = any(t.get("outcome") == "contradicted" for t in getattr(result, "tried", None) or [])
+
+        def go(client: Any) -> Any:
+            from yuki.skills import registry
+
+            return registry.finish_run(getattr(client, "store", client), run_key, outcome=outcome, checked=None,
+                                       acted=acted)
+
+        self._memory_call(memory, "skill_run_finish", go, timeout_s=0.5)
+
+    def _keep_from_run(self, skill_key: str, result: Any) -> dict[str, Any]:
+        """The pending "Keep this as your usual?" when the user's words named a new usual and the PC saw it done (no
+        memory call: the engine's ``ask_keep``). A newer run lets an older question lapse."""
+        out: dict[str, Any] = {}
+        keep = result.ask_keep if isinstance(getattr(result, "ask_keep", None), dict) else None
+        if keep and result.done and result.outcome == "done":
+            self.pending_keep = {"pref": str(keep.get("pref") or ""), "option": str(keep.get("option") or ""),
+                                 "skill": skill_key, "run_key": result.run_key, "at": time.time()}
+            out["keep_question"] = True
+        elif result.outcome not in ("asked",):
+            self.pending_keep = None   # a newer run: an older question lapses
+        return out
+
     def _learn_from_run(self, skill_key: str, args: dict[str, Any], slots: dict[str, Any], result: Any,
                         previous: dict[str, Any] | None, words: list[str]) -> dict[str, Any]:
-        """The preference side of a run (S4.2, S4.3), in one bounded memory call: a correction naming another option
-        writes corrected / rejected; a usual three later choices went against gets its one "still your usual?" card.
-        Then the pending "Keep this as your usual?" when the user's words named a new usual and the PC saw it done.
-        Content-free counts back."""
+        """The preference side of a run (S4.2, S4.3), in one bounded memory call, after its line was said: a
+        correction naming another option writes corrected / rejected; a usual three later choices went against gets
+        its one "still your usual?" card. Content-free counts back."""
         out: dict[str, Any] = {}
         memory = self.skill_memory if self.skill_memory is not None else self.memory
         corrects = bool(args.get("corrects"))
@@ -2052,13 +2179,6 @@ class Hands:
             if isinstance(got, dict):
                 out["corrected"] = len(got.get("corrected") or [])
                 out["still_card"] = bool(got.get("still_card"))
-        keep = result.ask_keep if isinstance(getattr(result, "ask_keep", None), dict) else None
-        if keep and result.done and result.outcome == "done":
-            self.pending_keep = {"pref": str(keep.get("pref") or ""), "option": str(keep.get("option") or ""),
-                                 "skill": skill_key, "run_key": result.run_key, "at": time.time()}
-            out["keep_question"] = True
-        elif result.outcome not in ("asked",):
-            self.pending_keep = None   # a newer run: an older question lapses
         return out
 
     @staticmethod
@@ -2095,6 +2215,9 @@ class Hands:
 
         got = self._memory_call(memory, "keep_usual", go)
         self.pending_keep = None
+        if got is None:
+            # review r1 L4: no answer in time (or memory failed): the write may still land on memory's own thread
+            return False, "I'm not sure that saved.", {"pending": True, "unsure": True}
         ok = isinstance(got, dict) and bool(got.get("ok"))
         if not ok:
             return False, "I couldn't save that.", {"pending": True}
@@ -2985,6 +3108,25 @@ class Hands:
         except Exception:  # noqa: BLE001 - unknown: the input layer's backstop still checks
             return ""
         return ""
+
+    def _game_strict(self) -> str:
+        """D9 for the skill engine (review r1 L2): :meth:`_game_front`'s read, but a read that fails raises, so the
+        engine's ``RunContext.game_now`` fails closed ("unknown" holds the rung) instead of reading as no game."""
+        own = getattr(self.backend, "game_front", None)
+        if callable(own):
+            return str(own() or "")
+        if _is_real_backend(self.backend):
+            from yuki.memory.gamegate import game_in_front
+
+            return str(game_in_front() or "")
+        return ""
+
+    def _game_closed(self) -> str:
+        """:meth:`_game_strict`, failing closed: ``"unknown"`` when the read raised (a hand-off then waits)."""
+        try:
+            return self._game_strict()
+        except Exception:  # noqa: BLE001
+            return "unknown"
 
     def _media_route(self) -> Any:
         """The media session route (``(verb, app, log=) -> MediaCommand``): the backend's own (a test desk's
