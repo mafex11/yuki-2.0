@@ -5347,7 +5347,12 @@ class Store:
         of an app with a seen call on record (``via`` screen / screen_stale / meeting) or one of the user's own
         ``[calls] apps``. Rows from before the first call row ever written stay as they were (nothing to judge them
         by), and so do rows since the gate (judged live) and a site's meeting rows (``host`` set: the site that took
-        the device in a browser)."""
+        the device in a browser).
+
+        D7's hold (fWire, so the display and the moments' ``call_join`` agree): a row that held the microphone
+        (``mic_s`` > 0) of an app with a seen call on record (:func:`yuki.memory.moments.seen_call_record`) or in the
+        user's ``[calls] apps``, never a game, stays a meeting with no call row around it (the moments count it as a
+        ``hold`` join); each call row is judged by the moments' own rule (:func:`yuki.memory.moments.is_call_join`)."""
         meet = [r for r in rows if r.meeting and r.process and not r.host]   # an app's own meeting, not a site's
         if not meet:
             return rows
@@ -5404,24 +5409,35 @@ class Store:
         def keys_of(process: str | None, app: str | None) -> tuple[str, str]:
             return app_key(process) or "", _shown(app, process).casefold()
 
-        allowed: set[str] = set(self._calls_apps_keys())
-        for c in seen:
+        from yuki.memory import moments as _moments   # D7's one rule (imported here: moments imports this module)
+
+        identity = getattr(self, "_proof_identity", None)
+        if identity is None:
+            identity = self._proof_identity = _moments.AppIdentity(self)
+        identity.refresh(time.time())   # the timeline's own app keys (re-read at most hourly)
+        calls_apps = frozenset(self._calls_apps_keys())
+        seen_apps, _services = _moments.seen_call_record(self, is_game=game, identity=identity)
+        allowed: set[str] = set(calls_apps) | set(seen_apps)
+        for c in seen:   # the same apps by the display's own two keys (the process key, the shown name)
             if not game(c[0]):
                 allowed.update(k for k in keys_of(c[0], c[1]) if k)
         spans = []
         for c in calls:
-            if game(c[0]):
-                continue
+            app = identity.key(c[0], c[3])
+            ok, _evidence = _moments.is_call_join({"kind": "call", "process": c[0], "app": c[3], "via": c[4]},
+                                                  app=app, seen_apps=allowed, is_game=game, calls_apps=calls_apps)
+            if not ok:
+                continue   # a game's, or a microphone hold of an app never seen in a call (VALORANT's 27 Sep rows)
             p, n = keys_of(c[0], c[3])
-            if c[4] == "mic" and p not in allowed and n not in allowed:
-                continue   # a microphone hold of an app never seen in a call (VALORANT's 27 Sep rows)
-            spans.append((p, n, float(c[1]), float(c[2])))
+            spans.append(({k for k in (p, n, app) if k}, float(c[1]), float(c[2])))
         out: list[TimelineRow] = []
         for r in rows:
             if r.meeting and r.process and not r.host and float(first) <= r.started_at and id(r) in before:
                 key, name = app_key(r.process) or "", (r.app or "").casefold()
-                if not any((p == key or (name and n == name)) and start < r.ended_at + slack and end > r.started_at - slack
-                           for p, n, start, end in spans):
+                held = float(r.mic_s or 0.0) > 0.0 and key in allowed and not game(key)   # D7's hold
+                if not held and not any((key in keys or (name and name in keys))
+                                        and start < r.ended_at + slack and end > r.started_at - slack
+                                        for keys, start, end in spans):
                     r = replace(r, meeting=None)
             out.append(r)
         return out

@@ -60,7 +60,8 @@ def links(store: Any) -> list[tuple[int, int, str]]:
 def test_migration_39_on_a_fresh_database_and_again(tmp_path):
     s = Store.open(tmp_path / "fresh.db")
     try:
-        assert len(MIGRATIONS) == 39 and s._query("PRAGMA user_version")[0][0] == 39
+        # phase F appends 40 (moments), later phases more: entry 39 is still there and the file is fully migrated
+        assert len(MIGRATIONS) >= 39 and s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS)
         tables = {r[0] for r in s._query("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"ui_tasks", "ui_task_actions", "ui_families", "ui_family_members", "ui_transitions",
                 "ui_task_runs"} <= tables
@@ -99,7 +100,7 @@ def test_migration_39_from_38_keeps_the_trace_rows(tmp_path):
     conn.close()
     s = Store.open(path)
     try:
-        assert s._query("PRAGMA user_version")[0][0] == 39
+        assert s._query("PRAGMA user_version")[0][0] == len(MIGRATIONS)
         assert s._query("SELECT count(*) FROM ui_actions")[0][0] == 1
         assert s._query("SELECT count(*) FROM ui_tasks")[0][0] == 0
     finally:

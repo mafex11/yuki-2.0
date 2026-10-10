@@ -90,7 +90,11 @@ def hover(x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") ->
 
     def job(automation: Any, shared: dict) -> None:
         shared["before"] = _near(automation, int(x), int(y), time.monotonic() + 0.6)
-        _move(int(x), int(y))
+        why: list[str] = []
+        if not _move(int(x), int(y), why=why):
+            # D17 (fGate review r2 L2): a game in front, or a game's window at the point: the pointer was not moved
+            shared["refused"] = why[0] if why else "the pointer move was refused"
+            return
         shared["moved"] = True
         deadline = time.monotonic() + WATCH_S
         while time.monotonic() < deadline:
@@ -103,6 +107,9 @@ def hover(x: int, y: int, *, expect_hwnd: int | None = None, label: str = "") ->
 
     pending = _Pending(job, "yuki-hover", 0.6 + WATCH_S + 0.8)
     shared = pending.wait()
+    if shared.get("refused"):
+        details["refused"] = "game"
+        return done(False, f"{shared['refused']}; the pointer was not moved")
     if not shared.get("moved"):
         return done(False, f"could not move the pointer ({shared.get('error') or 'timed out'})")
     appeared = shared.get("appeared") or {}

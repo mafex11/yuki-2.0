@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from ctypes import POINTER, byref, c_float, c_int, c_long, c_uint32, c_ulong, c_ulonglong, c_ushort, c_void_p
+from ctypes import POINTER, byref, c_int, c_long, c_uint32, c_ulong, c_ulonglong, c_ushort, c_void_p
 from ctypes import c_wchar_p, wintypes
 from dataclasses import dataclass, field
 from typing import Any

@@ -451,7 +451,8 @@ def test_hover_reports_what_appeared_without_touching_the_real_pointer(monkeypat
     import yuki.actions.input as inp
 
     moved: list[tuple[int, int]] = []
-    monkeypatch.setattr(inp, "_move", lambda x, y: moved.append((x, y)))  # never the real cursor (rule 7)
+    # never the real cursor (rule 7); like input._move it says whether the pointer moved (fGate D17: False = refused)
+    monkeypatch.setattr(inp, "_move", lambda x, y, why=None: moved.append((x, y)) or True)
     monkeypatch.setattr(inp, "_in_screen_bounds", lambda x, y: True)
     monkeypatch.setattr(inp, "_foreground_mismatch", lambda hwnd: None)
     reads = iter([{("Button", "Mute (m)"): (176, 951)},

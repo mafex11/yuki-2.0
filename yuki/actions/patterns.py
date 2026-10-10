@@ -204,6 +204,14 @@ def element_action(hwnd: int, element: dict[str, Any], verb: str, *, value: str 
         return None
     details: dict[str, Any] = {"via": "uia_pattern", "pattern": label, "hwnd": int(hwnd),
                                "element": {"role": element.get("role"), "name": str(element.get("name") or "")[:80]}}
+    from yuki.memory import gamegate as _gamegate
+
+    # D17 (phase F, fGate): a pattern call sends no input and takes no focus, so it may run with a game in front
+    # (front_ok), but never on a game's own window; refused here, it never falls back to the mouse or keys either
+    if (refused := _gamegate.refuse_input("uia_pattern", hwnd=int(hwnd), front_ok=True)) is not None:
+        details["refused"] = "game"
+        return ActionResult(ok=False, summary=refused, details=details,
+                            elapsed_ms=(time.perf_counter() - started) * 1000)
     root = _root(hwnd)
     title_before = _title(root)
     pid = _window_pid(root) if verb == "click" else 0

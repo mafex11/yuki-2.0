@@ -1910,6 +1910,11 @@ class CallWorker:
 
     # -- plumbing ------------------------------------------------------------
 
+    def mic_holders(self) -> list[str]:
+        """The app keys holding the microphone at the worker's last look (content-free), for the Now board's live
+        signals (fWire, fLive review r1 L1). Safe from any thread (the set is replaced whole, never changed in place)."""
+        return sorted(self._held)
+
     @property
     def cfg(self) -> CallConfig:
         return self._config if self._config is not None else self._section.get()

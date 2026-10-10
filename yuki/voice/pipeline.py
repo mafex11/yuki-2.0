@@ -3462,6 +3462,7 @@ class Conversation:
         # v3.9: the bridge binds each job to the user turn it answers, paces its "still on it" line by real
         # silence, and says a job's own finishing line by code when no tell_yuki call carries it.
         bridge.user_turns = lambda: self.observer.user_turns
+        bridge.turn_key = self.observer.turn_id   # phase F: a handed-over request's id in the logs names its turn
         bridge.quiet_for = self._quiet_for
         bridge.speak = self._speak
         # v3.17: a short or verified result said by code (C1), its sentences fetched by the voice ahead (C2).

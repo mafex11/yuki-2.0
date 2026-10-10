@@ -89,8 +89,9 @@ LIVE_SOURCES: tuple[str, ...] = ("site", "media", "spotify", "volume")
 SEEN_VIAS: tuple[str, ...] = ("screen", "screen_stale", "meeting")
 #: ``evidence`` values of a seen join (``hold`` is the other one).
 SEEN_EVIDENCE: tuple[str, ...] = ("screen", "meeting", "site")
-#: Bumped whenever a derived rule changes: the service rebuilds the derived moments once on its next start.
-RULE_VERSION = 1
+#: Bumped whenever a derived rule changes: the service rebuilds the derived moments once on its next start. 2 (fWire,
+#: 10 Oct): page moments take their entity from the sites' URL templates (``yuki.connect.templates.page_entity``).
+RULE_VERSION = 2
 #: Join candidates of one app closer than this are one join (the timeline's own "one meeting" gap,
 #: ``yuki.memory.timeline.MEETING_GAP_S``).
 JOIN_GAP_S = 300.0
@@ -1307,6 +1308,10 @@ class MomentHub:
             runs_fn=self._runs_fn, log=log, clock=clock)
         self.writer = MomentWriter(store)
         self.calling_service = calling_service
+        #: ``tab_known(hwnd) -> bool``: whether the calling site's tab in that window was identified by its last read
+        #: (``yuki.memory.callevidence.SiteTabs.known``, set by the service; it runs before :meth:`site` on the same
+        #: sighting). None: not known (``facts.tab_known`` left out).
+        self.tab_known_fn: Callable[[int], bool] | None = None
         self._db_path = db_path
         if acting_fn is None and db_path is not None:
             from yuki.memory import acting as _acting
@@ -1639,9 +1644,17 @@ class MomentHub:
             service = " ".join(str(service).split())[:40]
             if service.casefold() in (host, host[4:] if host.startswith("www.") else host):
                 service = None   # a calling site with no product name known: never its host (logs carry no host)
+            facts: dict[str, Any] = {"sighting": "first" if open_ is None else "again"}
+            tab_known = None
+            if self.tab_known_fn is not None and hwnd:
+                try:
+                    tab_known = bool(self.tab_known_fn(hwnd))
+                except Exception:  # noqa: BLE001 - unknown
+                    tab_known = None
+            if tab_known is not None:
+                facts["tab_known"] = tab_known
             m = Moment(kind="site_front", at=at, source="site", source_id=key, app=app,
-                       service=service, evidence="site",
-                       facts={"sighting": "first" if open_ is None else "again"})
+                       service=service, evidence="site", facts=facts)
             yuki, request_id = self._acting()
             if yuki:
                 m.by, m.request_id = "yuki", request_id
@@ -1652,7 +1665,7 @@ class MomentHub:
                     self._site_open.pop(next(iter(self._site_open)))
             self.writer.put(m)
             self._log("site_front", app=app, service=m.service, sighting=m.facts["sighting"], by=m.by,
-                      request_id=m.request_id, tab_known=None)
+                      request_id=m.request_id, tab_known=tab_known)
         except Exception as exc:  # noqa: BLE001
             self.errors += 1
             self._log("error", where="moments.site", error=type(exc).__name__)

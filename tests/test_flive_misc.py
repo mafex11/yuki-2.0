@@ -110,6 +110,10 @@ def test_doctor_moments_flowing(tmp_path: Path) -> None:
     path = _db(tmp_path)
     priv = tmp_path / "privacy.toml"
     priv.write_text("", encoding="utf-8")
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE moments")   # fWire: a fresh store has migration 40 since the fMoments merge; a database
+    conn.commit()                        # from before it has no moments table
+    conn.close()
     assert doctor.check_moments(path, priv).status == doctor.SKIP          # not part of this install yet
     now = time.time()
     _moments(path, [("call_join", now - 3600, "user"), ("media_play", now - 120, "user"),
@@ -275,6 +279,7 @@ def test_doctor_moments_count_by_when_they_happened_not_when_written(tmp_path: P
     priv.write_text("", encoding="utf-8")
     now = time.time()
     conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE IF EXISTS moments")   # fWire: the doctor reads only these columns of migration 40's table
     conn.execute("CREATE TABLE moments (id INTEGER PRIMARY KEY, at REAL NOT NULL, ended_at REAL, "
                  "seen_at REAL NOT NULL, kind TEXT NOT NULL, app TEXT, by TEXT NOT NULL DEFAULT 'user', "
                  "source TEXT NOT NULL DEFAULT 'x')")

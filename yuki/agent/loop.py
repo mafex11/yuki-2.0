@@ -1344,6 +1344,7 @@ class Agent:
         voice: bool = False, memory_query: str | None = None, previous_query: str | None = None,
         memory_apps: Iterable[str] | None = None, pack: "RequestPack | None" = None,
         user_words: Iterable[str] | str | None = None, app_named: str | None = None,
+        request_id: str | None = None,
     ) -> Iterator[AgentEvent]:
         """Handle one user request, yielding events as work happens.
 
@@ -1401,6 +1402,9 @@ class Agent:
             app_named: The app or route the user named for this request in their own words (V4, 3 Oct: the voice
                 talker's ``app_named``, taken from the heard words). It wins over the usual route: the task frame says
                 so above the person's routes, and the authorization judge compares a send's target app with it.
+            request_id: The id this request already has in the logs (phase F, fPrivacy R1.3: a front desk's request
+                handed to the worker keeps the front desk's id, so the user's words and the actions are one request in
+                ``python -m yuki.log.follow``); ``None``: the session log begins a new one (``<session id>-<n>``).
 
         Yields:
             :class:`~yuki.log.events.AgentEvent` values. The generator pauses on
@@ -1505,6 +1509,8 @@ class Agent:
         model, effort = self._request_model or self.settings.model, self._request_effort or self.settings.effort
         self.logger.reset_usage()
         self.logger.begin_turn()
+        if request_id:
+            self.logger.begin_request(str(request_id))   # user_message then begins no other
         self.logger.user_message(request)
         if stale:
             # Added after the previous request's last step: the caller hears of
@@ -1717,12 +1723,17 @@ class Agent:
                 "verdict": (getattr(self, "_last_verdict", None) or {}).get("level"),
             }
             self.last_summary = summary
-            self.logger.request_summary(summary)
+            record = self.logger.request_summary(summary)
+            # phase F (fPrivacy R1.3): the request's id on its requests.csv line; the summary ended the request, so
+            # it is the written record's (or the logger's last ended one), never the logger's current id (None now)
+            request_id = ((record.get("request_id") if isinstance(record, dict) else None)
+                          or getattr(self.logger, "last_request_id", None))
             if self.record_requests:
                 append_request_row(
                     self.settings.requests_csv_path,
                     {
                         "timestamp": summary["started_at"],
+                        "request_id": request_id,
                         "session": self.logger.session_id,
                         "lane": self.lane,
                         "request": request,
@@ -1811,7 +1822,12 @@ class Agent:
         the request refreshes the marker (memory ignores one not refreshed for
         ``yuki.memory.acting.MAX_AGE_S``, so an end that fails can never hold it long)."""
         refresh = self._acting_token is not None
-        token = self._acting_token or f"{self.lane}-{self.logger.session_id}-{self._requests}"
+        # phase F (fPrivacy R1.3): the token carries the session log's own request id, so the marker's id
+        # (acting.request_id_of: the lane's prefix taken off) is exactly the one every record of this request has,
+        # a front desk's hand-off id included; the old form only when the log began none
+        request_id = getattr(self.logger, "request_id", None)
+        token = self._acting_token or (f"{self.lane}-{request_id}" if request_id
+                                       else f"{self.lane}-{self.logger.session_id}-{self._requests}")
         try:
             begin = getattr(self.memory, "acting_begin", None)
             published = bool(begin(token, self._request_text or "", lane=self.lane)) if callable(begin) else False

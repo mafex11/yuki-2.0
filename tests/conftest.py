@@ -227,3 +227,22 @@ def pytest_configure(config: pytest.Config) -> None:
 def pytest_unconfigure(config: pytest.Config) -> None:
     while _RUN_CLOCK:
         _RUN_CLOCK.pop()[0].undo()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_game_check(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """fGate (D17, review r2 L8): the input backstop reads the live foreground window's program and the window under
+    the cursor; a game in front during a test run would refuse every stubbed action. Tests see no game, unless their
+    module sets ``LIVE_GAMEGATE = True`` (the fGate tests stub the facts themselves). A front source or refusal
+    listener a test registers (the tray's ``_wire_game_backstop``) never outlives it."""
+    from yuki.memory import gamegate
+
+    monkeypatch.setattr(gamegate, "_front_source", None)
+    monkeypatch.setattr(gamegate, "_refusal_listeners", [])
+    if getattr(request.module, "LIVE_GAMEGATE", False):
+        yield
+        return
+    monkeypatch.setattr(gamegate, "game_in_front", lambda: "")
+    monkeypatch.setattr(gamegate, "_point_root", lambda x, y: 0)
+    monkeypatch.setattr(gamegate, "pid_game", lambda pid, front=False, games=None: "")
+    yield

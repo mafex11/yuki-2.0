@@ -130,6 +130,9 @@ class Job:
     #: How many user turns the conversation had when this was handed over (v3.9): a result that arrives
     #: after the user said more is the outcome of an earlier request, never an answer to their newest words.
     user_turn: int = 0
+    #: The conversation's turn it was handed over in (``<session>-<n>``, phase F): its request id in the logs is
+    #: ``voice-<turn>-t<token>``, beside that turn's hands (``voice-<turn>-h<n>``), for ``python -m yuki.log.follow``.
+    turn_id: str | None = None
     #: Withdrawn because a newer request of the user's replaced it (tell_yuki intent ``instead``): nothing of
     #: it is ever spoken, even an outcome that raced the withdrawal.
     superseded: bool = False
@@ -352,6 +355,9 @@ class VoiceBridge(QObject):
         #: ``() -> int``: the conversation's user turns so far (set by the conversation; v3.9): binds each job to
         #: the request it answers, so a result arriving after the user said more is framed as the earlier one's.
         self.user_turns: Callable[[], int] | None = None
+        #: ``() -> str``: the id of the conversation's turn now open (set by the conversation; phase F): a job's
+        #: request id in the logs names it (:attr:`Job.turn_id`).
+        self.turn_key: Callable[[], str] | None = None
         #: ``() -> float``: seconds since anyone spoke (Yuki or the user; 0 while someone is speaking), set by
         #: the conversation: a running task's "still on it" line waits for real silence.
         self.quiet_for: Callable[[], float] | None = None
@@ -446,6 +452,7 @@ class VoiceBridge(QObject):
             self.on_jobs_changed = None
             self.end_requested = None
             self.user_turns = None
+            self.turn_key = None
             self.quiet_for = None
             self.speak = None
             self.speak_result = None
@@ -662,8 +669,15 @@ class VoiceBridge(QObject):
                 turns = int(self.user_turns())
             except Exception:  # noqa: BLE001
                 turns = 0
+        turn_id = None
+        if self.turn_key is not None:
+            try:
+                turn_id = str(self.turn_key() or "") or None
+            except Exception:  # noqa: BLE001
+                turn_id = None
         return Job(job_id=None, request=request, source=source, token=next(self._tokens),
-                   events=asyncio.Queue() if with_queue else None, log=JobLog(request=request), user_turn=turns)
+                   events=asyncio.Queue() if with_queue else None, log=JobLog(request=request), user_turn=turns,
+                   turn_id=turn_id)
 
     # -- the mouth's tools (voice thread) ---------------------------------------
 
@@ -1524,6 +1538,9 @@ class VoiceBridge(QObject):
                 extra["app_named"] = app_named
         if view:
             extra["view_hwnd"] = view
+        if job.turn_id and self._takes("log_request_id"):
+            # phase F (fPrivacy R1.3): the request's id in every log, next to its turn's hands (probed)
+            extra["log_request_id"] = f"voice-{job.turn_id}-t{job.token}"
         if memory_query:
             # 22 §4 (v3.17): memory is searched with the user's own words (``memory_words``), passed explicitly, so it
             # never depends on the hand-off's format.

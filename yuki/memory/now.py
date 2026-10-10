@@ -321,9 +321,16 @@ class NowBoard:
             game_front, game_front_at = self._game_front, self._game_front_at
             signals = dict(self._signals)
             game_front_fn, signals_fn = self.game_front_fn, self.signals_fn
+        game_front_name: str | None = None
         if game_front_fn is not None:
             try:
-                game_front, game_front_at = bool(game_front_fn()), now
+                got = game_front_fn()
+                if got is None:      # not known now (a game gate that stopped): the reader reads locally (D9)
+                    game_front, game_front_at = None, None
+                else:
+                    game_front, game_front_at = bool(got), now
+                    # the game gate's front_game(): the game's program stem ("d3d" in exclusive full screen)
+                    game_front_name = got if isinstance(got, str) and got else None
             except Exception:  # noqa: BLE001 - unknown: the reader falls back to its own local read (D9)
                 game_front, game_front_at = None, None
         if signals_fn is not None:
@@ -331,7 +338,7 @@ class NowBoard:
         return {"at": now, "foreground": layout.get("foreground"), "layout_at": layout.get("at"),
                 "layout_ms": layout.get("ms"), "windows": windows, "popups": popups, "counters": counters,
                 "calling_tabs": calling_tabs, "game_front": game_front, "game_front_at": game_front_at,
-                "signals": signals}
+                "game_front_name": game_front_name, "signals": signals}
 
     def sizes(self) -> dict[str, int]:
         """Content-free sizes, for the service's stats."""
@@ -843,5 +850,43 @@ def game_in_front(board: dict[str, Any] | None, *, max_age_s: float = 2.0, now: 
     return bool(board["game_front"])
 
 
-__all__ = ["APP_DATA_READERS", "NowBoard", "NowClient", "NowServer", "NowTiming", "app_data_for", "format_now",
-           "game_in_front", "gist_of", "pipe_name", "shared_client", "timing_of"]
+#: How long the tray reuses the Now board's answer to "which game is in front" (s): the backstop asks before every
+#: step, every typed character included; the local read of the foreground program reuses its verdict as long
+#: (``gamegate.FRONT_FRESH_S``).
+FRONT_SOURCE_REUSE_S = 0.25
+
+
+def board_front_source(client_fn: Callable[[], Any] | None = None, *, max_age_s: float = 2.0,
+                       reuse_s: float = FRONT_SOURCE_REUSE_S, wait_s: float = 0.05,
+                       clock: Callable[[], float] = time.monotonic) -> Callable[[], str | None]:
+    """The tray's second answer to "which game is in front" for the D17 backstop
+    (``gamegate.set_front_source``, PLAN.md D9): the memory service's Now board ``game_front`` when it is at most
+    ``max_age_s`` old (:func:`game_in_front`), as the game's program stem (``game_front_name``), else None. It knows
+    the games the memory service's gate learned (a learned game played borderless, on no list). The board is asked at
+    most once per ``reuse_s`` and never waits longer than ``wait_s``; no answer is None (the backstop's own local read
+    stands). Never raises."""
+    lock = threading.Lock()
+    last: list[Any] = [float("-inf"), None]
+
+    def source() -> str | None:
+        with lock:
+            if clock() - last[0] < reuse_s:
+                return last[1]
+        game: str | None = None
+        try:
+            client = client_fn() if client_fn is not None else shared_client()
+            board = client.now(wait_s=wait_s) if client is not None else None
+            if game_in_front(board, max_age_s=max_age_s):
+                game = str((board or {}).get("game_front_name") or "game")
+        except Exception:  # noqa: BLE001 - no answer: the local read stands
+            game = None
+        with lock:
+            last[0], last[1] = clock(), game
+        return game
+
+    return source
+
+
+__all__ = ["APP_DATA_READERS", "FRONT_SOURCE_REUSE_S", "NowBoard", "NowClient", "NowServer", "NowTiming",
+           "app_data_for", "board_front_source", "format_now", "game_in_front", "gist_of", "pipe_name",
+           "shared_client", "timing_of"]

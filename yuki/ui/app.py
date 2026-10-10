@@ -435,6 +435,7 @@ class YukiUi(QObject):
         self.voice.start()
         self.window_host.start()
         self.island.start()
+        self._wire_game_backstop()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -449,6 +450,7 @@ class YukiUi(QObject):
         lifetime, and keeps remembering while Yuki is closed.
         """
         self.ui_log.event("stop")
+        self._unwire_game_backstop()
         self.window_host.stop()
         self.voice.shutdown()
         self.island.stop()
@@ -466,6 +468,36 @@ class YukiUi(QObject):
         for card in (self.notice_card, self.return_card):
             if card is not None:
                 card.hide()
+
+    def _wire_game_backstop(self) -> None:
+        """D17's backstop in this process (``yuki.memory.gamegate.refuse_input``, phase F, fGate): every refusal goes to
+        the UI log as ``input_refused_game`` (action, game stem, where; content-free), and the memory service's Now
+        board ``game_front`` (fresh, at most 2 s old) is its second answer to "which game is in front", so a game the
+        memory service's gate learned (played borderless, on no list) is refused too (D9). Never raises."""
+        try:
+            from yuki.memory import gamegate
+            from yuki.memory.now import board_front_source
+
+            def refused(event: str, **facts: Any) -> None:
+                self.ui_log.event(event, **facts)
+
+            self._refusal_listener = refused
+            gamegate.add_refusal_listener(refused)
+            gamegate.set_front_source(board_front_source())
+        except Exception as exc:  # noqa: BLE001 - the backstop's local read stands without them
+            self.ui_log.event("game_backstop", error=type(exc).__name__)
+
+    def _unwire_game_backstop(self) -> None:
+        try:
+            from yuki.memory import gamegate
+
+            listener = getattr(self, "_refusal_listener", None)
+            if listener is not None:
+                gamegate.remove_refusal_listener(listener)
+                self._refusal_listener = None
+                gamegate.set_front_source(None)
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- input -------------------------------------------------------------
 

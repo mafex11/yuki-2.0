@@ -832,7 +832,7 @@ class MemoryAccess:
 
     # -- "Yuki is acting" ------------------------------------------------------
 
-    def acting_begin(self, token: str, request: str, *, lane: str = "") -> bool:
+    def acting_begin(self, token: str, request: str, *, lane: str = "", request_id: str | None = None) -> bool:
         """Tell the memory service that Yuki is about to act on the desktop for ``request``.
 
         Written next to the database (:mod:`yuki.memory.acting`: a small file
@@ -840,14 +840,16 @@ class MemoryAccess:
         :meth:`acting_end` is recorded as Yuki's doing at the user's request,
         not as the user's own activity. Local file I/O, a millisecond; never
         raises. An access built on a stub client (offline checks) publishes
-        nothing unless it was given a database path.
+        nothing unless it was given a database path. ``request_id``: the
+        request's id in the logs (phase F; a voice hand's own id), else the one
+        the token stands for (:func:`yuki.memory.acting.request_id_of`).
         """
         if not self.installed or (self._custom and self._path is None):
             return False
         try:
             from yuki.memory import acting
 
-            return acting.begin(self._path, token, request, lane=lane)
+            return acting.begin(self._path, token, request, lane=lane, request_id=request_id)
         except Exception:
             return False
 

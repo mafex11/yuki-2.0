@@ -225,7 +225,8 @@ HAND_TOOLS: list[dict[str, Any]] = [
         "name": "media_key",
         "description": (
             "Your hand: a media key, or the SYSTEM volume (every app at once, 2% per press). playpause, nexttrack, "
-            "prevtrack and stop act on the media session the desktop block marks. One app's volume is app_volume. "
+            "prevtrack and stop act on the media session that is playing, else the current one (through Windows' "
+            "media controls; never a game's). One app's volume is app_volume. "
             "Verified from the session's status or the volume." + _NOW
         ),
         "properties": {
@@ -736,6 +737,9 @@ class Hands:
         #: Traces kept (one per hand, and one per skill run), for the tests and the log.
         self.traces_queued = 0
         self._trace_n = 0
+        #: Phase F (fPrivacy R1.3): each hand's id (``voice-<turn>-h<n>``) by tool call, minted as the hand starts so
+        #: memory's acting marker and the hand's run trace carry the same one (``python -m yuki.log.follow``).
+        self._hand_ids: dict[Any, str] = {}
         #: The authorization check for the talker's hands (``yuki.agent.judge.Authorizer``, revamp D S1): made on first
         #: use from the thinker's agent (its client, settings and policy), ``False`` when there is none (no judge in
         #: this build, no agent, or the judge turned off); a user turn is one request for it.
@@ -1278,8 +1282,9 @@ class Hands:
         self.busy += 1
         if self.bridge is not None:
             self.bridge.busy_tools += 1
+        hand_id = self._mint_hand_id(params.tool_call_id)
         try:
-            ok, report, facts = await asyncio.to_thread(self._acting_run, name, args)
+            ok, report, facts = await asyncio.to_thread(self._acting_run, name, args, hand_id)
         except Exception as exc:  # noqa: BLE001 - a hand's crash is a failed hand
             ok, report, facts = False, f"{type(exc).__name__}: {exc}", {}
         finally:
@@ -1340,6 +1345,7 @@ class Hands:
         elif not facts.get("refused"):
             self._trace(name, args, ok=ok, verified=verified, report=report, facts=facts, ms=ms,
                         call=params.tool_call_id)
+        self._hand_ids.pop(params.tool_call_id, None)   # a hand that kept no trace leaves no id behind
         if ok and facts.get("starting"):
             await params.result_callback({"starting": report[:700], "how_to_say_it": _STARTING_NOTE})
             return
@@ -1481,13 +1487,24 @@ class Hands:
         except Exception:  # noqa: BLE001 - a trace's context is a hint
             return default
 
-    def _trace_ids(self, call: Any) -> tuple[str, list[str], list[int]]:
-        """``(request id, the user's words, playbook ids shown)`` for a hand's trace."""
+    def _mint_hand_id(self, call: Any = None) -> str:
+        """A new hand id, ``voice-<turn key>-h<n>``, kept for ``call`` so the hand's trace reuses it."""
         self._trace_n += 1
         key = str(self._call_safely(self.turn_key, "") or "voice")
+        hand_id = f"voice-{key}-h{self._trace_n}"
+        if call is not None:
+            self._hand_ids[call] = hand_id
+            while len(self._hand_ids) > 64:   # bounded: a hand whose end never came
+                self._hand_ids.pop(next(iter(self._hand_ids)))
+        return hand_id
+
+    def _trace_ids(self, call: Any) -> tuple[str, list[str], list[int]]:
+        """``(request id, the user's words, playbook ids shown)`` for a hand's trace: the id minted when the hand
+        started (the acting marker's), else a new one."""
+        hand_id = self._hand_ids.pop(call, None) if call is not None else None
         words = [str(w) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
         shown = [int(i) for i in (self._call_safely(self.shown, []) or []) if isinstance(i, int)]
-        return f"voice-{key}-h{self._trace_n}", words, shown
+        return hand_id or self._mint_hand_id(), words, shown
 
     def _queue(self, write: Any) -> None:
         """A trace write, off the voice loop, in order with memory's turn log (no disk on the loop)."""
@@ -1758,18 +1775,21 @@ class Hands:
                            f"still until the user speaks again. Nothing was done. Tell them in a few words what the "
                            f"report showed, or hand it to the thinker with the state; never repeat it blindly")
 
-    def _acting_run(self, name: str, args: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    def _acting_run(self, name: str, args: dict[str, Any],
+                    hand_id: str | None = None) -> tuple[bool, str, dict[str, Any]]:
         """:meth:`_run` inside memory's "Yuki is acting" marker (appOpen F3): what a hand puts on screen is recorded as
         Yuki's doing, not the user's (5 Oct the Riot window the open_app hand brought up was logged as the user's own
-        for 107 s). Blocking, off the loop; the marker is a small file write. Sound-only hands publish nothing."""
+        for 107 s). Blocking, off the loop; the marker is a small file write. Sound-only hands publish nothing.
+        ``hand_id``: the hand's id (phase F): the marker carries it as its ``request_id``, as the hand's trace does."""
         memory = self.memory
         begin = getattr(memory, "acting_begin", None) if memory is not None else None
         token = f"voice-hand-{id(self)}-{time.monotonic_ns()}"
         published = False
         if callable(begin) and name not in AUDIO_HANDS:
             words = [str(w) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
+            extra = {"request_id": hand_id} if hand_id and _takes_kw(begin, "request_id") else {}
             try:
-                published = bool(begin(token, " / ".join(words[-2:]) or name, lane="voice"))
+                published = bool(begin(token, " / ".join(words[-2:]) or name, lane="voice", **extra))
             except Exception:  # noqa: BLE001 - the marker never breaks a hand
                 published = False
         try:
@@ -1842,7 +1862,7 @@ class Hands:
         if name == "media_key":
             key = str(args.get("key") or "")
             facts["target"] = ("the system volume (a media key: every app at once)" if key in _VOLUME_KEYS
-                               else "the media session the media keys act on")
+                               else "the media session playing (else the current one)")
         elif name == "app_volume":
             facts["target"] = f"the mixer volume of {str(args.get('app') or '?')[:60]} (that app only)"
             facts["app"] = str(args.get("app") or "") or None
@@ -2825,6 +2845,8 @@ class Hands:
     def _report(result: Any, lead: str, facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         ok = bool(getattr(result, "ok", False))
         facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
+        if _detail(result, "refused") == "game":
+            facts["refused"] = "game"   # D17(2): the backstop refused it for a game; never handed to the thinker
         return ok, lead + str(getattr(result, "summary", "")), facts
 
 

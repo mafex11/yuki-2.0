@@ -322,6 +322,9 @@ def run(args: argparse.Namespace) -> int:
     game_gate = None
     trace = None
     moments = None   # yuki.memory.moments.MomentHub (built after the AV signals)
+    volume_watch = None   # yuki.memory.volumewatch.VolumeWatch (phase F, fLive; needs the moments hub)
+    spotify = None        # yuki.connect.spotify_desktop.SpotifyWatch (phase F, fLive; needs the moments hub)
+    site_tabs = None      # yuki.memory.callevidence.SiteTabs (the Meet tab by identity, D8)
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -418,11 +421,21 @@ def run(args: argparse.Namespace) -> int:
             try:
                 from yuki.memory.callevidence import CallEvidence
 
-                call_evidence = CallEvidence(log=log, privacy=watcher.privacy)   # [meetings] always/never_sites
+                # [meetings] always/never_sites; the shipped site list's verdicts kept across restarts (state=)
+                call_evidence = CallEvidence(log=log, privacy=watcher.privacy, state=store)
+                # sightings go to the call evidence alone until the moments hub exists (its full hook is set below)
                 watcher.on_screen = call_evidence.seen
             except Exception as exc:  # calls then need the user's own [calls] apps
                 log("error", where="call_evidence", error=f"{type(exc).__name__}: {exc}")
                 call_evidence = None
+            if call_evidence is not None:
+                try:   # phase F (fLive, D8): a calling site's tab (the Meet tab in Zen) learned by identity, never title
+                    from yuki.memory.callevidence import SiteTabs
+
+                    site_tabs = SiteTabs(call_evidence, store=store, board=now_board, log=log)
+                except Exception as exc:  # the calls run on without it
+                    log("error", where="site_tabs_start", error=f"{type(exc).__name__}: {exc}")
+                    site_tabs = None
         watcher.start()
 
         # Who holds the microphone and camera, and which of them plays sound: measured, shared by the
@@ -442,13 +455,31 @@ def run(args: argparse.Namespace) -> int:
         try:
             from yuki.memory.moments import MomentHub
 
+            # the hub's calling-site answer (fLive review r2 L3): a product name, or the host itself for a calling
+            # site with no product name (stored as a site_front with no service, never logged); None otherwise
             moments = MomentHub(store, privacy=privacy, log=log, db_path=db_path,
-                                calling_service=lambda host: (getattr(call_evidence, "calling_service", None)
+                                calling_service=lambda host: (getattr(call_evidence, "site_front_service", None)
                                                               or (lambda _h: None))(host))
+            if site_tabs is not None:
+                moments.tab_known_fn = site_tabs.known   # site_front's facts.tab_known
             moments.start()
         except Exception as exc:  # memory runs on without moments
             log("error", where="moments_start", error=f"{type(exc).__name__}: {exc}")
             moments = None
+        if call_evidence is not None:
+            # the watcher's full hook, now that the hub exists (or not): the call evidence, then the calling site's
+            # tab, then the hub's site_front (which reads the tab's verdict). The watcher thread already runs; the
+            # attribute is read per sighting, so replacing it is safe. Each part never raises.
+            _evidence, _tabs, _hub = call_evidence, site_tabs, moments
+
+            def _on_screen(screen: dict[str, Any]) -> None:
+                _evidence.seen(screen)
+                if _tabs is not None:
+                    _tabs.seen(screen)
+                if _hub is not None:
+                    _hub.site(screen)
+
+            watcher.on_screen = _on_screen
 
         if not args.no_timeline:
             try:
@@ -749,6 +780,47 @@ def run(args: argparse.Namespace) -> int:
             log("error", where="game_gate_start", error=f"{type(exc).__name__}: {exc}")
             game_gate = None
 
+        # Phase F (fLive) wiring on the hub and the gate. The Now board's game_front (D9) is the gate's front_game(),
+        # asked at snapshot time (None, "not known", once the gate's thread is gone); its live signals are the call
+        # worker's microphone holders and the timeline's playing apps (app keys only).
+        if now_board is not None:
+            if game_gate is not None:
+                _gate = game_gate
+                now_board.game_front_fn = lambda: _gate.front_game() if _gate.alive else None
+            now_board.signals_fn = lambda: {
+                "mic_holders": calls.mic_holders() if calls is not None else [],
+                "playing": timeline.playing_apps() if timeline is not None else []}
+        if moments is not None:
+            def _game_front() -> bool:
+                gg = game_gate
+                return gg is None or not gg.alive or bool(gg.front_game())   # no live gate: held (fails closed)
+
+            # [moments] enabled / volume_events: the volume watcher starts only when both are on (the hub checks
+            # them again on every change, so turning them off later writes nothing)
+            try:   # master and app volume changes from Core Audio's own callbacks: one thread blocked on a queue
+                moments_cfg = moments.config()
+                if moments_cfg.enabled and moments_cfg.volume_events:
+                    from yuki.memory.volumewatch import VolumeWatch, hub_on_change
+
+                    volume_watch = VolumeWatch(
+                        on_change=hub_on_change(moments), log=log,
+                        front_fn=lambda: call_evidence.front()[0] if call_evidence is not None else None).start()
+            except Exception as exc:   # memory runs on without it
+                log("error", where="volume_watch_start", error=f"{type(exc).__name__}: {exc}")
+                volume_watch = None
+            try:   # Spotify's own window, read through UI Automation (D4): which playlist, the in-app slider
+                from yuki.connect.spotify_desktop import SpotifyWatch, hub_emit
+
+                spotify = SpotifyWatch(emit=hub_emit(moments), log=log, store=store, privacy=privacy,
+                                       game_front_fn=_game_front)
+                moments.subscribe_media(spotify.on_media_change)   # "its music started"
+                moments.subscribe_front(spotify.on_front_change)   # "it left the front"
+                if now_board is not None:
+                    now_board.subscribe_layout(spotify.on_layout)  # where its window is (the probe's states)
+            except Exception as exc:   # memory runs on without it
+                log("error", where="spotify_watch_start", error=f"{type(exc).__name__}: {exc}")
+                spotify = None
+
         # The action trace (report 78 C1, shadow; yuki.memory.trace): nothing runs until the user turns on Settings ->
         # Record how I work; then it shares presence's one Raw Input reader, obeys the game gate (a gate that failed
         # to start holds) and the pause. Retention runs either way (raw rows 30 days, elements 60).
@@ -763,14 +835,15 @@ def run(args: argparse.Namespace) -> int:
         # (source_checkpoints['trace.name_rule']), on a short-lived thread (about a second on 5.5k rows); logged
         # trace_name_scrub, counts only. A failure leaves the checkpoint, so the next start tries again; ancestries
         # left unrecovered are looked at again at the next start, and cleared at the last try (it fails closed).
-        # While the hard game gate holds (any game running; a gate that failed to start holds) it waits.
+        # While a game runs anywhere it waits (a background CPU job: the running gate since fGate, not the input
+        # gate, which holds only for a game in front; a gate that failed to start holds).
         try:
             from yuki.memory import trace_store as _trace_store_scrub
 
             def _scrub_hold() -> bool:
-                from yuki.memory.gamegate import gate_holds
+                from yuki.memory.gamegate import running_holds
 
-                return gate_holds(game_gate)
+                return running_holds(game_gate)
 
             def _name_scrub() -> None:
                 try:
@@ -833,6 +906,11 @@ def run(args: argparse.Namespace) -> int:
                     moments.beat()
                 except Exception as exc:
                     log("error", where="moments_beat", error=type(exc).__name__)
+            if spotify is not None:
+                try:   # the daily state probe's one-shot timer (a timer compare; no loop of its own)
+                    spotify.beat()
+                except Exception as exc:
+                    log("error", where="spotify_beat", error=type(exc).__name__)
             if timeline is not None and not timeline.alive:
                 log("error", where="timeline", error="timeline thread exited")  # not fatal
                 timeline = None
@@ -890,7 +968,10 @@ def run(args: argparse.Namespace) -> int:
                     screen_recall=screen_recall.stats() if screen_recall is not None else None,
                     game_gate=game_gate.stats() if game_gate is not None else None,
                     trace=trace.stats() if trace is not None else None,
-                    moments=moments.stats() if moments is not None else None)
+                    moments=moments.stats() if moments is not None else None,
+                    volume=volume_watch.stats() if volume_watch is not None else None,
+                    spotify=spotify.stats() if spotify is not None else None,
+                    site_tabs=site_tabs.stats() if site_tabs is not None else None)
                 if moments is not None:
                     moments.log_sources()
                 if trace is not None and trace.sink is not None:
@@ -969,6 +1050,11 @@ def run(args: argparse.Namespace) -> int:
                 pass
         if game_gate is not None:
             game_gate.stop()
+        if volume_watch is not None:
+            try:
+                volume_watch.stop()   # its Core Audio callbacks are released on its own thread
+            except Exception:
+                pass
         if moments is not None:
             moments.stop()   # the queued live moments (the derived ones are re-read from their sources next start)
         if watcher is not None:

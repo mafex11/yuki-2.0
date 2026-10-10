@@ -310,7 +310,8 @@ def test_the_service_scrubs_once_at_start_off_its_main_thread():
     start = src.index('log("trace_purge"')
     block = src[start:start + 2500]
     assert "scrub_names_once(store, log, hold=_scrub_hold, stop=stop)" in block and "yuki-memory-namescrub" in block
-    assert "gate_holds(game_gate)" in block                                  # it waits while a game runs
+    # it waits while a game runs anywhere (a CPU job: fGate's running gate, not the input gate; fWire)
+    assert "running_holds(game_gate)" in block
 
 
 def test_the_scrub_never_fails_open_on_an_ancestry_it_could_not_recover(store, monkeypatch):
@@ -739,11 +740,45 @@ def test_the_digest_rule_holds_in_a_log_that_keeps_content(tmp_path, store):
     assert full not in text and "Quillon" not in text
 
 
-def test_the_agents_acting_token_names_the_same_request():
-    """The agent's marker token is ``<lane>-<session id>-<n>`` (loop._acting_start); its session log's id is
-    ``<session id>-<n>``: the marker carries that id without the agent passing it."""
-    src = (ROOT / "yuki" / "agent" / "loop.py").read_text(encoding="utf-8")
-    assert 'f"{self.lane}-{self.logger.session_id}-{self._requests}"' in src
+def test_the_agents_acting_token_names_the_same_request(tmp_path):
+    """The agent's marker token is ``<lane>-<the session log's request id>`` (loop._acting_start, fWire: R1.3 must 1),
+    so the marker carries exactly the id every record of the request has, a front desk's hand-off id included (never
+    one derived from the agent's own request counter); ``<lane>-<session id>-<n>`` only when the log began none."""
+    from yuki.agent.loop import Agent
+
+    begun: list[tuple[str, str]] = []
+
+    class _Memory:
+        def acting_begin(self, token: str, request: str, *, lane: str = "") -> bool:
+            begun.append((token, lane))
+            return acting.begin(tmp_path / "memory.db", token, request, lane=lane)
+
+    logger = SessionLogger(tmp_path, session_id="20261010-091512-worker", quiet=True)
+
+    def agent(request_id: str | None) -> Any:
+        logger.end_request()
+        if request_id is not None:
+            logger.begin_request(request_id)
+        return SimpleNamespace(lane="worker", logger=logger, memory=_Memory(), _acting_token=None, _requests=7,
+                               _request_text="x", _watch_on=lambda: None)
+
+    handed = agent("20261010-091512-frontdesk-2")            # the front desk's id, kept across the hand-off
+    Agent._acting_start(handed)
+    assert begun[-1] == ("worker-20261010-091512-frontdesk-2", "worker")
+    assert acting.current(tmp_path / "memory.db").request_id == "20261010-091512-frontdesk-2"
+    acting.end(tmp_path / "memory.db", handed._acting_token)
+    own = agent(None)
+    logger.user_message("y")                                  # the log begins its own: <session id>-<n>
+    Agent._acting_start(own)
+    assert begun[-1][0] == f"worker-{logger.request_id}" and logger.request_id.startswith("20261010-091512-worker-")
+    assert acting.current(tmp_path / "memory.db").request_id == logger.request_id
+    acting.end(tmp_path / "memory.db", own._acting_token)
+    logger.end_request()
+    none = agent(None)                                        # no request begun: the old form
+    Agent._acting_start(none)
+    assert begun[-1][0] == "worker-20261010-091512-worker-7"
+    acting.end(tmp_path / "memory.db", none._acting_token)
+    logger.close()
     assert acting.request_id_of("worker-20261010-091512-worker-3", "worker") == "20261010-091512-worker-3"
     assert acting.request_id_of("voice-hand-1-2", "voice") == "hand-1-2"
     assert acting.request_id_of("custom-token", "") == "custom-token"

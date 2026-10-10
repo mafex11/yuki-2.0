@@ -1212,6 +1212,17 @@ class TimelineRecorder:
             return None
         return {"process": st.process, "app": st.app, "service": st.meeting}
 
+    def playing_apps(self) -> list[str]:
+        """The app keys of the media sessions the last media read found playing (content-free: app keys only), for
+        the Now board's live signals (fWire, fLive review r1 L1). Cheap and safe from any thread: a session id the
+        recorder has not resolved yet stands as its own key (no process scan here)."""
+        out: set[str] = set()
+        for app_id, _label, _title in list(self._playing):
+            key = self._app_ids.get(app_id) or app_key(app_id) or ""
+            if key:
+                out.add(key)
+        return sorted(out)
+
     def stats(self) -> dict[str, Any]:
         """Counters (content-free)."""
         probe = self._probe

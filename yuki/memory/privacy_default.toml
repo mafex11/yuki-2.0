@@ -366,6 +366,36 @@ deliver_within_h = 72
 # A failed run is retried no sooner than this many minutes later.
 retry_min = 30
 
+[moments]
+# Moments (yuki.memory.moments, phase F): one table of what changed - you joined a call, music
+# started, a page you stayed on, a volume you moved, a message you sent - so Yuki can learn your
+# usual moments.  Derived again from what memory already keeps whenever its rules change; never
+# shown to other apps (not in the MCP).  false = none are written (nothing else changes).
+enabled = true
+# Volume changes (the system volume and each app's mixer level, from Windows' own audio events).
+volume_events = true
+# Media titles are never kept, only a keyed digest; true keeps the title encrypted (never for an
+# app that was private in the last 10 minutes).
+media_titles = false
+# How often the derived moments are brought up to date (seconds; sooner after a call starts or ends).
+refresh_s = 60
+# A web page counts as a moment once you stayed on it this long (seconds), or when it matches a
+# site's known page shape (a YouTube video, a channel).
+page_dwell_s = 300
+# Moments older than this many days are deleted.
+keep_days = 90
+
+[spotify]
+# Spotify's own desktop window, read through UI Automation: no account, key or sign-in (PLAN.md D0, D4).
+enabled = true
+# Q10: when Spotify's music starts, read its Library for the playing row and the playlist links on screen.
+# Names and links are kept encrypted, never logged, never read with a game in front.
+library_reads = true
+read_budget_s = 0.3
+warm_budget_s = 3.0
+# Once a day per window state (covered, on another screen, minimised), one counts-only read. Off once S-1 settled them.
+state_probe = true
+
 [calls]
 # Calls, both sides (yuki.memory.calls; your decision of 3 Oct 2026 - from
 # 24 Sept to 3 Oct only your own microphone was recorded).  If you say yes on

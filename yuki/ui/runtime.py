@@ -174,6 +174,9 @@ class Job:
     #: V4: the app or route the user named for this request in their own words (``Agent.run(app_named=)``; voice: the
     #: talker's ``app_named``); ``None``: none named.
     app_named: str | None = None
+    #: Phase F (fPrivacy R1.3): the id this request already has in the logs (``Agent.run(request_id=)``): a front
+    #: desk's request handed to the worker keeps the front desk's session-log id; ``None``: the lane's log begins one.
+    log_request_id: str | None = None
 
 
 def _words_tuple(words: "Iterable[str] | str | None") -> tuple[str, ...] | None:
@@ -432,6 +435,12 @@ class Lane(QThread):
             reached_for_hands: list[str] = []
             try:
                 reached_for_hands = self._drive(job)
+                # phase F (fPrivacy R1.3): the session-log id this request ended with, kept for a hand-off (read on
+                # the GUI thread in _on_lane_done, after this lane may already have begun its next request)
+                ended = getattr(getattr(self.agent, "logger", None), "last_request_id", None)
+                log_ids = getattr(self.runtime, "_log_ids", None)
+                if isinstance(ended, str) and ended and isinstance(log_ids, dict):
+                    log_ids[job.id] = ended
                 # The agent writes its summary in the generator's finally, which
                 # has run by now: the final/failed signal went out first, so the
                 # UI can label the message that is already on screen.
@@ -498,6 +507,8 @@ class Lane(QThread):
             # V4: the app the user named (the job's own, or one named after it was queued: AgentRuntime.name_app)
             **({"app_named": named} if (named := job.app_named or getattr(runtime, "_apps_named", {}).get(job.id))
                else {}),
+            # phase F: one request id across the front desk's hand-off (the user's words and the worker's actions)
+            **({"request_id": job.log_request_id} if job.log_request_id else {}),
         )
         begun = False
         while True:
@@ -744,6 +755,9 @@ class AgentRuntime(QObject):
         self._memory_queries: dict[int, str] = {}
         self._user_words: dict[int, tuple[str, ...]] = {}   # front-desk requests' heard words, kept for a hand-off
         self._apps_named: dict[int, str] = {}   # front-desk requests' named app (V4), kept for a hand-off
+        #: Phase F (fPrivacy R1.3): the session-log id each request ended with (written by its lane's thread, popped in
+        #: _on_lane_done), so a front desk's request handed to the worker keeps one id in every log.
+        self._log_ids: dict[int, str] = {}
 
         session = ui_log.logger.session_id
         console = ui_log.logger.console
@@ -860,7 +874,7 @@ class AgentRuntime(QObject):
         self, request: str, *, origin_hwnd: int | None = None, source: str = "text", lane: str | None = None,
         view_hwnd: int | None = None, memory_query: str | None = None, previous_query: str | None = None,
         user_words: "Iterable[str] | str | None" = None, pack: Any = None, needs_hands: bool | None = None,
-        app_named: str | None = None,
+        app_named: str | None = None, log_request_id: str | None = None,
     ) -> tuple[str, int]:
         """Route one request to a lane.
 
@@ -892,6 +906,8 @@ class AgentRuntime(QObject):
                 as before. ``None`` / ``True``: as before.
             app_named: The app or route the user named in their own words (V4; voice: the talker's ``app_named``):
                 kept across a front-desk hand-off and given to ``Agent.run(app_named=)``.
+            log_request_id: The id the request already has in the logs (phase F; voice: ``voice-<turn>-t<n>``),
+                kept by the lane's run and across a front-desk hand-off; ``None``: the lane's log begins one.
 
         Returns:
             ``(lane name, request id)``.
@@ -920,7 +936,7 @@ class AgentRuntime(QObject):
             self._apps_named[request_id] = named
         fresh = pack if (lane is self.worker and worker_idle) else None
         waiting = lane.enqueue(Job(request_id, request, origin_hwnd, source, view_hwnd, memory_query,
-                                   previous_query, words, fresh, named))
+                                   previous_query, words, fresh, named, log_request_id=log_request_id or None))
         self.ui_log.event(
             "lane", lane=lane.name, id=request_id, waiting=waiting, request=request,
             origin_hwnd=origin_hwnd, source=source, view_hwnd=view_hwnd,
@@ -930,7 +946,7 @@ class AgentRuntime(QObject):
 
     def queue_for_worker(self, request: str, *, origin_id: int | None = None, source: str = "text",
                          memory_query: str | None = None, user_words: "Iterable[str] | str | None" = None,
-                         app_named: str | None = None) -> int:
+                         app_named: str | None = None, log_request_id: str | None = None) -> int:
         """Put a request on the worker's queue explicitly.
 
         Args:
@@ -938,6 +954,8 @@ class AgentRuntime(QObject):
             origin_id: The front-desk request it came from, for the log.
             source: Where the request came from (``text`` or ``voice``), kept across the hand-off.
             memory_query: The user's own words for the memory lookup, kept across the hand-off.
+            log_request_id: The id the request already has in the logs (the front desk's session-log id), kept by
+                the worker's run (phase F: one request id from the words to the result).
 
         Returns:
             The new request id.
@@ -946,9 +964,11 @@ class AgentRuntime(QObject):
         self._worker_outstanding.append(request_id)
         waiting = self.worker.enqueue(Job(request_id, request, None, source, memory_query=memory_query,
                                           user_words=_words_tuple(user_words),
-                                          app_named=" ".join(str(app_named or "").split()) or None))
+                                          app_named=" ".join(str(app_named or "").split()) or None,
+                                          log_request_id=log_request_id or None))
         self.ui_log.event(
-            "queued", id=request_id, origin=origin_id, waiting=waiting, request=request
+            "queued", id=request_id, origin=origin_id, waiting=waiting, request=request,
+            **({"request_id": log_request_id} if log_request_id else {}),
         )
         self.queued.emit(request_id, request, waiting)
         return request_id
@@ -1134,18 +1154,22 @@ class AgentRuntime(QObject):
         model asked for ``click`` and did not have it -- so nothing here reads the
         model's prose.
         """
+        log_id = getattr(self, "_log_ids", {}).pop(request_id, None)   # its session-log id when it ended (phase F)
         if lane_name == WORKER:
             if request_id in self._worker_outstanding:
                 self._worker_outstanding.remove(request_id)
             self._apps_named.pop(request_id, None)
             return
         if needed_hands:
-            self.ui_log.event("handoff", id=request_id, refused=list(refused))
             new_id = self.queue_for_worker(request, origin_id=request_id,
                                            source=self._sources.pop(request_id, "text"),
                                            memory_query=self._memory_queries.pop(request_id, None),
                                            user_words=self._user_words.pop(request_id, None),
-                                           app_named=self._apps_named.pop(request_id, None))
+                                           app_named=self._apps_named.pop(request_id, None),
+                                           log_request_id=log_id)
+            # both runtime ids (the front desk's, the worker's) and the one log id they share from here on
+            self.ui_log.event("handoff", id=request_id, worker_id=new_id, refused=list(refused),
+                              **({"request_id": log_id} if log_id else {}))
             self.handed_off.emit(request_id, new_id, len(self.worker.waiting_ids()))
         else:
             self._sources.pop(request_id, None)
