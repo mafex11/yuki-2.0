@@ -346,6 +346,18 @@ question_max_age_days = 7
 # to copy, or a suggestion put unsent in the ask bar - never your own work.
 # "off": cards only tell you things; no button runs anything.
 offers = "yuki_only"
+# The routine card ("Your usual", yuki.memory.routine_offers): when a skill Yuki learned from you has a usual time
+# (a weekday meeting tab at 08:58), one card in its window offers to run it: from routine_lead_min to
+# routine_lead_last_min minutes before the usual time; its button expires routine_expire_after_min minutes after it;
+# once you sat down it waits routine_settle_s seconds; at most routine_per_day a day.  Code only, no model; it never
+# sends a message or joins a call (you click Join), and never shows over a game, a call, quiet hours or a snooze.
+# offers = "off" stops it too.
+routine_offers = true
+routine_per_day = 2
+routine_lead_min = 8
+routine_lead_last_min = 1
+routine_expire_after_min = 10
+routine_settle_s = 30
 
 [review]
 # The weekly review (yuki.memory.review): the last seven days in numbers and a
@@ -383,6 +395,9 @@ refresh_s = 60
 # A web page counts as a moment once you stayed on it this long (seconds), or when it matches a
 # site's known page shape (a YouTube video, a channel).
 page_dwell_s = 300
+# A site with no known page shape counts as a moment once you stayed on it this long (seconds): one moment per site,
+# never its page's title or address (the skill learner reads these for your usual sites).
+host_dwell_s = 60
 # Moments older than this many days are deleted.
 keep_days = 90
 

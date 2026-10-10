@@ -414,6 +414,8 @@ OFFER_STATE_WORDS: dict[str, str] = {
     "running": "Running…", "done": "Done", "undoing": "Undoing…", "undone": "Undone", "prefilled": "In the ask bar",
     "stopped": "Stopped", "abandoned": "Not sent", "expired": "Expired", "gone": "No longer there",
     "off": "Offers are off", "already": "Already done", "error": "Didn't work",
+    # phase R (rLane merge note): the routine card's run_skill states
+    "failed": "Didn't work", "not_ready": "Not ready yet", "busy": "Busy",
 }
 #: Offer states after which the card's offer button is gone altogether.
 OFFER_GONE_STATES: frozenset[str] = frozenset({"dismissed", "less"})
@@ -783,7 +785,11 @@ class _ItemWidget(QWidget):
             self.do.setText(OFFER_STATE_WORDS.get(state, state) if state else (offer_label(nudge) or "Do it"))
             self.do.setEnabled(state is None)
         if self.undo is not None:
-            self.undo.setVisible(state == "done" and offer.get("do") in ("todo_add", "bring_back"))
+            # phase R: a routine card's run puts back the window that was in front, after a failed run too (as the
+            # corner card's Undo, ui.nudges.undo_offer)
+            do = offer.get("do")
+            self.undo.setVisible((state == "done" and do in ("todo_add", "bring_back", "run_skill"))
+                                 or (state == "failed" and do == "run_skill"))
         if self.offer_result is not None:
             shown = ""
             if state == "done" and offer.get("do") == "draft":

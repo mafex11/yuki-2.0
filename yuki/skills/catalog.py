@@ -206,9 +206,29 @@ def specialise(cap: Skill, *, key: str, spec: Mapping[str, Any], name: str = "")
     commit = strictest(cap.commit, str(spec.get("commit") or ""))
     menu = _clip(str(spec.get("menu") or "") or name or cap.menu, MENU_LINE_CHARS)
     digest = hashlib.sha256(json.dumps(spec, sort_keys=True, default=str, ensure_ascii=False).encode()).hexdigest()
-    return replace(cap, key=key, menu=menu, slots=slots, routes=tuple(routes), wont=wont, commit=commit,
-                   origin="learned", capability=cap.key, name=_clip(name, 60), bound=bound, file="learned",
-                   hash=digest[:16], warnings=())
+    learned = replace(cap, key=key, menu=menu, slots=slots, routes=tuple(routes), wont=wont, commit=commit,
+                      origin="learned", capability=cap.key, name=_clip(name, 60), bound=bound, file="learned",
+                      hash=digest[:16], warnings=())
+    return _with_taste_kinds(learned)
+
+
+def _with_taste_kinds(skill: Skill) -> Skill:
+    """lWire (open point): a learned skill's free entity slot takes its taste kind from data
+    (:func:`yuki.skills.taste.slot_kind`: its bound site and page are a site file's page kind with a speakable
+    variable, e.g. a channel on a site's channel pages), so the resolver and the menu offer the user's own
+    candidates for it. A slot with its own kind, a bound slot and any other slot are left as they are. Never raises
+    (the skill as it was)."""
+    try:
+        from yuki.skills import taste
+
+        kinds = {s.name: taste.slot_kind(skill, s) for s in skill.slots
+                 if s.type == "entity" and not s.taste and s.name not in skill.bound}
+    except Exception:  # noqa: BLE001 - no taste kind: the slot fills from the words, as before
+        return skill
+    if not any(kinds.values()):
+        return skill
+    return replace(skill, slots=tuple(replace(s, taste=kinds[s.name]) if kinds.get(s.name) else s
+                                      for s in skill.slots))
 
 
 def _combine(caps: Loaded, rows: tuple[_Row, ...], row_errors: tuple[str, ...], learned_v: str) -> Loaded:

@@ -6,8 +6,8 @@ own fixed words for its own parts and format, not anything the user said, so a d
 vocabulary is the right tool here (the speech guard's model judgement stays for everything else):
 
 * :data:`INTERNAL_WORDS` - names of Yuki's parts ("thinker", "talker");
-* :data:`TOOL_WORDS` - Yuki's own tool and field names with an underscore (``tell_yuki``, ``say_first``,
-  ``check_progress``): a file or site name of the user's with an underscore is theirs and stays;
+* :data:`TOOL_WORDS` - Yuki's own tool and field names with an underscore (``tell_yuki``, ``hand_over``,
+  ``say_first``, ``check_progress``): a file or site name of the user's with an underscore is theirs and stays;
 * :data:`MARKER_WORDS` - the speech channel's marker words, only when one stands alone as a whole piece or as the
   last word after a sentence has ended ("Opening Chrome. act"); "act" inside a sentence is English.
 
@@ -29,6 +29,8 @@ TOOL_WORDS: frozenset[str] = frozenset({
     "run_powershell", "run_skill", "set_slider", "spawn_helpers", "stay_quiet", "system_facts", "take_screenshot",
     "tell_yuki", "type_text", "watch_for", "window_action", "write_clipboard", "say_first", "say_when_done",
     "tool_use", "tool_result", "check_situation",
+    # bTalk (brain = "all"): the lean talker's cancel tool, beside hand_over; the full talker's own cancel tool
+    "cancel_hand_over", "cancel_tell_yuki",
 })
 #: The speech channel's marker words (yuki.voice.mouth.MARKERS; its "more" divider is an everyday answer, "More.").
 MARKER_WORDS: frozenset[str] = frozenset({"say", "act", "quiet"})

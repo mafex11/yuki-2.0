@@ -436,6 +436,7 @@ class YukiUi(QObject):
         self.window_host.start()
         self.island.start()
         self._wire_game_backstop()
+        self._wire_skills_log()
         self.ui_log.event(
             "start",
             hotkeys=self.bindings,
@@ -486,6 +487,18 @@ class YukiUi(QObject):
             gamegate.set_front_source(board_front_source())
         except Exception as exc:  # noqa: BLE001 - the backstop's local read stands without them
             self.ui_log.event("game_backstop", error=type(exc).__name__)
+
+    def _wire_skills_log(self) -> None:
+        """Phase L (lPage note 4, lWire "open"): the skills catalog in this process tells the UI log once about each
+        connection file it refused and each learned skill row it could not read (``connection_error`` /
+        ``learned_error``: a file name or row id and a code word, never content). Never raises."""
+        setter = getattr(self.runtime.memory, "set_skills_log", None)
+        if not callable(setter):
+            return
+        try:
+            setter(lambda event, **facts: self.ui_log.event(event, **facts))
+        except Exception as exc:  # noqa: BLE001 - the catalog then keeps its errors untold
+            self.ui_log.event("skills_log", error=type(exc).__name__)
 
     def _unwire_game_backstop(self) -> None:
         try:
@@ -1248,7 +1261,8 @@ class YukiUi(QObject):
         def run() -> None:
             out: dict[str, str] = {}
             try:
-                data = memory.call_method("workflows", timeout_s=8.0) or {}
+                # the practice part only (lPage note 6): the learned-skills section is the Playbook page's
+                data = memory.call_method("workflows", timeout_s=8.0, skills=False) or {}
                 for card in data.get("workflows") or []:
                     if isinstance(card, dict) and card.get("id"):
                         out[str(card["id"])] = "" if card.get("kind") == "pitfall" else str(
@@ -1443,7 +1457,7 @@ class YukiUi(QObject):
 
         def fetch(late: bool) -> bool:
             try:
-                learned = learned_for_card(memory.call_method("workflows", timeout_s=8.0), started_wall,
+                learned = learned_for_card(memory.call_method("workflows", timeout_s=8.0, skills=False), started_wall,
                                            started_wall + took)
             except Exception:
                 learned = None
