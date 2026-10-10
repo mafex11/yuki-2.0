@@ -15,23 +15,28 @@ Never the portrait's interests (rule 3: no join of interests to handles by name)
 nightly part takes at most :data:`NIGHT_READS`; never with a game in front; never when the user's privacy file blocks
 the site):
 
-* a channel's id: one read of its handle page, once (``yt_channels``; a failure is retried at most
-  :data:`LOOKUP_TRIES` times, a week apart): the nightly part, for the channels the user picks most;
-* a watched video's channel: one oEmbed read per video id, ever (the nightly part, the newest watches first, the
-  ones right after an offer before the rest);
+* a channel's id: one read of its handle page, once (``yt_channels``; a failure that got an answer is retried at most
+  :data:`LOOKUP_TRIES` times, a week apart; no answer at all, offline, counts no try): the nightly part, for the
+  channels the user picks most;
+* a watched video's channel: one oEmbed read per video id, ever (an answer, even a failed one; offline is tried
+  again), the nightly part, the newest watches first, the ones right after an offer before the rest;
 * a channel's fresh uploads: its public feed, **only on request** (:func:`offer`): when a run opens YouTube's home
   page (:func:`wants`), the top :data:`FEED_CHANNELS` channels at this hour whose feed is older than
-  :data:`FEED_FRESH_S` are read in parallel within :data:`REQUEST_BUDGET_S`; older feeds serve otherwise.
+  :data:`FEED_FRESH_S` are read in parallel within :data:`REQUEST_BUDGET_S` (``Settings.youtube_feed_budget_s``);
+  older feeds serve otherwise. A feed counts as read only once its answer parsed (an error answer waits the same
+  hour: a backoff); no answer or a cut-off body is read again on the next request.
 
-**The offer:** videos published in the last :data:`FRESH_DAYS` that the user never had on screen (no ``page`` moment
-of that video: the moments' ``entity_key``, D23), ranked by ``taste score of the channel at this hour x
-exp(-age / 7 days)``, one per channel, the top :data:`OFFER_N`. They are named aloud with the done line
-(:func:`offer_line`: "New from NDL, Deji and Sidemen: want one?"; the names are the channels' own, from the user's
-data). **Nothing plays:** a video opens only when the user picks one ("the Deji one": :func:`pick`, through
-``web.open_video``, whose slot takes no taste guess). Shorts are left out (their link is not a watch page).
+**The offer:** videos published in the last :data:`FRESH_DAYS` (``Settings.youtube_fresh_days``) that the user never
+had on screen (no ``page`` moment of that video: the moments' ``entity_key``, D23), ranked by ``taste score of the
+channel at this hour x exp(-age / 7 days)``, one per channel, the top :data:`OFFER_N`. Ranking notes nothing: the
+caller names them with a checked done line (:func:`offer_line`: "New from NDL, Deji and Sidemen: want one?"; the names
+are the channels' own, from the user's data) and only then notes them (:func:`said`, :meth:`Pending.confirm`), so an
+offer never named is never scored and never pickable. **Nothing plays:** a video opens only when the user picks one
+("the Deji one": :func:`pick`, through ``web.open_video``, whose slot takes no taste guess). Shorts are left out
+(their link is not a watch page).
 
-**Learning and the live check:** each offer is a ``taste_events`` row; the nightly part writes its outcome: the user's
-next YouTube pick within :data:`OUTCOME_S` was one of the three (``hit``), from one of the three channels
+**Learning and the live check:** each offer named is a ``taste_events`` row; the nightly part writes its outcome: the
+user's next YouTube pick within :data:`OUTCOME_S` was one of the three (``hit``), from one of the three channels
 (``channel``), something else (``miss``), or nothing (``none``). Once :data:`LIVE_MIN_PICKS` picks are on record, a
 rate under :data:`LIVE_MIN_RATE` switches the offers off (PLAN.md Phase T: plain YouTube home stays), noted once.
 
@@ -93,10 +98,12 @@ OFF_STATE = "taste.youtube_offers"
 #: A channel id lookup that failed is retried after this long, at most this many times in all.
 LOOKUP_RETRY_S = 7 * 86400.0
 LOOKUP_TRIES = 3
-#: The nightly part: its reads at most (half the hour's cap, so a request in the same hour still reads feeds), of
-#: which channel lookups at most (the rest go to oEmbed), the channels it looks at (most picked first), how far back it
-#: attributes watched videos, and each read's socket timeout.
+#: The nightly part: its reads in any hour at most (half the hour's cap, so a request in the same hour still reads
+#: feeds, however often the pass runs: its reads of the last hour count against it), the read kinds that are its own,
+#: of which channel lookups at most (the rest go to oEmbed), the channels it looks at (most picked first), how far back
+#: it attributes watched videos, and each read's socket timeout.
 NIGHT_READS = 4
+NIGHT_KINDS = ("page", "oembed")
 NIGHT_LOOKUPS = 3
 NIGHT_CHANNELS = 16
 ATTRIBUTE_DAYS = 14.0
@@ -349,13 +356,21 @@ def _iso(text: Any) -> float | None:
 
 def parse_feed(data: bytes) -> tuple[str | None, list[dict[str, Any]]]:
     """``(the channel's display name, [{video_id, title, published_at, link}])`` of a channel's public Atom feed
-    (YouTube's documented format). A document with a DTD is refused (no entities are ever expanded). Never raises."""
+    (YouTube's documented format). A document with a DTD is refused (no entities are ever expanded). Never raises;
+    ``(None, [])`` for a body that does not parse."""
+    return _parse_feed(data) or (None, [])
+
+
+def _parse_feed(data: bytes) -> tuple[str | None, list[dict[str, Any]]] | None:
+    """:func:`parse_feed`, None when the body is no whole Atom feed (empty, a DTD, cut off, malformed)."""
     if not data or b"<!DOCTYPE" in data[:4096].upper() or b"<!ENTITY" in data.upper():
-        return None, []
+        return None
     try:
         root = ElementTree.fromstring(data)
     except (ElementTree.ParseError, ValueError):
-        return None, []
+        return None
+    if root.tag != f"{ATOM}feed":
+        return None
     name = root.findtext(f"{ATOM}author/{ATOM}name") or root.findtext(f"{ATOM}title") or ""
     out: list[dict[str, Any]] = []
     for entry in root.findall(f"{ATOM}entry"):
@@ -377,19 +392,30 @@ def _is_watch(link: str) -> bool:
 def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: float,
                deadline: float | None = None) -> dict[str, int]:
     """Read one channel's feed and keep its uploads (watch pages only: shorts left out), its display name and the
-    cache row. Content-free counts: ``ok`` / ``failed`` / ``capped``, ``bytes``, ``videos``."""
+    cache row. The cache row marks the feed read only once its body parsed (tTaste r1 L2), or for an error answer (a
+    404, a 429: it waits :data:`FEED_FRESH_S` like a read one, a backoff under the hourly cap); no answer (offline, a
+    timeout) or a body cut off by the deadline leaves it stale, so the next request reads it again. Content-free
+    counts: ``ok`` / ``failed`` / ``capped``, ``bytes``, ``videos``."""
     got = _read(store, "feed", _url(FEED_URL, id=channel_id), max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s,
                 deadline=deadline)
     if got is None:
         return {"capped": 1}
     status, body = got
-    try:
-        store.save_yt_feed_cache(key, at=now, status=status, nbytes=len(body))
-    except Exception:  # noqa: BLE001
-        pass
+
+    def cached() -> None:
+        try:
+            store.save_yt_feed_cache(key, at=now, status=status, nbytes=len(body))
+        except Exception:  # noqa: BLE001
+            pass
+
     if status != 200:
+        if status:
+            cached()
         return {"failed": 1, "bytes": len(body)}
-    name, entries = parse_feed(body)
+    parsed = _parse_feed(body)
+    if parsed is None:
+        return {"failed": 1, "bytes": len(body)}
+    name, entries = parsed
     rows = [{"video_key": video_key(store, e["video_id"]), "channel_key": key, "video_id": e["video_id"],
              "title": e["title"] or None, "published_at": e["published_at"], "source": "feed"}
             for e in entries if not e["link"] or _is_watch(e["link"])]
@@ -399,6 +425,7 @@ def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: 
             store.save_yt_channel(key, name=name, at=now)
     except Exception:  # noqa: BLE001
         return {"failed": 1, "bytes": len(body)}
+    cached()
     return {"ok": 1, "bytes": len(body), "videos": len(rows)}
 
 
@@ -438,16 +465,18 @@ def _fetch_all(store: Any, todo: Sequence[tuple[str, str]], *, now: float, budge
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def rank(store: Any, picks: Sequence[Any], known: Mapping[str, Mapping[str, Any]], *, now: float) -> list[Offer]:
-    """The top :data:`OFFER_N` fresh, never-shown uploads of ``picks`` (taste rows of :data:`CHANNEL_KIND` with their
-    score at this hour), one per channel, by ``score x exp(-age / AGE_DAYS)``; names told apart (a second channel of
-    the same name is left out)."""
+def rank(store: Any, picks: Sequence[Any], known: Mapping[str, Mapping[str, Any]], *, now: float,
+         fresh_days: float = FRESH_DAYS) -> list[Offer]:
+    """The top :data:`OFFER_N` uploads of ``picks`` (taste rows of :data:`CHANNEL_KIND` with their score at this hour)
+    published in the last ``fresh_days`` and never shown, one per channel, by ``score x exp(-age / AGE_DAYS)``; names
+    told apart (a second channel of the same name is left out)."""
     from yuki.connect.templates import fill
 
     score = {t.entity_key: float(t.score) for t in picks}
     if not score:
         return []
-    vids = store.yt_videos(channel_keys=list(score), published_since=now - FRESH_DAYS * 86400.0, unwatched=True)
+    vids = store.yt_videos(channel_keys=list(score), published_since=now - float(fresh_days) * 86400.0,
+                           unwatched=True)
     seen = store.page_entity_keys_seen([v["video_key"] for v in vids])
     best: dict[str, Offer] = {}
     for v in vids:
@@ -476,11 +505,12 @@ def rank(store: Any, picks: Sequence[Any], known: Mapping[str, Mapping[str, Any]
 
 
 def offer(store: Any, *, now: float | None = None, game: str | None = None, budget_s: float = REQUEST_BUDGET_S,
-          log: LogFn | None = None) -> list[Offer]:
+          fresh_days: float = FRESH_DAYS, log: LogFn | None = None) -> list[Offer]:
     """On request (a run opening YouTube's home): read the stale feeds of the top :data:`FEED_CHANNELS` channels at
-    this hour within ``budget_s`` (the hourly cap holds), then the top :data:`OFFER_N` fresh uploads, marked offered
-    and noted (``taste_events`` ``offered``). Nothing is opened or played. ``[]`` when the offers are off, a game is
-    in front, the site is blocked, or nothing is fresh. Never raises."""
+    this hour within ``budget_s`` (the hourly cap holds), then rank the top :data:`OFFER_N` uploads of the last
+    ``fresh_days``. Ranks only: nothing is noted until the caller names them (:func:`said`; tTaste r1 M2), and nothing
+    is opened or played. ``[]`` when the offers are off, a game is in front, the site is blocked, or nothing is fresh.
+    Never raises."""
     now = time.time() if now is None else float(now)
     started = time.perf_counter()
     try:
@@ -505,19 +535,35 @@ def offer(store: Any, *, now: float | None = None, game: str | None = None, budg
         left = float(budget_s) - (time.perf_counter() - started)
         fetched = _fetch_all(store, stale, now=now, budget_s=left, log=log)
         known = store.yt_channels(keys)   # display names a feed just gave
-        offers = rank(store, picks, known, now=now)
-        if offers:
-            store.mark_yt_videos([o.key for o in offers], "offered_at", now)
-            store.add_taste_event("offered", {"videos": [o.key for o in offers],
-                                              "channels": [o.channel_key for o in offers],
-                                              "ages_d": [o.age_days for o in offers], "fetched": fetched["ok"]}, at=now)
-        _log(log, "taste_offer", n=len(offers), channels=len(picks), with_id=sum(
+        offers = rank(store, picks, known, now=now, fresh_days=fresh_days)
+        _log(log, "taste_offer", n=len(offers), channels=len(picks), fetched=fetched["ok"], with_id=sum(
             1 for k in keys if (known.get(k) or {}).get("channel_id")), ms=round((time.perf_counter() - started)
                                                                                     * 1000.0, 1))
         return offers
     except Exception as exc:  # noqa: BLE001 - an offer never breaks the request
         _log(log, "taste_offer", error=type(exc).__name__)
         return []
+
+
+def said(store: Any, offers: Sequence[Offer], *, at: float | None = None, log: LogFn | None = None) -> bool:
+    """The offers were named aloud (with a checked done line): their videos are marked offered and the ``offered``
+    taste event is noted, from ``at`` (the time they were said). From then on they are what "the X one" matches for
+    :data:`OFFER_KEEP_S` (:func:`offered`) and what the nightly outcome scores. Call it only once the line will be
+    said; an offer never said is never noted. False (nothing to note, or the write failed: then don't name them, they
+    could not be picked). Never raises."""
+    got = [o for o in offers or [] if o.key]
+    if not got:
+        return False
+    at = time.time() if at is None else float(at)
+    try:
+        store.mark_yt_videos([o.key for o in got], "offered_at", at)
+        store.add_taste_event("offered", {"videos": [o.key for o in got], "channels": [o.channel_key for o in got],
+                                          "ages_d": [o.age_days for o in got]}, at=at)
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "taste_offered", error=type(exc).__name__)
+        return False
+    _log(log, "taste_offered", n=len(got))
+    return True
 
 
 def offer_line(offers: Sequence[Offer]) -> str:
@@ -531,17 +577,38 @@ def offer_line(offers: Sequence[Offer]) -> str:
 
 
 class Pending:
-    """An offer being made on its own short thread while the page opens."""
+    """An offer being ranked on its own short thread while the page opens. :meth:`wait` gives the offers (nothing
+    noted); :meth:`confirm` notes them once the caller names them."""
 
-    def __init__(self) -> None:
+    def __init__(self, memory: Any = None, *, log: LogFn | None = None, budget_s: float = REQUEST_BUDGET_S) -> None:
         self._done = threading.Event()
+        self._memory = memory
+        self._log = log
+        self._confirmed = False
+        #: How long the ranking may read feeds (``Settings.youtube_feed_budget_s``): what the caller waits at most.
+        self.budget_s = float(budget_s)
         self.offers: list[Offer] = []
 
-    def wait(self, timeout_s: float) -> list[Offer]:
-        """The offers when they are ready within ``timeout_s``, else ``[]`` (they still land for "the X one")."""
-        if self._done.wait(max(0.0, float(timeout_s))):
+    def wait(self, timeout_s: float | None = None) -> list[Offer]:
+        """The offers when they are ready within ``timeout_s`` (default :attr:`budget_s`), else ``[]`` (a late ranking
+        is never named, so it is never noted nor pickable)."""
+        if self._done.wait(max(0.0, float(self.budget_s if timeout_s is None else timeout_s))):
             return list(self.offers)
         return []
+
+    def confirm(self, offers: Sequence[Offer] | None = None, *, at: float | None = None) -> bool:
+        """Note the offers as named (:func:`said`), once: call it after the run's checked done and a non-empty
+        :meth:`wait`, right before the line is said. False when there is nothing to note, it was noted already, or
+        the write failed (then don't name them). Never raises."""
+        got = list(self.offers if offers is None else offers)
+        if self._confirmed or not got:
+            return False
+        self._confirmed = True
+        try:
+            return bool(_with_store(self._memory, lambda store: said(store, got, at=at, log=self._log),
+                                    timeout_s=1.0))
+        except Exception:  # noqa: BLE001
+            return False
 
 
 def _with_store(memory: Any, fn: Callable[[Any], Any], timeout_s: float) -> Any:
@@ -559,19 +626,36 @@ def _with_store(memory: Any, fn: Callable[[Any], Any], timeout_s: float) -> Any:
     return None
 
 
+def _setting(settings: Any, name: str, default: float) -> float:
+    """A phase T knob from ``Settings`` (``youtube_feed_budget_s``, ``youtube_fresh_days``), else the module's
+    default; a value that is not a positive number keeps the default."""
+    try:
+        from yuki.skills import setting
+
+        value = float(setting(settings, name) or 0.0)
+    except (TypeError, ValueError, ImportError):
+        return float(default)
+    return value if value > 0 else float(default)
+
+
 def start(memory: Any, values: Mapping[str, Any] | None, *, game: str | None = None, log: LogFn | None = None,
-          budget_s: float = REQUEST_BUDGET_S) -> Pending | None:
-    """On request: when a run's values open YouTube's home (:func:`wants`) and no game is in front, make the offer on a
-    short thread of its own (it reads the feeds while the page opens); None otherwise. The caller waits on the
-    returned :class:`Pending` after the run's done-check, and names the offers only with a checked done."""
+          settings: Any = None, budget_s: float | None = None) -> Pending | None:
+    """On request: when a run's values open YouTube's home (:func:`wants`) and no game is in front, rank the offer on a
+    short thread of its own (it reads the feeds while the page opens); None otherwise. The feed budget and the fresh
+    window come from ``settings`` (``youtube_feed_budget_s``, ``youtube_fresh_days``; else :data:`REQUEST_BUDGET_S`,
+    :data:`FRESH_DAYS`). The caller waits on the returned :class:`Pending` after the run's done-check, names the offers
+    only with a checked done, and notes them then (:meth:`Pending.confirm`)."""
     if not wants(values) or game:
         return None
-    pending = Pending()
+    budget = float(budget_s) if budget_s is not None else _setting(settings, "youtube_feed_budget_s",
+                                                                   REQUEST_BUDGET_S)
+    fresh_days = _setting(settings, "youtube_fresh_days", FRESH_DAYS)
+    pending = Pending(memory, log=log, budget_s=budget)
 
     def work() -> None:
         try:
-            got = _with_store(memory, lambda store: offer(store, game=game, budget_s=budget_s, log=log),
-                              timeout_s=budget_s + 1.0)
+            got = _with_store(memory, lambda store: offer(store, game=game, budget_s=budget, fresh_days=fresh_days,
+                                                          log=log), timeout_s=budget + 1.0)
             pending.offers = list(got or [])
         except Exception:  # noqa: BLE001
             pending.offers = []
@@ -681,15 +765,16 @@ def fresh_ages(store: Any) -> dict[str, float]:
 
 def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: int = NIGHT_LOOKUPS) -> dict[str, int]:
     """One read of the handle page of each channel the user picks most (:data:`NIGHT_CHANNELS`, most picked first)
-    that has no id yet: its canonical link's channel id, kept for good. At most ``limit`` reads; a failure is retried a
-    week later, at most :data:`LOOKUP_TRIES` times."""
+    that has no id yet: its canonical link's channel id, kept for good. At most ``limit`` reads; a failure that got an
+    answer is retried a week later, at most :data:`LOOKUP_TRIES` times; no answer at all (offline, a timeout) counts no
+    try and ends the pass (the next one tries again; tTaste r1 L4)."""
     from yuki.skills import taste
 
     rows = taste.top(store, CHANNEL_KIND, now=now, n=10_000)
     rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
     rows = [t for t in rows if t.name][:NIGHT_CHANNELS]
     known = store.yt_channels([t.entity_key for t in rows])
-    counts = {"lookups": 0, "resolved": 0, "lookup_failed": 0}
+    counts = {"lookups": 0, "resolved": 0, "lookup_failed": 0, "lookup_offline": 0}
     for t in rows:
         info = known.get(t.entity_key) or {}
         if info.get("channel_id"):
@@ -708,6 +793,9 @@ def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: 
             break   # the hour's reads are used up
         counts["lookups"] += 1
         status, _body = got
+        if not status:
+            counts["lookup_offline"] += 1
+            break   # no answer: no try counted, the rest would fare the same
         cid = channel_id_of(parser.href) if status == 200 else None
         if cid:
             store.save_yt_channel(t.entity_key, handle=t.name, channel_id=cid, tried=True, at=now)
@@ -724,8 +812,9 @@ def attribute_watched(store: Any, *, now: float, log: LogFn | None = None, limit
     """oEmbed reads (one per video id, ever) for the user's own watched videos of the last :data:`ATTRIBUTE_DAYS` whose
     channel is unknown: the watches right after an offer first (their outcome waits on it), then the newest; as many
     as ``limit`` and the hour's cap allow. Each answer's ``author_url`` (the channel's handle page) and
-    ``author_name``."""
-    counts = {"oembed": 0, "attributed": 0, "oembed_failed": 0}
+    ``author_name``. A video with an answer, even a failed one, is never read again; no answer (offline, a timeout)
+    keeps nothing and ends the pass, so the next one reads it."""
+    counts = {"oembed": 0, "attributed": 0, "oembed_failed": 0, "oembed_offline": 0}
     try:
         rows = store.moments_between(now - ATTRIBUTE_DAYS * 86400.0, now + 1.0, kinds=["page"])
     except Exception:  # noqa: BLE001
@@ -759,6 +848,9 @@ def attribute_watched(store: Any, *, now: float, log: LogFn | None = None, limit
             break   # the hour's reads are used up
         counts["oembed"] += 1
         status, body = got
+        if not status:
+            counts["oembed_offline"] += 1
+            break   # no answer: nothing kept, the next pass reads it again
         handle, name = None, None
         if status == 200:
             try:
@@ -861,14 +953,21 @@ def settle(store: Any, *, now: float, log: LogFn | None = None) -> dict[str, int
 
 def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, network: bool = True) -> dict[str, int]:
     """YouTube's nightly part (``taste.seed``, after the recompute): with the offers on, reads allowed and nothing in
-    front, the channel lookups then oEmbed for watched videos (the hour's cap shared); then :func:`settle`. Content-free
-    counts; never raises (``{"error": 1}``)."""
+    front, the channel lookups then oEmbed for watched videos, within :data:`NIGHT_READS` in any hour less the reads of
+    its own kinds (:data:`NIGHT_KINDS`) the last hour already made (a pass run again after a restart takes no more, so
+    a request keeps its share of the cap; tTaste r1 L5); then :func:`settle`. Content-free counts; never raises
+    (``{"error": 1}``)."""
     now = time.time() if now is None else float(now)
     out: dict[str, int] = {}
     try:
         if network and enabled(store) and blocked() is None:
-            out.update(lookup_channels(store, now=now, log=log))
-            out.update(attribute_watched(store, now=now, log=log, limit=NIGHT_READS - out.get("lookups", 0)))
+            used = (store.yt_reads_since(now - 3600.0).get("kinds") or {})
+            left = NIGHT_READS - sum(int(used.get(k, 0) or 0) for k in NIGHT_KINDS)
+            out["night_left"] = max(0, left)
+            if left > 0:
+                out.update(lookup_channels(store, now=now, log=log, limit=min(NIGHT_LOOKUPS, left)))
+                if left - out.get("lookups", 0) > 0 and not out.get("lookup_offline"):
+                    out.update(attribute_watched(store, now=now, log=log, limit=left - out.get("lookups", 0)))
         out.update(settle(store, now=now, log=log))
         out["reads_hour"] = int(store.yt_reads_since(now - 3600.0).get("reads", 0))
     except Exception as exc:  # noqa: BLE001
@@ -878,7 +977,7 @@ def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, n
 
 
 __all__ = ["SITE", "CHANNEL_KIND", "MAX_READS_PER_HOUR", "FEED_CHANNELS", "REQUEST_BUDGET_S", "FRESH_DAYS",
-           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "Offer", "Pending", "wants", "blocked", "enabled", "video_key",
-           "channel_key", "parse_feed", "channel_id_of", "fetch_feed", "rank", "offer", "offer_line", "start",
-           "offered", "pick", "attributed", "fresh_ages", "lookup_channels", "attribute_watched", "live_bar", "settle",
-           "nightly"]
+           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "NIGHT_READS", "NIGHT_KINDS", "Offer", "Pending", "wants", "blocked",
+           "enabled", "video_key", "channel_key", "parse_feed", "channel_id_of", "fetch_feed", "rank", "offer", "said",
+           "offer_line", "start", "offered", "pick", "attributed", "fresh_ages", "lookup_channels", "attribute_watched",
+           "live_bar", "settle", "nightly"]

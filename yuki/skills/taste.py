@@ -26,8 +26,9 @@ data"):
 **The nightly recompute** (:func:`recompute`, run by :func:`seed`, the memory service's daily hook): per kind, from the
 last 60 days of moments, each pick weighted ``0.5 ** (age / 21 days)``; the same entity again within 30 minutes is
 the same pick (a pause and resume, a channel page then one of its videos). A pick is the user's: their own moments,
-or a run of Yuki's whose values came from their words (the run's ``filled``: ``words`` / ``again`` / ``told``, never a
-taste or usual guess, so a guess never feeds itself). Never a skill the user marked Not mine. Recomputed, never
+or a request of Yuki's whose values came from their words (its runs' ``filled``: ``words`` / ``again`` / ``told``,
+never a taste guess, so a guess never feeds itself; a usual only picks the browser). Never a skill the user marked Not
+mine. Recomputed, never
 incremented: a rerun changes nothing and nothing drifts; an entity whose weight fell under :data:`FLOOR` drops out.
 Never with a game in front or a call: then it is tried again later (a one-shot timer, :data:`RETRY_S`).
 
@@ -161,9 +162,9 @@ def find(store: Any, kind: str, name: str) -> Taste | None:
 
 def offered(store: Any, *, now: float | None = None) -> list[Taste]:
     """The fresh uploads named aloud after a request in the last minutes (:func:`yuki.skills.youtube_feed.offered`), as
-    tastes: the name said (the channel's), the video's link, its key. What "the Deji one" is matched against: an entity
-    slot with no taste kind (``web.open_video``'s ``video``: a video nobody picked never plays) takes only these
-    names. Never raises (``[]``)."""
+    tastes: the name said (the channel's), the video's link, its key. What "the Deji one" is matched against, for a
+    slot that :func:`takes_offers` (``web.open_video``'s ``video``: a video nobody picked never plays). Never raises
+    (``[]``)."""
     try:
         from yuki.skills import youtube_feed
 
@@ -181,6 +182,27 @@ def find_offered(store: Any, name: Any, *, now: float | None = None) -> dict[str
         return youtube_feed.pick(store, name, now=now)
     except Exception:  # noqa: BLE001
         return None
+
+
+def takes_offers(skill: Any, slot: Any) -> bool:
+    """Whether ``slot`` is filled from the offered options (:func:`offered`, "the Deji one"): an entity slot with no
+    taste kind that every route of ``skill`` runs only with a value carrying a field an offered option's value has and
+    a spoken name lacks (:data:`OFFER_FIELDS`: ``when = { slot = "video", field = "ref", has = true }`` on
+    ``web.open_video``). A name alone can never run such a slot, so the offers are what it picks from. Data only (the
+    routes' own conditions, read through ``connection.py``): ``web.open_page``'s ``item`` (a handle opens by name) and
+    a voice channel are not (tTaste r1 M3). Never raises (False)."""
+    try:
+        if getattr(slot, "type", "") != "entity" or getattr(slot, "taste", ""):
+            return False
+        name = str(getattr(slot, "name", "") or "")
+        routes = tuple(getattr(skill, "routes", None) or ())
+        if not name or not routes:
+            return False
+        return all(any(str(cond.get("slot") or "") == name and str(cond.get("field") or "") in OFFER_FIELDS
+                       and bool(cond.get("has", True)) for cond in (getattr(r, "when", None) or ()))
+                   for r in routes)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -201,10 +223,15 @@ OPAQUE_VAR = "id"
 #: site data): their ``observed`` rows are removed by the recompute (lWire review r1 L4). Our own old codes, never the
 #: user's.
 RETIRED_KINDS: tuple[str, ...] = ("yt_channel",)
-#: A run of Yuki's counts as the user's pick when its values came from these fill sources (``skill_runs.filled``),
-#: and never when any came from :data:`GUESS_FILLS` (a guess must not feed itself).
+#: A request of Yuki's counts as the user's pick when its runs' values came from these fill sources
+#: (``skill_runs.filled``), and never when any came from :data:`GUESS_FILLS` (a guess must not feed itself). Only the
+#: taste guess: ``pref`` fills means slots only (``connection.py`` derives ``Slot.pref`` for ``role = "means"``: which
+#: browser, never which entity), so "open Deji's channel" in the usual browser is still the user's pick (tTaste r1 M1).
 ASKED_FILLS: frozenset[str] = frozenset({"words", "again", "told"})
-GUESS_FILLS: frozenset[str] = frozenset({"taste", "pref"})
+GUESS_FILLS: frozenset[str] = frozenset({"taste"})
+#: The fields an offered option's value carries beyond its name (``youtube_feed.Offer.value``): a slot every route of
+#: which needs one of them is filled from the offers (:func:`takes_offers`).
+OFFER_FIELDS: frozenset[str] = frozenset({"key", "ref"})
 #: A recompute held back by a game or a call is tried again this long after, at most :data:`RETRIES` times.
 RETRY_S = 1800.0
 RETRIES = 8
@@ -286,24 +313,29 @@ def slot_kind(skill: Any, slot: Any) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _asked_runs(store: Any, since: float) -> dict[tuple[str, str], bool]:
-    """``{(request_id, end kind): the user named its values}`` of Yuki's runs since ``since`` (``skill_runs.filled``):
-    True when a value came from their words (:data:`ASKED_FILLS`) and none from a guess (:data:`GUESS_FILLS`)."""
+def _asked_runs(store: Any, since: float) -> dict[str, bool]:
+    """``{request_id: the user named its values}`` of Yuki's runs since ``since`` (``skill_runs.filled``): True when a
+    run's value came from their words (:data:`ASKED_FILLS`) and no run of that request took a guess
+    (:data:`GUESS_FILLS`). Keyed on the request alone, so a moment counts whatever end its run declared: the watch page
+    of "the Deji one" belongs to a ``web.open_video`` run whose end is ``media_play`` (tTaste r1 L3)."""
     try:
-        rows = store._query("SELECT request_id, end_kind, filled FROM skill_runs WHERE t0 >= ? AND request_id IS NOT "
-                            "NULL", (float(since) - 3600.0,))
+        rows = store._query("SELECT request_id, filled FROM skill_runs WHERE t0 >= ? AND request_id IS NOT NULL",
+                            (float(since) - 3600.0,))
     except Exception:  # noqa: BLE001 - no ledger yet
         return {}
-    out: dict[tuple[str, str], bool] = {}
-    for request_id, end_kind, filled in rows:
+    named: set[str] = set()
+    guessed: set[str] = set()
+    for request_id, filled in rows:
         try:
             sources = {str(v) for v in (json.loads(filled or "{}") or {}).values()}
         except (TypeError, ValueError, AttributeError):
             sources = set()
-        asked = bool(sources & ASKED_FILLS) and not (sources & GUESS_FILLS)
-        key = (str(request_id), str(end_kind or ""))
-        out[key] = out.get(key, False) or asked
-    return out
+        key = str(request_id)
+        if sources & GUESS_FILLS:
+            guessed.add(key)
+        elif sources & ASKED_FILLS:
+            named.add(key)
+    return {key: key not in guessed for key in named | guessed}
 
 
 def _not_mine_moments(store: Any) -> set[int]:
@@ -390,7 +422,7 @@ def recompute(store: Any, *, now: float | None = None, days: float = SEED_DAYS, 
             return False
         if r.get("by", "user") == "user":
             return True
-        return asked.get((str(r.get("request_id") or ""), str(r.get("kind") or "")), False)
+        return asked.get(str(r.get("request_id") or ""), False)
 
     from yuki.connect.templates import fill
 
@@ -607,6 +639,7 @@ def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retr
 
 
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "Taste", "hour_score", "score_at", "top",
-           "candidates", "options", "find", "offered", "find_offered", "SEED_DAYS", "HALF_LIFE_DAYS", "SESSION_GAP_S",
-           "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "entity_key", "site_kinds",
+           "candidates", "options", "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
+           "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
+           "entity_key", "site_kinds",
            "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "busy", "seed"]
