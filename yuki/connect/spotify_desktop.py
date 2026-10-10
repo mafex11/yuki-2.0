@@ -1316,6 +1316,8 @@ class SpotifyWatch:
         self.counters = {"triggers": 0, "jobs": 0, "reads": 0, "warms": 0, "probes": 0, "held_game": 0,
                          "moments": 0, "links_learned": 0, "labels_learned": 0, "labels_dropped": 0, "errors": 0,
                          "rewarms": 0}
+        #: :meth:`stop` was called: no job starts and no moment is written from then on.
+        self._stopped = False
 
     # -- settings, logging, state -----------------------------------------------------------------
 
@@ -1467,7 +1469,17 @@ class SpotifyWatch:
             self._probe_due = None
             self._trigger("probe_check")
 
+    def stop(self) -> None:
+        """The service is stopping (before the moments hub stops): no new job starts, the queued ones are dropped and a
+        read still running writes no moment (fWire review r1 L3). Its job thread is a daemon; nothing waits for it."""
+        self._stopped = True
+        with self._lock:
+            self._pending.clear()
+        self._probe_due = None
+
     def _trigger(self, kind: str) -> None:
+        if self._stopped:
+            return
         s = self.settings()
         if not s.enabled:
             return
@@ -1487,7 +1499,8 @@ class SpotifyWatch:
     def _drain(self) -> None:
         while True:
             with self._lock:
-                if not self._pending:
+                if not self._pending or self._stopped:
+                    self._pending.clear()
                     self._busy = False
                     return
                 kind = self._pending.pop(0)
@@ -1691,7 +1704,7 @@ class SpotifyWatch:
                              "prev_read_at": since}})
 
     def _put(self, moment: dict[str, Any]) -> None:
-        if self._emit is None:
+        if self._emit is None or self._stopped:
             return
         try:
             self._emit(moment)

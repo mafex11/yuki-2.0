@@ -57,6 +57,40 @@ def test_the_service_wires_the_live_sources_onto_the_hub():
     # the board's game_front and the live sources come after the game gate is built; the volume watcher stops first
     assert src.index("game_gate = GameGate(") < src.index("now_board.game_front_fn") < src.index("SpotifyWatch(")
     assert src.index("volume_watch.stop()") < src.index("moments.stop()")
+    # review r1 L3: before the hub stops, the watcher's hook goes back to the call evidence and the Spotify reader stops
+    stopping = src[src.index("volume_watch.stop()"):]
+    assert (stopping.index("watcher.on_screen = call_evidence.seen") < stopping.index("spotify.stop()")
+            < stopping.index("moments.stop()") < stopping.index("watcher.stop()"))
+    # review r1 L4: the Spotify reader is built only with [moments] enabled (like the volume watcher)
+    assert (src.index("live_on = moments_cfg is not None") < src.index("if live_on and moments_cfg.volume_events")
+            < src.index("if live_on:") < src.index("SpotifyWatch(emit="))
+
+
+def test_a_stopped_spotify_reader_starts_no_job_and_writes_no_moment(monkeypatch):
+    """Review r1 L3: ``SpotifyWatch.stop()`` (the service calls it before the hub stops): a read already running
+    writes no moment, and no later change, layout or probe timer starts a job."""
+    from test_flive_spotify_watch import STORE_ID, make
+
+    from yuki.connect import spotify_desktop as SD
+
+    monkeypatch.setattr(SD, "process_identity", lambda pid: {"aumid": "", "family": "", "image": "Spotify.exe"})
+    monkeypatch.setattr(SD, "is_spotify_pid", lambda pid: pid == 4242)
+    watch, reader, _store, moments, _logs, clock = make()
+    real_read = reader.read
+
+    def read_then_stop(hwnd: int, budget_s: float, **kw: Any) -> Any:
+        watch.stop()                     # the service stops while the Library read runs
+        return real_read(hwnd, budget_s, **kw)
+
+    reader.read = read_then_stop
+    watch.on_media_change(started=[(STORE_ID, "Spotify", "x")], stopped=[])
+    assert reader.reads and moments == []
+    jobs = watch.counters["jobs"]
+    watch.on_front_change("spotify", "arc")
+    watch.on_front_change("arc", "spotify")
+    watch.on_layout([{"pid": 4243, "hwnd": 9002, "share": 0.5}], foreground=1)
+    watch.beat(now=clock.mono + 10 ** 6)
+    assert watch.counters["jobs"] == jobs and moments == []
 
 
 def test_the_board_carries_the_gates_game_and_says_unknown_for_a_stopped_gate():
@@ -339,6 +373,98 @@ def test_the_front_desks_hand_off_carries_one_id_to_the_worker(tmp_path):
     assert "request_id" not in worker.runs[-1]
 
 
+def test_the_front_desks_lane_keeps_the_id_its_run_ended_with_for_the_hand_off(tmp_path):
+    """Review r1 L1: the producer. The front desk's lane thread reads its logger's ``last_request_id`` after the run
+    and keeps it before ``lane_done``; the worker's job then carries it (and nothing is left behind)."""
+    import test_voice_v39  # noqa: F401 - the Qt application
+
+    from yuki.config import Settings
+    from yuki.log.events import ToolCall
+    from yuki.ui.runtime import AgentRuntime, Job
+    from yuki.ui.uilog import UiLog
+
+    class Desk(_LaneAgent):
+        tool_names = ("read_screen",)   # no hands: a click is refused, so the request goes to the worker
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.logger = SimpleNamespace(last_request_id=None)
+
+        def run(self, request: str, **kw: Any) -> Any:
+            self.runs.append(kw)
+            self.logger.last_request_id = "20261010-091512-frontdesk-3"   # the logger ends the request in the run
+            return iter([ToolCall(name="click", input={})])
+
+    events: list[tuple[str, dict]] = []
+    log = UiLog(sessions_dir=tmp_path / "s", session_id=None)
+    real_event = log.event
+    log.event = lambda name, **f: (events.append((name, f)), real_event(name, **f))   # type: ignore[method-assign]
+    desk = Desk()
+    rt = AgentRuntime(Settings(log_dir=tmp_path / "s", requests_csv=tmp_path / "r.csv"), log,
+                      worker_agent=_LaneAgent(), front_desk_agent=desk, memory=SimpleNamespace(session_id="t"))
+    rt.front_desk.enqueue(Job(7, "close it"))
+    rt.front_desk._jobs.put(None)          # the lane's loop ends after the one job
+    rt.front_desk.run()                    # the lane thread's body, on this thread (lane_done connects directly)
+    job = rt.worker._jobs.get_nowait()
+    assert job.log_request_id == "20261010-091512-frontdesk-3" and rt._log_ids == {}
+    assert next(f for name, f in events if name == "handoff")["request_id"] == "20261010-091512-frontdesk-3"
+
+
+def test_follow_puts_a_front_desk_hand_off_together_across_the_runs_files(tmp_path, monkeypatch):
+    """Review r1 M1: after the hand-off the worker writes the front desk's id in its own file and the UI log has the
+    ``handoff`` / ``queued`` lines; ``follow`` reads the run's files (another run's file is never opened), and shows
+    no word of either."""
+    from yuki.log import follow as follow_mod
+    from yuki.log.events import SessionLogger
+
+    sessions = tmp_path / "logs" / "sessions"
+    run = "20261010-091512"
+    ui = SessionLogger(sessions, session_id=run, quiet=True)                       # the tray's UI log keeps words
+    desk = SessionLogger(sessions, session_id=f"{run}-frontdesk", quiet=True, content=False)
+    worker = SessionLogger(sessions, session_id=f"{run}-worker", quiet=True, content=False)
+    other = SessionLogger(sessions, session_id="20261010-101010-worker", quiet=True, content=False)
+    desk.user_message("invented private words")
+    desk.log("tool_call", tool="click")
+    desk.request_summary({"started_at": "2026-10-10T09:15:12"})
+    rid = desk.last_request_id
+    assert rid == f"{run}-frontdesk-1"
+    ui.log("ui", event="queued", id=6, origin=5, waiting=0, request="invented private words", request_id=rid)
+    ui.log("ui", event="handoff", id=5, worker_id=6, refused=["click"], request_id=rid)
+    worker.begin_request(rid)
+    worker.user_message("invented private words")
+    worker.log("tool_call", tool="click")
+    worker.log("tool_result", tool="click", outcome="ok")
+    worker.request_summary({"started_at": "2026-10-10T09:15:20"})
+    other.user_message("another run")
+    for lg in (ui, desk, worker, other):
+        lg.close()
+    opened: list[str] = []
+    real = follow_mod._jsonl
+
+    def spy(path: Path, needle: str | None = None) -> Any:
+        opened.append(path.name)
+        return real(path, needle)
+
+    monkeypatch.setattr(follow_mod, "_jsonl", spy)
+    out = follow_mod.follow(rid, logs=tmp_path / "logs")
+    by_file: dict[str, list[str]] = {}
+    for r in out["records"]:
+        if r["_source"] == "session":
+            by_file.setdefault(r["_file"], []).append(r.get("event") or r["type"])
+    assert sorted(by_file[f"{run}-worker.jsonl"]) == ["request_summary", "tool_call", "tool_result", "user_message"]
+    assert sorted(by_file[f"{run}-frontdesk.jsonl"]) == ["request_summary", "tool_call", "user_message"]
+    assert sorted(by_file[f"{run}.jsonl"]) == ["handoff", "queued"]
+    handoff = next(r for r in out["records"] if r.get("event") == "handoff")
+    assert handoff["id"] == 5 and handoff["worker_id"] == 6
+    assert "20261010-101010-worker.jsonl" not in opened
+    assert "invented" not in json.dumps(out, ensure_ascii=False)
+    assert {p.name for p in follow_mod._session_files(sessions, f"{run}-frontdesk-1")} == {
+        f"{run}.jsonl", f"{run}-frontdesk.jsonl", f"{run}-worker.jsonl"}
+    # the run of a time-shaped id is its time; of a custom (test) id, the id without its lane
+    assert follow_mod._run_of(f"{run}-frontdesk") == run and follow_mod._run_of(run) == run
+    assert follow_mod._run_of("s1-frontdesk") == "s1"
+
+
 def test_a_spoken_request_handed_to_the_thinker_carries_its_turns_id(tmp_path):
     import asyncio
 
@@ -417,6 +543,36 @@ def test_a_voice_hand_marks_its_acting_and_its_trace_with_one_id(tmp_path):
 
     hands.memory = OldMemory()
     assert Hands._acting_run(hands, "window", {}, "voice-S-4-h3")[0] is True and "request_id" not in began[-1]
+
+
+def test_a_voice_hands_own_log_line_carries_its_id():
+    """Review r1 L2: the voice log's ``hands`` line (ok, ms, verified) names the hand's id, the one on its acting
+    marker, so ``follow voice-...-h<n>`` finds the hand's outcome; a fact of the same name never replaces it."""
+    import asyncio
+
+    from test_voice_v39 import _bridge, _hand_params
+    from test_voice_v312 import _ScrollDesk, _scroll_hands
+
+    logged: list[tuple[str, dict]] = []
+    marked: list[Any] = []
+
+    async def main() -> Any:
+        _rt, bridge = _bridge()
+        hands = _scroll_hands(_ScrollDesk(), bridge)
+        hands.turn_key = lambda: "20261010-1-4"
+        hands.log = SimpleNamespace(event=lambda t, **f: logged.append((t, f)))
+        real_run = hands._acting_run
+        hands._acting_run = lambda name, args, hand_id=None: (marked.append(hand_id), real_run(name, args, hand_id))[1]
+        hands._act = lambda name, args, facts: (True, "scrolled Document down: 10% -> 20%",
+                                                 {**facts, "verified": True, "request_id": 7})
+        await hands.handle(_hand_params("scroll", {"window": 7, "direction": "down", "say_when_done": ""}))
+        return hands
+
+    hands = asyncio.run(main())
+    line = next(f for t, f in logged if t == "hands" and "ok" in f)
+    assert line["request_id"] == marked[-1] and line["request_id"].startswith("voice-20261010-1-4-h")
+    assert line["ok"] is True and line["verified"] is True and line["call"] == "h-scroll"
+    assert hands._hand_ids == {}                                         # popped after the line, as before
 
 
 # =====================================================================================================================

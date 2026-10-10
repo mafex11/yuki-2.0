@@ -325,6 +325,7 @@ def run(args: argparse.Namespace) -> int:
     volume_watch = None   # yuki.memory.volumewatch.VolumeWatch (phase F, fLive; needs the moments hub)
     spotify = None        # yuki.connect.spotify_desktop.SpotifyWatch (phase F, fLive; needs the moments hub)
     site_tabs = None      # yuki.memory.callevidence.SiteTabs (the Meet tab by identity, D8)
+    call_evidence = None  # yuki.memory.callevidence.CallEvidence (the watcher's sightings; read again at the stop)
     pause_path = flag_path(db_path, PAUSE_FLAG)
     refresh_path = flag_path(db_path, REFRESH_FLAG)
     render_path = flag_path(db_path, RENDER_FLAG)
@@ -795,11 +796,17 @@ def run(args: argparse.Namespace) -> int:
                 gg = game_gate
                 return gg is None or not gg.alive or bool(gg.front_game())   # no live gate: held (fails closed)
 
-            # [moments] enabled / volume_events: the volume watcher starts only when both are on (the hub checks
-            # them again on every change, so turning them off later writes nothing)
-            try:   # master and app volume changes from Core Audio's own callbacks: one thread blocked on a queue
+            # [moments] enabled / volume_events: the volume watcher starts only when both are on, the Spotify reader
+            # only when moments are on (both only feed the hub; it checks them again on every change, so turning them
+            # off later writes nothing). fWire review r1 L4: with moments off, nothing reads Spotify's window.
+            try:
                 moments_cfg = moments.config()
-                if moments_cfg.enabled and moments_cfg.volume_events:
+            except Exception as exc:   # the live sources then stay off
+                log("error", where="moments_config", error=f"{type(exc).__name__}: {exc}")
+                moments_cfg = None
+            live_on = moments_cfg is not None and bool(moments_cfg.enabled)
+            try:   # master and app volume changes from Core Audio's own callbacks: one thread blocked on a queue
+                if live_on and moments_cfg.volume_events:
                     from yuki.memory.volumewatch import VolumeWatch, hub_on_change
 
                     volume_watch = VolumeWatch(
@@ -809,14 +816,15 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="volume_watch_start", error=f"{type(exc).__name__}: {exc}")
                 volume_watch = None
             try:   # Spotify's own window, read through UI Automation (D4): which playlist, the in-app slider
-                from yuki.connect.spotify_desktop import SpotifyWatch, hub_emit
+                if live_on:
+                    from yuki.connect.spotify_desktop import SpotifyWatch, hub_emit
 
-                spotify = SpotifyWatch(emit=hub_emit(moments), log=log, store=store, privacy=privacy,
-                                       game_front_fn=_game_front)
-                moments.subscribe_media(spotify.on_media_change)   # "its music started"
-                moments.subscribe_front(spotify.on_front_change)   # "it left the front"
-                if now_board is not None:
-                    now_board.subscribe_layout(spotify.on_layout)  # where its window is (the probe's states)
+                    spotify = SpotifyWatch(emit=hub_emit(moments), log=log, store=store, privacy=privacy,
+                                           game_front_fn=_game_front)
+                    moments.subscribe_media(spotify.on_media_change)   # "its music started"
+                    moments.subscribe_front(spotify.on_front_change)   # "it left the front"
+                    if now_board is not None:
+                        now_board.subscribe_layout(spotify.on_layout)  # where its window is (the probe's states)
             except Exception as exc:   # memory runs on without it
                 log("error", where="spotify_watch_start", error=f"{type(exc).__name__}: {exc}")
                 spotify = None
@@ -1053,6 +1061,15 @@ def run(args: argparse.Namespace) -> int:
         if volume_watch is not None:
             try:
                 volume_watch.stop()   # its Core Audio callbacks are released on its own thread
+            except Exception:
+                pass
+        # fWire review r1 L3: nothing reaches the hub once it stops. The watcher (stopped below) hands its sightings
+        # to the call evidence alone again, and the Spotify reader starts no job and writes no moment.
+        if watcher is not None and call_evidence is not None:
+            watcher.on_screen = call_evidence.seen
+        if spotify is not None:
+            try:
+                spotify.stop()
             except Exception:
                 pass
         if moments is not None:

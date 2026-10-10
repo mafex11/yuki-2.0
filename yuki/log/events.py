@@ -298,10 +298,12 @@ ENUM_FIELDS: frozenset[str] = frozenset({
 #: only at a record's **top level**, where Yuki's own code writes them (``skill_run(skill=..., route=...)``). Never
 #: inside a nested value: a tool's input is the model's, a payload or a result is read from the world and a skill's
 #: slots are the user's, and there the same key can carry a host, a file or a person (review r1 M1). ``result`` is
-#: not one of them: it carries a tool's output (:data:`RESULT_WORD_TYPES`).
+#: not one of them: it carries a tool's output (:data:`RESULT_WORD_TYPES`). ``event``: a UI record's name
+#: (:meth:`yuki.ui.uilog.UiLog.event`: ``handoff``, ``queued``), so ``python -m yuki.log.follow`` can say which line
+#: of the tray's UI log names a request (review fWire r1 M1).
 TOP_ENUM_FIELDS: frozenset[str] = frozenset({
     "skill", "route", "check", "end_kind", "means", "slot_source", "moment", "evidence", "scope", "service_kind",
-    "done_check", "recheck", "verb", "rung", "label_source", "gate",
+    "done_check", "recheck", "verb", "rung", "label_source", "gate", "event",
 })
 #: The D12 records whose top-level ``result`` is the outcome word Yuki's own code wrote for a skill run or a check
 #: (``done``, ``unverified``). Everywhere else ``result`` is a tool's output (``{"result": page text}``) and only its

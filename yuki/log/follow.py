@@ -5,7 +5,9 @@
 One ``request_id`` follows a request from the user's words to the result:
 
 * the agent's session log (``<logs>/sessions/<session>.jsonl``): every record of the request carries it
-  (:meth:`yuki.log.events.SessionLogger.begin_request`; the id is ``<session id>-<n>``, so its file is found by name);
+  (:meth:`yuki.log.events.SessionLogger.begin_request`; the id is ``<session id>-<n>``, so its file is found by name),
+  and the other files of the same run: after the front desk's hand-off the worker's records carry the front desk's id
+  in ``<run>-worker.jsonl``, and the tray's UI log (``<run>.jsonl``) has the ``handoff`` / ``queued`` lines;
 * the voice logs (``<logs>/voice/*.jsonl``) where a record names it;
 * the memory service's log (``<logs>/memory-*.jsonl``): the ``acting`` line (the marker carries the same id,
   :mod:`yuki.memory.acting`) and, inside the request's time, the state changes and guards around it (moments, the
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import sqlite3
 import sys
@@ -51,6 +54,8 @@ MOMENT_COLUMNS = ("id", "at", "kind", "app", "service", "by", "request_id", "evi
 #: Request ids are stamped from phase F (10 Oct 2026) on; a file last written before this time cannot hold one, so a
 #: search through every file skips it unopened (review r1 L6: the logs before 5 Oct kept the words).
 STAMPED_SINCE = datetime(2026, 10, 9).timestamp()
+#: :class:`yuki.log.events.SessionLogger`'s own session id (a time); the tray's front desk and worker add ``-<lane>``.
+SESSION_ID_FORMAT = "%Y%m%d-%H%M%S"
 
 
 def _stamped(paths: Iterable[Path]) -> list[Path]:
@@ -83,13 +88,35 @@ def _jsonl(path: Path, needle: str | None = None) -> Iterator[dict[str, Any]]:
                 yield rec
 
 
-def session_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
-    """The session-log records stamped with ``request_id``: its own file first (``<session>.jsonl``, the id being
-    ``<session>-<n>``), else every session file written since request ids exist (:func:`_stamped`)."""
-    folder = logs / "sessions"
+def _run_of(stem: str) -> str:
+    """The run a session file belongs to: the leading :data:`SESSION_ID_FORMAT` of its id (the tray's lanes add
+    ``-frontdesk`` / ``-worker`` to it, its UI log is the bare id), else the id without its last ``-`` part."""
+    head = "-".join(stem.split("-")[:2])
+    try:
+        datetime.strptime(head, SESSION_ID_FORMAT)
+        return head
+    except ValueError:
+        return stem.rsplit("-", 1)[0] if "-" in stem else stem
+
+
+def _session_files(folder: Path, request_id: str) -> list[Path]:
+    """Where a request's session records can be: its own file (``<session>.jsonl``, the id being ``<session>-<n>``)
+    and the files of the same run (review fWire r1 M1: after the front desk's hand-off the worker keeps the front
+    desk's id in ``<run>-worker.jsonl``, and the UI log's ``handoff`` / ``queued`` lines are in ``<run>.jsonl``);
+    an id with no file of its own (a voice id): every session file written since request ids exist."""
     stem = request_id.rsplit("-", 1)[0] if "-" in request_id else ""
     own = folder / f"{stem}.jsonl"
-    files = [own] if stem and own.exists() else _stamped(folder.glob("*.jsonl"))
+    if not stem or not own.exists():
+        return _stamped(folder.glob("*.jsonl"))
+    run = _run_of(stem)
+    siblings = [p for p in folder.glob(f"{glob.escape(run)}*.jsonl") if p.stem == run or p.stem.startswith(run + "-")]
+    return sorted({own, *siblings})
+
+
+def session_records(logs: Path, request_id: str) -> list[dict[str, Any]]:
+    """The session-log records stamped with ``request_id`` (:func:`_session_files`: its own file and its run's)."""
+    folder = logs / "sessions"
+    files = _session_files(folder, request_id)
     out: list[dict[str, Any]] = []
     for path in files:
         for rec in _jsonl(path, request_id):

@@ -1332,10 +1332,12 @@ class Hands:
             except Exception:  # noqa: BLE001 - the screen never breaks a hand
                 pass
         if self.log is not None:
+            # request_id: the hand's id (its marker's and trace's), so follow finds its outcome (fWire r1 L2)
             self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
-                           done_line=speak, **{k: v for k, v in facts.items()
-                                               if (isinstance(v, (int, float, bool)) or v is None)
-                                               and k not in ("question",)})
+                           done_line=speak, request_id=hand_id,
+                           **{k: v for k, v in facts.items()
+                              if (isinstance(v, (int, float, bool)) or v is None)
+                              and k not in ("question", "request_id")})
         # v3.18: every hand that acted is kept as a run trace for practice memory (off the loop, in order)
         if name == SKILL_HAND:
             self._trace_skill(args, ok=ok, report=report, facts=facts, ms=ms, call=params.tool_call_id)

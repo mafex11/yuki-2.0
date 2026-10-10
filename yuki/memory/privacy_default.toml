@@ -370,7 +370,8 @@ retry_min = 30
 # Moments (yuki.memory.moments, phase F): one table of what changed - you joined a call, music
 # started, a page you stayed on, a volume you moved, a message you sent - so Yuki can learn your
 # usual moments.  Derived again from what memory already keeps whenever its rules change; never
-# shown to other apps (not in the MCP).  false = none are written (nothing else changes).
+# shown to other apps (not in the MCP).  false = none are written, and the volume watcher and the
+# Spotify reader below (they only feed moments) do not start (read when memory starts).
 enabled = true
 # Volume changes (the system volume and each app's mixer level, from Windows' own audio events).
 volume_events = true
