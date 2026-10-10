@@ -526,6 +526,38 @@ def test_the_router_is_on_by_default_off_when_set_and_never_runs_on_doubtful_wor
     assert getattr(conv, "_router_task", None) is None
 
 
+
+def test_sWire_r1_l3_the_conversation_sends_the_router_its_skills_line(tmp_path: Path, monkeypatch) -> None:
+    """sWire review r1 L3: the pipeline's own wiring (``_route_turn`` reading ``mouth_memory.skills`` through
+    ``_skill_keys``), not ``router_request`` alone: with the talker's Skills menu the router's request opens with the
+    Skills line, so "play my focus playlist" stays the talker's; with no menu it has none."""
+    import yuki.voice.router as router
+    from yuki.skills.menu import menu_text
+
+    seen: list[dict] = []
+
+    async def fake_decide(client: Any, request: dict, timeout_s: float = 3.0) -> Any:
+        seen.append(request)
+        return router.Route(to="talker", screen=False, ms=1.0)
+
+    monkeypatch.setattr(router, "decide", fake_decide)
+
+    async def main(menu: str | None) -> str:
+        bridge = SimpleNamespace(has_open_voice_job=lambda: False, not_heard=None, hands=SimpleNamespace(last=None))
+        conv = _router_conversation(tmp_path, bridge)
+        conv.mouth_memory.skills = menu
+        context = SimpleNamespace(get_messages=lambda: [{"role": "user", "content": "play my focus playlist"}])
+        conv._route_turn(context, SimpleNamespace(user_turn=True, entered=time.monotonic(), route=None, route_ms=None))
+        await asyncio.sleep(0.05)
+        assert seen, "the router was never asked"
+        return seen.pop()["messages"][0]["content"]
+
+    menu = menu_text(None, audience="talker")
+    assert menu
+    content = asyncio.run(main(menu))
+    assert content.startswith("[Skills line") and content.endswith('Their words now: "play my focus playlist"')
+    assert "Skills line" not in asyncio.run(main(None))
+
 # -- H1: the talker's prompt by measured state ----------------------------------------------------------------------
 
 def test_the_prompt_is_layered_by_state_with_breakpoints_before_the_call_layer() -> None:

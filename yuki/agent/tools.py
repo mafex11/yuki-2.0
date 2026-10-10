@@ -2121,7 +2121,8 @@ class Dispatcher:
         #: ``request_id``, ``log``, ``settings``), set by the agent loop at each request's start.
         self.skill_context: dict[str, Any] = {}
         #: Phase S (sWire, sVoice r1 M2): where the per-app "Act" switches are read for ``run_skill``'s window-touching
-        #: rungs (``yuki.agent.judge.PolicyReader``); ``None``: the judge's shared reader of the stored policy.
+        #: rungs (``yuki.agent.judge.PolicyReader``; the agent loop sets its Authorizer's at each request, sWire r1
+        #: L1); ``None``: the judge's shared reader of the stored policy on the real desk, none on a stand-in desk.
         self.act_policy: Any = None
         #: Append the live picture of the screen (yuki.memory.now: what the windows on screen show, popups,
         #: the focus line) to :meth:`overview_text`, i.e. the brain's per-turn situation block. Off unless the
@@ -4668,8 +4669,12 @@ class Dispatcher:
                     try:
                         from yuki.agent.judge import _shared_reader
 
-                        policy = self.act_policy if self.act_policy is not None else _shared_reader()
-                        off = policy.app_off(engine.acted_app(call.skill, route, call.args))
+                        policy = self.act_policy
+                        if policy is None and isinstance(getattr(self, "backend", None), _LazyRealBackend):
+                            policy = _shared_reader()
+                        # sWire r1 L1: a stand-in desk with no policy of its own never reads the user's real settings
+                        off = None if policy is None else \
+                            policy.app_off(engine.acted_app(call.skill, route, call.args))
                     except Exception:  # noqa: BLE001 - an unreadable policy is the backstop's
                         off = None
                     if off:

@@ -105,7 +105,9 @@ class RunContext:
     ``baselines``: replacements of the onset probes' before-reads (:data:`yuki.skills.donecheck.BASELINES`);
     ``window_state``: the app's window state now for the ``game = "states"`` rule (default the skill's driver hook,
     :func:`window_state_reader`); ``on_focus``: called right before a rung that takes focus (the acting marker;
-    sound-only rungs publish none)."""
+    sound-only rungs publish none); ``hand_id``: the voice hand that called the run (``voice-<turn>-h<n>``), written
+    on each engine line as ``hand_id`` beside ``request_id`` (the turn, D19), so following one hand never picks up a
+    second skill hand's lines in the same turn (sWire r1 L2)."""
 
     origin: str = "voice"
     words: list[str] = field(default_factory=list)
@@ -124,6 +126,7 @@ class RunContext:
     sleep: Callable[[float], None] = time.sleep
     baselines: Mapping[str, Callable[[Mapping[str, Any]], Any]] = field(default_factory=dict)
     window_state: Callable[[str], str | None] | None = None
+    hand_id: str | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -245,6 +248,8 @@ def _emit(ctx: RunContext, event: str, **fields: Any) -> None:
         rec.pop("type", None)
         if ctx.request_id and "request_id" not in rec:
             rec["request_id"] = ctx.request_id
+        if ctx.hand_id and "hand_id" not in rec:
+            rec["hand_id"] = ctx.hand_id
         ctx.log(event, **rec)
     except Exception:  # noqa: BLE001 - a log never breaks a run
         pass

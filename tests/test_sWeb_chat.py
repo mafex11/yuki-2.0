@@ -765,6 +765,84 @@ def test_r2_h1_an_exact_draft_is_never_retyped_and_an_empty_composer_is_typed(cl
     assert got.outcome == "done"
 
 
+def _unreadable_after_open(desk: Any, read: Any, *, times: int | None = None) -> None:
+    """Once the chat opened (the switcher's Enter), the composer's focus read answers ``read(desk)`` instead (the
+    first ``times`` reads only, when given: then the field answers again)."""
+    opened = {"yes": False, "left": times}
+    open_chat = desk.effects[("hotkey", "enter")]
+
+    def enter() -> None:
+        open_chat()
+        opened["yes"] = True
+
+    def focus(timeout_s: float = 0.4) -> Any:
+        if opened["yes"] and desk.field[1] == "Message" and (opened["left"] is None or opened["left"] > 0):
+            if opened["left"] is not None:
+                opened["left"] -= 1
+            return read(desk)
+        return real(timeout_s)
+
+    desk.effects[("hotkey", "enter")] = enter
+    real = desk._focus
+    desk._focus = focus
+
+
+def _no_pattern(desk: Any) -> Any:
+    """A composer that takes text but answers neither its Text nor its Value pattern (the real read's shape)."""
+    return SimpleNamespace(accepts_text=True, is_password=False, window=desk.front, role="Edit", name="Message",
+                           text_source="", value=None, before="", after="")
+
+
+LINE_UNREAD = ("It's typed in your chat with Juno Pike, but I couldn't read the message box, so I didn't send it. "
+               "Press Enter when you want it to go.")
+
+
+@pytest.mark.parametrize("case,read,times,typed,say", [
+    ("no_pattern", _no_pattern, None, True, LINE_UNREAD),
+    ("read_timed_out_once", lambda d: None, 1, True, LINE_UNREAD),
+    ("read_timed_out", lambda d: None, None, False, "I opened your chat with Juno Pike, but couldn't type it."),
+])
+def test_sWire_r1_m1_a_send_into_an_unreadable_composer_never_presses_send(client, guard, case, read, times, typed,
+                                                                            say) -> None:
+    """sWire review r1 M1: Juno's chat opens holding the kept draft "hey are you free " and its composer can't be read
+    (it exposes no Text or Value pattern; or the focus read times out, once or throughout). "Send see you at nine to
+    Juno" presses no send key (Enter would send the draft with the words): the words are typed when a text field takes
+    them, and the user is told; never "done"."""
+    desk = _desk(client, guard)
+    sent: list[str] = []
+    _kept_draft_world(client, guard, desk, "hey are you free ", sent)
+    _unreadable_after_open(desk, read, times=times)
+    logs: list = []
+    got = _run(client, _ctx(client, hands=desk, words=["send see you at nine to Juno"], log=logs),
+               {"person": "Juno", "text": "see you at nine", "send": "send"})
+    assert got.outcome == "asked" and not got.done and not got.verified, (case, got)
+    assert got.say == say, case
+    assert desk.keys() == ["ctrl+k", "enter"], case                                     # 0 send keys
+    assert desk.typed() == (["@juno.pike", "see you at nine"] if typed else ["@juno.pike"]), case
+    assert sent == [], case                                                             # nothing went
+    assert desk.composer == ("hey are you free see you at nine" if typed else "hey are you free "), case
+    assert _runs(client)[-1]["outcome"] == "asked", case
+    assert "hey are you free" not in json.dumps(logs, default=str)
+    _no_secrets(logs, client)
+
+
+def test_sWire_r1_m1_a_composer_reads_empty_only_from_a_source_that_answered() -> None:
+    """``_composer_text``: no pattern answered -> unread (``None``), never ""; a Value or Text pattern that read
+    nothing -> "" (empty)."""
+    def hands(**snap: Any) -> Any:
+        base = {"accepts_text": True, "is_password": False, "before": "", "after": "", "value": None,
+                "text_source": ""}
+        return SimpleNamespace(_focus=lambda timeout_s=0.4: SimpleNamespace(**{**base, **snap}))
+
+    assert CH._composer_text(hands()) is None
+    assert CH._composer_state(hands(), "see you at nine") == "unread"
+    assert CH._composer_text(hands(text_source="value", value="")) == ""
+    assert CH._composer_text(hands(text_source="text")) == ""
+    assert CH._composer_text(hands(text_source="text", before="hey ", after="there")) == "hey there"
+    assert CH._composer_text(hands(text_source="value", value="hey")) == "hey"
+    assert CH._composer_text(SimpleNamespace(_focus=lambda timeout_s=0.4: None)) is None
+
+
 def test_r2_l3_a_composer_focused_late_never_passes_for_the_switcher(client, guard) -> None:
     """Review r2 L3: no text field has the keyboard right after Discord comes forward; its composer takes it a moment
     later; Ctrl+K opens nothing. The settled read makes the composer the "before", so nothing is typed or sent."""

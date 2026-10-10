@@ -2773,7 +2773,15 @@ class Agent:
             return prev
 
     def _set_skill_context(self, request: str, user_words: Any) -> None:
-        """Phase S: what the thinker's run_skill needs (memory, the user's own words, the request id, the log)."""
+        """Phase S: what the thinker's run_skill needs (memory, the user's own words, the request id, the log), and the
+        per-app "Act" switches it reads: this agent's own Authorizer policy (sWire r1 L1: a test's or eval's temp
+        policy, never the user's real file behind it)."""
+        authorizer = getattr(self, "authorizer", None)
+        if authorizer is not None and getattr(authorizer, "policy", None) is not None:
+            try:
+                self.dispatcher.act_policy = authorizer.policy
+            except Exception:  # noqa: BLE001 - a stand-in dispatcher: the run_skill wrapper's own default
+                pass
         try:
             from yuki.memory.store import split_envelope
 

@@ -281,6 +281,7 @@ def content_kept() -> bool:
 ID_FIELDS: frozenset[str] = frozenset({
     "session", "session_id", "type", "path", "model", "name", "tool_use_id", "stop_reason", "lane", "outcome",
     "effort", "kind", "state", "started_at", "role", "mode", "via", "id", "request_id", "tool", "app", "op",
+    "hand_id",
 })
 
 

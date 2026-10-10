@@ -279,6 +279,7 @@ def test_a_voice_skill_hand_carries_its_hand_id_and_the_ledger_its_turn(tmp_path
     assert lines and all(f.get("request_id") == hand_id for f in lines)
     engine_lines = [f for k, f in log.lines if k in ("skill_run", "skill_resolve")]
     assert engine_lines and all(f.get("request_id") == "20261010-1-4" for f in engine_lines)
+    assert all(f.get("hand_id") == hand_id for f in engine_lines)   # sWire r1 L2: which hand, beside the turn (D19)
     rows = client.store._query("SELECT request_id FROM skill_runs")
     assert [r[0] for r in rows] == ["20261010-1-4"]
     assert hands._hand_ids == {}
@@ -302,6 +303,45 @@ def test_follow_joins_a_voice_skill_hand_to_its_turns_lines(tmp_path: Path) -> N
     out = F.follow("voice-20261010-1-4-h2", logs=tmp_path / "logs")
     got = [(r["type"], r.get("request_id")) for r in out["records"] if r["_source"] == "voice"]
     assert got == [("hands", "voice-20261010-1-4-h2"), ("skill_run", "20261010-1-4")]
+
+
+def test_follow_keeps_a_second_skill_hand_of_the_same_turn_apart(tmp_path: Path) -> None:
+    """sWire review r1 L2: the talker called run_skill twice in one turn. Both hands' engine lines carry the turn
+    (D19) and each its own ``hand_id``: following one hand gets its own engine lines only; following the turn gets
+    both."""
+    from yuki.log import follow as F
+    from yuki.log.events import content_free
+
+    voice = tmp_path / "logs" / "voice"
+    voice.mkdir(parents=True)
+    now = time.time()
+    h1, h2, turn = "voice-20261010-1-4-h1", "voice-20261010-1-4-h2", "20261010-1-4"
+    lines = [{"type": "hands", "ts": now, "op": "run_skill", "request_id": h1},
+             {"type": "skill_run", "ts": now + 0.1, "skill": "volume", "request_id": turn, "hand_id": h1},
+             {"type": "hands", "ts": now + 0.2, "op": "run_skill", "request_id": h2},
+             {"type": "skill_run", "ts": now + 0.3, "skill": "spotify.playlist", "request_id": turn, "hand_id": h2}]
+    (voice / "20261010-1.jsonl").write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+
+    def voice_of(request_id: str) -> list[tuple[str, str | None, str | None]]:
+        out = F.follow(request_id, logs=tmp_path / "logs")
+        return [(r["type"], r.get("request_id"), r.get("hand_id")) for r in out["records"] if r["_source"] == "voice"]
+
+    assert voice_of(h1) == [("hands", h1, None), ("skill_run", turn, h1)]
+    assert voice_of(h2) == [("hands", h2, None), ("skill_run", turn, h2)]
+    assert [x[2] for x in voice_of(turn)] == [h1, h2]
+    assert content_free({"type": "skill_run", "hand_id": h1})["hand_id"] == h1      # an id the logs keep as it is
+
+
+def test_the_engine_writes_the_hand_id_beside_the_turn() -> None:
+    lines: list[tuple[str, dict]] = []
+    ctx = E.RunContext(request_id="20261010-1-4", hand_id="voice-20261010-1-4-h2",
+                       log=lambda event, **f: lines.append((event, f)))
+    E._emit(ctx, "skill_run", skill="volume", result="done")
+    assert lines == [("skill_run", {"skill": "volume", "result": "done", "request_id": "20261010-1-4",
+                                    "hand_id": "voice-20261010-1-4-h2"})]
+    lines.clear()
+    E._emit(E.RunContext(request_id="worker-1", log=lambda event, **f: lines.append((event, f))), "skill_run")
+    assert "hand_id" not in lines[0][1]
 
 
 # =====================================================================================================================
@@ -366,6 +406,53 @@ def test_the_thinkers_run_skill_never_presses_in_an_app_whose_act_switch_is_off(
     d._do_run_skill({"skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
     assert pressed                                                      # with Act on, the same rung presses
     client.close()
+
+
+def test_a_stand_in_desk_never_reads_the_users_real_act_switches(tmp_path: Path, demo: C.Loaded,
+                                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    """sWire review r1 L1: with no policy of its own, the thinker's run_skill on a stand-in desk never reads the
+    shared (real) policy file; on the real desk it does; and the agent loop gives the dispatcher its Authorizer's
+    policy (a test's or eval's temp file) at each request."""
+    from yuki.agent import judge
+    from yuki.agent import tools as T
+    from yuki.agent.loop import Agent
+
+    reads: list[str] = []
+
+    class _Real(_Policy):
+        def app_off(self, app: str | None) -> str | None:
+            reads.append(str(app))
+            return super().app_off(app)
+
+    from yuki.memory import gamegate
+
+    monkeypatch.setattr(judge, "_shared_reader", lambda: _Real({"demoplayer"}))
+    monkeypatch.setattr(gamegate, "game_in_front", lambda: "")         # no read of this PC's foreground window
+    client = MemoryClient(Store.open(tmp_path / "memory.db"))
+    R.seed(client.store, demo)
+    pressed: list[Any] = []
+    monkeypatch.setitem(E.VERB_FUNCS, "uia_invoke",
+                        lambda call: pressed.append(call) or E.RouteResult(ran=True, outcome="pressed"))
+    d = _dispatcher()
+    d.backend = SimpleNamespace()                                       # a stand-in desk
+    d.skill_context = {"memory": client, "words": ["set demo player to 40"], "request_id": "r-1", "log": None,
+                       "settings": SimpleNamespace(skills=True)}
+    d._do_run_skill({"skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
+    assert pressed and reads == []
+    pressed.clear()
+    d.backend = T._LazyRealBackend.__new__(T._LazyRealBackend)          # the real desk (never started here)
+    out = d._do_run_skill({"skill": "demo.volume", "slots": {"level": 40, "control": "in_app"}})
+    assert not pressed and reads and out.payload["refused"] == "act_off"
+    client.close()
+    own = _Policy(set())
+    agent = Agent.__new__(Agent)
+    agent.authorizer = SimpleNamespace(policy=own)
+    agent.dispatcher = SimpleNamespace(act_policy=None, skill_context={})
+    agent.memory = SimpleNamespace(installed=False)
+    agent.logger = SimpleNamespace(request_id="r-2", log=None)
+    agent.settings = None
+    agent._set_skill_context("set demo player to 40", ["set demo player to 40"])
+    assert agent.dispatcher.act_policy is own and agent.dispatcher.skill_context["request_id"] == "r-2"
 
 
 def test_a_resolve_memory_does_not_answer_runs_nothing_for_the_thinker(demo: C.Loaded,

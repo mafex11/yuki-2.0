@@ -2148,7 +2148,7 @@ class Hands:
                                 log=self._skill_log,
                                 request_id=turn if hand_id is not None else self._skill_request_id(),
                                 session_id=getattr(memory, "session_id", None), on_focus=on_focus,
-                                verbs=self._skill_verbs(state), game=self._game_strict)
+                                verbs=self._skill_verbs(state), game=self._game_strict, hand_id=hand_id)
         try:
             result = engine.resolve_and_run(skill_key, slots, words, ctx, again=bool(args.get("again")),
                                             settings=self.skill_settings, corrects=bool(args.get("corrects")),

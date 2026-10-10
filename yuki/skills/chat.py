@@ -37,7 +37,8 @@ confirmed open.**
 judged by Yuki's own check with the user's words, and both whom and what must stand in their words
 (:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
 types it and leaves it; no text just opens the chat. The opened chat's composer is read first: other text already
-there (the app's kept draft) means nothing is typed or pressed, said plainly. A send is "done" only when memory
+there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer that can't be read gets a
+send's words typed and its send key never pressed (told to press Enter). A send is "done" only when memory
 captured the user's own message equal to that text in that very chat (the messages table, matched by the route's
 capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the send key
 went out (its own step dispatched).
@@ -93,6 +94,11 @@ LINE_TYPED_HELD = "It's typed in your chat with {name}, but I held back sending 
 #: The opened chat's composer already holds other text (the app's kept draft; review r2 H1): nothing typed, nothing
 #: pressed (Enter would send that text with the user's words).
 LINE_DRAFT_THERE = "There's already unsent text in your chat with {name}, so I left it."
+#: A send whose composer couldn't be read before typing (sWire r1 M1: it may hold the app's kept draft, which Enter
+#: would send with the user's words): the words are typed and the send key is never pressed; told, not asked (a "yes"
+#: would re-run the skill and type them a second time).
+LINE_TYPED_UNREAD = ("It's typed in your chat with {name}, but I couldn't read the message box, so I didn't send it. "
+                     "Press Enter when you want it to go.")
 LINE_VOICE_UNCONFIRMED = "I opened {channel} in Discord, but couldn't confirm you joined it."
 #: Asked before a join while a call is live (review r2 M2: the question says what the route does; never a promise to
 #: leave a call it can't leave). The app's own words come from its data (``[chat.asks]``); these are the fallbacks.
@@ -473,7 +479,10 @@ def _step_verdict(facts: Mapping[str, Any], do: str) -> bool | None:
 
 def _composer_text(hands: Any) -> str | None:
     """What the text field with the keyboard (the opened chat's composer) holds now, read in RAM and dropped (never
-    logged); ``None`` when no text field has the keyboard or it can't be read."""
+    logged); ``None`` when no text field has the keyboard or it can't be read. A field that answered neither its Text
+    nor its Value pattern (``text_source`` empty and no value: the focus read can't tell "no pattern" from a Value
+    pattern that read empty) is unread, never "empty" (sWire r1 M1: an unreadable composer may hold the app's kept
+    draft)."""
     read = getattr(hands, "_focus", None)
     if not callable(read):
         return None
@@ -483,9 +492,13 @@ def _composer_text(hands: Any) -> str | None:
         return None
     if snap is None or not getattr(snap, "accepts_text", False) or getattr(snap, "is_password", False):
         return None
-    if getattr(snap, "text_source", "") == "text":
+    source = str(getattr(snap, "text_source", "") or "")
+    if source == "text":
         return f"{getattr(snap, 'before', '') or ''}{getattr(snap, 'after', '') or ''}"
-    return str(getattr(snap, "value", "") or "")
+    value = getattr(snap, "value", None)
+    if value is None and not source:
+        return None
+    return str(value or "")
 
 
 def _composer_state(hands: Any, text: str) -> str:
@@ -797,9 +810,10 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     # The composer is read before anything is typed (review r1 L6, r2 H1). Exactly these words already there (a draft
     # Yuki typed on an earlier run whose send key was held, kept by the app): never typed a second time; only the send
     # key, if asked. Any other text there (the chat's own kept draft): nothing typed and nothing pressed, in either mode
-    # (appended, Enter would send that text with the user's words). Unreadable: typed as before (the live check
-    # settles whether each app's composer can be read; until then a hidden draft is the residual risk, and the send's
-    # done-check, an exact match of the captured message, then says "couldn't confirm").
+    # (appended, Enter would send that text with the user's words). Unreadable (no pattern answered, the read timed
+    # out, no text field has the keyboard): a draft is typed as before; a send is typed and its send key is never
+    # pressed (sWire r1 M1: a hidden kept draft would go out with the words), and the user is told to press Enter.
+    # The live check settles whether each app's composer can be read.
     composer = _composer_state(call.ctx.hands, text)
     facts["composer"] = composer
     if composer == "other_text":
@@ -807,12 +821,13 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         return RouteResult(ran=True, ask=LINE_DRAFT_THERE.format(name=name), outcome="draft_in_the_way", app=app,
                            facts={**facts, "typed": "no", "pressed": False}, facts_ram=ram)
     kept = composer == "same_text"
+    blind = send and composer == "unread"
     steps: list[dict[str, Any]] = [] if kept else [{"do": "type", "text": text}]
-    if send:
+    if send and not blind:
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
     if steps:
         _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
-                             key="message", sends={"to": target.said, "what": text} if send else None)
+                             key="message", sends={"to": target.said, "what": text} if send and not blind else None)
     else:
         run = {"steps": 0, "steps_done": 0, "results": []}
     facts["kept_draft"] = kept
@@ -836,6 +851,14 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         stop.facts_ram = ram
         stop.app = app
         return stop
+    if blind:
+        # sWire r1 M1: a composer that couldn't be read; the send key was never pressed. Told, not asked, either way
+        if typed is not False and _dispatched(run, "type"):
+            return RouteResult(ran=True, ask=LINE_TYPED_UNREAD.format(name=name), outcome="typed_unread", app=app,
+                               facts={**facts, "held_at": "composer"}, facts_ram=ram)
+        ram.update(typed=False)
+        return RouteResult(ran=True, ask=LINE_NOT_TYPED.format(name=name), outcome="not_typed", app=app,
+                           facts={**facts, "typed": "no"}, facts_ram=ram)
     say = (SAY_SENT if send else SAY_DRAFT).format(name=name, where=where)
     unverified = (LINE_SENT_UNCONFIRMED if pressed else LINE_NOT_TYPED if typed is False else
                   LINE_TYPED_NOT_SENT if send else LINE_DRAFT_UNCONFIRMED).format(name=name)

@@ -138,14 +138,21 @@ def related_ids(request_id: str) -> tuple[str, ...]:
 
 
 def voice_records(logs: Path, request_id: str, ids: Sequence[str] | None = None) -> list[dict[str, Any]]:
-    """Voice-log records that name the request (or one of ``ids``, :func:`related_ids`)."""
+    """Voice-log records that name the request (or one of ``ids``, :func:`related_ids`). Following a voice hand, an
+    engine line that names its hand (``hand_id``, sWire r1 L2) is kept only when it is this hand: a second skill hand
+    in the same turn shares the turn key. (Moments and ledger rows carry the turn alone, D19, so they still join by
+    turn.)"""
     want = set(ids or ()) | {request_id}
     needle = min(want, key=len)          # the turn is a part of a hand's id: one needle finds both
+    is_hand = len(want) > 1
     out: list[dict[str, Any]] = []
     for path in _stamped((logs / "voice").glob("*.jsonl")):
         for rec in _jsonl(path, needle):
-            if rec.get("request_id") in want:
-                out.append({**rec, "_source": "voice", "_file": path.name})
+            if rec.get("request_id") not in want:
+                continue
+            if is_hand and rec.get("hand_id") and rec.get("hand_id") != request_id:
+                continue
+            out.append({**rec, "_source": "voice", "_file": path.name})
     return out
 
 
