@@ -274,18 +274,19 @@ _STEP_THEN_NOTE_LEAN = (
 STEP_FIRST_OPS = {"window": ("focus", "restore"), "tab": ("show", "new")}   # a new tab: only an empty one
 _STEP_CHECK_NOTE = (
     "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
-    "part of a request: read their words again now. When they asked for more than that (open, play, close, type, send "
-    "or find something in it), do the rest now: with one of your hands on what the desktop block shows, alone, with "
-    "say_when_done for the whole, else hand it to the thinker with tell_yuki (screen true, their request as they said "
-    "it, and in context what you just did). When bringing it up was all they asked, call stay_quiet alone. Never say "
-    "it is done before a hand verified it."
+    "part of a request: read their newest turn again now (the words this step was for, never an older request). "
+    "When it asked for more than that (open, play, close, type, send or find something in it), do the rest now: "
+    "with one of your hands on what the desktop block shows, alone, with say_when_done for the whole, else hand it to "
+    "the thinker with tell_yuki (screen true, their request as they said it, and in context what you just did). When "
+    "bringing it up was all that turn asked, call stay_quiet alone. Never say it is done before a hand verified it."
 )
 _STEP_CHECK_NOTE_LEAN = (
     "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
-    "part of a request: read their words again now. When they asked for more than that (open, play, close, type, send "
-    "or find something in it), do the rest now: with one of your hands on what the desktop block shows, alone, with "
-    "say_when_done for the whole, else call hand_over, intent new_task (their words go with it by code). When bringing "
-    "it up was all they asked, call stay_quiet alone. Never say it is done before a hand verified it."
+    "part of a request: read their newest turn again now (the words this step was for, never an older request). "
+    "When it asked for more than that (open, play, close, type, send or find something in it), do the rest now: "
+    "with one of your hands on what the desktop block shows, alone, with say_when_done for the whole, else call "
+    "hand_over, intent new_task (their words go with it by code). When bringing it up was all that turn asked, call "
+    "stay_quiet alone. Never say it is done before a hand verified it."
 )
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
 _TAB_CHOOSE_NOTE = (
@@ -2181,7 +2182,7 @@ class Hands:
         if skill is not None and not getattr(skill, "handoff", True):
             return None
         engine_hands_over = "voice" in tuple(getattr(engine, "HANDOFF_ORIGINS", ()) or ())
-        if outcome in ("unverified", "failed", "asked", "error") and engine_hands_over:
+        if outcome in ("unverified", "failed", "asked", "error") and engine_hands_over and not facts.get("voice_error"):
             # x5Fallback's engine hands these over itself (an unconfirmed rung, a dropped value, a crash) whenever a
             # second try is safe; what still ends this way is its deliberate stop (it may have sent, a rung's data
             # forbids it, a relative change, a state already there, a result on another device, a real question):
@@ -2223,6 +2224,22 @@ class Hands:
             slot = _asked_slot(skill, facts.get("ask"), facts.get("options"))
             if slot is None or slot not in given:
                 return None   # a value they never gave: a real question, said by code
+            # review r1 L1 (as x5Fallback's engine decides it): only a value set aside because their heard words do not
+            # hold it (a misheard name, "hey meant" for Hemanth) is handed over; one they said word for word that is
+            # still asked about (two of their people answer to it) is a real question, and a run that commits without
+            # sending (a call join) keeps its question (a value nobody said is never joined)
+            value = given.get(slot)
+            value = value.get("name") if isinstance(value, dict) else value
+            text = " ".join(str(value or "").split())
+            heard = [str(w) for w in facts.get("_words") or [] if str(w or "").strip()]
+            try:
+                from yuki.skills.uia_route import said
+
+                literal = bool(text) and said(text, heard)
+            except Exception:  # noqa: BLE001 - unknown: the question stands (never a hand-off on a guess)
+                literal = True
+            if literal or (commits and not getattr(skill, "sends", False)):
+                return None   # a skill that can send keeps its hand-off: the consent rule asks before any send
             why = "dropped"
         if outcome == "handed_over":
             why = "failed"    # a hand-off with no seed: the same as a plain failure
@@ -2253,17 +2270,24 @@ class Hands:
             context = SKILL_FALLBACK_CONTEXT.get(why, SKILL_FALLBACK_CONTEXT["failed"]).format(skill=words)
         return {"why": why, "pin": pin, "context": context, "slot": slot}
 
-    def _skill_late(self, key: str, task: Any, hand_id: str | None) -> None:
+    def _skill_late(self, key: str, task: Any, hand_id: str | None, args: dict[str, Any] | None = None) -> None:
         """x3 (3d): a run_skill that outlived :data:`SKILL_HAND_MAX_S` returned at last: its step is no longer running
-        (the same skill may be called again), and what it ended with is only logged (its result went long ago)."""
+        (the same skill may be called again), and what it ended with is logged (its result went long ago). Review r1
+        L2: when it acted or was seen done, the actions line says so too (the talker and the thinker read it), since
+        the user was told it couldn't be told yet."""
         self._inflight.pop(key, None)
         outcome = "error"
         try:
             if task.cancelled():
                 outcome = "cancelled"   # the loop went away (the conversation ended); the thread ran on its own
             else:
-                _ok, _report, facts = task.result()
-                outcome = str((facts or {}).get("outcome") or "") or "none"
+                ok, report, facts = task.result()
+                facts = facts or {}
+                outcome = str(facts.get("outcome") or "") or "none"
+                if facts.get("verified") is True or facts.get("sent_at") is not None or facts.get("acted"):
+                    self.actions.add("your hand", _what(SKILL_HAND, dict(args or {})),
+                                     f"finished late, after the {self.SKILL_HAND_MAX_S:g} s wait: {str(report)[:300]}",
+                                     ok=bool(ok), verified=facts.get("verified"))
         except Exception:  # noqa: BLE001
             pass
         if self.log is not None:
@@ -2310,6 +2334,14 @@ class Hands:
                                           "how_to_say_it": "Nothing was kept. Answer their words as usual."})
             return
         key = _step_key(name, args)
+        if key in self._inflight and time.monotonic() - float(self._inflight[key]) > self.SKILL_HAND_MAX_S:
+            # review r1 L2: a run past its backstop is still going: never started twice, and never a silent end
+            if self.log is not None:
+                self.log.event("hands", op=name, deduped=True, running=True, overdue=True, call=params.tool_call_id)
+            await params.result_callback({"already": "the same skill is still running from before",
+                                          "how_to_say_it": _SKILL_OVERDUE_NOTE.format(
+                                              secs=f"{self.SKILL_HAND_MAX_S:g}")})
+            return
         if key in self._inflight:
             if self.log is not None:
                 self.log.event("hands", op=name, deduped=True, running=True, call=params.tool_call_id)
@@ -2341,7 +2373,7 @@ class Hands:
             if task.done():
                 self._inflight.pop(key, None)
             else:
-                task.add_done_callback(lambda t, k=key, h=hand_id: self._skill_late(k, t, h))
+                task.add_done_callback(lambda t, k=key, h=hand_id, a=dict(args): self._skill_late(k, t, h, a))
             self.busy = max(0, self.busy - 1)
             if self.bridge is not None:
                 self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
@@ -2351,7 +2383,9 @@ class Hands:
             try:
                 ok, report, facts = task.result()
             except Exception as exc:  # noqa: BLE001 - a crash is a failed run
-                ok, report, facts = False, f"{type(exc).__name__}: {exc}", {"outcome": "error", "verified": None}
+                # review r1 L5: the voice's own crash (outside the engine), never one of the engine's deliberate stops
+                ok, report, facts = False, f"{type(exc).__name__}: {exc}", {"outcome": "error", "verified": None,
+                                                                          "voice_error": True}
         else:
             ok, facts = False, {"outcome": "timeout", "verified": None, "skill": str(args.get("skill") or ""),
                                 "timed_out": True}
@@ -2398,6 +2432,7 @@ class Hands:
                     report = f"Held: a game is in front, so nothing more is tried now. Say: {HELD_LINE}"
         facts.pop("_values", None)
         facts.pop("_tried", None)
+        facts.pop("_words", None)
         try:
             await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id, fallback=fallback)
         finally:
@@ -2727,6 +2762,7 @@ class Hands:
                               or any(t.get("outcome") == "contradicted" for t in result.tried or []))
         facts["_values"] = dict(result.values or {})
         facts["_tried"] = [dict(t) for t in result.tried or [] if isinstance(t, dict)]
+        facts["_words"] = list(words)   # review r1 L1: whether a value the resolver asks about was said word for word
         if facts.get("held") == "game":
             facts["game_front"] = True
         if sound_only:
@@ -3641,12 +3677,13 @@ class Hands:
                                f"done", stale=True)
             title = shown[index - 1]
         facts["target"] = f'TabItem "{title[:80]}"'
+        # review r1 L3: the window comes up first, so a refused focus (a game in front) leaves its tabs as they were
+        # and "nothing was done" stays true
+        lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
         result = select(hwnd, index, expect_name=title)
-        ok, report, facts = self._report(result, "", facts)
+        ok, report, facts = self._report(result, lead, facts)
         facts["verified"] = bool(_detail(result, "verified")) if ok else False
-        if ok and self._foreground() != hwnd:
-            report = self._front(hwnd) + report
         return ok, report, facts
 
     # -- x3 (fix-plan 3f): tabs by title, and a new tab ------------------------------------------------------------
@@ -4436,7 +4473,12 @@ _WHY_WORDS = {"handed_over": "its routes didn't reach it", "unverified": "the PC
               "dropped": "it set aside a name it was given", "timeout": "it took too long"}
 #: Said by code for a run_skill that never finished when no fallback may go (one that may have sent or joined, or a
 #: relative change that may have landed): nothing more is tried.
-LINE_SKILL_TIMEOUT = "That's taking far too long, and I can't tell whether it worked, so I've left it there."
+#: Review r1 L2: the run may still be going (its thread is never killed), so the line never says it was left there.
+LINE_SKILL_TIMEOUT = "That's taking far too long, and I can't tell yet whether it worked."
+#: What the talker reads when the same skill is called again while a run past the backstop is still going (r1 L2).
+_SKILL_OVERDUE_NOTE = ("Not started again: the same skill's earlier run is still going, past {secs} s, so whether it "
+                       "worked can't be told yet. Say that plainly in a few words, the line alone; never say it is "
+                       "done. How it ends shows on the actions line.")
 
 
 def _pin_context(pin: dict[str, Any], skill_words: str) -> str:
