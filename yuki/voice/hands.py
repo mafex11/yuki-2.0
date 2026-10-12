@@ -264,8 +264,8 @@ _STEP_THEN_NOTE_LEAN = (
     "That step is done, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your "
     "desktop block now shows the screen as it is: when one of your hands does that on what it shows (an item of the "
     "window in front, a tab, an opening in that browser), do it now, alone, with say_when_done for the whole; otherwise "
-    "call hand_over now, intent new_task (their words go with it by code). Never stop here, never say it is done "
-    "before a hand verified it."
+    "call hand_over now (intent follow_up when their words answer or add to a job already waiting or running, else "
+    "new_task; their words go with it by code). Never stop here, never say it is done before a hand verified it."
 )
 #: x3 (3b): the window and tab operations that are usually only the first step of a request (bring a window or a tab
 #: up). Verified with no done line and no "then", the turn no longer ends there in silence: the talker reads its own
@@ -285,8 +285,9 @@ _STEP_CHECK_NOTE_LEAN = (
     "part of a request: read their newest turn again now (the words this step was for, never an older request). "
     "When it asked for more than that (open, play, close, type, send or find something in it), do the rest now: "
     "with one of your hands on what the desktop block shows, alone, with say_when_done for the whole, else call "
-    "hand_over, intent new_task (their words go with it by code). When bringing it up was all that turn asked, call "
-    "stay_quiet alone. Never say it is done before a hand verified it."
+    "hand_over (intent follow_up when that turn answers or adds to a job already waiting or running, else new_task; "
+    "their words go with it by code). When bringing it up was all that turn asked, call stay_quiet alone. Never say "
+    "it is done before a hand verified it."
 )
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
 _TAB_CHOOSE_NOTE = (
@@ -379,8 +380,9 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "by its identity and verified gone. new: a new tab in that window; with url, that address opened in a new "
             "tab of that window's own browser. reopen: the tab most recently closed, verified by expect. A tab is named "
             "by title (its words on the tabs line, or the part they said: \"YouTube\"): one tab that matches is enough, "
-            "and the user is never asked for a number; tab or tabs (numbers on the tabs line) only when you have them. "
-            "What a page holds is the thinker's." + _NOW
+            "and the user is never asked for a number; tab or tabs (numbers) only as the tabs line or a not-done note "
+            "gives them, never guessed for another window's tabs (name those by title). What a page holds is the "
+            "thinker's." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
@@ -926,8 +928,10 @@ class Hands:
         #: The one "Keep this as your usual?" waiting for its answer (RAM only): pref, option, run key, when.
         self.pending_keep: dict[str, Any] | None = None
         #: x3 (fix-plan 3f): the tabs of a window that was not in front, read for a tab hand by title: ``{hwnd: (names,
-        #: ids, read at)}`` (RAM only), so a second call naming its tabs by number goes by the same read.
-        self._other_tabs: dict[int, tuple[list[str], list[str], float]] = {}
+        #: ids, read at, numbers offered)}`` (RAM only). Review r2 H1: the talker never saw those tabs, so a number for
+        #: one is a guess, acted on only when that number was offered to it from this very read (several tabs fit
+        #: its title: :data:`_TAB_CHOOSE_NOTE`), and a second call naming those goes by the same read.
+        self._other_tabs: dict[int, tuple[list[str], list[str], float, frozenset[int]]] = {}
         #: x3 (3b): ``(user turn, count)``: how often a silent window or tab step gave the talker its turn back in it.
         self._step_checked: tuple[Any, int] | None = None
 
@@ -3688,38 +3692,50 @@ class Hands:
 
     # -- x3 (fix-plan 3f): tabs by title, and a new tab ------------------------------------------------------------
 
-    def _tab_strip(self, hwnd: int) -> tuple[list[str], list[str]]:
-        """``(names, ids)`` of a window's tabs, in strip order: what the talker was shown for the window in front (the
-        tabs line); any other window's read now, bounded, and kept a short while (:attr:`_other_tabs`) so a second call
-        naming those tabs by number goes by the same read. ``([], [])``: no tabs can be read there."""
+    def _tab_strip(self, hwnd: int) -> tuple[list[str], list[str], frozenset[int] | None]:
+        """``(names, ids, known)`` of a window's tabs, in strip order: what the talker was shown for the window in front
+        (the tabs line; ``known`` is ``None``: every number on it was shown); any other window's read now, bounded, and
+        kept a short while (:attr:`_other_tabs`) so a second call goes by the same read (``known``: the numbers of it
+        offered to the talker, empty when none was: review r2 H1, it never saw that strip). ``([], [], frozenset())``:
+        no tabs can be read there."""
         with self._lock:
             names = list(self.last.tabs.get(hwnd) or [])
             ids = list(self.last.tab_ids.get(hwnd) or [])
         if names:
-            return names, ids
+            return names, ids, None
         kept = self._other_tabs.get(hwnd)
         if kept is not None and time.monotonic() - kept[2] < _TABS_FRESH_S:
-            return list(kept[0]), list(kept[1])
+            return list(kept[0]), list(kept[1]), kept[3]
         read = getattr(self.backend, "read_tabs", None)
         if not callable(read):
-            return [], []
+            return [], [], frozenset()
         try:
             strip = read(int(hwnd), budget_s=_OTHER_TABS_BUDGET_S)
         except Exception:  # noqa: BLE001 - no tabs read: the caller refuses (the thinker reads the window itself)
-            return [], []
+            return [], [], frozenset()
         tabs = list(getattr(strip, "tabs", None) or [])
         names = [str(t.name) for t in tabs]
         ids = [str(getattr(t, "tab_id", "") or "") for t in tabs]
         if names:
             self._other_tabs = {h: v for h, v in self._other_tabs.items() if time.monotonic() - v[2] < _TABS_FRESH_S}
-            self._other_tabs[hwnd] = (names, ids, time.monotonic())
-        return names, ids
+            self._other_tabs[hwnd] = (names, ids, time.monotonic(), frozenset())
+        return names, ids, frozenset()
+
+    def _offer_tabs(self, hwnd: int, numbers: list[int]) -> None:
+        """Review r2 H1: these numbers of a window's kept strip (one not in front) were handed to the talker, so a call
+        naming them goes by that read."""
+        kept = self._other_tabs.get(hwnd)
+        if kept is not None:
+            self._other_tabs[hwnd] = (kept[0], kept[1], kept[2], frozenset(kept[3]) | frozenset(int(n) for n in numbers))
 
     def _tab_args(self, args: dict[str, Any]) -> dict[str, Any]:
         """A tab hand's arguments with the tabs it acts on found (``_targets``: ``[(number, title, id)]``), for show and
         close: by their numbers when given, else by ``title``. A title is one tab's when exactly one tab's title holds
         those words (:func:`tabs_titled`); none matching is refused as stale (the thinker reads the window afresh, by
-        code), several matching is refused with their titles, so the talker asks by title, never for a number. ``new``
+        code), several matching is refused with their titles, so the talker asks by title, never for a number. Review
+        r2 H1: a number counts only on a strip the talker was shown (the window in front's tabs line, or numbers offered
+        to it from another window's read); for any other window's tabs the title alone names them, and a call with
+        numbers and no title is refused as stale (the thinker gets it by code). ``new``
         gets the window's browser (``_app``). Raises :class:`_Refused`; returns a copy (the call's own words untouched)."""
         action = str(args.get("action") or "show")
         out = dict(args)
@@ -3734,21 +3750,32 @@ class Hands:
         if not numbers and not title:
             raise _Refused("name the tab by its title (title: its words on the tabs line, or the part they said); "
                            "nothing was done")
-        names, ids = self._tab_strip(hwnd)
+        names, ids, known = self._tab_strip(hwnd)
         if not names:
             raise _Refused(f"the tabs of window {hwnd} could not be read; nothing was done", stale=True)
+        wanted: list[int] = []
         if numbers:
             try:
                 wanted = sorted({int(n) for n in numbers})
             except (TypeError, ValueError):
                 raise _Refused("give the tabs' numbers from the tabs line, or the tab's title in title") from None
+            if known is not None and not set(wanted) <= known:
+                # review r2 H1: a window not in front, whose tabs the talker was never shown (only read now, for this
+                # call): its number is a guess (live #17's words with Arc in front: "tab 1" of Chrome, its Gmail tab,
+                # would have been closed with "Closed it."). The title alone names the tab; with none, the thinker
+                # reads that window and does it, by code, as before
+                if not title:
+                    raise _Refused(f"the tabs of window {hwnd} were not on the tabs line you were shown, so a tab number "
+                                   f"there is not known; nothing was done", stale=True)
+                wanted = []
+        if wanted:
             bad = [n for n in wanted if not 1 <= n <= len(names)]
-            if bad:
+            if bad and not title:
                 raise _Refused(f"tab {', '.join(str(n) for n in bad)} of window {hwnd} is not on the tabs line you were "
                                f"shown; nothing was done", stale=True)
-            if title and not all(tabs_titled(title, [names[n - 1]]) for n in wanted):
+            if bad or (title and not all(tabs_titled(title, [names[n - 1]]) for n in wanted)):
                 # the number and the title disagree (the strip moved since it was shown): the title decides
-                numbers = []
+                wanted = []
             else:
                 out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "") for n in wanted]
                 return out
@@ -3756,6 +3783,8 @@ class Hands:
         if not hits:
             raise _Refused(f"no tab of window {hwnd} has a title with those words; nothing was done", stale=True)
         if len(hits) > 1:
+            if known is not None:
+                self._offer_tabs(hwnd, hits[:6])   # review r2 H1: these numbers of that read are now the talker's
             listed = "; ".join(f'"{names[n - 1][:60]}"' for n in hits[:6])
             raise _Refused(f"{len(hits)} tabs of window {hwnd} fit that title: {listed}. Nothing was done",
                            choose={"count": len(hits), "numbers": ", ".join(str(n) for n in hits[:6]),
@@ -3801,14 +3830,19 @@ class Hands:
                 before = read(hwnd, budget_s=_OTHER_TABS_BUDGET_S)
             except Exception:  # noqa: BLE001 - then no verdict can be had
                 before = None
+        if before is None or not getattr(before, "tabs", None):
+            # review r2 L4: no tab strip there (not a browser, or it could not be read): the new-tab key is never
+            # pressed blind (in another app it is that app's own ctrl+t); the thinker reads the window, by code
+            raise _Refused(f"no tab strip could be read in window {hwnd}, so no new-tab key was pressed; nothing was "
+                           f"done", stale=True)
         seen = {(getattr(t, "tab_id", "") or t.name) for t in getattr(before, "tabs", None) or []}
         facts["target"] = f'a new tab of window {hwnd}'
         lead = self._front(hwnd)
         facts["sent_at"] = time.monotonic()
         result = self.backend.hotkey("ctrl", "t", expect_hwnd=hwnd)
         ok, report, facts = self._report(result, lead, facts)
-        if not ok or before is None or not getattr(before, "tabs", None):
-            facts["verified"] = False if not ok else None
+        if not ok:
+            facts["verified"] = False
             return ok, report, facts
         deadline = time.monotonic() + _NEW_TAB_WAIT_S
         fresh = None
@@ -4462,8 +4496,9 @@ SKILL_FALLBACK_CONTEXT: dict[str, str] = {
                "heard (a name can be misheard), so it did not run. Work out the {slot} from their words and memory, "
                "then do it by steps: look at the screen, click and type. Do not run that skill again.",
     "timeout": "Yuki's voice ran their usual way ({skill}) and it had not finished after {secs} s, so what it did is "
-               "not known. Look at the screen first: it may be done, or half done. Finish it by steps (click, type). "
-               "Do not run that skill again.",
+               "not known, and it may still be acting. Look at the screen first, then again a few seconds later: "
+               "while it is still changing, wait for it to stop. It may be done, or half done. Finish it by steps "
+               "(click, type). Do not run that skill again.",
 }
 #: What the talker reads for a run_skill that fell back to the thinker (x3): never the skill's own "say so plainly".
 SKILL_PASSED_REPORT = ("Its own way did not get there ({why}), so the thinker is doing their request now by steps, with "

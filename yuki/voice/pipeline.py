@@ -2768,6 +2768,33 @@ def _spoken_before(messages: list[Any], end: int) -> int:
     return -1
 
 
+def _tail_held(users: list[tuple[int, str]], spans: dict[int, list[tuple[int, int]]], n: int, lo: int,
+               hi: int) -> int:
+    """How many of the ``n`` snapshot turns, newest first and in order, the user's messages strictly between indexes
+    ``lo`` and ``hi`` hold back from ``hi``, the newest in the last of those messages (``0``: that message does not hold
+    it). Found as :func:`with_heard_turns` finds them: a message holds a turn when it is that turn or a merge of these
+    turns (:func:`_turn_spans`)."""
+    count, bound, newer = 0, hi - 1, None
+    for j in range(n - 1, -1, -1):
+        found = None
+        for i, _t in reversed(users):
+            if i > bound or i <= lo:
+                continue
+            if i == bound and newer is not None:
+                ok = any(k <= j and newer < m for k, m in spans[i])   # the newer turn's own message: a merge of both
+            else:
+                ok = any(k <= j < m for k, m in spans[i])
+            if ok:
+                found = i
+                break
+            if newer is None:
+                break   # the newest turn: their last message there, or none
+        if found is None:
+            break
+        count, bound, newer = count + 1, found, j
+    return count
+
+
 def with_heard_turns(messages: list[Any], turns: list[str], held_id: str | None = None) -> list[Any]:
     """x3 (fix-plan 3e): ``messages`` (a conversation's, oldest first) with each of ``turns`` (the user's own heard
     turns of the moment a call was held, oldest first) that no user message holds put back as a user message where it
@@ -2776,7 +2803,9 @@ def with_heard_turns(messages: list[Any], turns: list[str], held_id: str | None 
     Review r1 M1: the newest turn (the one that set the call off, or was heard while it was being written) is looked
     for only among the user's messages after Yuki's last reply with words before the held call (:func:`_spoken_before`),
     or in one that landed right after the call, before Yuki said anything more; it is never matched to an older "Yeah."
-    said long before. Each older turn is looked for from where the newer one was found, back. A message holds a turn
+    said long before. Review r2 L1: when a line said by code stands between their turns and the call, their last
+    message before it counts for the newest turn when it and the one before it hold the snapshot's last two turns in
+    order (:func:`_tail_held`). Each older turn is looked for from where the newer one was found, back. A message holds a turn
     only when it is that turn or a merge of these turns (:func:`_turn_spans`). A missing turn goes right before the
     message holding the next turn of theirs that is there; a missing newest turn right after their last message before
     the held call (after Yuki's last reply when there is none). Never between a call and its result. The messages
@@ -2804,6 +2833,17 @@ def with_heard_turns(messages: list[Any], turns: list[str], held_id: str | None 
         after = next((i for i in range(end + 1, len(messages)) if isinstance(messages[i], dict)
                       and messages[i].get("role") == "assistant" and _message_text(messages[i])), len(messages))
         hit = next((i for i, _t in users if end < i < after and any(k <= newest < m for k, m in spans[i])), None)
+    if hit is None and n >= 2 and floor >= 0 and not any(floor < i < end for i, _t in users):
+        # review r2 L1: a line said by code after their turns (an older job's announcement lands in the context like a
+        # reply) can stand between the turn that set the call off and the call. When their last message before that
+        # line holds the newest turn and the one before it holds the turn before (or one message is the merge of
+        # both), with nothing of theirs after the line, the newest is there, not missing: put back after the line, it
+        # would hide the earlier turns from "their words since Yuki last spoke". Two turns in a row the same as an old
+        # exchange's, both missing, is not a case that happens; a single turn is never taken this way (an old "Yeah."
+        # before a reply may be just that, and a new one put back after the reply loses nothing)
+        lo = _spoken_before(messages, floor)
+        if _tail_held(users, spans, n, lo, floor) >= 2:
+            hit = next(i for i, _t in reversed(users) if lo < i < floor)
     place[newest] = hit
     bound, newer = (hit, newest) if hit is not None else (end - 1, None)
     for j in range(n - 2, -1, -1):
