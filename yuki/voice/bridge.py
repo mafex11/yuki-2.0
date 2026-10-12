@@ -134,6 +134,9 @@ CLAIM_TURN_S = 20.0
 #: The same turn offered to :meth:`VoiceBridge.answer_waiting` twice this close together (s; a held final transcript
 #: the fast path releases again) is taken once.
 ANSWER_SAME_TURN_S = 2.0
+#: Review r2 M1: a context message is one of a claim's turns when the heard log places it this close to them (s; the
+#: same entry gives the same time, this only absorbs a turn noted twice far apart); a later turn is never the claim's.
+CLAIM_HEARD_S = 0.5
 
 _WORD = re.compile(r"\w+")
 
@@ -207,6 +210,11 @@ class _Claim:
     dropped: bool = False
     #: What routed it (code words: ``held``, ``now``, ``follow_up``, ``escalated``, ``held_call``), once routed.
     via: str = ""
+    #: Review r2 M1: when its first and its last part were heard (:class:`HeardLog`'s clock), else ``None``: a talker
+    #: call is for this claim only when the context's newest message is one of these turns (never a later turn that
+    #: merely holds the same words: "Yes." answered, then "Yes, and turn the volume down" is a request of its own).
+    heard_from: float | None = None
+    heard_at: float | None = None
 
     @property
     def text(self) -> str:
@@ -316,6 +324,9 @@ class Job:
     #: Item 2: when its open question was said to the user (monotonic; by code, or handed to the talker), else
     #: ``None``: only a question they heard takes their next turn as its answer.
     asked_at: float | None = None
+    #: Item 2 review r2 L1: the keys of the user's skills it was pinned with or ran (``run_skill``): a skill hand-off of
+    #: the talker's for one of these while it waits on a question is its answer, never a request of its own.
+    skills: set[str] = field(default_factory=set)
 
     @property
     def unadopted(self) -> bool:
@@ -366,11 +377,23 @@ class HeardLog:
     def __init__(self) -> None:
         self._turns: deque[tuple[float, tuple[str, ...]]] = deque(maxlen=self.KEEP)
 
-    def note(self, text: str, at: float | None = None) -> None:
-        """A final turn of the user's was heard now (or ``at``)."""
+    def note(self, text: str, at: float | None = None) -> float | None:
+        """A final turn of the user's was heard now (or ``at``); returns when that turn was heard (``None``: no words).
+
+        The same turn noted twice (the conversation's final-words hook, which Pipecat's observers run on their own
+        task, and :meth:`VoiceBridge.answer_waiting`, which may come first) is kept once: the same words noted within
+        :data:`ANSWER_SAME_TURN_S` of a recent note are that note's turn (review r2 M1: a claim is bound to its turn's
+        time)."""
         words = _tokens(text)
-        if words:
-            self._turns.append((time.monotonic() if at is None else float(at), words))
+        if not words:
+            return None
+        when = time.monotonic() if at is None else float(at)
+        for k in range(len(self._turns) - 1, max(-1, len(self._turns) - 1 - self.AHEAD), -1):
+            seen, same = self._turns[k]
+            if same == words and abs(when - seen) <= ANSWER_SAME_TURN_S:
+                return seen
+        self._turns.append((when, words))
+        return when
 
     def newest(self) -> float | None:
         """When the newest final turn was heard (monotonic), or ``None``."""
@@ -732,6 +755,8 @@ class VoiceBridge(QObject):
         #: Hands of the talker's that did not take effect and went to the thinker (their action records, by identity):
         #: the job they became decides whether the request finished, never the hand's own record.
         self._escalated_hands: deque[Any] = deque(maxlen=16)
+        #: Review r2 L4: ``(skill run, whether its skill sends)`` for the latest skill run read (:meth:`_run_sends`).
+        self._sends_of: tuple[dict[str, Any], bool] | None = None
         #: IF-answer (Item 2c): the user's turn claimed as the answer to the waiting question, until it is routed or
         #: the talker's own call for the turn says it is not (:meth:`answer_waiting`).
         self._claim: _Claim | None = None
@@ -1021,12 +1046,15 @@ class VoiceBridge(QObject):
         answer and carry the request ("try another way" after the stuck line is about that same playlist). Its words
         are never carried into a new request (live 10 Oct a request after a failed one re-ran the failed YouTube task;
         the brain takes every carried turn as their request): what they say next ("message Hemanth", or "just do it")
-        goes with the labelled earlier lines instead. A done act at ``verified`` or ``likely`` ends it even with an
-        offer after it ("Want it louder?" then "yes" never plays it again), and so does any request that tried to send
+        goes with the labelled earlier lines instead. A done act at ``verified``, ``likely`` or ``unverified`` ends it
+        even with an offer after it ("Want it louder?" then "yes" never plays it again; review r2 L2: below likely the
+        thinker's words, offer and all, are never said as written, and an act that may have worked is never redone by
+        the next request), and so does any request that tried to send
         (the verdict's ``send``, or a send countdown of its that ended ``going``: the new brain's stuck endings carry
         no ``send`` even after one went, review r1 M2): nothing is ever sent twice (rule 8). A request to keep
         (``remember``) ends it when it ends (review r1 L2: its words are never handed over, or saved, again). A request
-        withdrawn for a newer one leaves its words to that one. The verdict's fields, the job's own marks and the
+        withdrawn for a newer one leaves its words to that one. A done act at ``failed`` keeps the rule of its words
+        ("That didn't work. Want me to try another way?" stays open). The verdict's fields, the job's own marks and the
         outcome's own closing mark only (:func:`asks`), never the words."""
         if job.source != "voice" or job.unadopted:
             return False
@@ -1037,7 +1065,8 @@ class VoiceBridge(QObject):
             return not job.superseded
         if job.superseded and not job.paused_out:
             return False
-        if state == DONE and str(verdict.get("level") or "") in ("verified", "likely"):
+        level = str(verdict.get("level") or "")
+        if state == DONE and (level in ("verified", "likely") or (level == "unverified" and verdict.get("acted"))):
             return True
         return not asks(job.outcome or "")
 
@@ -1049,6 +1078,8 @@ class VoiceBridge(QObject):
         * the hand-over of a spoken request still open from an earlier turn (its words are its own: a new request never
           carries them again, so it can never redo, or send twice, what that one is doing; a job made for the user's
           current turn, started early or by a hand that did not take effect, is this request's own and sets none);
+        * the last turn routed to such an open job as the answer to its question (review r2 M1: those words are its
+          own too);
         * a hand of the talker's that acted before the newest of their turns (``newest_at``, monotonic; by default the
           newest turn in :attr:`heard_log`; ``None``: no hand counts) (:meth:`_hand_marks`): "volume down", done, then
           "what's on my calendar?" never turns the volume down again.
@@ -1071,6 +1102,12 @@ class VoiceBridge(QObject):
                                                                                          j.cancel_requested))
                     and not j.unadopted and (turn is None or j.user_turn < turn)]
         marks = [m for m in (self._closed_at, *(j.started_at for j in live)) if m is not None]
+        claim = self._claim
+        if claim is not None and claim.done and not claim.dropped and claim.heard_at is not None \
+                and any(claim.job is j for j in live):
+            # review r2 M1: the turns routed to an open job as its answer are that job's words, like its request: a
+            # later request ("Yes, and turn the volume down" after "Yes.") never carries them
+            marks.append(claim.heard_at)
         if newest_at is not None:
             marks.extend(m for m in self._hand_marks() if m < newest_at)
         return max(marks) if marks else None
@@ -1093,7 +1130,7 @@ class VoiceBridge(QObject):
                 out.append(mono - (wall - float(getattr(record, "at", wall))))
         last = getattr(getattr(self, "hands", None), "last_skill", None)
         if isinstance(last, dict) and not any(last is e for e in escalated) and (
-                last.get("outcome") == "unverified" or (last.get("outcome") == "failed" and _skill_sends(last))):
+                last.get("outcome") == "unverified" or (last.get("outcome") == "failed" and self._run_sends(last))):
             # review r1 M2: a skill that sends and failed after a rung acted may have sent anyway (the engine never
             # tries again for that reason): its words are never handed over again either (rule 8)
             try:
@@ -1101,6 +1138,16 @@ class VoiceBridge(QObject):
             except (TypeError, ValueError):
                 pass
         return out
+
+    def _run_sends(self, run: dict[str, Any]) -> bool:
+        """:func:`_skill_sends` of a skill run, read once per run (review r2 L4: :meth:`_hand_marks` runs on the voice
+        loop at every hand-off and claim, and the catalog read stats every connection file; the lightweight rule)."""
+        cached = getattr(self, "_sends_of", None)
+        if cached is not None and cached[0] is run:
+            return cached[1]
+        sends = _skill_sends(run)
+        self._sends_of = (run, sends)
+        return sends
 
     #: A hand's record (or its skill run) this recent when :meth:`escalate` is called is the one that went over (s).
     ESCALATED_RECENT_S = 10.0
@@ -2114,6 +2161,8 @@ class VoiceBridge(QObject):
         if job.turn_id and self._takes("log_request_id"):
             # phase F (fPrivacy R1.3): the request's id in every log, next to its turn's hands (probed)
             extra["log_request_id"] = f"voice-{job.turn_id}-t{job.token}"
+        if skill and str(skill.get("key") or ""):
+            job.skills.add(str(skill.get("key")))   # review r2 L1: its own skill (the key, data only)
         if skill and self._takes("skill"):
             # Phase S: the user's usual way the code handed over (rung C), pinned in the thinker's frame
             extra["skill"] = dict(skill)
@@ -2402,6 +2451,8 @@ class VoiceBridge(QObject):
         if job is None:
             return
         self._note_runner(job, lane)
+        if name == "run_skill" and str((tool_input or {}).get("skill") or "").strip():
+            job.skills.add(str(tool_input["skill"]).strip())   # review r2 L1: a skill it ran (its key, data only)
         if name == "tasks" and isinstance((tool_input or {}).get("items"), list):
             # N10: the kept list rides on the thinker line (what is left), so an interjection never loses it
             job.tasks = [dict(i) for i in tool_input["items"] if isinstance(i, dict)][:12]
@@ -2864,6 +2915,9 @@ class VoiceBridge(QObject):
         job = self._answerable()
         if job is None:
             return False
+        # review r2 M1: the turn's own time in the heard log (noted here if the final-words hook has not yet: Pipecat
+        # runs observers on their own task), so the claim is bound to this turn, never to its words
+        heard = self.heard_log.note(words) if self.heard_log is not None else None
         now = time.monotonic()
         claim = self._claim
         if claim is not None and claim.job is job and claim.parts and claim.parts[-1] == words \
@@ -2872,10 +2926,13 @@ class VoiceBridge(QObject):
         if claim is not None and not claim.done and claim.job is job:
             claim.parts.append(words)   # they said more while it was held: their answer is all of it
             claim.last_at, claim.quiet_since = now, None
+            claim.heard_at = heard
+            if claim.heard_from is None:
+                claim.heard_from = heard
         else:
             if claim is not None and not claim.done:
                 self._drop_claim("replaced")
-            claim = self._claim = _Claim(job=job, parts=[words])
+            claim = self._claim = _Claim(job=job, parts=[words], heard_from=heard, heard_at=heard)
         self._log("bridge", op="answer_claimed", job_id=job.job_id, parts=len(claim.parts), chars=len(claim.text))
         hold = None if hold_s is None else max(0.0, float(hold_s))
         if hold == 0.0:
@@ -2990,17 +3047,43 @@ class VoiceBridge(QObject):
                        and now - j.asked_at <= ANSWER_S]
         return max(waiting, key=lambda j: j.asked_at or 0.0) if waiting else None
 
+    def _waiting_ran(self, key: str) -> bool:
+        """Review r2 L1: whether the voice job waiting on a question the user heard (or the one a still-held claim is
+        for) was pinned with, or ran, the user's skill ``key`` (:attr:`Job.skills`). Keys only (data), never words."""
+        if not key:
+            return False
+        claim = self._claim
+        job = claim.job if claim is not None and not claim.done else self._answerable()
+        return job is not None and key in job.skills
+
     def _claim_of(self, newest: str | None) -> _Claim | None:
         """The claim the user's newest turn (``newest``: the context's newest user message, which may join their last
-        turns) belongs to, else ``None``: its words hold the claim's last part, or are part of what it holds, and their
-        last words in it were heard within :data:`CLAIM_TURN_S`. Words as tokens (:func:`_tokens`), never meaning."""
+        turns) belongs to, else ``None``. Their last words in it were heard within :data:`CLAIM_TURN_S`, and the message
+        *is* one of the claim's turns, not merely a later turn holding the same words (review r2 M1: "Yes." answered the
+        question, then "Yes, and turn the Spotify volume down a bit." 3 s later was settled as that answer, and the new
+        request was lost): the heard log places the message (:meth:`HeardLog.heard_at`) between the claim's first and
+        last part. Its words must also hold the claim's last part or be part of what it holds (the context may join
+        turns). When the heard log cannot place it, the claim's last part must end the message (their newest words;
+        the context joins older turns before it). The heard turns' times and words as tokens (:func:`_tokens`), never
+        meaning."""
         claim = self._claim
         if claim is None or not claim.parts or time.monotonic() - claim.last_at > CLAIM_TURN_S:
             return None
         message = _tokens(newest)
         if not message:
             return None
-        if _within(_tokens(claim.parts[-1]), message) or _within(message, _tokens(claim.text)):
+        last, whole = _tokens(claim.parts[-1]), _tokens(claim.text)
+        at = None
+        if self.heard_log is not None:
+            try:
+                at = self.heard_log.heard_at(str(newest))
+            except Exception:  # noqa: BLE001 - placed by its words alone, below
+                at = None
+        if at is not None and claim.heard_from is not None and claim.heard_at is not None:
+            if not claim.heard_from - CLAIM_HEARD_S <= at <= claim.heard_at + CLAIM_HEARD_S:
+                return None   # a turn heard after the claim's last part (or before it began): never the claim's
+            return claim if _within(last, message) or _within(message, whole) else None
+        if (last and message[-len(last):] == last) or _within(message, whole):
             return claim
         return None
 
@@ -3125,7 +3208,9 @@ class VoiceBridge(QObject):
             return False
         if self._claim is not None and not self._claim.done:
             self._drop_claim("replaced")
-        claim = self._claim = _Claim(job=job, parts=list(turns))
+        # review r2 M1: bound to these turns (said after the question, the newest at ``newest``), never to their words
+        claim = self._claim = _Claim(job=job, parts=list(turns),
+                                     heard_from=job.asked_at if newest is not None else None, heard_at=newest)
         if not self._commit_claim("escalated", claim):
             return False
         self._log("bridge", op="escalated_to_answer", hand=name, job_id=job.job_id, turns=len(turns),
@@ -3278,12 +3363,15 @@ class VoiceBridge(QObject):
         self._note_escalated_hand(name)   # Item 2(a): its record is no finished request; what it becomes decides
         heard = heard_words(params.context, skip=self.not_heard)
         seeded = isinstance(skill, dict) and bool(skill.get("key"))
-        if seeded:
+        own = seeded and self._waiting_ran(str(skill.get("key")))
+        if seeded and not own:
             # review r1 L1: the talker picked one of the user's skills for these words: a request of their own ("play my
             # Japanese playlist" while "Did you mean Hemanth?" waits), never that question's answer. A claim of the turn
-            # still held is dropped; the runtime sets the waiting job aside for this one (quietly, ``parked``)
+            # still held is dropped; the runtime sets the waiting job aside for this one (quietly, ``parked``).
+            # Review r2 L1: unless the waiting job itself runs that skill ("Yeah." to "Did you mean Hemanth?", and the
+            # talker ran the message skill on it): then the words are its answer, as a refused hand's are
             self._not_an_answer(params, "skill")
-        if self._escalate_to_answer(params, name, heard, fresh=not seeded):
+        if self._escalate_to_answer(params, name, heard, fresh=not seeded or own):
             return True   # Item 2(c, d): a voice job waits on a question they heard: these words are its answer
         if self.on_brain:
             return self._brain_escalate(params, name, args, report, heard, acked=acked, context=context, skill=skill)
