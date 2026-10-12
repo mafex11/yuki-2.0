@@ -14,30 +14,61 @@ applies decides:
    the commit check says ``effect = join``: **refuse** (bring the window forward, "you click Join"). The one
    exception: a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``,
    on the user's plain words (the commit check's ``asked``; decision 7).
-4. **Send**: the step sends for certain (``tools.sends_for_certain``: typed with Enter or a line break, or a click on
-   a control that is not a button, menu item or split button while Yuki's typed text waits in that window), is a
-   ``run_skill`` whose skill sends with these slots, or the commit check says ``effect = send`` (a button, menu item or
-   split button click, or a key, in a window where that text waits is may-commit and goes to the check, told the text
-   waits, so "type a search, click Search" is not refused as a send; designer's call, review r2 L1): **refuse**
-   ("undeclared send") unless the plan declared ``consent.commit = send`` and the step is a sending capability. Then
-   allowed only when (a) ``quote`` is a whole-words span of the user's words, (b) ``to`` is named in the quote (memory's
-   people index, ``contacts.named_in``, or its words in the quote), (c) the step's text equals ``consent.text`` and is
-   itself a span of the user's words (decision 2), (d) the commit check says ``asked``, (e) the user's recent messages
-   to that person hold no near-duplicate of the text (``util.similar``, last 3 hours). (c) or (d) failing is **draft**:
-   the capability runs with its send slot on a non-sending option, or, for Yuki's own wording, opens the chat with no
-   text and the wording is typed without Enter. (e) failing is **ask**. An allowed send runs the countdown first, and
-   only with every ``sends_when`` slot on a sending value (a slot left out would be filled with its default, a draft:
-   refused so the planner fills it, never counted down or reported as sent).
+4. **Send**: the step sends for certain (:func:`sends_now`: a click on a control that is not a button, menu item or
+   split button while Yuki's typed text waits in that window; typing with Enter or a line break only where Enter sends
+   a message: a chat's window, :func:`chat_window`, by its program among a chat app's connection data (``[chat]
+   images`` / ``processes``), by the page it shows (the Now board's address) on one of a chat app's web ``services``
+   hosts, or by memory's capture profiles calling the program or page a ``conversation``, a window whose program is
+   unknown counting as a chat; or a window where Yuki's typed text waits), is a ``run_skill`` whose skill sends with
+   these slots, or the commit check says ``effect = send`` (a button, menu item or split button click, a key, or
+   typing with Enter anywhere else, a search box, a command field, is may-commit and goes to the check, told when
+   Yuki's text waits, so "type a search, press Enter" is row 5's, and a chat no data knows still comes back here as
+   the check's ``send``; designer's call, review r2 L1, failure fix-plan item 11).
+
+   One web address typed with Enter into a browser window known not to be a chat (:func:`navigates`: its address bar)
+   opens that page, as ``open_url`` would: judged as typing (rows 1-2), never a send, whatever word the check gives
+   it. Enter typed or pressed in a window known not to be a chat, which the check calls a send their words didn't ask
+   for, is **ask**ed with the check's question (a search box it misread, or a chat no data knows: their call).
+
+   A send: **refuse** ("undeclared send") unless the plan declared ``consent.commit = send`` and the step is a sending
+   capability. A plan that declares a send while its capability step leaves a draft (its send slot on a non-sending
+   option) is refused too, so the planner makes the two agree. Then (HANDBOOK rule 8: "send X to Y" means send; naming
+   only the person means a draft):
+
+   * code facts first, each a **refuse** the planner can fix: ``consent.to`` is given; the capability's person slot
+     names the same person as ``to`` (the same words, or memory's people index, ``live.people_in``, finds one person
+     who goes by both); the step's text slot is ``consent.text`` (the countdown shows ``consent.text``);
+   * the commit check does not say this very send was asked (``effect = send`` and ``asked``), or failed: **draft**
+     (the capability runs with its send slot on a non-sending option; for Yuki's own wording the chat opens with no
+     text and the wording is typed without Enter);
+   * ``quote`` (their words asking for it) stands in the user's words of this exchange, whole words in order, where a
+     name the recipient goes by may stand in place of how the words named them (speech heard "hey meant" or "हेमंत"
+     for Hemanth); else **refuse**;
+   * the text is their own words (a span of them), or Yuki's wording of what they said: :func:`said_share`, the share
+     of the text's words (the recipient's names aside) that stand in their words of this exchange. None of them:
+     nothing of the message came from the user, they named only the person: **draft**;
+   * every ``sends_when`` slot on a sending value, else **refuse** (a slot left out would be filled with its default,
+     a draft: never counted down or reported as sent);
+   * a near-duplicate of the user's recent messages to that person (``util.similar``, last 3 hours): **ask** "send it
+     again?"; Yuki's wording with less than :data:`SAID_SHARE` of it from their words, or a recipient their words
+     don't name (literally or through the people index: one person): **ask** "Send "<text>" to <to>?" (a yes is their
+     plain instruction);
+   * otherwise **allow** with the countdown first (showing the text, the user may stop or change it).
 5. **Lasting**: any other may-commit step (its traits destroy or reach: a committing-role click, a key, a shell, a
    close, a non-web open, a fetch after a file, clipboard or memory read, M9), and a step of a kind the user's policy
    holds below "do it and tell me": the commit check decides (``effect = none`` allow; lasting and asked allow; lasting
    and not asked **ask** its question; the check failed or timed out **ask**, fail closed).
-6. Anything else (focus, a web page, scroll, typing without Enter, a list item, tab or link click, reads): **allow**.
+6. Anything else (focus, a web page, an address typed into a browser with Enter, scroll, typing without Enter, a list
+   item, tab or link click, reads): **allow**.
 
-Rows 1-4 (a)-(c), (e) are code facts: tool metadata (``yuki.agent.tools.call_traits``), the Now board, capability
-data and string spans. Whether the words *ask* for the effect is the commit check's call (``yuki.brain.check``), an
-independent model that sees only the user's words and the steps, never the planner's own judgement (H1, H2). No regex,
-no keyword list, no app name: strings are only compared with strings.
+Rows 1-4's facts are code facts: tool metadata (``yuki.agent.tools.call_traits``), the Now board, capability data,
+memory's people index, string spans and counted shares of words. Whether the words *ask* for the effect is the commit
+check's call (``yuki.brain.check``), an independent model that sees only the user's words and the steps, never the
+planner's own judgement (H1, H2). No regex, no keyword list, no app name: strings are only compared with strings.
+
+A verdict's ``why`` is a code word for the logs and ``line`` of a refusal that is not final is for the planner: neither
+is ever said to the user (:func:`plain_why` gives the plain words for a code word, or nothing). Final refusals' lines,
+questions and the draft line are what the user hears.
 """
 
 from __future__ import annotations
@@ -46,7 +77,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.agent.tools import Traits, call_traits, sends_for_certain, tool_traits
+from yuki.agent.tools import WEB_SCHEMES, Traits, call_traits, sends_for_certain, tool_traits
 from yuki.brain import util
 
 ALLOW, ASK, REFUSE, DRAFT = "allow", "ask", "refuse", "draft"
@@ -62,16 +93,32 @@ LINE_JOIN = "{app} is in front: you click Join."
 LINE_JOIN_PLAIN = "You click Join."
 LINE_UNDECLARED_SEND = ("that step would send something the plan did not declare as a send: send only through the "
                         "message capability with commit send, or leave it as a draft")
-#: The same refusal for typing with Enter (``submit`` or a line break): Enter as its own step is checked (row 5), so a
-#: search box or an address bar still works; a message still goes through the capability.
-LINE_TYPED_ENTER = ("typing with Enter sends what was typed, and the plan declared no send: type it without submit and "
-                    "press Enter as its own step (that step is checked), send a message through the message capability "
-                    "with commit send, or leave it as a draft")
+#: The same refusal for typing with Enter (``submit`` or a line break) in a chat app's window or where Yuki's typed text
+#: waits (planner-facing). Elsewhere (an address bar, a search box) typing with Enter goes to the commit check (row 5).
+LINE_TYPED_ENTER = ("typing with Enter here sends what is typed (a chat app's window or page, or Yuki's unsent text "
+                    "waits there), and the plan declared no send: send a message through the message capability with "
+                    "commit send, type it without submit and press Enter as its own step (that step is checked), or "
+                    "leave it as a draft")
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
+#: Planner-facing refusals of a declared send (code facts the planner can fix).
+LINE_NO_RECIPIENT = "a send names whom it goes to in consent.to"
+LINE_DECLARED_DRAFT = ("the plan declares a send (consent.commit send) but this step leaves a draft (its send slot "
+                       "{slots} on a non-sending option): put the send slot on its sending value with the text in the "
+                       "text slot, or declare consent.commit none for a draft")
+LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write the same text in both (the countdown "
+                      "shows consent.text)")
+LINE_QUOTE = ("consent.quote is not the user's words as heard: copy their words asking for the send exactly as they "
+              "stand in their words (a name they said may be written as that person's name)")
 LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_DUPLICATE = "You sent that to {to} at {at}. Send it again?"
 LINE_DUPLICATE_PLAIN = "You sent that recently. Send it again?"
+#: A send the user is asked about, showing what goes to whom (Yuki's own wording of what they said, or a recipient their
+#: words didn't plainly name: speech heard the name another way). A yes is their plain instruction (rule 8).
+LINE_ASK_SEND = "Send \"{text}\" to {to}?"
+LINE_ASK_SEND_PLAIN = "Send that message?"
+#: The most characters of the text a question shows.
+ASK_TEXT_CHARS = 160
 LINE_CHECK_FAILED = "Should I go ahead with that? I couldn't check it was what you asked for."
 #: The same question naming the step (``describe_step``'s running words for it: "Closing Slack").
 LINE_CHECK_FAILED_STEP = "Should I go ahead with {step}? I couldn't check it was what you asked for."
@@ -80,11 +127,42 @@ LINE_SEND_SLOT = ("the send leaves its send slot ({slots}) out: fill it with its
 
 #: A near-duplicate send counts within this many seconds (the user's messages to that person, §2.3).
 DUPLICATE_WINDOW_S = 3 * 3600.0
+#: Yuki's own wording of a message goes with the countdown alone when at least this share of its words (the
+#: recipient's names aside, each word once) stand in the user's words of this exchange: a rewording keeps their words
+#: and changes the person ("ask him when he will come" -> "When will you come?": 3 of 4). Less is asked first, showing
+#: the text; none at all is a draft (they named only the person, rule 8). A counted share of words, never a reading of
+#: them; measured on the 10 Oct requests (failure fix-plan item 11), where the commit check alone called "Message
+#: Hemanth." an asked send.
+SAID_SHARE = 0.5
+
+#: The plain words said for a refusal's code word (``Verdict.why``), for a line the user hears; a code word itself is
+#: never said. Missing or empty: nothing worth saying (the planner's own fixes).
+PLAIN_WHY: dict[str, str] = {
+    "game": "a game is in front",
+    "act_off": "Act is switched off for that app",
+    "suggest": "your settings say only suggest for that",
+    "join_window": "joining is your click",
+    "join_control": "joining is your click",
+    "join_effect": "joining is your click",
+    "undeclared_send": "that would have sent something you didn't ask me to send",
+    "not_capability": "I only send messages through the chat apps' own way",
+    "recipient": "I couldn't be sure who it was for",
+    "recipient_slot": "I couldn't be sure who it was for",
+    "no_draft": "that app has no way to leave a draft",
+    "check_failed": "I couldn't check it was what you asked for",
+    "error": "I couldn't check it was what you asked for",
+}
 
 #: The steps whose input takes the screen even with no focus trait of their own (row 1): an app opened, a link
 #: opened, a shell (it may start a window), a window shown or restored. Fixed tool names and operations.
 _TAKES_SCREEN_TOOLS = frozenset({"launch_app", "open_url", "run_powershell", "open_yuki"})
 _TAKES_SCREEN_WINDOW_OPS = frozenset({"restore", "focus", "maximize", "fullscreen"})
+#: The steps that submit with Enter (typed with it, or pressed as its own step: the way :data:`LINE_TYPED_ENTER`
+#: offers). Outside a chat app's window the check's ``send`` their words didn't ask for is a question, never a refusal.
+_ENTER_TOOLS = frozenset({"type_text", "press"})
+#: A web address typed with Enter in a window known not to be a chat (:func:`navigates`): typing in the app (its Act
+#: switch and the typing policy apply) that opens a page (the kind ``open_url`` has); it neither sends nor destroys.
+ADDRESS_TRAITS = Traits(("click_type", "open_apps"), "input")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -117,7 +195,10 @@ class Live:
     ``reads``: what this request has read so far (``file``, ``clipboard``, ``memory``: M9). ``join_controls``: the
     (role, name) pairs capabilities declare as their join control, casefolded. ``recent``: the user's own last messages
     to the person the send names (``{"text", "at"}``). ``people_in(text)``: memory's people index, the names of each
-    person named in ``text`` (``None``: memory can't say). ``policy``: the autonomy policy reader."""
+    person named in ``text`` (``None``: memory can't say). ``policy``: the autonomy policy reader. ``pages``: the
+    address each window shows (the Now board's ``windows[].url`` by hwnd), for a caller that read the board already;
+    ``None``: :func:`window_page` reads the board itself when a step needs it (typing with Enter outside a chat app's
+    program)."""
 
     game: str | None = ""
     calling: frozenset[int] = frozenset()
@@ -128,13 +209,15 @@ class Live:
     people_in: Callable[[str], list[list[str]] | None] | None = None
     policy: Any = None
     now: float = field(default_factory=time.time)
+    pages: Mapping[int, str] | None = None
 
 
 @dataclass(frozen=True)
 class Verdict:
-    """The rule's answer for one step. ``why``: a code word for the logs (content-free). ``line``: what a refusal says;
-    ``question``: what an ask asks; ``final``: a refusal that ends the run with its line (a game in front, an app
-    switched off, a join) instead of a replan; ``countdown``: an allowed send runs the countdown first;
+    """The rule's answer for one step. ``why``: a code word for the logs (content-free), never said to the user
+    (:func:`plain_why`). ``line``: what a refusal says (to the user when ``final``, else to the planner, never
+    spoken); ``question``: what an ask asks; ``final``: a refusal that ends the run with its line (a game in front, an
+    app switched off, a join) instead of a replan; ``countdown``: an allowed send runs the countdown first;
     ``draft_input``: a draft's capability input (its send slot on a non-sending option, and for Yuki's own wording no
     text); ``type_after``: Yuki's own wording, typed without Enter once the chat is open; ``focus``: a refused join's
     window, brought forward."""
@@ -190,6 +273,130 @@ def in_words(text: str, user_words: Sequence[str]) -> bool:
     if not text or not entries:
         return False
     return any(span_in(text, w) for w in entries) or span_in(text, " ".join(entries))
+
+
+def plain_why(why: str) -> str:
+    """The plain words for a refusal's code word (:data:`PLAIN_WHY`), for a line the user hears; ``""`` when there is
+    nothing worth saying. A code word is never said as it is."""
+    return PLAIN_WHY.get(str(why or ""), "")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Whom a send goes to, and what of it the user said (row 4; memory's people index through ``live.people_in``)
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class _People:
+    """Memory's people index for one check (``live.people_in``: each person named in a text, with every name they go
+    by; ``None``: memory can't say), each text looked up once."""
+
+    def __init__(self, live: Live) -> None:
+        self.live = live
+        self.memo: dict[str, list[list[str]] | None] = {}
+
+    def __call__(self, text: str) -> list[list[str]] | None:
+        key = words(text)
+        if not key:
+            return []
+        if key not in self.memo:
+            try:
+                got = self.live.people_in(key) if self.live.people_in is not None else None
+            except Exception:  # noqa: BLE001 - memory can't say
+                got = None
+            self.memo[key] = [[str(n) for n in names] for names in got if names] if isinstance(got, list) else None
+        return self.memo[key]
+
+
+def _fits(people: Sequence[Sequence[str]] | None, name: str) -> list[Sequence[str]]:
+    """The people (each a list of their names) one of whose names is ``name``'s words."""
+    from yuki.memory.contacts import tokens
+
+    want = tokens(name)
+    if not want:
+        return []
+    return [names for names in people or [] if any(tokens(n) == want for n in names)]
+
+
+def _joined(user_words: Sequence[str]) -> str:
+    return " ".join(words(w) for w in user_words if words(w))
+
+
+def _recipient_names(to: str, who: str, look: _People, user_words: Sequence[str]) -> list[str]:
+    """Every name the recipient goes by: ``to``, the person slot's words, and the names memory's people index keeps for
+    the one person ``to`` names (looked up by ``to`` itself and in the user's words)."""
+    names = [n for n in (to, who) if words(n)]
+    for text in (to, _joined(user_words)):
+        fits = _fits(look(text), to)
+        if len(fits) == 1:
+            names += [str(n) for n in fits[0]]
+    return list(dict.fromkeys(words(n) for n in names if words(n)))
+
+
+def _named_by_user(to: str, who: str, user_words: Sequence[str], look: _People) -> bool:
+    """The recipient is someone the user's words name: ``to`` or the person slot's words stand in them, or memory's
+    people index finds exactly one person in them who goes by ``to`` (a misheard or transliterated name the index
+    knows: ``contacts`` matches heard forms)."""
+    if any(n and in_words(n, user_words) for n in (to, who)):
+        return True
+    return len(_fits(look(_joined(user_words)), to)) == 1
+
+
+def _cut_names(text: str, names: Sequence[str]) -> tuple[list[list[str]], bool]:
+    """``text``'s words with every run of words that is one of ``names`` cut out (the longest first): the pieces left
+    between them, and whether any name was cut."""
+    from yuki.memory.contacts import tokens
+
+    runs = sorted({tuple(tokens(n)) for n in names if tokens(n)}, key=len, reverse=True)
+    ws = tokens(text)
+    pieces: list[list[str]] = []
+    cur: list[str] = []
+    cut, i = False, 0
+    while i < len(ws):
+        hit = next((r for r in runs if tuple(ws[i:i + len(r)]) == r), None)
+        if hit is None:
+            cur.append(ws[i])
+            i += 1
+            continue
+        if cur:
+            pieces.append(cur)
+            cur = []
+        i += len(hit)
+        cut = True
+    if cur:
+        pieces.append(cur)
+    return pieces, cut
+
+
+def quote_in_words(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> bool:
+    """Row 4: the plan's quote stands in the user's words (:func:`in_words`), or does once every name the recipient
+    goes by (``names``) is cut out of it: each piece left stands in their words. Speech writes a name the way it heard
+    it ("hey meant", "हेमंत"); the planner writes the person's name. A quote that is only a name does not stand."""
+    if in_words(quote, user_words):
+        return True
+    pieces, cut = _cut_names(quote, names)
+    return cut and bool(pieces) and all(in_words(" ".join(p), user_words) for p in pieces)
+
+
+def said_share(text: str, heard: str | Sequence[str], names: Sequence[str] = ()) -> float:
+    """The share (0-1) of a message's words that stand in the user's words (``heard``: their quote, or every turn of
+    this exchange), each word once, the recipient's names aside: how much of Yuki's wording came from what they said.
+    ``0`` when the text has no word of its own. A count of words, never a reading of them."""
+    from yuki.memory.contacts import tokens
+
+    name_words = {t for n in names for t in tokens(n)}
+    own = list(dict.fromkeys(t for t in tokens(text) if t not in name_words))
+    if not own:
+        return 0.0
+    said = set(tokens(heard if isinstance(heard, str) else " ".join(str(h or "") for h in heard)))
+    return sum(1 for t in own if t in said) / len(own)
+
+
+def ask_send_question(text: str, to: str) -> str:
+    """The question for a send the user is asked about: what goes to whom (the text cut to :data:`ASK_TEXT_CHARS`)."""
+    body = words(text)
+    if len(body) > ASK_TEXT_CHARS:
+        body = body[:ASK_TEXT_CHARS - 1].rstrip() + "…"
+    return LINE_ASK_SEND.format(text=body, to=words(to)) if body and words(to) else LINE_ASK_SEND_PLAIN
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -303,6 +510,189 @@ def traits_of(call: Call, live: Live) -> Traits:
                        files_read=bool(live.reads))
 
 
+def _chat_data() -> tuple[frozenset[str], frozenset[str]] | None:
+    """What chat apps' connection data says identifies them (``[chat]`` of each, read through ``yuki.skills.chat``, as
+    :func:`join_controls` reads its labels): their programs (``images`` / ``processes``, by memory's app key) and the
+    web hosts they serve chats on (``services`` that are hosts: ``discord.com``, ``web.whatsapp.com``). ``None``: the
+    data can't be read or lists no program. Never raises."""
+    try:
+        from yuki.core.appnames import app_key
+        from yuki.skills.chat import app_data, chat_apps
+
+        programs: set[str] = set()
+        hosts: set[str] = set()
+        for app in chat_apps():
+            data = app_data(app)
+            programs.update(app_key(str(p)) for p in [*(data.get("images") or []), *(data.get("processes") or [])])
+            hosts.update(str(s).strip().casefold() for s in data.get("services") or [] if "." in str(s))
+    except Exception:  # noqa: BLE001 - no data: unknown (counted as a chat by the caller)
+        return None
+    programs.discard("")
+    hosts.discard("")
+    return (frozenset(programs), frozenset(hosts)) if programs else None
+
+
+#: A board read for :func:`window_page` serves the rule's other questions about the same step for this long (one
+#: check asks up to three times: the step's traits, may-commit, the send row).
+PAGE_TTL_S = 1.0
+_pages_read: dict[int, tuple[float, str]] = {}
+
+
+def window_page(hwnd: int | None, live: Live | None = None) -> str:
+    """The address the window shows: ``live.pages`` when the caller read the board already, else the Now board's entry
+    for that window (``windows[].url``, read now: 50 ms at most, kept :data:`PAGE_TTL_S`). ``""``: not known (no board,
+    a window with no page, a page privacy keeps out). Never raises."""
+    if not hwnd:
+        return ""
+    try:
+        key = int(hwnd)
+    except (TypeError, ValueError):
+        return ""
+    if live is not None and live.pages is not None:
+        try:
+            return words(live.pages.get(key) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+    now = time.monotonic()
+    hit = _pages_read.get(key)
+    if hit is not None and now - hit[0] <= PAGE_TTL_S:
+        return hit[1]
+    url = ""
+    try:
+        from yuki.memory.now import shared_client
+
+        client = shared_client()
+        board = client.now(wait_s=0.05) if client is not None else None
+        for w in (board or {}).get("windows") or []:
+            if isinstance(w, Mapping) and str(w.get("hwnd")) == str(key):
+                url = words(w.get("url") or "")
+                break
+    except Exception:  # noqa: BLE001 - no board: not known
+        url = ""
+    if len(_pages_read) > 64:
+        _pages_read.clear()
+    _pages_read[key] = (now, url)
+    return url
+
+
+def _host(url: str) -> str:
+    """An address's host, casefolded (a fixed machine format, parsed); ``""`` when it has none."""
+    from urllib.parse import urlparse
+
+    try:
+        return (urlparse(words(url)).hostname or "").casefold().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _capture_kind(program: str, url: str) -> str:
+    """The kind memory's capture profiles give this window (``yuki.memory.extract.profiles``: data, by the window's
+    program or its page's host and path; ``conversation`` for a chat such as Teams, Telegram or Messenger), ``""``
+    when none fits or the data can't be read. Never raises."""
+    try:
+        from yuki.memory.extract import profiles
+
+        prof = profiles.current().for_window(process=program.casefold(), url=url or None)
+        return str(getattr(prof, "kind", "") or "") if prof is not None else ""
+    except Exception:  # noqa: BLE001 - no profile data: not known
+        return ""
+
+
+def chat_window(call: Call, live: Live | None = None) -> bool | None:
+    """Whether the step's window is a chat's, where Enter sends a message. Data only, never names: its program
+    (``call.app``, the window's process) among the programs a chat app's connection data lists; the page it shows
+    (:func:`window_page`) on one of a chat app's web hosts or below one (Discord or WhatsApp in a browser); or memory's
+    capture profiles calling that program or page a ``conversation`` (Teams, Telegram, Messenger, LinkedIn or Instagram
+    messages: chats with no message capability). ``None``: the program is unknown, or the chat apps' data can't be read
+    (the caller counts that as a chat, fail closed)."""
+    import ntpath
+
+    from yuki.core.appnames import app_key
+
+    data = _chat_data()
+    if data is None:
+        return None
+    programs, hosts = data
+    program = ntpath.basename(words(call.app))
+    key = app_key(program)
+    if key and key in programs:
+        return True
+    url = window_page(call.hwnd, live) if call.hwnd else ""
+    host = _host(url)
+    if host and any(host == h or host.endswith("." + h) for h in hosts):
+        return True
+    if _capture_kind(program, url) == "conversation":
+        return True
+    return False if key else None
+
+
+def sends_now(call: Call, live: Live, traits: Traits | None = None) -> bool:
+    """Row 4's code fact: the step sends something to someone for certain. A click while Yuki's typed text waits in
+    that window (``tools.sends_for_certain``) does. Typing with Enter or a line break does only where Enter sends a
+    message: in a chat app's own window or page (:func:`chat_window`; a program that can't be told counts as a chat,
+    fail closed), or in a window where Yuki's typed text waits (Enter sends that text too, and the commit check is not
+    told of it for typing). Anywhere else (an address bar, a search box, a command field) typing with Enter is a
+    may-commit step like a key: the commit check decides it (row 5), and its ``send`` (a chat the data doesn't know)
+    brings it back to row 4. ``tools.sends_for_certain`` itself is left as it is: the old loop shares it."""
+    traits = traits if traits is not None else traits_of(call, live)
+    if not sends_for_certain(traits):
+        return False
+    if call.tool != "type_text":
+        return True
+    if call.hwnd and int(call.hwnd) in live.typed_pending:
+        return True
+    return chat_window(call, live) is not False
+
+
+def typed_address(call: Call) -> str:
+    """The one web address a ``type_text`` step types: an http(s) address with a host and nothing else (a trailing line
+    break aside), else ``""``. A fixed machine format, parsed as ``tools`` parses ``open_url``'s address, never
+    words."""
+    if call.tool != "type_text":
+        return ""
+    text = str((call.input or {}).get("text") or "").strip()
+    if not text or any(ch.isspace() for ch in text):
+        return ""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return ""
+    return text if parsed.scheme.casefold() in WEB_SCHEMES and parsed.netloc else ""
+
+
+def navigates(call: Call, live: Live) -> bool:
+    """Typing one web address with Enter (:func:`typed_address`) where Enter can only load it: a window showing a web
+    page (the Now board holds an http(s) address for it: a browser, never a terminal where Enter runs what was typed)
+    that is known not to be a chat (:func:`chat_window` false: its program is known and no chat's, and its page is no
+    chat's), with no text of Yuki's waiting there and no call in it (``live.calling``: loading over a call's tab would
+    leave the call). That opens the address through the browser's own address bar, as ``open_url`` would (the path that
+    worked in Arc on 5 Oct: a new tab, the command bar, Enter): typing that opens a page (:data:`ADDRESS_TRAITS`), not a
+    send (row 4), and not the commit check's to turn into one (10 Oct: it called that very step a send once in two
+    runs)."""
+    if not typed_address(call) or not sends_for_certain(traits_of(call, live)) or not call.hwnd:
+        return False
+    if int(call.hwnd) in live.typed_pending or int(call.hwnd) in live.calling:
+        return False
+    try:
+        from urllib.parse import urlparse
+
+        shows_page = urlparse(window_page(call.hwnd, live)).scheme.casefold() in WEB_SCHEMES
+    except ValueError:
+        shows_page = False
+    # a window showing a web page (the Now board's address for it): a browser, never a terminal or an editor, where
+    # Enter would run or keep what was typed
+    return shows_page and chat_window(call, live) is False
+
+
+def step_traits(call: Call, live: Live) -> Traits:
+    """The traits the rule judges a step by: :func:`traits_of`, but a navigating step's are :data:`ADDRESS_TRAITS`
+    (typing in the app, so its Act switch and the typing policy still apply, that opens a page: no send, nothing that
+    destroys)."""
+    return ADDRESS_TRAITS if navigates(call, live) else traits_of(call, live)
+
+
 def is_join_control(call: Call, live: Live) -> bool:
     """A click on a capability's declared join control, by (role, name) identity."""
     if call.tool != "click" or not call.name:
@@ -310,14 +700,16 @@ def is_join_control(call: Call, live: Live) -> bool:
     return (call.role.casefold(), words(call.name).casefold()) in live.join_controls
 
 
-def policy_holds(call: Call, live: Live) -> bool:
-    """One of the step's kinds is held below "do it and tell me" by the user's autonomy settings (``ask`` or
-    ``show_plan``): the commit check must find their words asked for it, as the judge did for those settings."""
+def policy_holds(call: Call, live: Live, traits: Traits | None = None) -> bool:
+    """One of the step's kinds (``traits``, default :func:`traits_of`) is held below "do it and tell me" by the user's
+    autonomy settings (``ask`` or ``show_plan``): the commit check must find their words asked for it, as the judge did
+    for those settings."""
     try:
         levels = (live.policy or util._shared_reader()).levels()
     except Exception:  # noqa: BLE001 - an unreadable policy: the defaults
         levels = dict(util.POLICY_DEFAULTS)
-    return any(levels.get(kind, "do_and_tell") in ("ask", "show_plan") for kind in traits_of(call, live).kinds)
+    kinds = (traits if traits is not None else traits_of(call, live)).kinds
+    return any(levels.get(kind, "do_and_tell") in ("ask", "show_plan") for kind in kinds)
 
 
 def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
@@ -330,6 +722,9 @@ def may_commit(call: Call, live: Live, plan: Any = None) -> bool:
         key, slots = skill_input(call, plan)
         sk = util.skill(key)
         return skill_sends(sk, slots) or skill_joins(sk)
+    if navigates(call, live):
+        # an address typed with Enter outside any chat: it opens a page (only a policy holding its kinds checks it)
+        return policy_holds(call, live, ADDRESS_TRAITS)
     t = traits_of(call, live)
     return t.destroys or t.reaches or is_join_control(call, live) or policy_holds(call, live)
 
@@ -416,23 +811,6 @@ def near_duplicate(text: str, live: Live) -> Mapping[str, Any] | None:
     return None
 
 
-def _named(to: str, quote: str, live: Live) -> bool:
-    """Row 4 (b): the recipient is named in the user's quote: one of the people the index finds in the quote goes by
-    ``to``, or ``to``'s own words stand in the quote (a group or channel by its name; memory unavailable)."""
-    from yuki.memory.contacts import span_in, tokens
-
-    if not to or not quote:
-        return False
-    if span_in(to, quote):
-        return True
-    try:
-        people = live.people_in(quote) if live.people_in is not None else None
-    except Exception:  # noqa: BLE001
-        people = None
-    want = tokens(to)
-    return any(tokens(n) == want for names in (people or []) for n in names)
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # The rule
 # ---------------------------------------------------------------------------------------------------------------------
@@ -468,7 +846,7 @@ def screen_gate(step: Call, live: Live) -> Verdict | None:
     """Rows 1-2 alone (a game in front; the app's Act switch off or a kind on "just suggest"): the refusal, or
     ``None``. Re-run after an ask was answered and after the send countdown, since the screen may have changed while
     the user was asked or the countdown ran."""
-    return _rows_1_2(step, live, traits_of(step, live))
+    return _rows_1_2(step, live, step_traits(step, live))
 
 
 def _rows_1_2(step: Call, live: Live, traits: Traits) -> Verdict | None:
@@ -498,9 +876,12 @@ def _rows_1_2(step: Call, live: Live, traits: Traits) -> Verdict | None:
 
 def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) -> Verdict:
     consent = plan_consent(plan)
-    traits = traits_of(step, live)
+    nav = navigates(step, live)
+    traits = ADDRESS_TRAITS if nav else traits_of(step, live)
     committing = may_commit(step, live, plan)
     effect = str(getattr(cv, "effect", "") or "") if cv is not None else ""
+    if nav and effect == "send":
+        effect = ""          # an address loaded in a browser is no message, whatever word a check gave it
     failed = cv is None or bool(getattr(cv, "failed", False))
     asked = bool(getattr(cv, "asked", False)) and not failed
 
@@ -525,10 +906,24 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         return Verdict(REFUSE, 3, why, line=LINE_JOIN.format(app=app) if step.app else LINE_JOIN_PLAIN, final=True,
                        focus=int(step.hwnd) if step.hwnd else None)
 
-    # row 4: sends
-    sends = sends_for_certain(traits) or effect == "send" or (sk is not None and skill_sends(sk, skill_input(step, plan)[1]))
-    if sends:
-        return _send(step, plan, consent, user_words, live, sk, asked, failed)
+    # row 4: sends (typing with Enter outside a chat goes to the commit check: row 5, or back here on its "send")
+    slots = skill_input(step, plan)[1] if sk is not None else {}
+    if sk is not None and consent["commit"] == "send" and getattr(sk, "sends", False) \
+            and not skill_sends(sk, slots):
+        # a declared send whose capability step leaves a draft (its send slot on a non-sending option, 10 Oct job 7):
+        # it could only open the chat and end unconfirmed; the planner makes the plan and the step agree
+        return Verdict(REFUSE, 4, "declared_draft",
+                       line=LINE_DECLARED_DRAFT.format(slots=", ".join(send_slots(sk)) or "send"))
+    by_code = sends_now(step, live, traits) or (sk is not None and skill_sends(sk, slots))
+    if not by_code and effect == "send" and not asked and step.tool in _ENTER_TOOLS \
+            and chat_window(step, live) is False:
+        # Enter typed or pressed where no chat app's data says Enter sends (a search box, a command field; the check
+        # called "lofi hip hop" + Enter in Arc's command bar a send on 10 Oct), and their words didn't ask for a send:
+        # theirs to say, asked plainly with the check's question, never refused into a dead end. A send their words
+        # asked for still goes through the capability (row 4 below).
+        return Verdict(ASK, 5, "maybe_send", question=words(getattr(cv, "question", "")) or failed_question(step))
+    if by_code or effect == "send":
+        return _send(step, plan, consent, user_words, live, sk, asked, failed, effect)
 
     # row 5: anything else that could last
     if committing:
@@ -546,50 +941,80 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
 
 
 def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str], live: Live, sk: Any, asked: bool,
-          failed: bool) -> Verdict:
-    """Row 4 for a step that sends."""
+          failed: bool, effect: str = "") -> Verdict:
+    """Row 4 for a step that sends (module docstring, row 4; HANDBOOK rule 8: "send X to Y" means send, naming only
+    the person means a draft). The order matters: an ask's yes skips everything after it (``after_ask``), so every
+    refusal and the send slots come before the asks."""
     if consent["commit"] != "send":
-        return Verdict(REFUSE, 4, "undeclared_send",
-                       line=LINE_TYPED_ENTER if step.tool == "type_text" else LINE_UNDECLARED_SEND)
+        typed_send = step.tool == "type_text" and sends_now(step, live)
+        return Verdict(REFUSE, 4, "undeclared_send", line=LINE_TYPED_ENTER if typed_send else LINE_UNDECLARED_SEND)
     if step.tool != "run_skill" or sk is None or not getattr(sk, "sends", False):
         return Verdict(REFUSE, 4, "not_capability", line=LINE_NOT_CAPABILITY)
     _key, slots = skill_input(step, plan)
     quote, to, text = consent["quote"], consent["to"], consent["text"]
-    # (a) the quote is the user's own words; (b) it names the recipient (code facts: refuse, the planner may fix it)
-    if not quote or not in_words(quote, user_words):
-        return Verdict(REFUSE, 4, "quote", line="the send's quote is not a span of the user's own words")
-    if not _named(to, quote, live):
-        return Verdict(REFUSE, 4, "recipient", line="the send's recipient is not named in the user's quote")
-    who = words(slots.get(person_slot(sk))) if person_slot(sk) else ""
-    if who and not _same_person(who, to, live):
+    look = _People(live)
+    # code facts of the plan itself (refused: the planner fixes them)
+    if not to:
+        return Verdict(REFUSE, 4, "recipient", line=LINE_NO_RECIPIENT)
+    pname = person_slot(sk)
+    who = words(slots.get(pname)) if pname else ""
+    if who and not _same_person(who, to, live, look):
         return Verdict(REFUSE, 4, "recipient_slot", line=LINE_RECIPIENT)
-    name = text_slot(sk)
-    step_text = words(slots.get(name)) if name else ""
-    own = bool(step_text) and step_text == text and in_words(step_text, user_words)       # (c)
-    if not own or not asked:                                                                # (c) or (d) failed
-        keep = bool(step_text) and in_words(step_text, user_words)
-        drafted = draft_slots(sk, slots, keep_text=keep)
-        if drafted is None:
-            return Verdict(REFUSE, 4, "no_draft", line="this capability has no way to leave a draft")
-        return Verdict(DRAFT, 4, "not_asked" if own else "text", line=LINE_DRAFTED,
-                       draft_input={**step.input, "slots": drafted},
-                       type_after="" if keep else (step_text or text))
+    tname = text_slot(sk)
+    step_text = words(slots.get(tname)) if tname else ""
+    if tname and step_text != text:
+        # one refusal with every fix the step needs (a declared send whose step drafts with no text: both at once)
+        fixes = [LINE_TEXT_MISMATCH]
+        if not skill_sends(sk, slots, partial=False):
+            fixes.append(LINE_SEND_SLOT.format(slots=", ".join(send_slots(sk)) or "send"))
+        return Verdict(REFUSE, 4, "text_mismatch", line="; ".join(fixes))
+    body = step_text or text
+    own = bool(step_text) and in_words(step_text, user_words)
+    # the commit check: their words ask for this very send (to that person, with that text), else a draft
+    if failed or not asked or effect != "send":
+        return _draft(step, sk, slots, body, own, "not_asked")
+    # the quote is their words as heard (a name they said may be written as the person's name)
+    names = _recipient_names(to, who, look, user_words)
+    if not quote or not quote_in_words(quote, user_words, names):
+        return Verdict(REFUSE, 4, "quote", line=LINE_QUOTE)
+    # what the message says came from them: their own words, or Yuki's wording of what they said in this exchange (the
+    # quote and their turns); nothing of it from them is naming only the person: a draft (rule 8)
+    share = 1.0 if own else said_share(body, [quote, *user_words], names)
+    if share <= 0.0:
+        return _draft(step, sk, slots, body, own, "not_said")
     if not skill_sends(sk, slots, partial=False):
         # a send slot left out: the resolver would fill its default (a draft), so this step would not send for sure;
         # it is never counted down or reported as sent (the planner fills the slot, or the plan drafts)
         return Verdict(REFUSE, 4, "send_slot", line=LINE_SEND_SLOT.format(slots=", ".join(send_slots(sk)) or "send"))
-    seen = near_duplicate(step_text, live)                                                 # (e)
+    seen = near_duplicate(body, live)
     if seen is not None:
         at = _clock(float(seen.get("at") or 0.0))
         question = LINE_DUPLICATE.format(to=to, at=at) if to and at else LINE_DUPLICATE_PLAIN
         return Verdict(ASK, 4, "duplicate", question=question)
-    return Verdict(ALLOW, 4, "send", countdown=True)
+    named = _named_by_user(to, who, user_words, look)
+    if not named or share < SAID_SHARE:
+        # asked first, showing what goes to whom: a recipient their words don't plainly name (speech heard the name
+        # another way), or Yuki's wording with little of their words in it; a yes is their plain instruction
+        return Verdict(ASK, 4, "worded" if named else "recipient_unsaid", question=ask_send_question(body, to))
+    return Verdict(ALLOW, 4, "send" if own else "send_worded", countdown=True)
 
 
-def _same_person(slot_value: str, to: str, live: Live) -> bool:
-    """The capability's person slot names the plan's recipient: the same words, or one of the names memory's people
-    index gives the one person ``to`` names (a first name for the full name). A part of a name alone ("Iyer" for
-    "Hemanth Iyer") is not enough, and with memory unable to say only the same words pass."""
+def _draft(step: Call, sk: Any, slots: Mapping[str, Any], body: str, own: bool, why: str) -> Verdict:
+    """Row 4's draft: the capability with its send slot on a non-sending option; the user's own words stay in its text
+    slot, Yuki's wording is typed without Enter once the chat is open (``type_after``)."""
+    drafted = draft_slots(sk, slots, keep_text=own)
+    if drafted is None:
+        return Verdict(REFUSE, 4, "no_draft", line="this capability has no way to leave a draft")
+    return Verdict(DRAFT, 4, why, line=LINE_DRAFTED, draft_input={**step.input, "slots": drafted},
+                   type_after="" if own else body)
+
+
+def _same_person(slot_value: str, to: str, live: Live, look: _People | None = None) -> bool:
+    """The capability's person slot names the plan's recipient: the same words; or memory's people index finds one
+    person ``to`` names who also goes by the slot's words (a first name for the full name); or it finds exactly one
+    person in the slot's words (as the user said them: a heard form, a script of its own), who goes by ``to``. A part
+    of a name alone ("Iyer" for "Hemanth Iyer") is not enough, and with memory unable to say only the same words
+    pass."""
     from yuki.memory.contacts import tokens
 
     want, slot = tokens(to), tokens(slot_value)
@@ -597,12 +1022,12 @@ def _same_person(slot_value: str, to: str, live: Live) -> bool:
         return False
     if slot == want:
         return True
-    try:
-        people = live.people_in(to) if live.people_in is not None else None
-    except Exception:  # noqa: BLE001
-        people = None
-    fits = [names for names in people or [] if any(tokens(n) == want for n in names)]
-    return len(fits) == 1 and any(tokens(n) == slot for n in fits[0])
+    look = look or _People(live)
+    fits = _fits(look(to), to)
+    if len(fits) == 1 and any(tokens(n) == slot for n in fits[0]):
+        return True
+    found = look(slot_value) or []
+    return len(found) == 1 and any(tokens(n) == want for n in found[0])
 
 
 def after_ask(verdict: Verdict) -> Verdict:
@@ -610,8 +1035,10 @@ def after_ask(verdict: Verdict) -> Verdict:
     return replace(verdict, result=ALLOW, countdown=verdict.row == 4)
 
 
-__all__ = ["ALLOW", "ASK", "COMMITS", "DRAFT", "EFFECTS", "LINE_DRAFTED", "LINE_GAME", "REFUSE", "RESULTS", "Call",
-           "Live", "Verdict", "after_ask", "calling_windows", "check", "draft_slots", "failed_question", "field_of",
-           "game_now", "in_words", "is_join_control", "join_controls", "may_commit", "near_duplicate", "person_slot",
-           "plan_consent", "policy_holds", "screen_gate", "send_slots", "skill_commit", "skill_input", "skill_joins",
-           "skill_sends", "takes_screen", "text_slot", "traits_of"]
+__all__ = ["ALLOW", "ASK", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME", "PLAIN_WHY",
+           "REFUSE", "RESULTS", "SAID_SHARE", "Call", "Live", "Verdict", "after_ask", "ask_send_question",
+           "calling_windows", "chat_window", "check", "draft_slots", "failed_question", "field_of", "game_now",
+           "in_words", "is_join_control", "join_controls", "may_commit", "near_duplicate", "person_slot", "plain_why",
+           "plan_consent", "policy_holds", "quote_in_words", "said_share", "screen_gate", "send_slots", "sends_now",
+           "skill_commit", "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot",
+           "traits_of", "typed_address", "navigates", "window_page"]
