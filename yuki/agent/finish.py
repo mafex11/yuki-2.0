@@ -805,9 +805,11 @@ LINE_SKILL_UNCONFIRMED = "I couldn't confirm that's done."
 LINE_SKILL_SENT_UNCONFIRMED = "I pressed send, but I couldn't confirm it landed."
 #: x5Fallback: the statuses of a pinned skill's check that can't read by design once its routes handed over: it reads
 #: the route's own result (``no_route``: which page the route opened), it has no spec or no value for a template
-#: (``no_check``, ``no_value``), or no code reads it (``no_probe``, ``no_driver``). The thinker's own steps can never
-#: raise such a check, so the outcome verdict of its trace decides (as for a skill with no machine check at all).
-UNREADABLE_AFTER_HANDOFF = frozenset({"no_route", "no_check", "no_value", "no_probe", "no_driver"})
+#: (``no_check``, ``no_value``), no name to look for (``no_name``: the hand-off left the user's word for the thing out
+#: of it, a playlist "Japanese" that is named otherwise, or a name nobody heard), or no code reads it (``no_probe``,
+#: ``no_driver``). The thinker's own steps can never raise such a check, so the outcome verdict of its trace decides
+#: (as for a skill with no machine check at all).
+UNREADABLE_AFTER_HANDOFF = frozenset({"no_route", "no_check", "no_value", "no_name", "no_probe", "no_driver"})
 
 
 def _unreadable(evidence: Any) -> bool:

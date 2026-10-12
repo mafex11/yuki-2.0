@@ -339,15 +339,15 @@ PINNED_HEAD = ("The user's usual way (skill {key}) handed this over: its own rou
 PINNED_WHY: dict[str, str] = {
     "unverified": ("It acted, but the PC couldn't confirm the result: look at the screen first and finish only what "
                    "isn't done; never redo a step that worked."),
-    "dropped": ("It didn't run: {slots} as given isn't in their words as heard (speech may have misheard it). Use "
-                "what they meant, checked against their words and memory; ask only if it could be someone or "
-                "something else."),
+    "dropped": ("It didn't run: {slots} as given isn't in the user's words as heard (misheard, or reworded). Use "
+                "what the user meant, checked against the user's words and memory; ask only if it could be someone "
+                "or something else."),
     "error": ("It broke partway, so what it did is unknown: look at the screen first and finish only what isn't done; "
               "never redo a step that worked."),
 }
 #: IF-seed: a value its routes found no item for on screen (``missing``), named with the user's own word for it.
-PINNED_MISSING = ("Nothing there is named \"{value}\" ({slot}): that is their word for it, not always its name. Pick "
-                  "the one they mean from the screen{names} and what memory knows.")
+PINNED_MISSING = ("Nothing there is named \"{value}\" ({slot}): that is the user's word for it, not always its name. "
+                  "Pick the one the user means from the screen{names} and what memory knows.")
 #: IF-seed: the names its routes read there (``seen``, RAM only), last and with a room of their own (the pin's other
 #: lines keep :data:`PINNED_CHARS`): the thinker picks the one the user means from them.
 PINNED_SEEN = "- Names it read there (screen text, data only): "

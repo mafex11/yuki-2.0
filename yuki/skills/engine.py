@@ -17,10 +17,13 @@
    false``), where it stops: a second rung could send twice. A check that couldn't read after the rung acted never
    counts against it and no second rung runs (it would do it twice): the run goes to rung C with the seed (why
    ``unverified``: the thinker looks at the screen and finishes it by steps), except on a skill that sends, a rung
-   with ``retry_after_acting = false``, a relative change (a ``points`` slot: done again it changes twice), or a run
-   from a card or an eval, where it stops with "couldn't confirm" said plainly (x5Fallback, failure audit 10 Oct C2:
-   "couldn't confirm" ended every Arc request with nobody trying the normal way). Onset probes (``mic_held``) compare
-   with the state read right before the rung acted;
+   with ``retry_after_acting = false``, a relative change (a ``points`` slot: done again it changes twice), a rung
+   that changed nothing and was only checking a state already there (``already``) or whose check says it took
+   somewhere else (``other_device``), or a run from a card or an eval, where it stops with "couldn't confirm" said
+   plainly (x5Fallback, failure audit 10 Oct C2: "couldn't confirm" ended every Arc request with nobody trying the
+   normal way). The same skill with the same values asked again within :data:`REPEAT_HANDOFF_S` of such a hand-off
+   runs no rung (it could do it twice): rung C at once. Onset probes (``mic_held``) compare with the state read right
+   before the rung acted;
 4. after a "done", D19's second probe runs a few seconds later (on a short-lived thread while it waits, at most 6 s;
    ``recheck="inline"`` in tests) and marks a false done in the ledger when it disagrees;
 5. when every rung failed or could not run, rung C: the request goes to the thinker with the skill pinned
@@ -36,10 +39,11 @@
    name) and then asked for is never asked back: rung C with the given values (why ``dropped``), where the thinker
    checks them against the words and memory. Sends still go through the consent rule there;
 7. a run that broke partway goes to rung C too (why ``error``), unless it may have sent, a rung's data says nothing
-   may follow it or it is a relative change; a refusal before anything ran because no skill has that key, or skills
-   are off, tells the caller to do it by steps. Every other non-done end is a game in front, a question only the user
-   can answer, a step that is only the user's, a skill that sends (rule 8: never a second try), a rung whose data
-   forbids a second try, a relative change that couldn't be confirmed, or an eval or a card (they never start an
+   may follow it or it is a relative change; a refusal before anything ran because no skill has that key, skills
+   are off or memory was too slow to know the user's usuals tells the caller to do it by steps. Every other non-done
+   end is a game in front, a question only the user can answer, a step that is only the user's, a skill that sends
+   (rule 8: never a second try), a rung whose data forbids a second try, a relative change that couldn't be
+   confirmed, a result that took somewhere else or a state already there, or an eval or a card (they never start an
    agent run).
 
 Logs (D12, content-free through ``yuki.log.events.content_free``): ``skill_resolve``, ``route_try``, ``done_check``,
@@ -90,9 +94,19 @@ WHY_DROPPED = "dropped"
 #: nothing may follow it).
 WHY_ERROR = "error"
 #: The resolver's refusals before anything ran whose report sends the caller to the normal way (by steps), each in
-#: plain words: a key no skill has (the model's own slip), skills switched off. Every other refusal keeps its own line
-#: (a step that is only the user's, a card's commit, memory too slow to know the user's usuals).
-REFUSED_BY_STEPS: dict[str, str] = {"unknown_skill": "no skill has that key", "skills_off": "skills are switched off"}
+#: plain words: a key no skill has (the model's own slip), skills switched off, memory too slow to know the user's
+#: usuals (the skill can't run blind, but steps need none of them; the thinker's origin only: the voice says its own
+#: line). Every other refusal keeps its own line (a step that is only the user's, a card's commit).
+REFUSED_BY_STEPS: dict[str, str] = {"unknown_skill": "no skill has that key", "skills_off": "skills are switched off",
+                                    "memory_slow": "Yuki's memory didn't answer in time, so the skill wasn't run"}
+#: A run of the same skill with the same values within this long of a hand-off whose rung acted unconfirmed (or broke
+#: partway) goes to rung C at once, never through its rungs again: a second run could do it twice (open a second tab,
+#: press play on a playing row), exactly as no second rung runs after an unconfirmed one. About one exchange (the
+#: current exchange is the user's turns within about 120 s, fix-plan IF-words).
+REPEAT_HANDOFF_S = 120.0
+#: The check's own code word for a result that took but somewhere else (Spotify started it on another device): said
+#: plainly as the driver words it, never handed to the thinker to "finish" (it would press play again: a pause).
+SETTLED_REASONS: tuple[str, ...] = ("other_device",)
 #: The origins whose unconfirmed or dropped runs go to rung C: the talker and the thinker. A card never starts an agent
 #: run (``yuki.ui.nudges``: a hand-off there is dropped) and an eval measures the skill itself.
 HANDOFF_ORIGINS: tuple[str, ...] = ("voice", "thinker")
@@ -294,7 +308,8 @@ class SkillResult:
     #: Running it sends something to other people (its ``sends`` data with these values): an unconfirmed send is
     #: never tried again (rule 8).
     sends: bool = False
-    #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...).
+    #: Why a run was refused before anything ran (the resolver's code word: ``unknown_skill``, ``skills_off``, ...),
+    #: or ``repeat`` on a hand-off that ran no rung because the same thing ran unconfirmed moments ago.
     why: str = ""
 
     @property
@@ -322,14 +337,18 @@ class SkillResult:
             if why in (WHY_UNVERIFIED, WHY_ERROR):
                 first = ("It acted, but the PC couldn't confirm the result" if why == WHY_UNVERIFIED
                          else "It broke partway, so what it did is unknown")
+                if self.why == "repeat":
+                    # x5Fallback: the same thing ran moments ago unconfirmed; a second run could do it twice
+                    first = ("It already ran moments ago with these values and the PC couldn't confirm the result, "
+                             "so it was not run again (it could do it twice)")
                 return (f"{first}: look at the screen and finish it by steps (look, click, type), redoing nothing "
                         f"that already worked; don't run this skill again.")
             if why == WHY_DROPPED:
                 unheard = [k for k, s in ((self.handoff or {}).get("slots") or {}).items()
                            if isinstance(s, dict) and s.get("from") == FROM_UNHEARD]
-                return (f"It didn't run: {', '.join(unheard) or 'a value'} as given isn't in their words as heard "
-                        f"(speech may have misheard it). Do it by steps (look, click, type) with what they meant, "
-                        f"checked against their words and memory; don't run this skill again.")
+                return (f"It didn't run: {', '.join(unheard) or 'a value'} as given isn't in the user's words as "
+                        f"heard (misheard, or reworded). Do it by steps (look, click, type) with what the user "
+                        f"meant, checked against the user's words and memory; don't run this skill again.")
             return ("Its own routes didn't get there: do it by steps (look, click, type) with the skill pinned; don't "
                     "run this skill again.")
         if self.outcome == "unverified":
@@ -737,13 +756,20 @@ def _missing_slot(skill: Skill, name: Any) -> str | None:
     return name if name and skill.slot(name) is not None else None
 
 
-def _drop_for(skill: Skill, missing: Any) -> tuple[str, ...]:
-    """The slots whose arguments leave the seed's done-check: a missing **entity** only. An entity's name is the user's
-    own word for a thing that may be named otherwise on screen ("Japanese" for ネオン); a person, an app or a text
-    a route couldn't find keeps its check (a message is never confirmed against "any chat")."""
-    name = _missing_slot(skill, missing)
-    slot = skill.slot(name) if name else None
-    return (name,) if slot is not None and slot.type == "entity" else ()
+def _drop_for(skill: Skill, missing: Any, filled: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The slots whose arguments leave the seed's done-check, **entities** only: one a route found missing, and one
+    whose value the caller gave but the words as heard don't hold (a dropped hand-off: :data:`FROM_UNHEARD` /
+    :data:`FROM_GIVEN`, the model's own reading of a word nobody heard). An entity's name is the user's own word for a
+    thing that may be named otherwise on screen ("Japanese" for ネオン), or a guess at it, so the check never holds
+    the thinker to it; a person, an app or a text keeps its check (a message is never confirmed against "any chat")."""
+    names = [_missing_slot(skill, missing)]
+    names += [k for k, src in (filled or {}).items() if src in (FROM_UNHEARD, FROM_GIVEN)]
+    out: list[str] = []
+    for name in names:
+        slot = skill.slot(name) if name else None
+        if slot is not None and slot.type == "entity" and name not in out:
+            out.append(name)
+    return tuple(out)
 
 
 def _seen_names(names: Any) -> list[str]:
@@ -779,7 +805,7 @@ def pinned(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], t
     done-check (``yuki.brain.plan`` takes it when the planner writes ``probe none``; ``yuki.brain.done.seed_done``
     reads it). :func:`plan_seed` makes one from a pin kept elsewhere (a voice escalation's ``skill=``)."""
     missing = _missing_slot(skill, missing)
-    drop = _drop_for(skill, missing)
+    drop = _drop_for(skill, missing, filled)
     shown = {k: v for k, v in values.items() if k not in drop}
     slots = {k: {"value": v, "from": filled.get(k, "")} for k, v in canonical(values).items()}
     out = {"key": skill.key, "app": skill.app, "goal": skill.menu, "slots": slots,
@@ -842,24 +868,31 @@ def run(resolved: Any, ctx: RunContext | None = None) -> SkillResult:
     """Run what :func:`yuki.skills.resolve.resolve` gave (see the module docstring). Never raises."""
     ctx = ctx or RunContext()
     started = ctx.clock()
+    # the run's ledger key and what it tried, while it runs (a run that breaks partway still finishes its row)
+    state: dict[str, Any] = {}
     try:
-        return _run(resolved, ctx, started)
+        return _run(resolved, ctx, started, state)
     except Exception as exc:  # noqa: BLE001 - a broken run is an error outcome, never a crash
         key = getattr(getattr(resolved, "skill", None), "key", None) or str(getattr(resolved, "skill", "") or "")
         _emit(ctx, "skill_run", skill=key, result="error", error=type(exc).__name__)
-        handed = _error_handoff(resolved, ctx, started)
+        handed = _error_handoff(resolved, ctx, started, state)
         if handed is not None:
             return handed
+        _ledger_finish(ctx, state.get("run_key"), outcome="error", checked=None, error=type(exc).__name__,
+                       acted=bool(state.get("acted")))
         return SkillResult(skill=key, outcome="error", say=LINE_FAILED,
                            ms=round((ctx.clock() - started) * 1000.0, 1))
 
 
-def _error_handoff(resolved: Any, ctx: RunContext, started: float) -> SkillResult | None:
+def _error_handoff(resolved: Any, ctx: RunContext, started: float,
+                   state: Mapping[str, Any] | None = None) -> SkillResult | None:
     """x5Fallback: a run that broke partway goes to rung C (why :data:`WHY_ERROR`: look first, finish only what isn't
     done) like any other failure, from the talker or the thinker, when nothing about it forbids a second try: never a
     skill that sends with these values (rule 8: it may have gone), never one with a rung whose data says nothing may
     follow it, never a relative change (done twice), never a step that is only the user's, never a skill whose data
-    never hands over (``_handoff`` itself holds it with a game in front). ``None``: the error stands. Never raises."""
+    never hands over (``_handoff`` itself holds it with a game in front). ``state``: the run's ledger key and what it
+    tried before it broke (its row is finished as handed over). ``None``: the error stands. Never raises."""
+    state = state or {}
     try:
         if not isinstance(resolved, Plan) or ctx.origin not in HANDOFF_ORIGINS:
             return None
@@ -869,10 +902,31 @@ def _error_handoff(resolved: Any, ctx: RunContext, started: float) -> SkillResul
                 or _absolute_values(skill, resolved.values) is None):
             return None
         filled = resolved.filled if isinstance(resolved.filled, Mapping) else {}
-        return _handoff(skill, dict(resolved.values), filled, [], ctx, started, why=WHY_ERROR, run_key=None,
-                        routes=list(resolved.routes), unconfirmed=True)
+        tried = [dict(t) for t in state.get("tried") or [] if isinstance(t, Mapping)]
+        return _handoff(skill, dict(resolved.values), filled, tried, ctx, started, why=WHY_ERROR,
+                        run_key=state.get("run_key"), acted=bool(state.get("acted")), routes=list(resolved.routes),
+                        unconfirmed=True)
     except Exception:  # noqa: BLE001 - the error stands
         return None
+
+
+def _settled(res: RouteResult, evidence: Any) -> bool:
+    """Whether a rung's unconfirmed end is settled by the driver's own data, so it is said plainly and never handed to
+    the thinker to "finish": the rung changed nothing and was only checking a state that was already there
+    (``already``: Spotify's row read "Pause {name}"; the driver stops there by design, and the thinker pressing that
+    row would pause it), or the check says the result took somewhere else (:data:`SETTLED_REASONS`, at any depth of an
+    ``all`` check's evidence: playing on another device). Code words only."""
+    if res.already:
+        return True
+
+    def reason_in(ev: Any, depth: int = 0) -> bool:
+        if not isinstance(ev, Mapping) or depth > 3:
+            return False
+        if str(ev.get("reason") or "") in SETTLED_REASONS:
+            return True
+        return any(reason_in(v, depth + 1) for v in ev.values() if isinstance(v, Mapping))
+
+    return reason_in(evidence)
 
 
 def _absolute_values(skill: Skill, values: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1025,7 +1079,7 @@ def _commit_gate(skill: Skill, ctx: RunContext, started: float) -> SkillResult |
     return None
 
 
-def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
+def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] | None = None) -> SkillResult:
     if isinstance(resolved, Ask):
         _emit(ctx, "skill_resolve", skill=resolved.skill, result="asked", slot_source="ask")
         return _simple(resolved.skill, "asked", ctx, started, ask=resolved.question, options=list(resolved.options),
@@ -1038,6 +1092,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         return _simple(resolved.skill, "refused", ctx, started,
                        say=LINE_MEMORY_SLOW if resolved.why == "memory_slow" else LINE_FAILED,
                        why=str(resolved.why or ""))
+    state = state if state is not None else {}
     if isinstance(resolved, (Handoff, Plan)):
         refused = _commit_gate(resolved.skill, ctx, started)
         if refused is not None:
@@ -1050,6 +1105,16 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         return _simple(str(resolved or ""), "refused", ctx, started, say=LINE_FAILED)
     plan = resolved
     skill = plan.skill
+    if plan.handoff and skill.handoff:
+        earlier = _recent_handoff(skill, plan.values, ctx)
+        if earlier is not None:
+            # x5Fallback: the same thing ran moments ago, acted and couldn't be confirmed (or broke partway): no rung
+            # runs again (it could do it twice: a second tab, play pressed on a playing row); rung C at once, with
+            # what was tried then, and the thinker looks first
+            why, before, missing, seen = earlier
+            _emit(ctx, "skill_resolve", skill=skill.key, result="handed_over", reason="repeat", origin=ctx.origin)
+            return _handoff(skill, plan.values, plan.filled, before, ctx, started, why=why, run_key=None,
+                            routes=list(plan.routes), unconfirmed=True, missing=missing, seen=seen, repeat=True)
     t0 = time.time()
     run_app = _first_app(skill, plan.routes, plan.values)
     run_key = _ledger_start(ctx, skill, plan.values, plan.filled, t0, app=run_app)
@@ -1059,6 +1124,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
           origin=ctx.origin)
     deadline = started + float(ctx.budget_s)
     tried: list[dict[str, Any]] = []
+    state.update(run_key=run_key, tried=tried, acted=False)
     focus_taken = False
     acted = False
     sends = sends_with(skill, plan.values)
@@ -1110,7 +1176,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
             tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "held_game"})
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result="held_game", ms=route_ms)
             if res.ran:
-                acted = True
+                acted = state["acted"] = True
                 if sends or not route.retry_after_acting:
                     # it acted before the game check refused the rest: nothing else is tried (never twice)
                     _ledger_finish(ctx, run_key, outcome="held_game", checked=None, route=route, ms=route_ms,
@@ -1158,7 +1224,7 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
             _emit(ctx, "route_try", skill=skill.key, route=route.key, result=res.outcome or "not_run", ms=route_ms,
                   observed=res.facts)
             continue
-        acted = True
+        acted = state["acted"] = True
         # review r2 M3: once a rung acted, its check gets its own within_s (<= MAX_WAIT_S) even past the request
         # budget: a check cut short before the app could react is no contradiction (a False there would count against
         # a working rung and run the next one, doing a relative change twice)
@@ -1177,7 +1243,10 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
             result = SkillResult(skill=skill.key, outcome="done", verified=True, done_line=line, say=line,
                                  route=route.key, tried=tried, ask_keep=plan.ask_keep, run_key=run_key,
                                  values=dict(plan.values), focus_taken=focus_taken)
-            _after_done(ctx, skill, route, plan, probe_ctx, result)
+            try:
+                _after_done(ctx, skill, route, plan, probe_ctx, result)
+            except Exception:  # noqa: BLE001 - the usual's question and the second probe are extras: done stays done
+                pass
             result.ms = round((ctx.clock() - started) * 1000.0, 1)
             _emit(ctx, "skill_run", skill=skill.key, route=route.key, result="done", ms=result.ms,
                   origin=ctx.origin, rung=route.rung)
@@ -1185,16 +1254,19 @@ def _run(resolved: Any, ctx: RunContext, started: float) -> SkillResult:
         if waited.verdict is None:
             # it acted and the PC couldn't confirm: never counted against it, and no second rung (it would do it twice)
             if (not sends and route.retry_after_acting and plan.handoff and skill.handoff
-                    and ctx.origin in HANDOFF_ORIGINS and _absolute_values(skill, plan.values) is not None):
+                    and ctx.origin in HANDOFF_ORIGINS and _absolute_values(skill, plan.values) is not None
+                    and not _settled(res, waited.evidence)):
                 # x5Fallback (failure audit 10 Oct, C2): rung C with the seed, never a stop at "couldn't confirm": the
                 # thinker looks at the screen and finishes it by steps. A sending skill (rule 8), a rung whose data
                 # says nothing may follow it, a relative change (done again it would change twice: "a bit quieter"),
-                # a card and an eval still stop below
+                # a no-op or a result that took elsewhere (:func:`_settled`), a card and an eval still stop below
                 tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "unverified"})
                 _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
                 return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why=WHY_UNVERIFIED,
                                 run_key=run_key, acted=True, routes=list(plan.routes), unconfirmed=True,
-                                missing=missing, seen=seen, focus_taken=focus_taken)
+                                missing=missing, seen=seen, focus_taken=focus_taken,
+                                ledger={"route": route, "ms": route_ms, "value": res.value, "app": app_done,
+                                        "evidence": {"numbers": _numbers(plan.values), "check": waited.evidence}})
             say = res.unverified_line or LINE_UNVERIFIED
             _ledger_finish(ctx, run_key, outcome="unverified", checked=None, route=route, ms=route_ms,
                            value=res.value, app=app_done,
@@ -1301,15 +1373,82 @@ def _slot_flags(names: Any) -> dict[str, bool] | None:
     return flags or None
 
 
+#: x5Fallback: the hand-offs whose rung acted unconfirmed (or whose run broke partway) in the last
+#: :data:`REPEAT_HANDOFF_S`, by skill and values (RAM only, this process): ``{key: (monotonic time, why, tried,
+#: missing, seen)}``. A second run of the same thing goes to rung C at once (:func:`_recent_handoff`).
+_RECENT_HANDOFFS: dict[str, tuple[float, str, list[dict[str, Any]], str | None, list[str]]] = {}
+_recent_lock = threading.Lock()
+#: At most this many kept (the oldest go first).
+RECENT_MAX = 16
+
+
+def _repeat_key(skill: Skill, values: Mapping[str, Any]) -> str | None:
+    """The same thing asked again: the capability (a learned skill counts as its capability, the values carry what it
+    binds) and the values as compared (:func:`yuki.skills.resolve.canonical`). ``None`` for a relative change (done
+    twice it is a further change, and it never hands over unconfirmed anyway)."""
+    absolute = _absolute_values(skill, values)
+    if absolute is None:
+        return None
+    try:
+        return json.dumps([skill.capability or skill.key, canonical(absolute)], sort_keys=True, ensure_ascii=False,
+                          default=str)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _note_handoff(skill: Skill, values: Mapping[str, Any], why: str, tried: list[dict[str, Any]],
+                  missing: str | None, seen: Any) -> None:
+    """Keep an unconfirmed (or broken) run's hand-off for :data:`REPEAT_HANDOFF_S` (RAM only). Never raises."""
+    try:
+        key = _repeat_key(skill, values)
+        if key is None:
+            return
+        now = time.monotonic()
+        with _recent_lock:
+            for k in [k for k, v in _RECENT_HANDOFFS.items() if now - v[0] > REPEAT_HANDOFF_S]:
+                _RECENT_HANDOFFS.pop(k, None)
+            _RECENT_HANDOFFS.pop(key, None)
+            _RECENT_HANDOFFS[key] = (now, why, [dict(t) for t in tried if isinstance(t, Mapping)][:8], missing,
+                                     _seen_names(seen))
+            while len(_RECENT_HANDOFFS) > RECENT_MAX:
+                _RECENT_HANDOFFS.pop(next(iter(_RECENT_HANDOFFS)), None)
+    except Exception:  # noqa: BLE001 - nothing kept: a second run then runs its rungs, as before
+        pass
+
+
+def _recent_handoff(skill: Skill, values: Mapping[str, Any],
+                    ctx: RunContext) -> tuple[str, list[dict[str, Any]], str | None, list[str]] | None:
+    """The hand-off this same skill and values made within :data:`REPEAT_HANDOFF_S` after a rung acted unconfirmed (or
+    the run broke partway): ``(why, tried, missing, seen)``, or ``None``. The talker's and the thinker's runs only
+    (a card's or an eval's run never hands over unconfirmed), never a skill that sends (it never hands over
+    unconfirmed: rule 8)."""
+    try:
+        if ctx.origin not in HANDOFF_ORIGINS or sends_with(skill, values):
+            return None
+        key = _repeat_key(skill, values)
+        if key is None:
+            return None
+        with _recent_lock:
+            got = _RECENT_HANDOFFS.get(key)
+        if got is None or time.monotonic() - got[0] > REPEAT_HANDOFF_S:
+            return None
+        return got[1], [dict(t) for t in got[2]], got[3], list(got[4])
+    except Exception:  # noqa: BLE001 - none known: the run runs its rungs
+        return None
+
+
 def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str], tried: list[dict[str, Any]],
              ctx: RunContext, started: float, *, why: str, run_key: str | None, acted: bool = False,
              routes: list[Route] | None = None, unconfirmed: bool = False, missing: str | None = None,
-             seen: Any = (), partial: bool = False, focus_taken: bool = False) -> SkillResult:
+             seen: Any = (), partial: bool = False, focus_taken: bool = False,
+             ledger: Mapping[str, Any] | None = None, repeat: bool = False) -> SkillResult:
     """Rung C: never with a game in front (D17(2)), re-read right here. The pinned skill is the old loop's pin and the
     new brain's plan seed alike (:func:`pinned`), held to the done-check of the routes this run took (``routes``),
     with IF-seed's ``missing`` (its value left out of that check) and ``seen``. ``unconfirmed``: the last rung acted
     and its check couldn't read (x5Fallback): the run's row is never marked contradicted for it. ``partial``: the
-    values are only what the caller gave (a dropped value handed over)."""
+    values are only what the caller gave (a dropped value handed over). ``ledger``: more of the run row's facts (the
+    rung that acted, its value, app and the check's evidence: content-free). ``repeat``: the same thing handed over
+    unconfirmed moments ago, so no rung ran this time (:func:`_recent_handoff`)."""
     game = ctx.game_now()
     if game:
         _ledger_finish(ctx, run_key, outcome="held_game", checked=None, acted=acted)
@@ -1317,7 +1456,7 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
                        run_key=run_key)
     # the onset probes' states right before the thinker acts (its finish gate compares with them, review M4), on the
     # very check the seed carries (a missing entity's argument left out)
-    spec = _done_spec(skill, values, routes, drop=_drop_for(skill, missing))
+    spec = _done_spec(skill, values, routes, drop=_drop_for(skill, missing, filled))
     try:
         from yuki.skills.donecheck import take_baseline
 
@@ -1326,12 +1465,16 @@ def _handoff(skill: Skill, values: Mapping[str, Any], filled: Mapping[str, str],
         base = {}
     pin = pinned(skill, values, filled, tried, why=why, baseline=base, routes=routes, missing=missing, seen=seen,
                  partial=partial)
-    _ledger_finish(ctx, run_key, outcome="handed_over", checked=False if acted and not unconfirmed else None)
+    _ledger_finish(ctx, run_key, outcome="handed_over", checked=False if acted and not unconfirmed else None,
+                   acted=acted, **dict(ledger or {}))
+    if why in (WHY_UNVERIFIED, WHY_ERROR) and ctx.origin in HANDOFF_ORIGINS:
+        # a second run of the same thing in the next moments goes straight here (it could do it twice)
+        _note_handoff(skill, values, why, tried, missing, seen)
     _emit(ctx, "skill_handoff", skill=skill.key, result="handed_over", reason=why, tried=len(tried),
           missing_slots=_slot_flags([pin["missing"]] if pin.get("missing") else []), seen=len(pin.get("seen") or []),
-          origin=ctx.origin)
+          repeat=True if repeat else None, origin=ctx.origin)
     return _simple(skill.key, "handed_over", ctx, started, handoff=pin, tried=tried, run_key=run_key,
-                   values=dict(values), focus_taken=focus_taken)
+                   values=dict(values), focus_taken=focus_taken, why="repeat" if repeat else "")
 
 
 def _to_planner(skill: Skill, plan: Plan, tried: list[dict[str, Any]], ctx: RunContext, started: float, *,
@@ -1411,11 +1554,19 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
     still asked about (two of the user's people answer to it: a real question too), a card or an eval
     (:data:`HANDOFF_ORIGINS`), a skill whose data never hands over. Sends still go through the consent rule where the
     thinker acts (rule 8); the seed's ``sends`` errs toward "may send" (only the given values are known)."""
+    if not isinstance(resolved, Ask) or ctx.origin not in HANDOFF_ORIGINS:
+        return None
+    try:
+        return _dropped(resolved, slots, words, loaded)
+    except Exception:  # noqa: BLE001 - the resolver's question stands
+        return None
+
+
+def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], loaded: Any) -> Handoff | None:
+    """:func:`_dropped_handoff`'s work (it may raise; the caller keeps the question then)."""
     from yuki.skills.resolve import app_name, check_value
     from yuki.skills.uia_route import said
 
-    if not isinstance(resolved, Ask) or ctx.origin not in HANDOFF_ORIGINS:
-        return None
     given = {str(k): v for k, v in (slots or {}).items() if _given_text(v) or isinstance(v, (int, float, bool))}
     if resolved.slot not in given:
         return None
@@ -1584,6 +1735,7 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
            "LINE_COMMIT_USER", "TO_PLANNER", "WHY_UNVERIFIED", "WHY_DROPPED", "WHY_ERROR", "REFUSED_BY_STEPS",
+           "REPEAT_HANDOFF_S", "SETTLED_REASONS",
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
