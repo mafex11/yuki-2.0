@@ -46,11 +46,12 @@ user's own app (Spotify's Library rows) as rows of source :data:`SEEN_SOURCE`, e
 behind them, so :func:`top` (the taste fill, a guess) never returns one, while :func:`candidates` lists them after the
 picked names and :func:`find` finds them, so the menu and the resolver can offer the user's real playlist names ("ネオン"
 when they say "my Japanese playlist"). **What the user called it**: when a request's words named an entity no row was
-called and the entity then played (the thinker's fallback, or the user's own pick), :func:`note` with ``said_as`` keeps
-those words as another name of that row (a row of kind ``<kind>@said``: the words encrypted, their keyed digest the
-key, the row's name encrypted as its target), so :func:`find` maps the same words to it next time. An identity of the
-user's own words, learned from a seen result, never a list of meanings written here; the newest pairing of the same
-words wins.
+called and the hand-off job that followed was seen putting one on (the driver decides when), :func:`note` with
+``said_as`` keeps those words as another name of that row (a row of kind ``<kind>@said``: the words encrypted, their
+keyed digest the key, the row's name encrypted as its target), so :func:`find` maps the same words to it next time. An
+identity of the user's own words, learned from a seen result, never a list of meanings written here; the newest pairing
+of the same words wins, and :func:`unsay` drops one the user's later choice contradicts (what they say wins over what
+was learned).
 """
 
 from __future__ import annotations
@@ -219,6 +220,30 @@ def said_target(store: Any, kind: str, words: Any) -> str | None:
     except Exception:  # noqa: BLE001
         return None
     return name or None
+
+
+def said_words(store: Any, kind: str, target: Any) -> list[str]:
+    """The words paired with the entity ``target`` of ``kind`` (:func:`note` ``said_as``; target matched with case and
+    spacing folded), newest first, decrypted in RAM: the driver tells by them whether a request reached that entity
+    through a pairing. Never raises (``[]``)."""
+    want = _norm(target)
+    if not want or not str(kind or "").strip():
+        return []
+    try:
+        rows = store._query("SELECT name_ciphertext, ref_ciphertext FROM tastes WHERE kind = ? "
+                            "ORDER BY last_at DESC, id DESC", (said_kind(kind),))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for name_ct, ref_ct in rows:
+        try:
+            if ref_ct and _norm(store._dec(ref_ct)) == want:
+                words = " ".join(str(store._dec(name_ct) or "").split())
+                if words:
+                    out.append(words)
+        except Exception:  # noqa: BLE001 - a row the key can't read is skipped
+            continue
+    return out
 
 
 def find(store: Any, kind: str, name: str) -> Taste | None:
@@ -659,9 +684,10 @@ def saw(store: Any, kind: str, names: Any, *, at: float | None = None) -> int:
     """Names the user's own app showed for an entity ``kind`` (the Library rows Spotify's driver read: their own
     playlists, fix-plan Item 7), kept as :data:`SEEN_SOURCE` rows (name encrypted, keyed digest, no pick): only names
     with no row of ``kind`` yet are written (a picked row is never touched), in the order shown; at most
-    :data:`SEEN_MAX` seen rows per kind (the oldest go). :func:`candidates` and :func:`find` then know them; the
-    nightly recompute leaves them alone (it rewrites ``observed`` rows only, and turns a seen row with picks into one).
-    Returns how many were added; never raises (0)."""
+    :data:`SEEN_MAX` seen rows per kind (the oldest go). :func:`candidates` and :func:`find` then know them; a
+    :func:`note` on one turns it into a pick. The nightly recompute leaves them alone: it rewrites ``observed`` rows
+    only, keyed by the moments' own digest, so an observed row of the same name may sit beside a seen one
+    (:func:`candidates` lists a name once). Returns how many were added; never raises (0)."""
     if not str(kind or "").strip():
         return 0
     clean: list[str] = []
@@ -696,6 +722,45 @@ def saw(store: Any, kind: str, names: Any, *, at: float | None = None) -> int:
         for (rid,) in extra:
             conn.execute("DELETE FROM tastes WHERE id = ?", (rid,))
         return added
+
+    try:
+        return int(store._write(write) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def unsay(store: Any, kind: str, target: str, *, words: str | None = None) -> int:
+    """Drop what the user's words were taken to mean (:func:`note` ``said_as``) when their later choice contradicts it
+    (fix-plan Item 7, review r1 M2: what they say wins over what was learned): the ``<kind>@said`` rows whose target is
+    ``target`` (case and spacing folded); with ``words``, only those words' row, and only while it still points at
+    ``target`` (a newer pairing of the same words is kept). The words then name no row again, so the driver hands
+    over once more and may learn again. The target row's own picks stay (it did play). Returns how many were dropped;
+    never raises (0)."""
+    want = _norm(target)
+    if not want or not str(kind or "").strip():
+        return 0
+    sk = said_kind(kind)
+    try:
+        key = entity_key(store, sk, words) if words is not None and _norm(words) else None
+    except Exception:  # noqa: BLE001 - no key: nothing to match
+        return 0
+
+    def write(conn: Any) -> int:
+        if key is not None:
+            rows = conn.execute("SELECT id, ref_ciphertext FROM tastes WHERE kind = ? AND entity_key = ?",
+                                (sk, key)).fetchall()
+        else:
+            rows = conn.execute("SELECT id, ref_ciphertext FROM tastes WHERE kind = ?", (sk,)).fetchall()
+        gone = 0
+        for rid, ref_ct in rows:
+            try:
+                name = _norm(store._dec(ref_ct)) if ref_ct else ""
+            except Exception:  # noqa: BLE001 - a row the key can't read is left alone
+                continue
+            if name == want:
+                conn.execute("DELETE FROM tastes WHERE id = ?", (rid,))
+                gone += 1
+        return gone
 
     try:
         return int(store._write(write) or 0)
@@ -788,7 +853,7 @@ def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retr
 
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
-           "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
+           "said_words", "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
            "entity_key", "site_kinds",
-           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "busy", "seed"]
+           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "unsay", "busy", "seed"]
