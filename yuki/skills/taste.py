@@ -40,6 +40,17 @@ against; :func:`offered` the fresh uploads named aloud after a request (``youtub
 
 Seeds kept from before phase T: :func:`seed_sites` (the site kinds alone) and :func:`note` (one choice the user named
 and a skill saw done: a voice channel joined, map-routines T1.2 "his words only").
+
+**Names the user's own app showed** (failure fix-plan Item 7, 10 Oct): :func:`saw` keeps the names a driver read in the
+user's own app (Spotify's Library rows) as rows of source :data:`SEEN_SOURCE`, encrypted like every taste: no pick is
+behind them, so :func:`top` (the taste fill, a guess) never returns one, while :func:`candidates` lists them after the
+picked names and :func:`find` finds them, so the menu and the resolver can offer the user's real playlist names ("ネオン"
+when they say "my Japanese playlist"). **What the user called it**: when a request's words named an entity no row was
+called and the entity then played (the thinker's fallback, or the user's own pick), :func:`note` with ``said_as`` keeps
+those words as another name of that row (a row of kind ``<kind>@said``: the words encrypted, their keyed digest the
+key, the row's name encrypted as its target), so :func:`find` maps the same words to it next time. An identity of the
+user's own words, learned from a seen result, never a list of meanings written here; the newest pairing of the same
+words wins.
 """
 
 from __future__ import annotations
@@ -60,6 +71,13 @@ FALLBACK_MASS = 1.0
 MENU_CANDIDATES = 5
 #: Names :func:`options` gives at most (T1.3).
 OPTIONS_N = 8
+#: The source of a row that is only a name the user's own app showed (a Spotify Library row the driver read): no pick
+#: behind it (empty histograms, ``n_obs`` 0). Listed and found, never a fill (fix-plan Item 7).
+SEEN_SOURCE = "seen"
+#: Seen rows kept per kind at most (the oldest go first).
+SEEN_MAX = 200
+#: The kind suffix of the rows that keep what the user called an entity (:func:`note` ``said_as``; :func:`find`).
+SAID_SUFFIX = "@said"
 
 LogFn = Callable[..., None]
 
@@ -107,15 +125,19 @@ def score_at(weekday: list[float], weekend: list[float], now: float) -> float:
     return s
 
 
-def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: float | None = None) -> list[Taste]:
+def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: float | None = None,
+        seen: bool = False) -> list[Taste]:
     """The ``n`` entities of ``kind`` the user picks most at this hour (:func:`score_at`), best first. ``until``: rows
-    last updated before it only (replays). Read only; never raises (``[]``)."""
+    last updated before it only (replays). ``seen``: also the rows that are only names the user's app showed
+    (:data:`SEEN_SOURCE`, score 0: last); left out by default, so a taste fill never guesses one. Read only; never
+    raises (``[]``)."""
     now = time.time() if now is None else float(now)
     try:
         rows = store._query(
             "SELECT entity_key, name_ciphertext, ref_ciphertext, hist_weekday, hist_weekend, n_obs FROM tastes "
-            "WHERE kind = ?" + (" AND updated_at < ?" if until is not None else ""),
-            (kind, float(until)) if until is not None else (kind,))
+            "WHERE kind = ?" + ("" if seen else " AND source != ?") + (" AND updated_at < ?" if until is not None
+                                                                      else ""),
+            (kind, *(() if seen else (SEEN_SOURCE,)), *((float(until),) if until is not None else ())))
     except Exception:  # noqa: BLE001
         return []
     scored = []
@@ -133,31 +155,93 @@ def top(store: Any, kind: str, *, now: float | None = None, n: int = 1, until: f
 
 def candidates(store: Any, kind: str, *, now: float | None = None, limit: int = MENU_CANDIDATES,
                by: str = "hour") -> list[str]:
-    """The names the menu lists for an entity slot of ``kind`` (the user's own names: their playlists, channels),
-    best at this hour first; ``by="n_obs"``: most seen first, an order that changes only when the table is recomputed
-    (nightly), for a menu that sits in a cached prompt block (the thinker's ``run_skill`` description)."""
+    """The names the menu lists for an entity slot of ``kind`` (the user's own names: their playlists, channels):
+    the picked ones first, at most ``limit``, best at this hour first (``by="n_obs"``: most seen first, an order that
+    changes only when the table is recomputed (nightly), for a menu that sits in a cached prompt block: the thinker's
+    ``run_skill`` description); then every name the user's own app showed with no pick yet (:func:`saw`; in the order
+    the app first showed them, a stable order), so a name on the user's own screen is one the resolver accepts and
+    the menu can offer (it shows the first few). Never raises (``[]``)."""
     if by == "n_obs":
         rows = top(store, kind, now=now, n=10_000)
         rows.sort(key=lambda t: (-t.n_obs, t.entity_key))
-        return [t.name for t in rows if t.name][:max(0, int(limit))]
-    return [t.name for t in top(store, kind, now=now, n=limit) if t.name]
+        picked = [t.name for t in rows if t.name][:max(0, int(limit))]
+    else:
+        picked = [t.name for t in top(store, kind, now=now, n=limit) if t.name]
+    have = {_norm(n) for n in picked}
+    for name in seen_names(store, kind):
+        if _norm(name) not in have:
+            have.add(_norm(name))
+            picked.append(name)
+    return picked
+
+
+def seen_names(store: Any, kind: str) -> list[str]:
+    """The names of ``kind`` the user's own app showed that have no pick yet (:data:`SEEN_SOURCE` rows), in the order
+    the app first showed them. Decrypted in RAM; never raises (``[]``)."""
+    try:
+        rows = store._query("SELECT name_ciphertext FROM tastes WHERE kind = ? AND source = ? ORDER BY last_at, id",
+                            (kind, SEEN_SOURCE))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    for (name_ct,) in rows:
+        try:
+            name = " ".join(str(store._dec(name_ct) or "").split())
+        except Exception:  # noqa: BLE001 - a row the key can't read is skipped
+            continue
+        if name:
+            out.append(name)
+    return out
 
 
 def options(store: Any, kind: str, *, now: float | None = None, n: int = OPTIONS_N) -> list[str]:
     """T1.3: the names the talker or the model may match the user's words against (their own playlist or channel
-    names, best at this hour first). Never raises."""
-    return candidates(store, kind, now=now, limit=n)
+    names: picked ones best at this hour first, then the names their own app showed), at most ``n``. Never raises."""
+    return candidates(store, kind, now=now, limit=n)[:max(0, int(n))]
+
+
+def said_kind(kind: str) -> str:
+    """The kind of the rows that keep what the user called an entity of ``kind`` (:func:`note` ``said_as``)."""
+    return f"{kind}{SAID_SUFFIX}"
+
+
+def said_target(store: Any, kind: str, words: Any) -> str | None:
+    """The name of the entity of ``kind`` the user's words ``words`` were last paired with (:func:`note` ``said_as``:
+    they named no row, and that entity then played), or None. Identity of the words (case and spacing folded), by
+    their keyed digest. Never raises."""
+    folded = _norm(words)
+    if not folded or not str(kind or "").strip():
+        return None
+    try:
+        rows = store._query("SELECT ref_ciphertext FROM tastes WHERE kind = ? AND entity_key = ?",
+                            (said_kind(kind), entity_key(store, said_kind(kind), folded)))
+        name = " ".join(str(store._dec(rows[0][0]) or "").split()) if rows and rows[0][0] else ""
+    except Exception:  # noqa: BLE001
+        return None
+    return name or None
 
 
 def find(store: Any, kind: str, name: str) -> Taste | None:
-    """The taste row whose name equals ``name`` (case and spacing folded: identity, never meaning)."""
-    want = " ".join(str(name or "").split()).casefold()
+    """The taste row whose name equals ``name`` (case and spacing folded: identity, never meaning), the names the
+    user's own app showed included (:func:`saw`); else the row the same words were paired with when they named no row
+    and that entity then played (:func:`said_target`). None when neither. Never raises."""
+    want = _norm(name)
     if not want:
         return None
-    for t in top(store, kind, n=200):
-        if " ".join(t.name.split()).casefold() == want:
+    rows = top(store, kind, n=10_000, seen=True)
+    for t in rows:
+        if _norm(t.name) == want:
             return t
-    return None
+    target = said_target(store, kind, want)
+    if not target:
+        return None
+    for t in rows:
+        if _norm(t.name) == _norm(target):
+            return t
+    try:
+        return Taste(entity_key(store, kind, target), target, "", 0.0, 0.0)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def offered(store: Any, *, now: float | None = None) -> list[Taste]:
@@ -520,15 +604,22 @@ def seed_sites(store: Any, *, now: float | None = None, days: float = SEED_DAYS)
 
 
 def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float | None = None,
-         source: str = "said") -> bool:
+         source: str = "said", said_as: str | None = None) -> bool:
     """One choice the user named and a skill saw done (a voice channel joined): ``kind``'s row for ``name`` gets one
-    more observation at that hour (its name and link encrypted). Never raises (False on failure)."""
+    more observation at that hour (its name and link encrypted); a row that was only a name their app showed
+    (:data:`SEEN_SOURCE`) becomes a pick of ``source``. ``said_as``: the words the request named it by when those
+    words named no row (fix-plan Item 7: "my Japanese playlist" for "ネオン", seen playing after the hand-off): kept as
+    another name of this row (:func:`said_target`; the newest pairing of the same words wins). Never raises (False on
+    failure)."""
     clean = " ".join(str(name or "").split())
     if not clean or not str(kind or "").strip():
         return False
     at = time.time() if at is None else float(at)
     weekend, hour = _slot_of(at)
     key = entity_key(store, kind, clean)
+    said = " ".join(str(said_as or "").split())
+    said = said if said and _norm(said) != _norm(clean) else ""
+    said_key = entity_key(store, said_kind(kind), said) if said else ""
 
     def write(conn: Any) -> None:
         row = conn.execute("SELECT hist_weekday, hist_weekend, n_obs FROM tastes WHERE kind = ? AND entity_key = ?",
@@ -538,21 +629,78 @@ def note(store: Any, kind: str, name: str, *, ref: str | None = None, at: float 
         n = float(row[2] or 0.0) + 1.0 if row else 1.0
         if row:
             conn.execute("UPDATE tastes SET name_ciphertext = ?, ref_ciphertext = coalesce(?, ref_ciphertext), "
-                         "hist_weekday = ?, hist_weekend = ?, n_obs = ?, last_at = ?, updated_at = ? "
-                         "WHERE kind = ? AND entity_key = ?",
+                         "hist_weekday = ?, hist_weekend = ?, n_obs = ?, last_at = ?, updated_at = ?, "
+                         "source = CASE WHEN source = ? THEN ? ELSE source END WHERE kind = ? AND entity_key = ?",
                          (store._enc(clean), store._enc(ref) if ref else None, json.dumps(wd), json.dumps(we), n, at,
-                          at, kind, key))
+                          at, SEEN_SOURCE, source, kind, key))
         else:
             conn.execute("INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
                          "hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (kind, key, store._enc(clean), store._enc(ref) if ref else None, source, json.dumps(wd),
                           json.dumps(we), n, at, at))
+        if said:
+            # what they called it: the words (encrypted) keyed by their digest, the row's name (encrypted) as the target
+            zero = json.dumps([0.0] * 24)
+            conn.execute("INSERT INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, source, hist_weekday, "
+                         "hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) "
+                         "ON CONFLICT(kind, entity_key) DO UPDATE SET name_ciphertext = excluded.name_ciphertext, "
+                         "ref_ciphertext = excluded.ref_ciphertext, n_obs = tastes.n_obs + 1, "
+                         "last_at = excluded.last_at, updated_at = excluded.updated_at",
+                         (said_kind(kind), said_key, store._enc(said), store._enc(clean), source, zero, zero, at, at))
 
     try:
         store._write(write)
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def saw(store: Any, kind: str, names: Any, *, at: float | None = None) -> int:
+    """Names the user's own app showed for an entity ``kind`` (the Library rows Spotify's driver read: their own
+    playlists, fix-plan Item 7), kept as :data:`SEEN_SOURCE` rows (name encrypted, keyed digest, no pick): only names
+    with no row of ``kind`` yet are written (a picked row is never touched), in the order shown; at most
+    :data:`SEEN_MAX` seen rows per kind (the oldest go). :func:`candidates` and :func:`find` then know them; the
+    nightly recompute leaves them alone (it rewrites ``observed`` rows only, and turns a seen row with picks into one).
+    Returns how many were added; never raises (0)."""
+    if not str(kind or "").strip():
+        return 0
+    clean: list[str] = []
+    for n in names or []:
+        c = " ".join(str(n or "").split())
+        if c and _norm(c) not in {_norm(x) for x in clean}:
+            clean.append(c)
+    if not clean:
+        return 0
+    at = time.time() if at is None else float(at)
+    try:
+        keyed = [(entity_key(store, kind, n), n) for n in clean]
+    except Exception:  # noqa: BLE001 - no key: nothing is kept
+        return 0
+    zero = json.dumps([0.0] * 24)
+
+    def write(conn: Any) -> int:
+        have = {str(r[0]) for r in conn.execute("SELECT entity_key FROM tastes WHERE kind = ?", (kind,)).fetchall()}
+        added = 0
+        for i, (key, name) in enumerate(keyed):
+            if key in have:
+                continue
+            stamp = at + i * 1e-3          # the order shown, kept by the time (the menu lists them in that order)
+            got = conn.execute("INSERT OR IGNORE INTO tastes (kind, entity_key, name_ciphertext, ref_ciphertext, "
+                               "source, hist_weekday, hist_weekend, n_obs, last_at, updated_at) VALUES (?, ?, ?, NULL, "
+                               "?, ?, ?, 0, ?, ?)",
+                               (kind, key, store._enc(name), SEEN_SOURCE, zero, zero, stamp, stamp))
+            added += max(0, int(got.rowcount or 0))
+            have.add(key)
+        extra = conn.execute("SELECT id FROM tastes WHERE kind = ? AND source = ? ORDER BY last_at DESC, id DESC "
+                             "LIMIT -1 OFFSET ?", (kind, SEEN_SOURCE, SEEN_MAX)).fetchall()
+        for (rid,) in extra:
+            conn.execute("DELETE FROM tastes WHERE id = ?", (rid,))
+        return added
+
+    try:
+        return int(store._write(write) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def busy(store: Any, now: float | None = None) -> str | None:
@@ -638,8 +786,9 @@ def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retr
     return {"pages": got, "youtube": yt, "yt_channel": flat}
 
 
-__all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "Taste", "hour_score", "score_at", "top",
-           "candidates", "options", "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
+__all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
+           "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
+           "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
            "entity_key", "site_kinds",
-           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "busy", "seed"]
+           "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "busy", "seed"]

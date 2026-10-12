@@ -24,8 +24,10 @@ request_warm_s = 2.5
 # Spotify's session says playing and Spotify.exe has no active render session on this PC for this long: it is playing
 # on another device (Spotify Connect); playlist and volume then say so and leave it (M2, Q11's default).
 this_pc_s = 2.0
-# Spotify's own autostart argument, used only to start Spotify with no game in front (unverified until a live run).
-launch_args = ["--minimized"]
+# Arguments Spotify is started with (the launch route; only with no game in front). None: a window started minimised
+# (Spotify's own --minimized) never builds its UI Automation tree, so the launch route was cold by design (10 Oct,
+# "cold_after_launch"). The driver restores a window that still comes up minimised, then warms it.
+launch_args = []
 
 # Whether Spotify's slider and its Windows mixer entry are one control, recorded by the live checks: F live check 1
 # (dragging the slider moves the mixer entry) and S-1 (moving the mixer entry moves the slider). Only with both true is
@@ -48,7 +50,10 @@ serves = [{ end = "media_context", target = "playlist", needs = "spotify" }]
 bind = { playlist = "entity" }
 
 # The playlist: a fill slot of kind "playlist" (the taste rows spotify_playlist: the user's own picks by hour, learned
-# from their moments); a routine is keyed per playlist (routine_key).
+# from their moments, plus the Library rows the driver read, listed but never a guess, and what the user called a
+# playlist when their words named no row and it then played); a routine is keyed per playlist (routine_key).
+# A Library read with no row of the name asked hands over with the slot reported missing and the row names read (RAM
+# only), so the thinker picks the user's own playlist from the screen and memory and plays it by steps.
 [[capability."spotify.playlist".slot]]
 name = "playlist"
 type = "entity"
@@ -98,7 +103,10 @@ done = { probe = "driver", driver = "spotify_route", call = "playing_here", name
 recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", name = "{playlist.name}", after_s = 4 }
 
 # No learned link: "Search in Your Library" (unverified; patterns only; the filter is cleared afterwards). Needs the
-# search labels in yuki/connect/sites/spotify.toml; without them it says "couldn't".
+# search labels (controls library_search / library_filter) in yuki/connect/sites/spotify.toml, and they are not shipped
+# (no live check has recorded them), so the route is off by data: its condition below holds for no playlist, so the
+# ladder skips it ("when") and it is never tried or counted (10 Oct: every run logged "no_label" here). When a live
+# check ships the labels, delete the `when` line.
 [[capability."spotify.playlist".route]]
 rung = "A"
 variant = "search"
@@ -108,10 +116,12 @@ call = "play_search"
 needs_focus = false
 game = "states"
 game_states = []
+when = { slot = "playlist", in = [] }
 done = { probe = "driver", driver = "spotify_route", call = "playing_here", name = "{playlist.name}", within_s = 4 }
 recheck = { probe = "driver", driver = "spotify_route", call = "still_playing", name = "{playlist.name}", after_s = 4 }
 
-# Spotify not running: started with its own --minimized argument (never with a game in front), then its row.
+# Spotify not running (or closed to the tray): started with [spotify] launch_args (never with a game in front), restored
+# if it still comes up minimised, warmed, then its row.
 [[capability."spotify.playlist".route]]
 rung = "A"
 variant = "launch"
