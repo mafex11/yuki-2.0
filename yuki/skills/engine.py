@@ -1261,7 +1261,8 @@ def _run(resolved: Any, ctx: RunContext, started: float, state: dict[str, Any] |
                 # says nothing may follow it, a relative change (done again it would change twice: "a bit quieter"),
                 # a no-op or a result that took elsewhere (:func:`_settled`), a card and an eval still stop below
                 tried.append({"route": route.key, "rung": route.rung, "via": route.via, "outcome": "unverified"})
-                _ledger_try(ctx, run_key, route, None, "unverified", route_ms)
+                # review r1 L1: no try row for this rung: the run's own row names it (``ledger`` below), never counted
+                # twice
                 return _handoff(skill, plan.values, plan.filled, tried, ctx, started, why=WHY_UNVERIFIED,
                                 run_key=run_key, acted=True, routes=list(plan.routes), unconfirmed=True,
                                 missing=missing, seen=seen, focus_taken=focus_taken,
@@ -1552,7 +1553,8 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
 
     ``None`` keeps the question: a slot nobody gave (a real question), a given value that **is** in the words and was
     still asked about (two of the user's people answer to it: a real question too), a card or an eval
-    (:data:`HANDOFF_ORIGINS`), a skill whose data never hands over. Sends still go through the consent rule where the
+    (:data:`HANDOFF_ORIGINS`), a skill whose data never hands over, a run that commits without sending (a call join:
+    redteam D10, review r1 M1). Sends still go through the consent rule where the
     thinker acts (rule 8); the seed's ``sends`` errs toward "may send" (only the given values are known)."""
     if not isinstance(resolved, Ask) or ctx.origin not in HANDOFF_ORIGINS:
         return None
@@ -1578,6 +1580,11 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
         skill = None
     asked = skill.slot(resolved.slot) if isinstance(skill, Skill) else None
     if asked is None or not skill.handoff or asked.type not in WORD_TYPES:
+        return None
+    if run_commit(skill) != "none" and not skill.sends:
+        # review r1 M1: a run that commits without sending (``discord.voice``: a call join reaches other people) keeps
+        # the question: a value nobody said is never joined (redteam D10), and the thinker has no consent step for a
+        # join. A skill that sends keeps its hand-off: the consent rule asks before any send where the thinker acts
         return None
     heard = [str(w) for w in words or [] if str(w or "").strip()]
     asked_text = _given_text(given[asked.name])

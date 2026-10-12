@@ -330,13 +330,19 @@ def named_app_line(app: str | None) -> str:
 #: Phase S (sCore, map-skills S3.5): the user's usual way the code handed over with the request (a skill whose own
 #: routes didn't get there). Placed first and never cut; its app's usual-path, go-to and pitfall lines are left out
 #: (the 4 Oct B2 trace failed because a procedure, a pitfall and a session lesson pointed three ways). x5Fallback
-#: (failure audit 10 Oct, C2): never "follow it" (the thinker re-ran the skill that had just failed, live 10 Oct): its
-#: own routes didn't get there, so the rest is done by steps.
-PINNED_HEAD = ("The user's usual way (skill {key}) handed this over: its own routes didn't get there. Do it by steps "
-               "(look, click, type) and don't run that skill again; it is done when {done}.")
+#: (failure audit 10 Oct, C2): never "follow it" (the thinker re-ran the skill that had just failed, live 10 Oct): the
+#: rest is done by steps. Neutral on why (review r1 L6): the reason is :data:`PINNED_WHY`'s line under it.
+PINNED_HEAD = ("The user's usual way (skill {key}) handed this over. Do it by steps (look, click, type) and don't run "
+               "that skill again; {done}.")
+#: The head's done clause: the capability's done line is what Yuki says once done ("Done.", "Volume set."), so it is
+#: quoted, never read as the state itself (review r1 L6: "it is done when Done."); with no done line, the plain one.
+PINNED_DONE = "it is done only when the PC shows it (\"{words}\")"
+PINNED_DONE_PLAIN = "it is done only when the PC shows the result"
 #: Why it was handed over (the engine's ``why``, a code word: ``yuki.skills.engine.WHY_*``), one line under the head
-#: in plain words. Other reasons (its routes failed or none fit) need none: the head says it.
+#: in plain words. A reason not named here (none fit) gets no line.
 PINNED_WHY: dict[str, str] = {
+    "routes_failed": "Its own routes didn't get there (what they tried is below).",
+    "to_planner": "It stopped before a step that would send or join with no plan behind it; that step did not run.",
     "unverified": ("It acted, but the PC couldn't confirm the result: look at the screen first and finish only what "
                    "isn't done; never redo a step that worked."),
     "dropped": ("It didn't run: {slots} as given isn't in the user's words as heard (misheard, or reworded). Use "
@@ -380,7 +386,8 @@ def pinned_lines(pinned: dict[str, Any] | None) -> list[str]:
     already tried (not to be redone), and last the names read on screen."""
     if not isinstance(pinned, dict) or not pinned.get("key"):
         return []
-    done = _one(pinned.get("done_words") or "the PC shows the result", 160).rstrip(". ")
+    words = _one(pinned.get("done_words") or "", 160).rstrip(". ")
+    done = PINNED_DONE.format(words=words) if words else PINNED_DONE_PLAIN
     lines = [PINNED_HEAD.format(key=_one(pinned.get("key"), 40), done=done)]
     slots = pinned.get("slots") if isinstance(pinned.get("slots"), dict) else {}
     why = PINNED_WHY.get(str(pinned.get("why") or ""))
