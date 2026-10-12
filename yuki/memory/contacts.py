@@ -41,9 +41,11 @@ of three: "Ark" for Arc). A run that sounds like two people matches neither, and
 written. :func:`named_in` (who does this text name, unprompted) reads Latin words only as written, learned heard forms
 included, and by sound only a transliteration: a guess at a mishearing would name people the user never meant ("fit
 their" sounds like Father). :func:`names_person`, a check for one name already given (a person slot's value), reads
-Latin runs by sound too, one word or a name split in two. :func:`resolve` falls back to the one person a name sounds
-like only when no group chat or channel is called exactly that. Fixed format rules over the user's own data, never a
-word list.
+Latin runs by sound too, one word or a name split in two. :func:`resolve` reads a name by sound only when asked
+(``heard=True``, which only :func:`names_person` passes: a name the talker or thinker inferred, confirmed by the user's
+words sounding like it, two signals agreeing), and then only when no group chat or channel is called exactly that. By
+default a literal name nobody in the index has stays nobody's: the chat driver says it doesn't know who that is, and
+never sends to someone who merely sounds alike. Fixed format rules over the user's own data, never a word list.
 
 Lightweight: the model call runs only when memory changed since the last run (after the nightly audit, or by hand);
 nothing here is on a request's path but SQL.
@@ -59,7 +61,7 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
     Linker(worker).run(kind="refresh" | "rebuild", dry_run=False, now=None) -> LinkResult
     people(store, learned=True) -> list[Contact]        # live contacts with their routes (cached by a stamp); with
                                                         # the heard forms learned since the last rebuild (aliases)
-    resolve(store, ref, near_thread=None) -> list[Contact]
+    resolve(store, ref, near_thread=None, heard=False) -> list[Contact]   # heard: also by sound (names_person)
     rank_routes(store, contact, now=None, near_thread=None) -> Ranking
     card(store, contact, now=None, near_thread=None, samples=STYLE_SAMPLES) -> dict
     directory(store, now=None, chars=DIRECTORY_CHARS) -> str
@@ -1544,12 +1546,17 @@ def places(store: Store) -> list[Route]:
     return [r for r in all_routes(store) if r.contact_id is None]
 
 
-def resolve(store: Store, ref: Any, *, near_thread: int | None = None) -> list[Contact]:
+def resolve(store: Store, ref: Any, *, near_thread: int | None = None, heard: bool = False) -> list[Contact]:
     """The contacts ``ref`` names: ``contact:N`` / ``route:N``, else its words as a name or alias (whole words, case
     aside; a misheard form the user corrected counts); several when several fit, the one with a route in
-    ``near_thread`` first. When no name fits as written and no group chat or channel is called exactly that, the one
-    person ``ref`` sounds like (its transliteration or a close mishearing of one of their names, and nobody else's:
-    the module docstring), so "हेमंत" finds Hemanth. ``[]`` when none."""
+    ``near_thread`` first. ``[]`` when none.
+
+    ``heard`` (only :func:`names_person`, which also needs the user's words to name that person): when no name fits
+    as written and no group chat or channel is called exactly that, the one person ``ref`` sounds like (its
+    transliteration or a close mishearing of one of their names, and nobody else's: the module docstring), so
+    "Hemant" finds Hemanth. Never by default: every other caller (the chat driver's target, the people lookup, alias
+    learning) gets a literal name as said, so a name that is not one of the user's people is never swapped for one
+    who sounds alike and a message never goes to them."""
     found = people(store)
     text = " ".join(str(ref or "").split())
     if not text:
@@ -1563,9 +1570,9 @@ def resolve(store: Store, ref: Any, *, near_thread: int | None = None) -> list[C
     want = tokens(text)
     exact = [c for c in found if any(tokens(n) == want for n in c.names)]
     hits = exact or [c for c in found if any(span_in(n, want) or span_in(want, n) for n in c.names)]
-    if not hits:
-        # by sound only for a name no place goes by: a group chat or channel called exactly ``ref`` is that place
-        # (chat.find_target's next step), never a person who sounds like it
+    if not hits and heard:
+        # by sound only when asked, and only for a name no place goes by: a group chat or channel called exactly
+        # ``ref`` is that place (chat.find_target's next step), never a person who sounds like it
         try:
             place = any(tokens(r.chat) == want for r in places(store))
         except Exception:
@@ -1621,14 +1628,17 @@ def named_in(store: Store, text: str | None) -> list[tuple[Contact, str]]:
 
 
 def names_person(store: Store, name: str | None, texts: Sequence[str] | str | None) -> Contact | None:
-    """The one person ``name`` stands for (:func:`resolve`: a name or alias, a learned heard form, or the one person it
-    sounds like; two people: ``None``), when ``texts`` name that same person: :func:`named_in` on each (as written, a
-    heard form memory learned, a transliteration), or, since ``name`` was given for this very person, a run of Latin
-    words, one or a name speech recognition split in two, that sounds like one of their names and like nobody else's
-    (:func:`heard_people` with ``single``). The check a person slot's value gets when the user's words don't spell it
-    ("Hemanth" for "message hey meant on this card", or for "His name is हेमंत"). Never raises (``None``)."""
+    """The one person ``name`` stands for (:func:`resolve` with ``heard``: a name or alias, a learned heard form, or
+    the one person it sounds like; two people: ``None``), when ``texts`` name that same person: :func:`named_in` on
+    each (as written, a heard form memory learned, a transliteration), or, since ``name`` was given for this very
+    person, a run of Latin words, one or a name speech recognition split in two, that sounds like one of their names
+    and like nobody else's (:func:`heard_people` with ``single``). The check a person slot's value gets when the
+    user's words don't spell it ("Hemanth" for "message hey meant on this card", or for "His name is हेमंत"). Sound
+    here only ever confirms a name the talker or thinker inferred, with the words naming that person too; a literal
+    name the user said is checked as said (the resolver keeps it, and :func:`resolve` without ``heard`` finds nobody
+    for a name not theirs). Never raises (``None``)."""
     try:
-        who = {c.id: c for c in resolve(store, name)}
+        who = {c.id: c for c in resolve(store, name, heard=True)}
         if len(who) != 1:
             return None
         target = next(iter(who.values()))

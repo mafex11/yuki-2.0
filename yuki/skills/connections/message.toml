@@ -41,6 +41,8 @@ bind = { person = "contact", app = "app" }
 # people index resolves it to exactly one person whom the user's words name as heard - a misheard form memory learned
 # ("hey meant" for Hemanth), a transliteration ("हेमंत") or a close mishearing by sound - and runs it as that
 # person's own name. A name two people fit is dropped and asked; a group chat or channel still needs its name said.
+# A name the user said that none of their people goes by, but that sounds like exactly one of them, is asked ("Did you
+# mean Hemanth?"), never swapped for that person.
 [[capability.message.slot]]
 name = "person"
 type = "text"

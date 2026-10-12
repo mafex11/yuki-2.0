@@ -22,11 +22,13 @@ eval). Step by step:
    slot, or a text slot the capability binds to a ``contact``: ``message``'s ``person``) may also be a name the
    people index resolves to exactly one person whom the words name as heard: a learned misheard form ("hey meant"),
    a transliteration ("हेमंत") or a close mishearing by sound (:func:`yuki.memory.contacts.names_person`); a group
-   chat or channel still needs its name as said. An app may also be one whose known names (its key, a web address's
-   name, a chat app's title, the names the user's timeline shows it under) stand in the words, or are heard there by
-   sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a site) one whose identity stands
-   there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot name returned (``dropped``), never
-   "corrected".
+   chat or channel still needs its name as said. A name the user said that none of their people goes by as written
+   but that sounds like exactly one of them is asked about (:data:`CONFIRM_PERSON`: "Did you mean Hemanth?"), never
+   swapped: sound only confirms a name the talker or thinker inferred. An app may also be one whose known names (its
+   key, a web address's name, a chat app's title, the names the user's timeline shows it under) stand in the words, or
+   are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a site) one whose
+   identity stands there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot name returned
+   (``dropped``), never "corrected".
 2. **Fill what is missing**, in :data:`FILL_ORDER`: what the user said always first (an app their words name, the
    newest turn that names one, for an app slot; :func:`named_app`), so a value they said beats a learned skill's
    bound value (only its default; a value they said for a bound slot that is another one runs the capability), its
@@ -72,6 +74,9 @@ APPS_TTL_S = 600.0
 PERSON_BIND = "contact"
 #: The bind source that marks a text slot as a site (``web.open_page``'s ``bind = { site = "site" }``).
 SITE_BIND = "site"
+#: The question when the user said a name none of their people (nor a group chat or channel) goes by, and it sounds
+#: like exactly one of them: asked, never swapped (a message to someone who merely sounds alike is a wrong send).
+CONFIRM_PERSON = "Did you mean {name}?"
 
 
 @dataclass
@@ -399,6 +404,30 @@ def _heard_person(store: Any) -> Callable[[str, Sequence[str]], str | None]:
     return check
 
 
+def _sounds_like(store: Any) -> Callable[[str], str | None]:
+    """``name -> the one person it sounds like | None`` for a name the user said literally: ``None`` when the people
+    index finds anyone by that name as written (:func:`yuki.memory.contacts.resolve`, the chat driver's own lookup) or
+    a group chat or channel goes by it; else the one person it sounds like (``resolve(..., heard=True)``), whom the
+    resolver asks about (:data:`CONFIRM_PERSON`) rather than run a name the chat driver doesn't know or send to a
+    person the user may not have meant."""
+    def check(name: str) -> str | None:
+        if store is None:
+            return None
+        try:
+            from yuki.memory import contacts as C
+
+            if C.resolve(store, name):
+                return None
+            got = C.resolve(store, name, heard=True)
+        except Exception:  # noqa: BLE001
+            return None
+        if len({c.id for c in got}) != 1:
+            return None
+        return " ".join(str(getattr(got[0], "name", "") or "").split()) or None
+
+    return check
+
+
 def _identity(slot: Slot | None, value: Any) -> str:
     """A slot value as one identity, to compare a value the user said with a learned skill's bound one: an app by its
     key, anything else as a preference scope compares it (:func:`yuki.skills.connection.scope_value`)."""
@@ -606,22 +635,54 @@ def _app_candidates(skill: Skill, slot: Slot, *, store: Any, live: "Live", until
     return out
 
 
+def _outside(turn: str, skip: Sequence[str]) -> list[str]:
+    """The parts of ``turn`` outside every whole-word occurrence of the ``skip`` values (each part its casefolded
+    words), so a name is matched only where it stands outside them and never across one."""
+    from yuki.memory.contacts import tokens
+
+    words = tokens(turn)
+    cut = [False] * len(words)
+    for value in skip:
+        n = tokens(value)
+        if not n:
+            continue
+        for i in range(len(words) - len(n) + 1):
+            if words[i:i + len(n)] == n:
+                cut[i:i + len(n)] = [True] * len(n)
+    parts: list[str] = []
+    cur: list[str] = []
+    for w, gone in zip(words, cut):
+        if gone:
+            if cur:
+                parts.append(" ".join(cur))
+            cur = []
+        else:
+            cur.append(w)
+    if cur:
+        parts.append(" ".join(cur))
+    return parts
+
+
 def named_app(skill: Skill, slot: Slot, turns: Sequence[str], *, store: Any = None, live: "Live | None" = None,
-              until: float | None = None, now: float | None = None) -> str | None:
+              until: float | None = None, now: float | None = None, skip: Sequence[str] = ()) -> str | None:
     """The app the user's own words name for an app slot no valid value was given for: the newest of ``turns``
     (newest last) that names any candidate (:func:`_app_candidates`), when it names exactly one; a turn that names two
     decides nothing (the usual fill runs, or asks). Whole words only: an app is never filled by sound or guess. What
     they said wins over a live "playing" guess, a preference, a learned skill's bound value or fill policy (failure
     fix-plan principle 2: "Can you play my Japanese playlist from Spotify? Make the volume a little bit down." turns
-    Spotify down, not the app playing)."""
+    Spotify down, not the app playing). ``skip``: the given values of the skill's free text slots (what to write, a
+    link): an app named only inside them is part of the message, never its channel ("tell Hemanth I'm on Discord
+    now" names no app to message him on), so a turn that names one only there decides nothing."""
     turns = [str(t) for t in turns or [] if str(t).strip()]
     if not turns:
         return None
     cands = _app_candidates(skill, slot, store=store, live=live or Live(), until=until, now=now)
     if not cands:
         return None
+    skip = [str(v) for v in skip or () if _words(v)]
     for turn in reversed(turns):
-        hit = {key for key, names in cands.items() if any(_said(n, [turn]) for n in names)}
+        parts = _outside(turn, skip) if skip else [turn]
+        hit = {key for key, names in cands.items() if any(_said(n, parts) for n in names)}
         if hit:
             return next(iter(hit)) if len(hit) == 1 else None
     return None
@@ -728,6 +789,12 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     told = told_values(store, skill.key)
     people = people or _person(store)
     heard_person = heard_person or _heard_person(store)
+    sounds_like = _sounds_like(store)
+    # the given values of free text slots (bound to nothing: what to write, a link): an app named inside them is the
+    # message's content, never its channel (named_app's ``skip``)
+    free_text = [str(v) for k, v in given.items()
+                 if isinstance(v, str) and (free := skill.slot(k)) is not None and free.type == "text"
+                 and not skill.bind.get(k)]
 
     def app_names(value: str) -> tuple[str, list[str]]:
         return app_identity(value, store=store, until=until)
@@ -774,6 +841,15 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     pick = taste.find_offered(store, value.get("name", ""), now=now)
                     if pick is not None:
                         value = pick          # {"name", "key", "ref"}: rung A's ``when ref has`` passes
+                # a name the user said that none of their people goes by as written but sounds like exactly one of
+                # them ("Hemant" for Hemanth; "Karan" with only a Kiran): asked, never run as that person and never
+                # run as a name the chat driver doesn't know
+                literal = isinstance(value, str) and _words(value).casefold() == _words(given[slot.name]).casefold()
+                if literal and slot.type == "text" and _person_bound(skill, slot):
+                    alike = sounds_like(value)
+                    if alike:
+                        return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike), [alike],
+                                   dropped=list(dropped))
                 values[slot.name], filled[slot.name] = value, "words"
                 ask_keep = keep_check(slot, value) or ask_keep
                 continue
@@ -781,7 +857,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
         # bound default (the volume of "Spotify", not of the app playing)
         if slot.type == "app":
-            app = named_app(skill, slot, heard, store=store, live=live, until=until, now=now)
+            app = named_app(skill, slot, heard, store=store, live=live, until=until, now=now, skip=free_text)
             if app is not None:
                 values[slot.name], filled[slot.name] = app, "words"
                 ask_keep = keep_check(slot, app) or ask_keep
@@ -1030,6 +1106,7 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
     return EvalResolver(Store.open(path), client=client, model=model, prompt=prompt, loaded=loaded)
 
 
-__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "Live", "Plan", "Ask", "Held", "Handoff", "Refused",
-           "app_name", "app_identity", "known_apps", "named_app", "check_value", "pref_option", "from_pref",
+__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "CONFIRM_PERSON", "Live", "Plan", "Ask", "Held",
+           "Handoff", "Refused", "app_name", "app_identity", "known_apps", "named_app", "check_value", "pref_option",
+           "from_pref",
            "told_values", "ladder", "resolve", "done_line", "canonical", "EvalResolver", "eval_resolver"]
