@@ -84,6 +84,10 @@ _TABS_BUDGET_S = 0.15
 #: A tab strip read ahead (when the user starts talking) serves a summary for this long, while the
 #: window's title is the same and nothing was done on the desktop since.
 _TABS_FRESH_S = 20.0
+#: x3 (3f): a window not in front has its tab strip read for a tab hand within this (s), and a new tab is waited for
+#: on its strip this long after the browser's new-tab key.
+_OTHER_TABS_BUDGET_S = 0.4
+_NEW_TAB_WAIT_S = 1.5
 #: How many action-log lines the mouth's desktop block carries (the thinker gets more).
 _MOUTH_ACTION_LINES = 4
 #: A summary read while the user was talking serves the reply if it is this recent and nothing was done on the
@@ -238,6 +242,57 @@ _THEN_NOTE_LEAN = (
     "otherwise call hand_over now, intent new_task (their words go with it by code). Never say again that it is open, "
     "never say it is done before a hand verified it."
 )
+#: x3 (fix-plan item 3b): a window or tab step is often the first part of a request ("open YouTube in Arc not in
+#: Chrome" began with a window focus; live 10 Oct #9, #16, #25), and a verified step with no done line ended the
+#: talker's turn in silence, so the rest was never done by anyone. These hands carry the same "then" as the openings:
+#: with it, the step's verified result goes back to the talker with the screen as it settled, never run_llm=False.
+THEN_HANDS = (*OPEN_HANDS, "window", "tab")
+_THEN_STEP = {
+    "type": "string",
+    "description": "What else their request asks once this step is done, in their words (\"open YouTube in it\"), "
+                   "else \"\". Then you get the new screen to do it.",
+}
+#: What the talker reads when a window or tab step with a rest verified (x3).
+_STEP_THEN_NOTE = (
+    "That step is done, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your "
+    "desktop block now shows the screen as it is: when one of your hands does that on what it shows (an item of the "
+    "window in front, a tab, an opening in that browser), do it now, alone, with say_when_done for the whole; otherwise "
+    "hand it to the thinker now with tell_yuki (screen true, that part as they said it, and in context what you just "
+    "did). Never stop here, never say it is done before a hand verified it."
+)
+_STEP_THEN_NOTE_LEAN = (
+    "That step is done, verified, and nothing was said for it. Still to do from their request: \"{rest}\". Your "
+    "desktop block now shows the screen as it is: when one of your hands does that on what it shows (an item of the "
+    "window in front, a tab, an opening in that browser), do it now, alone, with say_when_done for the whole; otherwise "
+    "call hand_over now, intent new_task (their words go with it by code). Never stop here, never say it is done "
+    "before a hand verified it."
+)
+#: x3 (3b): the window and tab operations that are usually only the first step of a request (bring a window or a tab
+#: up). Verified with no done line and no "then", the turn no longer ends there in silence: the talker reads its own
+#: request again and does the rest, or stays quiet when bringing it up was all of it (live 10 Oct #9 "try another way"
+#: and #16 "open YouTube in Arc not in Chrome" ended at a focus, #25 "do it" too, with 34 s of silence after it).
+STEP_FIRST_OPS = {"window": ("focus", "restore"), "tab": ("show", "new")}   # a new tab: only an empty one
+_STEP_CHECK_NOTE = (
+    "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
+    "part of a request: read their words again now. When they asked for more than that (open, play, close, type, send "
+    "or find something in it), do the rest now: with one of your hands on what the desktop block shows, alone, with "
+    "say_when_done for the whole, else hand it to the thinker with tell_yuki (screen true, their request as they said "
+    "it, and in context what you just did). When bringing it up was all they asked, call stay_quiet alone. Never say "
+    "it is done before a hand verified it."
+)
+_STEP_CHECK_NOTE_LEAN = (
+    "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
+    "part of a request: read their words again now. When they asked for more than that (open, play, close, type, send "
+    "or find something in it), do the rest now: with one of your hands on what the desktop block shows, alone, with "
+    "say_when_done for the whole, else call hand_over, intent new_task (their words go with it by code). When bringing "
+    "it up was all they asked, call stay_quiet alone. Never say it is done before a hand verified it."
+)
+#: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
+_TAB_CHOOSE_NOTE = (
+    "Not done: {count} tabs fit that title, so nothing was closed or shown. When their words meant all of them, call "
+    "it again with tabs (their numbers: {numbers}). Otherwise ask them which in a few words, by the tabs' titles "
+    "({titles}), the question alone with no call; never ask for a tab number."
+)
 #: After an opening with a rest, the screen is read again once it has settled: its windows, the window in front and
 #: the popups unchanged for SETTLE_QUIET_S, at most SETTLE_MAX_S (a launch is verified once its window takes input; a
 #: crash bubble or a page's dialog can come a moment later). Polled every SETTLE_POLL_S. Not measured live yet: every
@@ -310,27 +365,35 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "window": _WINDOW,
             "action": {"type": "string", "enum": ["focus", "minimize", "maximize", "fullscreen", "restore", "close"]},
             "named": {"type": "string", "description": "close: their own words asking to close it."},
+            "then": _THEN_STEP,
             "say_when_done": _DONE_LINE,
         },
-        "required": ["window", "action", "say_when_done"],
+        "required": ["window", "action", "then", "say_when_done"],
     },
     {
         "name": "tab",
         "description": (
-            "Your hand for the tabs line. show: make one tab the one showing. close: exactly the tabs you name by "
-            "number, each found by its identity and verified gone. reopen: the tab most recently closed, verified "
-            "by expect. What a page holds is the thinker's." + _NOW
+            "Your hand for one browser window's tabs (the window in front's are on the tabs line; another window's are "
+            "read when you call it). show: make one tab the one showing. close: exactly the tabs they named, each found "
+            "by its identity and verified gone. new: a new tab in that window; with url, that address opened in a new "
+            "tab of that window's own browser. reopen: the tab most recently closed, verified by expect. A tab is named "
+            "by title (its words on the tabs line, or the part they said: \"YouTube\"): one tab that matches is enough, "
+            "and the user is never asked for a number; tab or tabs (numbers on the tabs line) only when you have them. "
+            "What a page holds is the thinker's." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
-            "action": {"type": "string", "enum": ["show", "close", "reopen"], "description": "Default show."},
-            "tab": {"type": "integer", "description": "Its number on the tabs line."},
+            "action": {"type": "string", "enum": ["show", "close", "new", "reopen"], "description": "Default show."},
+            "title": {"type": "string", "description": "show, close: the tab's title, or the part of it they said."},
+            "tab": {"type": "integer", "description": "Or its number on the tabs line."},
             "tabs": {"type": "array", "items": {"type": "integer"}, "description": "close: several at once."},
+            "url": {"type": "string", "description": "new: the full address to open in it, else \"\"."},
             "named": {"type": "string", "description": "close: their own words naming each tab."},
             "expect": {"type": "string", "description": "reopen: the closed tab's title."},
+            "then": _THEN_STEP,
             "say_when_done": _DONE_LINE,
         },
-        "required": ["window", "say_when_done"],
+        "required": ["window", "then", "say_when_done"],
     },
     {
         "name": "open_url",
@@ -808,6 +871,10 @@ class Hands:
         #: (``<session>-<n>``); ``() -> [int]``: the playbook ids shown to the talker for this call; ``() -> int``: the
         #: user turns so far. All set by the conversation.
         self.words: Any = None
+        #: x3 (fix-plan 3a, IF-words): ``() -> [str]``: the user's turns of the current exchange (at most 4, within about
+        #: 120 s, oldest first, each as heard), set by the conversation; the commit check reads these as "this
+        #: request" (``None``: the last 4 of :attr:`words`).
+        self.exchange: Any = None
         self.turn_key: Any = None
         self.shown: Any = None
         self.user_turn: Any = None
@@ -857,6 +924,11 @@ class Hands:
         self.last_skill: dict[str, Any] | None = None
         #: The one "Keep this as your usual?" waiting for its answer (RAM only): pref, option, run key, when.
         self.pending_keep: dict[str, Any] | None = None
+        #: x3 (fix-plan 3f): the tabs of a window that was not in front, read for a tab hand by title: ``{hwnd: (names,
+        #: ids, read at)}`` (RAM only), so a second call naming its tabs by number goes by the same read.
+        self._other_tabs: dict[int, tuple[list[str], list[str], float]] = {}
+        #: x3 (3b): ``(user turn, count)``: how often a silent window or tab step gave the talker its turn back in it.
+        self._step_checked: tuple[Any, int] | None = None
 
     @property
     def skills_on(self) -> bool:
@@ -998,8 +1070,25 @@ class Hands:
             return SimpleNamespace(allowed=False, decision="ask_user", question="", source="error", handover=False,
                                    act_off="", row=0, why=f"the check could not run ({type(exc).__name__})")
         recent = [" ".join(str(w).split()) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
-        words = recent[-1:]
-        before = [*recent[-4:-1], *[" ".join(str(e).split()) for e in (earlier or []) if str(e).strip()]][-3:]
+        # x3 (fix-plan 3a, IF-words): the check reads the whole exchange as this request, not the last turn alone. Live
+        # 10 Oct "Close it, dude." then "which one would it be?" then "is not closed": the check saw only the newest
+        # turn, found no ask to close, and held the tab close twice (#20, #21). The exchange: the user's own turns, at
+        # most 4, within about 120 s (the conversation's hook; else the last 4 heard); older turns stay "earlier"
+        exchange = self._call_safely(self.exchange, None) if self.exchange is not None else None
+        words = [" ".join(str(w).split()) for w in exchange if str(w).strip()][-4:] \
+            if isinstance(exchange, (list, tuple)) else []
+        if not words:
+            words = recent[-4:]
+        if tool == "window_action" and str((tool_input or {}).get("action") or "") == "close" and words:
+            # x3: a whole window holds everything in it (every tab), so its close is judged on their newest turn alone,
+            # the rest of the exchange as earlier words (they authorise nothing unless that turn refers back). Simulated
+            # 12 Oct on the live #18-#21 turns: with the exchange as this request the check allowed closing all of
+            # Chrome on "Close it, dude." ... "is not closed" (the window's title is its YouTube tab's); on the newest
+            # turn it holds, as it did live. The step kind only, never the words' meaning
+            words = words[-1:]
+        older = recent[:len(recent) - len(words)] if words and recent[-len(words):] == words else \
+            [w for w in recent if w not in words]
+        before = [*older[-3:], *[" ".join(str(e).split()) for e in (earlier or []) if str(e).strip()]][-3:]
         facts = dict(target or {})
         if not facts.get("role") and not facts.get("name") and not facts.get("element_name"):
             role, name = _element_parts(facts.get("element"))
@@ -1207,14 +1296,18 @@ class Hands:
         hwnd = args.get("window")
         names: list[str] = []
         if name == "tab":
-            with self._lock:
-                shown = list(self.last.tabs.get(int(hwnd), []) if str(hwnd).lstrip("-").isdigit() else [])
-            wanted = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
-            for n in wanted:
-                try:
-                    names.append(shown[int(n) - 1])
-                except (TypeError, ValueError, IndexError):
-                    continue
+            targets = args.get("_targets")
+            if isinstance(targets, list):
+                names = [str(t[1]) for t in targets]   # x3: found by title or number (:meth:`_tab_args`)
+            else:
+                with self._lock:
+                    shown = list(self.last.tabs.get(int(hwnd), []) if str(hwnd).lstrip("-").isdigit() else [])
+                wanted = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
+                for n in wanted:
+                    try:
+                        names.append(shown[int(n) - 1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
         call = judged_call(name, args, tab_names=names)
         if call is None:
             return
@@ -1569,8 +1662,9 @@ class Hands:
         if confirmed and name in ("open_url", "open_app"):
             self._opened = {k: v for k, v in self._opened.items() if started - v[0] < _OPEN_REPEAT_S}
             self._opened[key] = (time.monotonic(), report)
-        # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request
-        rest = " ".join(str(args.get("then") or "").split()) if name in OPEN_HANDS else ""
+        # fx2: an opening that leaves part of their request to do (the talker's own "then") is not the whole request;
+        # x3 (3b): nor is a window or tab step that does (a focus, a restore, a tab shown or opened first)
+        rest = " ".join(str(args.get("then") or "").split()) if name in THEN_HANDS else ""
         speak = bool(line) and confirmed and not rest
         if speak:
             words = " ".join(line.casefold().split())
@@ -1617,9 +1711,25 @@ class Hands:
             if self.log is not None:
                 self.log.event("hands", op="open_settle", hand=name, rest_chars=len(rest), call=params.tool_call_id,
                                **settle)
+            note = (self._note(_THEN_NOTE, _THEN_NOTE_LEAN) if name in OPEN_HANDS
+                    else self._note(_STEP_THEN_NOTE, _STEP_THEN_NOTE_LEAN))
             await params.result_callback({"done": report[:700], "then": rest[:200],
-                                          "how_to_handle_it": self._note(_THEN_NOTE, _THEN_NOTE_LEAN).format(
-                                              rest=rest[:200])})
+                                          "how_to_handle_it": note.format(rest=rest[:200])})
+            return
+        turn = self._call_safely(self.user_turn, None)
+        op = str(args.get("action") or ("show" if name == "tab" else ""))
+        if confirmed and not str(args.get("say_when_done") or "").strip() and op in STEP_FIRST_OPS.get(name, ()) \
+                and not (op == "new" and str(args.get("url") or "").strip()) \
+                and turn is not None and self._step_checks(turn) < self.STEP_CHECKS_PER_TURN:
+            # x3 (3b): a window or tab brought up with nothing said and no "then" is usually the first step of their
+            # request (live 10 Oct: three focuses ended the turn in silence and nothing else was done): the talker gets
+            # its turn back to do the rest, or stays quiet when that was all (at most twice per user turn: a focus,
+            # then a new tab; never a loop)
+            self._step_checked = (turn, self._step_checks(turn) + 1)
+            if self.log is not None:
+                self.log.event("hands", op=name, step_check=True, call=params.tool_call_id)
+            await params.result_callback({"done": report[:700], "said": "",
+                                          "how_to_handle_it": self._note(_STEP_CHECK_NOTE, _STEP_CHECK_NOTE_LEAN)})
             return
         if confirmed and not line:
             from pipecat.frames.frames import FunctionCallResultProperties
@@ -1644,6 +1754,13 @@ class Hands:
             # v3.18 (34-review H5): Act is off for that app in Settings: nothing is done there, by anyone
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _ACT_OFF_NOTE.format(
                 app=facts["act_off"])})
+            return
+        if isinstance(facts.get("choose"), dict):
+            # x3 (3f): several tabs fit the title: asked by title, never by number (live 10 Oct "which one's the
+            # YouTube tab, is it tab 10?" and "I need you to say which tab number")
+            choose = facts["choose"]
+            await params.result_callback({"not_done": report[:700], "how_to_handle_it": _TAB_CHOOSE_NOTE.format(
+                count=choose.get("count"), numbers=choose.get("numbers"), titles=choose.get("titles"))})
             return
         if ok and facts.get("expected"):
             # V6: done, and its effect cannot be read back by the nature of the target (a web page's scroll): no
@@ -1994,21 +2111,179 @@ class Hands:
 
     # -- Phase S: one of the user's skills as the talker's hand (yuki.skills; map-skills S3.4, S4.2, S4.3) ----------
 
-    #: The outcomes whose line code says itself (it settles the call: no talker run, no hand-off): a game in front,
-    #: Spotify playing on another device, "couldn't confirm", a plain failure, and the resolver's one question.
-    SKILL_SAID = ("held_game", "other_device", "unverified", "failed", "asked")
+    #: The outcomes whose line code always says itself (it settles the call: no talker run, no hand-off): a game in
+    #: front, Spotify playing on another device. x3 (fix-plan 3c): "couldn't confirm", a failure and the resolver's
+    #: question are no longer a stop: they fall back to the thinker doing it by steps (:meth:`_skill_fallback`), and
+    #: their line (:data:`SKILL_SAID_PLAIN`) is said by code only when no fallback may go (a skill that may already have
+    #: sent or joined, data that never hands over, a real question, no thinker to take it).
+    SKILL_SAID = ("held_game", "other_device")
+    SKILL_SAID_PLAIN = ("unverified", "failed", "asked", "refused", "error")
+    #: x3 (3c): the outcomes that fall back to the normal way (look at the screen, click, type) when they may.
+    SKILL_FALLBACK = ("handed_over", "unverified", "failed", "asked", "refused", "error", "timeout")
+    #: x3 (3d): a run_skill still running after this long (s) counts as not finished (far past any designed run).
+    SKILL_HAND_MAX_S = 60.0
     #: What the talker reads after a skill's line was said by code (nothing more to say).
     _SKILL_SAID_NOTE = ("Said aloud just now by code, word for word: {line} Say nothing more about it now. When they "
                         "answer a question in it, act on their answer (run_skill again with that slot, or keep_usual).")
+
+    #: x3 (3b): a silent first step (a focus, a tab shown or opened) gives the talker its turn back at most this often in
+    #: one user turn.
+    STEP_CHECKS_PER_TURN = 2
+
+    def _step_checks(self, turn: Any) -> int:
+        """How often a silent window or tab step gave the talker its turn back in this user turn (x3, 3b)."""
+        got = self._step_checked
+        return int(got[1]) if isinstance(got, tuple) and got[0] == turn else 0
+
+    def _skill_fallback(self, args: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any] | None:
+        """x3 (fix-plan 3c, principle 1): whether a run_skill that did not end in a checked done falls back to the
+        thinker doing it the normal way (look at the screen, click, type), and with what: ``{"why", "pin", "context",
+        "slot"}`` (``pin``: the skill's hand-off seed, :func:`yuki.skills.engine.pinned`, or ``None``), else ``None``.
+
+        It falls back on ``handed_over`` (the routes' own rung C), ``unverified``, ``failed``, ``error``, a run that never
+        finished (``timeout``), a refusal of the engine's (skills off, unknown, no route, memory slow) and the resolver's
+        question for a value the talker gave that it dropped (``dropped``: a misheard name, "hey meant" for Hemanth).
+        Never when: the run may already have sent or joined (rule 8: no second send; a join that did not take is never
+        followed by clicks), the skill's data says it is never handed over or that a rung that acted is never followed
+        (``handoff = false``, ``retry_after_acting = false``: a meeting tab's Join is the user's), the step is the user's
+        own (D24), a game is in front, Act is off there, Yuki's own check holds it with a question, the run went on
+        unsure words with no window (the volume skill, review r2 L3: the thinker would take one), the hands are halted
+        (the thinker has it already), a rung asked its own question, or the resolver asked for a slot the talker never
+        gave (a real question). A crash or a run that never finished counts as one that may have acted; a relative
+        change that may have acted is never done again. With x5Fallback's engine (it hands these over itself when a
+        second try is safe), an ``unverified``, ``failed``, ``asked`` or ``error`` that still reaches the voice is its
+        deliberate stop and is left as it is. Data and outcome codes only, never the words. Blocking (the catalog
+        read): off the loop."""
+        outcome = str(facts.get("outcome") or "")
+        if facts.get("verified") is True or outcome not in self.SKILL_FALLBACK:
+            return None
+        if (facts.get("handover") or facts.get("held") or facts.get("act_off") or facts.get("game_front")
+                or facts.get("unsure_focus") or facts.get("halted") or facts.get("sound_only")):
+            return None
+        from yuki.skills import engine
+
+        key = str(facts.get("skill") or args.get("skill") or "").strip()
+        given = {k: v for k, v in args.get("slots").items() if v not in (None, "", [], {})} \
+            if isinstance(args.get("slots"), dict) else {}
+        if outcome == "refused" and str(facts.get("say") or "") == engine.LINE_COMMIT_USER:
+            return None   # D24: the step is only the user's (they click Join): never Yuki's, by any hand
+        skill = _skill_def(key)
+        if outcome == "handed_over":
+            pin = facts.get("handoff_skill") if isinstance(facts.get("handoff_skill"), dict) else None
+            if pin is not None and pin.get("why") == engine.TO_PLANNER:
+                # a step of it would send or join: the planner decides with its consent rule (bSkill), as before
+                return {"why": "to_planner", "pin": pin, "context": None, "slot": None}
+            if pin is not None:
+                # rung C's own seed (x5Fallback's engine also hands over an unconfirmed rung, a dropped value and a
+                # crash this way): the note says what happened, by the seed's own why
+                return {"why": "handed_over", "pin": pin, "slot": None,
+                        "context": _pin_context(pin, _skill_words(skill, key))}
+        if skill is not None and not getattr(skill, "handoff", True):
+            return None
+        engine_hands_over = "voice" in tuple(getattr(engine, "HANDOFF_ORIGINS", ()) or ())
+        if outcome in ("unverified", "failed", "asked", "error") and engine_hands_over:
+            # x5Fallback's engine hands these over itself (an unconfirmed rung, a dropped value, a crash) whenever a
+            # second try is safe; what still ends this way is its deliberate stop (it may have sent, a rung's data
+            # forbids it, a relative change, a state already there, a result on another device, a real question):
+            # said plainly, never second-guessed here. With an engine that does not, the checks below decide
+            return None
+        values = facts.get("_values") if isinstance(facts.get("_values"), dict) else {}
+        acted = bool(facts.get("acted")) or outcome in ("unverified", "timeout", "error")
+        if skill is not None:
+            try:
+                from yuki.skills.connection import sends_with
+
+                sends = bool(sends_with(skill, values or given, partial=True))
+            except Exception:  # noqa: BLE001 - unknown: counted as one that sends (never a second send)
+                sends = True
+            try:
+                commits = engine.run_commit(skill) != "none"   # D24: a join (or any commit end) is never retried
+            except Exception:  # noqa: BLE001 - unknown: counted as a commit (never a second join)
+                commits = True
+            if acted and (sends or commits):
+                return None
+            route = next((r for r in getattr(skill, "routes", ()) or () if r.key == facts.get("route")), None)
+            if acted and route is not None and not getattr(route, "retry_after_acting", True):
+                return None
+            if acted and route is None and any(not getattr(r, "retry_after_acting", True)
+                                               for r in getattr(skill, "routes", ()) or ()):
+                return None   # a crash or a run that never finished: any rung whose data forbids a second try may be it
+            try:
+                relative = engine._absolute_values(skill, values or given) is None
+            except Exception:  # noqa: BLE001 - unknown: counted as relative (never done twice)
+                relative = True
+            if acted and relative:
+                return None   # "a bit quieter" that may have landed: done again it would change twice (x5's rule)
+        elif acted:
+            return None   # an unknown skill that acted: nothing says what a second try would do
+        why, slot = outcome, None
+        if outcome == "asked":
+            if facts.get("route") or skill is None:
+                return None   # a rung's own question (two equal tabs), or one we cannot place: said as it is
+            slot = _asked_slot(skill, facts.get("ask"), facts.get("options"))
+            if slot is None or slot not in given:
+                return None   # a value they never gave: a real question, said by code
+            why = "dropped"
+        if outcome == "handed_over":
+            why = "failed"    # a hand-off with no seed: the same as a plain failure
+        pin = None
+        if skill is not None and why in ("unverified", "failed", "error", "dropped"):
+            vals = dict(given) if why == "dropped" else dict(values)
+            if why == "dropped":
+                # the talker's values as the resolver types them (an entity or a person is {"name": ...})
+                for k, v in list(vals.items()):
+                    spec = skill.slot(k) if callable(getattr(skill, "slot", None)) else None
+                    if spec is not None and spec.type in ("entity", "person") and isinstance(v, str):
+                        vals[k] = {"name": v}
+            if vals:
+                # as x5Fallback's engine marks them: the slot it set aside "unheard", the talker's other values "given"
+                filled = {k: ("unheard" if k == slot else "given") for k in vals} if why == "dropped" else {}
+                try:
+                    pin = engine.pinned(skill, vals, filled, list(facts.get("_tried") or []), why=why)
+                except Exception:  # noqa: BLE001 - no seed: the request and the context alone
+                    pin = None
+        words = _skill_words(skill, key)
+        if why == "dropped":
+            value = given.get(slot)
+            value = value.get("name") if isinstance(value, dict) else value
+            context = SKILL_FALLBACK_CONTEXT["dropped"].format(skill=words, slot=slot, value=str(value)[:80])
+        elif why == "timeout":
+            context = SKILL_FALLBACK_CONTEXT["timeout"].format(skill=words, secs=f"{self.SKILL_HAND_MAX_S:g}")
+        else:
+            context = SKILL_FALLBACK_CONTEXT.get(why, SKILL_FALLBACK_CONTEXT["failed"]).format(skill=words)
+        return {"why": why, "pin": pin, "context": context, "slot": slot}
+
+    def _skill_late(self, key: str, task: Any, hand_id: str | None) -> None:
+        """x3 (3d): a run_skill that outlived :data:`SKILL_HAND_MAX_S` returned at last: its step is no longer running
+        (the same skill may be called again), and what it ended with is only logged (its result went long ago)."""
+        self._inflight.pop(key, None)
+        outcome = "error"
+        try:
+            if task.cancelled():
+                outcome = "cancelled"   # the loop went away (the conversation ended); the thread ran on its own
+            else:
+                _ok, _report, facts = task.result()
+                outcome = str((facts or {}).get("outcome") or "") or "none"
+        except Exception:  # noqa: BLE001
+            pass
+        if self.log is not None:
+            try:
+                self.log.event("hands", op=SKILL_HAND, late=True, skill_outcome=outcome, request_id=hand_id)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _handle_skill(self, params: Any) -> None:
         """Phase S: ``run_skill`` (one of the user's skills, :mod:`yuki.skills.engine`) or ``keep_usual``, off the loop.
 
         "Done" only on a seen result (D19): the done line (the connection's, filled by code) is said by code only when
         the skill's done-check saw the result, with "Keep this as your usual?" after it when the user's words named a
-        new usual. A game in front ("after the round?"), Spotify on another device, "couldn't confirm", a failure and
-        the resolver's question are said by code too, plainly; a hand-off goes to the thinker by code with the skill
-        pinned. The talker gets the report, never a second run to narrate it."""
+        new usual. A game in front ("after the round?") and Spotify on another device are said by code, plainly. x3
+        (fix-plan 3c): every other end but a checked done (its routes' hand-off, "couldn't confirm", a failure, a crash,
+        a refusal, the resolver's question for a value the talker gave, a run that never finished) goes to the thinker
+        by code, to do it the normal way with the skill's seed (:meth:`_skill_fallback`), unless it may have sent or
+        joined or its data forbids it: then its own line is said plainly, as before. The talker gets the report, never
+        a second run to narrate it. Not under pipecat's function timer (pipeline registers it with none): its own
+        backstop is :data:`SKILL_HAND_MAX_S`."""
         from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 
         name = params.function_name
@@ -2053,17 +2328,35 @@ class Hands:
         # follow joins the two (yuki.log.follow: a hand id also reads its turn's skill lines)
         turn = self._skill_request_id()       # read once: the hand id and the engine's request id name one turn
         hand_id = self._mint_hand_id(params.tool_call_id, key=turn or "voice")
+        # x3 (3d): run_skill is no longer cut off by pipecat's function timer (live 10 Oct 21:08:14 a 31.9 s run was
+        # cancelled at 30 s and its result never reached the talker). Its own backstop here is far past any designed
+        # run (budget, checks and a launch: ~20 s); past it the run counts as not finished (``timeout``) and falls back
+        # like any other, while the thread keeps the step marked running until it really returns
+        task = asyncio.ensure_future(asyncio.to_thread(self._skill_hand, args, hand_id, turn))
         try:
-            ok, report, facts = await asyncio.to_thread(self._skill_hand, args, hand_id, turn)
-        except Exception as exc:  # noqa: BLE001 - a crash is a failed run
-            ok, report, facts = False, f"{type(exc).__name__}: {exc}", {"outcome": "error", "verified": None}
+            done, _pending = await asyncio.wait({task}, timeout=self.SKILL_HAND_MAX_S)
         finally:
-            self._inflight.pop(key, None)
+            # also when this call is cancelled (the conversation ends): the counters come back, and a run still going
+            # keeps its step marked running until its thread returns (:meth:`_skill_late`)
+            if task.done():
+                self._inflight.pop(key, None)
+            else:
+                task.add_done_callback(lambda t, k=key, h=hand_id: self._skill_late(k, t, h))
             self.busy = max(0, self.busy - 1)
             if self.bridge is not None:
                 self.bridge.busy_tools = max(0, self.bridge.busy_tools - 1)
                 if self.bridge.gate is not None:
                     self.bridge.gate.poke()
+        if task in done:
+            try:
+                ok, report, facts = task.result()
+            except Exception as exc:  # noqa: BLE001 - a crash is a failed run
+                ok, report, facts = False, f"{type(exc).__name__}: {exc}", {"outcome": "error", "verified": None}
+        else:
+            ok, facts = False, {"outcome": "timeout", "verified": None, "skill": str(args.get("skill") or ""),
+                                "timed_out": True}
+            report = (f"It had not finished after {self.SKILL_HAND_MAX_S:g} s, so what it did is not known; nothing "
+                      f"was confirmed.")
         ms = round((time.monotonic() - started) * 1000)
         prefs = facts.pop("_prefs", None)
         if self.on_action is not None and facts.get("sent_at") is not None:
@@ -2084,8 +2377,29 @@ class Hands:
                 if self.last_skill and self.last_skill.get("run_key") == getattr(result, "run_key", None):
                     self.last_skill["outcome"] = "held_game"
                 report = f"Held: a game is in front, nothing was sent. Say: {HELD_LINE}"
+        # x3 (3c): any other outcome than a checked done falls back to the normal way (the thinker by steps) unless the
+        # run may already have sent or joined, its data says it is never handed over, or it is a real question; never
+        # with a game in front (read again here, as for the routes' own hand-off)
+        fallback = None
+        if facts.get("verified") is not True:
+            try:
+                fallback = await asyncio.to_thread(self._skill_fallback, args, facts)
+            except Exception as exc:  # noqa: BLE001 - no fallback known: the run's own line, as before
+                fallback = None
+                if self.log is not None:
+                    self.log.event("hands", op=name, fallback_error=type(exc).__name__, request_id=hand_id)
+            if fallback is not None and fallback.get("why") not in ("handed_over", "to_planner"):
+                game = await asyncio.to_thread(self._game_closed)
+                if game:
+                    from yuki.skills.resolve import HELD_LINE
+
+                    fallback = None
+                    facts.update(held="game", game_front=True, settled=True, say=HELD_LINE)
+                    report = f"Held: a game is in front, so nothing more is tried now. Say: {HELD_LINE}"
+        facts.pop("_values", None)
+        facts.pop("_tried", None)
         try:
-            await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id)
+            await self._skill_reply(params, name, args, ok, report, facts, ms, hand_id=hand_id, fallback=fallback)
         finally:
             self._hand_ids.pop(params.tool_call_id, None)
             if prefs is not None:
@@ -2100,25 +2414,23 @@ class Hands:
                                    request_id=hand_id)
 
     async def _skill_reply(self, params: Any, name: str, args: dict[str, Any], ok: bool, report: str,
-                           facts: dict[str, Any], ms: float, hand_id: str | None = None) -> None:
-        """The result of one ``run_skill``: the line code says (done only when verified), the hand-off with the skill
-        pinned, or the report for the talker."""
+                           facts: dict[str, Any], ms: float, hand_id: str | None = None,
+                           fallback: dict[str, Any] | None = None) -> None:
+        """The result of one ``run_skill``: the line code says (done only when verified), a hand-off to the thinker, or
+        the report for the talker.
+
+        x3 (fix-plan 3c): ``fallback`` (:meth:`_skill_fallback`): any outcome but a checked done goes to the thinker by
+        code, to do it the normal way (look at the screen, click, type), with the skill's seed when there is one and a
+        plain note of what happened; never a "say so plainly" stop. Only when no fallback may go (a skill that may have
+        sent or joined, data that never hands over, a real question) or the hand-off could not start is the skill's own
+        plain line said by code, as before."""
         from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
 
         outcome = str(facts.get("outcome") or "")
         verified = facts.get("verified") is True
-        line = ""
-        if verified:
-            line = str(facts.get("done_line") or "")
-            if facts.get("keep_question"):
-                from yuki.skills.prefs import keep_line
-
-                line = keep_line(line)
-        elif outcome in self.SKILL_SAID or facts.get("held") or facts.get("act_off") or facts.get("memory_slow"):
-            line = str(facts.get("say") or "")
-        if outcome in ("failed", "error") or (facts.get("refused") and not facts.get("held")
-                                               and not facts.get("act_off") and not facts.get("memory_slow")
-                                               and not facts.get("unsure_focus")):
+        if outcome in ("failed", "error", "timeout") or (facts.get("refused") and not facts.get("held")
+                                                         and not facts.get("act_off") and not facts.get("memory_slow")
+                                                         and not facts.get("unsure_focus")):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=facts.get("verified"))
         if self.on_step is not None:
@@ -2126,67 +2438,42 @@ class Hands:
                 self.on_step(name, hand_words(name, args, facts.get("app")), bool(ok and verified), report[:400], ms)
             except Exception:  # noqa: BLE001 - the screen never breaks a hand
                 pass
-        if self.log is not None:
-            self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
-                           request_id=hand_id,
-                           skill_outcome=outcome or None, verified=facts.get("verified"), done_line=bool(line),
-                           keep_question=bool(facts.get("keep_question")), focus_taken=bool(facts.get("focus_taken")),
-                           act_off=bool(facts.get("act_off")), memory_slow=bool(facts.get("memory_slow")),
-                           unsure_focus=bool(facts.get("unsure_focus")))
-        if facts.get("handover") and self.bridge is not None and callable(getattr(self.bridge, "escalate", None)):
+        can_pass = self.bridge is not None and callable(getattr(self.bridge, "escalate", None))
+        if facts.get("handover") and can_pass:
             # bTalk (design 3, L10): a skill run that would send or join is handed to the planner with the user's exact
             # words (its consent rule, commit check and send countdown decide), never refused silently
-            ack = False
-            try:
-                ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
-            except Exception:  # noqa: BLE001
-                ack = False
-            try:
-                passed = await self.bridge.escalate(params, name, args, report, acked=ack,
-                                                    context=HANDOVER_CONTEXT.format(hand=name))
-            except Exception as exc:  # noqa: BLE001
-                passed = False
-                if self.log is not None:
-                    self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
-            if passed:
-                if self.log is not None:
-                    self.log.event("hands", op=name, escalated=True, handover=True, acked=ack,
-                                   call=params.tool_call_id, request_id=hand_id)
-                if ack:
-                    self.bridge.acked()
-                await params.result_callback({"not_done": report[:700], "passed_on": True,
-                                              "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
-                                             properties=FunctionCallResultProperties(run_llm=ack))
+            if await self._skill_pass(params, name, args, report, context=HANDOVER_CONTEXT.format(hand=name),
+                                      skill=None, told=report, why="handover", hand_id=hand_id, ms=ms, facts=facts):
                 return
-        if outcome == "handed_over" and facts.get("handoff_skill") and self.bridge is not None \
-                and callable(getattr(self.bridge, "escalate", None)):
-            # rung C: its routes didn't get there; the thinker does it with the skill pinned (never with a game in
-            # front: read again just before this, D17(2))
-            ack = False
-            try:
-                ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
-            except Exception:  # noqa: BLE001
-                ack = False
-            try:
-                try:
-                    passed = await self.bridge.escalate(params, name, args, report, acked=ack,
-                                                        skill=facts["handoff_skill"])
-                except TypeError:   # a stand-in bridge without the skill argument
-                    passed = await self.bridge.escalate(params, name, args, report)
-            except Exception as exc:  # noqa: BLE001
-                passed = False
-                if self.log is not None:
-                    self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
-            if passed:
-                if self.log is not None:
-                    self.log.event("hands", op=name, escalated=True, acked=ack, call=params.tool_call_id,
-                                   request_id=hand_id)
-                if ack:
-                    self.bridge.acked()
-                await params.result_callback({"not_verified": report[:700], "passed_on": True,
-                                              "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
-                                             properties=FunctionCallResultProperties(run_llm=ack))
+        if fallback is not None and can_pass:
+            # x3 (3c, principle 1): the normal way, by the thinker: the seed (rung C's own, or one built from this run)
+            # and a plain note; a send or join step inside it is the planner's consent rule's, as before
+            why = str(fallback.get("why") or outcome)
+            told = (report if why == "to_planner"
+                    else SKILL_PASSED_REPORT.format(why=_WHY_WORDS.get(why, _WHY_WORDS["failed"])))
+            if await self._skill_pass(params, name, args, report, context=fallback.get("context"),
+                                      skill=fallback.get("pin"), told=told, why=why, hand_id=hand_id, ms=ms,
+                                      facts=facts):
                 return
+        line = ""
+        if verified:
+            line = str(facts.get("done_line") or "")
+            if facts.get("keep_question"):
+                from yuki.skills.prefs import keep_line
+
+                line = keep_line(line)
+        elif (outcome in self.SKILL_SAID or outcome in self.SKILL_SAID_PLAIN or facts.get("held")
+              or facts.get("act_off") or facts.get("memory_slow")):
+            # no fallback went (it may have sent or joined, its data never hands over, a real question, a game in
+            # front, or no thinker to take it): its own plain line, said by code, as before
+            line = str(facts.get("say") or "")
+            if not line and outcome == "error" and not facts.get("refused"):
+                from yuki.skills.engine import LINE_FAILED
+
+                line = LINE_FAILED
+        elif outcome == "timeout":
+            line = LINE_SKILL_TIMEOUT   # never tried again (it may have sent): said plainly, nothing handed over
+        self._skill_reply_log(params, name, ok, report, facts, ms, hand_id, line=bool(line), fallback=None)
         if line:
             await params.llm.push_frame(TTSSpeakFrame(text=line))
             await params.result_callback({"done" if verified else "result": report[:700], "said": line,
@@ -2196,7 +2483,7 @@ class Hands:
         if facts.get("unsure_focus"):
             await params.result_callback({"held": report[:700], "how_to_handle_it": _UNSURE_FOCUS_NOTE})
             return
-        if facts.get("held") and not line:
+        if facts.get("held"):
             question = str(facts.get("question") or "").strip() or "Ask whether they want exactly this."
             await params.result_callback({"held": report[:700],
                                           "how_to_handle_it": _JUDGE_HELD_NOTE.format(question=question)})
@@ -2204,6 +2491,58 @@ class Hands:
         note = self._note(_FAILED_NOTE, _FAILED_NOTE_LEAN) if not ok else self._note(_UNCONFIRMED_NOTE,
                                                                                       _UNCONFIRMED_NOTE_LEAN)
         await params.result_callback({"failed" if not ok else "not_verified": report[:700], "how_to_say_it": note})
+
+    def _skill_reply_log(self, params: Any, name: str, ok: bool, report: str, facts: dict[str, Any], ms: float,
+                         hand_id: str | None, *, line: bool, fallback: str | None, **more: Any) -> None:
+        """The skill hand's one ``hands`` line (content-free: codes, counts, flags)."""
+        if self.log is None:
+            return
+        self.log.event("hands", op=name, ok=ok, ms=ms, report_chars=len(report), call=params.tool_call_id,
+                       request_id=hand_id,
+                       skill_outcome=str(facts.get("outcome") or "") or None, verified=facts.get("verified"),
+                       done_line=line, keep_question=bool(facts.get("keep_question")),
+                       focus_taken=bool(facts.get("focus_taken")), act_off=bool(facts.get("act_off")),
+                       memory_slow=bool(facts.get("memory_slow")), unsure_focus=bool(facts.get("unsure_focus")),
+                       fallback=fallback, timed_out=bool(facts.get("timed_out")), **more)
+
+    async def _skill_pass(self, params: Any, name: str, args: dict[str, Any], report: str, *, context: str | None,
+                          skill: dict[str, Any] | None, told: str, why: str, hand_id: str | None, ms: float,
+                          facts: dict[str, Any]) -> bool:
+        """Hand a run_skill's request to the thinker by code (:meth:`VoiceBridge.escalate`, the user's own words with
+        ``context`` as labelled context and ``skill`` as the seed), and settle the talker's call: two or three words now
+        when nothing was said for their words yet, else nothing. ``False``: no job started (the caller says the line)."""
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        ack = False
+        try:
+            ack = bool(self.bridge.may_ack()) if callable(getattr(self.bridge, "may_ack", None)) else False
+        except Exception:  # noqa: BLE001
+            ack = False
+        pin = skill if isinstance(skill, dict) and skill.get("key") else None
+        try:
+            kwargs: dict[str, Any] = {"acked": ack}
+            if context:
+                kwargs["context"] = context
+            if pin is not None:
+                kwargs["skill"] = pin
+            try:
+                passed = await self.bridge.escalate(params, name, args, report, **kwargs)
+            except TypeError:   # a stand-in bridge without the v3.14 / v3.18 / phase S arguments
+                passed = await self.bridge.escalate(params, name, args, report)
+        except Exception as exc:  # noqa: BLE001 - then the skill's own line, as before
+            passed = False
+            if self.log is not None:
+                self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
+        if not passed:
+            return False
+        self._skill_reply_log(params, name, False, report, facts, ms, hand_id, line=False, fallback=why,
+                              escalated=True, acked=ack, handover=why == "handover", seed=pin is not None)
+        if ack:
+            self.bridge.acked()
+        await params.result_callback({"not_done": told[:700], "passed_on": True,
+                                      "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
+                                     properties=FunctionCallResultProperties(run_llm=ack))
+        return True
 
     def _skill_request_id(self) -> str | None:
         """The voice turn's id (``<session>-<n>``): one request per user turn, so a model calling a skill twice in one
@@ -2321,7 +2660,7 @@ class Hands:
         # takes no focus
         sound_only = skill_key == VOLUME_SKILL and bool(self._call_safely(self.unsure, False))
         if self.halted:
-            facts.update(refused=True, outcome="refused")
+            facts.update(refused=True, outcome="refused", halted=True)   # x3: the thinker has it already, never again
             return False, (f"your last hand did not show the effect it was for ({self.halted}); your hands stay still "
                            f"until the user speaks again. Nothing was done"), facts
         try:
@@ -2382,8 +2721,16 @@ class Hands:
         facts.update(more)
         facts["focus_taken"] = bool(result.focus_taken)
         facts["sent_at"] = state.get("sent_at")
+        # x3 (3c): what the fallback needs to know (RAM only, never logged): whether a rung may have acted (a verb ran,
+        # or a rung's check contradicted it), the run's values and what it tried (the hand-off seed is built from them)
+        facts["acted"] = bool(state.get("sent_at") is not None or result.outcome == "unverified"
+                              or any(t.get("outcome") == "contradicted" for t in result.tried or []))
+        facts["_values"] = dict(result.values or {})
+        facts["_tried"] = [dict(t) for t in result.tried or [] if isinstance(t, dict)]
         if facts.get("held") == "game":
             facts["game_front"] = True
+        if sound_only:
+            facts["sound_only"] = True   # x3: on unsure words, never handed to the thinker (it would take a window)
         if resolve_wait is not None and resolve_wait.slow:
             # review r2 M3: memory didn't answer the resolve in time: nothing ran (no rung, no ledger row), said plainly
             facts.update(outcome="refused", refused=True, memory_slow=True, say=MEMORY_SLOW_LINE, settled=True,
@@ -2658,6 +3005,8 @@ class Hands:
                 # off (their schemas are gone; a call written anyway is refused here, nothing moved)
                 raise _Refused("the volume is run_skill volume in this conversation (code picks their usual control); "
                                "nothing was changed")
+            if name == "tab":
+                args = self._tab_args(args)   # x3 (3f): tabs named by title found first (the check reads their titles)
             if name != SKILL_HAND:
                 self._check_hand(name, args)   # v3.18: a close, a tab close, a held kind: Yuki's own check first
             ok, report, facts = self._act(name, args, facts)
@@ -2673,6 +3022,8 @@ class Hands:
                 facts["act_off"] = exc.act_off   # ... or says Act is off for that app in Settings (v3.18)
             if exc.handover:
                 facts["handover"] = True   # ... or (bTalk) it goes to the planner by code: never refused silently
+            if exc.choose is not None:
+                facts["choose"] = exc.choose   # ... or (x3) it asks which tab, by title
             if exc.stale:
                 # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
                 # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
@@ -3268,62 +3619,206 @@ class Hands:
             return self._tab_close(args, facts)
         if action == "reopen":
             return self._tab_reopen(args, facts)
+        if action == "new":
+            return self._tab_new(args, facts)
         hwnd = self._window(args)
         select = getattr(self.backend, "select_tab", None)
         if not callable(select):
             raise _Refused("this desktop has no tab hand")
-        try:
-            index = int(args.get("tab"))
-        except (TypeError, ValueError):
-            raise _Refused("give the tab's number from the tabs line") from None
-        with self._lock:
-            shown = list(self.last.tabs.get(hwnd) or [])
-        if not 1 <= index <= len(shown):
-            raise _Refused(f"tab {index} of window {hwnd} is not on the tabs line you were shown; nothing was done",
-                           stale=True)
-        facts["target"] = f'TabItem "{shown[index - 1][:80]}"'
+        targets = args.get("_targets")
+        if isinstance(targets, list) and targets:
+            index, title = int(targets[0][0]), str(targets[0][1])
+        else:
+            try:
+                index = int(args.get("tab"))
+            except (TypeError, ValueError):
+                raise _Refused("name the tab by its title (title), or give its number from the tabs line; nothing "
+                               "was done") from None
+            with self._lock:
+                shown = list(self.last.tabs.get(hwnd) or [])
+            if not 1 <= index <= len(shown):
+                raise _Refused(f"tab {index} of window {hwnd} is not on the tabs line you were shown; nothing was "
+                               f"done", stale=True)
+            title = shown[index - 1]
+        facts["target"] = f'TabItem "{title[:80]}"'
         facts["sent_at"] = time.monotonic()
-        result = select(hwnd, index, expect_name=shown[index - 1])
+        result = select(hwnd, index, expect_name=title)
         ok, report, facts = self._report(result, "", facts)
         facts["verified"] = bool(_detail(result, "verified")) if ok else False
         if ok and self._foreground() != hwnd:
             report = self._front(hwnd) + report
         return ok, report, facts
 
+    # -- x3 (fix-plan 3f): tabs by title, and a new tab ------------------------------------------------------------
+
+    def _tab_strip(self, hwnd: int) -> tuple[list[str], list[str]]:
+        """``(names, ids)`` of a window's tabs, in strip order: what the talker was shown for the window in front (the
+        tabs line); any other window's read now, bounded, and kept a short while (:attr:`_other_tabs`) so a second call
+        naming those tabs by number goes by the same read. ``([], [])``: no tabs can be read there."""
+        with self._lock:
+            names = list(self.last.tabs.get(hwnd) or [])
+            ids = list(self.last.tab_ids.get(hwnd) or [])
+        if names:
+            return names, ids
+        kept = self._other_tabs.get(hwnd)
+        if kept is not None and time.monotonic() - kept[2] < _TABS_FRESH_S:
+            return list(kept[0]), list(kept[1])
+        read = getattr(self.backend, "read_tabs", None)
+        if not callable(read):
+            return [], []
+        try:
+            strip = read(int(hwnd), budget_s=_OTHER_TABS_BUDGET_S)
+        except Exception:  # noqa: BLE001 - no tabs read: the caller refuses (the thinker reads the window itself)
+            return [], []
+        tabs = list(getattr(strip, "tabs", None) or [])
+        names = [str(t.name) for t in tabs]
+        ids = [str(getattr(t, "tab_id", "") or "") for t in tabs]
+        if names:
+            self._other_tabs = {h: v for h, v in self._other_tabs.items() if time.monotonic() - v[2] < _TABS_FRESH_S}
+            self._other_tabs[hwnd] = (names, ids, time.monotonic())
+        return names, ids
+
+    def _tab_args(self, args: dict[str, Any]) -> dict[str, Any]:
+        """A tab hand's arguments with the tabs it acts on found (``_targets``: ``[(number, title, id)]``), for show and
+        close: by their numbers when given, else by ``title``. A title is one tab's when exactly one tab's title holds
+        those words (:func:`tabs_titled`); none matching is refused as stale (the thinker reads the window afresh, by
+        code), several matching is refused with their titles, so the talker asks by title, never for a number. ``new``
+        gets the window's browser (``_app``). Raises :class:`_Refused`; returns a copy (the call's own words untouched)."""
+        action = str(args.get("action") or "show")
+        out = dict(args)
+        if action in ("reopen",):
+            return out
+        hwnd = self._window(args)
+        if action == "new":
+            out["_app"] = self._browser_app(hwnd)
+            return out
+        numbers = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
+        title = " ".join(str(args.get("title") or "").split())
+        if not numbers and not title:
+            raise _Refused("name the tab by its title (title: its words on the tabs line, or the part they said); "
+                           "nothing was done")
+        names, ids = self._tab_strip(hwnd)
+        if not names:
+            raise _Refused(f"the tabs of window {hwnd} could not be read; nothing was done", stale=True)
+        if numbers:
+            try:
+                wanted = sorted({int(n) for n in numbers})
+            except (TypeError, ValueError):
+                raise _Refused("give the tabs' numbers from the tabs line, or the tab's title in title") from None
+            bad = [n for n in wanted if not 1 <= n <= len(names)]
+            if bad:
+                raise _Refused(f"tab {', '.join(str(n) for n in bad)} of window {hwnd} is not on the tabs line you were "
+                               f"shown; nothing was done", stale=True)
+            if title and not all(tabs_titled(title, [names[n - 1]]) for n in wanted):
+                # the number and the title disagree (the strip moved since it was shown): the title decides
+                numbers = []
+            else:
+                out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "") for n in wanted]
+                return out
+        hits = tabs_titled(title, names)
+        if not hits:
+            raise _Refused(f"no tab of window {hwnd} has a title with those words; nothing was done", stale=True)
+        if len(hits) > 1:
+            listed = "; ".join(f'"{names[n - 1][:60]}"' for n in hits[:6])
+            raise _Refused(f"{len(hits)} tabs of window {hwnd} fit that title: {listed}. Nothing was done",
+                           choose={"count": len(hits), "numbers": ", ".join(str(n) for n in hits[:6]),
+                                   "titles": listed})
+        out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "") for n in hits]
+        return out
+
+    def _browser_app(self, hwnd: int) -> str | None:
+        """The app a window is, as the Start menu names it (``Arc``, ``Google Chrome``), for opening an address in that
+        very browser: memory's name for its process, else the process name without ``.exe``. ``None``: unknown."""
+        process = self._app_at(hwnd)
+        if not process:
+            return None
+        stem = str(process)[:-4] if str(process).casefold().endswith(".exe") else str(process)
+        try:
+            from yuki.core import appnames
+
+            return str(appnames.name_for_key(str(process), fallback=stem) or stem) or None
+        except Exception:  # noqa: BLE001 - the process name is enough for the Start menu's substring match
+            return stem or None
+
+    def _tab_new(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        """A new tab in that window (x3, 3f; live 10 Oct "open a new tab, open YouTube" was refused three times: the
+        hand had no new tab). With ``url``: the address opened in that window's own browser (the open_url hand with
+        ``app`` = that browser: a new tab of its own, verified at the address and titled). Without: the browser's own
+        new-tab key in that window, verified by a new tab selected on its strip (Arc's key opens its command bar, not
+        a tab: that is not verified, so the thinker gets it by code)."""
+        hwnd = self._window(args)
+        url = str(args.get("url") or "").strip()
+        app = args.get("_app") or self._browser_app(hwnd)
+        if url:
+            if not app:
+                raise _Refused(f"window {hwnd}'s browser is not known, so nothing was opened; open_url with the app "
+                               f"they named does it")
+            facts["app"] = app
+            ok, report, facts = self._open_url({"url": url, "app": app}, facts)
+            facts["target"] = url[:160]
+            return ok, report, facts
+        read = getattr(self.backend, "read_tabs", None)
+        before = None
+        if callable(read):
+            try:
+                before = read(hwnd, budget_s=_OTHER_TABS_BUDGET_S)
+            except Exception:  # noqa: BLE001 - then no verdict can be had
+                before = None
+        seen = {(getattr(t, "tab_id", "") or t.name) for t in getattr(before, "tabs", None) or []}
+        facts["target"] = f'a new tab of window {hwnd}'
+        lead = self._front(hwnd)
+        facts["sent_at"] = time.monotonic()
+        result = self.backend.hotkey("ctrl", "t", expect_hwnd=hwnd)
+        ok, report, facts = self._report(result, lead, facts)
+        if not ok or before is None or not getattr(before, "tabs", None):
+            facts["verified"] = False if not ok else None
+            return ok, report, facts
+        deadline = time.monotonic() + _NEW_TAB_WAIT_S
+        fresh = None
+        while True:
+            try:
+                strip = read(hwnd, budget_s=0.3)
+            except Exception:  # noqa: BLE001
+                strip = None
+            new = [t for t in getattr(strip, "tabs", None) or [] if (getattr(t, "tab_id", "") or t.name) not in seen]
+            fresh = next((t for t in new if t.selected), None)
+            if fresh is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(_POLL_S * 2)
+        facts["verified"] = fresh is not None
+        if fresh is None:
+            return ok, (f"{report}; no new tab came up in window {hwnd} within {_NEW_TAB_WAIT_S:g} s (the key may have "
+                        f"opened something else, such as a command bar)"), facts
+        return ok, f"a new tab is showing in window {hwnd}: tab {fresh.index}, \"{fresh.name}\". ({report})", facts
+
     def _tab_close(self, args: dict[str, Any], facts: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
-        """Close exactly the tabs named by their numbers on the tabs line, each by its identity."""
+        """Close exactly the tabs the user named (found by title or number, :meth:`_tab_args`), each by its identity."""
         hwnd = self._window(args)
         act = getattr(self.backend, "tab", None)
         if not callable(act):
             raise _Refused("this desktop cannot close a tab by its identity; hand it to the thinker")
-        numbers = [args.get("tab")] if args.get("tab") is not None else []
-        numbers += list(args.get("tabs") or [])
-        try:
-            wanted = sorted({int(n) for n in numbers})
-        except (TypeError, ValueError):
-            raise _Refused("give the tabs' numbers from the tabs line") from None
-        with self._lock:
-            names = list(self.last.tabs.get(hwnd) or [])
-            ids = list(self.last.tab_ids.get(hwnd) or [])
-        if not wanted:
-            raise _Refused("name the tab (or tabs) to close by the numbers on the tabs line; nothing was closed")
-        if not str(args.get("named") or "").strip():
+        targets = args.get("_targets")
+        if not isinstance(targets, list) or not targets:
+            raise _Refused("name the tab (or tabs) to close by title (or their numbers on the tabs line); nothing was "
+                           "closed")
+        if not str(args.get("named") or args.get("title") or "").strip():
+            # x3 (3f): a tab named by title carries the words that name it (the part they said); by number alone, the
+            # talker says which of their words name each one
             raise _Refused("say in named which of the user's words name each tab to close; a tab their words do "
                            "not name is never closed. Nothing was closed")
-        if any(not 1 <= n <= len(names) for n in wanted):
-            raise _Refused(f"not every tab {wanted} of window {hwnd} is on the tabs line you were shown; nothing "
-                           f"was closed", stale=True)
-        if any(not ids[n - 1] for n in wanted):
+        if any(not t[2] for t in targets):
             raise _Refused("those tabs have no identity to close them by; hand it to the thinker. Nothing was closed")
-        facts["target"] = "TabItem " + ", ".join(f'"{names[n - 1][:60]}"' for n in wanted)
+        facts["target"] = "TabItem " + ", ".join(f'"{str(t[1])[:60]}"' for t in targets)
         facts["sent_at"] = time.monotonic()
         closed, failed, lines = [], [], []
-        for n in wanted:
-            result = act(hwnd, ids[n - 1], "close")
+        for _n, title, tab_id in targets:
+            result = act(hwnd, tab_id, "close")
             good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
-            (closed if good else failed).append(names[n - 1])
+            (closed if good else failed).append(title)
             lines.append(str(getattr(result, "summary", "")))
             facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
+        if closed:
+            self._other_tabs.pop(hwnd, None)   # that window's strip changed: a later call reads it again
         facts["verified"] = bool(closed) and not failed
         report = "; ".join(lines)
         if closed:
@@ -3740,6 +4235,40 @@ def same_tab(expected: str, name: str) -> bool:
     return sum(1 for w in want if w in have) / len(want) >= 0.6
 
 
+def tabs_titled(title: str, names: list[str]) -> list[int]:
+    """The tabs (1-based places in ``names``) a title names (x3, 3f), the first rule that finds any: the tabs whose
+    title is it exactly (case and spacing aside); a title the tabs line cut with "…" that starts theirs; those whose
+    title holds its words in a row, whole words ("YouTube" names "(1646) YouTube", never "Arc" in "Search"); else
+    those that share most of its words (:func:`same_tab`: titles drift). The title's identity, never what it means."""
+    def norm(text: str) -> str:
+        return " ".join(str(text or "").casefold().split())
+
+    def words(text: str) -> list[str]:
+        return "".join(ch.casefold() if ch.isalnum() else " " for ch in str(text or "")).split()
+
+    cut = norm(title).endswith("…")
+    want = norm(title).rstrip("…").strip()
+    if not want:
+        return []
+    exact = [i for i, n in enumerate(names, 1) if norm(n) == want]
+    if exact:
+        return exact
+    if cut:
+        starts = [i for i, n in enumerate(names, 1) if norm(n).startswith(want)]
+        if starts:
+            return starts
+    run = words(want)
+
+    def holds(name: str) -> bool:
+        have = words(name)
+        return bool(run) and any(have[k:k + len(run)] == run for k in range(len(have) - len(run) + 1))
+
+    held = [i for i, n in enumerate(names, 1) if holds(n)]
+    if held:
+        return held
+    return [i for i, n in enumerate(names, 1) if same_tab(want, str(n))]
+
+
 def _detail(result: Any, key: str) -> Any:
     details = getattr(result, "details", None)
     return details.get(key) if isinstance(details, dict) else None
@@ -3760,6 +4289,9 @@ def hand_words(name: str, args: dict[str, Any], app: Any = None) -> str:
     feedback 12 and 14). ``app``: the window's app the hand acted in, when its facts name it."""
     from yuki.ui.step_words import describe_hand
 
+    if name == "tab" and str(args.get("action") or "") == "new" and str(args.get("url") or "").strip():
+        # x3 (3f): a new tab with an address is an opening in that window's browser, in the opening's words
+        name, args = "open_url", {"url": str(args.get("url") or "").strip(), "app": app}
     try:
         return describe_hand(name, args, app=app if isinstance(app, str) else None)
     except Exception:  # noqa: BLE001 - presentation only
@@ -3769,8 +4301,8 @@ def hand_words(name: str, args: dict[str, Any], app: Any = None) -> str:
 def _what(name: str, args: dict[str, Any]) -> str:
     """One line naming a hand's action from its arguments (for the shared action log the mouth reads; never shown)."""
     parts = [name]
-    for key in ("skill", "window", "tab", "action", "direction", "amount", "keep", "key", "keys", "times", "url", "app",
-                "name", "level", "change", "mute", "page"):
+    for key in ("skill", "window", "tab", "title", "action", "direction", "amount", "keep", "key", "keys", "times", "url",
+                "app", "name", "level", "change", "mute", "page"):
         if args.get(key) not in (None, "", []):
             parts.append(f"{key}={args[key]}")
     return " ".join(str(p) for p in parts)
@@ -3824,6 +4356,10 @@ def judged_call(name: str, args: dict[str, Any], *, tab_names: list[str] | None 
         return "window_action", {"hwnd": w, "action": str(args.get("action") or "")}
     if name == "tab":
         action = str(args.get("action") or "show")
+        if action == "new" and str(args.get("url") or "").strip():
+            # x3 (3f): a new tab with an address is an opening in that window's own browser, judged as the opening
+            app = args.get("_app")
+            return "open_url", {"url": str(args.get("url") or "").strip(), **({"app": app} if app else {})}
         out: dict[str, Any] = {"hwnd": w, "action": action}
         if action == "close":
             out["tabs"] = list(tab_names or [])
@@ -3869,6 +4405,96 @@ def hand_run(trace: dict[str, Any], *, session_id: Any, injected: list[int]) -> 
 #: could send or join (design 3, L10): the user's exact words go with it as their words.
 HANDOVER_CONTEXT = ("Yuki's voice did not run its {hand} hand: the step could send, post or join something, which only "
                     "a plan does, from the user's own words (the consent rule and the commit check decide).")
+#: x3 (fix-plan 3c, principle 1): what the thinker is told, as labelled context, when a run_skill of the talker's did not
+#: end in a checked done and falls back to the normal way (look at the screen, click, type). Code words never reach it:
+#: each outcome has its own plain note. ``{skill}``: :func:`_skill_words`.
+_BY_STEPS = "Do it the normal way, by steps: look at the screen, click and type."
+SKILL_FALLBACK_CONTEXT: dict[str, str] = {
+    "handed_over": "Yuki's voice ran their usual way ({skill}) and its own routes did not get there. " + _BY_STEPS
+                   + " Do not run that skill again.",
+    "unverified": "Yuki's voice ran their usual way ({skill}): it acted, but the PC could not confirm the result. Look "
+                  "at the screen first: when it is not done, finish it by steps (click, type). Do not run that skill "
+                  "again.",
+    "failed": "Yuki's voice tried their usual way ({skill}) and it did not work. " + _BY_STEPS
+              + " Do not run that skill again.",
+    "error": "Yuki's voice tried their usual way ({skill}) and it stopped with an error. Look at the screen first: it "
+             "may have done part of it. " + _BY_STEPS + " Do not run that skill again.",
+    "refused": "Yuki's voice could not run their usual way ({skill}), so nothing was done by it. " + _BY_STEPS,
+    "dropped": "Yuki's voice tried their usual way ({skill}) with {slot} \"{value}\" (Yuki's reading of their words), "
+               "but the skill set that value aside because those exact words were not in what speech recognition "
+               "heard (a name can be misheard), so it did not run. Work out the {slot} from their words and memory, "
+               "then do it by steps: look at the screen, click and type. Do not run that skill again.",
+    "timeout": "Yuki's voice ran their usual way ({skill}) and it had not finished after {secs} s, so what it did is "
+               "not known. Look at the screen first: it may be done, or half done. Finish it by steps (click, type). "
+               "Do not run that skill again.",
+}
+#: What the talker reads for a run_skill that fell back to the thinker (x3): never the skill's own "say so plainly".
+SKILL_PASSED_REPORT = ("Its own way did not get there ({why}), so the thinker is doing their request now by steps, with "
+                       "the screen; its outcome comes back to you.")
+_WHY_WORDS = {"handed_over": "its routes didn't reach it", "unverified": "the PC couldn't confirm it",
+              "failed": "it didn't work", "error": "it stopped with an error", "refused": "it couldn't run",
+              "dropped": "it set aside a name it was given", "timeout": "it took too long"}
+#: Said by code for a run_skill that never finished when no fallback may go (one that may have sent or joined, or a
+#: relative change that may have landed): nothing more is tried.
+LINE_SKILL_TIMEOUT = "That's taking far too long, and I can't tell whether it worked, so I've left it there."
+
+
+def _pin_context(pin: dict[str, Any], skill_words: str) -> str:
+    """The thinker's note for a rung C seed (:func:`yuki.skills.engine.pinned`), by the seed's own ``why``: an
+    unconfirmed rung (``unverified``), a crash (``error``), a dropped value (``dropped``: the slot x5Fallback's seed marks
+    ``unheard``, with the value given), else its routes didn't get there. Code words in, plain words out."""
+    why = str(pin.get("why") or "")
+    if why in ("unverified", "error"):
+        return SKILL_FALLBACK_CONTEXT[why].format(skill=skill_words)
+    if why == "dropped":
+        slots = pin.get("slots") if isinstance(pin.get("slots"), dict) else {}
+        name, value = next(((k, s.get("value")) for k, s in slots.items()
+                            if isinstance(s, dict) and s.get("from") == "unheard"), (None, None))
+        if name:
+            value = value.get("name") if isinstance(value, dict) else value
+            return SKILL_FALLBACK_CONTEXT["dropped"].format(skill=skill_words, slot=name, value=str(value or "")[:80])
+    return SKILL_FALLBACK_CONTEXT["handed_over"].format(skill=skill_words)
+
+
+def _skill_def(key: str) -> Any:
+    """The catalog entry for a skill key (:func:`yuki.skills.catalog.load`), or ``None`` (unknown, or unreadable)."""
+    if not key:
+        return None
+    try:
+        from yuki.skills.catalog import load
+
+        return load().get(key)
+    except Exception:  # noqa: BLE001 - unknown: the fallback treats it as one that may have acted
+        return None
+
+
+def _skill_words(skill: Any, key: str) -> str:
+    """A skill as the thinker's note names it: a learned one by its name and the capability it specialises (never its
+    free-text menu line, which can name a browser it does not bind), a capability by its key and menu line."""
+    if skill is None:
+        return key or "a skill"
+    if getattr(skill, "learned", False):
+        name = str(getattr(skill, "name", "") or "").strip()
+        return f"\"{name[:80]}\", a learned way to {getattr(skill, 'capability', '') or key}" if name else key
+    menu = " ".join(str(getattr(skill, "menu", "") or "").split())
+    return f"{key}: {menu[:140]}" if menu else key
+
+
+def _asked_slot(skill: Any, ask: Any, options: Any) -> str | None:
+    """Which slot the resolver's question was for (:class:`yuki.skills.resolve.Ask`): the slot whose own question (its
+    data, or "Which <slot>?") is the one asked; else, for a question listing the media playing (the only question not
+    from the data), the slot filled from what plays. Code data and string identity only, never what the words mean."""
+    asked = " ".join(str(ask or "").split()).casefold()
+    slots = list(getattr(skill, "slots", ()) or ())
+    for slot in slots:
+        own = " ".join(str(getattr(slot, "ask", "") or f"Which {slot.name}?").split()).casefold()
+        if asked and own == asked:
+            return str(slot.name)
+    if options:
+        playing = [s for s in slots if getattr(s, "live", "") == "playing"]
+        if len(playing) == 1:
+            return str(playing[0].name)
+    return None
 
 
 class _Refused(Exception):
@@ -3879,10 +4505,12 @@ class _Refused(Exception):
     """
 
     def __init__(self, message: str, *, stale: bool = False, held: str | None = None,
-                 act_off: str | None = None, handover: bool = False) -> None:
+                 act_off: str | None = None, handover: bool = False, choose: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         #: bTalk (``brain = "all"``): the step could send or join: handed over to the planner by code (design 3, L10).
         self.handover = handover
+        #: x3 (3f): several tabs fit the title given: ``{"count", "numbers", "titles"}`` (the talker asks by title).
+        self.choose = choose
         self.stale = stale
         #: Held by the authorization check (v3.18): its question for the user (``""`` without one); ``None``: not held.
         self.held = held
