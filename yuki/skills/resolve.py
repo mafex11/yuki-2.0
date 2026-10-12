@@ -22,18 +22,24 @@ eval). Step by step:
    slot, or a text slot the capability binds to a ``contact``: ``message``'s ``person``) may also be a name the
    people index resolves to exactly one person whom the words name as heard: a learned misheard form ("hey meant"),
    a transliteration ("हेमंत") or a close mishearing by sound (:func:`yuki.memory.contacts.names_person`); a group
-   chat or channel still needs its name as said. A name the user said that none of their people goes by as written
-   but that sounds like exactly one of them is asked about (:data:`CONFIRM_PERSON`: "Did you mean Hemanth?"), never
-   swapped: sound only confirms a name the talker or thinker inferred. An app may also be one whose known names (its
-   key, a web address's name, a chat app's title, the names the user's timeline shows it under) stand in the words, or
-   are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a site) one whose
-   identity stands there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot name returned
-   (``dropped``), never "corrected".
+   chat or channel still needs its name as said. A name the user said in another script than their people's names
+   runs as the one person it reads as ("हेमंत" as Hemanth: a conversion). A Latin name the user said that none of
+   their people goes by as written but that sounds like exactly one of them is asked about once
+   (:data:`CONFIRM_PERSON`: "Did you mean Hemanth?"), never swapped: sound only confirms a name the talker or thinker
+   inferred, and the same name given again within the exchange runs as said. An app may also be one whose known
+   names (its key, a web address's name, a chat app's title, the names the user's timeline shows it under) stand in
+   the words, or are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a
+   site) one whose identity stands there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot
+   name returned (``dropped``), never "corrected".
 2. **Fill what is missing**, in :data:`FILL_ORDER`: what the user said always first (an app their words name, the
-   newest turn that names one, for an app slot; :func:`named_app`), so a value they said beats a learned skill's
-   bound value (only its default; a value they said for a bound slot that is another one runs the capability), its
-   fill policy, a preference and a live guess -> "again" (the last run's numbers within 10 minutes) -> told -> a live
-   fact (``playing``: the app playing now; two playing is a question) -> the preference
+   newest turn that names one, for an app slot; :func:`named_app`; never an app Yuki itself just acted in
+   (:func:`just_acted`: a turn may name it to complain), and with a call live, for a slot that asks in a call, only
+   the newest turn and never the call's own app (:func:`call_apps`); when the caller gave an app the words don't hold
+   and the words name another, the two readings disagree and it is asked with the slot dropped, never swapped), so a
+   value they said beats a learned skill's bound value (only its default; a value they said for a bound slot that is
+   another one runs the capability), its fill policy, a preference and a live guess -> "again" (the last run's
+   numbers within 10 minutes) -> told -> a live fact (``playing``: the app playing now; two playing is a question)
+   -> the preference
    (:func:`yuki.skills.prefs.choose`) -> taste (:func:`yuki.skills.taste.top`) -> the connection's default. A text
    the caller gave for what to write that the words don't hold is asked about, never replaced by its default.
 3. **Name what was not said.** A value from a preference that is not the usual, from taste or from a default is
@@ -52,7 +58,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from yuki.skills.catalog import load
 from yuki.skills.connection import Loaded, Route, Skill, Slot, fill
@@ -77,6 +83,13 @@ SITE_BIND = "site"
 #: The question when the user said a name none of their people (nor a group chat or channel) goes by, and it sounds
 #: like exactly one of them: asked, never swapped (a message to someone who merely sounds alike is a wrong send).
 CONFIRM_PERSON = "Did you mean {name}?"
+#: How far back "what Yuki just did" reaches (:func:`just_acted`): the exchange's turns span about 120 s (fix-plan
+#: IF-words), and the run they may talk about ended before them (the longest run tonight took 47 s).
+JUST_ACTED_S = 180.0
+#: A confirm question (:data:`CONFIRM_PERSON`) is asked once per name within this long (the exchange's span): the same
+#: literal name given again means the answer was no, so it runs as said and the chat driver says it doesn't know who
+#: that is, rather than asking the same question again. RAM only, never logged.
+CONFIRM_ONCE_S = 120.0
 
 
 @dataclass
@@ -428,6 +441,42 @@ def _sounds_like(store: Any) -> Callable[[str], str | None]:
     return check
 
 
+def _written(store: Any) -> Callable[[str], str | None]:
+    """``name -> the person's own name | None`` for a name the user said in another script than their people's names
+    ("हेमंत"): the one person it reads as, letter for letter (:func:`yuki.memory.contacts.transliterated`: a
+    conversion, not a mishearing), so it runs as that person without a question; ``None`` for a Latin name, or one
+    that reads as nobody or as two people."""
+    def check(name: str) -> str | None:
+        if store is None:
+            return None
+        try:
+            from yuki.memory.contacts import transliterated
+
+            got = transliterated(store, name)
+        except Exception:  # noqa: BLE001
+            return None
+        return (" ".join(str(getattr(got, "name", "") or "").split()) or None) if got is not None else None
+
+    return check
+
+
+_confirm_lock = threading.Lock()
+#: (skill's capability, slot, the name as said, folded) -> when :data:`CONFIRM_PERSON` was last asked about it (RAM).
+_confirms: dict[tuple[str, str, str], float] = {}
+
+
+def _first_confirm(key: tuple[str, str, str], now: float) -> bool:
+    """Whether the confirm question about ``key`` is new within :data:`CONFIRM_ONCE_S` (and note it asked now). The
+    same literal name given again after the question means the answer was no (a yes gives the person's own name)."""
+    with _confirm_lock:
+        for k in [k for k, at in _confirms.items() if not (0.0 <= now - at <= CONFIRM_ONCE_S)]:
+            _confirms.pop(k, None)
+        if key in _confirms:
+            return False
+        _confirms[key] = now
+        return True
+
+
 def _identity(slot: Slot | None, value: Any) -> str:
     """A slot value as one identity, to compare a value the user said with a learned skill's bound one: an app by its
     key, anything else as a preference scope compares it (:func:`yuki.skills.connection.scope_value`)."""
@@ -464,9 +513,17 @@ def _tidy(key: str) -> str:
         return key
 
 
+_chats_cache: list[tuple[float, dict[str, tuple[str, set[str]]]]] = []
+
+
 def _chat_titles() -> dict[str, tuple[str, set[str]]]:
     """Each chat app's file name -> (its title, every identity its data gives it: the file name, the title, its
-    programs, its images' keys and its services), from the connection files' ``[chat]`` tables."""
+    programs, its images' keys and its services), from the connection files' ``[chat]`` tables (read again at most
+    once a minute: a resolve asks for it once per app it compares)."""
+    now = time.monotonic()
+    with _apps_lock:
+        if _chats_cache and now - _chats_cache[0][0] < 60.0:
+            return _chats_cache[0][1]
     out: dict[str, tuple[str, set[str]]] = {}
     try:
         from yuki.skills.chat import app_data, chat_apps
@@ -477,17 +534,20 @@ def _chat_titles() -> dict[str, tuple[str, set[str]]]:
             ids = {stem, title.casefold(), *(str(x).casefold() for x in d.get("services") or []),
                    *(app_name(x) for x in d.get("processes") or []), *(app_name(x) for x in d.get("images") or [])}
             out[stem] = (title, {i for i in ids if i})
-    except Exception:  # noqa: BLE001 - no chat data: none named by it
-        pass
+    except Exception:  # noqa: BLE001 - no chat data: none named by it (not kept: read again next time)
+        return out
+    with _apps_lock:
+        _chats_cache[:] = [(now, out)]
     return out
 
 
 def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str, Any]]:
     """The user's own programs as their timeline shows them (never Yuki's rows): ``{app key: {"names": [...],
-    "sound": bool}}``. ``names``: the display name it is shown under most, its key tidied ("chrome": "Google Chrome",
-    "Chrome") and a chat app's title from its connection data ("whatsapp.root": "WhatsApp"); a name two programs share
-    names neither (Yuki's own windows carry its name in several). ``sound``: in those rows it played media, in front
-    or behind, or held a call's microphone (measured, never a list of audio apps). Cached per database for
+    "sound": bool, "mic": bool}}``. ``names``: the display name it is shown under most, its key tidied ("chrome":
+    "Google Chrome", "Chrome") and a chat app's title from its connection data ("whatsapp.root": "WhatsApp"); a name
+    two programs share names neither (Yuki's own windows carry its name in several). ``sound``: in those rows it played
+    media, in front or behind, or held a call's microphone (measured, never a list of audio apps); ``mic``: it held a
+    call's microphone (a program a call may be in). Cached per database for
     :data:`APPS_TTL_S` (an eval's ``until`` reads as of then, uncached). Never raises (``{}``)."""
     if store is None:
         return {}
@@ -510,6 +570,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         return {}
     shown: dict[str, dict[str, int]] = {}
     sound: dict[str, bool] = {}
+    held_mic: dict[str, bool] = {}
     for process, app, n, media, mic in rows:
         key = app_name(process)
         if not key:
@@ -519,6 +580,7 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
         else:
             shown.setdefault(key, {})
         sound[key] = sound.get(key, False) or float(media or 0) > 0 or float(mic or 0) > 0
+        held_mic[key] = held_mic.get(key, False) or float(mic or 0) > 0
     # a background player is named by its display name: the one program shown under that name
     by_display: dict[str, set[str]] = {}
     for key, names in shown.items():
@@ -544,7 +606,8 @@ def known_apps(store: Any, *, until: float | None = None) -> dict[str, dict[str,
     for key, names in names_of.items():
         for n in names:
             owners.setdefault(_name_key(n), set()).add(key)
-    out = {key: {"names": [n for n in names if len(owners.get(_name_key(n), ())) == 1], "sound": sound.get(key, False)}
+    out = {key: {"names": [n for n in names if len(owners.get(_name_key(n), ())) == 1], "sound": sound.get(key, False),
+                 "mic": held_mic.get(key, False)}
            for key, names in names_of.items()}
     if until is None:
         with _apps_lock:
@@ -592,6 +655,79 @@ def app_identity(value: Any, *, store: Any = None, until: float | None = None) -
         if not chat:
             ident = tkey
     return ident, [n for n in dict.fromkeys(names) if _name_key(n)]
+
+
+def _app_forms(value: Any, *, store: Any = None, until: float | None = None) -> set[str]:
+    """The identities one app goes by, to tell whether two values are one app: its key (:func:`app_name`) and its
+    identity key (:func:`app_identity`: a chat app's file name, so the timeline's "whatsapp.root" and the message
+    route's "whatsapp" are one app)."""
+    text = _words(value)
+    if not text:
+        return set()
+    forms = {app_name(text)}
+    try:
+        forms.add(app_identity(text, store=store, until=until)[0])
+    except Exception:  # noqa: BLE001 - its key alone
+        pass
+    return {f for f in forms if f}
+
+
+def just_acted(store: Any, *, now: float, until: float | None = None, skills: Collection[str] = ()) -> set[str]:
+    """The apps Yuki itself just acted in, within :data:`JUST_ACTED_S` before ``now`` (``until`` in an eval), each as
+    its identities (:func:`_app_forms`): the timeline's stretches begun while Yuki acted (``by_yuki``: the windows its
+    own steps brought up, whatever lane ran them: tonight's three YouTube-in-Chrome opens came from the thinker's own
+    steps) and the apps the skill ledger says runs of ``skills`` drove (``skill_runs.app``; the caller passes the
+    skill's capability and the learned skills of it, so a volume change on Arc's sound doesn't count against "open
+    YouTube in Arc"). A turn of the exchange that names one of them may be the user talking about what Yuki just did
+    ("You opened YouTube in Chrome again. Try another way."), so :func:`named_app` never fills a slot with one. Data
+    only (the ledger and the timeline, never what the turn's words mean). Never raises (an empty set)."""
+    if store is None:
+        return set()
+    t = float(until) if until is not None else float(now)
+    raw: list[str] = []
+    try:
+        raw += [str(r[0]) for r in store._query(
+            "SELECT DISTINCT process FROM timeline WHERE by_yuki = 1 AND process IS NOT NULL AND process != '' "
+            "AND started_at >= ? AND started_at <= ?", (t - JUST_ACTED_S, t))]
+    except Exception:  # noqa: BLE001
+        pass
+    keys = sorted({str(k) for k in skills or () if k})
+    if keys:
+        try:
+            marks = ",".join("?" * len(keys))
+            raw += [str(r[0]) for r in store._query(
+                f"SELECT DISTINCT app FROM skill_runs WHERE skill IN ({marks}) AND app IS NOT NULL AND app != '' "
+                "AND t0 >= ? AND t0 <= ?", (*keys, t - JUST_ACTED_S, t))]
+        except Exception:  # noqa: BLE001
+            pass
+    out: set[str] = set()
+    for a in dict.fromkeys(raw):
+        out |= _app_forms(a, store=store, until=until)
+    return out
+
+
+def call_apps(store: Any, *, now: float, until: float | None = None) -> set[str]:
+    """The apps a live call may be in, each as its identities (:func:`_app_forms`): the calls memory sees going on now
+    (:func:`yuki.memory.callspans.open_calls`: the app holding the microphone as a call), else, when it sees none (the
+    voice's own picture said a call is live), every program the timeline measured holding a call's microphone
+    (:func:`known_apps` ``mic``). audio.toml: a call live and no app named is asked, never the call's own app by
+    guess. Never raises (an empty set)."""
+    if store is None:
+        return set()
+    raw: list[str] = []
+    try:
+        from yuki.memory.callspans import open_calls
+
+        for c in open_calls(store, now=float(until) if until is not None else float(now)):
+            raw += [str(c.get("process") or ""), str(c.get("app") or "")]
+    except Exception:  # noqa: BLE001
+        pass
+    if not any(raw):
+        raw = [k for k, a in known_apps(store, until=until).items() if a.get("mic")]
+    out: set[str] = set()
+    for a in dict.fromkeys(r for r in raw if r):
+        out |= _app_forms(a, store=store, until=until)
+    return out
 
 
 def _app_candidates(skill: Skill, slot: Slot, *, store: Any, live: "Live", until: float | None,
@@ -664,7 +800,8 @@ def _outside(turn: str, skip: Sequence[str]) -> list[str]:
 
 
 def named_app(skill: Skill, slot: Slot, turns: Sequence[str], *, store: Any = None, live: "Live | None" = None,
-              until: float | None = None, now: float | None = None, skip: Sequence[str] = ()) -> str | None:
+              until: float | None = None, now: float | None = None, skip: Sequence[str] = (),
+              avoid: Collection[str] = ()) -> str | None:
     """The app the user's own words name for an app slot no valid value was given for: the newest of ``turns``
     (newest last) that names any candidate (:func:`_app_candidates`), when it names exactly one; a turn that names two
     decides nothing (the usual fill runs, or asks). Whole words only: an app is never filled by sound or guess. What
@@ -672,11 +809,16 @@ def named_app(skill: Skill, slot: Slot, turns: Sequence[str], *, store: Any = No
     fix-plan principle 2: "Can you play my Japanese playlist from Spotify? Make the volume a little bit down." turns
     Spotify down, not the app playing). ``skip``: the given values of the skill's free text slots (what to write, a
     link): an app named only inside them is part of the message, never its channel ("tell Hemanth I'm on Discord
-    now" names no app to message him on), so a turn that names one only there decides nothing."""
+    now" names no app to message him on), so a turn that names one only there decides nothing. ``avoid``: app
+    identities never filled from the words (:func:`just_acted`: what Yuki itself just acted in, which a turn may name
+    to complain about it; :func:`call_apps`: a live call's own app): such an app is no candidate at all, so "You opened
+    it in Chrome. I asked you to open it in Arc." names Arc alone after Yuki opened Chrome."""
     turns = [str(t) for t in turns or [] if str(t).strip()]
     if not turns:
         return None
     cands = _app_candidates(skill, slot, store=store, live=live or Live(), until=until, now=now)
+    if avoid:
+        cands = {k: v for k, v in cands.items() if not ({k} | _app_forms(k, store=store, until=until)) & set(avoid)}
     if not cands:
         return None
     skip = [str(v) for v in skip or () if _words(v)]
@@ -790,6 +932,12 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     people = people or _person(store)
     heard_person = heard_person or _heard_person(store)
     sounds_like = _sounds_like(store)
+    written = _written(store)
+    # what Yuki just did (:func:`just_acted`), read once and only for an app slot: the windows its steps brought up,
+    # and the apps runs of this skill's capability (the capability and its learned skills) drove
+    acted: set[str] | None = None
+    cap = skill.capability or skill.key
+    family = {cap, skill.key, *(s.key for s in getattr(loaded, "skills", ()) or () if s.capability == cap)}
     # the given values of free text slots (bound to nothing: what to write, a link): an app named inside them is the
     # message's content, never its channel (named_app's ``skip``)
     free_text = [str(v) for k, v in given.items()
@@ -841,23 +989,50 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                     pick = taste.find_offered(store, value.get("name", ""), now=now)
                     if pick is not None:
                         value = pick          # {"name", "key", "ref"}: rung A's ``when ref has`` passes
-                # a name the user said that none of their people goes by as written but sounds like exactly one of
-                # them ("Hemant" for Hemanth; "Karan" with only a Kiran): asked, never run as that person and never
-                # run as a name the chat driver doesn't know
                 literal = isinstance(value, str) and _words(value).casefold() == _words(given[slot.name]).casefold()
                 if literal and slot.type == "text" and _person_bound(skill, slot):
-                    alike = sounds_like(value)
-                    if alike:
-                        return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike), [alike],
-                                   dropped=list(dropped))
+                    # a name said in another script than their people's names ("हेमंत") is the one person it reads as,
+                    # letter for letter (a conversion): run as that person, unasked
+                    script = written(value)
+                    if script:
+                        value = script
+                    else:
+                        # a name the user said that none of their people goes by as written but sounds like exactly
+                        # one of them ("Hemant" for Hemanth; "Karan" with only a Kiran): asked once, never run as
+                        # that person. Given again as said within the exchange, the answer was no: it runs as said,
+                        # and the chat driver says it doesn't know who that is (never the same question twice; an
+                        # eval's replay, ``until``, asks every time: its phrasings are separate requests)
+                        alike = sounds_like(value)
+                        if alike and (until is not None or _first_confirm(
+                                (skill.capability or skill.key, slot.name, _words(value).casefold()), now)):
+                            return Ask(skill.key, slot.name, CONFIRM_PERSON.format(name=alike), [alike],
+                                       dropped=list(dropped))
                 values[slot.name], filled[slot.name] = value, "words"
                 ask_keep = keep_check(slot, value) or ask_keep
                 continue
             dropped.append(slot.name)
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
-        # bound default (the volume of "Spotify", not of the app playing)
+        # bound default (the volume of "Spotify", not of the app playing). Never an app Yuki itself just acted in (a
+        # turn may name it to complain: "You opened YouTube in Chrome again"), and with a call live, for a slot that
+        # asks in a call, only the newest turn and never the call's own app (audio.toml: "I'm on Discord with
+        # Hemanth, turn the music down" asks whose volume, as before)
         if slot.type == "app":
-            app = named_app(skill, slot, heard, store=store, live=live, until=until, now=now, skip=free_text)
+            in_call_ask = bool(slot.ask_in_call and live.in_call)
+            if acted is None:
+                acted = just_acted(store, now=now, until=until, skills=family)
+            avoid = set(acted) | (call_apps(store, now=now, until=until) if in_call_ask else set())
+            app = named_app(skill, slot, heard[-1:] if in_call_ask else heard, store=store, live=live, until=until,
+                            now=now, skip=free_text, avoid=avoid)
+            if app is not None and slot.name in dropped and \
+                    not (_app_forms(app, store=store, until=until) &
+                         _app_forms(given[slot.name], store=store, until=until)):
+                # the caller gave one app (its reading of the whole conversation) that the words don't hold, and the
+                # words name another: two readings that disagree. Never silently swapped for the words' app: asked,
+                # with the slot dropped, so the engine hands the caller's value to the thinker (fix-plan
+                # IF-handoff), which has the conversation; a value nobody gave fills from the words as above
+                theirs = app_identity(given[slot.name], store=store, until=until)[0] or app_name(given[slot.name])
+                return Ask(skill.key, slot.name, f"{_title(theirs)} or {_title(app)}?", [theirs, app],
+                           dropped=list(dropped))
             if app is not None:
                 values[slot.name], filled[slot.name] = app, "words"
                 ask_keep = keep_check(slot, app) or ask_keep
@@ -871,6 +1046,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             values[slot.name], filled[slot.name] = told[slot.name], "told"
             continue
         if slot.ask_in_call and live.in_call and slot.name not in given:
+            # a call live and no app the newest turn names (save the call's own): asked, never a guess
             return Ask(skill.key, slot.name, slot.ask or f"Which {slot.name}?", [], dropped=list(dropped))
         # FILL_ORDER "live"
         if slot.live == "playing":
@@ -1106,7 +1282,7 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
     return EvalResolver(Store.open(path), client=client, model=model, prompt=prompt, loaded=loaded)
 
 
-__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "CONFIRM_PERSON", "Live", "Plan", "Ask", "Held",
-           "Handoff", "Refused", "app_name", "app_identity", "known_apps", "named_app", "check_value", "pref_option",
-           "from_pref",
+__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "CONFIRM_PERSON", "JUST_ACTED_S", "CONFIRM_ONCE_S",
+           "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity", "known_apps", "named_app",
+           "just_acted", "call_apps", "check_value", "pref_option", "from_pref",
            "told_values", "ladder", "resolve", "done_line", "canonical", "EvalResolver", "eval_resolver"]

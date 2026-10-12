@@ -67,8 +67,10 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
     directory(store, now=None, chars=DIRECTORY_CHARS) -> str
     named_in(store, text) -> list[(Contact, words)]     # contacts the text names: a name or alias as written, or
                                                         # (one person only) its transliteration
-    names_person(store, name, texts) -> Contact | None  # the one person ``name`` is, when ``texts`` name them (as
-                                                        # written, transliterated or by sound)
+    names_person(store, name, texts, by_sound=True) -> Contact | None  # the one person ``name`` is, when ``texts``
+                                                        # name them (as written, transliterated or, unless
+                                                        # by_sound=False: a send's recipient, by sound)
+    transliterated(store, name) -> Contact | None       # the one person a name in a Brahmic script reads as
     sounds_in(name, texts, short=False) -> str | None   # the words in ``texts`` that sound like ``name`` (an app)
     contacts_of_threads(store, thread_ids) -> {thread id: [(Contact, Route)]}
     recent_chat_contacts(store, now=None, minutes=10) -> list[dict]
@@ -1627,7 +1629,8 @@ def named_in(store: Store, text: str | None) -> list[tuple[Contact, str]]:
     return [(c, n) for _i, c, n in out]
 
 
-def names_person(store: Store, name: str | None, texts: Sequence[str] | str | None) -> Contact | None:
+def names_person(store: Store, name: str | None, texts: Sequence[str] | str | None, *,
+                 by_sound: bool = True) -> Contact | None:
     """The one person ``name`` stands for (:func:`resolve` with ``heard``: a name or alias, a learned heard form, or
     the one person it sounds like; two people: ``None``), when ``texts`` name that same person: :func:`named_in` on
     each (as written, a heard form memory learned, a transliteration), or, since ``name`` was given for this very
@@ -1636,9 +1639,13 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
     user's words don't spell it ("Hemanth" for "message hey meant on this card", or for "His name is हेमंत"). Sound
     here only ever confirms a name the talker or thinker inferred, with the words naming that person too; a literal
     name the user said is checked as said (the resolver keeps it, and :func:`resolve` without ``heard`` finds nobody
-    for a name not theirs). Never raises (``None``)."""
+    for a name not theirs).
+
+    ``by_sound=False`` (a send's recipient: whom a message goes to): no Latin by sound at all, neither for ``name``
+    (found as written) nor in ``texts`` (:func:`named_in` only: as written, a learned heard form, a transliteration),
+    so a thinker's "Kiran" for the user's "Karan" is nobody's, never a send to Kiran. Never raises (``None``)."""
     try:
-        who = {c.id: c for c in resolve(store, name, heard=True)}
+        who = {c.id: c for c in resolve(store, name, heard=bool(by_sound))}
         if len(who) != 1:
             return None
         target = next(iter(who.values()))
@@ -1646,11 +1653,25 @@ def names_person(store: Store, name: str | None, texts: Sequence[str] | str | No
         for text in [texts] if isinstance(texts, str) else list(texts or []):
             if any(c.id == target.id for c, _w in named_in(store, text)):
                 return target
-            if any(c.id == target.id for _s, c, _w in heard_people(found, text, single=True)):
+            if by_sound and any(c.id == target.id for _s, c, _w in heard_people(found, text, single=True)):
                 return target
     except Exception:
         return None
     return None
+
+
+def transliterated(store: Store, name: str | None) -> Contact | None:
+    """The one person a name written in a Brahmic script reads as, letter for letter (:func:`named_in`: as written, or
+    its transliteration of one of their names and nobody else's: "हेमंत" -> Hemanth). A conversion, never a guess at a
+    mishearing: ``None`` for a name with no Brahmic letter (a Latin name is matched only as written, or confirmed), one
+    that reads as nobody, or as two people. Never raises (``None``)."""
+    try:
+        if not any(_is_script(w) for _s, w in spoken_words(name)):
+            return None
+        who = {c.id: c for c, _w in named_in(store, name)}
+    except Exception:
+        return None
+    return next(iter(who.values())) if len(who) == 1 else None
 
 
 def contacts_of_threads(store: Store, thread_ids: Sequence[int]) -> dict[int, list[tuple[Contact, Route]]]:
