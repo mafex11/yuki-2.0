@@ -170,6 +170,23 @@ def _preparatory(what: str) -> bool:
     return action in _PREPARATORY[parts[0]]
 
 
+def _skill_sends(run: dict[str, Any]) -> bool:
+    """Whether the skill of a voice hand's run (``hands.last_skill``: its key and slot values) sends something to other
+    people, by its data (``yuki.skills.connection.sends_with``, as the hands' own rule-8 check reads it). ``True`` when
+    the catalog can't be read: a run that may have sent is never taken for one that did not. Data only."""
+    try:
+        from yuki.skills.catalog import load
+        from yuki.skills.connection import sends_with
+
+        skill = load().get(str(run.get("skill") or ""))
+        if skill is None:
+            return False
+        values = run.get("values")
+        return bool(sends_with(skill, values if isinstance(values, dict) else {}, partial=True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 @dataclass
 class _Claim:
     """IF-answer (fix plan Item 2c): a turn of the user's claimed as the answer to a voice job's open question. Words in
@@ -238,6 +255,10 @@ class Job:
     #: appPT: who a send of this job goes to while its send countdown runs (the island's "3 s to stop"), else
     #: ``None``: the talker's thinker line says so, so their "stop" in those seconds is taken for that send.
     sending: str | None = None
+    #: Item 2 review r1 M2: a send countdown of this job ended ``going`` (the message went out, or may have): kept for
+    #: good, so its end closes the exchange whatever its outcome says (the new brain's stuck endings carry no ``send``)
+    #: and no later request carries its words again (rule 8: never sent twice).
+    sent: bool = False
     #: appTakeover: paused because the user took over the keyboard or mouse (the talker's thinker line says so, so their
     #: "go on" or anything they add is for this task); ``paused_out``: it ended unresumed (quietly: nothing is said).
     paused: bool = False
@@ -1002,14 +1023,18 @@ class VoiceBridge(QObject):
         the brain takes every carried turn as their request): what they say next ("message Hemanth", or "just do it")
         goes with the labelled earlier lines instead. A done act at ``verified`` or ``likely`` ends it even with an
         offer after it ("Want it louder?" then "yes" never plays it again), and so does any request that tried to send
-        (the verdict's ``send``): nothing is ever sent twice (rule 8). A request withdrawn for a newer one leaves its
-        words to that one. The verdict's fields and the outcome's own closing mark only (:func:`asks`), never the
-        words."""
-        if job.source != "voice" or job.remember or job.unadopted:
+        (the verdict's ``send``, or a send countdown of its that ended ``going``: the new brain's stuck endings carry
+        no ``send`` even after one went, review r1 M2): nothing is ever sent twice (rule 8). A request to keep
+        (``remember``) ends it when it ends (review r1 L2: its words are never handed over, or saved, again). A request
+        withdrawn for a newer one leaves its words to that one. The verdict's fields, the job's own marks and the
+        outcome's own closing mark only (:func:`asks`), never the words."""
+        if job.source != "voice" or job.unadopted:
             return False
         verdict = job.verdict if isinstance(job.verdict, dict) else {}
-        if verdict.get("send"):
+        if verdict.get("send") or job.sent:
             return True
+        if job.remember:
+            return not job.superseded
         if job.superseded and not job.paused_out:
             return False
         if state == DONE and str(verdict.get("level") or "") in ("verified", "likely"):
@@ -1039,18 +1064,22 @@ class VoiceBridge(QObject):
             except Exception:  # noqa: BLE001
                 turn = None
         with self._lock:
+            # a request to keep counts too (review r1 L2), and one replaced after its send went keeps its words its own
+            # (rule 8)
             live = [j for j in list(self._jobs.values()) + list(self._unsubmitted.values())
-                    if j.source == "voice" and j.state in OPEN_STATES and not j.superseded and not j.cancel_requested
-                    and not j.remember and not j.unadopted and (turn is None or j.user_turn < turn)]
+                    if j.source == "voice" and j.state in OPEN_STATES and (j.sent or not (j.superseded or
+                                                                                         j.cancel_requested))
+                    and not j.unadopted and (turn is None or j.user_turn < turn)]
         marks = [m for m in (self._closed_at, *(j.started_at for j in live)) if m is not None]
         if newest_at is not None:
             marks.extend(m for m in self._hand_marks() if m < newest_at)
         return max(marks) if marks else None
 
     def _hand_marks(self) -> list[float]:
-        """When the talker's own hands finished a request (monotonic): each record of a hand that acted (``ok``), and a
-        skill run that acted but could not confirm it (its engine outcome ``unverified``: it may have sent), unless the
-        hand went to the thinker (:meth:`_note_escalated_hand`). A refused or failed hand did nothing: "just do it"
+        """When the talker's own hands finished a request (monotonic): each record of a hand that acted (``ok``), a
+        skill run that acted but could not confirm it (its engine outcome ``unverified``: it may have sent), and a run
+        of a skill that sends which ended ``failed`` (it may have gone anyway, :func:`_skill_sends`), unless the hand
+        went to the thinker (:meth:`_note_escalated_hand`). A refused or failed hand did nothing: "just do it"
         after it still carries the request. Nor does a hand that only brought a window or a tab to the front
         (:func:`_preparatory`; live 10 Oct "do it." got a focus of Arc and nothing more, fix plan C1): what was asked is
         still to do. Records and code words only."""
@@ -1063,7 +1092,10 @@ class VoiceBridge(QObject):
                     and not any(record is e for e in escalated):
                 out.append(mono - (wall - float(getattr(record, "at", wall))))
         last = getattr(getattr(self, "hands", None), "last_skill", None)
-        if isinstance(last, dict) and last.get("outcome") == "unverified" and not any(last is e for e in escalated):
+        if isinstance(last, dict) and not any(last is e for e in escalated) and (
+                last.get("outcome") == "unverified" or (last.get("outcome") == "failed" and _skill_sends(last))):
+            # review r1 M2: a skill that sends and failed after a rung acted may have sent anyway (the engine never
+            # tries again for that reason): its words are never handed over again either (rule 8)
             try:
                 out.append(mono - (wall - float(last.get("at") or wall)))
             except (TypeError, ValueError):
@@ -1194,7 +1226,16 @@ class VoiceBridge(QObject):
         if intent == "follow_up":
             target = self._follow_up_target()
             if target is not None:
-                how = await self._follow_up(target, text)
+                given = text
+                if target.state == WAITING and target.asked_at is not None:
+                    # review r1 L3: their answer is the words since its question was said (as _hand_over cuts it), not
+                    # the whole exchange again (the steers before the question already reached it)
+                    answer = " ".join(self._turns(params.context, heard, after=target.asked_at))
+                    if answer and answer != request:
+                        given = brain_request(answer, heard, context=context, remember=remember,
+                                              done_before=done_before, corrects=corrects, said=said, tabs=tabs,
+                                              app_named=app_named)
+                how = await self._follow_up(target, given)
                 if app_named and how != "restart" and target.job_id is not None:
                     self._name_app(target, app_named)
                 self._log("bridge", op="follow_up", job_id=target.job_id, how=how, call=params.tool_call_id)
@@ -1852,8 +1893,12 @@ class VoiceBridge(QObject):
 
         by_user = self.user_turn() if self.user_turn is not None else None
         in_call = bool(self.call_mode()) if self.call_mode is not None else False
-        if by_user:
-            self._not_an_answer(params, "quiet")   # Item 2(c): the talker judged the words were not for Yuki
+        if by_user and in_call:
+            # Item 2(c), review r1 M1: only in a call is a quiet on the user's turn a judgement that the words were for
+            # the others. Outside a call the talker's prompt answers "yeah" with stay_quiet while an outcome is on its
+            # way; after "Did you mean Hemanth?" that "yeah" is the waiting job's answer and still goes to it (the plan
+            # lets only a new_task / instead hand-off take a turn from the waiting job)
+            self._not_an_answer(params, "quiet_in_call")
         owed, self.said_owed_at = self.said_owed_at, None
         spoke_now = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         ledger = self.ledger
@@ -2314,6 +2359,8 @@ class VoiceBridge(QObject):
         send = send if isinstance(send, dict) else {}
         job.sending = (" ".join(str(send.get("who") or "").split()) or "them") \
             if send.get("state") == "counting" else None
+        if send.get("state") == "going":
+            job.sent = True   # Item 2 review r1 M2: it went (or may have): its end closes the exchange (rule 8)
         self._log("bridge", op="send_countdown", job_id=job_id, state=send.get("state"))
         self._changed()
 
@@ -2801,8 +2848,10 @@ class VoiceBridge(QObject):
         when the talker called a follow-up hand-off. Now the turn is claimed for the job and routed (``_route``, the
         runtime's ``answer``) once the talker's run for it has settled (:meth:`_claim_tick`), unless the talker's own
         call for the same turn says first that it is a new task or replaces the job (``hand_over`` / ``tell_yuki``
-        ``new_task`` / ``instead``) or was not for Yuki (``stay_quiet``, ``check_progress``, the end of the
-        conversation). The talker's follow-up hand-off, or a hand of its that did not take effect, routes it at once; a
+        ``new_task`` / ``instead``), asks about the work (``check_progress``, ``more_of_result``), ends the
+        conversation, or (in a call only) stays quiet on it; outside a call a ``stay_quiet`` keeps the claim ("yeah" is
+        often met with silence while an outcome is on its way). The talker's follow-up hand-off, or a hand of its that
+        did not take effect (not a skill run: :meth:`escalate`), routes it at once; a
         hand of its that acted on the turn (not one that only brought a window to the front) used it, so it is not
         routed as well. ``hold_s``: route after exactly this long instead (``0``: at once). Another turn while the claim
         is held is added to it. Called on the voice loop by the pipeline's user-turn point (Item 3, guarded by
@@ -3016,7 +3065,8 @@ class VoiceBridge(QObject):
             self._drop_claim(intent)
             return None
         if intent == "follow_up":
-            self._commit_claim("follow_up", claim)
+            if not self._commit_claim("follow_up", claim):
+                return None   # the waiting job has gone meanwhile: the follow-up goes on as usual, never lost
             return claim, "answered"
         return None
 
@@ -3032,6 +3082,11 @@ class VoiceBridge(QObject):
         claim, how = decided
         status = ("already being done for these words" if how == "merged" and claim.via == "escalated" else
                   "passed on to the waiting task (answered)")
+        app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
+        if app_named and not claim.dropped:
+            # review r1 L3: the app they named in these words goes to the job they answered (V4, as a follow-up's does)
+            job = claim.job
+            self._gui(lambda: self._name_app(job, app_named))
         if early is not None:
             self._gui(lambda: self._cancel(early))
         await self._ack_if_silent(params, args)
@@ -3041,11 +3096,13 @@ class VoiceBridge(QObject):
                                      properties=FunctionCallResultProperties(run_llm=False))
         return True
 
-    def _escalate_to_answer(self, params: Any, name: str, heard: list[str]) -> bool:
+    def _escalate_to_answer(self, params: Any, name: str, heard: list[str], *, fresh: bool = True) -> bool:
         """Item 2(c, d): a hand of the talker's did not take effect while a voice job waits on a question the user
         heard: their words since that question are its answer (routed now), never a second job on the same words, and
         the waiting job is never withdrawn for it (live 10 Oct "Do it, bro" became a refused click, withdrew the job
-        waiting for exactly that yes and restarted an old one). ``False``: nothing waits; escalate as before."""
+        waiting for exactly that yes and restarted an old one). ``False``: nothing waits; escalate as before.
+        ``fresh=False`` (a skill run handing over): only words already routed to the job as its answer stay its answer
+        (never a second job on them); none are claimed for it here."""
         claim = self._claim_of(heard[-1] if heard else None)
         if claim is not None:
             if claim.dropped:
@@ -3055,6 +3112,8 @@ class VoiceBridge(QObject):
             self._log("bridge", op="escalated_to_answer", hand=name, job_id=claim.job.job_id, claimed=True,
                       call=params.tool_call_id)
             return True
+        if not fresh:
+            return False
         job = self._answerable()
         if job is None:
             return False
@@ -3218,7 +3277,13 @@ class VoiceBridge(QObject):
             return False
         self._note_escalated_hand(name)   # Item 2(a): its record is no finished request; what it becomes decides
         heard = heard_words(params.context, skip=self.not_heard)
-        if self._escalate_to_answer(params, name, heard):
+        seeded = isinstance(skill, dict) and bool(skill.get("key"))
+        if seeded:
+            # review r1 L1: the talker picked one of the user's skills for these words: a request of their own ("play my
+            # Japanese playlist" while "Did you mean Hemanth?" waits), never that question's answer. A claim of the turn
+            # still held is dropped; the runtime sets the waiting job aside for this one (quietly, ``parked``)
+            self._not_an_answer(params, "skill")
+        if self._escalate_to_answer(params, name, heard, fresh=not seeded):
             return True   # Item 2(c, d): a voice job waits on a question they heard: these words are its answer
         if self.on_brain:
             return self._brain_escalate(params, name, args, report, heard, acked=acked, context=context, skill=skill)
