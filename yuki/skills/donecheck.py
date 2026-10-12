@@ -18,7 +18,9 @@ be replaced through ``ProbeContext.probes`` (tests, replays, a driver):
 * ``media_session``: one app's media session has ``status`` (``playing`` / ``paused``) or its track changed since t0;
 * ``audio_active``: the app's process has an active render session on this PC (Core Audio);
 * ``level``: a mixer or the endpoint level is ``value`` (within 2 points);
-* ``page_at``: the window in front shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates);
+* ``page_at``: the browser window shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates): the window a
+  route launched (its ``hwnd``), else the named ``process``'s top window, else the window in front (x8WebArc: never
+  the foreground while the launched window is known);
 * ``tab_shown``: the app's window is in front with the expected tab selected (identity, never a title template);
 * ``foreground``: the app's window is in front;
 * ``mic_held``: the app took the microphone after t0: an onset against the state read right before the rung acted
@@ -187,6 +189,8 @@ def probe_level(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 
 
 def _front() -> tuple[int, str]:
+    """``(hwnd, image)`` of the window in front: only for the probes whose end state *is* being in front
+    (``foreground``, ``tab_shown``), or a page check with no window known (:func:`_window_for`)."""
     try:
         import win32gui
         import win32process
@@ -196,6 +200,83 @@ def _front() -> tuple[int, str]:
         return hwnd, _image_of(pid)
     except Exception:  # noqa: BLE001
         return 0, ""
+
+
+def _app_key(name: Any) -> str:
+    try:
+        from yuki.memory.store import app_key
+
+        return app_key(str(name or "")) or ""
+    except Exception:  # noqa: BLE001
+        return str(name or "").strip().casefold().removesuffix(".exe")
+
+
+def _window_image(hwnd: int) -> str:
+    """The image name of the process that owns ``hwnd`` (``""``: gone or unknown); never reads the foreground."""
+    try:
+        import win32gui
+        import win32process
+
+        if not hwnd or not win32gui.IsWindow(int(hwnd)):
+            return ""
+        return _image_of(int(win32process.GetWindowThreadProcessId(int(hwnd))[1]))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _top_window(process: str) -> tuple[int, str]:
+    """``(hwnd, image)`` of the program's top user window in Z-order (one on screen before a minimised one), or
+    ``(0, "")``. Window enumeration only: never the foreground."""
+    want = _app_key(process)
+    if not want:
+        return 0, ""
+    try:
+        import win32gui
+
+        from yuki.perception.windows import is_user_window
+    except Exception:  # noqa: BLE001
+        return 0, ""
+    found: list[tuple[bool, int, str]] = []
+
+    def collect(hwnd: int, _extra: Any) -> bool:
+        try:
+            if is_user_window(hwnd):
+                image = _window_image(hwnd)
+                if _app_key(image) == want:
+                    found.append((bool(win32gui.IsIconic(hwnd)), int(hwnd), image))
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    try:
+        win32gui.EnumWindows(collect, None)
+    except Exception:  # noqa: BLE001
+        return 0, ""
+    shown = [f for f in found if not f[0]] or found
+    return (shown[0][1], shown[0][2]) if shown else (0, "")
+
+
+def _window_for(ctx: ProbeContext, args: Mapping[str, Any]) -> tuple[int, str, str]:
+    """``(hwnd, image, how)`` of the window a page check reads (x8WebArc). The window a route launched or acted in
+    (``hwnd`` in the check's arguments, else in the route's RAM facts), while it is still a window: ``route``; else,
+    with a ``process`` named, that program's top window (``process``; 0 when it has none); else the window in front
+    (``front``). The foreground is never read while a launched window or the browser is known: on 10 Oct the check
+    read the window in front (Arc's command bar, or Yuki's own) 19 times and never saw the page in Arc."""
+    ram = getattr(getattr(ctx, "result", None), "facts_ram", None)
+    raw = args.get("hwnd") or (ram.get("hwnd") if isinstance(ram, Mapping) else None)
+    try:
+        hwnd = int(raw or 0)
+    except (TypeError, ValueError):
+        hwnd = 0
+    if hwnd:
+        image = _window_image(hwnd)
+        if image:
+            return hwnd, image, "route"
+    if _proc(args):
+        top, image = _top_window(_proc(args))
+        return top, image, "process"
+    hwnd, image = _front()
+    return hwnd, image, "front"
 
 
 def probe_foreground(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
@@ -208,13 +289,19 @@ def probe_foreground(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 
 
 def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
-    """The window in front shows a page of ``site`` (and ``kind``): its Document's address, matched against the site
-    templates (``yuki.connect.templates.page_of``), never a title."""
-    hwnd, image = _front()
+    """The browser window shows a page of ``site`` (and ``kind``): its Document's address, matched against the site
+    templates (``yuki.connect.templates.page_of``), never a title. x8WebArc: the window read is the one the route
+    launched or acted in, else the named ``process``'s top window, else the window in front (:func:`_window_for`), so
+    a page in the browser asked for counts and one in another browser never does. Evidence: ``via`` (which window),
+    ``process`` (its program)."""
+    hwnd, image, how = _window_for(ctx, args)
     if not hwnd:
-        return None, {"status": "unread"}
-    if _proc(args) and image.casefold() != _proc(args):
-        return False, {"status": "other_app"}
+        if how == "front":
+            return None, {"status": "unread", "via": how}
+        return False, {"status": "no_window", "via": how}     # the program named has no window: no page in it
+    ev = {"via": how, "process": image}
+    if _proc(args) and _app_key(image) != _app_key(_proc(args)):
+        return False, {**ev, "status": "other_app"}
     try:
         from yuki.connect.spotify_desktop import run_uia, UiaTree
         from yuki.connect.templates import page_of
@@ -225,18 +312,18 @@ def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
 
         shared, late = run_uia(job, 0.5, name="yuki-skill-page")
         if late:
-            return None, {"status": "timeout"}       # a blocked provider: the wait stops polling it (no pile-up)
+            return None, {**ev, "status": "timeout"}   # a blocked provider: the wait stops polling it (no pile-up)
         urls = list(shared.get("urls") or [])
     except Exception:  # noqa: BLE001
-        return None, {"status": "unread"}
+        return None, {**ev, "status": "unread"}
     if not urls:
-        return None, {"status": "no_document"}
+        return None, {**ev, "status": "no_document"}
     for url in urls:
         m = page_of(url)
         if m is not None and m.site == str(args.get("site") or m.site) and \
                 (not args.get("kind") or m.kind == str(args.get("kind"))):
-            return True, {"status": "page"}
-    return False, {"status": "other_page"}
+            return True, {**ev, "status": "page"}
+    return False, {**ev, "status": "other_page"}
 
 
 def probe_tab_shown(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:

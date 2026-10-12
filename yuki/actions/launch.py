@@ -14,15 +14,18 @@ menu entry it is - facts about the entry, never about which app it is:
 * a packaged app (its AppID is an AppUserModelID, ``<PackageFamilyName>!<App>``)
   is looked up in its package manifest (``AppxManifest.xml`` in the package's
   install folder) and started, in this order, through
-  1. its **App Execution Alias** (``uap3``/``uap5:ExecutionAlias``, the
+  1. ``IApplicationActivationManager::ActivateForProtocol``, when every argument
+     is a URI whose scheme the manifest declares under ``windows.protocol``:
+     protocol activation is what a running instance is built to receive.  It
+     comes before the alias (x8WebArc, 10 Oct): Arc declares both, and every
+     web address its alias carried was ignored (it stayed on the page it had,
+     or showed an old tab);
+  2. its **App Execution Alias** (``uap3``/``uap5:ExecutionAlias``, the
      ``%LOCALAPPDATA%\\Microsoft\\WindowsApps`` link verified to point at this
      very app), with ``Start-Process``: exactly what typing the alias in a
      terminal does.  It creates a process *with* package identity, and that
      process hands its command line to an instance that is already running the
      way the app itself does it;
-  2. ``IApplicationActivationManager::ActivateForProtocol``, when every argument
-     is a URI whose scheme the manifest declares under ``windows.protocol``:
-     protocol activation is what a running instance is built to receive;
   3. ``IApplicationActivationManager::ActivateApplication`` otherwise.  It keeps
      package identity too, but when the app is already running Windows may
      only activate that instance and drop the arguments (on 2026-09-23 a
@@ -63,6 +66,20 @@ opened the URL every time while its title stayed "Arc", and the old "nothing
 visibly changed" report cost the model rounds re-doing work that had worked.
 The window-title and foreground signals remain for arguments that are not
 pages.
+
+**A page that was already there is not the page opened** (x8WebArc, 10 Oct).
+When the app (or the default handler) was already running, the main page of
+each of its windows is read right before the address is handed over
+(:func:`_pages_before`), and a page a window already showed never counts
+afterwards.  On 10 Oct at 20:55 Arc ignored the address while its window,
+behind another app, still showed a YouTube watch page; that page was taken for
+the one opened and the hand said "verified".  Now that is ``ok=False`` with
+``details["reason"] = "page_unchanged"`` (also when the pages shown are of
+another host), so a skill moves on to its next rung.  ``deadline=`` (a
+``time.monotonic()`` time) bounds the whole call - the start, the page, the
+window and bringing it forward - for a caller that must answer in time (a
+skill's rung; on 10 Oct one Arc launch took 26-34 s).  ``details["via_word"]``
+says how the app was started as a code word a content-free log keeps.
 
 **An app running with no window** (closed to the background or the tray) is
 brought back when launched without arguments: its own hidden main window is
@@ -1116,10 +1133,10 @@ def _uri_schemes(args: list[str]) -> list[str] | None:
 def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict | None, list[str]]:
     """How to start ``chosen`` with ``args``, or why it cannot be.
 
-    For a packaged app, in order (see the module docstring): its App Execution
-    Alias, protocol activation when every argument is a URI of a scheme it
-    declares, ``ActivateApplication``.  For a desktop app, ``Start-Process`` on
-    its program file.
+    For a packaged app, in order (see the module docstring): protocol activation
+    when every argument is a URI of a scheme it declares, its App Execution
+    Alias, ``ActivateApplication``.  For a desktop app, ``Start-Process`` on its
+    program file.
 
     Returns:
         ``(plan, notes)``.  ``plan["via"]`` is ``"AppExecutionAlias"`` or
@@ -1144,6 +1161,15 @@ def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict
         }
         if facts["error"]:
             notes.append(facts["error"])
+        schemes = _uri_schemes(args)
+        if schemes and all(scheme in facts["protocols"] for scheme in schemes):
+            # x8WebArc (10 Oct): every argument is a URI of a scheme the package declares, so it is handed over
+            # the way a running instance is built to receive it, before the alias: Arc ignored every web address
+            # its alias carried (3, 5 and 10 Oct: it stayed on the page it had, or showed an old tab).
+            if facts["aliases"]:
+                notes.append("protocol activation chosen over its App Execution Alias: every argument is a URI "
+                             "of a scheme its manifest declares")
+            return {**base, "via": "ActivateForProtocol", "uris": list(args)}, notes
         link, alias_notes = _find_alias(appid, facts["aliases"])
         notes.extend(alias_notes)
         if link is not None:
@@ -1160,9 +1186,6 @@ def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict
             }, notes
         if not facts["error"] and not facts["aliases"]:
             notes.append("its package manifest declares no App Execution Alias")
-        schemes = _uri_schemes(args)
-        if schemes and all(scheme in facts["protocols"] for scheme in schemes):
-            return {**base, "via": "ActivateForProtocol", "uris": list(args)}, notes
         if facts["protocols"]:
             notes.append(
                 "not every argument is a URI of a scheme its manifest declares "
@@ -1502,22 +1525,111 @@ def _past_root(requested: str, actual: str) -> bool:
     return bool(want and got and not want[3] and got[3] and _same_page(requested, actual))
 
 
-def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, int], timeout_s: float):
+def _page_key(url: str):
+    """An address as "the same page" is compared before and after a hand-off: its normalised parts
+    (:func:`_address_parts`: scheme, host without ``www.``, port, path, the query pairs), the address itself when it
+    cannot be parsed."""
+    parts = _address_parts(url or "")
+    if parts is None:
+        return url or ""
+    scheme, host, port, path, query = parts
+    return (scheme, host, port, path, tuple(query))
+
+
+#: x8WebArc: the read of the app's own pages right before an address is handed over (only when the app is already
+#: running): at most this many of its on-screen windows, topmost first, each read for at most
+#: :data:`_PAGE_BEFORE_WINDOW_S`, all of them within :data:`_PAGE_BEFORE_S`.
+_PAGE_BEFORE_WINDOWS = 4
+_PAGE_BEFORE_WINDOW_S = 0.35
+_PAGE_BEFORE_S = 1.0
+#: With a deadline (``deadline=``), the address is handed a second time (percFix, a cold start that dropped it) only
+#: when at least this much of it is left.
+_AGAIN_MIN_S = 1.5
+#: How an app was started with its arguments (``details["via"]``, a Windows name) as the code word a content-free
+#: log keeps (``details["via_word"]``; x8WebArc: "the launch's via isn't logged").
+VIA_WORDS: dict[str, str] = {
+    "ActivateForProtocol": "protocol",
+    "AppExecutionAlias": "alias",
+    "ActivateApplication": "activate",
+    "Start-Process": "start_process",
+    "startfile": "startfile",
+}
+
+
+def _pages_before(identity: _AppIdentity, budget_s: float = _PAGE_BEFORE_S) -> dict[int, str]:
+    """``{hwnd: address}``: the main page each on-screen window of the app shows right now, read right before an
+    address is handed over (x8WebArc). A page-only read per window
+    (:func:`yuki.perception.tree.wait_for_page`, whose first accepted page is the window's main one), windows that
+    show no page left out. Only an app whose windows can be recognised (``identity.confirmable``); never raises.
+
+    On 10 Oct at 20:55 Arc ignored the address and its window, behind another app, still showed the YouTube watch
+    page it had: that page was taken for the one opened and the launch said "verified". A page its window already
+    showed is never the page opened."""
+    if not identity.confirmable or budget_s <= 0:
+        return {}
+    try:
+        from yuki.perception.tree import wait_for_page
+
+        hwnds = list(_app_windows(identity, {})())
+    except Exception:
+        return {}
+    out: dict[int, str] = {}
+    end = time.monotonic() + budget_s
+    for hwnd in hwnds[:_PAGE_BEFORE_WINDOWS]:
+        left = end - time.monotonic()
+        if left <= 0.05:
+            break
+        try:
+            got = wait_for_page(lambda h=hwnd: [h], lambda _url: True, timeout_s=min(_PAGE_BEFORE_WINDOW_S, left))
+        except Exception:  # noqa: BLE001 - that window just isn't known before
+            continue
+        if got.matched is not None and got.matched.url:
+            out[int(hwnd)] = str(got.matched.url)
+    return out
+
+
+def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, int], timeout_s: float,
+                unchanged: dict[int, str] | None = None):
     """Wait (bounded) until one of the app's windows shows a page at one of
     ``targets`` (see :func:`yuki.perception.tree.wait_for_page`); ``None`` when
     the accessibility reader cannot be loaded. V11: for a site's home page, another page of that site that was already
     showing when the address was handed over is not the page asked for (a redirect from the root to a deeper page,
-    which appears after the hand-off, still counts)."""
+    which appears after the hand-off, still counts). x8WebArc: a page one of its windows already showed before the
+    hand-off (``unchanged``, :func:`_pages_before`) never counts, so a browser that ignored the address is not taken
+    for one that opened it."""
     try:
         from yuki.perception.tree import wait_for_page
     except Exception:
         return None
-    return wait_for_page(
+    unchanged = unchanged or {}
+    old = {_page_key(url) for url in unchanged.values()}
+    wait = wait_for_page(
         _app_windows(identity, before),
-        lambda url: any(_same_page(target, url) for target in targets),
+        lambda url: any(_same_page(target, url) for target in targets) and _page_key(url) not in old,
         timeout_s=timeout_s,
         stale=lambda url: any(_past_root(target, url) for target in targets),
     )
+    if wait.matched is None and old:
+        # The test above sees an address, not its window: a page another window already showed was refused even in
+        # a window that showed something else before (a second window on the same page). The last read settles it
+        # window by window: never a window's own old page, and only the very page asked for (a page deeper than a
+        # requested site root stays V11's to judge).
+        wait.matched = next(
+            (page for page in wait.seen
+             if _page_key(page.url) in old
+             and (page.hwnd not in unchanged or _page_key(page.url) != _page_key(unchanged[page.hwnd]))
+             and any(_same_page(target, page.url) and not _past_root(target, page.url) for target in targets)),
+            None,
+        )
+    return wait
+
+
+def _unchanged_windows(wait, unchanged: dict[int, str] | None) -> list[int]:
+    """The windows whose main page after the hand-off is the very page they showed before it."""
+    if wait is None or not unchanged:
+        return []
+    return [page.hwnd for page in wait.seen
+            if page.main and page.hwnd in unchanged and _page_key(page.url) == _page_key(unchanged[page.hwnd])]
 
 
 def _page_details(wait) -> dict:
@@ -1542,12 +1654,15 @@ def _page_phrase(title: str, url: str) -> str:
     return f"{url} (page still loading, no title yet)"
 
 
-def _page_miss(name: str, targets: list[str], wait) -> tuple[bool, str]:
+def _page_miss(name: str, targets: list[str], wait, unchanged: Sequence[int] = ()) -> tuple[bool, str]:
     """``(ok, clause)`` for a hand-off after which no window showed the page.
 
     ``ok`` is False only when the app's windows do show pages and none is at
     the address - the effect provably did not happen.  When no page could be
     read at all, the clause says the address could not be checked.
+    ``unchanged``: the windows still showing the very page they showed before
+    the hand-off (x8WebArc): said so, since that page may well be at the
+    address (an old tab of the same site) without being the one opened.
     """
     target = targets[0] + (f" (+{len(targets) - 1} more)" if len(targets) > 1 else "")
     if wait is None:
@@ -1555,8 +1670,13 @@ def _page_miss(name: str, targets: list[str], wait) -> tuple[bool, str]:
     secs = wait.waited_ms / 1000.0
     visible = [page for page in wait.seen if page.main]
     if visible:
-        shown = visible[0]
+        shown = next((page for page in visible if page.hwnd in unchanged), visible[0])
         others = f" (+{len(visible) - 1} other window(s) with a page)" if len(visible) > 1 else ""
+        if shown.hwnd in unchanged:
+            return False, (
+                f"handed {name} {target}, but after {secs:.1f} s {name} still shows the page it showed "
+                f"before, {_page_phrase(shown.title, shown.url)}: it did not open the address{others}"
+            )
         return False, (
             f"handed {name} {target}, but after {secs:.1f} s no page in {name} is at that "
             f"address; the visible page is {_page_phrase(shown.title, shown.url)}{others}"
@@ -1577,9 +1697,12 @@ def _page_opened(
     content_deadline: float,
     targets: list[str],
     identity: _AppIdentity | None = None,
+    *,
+    focus_floor_s: float | None = None,
 ) -> str:
     """Bring the window showing the requested page forward, wait out the rest of
-    its content (within ``content_deadline``) and say so, fact first."""
+    its content (within ``content_deadline``) and say so, fact first.
+    ``focus_floor_s``: the bring-forward's least time (``None``: its default)."""
     seen = wait.matched
     hwnd = seen.hwnd
     info = window_info(hwnd)
@@ -1602,7 +1725,8 @@ def _page_opened(
         for other in appeared
     ]
     _note_fresh(hwnd)
-    forward = _bring_forward(hwnd, time.monotonic(), details)
+    forward = _bring_forward(hwnd, time.monotonic(), details,
+                             **({} if focus_floor_s is None else {"floor_s": focus_floor_s}))
     # The page at the address is the navigation confirmed: return now. Waiting on for the
     # page's content cost 1.9 s on the 25 Sept live "open YouTube on Chrome" (16.4 s in all)
     # and bought nothing the caller needs; the window is noted fresh, so the next tree read
@@ -2533,6 +2657,7 @@ def launch_app(
     args: list[str] | None = None,
     timeout_s: float = 8.0,
     content_timeout_s: float = CONTENT_WAIT_S,
+    deadline: float | None = None,
 ) -> ActionResult:
     """Launch a Start menu app by display name and wait for its window.
 
@@ -2552,6 +2677,18 @@ def launch_app(
         content_timeout_s: with ``args``, how much longer to wait for the window
             to expose what it was handed (see
             :func:`yuki.perception.tree.wait_for_content`).
+        deadline: x8WebArc: a ``time.monotonic()`` time the whole call answers
+            by (a skill's rung passes its request's time left): every wait
+            below - the start, the page, the window, bringing it forward (at
+            most :data:`_DEADLINE_FOCUS_FLOOR_S` over) - ends by it. ``None``:
+            the waits above only (on 10 Oct an Arc launch took 26-34 s).
+
+    Handed a web address while it was already running, the main page of each
+    of its windows is read right before the hand-off (:func:`_pages_before`):
+    a page a window already showed is never the one opened, and when its
+    windows show pages but none newly at the address the result is
+    ``ok=False`` with ``details["reason"] = "page_unchanged"`` (Arc ignored
+    the address and kept its old page, or showed a YouTube tab it already had).
 
     The window that appeared (or changed) is brought to the foreground exactly as
     :func:`focus_window` does and waited on until it accepts input, so the caller
@@ -2615,6 +2752,13 @@ def launch_app(
     # D17: no app is launched, shown or brought forward while a game is in front (re-checked before each step below)
     if (refused := _gamegate.refuse_input("launch")) is not None:
         return finish(False, refused, {"launched": False, "hwnd": None, "candidates": [], "refused": "game"})
+    focus_floor = _FOCUS_FLOOR_S
+    if deadline is not None:
+        # x8WebArc: the caller's deadline bounds every wait of the call (a skill rung answers within its request)
+        left_s = max(0.0, float(deadline) - time.monotonic())
+        timeout_s = max(0.5, min(float(timeout_s), left_s))
+        content_timeout_s = max(0.0, min(float(content_timeout_s), left_s))
+        focus_floor = _DEADLINE_FOCUS_FLOOR_S
     # Where the time goes, stage by stage (the 25 Sept "open YouTube on Chrome" took 16.4 s
     # and the log could not say where): ms since the call started, per stage end.
     timings: dict[str, float] = {}
@@ -2643,6 +2787,8 @@ def launch_app(
         "timings_ms": timings,
     }
     start_budget = max(2.0, min(timeout_s, 15.0))
+    if deadline is not None:
+        start_budget = max(1.0, min(start_budget, float(deadline) - time.monotonic()))
     if not arg_list:
         # appOpen F1: a Start entry that has another program start its app (a game through its launcher) is started
         # the way the Start menu does and only the app's own window counts - never the launcher's, never a hidden
@@ -2684,6 +2830,8 @@ def launch_app(
             details["manifest"] = plan["manifest"]
             details["manifest_aliases"] = plan["manifest_aliases"]
             details["manifest_protocols"] = plan["manifest_protocols"]
+    # x8WebArc: how it was started, as a code word a content-free log keeps (``via`` itself is a Windows name)
+    details["via_word"] = VIA_WORDS.get(str(details.get("via") or ""), "" if arg_list else "start_menu")
 
     # Who the app is, and whether it is running already: only its windows are
     # ever reported, and a running instance gets a short wait to react.
@@ -2710,6 +2858,18 @@ def launch_app(
             details["identity"] = identity.describe()
             return finish(ok, summary, details)
 
+    # x8WebArc: handed a web address while running, what each of its windows shows now is read first, so a page it
+    # already showed is never taken for the one opened (10 Oct 20:55: Arc kept an old YouTube tab, "verified")
+    page_targets = [address for address in (_page_address(arg) for arg in arg_list) if address]
+    unchanged: dict[int, str] = {}
+    if page_targets and already_running:
+        budget = _PAGE_BEFORE_S if deadline is None else min(
+            _PAGE_BEFORE_S, 0.25 * max(0.0, float(deadline) - time.monotonic()))
+        unchanged = _pages_before(identity, budget)
+        details["pages_before"] = len(unchanged)
+        # the pages themselves stay in RAM with the result (a caller's own check compares with them; never logged)
+        details["before_pages"] = [{"hwnd": hwnd, "url": url} for hwnd, url in unchanged.items()]
+        mark("pages_before")
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
     def hand_over(into: dict) -> tuple[int | None, str]:
@@ -2762,6 +2922,8 @@ def launch_app(
 
     handed_off = time.monotonic()
     window_deadline = handed_off + timeout_s
+    if deadline is not None:
+        window_deadline = min(window_deadline, float(deadline))
     carrier: psutil.Process | None = None
     if launched_pid and launched_pid not in running_before:
         identity.add_launched(launched_pid)
@@ -2777,12 +2939,14 @@ def launch_app(
     # Handed a web address: success is a window of the app showing a page at
     # that address - not its window title changing, which for some browsers
     # never happens whatever page they show.
-    page_targets = [address for address in (_page_address(arg) for arg in arg_list) if address]
     page_miss: tuple[bool, str] | None = None
     if page_targets:
         details["page_targets"] = page_targets
         content_deadline = handed_off + content_timeout_s + (0.0 if already_running else timeout_s)
-        page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic())
+        if deadline is not None:
+            content_deadline = min(content_deadline, float(deadline))
+        page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic(),
+                                unchanged=unchanged)
         mark("page")
         details["page_check"] = _page_details(page_wait)
         details["identity"] = identity.describe()
@@ -2792,11 +2956,12 @@ def launch_app(
                 True,
                 _page_opened(
                     chosen["name"], page_wait, before, details, content_deadline,
-                    page_targets, identity,
+                    page_targets, identity, focus_floor_s=focus_floor,
                 ),
                 details,
             )
         if (page_wait is not None and page_wait.windows and not page_wait.seen and not already_running
+                and (deadline is None or float(deadline) - time.monotonic() >= _AGAIN_MIN_S)
                 and identity.running_pids()):
             # percFix (live 5 Oct): Arc started cold with an address came up on its own new-tab view and never
             # showed the page - the address handed to it at its start was dropped - and the agent spent 111 s and
@@ -2809,18 +2974,26 @@ def launch_app(
             if not again.get("launched"):
                 details["handed_again"]["error"] = str(again_failure)[:160]
             else:
-                page_wait = _await_page(identity, page_targets, before,
-                                        handed_again + content_timeout_s - time.monotonic())
+                again_deadline = handed_again + content_timeout_s
+                if deadline is not None:
+                    again_deadline = min(again_deadline, float(deadline))
+                page_wait = _await_page(identity, page_targets, before, again_deadline - time.monotonic())
                 mark("page_again")
                 details["page_check_again"] = _page_details(page_wait)
                 if page_wait is not None and page_wait.matched is not None:
                     details["waited_ms"] = round((time.monotonic() - handed_off) * 1000.0, 1)
                     opened = _page_opened(chosen["name"], page_wait, before, details,
-                                          handed_again + content_timeout_s, page_targets, identity)
+                                          again_deadline, page_targets, identity, focus_floor_s=focus_floor)
                     return finish(True, f"{opened} (the address was handed again once {chosen['name']} was "
                                         f"running: its first start showed no page)", details)
         details["page_verified"] = False if page_wait is not None and page_wait.seen else None
-        page_miss = _page_miss(chosen["name"], page_targets, page_wait)
+        still = _unchanged_windows(page_wait, unchanged)
+        page_miss = _page_miss(chosen["name"], page_targets, page_wait, still)
+        if not page_miss[0]:
+            # x8WebArc: its windows show pages and none newly at the address (the old page kept, or another
+            # host): not opened, so a skill goes on to its next rung instead of counting this as acted
+            details["reason"] = "page_unchanged"
+            details["page_state"] = "same" if still else "other"
         # The address is not on screen.  What did change, if anything, is
         # looked up once, without waiting any longer.
         window_deadline = time.monotonic() + 2 * _POLL_S
@@ -2862,6 +3035,7 @@ def launch_app(
                 waited_s,
                 window_deadline,
                 lead=page_miss[1] if page_miss else None,
+                focus_floor_s=focus_floor,
             ),
             details,
         )
@@ -2872,12 +3046,14 @@ def launch_app(
     # Launching something is asking to use it: bring the window to the front and
     # wait for it to listen, within what is left of the budget, so the next step
     # does not have to spend a round on focusing it.
-    forward = _bring_forward(hwnd, window_deadline, details)
+    forward = _bring_forward(hwnd, window_deadline, details, floor_s=focus_floor)
     content_note = ""
     if arg_list and not page_miss:
         # It was handed something to open: wait (bounded) until that is on
         # screen and readable, so the next look sees it rather than the frame.
-        content_note = _wait_for_opened_content(hwnd, content_timeout_s, details)
+        content_wait = content_timeout_s if deadline is None else max(
+            0.0, min(content_timeout_s, float(deadline) - time.monotonic()))
+        content_note = _wait_for_opened_content(hwnd, content_wait, details)
         if (fresh := window_info(hwnd)) is not None:
             details["title"] = fresh.title
     same_app = [w for w in details["new_windows"] if w["is_app_window"]]
@@ -2921,6 +3097,7 @@ def _no_window_outcome(
     window_deadline: float,
     *,
     lead: str | None = None,
+    focus_floor_s: float | None = None,
 ) -> str:
     """The summary (and ``details``) for a launch after which no window of the
     app appeared, changed or came forward by itself.
@@ -2990,7 +3167,8 @@ def _no_window_outcome(
     info = window_info(app_hwnd)
     details["title"] = info.title if info else ""
     details["process_name"] = info.process_name if info else ""
-    forward = _bring_forward(app_hwnd, window_deadline, details)
+    forward = _bring_forward(app_hwnd, window_deadline, details,
+                             **({} if focus_floor_s is None else {"floor_s": focus_floor_s}))
     return (
         f"{lead}; {how}: hwnd {app_hwnd} ({details['process_name']}) "
         f"\"{details['title']}\"; {forward}"
@@ -3000,19 +3178,24 @@ def _no_window_outcome(
 #: Least time :func:`_bring_forward` gets, however little of the launch budget
 #: the window's appearance left: :func:`focus_window`'s own default.
 _FOCUS_FLOOR_S = 2.0
+#: x8WebArc: the same floor for a call that has a deadline of its own (``deadline=``): a skill's rung gets its whole
+#: answer within the request's time, so the focus may run over it by this much at most.
+_DEADLINE_FOCUS_FLOOR_S = 0.5
 
 
-def _bring_forward(hwnd: int, deadline: float, details: dict) -> str:
+def _bring_forward(hwnd: int, deadline: float, details: dict, *, floor_s: float = _FOCUS_FLOOR_S) -> str:
     """Activate ``hwnd`` as :func:`focus_window` does and say how that went.
 
-    Budget: what is left until ``deadline``, but at least :data:`_FOCUS_FLOOR_S`.
+    Budget: what is left until ``deadline``, but at least ``floor_s``
+    (:data:`_FOCUS_FLOOR_S`; a call with a deadline of its own passes
+    :data:`_DEADLINE_FOCUS_FLOOR_S`).
     Fills ``details`` with ``foreground``, ``ready``, ``ready_ms`` and ``focus``
     (the focus attempt's own details).
 
     Returns:
         A clause for the summary.
     """
-    budget = max(deadline - time.monotonic(), _FOCUS_FLOOR_S)
+    budget = max(deadline - time.monotonic(), floor_s)
     focus = focus_window(hwnd, timeout_s=budget)
     details["foreground"] = focus.ok
     details["focus"] = focus.details
@@ -3476,7 +3659,8 @@ def _default_handler(target: str) -> str:
 
 
 def open_url(
-    url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S
+    url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
+    deadline: float | None = None,
 ) -> ActionResult:
     """Open a URL (or any shell target: a file, a folder).
 
@@ -3488,6 +3672,13 @@ def open_url(
             an argument, so nothing is typed anywhere - including bringing the
             window to the front and waiting for the content.
         content_timeout_s: bound on the wait for the content to be on screen.
+        deadline: x8WebArc: a ``time.monotonic()`` time the whole call answers
+            by (see :func:`launch_app`); ``None``: the waits above only.
+
+    A web address handed to a browser that was already running is checked
+    against what its windows showed right before (:func:`_pages_before`): an
+    unchanged page, or pages none of which is newly at the address, give
+    ``ok=False`` with ``details["reason"] = "page_unchanged"``, never "verified".
 
     With the default handler, the handler's window is watched for (a new window,
     the foreground changing, or a window of the handler's program changing its
@@ -3513,12 +3704,31 @@ def open_url(
     if (refused := _gamegate.refuse_input("open_url")) is not None:
         return finish(False, refused, {"url": target, "refused": "game"})
     if app is not None and app.strip():
-        launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s)
+        launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s, deadline=deadline)
         launched.details["url"] = target
         return launched
 
+    focus_floor = _FOCUS_FLOOR_S
+    if deadline is not None:
+        content_timeout_s = max(0.0, min(float(content_timeout_s), float(deadline) - time.monotonic()))
+        focus_floor = _DEADLINE_FOCUS_FLOOR_S
     handler = _default_handler(target)
-    details: dict = {"url": target, "handler": handler}
+    details: dict = {"url": target, "handler": handler, "via_word": "startfile"}
+    # Only the handler's windows count; with no handler known, only a window
+    # that newly appears does (said so in its reason), never an old one that
+    # merely came to the front.
+    identity = _AppIdentity(handler or "the default handler", image_names=[handler] if handler else [])
+    # A web address: success is a page at that address in the handler's windows
+    # (or, with no handler known, in a window that appeared or is in front).
+    address = _page_address(target)
+    unchanged: dict[int, str] = {}
+    if address and handler:
+        # x8WebArc: what the handler's windows show now, so a page one already showed is never the one opened
+        budget = _PAGE_BEFORE_S if deadline is None else min(
+            _PAGE_BEFORE_S, 0.25 * max(0.0, float(deadline) - time.monotonic()))
+        unchanged = _pages_before(identity, budget)
+        details["pages_before"] = len(unchanged)
+        details["before_pages"] = [{"hwnd": hwnd, "url": url} for hwnd, url in unchanged.items()]
     before, before_pids, before_titles = _window_snapshot()
     before_foreground = _user32.GetForegroundWindow()
     try:
@@ -3537,18 +3747,16 @@ def open_url(
         opened += f" ({handler})"
 
     window_deadline = time.monotonic() + _HANDLER_WINDOW_S
-    # Only the handler's windows count; with no handler known, only a window
-    # that newly appears does (said so in its reason), never an old one that
-    # merely came to the front.
-    identity = _AppIdentity(handler or "the default handler", image_names=[handler] if handler else [])
-    # A web address: success is a page at that address in the handler's windows
-    # (or, with no handler known, in a window that appeared or is in front).
-    address = _page_address(target)
+    if deadline is not None:
+        window_deadline = min(window_deadline, float(deadline))
     page_miss: tuple[bool, str] | None = None
     if address:
         details["page_targets"] = [address]
         content_deadline = time.monotonic() + _HANDLER_WINDOW_S + content_timeout_s
-        page_wait = _await_page(identity, [address], before, content_deadline - time.monotonic())
+        if deadline is not None:
+            content_deadline = min(content_deadline, float(deadline))
+        page_wait = _await_page(identity, [address], before, content_deadline - time.monotonic(),
+                                unchanged=unchanged)
         details["page_check"] = _page_details(page_wait)
         who = os.path.splitext(handler)[0] if handler else "the default browser"
         if page_wait is not None and page_wait.matched is not None:
@@ -3558,11 +3766,16 @@ def open_url(
             return finish(
                 True,
                 f"{opened}; "
-                + _page_opened(who, page_wait, before, details, content_deadline, [address]),
+                + _page_opened(who, page_wait, before, details, content_deadline, [address],
+                               focus_floor_s=focus_floor),
                 details,
             )
         details["page_verified"] = False if page_wait is not None and page_wait.seen else None
-        page_miss = _page_miss(who, [address], page_wait)
+        still = _unchanged_windows(page_wait, unchanged)
+        page_miss = _page_miss(who, [address], page_wait, still)
+        if not page_miss[0]:
+            details["reason"] = "page_unchanged"
+            details["page_state"] = "same" if still else "other"
         window_deadline = time.monotonic() + 2 * _POLL_S
     hwnd, reason, appeared = _wait_for_new_window(
         identity,
@@ -3600,7 +3813,7 @@ def open_url(
     details["title"] = info.title if info else ""
     details["process_name"] = info.process_name if info else ""
     _note_fresh(hwnd)
-    forward = _bring_forward(hwnd, window_deadline, details)
+    forward = _bring_forward(hwnd, window_deadline, details, floor_s=focus_floor)
     if page_miss:
         return finish(
             page_miss[0],
@@ -3608,8 +3821,10 @@ def open_url(
             f"\"{details['title']}\" - {reason}; {forward}",
             details,
         )
+    content_wait = content_timeout_s if deadline is None else max(
+        0.0, min(content_timeout_s, float(deadline) - time.monotonic()))
     content_note = _wait_for_opened_content(
-        hwnd, content_timeout_s, details, require_document=True
+        hwnd, content_wait, details, require_document=True
     )
     if (fresh := window_info(hwnd)) is not None:
         details["title"] = fresh.title

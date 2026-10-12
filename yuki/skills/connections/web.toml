@@ -9,10 +9,16 @@
 # video's, a channel's) only from an offered option's link (phase T), never from words and never guessed. The address
 # is a launch argument (nothing typed); nothing plays until the user picks.
 #
-# The browser is a means, with no ranked rule shipped (design §5, critique M8): the one the user named, else their
-# usual (preference web.open_page:browser@<site>, or the learned skill's fill policy), else the browser they use most,
-# else Windows' default handler. "A browser" is measured, never a list: a program whose timeline rows carried pages of
-# at least 3 hosts (yuki/skills/web_route.py). Never with a game in front ("after the round?").
+# The browser is a means, with no ranked rule shipped (design §5, critique M8): the one the user named (anywhere in
+# the request's exchange: it beats every other rule), else their usual (preference web.open_page:browser@<site>, or the
+# learned skill's fill policy), else the browser they use most, else Windows' default handler. "A browser" is measured,
+# never a list: a program whose timeline rows carried pages of at least 3 hosts (yuki/skills/web_route.py). Never with
+# a game in front ("after the round?").
+#
+# The ladder (x8WebArc, 10 Oct: Arc ignored every address its alias carried): the address as a launch argument (a
+# packaged browser by protocol activation); a browser that kept the page it had did not open it, so the address-bar
+# rung runs (in that browser's own window: a new tab, the address typed into the browser's own address field and read
+# back, Enter); when neither got there, the hand-off. Each rung's done-check reads the browser window it acted in.
 #
 # Zero setup (D0): nothing to connect, no API; the browser's own window.
 
@@ -65,9 +71,26 @@ driver = "web_route"
 call = "open_page"
 needs_focus = true
 means = "browser"
-# the page in front is the one opened (by template value, or by host for a host-scope page)
+# the browser window it opened the page in shows it (by template value, or by host for a host-scope page)
 done = { probe = "driver", driver = "web_route", call = "page_shown", within_s = 6 }
-# the watcher's own read of the window in front (memory's Now board), a second source
+# the watcher's own read of that window (memory's Now board), a second source
+recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s = 3 }
+
+# x8WebArc: the rung before it didn't open the page (the browser kept the page it had, or another page shows): in the
+# chosen browser's own window (by hwnd), a new tab (new_tab: the keys every desktop browser opens one with, its address
+# field focused; in Arc they open its command bar, which takes an address the same way: the path that worked on 5 Oct),
+# the address typed only into a text field of the browser's own frame (never a page's own box, so never a send) and read
+# back, then Enter as navigation.
+[[capability."web.open_page".route]]
+rung = "A"
+variant = "address_bar"
+via = "driver"
+driver = "web_route"
+call = "address_bar"
+needs_focus = true
+means = "browser"
+args = { opens = "page", new_tab = ["ctrl", "t"] }
+done = { probe = "driver", driver = "web_route", call = "page_shown", within_s = 6 }
 recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s = 3 }
 
 [capability."web.open_video"]
@@ -112,6 +135,34 @@ parts = [
   { probe = "driver", driver = "web_route", call = "video_playing" },
 ]
 # a later re-read: the media session still playing (a source the done-check also read: flagged as such)
+[capability."web.open_video".route.recheck]
+probe = "driver"
+driver = "web_route"
+call = "video_playing"
+after_s = 4
+same_source = true
+
+# x8WebArc: the video's own link typed into the chosen browser's address field when the rung before didn't open it
+# (see web.open_page's address-bar rung).
+[[capability."web.open_video".route]]
+rung = "A"
+variant = "address_bar"
+via = "driver"
+driver = "web_route"
+call = "address_bar"
+needs_focus = true
+means = "browser"
+when = { slot = "video", field = "ref", has = true }
+args = { opens = "video", new_tab = ["ctrl", "t"] }
+
+[capability."web.open_video".route.done]
+probe = "all"
+within_s = 6
+parts = [
+  { probe = "driver", driver = "web_route", call = "video_shown" },
+  { probe = "driver", driver = "web_route", call = "video_playing" },
+]
+
 [capability."web.open_video".route.recheck]
 probe = "driver"
 driver = "web_route"

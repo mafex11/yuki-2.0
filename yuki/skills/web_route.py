@@ -40,6 +40,24 @@ site itself (a chat app that draws its one site in its own window shows one or t
 opens its own link and is checked by the page in front showing that video and the browser's media session playing. A
 browser the user didn't name is named in the done line, so one word corrects it.
 
+x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, and once "verified" an old tab):
+
+* **A browser named anywhere in the exchange wins** (:func:`choose_browser`): their words are the request's whole
+  exchange, and a measured browser whose name stands in them beats their usual and any learned fill policy. Two
+  different browsers named and the slot naming neither: Yuki asks which, never guesses.
+* **The ladder is protocol, then the address bar, then the hand-off.** Rung A hands the address over as a launch
+  argument (``launch.open_url``: a packaged browser by protocol activation, how a running browser takes a link), within
+  the request's deadline. A browser that kept the page it had (``page_unchanged``) did not open it: that rung did not
+  run, and the next one does. The address-bar rung (:func:`route_address_bar`) types the address into the chosen
+  browser's own address field in its own window (by hwnd): a new tab (the route's ``new_tab`` keys), the address typed
+  and read back, Enter as navigation; only into a text field of the browser's own frame (never a page's own box, so
+  never a send), checked by structure, not by name. When it doesn't get there either, the engine hands off.
+* **The done-check reads the browser the rung opened the page in** (:func:`_page_window`: the window by hwnd, else that
+  browser's top window), never the window in front while that window is known: on 10 Oct it read the window in front
+  (Arc's command bar, or Yuki's own) 19 times and never saw a page. Another page there is False (the rung counts as
+  contradicted and the next one runs); a page that window already showed before the rung, which the rung itself never
+  saw arrive, is no proof either (False).
+
 **message, web_link** (:func:`route_chat_web_link`). A chat whose captured address the chat app's own ``[chat.links]``
 data matches (critique L4: an address is a route only when the app's link data recognises it) opens at that address in
 a browser (the one that address's site was last shown in, unless a learned policy says otherwise). It only opens the
@@ -53,6 +71,7 @@ services and links stay in RAM.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -75,6 +94,8 @@ LINE_TAB_UP = "{service} is up in {browser}."
 LINE_PAGE_UP = "{site} is up."
 LINE_VIDEO_UP = "Playing it."
 LINE_CHAT_WEB = "Your chat with {name} is open in {browser}."
+#: x8WebArc: two different browsers named in the exchange and the slot naming neither (``{choices}``: "Arc or Chrome").
+ASK_BROWSER = "Which browser, {choices}?"
 ORDINALS = ("the first", "the second", "the third", "the fourth")
 #: The candidates tried in identity order when one won't select (D8: each checked, the next one after a miss).
 TAB_TRIES = 2
@@ -98,6 +119,27 @@ BAND_H = 1
 BAND_DAYS = 28
 #: How much a done-check's front-window read may take (one UIA job on its own thread).
 FRONT_READ_S = 0.5
+#: x8WebArc: the least time a rung's page open gets, however much of the request's budget the resolve and an earlier
+#: rung spent (the request's 5 s is a p90 target, and the engine lets an acted rung's check run past it too): with less,
+#: a browser that did open the page could not be seen doing it.
+OPEN_FLOOR_S = 3.0
+#: x8WebArc, the address-bar rung: how long it reads the window's page before it acts, how long the frame-field check
+#: may take, how long it watches for the page after Enter (at least ``BAR_PAGE_MIN_S``), and the least time the whole
+#: rung gets however much of the request's budget the rungs before it spent.
+BAR_BEFORE_S = 0.5
+FIELD_READ_S = 0.6
+BAR_PAGE_S = 4.0
+BAR_PAGE_MIN_S = 1.5
+BAR_FLOOR_S = 8.0
+#: How long the window a rung opened a page in is kept for the next rung of the same run (RAM only).
+NOTE_KEEP_S = 30.0
+#: UI Automation control type ids (``UIA_*ControlTypeId``): a page's document, and the text fields an address or
+#: command bar is (an edit box, or an editable combo box).
+UIA_DOCUMENT = 50030
+UIA_EDIT = 50004
+UIA_COMBOBOX = 50003
+#: How far up from the focused element the frame-field check climbs (the desktop root is reached long before).
+CLIMB_MAX = 60
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -212,10 +254,111 @@ def _focus(hwnd: int) -> Any:
     return launch.focus_window(int(hwnd))
 
 
-def _open_url(url: str, app: str | None) -> Any:
+def _open_url(url: str, app: str | None, deadline: float | None = None) -> Any:
+    """``launch.open_url``: the address handed over as a launch argument, answering by ``deadline`` (a
+    ``time.monotonic()`` time; x8WebArc: on 10 Oct one Arc launch took 26-34 s, past the talker's 30 s)."""
     from yuki.actions import launch
 
-    return launch.open_url(url, app=app or None)
+    return launch.open_url(url, app=app or None, deadline=deadline)
+
+
+def _launch_deadline(call: RouteCall) -> float:
+    """The ``time.monotonic()`` time a rung's page open answers by: what is left of the request's deadline (on the
+    run's own clock), at least :data:`OPEN_FLOOR_S` from now."""
+    try:
+        left = float(call.deadline) - float(call.ctx.clock())
+    except Exception:  # noqa: BLE001 - no clock: the floor
+        left = 0.0
+    return time.monotonic() + max(left, OPEN_FLOOR_S)
+
+
+def _launch_seen(result: Any) -> dict[str, Any]:
+    """What a launch saw, from its result's details (RAM): the window it acted in (``hwnd``), the code word of how it
+    started the browser (``via``: ``protocol``, ``alias``, ``startfile``...), whether a window newly showed the page
+    (``verified``) or kept the one it had (``reason`` ``page_unchanged``, ``state`` ``same``/``other``), whether the
+    window came to the front, its process, and the page that window showed before the hand-off (``before``)."""
+    details = getattr(result, "details", None) or {}
+    if not isinstance(details, Mapping):
+        details = {}
+    try:
+        hwnd = int(details.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        hwnd = 0
+    before = ""
+    for page in details.get("before_pages") or []:
+        if isinstance(page, Mapping) and hwnd and int(page.get("hwnd") or 0) == hwnd:
+            before = str(page.get("url") or "")
+    return {"hwnd": hwnd, "via": str(details.get("via_word") or ""), "verified": details.get("page_verified") is True,
+            "reason": str(details.get("reason") or ""), "state": str(details.get("page_state") or ""),
+            "front": details.get("foreground") is True, "process": str(details.get("process_name") or ""),
+            "before": before}
+
+
+def _log_open(call: RouteCall, rung: str, seen: Mapping[str, Any], status: str) -> None:
+    """One content-free line per page a rung opened or tried to (x8WebArc, "the launch's via isn't logged"): the rung
+    (``protocol`` or ``address_bar``), how the browser was started or reached, the page's state, the process of the
+    window it acted in and whether that window came to the front."""
+    _log(call.ctx)("web_open", stage=rung, via=str(seen.get("via") or ""), status=status,
+                   process=str(seen.get("process") or ""), front=bool(seen.get("front")),
+                   state=str(seen.get("state") or ""))
+
+
+# x8WebArc: the window a rung of this run opened (or tried to open) a page in, for the next rung of the same run (the
+# address bar types into that very window): by run context, a few seconds, RAM only.
+_noted: dict[int, tuple[float, str, int]] = {}
+_noted_lock = threading.Lock()
+
+
+def _note_window(call: RouteCall, key: str, hwnd: int) -> None:
+    key = _app_key(key)
+    if not key or not hwnd:
+        return
+    now = time.monotonic()
+    with _noted_lock:
+        for old in [k for k, (at, _key, _hwnd) in _noted.items() if now - at > NOTE_KEEP_S]:
+            _noted.pop(old, None)
+        _noted[id(call.ctx)] = (now, key, int(hwnd))
+
+
+def _noted_window(call: RouteCall, key: str) -> int:
+    """The window an earlier rung of this run acted in for browser ``key``, while it is still that browser's window."""
+    with _noted_lock:
+        got = _noted.get(id(call.ctx))
+    if not got or time.monotonic() - got[0] > NOTE_KEEP_S or got[1] != _app_key(key):
+        return 0
+    hwnd = got[2]
+    return hwnd if _is_window(hwnd) and _app_key(_window_image(hwnd)) == got[1] else 0
+
+
+def _is_window(hwnd: int) -> bool:
+    try:
+        import win32gui
+
+        return bool(hwnd) and bool(win32gui.IsWindow(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _window_pid(hwnd: int) -> int:
+    try:
+        import win32process
+
+        return int(win32process.GetWindowThreadProcessId(int(hwnd))[1])
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _window_image(hwnd: int) -> str:
+    """The image name of the process that owns ``hwnd`` (``""``: unknown). Never reads the foreground."""
+    pid = _window_pid(hwnd)
+    if not pid:
+        return ""
+    try:
+        from yuki.skills.donecheck import _image_of
+
+        return _image_of(pid)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _handler_key(url: str) -> str:
@@ -417,22 +560,38 @@ def route_told_link(call: RouteCall) -> RouteResult:
     service = service_of(store, said) if store is not None else said
     ident = _identities(store, service) if store is not None and service else {}
     key = _app_key(call.values.get("browser")) or _app_key(ident.get("process"))
-    if key:
+    said_key, choices = _said_browser(call, store)
+    if choices:
+        return _ask_browser(choices)
+    if said_key:
+        # x8WebArc: a browser named in the exchange beats the slot's usual and memory's sighting
+        key = said_key
+        name, source = _browser_title(key), "words"
+    elif key:
         name, source = _browser_title(key), "slot" if call.values.get("browser") else "identity"
     else:
         name, key, source = choose_browser(call)
+        if source == "ask":
+            return _ask_browser(name)
     if _refused("open_url"):
         return RouteResult(ran=False, held="game", outcome="refused")
     if source == "default" and not key:
         key = _handler_key(link)
     _claim_app(call, key)
-    result = _open_url(link, name if source != "default" else None)
+    result = _open_url(link, name if source != "default" else None, _launch_deadline(call))
     if _held_by_game(result):
         return RouteResult(ran=False, held="game", outcome="refused")
+    seen = _launch_seen(result)
     if not getattr(result, "ok", False):
         details = getattr(result, "details", None) or {}
+        if seen["reason"] == "page_unchanged":
+            # x8WebArc: the browser kept the page it had: not opened
+            _log_open(call, "protocol", seen, "page_unchanged")
+            return RouteResult(ran=False, outcome="page_unchanged",
+                               facts={"browser_from": source, "via": seen["via"], "state": seen["state"]})
         if not (isinstance(details, Mapping) and (details.get("launched") or details.get("hwnd"))):
-            return RouteResult(ran=False, outcome="not_opened", facts={"browser_from": source})
+            return RouteResult(ran=False, outcome="not_opened", facts={"browser_from": source, "via": seen["via"]})
+    _log_open(call, "protocol", seen, "page" if seen["verified"] else "unread")
     words = {"service": service or said or "It", "browser": _browser_title(key) or name or "the browser"}
     return RouteResult(ran=True, outcome="opened", app=key or None, say=LINE_TAB_UP.format(**words),
                        facts={"browser_from": source}, facts_ram={"process": key, "service": service})
@@ -664,19 +823,104 @@ def _policy(call: RouteCall, slot: str = "browser", default: str = "most") -> st
     return got if got in BROWSER_POLICIES else default
 
 
-def choose_browser(call: RouteCall, *, hosts: Sequence[str] = (), policy: str | None = None) -> tuple[str, str, str]:
-    """``(name to launch it by, app key, where it came from)`` for a browser route (see :func:`browser_rule`).
-    ``hosts``: the site's own hosts (a program that showed it counts as a browser; the ``site`` policy)."""
+def browsers_said(measured: Sequence[Mapping[str, Any]], words: Sequence[str]) -> list[str]:
+    """The app keys of the measured browsers whose name stands, whole words in order, in the user's ``words`` (its
+    display name as Windows shows it, or its app key as people say it: "Arc", "Chrome"): identity of names, never
+    meaning. In the order measured, each once."""
+    from yuki.skills.uia_route import said as is_said
+
+    sources = [str(w) for w in words if w]
+    out: list[str] = []
+    for m in measured:
+        key = str(m.get("key") or "")
+        names = {str(m.get("name") or ""), _browser_title(key)}
+        if key and key not in out and any(n and is_said(n, sources) for n in names):
+            out.append(key)
+    return out
+
+
+def _said_browser(call: RouteCall, store: Any,
+                  measured: Sequence[Mapping[str, Any]] | None = None) -> tuple[str, str]:
+    """``(app key, "")`` of the browser the user named (the slot's value when it stands in their words, else the one
+    measured browser whose name does), ``("", "Arc or Chrome")`` when two different ones are named and the slot names
+    neither, ``("", "")`` when none is. ``measured``: :func:`measured_browsers` already read (else read here)."""
+    words = [str(w) for w in call.ctx.words if w]
     named = call.values.get("browser")
-    named = str(named) if named else None
-    said = False
+    if measured is None:
+        measured = measured_browsers(store) if store is not None else []
+    hits = browsers_said(measured, words)
     if named:
         from yuki.skills.uia_route import said as is_said
 
-        said = is_said(named, [str(w) for w in call.ctx.words if w])
+        key = _app_key(named)
+        if is_said(str(named), words):
+            others = [k for k in hits if k != key]
+            # their words name only this one, or the talker gave it from their words (it resolved "Arc, not Chrome"):
+            # it stands. The words name others too and the value is only their usual: asked, never assumed
+            if not others or _slot_source(call, "browser") in ("words", ""):
+                return key, ""
+            return "", " or ".join(_browser_title(k) for k in ([key] + others)[:3])
+    if len(hits) > 1:
+        return "", " or ".join(_browser_title(k) for k in hits[:3])
+    return (hits[0] if hits else ""), ""
+
+
+def _slot_source(call: RouteCall, slot: str) -> str:
+    """Where the resolver took ``slot``'s value from for this run (``words``: the caller gave it and it stands in
+    their words; ``pref``, ``taste``, ``default``, ``again``...): the run's own ledger row, which the engine wrote before
+    the first rung (``skill_runs.filled``, code words only). ``""`` when it can't be read (no memory)."""
+    memory = getattr(call.ctx, "memory", None)
+    if memory is None:
+        return ""
+    from yuki.skills.engine import _mem, _store_of
+
+    rid = getattr(call.ctx, "request_id", None)
+    keys = tuple(dict.fromkeys(k for k in (call.skill.key, getattr(call.skill, "capability", "")) if k))
+
+    def go(client: Any) -> str:
+        rows = _store_of(client)._query(
+            f"SELECT filled FROM skill_runs WHERE skill IN ({','.join('?' * len(keys))}) AND outcome = 'running' "
+            "AND t0 >= ?" + (" AND request_id = ?" if rid else "") + " ORDER BY t0 DESC LIMIT 1",
+            (*keys, time.time() - 120.0, *((rid,) if rid else ())))
+        if not rows or not rows[0][0]:
+            return ""
+        import json
+
+        got = json.loads(rows[0][0])
+        return str(got.get(slot) or "") if isinstance(got, dict) else ""
+
+    try:
+        return str(_mem(memory, "skill_slot_source", go, timeout_s=0.5) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ask_browser(choices: str) -> RouteResult:
+    """Two browsers named and none picked: asked, never guessed (the engine's settled "asked" path)."""
+    return RouteResult(ran=False, ask=ASK_BROWSER.format(choices=choices), options=choices.split(" or "),
+                       outcome="ask_browser")
+
+
+def choose_browser(call: RouteCall, *, hosts: Sequence[str] = (), policy: str | None = None) -> tuple[str, str, str]:
+    """``(name to launch it by, app key, where it came from)`` for a browser route (see :func:`browser_rule`).
+    ``hosts``: the site's own hosts (a program that showed it counts as a browser; the ``site`` policy).
+
+    x8WebArc: what the user said wins. The slot's value stands when it is in their words (the request's whole exchange,
+    ``ctx.words``); otherwise a measured browser whose name is in those words beats their usual and any learned fill
+    policy (10 Oct: the learned "Open YouTube home" was called with no browser while "in Arc" stood two turns back).
+    Two different browsers named there and the slot naming neither (``"open it in Arc, not Chrome"``): ``source`` is
+    ``"ask"`` and ``name`` the choices (``"Arc or Chrome"``), for :func:`_ask_browser`: never a guess."""
+    named = call.values.get("browser")
+    named = str(named) if named else None
     store = _store(call.ctx)
     measured = measured_browsers(store, site_hosts=list(hosts)) if store is not None else []
     keys = [m["key"] for m in measured]
+    said_key, choices = _said_browser(call, store, measured)
+    if choices:
+        return choices, "", "ask"
+    said = bool(said_key)
+    if said:
+        named = said_key
     policy = policy or _policy(call)
     front = recent = band = None
     if store is not None and not named and policy == "front_or_recent":
@@ -699,24 +943,49 @@ def _browser_line(base: str, name: str, source: str) -> str:
 
 
 def _open_in_browser(call: RouteCall, url: str, *, hosts: Sequence[str] = (),
-                     policy: str | None = None) -> tuple[RouteResult | None, str, str, str]:
-    """Open ``url`` in the chosen browser: ``(a result when it didn't open, name, key, source)``."""
+                     policy: str | None = None) -> tuple[RouteResult | None, str, str, str, dict[str, Any]]:
+    """Open ``url`` in the chosen browser: ``(a result when it didn't open, name, key, source, what the open saw)``
+    (:func:`_launch_seen`; RAM). x8WebArc: the open answers by the request's deadline (:func:`_launch_deadline`); a
+    browser that kept the page it had (``page_unchanged``: Arc ignored the address and still showed its old tab, or
+    another page) did not open it, so the rung did not run and the next one (the address bar) does."""
     name, key, source = choose_browser(call, hosts=hosts, policy=policy)
+    if source == "ask":
+        return _ask_browser(name), name, key, source, {}
     if _refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source
+        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
     if source == "default" and not key:
         key = _handler_key(url)
     _claim_app(call, key)
-    result = _open_url(url, name if source != "default" else None)
+    result = _open_url(url, name if source != "default" else None, _launch_deadline(call))
     if _held_by_game(result):
-        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source
+        return RouteResult(ran=False, held="game", outcome="refused"), name, key, source, {}
+    seen = _launch_seen(result)
+    if seen["hwnd"]:
+        _note_window(call, key or _app_key(seen["process"]), seen["hwnd"])
+    facts = {"browser_from": source, "via": seen["via"]}
     if not getattr(result, "ok", False):
+        if seen["reason"] == "page_unchanged":
+            _log_open(call, "protocol", seen, "page_unchanged")
+            return RouteResult(ran=False, outcome="page_unchanged", facts={**facts, "state": seen["state"]}), \
+                name, key, source, seen
         details = getattr(result, "details", None) or {}
         launched = isinstance(details, Mapping) and bool(details.get("launched") or details.get("hwnd"))
+        _log_open(call, "protocol", seen, "unread" if launched else "not_opened")
         # a browser that started but didn't show the page may still: acted, and the done-check decides
-        return (None if launched else RouteResult(ran=False, outcome="not_opened",
-                                                  facts={"browser_from": source})), name, key, source
-    return None, name, key, source
+        return (None if launched else RouteResult(ran=False, outcome="not_opened", facts=facts)), \
+            name, key, source, seen
+    _log_open(call, "protocol", seen, "page" if seen["verified"] else "unread")
+    return None, name, key, source, seen
+
+
+def _opened_result(line: str, key: str, source: str, seen: Mapping[str, Any], ram: dict[str, Any]) -> RouteResult:
+    """A rung that handed the page over: acted. ``verified`` when the launch itself saw a window newly show the page
+    (never a page it already showed); the done-check reads the window it acted in (``hwnd``) and compares with what that
+    window showed before (``before``)."""
+    return RouteResult(ran=True, verified=True if seen.get("verified") else None, outcome="opened", app=key or None,
+                       say=line, facts={"browser_from": source, "via": str(seen.get("via") or "")},
+                       facts_ram={**ram, "browser": key, "hwnd": int(seen.get("hwnd") or 0),
+                                  "before": str(seen.get("before") or "")})
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -822,16 +1091,30 @@ def _hosts_of(expect: Mapping[str, Any]) -> list[str]:
 def route_open_page(call: RouteCall) -> RouteResult:
     """web.open_page's rung A: the page's address (:func:`page_address`) in the chosen browser. Nothing else is
     opened, so nothing plays until the user picks."""
+    url, expect, base = _target(call, "page")
+    if not url:
+        return RouteResult(ran=False, outcome=str(expect.get("why") or "no_address"))
+    failed, name, key, source, seen = _open_in_browser(call, url, hosts=_hosts_of(expect))
+    if failed is not None:
+        return failed
+    return _opened_result(_browser_line(base, name, source), key, source, seen, {"expect": expect})
+
+
+def _target(call: RouteCall, opens: str) -> tuple[str | None, dict[str, Any], str]:
+    """``(address, what the page must be, the done line before the browser is named)`` of a web route: a picked
+    video's own link (``opens = "video"``), else the site's page (:func:`page_address`); ``(None, {"why": code}, "")``
+    when no address can be built from data."""
+    if opens == "video":
+        video = call.values.get("video")
+        got = video_page(video.get("ref") if isinstance(video, Mapping) else None)
+        if got is None:
+            return None, {"why": "no_link"}, ""
+        return got[0], got[1], LINE_VIDEO_UP
     said = _words(call.values.get("site"))
     url, expect = page_address(said, call.values.get("page"), call.values.get("item"))
     if not url:
-        return RouteResult(ran=False, outcome=str(expect.get("why") or "no_address"))
-    failed, name, key, source = _open_in_browser(call, url, hosts=_hosts_of(expect))
-    if failed is not None:
-        return failed
-    line = _browser_line(LINE_PAGE_UP.format(site=_site_title(expect, said)), name, source)
-    return RouteResult(ran=True, outcome="opened", app=key or None, say=line, facts={"browser_from": source},
-                       facts_ram={"expect": expect, "browser": key})
+        return None, expect, ""
+    return url, expect, LINE_PAGE_UP.format(site=_site_title(expect, said))
 
 
 def video_page(ref: Any) -> tuple[str, dict[str, Any]] | None:
@@ -850,21 +1133,18 @@ def video_page(ref: Any) -> tuple[str, dict[str, Any]] | None:
 
 def route_open_video(call: RouteCall) -> RouteResult:
     """web.open_video's rung A: the picked video's own page in the chosen browser (its link from the offered options)."""
-    video = call.values.get("video")
-    ref = video.get("ref") if isinstance(video, Mapping) else None
-    got = video_page(ref)
-    if got is None:
-        return RouteResult(ran=False, outcome="no_link")
-    url, expect = got
-    failed, name, key, source = _open_in_browser(call, url, hosts=_hosts_of(expect))
+    url, expect, base = _target(call, "video")
+    if not url:
+        return RouteResult(ran=False, outcome=str(expect.get("why") or "no_link"))
+    failed, name, key, source, seen = _open_in_browser(call, url, hosts=_hosts_of(expect))
     if failed is not None:
         return failed
-    return RouteResult(ran=True, outcome="opened", app=key or None, say=_browser_line(LINE_VIDEO_UP, name, source),
-                       facts={"browser_from": source}, facts_ram={"expect": expect, "browser": key})
+    return _opened_result(_browser_line(base, name, source), key, source, seen, {"expect": expect})
 
 
 def _front_urls(hwnd: int) -> list[str] | None:
-    """The addresses of the Documents of the window in front (a browser's page), read in one UIA job."""
+    """The addresses of the Documents of window ``hwnd`` (a browser's page), read in one UIA job (never the foreground:
+    the caller names the window)."""
     from yuki.connect.spotify_desktop import UiaTree, run_uia
 
     def job(automation: Any, shared: dict) -> None:
@@ -877,36 +1157,249 @@ def _front_urls(hwnd: int) -> list[str] | None:
     return list(shared.get("urls") or [])
 
 
-def _front_page(expect: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    hwnd, _image = _front()
+def _page_window(ctx: Any) -> tuple[int, str]:
+    """``(hwnd, how)`` of the window a page check reads (x8WebArc): the window the route opened the page in (its RAM
+    ``hwnd``, while it is still a window of that browser): ``route``; else the top window of the browser it opened it in
+    (``browser``; 0 when that browser has none): ``browser``; else, with no route facts at all, the window in front:
+    ``front``. The foreground is never read while the route's window or browser is known: on 10 Oct the check read the
+    window in front (Arc's command bar, or Yuki's own window) 19 times and never saw the page."""
+    ram = _ram(ctx)
+    key = _app_key(ram.get("browser"))
+    try:
+        hwnd = int(ram.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        hwnd = 0
+    if hwnd and _is_window(hwnd) and (not key or _app_key(_window_image(hwnd)) == key):
+        return hwnd, "route"
+    if key:
+        return next((h for h, _pid in _app_windows(key)), 0), "browser"
+    front, _image = _front()
+    return front, "front"
+
+
+def _page_key(url: str) -> Any:
+    """An address as "the same page" (``launch._page_key``: scheme, host without ``www.``, port, path, query pairs)."""
+    try:
+        from yuki.actions.launch import _page_key as key
+
+        return key(str(url or ""))
+    except Exception:  # noqa: BLE001
+        return str(url or "")
+
+
+def _shown_page(ctx: Any, matches: Callable[[str], bool]) -> tuple[bool | None, dict[str, Any]]:
+    """The page check of a browser route: the window :func:`_page_window` names shows a page ``matches`` takes. Another
+    page there: False (contradicted, so the engine's next rung runs). The very page that window showed before the rung
+    acted (RAM ``before``), when the rung itself never saw a window newly show it (``verified``): False too (an old tab
+    is no proof the address was opened). No window, or no readable page: None. Evidence (content-free): ``status``,
+    ``via`` (which window was read) and ``process`` (that window's program)."""
+    hwnd, how = _page_window(ctx)
     if not hwnd:
-        return None, {"status": "unread"}
+        return (None if how == "front" else False), {"status": "unread" if how == "front" else "no_window", "via": how}
+    ev: dict[str, Any] = {"via": how, "process": _window_image(hwnd)}
     urls = _front_urls(hwnd)
     if urls is None:
-        return None, {"status": "timeout"}
+        return None, {**ev, "status": "timeout"}
     if not urls:
-        return None, {"status": "no_document"}
-    if any(page_matches(url, expect) for url in urls):
-        return True, {"status": "page"}
-    return False, {"status": "other_page"}
+        return None, {**ev, "status": "no_document"}
+    hits = [url for url in urls if matches(url)]
+    if not hits:
+        return False, {**ev, "status": "other_page"}
+    ram = _ram(ctx)
+    before = str(ram.get("before") or "")
+    fresh = getattr(getattr(ctx, "result", None), "verified", None) is True
+    if before and not fresh and all(_page_key(url) == _page_key(before) for url in hits):
+        return False, {**ev, "status": "unchanged"}
+    return True, {**ev, "status": "page"}
 
 
 def probe_page_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    """web.open_page's done-check: the page in front is the one the route opened (by template value, or by host for a
-    host-scope page). After a hand-off (no route result) it can't say: None."""
+    """web.open_page's done-check: the browser window the route opened the page in shows it (by template value, or by
+    host for a host-scope page; :func:`_shown_page`). After a hand-off (no route result) it can't say: None."""
     expect = _ram(ctx).get("expect")
     if not isinstance(expect, Mapping) or not expect:
         return None, {"status": "no_route"}
-    return _front_page(expect)
+    return _shown_page(ctx, lambda url: page_matches(url, expect))
 
 
 def probe_video_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
-    """web.open_video's done-check: the page in front is the very video page the route opened. After a hand-off (no
-    route result) it can't say which page counts: None (never a false done)."""
+    """web.open_video's done-check: the browser window the route opened it in shows that very video page. After a
+    hand-off (no route result) it can't say which page counts: None (never a false done)."""
     expect = _ram(ctx).get("expect")
     if not isinstance(expect, Mapping) or not expect:
         return None, {"status": "no_route"}
-    return _front_page(expect)
+    return _shown_page(ctx, lambda url: page_matches(url, expect))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# x8WebArc: the address-bar rung
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _first_page(windows: Callable[[], list[int]], accept: Callable[[str], bool], timeout_s: float) -> Any:
+    """The first page one of ``windows()`` shows that ``accept`` takes, within ``timeout_s``
+    (:func:`yuki.perception.tree.wait_for_page`, a page-only read on its own thread), else ``None``."""
+    try:
+        from yuki.perception.tree import wait_for_page
+
+        return wait_for_page(windows, accept, timeout_s=max(0.0, float(timeout_s))).matched
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def frame_field(pid: int, budget_s: float = FIELD_READ_S) -> tuple[bool | None, str]:
+    """Whether keyboard focus is on a text field of the browser's own frame (its address or command bar) and not inside
+    a page: the focused element belongs to the browser's process ``pid``, is an edit box or an editable combo box, and
+    nothing above it up to the desktop is a Document (a page's own box, a chat's composer or a search field, always
+    is). ``(True, "frame_field")``; ``(False, code)`` read and not so; ``(None, code)`` couldn't read. Structure only,
+    one UIA job on its own thread: nothing here knows which browser it is, or reads a name."""
+    from yuki.connect.spotify_desktop import run_uia
+
+    def job(automation: Any, shared: dict) -> None:
+        element = automation.GetFocusedElement()
+        if not element:
+            shared["status"] = "no_focus"
+            return
+        shared["pid"] = int(element.CurrentProcessId or 0)
+        shared["type"] = int(element.CurrentControlType or 0)
+        walker = automation.ControlViewWalker
+        node, depth = element, 0
+        while node and depth < CLIMB_MAX:
+            if int(node.CurrentControlType or 0) == UIA_DOCUMENT:
+                shared["in_page"] = True
+                return
+            node = walker.GetParentElement(node)
+            depth += 1
+        # past the desktop root (a null parent): no Document above it; the climb cut short: unknown
+        shared["in_page"] = None if node else False
+
+    shared, late = run_uia(job, budget_s, name="yuki-skill-field")
+    if late:
+        return None, "timeout"
+    if shared.get("error"):
+        return None, "unread"
+    if shared.get("status"):
+        return None, str(shared["status"])
+    if not pid or int(shared.get("pid") or 0) != int(pid):
+        return False, "other_process"
+    if shared.get("in_page") is True:
+        return False, "in_page"
+    if shared.get("in_page") is None:
+        return None, "climb_cut"
+    if int(shared.get("type") or 0) not in (UIA_EDIT, UIA_COMBOBOX):
+        return False, "not_a_field"
+    return True, "frame_field"
+
+
+def _keys() -> Any:
+    from yuki.actions import input as keys
+
+    return keys
+
+
+def route_address_bar(call: RouteCall) -> RouteResult:
+    """web.open_page's and web.open_video's second rung A (x8WebArc; the path that worked in Arc on 5 Oct): the address
+    typed into the chosen browser's own address field, in its own window.
+
+    The browser is the one :func:`choose_browser` picks (the same as the rung before); its window is the one that rung
+    acted in (kept for this run), else that browser's top window. It comes forward (the guarded ``focus_window``), the
+    route's ``new_tab`` keys open a new tab with its address field focused (in Arc: the command bar), and only when
+    focus is then on a text field of the browser's own frame in that same program (:func:`frame_field`: never a
+    page's own box, so it can never send anything) is the address typed and read back (``type_text`` without Enter);
+    an inline completion the field added after it is deleted, and Enter navigates. Then the browser's windows are read
+    for the page (:data:`BAR_PAGE_S`). Anything short of typing the address (no window, the keys refused, no frame
+    field, the text not kept) did not run: the engine hands off. Every key goes through Yuki's guarded input (nothing
+    with a game in front: D17)."""
+    started = time.monotonic()
+    a = call.args if isinstance(call.args, Mapping) else {}
+    url, expect, base = _target(call, str(a.get("opens") or "page"))
+    if not url:
+        return RouteResult(ran=False, outcome=str(expect.get("why") or "no_address"))
+    new_tab = [str(k) for k in (a.get("new_tab") or []) if str(k or "").strip()]
+    if not new_tab:
+        return RouteResult(ran=False, outcome="no_keys")
+    name, key, source = choose_browser(call, hosts=_hosts_of(expect))
+    if source == "ask":
+        return _ask_browser(name)
+    if source == "default" and not key:
+        key = _handler_key(url)
+    facts: dict[str, Any] = {"browser_from": source, "via": "address_bar"}
+    if not key:
+        return RouteResult(ran=False, outcome="no_browser", facts=facts)
+    hwnd = _noted_window(call, key) or next((h for h, _pid in _app_windows(key)), 0)
+    pid = _window_pid(hwnd) if hwnd else 0
+    if not hwnd or not pid:
+        return RouteResult(ran=False, outcome="no_window", facts=facts)
+    if _refused("focus", hwnd=hwnd):
+        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    end = max(_launch_deadline(call), started + BAR_FLOOR_S)
+    seen: dict[str, Any] = {"via": "address_bar", "process": _window_image(hwnd), "front": False, "state": ""}
+    # what the window shows now: a page it already showed is no proof the address opened (the done-check compares)
+    before = _first_page(lambda: [hwnd], bool, BAR_BEFORE_S)
+    before_url = str(getattr(before, "url", "") or "")
+    _claim_app(call, key)
+    focused = _focus(hwnd)
+    if _held_by_game(focused):
+        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if not getattr(focused, "ok", False):
+        _log_open(call, "address_bar", seen, "not_focused")
+        return RouteResult(ran=False, outcome="not_focused", facts=facts)
+    seen["front"] = True
+    keys = _keys()
+    opened = keys.hotkey(*new_tab, expect_hwnd=hwnd)
+    if _held_by_game(opened):
+        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if not getattr(opened, "ok", False):
+        _log_open(call, "address_bar", seen, "keys_refused")
+        return RouteResult(ran=False, outcome="keys_refused", facts=facts)
+    details = getattr(opened, "details", None) or {}
+    try:
+        field_hwnd = int(details.get("foreground_hwnd") or 0) if isinstance(details, Mapping) else 0
+    except (TypeError, ValueError):
+        field_hwnd = 0
+    if not field_hwnd or _window_pid(field_hwnd) != pid:
+        # the keys took focus out of the browser (another program in front now): nothing is typed anywhere
+        _log_open(call, "address_bar", seen, "other_window")
+        return RouteResult(ran=False, outcome="other_window", facts=facts)
+    ok, why = frame_field(pid)
+    facts["stage"] = why
+    if ok is not True:
+        # focus is not on the browser's own address field (or it couldn't be read): never typed into, so never sent
+        _log_open(call, "address_bar", seen, "no_field")
+        return RouteResult(ran=False, outcome="no_address_field", facts=facts)
+    typed = keys.type_text(url, expect_hwnd=field_hwnd)
+    if _held_by_game(typed):
+        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    typed_facts = getattr(typed, "details", None) or {}
+    if not getattr(typed, "ok", False) or typed_facts.get("readback") != "arrived":
+        # not kept, or unreadable: no Enter on an address that may be half there; the field is left as it was opened
+        keys.press("escape", expect_hwnd=field_hwnd)
+        _log_open(call, "address_bar", seen, "not_typed")
+        return RouteResult(ran=False, outcome="not_typed", facts=facts)
+    if typed_facts.get("readback_source") == "caret" or \
+            len(" ".join(str(typed_facts.get("readback_text") or "").split())) > len(url):
+        # the field completed the address inline (the rest selected after what was typed; a read up to the caret can't
+        # see it): that rest goes, so Enter opens the address asked for (in a field opened empty, nothing else follows
+        # the caret, and with nothing selected the key does nothing)
+        keys.press("delete", expect_hwnd=field_hwnd)
+    entered = keys.press("enter", expect_hwnd=field_hwnd)
+    if _held_by_game(entered):
+        return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+    if not getattr(entered, "ok", False):
+        _log_open(call, "address_bar", seen, "enter_refused")
+        return RouteResult(ran=False, outcome="enter_refused", facts=facts)
+    watch = max(BAR_PAGE_MIN_S, min(BAR_PAGE_S, end - time.monotonic()))
+    page = _first_page(lambda: [hwnd] + [h for h, _pid in _app_windows(key) if h != hwnd],
+                       lambda u: page_matches(u, expect), watch)
+    at = int(getattr(page, "hwnd", 0) or 0) or hwnd
+    seen["state"] = "same" if before_url and page is not None and _page_key(page.url) == _page_key(before_url) \
+        else ""
+    facts["status"] = "page" if page is not None else "not_seen"
+    _note_window(call, key, at)
+    _log_open(call, "address_bar", seen, facts["status"])
+    return RouteResult(ran=True, verified=True if page is not None else None, outcome="typed", app=key,
+                       say=_browser_line(base, name, source), facts=facts,
+                       facts_ram={"expect": expect, "browser": key, "hwnd": at, "before": before_url})
 
 
 def probe_video_playing(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -929,7 +1422,8 @@ def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dic
     """web.open_page's re-check from a second source: memory's own read of the window in front (the watcher's Now
     board, read after the run began) shows the page the route opened (``site`` / ``kind`` in the check: any page of
     them). A stale or blocked read: None."""
-    expect = _ram(ctx).get("expect")
+    ram = _ram(ctx)
+    expect = ram.get("expect")
     if not isinstance(expect, Mapping) or not expect:
         expect = {k: args[k] for k in ("site", "kind", "host") if args.get(k)}
     if not expect:
@@ -937,7 +1431,14 @@ def probe_page_seen(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dic
     board = _board_now()
     if not board:
         return None, {"status": "no_board"}
-    front = next((w for w in board.get("windows") or [] if w.get("foreground")), None)
+    windows = [w for w in board.get("windows") or [] if isinstance(w, Mapping)]
+    try:
+        want = int(ram.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        want = 0
+    # x8WebArc: the window the route opened the page in, when the watcher read it; else the one in front
+    front = next((w for w in windows if want and int(w.get("hwnd") or 0) == want), None) or \
+        next((w for w in windows if w.get("foreground")), None)
     if front is None:
         return None, {"status": "no_front"}
     if front.get("blocked") or not front.get("read_at") or float(front["read_at"]) < float(ctx.since):
@@ -1011,13 +1512,12 @@ def route_chat_web_link(call: RouteCall) -> RouteResult:
     if not url:
         return RouteResult(ran=False, outcome="no_web_address")
     host = url_host(url) or ""
-    failed, name, key, source = _open_in_browser(call, url, hosts=[host] if host else [],
-                                                 policy=_policy(call, default="site"))
+    failed, name, key, source, seen = _open_in_browser(call, url, hosts=[host] if host else [],
+                                                       policy=_policy(call, default="site"))
     if failed is not None:
         return failed
     words = {"name": target.name, "browser": _browser_title(key) or name or "the browser"}
-    return RouteResult(ran=True, outcome="opened", app=key or None, say=LINE_CHAT_WEB.format(**words),
-                       facts={"browser_from": source}, facts_ram={"url": url, "browser": key, "app": route.app})
+    return _opened_result(LINE_CHAT_WEB.format(**words), key, source, seen, {"url": url, "app": route.app})
 
 
 def probe_chat_page_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
@@ -1025,21 +1525,13 @@ def probe_chat_page_shown(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | Non
     want = str(_ram(ctx).get("url") or "")
     if not want:
         return None, {"status": "no_route"}
-    hwnd, _image = _front()
-    if not hwnd:
-        return None, {"status": "unread"}
-    urls = _front_urls(hwnd)
-    if urls is None:
-        return None, {"status": "timeout"}
-    if not urls:
-        return None, {"status": "no_document"}
-    ok = any(_same_page(u, want) for u in urls)
-    return ok, {"status": "page" if ok else "other_page"}
+    # x8WebArc: the browser window the route opened it in, never the window in front while that one is known
+    return _shown_page(ctx, lambda url: _same_page(url, want))
 
 
 ROUTES: dict[str, Callable[[RouteCall], RouteResult]] = {
     "site_tab": route_site_tab, "told_link": route_told_link, "open_page": route_open_page,
-    "open_video": route_open_video, "chat_web_link": route_chat_web_link,
+    "open_video": route_open_video, "chat_web_link": route_chat_web_link, "address_bar": route_address_bar,
 }
 PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {
     "site_tab_shown": probe_site_tab_shown, "site_front": probe_site_front, "browser_front": probe_browser_front,
@@ -1048,7 +1540,8 @@ PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {
 }
 
 __all__ = ["ROUTES", "PROBES", "route_site_tab", "route_told_link", "route_open_page", "route_open_video",
-           "route_chat_web_link", "probe_site_tab_shown", "probe_site_front", "probe_browser_front",
+           "route_chat_web_link", "route_address_bar", "frame_field", "browsers_said", "ASK_BROWSER",
+           "probe_site_tab_shown", "probe_site_front", "probe_browser_front",
            "probe_page_shown", "probe_page_seen", "probe_video_shown", "probe_video_playing", "probe_chat_page_shown",
            "browser_rule", "choose_browser", "measured_browsers", "last_in_front", "band_browser", "site_hosts",
            "known_services", "service_of", "page_address", "page_matches", "video_page", "domain_like",
