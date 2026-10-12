@@ -352,12 +352,18 @@ class SkillResult:
             return ("Its own routes didn't get there: do it by steps (look, click, type) with the skill pinned; don't "
                     "run this skill again.")
         if self.outcome == "unverified":
-            if self.sends:
-                # rule 8: it may have gone already; a second try could send it twice
-                return (f"It ran and may have sent it already, but the PC couldn't confirm it: never send it again. "
-                        f"Look at the screen and say plainly what it shows: {self.say}")
-            return (f"It ran, but the PC couldn't confirm the result, and doing it again could do it twice: look at "
-                    f"the screen and say plainly what it shows; don't run this skill again. {self.say}").strip()
+            # review r2 M1: the first line keeps main's shape, the driver's own line right after "Say so plainly: "
+            # (``brain.done.engine_line`` reads it off the run_skill summary: the first line, cut at 200 characters;
+            # 64 + the longest driver line, 117, fits), so the brain speaks "playing on another device..." or "already
+            # playing ... so I left it" and never a generic "I did it" for a press that never happened; the guidance
+            # rides on the second line, which only the model reads
+            head = ("It ran, but the PC couldn't confirm it." if self.sends
+                    else "It ran, but the PC couldn't confirm the result.")
+            say = " ".join(str(self.say or "").split())
+            # rule 8: a send may have gone already, so a second try could send it twice
+            rest = ("It may have sent already: never send it again." if self.sends
+                    else "Don't run this skill again: doing it again could do it twice.")
+            return f"{head} Say so plainly: {say}\n{rest}" if say else f"{head}\n{rest}"
         if self.outcome == "other_device":
             return f"Not changed: {self.say}"
         if self.outcome == "refused" and self.why in REFUSED_BY_STEPS:
@@ -1548,11 +1554,13 @@ def _dropped_handoff(resolved: Any, slots: Mapping[str, Any] | None, words: list
     the resolver dropped because the value isn't a span of the words as heard (the talker's or the thinker's own
     reading: "Hemanth" for the heard "hey meant", "Discord" for "this card") becomes rung C with the given values (why
     :data:`WHY_DROPPED`), never "Who to?" asked back. In the seed the asked slot is :data:`FROM_UNHEARD`, another given
-    value that stands in the words is ``words`` (the resolver's word for it) and one that doesn't is
-    :data:`FROM_GIVEN`; an option or a number that isn't valid is left out (code checks those without the words).
+    value that stands in the words (or that the resolver checked and kept, review r2 L1) is ``words`` (the resolver's
+    word for it) and one that doesn't is :data:`FROM_GIVEN`; an option or a number that isn't valid is left out (code
+    checks those without the words).
 
     ``None`` keeps the question: a slot nobody gave (a real question), a given value that **is** in the words and was
-    still asked about (two of the user's people answer to it: a real question too), a card or an eval
+    still asked about (two of the user's people answer to it: a real question too), a question about a given value
+    the resolver kept (its ``Ask.dropped`` doesn't name the slot: "Did you mean Hemanth?"), a card or an eval
     (:data:`HANDOFF_ORIGINS`), a skill whose data never hands over, a run that commits without sending (a call join:
     redteam D10, review r1 M1). Sends still go through the consent rule where the
     thinker acts (rule 8); the seed's ``sends`` errs toward "may send" (only the given values are known)."""
@@ -1586,6 +1594,20 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
         # the question: a value nobody said is never joined (redteam D10), and the thinker has no consent step for a
         # join. A skill that sends keeps its hand-off: the consent rule asks before any send where the thinker acts
         return None
+    # review r2 L1: the resolver's own verdict when it gives one (x6Resolver's ``Ask.dropped``, the slots whose given
+    # value failed its checks). A question about a given value it kept (x6's "Did you mean Hemanth?" for a name said
+    # as written that sounds like one of the user's people) is a real question and stands. A given slot it checked
+    # (its slot loop stops at the question, so only the slots before the asked one) and kept passed every check it
+    # has (the user's people, heard forms, transliterations: "Hemanth" from "हेमंत"), so it is the user's word, never
+    # "given". With no verdict (an older resolver) today's literal checks stand
+    verdict = getattr(resolved, "dropped", None)
+    kept: set[str] = set()
+    if isinstance(verdict, (list, tuple)):
+        failed = {str(v) for v in verdict}
+        if asked.name not in failed:
+            return None
+        order = [s.name for s in skill.slots]
+        kept = set(order[:order.index(asked.name)]) - failed if asked.name in order else set()
     heard = [str(w) for w in words or [] if str(w or "").strip()]
     asked_text = _given_text(given[asked.name])
     if not asked_text or said(asked_text, heard):
@@ -1614,7 +1636,9 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
             continue
         values[slot.name] = app_name(text) if slot.type == "app" else (
             {"name": text} if slot.type in ("entity", "person") else text)
-        filled[slot.name] = FROM_UNHEARD if slot.name == asked.name else FROM_GIVEN
+        # review r2 L1: a value the resolver kept is the user's word even when the literal check here can't see it
+        filled[slot.name] = FROM_UNHEARD if slot.name == asked.name else ("words" if slot.name in kept
+                                                                           else FROM_GIVEN)
     return Handoff(skill, values, filled, why=WHY_DROPPED)
 
 
