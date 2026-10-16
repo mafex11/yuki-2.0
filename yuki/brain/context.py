@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, skill_family
+from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, seed_sends, skill_family
 from yuki.brain.prompt import menu_text, profile_text
 
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
@@ -66,8 +66,11 @@ SEED_LABELS: dict[str, str] = {"unverified": SEED_UNSURE_LABEL, "error": SEED_UN
 #: not run; the planner runs the skill in a plan that declares the commit (x10).
 SEED_COMMIT_LABEL = ("[A skill stopped before a step that would send or join (not a failure: that step needs a plan). "
                      "Run that skill again in a plan that declares the commit, with the consent it needs]")
-#: A hand-off of a skill that sends, done by steps: only the message capability sends, so steps leave a draft.
-SEED_DRAFT_LINE = "A message done by steps is typed, never sent: leave it as a draft and say it is ready for them."
+#: A hand-off of a skill that sends, done by steps: only the message capability sends, so steps leave a draft. Its
+#: check is the plan's own (the skill's reads a send: ``yuki.brain.plan.seed_sends``, never a draft's check); code says
+#: the draft's line when that probe saw the text typed in (``agent.LINE_DRAFTED``), so the planner says no line.
+SEED_DRAFT_LINE = ("A message done by steps is typed, never sent: leave it as a draft. Its done: field_holds of the "
+                   "message box with the text typed (not none: the skill's check below reads a send).")
 #: The most names a seed's ``seen`` list shows (IF-seed: up to 40, kept in RAM only), and their room in characters.
 SEEN_MAX = 40
 SEEN_CHARS = 700
@@ -455,7 +458,8 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -
     what to do next, by the hand-off's ``why`` (:data:`SEED_LABELS`): by steps (never that skill again; look first and
     redo nothing after one that acted unconfirmed; check the values after one that dropped a misheard value), or with
     the consent a send or a join needs when the skill stopped for one (:data:`yuki.brain.plan.SEED_RERUN_OK`). A skill
-    that sends, done by steps, is left as a draft (:data:`SEED_DRAFT_LINE`)."""
+    that sends, done by steps, is left as a draft, checked by its own probe and never by the skill's send check
+    (:data:`SEED_DRAFT_LINE`)."""
     if not seed:
         return ""
     keep = {k: seed.get(k) for k in ("skill", "goal", "slots", "done", "tried", "missing") if seed.get(k) is not None}
@@ -466,13 +470,18 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -
     why = str(seed.get("why") or "").strip()
     rerun = why in SEED_RERUN_OK
     label = SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
+    draft = not rerun and seed_sends(seed)
+    if draft:
+        # the skill's check reads a send, never a draft's (the validator gives a plan by steps none for it): the
+        # draft line says what its done is
+        label = label.replace(f" {SEED_DONE}", "")
     text = f"{label}\n{clip(body, limit)}"
     family = skill_family(seed.get("skill") or seed.get("key"))
     if family and not rerun:
         # the id itself (a catalog key, code data): a plan that routes it, or any learned form of it, is refused
         text += (f"\nNot in this request, not even with other values: {family} or a learned form of it (no "
                  f"skill:{family} route, no run_skill of it).")
-    if seed.get("sends") and not rerun:
+    if draft:
         text += "\n" + SEED_DRAFT_LINE
     missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) else ""
     if missing:

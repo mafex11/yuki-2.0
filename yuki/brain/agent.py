@@ -69,6 +69,7 @@ from yuki.brain.plan import (
     Step,
     StepStatus,
     error_codes,
+    seed_sends,
     seed_skill,
     skill_family,
 )
@@ -1847,6 +1848,11 @@ class Brain:
         if status in ENDINGS:
             line = result.line or {"unconfirmed": LINE_UNCONFIRMED, "drafted": LINE_DRAFTED,
                                    "declined": LINE_DECLINED}[status]
+            if status == "done" and result.probe == "field_holds" and typed_draft(
+                    plan, self._req.seed if self._req is not None else None):
+                # review r2 L3: a message skill's hand-off finished by steps is a draft its own probe saw typed in:
+                # said as one ("send it when you're ready"), never a generic "the box holds it"
+                line = LINE_DRAFTED
             outcome = self._result_outcome(result, state, plan, line)
             if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
                     and state.replans < bs.max_replans and self._budget_left(state, bs, self._req)):
@@ -2041,7 +2047,7 @@ class Brain:
         if last is not None and last.reason:
             # x10: a reason is a code word (or an executor's note) for the planner and the log: only the few with
             # plain words of their own are said; any other is left out
-            why = plain_reason(last.reason)
+            why = plain_reason(last.reason, refused=last.status == "refused")
         line = (last.line if last is not None and last.line and last.status in ("mismatch", "refused") else
                 LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else ""))
         self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
@@ -2262,16 +2268,19 @@ class Brain:
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
 
 
-def plain_reason(reason: Any) -> str:
+def plain_reason(reason: Any, *, refused: bool = False) -> str:
     """A stuck plan's reason in plain words for the line the user hears (x10, C9), or ``""``: the executor's own code
-    words (:data:`REASON_WORDS`), else the consent rule's plain words for its refusal code word (``consent.plain_why``,
-    x11Consent; absent before it merges). Anything else, a code word with no plain words or an executor's note, is
-    left out: it is never spoken."""
+    words (:data:`REASON_WORDS`), else, only for a refusal (``refused``: the plan's status is ``refused``, so the code
+    word is the consent rule's), that rule's plain words for it (``consent.plain_why``, x11Consent; absent before it
+    merges). Anything else, a code word with no plain words or an executor's note, is left out: it is never spoken (an
+    executor code that shares a name with a consent code, ``error`` for one, is never said in consent's meaning)."""
     code = " ".join(str(reason or "").split())
     if not code:
         return ""
     if code in REASON_WORDS:
         return REASON_WORDS[code]
+    if not refused:
+        return ""
     try:
         from yuki.brain import consent as _consent
 
@@ -2280,6 +2289,17 @@ def plain_reason(reason: Any) -> str:
     except Exception:  # noqa: BLE001 - no plain words: left out
         said = ""
     return " ".join(str(said or "").split())
+
+
+def typed_draft(plan: Plan | None, seed: Mapping[str, Any] | None) -> bool:
+    """A plan by steps that finished a sending skill's hand-off (``seed_sends``) as a draft: it declares no send, and
+    its own done is ``field_holds`` of the message box with the text, so a True there is the draft typed in (said as
+    :data:`LINE_DRAFTED`)."""
+    if plan is None or plan.kind != "act" or not plan.seeded or plan.skill is not None:
+        return False
+    if plan.consent.commit == "send" or not seed_sends(seed):
+        return False
+    return plan.done.name == "field_holds" and bool(" ".join(str(plan.done.args.get("text") or "").split()))
 
 
 def _acted(result: ExecResult) -> bool:
@@ -2338,4 +2358,4 @@ def _as_result(got: Any) -> ExecResult:
 
 
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
-           "STEP_WORDS", "REASON_WORDS", "plain_reason", "with_watch_steps"]
+           "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps"]

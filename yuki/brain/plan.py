@@ -25,6 +25,7 @@ the checks are on types, sizes, string identity and the catalog's own data (``se
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
@@ -522,15 +523,35 @@ def _hex4(text: str, at: int) -> int | None:
     return int(chunk, 16) if len(chunk) == 4 and all(c in _HEX_DIGITS for c in chunk) else None
 
 
+def _pathlike(text: str) -> bool:
+    """``text`` holds a Windows path (a drive's ``X:\\`` or a ``\\\\`` share): its ``\\u`` is a folder's name."""
+    if "\\\\" in text:
+        return True
+    at = text.find(":\\")
+    while at != -1:
+        if at > 0 and text[at - 1].isascii() and text[at - 1].isalpha():
+            return True
+        at = text.find(":\\", at + 1)
+    return False
+
+
+def _latin(char: str) -> bool:
+    """ASCII or a Latin letter or mark: a script the model writes as it is, never as an escape."""
+    return ord(char) < 0x250 or "LATIN" in unicodedata.name(char, "")
+
+
 def unescape(text: str) -> str:
     """``text`` with the JSON escapes the model sometimes writes twice decoded: each well-formed ``\\uXXXX`` (a
     surrogate pair joined) becomes its character. A format fix, never a reading of meaning (x10: in the simulation the
     planner wrote the playlist row "ネオン" as ``\\u30cd\\u30aa\\u30f3`` in an element name, a target and a
     probe's arguments, so its click would have looked for a control by that literal name). A lone surrogate or a
-    control character stays as written."""
-    if not isinstance(text, str) or "\\u" not in text:
+    control character stays as written. The text stays exactly as written when it holds a Windows path
+    (``C:\\Users\\me\\ufeed``) or when any escape in it stands for ASCII or a Latin letter (``"\\u00e9"`` typed into
+    code): the model writes those as they are, so such a ``\\u`` is the text's own (review r2 L2)."""
+    if not isinstance(text, str) or "\\u" not in text or _pathlike(text):
         return text
     out: list[str] = []
+    decoded = False
     i, n = 0, len(text)
     while i < n:
         if text.startswith("\\u", i):
@@ -542,12 +563,15 @@ def unescape(text: str) -> str:
                     if low is not None and 0xDC00 <= low < 0xE000:
                         code, end = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00), end + 6
                 if code >= 0x20 and not 0xD800 <= code < 0xE000:
+                    if _latin(chr(code)):
+                        return text   # not the model's doubled escape: the text's own "\u"
                     out.append(chr(code))
+                    decoded = True
                     i = end
                     continue
         out.append(text[i])
         i += 1
-    return "".join(out)
+    return "".join(out) if decoded else text
 
 
 def _unescape_data(value: Any) -> Any:
@@ -794,7 +818,8 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
     * a send: ``message_sent`` of ``consent.text``; a join: ``mic_held`` of the target app;
     * a seeded plan by steps: its own probe from the closed list decides it; ``none`` (or the hand-off's own probe
       written out) takes the seed's fixed check (``seed_check``), except a send's or a join's check in a plan that
-      declares neither (that would read the user's own doing, as :func:`yuki.brain.done.pick_done` refuses it);
+      declares neither, a sending skill's own check among them (that would read the user's own doing, as
+      :func:`yuki.brain.done.pick_done` refuses it): ``none``;
     * any other act plan: the planner's pick.
 
     Raises :class:`PlanError` only for a probe a plan may not pick: one only a skill reads, or a send's or a join's
@@ -815,8 +840,10 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
         return replace(plan, done=Probe("mic_held", args, json.dumps(args, ensure_ascii=False)))
     seed = _seed_probe(checks.seed) if plan.seeded else None
     if seed is not None and (done.none or done.name in ENGINE_ONLY_PROBES or done.same(seed)):
-        if _commit_probe(seed):
-            # the hand-off's check reads a send or a join this plan doesn't declare: never its check (M3)
+        if _commit_probe(seed) or seed_sends(checks.seed):
+            # the hand-off's check reads a send or a join this plan doesn't declare: never its check (M3; review r2
+            # L3: a message skill's own check reads the send, so a draft typed by steps that the user then sends
+            # themselves would be said as Yuki's "Done.")
             return replace(plan, done=Probe())
         return replace(plan, done=seed, seed_check=True)
     # the planner's pick, from the closed list, never one only a skill or a declared commit can use
@@ -834,6 +861,18 @@ def _commit_probe(probe: Probe) -> bool:
     if probe.name in ("message_sent", "mic_held"):
         return True
     return probe.name == "moment" and str(probe.args.get("kind") or "") in _done.COMMIT_MOMENTS
+
+
+def seed_sends(seed: Mapping[str, Any] | None) -> bool:
+    """The hand-off is a skill that sends (the engine's ``sends`` mark, ``engine.pinned``), or its check is a capability
+    driver's send check (``send: send``, the message capability's ``chat.message_done``): that check reads a send, so
+    a plan by steps that declares none never takes it (review r2 L3)."""
+    if not isinstance(seed, Mapping):
+        return False
+    if seed.get("sends"):
+        return True
+    probe = _seed_probe(seed)
+    return probe is not None and probe.name == "driver" and str(probe.args.get("send") or "") == "send"
 
 
 def _two_ints(text: str) -> bool:
@@ -1127,7 +1166,9 @@ class ExecResult:
     check_calls: int = 0
     #: The run ends here with ``line`` (a refusal such as a game in front, the desk busy): no replan.
     final: bool = False
-    #: A skill's hand-off (rung C) from a ``run_skill`` step: the next plan is seeded with it (its done-check fixed).
+    #: A skill's hand-off (rung C) from a ``run_skill`` step: the next plan is seeded with it. Its done-check decides
+    #: that plan only when the plan writes none (or the check itself) or re-runs the skill; a plan by steps with a
+    #: probe of its own is decided by that probe (x10).
     seed: dict[str, Any] | None = None
     #: ``seen`` is outside text the executor capped and fenced as untrusted data: it is never cut again.
     seen_fenced: bool = False
@@ -1144,5 +1185,5 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape",
+    "spent_skills", "unescape", "seed_sends",
 ]
