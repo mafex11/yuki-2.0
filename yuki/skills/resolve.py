@@ -811,22 +811,27 @@ def named_app(skill: Skill, slot: Slot, turns: Sequence[str], *, store: Any = No
     link): an app named only inside them is part of the message, never its channel ("tell Hemanth I'm on Discord
     now" names no app to message him on), so a turn that names one only there decides nothing. ``avoid``: app
     identities never filled from the words (:func:`just_acted`: what Yuki itself just acted in, which a turn may name
-    to complain about it; :func:`call_apps`: a live call's own app): such an app is no candidate at all, so "You opened
-    it in Chrome. I asked you to open it in Arc." names Arc alone after Yuki opened Chrome."""
+    to complain about it; :func:`call_apps`: a live call's own app): such an app is never filled, and it still counts
+    as a hit for "names exactly one" (x8WebArc review r2: the just-acted record is partial, it sees only windows that
+    came to the front, so at 21:05 it held Arc but not the Chrome the default handler opened behind; "Dude, I ask you
+    to open YouTube in arc not in Chrome." must never fill Chrome). A turn naming an avoided app and another decides
+    nothing; the caller's own value ("You opened it in Chrome. I asked you to open it in Arc." with the talker's
+    ``browser: Arc``) is kept by :func:`check_value` before this runs, and with none the browser driver asks."""
     turns = [str(t) for t in turns or [] if str(t).strip()]
     if not turns:
         return None
     cands = _app_candidates(skill, slot, store=store, live=live or Live(), until=until, now=now)
-    if avoid:
-        cands = {k: v for k, v in cands.items() if not ({k} | _app_forms(k, store=store, until=until)) & set(avoid)}
     if not cands:
         return None
+    avoided = {k for k in cands if ({k} | _app_forms(k, store=store, until=until)) & set(avoid)} if avoid else set()
     skip = [str(v) for v in skip or () if _words(v)]
     for turn in reversed(turns):
         parts = _outside(turn, skip) if skip else [turn]
         hit = {key for key, names in cands.items() if any(_said(n, parts) for n in names)}
+        if hit and hit <= avoided:
+            continue      # a complaint about what Yuki just did ("You opened YouTube in Chrome again"): an older turn
         if hit:
-            return next(iter(hit)) if len(hit) == 1 else None
+            return next(iter(hit)) if len(hit) == 1 and not (hit & avoided) else None
     return None
 
 
