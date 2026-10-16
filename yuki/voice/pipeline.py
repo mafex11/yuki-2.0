@@ -1619,6 +1619,10 @@ class TurnObserver:
         #: asked, the words a learned way may type or send, and what the authorization check of a hand reads; content,
         #: RAM only).
         self.recent_words: deque[str] = deque(maxlen=8)
+        #: x3 (IF-words): the user's final turns that reached the talker (the fast path's own, the name alone or a
+        #: dismissal, never do), with when each was heard (monotonic), oldest first: the current exchange for the hands'
+        #: commit check and a held call's words is cut from these (``Conversation._turn_reached``; content, RAM only).
+        self.recent_heard: deque[tuple[float, str]] = deque(maxlen=8)
         #: ``(words)``: the user's turn ended with these words (the thinker's request pack is built then, v3.18).
         self.on_final_words: Callable[[str], None] | None = None
         #: The conversation's spoken-line check (yuki.voice.speechguard), or ``None``.
@@ -2695,6 +2699,222 @@ def _last_user_text(context: Any) -> str:
     return ""
 
 
+def _user_text(message: Any) -> str:
+    """A user-role message's text as the hand-offs read it (``""`` for any other message)."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = " ".join(str(p.get("text") or "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    else:
+        text = ""
+    return " ".join(text.split())
+
+
+def _turn_spans(text: str, turns: list[str]) -> list[tuple[int, int]]:
+    """Which of ``turns`` (the user's heard turns, oldest first) a user message's text is, as half-open spans
+    ``(k, m)``: one turn exactly (``m = k + 1``), or the aggregator's merge of two or more of them in a row (the text is
+    their join; the oldest of them may follow older turns of theirs merged before them, outside the snapshot). Review
+    r1 M1: a single turn that merely starts or ends with the same words never holds one ("Dude, just do it." holds no
+    "do it."). String identity only, never the words' meaning."""
+    n = len(turns)
+    out = [(j, j + 1) for j in range(n) if text == turns[j]]
+    for k in range(n):
+        for m in range(k + 2, n + 1):
+            joined = " ".join(turns[k:m])
+            if text == joined or (k == 0 and text.endswith(" " + joined)):
+                out.append((k, m))
+    return out
+
+
+def _message_text(message: Any) -> str:
+    """Any message's own words (its text content, whitespace collapsed; ``""`` when it has none: a call, a result)."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = " ".join(str(p.get("text") or "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    else:
+        text = ""
+    return " ".join(text.split())
+
+
+def _call_index(messages: list[Any], call_id: str | None) -> int | None:
+    """Where a call is in a conversation: the assistant message that made it, else its result (``None``: not there)."""
+    if not call_id:
+        return None
+    for i, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            calls = message.get("tool_calls") or ()
+            if any(isinstance(c, dict) and str(c.get("id")) == str(call_id) for c in calls):
+                return i
+    for i, message in enumerate(messages):
+        if (isinstance(message, dict) and message.get("role") == "tool"
+                and str(message.get("tool_call_id")) == str(call_id)):
+            return i
+    return None
+
+
+def _spoken_before(messages: list[Any], end: int) -> int:
+    """The index of Yuki's last reply with words before ``end`` (``-1``: none). A held reply's words never reach the
+    conversation (they are dropped unsaid, and nothing is said early on a doubtful turn), so any assistant message
+    with words before a held call was said before the turn that set it off."""
+    for i in range(min(end, len(messages)) - 1, -1, -1):
+        message = messages[i]
+        if isinstance(message, dict) and message.get("role") == "assistant" and _message_text(message):
+            return i
+    return -1
+
+
+def _tail_held(users: list[tuple[int, str]], spans: dict[int, list[tuple[int, int]]], n: int, lo: int,
+               hi: int) -> int:
+    """How many of the ``n`` snapshot turns, newest first and in order, the user's messages strictly between indexes
+    ``lo`` and ``hi`` hold back from ``hi``, the newest in the last of those messages (``0``: that message does not hold
+    it). Found as :func:`with_heard_turns` finds them: a message holds a turn when it is that turn or a merge of these
+    turns (:func:`_turn_spans`)."""
+    count, bound, newer = 0, hi - 1, None
+    for j in range(n - 1, -1, -1):
+        found = None
+        for i, _t in reversed(users):
+            if i > bound or i <= lo:
+                continue
+            if i == bound and newer is not None:
+                ok = any(k <= j and newer < m for k, m in spans[i])   # the newer turn's own message: a merge of both
+            else:
+                ok = any(k <= j < m for k, m in spans[i])
+            if ok:
+                found = i
+                break
+            if newer is None:
+                break   # the newest turn: their last message there, or none
+        if found is None:
+            break
+        count, bound, newer = count + 1, found, j
+    return count
+
+
+def with_heard_turns(messages: list[Any], turns: list[str], held_id: str | None = None) -> list[Any]:
+    """x3 (fix-plan 3e): ``messages`` (a conversation's, oldest first) with each of ``turns`` (the user's own heard
+    turns of the moment a call was held, oldest first) that no user message holds put back as a user message where it
+    was said. ``held_id``: the held call's id; the moment is where that call stands (the end when it is not there).
+
+    Review r1 M1: the newest turn (the one that set the call off, or was heard while it was being written) is looked
+    for only among the user's messages after Yuki's last reply with words before the held call (:func:`_spoken_before`),
+    or in one that landed right after the call, before Yuki said anything more; it is never matched to an older "Yeah."
+    said long before. Review r2 L1: when a line said by code stands between their turns and the call, their last
+    message before it counts for the newest turn when it and the one before it hold the snapshot's last two turns in
+    order (:func:`_tail_held`). Each older turn is looked for from where the newer one was found, back. A message holds a turn
+    only when it is that turn or a merge of these turns (:func:`_turn_spans`). A missing turn goes right before the
+    message holding the next turn of theirs that is there; a missing newest turn right after their last message before
+    the held call (after Yuki's last reply when there is none). Never between a call and its result. The messages
+    themselves are kept as they are (the same objects); nothing is added when every turn is there. String identity and
+    order only, never the words' meaning."""
+    turns = [" ".join(str(t or "").split()) for t in turns or ()]
+    turns = [t for t in turns if t]
+    messages = list(messages)
+    if not turns:
+        return messages
+    users = [(i, _user_text(m)) for i, m in enumerate(messages)]
+    users = [(i, t) for i, t in users if t]
+    if not users:
+        return [*messages, *({"role": "user", "content": t} for t in turns)]
+    at = _call_index(messages, held_id)
+    end = len(messages) if at is None else at
+    floor = _spoken_before(messages, end)
+    spans = {i: _turn_spans(t, turns) for i, t in users}
+    n = len(turns)
+    newest = n - 1
+    place: list[int | None] = [None] * n
+    hit = next((i for i, _t in reversed(users) if floor < i < end and any(k <= newest < m for k, m in spans[i])), None)
+    if hit is None and at is not None:
+        # it landed right after the held call (before Yuki said anything more): there, not missing
+        after = next((i for i in range(end + 1, len(messages)) if isinstance(messages[i], dict)
+                      and messages[i].get("role") == "assistant" and _message_text(messages[i])), len(messages))
+        hit = next((i for i, _t in users if end < i < after and any(k <= newest < m for k, m in spans[i])), None)
+    if hit is None and n >= 2 and floor >= 0 and not any(floor < i < end for i, _t in users):
+        # review r2 L1: a line said by code after their turns (an older job's announcement lands in the context like a
+        # reply) can stand between the turn that set the call off and the call. When their last message before that
+        # line holds the newest turn and the one before it holds the turn before (or one message is the merge of
+        # both), with nothing of theirs after the line, the newest is there, not missing: put back after the line, it
+        # would hide the earlier turns from "their words since Yuki last spoke". Two turns in a row the same as an old
+        # exchange's, both missing, is not a case that happens; a single turn is never taken this way (an old "Yeah."
+        # before a reply may be just that, and a new one put back after the reply loses nothing)
+        lo = _spoken_before(messages, floor)
+        if _tail_held(users, spans, n, lo, floor) >= 2:
+            hit = next(i for i, _t in reversed(users) if lo < i < floor)
+    place[newest] = hit
+    bound, newer = (hit, newest) if hit is not None else (end - 1, None)
+    for j in range(n - 2, -1, -1):
+        found = None
+        for i, _t in reversed(users):
+            if i > bound:
+                continue
+            if i == bound and newer is not None:
+                ok = any(k <= j and newer < m for k, m in spans[i])   # the newer turn's own message: a merge of both
+            else:
+                ok = any(k <= j < m for k, m in spans[i])
+            if ok:
+                found = i
+                break
+        place[j] = found
+        if found is not None:
+            bound, newer = found, j
+    before: dict[int, list[str]] = {}
+    tail: list[str] = []
+    for j, turn in enumerate(turns):
+        if place[j] is not None:
+            continue
+        nxt = next((place[k] for k in range(j + 1, n) if place[k] is not None), None)
+        if nxt is not None:
+            before.setdefault(nxt, []).append(turn)
+        else:
+            tail.append(turn)
+    if not before and not tail:
+        return messages
+    spot = len(messages)
+    if tail:
+        last = next((i for i, _t in reversed(users) if floor < i < end), None)
+        spot = last + 1 if last is not None else (floor + 1 if floor >= 0 else end)
+        while spot < len(messages) and isinstance(messages[spot], dict) and messages[spot].get("role") == "tool":
+            spot += 1   # never between a call and its result
+    out: list[Any] = []
+    for i, message in enumerate(messages):
+        if i == spot:
+            out.extend({"role": "user", "content": t} for t in tail)
+        out.extend({"role": "user", "content": t} for t in before.get(i, ()))
+        out.append(message)
+    if tail and spot >= len(messages):
+        out.extend({"role": "user", "content": t} for t in tail)
+    return out
+
+
+class HeldWords:
+    """x3 (fix-plan 3e): a held call's conversation as its hand-off reads it: the live context, with any of the user's
+    own turns of the moment it was held that the context lacks put back where they were said (:func:`with_heard_turns`,
+    placed by the held call's own id). Everything else is the live context's own (attributes pass through). r16 20:47
+    the turn that triggered a held hand-off never reached the conversation before it, so the call made again carried
+    only the turns before it."""
+
+    def __init__(self, context: Any, turns: list[str], held_id: str | None = None) -> None:
+        self._context = context
+        self._turns = list(turns or ())
+        self._held_id = str(held_id) if held_id else None
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("_context", "_turns", "_held_id"):
+            raise AttributeError(name)   # not set yet (a copy): never a lookup on itself
+        return getattr(self._context, name)
+
+    def get_messages(self) -> list[Any]:
+        try:
+            messages = list(self._context.get_messages() or [])
+        except Exception:  # noqa: BLE001 - as a context that cannot be read: the turns alone
+            messages = []
+        return with_heard_turns(messages, self._turns, self._held_id)
+
+
 def fast_path_processor(conversation: Any) -> Any:
     """vGame: the frame processor between speech recognition and the talker's context (``Conversation._fast_turn``).
 
@@ -2712,6 +2932,16 @@ def fast_path_processor(conversation: Any) -> Any:
     )
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+    def answered(frame: Any) -> None:
+        # x3 (IF-words, fix-plan 3g IF-answer): a final transcript that goes on to the talker is the user's turn: kept
+        # for the current exchange, and offered to the voice job waiting for their answer (the fast path's own turns,
+        # the name alone or a dismissal, never are)
+        if isinstance(frame, TranscriptionFrame) and not isinstance(frame, EagerTranscriptionFrame):
+            try:
+                conversation._turn_reached(frame.text or "")
+            except Exception as exc:  # noqa: BLE001 - the turn goes on to the talker either way
+                conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
+
     class FastPath(FrameProcessor):
         async def process_frame(self, frame: Any, direction: Any) -> None:
             await super().process_frame(frame, direction)
@@ -2724,9 +2954,11 @@ def fast_path_processor(conversation: Any) -> Any:
                     taken = False
                     conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
                 for held in conversation._fast_released():
+                    answered(held)
                     await self.push_frame(held, direction)   # the withdrawn dismissal's words, before the new ones
                 if taken:
                     return
+                answered(frame)
                 await self.push_frame(frame, direction)
                 return
             if direction == FrameDirection.DOWNSTREAM and isinstance(frame, (EagerEndOfTurnCancelFrame,
@@ -2737,6 +2969,7 @@ def fast_path_processor(conversation: Any) -> Any:
                     conversation.log.event("fast_path", op="error", error=f"{type(exc).__name__}: {str(exc)[:160]}")
                 await self.push_frame(frame, direction)
                 for held in conversation._fast_released():
+                    answered(held)
                     await self.push_frame(held, direction)
                 return
             await self.push_frame(frame, direction)
@@ -3699,6 +3932,9 @@ class Conversation:
             # v3.18: practice memory sees the hands (their run traces) and the hands run the learned ways offered
             hands.memory = self.memory if getattr(self.settings, "voice_hand_traces", True) else None
             hands.words = lambda: list(self.observer.recent_words)
+            # x3 (fix-plan 3a, IF-words): the turns of the current exchange, which the hands' commit check reads as
+            # this request (probed by the hands: an older Hands has no such hook)
+            hands.exchange = self._exchange_words
             hands.turn_key = self.observer.turn_id
             hands.shown = lambda: list(self._shown_ids)
             hands.user_turn = lambda: self.observer.user_turns
@@ -3912,9 +4148,15 @@ class Conversation:
         if s.voice_hands and hands is not None:
             # The mouth's own one-step hands (§5.6). Not cancelled by a barge-in: the action
             # may already have happened, and its report must reach the context either way.
+            # x3 (fix-plan 3d): the skill hand (run_skill with a Skills menu) has no pipecat timer (as hand_over): live
+            # 10 Oct 21:08:14 a 31.9 s skill run was cancelled at 30 s and its result never reached the talker; the
+            # hand's own backstop (Hands.SKILL_HAND_MAX_S) ends a run that never returns, and it then falls back to the
+            # thinker. The old step-list run_skill (no menu) keeps its 30 s, as before (it has no backstop of its own)
+            skill_hand = bool(self._skill_keys())
             for tool in self._talker_hand_tools():
+                untimed = skill_hand and tool["name"] == "run_skill"
                 llm.register_function(tool["name"], self._hand_or_hold, cancel_on_interruption=False,
-                                      timeout_secs=30)
+                                      timeout_secs=None if untimed else 30)
         if self.memory is not None:
             # vfix4: the talker's quick look into memory (its to-do list, today's talk, a search) and its to-do adds;
             # not cancelled by a barge-in (an add may already be saved, and its report must reach the context).
@@ -4637,11 +4879,102 @@ class Conversation:
         routes = [r for r in (getattr(skill, "routes", ()) or ()) if r.via != "agent"]
         return bool(routes) and not any(r.needs_focus for r in routes)
 
+    #: x3 (IF-words; the same numbers as fix-plan Item 2a's): the current exchange is at most this many of the user's
+    #: turns, each heard within this long (s); the newest always counts.
+    EXCHANGE_TURNS = 4
+    EXCHANGE_S = 120.0
+
+    def _exchange_words(self) -> list[str]:
+        """x3 (fix-plan 3a, IF-words): the user's turns of the current exchange, oldest first, each exactly as heard: back
+        to the bridge's floor (the last spoken request that finished with its outcome, or one still open: Item 2's
+        ``exchange_floor``, probed), at most :data:`EXCHANGE_TURNS`, heard within :data:`EXCHANGE_S`; the newest always
+        counts. The hands' commit check reads these as "this request" (live 10 Oct "Close it, dude." ... "is not
+        closed" was held twice when the check read the newest turn alone), and a held call keeps them (3e). The
+        heard turns' times and the job table only, never the words' meaning."""
+        floor = None
+        probe = getattr(self.bridge, "exchange_floor", None)
+        if callable(probe):
+            try:
+                got = probe()
+                floor = float(got) if got is not None else None
+            except Exception:  # noqa: BLE001 - no floor known: the times alone cut it
+                floor = None
+        now = time.monotonic()
+        out: list[str] = []
+        for at, text in reversed(list(getattr(self.observer, "recent_heard", ()) or ())):
+            if out and (len(out) >= self.EXCHANGE_TURNS or now - at > self.EXCHANGE_S
+                        or (floor is not None and at <= floor)):
+                break
+            out.append(text)
+        return list(reversed(out))
+
+    #: x3 (3e): a call held on unsure words and called again (by the talker, or by its second stay_quiet) within this
+    #: long (s) carries the user's words as they were when it was held.
+    HELD_WORDS_S = 120.0
+
+    def _resent(self, params: Any) -> Any:
+        """x3 (fix-plan 3e): a held call called again carries the words snapshot taken when it was held: its context
+        gets back any of the user's turns of that moment it lacks (:class:`HeldWords`), so the turn that triggered it
+        is never lost (r16 20:47: "Can you WhatsApp him?" was held, and the call made again carried only the two turns
+        before it). The same hand, or the talker's hand-off, takes the snapshot once; any other hand keeps its own
+        words. Returns the params to act on (the same object when nothing was held)."""
+        held = getattr(self, "_held_words", None)
+        if not held:
+            return params
+        at, name, turns, held_id = held
+        if time.monotonic() - at > self.HELD_WORDS_S:
+            self._held_words = None
+            return params
+        if params.function_name != name and params.function_name not in HANDOFF_TOOLS:
+            return params
+        self._held_words = None
+        try:
+            import dataclasses
+
+            # placed by the held call's own id (review r1 M1), so a short turn said long ago is never taken for it
+            out = dataclasses.replace(params, context=HeldWords(params.context, turns, held_id))
+        except Exception:  # noqa: BLE001 - a stand-in params object: its own context, as before
+            return params
+        self.log.event("hands" if params.function_name not in HANDOFF_TOOLS else "bridge", op=params.function_name,
+                       held_words=len(turns))
+        return out
+
+    def _turn_reached(self, text: str) -> None:
+        """A final turn of the user's goes on to the talker (``FastPath``: not the name alone, not a dismissal): kept, with
+        when it was heard, for the current exchange (:meth:`_exchange_words`; x3, IF-words), then offered to the voice job
+        waiting for their answer (:meth:`_answer_turn`)."""
+        words = " ".join(str(text or "").split())
+        if not words:
+            return
+        self.observer.recent_heard.append((time.monotonic(), words))
+        self._answer_turn(words)
+
+    def _answer_turn(self, text: str) -> None:
+        """x3 (fix-plan 3g, IF-answer): the user's turn that reaches the talker goes to the voice job waiting for their
+        answer (``VoiceBridge.answer_waiting``, Item 2; probed): it claims the turn and routes it unless the talker's own
+        call for that turn says it is a new task or replaces the job. Live 10 Oct "Yeah." and "Yes." after "Did you mean
+        Hemanth?" never reached the job. The fast path's own turns (the name alone, a dismissal) never come here."""
+        answer = getattr(self.bridge, "answer_waiting", None)
+        if not callable(answer) or self.dormant or not " ".join(str(text or "").split()):
+            return
+        try:
+            used = bool(answer(str(text)))
+        except Exception as exc:  # noqa: BLE001 - the talker still has the turn, as before
+            self.log.event("bridge", op="answer_turn", error=type(exc).__name__)
+            return
+        if used:
+            self.log.event("bridge", op="answer_turn", claimed=True)
+
     async def _hold(self, params: Any) -> None:
         self.log.event("hands" if params.function_name not in HANDOFF_TOOLS else "bridge", op=params.function_name,
                        held="asked_first")
         self.bridge.held_at = time.monotonic()
-        self.bridge.held_call = (params.function_name, dict(params.arguments or {}), params.context)
+        # x3 (3e): the words snapshot of this moment, the turn that triggered it included, goes with the held call
+        turns = self._exchange_words()
+        held_id = str(params.tool_call_id or "") or None
+        self._held_words = (time.monotonic(), params.function_name, turns, held_id) if turns else None
+        context = HeldWords(params.context, turns, held_id) if turns else params.context
+        self.bridge.held_call = (params.function_name, dict(params.arguments or {}), context)
         self.bridge._held_refused = False
         # The reply's words were held with it and never said (v3.6): the user heard nothing yet, so nothing
         # was promised. The mouth now asks plainly, or acts if the words were clear after all.
@@ -4660,7 +4993,7 @@ class Conversation:
             self.bridge.drop_early(str(params.tool_call_id))
             await self._hold(params)
             return
-        await self.bridge.tell_yuki(params)
+        await self.bridge.tell_yuki(self._resent(params))
 
     def _early_handoff(self, call_id: str, screen: bool = False) -> None:
         """Start the thinker on the user's words the moment the mouth's reply begins a hand-off (v3.6).
@@ -4835,7 +5168,7 @@ class Conversation:
         if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)
             return
-        await self.bridge.hands.handle(params)
+        await self.bridge.hands.handle(self._resent(params))
 
     def _quiet_for(self) -> float:
         """Seconds since anyone spoke (Yuki, or the user by the mic or a transcript); 0 while someone speaks."""
