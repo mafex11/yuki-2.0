@@ -5,7 +5,9 @@
 =====================================================  ============================================================
 Plan class                                             Done-check
 =====================================================  ============================================================
-``route = skill:<id>`` / a skill-seeded plan           the skill's own done-check and its D19 re-check (fixed)
+``route = skill:<id>`` / a skill-seeded plan           the skill's own done-check and its D19 re-check (fixed; a
+                                                       seeded plan by steps that wrote a check of its own is classed
+                                                       like any act plan: :func:`own_check`)
 ``consent.commit = send``                              the message capability's own checks (``message_sent``)
 ``consent.commit = join``                              the capability's own (``call_join`` / ``mic_held`` onset)
 other act plans                                        the planner's pick from the closed list, with coverage
@@ -23,7 +25,8 @@ doesn't cover makes the line "<what was verified>; I couldn't check the rest."
 **The line is code's**, one template per probe (:data:`LINES`), filled only from the probe's own arguments and
 evidence; the model writes no "done" sentence, so a weak probe can't carry a strong claim. ``None`` (couldn't read) is
 never "done": the engine's ``LINE_UNVERIFIED``. ``False`` goes back to the planner once with what showed; still false:
-"I couldn't confirm <goal>: <what showed>".
+"I couldn't confirm <what the probe looked for>: <what showed>" (:func:`not_confirmed`; never the planner's goal text).
+A page check of a request that named its browser reads that browser's page (:func:`with_browser`).
 
 **Re-check.** Probes that can flip (media, page, the window in front, a tab, a window's state, sound) are read once more
 about 2 s later on a short-lived thread, off the speaking path (:func:`recheck_later`); a disagreement is one correcting
@@ -114,7 +117,9 @@ LINES: dict[str, str] = {
     "media_track": "{App} is on another track.",
     "audio_active": "{App} is playing sound.",
     "level": "{App} is at {level}%.",
+    "level_system": "The volume is at {level}%.",
     "page_at": "{site} is open.",
+    "page_at_in": "{site} is open in {App}.",
     "tab_shown": "That tab is showing in {App}.",
     "foreground": "{App} is in front.",
     "mic_held": "{App} has the microphone now.",
@@ -143,8 +148,15 @@ SEEN_WORDS: dict[str, str] = {
     "no_selection": "no tab is selected", "no_element": "that box isn't there",
 }
 LINE_REST = "{line}; I couldn't check the rest."
-LINE_NOT_CONFIRMED = "I couldn't confirm {goal}: {seen}."
+#: After a done-check still read "not so": ``{what}`` is what the check looked for in code's own words (the line a
+#: "so" would have said: :func:`claim_for`), never the planner's goal text (x9: :func:`not_confirmed`).
+LINE_NOT_CONFIRMED = "I couldn't confirm {what}: {seen}."
 LINE_NOT_CONFIRMED_PLAIN = "I couldn't confirm it: {seen}."
+#: The line templates that start with the thing they name, so they read inside "I couldn't confirm ...": the rest
+#: start with a fixed word ("The", "Your", "That") and would need their case changed mid-sentence.
+NAMED_FIRST: tuple[str, ...] = ("{App}", "{site}", "{file}", "\"")
+#: Probes whose line claims nothing a person could check by looking ("shows the change", "its own check saw it").
+NO_CLAIM = frozenset({NONE, "read_back", "driver"})
 LINE_STUCK = "I got stuck at {step}: {seen}. Try another way?"
 LINE_RECHECK = "Looking again, I can't see that any more."
 #: A draft whose text can't be shown to be in: the chat was seen open and Yuki's wording typed, but the typing's own
@@ -224,22 +236,54 @@ def plan_done(plan: Any) -> tuple[str, dict[str, Any] | None, str]:
 
 
 def plan_class(plan: Any, seed: Mapping[str, Any] | None = None) -> str:
-    """The plan's class for the required-probe table: ``answer``, ``skill`` (a skill route or a skill-seeded plan),
-    ``send``, ``join`` or ``pick`` (the planner's pick)."""
+    """The plan's class for the required-probe table: ``answer``, ``skill`` (a skill route, or a skill-seeded plan held
+    to the seed's check), ``send``, ``join`` or ``pick`` (the planner's pick). A seeded plan done by steps that wrote
+    a check of its own (:func:`own_check`) is classed by its consent like any act plan: the seed's check applies only
+    when the plan runs the skill again (fix plan item 10), so the click on "ネオン" is checked by what it shows,
+    never by the seed's "Japanese"."""
     from yuki.brain.consent import field_of, plan_consent
 
     if str(field_of(plan, "kind", "act")) in ("answer", "ask"):
         return "answer"
-    if str(field_of(plan, "route", "steps") or "").startswith("skill:") or (seed and seed.get("done")):
+    if str(field_of(plan, "route", "steps") or "").startswith("skill:") or (
+            seed and seed.get("done") and not own_check(plan, seed)):
         return "skill"
     commit = plan_consent(plan)["commit"]
     return commit if commit in ("send", "join") else "pick"
 
 
+#: The keys of the engine's flat done-check that are not its probe's arguments (``connection.Check.as_dict``; the
+#: planner's seed reading, ``yuki.brain.plan._SEED_CHECK_KEYS``, drops the same).
+_SEED_CHECK_META = frozenset({"probe", "within_s", "after_s", "parts", "same_source", "live"})
+
+
+def own_check(plan: Any, seed: Mapping[str, Any] | None) -> bool:
+    """Whether a skill-seeded plan done by steps wrote a done-check of its own: a probe from the pick list that is not
+    the seed's (another probe, or other arguments). A plan whose done is the seed's (the validator puts it there for
+    ``probe none``), a broken one, or one with no seed: ``False``."""
+    if not isinstance(seed, Mapping) or not isinstance(seed.get("done"), Mapping):
+        return False
+    probe, args, _why = plan_done(plan)
+    if probe == NONE or args is None or probe not in PICK_PROBES:
+        return False
+    spec = dict(seed["done"])
+    seed_probe = str(spec.get("probe") or "")
+    seed_args = spec.get("args") if isinstance(spec.get("args"), Mapping) else {
+        k: v for k, v in spec.items() if k not in _SEED_CHECK_META}
+    if probe != seed_probe:
+        return True
+    parsed, _bad = parse_args(seed_probe, seed_args)   # the same reading the plan's arguments had (aliases)
+
+    def canon(values: Mapping[str, Any]) -> str:
+        return json.dumps({str(k): v for k, v in dict(values).items()}, sort_keys=True, ensure_ascii=False, default=str)
+
+    return canon(args) != canon(parsed if parsed is not None else seed_args)
+
+
 def allowed_probes(plan: Any, seed: Mapping[str, Any] | None = None) -> tuple[str, ...] | None:
     """What the plan's ``done.probe`` may be (for bCore's validator): ``("none",)`` for an answer plan; ``None`` for a
-    class whose done-check is the capability's own and fixed by code (a skill route, a skill-seeded plan, a send, a
-    join: whatever the planner wrote there is not used); else the closed list."""
+    class whose done-check is the capability's own and fixed by code (a skill route, a skill-seeded plan held to the
+    seed's check, a send, a join: whatever the planner wrote there is not used); else the closed list."""
     cls = plan_class(plan, seed)
     if cls == "answer":
         return (NONE,)
@@ -659,52 +703,79 @@ def _display(value: Any) -> str:
     return util.app_name(str(value or "")) if value else "It"
 
 
-def line_for(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
-             window_entry: Mapping[str, Any] | None = None, consent: Mapping[str, Any] | None = None) -> str:
-    """The done line for a probe that read True, from its own arguments and evidence only."""
+def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
+                window_entry: Mapping[str, Any] | None = None,
+                consent: Mapping[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
+    """Which :data:`LINES` template a probe's line is, and its fields: from the probe's own arguments and evidence
+    only (``evidence`` ``{}``: from its arguments alone, what it looked for)."""
     consent = consent or {}
     app = _display(args.get("process") or args.get("app") or (args.get("target") if args.get("target") not in (
         None, "system") else "") or (window_entry or {}).get("process_name"))
     if probe == "media_session" and args.get("changed") == "track":
-        return LINES["media_track"].format(App=app)
+        return "media_track", {"App": app}
     if probe == "media_session":
         status = str(evidence.get("status") or args.get("status") or "")
-        return LINES["media_session"].format(App=app, status=status) if status.isalpha() else LINES["read_back"].format(
-            App=app)
+        return ("media_session", {"App": app, "status": status}) if status.isalpha() else ("read_back", {"App": app})
     if probe == "level":
         level = evidence.get("level", args.get("value"))
         try:
             shown = int(round(float(level)))
         except (TypeError, ValueError):
-            return LINES["read_back"].format(App=app)
+            return "read_back", {"App": app}
         if str(args.get("target") or "system") == "system":
-            return f"The volume is at {shown}%."
-        return LINES["level"].format(App=app, level=shown)
+            return "level_system", {"level": shown}
+        return "level", {"App": app, "level": shown}
     if probe == "page_at":
-        return LINES["page_at"].format(site=_display(args.get("site")))
+        site = _display(args.get("site"))
+        # x9: the browser the page was read in, when the check was held to one (its ``process``)
+        return ("page_at_in", {"site": site, "App": app}) if args.get("process") else ("page_at", {"site": site})
     if probe == "message_sent":
         text = " ".join(str(args.get("text") or consent.get("text") or "").split())
         person = " ".join(str(args.get("person") or consent.get("to") or "").split())
-        return (LINES["message_sent"].format(text=text, person=person) if person
-                else LINES["message_sent_plain"].format(text=text))
+        return ("message_sent", {"text": text, "person": person}) if person else ("message_sent_plain", {"text": text})
     if probe == "chat_open":
-        return LINES["chat_open"].format(person=" ".join(str(args.get("person") or "").split()))
+        return "chat_open", {"person": " ".join(str(args.get("person") or "").split())}
     if probe == "moment":
-        return LINES["moment"].format(moment=MOMENT_WORDS.get(str(args.get("kind") or ""), "The PC saw it happen"))
+        return "moment", {"moment": MOMENT_WORDS.get(str(args.get("kind") or ""), "The PC saw it happen")}
     if probe == "uia_name":
-        return LINES["uia_name"].format(App=app, name=" ".join(str(args.get("name") or "").split())[:80])
+        return "uia_name", {"App": app, "name": " ".join(str(args.get("name") or "").split())[:80]}
     if probe == "field_holds":
-        return LINES["field_holds"].format(name=" ".join(str(args.get("name") or "").split())[:60] or "text")
+        return "field_holds", {"name": " ".join(str(args.get("name") or "").split())[:60] or "text"}
     if probe == "window_state":
-        return LINES["window_state"].format(App=app, state=str(evidence.get("window_state") or args.get("state")))
+        return "window_state", {"App": app, "state": str(evidence.get("window_state") or args.get("state"))}
     if probe == "gone":
         if args.get("name"):
-            return LINES["gone_element"].format(name=" ".join(str(args.get("name")).split())[:80])
+            return "gone_element", {"name": " ".join(str(args.get("name")).split())[:80]}
         named = str(args.get("process") or (window_entry or {}).get("process_name") or "")
-        return LINES["gone"].format(App=_display(named)) if named else LINES["gone_plain"]
+        return ("gone", {"App": _display(named)}) if named else ("gone_plain", {})
     if probe == "file_exists":
-        return LINES["file_exists"].format(file=Path(str(args.get("path") or "")).name or "It")
-    return LINES.get(probe, LINES["read_back"]).format(App=app)
+        return "file_exists", {"file": Path(str(args.get("path") or "")).name or "It"}
+    return (probe if probe in LINES else "read_back"), {"App": app}
+
+
+def line_for(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
+             window_entry: Mapping[str, Any] | None = None, consent: Mapping[str, Any] | None = None) -> str:
+    """The done line for a probe that read True, from its own arguments and evidence only."""
+    key, fields = _line_parts(probe, args, evidence, window_entry=window_entry, consent=consent)
+    return LINES[key].format(**fields)
+
+
+def claim_for(probe: str, args: Mapping[str, Any] | None, *, window_entry: Mapping[str, Any] | None = None) -> str:
+    """What a probe looked for, in code's own words from its arguments alone (the line it would have said had it read
+    "so", without its full stop), for "I couldn't confirm <it>": only a line that starts with the thing it names
+    (:data:`NAMED_FIRST`) and names it (never "It shows ..."). ``""``: no such claim (say the plain line)."""
+    if probe in NO_CLAIM or probe not in PROBES or not isinstance(args, Mapping):
+        return ""
+    try:
+        key, fields = _line_parts(probe, args, {}, window_entry=window_entry)
+        template = LINES[key]
+        if key in NO_CLAIM or not template.startswith(NAMED_FIRST):
+            return ""
+        if "{App}" in template and fields.get("App") == _display(None):
+            return ""   # no app known: "It shows ..." names nothing
+        return template.format(**fields).rstrip(". ")
+    except (KeyError, IndexError, ValueError):
+        return ""
 
 
 def seen_words(probe: str, verdict: bool | None, evidence: Mapping[str, Any]) -> str:
@@ -827,17 +898,31 @@ def seed_done(seed: Mapping[str, Any], env: ProbeEnv) -> DoneResult:
                       seen=seen_words(probe, verdict, evidence), probe=probe, evidence=evidence)
 
 
+def with_browser(probe: str, args: Mapping[str, Any], browser: str) -> dict[str, Any]:
+    """A probe's arguments with page_at's ``process`` (the program whose page it reads: ``yuki.skills.donecheck``
+    compares it with the window's process image) filled from the browser the request named (x9: its process image,
+    "Arc.exe"), when the plan left it out: a page shown in another browser is then "not so", never "likely done".
+    Every other probe, or a ``process`` the plan wrote, as given."""
+    out = dict(args)
+    if probe == "page_at" and str(browser or "").strip() and not str(out.get("process") or "").strip():
+        out["process"] = str(browser).strip()
+    return out
+
+
 def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window: Mapping[str, Any] | None = None,
-              cancelled: Callable[[], bool] | None = None) -> DoneResult:
+              cancelled: Callable[[], bool] | None = None, args: Mapping[str, Any] | None = None) -> DoneResult:
     """An act plan's own pick from the closed list: read (bounded), covered, lined. ``hwnd`` / ``last_window``: the
-    window the last act step acted on (its events pace the re-reads; ``read_back`` names its app)."""
+    window the last act step acted on (its events pace the re-reads; ``read_back`` names its app). ``args``: the
+    done's arguments as the executor resolved them (x9: page_at's ``process`` the browser the request named,
+    :func:`with_browser`); ``None``: as the plan wrote them."""
     from yuki.skills.engine import LINE_UNVERIFIED
     from yuki.brain.consent import plan_consent
 
-    probe, args, why = plan_done(plan)
-    if probe == NONE or args is None or probe not in PROBES:
+    probe, written, why = plan_done(plan)
+    if probe == NONE or written is None or probe not in PROBES:
         # the validator lets no act plan through without a probe; a broken one is never "done"
         return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="nothing was set to check it", probe=probe)
+    args = dict(args) if isinstance(args, Mapping) else written
     if probe not in PICK_PROBES or (probe == "moment" and str(args.get("kind") or "") in COMMIT_MOMENTS):
         # this plan sent and joined nothing (rows 3-4): a send or a join read now would be the user's own doing
         return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="a send or a join is not this plan's to check",
@@ -869,12 +954,19 @@ def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window:
                       window=entry)
 
 
-def not_confirmed(goal: str, seen: str) -> str:
-    """The line after a done-check still read "not so" after one replan."""
-    goal = " ".join(str(goal or "").split()).rstrip(". ")
+def not_confirmed(goal: str = "", seen: str = "", *, probe: str = "", args: Mapping[str, Any] | None = None,
+                  window_entry: Mapping[str, Any] | None = None) -> str:
+    """The line after a done-check still read "not so" after one replan: what the check looked for, in code's words
+    from the probe's own arguments (:func:`claim_for`: "I couldn't confirm Youtube is open in Arc: another app is in
+    front."), else :data:`LINE_NOT_CONFIRMED_PLAIN`.
+
+    ``goal`` (the planner's goal) is never said (x9, C9: model text, it spoke of the user as "they" on 10 Oct: "...pick
+    a video they usually watch"). Whether model text is addressed to the user is a judgement of its words, which code
+    doesn't make without a word list, so it is taken as not addressed; the parameter stays for callers."""
+    del goal   # never said (docstring)
     seen = " ".join(str(seen or "").split()).rstrip(". ") or "the PC shows otherwise"
-    return LINE_NOT_CONFIRMED.format(goal=goal[:1].lower() + goal[1:], seen=seen) if goal else \
-        LINE_NOT_CONFIRMED_PLAIN.format(seen=seen)
+    what = claim_for(probe, args, window_entry=window_entry)
+    return LINE_NOT_CONFIRMED.format(what=what, seen=seen) if what else LINE_NOT_CONFIRMED_PLAIN.format(seen=seen)
 
 
 def stuck(step: str, seen: str) -> str:
@@ -946,6 +1038,7 @@ def outcome(result: DoneResult | None, steps: Sequence[Mapping[str, Any]], *, st
 
 __all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT_BUDGET_S", "FLIPPABLE",
            "GENERIC_PROBES", "LINES", "NONE", "PICK_PROBES", "PROBES", "PROBE_ARGS", "DoneResult", "ProbeEnv",
-           "allowed_probes", "as_hwnd", "coverage", "engine_line", "find_named", "line_for", "not_confirmed", "outcome",
-           "overview", "parse_args", "pick_done", "plan_class", "plan_done", "probe_name", "read", "recheck_later",
-           "seed_done", "seen_words", "skill_done", "stuck", "wait_read", "window_of"]
+           "allowed_probes", "as_hwnd", "claim_for", "coverage", "engine_line", "find_named", "line_for",
+           "not_confirmed", "outcome", "overview", "own_check", "parse_args", "pick_done", "plan_class", "plan_done",
+           "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck", "wait_read",
+           "window_of", "with_browser"]

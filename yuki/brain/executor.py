@@ -31,6 +31,17 @@ event-paced: ``done.wait_read``) or the action's own verdict (``util.action_verd
 expectation still false after 1.5 s, is a **mismatch**: the planner gets the plan id, the step statuses, what showed
 (at most 1.5k characters) and that window's view.
 
+**open_url opens in the browser the plan named** (x9): the step's ``window``, else the plan's target app, goes to the
+tool as ``app`` (the name Windows gives that program: "Arc.exe" -> "Arc") when machine data says it is a browser (the
+user's own timeline, ``web_route.measured_browsers``: a program that showed pages of several sites; or a browser
+Windows has registered), so a chat app a link is in is never one; with none, Windows' default handler opens it. A
+``page_at`` check then reads that browser's page (its ``process``), never a page in another browser; a probe's
+``process`` the plan wrote as an app's name ("Arc") is read as that program's image ("Arc.exe"), as the probes compare.
+
+**A run_skill step** gets the user's words of this exchange, and before them the span of an earlier request of theirs
+that says a value the step gives (:meth:`Executor._skill_words`). One that didn't get there ends, if the request ends
+on it, on a plain line of code's (never its outcome's code word).
+
 **One desk lease** (``yuki.actions.leases.input_lease``) per act run: taken at the first act step, held across replans,
 freed only while an ask waits (a consent question, or an ask plan's own question); an answer plan never takes it.
 
@@ -125,6 +136,21 @@ LINE_STOPPED_SEND = "Stopped. Nothing was sent."
 LINE_CUT_SHORT = "I lost my train of thought partway through, so I stopped there."
 LINE_DRAFT_HELD = "I opened the chat but didn't type the text in."
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
+#: A ``run_skill`` step that didn't get it done, as said when the request ends on it (x9: never the outcome's code
+#: word, "handed_over" or "asked", in speech: 10 Oct's "I got stuck running your usual way: handed_over"). By the
+#: hand-off seed's ``why``: its routes didn't get there (or it didn't run), it acted but the result is unknown, or it
+#: stopped before a step that sends or joins (that step didn't run).
+LINE_SKILL_HANDED = "My usual way for that didn't get there, so it isn't done. Try another way?"
+LINE_SKILL_UNSURE = "I tried my usual way for that, but I couldn't confirm it worked."
+LINE_SKILL_STOPPED = "I stopped before the step that sends or joins, so that part isn't done."
+#: The capability needed one thing more from the user (``{ask}``: its own question, capability data).
+LINE_SKILL_ASK = "Before I can do that: {ask}"
+LINE_SKILL_ASK_PLAIN = "I needed one more thing from you to do that."
+LINE_SKILL_FAILED = "My usual way for that didn't work. Try another way?"
+#: The slot types the skill resolver checks a given value of against the user's words (``yuki.skills.resolve.
+#: check_value``: a whole-words span, or a name it is known by); an enum, a number or a switch is checked against its
+#: own options instead (``yuki.skills.connection.SLOT_TYPES``).
+WORD_SLOT_TYPES = frozenset({"text", "app", "person", "entity"})
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -324,6 +350,13 @@ class Executor:
         self._swap_words: list[str] = []
         self._done_replan = False
         self._last_overview: dict[str, Any] = {}
+        #: x9: the program (process image) of the browser this request's last open_url of a web address opened it in
+        #: by name; a page_at check reads that browser's page, never another browser's (``""``: none named, or the
+        #: last one went to Windows' default handler)
+        self.browser = ""
+        #: x9 (review r1 M1): the programs that are browsers by machine data, read once per request
+        #: (:meth:`_browsers`; ``None``: not read yet)
+        self._browser_rows: list[dict[str, Any]] | None = None
         self._reset_plan()
         self._skill_context()
 
@@ -341,6 +374,8 @@ class Executor:
         self.batch: dict[int, CheckVerdict] = {}
         self._batch_typed: dict[int, bool] = {}
         self._batch_words = -1   # how many of the user's words the batch was checked on (they only grow)
+        #: x9: each open_url step's browser image as its resolution found it (step index -> image)
+        self._open_images: dict[int, str] = {}
         self.stopped: RunResult | None = None
         self.plan_since = time.time()
 
@@ -671,7 +706,11 @@ class Executor:
             return None
         hwnd, entry = done.window_of(self.dispatcher, field_of(step, "window", None), payload=payload) \
             if field_of(step, "window", None) else (None, {})
-        if hwnd is None and not field_of(step, "window", None) and \
+        if verb == "open_url":   # the browser it will open in, as it will run (x9)
+            hwnd, entry, _image = self._open_url_browser(tool_input, field_of(step, "window", None), hwnd, entry,
+                                                         payload, log=False)
+            entry = entry or ({"process_name": words(tool_input.get("app"))} if tool_input.get("app") else {})
+        elif hwnd is None and not field_of(step, "window", None) and \
                 verb in ELEMENT_VERBS | {"hotkey", "press", "window_action", "tab", "focus_window"}:
             hwnd = self._front(payload, log=False)
             entry = next((w for w in payload.get("windows") or [] if isinstance(w, dict)
@@ -868,7 +907,9 @@ class Executor:
         about = self._about(call)
         desk = None
         if call.tool == "run_skill":
-            self._skill_context()   # the engine checks slot values against the user's words as they stand now
+            # the engine checks slot values against the user's words as they stand now (x9: and an earlier request of
+            # theirs that holds one of this step's values)
+            self._skill_context(call)
             desk = self._desk_hands()
             if desk is not None:
                 # this step's grant only (the send key passes only for what the consent rule allowed and counted down)
@@ -887,12 +928,21 @@ class Executor:
                               about=about))
         self._note_numbers(call, outcome)
         self._read_cache.pop(int(call.hwnd or 0), None)
+        if call.tool == "open_url" and _web_host(call.input.get("url")):
+            # the browser a later page_at reads: the one this address went to by name; one that went to Windows'
+            # default handler names none, so an earlier one no longer holds the check (review r1 L3)
+            if words(call.input.get("app")):
+                self._note_browser(call, outcome)
+            else:
+                self.browser = ""
         own, why = util.action_verdict(call.tool, outcome)
         verdict = own
         expect = field_of(step, "expect", None)
         if outcome.ok and expect is not None:
             probe = done.probe_name(expect, "")   # the design's "probe", or bCore's validated Probe's "name"
             args, bad = done.parse_args(probe, field_of(expect, "args", "{}"))
+            if args is not None:
+                args = self._probe_args(probe, args)   # x9: page_at reads the named browser's page
             if args is not None and probe in done.PROBES:
                 env = done.ProbeEnv(since=started_at, dispatcher=self.dispatcher, memory=self.host.memory,
                                     last_verdict=own, lock=self._dispatch_lock)
@@ -957,17 +1007,22 @@ class Executor:
         if details.get("refused") == "act_off" or payload.get("refused") == "act_off":
             status.state, status.why = "refused", "act_off"
             return RunResult("refused", line=done.engine_line(outcome) or str(outcome.summary or ""), final=True)
+        # ``why`` stays the outcome's code word (the planner's report, the logs); ``line`` is what is said if the
+        # request ends on this step: plain words only, never the code word
         if state == "handed_over" and isinstance(payload.get("handoff"), dict):
             status.state, status.why = "failed", "handed_over"
             self.seed = dict(payload["handoff"])
             return self._mismatch_result(index, "handed_over", seen=str(outcome.summary or ""), call=call,
-                                         seed=dict(payload["handoff"]))
+                                         seed=dict(payload["handoff"]), line=_handed_line(payload["handoff"]))
         if state == "asked":
             status.state, status.why = "failed", "asked"
-            return self._mismatch_result(index, "asked", seen=str(outcome.summary or ""), call=call)
+            ask = _engine_ask(outcome)
+            return self._mismatch_result(index, "asked", seen=str(outcome.summary or ""), call=call,
+                                         line=LINE_SKILL_ASK.format(ask=ask) if ask else LINE_SKILL_ASK_PLAIN)
         if not outcome.ok or state in ("failed", "refused"):
             status.state, status.why = "failed", state or "failed"
-            return self._mismatch_result(index, state or "failed", seen=str(outcome.summary or ""), call=call)
+            return self._mismatch_result(index, state or "failed", seen=str(outcome.summary or ""), call=call,
+                                         line=_engine_said(outcome) or LINE_SKILL_FAILED)
         status.state, status.why = "ok", state
         return None
 
@@ -1149,6 +1204,211 @@ class Executor:
             self._emit_log("brain_origin", used=True, front_known=front is not None)
         return origin
 
+    def _open_url_browser(self, tool_input: dict[str, Any], ref: Any, hwnd: int | None, entry: Mapping[str, Any],
+                          payload: Mapping[str, Any], *, log: bool = True) -> tuple[int | None, dict[str, Any], str]:
+        """An ``open_url`` step's browser (x9, C5: the plan's ``window: Arc`` never reached the tool, so Windows'
+        default handler opened YouTube in Chrome three times on 10 Oct). Only for a web page address whose step value
+        gives no ``app``; the browser is the step's own ``window``, else the plan's target app, each read so:
+
+        1. a listed window of it (an hwnd on the list, a window of the app it names, or the one window its title hint
+           names): ``app`` is the name Windows gives that program ("Arc.exe" -> "Arc"), so open_url hands the address
+           to that very browser;
+        2. else the name as written: a browser that isn't open (open_url starts it with the address; ``launch_app``
+           never guesses, so a name that fits no Start menu app fails the step with the candidates and the planner
+           replans).
+
+        Either way the program is taken only when machine data says it is a browser (:meth:`_is_browser`, review r1
+        M1): for "open the YouTube link Hemanth sent me on Discord" the plan's target app is Discord, which
+        would be handed the link and never open it. A name that is the address's own site ("YouTube" for youtube.com,
+        "Microsoft Teams" for teams.microsoft.com) names no browser, and Yuki's own window is never one. A name an app
+        on this PC is known by (``appnames.aliases``: machine data) is that app, never a title hint: "Arc" while Arc is
+        closed starts Arc, never a Chrome window whose title has the word "Arc". A name that fits windows on screen by
+        their titles but no one program is not started either. No browser named: ``app`` stays unset (Windows' default
+        handler, as before).
+
+        A bare host ("youtube.com", :func:`_bare_host`) is a web address here only when its browser is named (review
+        r1 L1); it goes to that browser as ``https://``, as a browser opens it. An ``app`` the step value wrote is kept
+        as written, and the call's window is that app's when one is listed (review r1 L4).
+
+        Sets ``tool_input["app"]`` (and ``"url"`` for a bare host); returns the window the address goes to (``None``
+        when its app isn't open; the step's own window when no browser was chosen), its entry, and its program's
+        process image (``""``: not known before it opens)."""
+        windows = [dict(w) for w in payload.get("windows") or [] if isinstance(w, Mapping)
+                   and done.as_hwnd(w.get("hwnd"))]
+        front = done.as_hwnd(payload.get("foreground_hwnd"))
+        given = words(tool_input.get("app"))
+        url = str(tool_input.get("url") or "").strip()
+        host = _web_host(url)
+        bare = "" if host else _bare_host(url)
+        chosen: tuple[int | None, dict[str, Any], str] | None = None
+        source = "none"
+        if given:
+            # the plan wrote its app itself: kept as written; the call is that app's window when it is listed (its Act
+            # switch, the screen gate and the done-check's window are the app the address goes to), else none
+            found = _app_windows(windows, given, front)
+            source = "value"
+            chosen = (done.as_hwnd(found[0].get("hwnd")), found[0], str(found[0].get("process_name") or "")) \
+                if found else (None, {}, "")
+            if bare and self._is_browser(chosen[2] or given):
+                tool_input["url"] = "https://" + url
+        elif not (host or bare):
+            source = "not_web"   # a file, a folder or another scheme: its own handler opens it, as before
+        else:
+            target = words(field_of(field_of(self.head, "target", {}), "app", "")) if self.head is not None else ""
+            names = [(name, kind) for name, kind in ((words(ref) if ref is not None else "", "window"),
+                                                     (target, "target"))
+                     if name and not _names_site(name, host or bare)]
+            resolved = dict(entry) if hwnd is not None and entry.get("process_name") and \
+                not _is_own_window(int(hwnd)) else None   # the one listed window the step's window field named
+            for name, kind in names:   # the step's own window wholly first, then the plan's target app
+                if done.as_hwnd(name) is not None:
+                    # an hwnd: the window it is while it is listed (an hwnd no longer listed names no program)
+                    found = [resolved] if kind == "window" and resolved is not None else []
+                else:
+                    found = _app_windows(windows, name, front)
+                    if not found and kind == "window" and resolved is not None and not _known_app(name):
+                        found = [resolved]   # the one window the hint's title names
+                if found:
+                    image = str(found[0].get("process_name") or "")
+                    if not self._is_browser(image):
+                        source = "not_browser"   # a program that isn't a browser (the chat app a link is in)
+                        continue
+                    tool_input["app"] = _launch_name(image)
+                    chosen, source = (done.as_hwnd(found[0].get("hwnd")), found[0], image), kind
+                    break
+                if done.as_hwnd(name) is not None:
+                    continue
+                fits = done.fitting(windows, name)
+                if any(_is_own_window(done.as_hwnd(w.get("hwnd")) or 0) for w in fits):
+                    continue   # Yuki's own window is never a browser
+                if fits and not _known_app(name):
+                    continue   # a title hint for windows on screen that fit no one program: nothing to start
+                if not self._is_browser(name):
+                    source = "not_browser"   # no browser goes by that name on this PC: nothing to start
+                    continue
+                tool_input["app"] = name   # a browser that isn't open: open_url starts it with the address
+                chosen, source = (None, {}, ""), "named_" + kind
+                break
+            if bare and chosen is not None:
+                tool_input["url"] = "https://" + url   # a bare host its browser opens as https
+            elif bare:
+                source = "not_web"   # no browser named: a bare name.tld goes to its own handler, as before
+        if log:
+            self._emit_log("brain_open_url", source=source, open=bool(chosen and chosen[0]))   # a code word (log enum)
+        return chosen if chosen is not None else (hwnd, dict(entry), "")
+
+    def _browsers(self) -> list[dict[str, Any]]:
+        """The programs that are browsers on this PC by machine data, each ``{"key", "name"}`` (app key, name), read
+        once per request; zero setup, never a list of browsers:
+
+        * the user's own timeline (``yuki.skills.web_route.measured_browsers`` with ``by_site=False``: a program that
+          showed pages of at least ``BROWSER_MIN_HOSTS`` hosts in the last ``BROWSER_DAYS`` days, never Yuki's own
+          rows; the web skill's definition, so a chat app that draws its one site, Discord or Slack, is never one),
+          through memory (one bounded query);
+        * the browsers Windows has registered (:func:`_registered_browsers`), so one installed but not used lately
+          ("open it in Firefox") counts too, and Chrome or Edge do while memory can't answer.
+
+        ``[]`` when neither can be read: then no program is taken for a browser (Windows' default handler opens the
+        address and the check reads the window in front, as before x9). Never raises."""
+        if self._browser_rows is None:
+            rows: Any = None
+            try:
+                run = done._memory_call(self.host.memory)
+
+                def go(client: Any) -> list[dict[str, Any]]:
+                    from yuki.skills.web_route import measured_browsers
+
+                    return measured_browsers(getattr(client, "store", client), by_site=False)
+
+                rows = run("brain_browsers", go) if run is not None else None
+            except Exception:  # noqa: BLE001 - memory unavailable or slow: the registered browsers only
+                rows = None
+            measured = [dict(r) for r in rows if isinstance(r, Mapping)] if isinstance(rows, list) else []
+            registered = _registered_browsers()
+            self._browser_rows = measured + registered
+            self._emit_log("brain_browsers", measured=len(measured), registered=len(registered))
+        return self._browser_rows
+
+    def _is_browser(self, name: str) -> bool:
+        """Whether a program (its image, "Arc.exe", or an app's name, "Arc", "Google Chrome") is a browser by machine
+        data (:meth:`_browsers`: the user's timeline, Windows' registered browsers), by every name it goes by
+        (``util.app_names``: as written, its process key, the name Windows gives it). Never a list of browsers.
+        ``False`` when it can't be read."""
+        try:
+            want = util.app_names(name)
+            return bool(want) and any(
+                want & (util.app_names(str(row.get("key") or "")) | util.app_names(str(row.get("name") or "")))
+                for row in self._browsers())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _note_browser(self, call: Call, outcome: Any) -> None:
+        """An ``open_url`` that named its app ran (x9): that app's program (its process image) is the browser a later
+        page_at check reads, when machine data says it is one (:meth:`_is_browser`); else none (``""``: the
+        check reads the window in front, as before), never an earlier browser of the request. Known from the window it
+        was resolved to, else from the window open_url reports (``launch_app``'s ``details.hwnd`` with its
+        ``process_name``, else as the window list shows that hwnd now; a ``process_name`` with no hwnd is the
+        launcher's own window in front, never the browser's). Never raises."""
+        image = ""
+        try:
+            image = self._open_images.get(call.index, "")
+            if not image:
+                payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
+                details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+                opened = done.as_hwnd(details.get("hwnd"))
+                image = str(details.get("process_name") or "").strip() if opened is not None else ""
+                if not image and opened is not None:
+                    now = done.overview(self.dispatcher, lock=self._dispatch_lock)
+                    self._last_overview = now or self._last_overview
+                    image = next((str(w.get("process_name") or "") for w in now.get("windows") or []
+                                  if isinstance(w, dict) and done.as_hwnd(w.get("hwnd")) == opened), "")
+        except Exception:  # noqa: BLE001 - bookkeeping: the check then reads the window in front, as before
+            image = ""
+        self.browser = image if image and self._is_browser(image) else ""
+
+    def _page_process(self, site: str = "") -> str:
+        """The program a page_at check reads (x9: YouTube in Chrome is never "likely" for an Arc request): the browser
+        this request's last open_url opened its address in by name, else the plan's target app when it is a browser
+        (:meth:`_is_browser`: never the chat app a link was opened from), a window of it is listed and it isn't the
+        page's own site. ``""`` when neither: the check reads the window in front, as before."""
+        if self.browser:
+            return self.browser
+        target = words(field_of(field_of(self.head, "target", {}), "app", "")) if self.head is not None else ""
+        if not target or _names_site(target, site):
+            return ""
+        image = self._listed_image(target)
+        return image if image and self._is_browser(image) else ""
+
+    def _listed_image(self, name: str) -> str:
+        """The process image of the one program an app name names among the listed windows ("Arc" -> "Arc.exe"), read
+        now; ``""`` when no listed window is that app's, or the name fits several programs."""
+        payload = done.overview(self.dispatcher, lock=self._dispatch_lock)
+        self._last_overview = payload or self._last_overview
+        windows = [w for w in payload.get("windows") or [] if isinstance(w, Mapping) and done.as_hwnd(w.get("hwnd"))]
+        found = _app_windows(windows, name, done.as_hwnd(payload.get("foreground_hwnd")))
+        return str(found[0].get("process_name") or "") if found else ""
+
+    def _probe_args(self, probe: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        """A probe's arguments as the check reads them (x9). A probe's ``process`` is compared with a window's process
+        image (``yuki.skills.donecheck``: page_at, foreground, tab_shown, uia_name, audio_active, mic_held), so one the
+        plan wrote as an app's name ("Arc") becomes that program's image when a window of it is listed ("Arc.exe":
+        "Arc" would never equal it, so the check would always read "another app", never what is there). For page_at
+        with none written, it is the browser of this request (:meth:`_page_process`, :func:`done.with_browser`): a page
+        in another browser is "not so", never "likely done". Every other argument as given."""
+        out = dict(args)
+        spec = done.PROBE_ARGS.get(probe, ((), ()))
+        if "process" not in spec[0] + spec[1]:
+            return out
+        written = words(out.get("process"))
+        if written:
+            image = "" if written.casefold().endswith(".exe") else self._listed_image(written)   # an image already
+            if image:
+                out["process"] = image
+            return out
+        if probe != "page_at":
+            return out
+        return done.with_browser(probe, out, self._page_process(str(out.get("site") or "")))
+
     def _resolve(self, index: int, step: Any) -> tuple[Call | None, str]:
         """The step as a Dispatcher call with its target's code facts: the window (an hwnd, or the one window a title
         hint or app names), the element by its name and role in a read of that window, the tab by its name in the
@@ -1167,7 +1427,15 @@ class Executor:
         self._last_overview = payload or self._last_overview
         ref = field_of(step, "window", None)
         hwnd, entry = done.window_of(self.dispatcher, ref, payload=payload) if ref else (None, {})
-        if ref and hwnd is None:
+        if verb == "open_url":
+            # x9: the step's window (else the plan's target app) is the browser to open it in, handed to open_url as
+            # its app; a browser that isn't open (or is open twice) still runs: open_url starts or picks it
+            hwnd, entry, image = self._open_url_browser(tool_input, ref, hwnd, entry, payload)
+            if image:
+                self._open_images[index] = image
+            else:
+                self._open_images.pop(index, None)
+        elif ref and hwnd is None:
             return None, "no single window fits that window"
         front = self._front(payload)
         if hwnd is None and verb in ELEMENT_VERBS | {"hotkey", "press", "window_action", "tab", "focus_window"}:
@@ -1176,6 +1444,8 @@ class Executor:
                           and done.as_hwnd(w.get("hwnd")) == hwnd), {}) if hwnd else {}
         call = Call(tool=verb, input=tool_input, index=index, hwnd=hwnd, app=str(entry.get("process_name") or ""),
                     title=str(entry.get("title") or ""))
+        if verb == "open_url" and not call.app and words(tool_input.get("app")):
+            call.app = words(tool_input.get("app"))   # a browser named that isn't open: its "Act" switch still applies
         element = field_of(step, "element", None)
         if verb in ("focus_window", "window_action"):
             if hwnd is None:
@@ -1736,20 +2006,28 @@ class Executor:
                                          type_after=deciding.type_after, typed=deciding.typed)
         else:
             entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
+            probe, args, _why = done.plan_done(self.head)
+            # x9: page_at reads the page of the browser this request named (never a page in another browser)
             result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
-                                    cancelled=self.host.cancelled)
+                                    cancelled=self.host.cancelled,
+                                    args=self._probe_args(probe, args) if args is not None else None)
         self._last_done = result
         self._emit_log("done_check", check=result.probe, result={True: "done", False: "false", None: "unverified"}[
             result.verdict], level=result.level, covered=len(result.covered), uncovered=len(result.uncovered))
+        # what the check looked for in code's words, never the planner's goal text (x9: it called the user "they")
+        unconfirmed = done.not_confirmed(seen=result.seen, probe=result.probe, args=result.args,
+                                         window_entry=result.window) if result.verdict is False else ""
         if result.verdict is False and cls == "pick" and not self._done_replan and self.replans < self.max_replans:
             self._done_replan = True   # one replan with what showed; still false after it: "I couldn't confirm"
             self.last_failed = {"step": None, "verb": "done", "words": "the final check", "seen": result.seen}
+            # ``line``: said if the request ends here after all (no replan left): the same honest line, never the
+            # mismatch's code word ("I got stuck partway: done_false")
             return RunResult("mismatch", plan_id=self.plan_id, statuses=list(self.statuses), done=result,
                              mismatch=Mismatch(step=len(self.steps) - 1, verb="done", why="done_false",
                                                expected=f"{result.probe} true", seen=result.seen,
-                                               view=self._view(self.last_act.get("hwnd"))))
+                                               view=self._view(self.last_act.get("hwnd"))), line=unconfirmed)
         if result.verdict is False and cls == "pick":
-            result.line = done.not_confirmed(words(field_of(self.head, "goal", "")), result.seen)
+            result.line = unconfirmed
         self._start_recheck(result, env)
         final = done.outcome(result, self.trace, step_words=self._step_words(), refused=self._refused_count())
         return RunResult("done", plan_id=self.plan_id, statuses=list(self.statuses), done=result, line=result.line,
@@ -1798,10 +2076,11 @@ class Executor:
 
     def _mismatch_result(self, index: int, why: str, *, refused: bool = False, seen: str = "",
                          call: Call | None = None, seed: dict[str, Any] | None = None,
-                         seen_fenced: bool = False) -> RunResult:
+                         seen_fenced: bool = False, line: str = "") -> RunResult:
         """A step that didn't go as planned: its status, the planner's mismatch (with that window's view), and the
         failed step kept for the "same step again" rejection. ``seen_fenced``: ``seen`` is outside text already
-        capped and fenced (it is not cut again)."""
+        capped and fenced (it is not cut again). ``line``: code's plain line for the user if the request ends on this
+        step (the Brain says it instead of a stuck line built from ``why``); ``""``: none of its own."""
         status = self.statuses[index] if 0 <= index < len(self.statuses) else None
         if status is not None and status.state == "pending":
             status.state, status.why = ("refused" if refused else "failed"), why
@@ -1822,7 +2101,7 @@ class Executor:
                             why=why, refused=refused, seed=seed, seen_fenced=fenced)
         self._emit_log("brain_mismatch", verb=self._verb(step), why=_code(why), refused=refused)
         return RunResult("mismatch", plan_id=self.plan_id, statuses=list(self.statuses), mismatch=mismatch,
-                         reads=list(self.read_results))
+                         reads=list(self.read_results), line=line)
 
     def _view(self, hwnd: int | None) -> str:
         """That window as a look shows it now (for the replan), capped."""
@@ -2030,11 +2309,78 @@ class Executor:
         except Exception:  # noqa: BLE001
             pass
 
-    def _skill_context(self) -> None:
+    def _earlier_requests(self) -> list[list[str]]:
+        """The user's earlier requests (``host.earlier_words``: their own words, never a card's or the screen's), oldest
+        first, each as its turns (the Brain keeps a request's turns joined by line breaks), without a turn this
+        exchange already holds or an older request already gave; requests left with no turn are dropped."""
+        seen = {words(w).casefold() for w in self.words}
+        out: list[list[str]] = []
+        for entry in self.earlier:
+            turns: list[str] = []
+            for turn in str(entry).split("\n"):
+                key = words(turn).casefold()
+                if key and key not in seen:
+                    seen.add(key)
+                    turns.append(turn.strip())
+            if turns:
+                out.append(turns)
+        return out
+
+    def _given_values(self, call: Call | None) -> list[str]:
+        """The values a ``run_skill`` step gives for the slots the engine checks against the user's words (text, app,
+        person and entity slots: ``yuki.skills.resolve.check_value``; an enum, a number or a switch is checked against
+        its options instead), as written. ``[]`` for any other step."""
+        if call is None or call.tool != "run_skill":
+            return []
+        key, slots = consent.skill_input(call, self.head)
+        sk = util.skill(key) if key else None
+        types = {str(getattr(sl, "name", "")): str(getattr(sl, "type", "")) for sl in getattr(sk, "slots", ()) or ()}
+        out: list[str] = []
+        for name, value in (slots or {}).items():
+            if types and types.get(str(name)) not in WORD_SLOT_TYPES:
+                continue
+            if isinstance(value, Mapping):
+                value = value.get("name")
+            if isinstance(value, str) and words(value):
+                out.append(words(value))
+        return out
+
+    def _skill_words(self, call: Call | None = None) -> tuple[list[str], list[str]]:
+        """``(words, earlier)``: the user's own words a capability checks this step's slot values against (x9, fix plan
+        item 9: "skill words = self.words + self.earlier").
+
+        ``words``: this exchange's turns as they stand now (with what was added mid-task), newest last; before them,
+        each value this very step gives that the exchange doesn't hold but an earlier request of theirs does, as the
+        span of their own (newest such) turn that says it: "Arc" out of "open YouTube in Arc" a request ago, then
+        "just do it", keeps the planner's ``browser: Arc`` instead of dropping it. Only the span goes in, never the rest
+        of that turn: the engine also fills an empty app slot from ``words``, newest turn last (x6's merge note), so
+        an older turn read whole could fill a slot nobody named now ("...the YouTube tab in Chrome" filling the
+        browser), and appended after the exchange it would read as the newest.
+
+        ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` once
+        the Dispatcher passes ``skill_context["earlier"]`` through. Whole words in order, never meaning."""
+        older = self._earlier_requests()
+        spans: list[str] = []
+        for value in self._given_values(call):
+            if consent.in_words(value, self.words):
+                continue
+            # the newest earlier request that says it (the request the user most likely meant)
+            found = next((s for request in reversed(older) for turn in reversed(request)
+                          if (s := _span_text(value, turn))), "")
+            if found and found.casefold() not in {s.casefold() for s in spans}:
+                spans.append(found)
+        return spans + list(self.words), [turn for request in older for turn in request]
+
+    def _skill_context(self, call: Call | None = None) -> None:
         """What the Dispatcher's ``run_skill`` needs from the request (``Dispatcher.skill_context``: memory, the user's
-        words, the request id, the log, settings), set the way the old loop sets it at a request's start."""
+        words for ``call``'s slot values (:meth:`_skill_words`), the request id, the log, settings), set the way the
+        old loop sets it at a request's start, and again before each ``run_skill`` step."""
         try:
-            context = {"memory": self.host.memory, "words": list(self.words),
+            said, earlier = self._skill_words(call)
+        except Exception:  # noqa: BLE001 - the spans are a help: without them the engine gets the exchange, as before
+            said, earlier = list(self.words), []
+        try:
+            context = {"memory": self.host.memory, "words": said, "earlier": earlier,
                        "request_id": getattr(self.host, "request_id", None), "log": self._log_fn,
                        "settings": self.settings}
             # zFinal (bSkill finding 1): the capability's own steps type and press through the desk hands here (a
@@ -2094,6 +2440,225 @@ def _center(bounds: Any) -> tuple[int, int] | None:
     if right <= left or bottom <= top:
         return None
     return (left + right) // 2, (top + bottom) // 2
+
+
+def _web_host(url: Any) -> str:
+    """The host of a web page address (casefolded), ``""`` for anything else (a file, a folder, another scheme). The
+    address's shape is parsed as ``launch.open_url`` reads it (``launch._page_address``: a bare ``www.host.tld`` counts
+    as ``https://``), a fixed machine format."""
+    from urllib.parse import urlsplit
+
+    text = str(url or "").strip()
+    try:
+        from yuki.actions.launch import _page_address
+
+        address = _page_address(text) or ""
+    except Exception:  # noqa: BLE001 - launch not importable here: the address as written
+        address = text
+    try:
+        parts = urlsplit(address)
+    except ValueError:
+        return ""
+    return (parts.hostname or "").casefold() if parts.scheme.casefold() in ("http", "https") else ""
+
+
+def _bare_host(url: Any) -> str:
+    """The host of a bare host value ("youtube.com", casefolded): one token with no scheme, path, port or user part,
+    not a file or folder on disk, whose ``https://`` reading has a dotted host. ``launch._page_address`` doesn't count
+    it a page (a bare ``name.tld`` is as likely a file), so it is read as one only for a step that names its browser
+    (review r1 L1: the 10 Oct talker wrote exactly "youtube.com"). ``""`` for anything else. A fixed machine format."""
+    import os
+    from urllib.parse import urlsplit
+
+    text = str(url or "").strip()
+    if not text or any(ch.isspace() or ch in "/\\:@" for ch in text):
+        return ""
+    try:
+        if os.path.exists(text):
+            return ""
+        host = urlsplit("https://" + text).hostname or ""
+    except (ValueError, OSError):
+        return ""
+    labels = host.split(".")
+    return host.casefold() if len(labels) > 1 and all(labels) else ""
+
+
+#: Where Windows keeps the browsers it lists as web browsers (each a client key with ``shell\open\command``), machine
+#: wide (both registry views) and the user's own.
+_BROWSER_CLIENTS = (("HKEY_LOCAL_MACHINE", r"SOFTWARE\Clients\StartMenuInternet"),
+                    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\WOW6432Node\Clients\StartMenuInternet"),
+                    ("HKEY_CURRENT_USER", r"SOFTWARE\Clients\StartMenuInternet"))
+
+
+def _registered_browsers() -> list[dict[str, str]]:
+    """The browsers Windows has registered as web browsers (``Clients\\StartMenuInternet``: the key its own list of
+    browsers reads), each ``{"key", "name"}``: its program's app key from the client's open command ("chrome" from
+    ``"C:\\...\\chrome.exe"``) and the client's name ("Google Chrome"; a resource reference, ``@...``, is left out).
+    Packaged browsers (Arc) don't register there; the timeline counts them. ``[]`` off Windows or when it can't be
+    read. Machine data, read-only; never raises."""
+    try:
+        import ntpath
+        import winreg
+
+        from yuki.core.appnames import app_key
+    except ImportError:
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for hive_name, path in _BROWSER_CLIENTS:
+        try:
+            root = winreg.OpenKey(getattr(winreg, hive_name), path)
+        except OSError:
+            continue
+        with root:
+            for i in range(256):   # a handful of browsers; the bound only keeps a broken hive from spinning
+                try:
+                    client = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(root, client + r"\shell\open\command") as key:
+                        command = str(winreg.QueryValueEx(key, "")[0] or "").strip()
+                    with winreg.OpenKey(root, client) as key:
+                        try:
+                            name = str(winreg.QueryValueEx(key, "")[0] or "").strip()
+                        except OSError:
+                            name = ""
+                except OSError:
+                    continue
+                # the program: the quoted path, else the path up to its ".exe" (unquoted, it may hold spaces)
+                end = command.casefold().find(".exe")
+                exe = command[1:].partition('"')[0] if command.startswith('"') else \
+                    (command[:end + 4] if end >= 0 else "")
+                program = app_key(ntpath.basename(exe)) if exe.casefold().endswith(".exe") else ""
+                if program and program not in seen:
+                    seen.add(program)
+                    out.append({"key": program, "name": "" if name.startswith("@") else name})
+    return out
+
+
+def _span_text(value: str, turn: str) -> str:
+    """The part of ``turn`` (the user's own words) that says ``value`` in whole words, in order, case and punctuation
+    aside (``contacts.span_in``'s reading: runs of letters and digits), as the user's turn has it ("YouTube" in "open
+    youtube, in Arc!" for "youtube"); ``""`` when the turn doesn't say it."""
+    runs: list[tuple[int, int, str]] = []   # each word of the turn: where it starts and ends, casefolded
+    start = -1
+    for i, ch in enumerate(str(turn or "") + " "):
+        if ch.isalnum():
+            if start < 0:
+                start = i
+        elif start >= 0:
+            runs.append((start, i, turn[start:i].casefold()))
+            start = -1
+    from yuki.memory.contacts import tokens
+
+    want = tokens(value)
+    if not want:
+        return ""
+    for i in range(len(runs) - len(want) + 1):
+        if [r[2] for r in runs[i:i + len(want)]] == want:
+            return turn[runs[i][0]:runs[i + len(want) - 1][1]]
+    return ""
+
+
+def _squash(text: Any) -> str:
+    """Letters and digits only, casefolded (``appnames._squash``): "YouTube" and "youtube" are the same name."""
+    return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+def _names_site(name: str, host: str) -> bool:
+    """Whether an app name is the address's own site, not a browser: one label of the host is the name's letters and
+    digits ("YouTube" for ``www.youtube.com``), or a name of several words has every word among the host's labels
+    ("Microsoft Teams" for ``teams.microsoft.com``, "YouTube Music" for ``music.youtube.com``; "Google Chrome" is not
+    ``www.google.com``'s: "chrome" isn't one of its labels). String identity of two machine facts, never a list of
+    sites."""
+    from yuki.memory.contacts import tokens
+
+    want = _squash(name)
+    labels = {_squash(label) for label in str(host or "").split(".") if _squash(label)}
+    if not want or not labels:
+        return False
+    parts = set(tokens(name))
+    return want in labels or (len(parts) > 1 and parts <= labels)
+
+
+def _known_app(name: str) -> bool:
+    """Whether an app on this PC goes by ``name`` (``yuki.core.appnames.aliases``: the names Windows gave the programs
+    memory has seen run here, machine data), so the name means that program, never a window title's word. ``False``
+    when it can't be read."""
+    try:
+        from yuki.core.appnames import aliases
+
+        return bool(aliases(words(name)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _app_windows(windows: Sequence[Mapping[str, Any]], name: str, front: int | None) -> list[dict[str, Any]]:
+    """The listed windows of the program an app name names (by every name the app goes by: as written, its process
+    key, the name Windows gives it: ``util.app_names``), the one in front first; ``[]`` when none fits, when the fits
+    are more than one program, or when it is Yuki's own window. Machine identities only."""
+    want = util.app_names(name)
+    if not want:
+        return []
+    hits = [dict(w) for w in windows if want & util.app_names(str(w.get("process_name") or ""))
+            and not _is_own_window(done.as_hwnd(w.get("hwnd")) or 0)]
+    if len({done._app_key(w.get("process_name")) for w in hits}) != 1:
+        return []
+    hits.sort(key=lambda w: done.as_hwnd(w.get("hwnd")) != front)
+    return hits
+
+
+def _launch_name(image: str) -> str:
+    """A program's process image as the app is launched by (``launch_app`` matches Start menu names): the name Windows
+    gives that program (``appnames.name_for_key``: "Arc.exe" -> "Arc", "chrome.exe" -> "Google Chrome"), else the image
+    made presentable."""
+    try:
+        from yuki.core.appnames import app_key, name_for_key, prettify
+
+        pretty = prettify(image)
+        return name_for_key(app_key(image), pretty) or pretty or str(image)
+    except Exception:  # noqa: BLE001
+        return util.app_name(image)
+
+
+#: A hand-off seed's ``why`` after its skill acted and the result is unknown (``yuki.skills.engine``'s code words, x5:
+#: ``WHY_UNVERIFIED`` its check couldn't confirm it, ``WHY_ERROR`` it broke partway), and before any step of it ran
+#: that sends or joins (``TO_PLANNER``).
+_ACTED_WHYS = frozenset({"unverified", "error"})
+_TO_PLANNER = "to_planner"
+
+
+def _handed_line(seed: Mapping[str, Any]) -> str:
+    """The plain line for a ``run_skill`` hand-off, by the seed's ``why`` (a code word the engine sets): it stopped
+    before a step that sends or joins, it acted and the result is unknown, or its routes didn't get there (or it
+    didn't run: a value it was given wasn't in the user's words)."""
+    why = str(seed.get("why") or "")
+    if why == _TO_PLANNER:
+        return LINE_SKILL_STOPPED
+    if why in _ACTED_WHYS:
+        return LINE_SKILL_UNSURE
+    return LINE_SKILL_HANDED
+
+
+def _engine_ask(outcome: Any) -> str:
+    """The capability's own question in a ``run_skill`` report (the engine's fixed shape ``Ask them: <question>``; the
+    question is the capability's data, e.g. "Who to?"), ``""`` when there is none."""
+    summary = " ".join(str(getattr(outcome, "summary", "") or "").split())
+    head, sep, rest = summary.partition("Ask them: ")
+    return rest.strip() if sep and not head.strip() else ""
+
+
+def _engine_said(outcome: Any) -> str:
+    """The engine's own line in a ``run_skill`` report that didn't get it done: its done-line marks
+    (``done.engine_line``), else what follows ``Not done (<outcome>).`` (``SkillResult.report``'s fixed shape)."""
+    line = done.engine_line(outcome)
+    if line:
+        return line
+    summary = " ".join(str(getattr(outcome, "summary", "") or "").split())
+    if summary.startswith("Not done ("):
+        return summary.partition(")")[2].lstrip(". ").strip()
+    return ""
 
 
 def _route_kind(plan: Any) -> str:
