@@ -39,7 +39,8 @@ judged by Yuki's own check with the user's words, and both whom and what must st
 types it and leaves it; no text just opens the chat. On the new brain the consent rule may allow a send in Yuki's own
 wording of what the user asked to say (failure fix-plan Item 11, row 4, with the 3 s countdown showing the text, or
 after their yes): that very step's grant (:attr:`yuki.skills.engine.RunContext.grant`) lets exactly that text go to
-exactly that person (by their id in the people index), and nothing else (Item 11's L2). The opened chat's composer is
+exactly that person (by their id in the people index), in their own direct message only, and nothing else (Item 11's L2;
+a group chat or channel, even the person's usual one, still needs the user's own words). The opened chat's composer is
 read first: other text already there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer
 that can't be read gets a send's words typed and its send key never pressed (told to press Enter). A send is "done" only
 when memory captured the user's own message equal to that text in that very chat (the messages table, matched by the
@@ -224,7 +225,8 @@ class ChatRoute:
 class Target:
     """Whom the message is for: the name memory keeps (a person's, or a group chat's), the user's own words for them,
     and the routes, the usual first. ``id``: the person's id in memory's people index (``None`` for a group chat or
-    channel), which a send declares so the brain's consent grant is matched by identity (Item 11's L2)."""
+    channel), which a send into that person's own direct message declares, so the brain's consent grant is matched by
+    identity (Item 11's L2; a send into a group or channel route of theirs declares none)."""
 
     name: str
     said: str
@@ -357,7 +359,7 @@ def _said_as(call: RouteCall, target: Target) -> str:
     only sounds like the person never authorises a send. Nothing found (or a group chat): the name as given, which the
     send check refuses before any step, so nothing is typed or sent and the run falls back (Item 5), unless the brain's
     consent grant for this very step covers the send (the user said yes to "Send ... to Hemanth?": the same person
-    by id, :func:`yuki.skills.uia_route.granted_send`)."""
+    by id, in their own direct message, :func:`yuki.skills.uia_route.granted_send`)."""
     from yuki.skills.uia_route import said
 
     words = [str(w) for w in call.ctx.words or () if w]
@@ -480,8 +482,9 @@ def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], 
     """Steps through the voice hands' step runner (:class:`yuki.skills.uia_route.SkillRunner`: each checked, keys and
     typing judged by Yuki's own check, the user's hands stop it). ``way_text``: the route's own words that may be typed
     (a chat's name memory keeps); everything else typed must be the user's words. ``sends``: ``{"to", "what"}`` when the
-    steps send (rule 8: both must stand in the user's words), with ``person_id`` the target's id in memory's people
-    index; ``grant``: the brain's consent grant for this very ``run_skill`` step (:attr:`RunContext.grant
+    steps send (rule 8: both must stand in the user's words), with ``kind`` the chat's kind as memory keeps it
+    (``dm``, ``group``, ``channel``) and, only for the person's own direct message, ``person_id`` their id in memory's
+    people index; ``grant``: the brain's consent grant for this very ``run_skill`` step (:attr:`RunContext.grant
     <yuki.skills.engine.RunContext.grant>`, validated by the engine; ``None`` on the voice and the old loop), which
     lets exactly its text go to exactly its person though Yuki worded it (:func:`yuki.skills.uia_route.granted_send`).
     Refused before any step: ``(False, {"refused_steps": True})``."""
@@ -493,8 +496,9 @@ def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], 
     if sends:
         item["sends"] = True
         args.update(to=str(sends.get("to") or ""), what=str(sends.get("what") or ""))
-        if sends.get("person_id") is not None:
-            args["person_id"] = sends.get("person_id")
+        for name in ("person_id", "kind"):
+            if sends.get(name) is not None:
+                args[name] = sends.get(name)
     # zFinal: hands that check a capability's own steps by what its driver declared (the new brain's desk hands,
     # ``uia_route.DeskHands.driver_steps``) are told this run's steps, the route's own words and what it sends
     declare = getattr(hands, "driver_steps", None)
@@ -894,8 +898,12 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     if steps:
         # Item 11's L2: the send also says whom by the person's id, so the brain's consent grant for this step (the
         # engine's validated ``ctx.grant``; none on the voice or the old loop) covers exactly its text to exactly its
-        # person, though Yuki worded the text or speech wrote the name another way
-        sends = {"to": _said_as(call, target), "what": text, "person_id": target.id} if send and not blind else None
+        # person, though Yuki worded the text or speech wrote the name another way. Only into that person's own
+        # direct message (the route's kind as memory keeps it): a group chat or channel of theirs is read by other
+        # people, so there the send carries no person id and needs the user's own words (review r1 H1)
+        own_dm = not target.place and target.id is not None and route.kind == "dm"
+        sends = ({"to": _said_as(call, target), "what": text, "person_id": target.id if own_dm else None,
+                  "kind": route.kind} if send and not blind else None)
         grant = getattr(call.ctx, "grant", None) if getattr(call.ctx, "origin", "") == "thinker" else None
         _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
                              key="message", sends=sends, grant=grant)

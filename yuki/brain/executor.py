@@ -127,6 +127,10 @@ WAIT_MAX_S = 10.0
 READ_REUSE_S = 2.0
 #: The send countdown when neither the host nor the settings set one (s): the user's "3 s to stop".
 DEFAULT_COUNTDOWN_S = 3.0
+#: A send countdown counts as one the user could stop (review r1 L3: a send grant for Yuki's own wording needs one, or
+#: their yes) only when it was open at least this long and ran out (``going``). A host with no countdown (0 s: the
+#: Brain's and the old loop's default, off the desktop) returns at once.
+COUNTED_MIN_S = 0.5
 #: How long a pause waits for the user to resume before the run stops quietly (s; ``takeover_idle_stop_s``).
 PAUSE_LIMIT_S = 600.0
 
@@ -349,6 +353,10 @@ class Executor:
         #: couldn't be made).
         self._desk: Any = None
         self._swap_words: list[str] = []
+        #: review r1 L2: the messages a send grant let go in this request (person, folded text): never a second time
+        self._sent_keys: set[tuple[Any, str]] = set()
+        #: review r1 L3: whether the last send countdown ran long enough for the user to stop it
+        self._counted = False
         self._done_replan = False
         self._last_overview: dict[str, Any] = {}
         #: x9: the program (process image) of the browser this request's last open_url of a web address opened it in
@@ -804,6 +812,21 @@ class Executor:
         effect = str(getattr(cv, "effect", "") or "") if cv is not None and not getattr(cv, "failed", False) else ""
         verdict = consent.check(call, self.head, self._all_words(), live, cv)
         self._emit_log("consent", verb=call.tool, row=verdict.row, result=verdict.result, why=verdict.why)
+        said_yes = False
+        # Item 11's L2 (review r1 L1, L2): a send's person is looked up before any question or countdown (a Stop
+        # during the lookup is seen by the countdown and the checks after it), and the same message to the same person
+        # goes once per request: a later step that would send it again is skipped (never asked, never run)
+        person_id: int | None = None
+        send_key: tuple[Any, str] | None = None
+        if call.tool == "run_skill" and verdict.row == 4 and verdict.result in (consent.ALLOW, consent.ASK) \
+                and self._sends_for_sure(call):
+            person_id, send_key = self._send_person(call)
+            if send_key in self._sent_keys:
+                status.state, status.why = "skipped", "already_sent"
+                self._trace_step(call, None, ok=False, verdict=None, why="already sent in this request",
+                                 kind="control")
+                self._emit_log("consent", verb=call.tool, row=4, result="skip", why="duplicate_send")
+                return None
         if verdict.result == consent.ASK:
             self.lease.release()
             try:
@@ -825,6 +848,7 @@ class Executor:
             # rows 1-2 again: a game may have come to the front, or a switch changed, while the user was asked
             gate = consent.screen_gate(again, self._live(again))
             call, verdict = again, (gate if gate is not None else consent.after_ask(verdict))
+            said_yes = gate is None
         if verdict.result == consent.REFUSE:
             status.state, status.why = "refused", verdict.why
             self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {verdict.why}", kind="control",
@@ -836,6 +860,9 @@ class Executor:
             return self._mismatch_result(index, verdict.why, refused=True, seen=verdict.line)
         if verdict.result == consent.DRAFT:
             return self._run_draft(index, step, call, verdict)
+        if call.tool == "run_skill" and send_key is None and self._grant_sends(call, verdict):
+            person_id, send_key = self._send_person(call)    # an allowed send no question came before
+        self._counted = False
         if verdict.countdown:
             went = self._countdown(call)
             if went == "stopped":
@@ -858,10 +885,16 @@ class Executor:
                 self._trace_step(call, None, ok=False, verdict=False, why=f"refused: {gate.why}", kind="control",
                                  refused=True)
                 return RunResult("refused", line=gate.line, final=True)
-        grant = self._skill_grant(call, verdict) if call.tool == "run_skill" else None
+        grant = None
+        if call.tool == "run_skill":
+            # review r1 L3: Yuki's own wording sends only after a countdown the user could stop, or their yes
+            grant = self._skill_grant(call, verdict, person_id=person_id, counted=self._counted or said_yes)
+            if grant.get("send") is True and send_key is not None:
+                self._sent_keys.add(send_key)
         return self._dispatch_act(index, step, call, effect=effect, grant=grant)
 
-    def _skill_grant(self, call: Call, verdict: consent.Verdict | None) -> dict[str, Any]:
+    def _skill_grant(self, call: Call, verdict: consent.Verdict | None, *, person_id: int | None = None,
+                     counted: bool = False) -> dict[str, Any]:
         """What the consent rule allowed this ``run_skill`` step (zFinal, bSkill finding 1: the desk hands read it for
         that one step): a send (row 4 allowed it and its countdown ran), a join on the user's plain words (row 3,
         decision 7), and the step's own text and person slots (code facts: the capability's checks name its slots)."""
@@ -870,21 +903,48 @@ class Executor:
         tname = consent.text_slot(sk) if sk is not None else ""
         pname = consent.person_slot(sk) if sk is not None else ""
         allowed = verdict is not None and verdict.allowed
-        send = bool(allowed and verdict.row == 4 and verdict.countdown and sk is not None
-                    and consent.skill_sends(sk, slots, partial=False))
+        send = bool(allowed and self._grant_sends(call, verdict))
         join = bool(allowed and verdict.row == 3 and verdict.why == "join_words")
         text, person = (words(slots.get(tname)) if tname else ""), (words(slots.get(pname)) if pname else "")
         grant: dict[str, Any] = {"skill": key, "text": text, "person": person, "send": send, "join": join}
         if send:
             # Item 11's L2: the skill run this step makes holds the grant to this very step (a one-step token, the
             # request, this thread) and to whom by identity: the one person the person slot names in memory's people
-            # index, the same one the plan's recipient names (the countdown showed it). The resolver and the chat
-            # driver's send check then take exactly this text to exactly this person (uia_route.send_grant)
+            # index, the same one the plan's recipient names (the countdown showed it), looked up before the
+            # countdown (:meth:`_send_person`). ``counted``: a countdown the user could stop ran, or they said yes;
+            # only then may Yuki's own wording go (review r1 L3, ``uia_route.send_grant``). The resolver and the chat
+            # driver's send check then take exactly this text to exactly this person
             grant.update(text_slot=tname, person_slot=pname, step=int(call.index),
                          request_id=getattr(self.host, "request_id", None), thread=threading.get_ident(),
-                         token=secrets.token_hex(8),
-                         person_id=self._grant_person(person, consent.plan_consent(self.head)["to"]))
+                         token=secrets.token_hex(8), person_id=person_id, counted=bool(counted))
         return grant
+
+    def _grant_sends(self, call: Call, verdict: consent.Verdict | None) -> bool:
+        """Whether this ``run_skill`` step's verdict lets it send for sure: row 4 allowed it with its countdown, and
+        its capability sends with these slots (:meth:`_sends_for_sure`)."""
+        if verdict is None or not verdict.allowed or verdict.row != 4 or not verdict.countdown:
+            return False
+        return self._sends_for_sure(call)
+
+    def _sends_for_sure(self, call: Call) -> bool:
+        """Whether this ``run_skill`` step's capability sends with these slots (its own ``sends_when`` data)."""
+        key, slots = consent.skill_input(call, self.head)
+        sk = util.skill(key)
+        return sk is not None and consent.skill_sends(sk, slots, partial=False)
+
+    def _send_person(self, call: Call) -> tuple[int | None, tuple[Any, str]]:
+        """``(person id, send key)`` of a ``run_skill`` send: the one person its person slot names (memory's people
+        index, :meth:`_grant_person`; ``None`` when memory can't say) and the message's identity in this request
+        (that person, else the slot's words folded, and the text folded), which goes once per request (review r1
+        L2). RAM only, never logged."""
+        key, slots = consent.skill_input(call, self.head)
+        sk = util.skill(key)
+        tname = consent.text_slot(sk) if sk is not None else ""
+        pname = consent.person_slot(sk) if sk is not None else ""
+        text, person = (words(slots.get(tname)) if tname else ""), (words(slots.get(pname)) if pname else "")
+        person_id = self._grant_person(person, consent.plan_consent(self.head)["to"])
+        who: Any = person_id if person_id is not None else person.casefold()
+        return person_id, (who, text.casefold())
 
     def _grant_person(self, person: str, to: str) -> int | None:
         """The id of the one person a send grant goes to (``yuki.skills.uia_route.grant_person``: the person slot's
@@ -1162,6 +1222,8 @@ class Executor:
         info = {"who": c["to"], "where": util.app_name(app) if app else "", "app": util.app_name(app) if app else "",
                 "text": c["text"], "typed": False, "from_memory": False, "window": ""}
         hosted = getattr(self.host, "countdown", None)
+        self._counted = False
+        opened = time.monotonic()
         if callable(hosted):
             # the host's own countdown (bCore's Brain: its swap chips, and its takeover and chip state see the send
             # open); one countdown, never two
@@ -1182,7 +1244,9 @@ class Executor:
                     self.steers += late
                     self.words += late
                     state = "swapped"
-            self._emit_log("send_countdown", state=state, hosted=True)
+            # review r1 L3: the host's countdown ran only if it was open (its 0 s default returns at once)
+            self._counted = state == "going" and time.monotonic() - opened >= COUNTED_MIN_S
+            self._emit_log("send_countdown", state=state, hosted=True, counted=self._counted)
             return state
         seconds = getattr(self.host, "send_countdown_s", None)
         if seconds is None:
@@ -1219,7 +1283,8 @@ class Executor:
             else:
                 threading.Event().wait(min(left, 0.1))
         self._emit(SendPending(state, seconds=seconds, **info))
-        self._emit_log("send_countdown", state=state, seconds=seconds)
+        self._counted = state == "going" and time.monotonic() - opened >= COUNTED_MIN_S
+        self._emit_log("send_countdown", state=state, seconds=seconds, counted=self._counted)
         return state
 
     # -- resolution --------------------------------------------------------------------------------------------------

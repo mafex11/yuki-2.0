@@ -293,17 +293,29 @@ def _person_id(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+#: The chat kind (memory's ``contacts.ROUTE_KINDS``) a send grant may cover: the person's own direct message. A group
+#: chat or channel is read by other people too, so a grant never covers a send there (review r1 H1).
+GRANT_KIND = "dm"
+
+
+def _dm_person(sends: Mapping[str, Any]) -> int | None:
+    """The person id a send declares, only when it goes into that person's own direct message (``kind`` ``dm``, as
+    memory keeps the chat's kind); ``None`` for a group chat or channel, or a send that doesn't say."""
+    return _person_id(sends.get("person_id")) if sends.get("kind") == GRANT_KIND else None
+
+
 def granted_send(sends: Mapping[str, Any] | None, grant: Mapping[str, Any] | None) -> bool:
     """Whether the brain's consent grant for this very ``run_skill`` step (:attr:`DeskHands.grant`, passed on as
     :func:`send_grant` validated it) covers this send whole (failure fix-plan Item 11's L2): the grant is a send
     (row 4 allowed it and its countdown ran, or the user said yes to it), what goes out is exactly the granted text
-    (case and spaces aside, never a part of it) and it goes to the granted person, the same person id memory's people
-    index gave both. Identity and equality only: a group chat or channel (no person id) is never covered, and a grant
-    for another text or another person covers nothing."""
+    (case and spaces aside, never a part of it) and it goes to the granted person's own direct message: the same
+    person id memory's people index gave both, on a chat whose kind memory keeps as ``dm``. Identity and equality
+    only: a group chat or channel is never covered, even the person's own usual one (review r1 H1), and a grant for
+    another text or another person covers nothing."""
     if not isinstance(sends, Mapping) or not isinstance(grant, Mapping) or grant.get("send") is not True:
         return False
     what = _folded(sends.get("what"))
-    pid, gid = _person_id(sends.get("person_id")), _person_id(grant.get("person_id"))
+    pid, gid = _dm_person(sends), _person_id(grant.get("person_id"))
     return bool(what) and what == _folded(grant.get("text")) and pid is not None and pid == gid
 
 
@@ -2379,15 +2391,18 @@ def grant_person(store: Any, person: Any, *others: Any) -> int | None:
 def send_grant(grant: Any, *, hands: Any, skill: str = "", request_id: Any = None) -> tuple[dict[str, Any] | None, str]:
     """``(grant, "ok")`` when ``grant`` (the Dispatcher's ``skill_context["grant"]``) is the brain's consent grant for
     the ``run_skill`` running now, else ``(None, why)`` with a content-free code word (failure fix-plan Item 11's L2).
-    It must be a send the consent rule allowed (row 4, after its countdown ran or the user's yes), held right now by
-    these very desk hands (:class:`DeskHands`, never the voice's), equal to theirs, one-step token and all (the
-    executor sets it just before the step and clears it after, so a grant left from an earlier step never matches),
-    on this thread, for this request and this skill, with its text and the one person id it goes to. Anything else (the
-    voice, the old loop, a card, a draft's grant) is no grant, and the run checks the user's words as before."""
+    It must be a send the consent rule allowed (row 4) after a countdown the user could stop actually ran or after their
+    yes (``counted``, review r1 L3: a host with no countdown never sends Yuki's wording unasked), held right now by
+    these very desk hands (:class:`DeskHands`, never the voice's), equal to theirs, one-step token and all (the executor
+    sets it just before the step and clears it after, so a grant left from an earlier step never matches), on this
+    thread, for this request and this skill, with its text and the one person id it goes to. Anything else (the voice,
+    the old loop, a card, a draft's grant) is no grant, and the run checks the user's words as before."""
     if not isinstance(grant, Mapping) or not grant:
         return None, "none"
     if grant.get("send") is not True:
         return None, "not_send"
+    if grant.get("counted") is not True:
+        return None, "no_countdown"
     held = hands.grant if isinstance(hands, DeskHands) else None
     if not isinstance(held, Mapping) or not str(grant.get("token") or "") or dict(held) != dict(grant):
         return None, "stale"
@@ -2425,10 +2440,10 @@ class DeskHands:
       quote, the recipient and the text are the user's own words, the commit check said they asked for it, no
       near-duplicate; or the user said yes to its question) and its countdown ran (:attr:`grant`, set by the executor
       for that one step), and only for the same text and the same person (by the person id the grant and the driver's
-      target both carry, else the same name). ``SkillRunner`` checks again that both whom and what are spans of the
-      user's words, or that the grant covers the send whole (:func:`granted_send`: Item 11's L2, Yuki's own wording
-      of what they asked to say), and the driver presses nothing when the chat's composer holds other text or can't
-      be read.
+      target both carry, in that person's own direct message; else the same name). ``SkillRunner`` checks again that
+      both whom and what are spans of the user's words, or that the grant covers the send whole (:func:`granted_send`:
+      Item 11's L2, Yuki's own wording of what they asked to say), and the driver presses nothing when the chat's
+      composer holds other text or can't be read.
     * **A join's button only on plain words**: the capability's declared join control (catalog data) passes only when
       the consent rule allowed this ``run_skill`` as a join on the user's plain words (row 3, decision 7).
     * **Anything else** goes to ``yuki.brain.check.one`` (rows 1-6 with a one-step commit check, the request's own
@@ -2615,9 +2630,10 @@ class DeskHands:
                         return "key"
                     sends = scope["sends"]
                     # the same text, and the same person: when both have one, the person id memory's people index
-                    # gave the grant and the driver's target (Item 11's L2: "हेमंत" or "hey meant" in the user's
-                    # words is Hemanth); else (a group chat or channel, or memory couldn't say) the grant's own name
-                    pid, gid = _person_id(sends.get("person_id")), _person_id(grant.get("person_id"))
+                    # gave the grant and the driver's target, in that person's own direct message (Item 11's L2:
+                    # "हेमंत" or "hey meant" in the user's words is Hemanth); else (a group chat or channel, or memory
+                    # couldn't say) the grant's own name, as before
+                    pid, gid = _dm_person(sends), _person_id(grant.get("person_id"))
                     same = pid == gid if pid is not None and gid is not None else \
                         _folded(sends.get("to")) == _folded(grant.get("person"))
                     if grant.get("send") is True and _folded(sends.get("what")) \
@@ -2726,4 +2742,4 @@ __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS", "site",
            "PATTERNS", "Found", "Pressed", "app_window", "search", "find_in", "apply_pattern", "press", "route_steps",
            "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path", "DeskHands",
-           "granted_send", "grant_person", "send_grant"]
+           "granted_send", "grant_person", "send_grant", "GRANT_KIND"]
