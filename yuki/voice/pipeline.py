@@ -795,8 +795,8 @@ def settle_only_when_newest(aggregator: Any) -> None:
 #: other calls are left out before Pipecat runs them, and each gets this result. Calls that do nothing on the desktop
 #: or for a job (stay quiet, a look into memory, a cancel) are never left out.
 SIBLING_SKIPPED: dict[str, str] = {
-    "not_run": "Not run: another call of this same reply could not run, so their whole request went to the thinker "
-               "by code; this one was left out so nothing is done twice.",
+    "not_run": "Left out, not run: another call of this same reply passes their whole request to the thinker by "
+               "code, so nothing is done twice.",
     "how_to_handle_it": "Say nothing about it.",
 }
 #: The talker's calls that never act or start a job (never left out by :func:`reply_skips`).
@@ -4020,6 +4020,8 @@ class Conversation:
         hands = getattr(self.bridge, "hands", None)
         if s.voice_hands and hands is not None and hasattr(hands, "prefetch_desk"):
             hands.prefetch_desk()   # the first reply's desktop block, read while they talk
+        if s.voice_hands and hands is not None and callable(getattr(hands, "warm_check", None)):
+            hands.warm_check()   # vRound2 review r1 M1: the step check's own model client, made off the loop (no call)
         tts = getattr(self, "_tts", None)
         for service in (getattr(self, "_stt", None), tts):
             load = getattr(service, "load_now", None)   # vLocal: the models on this PC load now (their own thread)

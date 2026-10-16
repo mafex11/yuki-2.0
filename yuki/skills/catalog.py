@@ -265,8 +265,12 @@ def means_free(text: str, skill: Any, names: Mapping[str, Iterable[str]] | None 
             say = str(slot.say or "")
             holder = "{" + slot.name + "}"
             if say.count("{") == 1 and holder in say:
+                # review r1 L3: the value with the slot's own name after it first ("in Arc browser" for ``in
+                # {browser}``), so no stray word of it is left behind
+                noun = slot.name.replace("_", " ")
                 for value in values:
-                    words, _hit = _cut(words, [_tok(w) for w in say.replace(holder, value).split()])
+                    for filled in (f"{value} {noun}", value):
+                        words, _hit = _cut(words, [_tok(w) for w in say.replace(holder, filled).split()])
             for value in values:
                 if _cut(words, [_tok(w) for w in value.split()])[1]:
                     return ""   # a value its template did not cover: no clean cut by its own data
