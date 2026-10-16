@@ -1378,10 +1378,12 @@ class VoiceBridge(QObject):
     LAST_NOT_DONE_S = 300.0
 
     def last_not_done(self) -> str | None:
-        """pVoice: the outcome of this conversation's newest finished spoken request when it ended not done (failed,
-        or done below ``likely`` with nothing acted), within :attr:`LAST_NOT_DONE_S`, else ``None``: the hands' end
-        check hands the rest of a request on with it ("try another way" after the playlist run that did not get
-        there), so the thinker never redoes that way. Its own words (content: RAM only, never logged). Not one the
+        """pVoice: the outcome of this conversation's newest finished spoken request when it really failed (its state
+        ``FAILED`` or its verdict ``failed``, or ``unverified`` when it was asked to act and nothing acted), within
+        :attr:`LAST_NOT_DONE_S`, else ``None``: the hands' end check hands the rest of a request on with it ("try
+        another way" after the playlist run that did not get there), so the thinker never redoes that way. Review r1
+        M2: an answered question (``answer``), a request with no verdict and any other ending are no failure (the
+        thinker is never told a false "ended not done"). Its own words (content: RAM only, never logged). Not one the
         user stopped or a newer request replaced. The job table's states and verdicts only."""
         now = time.monotonic()
         with self._lock:
@@ -1395,12 +1397,29 @@ class VoiceBridge(QObject):
                 return None
             verdict = job.verdict if isinstance(job.verdict, dict) else {}
             level = str(verdict.get("level") or "")
-            if job.state == DONE and (level in ("verified", "likely") or (level == "unverified"
-                                                                          and verdict.get("acted"))):
+            failed = job.state == FAILED or level == "failed" or (
+                level == "unverified" and job.acts and not verdict.get("acted"))
+            if not failed:
                 return None
             outcome = " ".join(str(job.outcome or "").split())
             return outcome[:300] or None
         return None
+
+    def turn_had_job(self) -> bool:
+        """pVoice review r1 L2: whether a spoken job (open or finished; never one to keep) was made for the user's
+        current turn: their request went to the thinker, so a ``then`` the hands still hold for this turn is closed
+        (never a second job for the same words). State only."""
+        if self.user_turns is None:
+            return False
+        try:
+            turn = int(self.user_turns())
+        except Exception:  # noqa: BLE001
+            return False
+        if turn <= 0:
+            return False
+        with self._lock:
+            jobs = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
+        return any(j.source == "voice" and not j.remember and not j.unadopted and j.user_turn == turn for j in jobs)
 
     async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
         """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.

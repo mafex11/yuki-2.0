@@ -172,15 +172,10 @@ _PASSED_NOTE = (
     "the thinker is doing it now and its outcome comes back to you. Say nothing now: no retry, no other hand, no "
     "\"let me try another way\"."
 )
-#: The same, when nothing has been said for their words yet (v3.14: offline 29 Sept a click refused on Warp was passed on
-#: by code and they heard nothing for 12 s): two or three words now, so they know Yuki is on it.
-_PASSED_ACK_NOTE = (
-    "It did not take effect, so it was handed to the thinker with this report and the window already read; its outcome "
-    "comes back to you. They have heard nothing yet for their words: say two or three words that you are on it (\"On "
-    "it.\", \"One sec.\"), nothing about what did not work, never that it is done; no retry, no other hand."
-)
-#: pVoice: the same when code said the acknowledgement ("On it.", :data:`STEP_REST_ACK`) and the talker gets no run on
-#: it (vRound2 found the talker's run there called another hand in 3 of 11 runs, while the thinker held the request).
+#: The same when nothing had been said for their words yet (v3.14: offline 29 Sept a click refused on Warp was passed on
+#: by code and they heard nothing for 12 s), so code said the acknowledgement ("On it.", :data:`STEP_REST_ACK`). pVoice:
+#: the talker gets no run on it (before, a run to "say two or three words"; vRound2 found it called another hand in 3 of
+#: 11 such runs, while the thinker held the request).
 _PASSED_SAID_NOTE = (
     "It did not take effect, so it went to the thinker by code with this report and the window already read; its "
     "outcome comes back to you. Code said the acknowledgement (said). Say nothing now: no retry, no other hand, never "
@@ -443,17 +438,23 @@ def rest_message(words: list[str], earlier: list[str], name: str, op: str, alrea
 #: The same kind of judgement (Yuki's own check model, one forced call, started with the hand's call and joined after
 #: it) reads their own heard words and the turn's steps in code's words, never the talker's. More (or, for "then", no
 #: verdict: an open rest is never left in silence): the rest goes to the thinker by code. No: as before.
-END_CHECK_PROMPT = """\
+_END_CHECK_TEMPLATE = """\
 You check one thing for Yuki, an assistant that acts on its user's Windows PC by voice. For the user's words, Yuki's \
-voice has just done the steps listed, and nothing else: it opened, brought up or scrolled what they name, and \
-clicked, picked, played, typed or sent nothing. You see the user's own words and those steps, in code's words.
+voice has just done the steps listed, and nothing else{only}. You see the user's own words and those steps, in code's \
+words.
 
 First, why: one short sentence: what their newest words ask Yuki to do now (their earlier words only tell you what \
 "it" or "that" means). Then more: true when their newest words ask Yuki for anything those steps did not do \
 themselves: to put on, play, pick, click, close, write or send anything, to just do it or try another way, or say it \
 is still not done, even when what is showing now already holds or plays such a thing: nothing done before these \
-steps counts as done now. false only when those steps are all their newest words ask for (to open, go to, search, \
-see, switch to, bring up or scroll that app, page, window or tab)."""
+steps counts as done now. false only when those steps are all their newest words ask for{kinds}."""
+#: The check when every hand of the turn only opened or moved something (as probed 17 Oct, word for word).
+END_CHECK_PROMPT = _END_CHECK_TEMPLATE.format(
+    only=": it opened, brought up or scrolled what they name, and clicked, picked, played, typed or sent nothing",
+    kinds=" (to open, go to, search, see, switch to, bring up or scroll that app, page, window or tab)")
+#: Review r1 L4: the same when another kind of hand acted in the turn too (a click, a key, a skill: listed among the
+#: steps), so the check is never told "it clicked nothing".
+END_CHECK_PROMPT_MIXED = _END_CHECK_TEMPLATE.format(only="", kinds="")
 #: The end check's one tool (forced; ``why`` first, as the rest check's; RAM only, never logged).
 END_CHECK_TOOL: dict[str, Any] = {
     "name": "rest",
@@ -468,6 +469,12 @@ END_CHECK_TOOL: dict[str, Any] = {
 }
 #: At most this many end checks in one user turn (a ``then`` step and one opening; never a loop).
 END_CHECKS_PER_TURN = 2
+#: Review r1 L1: an opening's (``first``) check is waited for at most this long after it started (s; at least
+#: :data:`REST_JOIN_FLOOR_S` once the act returned), not :data:`REST_CHECK_S`: every plain "open YouTube" waits for it
+#: before its done line, and a late verdict there is the old way anyway (the line said). Probes 17 Oct: p50 1.5-1.8 s.
+END_FIRST_CHECK_S = 3.0
+#: Review r1 L4: at most this many of a user turn's hand calls are kept for the end check's list of steps.
+TURN_CALLS_MAX = 6
 #: The hands that only bring something up or move it, and start nothing: after a ``then`` went back to the talker, a
 #: turn that ends at one of these left the rest of the request open (a code fact of the hands, not of the words).
 MOVE_OPS: dict[str, tuple[str, ...] | None] = {"scroll": None, "window": ("focus", "restore"), "tab": ("show",)}
@@ -492,13 +499,14 @@ _END_REST_NOTE = (
 )
 
 
-def end_message(words: list[str], earlier: list[str], steps: list[str]) -> str:
+def end_message(words: list[str], earlier: list[str], steps: list[str], plain: bool = True) -> str:
     """pVoice: what the turn's end check reads (:data:`END_CHECK_PROMPT`): the turn's steps in code's words (each a
     fact of a hand's call: what it opened, brought up or scrolled, in which app; never a report or a title), then the
-    user's own words of this exchange and up to 3 earlier turns, newest last."""
+    user's own words of this exchange and up to 3 earlier turns, newest last. ``plain``: every hand of the turn only
+    opened or moved something (review r1 L4: only then "it clicked ... nothing")."""
     lines = ["[What Yuki's voice did for them, in order]"]
     lines += [f"- It {s}." for s in steps if s] or ["- It brought something up."]
-    lines.append("Nothing else: it clicked, picked, played, typed or sent nothing.")
+    lines.append("Nothing else: it clicked, picked, played, typed or sent nothing." if plain else "Nothing else.")
     if earlier:
         lines += ["", "[Their earlier words: context only]"]
         lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in earlier]
@@ -1175,6 +1183,9 @@ class Hands:
         #: the end checks started in that turn (at most :data:`END_CHECKS_PER_TURN`)
         self._then_open: dict[str, Any] | None = None
         self._end_checked: tuple[Any, int] | None = None
+        #: review r1 L4: ``(turn, [(hand, args), ...])``: the hands called in this user turn, in order (RAM only), so
+        #: the end check lists all of the turn's steps, never "nothing else" after a hand it does not name
+        self._turn_calls: tuple[Any, list[tuple[str, dict[str, Any]]]] | None = None
 
     @property
     def skills_on(self) -> bool:
@@ -1860,6 +1871,7 @@ class Hands:
         if then_open is not None and not self._moves(name, args):
             # pVoice: a hand that can act after a "then" is the talker's own try at the rest: its outcome decides
             self._then_open = then_open = None
+        self._note_call(name, args)   # review r1 L4: the turn's hands, for the end check's list of steps
         if self.skills_on and name in (SKILL_HAND, KEEP_USUAL_HAND):
             await self._handle_skill(params)   # Phase S: one of the user's skills, or the answer to its question
             return
@@ -2594,17 +2606,19 @@ class Hands:
             job["done"].set()
         return job
 
-    def _rest_join(self, job: dict[str, Any], name: str, field: str = "rest_check", **extra: Any) -> bool | None:
+    def _rest_join(self, job: dict[str, Any], name: str, field: str = "rest_check", bound: float | None = None,
+                   **extra: Any) -> bool | None:
         """vRound2 review r1 M1: the rest check's verdict for the step check: waited for until :data:`REST_CHECK_S`
         after it started, and at least :data:`REST_JOIN_FLOOR_S` now that the hand returned. ``True`` / ``False``, or
         ``None`` (no client, an error, a late or unreadable answer: the caller says the step's line as before, never
         acts on it). Blocking: off the voice loop. Logged content-free (the verdict word, the check's ms, the wait's ms,
-        a code word on a miss; pVoice: the end check's under ``field`` ``end_check``, with ``extra`` code words). Never
-        raises."""
+        a code word on a miss; pVoice: the end check's under ``field`` ``end_check``, with ``extra`` code words, and an
+        opening's under its own shorter ``bound``). Never raises."""
         waited = time.perf_counter()
         started = float(job.get("started") or waited) if isinstance(job, dict) else waited
         try:
-            on_time = bool(job["done"].wait(max(REST_JOIN_FLOOR_S, REST_CHECK_S - (waited - started))))
+            limit = REST_CHECK_S if bound is None else float(bound)
+            on_time = bool(job["done"].wait(max(REST_JOIN_FLOOR_S, limit - (waited - started))))
         except Exception:  # noqa: BLE001
             on_time = False
         verdict = job.get("verdict") if on_time else None
@@ -2749,7 +2763,12 @@ class Hands:
                 return f"scrolled the {app or 'front'} window {way}".rstrip()
             if (name, op) in _STEP_WHAT_APP:
                 return _STEP_WHAT_APP[(name, op)].format(app=app) if app else _STEP_WHAT[(name, op)]
-            return f"used its {name} hand"
+            if name == SKILL_HAND:   # review r1 L4: the turn's other hands, by their call's kind
+                return "ran their skill " + " ".join(str(args.get("skill") or "").split())[:40]
+            if name in ("click", "type", "media_key"):
+                return {"click": "clicked an item", "type": "typed into a field",
+                        "media_key": "pressed a media key"}[name] + (f" in {app}" if app else "")
+            return f"used its {name} hand" + (f" ({op})" if op else "")
         except Exception:  # noqa: BLE001
             return f"used its {name} hand"
 
@@ -2761,10 +2780,41 @@ class Hands:
         ops = MOVE_OPS[name]
         return ops is None or str(args.get("action") or ("show" if name == "tab" else "")) in ops
 
+    def _opens_or_moves(self, name: str, args: dict[str, Any]) -> bool:
+        """Review r1 L4: whether this hand only opened (an opening, a new tab) or moved something (:meth:`_moves`)."""
+        return name in OPEN_HANDS or (name == "tab" and str(args.get("action") or "") == "new") or \
+            self._moves(name, args)
+
+    def _note_call(self, name: str, args: dict[str, Any]) -> None:
+        """Review r1 L4: one hand's call in this user turn's list (at most :data:`TURN_CALLS_MAX`, RAM only). Never
+        raises."""
+        try:
+            turn = self._call_safely(self.user_turn, None)
+            if turn is None:
+                return
+            got = self._turn_calls
+            calls = list(got[1]) if isinstance(got, tuple) and got[0] == turn else []
+            calls.append((str(name), dict(args)))
+            self._turn_calls = (turn, calls[-TURN_CALLS_MAX:])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _turn_hands(self) -> list[tuple[str, dict[str, Any]]]:
+        """The hands called in this user turn, in order (:meth:`_note_call`), else ``[]``."""
+        got = self._turn_calls
+        turn = self._call_safely(self.user_turn, None)
+        return list(got[1]) if isinstance(got, tuple) and turn is not None and got[0] == turn else []
+
     def _then_now(self) -> dict[str, Any] | None:
-        """The ``then`` given back to the talker in this user turn and still open (pVoice), else ``None``."""
+        """The ``then`` given back to the talker in this user turn and still open (pVoice), else ``None``. Review r1
+        L2: closed once any job (open or finished) was made for this turn (the talker's own hand_over too): their
+        request is the thinker's then, never handed on a second time."""
         got = self._then_open
         if not isinstance(got, dict) or got.get("turn") != self._call_safely(self.user_turn, None):
+            return None
+        had = getattr(self.bridge, "turn_had_job", None) if self.bridge is not None else None
+        if self._turn_handed_over() or (callable(had) and self._call_safely(had, False)):
+            self._then_open = None
             return None
         return got
 
@@ -2800,13 +2850,22 @@ class Hands:
         self._end_checked = (turn, self._given(self._end_checked, turn) + 1)
         before = list((then_open or {}).get("steps") or [])
         holder: dict[str, Any] = {"steps": before}
+        # review r1 L4: every hand of this turn, in order (this call is the newest), never only the then chain; "it
+        # clicked nothing" only when every one of them only opened or moved something
+        calls = self._turn_hands() or [(name, dict(args))]
+        plain = all(self._opens_or_moves(hand, given) for hand, given in calls)
 
         def message(words: list[str], older: list[str]) -> str:
-            holder["steps"] = [*before, self._end_step(name, args)]
-            return end_message(words, older[-3:], holder["steps"])
+            steps: list[str] = []
+            for hand, given in calls:
+                step = self._end_step(hand, given)
+                if step and (not steps or steps[-1] != step):   # a repeated call is the same step
+                    steps.append(step)
+            holder["steps"] = steps or [*before, self._end_step(name, args)]
+            return end_message(words, older[-3:], holder["steps"], plain)
 
-        job = self._check_start(END_CHECK_PROMPT, END_CHECK_TOOL, message)
-        job["kind"], job["holder"] = kind, holder
+        job = self._check_start(END_CHECK_PROMPT if plain else END_CHECK_PROMPT_MIXED, END_CHECK_TOOL, message)
+        job["kind"], job["holder"], job["plain"] = kind, holder, plain
         return job
 
     async def _end_rest(self, params: Any, name: str, args: dict[str, Any], report: str,
@@ -2816,7 +2875,8 @@ class Hands:
         their request goes to the thinker by code (:meth:`_rest_over`) and ``True``. No, or no verdict for ``first``:
         ``False`` (as before). Never a second job (this turn with the thinker already: ``False``)."""
         kind = str(job.get("kind") or "first")
-        more = await asyncio.to_thread(self._rest_join, job, name, "end_check", check=kind)
+        bound = REST_CHECK_S if kind == "then" else END_FIRST_CHECK_S   # review r1 L1: an opening waits less
+        more = await asyncio.to_thread(self._rest_join, job, name, "end_check", bound, check=kind)
         self._then_open = None   # judged: open no more either way
         if more is False or (more is None and kind != "then") or self._turn_handed_over():
             return False
@@ -3292,8 +3352,9 @@ class Hands:
                           skill: dict[str, Any] | None, told: str, why: str, hand_id: str | None, ms: float,
                           facts: dict[str, Any]) -> bool:
         """Hand a run_skill's request to the thinker by code (:meth:`VoiceBridge.escalate`, the user's own words with
-        ``context`` as labelled context and ``skill`` as the seed), and settle the talker's call: two or three words now
-        when nothing was said for their words yet, else nothing. ``False``: no job started (the caller says the line)."""
+        ``context`` as labelled context and ``skill`` as the seed), and settle the talker's call with no talker run:
+        code says "On it." when nothing was said for their words yet (pVoice), else nothing. ``False``: no job started
+        (the caller says the line)."""
         from pipecat.frames.frames import FunctionCallResultProperties
 
         ack = False
