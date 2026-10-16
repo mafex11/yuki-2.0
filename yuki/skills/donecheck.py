@@ -211,6 +211,16 @@ def _app_key(name: Any) -> str:
         return str(name or "").strip().casefold().removesuffix(".exe")
 
 
+def _is_window(hwnd: int) -> bool:
+    """Whether ``hwnd`` is still a window (read only; ``False`` when it can't be told)."""
+    try:
+        import win32gui
+
+        return bool(hwnd) and bool(win32gui.IsWindow(int(hwnd)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _window_image(hwnd: int) -> str:
     """The image name of the process that owns ``hwnd`` (``""``: gone or unknown); never reads the foreground."""
     try:
@@ -259,9 +269,10 @@ def _top_window(process: str) -> tuple[int, str]:
 def _window_for(ctx: ProbeContext, args: Mapping[str, Any]) -> tuple[int, str, str]:
     """``(hwnd, image, how)`` of the window a page check reads (x8WebArc). The window a route launched or acted in
     (``hwnd`` in the check's arguments, else in the route's RAM facts), while it is still a window: ``route``; else,
-    with a ``process`` named, that program's top window (``process``; 0 when it has none); else the window in front
-    (``front``). The foreground is never read while a launched window or the browser is known: on 10 Oct the check
-    read the window in front (Arc's command bar, or Yuki's own) 19 times and never saw the page in Arc."""
+    with a ``process`` named, that program's top window (``process``; 0 when it has none); else, when the route's
+    window is gone, none (0, ``route``: the check says ``no_window``); else the window in front (``front``). The
+    foreground is never read while a launched window or the browser is known: on 10 Oct the check read the window in
+    front (Arc's command bar, or Yuki's own) 19 times and never saw the page in Arc."""
     ram = getattr(getattr(ctx, "result", None), "facts_ram", None)
     raw = args.get("hwnd") or (ram.get("hwnd") if isinstance(ram, Mapping) else None)
     try:
@@ -275,6 +286,10 @@ def _window_for(ctx: ProbeContext, args: Mapping[str, Any]) -> tuple[int, str, s
     if _proc(args):
         top, image = _top_window(_proc(args))
         return top, image, "process"
+    if hwnd:
+        # review r2 L3: no program named and the window the route acted in is gone (no page in it: the window in front
+        # is some other window, never read for it), or still there with its program unread (that window is read)
+        return (hwnd if _is_window(hwnd) else 0), "", "route"
     hwnd, image = _front()
     return hwnd, image, "front"
 
