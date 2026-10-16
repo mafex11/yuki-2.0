@@ -282,6 +282,10 @@ class _State:
     #: (:func:`text_back`).
     part_rests: int = 0
     text_backs: int = 0
+    #: pBrain review r1 (L1): how many of the user's words (``Host.user_words``: their turns, steers, answers to a
+    #: question) there were when the last plan began; words added since mean the user spoke after it (a steer folded
+    #: into its report, an answer), and :func:`text_back` then leaves their reply to the planner's reading of them.
+    plan_words: int = 0
 
 
 class _NoticeSink:
@@ -1609,6 +1613,7 @@ class Brain:
                 tool = call.next_tool()
                 if tool is not None and tool.name == PLAN_TOOL and call.plan is not None:
                     state.plans += 1
+                    state.plan_words = len(host.user_words)
                     result = self._run_plan(call.plan, executor, host, state, req, nonce)
                 resp = call.finish()
             except CallCancelled:
@@ -2277,7 +2282,7 @@ class Brain:
             return False
         text = (text or "").strip()
         last = state.last
-        where = text_back(state, self._req.seed if self._req is not None else None)
+        where = text_back(state, self._req.seed if self._req is not None else None, words=len(host.user_words))
         if where is not None and not self._cancelled.is_set():
             # pBrain (17 Oct e2e2 B14 r2: the done read "another page is showing" and the planner's reply, "Tell me
             # what you want to watch and I'll put it on.", ended the request on code's "I couldn't confirm ..."): an act
@@ -2659,16 +2664,20 @@ def part_rest(plan: Plan | None, result: ExecResult, outcome: Mapping[str, Any] 
     return isinstance(outcome, Mapping) and str(outcome.get("level") or "") == "likely"
 
 
-def text_back(state: _State, seed: Mapping[str, Any] | None) -> str | None:
+def text_back(state: _State, seed: Mapping[str, Any] | None, *, words: int | None = None) -> str | None:
     """pBrain: code's line for where an act request stands when the planner just replied in plain text and the request
     is not confirmed done, so the reply goes back once (:data:`TEXT_BACKS_MAX`); ``None`` when it ends as before. Not
     confirmed: its last plan stopped (a step or the done read otherwise: ``mismatch``, an ``error``), and the report
     the planner got asked for a revised plan. Never with a held line (a look-back's, an unconfirmed skill's, a skill
     route's or a part's turn already was code's one more turn, with a plain reply as one of its answers; the user's
     addition), after a refusal (consent's line stands), an ending the executor called final (a game in front), or on a
-    send or a join (rule 8: nothing more is planned on a send's back, nor for a sending skill's hand-off). Code facts
-    only."""
+    send or a join (rule 8: nothing more is planned on a send's back, nor for a sending skill's hand-off), nor when the
+    user spoke since the last plan began (``words``: how many of their words there are now, against
+    :attr:`_State.plan_words`; review r1 L1: a "leave it" folded into the step report, or "no, forget it" to a
+    question, and the planner's "Okay." is their word, never pushed back). Code facts only."""
     if state.kind != "act" or state.text_backs >= TEXT_BACKS_MAX or state.held is not None:
+        return None
+    if words is not None and words > state.plan_words:
         return None
     plan, last = state.current, state.last
     if plan is not None and plan.consent.commit in ("send", "join"):

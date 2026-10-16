@@ -891,22 +891,31 @@ def look_report(result: ExecResult | Mapping[str, Any], plan: Plan | None) -> st
 #: The one-word reply the planner gives after a skill route did its part when all they asked is done
 #: (:func:`skill_rest_report`; ``yuki.brain.agent.rest_done_reply`` compares it exactly).
 REST_DONE_WORD = "done"
+#: pBrain review r1 (M1: B14 on a skill route, the goal "Open a new tab in Arc with YouTube's front page." and the rest
+#: turn's ``done`` for "Open a new tab and put something on from the front page"): a rest turn reads their words, not
+#: the plan's goal, to the last thing they ask for; a pick their words leave to Yuki is Yuki's to make, never a reason
+#: for the one word. Guidance for the planner's own judgement of their words (examples, never matched by code).
+REST_LAST_PART = ("Read their words above, not the plan's goal, to the last thing they ask for. A pick their words "
+                  "leave to you (\"put something on\", \"a video I'd like\") is yours to make from memory and the "
+                  "screen, never a reason to stop.")
 
 
 def skill_rest_report(plan: Plan | None, line: str) -> str:
     """A skill route that ended done (sBrainFix, F2): the skill's own check saw its own part, which may be only part of
     what they asked ("Open YouTube home" for "open a new tab and put something on"). Whether anything is left is the
     planner's to read from their words, never code's: it plans the rest by steps or replies that it is all done (the
-    held line then stands). Code-written; the skill is a menu id, the line code's own."""
+    held line then stands), read to the last thing they ask for (:data:`REST_LAST_PART`, pBrain review r1 M1).
+    Code-written; the skill is a menu id, the line code's own."""
     pid = plan.id if plan else ""
     skill = str(getattr(plan, "skill", "") or "") if plan else ""
     return "\n".join([
         f"{CHECK_LABEL} Plan {pid} ended: done. The skill {skill} did its part and its own check saw it. Yuki's line "
         f"for it, not said yet: {one_line(line, 200)}",
-        f"Their request may ask for more than that skill does. If any part of what they asked is not done yet, plan "
-        f"just that part now by steps (revises {pid}): look first, then click or type in the app, with a done probe "
-        f"that reads the result; don't run that skill again or redo what it did. If all they asked is done, reply "
-        f"with the one word: {REST_DONE_WORD}. If the rest can't be done, say why in one short line."])
+        f"Their request may ask for more than that skill does. {REST_LAST_PART} If that last thing is not done yet, "
+        f"plan the rest now by steps (revises {pid}): look first, then click or type in the app, with a done probe "
+        f"that reads that last thing; don't run that skill again or redo what it did. Reply with the one word "
+        f"{REST_DONE_WORD} only when Yuki's line shows that last thing happened. If the rest can't be done, say why "
+        f"in one short line."])
 
 
 def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
@@ -924,10 +933,10 @@ def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, 
         lines.append("Steps:\n" + _statuses_text(statuses))
     if reads:
         lines.append("What its reads returned:\n\n" + "\n\n".join(reads))
-    lines.append(f"If any part of what they asked is not done yet, do it now by steps from what the look showed "
-                 f"(revises {pid}), with a done probe that reads the last part they asked for; redo nothing that took. "
-                 f"If all they asked is done, reply with the one word: {REST_DONE_WORD}. If the rest can't be done, "
-                 f"say why in one short line.")
+    lines.append(f"{REST_LAST_PART} If that last thing is not done yet, do it now by steps from what the look "
+                 f"showed (revises {pid}), with a done probe that reads that last thing; redo nothing that took. Reply "
+                 f"with the one word {REST_DONE_WORD} only when Yuki's line shows that last thing happened. If the "
+                 f"rest can't be done, say why in one short line.")
     return "\n".join(lines)
 
 
@@ -981,6 +990,6 @@ __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "re
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
            "look_report", "skill_rest_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
-           "part_rest_report", "text_back_report",
+           "part_rest_report", "text_back_report", "REST_LAST_PART",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]

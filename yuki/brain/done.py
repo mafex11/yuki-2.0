@@ -819,6 +819,38 @@ def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any]
     return (probe if probe in LINES else "read_back"), {"App": app}
 
 
+#: Probes a plan's own done can pick whose line names a person (pBrain review r1 L3: "Your chat with {person} is
+#: open." said by memory's own name for them, :func:`said_person`).
+PERSON_LINES = frozenset({"chat_open"})
+
+
+def said_person(person: Any, env: ProbeEnv) -> str:
+    """pBrain review r1 (L3, the rule of B35's "Sending to हेमंत"): the name a done line says for the person a probe
+    read: memory's own name for them (:func:`yuki.brain.consent.spoken_name` over memory's people index,
+    ``contacts.named_in``: as written, a learned heard form, a transliteration), else the person as written. One
+    bounded memory read (:func:`_memory_call`); only what is said, never what the probe read. Never raises."""
+    from yuki.brain.consent import spoken_name
+
+    given = " ".join(str(person or "").split())
+    call = _memory_call(env.memory)
+    if not given or call is None:
+        return given
+
+    def people(text: str) -> list[list[str]] | None:
+        def go(client: Any) -> list[list[str]]:
+            from yuki.memory.contacts import named_in
+
+            return [list(c.names) for c, _matched in named_in(getattr(client, "store", client), text)]
+
+        got = call("brain_said_person", go)
+        return got if isinstance(got, list) else None
+
+    try:
+        return spoken_name(given, people) or given
+    except Exception:  # noqa: BLE001 - memory can't say: the name as written
+        return given
+
+
 def line_for(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
              window_entry: Mapping[str, Any] | None = None, consent: Mapping[str, Any] | None = None) -> str:
     """The done line for a probe that read True, from its own arguments and evidence only."""
@@ -1083,7 +1115,10 @@ def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window:
                           seen=seen_words(probe, verdict, evidence), probe=probe, args=args, evidence=evidence,
                           window=entry)
     covered, uncovered = coverage(probe, args, plan, window_entry=entry, consent=consent)
-    line = line_for(probe, args, evidence, window_entry=entry, consent=consent)
+    said = dict(args)
+    if probe in PERSON_LINES and " ".join(str(args.get("person") or "").split()):
+        said["person"] = said_person(args.get("person"), env)   # review r1 L3: said by memory's name for them
+    line = line_for(probe, said, evidence, window_entry=entry, consent=consent)
     if uncovered:
         line = LINE_REST.format(line=line.rstrip(". "))
     return DoneResult(True, util.LIKELY if uncovered else util.VERIFIED, line, probe=probe, args=args,
