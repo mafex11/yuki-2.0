@@ -60,7 +60,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from yuki.skills.connection import (Check, Route, Skill, fill, fill_value, sends_with, strictest, template_names,
                                     window_state_reader)
@@ -1644,9 +1644,12 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
 
 def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list[str], ctx: RunContext, *,
                     again: bool = False, live: Live | None = None, settings: Any = None, corrects: bool = False,
-                    game_answer: str | None = None) -> SkillResult:
+                    game_answer: str | None = None, earlier: Sequence[str] | None = None) -> SkillResult:
     """Resolve (on the memory's own store, in one bounded call) and run, for every origin. Live facts default to a
     fresh read (``game_answer``: the caller's own D9 answer for them; every rung still reads the game again).
+    ``earlier``: the conversation's older turns, oldest first (x6Resolver merge note M1): only ever passed to the
+    resolver as ``earlier=``, which validates a given value against them and never fills from them; never appended to
+    ``words``, whose newest turn decides a named app.
     ``corrects``: the user corrected the skill's last run; with it, or the same skill and absolute values asked again
     within 60 s of a "done" (not ``again``), that run is marked a false done first (D19, review r2 M2)."""
     from yuki.skills import enabled, setting
@@ -1679,8 +1682,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # lPage merge note 5 (lSplit review r2 L1): words naming another value for a learned skill's bound key slot
         # run its capability (the learned routes carry the bound value in their arguments), never the learned skill
         key = request_key(loaded, str(skill_key or ""), slots)
+        extra = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
-                               live=live, again=again, default_step=step, disable_after=disable_after)
+                               live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
     resolved = _mem(ctx.memory, "skill_resolve", go, timeout_s=1.0) if ctx.memory is not None else go(None)
     if resolved is None and ctx.memory is not None and ctx.origin in ("thinker", "card"):
@@ -1751,17 +1755,18 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
                     log: Callable[..., Any] | None = None, request_id: str | None = None,
                     settings: Any = None, game: Callable[[], str] | None = None,
                     verbs: Mapping[str, Callable[[RouteCall], RouteResult]] | None = None,
-                    hands: Any = None) -> SkillResult:
+                    hands: Any = None, earlier: Sequence[str] | None = None) -> SkillResult:
     """The thinker's ``run_skill`` tool (``agent/tools.py``). A hand-off here means the thinker does it itself with
     the skill pinned (the loop pins it); with a game in front the run is held (D17). ``verbs``: the dispatcher's
     wrappers (sWire: a window-touching rung in an app whose "Act" switch is off is refused, as the voice does).
     ``hands``: the new brain's desk hands (``yuki.skills.uia_route.DeskHands``, zFinal): the chat driver's own steps
-    type and press through them, each through the consent rule; the old loop passes none."""
+    type and press through them, each through the consent rule; the old loop passes none. ``earlier``: the
+    conversation's older turns, oldest first, for the resolver only (see :func:`resolve_and_run`)."""
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
                      request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands)
     return resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
                            else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings,
-                           corrects=bool(args.get("corrects")))
+                           corrects=bool(args.get("corrects")), earlier=earlier)
 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",

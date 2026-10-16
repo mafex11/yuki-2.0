@@ -160,7 +160,7 @@ _NEWEST: Any = object()
 
 #: The talker's hands that only bring a window or a tab to the front, by hand and action (``tab`` shows by default):
 #: a step on the way to what was asked, never the end of a request (fix plan C1, Item 3(b)).
-_PREPARATORY = {"window": ("focus", "restore"), "tab": ("", "show")}
+_PREPARATORY = {"window": ("focus", "restore"), "tab": ("", "show", "new")}
 
 
 def _preparatory(what: str) -> bool:

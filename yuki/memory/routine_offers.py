@@ -557,6 +557,17 @@ def _write_request(path: Path, data: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def _skills_on(config: Any) -> bool:
+    """Whether the skill path is on (x1Switch: ``Settings.skills``, else the user's switch now). Off: no routine card,
+    since its "Open it" runs a skill the engine would refuse (``skills_off``); never raises (on)."""
+    try:
+        from yuki.skills import enabled
+
+        return enabled(config)
+    except Exception:  # noqa: BLE001 - the card lane never breaks on a settings read
+        return True
+
+
 @dataclass
 class Due:
     """A routine due now: in ``mode``, its usual time ``at``, its window's end, and whether ``offer-now`` forced it."""
@@ -633,7 +644,8 @@ class RoutineLane:
         except Exception as exc:
             self._log("nudge_error", where="routine_learn", error=f"{type(exc).__name__}: {exc}")
         request = self._read_request(now)
-        if not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off":
+        if (not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off"
+                or not _skills_on(config)):
             if request is not None:
                 self._finish_request(request, "off")
             return None
@@ -670,7 +682,8 @@ class RoutineLane:
         if not has_tables(self.store):
             return []
         request = self._read_request(now)
-        if not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off":
+        if (not getattr(config, "routine_offers", True) or getattr(config, "offers", "yuki_only") == "off"
+                or not _skills_on(config)):
             if request is not None:
                 self._finish_request(request, "off")
             return []

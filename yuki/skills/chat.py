@@ -344,6 +344,38 @@ def _probe_store(ctx: Any) -> Any:
         return None
 
 
+def _said_as(call: RouteCall, target: Target) -> str:
+    """Whom a send goes to, in the user's own words (rule 8: the send check reads ``to`` as a span of what they said).
+    The name as given or as memory keeps it when it stands in their words; else the span of their words that names
+    that same person as written, as a heard form memory learned when they confirmed it ("hey meant"), or as a
+    transliteration ("हेमंत"): :func:`yuki.memory.contacts.names_person` with ``by_sound=False``, so a Latin word that
+    only sounds like the person never authorises a send. Nothing found (or a group chat): the name as given, which the
+    send check refuses before any step, so nothing is typed or sent and the run falls back (Item 5)."""
+    from yuki.skills.uia_route import said
+
+    words = [str(w) for w in call.ctx.words or () if w]
+    for form in (target.said, target.name):
+        if form and said(form, words):
+            return form
+    if target.place:
+        return target.said
+    store = _store(call.ctx)
+    if store is None:
+        return target.said
+    try:
+        from yuki.memory import contacts as C
+
+        person = C.names_person(store, target.said or target.name, words, by_sound=False)
+        if person is not None:
+            for text in reversed(words):
+                for c, span in C.named_in(store, text):
+                    if c.id == person.id and said(span, words):
+                        return span
+    except Exception:  # noqa: BLE001 - a memory read never sends; the name as given is refused
+        pass
+    return target.said
+
+
 def _app_named(values: Mapping[str, Any]) -> str | None:
     app = values.get("app")
     return _app_key(app) or None if app else None
@@ -847,7 +879,8 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
     if steps:
         _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
-                             key="message", sends={"to": target.said, "what": text} if send and not blind else None)
+                             key="message",
+                             sends={"to": _said_as(call, target), "what": text} if send and not blind else None)
     else:
         run = {"steps": 0, "steps_done": 0, "results": []}
     facts["kept_draft"] = kept
