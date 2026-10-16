@@ -11,7 +11,8 @@ bExec builds the executor against the same pinned text (the schema below and :cl
   before step 1 can run), no self-report field and no ``done.line`` (code writes the line from the probe's evidence).
 * :func:`parse_header`, :func:`parse_step` and :func:`validate_plan` are the validator. The planner validates the header
   once ``steps`` begins, each step as its object closes in the stream, and the whole plan at the end. A failure is a
-  :class:`PlanError` whose plain-words ``errors`` go back to the model as an ``is_error`` tool result (one retry).
+  :class:`PlanError` whose plain-words ``errors`` go back to the model as an ``is_error`` tool result (retried within
+  the replan budget; its code words are logged: :func:`error_codes`).
 * :class:`ExecHost` is the protocol the executor runs against, verbatim as pinned in design 10.1.
 * :class:`StepSource` and :class:`ExecResult` are bCore's side of the executor seam (what the Brain hands the executor
   and what it reads back). They are not part of the pinned text: the merge reviewer reconciles them with bExec's
@@ -24,6 +25,7 @@ the checks are on types, sizes, string identity and the catalog's own data (``se
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
@@ -73,7 +75,7 @@ def probe_args_text() -> str:
         if name == "window_state":
             names = [n if n != "state" else "state=" + "|".join(_done.WINDOW_STATES) for n in names]
         parts.append(f"{name} {','.join(names)}")
-    return "done/expect args, a JSON object as a string (? optional): " + "; ".join(parts)
+    return "done/expect args, JSON object as string (? optional): " + "; ".join(parts)
 
 #: What ``look`` reads (a step's value, the ``look`` tool's ``what``) and the windows it needs.
 LOOK_WHATS: tuple[str, ...] = ("desktop", "window", "page", "tabs", "focus", "clipboard", "system")
@@ -85,28 +87,30 @@ MEMORY_KINDS: tuple[str, ...] = (
     "recall", "activity", "calls", "call_timeline", "threads", "before", "links", "people", "skills",
 )
 
-#: How each verb's fields are read (the executor's contract; the tool description says it in short).
+#: How each verb's fields are read (the executor's contract; the tool description says it in short). ``open_url``'s
+#: window is the browser it opens in (the executor hands that window's app to the tool: x10, Item 9's side): a step
+#: with no browser opens in Windows' default one.
 VERB_FIELDS: dict[str, str] = {
     "launch_app": "value: app name",
     "focus_window": "window",
-    "open_url": "value: address, file or folder",
+    "open_url": "window: the browser it opens in; value: address, file or folder",
     "window_action": "window; value: minimize|maximize|fullscreen|restore|focus|close",
     "tab": "window; element: the tab; value: select|close",
     "click": "element; value: null|right|middle|double",
-    "type_text": "element or the focus; value: text; submit: Enter after",
-    "hotkey": "value: chord, e.g. ctrl+t",
+    "type_text": "element or focus; value: text; submit: Enter after",
+    "hotkey": "value: chord (ctrl+t)",
     "press": "value: one key",
     "scroll": "element or window; value: notches, + is up",
     "set_slider": "element; value: 0-100",
-    "app_volume": "target.app; value: 0-100, +N, -N, mute, unmute",
+    "app_volume": "target.app; value: 0-100, +N, -N, mute|unmute",
     "run_powershell": "value: command",
     "write_clipboard": "value: text",
     "run_skill": "value: JSON {\"skill\": id, \"slots\": {}}",
     "open_yuki": "value: page",
     "look": "value: desktop|window|page|tabs|focus|clipboard|system; window",
-    "memory": "value: JSON memory-tool arguments with kind",
+    "memory": "value: JSON memory-tool args with kind",
     "fetch": "value: http(s) address or file path",
-    "wait": "value: seconds, at most 10",
+    "wait": "value: seconds (max 10)",
 }
 
 #: String caps, enforced in code (strict mode has no ``maxLength``). Goal, question and say are cut to fit (display
@@ -180,7 +184,7 @@ def plan_schema() -> dict[str, Any]:
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
             "to": _nullable("string", "The person or channel."),
-            "text": _nullable("string", "The exact text: their own words."),
+            "text": _nullable("string", "The exact message text."),
         },
     }
     element = {
@@ -200,7 +204,7 @@ def plan_schema() -> dict[str, Any]:
         "required": ["verb", "window", "element", "value", "submit", "expect", "say"],
         "properties": {
             "verb": {"type": "string", "enum": list(VERBS)},
-            "window": _nullable("string", "An hwnd, or a title."),
+            "window": _nullable("string", "An hwnd or a title."),
             "element": element,
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
@@ -332,8 +336,10 @@ class Step:
 
 @dataclass(frozen=True)
 class Plan:
-    """One validated plan. ``id`` is code's (``p1``, ``p2`` ...). ``seeded``: built from a skill's hand-off (its done
-    check is fixed). ``done_by_skill``: a skill route checks itself (the engine's own done-check and line)."""
+    """One validated plan. ``id`` is code's (``p1``, ``p2`` ...). ``seeded``: made in a request a skill handed over
+    (rung C). ``done_by_skill``: a skill route checks itself (the engine's own done-check and line). ``seed_check``: the
+    hand-off's own fixed check decides this plan (the planner wrote ``none`` for it, or the seed's probe itself); a
+    seeded plan by steps that wrote a probe of its own is decided by that probe (x10)."""
 
     id: str
     goal: str
@@ -347,6 +353,7 @@ class Plan:
     steps: tuple[Step, ...] = ()
     seeded: bool = False
     done_by_skill: bool = False
+    seed_check: bool = False
 
     @property
     def skill(self) -> str | None:
@@ -368,7 +375,7 @@ class Plan:
         return {"plan": self.id, "kind": self.kind, "route": "skill" if self.skill else STEPS_ROUTE,
                 "commit": self.consent.commit, "probe": self.done.name, "steps": len(self.steps),
                 "verbs": [s.verb for s in self.steps], "revises": bool(self.revises), "seeded": self.seeded,
-                "goal_chars": len(self.goal), "target": sorted(self.target.fields())}
+                "seed_check": self.seed_check, "goal_chars": len(self.goal), "target": sorted(self.target.fields())}
 
 
 class PlanError(Exception):
@@ -377,6 +384,52 @@ class PlanError(Exception):
     def __init__(self, errors: Sequence[str]) -> None:
         self.errors = [str(e) for e in errors if str(e)]
         super().__init__("; ".join(self.errors) or "invalid plan")
+
+    @property
+    def codes(self) -> list[str]:
+        """The errors as log code words (:func:`error_codes`)."""
+        return error_codes(self.errors)
+
+
+#: Most code words one error becomes (its first words: enough to tell the validator's rules apart).
+ERROR_CODE_WORDS = 6
+#: The longest error code (the content-free log keeps a code word of at most 48 characters).
+ERROR_CODE_CHARS = 48
+
+
+def error_code(text: str) -> str:
+    """One validator error as a log code word: the validator's own sentence without its step number and without any
+    quoted value (the only place a model-written value can stand in it: ``no skill 'x' in the menu``), its first few
+    words joined by ``_``. The validator writes every error, so this is its wording as a code, never the model's or
+    the user's words (x10: the PlanError texts are logged, content-free)."""
+    out = str(text or "").strip()
+    if out.startswith("step ") and ":" in out[:12]:
+        head, _, rest = out.partition(":")
+        if head[5:].strip().isdigit():
+            out = rest
+    clean: list[str] = []
+    quote = ""
+    prev = " "
+    for ch in out:
+        if quote:
+            if ch == quote:
+                quote = ""
+            prev = " "
+            continue
+        # a quote opens only where a word does not go on through it ("skill's" is one word, 'x' is a value)
+        if ch in "'\"" and not prev.isalnum():
+            quote = ch
+            continue
+        clean.append(ch.lower() if ch.isascii() and ch.isalnum() else " ")
+        prev = ch
+    words = "".join(clean).split()[:ERROR_CODE_WORDS]
+    code = "_".join(words)[:ERROR_CODE_CHARS].strip("_")
+    return code if code and code[0].isalpha() else ("e_" + code)[:ERROR_CODE_CHARS] if code else "invalid"
+
+
+def error_codes(errors: Sequence[str]) -> list[str]:
+    """Each validator error as a code word (:func:`error_code`), duplicates once, in order."""
+    return list(dict.fromkeys(error_code(e) for e in errors if str(e).strip()))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -397,6 +450,9 @@ class Checks:
         failed_step: The step that just failed (a replan must not repeat it unchanged, once).
         repeat_rejected: A repeat was already rejected once in this request (the next one is accepted).
         current_plan: The id of the plan a replan revises, or ``None``.
+        spent_skills: Skills that already ran in this request and handed over or couldn't confirm the result (code
+            ids): a plan that runs one again is invalid, as is one that runs the skill the seed handed over
+            (:func:`spent_skills`).
     """
 
     plan_id: str
@@ -407,6 +463,139 @@ class Checks:
     failed_step: Step | None = None
     repeat_rejected: bool = False
     current_plan: str | None = None
+    spent_skills: frozenset[str] = frozenset()
+
+
+#: A hand-off whose skill never ran its own way to the end: one of its steps would send or join with no plan behind it
+#: (``yuki.skills.engine.TO_PLANNER``), so the planner runs that skill with the consent it needs. Every other hand-off
+#: means the skill's own way didn't get there (its routes failed, it couldn't confirm, a value it was given was
+#: dropped): running it again would do the same, so the plan does it by steps.
+SEED_RERUN_OK: frozenset[str] = frozenset({"to_planner"})
+
+
+def skill_family(key: Any) -> str:
+    """A skill's family: a learned skill (``web.open_page#c841...``) and the capability it specialises run the same
+    routes, so one that just handed over stands for both."""
+    return str(key or "").strip().split("#", 1)[0]
+
+
+def seed_skill(seed: Mapping[str, Any] | None) -> str | None:
+    """The skill a plan seed handed over when running it again would only repeat it (its hand-off's ``why`` is not in
+    :data:`SEED_RERUN_OK`), else ``None``."""
+    if not isinstance(seed, Mapping):
+        return None
+    key = str(seed.get("skill") or seed.get("key") or "").strip()
+    if not key or str(seed.get("why") or "").strip() in SEED_RERUN_OK:
+        return None
+    return key
+
+
+def spent_skills(checks: Checks) -> dict[str, str]:
+    """Skill families a plan of this request may not run again, each with why in plain words: the seed's skill (it
+    handed over) and :attr:`Checks.spent_skills` (they ran in this request and handed over or couldn't confirm)."""
+    out = {skill_family(k): "already ran in this request without a confirmed result" for k in checks.spent_skills
+           if skill_family(k)}
+    handed = seed_skill(checks.seed)
+    if handed:
+        out[skill_family(handed)] = "just handed over: its own way didn't get there"
+    return out
+
+
+def _spent_error(where: str, skill: str, checks: Checks) -> str | None:
+    """The error for a plan that runs a skill that just handed over or couldn't confirm (``skill``: a menu id, so the
+    error holds no model-written text), else ``None``."""
+    why = spent_skills(checks).get(skill_family(skill))
+    if why is None:
+        return None
+    # the id in quotes: the log's code of this error (error_code) leaves quoted values out
+    return (f"{where}skill '{skill}' {why}, so don't run it again: do it by steps (look, then click or type in the "
+            f"app), route steps")
+
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+#: The verbs whose value is a command, an address or a path, taken exactly as written (a ``\u`` there is its own: a
+#: folder's name), never :func:`unescape`'d.
+RAW_VALUE_VERBS: frozenset[str] = frozenset({"run_powershell", "fetch", "open_url"})
+
+
+def _hex4(text: str, at: int) -> int | None:
+    chunk = text[at:at + 4]
+    return int(chunk, 16) if len(chunk) == 4 and all(c in _HEX_DIGITS for c in chunk) else None
+
+
+def _pathlike(text: str) -> bool:
+    """``text`` holds a Windows path (a drive's ``X:\\`` or a ``\\\\`` share): its ``\\u`` is a folder's name."""
+    if "\\\\" in text:
+        return True
+    at = text.find(":\\")
+    while at != -1:
+        if at > 0 and text[at - 1].isascii() and text[at - 1].isalpha():
+            return True
+        at = text.find(":\\", at + 1)
+    return False
+
+
+def _latin(char: str) -> bool:
+    """ASCII or a Latin letter or mark: a script the model writes as it is, never as an escape."""
+    return ord(char) < 0x250 or "LATIN" in unicodedata.name(char, "")
+
+
+def unescape(text: str) -> str:
+    """``text`` with the JSON escapes the model sometimes writes twice decoded: each well-formed ``\\uXXXX`` (a
+    surrogate pair joined) becomes its character. A format fix, never a reading of meaning (x10: in the simulation the
+    planner wrote the playlist row "ネオン" as ``\\u30cd\\u30aa\\u30f3`` in an element name, a target and a
+    probe's arguments, so its click would have looked for a control by that literal name). A lone surrogate or a
+    control character stays as written. The text stays exactly as written when it holds a Windows path
+    (``C:\\Users\\me\\ufeed``) or when any escape in it stands for ASCII or a Latin letter (``"\\u00e9"`` typed into
+    code): the model writes those as they are, so such a ``\\u`` is the text's own (review r2 L2)."""
+    if not isinstance(text, str) or "\\u" not in text or _pathlike(text):
+        return text
+    out: list[str] = []
+    decoded = False
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("\\u", i):
+            code = _hex4(text, i + 2)
+            if code is not None:
+                end = i + 6
+                if 0xD800 <= code < 0xDC00 and text.startswith("\\u", end):
+                    low = _hex4(text, end + 2)
+                    if low is not None and 0xDC00 <= low < 0xE000:
+                        code, end = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00), end + 6
+                if code >= 0x20 and not 0xD800 <= code < 0xE000:
+                    if _latin(chr(code)):
+                        return text   # not the model's doubled escape: the text's own "\u"
+                    out.append(chr(code))
+                    decoded = True
+                    i = end
+                    continue
+        out.append(text[i])
+        i += 1
+    return "".join(out) if decoded else text
+
+
+def _unescape_data(value: Any) -> Any:
+    """:func:`unescape` on every string inside parsed JSON data (keys too)."""
+    if isinstance(value, str):
+        return unescape(value)
+    if isinstance(value, list):
+        return [_unescape_data(v) for v in value]
+    if isinstance(value, dict):
+        return {unescape(str(k)): _unescape_data(v) for k, v in value.items()}
+    return value
+
+
+def _unescape_json_text(text: str) -> str:
+    """A JSON value written as a string (a ``run_skill`` or ``memory`` step's value) with :func:`unescape` applied to
+    the strings inside it, written back as JSON; the text as it was when it holds no such escape or isn't one JSON
+    object (the validator then says so)."""
+    if "\\\\u" not in text:
+        return text
+    data = _json_object(text)
+    if data is None:
+        return text
+    fixed = _unescape_data(data)
+    return json.dumps(fixed, ensure_ascii=False) if fixed != data else text
 
 
 def _json_object(text: Any) -> dict[str, Any] | None:
@@ -430,7 +619,7 @@ def _opt_str(raw: Mapping[str, Any], key: str, errors: list[str], where: str, ca
     if not isinstance(value, str):
         errors.append(f"{where}{key} must be a string or null")
         return None
-    value = value.strip()
+    value = unescape(value).strip()
     if not value:
         return None
     if cap is not None and len(value) > cap:
@@ -461,6 +650,7 @@ def _probe(raw: Any, errors: list[str], where: str) -> Probe | None:
     if args is None:
         errors.append(f"{where}.args must parse as one JSON object (\"{{}}\" for none)")
         return None
+    args = _unescape_data(args)
     if name == "none":
         if args:
             errors.append(f"{where}.args for none take nothing (\"{{}}\")")
@@ -484,8 +674,16 @@ def probe_errors(raw: Any) -> list[str]:
     if not isinstance(raw, Mapping):
         return out
     try:
-        if raw.get("done") is not None:
-            _probe(raw.get("done"), out, "done")
+        done = raw.get("done")
+        consent = raw.get("consent") if isinstance(raw.get("consent"), Mapping) else {}
+        route = raw.get("route") if isinstance(raw.get("route"), str) else ""
+        # x10: a done that code decides (an answer, a skill route, a send, a join) or a hand-off's own check written
+        # out is never used as written (parse_header), so it is no problem to report
+        code_done = (raw.get("kind") in ("answer", "ask") or route.strip().startswith(SKILL_ROUTE_PREFIX)
+                     or consent.get("commit") in ("send", "join")
+                     or (isinstance(done, Mapping) and done.get("probe") in ENGINE_ONLY_PROBES))
+        if done is not None and not code_done:
+            _probe(done, out, "done")
         steps = raw.get("steps")
         for index, step in enumerate(steps if isinstance(steps, list) else []):
             if isinstance(step, Mapping) and step.get("expect") is not None:
@@ -496,12 +694,13 @@ def probe_errors(raw: Any) -> list[str]:
 
 
 def required_probe(plan: Plan) -> str | None:
-    """The probe class the plan must end on (design 2.4): ``skill`` (the skill's own check), ``message_sent`` (a
-    send), ``mic_held`` (a join), ``none`` (an answer or a question), or ``None`` (the planner's pick). A seed's fixed
-    check applies to its act plans only: an answer or a question in a seeded request changes nothing to check."""
+    """The probe class the plan ends on (design 2.4): ``none`` (an answer or a question), ``skill`` (a skill route: the
+    skill's own check), ``message_sent`` (a send), ``mic_held`` (a join), or ``None`` (the planner's pick). A seeded
+    plan by steps is the planner's pick too (x10): its own probe decides, and ``none`` takes the seed's fixed check
+    (:func:`_check_done`)."""
     if plan.kind in ("answer", "ask"):
         return "none"
-    if plan.seeded or plan.skill:
+    if plan.skill:
         return "skill"
     if plan.consent.commit == "send":
         return "message_sent"
@@ -512,8 +711,9 @@ def required_probe(plan: Plan) -> str | None:
 
 def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
     """The plan's fields before ``steps``, validated (design 2.2); raises :class:`PlanError`. The returned plan has no
-    steps; its done probe is normalised to the required one when the model wrote ``none`` for a send, a join, a skill
-    route or a seeded plan."""
+    steps; its done probe is normalised where code decides the check (:func:`_check_done`): a skill route, a send, a
+    join, an answer or a question, and a seeded plan that wrote ``none`` (the seed's check). A route to a skill that
+    just handed over or couldn't confirm in this request is refused (:func:`spent_skills`)."""
     errors: list[str] = []
     if not isinstance(raw, Mapping):
         raise PlanError(["the plan must be a JSON object"])
@@ -543,6 +743,10 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
             errors.append("the skill list could not be read: use route steps")
         elif skill not in checks.skills:
             errors.append(f"no skill {skill!r} in the menu: use one listed there, or route steps")
+        else:
+            spent = _spent_error("route: ", skill, checks)
+            if spent:
+                errors.append(spent)
         route = SKILL_ROUTE_PREFIX + skill
         if kind != "act":
             errors.append("a skill route runs the skill, so it is kind act (an answer or a question routes steps)")
@@ -564,7 +768,17 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
             errors.append("a join needs consent.quote (the user's words asking for it) and consent.to")
         if consent.commit != "none" and kind != "act":
             errors.append("only an act plan commits anything: consent.commit none for an answer or a question")
-    done = _probe(raw.get("done"), errors, "done") or Probe()
+    raw_done = raw.get("done")
+    written = raw_done.get("probe") if isinstance(raw_done, Mapping) else None
+    if kind in ("answer", "ask") or skill is not None or consent.commit in ("send", "join"):
+        # code decides this plan's check (nothing to check, the skill's own, the send's or the join's): whatever the
+        # model wrote there is never used, so it is never a reason to refuse the plan (x10)
+        done = Probe()
+    elif checks.seed is not None and written in ENGINE_ONLY_PROBES:
+        # the hand-off's own check written out (its arguments are the engine's, not a plan's): the seed's check
+        done = Probe(name=str(written))
+    else:
+        done = _probe(raw_done, errors, "done") or Probe()
     question = _opt_str(raw, "question", errors, "", QUESTION_CHARS)
     if kind == "ask" and not question:
         errors.append("kind ask needs the question")
@@ -596,49 +810,43 @@ _SEED_CHECK_KEYS = frozenset({"probe", "within_s", "after_s", "parts", "same_sou
 
 
 def _check_done(plan: Plan, checks: Checks) -> Plan:
-    """The done probe against the required table (design 2.4, M3); raises :class:`PlanError`."""
+    """The done probe against the required table (design 2.4, M3), normalised wherever code decides the check (x10:
+    two refusals of a seeded click plan for its done field ended tonight's requests, 10 Oct):
+
+    * an answer or a question: nothing to check (``none``);
+    * a skill route: the skill checks itself (``done_by_skill``), whatever was written;
+    * a send: ``message_sent`` of ``consent.text``; a join: ``mic_held`` of the target app;
+    * a seeded plan by steps: its own probe from the closed list decides it; ``none`` (or the hand-off's own probe
+      written out) takes the seed's fixed check (``seed_check``), except a send's or a join's check in a plan that
+      declares neither, a sending skill's own check among them (that would read the user's own doing, as
+      :func:`yuki.brain.done.pick_done` refuses it): ``none``;
+    * any other act plan: the planner's pick.
+
+    Raises :class:`PlanError` only for a probe a plan may not pick: one only a skill reads, or a send's or a join's
+    check without that commit."""
     need = required_probe(plan)
     done = plan.done
-    if need == "skill":
-        seed = _seed_probe(checks.seed) if plan.seeded else None
-        if seed is not None:
-            if done.none:
-                done = seed
-            elif not done.same(seed):
-                raise PlanError(["this plan comes from a skill's hand-off: its done check is fixed (write done as "
-                                 "the seed gives it, or probe none)"])
-            return replace(plan, done=done)
-        if plan.skill:
-            if not done.none:
-                raise PlanError(["a skill route checks itself: done.probe none"])
-            return replace(plan, done=Probe(), done_by_skill=True)
-        # a hand-off that carried no done check of its own: the rules of the plan's own class below
-        # (an act plan here: answers and questions never need "skill")
-        need = {"send": "message_sent", "join": "mic_held"}.get(plan.consent.commit)
     if need == "none":
-        if not done.none:
-            raise PlanError(["an answer or a question changes nothing to check: done.probe none"])
-        return plan
+        return replace(plan, done=Probe()) if not done.none else plan
+    if need == "skill":
+        return replace(plan, done=Probe(), done_by_skill=True)
     if need == "message_sent":
-        if done.none:
-            args = {"text": plan.consent.text or ""}
-            if plan.target.app:
-                args["app"] = plan.target.app
-            return replace(plan, done=Probe("message_sent", args, json.dumps(args, ensure_ascii=False)))
-        if done.name != "message_sent":
-            raise PlanError(["a send is checked by message_sent (the message seen in the chat): done.probe "
-                             "message_sent"])
-        if str(done.args.get("text") or "") != (plan.consent.text or ""):
-            raise PlanError(["done.args.text must be consent.text exactly"])
-        return plan
+        args = {"text": plan.consent.text or ""}
+        if plan.target.app:
+            args["app"] = plan.target.app
+        return replace(plan, done=Probe("message_sent", args, json.dumps(args, ensure_ascii=False)))
     if need == "mic_held":
-        if done.none:
-            args = {"process": plan.target.app} if plan.target.app else {}
-            return replace(plan, done=Probe("mic_held", args, json.dumps(args, ensure_ascii=False)))
-        if done.name != "mic_held":
-            raise PlanError(["a join is checked by mic_held (the app took the microphone): done.probe mic_held"])
-        return plan
-    # other act plans: the planner's pick, from the closed list, never one only a skill or a declared commit can use
+        args = {"process": plan.target.app} if plan.target.app else {}
+        return replace(plan, done=Probe("mic_held", args, json.dumps(args, ensure_ascii=False)))
+    seed = _seed_probe(checks.seed) if plan.seeded else None
+    if seed is not None and (done.none or done.name in ENGINE_ONLY_PROBES or done.same(seed)):
+        if _commit_probe(seed) or seed_sends(checks.seed):
+            # the hand-off's check reads a send or a join this plan doesn't declare: never its check (M3; review r2
+            # L3: a message skill's own check reads the send, so a draft typed by steps that the user then sends
+            # themselves would be said as Yuki's "Done.")
+            return replace(plan, done=Probe())
+        return replace(plan, done=seed, seed_check=True)
+    # the planner's pick, from the closed list, never one only a skill or a declared commit can use
     if done.name in ENGINE_ONLY_PROBES:
         raise PlanError([f"done.probe {done.name} is only for skills: pick one that reads the screen or the PC"])
     if done.name == "message_sent":
@@ -646,6 +854,25 @@ def _check_done(plan: Plan, checks: Checks) -> Plan:
     if done.name == "mic_held":
         raise PlanError(["mic_held checks a join: declare consent.commit join, or pick another probe"])
     return plan
+
+
+def _commit_probe(probe: Probe) -> bool:
+    """A probe that reads a send or a join (``message_sent``, ``mic_held``, a send's or a join's moment)."""
+    if probe.name in ("message_sent", "mic_held"):
+        return True
+    return probe.name == "moment" and str(probe.args.get("kind") or "") in _done.COMMIT_MOMENTS
+
+
+def seed_sends(seed: Mapping[str, Any] | None) -> bool:
+    """The hand-off is a skill that sends (the engine's ``sends`` mark, ``engine.pinned``), or its check is a capability
+    driver's send check (``send: send``, the message capability's ``chat.message_done``): that check reads a send, so
+    a plan by steps that declares none never takes it (review r2 L3)."""
+    if not isinstance(seed, Mapping):
+        return False
+    if seed.get("sends"):
+        return True
+    probe = _seed_probe(seed)
+    return probe is not None and probe.name == "driver" and str(probe.args.get("send") or "") == "send"
 
 
 def _two_ints(text: str) -> bool:
@@ -685,8 +912,8 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
         if not isinstance(e, Mapping) or not isinstance(e.get("name"), str):
             errors.append(f"{where}element must be null or an object with name and role")
         else:
-            name = " ".join(str(e.get("name") or "").split())[:NAME_CHARS]
-            role = " ".join(str(e.get("role") or "").split())[:ROLE_CHARS]
+            name = " ".join(unescape(str(e.get("name") or "")).split())[:NAME_CHARS]
+            role = " ".join(unescape(str(e.get("role") or "")).split())[:ROLE_CHARS]
             if not name:
                 errors.append(f"{where}element.name must name the element (or [id] from a look)")
             elif _two_ints(name):
@@ -696,6 +923,8 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
     if value is not None and not isinstance(value, str):
         errors.append(f"{where}value must be a string or null")
         value = None
+    if isinstance(value, str) and verb not in RAW_VALUE_VERBS:
+        value = _unescape_json_text(value) if verb in ("run_skill", "memory") else unescape(value)
     if isinstance(value, str) and len(value) > VALUE_CHARS:
         errors.append(f"{where}value is longer than {VALUE_CHARS} characters")
     submit = raw.get("submit")
@@ -778,6 +1007,12 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
             errors.append(f"{where}no skill {call[0]!r} in the menu")
         elif data is not None and "slots" in data and not isinstance(data.get("slots"), dict):
             errors.append(f"{where}run_skill slots must be an object")
+        else:
+            # checked as the step closes, before it can run: a skill that just handed over (or couldn't confirm) is
+            # never run again in the same request (its own way would only repeat; a second try may act twice)
+            spent = _spent_error(where, call[0], checks)
+            if spent:
+                errors.append(spent)
     if errors:
         raise PlanError(errors)
     # sends (design 2.2, 2.5 row 4; decision 2): a send runs only through a sending capability, declared
@@ -931,10 +1166,16 @@ class ExecResult:
     check_calls: int = 0
     #: The run ends here with ``line`` (a refusal such as a game in front, the desk busy): no replan.
     final: bool = False
-    #: A skill's hand-off (rung C) from a ``run_skill`` step: the next plan is seeded with it (its done-check fixed).
+    #: A skill's hand-off (rung C) from a ``run_skill`` step: the next plan is seeded with it. Its done-check decides
+    #: that plan only when the plan writes none (or the check itself) or re-runs the skill; a plan by steps with a
+    #: probe of its own is decided by that probe (x10).
     seed: dict[str, Any] | None = None
     #: ``seen`` is outside text the executor capped and fenced as untrusted data: it is never cut again.
     seen_fenced: bool = False
+    #: An ``unconfirmed`` plan whose deciding ``run_skill`` step acted and couldn't confirm, when doing the rest by
+    #: steps is safe (it sends and joins nothing, and its route may be followed after acting): that skill's id. The
+    #: Brain then replans once by steps after a look instead of ending (x10); ``None`` otherwise.
+    unconfirmed_skill: str | None = None
 
 
 __all__ = [
@@ -943,5 +1184,6 @@ __all__ = [
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
-    "probe_args_text", "probe_errors",
+    "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
+    "spent_skills", "unescape", "seed_sends",
 ]

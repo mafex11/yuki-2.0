@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Mapping, Sequence
 
-from yuki.brain.plan import ExecResult, Plan, StepStatus
+from yuki.brain.plan import SEED_RERUN_OK, ExecResult, Plan, StepStatus, seed_sends, skill_family
 from yuki.brain.prompt import menu_text, profile_text
 
 #: How the request turn labels each part (Yuki's own words about the parts, never the user's).
@@ -48,7 +48,32 @@ CONTEXT_LABEL = ("[Context the request came with: text from Yuki's own card or n
                  "or send it as theirs]")
 YOU_LABEL = "[You right now, from Yuki's memory service]"
 PEOPLE_LABEL = "[People their words name, from memory's people index]"
-SEED_LABEL = "[A skill's hand-off: its own routes did not get there. Its done check is fixed]"
+#: The seed block's label (x10): what to do next, by the hand-off's ``why`` (the engine's code word; x5Fallback adds
+#: ``unverified``, ``error`` and ``dropped``). Every hand-off but a commit's is done by steps, never by that skill again
+#: (:func:`yuki.brain.plan.spent_skills` refuses a plan that runs it).
+SEED_DONE = "Write done as a probe that reads the result, or none to take the skill's check below"
+SEED_LABEL = ("[A skill's hand-off: its own way did not get there. Do it by steps now (look, then click or type in the "
+              f"app); never run that skill again. {SEED_DONE}]")
+SEED_UNSURE_LABEL = ("[A skill's hand-off: it acted but couldn't confirm the result, or it broke partway. Look first, "
+                     "then finish by steps only what isn't done (click or type in the app); redo nothing that took; "
+                     f"never run that skill again. {SEED_DONE}]")
+SEED_DROPPED_LABEL = ("[A skill's hand-off: a value it was given isn't in their words as heard (misheard, or reworded), "
+                      "so it didn't run. Check the values against their words, the people named and memory, then do it "
+                      f"by steps (look, then click or type in the app); never run that skill again. {SEED_DONE}]")
+SEED_LABELS: dict[str, str] = {"unverified": SEED_UNSURE_LABEL, "error": SEED_UNSURE_LABEL,
+                               "dropped": SEED_DROPPED_LABEL}
+#: A hand-off whose step would send or join with no plan behind it (``yuki.skills.engine.TO_PLANNER``): that step did
+#: not run; the planner runs the skill in a plan that declares the commit (x10).
+SEED_COMMIT_LABEL = ("[A skill stopped before a step that would send or join (not a failure: that step needs a plan). "
+                     "Run that skill again in a plan that declares the commit, with the consent it needs]")
+#: A hand-off of a skill that sends, done by steps: only the message capability sends, so steps leave a draft. Its
+#: check is the plan's own (the skill's reads a send: ``yuki.brain.plan.seed_sends``, never a draft's check); code says
+#: the draft's line when that probe saw the text typed in (``agent.LINE_DRAFTED``), so the planner says no line.
+SEED_DRAFT_LINE = ("A message done by steps is typed, never sent: leave it as a draft. Its done: field_holds of the "
+                   "message box with the text typed (not none: the skill's check below reads a send).")
+#: The most names a seed's ``seen`` list shows (IF-seed: up to 40, kept in RAM only), and their room in characters.
+SEEN_MAX = 40
+SEEN_CHARS = 700
 CHECK_LABEL = "[Yuki's check, not the user]"
 STEER_LABEL = "[The user added while you were working]"
 ANSWER_LABEL = "[The user's answer to your question]"
@@ -426,16 +451,49 @@ def recent_block(history: Sequence[Exchange], *, limit: int) -> str:
     return RECENT_LABEL + "\n" + "\n\n".join(parts)
 
 
-def seed_block(seed: Mapping[str, Any] | None, *, limit: int) -> str:
-    """A skill's plan seed (rung C): goal, slot values, its fixed done check, what was tried. Code data."""
+def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -> str:
+    """A skill's plan seed (rung C): goal, slot values, its fixed done check, what was tried (code data), and, when the
+    routes said so (IF-seed, Items 5 and 7), ``missing``: the slot whose value no route could find, and ``seen``: the
+    names the route read on screen there (outside text: fenced as untrusted data, never instructions). The label says
+    what to do next, by the hand-off's ``why`` (:data:`SEED_LABELS`): by steps (never that skill again; look first and
+    redo nothing after one that acted unconfirmed; check the values after one that dropped a misheard value), or with
+    the consent a send or a join needs when the skill stopped for one (:data:`yuki.brain.plan.SEED_RERUN_OK`). A skill
+    that sends, done by steps, is left as a draft, checked by its own probe and never by the skill's send check
+    (:data:`SEED_DRAFT_LINE`)."""
     if not seed:
         return ""
-    keep = {k: seed.get(k) for k in ("skill", "goal", "slots", "done", "tried") if seed.get(k) is not None}
+    keep = {k: seed.get(k) for k in ("skill", "goal", "slots", "done", "tried", "missing") if seed.get(k) is not None}
     try:
         body = json.dumps(keep, ensure_ascii=False, sort_keys=True, default=str)
     except (TypeError, ValueError):
         body = str(keep)
-    return f"{SEED_LABEL}\n{clip(body, limit)}"
+    why = str(seed.get("why") or "").strip()
+    rerun = why in SEED_RERUN_OK
+    label = SEED_COMMIT_LABEL if rerun else SEED_LABELS.get(why, SEED_LABEL)
+    draft = not rerun and seed_sends(seed)
+    if draft:
+        # the skill's check reads a send, never a draft's (the validator gives a plan by steps none for it): the
+        # draft line says what its done is
+        label = label.replace(f" {SEED_DONE}", "")
+    text = f"{label}\n{clip(body, limit)}"
+    family = skill_family(seed.get("skill") or seed.get("key"))
+    if family and not rerun:
+        # the id itself (a catalog key, code data): a plan that routes it, or any learned form of it, is refused
+        text += (f"\nNot in this request, not even with other values: {family} or a learned form of it (no "
+                 f"skill:{family} route, no run_skill of it).")
+    if draft:
+        text += "\n" + SEED_DRAFT_LINE
+    missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) else ""
+    if missing:
+        text += (f"\nIts routes found no {missing} named as given. Pick the one they mean from what the screen shows "
+                 f"and what memory holds, then do it by steps.")
+    seen = seed.get("seen")
+    names = [one_line(n, 80) for n in (seen if isinstance(seen, (list, tuple)) else ()) if str(n or "").strip()]
+    if names:
+        listed = clip("\n".join(f"- {n}" for n in names[:SEEN_MAX]), SEEN_CHARS)
+        where = f"the {missing} names" if missing else "the names"
+        text += "\n" + fence(listed, source=f"{where} the skill read on screen", nonce=nonce or "seed")
+    return text
 
 
 def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: Gathered,
@@ -462,7 +520,7 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
         texts.append(fence(gathered.overview, source="the window list and what the windows show", nonce=nonce))
     else:
         texts.append("[The window list could not be read just now: look before acting.]")
-    seed_text = seed_block(seed, limit=limits.seed_chars)
+    seed_text = seed_block(seed, limit=limits.seed_chars, nonce=nonce)
     if seed_text:
         texts.append(seed_text)
     blocks = [{"type": "text", "text": t} for t in texts if t]
@@ -664,11 +722,32 @@ def read_report(result: ExecResult | Mapping[str, Any]) -> str:
     return f"{head}\n\n{body}\n\nAnswer them now in plain text, from what came back."
 
 
-def invalid_report(errors: Sequence[str], statuses: Sequence[Any] = ()) -> str:
+def invalid_report(errors: Sequence[str], statuses: Sequence[Any] = (), *, replans_left: int | None = None) -> str:
     text = f"{CHECK_LABEL} The plan was not run as written: " + "; ".join(errors)
     if statuses:
         text += "\nSteps that already ran:\n" + _statuses_text(statuses)
-    return text + "\nSend the plan again, fixed."
+    text += "\nSend the plan again, fixed."
+    if replans_left is not None:
+        text += f" Replans left: {max(0, replans_left)}."
+    return text
+
+
+def unconfirmed_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, skill: str, *,
+                       replans_left: int) -> str:
+    """A plan whose skill acted and couldn't confirm the result (x10): one replan, by steps, after a look. The skill is
+    not run again (the next plan that does is refused), and what may already have taken effect is not redone.
+    Code-written; ``skill`` is a menu id."""
+    status = str(_field(result, "status", "") or "")
+    lines = [f"{CHECK_LABEL} Plan {plan.id if plan else ''} ended: {status}. The skill {skill} ran, but its check "
+             f"couldn't confirm the result."]
+    statuses = _field(result, "statuses", None) or []
+    if statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    lines.append("Don't run that skill again, and don't redo what may already have taken effect. Look first (the look "
+                 "tool): if it shows done, send a plan with one look step and a done probe that reads it; otherwise "
+                 "finish it by steps (click or type in the app). If nothing more needs doing, reply in one short line. "
+                 f"Replans left: {max(0, replans_left)}.")
+    return "\n".join(lines)
 
 
 def answer_report(question: str, answer: str | None) -> str:
@@ -679,5 +758,5 @@ def answer_report(question: str, answer: str | None) -> str:
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "request_turn", "Conversation",
-           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report", "invalid_report", "answer_report", "clip",
+           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report", "invalid_report", "unconfirmed_report", "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]
