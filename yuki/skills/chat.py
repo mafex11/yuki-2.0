@@ -36,12 +36,15 @@ confirmed open.**
 **Rule 8** (Q3): ``send = "send"`` (the user plainly said "send X to Y") types X and presses the app's send key, both
 judged by Yuki's own check with the user's words, and both whom and what must stand in their words
 (:func:`yuki.skills.uia_route.check_sends`); ``draft`` (naming only the person, or saying what to write without "send")
-types it and leaves it; no text just opens the chat. The opened chat's composer is read first: other text already
-there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer that can't be read gets a
-send's words typed and its send key never pressed (told to press Enter). A send is "done" only when memory
-captured the user's own message equal to that text in that very chat (the messages table, matched by the route's
-capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the send key
-went out (its own step dispatched).
+types it and leaves it; no text just opens the chat. On the new brain the consent rule may allow a send in Yuki's own
+wording of what the user asked to say (failure fix-plan Item 11, row 4, with the 3 s countdown showing the text, or
+after their yes): that very step's grant (:attr:`yuki.skills.engine.RunContext.grant`) lets exactly that text go to
+exactly that person (by their id in the people index), and nothing else (Item 11's L2). The opened chat's composer is
+read first: other text already there (the app's kept draft) means nothing is typed or pressed, said plainly; a composer
+that can't be read gets a send's words typed and its send key never pressed (told to press Enter). A send is "done" only
+when memory captured the user's own message equal to that text in that very chat (the messages table, matched by the
+route's capture thread ids, never by the app's name); "pressed send, couldn't confirm it landed" otherwise, once the
+send key went out (its own step dispatched).
 If Yuki's own check holds the send key after the text was typed, the user is told it's typed and not sent (never
 asked: a "yes" would type it twice).
 A rung that acted on a send is never followed by another (the engine's rule: never twice).
@@ -220,12 +223,14 @@ class ChatRoute:
 @dataclass
 class Target:
     """Whom the message is for: the name memory keeps (a person's, or a group chat's), the user's own words for them,
-    and the routes, the usual first."""
+    and the routes, the usual first. ``id``: the person's id in memory's people index (``None`` for a group chat or
+    channel), which a send declares so the brain's consent grant is matched by identity (Item 11's L2)."""
 
     name: str
     said: str
     routes: list[ChatRoute]
     place: bool = False
+    id: int | None = None
 
 
 @dataclass
@@ -293,7 +298,7 @@ def find_target(store: Any, person: str) -> Target | Asked:
             routes = [_chat_route(store, r) for r in ranking.routes]
         except Exception:  # noqa: BLE001
             routes = []
-        return Target(name=contact.name, said=who, routes=routes)
+        return Target(name=contact.name, said=who, routes=routes, id=int(contact.id))
     want = C.tokens(who)
     try:
         places = [r for r in C.places(store) if want and C.tokens(r.chat) == want]
@@ -350,7 +355,9 @@ def _said_as(call: RouteCall, target: Target) -> str:
     that same person as written, as a heard form memory learned when they confirmed it ("hey meant"), or as a
     transliteration ("हेमंत"): :func:`yuki.memory.contacts.names_person` with ``by_sound=False``, so a Latin word that
     only sounds like the person never authorises a send. Nothing found (or a group chat): the name as given, which the
-    send check refuses before any step, so nothing is typed or sent and the run falls back (Item 5)."""
+    send check refuses before any step, so nothing is typed or sent and the run falls back (Item 5), unless the brain's
+    consent grant for this very step covers the send (the user said yes to "Send ... to Hemanth?": the same person
+    by id, :func:`yuki.skills.uia_route.granted_send`)."""
     from yuki.skills.uia_route import said
 
     words = [str(w) for w in call.ctx.words or () if w]
@@ -468,12 +475,16 @@ def switcher_query(data: Mapping[str, Any], route: ChatRoute) -> str:
 
 
 def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], apps: Sequence[str], key: str,
-              way_text: str = "", sends: Mapping[str, str] | None = None) -> tuple[bool, dict[str, Any]]:
+              way_text: str = "", sends: Mapping[str, Any] | None = None,
+              grant: Mapping[str, Any] | None = None) -> tuple[bool, dict[str, Any]]:
     """Steps through the voice hands' step runner (:class:`yuki.skills.uia_route.SkillRunner`: each checked, keys and
     typing judged by Yuki's own check, the user's hands stop it). ``way_text``: the route's own words that may be typed
     (a chat's name memory keeps); everything else typed must be the user's words. ``sends``: ``{"to", "what"}`` when the
-    steps send (rule 8: both must stand in the user's words). Refused before any step:
-    ``(False, {"refused_steps": True})``."""
+    steps send (rule 8: both must stand in the user's words), with ``person_id`` the target's id in memory's people
+    index; ``grant``: the brain's consent grant for this very ``run_skill`` step (:attr:`RunContext.grant
+    <yuki.skills.engine.RunContext.grant>`, validated by the engine; ``None`` on the voice and the old loop), which
+    lets exactly its text go to exactly its person though Yuki worded it (:func:`yuki.skills.uia_route.granted_send`).
+    Refused before any step: ``(False, {"refused_steps": True})``."""
     from yuki.skills.uia_route import SkillRefused, SkillRunner
 
     item: dict[str, Any] = {"run": [dict(s) for s in steps], "apps": list(apps), "ref": f"skill:{key}",
@@ -482,6 +493,8 @@ def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], 
     if sends:
         item["sends"] = True
         args.update(to=str(sends.get("to") or ""), what=str(sends.get("what") or ""))
+        if sends.get("person_id") is not None:
+            args["person_id"] = sends.get("person_id")
     # zFinal: hands that check a capability's own steps by what its driver declared (the new brain's desk hands,
     # ``uia_route.DeskHands.driver_steps``) are told this run's steps, the route's own words and what it sends
     declare = getattr(hands, "driver_steps", None)
@@ -489,7 +502,8 @@ def run_steps(hands: Any, steps: list[dict[str, Any]], *, words: Sequence[str], 
              else nullcontext())
     try:
         with scope:
-            ok, _report, facts = SkillRunner(hands).run(args, item=item, words=[str(w) for w in words if w])
+            ok, _report, facts = SkillRunner(hands).run(args, item=item, words=[str(w) for w in words if w],
+                                                        grant=grant if sends else None)
     except SkillRefused:
         return False, {"refused_steps": True, "steps_done": 0}
     return bool(ok), dict(facts or {})
@@ -878,9 +892,13 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
     if send and not blind:
         steps.append({"do": "keys", "keys": [str(k) for k in data.get("send") or ["enter"]]})
     if steps:
+        # Item 11's L2: the send also says whom by the person's id, so the brain's consent grant for this step (the
+        # engine's validated ``ctx.grant``; none on the voice or the old loop) covers exactly its text to exactly its
+        # person, though Yuki worded the text or speech wrote the name another way
+        sends = {"to": _said_as(call, target), "what": text, "person_id": target.id} if send and not blind else None
+        grant = getattr(call.ctx, "grant", None) if getattr(call.ctx, "origin", "") == "thinker" else None
         _ok, run = run_steps(call.ctx.hands, steps, words=call.ctx.words, apps=list(data.get("images") or []),
-                             key="message",
-                             sends={"to": _said_as(call, target), "what": text} if send and not blind else None)
+                             key="message", sends=sends, grant=grant)
     else:
         run = {"steps": 0, "steps_done": 0, "results": []}
     facts["kept_draft"] = kept

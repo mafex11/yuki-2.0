@@ -243,7 +243,11 @@ class RunContext:
     :func:`window_state_reader`); ``on_focus``: called right before a rung that takes focus (the acting marker;
     sound-only rungs publish none); ``hand_id``: the voice hand that called the run (``voice-<turn>-h<n>``), written
     on each engine line as ``hand_id`` beside ``request_id`` (the turn, D19), so following one hand never picks up a
-    second skill hand's lines in the same turn (sWire r1 L2)."""
+    second skill hand's lines in the same turn (sWire r1 L2). ``grant``: the brain's consent grant for this very
+    ``run_skill`` step, only as :func:`yuki.skills.uia_route.send_grant` validated it (:func:`run_for_thinker`): a send
+    the consent rule allowed and counted down, held by the request's desk hands now. The resolver keeps its exact
+    text and person, and the chat driver may send exactly that text to exactly that person (failure fix-plan Item 11's
+    L2). ``None`` on the voice, the old loop, a card or an eval: their runs check the user's words as before."""
 
     origin: str = "voice"
     words: list[str] = field(default_factory=list)
@@ -263,6 +267,7 @@ class RunContext:
     baselines: Mapping[str, Callable[[Mapping[str, Any]], Any]] = field(default_factory=dict)
     window_state: Callable[[str], str | None] | None = None
     hand_id: str | None = None
+    grant: Mapping[str, Any] | None = None
 
     def game_now(self) -> str:
         """D9, read now (fails closed: a check that raised counts as a game)."""
@@ -1642,6 +1647,43 @@ def _dropped(resolved: Ask, slots: Mapping[str, Any] | None, words: list[str], l
     return Handoff(skill, values, filled, why=WHY_DROPPED)
 
 
+def granted_values(grant: Mapping[str, Any] | None, slots: Mapping[str, Any] | None) -> dict[str, str] | None:
+    """The slot values a validated send grant (:attr:`RunContext.grant`) covers, ``{slot: value}`` for the resolver's
+    ``granted=``: its text slot's and its person slot's, when the run gives exactly those values (case and spaces
+    aside). ``None`` when there is no grant or this run's values are not the granted ones: a grant for another text or
+    another person covers nothing, not even the half that matches (failure fix-plan Item 11's L2)."""
+    if not isinstance(grant, Mapping):
+        return None
+    given = dict(slots or {})
+    out: dict[str, str] = {}
+    for slot_key, value_key in (("text_slot", "text"), ("person_slot", "person")):
+        name, want = _given_text(grant.get(slot_key)), _given_text(grant.get(value_key))
+        if not name or not want or name not in given or _given_text(given[name]).casefold() != want.casefold():
+            return None
+        out[name] = want
+    return out
+
+
+def _thinker_grant(grant: Any, ctx: RunContext, skill_key: str, slots: Mapping[str, Any] | None
+                   ) -> Mapping[str, Any] | None:
+    """The brain's consent grant for this run when it is one (:func:`yuki.skills.uia_route.send_grant`: a send the
+    consent rule allowed for this very step, held by the request's desk hands now) and this run gives exactly its
+    values (:func:`granted_values`), else ``None``. Logged content-free (``skill_grant``: whether it holds and a code
+    word why not) whenever the caller passed one."""
+    if not grant:
+        return None
+    try:
+        from yuki.skills.uia_route import send_grant
+
+        held, why = send_grant(grant, hands=ctx.hands, skill=str(skill_key or ""), request_id=ctx.request_id)
+    except Exception:  # noqa: BLE001 - a grant that can't be checked is none
+        held, why = None, "error"
+    if held is not None and granted_values(held, slots) is None:
+        held, why = None, "other_values"
+    _emit(ctx, "skill_grant", skill=str(skill_key or ""), held=held is not None, why=why, origin=ctx.origin)
+    return held
+
+
 def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list[str], ctx: RunContext, *,
                     again: bool = False, live: Live | None = None, settings: Any = None, corrects: bool = False,
                     game_answer: str | None = None, earlier: Sequence[str] | None = None) -> SkillResult:
@@ -1651,7 +1693,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     resolver as ``earlier=``, which validates a given value against them and never fills from them; never appended to
     ``words``, whose newest turn decides a named app.
     ``corrects``: the user corrected the skill's last run; with it, or the same skill and absolute values asked again
-    within 60 s of a "done" (not ``again``), that run is marked a false done first (D19, review r2 M2)."""
+    within 60 s of a "done" (not ``again``), that run is marked a false done first (D19, review r2 M2).
+    ``ctx.grant`` (the brain's validated consent grant, :func:`run_for_thinker`): the resolver keeps the granted text
+    and person as given (``granted=``) instead of dropping them; with none, nothing changes."""
     from yuki.skills import enabled, setting
     from yuki.skills import resolve as res_mod
 
@@ -1668,6 +1712,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
     step = float(setting(settings, "skills_volume_step") or 10)
     disable_after = int(setting(settings, "skills_disable_after") or 2)
     catalog: dict[str, Any] = {}
+    # Item 11's L2: only a grant the thinker origin's caller validated for this very step (never the voice's or a
+    # card's), and only for exactly these values
+    granted = granted_values(ctx.grant, slots) if ctx.origin == "thinker" else None
 
     def go(client: Any) -> Any:
         from yuki.skills.catalog import load
@@ -1682,7 +1729,9 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         # lPage merge note 5 (lSplit review r2 L1): words naming another value for a learned skill's bound key slot
         # run its capability (the learned routes carry the bound value in their arguments), never the learned skill
         key = request_key(loaded, str(skill_key or ""), slots)
-        extra = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
+        extra: dict[str, Any] = {"earlier": [str(w) for w in earlier if w]} if earlier else {}
+        if granted:
+            extra["granted"] = dict(granted)
         return res_mod.resolve(key, slots, words, store=_store_of(client) if client is not None else None,
                                live=live, again=again, default_step=step, disable_after=disable_after, **extra)
 
@@ -1755,18 +1804,24 @@ def run_for_thinker(args: Mapping[str, Any], words: list[str], *, memory: Any = 
                     log: Callable[..., Any] | None = None, request_id: str | None = None,
                     settings: Any = None, game: Callable[[], str] | None = None,
                     verbs: Mapping[str, Callable[[RouteCall], RouteResult]] | None = None,
-                    hands: Any = None, earlier: Sequence[str] | None = None) -> SkillResult:
+                    hands: Any = None, earlier: Sequence[str] | None = None,
+                    grant: Mapping[str, Any] | None = None) -> SkillResult:
     """The thinker's ``run_skill`` tool (``agent/tools.py``). A hand-off here means the thinker does it itself with
     the skill pinned (the loop pins it); with a game in front the run is held (D17). ``verbs``: the dispatcher's
     wrappers (sWire: a window-touching rung in an app whose "Act" switch is off is refused, as the voice does).
     ``hands``: the new brain's desk hands (``yuki.skills.uia_route.DeskHands``, zFinal): the chat driver's own steps
     type and press through them, each through the consent rule; the old loop passes none. ``earlier``: the
-    conversation's older turns, oldest first, for the resolver only (see :func:`resolve_and_run`)."""
+    conversation's older turns, oldest first, for the resolver only (see :func:`resolve_and_run`). ``grant``: the
+    brain executor's consent grant for this very step (``Dispatcher.skill_context["grant"]``; the old loop has none):
+    used only when :func:`yuki.skills.uia_route.send_grant` finds it is the one these desk hands hold now, for this
+    request and skill, a send with its text and person id, and these slots give exactly its text and person
+    (:attr:`RunContext.grant`, failure fix-plan Item 11's L2)."""
+    slots = args.get("slots") if isinstance(args.get("slots"), Mapping) else {}
     ctx = RunContext(origin="thinker", words=[str(w) for w in words or []], memory=memory, log=log,
                      request_id=request_id, game=game, verbs=dict(verbs or {}), hands=hands)
-    return resolve_and_run(str(args.get("skill") or ""), args.get("slots") if isinstance(args.get("slots"), Mapping)
-                           else {}, ctx.words, ctx, again=bool(args.get("again")), settings=settings,
-                           corrects=bool(args.get("corrects")), earlier=earlier)
+    ctx.grant = _thinker_grant(grant, ctx, str(args.get("skill") or ""), slots)
+    return resolve_and_run(str(args.get("skill") or ""), slots, ctx.words, ctx, again=bool(args.get("again")),
+                           settings=settings, corrects=bool(args.get("corrects")), earlier=earlier)
 
 
 __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_OTHER_DEVICE", "LINE_ALREADY",
@@ -1775,4 +1830,4 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker"]
+           "run_for_thinker", "granted_values"]

@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -872,8 +873,38 @@ class Executor:
         send = bool(allowed and verdict.row == 4 and verdict.countdown and sk is not None
                     and consent.skill_sends(sk, slots, partial=False))
         join = bool(allowed and verdict.row == 3 and verdict.why == "join_words")
-        return {"skill": key, "text": words(slots.get(tname)) if tname else "",
-                "person": words(slots.get(pname)) if pname else "", "send": send, "join": join}
+        text, person = (words(slots.get(tname)) if tname else ""), (words(slots.get(pname)) if pname else "")
+        grant: dict[str, Any] = {"skill": key, "text": text, "person": person, "send": send, "join": join}
+        if send:
+            # Item 11's L2: the skill run this step makes holds the grant to this very step (a one-step token, the
+            # request, this thread) and to whom by identity: the one person the person slot names in memory's people
+            # index, the same one the plan's recipient names (the countdown showed it). The resolver and the chat
+            # driver's send check then take exactly this text to exactly this person (uia_route.send_grant)
+            grant.update(text_slot=tname, person_slot=pname, step=int(call.index),
+                         request_id=getattr(self.host, "request_id", None), thread=threading.get_ident(),
+                         token=secrets.token_hex(8),
+                         person_id=self._grant_person(person, consent.plan_consent(self.head)["to"]))
+        return grant
+
+    def _grant_person(self, person: str, to: str) -> int | None:
+        """The id of the one person a send grant goes to (``yuki.skills.uia_route.grant_person``: the person slot's
+        one person in memory's people index, never by sound, whom the plan's recipient names too); ``None`` when
+        memory can't say, which leaves the grant to the user's own words as before."""
+        memory = self.host.memory
+        call = getattr(memory, "call", None)
+        if not person or not callable(call):
+            return None
+
+        def go(client: Any) -> int | None:
+            from yuki.skills.uia_route import grant_person
+
+            return grant_person(getattr(client, "store", client), person, to)
+
+        try:
+            got = call("brain_grant_person", go, timeout_s=0.8)
+        except Exception:  # noqa: BLE001
+            return None
+        return got if isinstance(got, int) and not isinstance(got, bool) else None
 
     def _desk_hands(self) -> Any:
         """The request's desk hands (``yuki.skills.uia_route.DeskHands``, made once): the hands the message and
@@ -909,8 +940,11 @@ class Executor:
         if call.tool == "run_skill":
             # the engine checks slot values against the user's words as they stand now (x9: and an earlier request of
             # theirs that holds one of this step's values)
-            self._skill_context(call)
             desk = self._desk_hands()
+            # Item 11's L2: a send's grant goes to the skill run too, which uses it only while these desk hands hold
+            # the very same one (uia_route.send_grant); any other step's grant stays with the hands alone
+            sends = desk is not None and isinstance(grant, Mapping) and grant.get("send") is True
+            self._skill_context(call, grant=grant if sends else None)
             if desk is not None:
                 # this step's grant only (the send key passes only for what the consent rule allowed and counted down)
                 desk.grant = dict(grant or {})
@@ -923,6 +957,10 @@ class Executor:
         finally:
             if desk is not None:
                 desk.grant = {}
+            if call.tool == "run_skill":
+                context = getattr(self.dispatcher, "skill_context", None)
+                if isinstance(context, dict):
+                    context.pop("grant", None)   # never left for a later step
         ms = round((time.perf_counter() - t0) * 1000, 1)
         self._emit(ToolResult(call.tool, bool(outcome.ok), str(outcome.summary or "")[:300], payload=outcome.payload,
                               about=about))
@@ -2371,10 +2409,12 @@ class Executor:
                 spans.append(found)
         return spans + list(self.words), [turn for request in older for turn in request]
 
-    def _skill_context(self, call: Call | None = None) -> None:
+    def _skill_context(self, call: Call | None = None, *, grant: Mapping[str, Any] | None = None) -> None:
         """What the Dispatcher's ``run_skill`` needs from the request (``Dispatcher.skill_context``: memory, the user's
         words for ``call``'s slot values (:meth:`_skill_words`), the request id, the log, settings), set the way the
-        old loop sets it at a request's start, and again before each ``run_skill`` step."""
+        old loop sets it at a request's start, and again before each ``run_skill`` step. ``grant``: that step's
+        consent grant (:meth:`_skill_grant`), as ``skill_context["grant"]`` for that step only (Item 11's L2; taken
+        out again after the step, and the engine uses it only while the desk hands hold the same one)."""
         try:
             said, earlier = self._skill_words(call)
         except Exception:  # noqa: BLE001 - the spans are a help: without them the engine gets the exchange, as before
@@ -2388,6 +2428,8 @@ class Executor:
             desk = self._desk_hands()
             if desk is not None:
                 context["hands"] = desk
+                if grant:
+                    context["grant"] = dict(grant)
             self.dispatcher.skill_context = context
         except Exception:  # noqa: BLE001
             pass

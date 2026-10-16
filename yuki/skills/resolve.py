@@ -30,7 +30,10 @@ eval). Step by step:
    names (its key, a web address's name, a chat app's title, the names the user's timeline shows it under) stand in
    the words, or are heard there by sound ("this card" for Discord, "Ark" for Arc); a site (a text slot bound to a
    site) one whose identity stands there ("youtube.com" for "YouTube"). A value that fails is dropped and its slot
-   name returned (``dropped``), never "corrected".
+   name returned (``dropped``), never "corrected". One exception, on the new brain only: a text (the message, the
+   person) that is exactly what the brain's consent rule allowed and counted down for this very run (``granted``,
+   failure fix-plan Item 11's L2: Yuki's wording of what the user asked to say) is kept as given, filled
+   :data:`FROM_GRANT`.
 2. **Fill what is missing**, in :data:`FILL_ORDER`: what the user said always first (an app their words name, the
    newest turn that names one, for an app slot; :func:`named_app`; never an app Yuki itself just acted in
    (:func:`just_acted`: a turn may name it to complain), and with a call live, for a slot that asks in a call, only
@@ -74,6 +77,10 @@ HELD_LINE = "You're in a game: after the round?"
 #: name): a learned skill's bound value is only the slot's default, its fill policy only its route's fallback, and a
 #: live "playing" fact only a guess, so none of them can replace it.
 FILL_ORDER: tuple[str, ...] = ("words", "again", "told", "live", "pref", "taste", "default")
+#: Where a given value came from when the words don't hold it but the brain's consent grant for this very run allowed
+#: exactly it (``resolve``'s ``granted``; failure fix-plan Item 11's L2): kept in the given slot's own place in the slot
+#: loop, right after "words" and before every fill, so it is never a guess and never fills an empty slot.
+FROM_GRANT = "granted"
 #: The user's apps as their timeline shows them (:func:`known_apps`) are read again at most this often per database.
 APPS_TTL_S = 600.0
 #: The bind source that marks a text slot as a person (``message``'s ``bind = { person = "contact" }``).
@@ -485,6 +492,15 @@ def _identity(slot: Slot | None, value: Any) -> str:
     if slot is not None and slot.type == "app" and not isinstance(value, Mapping):
         return app_name(value)
     return scope_value(value)
+
+
+def _granted(slot: Slot, value: Any, granted: Mapping[str, str] | None) -> bool:
+    """Whether a given value the words don't hold is the exact value the brain's consent grant allowed for this slot
+    (``resolve``'s ``granted``): a text slot only, string equality with case and spaces aside, never a part of it."""
+    if not granted or slot.type != "text" or not isinstance(value, str):
+        return False
+    want = _words(granted.get(slot.name))
+    return bool(want) and _words(value).casefold() == want.casefold()
 
 
 def _person_bound(skill: Skill, slot: Slot) -> bool:
@@ -907,13 +923,18 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             until: float | None = None, again: bool = False, disable_after: int = 2,
             people: Callable[[str], dict[str, Any] | None] | None = None,
             default_step: float = 10.0, earlier: Sequence[str] | None = None,
-            heard_person: Callable[[str, Sequence[str]], str | None] | None = None) -> Result:
+            heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
+            granted: Mapping[str, str] | None = None) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
     ``earlier``: older turns of this conversation (their own words too), a source for validating a value the caller
     gave, never for filling one; ``until``: as of that time (an eval or a replay: no ledger, preference or taste after
     it); ``store``: the store to read (``None``: files only). ``people`` / ``heard_person``: the people-index checks
-    (default: this store's, :func:`yuki.memory.contacts`)."""
+    (default: this store's, :func:`yuki.memory.contacts`). ``granted``: slot name -> the exact value the brain's
+    consent rule allowed for this very run (the engine's :func:`~yuki.skills.engine.granted_values`: a send it allowed
+    and counted down, or the user's yes to it; failure fix-plan Item 11's L2): a given text value of that slot that the
+    words don't hold but equals it (case and spaces aside) is kept as given (filled :data:`FROM_GRANT`), never
+    dropped; nothing is ever filled from it, and it changes nothing for a value the words already hold."""
     from yuki.skills import prefs, taste
 
     now = time.time() if now is None else float(now)
@@ -1015,6 +1036,12 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 values[slot.name], filled[slot.name] = value, "words"
                 ask_keep = keep_check(slot, value) or ask_keep
                 continue
+            if _granted(slot, given[slot.name], granted):
+                # Item 11's L2: the very text (or person) the brain's consent rule allowed this step and counted down,
+                # as given: Yuki's wording of what the user asked to say ("When will you come?" for "ask him when he
+                # will come"), never dropped to an Ask and handed back as a draft
+                values[slot.name], filled[slot.name] = _words(given[slot.name]), FROM_GRANT
+                continue
             dropped.append(slot.name)
         # FILL_ORDER "words" (2): an app their own words name, before any live guess, preference, fill policy or
         # bound default (the volume of "Spotify", not of the app playing). Never an app Yuki itself just acted in (a
@@ -1108,7 +1135,7 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 _identity(skill.slot(name), bound) for name, bound in (skill.bound or {}).items()):
         return resolve(skill.capability, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
-                       earlier=earlier, heard_person=heard_person)
+                       earlier=earlier, heard_person=heard_person, granted=granted)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)
@@ -1287,7 +1314,7 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
     return EvalResolver(Store.open(path), client=client, model=model, prompt=prompt, loaded=loaded)
 
 
-__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "CONFIRM_PERSON", "JUST_ACTED_S", "CONFIRM_ONCE_S",
-           "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity", "known_apps", "named_app",
-           "just_acted", "call_apps", "check_value", "pref_option", "from_pref",
+__all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "CONFIRM_PERSON", "JUST_ACTED_S",
+           "CONFIRM_ONCE_S", "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity",
+           "known_apps", "named_app", "just_acted", "call_apps", "check_value", "pref_option", "from_pref",
            "told_values", "ladder", "resolve", "done_line", "canonical", "EvalResolver", "eval_resolver"]

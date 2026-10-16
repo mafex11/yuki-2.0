@@ -4628,11 +4628,13 @@ class Dispatcher:
         state: dict[str, Any] = {}
         # zFinal (bSkill finding 1): on the new brain the request's desk hands (``uia_route.DeskHands``) let the message
         # and voice-join capabilities type and press through the same consent and commit checks; the old loop passes
-        # none (its capability steps hand back to it, as before)
+        # none (its capability steps hand back to it, as before). Item 11's L2: the brain's consent grant for this
+        # very step (``skill_context["grant"]``, the executor's; the old loop never sets one), checked by the engine
+        # against the grant those desk hands hold now
         result = run_for_thinker(tool_input, list(ctx.get("words") or []), memory=ctx.get("memory"),
                                  log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"),
                                  verbs=self._skill_act_verbs(state), hands=ctx.get("hands"),
-                                 earlier=list(ctx.get("earlier") or []) or None)
+                                 earlier=list(ctx.get("earlier") or []) or None, grant=ctx.get("grant") or None)
         off = state.get("act_off")
         acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
         if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):

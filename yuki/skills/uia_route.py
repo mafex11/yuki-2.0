@@ -288,14 +288,36 @@ def said(text: str, sources: list[str]) -> bool:
     return bool(_words(text)) and any(span_in(text, s) for s in sources if s)
 
 
-def check_sends(args: dict[str, Any], words: list[str]) -> str | None:
+def _person_id(value: Any) -> int | None:
+    """A person's id as a grant or a send declares it (an int, never a bool); ``None`` for anything else."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def granted_send(sends: Mapping[str, Any] | None, grant: Mapping[str, Any] | None) -> bool:
+    """Whether the brain's consent grant for this very ``run_skill`` step (:attr:`DeskHands.grant`, passed on as
+    :func:`send_grant` validated it) covers this send whole (failure fix-plan Item 11's L2): the grant is a send
+    (row 4 allowed it and its countdown ran, or the user said yes to it), what goes out is exactly the granted text
+    (case and spaces aside, never a part of it) and it goes to the granted person, the same person id memory's people
+    index gave both. Identity and equality only: a group chat or channel (no person id) is never covered, and a grant
+    for another text or another person covers nothing."""
+    if not isinstance(sends, Mapping) or not isinstance(grant, Mapping) or grant.get("send") is not True:
+        return False
+    what = _folded(sends.get("what"))
+    pid, gid = _person_id(sends.get("person_id")), _person_id(grant.get("person_id"))
+    return bool(what) and what == _folded(grant.get("text")) and pid is not None and pid == gid
+
+
+def check_sends(args: dict[str, Any], words: list[str], *, grant: Mapping[str, Any] | None = None) -> str | None:
     """Why a way that sends may not run (``None``: it may). ``sends`` is the talker's own declaration; when true, whom
-    and what must both be the user's own words."""
+    and what must both be the user's own words, or (``grant``: the brain's consent grant for this very step) exactly
+    the text and the person the consent rule allowed and counted down (:func:`granted_send`)."""
     if args.get("sends") is not True:
         return None
     to, what = _words(args.get("to")), _words(args.get("what"))
     if not to or not what:
         return "it would send something, and their words do not plainly say both what it says and who it goes to"
+    if granted_send(args, grant):
+        return None
     if not said(to, words):
         return f"it would send to \"{to[:60]}\", which is not what they said"
     if not said(what, words):
@@ -381,10 +403,15 @@ def check_picks_for_send(steps: list[SkillStep], args: dict[str, Any]) -> str | 
     return None
 
 
-def check_texts(steps: list[SkillStep], words: list[str], way_text: str) -> str | None:
+def check_texts(steps: list[SkillStep], words: list[str], way_text: str, *, granted: str = "") -> str | None:
     """Why a step's text may not be typed (``None``: all may): only the user's own words or the way's own words
-    (``way_text`` ``""`` for a way learned from what the user did: decision D8, its typing is always their words)."""
+    (``way_text`` ``""`` for a way learned from what the user did: decision D8, its typing is always their words), or
+    ``granted``: the whole text of a send the brain's consent grant covers (:func:`granted_send`), typed as it is
+    (case and spaces aside), never a part of it."""
+    granted = _folded(granted)
     for step in steps:
+        if step.do == "type" and granted and _folded(step.text) == granted:
+            continue
         if step.do == "type" and not said(step.text, [*words, way_text]):
             return (f"step {step.i} would type \"{step.text[:60]}\", which is neither their words nor the learned "
                     f"way's own")
@@ -1560,8 +1587,13 @@ class SkillRunner:
 
     # -- the run -------------------------------------------------------------------
 
-    def run(self, args: dict[str, Any], *, item: dict[str, Any], words: list[str]) -> tuple[bool, str, dict[str, Any]]:
+    def run(self, args: dict[str, Any], *, item: dict[str, Any], words: list[str],
+            grant: Mapping[str, Any] | None = None) -> tuple[bool, str, dict[str, Any]]:
         """Run the way ``item`` (offered to the talker) with the talker's ``args``: ``(ok, report, facts)``.
+        ``grant``: the brain's consent grant for this very ``run_skill`` step (the chat driver's own steps on the
+        desk hands only; the voice and the old loop pass none): a send it covers whole (:func:`granted_send`) may
+        type and send its text though the user's words don't hold it; the desk hands still check the send key
+        against their own grant.
 
         Raises :class:`SkillRefused` before any step runs when the call cannot be run as written."""
         if item.get("trace") or item.get("demo"):
@@ -1611,9 +1643,13 @@ class SkillRunner:
             raise SkillRefused("it sends what is typed, and only their own words may say what goes to whom")
         way_text = str(item.get("text") or "")
         demo = bool(item.get("demo") or parts)
-        why = check_sends(args, words) or (
+        # Item 11's L2: a send the brain's consent grant covers whole (its exact text, to its person) is the user's
+        # instruction, though Yuki worded it; never a learned way's (a demo, its parts) and never a part of the text
+        granted = str(args.get("what") or "") if (not demo and args.get("sends") is True
+                                                    and granted_send(args, grant)) else ""
+        why = check_sends(args, words, grant=grant if not demo else None) or (
             check_picks_for_send(steps, args) if item.get("sends") or args.get("sends") is True else None) or \
-            check_texts(steps, words, "" if demo else way_text)   # V9: a demo's typing is only ever their words
+            check_texts(steps, words, "" if demo else way_text, granted=granted)   # V9: a demo's typing: their words
         if why:
             raise SkillRefused(why)
         # capC4: where each part ends (the index of its last step in ``steps``) and the checked state it ends on
@@ -2308,6 +2344,66 @@ def _folded(text: Any) -> str:
     return _words(text).casefold()
 
 
+def grant_person(store: Any, person: Any, *others: Any) -> int | None:
+    """The id of the one person a send grant goes to (the executor's ``Executor._skill_grant``): the one person
+    memory's people index finds for ``person`` (the capability's person slot, what the chat driver looks up): a name
+    or alias as written, a heard form memory learned ("hey meant"), a transliteration ("हेमंत"), never by sound
+    (:func:`yuki.memory.contacts.resolve` without ``heard``, :func:`~yuki.memory.contacts.transliterated`); each of
+    ``others`` (the plan's recipient, as the countdown showed it) that names anyone must name that same one.
+    ``None`` when ``person`` names nobody or two people, or another name names someone else. Never raises."""
+    try:
+        from yuki.memory import contacts as C
+
+        def ids(name: Any) -> set[int]:
+            text = _words(name)
+            if not text:
+                return set()
+            found = {int(c.id) for c in C.resolve(store, text)}
+            if not found:
+                one = C.transliterated(store, text)
+                found = {int(one.id)} if one is not None else set()
+            return found
+
+        first = ids(person)
+        if len(first) != 1:
+            return None
+        for other in others:
+            seen = ids(other)
+            if seen and seen != first:
+                return None
+        return next(iter(first))
+    except Exception:  # noqa: BLE001 - memory can't say: no person id, so the grant covers no worded send
+        return None
+
+
+def send_grant(grant: Any, *, hands: Any, skill: str = "", request_id: Any = None) -> tuple[dict[str, Any] | None, str]:
+    """``(grant, "ok")`` when ``grant`` (the Dispatcher's ``skill_context["grant"]``) is the brain's consent grant for
+    the ``run_skill`` running now, else ``(None, why)`` with a content-free code word (failure fix-plan Item 11's L2).
+    It must be a send the consent rule allowed (row 4, after its countdown ran or the user's yes), held right now by
+    these very desk hands (:class:`DeskHands`, never the voice's), equal to theirs, one-step token and all (the
+    executor sets it just before the step and clears it after, so a grant left from an earlier step never matches),
+    on this thread, for this request and this skill, with its text and the one person id it goes to. Anything else (the
+    voice, the old loop, a card, a draft's grant) is no grant, and the run checks the user's words as before."""
+    if not isinstance(grant, Mapping) or not grant:
+        return None, "none"
+    if grant.get("send") is not True:
+        return None, "not_send"
+    held = hands.grant if isinstance(hands, DeskHands) else None
+    if not isinstance(held, Mapping) or not str(grant.get("token") or "") or dict(held) != dict(grant):
+        return None, "stale"
+    if grant.get("thread") != threading.get_ident():
+        return None, "other_thread"
+    if grant.get("request_id") and request_id and str(grant.get("request_id")) != str(request_id):
+        return None, "other_request"
+    if skill and _words(grant.get("skill")) != _words(skill):
+        return None, "other_skill"
+    if not _folded(grant.get("text")) or not _words(grant.get("text_slot")):
+        return None, "no_text"
+    if _person_id(grant.get("person_id")) is None or not _words(grant.get("person_slot")):
+        return None, "no_person"
+    return dict(grant), "ok"
+
+
 class DeskHands:
     """The hands the engine's chat driver (``yuki.skills.chat``: the message and voice-join capabilities) runs its own
     steps through when the new brain runs a ``run_skill`` (``Dispatcher._do_run_skill``; bSkill finding 1). Without
@@ -2327,9 +2423,12 @@ class DeskHands:
     * **The send key only after the countdown**: in a run that declares a send, its key passes only when the brain's
       consent rule allowed this very ``run_skill`` as a send (row 4: the plan declared ``consent.commit = send``, the
       quote, the recipient and the text are the user's own words, the commit check said they asked for it, no
-      near-duplicate) and its countdown ran (:attr:`grant`, set by the executor for that one step), and only for the
-      same text and person. ``SkillRunner`` checks again that both whom and what are spans of the user's words, and the
-      driver presses nothing when the chat's composer holds other text or can't be read.
+      near-duplicate; or the user said yes to its question) and its countdown ran (:attr:`grant`, set by the executor
+      for that one step), and only for the same text and the same person (by the person id the grant and the driver's
+      target both carry, else the same name). ``SkillRunner`` checks again that both whom and what are spans of the
+      user's words, or that the grant covers the send whole (:func:`granted_send`: Item 11's L2, Yuki's own wording
+      of what they asked to say), and the driver presses nothing when the chat's composer holds other text or can't
+      be read.
     * **A join's button only on plain words**: the capability's declared join control (catalog data) passes only when
       the consent rule allowed this ``run_skill`` as a join on the user's plain words (row 3, decision 7).
     * **Anything else** goes to ``yuki.brain.check.one`` (rows 1-6 with a one-step commit check, the request's own
@@ -2353,8 +2452,10 @@ class DeskHands:
         self.earlier: list[str] = [str(w) for w in earlier or () if str(w).strip()]
         self.checker = checker
         self._log = log
-        #: The consent rule's verdict for the ``run_skill`` step running now (the executor sets it for that one step):
-        #: ``{"skill", "text", "person", "send": bool, "join": bool}``; empty: nothing was granted.
+        #: The consent rule's verdict for the ``run_skill`` step running now (the executor sets it for that one step and
+        #: clears it after): ``{"skill", "text", "person", "send": bool, "join": bool}``, and for a send also
+        #: ``person_id``, ``text_slot`` / ``person_slot``, ``request_id``, ``step``, ``thread`` and a one-step
+        #: ``token`` (:func:`send_grant` holds a skill run's grant to it); empty: nothing was granted.
         self.grant: dict[str, Any] = {}
         self._scopes: list[dict[str, Any]] = []
         #: Windows this run typed Yuki's text into with no send yet (hwnd -> monotonic): a later key or click there is
@@ -2513,9 +2614,14 @@ class DeskHands:
                     if not scope["sends"]:
                         return "key"
                     sends = scope["sends"]
+                    # the same text, and the same person: when both have one, the person id memory's people index
+                    # gave the grant and the driver's target (Item 11's L2: "हेमंत" or "hey meant" in the user's
+                    # words is Hemanth); else (a group chat or channel, or memory couldn't say) the grant's own name
+                    pid, gid = _person_id(sends.get("person_id")), _person_id(grant.get("person_id"))
+                    same = pid == gid if pid is not None and gid is not None else \
+                        _folded(sends.get("to")) == _folded(grant.get("person"))
                     if grant.get("send") is True and _folded(sends.get("what")) \
-                            and _folded(sends.get("what")) == _folded(grant.get("text")) \
-                            and _folded(sends.get("to")) == _folded(grant.get("person")):
+                            and _folded(sends.get("what")) == _folded(grant.get("text")) and same:
                         return "send"
                     return NOT_GRANTED   # a send key the consent rule didn't allow and count down: never pressed
             elif tool == "type_text":
@@ -2619,4 +2725,5 @@ __all__ = ["RUN_SKILL_TOOL", "SkillRunner", "SkillRefused", "SkillStep", "parse_
            "check_picks_for_send",
            "fit_to_way", "fill_slots", "way_step", "said", "trace_steps", "SKILL_DOS", "MAX_PARTS", "site",
            "PATTERNS", "Found", "Pressed", "app_window", "search", "find_in", "apply_pattern", "press", "route_steps",
-           "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path", "DeskHands"]
+           "run_route", "use_learned", "set_use_learned", "way_steps", "way_path", "recorded_path", "DeskHands",
+           "granted_send", "grant_person", "send_grant"]
