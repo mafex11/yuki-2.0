@@ -404,6 +404,9 @@ class YukiUi(QObject):
         if speak is not None:
             speak.connect(lambda: self.voice.start_conversation("askbar"))
         self.overlay.call_line = self._call_line
+        # x12Overlay merge note L2: a paused run is not a running one (the hotkey opens the ask bar, not the small bar)
+        self.overlay.desk_paused = lambda: (callable(getattr(self.runtime, "paused_id", None))
+                                            and self.runtime.paused_id() is not None)
         thread = getattr(self.overlay, "thread", None)
         if thread is not None and hasattr(thread, "undo_nudge"):   # Undo on a card in the overlay's chat thread
             thread.undo_nudge.connect(lambda nudge: self.nudges.undo_offer(nudge) if isinstance(nudge, dict) else None)
