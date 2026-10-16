@@ -53,7 +53,9 @@ from yuki.brain.context import (
     read_report,
     REST_DONE_WORD,
     request_turn,
+    SEED_MEMORY_WAIT_S,
     seed_block,
+    seed_memory,
     sends_fn,
     skill_rest_report,
     step_report,
@@ -170,6 +172,17 @@ OBSERVE_ACTED_LEVELS: frozenset[str] = frozenset({"unverified"})
 #: planner's look at what the skill left, then its plan).
 SKILL_RESTS_MAX = 1
 SKILL_REST_CALLS = 2
+#: bRound2 (B28): the user's own turns of this conversation the executor may find a step's app value in
+#: (:meth:`Host.said_before`): memory's turn log of the last ``SAID_BEFORE_S`` (the 10 Oct YouTube-in-Arc task ran 17
+#: minutes; "in arc not in Chrome" stood 4 minutes before "Open the fucking YouTube tab"), at most
+#: ``SAID_BEFORE_TURNS`` turns, read within ``SAID_BEFORE_WAIT_S``. Only the turns the voice pipeline marked as said
+#: to Yuki (``addressed`` ``yuki``; the 10 Oct copy: 37 such turns that evening, the rest Yuki's own lines with no
+#: words): never a turn said to others in a call, and never a Brain request's own logged row (its text is the request
+#: as it came, which a card may have composed; the Brain's own requests are its earlier words already).
+SAID_BEFORE_S = 600.0
+SAID_BEFORE_TURNS = 16
+SAID_BEFORE_WAIT_S = 0.4
+SAID_BEFORE_TO: tuple[str | None, ...] = ("yuki",)
 
 _END = object()
 
@@ -219,6 +232,8 @@ class _State:
     current: Plan | None = None
     failed_step: Step | None = None
     repeat_rejected: bool = False
+    #: bRound2 (F1c): a send's text with too few of their words was sent back once (:func:`plan.send_text_error`).
+    text_bounced: bool = False
     last: ExecResult | None = None
     #: M9: the request already holds the user's private content (the people block's own messages, a memory, file or
     #: clipboard read), so an outbound fetch is a commit from here on.
@@ -363,6 +378,48 @@ class Host:
         self.origin_hwnd: int | None = req.origin_hwnd
         #: The executor's desk lease (set by the Brain once the executor is made): freed while a question waits.
         self.desk: Any = None
+        #: bRound2: the conversation's turns from memory's turn log, read on first use (:meth:`said_before`).
+        self._said_before: list[str] | None = None
+
+    def said_before(self) -> list[str]:
+        """bRound2 (B28): the user's own turns of this conversation, oldest first: memory's turn log (what the user
+        said to Yuki, exactly as heard, including the turns only the voice talker answered, which never reached this
+        Brain as a request) of the last :data:`SAID_BEFORE_S`, marked as said to Yuki (:data:`SAID_BEFORE_TO`), at most
+        :data:`SAID_BEFORE_TURNS`, each once, none of this request's own. Never a card's text, a model's words or
+        Yuki's replies. Read once per request on first use (the executor asks only for a step's app value no request
+        of the Brain's says); ``[]`` when memory can't say. RAM only; the log has the count."""
+        if self._said_before is not None:
+            return list(self._said_before)
+        got: list[str] = []
+        memory = self.memory
+        call = getattr(memory, "call", None)
+        if callable(call):
+            now = time.time()
+
+            def go(client: Any) -> list[str]:
+                store = getattr(client, "store", client)
+                turns = store.turns_between(now - SAID_BEFORE_S, now + 1.0)
+                return [str(t.user_text or "") for t in turns
+                        if getattr(t, "addressed", None) in SAID_BEFORE_TO and str(t.user_text or "").strip()]
+
+            try:
+                got = list(call("brain_said_before", go, timeout_s=SAID_BEFORE_WAIT_S) or [])
+            except Exception:  # noqa: BLE001 - a help only
+                got = []
+        mine = {" ".join(str(w).split()).casefold() for w in self.user_words}
+        out: list[str] = []
+        seen: set[str] = set()
+        for text in got:
+            key = " ".join(text.split()).casefold()
+            if key and key not in mine and key not in seen:
+                seen.add(key)
+                out.append(" ".join(text.split()))
+        self._said_before = out[-SAID_BEFORE_TURNS:]
+        try:
+            self.log("brain_said_before_read", turns=len(self._said_before), read=len(got))
+        except Exception:  # noqa: BLE001
+            pass
+        return list(self._said_before)
 
     @property
     def model_calls(self) -> int:
@@ -1337,6 +1394,40 @@ class Brain:
         self._reset_accounting()
         self.last_summary = None
 
+    # -- the seed's memory hint (bRound2, B08) -----------------------------------------------------------------------
+
+    def _seed_hint(self, seed: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        """What memory ties to a hand-off's missing value (:func:`yuki.brain.context.seed_memory`: the pairing the
+        driver learned, else the names read that memory's facts about the words name), for the seed block. Read only
+        for a seed with a ``missing`` value and names read; logged as code words and a count. Never raises."""
+        if not isinstance(seed, Mapping) or not seed.get("missing") or not seed.get("seen"):
+            return None
+        try:
+            hint = seed_memory(self.memory, seed)
+        except Exception:  # noqa: BLE001 - a help only
+            hint = None
+        try:
+            self.logger.log("brain_seed_memory", found=(hint or {}).get("from") or "none",
+                            names=len((hint or {}).get("names") or ()))
+        except Exception:  # noqa: BLE001
+            pass
+        return hint
+
+    def _seed_hint_job(self, seed: Mapping[str, Any] | None, box: list[Any]) -> threading.Thread | None:
+        """:meth:`_seed_hint` on its own thread, alongside the request turn's reads (its result lands in ``box``);
+        ``None`` when the seed has nothing to look up."""
+        if not isinstance(seed, Mapping) or not seed.get("missing") or not seed.get("seen"):
+            return None
+
+        def run() -> None:
+            got = self._seed_hint(seed)
+            if got:
+                box.append(got)
+
+        job = threading.Thread(target=run, name="yuki-brain-seed-memory", daemon=True)
+        job.start()
+        return job
+
     # -- the worker ---------------------------------------------------------------------------------------------------
 
     def _work(self, req: _Request) -> None:
@@ -1372,9 +1463,13 @@ class Brain:
         nonce = early_nonce if early is not None and early_nonce else new_nonce()
         self._set_skill_context(req, host)
         started = time.perf_counter()
+        hint_box: list[Any] = []
+        hint_job = self._seed_hint_job(req.seed, hint_box)
         gathered = gather(dispatcher=self.dispatcher, memory=self.memory, settings=self.settings, words=said,
                           names=list(getattr(self.settings, "user_names", []) or []), limits=bs, nonce=nonce,
                           reuse=early)
+        if hint_job is not None:
+            hint_job.join(SEED_MEMORY_WAIT_S)
         # M9: the people block carries the user's own last messages (and the chat in front): from the first call, an
         # outbound fetch goes through a plan step, where the consent rule and the commit check see it
         state.private_read = bool(gathered.people)
@@ -1384,7 +1479,7 @@ class Brain:
         sends = sends_fn(catalog)
         conv = Conversation(request_turn(words=req.words, channel=req.channel, context=req.context,
                                          gathered=gathered, history=list(self._history), seed=req.seed, limits=bs,
-                                         nonce=nonce))
+                                         nonce=nonce, seed_hint=hint_box[0] if hint_box else None))
         system = system_blocks(gathered.profile, gathered.menu)
         effort = bs.effort_for(req.channel)
         self._effort = effort
@@ -1444,7 +1539,8 @@ class Brain:
             checks = Checks(plan_id=plan_id, channel=req.channel, seed=req.seed, skills=gathered.skill_keys,
                             sends=sends, failed_step=state.failed_step, repeat_rejected=state.repeat_rejected,
                             current_plan=state.current.id if state.current is not None else None,
-                            spent_skills=frozenset(state.spent), done_skills=frozenset(state.skills_done))
+                            spent_skills=frozenset(state.spent), done_skills=frozenset(state.skills_done),
+                            words=tuple(host.user_words), text_bounced=state.text_bounced)
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
@@ -1467,6 +1563,7 @@ class Brain:
                 call.close()
                 raise
             state.repeat_rejected = checks.repeat_rejected
+            state.text_bounced = checks.text_bounced
             self._record_call(resp, call, exec_s=self._last_exec_s if result is not None else 0.0)
             if result is not None and _acted(result):
                 state.acted = True
@@ -1981,7 +2078,8 @@ class Brain:
             handed = seed_skill(result.seed)
             if handed:
                 state.spent.add(handed)
-            seeded = seed_block(result.seed, limit=bs.seed_chars, nonce=str(getattr(host, "nonce", "") or ""))
+            seeded = seed_block(result.seed, limit=bs.seed_chars, nonce=str(getattr(host, "nonce", "") or ""),
+                                hint=self._seed_hint(result.seed))
             if seeded:
                 blocks.append({"type": "text", "text": seeded})
         conv.add_user([tool_result(tool_id, step_report(result, plan, limit=bs.result_chars, replans_left=left)),

@@ -165,6 +165,37 @@ UIA_EDIT = 50004
 UIA_COMBOBOX = 50003
 #: How far up from the focused element the frame-field check climbs (the desktop root is reached long before).
 CLIMB_MAX = 60
+#: bRound2: the user's choice of browser is measured on their own timeline rows, never on a page Yuki itself opened.
+#: ``by_yuki = 0`` alone left in the stretch right after Yuki's act ended, on the page it brought up: on 10 Oct at
+#: 21:10:12 Yuki opened YouTube in Chrome (the default handler), and the next 48 s on that very page (the user looking
+#: at the wrong browser while saying so) counted as their own, so from then on "the browser YouTube was last shown in"
+#: (the learned skill's ``site`` policy) and "the one used most" read Chrome. A row inside a page visit memory
+#: attributes to Yuki (``yuki.memory.moments``: a ``page`` moment ``by = 'yuki'``, the visit whose first stretch began
+#: while Yuki acted, in the same program) is left out of every measure of the user's browser (:func:`measured_browsers`,
+#: :func:`last_in_front`, :func:`band_browser`, and the learner's ``prefs.FillPolicyScorer``). ``{t}``: the outer
+#: query's timeline alias. Data only: memory's own visit attribution, no rule about any browser.
+#: Yuki's own page visits, read once per query (``MATERIALIZED``: a few hundred rows, so each timeline row is checked
+#: against them in memory rather than by a scan of every page moment: the plain correlated form took 0.85 s against
+#: 0.05 s and ran past the executor's 0.8 s browser read on 16 Oct)
+YUKIS_VISITS_SQL = (
+    "WITH yv AS MATERIALIZED (SELECT yt.process AS p, ym.at AS a, coalesce(ym.ended_at, ym.at) AS e FROM moments ym "
+    "JOIN timeline yt ON yt.id = ym.source_id WHERE ym.kind = 'page' AND ym.by = 'yuki' AND ym.source = 'timeline') ")
+NOT_YUKIS_VISIT_SQL = ("NOT EXISTS (SELECT 1 FROM yv WHERE yv.p = {t}.process AND yv.a <= {t}.started_at "
+                       "AND {t}.started_at <= yv.e)")
+
+
+def own_rows_query(store: Any, sql: str, args: Sequence[Any], *, alias: str = "t") -> list[Any]:
+    """``store._query`` of a timeline read (a ``SELECT``) whose ``{own}`` marks where :data:`NOT_YUKIS_VISIT_SQL` goes
+    (with ``AND``), for the timeline aliased ``alias``, with Yuki's visits read first (:data:`YUKIS_VISITS_SQL`). A
+    database without memory's moments (an old one, a test's) reads as before, ``{own}`` dropped. Raises what the read
+    itself raises."""
+    clause = " AND " + NOT_YUKIS_VISIT_SQL.format(t=alias)
+    try:
+        return store._query(YUKIS_VISITS_SQL + sql.replace("{own}", clause), args)
+    except Exception as exc:  # noqa: BLE001 - only a missing moments table (or column) falls back
+        if "moments" not in str(exc) and "no such column" not in str(exc):
+            raise
+    return store._query(sql.replace("{own}", ""), args)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -762,16 +793,19 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
     on pages, its last row's end, distinct hosts, when it last showed a page of ``site_hosts``). A browser is measured,
     never listed: a program that showed pages of at least :data:`BROWSER_MIN_HOSTS` hosts, or a page of the site itself
     (an app that draws one site in its own window, such as a chat app, shows one or two). ``min_hosts`` / ``by_site``
-    are the definition's two knobs, for the replay that chose them (``scripts/browser_rule_replay.py``). Never raises
-    (``[]``)."""
+    are the definition's two knobs, for the replay that chose them (``scripts/browser_rule_replay.py``). bRound2: a
+    page Yuki itself opened counts for nothing here, however long the user then looked at it
+    (:data:`NOT_YUKIS_VISIT_SQL`). Never raises (``[]``)."""
     now = time.time() if now is None else float(now)
     hosts = [str(h).casefold() for h in site_hosts if h]
-    site_sql = (f"max(CASE WHEN host IN ({','.join('?' * len(hosts))}) THEN ended_at END)" if hosts else "NULL")
+    site_sql = (f"max(CASE WHEN t.host IN ({','.join('?' * len(hosts))}) THEN t.ended_at END)" if hosts else "NULL")
     try:
-        rows = store._query(
-            f"SELECT process, sum(active_s + passive_s) AS s, max(ended_at) AS last, count(DISTINCT host) AS n, "
-            f"{site_sql} AS site_last FROM timeline WHERE host IS NOT NULL AND started_at >= ? AND started_at <= ? "
-            "AND by_yuki = 0 AND state = 'present' AND process IS NOT NULL GROUP BY process ORDER BY s DESC",
+        rows = own_rows_query(
+            store,
+            f"SELECT t.process, sum(t.active_s + t.passive_s) AS s, max(t.ended_at) AS last, "
+            f"count(DISTINCT t.host) AS n, {site_sql} AS site_last FROM timeline t WHERE t.host IS NOT NULL "
+            "AND t.started_at >= ? AND t.started_at <= ? AND t.by_yuki = 0 AND t.state = 'present' "
+            "AND t.process IS NOT NULL{own} GROUP BY t.process ORDER BY s DESC",
             (*hosts, now - days * 86400.0, now))
     except Exception:  # noqa: BLE001
         return []
@@ -797,18 +831,21 @@ def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, 
     """Of ``keys`` (browsers), the one in front most recently, if its row ended at most ``within_s`` ago. The knobs are
     for the replay's refinements (review r2 M3; ``scripts/browser_rule_replay.py``): ``min_s`` skips glance rows (the
     user's time on the row, active plus passive, under it), ``active_only`` counts only rows with input,
-    ``page_only`` only rows that showed a web page."""
+    ``page_only`` only rows that showed a web page. bRound2: never a row on a page Yuki itself opened
+    (:data:`NOT_YUKIS_VISIT_SQL`)."""
     now = time.time() if now is None else float(now)
     if not keys:
         return None
     marks = ",".join("?" * len(keys))
-    extra = "".join(part for part, on in ((" AND (active_s + passive_s) >= ?", min_s > 0),
-                                          (" AND active_s > 0", active_only),
-                                          (" AND host IS NOT NULL", page_only)) if on)
+    extra = "".join(part for part, on in ((" AND (t.active_s + t.passive_s) >= ?", min_s > 0),
+                                          (" AND t.active_s > 0", active_only),
+                                          (" AND t.host IS NOT NULL", page_only)) if on)
     try:
-        rows = store._query(
-            f"SELECT process FROM timeline WHERE process IN ({marks}) AND state = 'present' AND by_yuki = 0 "
-            f"AND ended_at >= ? AND started_at <= ?{extra} ORDER BY ended_at DESC LIMIT 1",
+        rows = own_rows_query(
+            store,
+            f"SELECT t.process FROM timeline t WHERE t.process IN ({marks}) AND t.state = 'present' "
+            f"AND t.by_yuki = 0 AND t.ended_at >= ? AND t.started_at <= ?{extra}{{own}} ORDER BY t.ended_at DESC "
+            "LIMIT 1",
             (*keys, now - within_s, now, *((float(min_s),) if min_s > 0 else ())))
     except Exception:  # noqa: BLE001
         return None
@@ -818,7 +855,8 @@ def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, 
 def band_browser(store: Any, keys: Sequence[str], *, now: float | None = None, hours: int = BAND_H,
                  days: float = BAND_DAYS) -> str | None:
     """Of ``keys`` (browsers), the one the user had in front most in this hour band (now's local hour ``hours`` either
-    side, on weekdays or on weekends like now) over the last ``days``; ``None`` when none was. Never raises."""
+    side, on weekdays or on weekends like now) over the last ``days``; ``None`` when none was. bRound2: never a row on a
+    page Yuki itself opened (:data:`NOT_YUKIS_VISIT_SQL`). Never raises."""
     now = time.time() if now is None else float(now)
     if not keys:
         return None
@@ -830,9 +868,10 @@ def band_browser(store: Any, keys: Sequence[str], *, now: float | None = None, h
     band = sorted({(hour + d) % 24 for d in range(-int(hours), int(hours) + 1)})
     marks = ",".join("?" * len(keys))
     try:
-        rows = store._query(
-            f"SELECT process, started_at, active_s + passive_s FROM timeline WHERE process IN ({marks}) "
-            "AND state = 'present' AND by_yuki = 0 AND started_at >= ? AND started_at <= ?",
+        rows = own_rows_query(
+            store,
+            f"SELECT t.process, t.started_at, t.active_s + t.passive_s FROM timeline t WHERE t.process IN ({marks}) "
+            "AND t.state = 'present' AND t.by_yuki = 0 AND t.started_at >= ? AND t.started_at <= ?{own}",
             (*keys, now - float(days) * 86400.0, now))
     except Exception:  # noqa: BLE001
         return None
@@ -1931,6 +1970,7 @@ __all__ = ["ROUTES", "PROBES", "route_site_tab", "route_told_link", "route_open_
            "probe_site_tab_shown", "probe_site_front", "probe_browser_front",
            "probe_page_shown", "probe_page_seen", "probe_video_shown", "probe_video_playing", "probe_chat_page_shown",
            "browser_rule", "choose_browser", "measured_browsers", "last_in_front", "band_browser", "site_hosts",
+           "NOT_YUKIS_VISIT_SQL", "YUKIS_VISITS_SQL", "own_rows_query",
            "known_services", "service_of", "page_address", "page_matches", "video_page", "domain_like",
            "chat_web_address", "read_whole", "BROWSER_MIN_HOSTS", "BROWSER_POLICIES", "LINE_TAB_UNREADABLE",
            "LINE_TAB_PARTIAL", "LINE_TAB_NONE", "LINE_TAB_UNKNOWN", "LINE_BROWSER_CLOSED", "LINE_TAB_NO_ID",

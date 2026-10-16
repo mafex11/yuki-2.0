@@ -825,10 +825,15 @@ class FillPolicyScorer:
 
         self._loaded = True
         try:
-            rows = self.store._query(
-                "SELECT process, started_at, ended_at, active_s + passive_s, host FROM timeline WHERE state ="
-                " 'present' AND by_yuki = 0 AND process IS NOT NULL AND started_at >= ? AND started_at <= ? ORDER BY"
-                " started_at", (since, self.now))
+            from yuki.skills.web_route import own_rows_query
+
+            # bRound2: never a page Yuki itself opened, however long the user then looked at it (web_route's
+            # NOT_YUKIS_VISIT_SQL): it says nothing about which program they choose
+            rows = own_rows_query(
+                self.store,
+                "SELECT t.process, t.started_at, t.ended_at, t.active_s + t.passive_s, t.host FROM timeline t WHERE"
+                " t.state = 'present' AND t.by_yuki = 0 AND t.process IS NOT NULL AND t.started_at >= ? AND"
+                " t.started_at <= ?{own} ORDER BY t.started_at", (since, self.now))
         except Exception:  # noqa: BLE001
             rows = []
         band: dict[tuple[str, bool, int], tuple[list[float], list[float]]] = {}

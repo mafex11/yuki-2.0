@@ -320,6 +320,8 @@ class Executor:
         self.seed = dict(plan_seed) if isinstance(plan_seed, Mapping) and plan_seed else None
         self.words: list[str] = [str(w) for w in (getattr(host, "user_words", None) or []) if str(w).strip()]
         self.earlier: list[str] = [str(w) for w in (getattr(host, "earlier_words", None) or []) if str(w).strip()]
+        #: bRound2: the user's turns of the whole conversation (memory's turn log), read on first use (:meth:`_said_before`)
+        self._convo: list[str] | None = None
         self.steers: list[str] = []
         self.started = time.time()
         self.started_mono = time.monotonic()
@@ -2450,20 +2452,38 @@ class Executor:
         """The values a ``run_skill`` step gives for the slots the engine checks against the user's words (text, app,
         person and entity slots: ``yuki.skills.resolve.check_value``; an enum, a number or a switch is checked against
         its options instead), as written. ``[]`` for any other step."""
+        return [value for value, _type in self._given_typed(call)]
+
+    def _given_typed(self, call: Call | None) -> list[tuple[str, str]]:
+        """:meth:`_given_values` with each value's slot type (``""`` when the catalog doesn't say)."""
         if call is None or call.tool != "run_skill":
             return []
         key, slots = consent.skill_input(call, self.head)
         sk = util.skill(key) if key else None
         types = {str(getattr(sl, "name", "")): str(getattr(sl, "type", "")) for sl in getattr(sk, "slots", ()) or ()}
-        out: list[str] = []
+        out: list[tuple[str, str]] = []
         for name, value in (slots or {}).items():
             if types and types.get(str(name)) not in WORD_SLOT_TYPES:
                 continue
             if isinstance(value, Mapping):
                 value = value.get("name")
             if isinstance(value, str) and words(value):
-                out.append(words(value))
+                out.append((words(value), types.get(str(name), "")))
         return out
+
+    def _said_before(self) -> list[str]:
+        """bRound2 (B28): the user's own turns of this conversation that memory's turn log holds
+        (``host.said_before()``: their words as heard, said to Yuki, the last minutes, newest last), read once per
+        request and only when a step gives an app no turn of this request or an earlier one says. ``[]`` when the host
+        has none or memory can't say."""
+        if self._convo is None:
+            fn = getattr(self.host, "said_before", None)
+            try:
+                got = fn() if callable(fn) else []
+            except Exception:  # noqa: BLE001 - a help only: without it the spans are the requests' own
+                got = []
+            self._convo = [str(t) for t in (got or []) if str(t).strip()]
+        return self._convo
 
     def _skill_words(self, call: Call | None = None) -> tuple[list[str], list[str]]:
         """``(words, earlier)``: the user's own words a capability checks this step's slot values against (x9, fix plan
@@ -2478,15 +2498,27 @@ class Executor:
         browser), and appended after the exchange it would read as the newest.
 
         ``earlier``: every earlier request's turns, oldest first, for the resolver's validate-only ``earlier=`` once
-        the Dispatcher passes ``skill_context["earlier"]`` through. Whole words in order, never meaning."""
+        the Dispatcher passes ``skill_context["earlier"]`` through. Whole words in order, never meaning.
+
+        bRound2 (B28, 10 Oct 21:09: "Open the fucking YouTube tab..." after "I ask you to open YouTube in arc not in
+        Chrome" four minutes before): an app value (a browser, an app; slot type ``app``) that neither this exchange
+        nor an earlier request of the Brain's says is looked for in the user's own turns of the whole conversation
+        (:meth:`_said_before`: memory's turn log, which also holds the turns only the voice talker answered), newest
+        first, the same span only. So what they named anywhere in the conversation beats a learned fill policy or
+        their most-used browser, and only for a value the planner itself gave from that conversation (never a fill
+        from the words, and never a message's text or a person: those keep the request's own words, rule 8)."""
         older = self._earlier_requests()
         spans: list[str] = []
-        for value in self._given_values(call):
+        for value, kind in self._given_typed(call):
             if consent.in_words(value, self.words):
                 continue
             # the newest earlier request that says it (the request the user most likely meant)
             found = next((s for request in reversed(older) for turn in reversed(request)
                           if (s := _span_text(value, turn))), "")
+            if not found and kind == "app":
+                found = next((s for turn in reversed(self._said_before()) if (s := _span_text(value, turn))), "")
+                if found:
+                    self._emit_log("brain_said_before", turns=len(self._said_before()))
             if found and found.casefold() not in {s.casefold() for s in spans}:
                 spans.append(found)
         return spans + list(self.words), [turn for request in older for turn in request]
