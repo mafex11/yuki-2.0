@@ -57,6 +57,7 @@ from yuki.brain.context import (
     steer_blocks,
     swap_blocks,
     tool_result,
+    unconfirmed_report,
 )
 from yuki.brain.plan import (
     ACT_VERBS,
@@ -67,6 +68,9 @@ from yuki.brain.plan import (
     STEP_STATES,
     Step,
     StepStatus,
+    error_codes,
+    seed_skill,
+    skill_family,
 )
 from yuki.brain.planner import CallCancelled, CallResult, ModelCall, PlanStream, build_params
 from yuki.brain.prompt import ANSWER_PROMPT, ANSWER_TOOL, system_blocks
@@ -99,7 +103,17 @@ LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Like
 #: Lines said by code (design 2.3, 2.4): never a claim the probe did not see (a done comes with the executor's line
 #: from the probe's evidence; without one it is said as not confirmed).
 LINE_UNCONFIRMED = "I tried, but I couldn't confirm it worked."
-LINE_STUCK = "I got stuck {where}{why}. Try another way?"
+#: ``where``: " " and the step in plain words (" partway" when that step is unknown), or "" when nothing ran.
+LINE_STUCK = "I got stuck{where}{why}. Try another way?"
+#: The executor's own code words a stuck line may say, in plain words (x10). A consent refusal's code word is said only
+#: in the consent rule's own plain words (``consent.plain_why``, x11), and any other reason is left out: a reason is a
+#: code word (or an executor's note) for the logs and the planner, never speech (tonight's "...your usual way:
+#: handed_over" and "...: quote").
+REASON_WORDS: dict[str, str] = {
+    "handed_over": "it didn't get there",
+    "asked": "it needed a detail I didn't have",
+    "chat_not_confirmed": "the chat didn't open",
+}
 LINE_DECLINED = "Okay, I didn't do that."
 LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_ANSWER_BUDGET = "I couldn't finish looking that up."
@@ -201,6 +215,10 @@ class _State:
     header_ms: float | None = None
     step_ms: float | None = None
     steps: int = 0
+    #: x10: skills that ran in this request and couldn't confirm, or handed over (code ids): never run again here.
+    spent: set[str] = field(default_factory=set)
+    #: x10: the one replan by steps after a skill's unconfirmed result was taken.
+    retried_unconfirmed: bool = False
 
 
 class _NoticeSink:
@@ -1306,6 +1324,13 @@ class Brain:
         bs = self._bs = BrainSettings.read(self.settings)
         host = self._host_ref = Host(self, req)
         state = self._state = _State()
+        if req.seed is not None:
+            # a skill handed this request over: something is to be done, so it is budgeted as an act request from
+            # the first call (an invalid first plan is no answer: x10), and that skill is not run again here
+            state.kind = "act"
+            handed = seed_skill(req.seed)
+            if handed:
+                state.spent.add(handed)
         from yuki.agent.untrusted import new_nonce
 
         early, early_words, early_nonce = self._take_early()
@@ -1386,7 +1411,8 @@ class Brain:
             plan_id = f"p{state.plans + 1}"
             checks = Checks(plan_id=plan_id, channel=req.channel, seed=req.seed, skills=gathered.skill_keys,
                             sends=sends, failed_step=state.failed_step, repeat_rejected=state.repeat_rejected,
-                            current_plan=state.current.id if state.current is not None else None)
+                            current_plan=state.current.id if state.current is not None else None,
+                            spent_skills=frozenset(state.spent))
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
@@ -1514,6 +1540,13 @@ class Brain:
         plan = source.plan
         if plan is not None:
             self._status_plan = plan
+        if result.status == "unconfirmed":
+            try:
+                skill = self._unconfirmed_skill(executor, plan, result)
+            except Exception:  # noqa: BLE001 - never breaks a plan's report: it ends as before
+                skill = None
+            if skill:
+                result = replace(result, unconfirmed_skill=skill)
         opened = source.opened_at
         if source.header_at is not None and state.header_ms is None and opened:
             state.header_ms = (source.header_at - opened) * 1000
@@ -1560,6 +1593,7 @@ class Brain:
         # steer taken into a turn) count as theirs for the consent rule's spans and the commit check
         known = set(getattr(executor, "words", []) or [])
         executor.add_words([w for w in host.user_words if w not in known])
+        self._seed_executor(executor, header)
         executor.begin(header)
         early = None
         for step in source.steps():
@@ -1582,6 +1616,85 @@ class Brain:
                 return ExecResult(status="invalid", statuses=[_step_status(s) for s in statuses],
                                   acted=any(s.tool and s.verb in ACT_VERBS for s in statuses))
         return self._exec_result(got, host)
+
+    def _seed_executor(self, executor: Any, header: Plan) -> None:
+        """The hand-off seed the executor holds for this plan (x10). Its done-check reads the seed's fixed check for a
+        seeded plan whose own ``done`` took it (``seed_check``: the planner wrote none) and for a skill route, as
+        before; a seeded plan by steps that picked a probe of its own (or sends, or joins) is decided by that probe or
+        its class, so the executor gets the seed without its check (its onset baseline and key stay). The request's
+        seed is the source: a hand-off within a plan updates it (``_after_plan``)."""
+        if not hasattr(executor, "seed"):
+            return
+        seed = self._req.seed if self._req is not None else None
+        if not seed:
+            executor.seed = None
+        elif header.seed_check or header.skill:
+            executor.seed = dict(seed)
+        else:
+            executor.seed = {k: v for k, v in seed.items() if k not in ("done", "done_words")}
+
+    def _unconfirmed_skill(self, executor: Any, plan: Plan | None, result: ExecResult) -> str | None:
+        """The skill whose own check left this plan unconfirmed, when finishing it by steps after a look is safe
+        (x10, principle 1), else ``None``. Safe means: the plan is a skill route (its ``run_skill`` step decides it)
+        and declares no send or join; that step acted and couldn't confirm (engine outcome ``unverified``); its skill
+        sends nothing and joins nothing (a message capability, even as a draft, is never redone: rule 8, no double
+        send or double text); it has no ``points`` slot (a relative change, "a bit quieter": done again, it changes
+        twice; which values the resolver filled is not in the report, so any such skill stops); and the route that
+        acted may be followed after acting (its data's ``retry_after_acting``: a tab pick or a join is not).
+        Unreadable data is not safe. Code data only, never the words.
+
+        An engine that hands over every unconfirmed end that may be finished by steps itself (x5Fallback: rung C, why
+        ``unverified``; it exports ``WHY_UNVERIFIED``) sends those here as a hand-off, which the seed path replans by
+        steps. An ``unverified`` it still returns is one it chose to stop at (a send, a relative change, a state that
+        was already there, a result on another device), so it is never redone here: ``None``."""
+        if result.status != "unconfirmed" or plan is None or not plan.skill or plan.consent.commit in ("send", "join"):
+            return None
+        try:
+            from yuki.skills import engine as skill_engine
+
+            if getattr(skill_engine, "WHY_UNVERIFIED", None):
+                return None
+        except Exception:  # noqa: BLE001 - no engine to ask: not safe to redo by steps
+            return None
+
+        def ran_key(run: Any) -> str:
+            payload = getattr(getattr(run, "outcome", None), "payload", None)
+            return str(payload.get("skill") or "") if isinstance(payload, Mapping) else ""
+
+        # this plan's runs only (the executor keeps them per plan); the route's own skill decides it
+        runs = list(getattr(executor, "skill_outcomes", None) or [])
+        pick = next((r for r in reversed(runs) if plan.skill in (ran_key(r), str(getattr(r, "key", "") or ""))), None)
+        payload = getattr(getattr(pick, "outcome", None), "payload", None)
+        if pick is None or not isinstance(payload, Mapping) or str(payload.get("outcome") or "") != "unverified":
+            return None
+        if getattr(pick, "drafted", False):
+            return None
+        key = ran_key(pick) or str(getattr(pick, "key", "") or "")
+        try:
+            from yuki.brain import util
+            from yuki.brain.consent import skill_joins, skill_sends
+
+            own = util.skill(key)
+            family = util.skill(skill_family(key)) if skill_family(key) != key else None
+            known = [s for s in (own, family) if s is not None]
+            if not known:
+                return None
+            slots = dict(getattr(pick, "slots", {}) or {})
+            if any(getattr(s, "sends", False) or getattr(s, "sends_when", ()) or skill_sends(s, slots, partial=True)
+                   or skill_joins(s) for s in known):
+                return None
+            if any(getattr(slot, "type", "") == "points" for s in known for slot in getattr(s, "slots", ()) or ()):
+                return None   # a relative change ("a bit quieter") may be in it: done again, it would change twice
+            # a learned skill runs its capability's rungs (it has none of its own)
+            routes = list(getattr(own, "routes", ()) or ()) or list(getattr(family, "routes", ()) or ())
+            route = next((r for r in routes if getattr(r, "key", None) == payload.get("route")), None)
+            if route is not None:
+                safe = bool(getattr(route, "retry_after_acting", False))
+            else:
+                safe = bool(routes) and all(bool(getattr(r, "retry_after_acting", False)) for r in routes)
+        except Exception:  # noqa: BLE001 - unreadable data: not safe to redo by steps
+            return None
+        return key if safe else None
 
     def _exec_result(self, got: Any, host: Host) -> ExecResult:
         """bExec's ``RunResult`` as bCore's :class:`ExecResult` (statuses and code words mapped; the done-check's
@@ -1697,12 +1810,24 @@ class Brain:
             conv.add_user([tool_result(tool_id, invalid_report(["the plan could not be read"]), error=True), *extra])
             return False
         if source.stop == "invalid" or result.status == "invalid":
+            # x10: an invalid plan counts against the replans (brain_max_replans, 3), as a mismatch does; it no
+            # longer ends the request at the second one. Its errors are logged as the validator's code words
+            # (content-free), so why a plan failed can be read from the log.
             state.invalid += 1
-            if state.invalid > 1:
+            errors = list(source.errors or ["invalid plan"])
+            raw_kind = resp.tool.input.get("kind") if resp.tool is not None and isinstance(resp.tool.input, Mapping) \
+                else None
+            if raw_kind == "act":
+                state.kind = "act"   # it meant to act: the act budget, never an answer's 30 s
+            self.logger.log("brain_plan_invalid", n=state.invalid, errors=len(errors), why=error_codes(errors)[:8],
+                            seeded=self._req is not None and self._req.seed is not None, replans=state.replans)
+            if state.replans >= bs.max_replans or not self._budget_left(state, bs, self._req):
                 self._finish_stuck(state)
                 return True
-            conv.add_user([tool_result(tool_id, invalid_report(source.errors or ["invalid plan"], result.statuses),
-                                       error=True), *extra])
+            state.replans += 1
+            conv.add_user([tool_result(tool_id, invalid_report(errors, result.statuses,
+                                                               replans_left=bs.max_replans - state.replans),
+                                       error=True), *extra, *self._steer_turn(host)])
             return False
         plan = source.plan
         if plan is not None:
@@ -1723,6 +1848,21 @@ class Brain:
             line = result.line or {"unconfirmed": LINE_UNCONFIRMED, "drafted": LINE_DRAFTED,
                                    "declined": LINE_DECLINED}[status]
             outcome = self._result_outcome(result, state, plan, line)
+            if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
+                    and state.replans < bs.max_replans and self._budget_left(state, bs, self._req)):
+                # x10 (principle 1): a skill that acted and couldn't confirm is not the end while replans remain:
+                # one replan by steps after a look, that skill never run again. Its line is held: it stands if the
+                # replan changes nothing (a plain reply, an invalid plan), and a plan that runs decides instead.
+                state.retried_unconfirmed = True
+                state.replans += 1
+                state.spent.add(result.unconfirmed_skill)
+                state.held = (line, outcome)
+                self.logger.log("brain_unconfirmed_replan", skill=skill_family(result.unconfirmed_skill),
+                                replans=state.replans)
+                conv.add_user([tool_result(tool_id, unconfirmed_report(
+                    result, plan, result.unconfirmed_skill, replans_left=bs.max_replans - state.replans)), *extra,
+                    *self._steer_turn(host)])
+                return False
             if self._steer_waiting() and self._budget_left(state, bs, self._req):
                 # the user added something before the line went out: it is held (loop.Agent's held final) and the
                 # model takes one more step with their words; the held line stands if nothing changes
@@ -1766,9 +1906,13 @@ class Brain:
             blocks.append({"type": "text", "text": f"{CHECK_LABEL} What that plan's reads returned:\n\n"
                                                    + "\n\n".join(result.reads)})
         if result.seed and self._req is not None:
-            # rung C: the skill handed over; the next plan is seeded with it and keeps the skill's done-check
+            # rung C: the skill handed over; the next plan is seeded with it (by steps, or with the consent a send or
+            # a join needs: x10), and the skill is not run again in this request
             self._req.seed = dict(result.seed)
-            seeded = seed_block(result.seed, limit=bs.seed_chars)
+            handed = seed_skill(result.seed)
+            if handed:
+                state.spent.add(handed)
+            seeded = seed_block(result.seed, limit=bs.seed_chars, nonce=str(getattr(host, "nonce", "") or ""))
             if seeded:
                 blocks.append({"type": "text", "text": seeded})
         conv.add_user([tool_result(tool_id, step_report(result, plan, limit=bs.result_chars, replans_left=left)),
@@ -1892,10 +2036,14 @@ class Brain:
         where, why = "", ""
         if last is not None and isinstance(last.step, int) and plan is not None and 0 <= last.step < len(plan.steps):
             where = STEP_WORDS.get(plan.steps[last.step].verb, "")
+        if not where and state.acted:
+            where = "partway"   # something ran, the step that stopped it is not known
         if last is not None and last.reason:
-            why = one_line(last.reason, 100)
+            # x10: a reason is a code word (or an executor's note) for the planner and the log: only the few with
+            # plain words of their own are said; any other is left out
+            why = plain_reason(last.reason)
         line = (last.line if last is not None and last.line and last.status in ("mismatch", "refused") else
-                LINE_STUCK.format(where=where or "partway", why=f": {why}" if why else ""))
+                LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else ""))
         self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
                                         partial=state.acted))
 
@@ -2114,6 +2262,26 @@ class Brain:
             self.logger.log("error", where="memory_turn", error=type(exc).__name__)
 
 
+def plain_reason(reason: Any) -> str:
+    """A stuck plan's reason in plain words for the line the user hears (x10, C9), or ``""``: the executor's own code
+    words (:data:`REASON_WORDS`), else the consent rule's plain words for its refusal code word (``consent.plain_why``,
+    x11Consent; absent before it merges). Anything else, a code word with no plain words or an executor's note, is
+    left out: it is never spoken."""
+    code = " ".join(str(reason or "").split())
+    if not code:
+        return ""
+    if code in REASON_WORDS:
+        return REASON_WORDS[code]
+    try:
+        from yuki.brain import consent as _consent
+
+        plain = getattr(_consent, "plain_why", None)
+        said = plain(code) if callable(plain) else ""
+    except Exception:  # noqa: BLE001 - no plain words: left out
+        said = ""
+    return " ".join(str(said or "").split())
+
+
 def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
     model's text after non-committing steps is never taken as the final word)."""
@@ -2170,4 +2338,4 @@ def _as_result(got: Any) -> ExecResult:
 
 
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
-           "STEP_WORDS", "with_watch_steps"]
+           "STEP_WORDS", "REASON_WORDS", "plain_reason", "with_watch_steps"]
