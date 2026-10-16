@@ -4631,7 +4631,8 @@ class Dispatcher:
         # none (its capability steps hand back to it, as before)
         result = run_for_thinker(tool_input, list(ctx.get("words") or []), memory=ctx.get("memory"),
                                  log=ctx.get("log"), request_id=ctx.get("request_id"), settings=ctx.get("settings"),
-                                 verbs=self._skill_act_verbs(state), hands=ctx.get("hands"))
+                                 verbs=self._skill_act_verbs(state), hands=ctx.get("hands"),
+                                 earlier=list(ctx.get("earlier") or []) or None)
         off = state.get("act_off")
         acted = any(t.get("outcome") == "contradicted" for t in result.tried or [])
         if off and (result.outcome == "handed_over" or (result.outcome == "failed" and not acted)):
