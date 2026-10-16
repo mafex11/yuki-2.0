@@ -18,9 +18,10 @@ be replaced through ``ProbeContext.probes`` (tests, replays, a driver):
 * ``media_session``: one app's media session has ``status`` (``playing`` / ``paused``) or its track changed since t0;
 * ``audio_active``: the app's process has an active render session on this PC (Core Audio);
 * ``level``: a mixer or the endpoint level is ``value`` (within 2 points);
-* ``page_at``: the browser window shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates): the window a
-  route launched (its ``hwnd``), else the named ``process``'s top window, else the window in front (x8WebArc: never
-  the foreground while the launched window is known);
+* ``page_at``: the browser window shows a page of ``site`` / ``kind`` (``yuki/connect/sites`` templates; ``site`` a
+  site name, a host or an address, normalised by :func:`site_key`): the window a route launched (its ``hwnd``), else
+  the named ``process``'s top window, else the window in front (x8WebArc: never the foreground while the launched
+  window is known);
 * ``tab_shown``: the app's window is in front with the expected tab selected (identity, never a title template);
 * ``foreground``: the app's window is in front;
 * ``mic_held``: the app took the microphone after t0: an onset against the state read right before the rung acted
@@ -303,11 +304,84 @@ def probe_foreground(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     return image.casefold() == _proc(args), {"front": bool(image)}
 
 
+def _bare_host(text: Any) -> str:
+    """The host of an address or a bare host (``"https://www.youtube.com/x"``, ``"www.youtube.com"``), casefolded,
+    without a leading ``www.``; ``""`` when there is none. A fixed-format parse (``urlsplit``), never a guess."""
+    from urllib.parse import urlsplit
+
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return ""
+    try:
+        host = (urlsplit(raw if "//" in raw else "https://" + raw).hostname or "").casefold()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def site_key(value: Any) -> str:
+    """The site a page check names, as the site files key it (sBrainFix, F3). A plan writes it as a site file's name
+    (``"youtube"``), a host (``"youtube.com"``, ``"www.youtube.com"``) or an address (``"https://www.youtube.com/"``),
+    and :func:`probe_page_at` compares it with ``page_of``'s site name: before this, ``"youtube.com"`` never matched a
+    real YouTube page, so a video that played read as "another page is showing" (16 Oct simulation, B14). A site
+    file's own name stays as it is; a host one of the files lists in ``[site] hosts`` (with or without ``www.``)
+    becomes that file's name; anything else is its bare host (:func:`_bare_host`). Casefolded; ``""`` when none is
+    given. Data only (the site files), never a list of sites in code."""
+    text = " ".join(str(value or "").split()).casefold()
+    if not text:
+        return ""
+    try:
+        from yuki.connect import templates
+
+        names = templates.sites()
+        if text in names:
+            return text
+        host = _bare_host(text)
+        if not host:
+            return text
+        for name in names:
+            hosts = {_bare_host(h) for h in (templates.site(name).get("site") or {}).get("hosts") or []}
+            if host in hosts:
+                return name
+        return host
+    except Exception:  # noqa: BLE001 - the site files can't be read: the value as written
+        return text
+
+
+def _page_matches(url: str, want: str, kind: str) -> bool | None:
+    """Whether the address ``url`` is a page of the site ``want`` (:func:`site_key`'s form; ``""``: any) and of
+    ``kind`` (``""``: any). A page one of the site's templates names: by its site and kind (as before). Otherwise by
+    its host as a site (:func:`site_key`): a page of that site no template names (a search page) is the site, of no
+    templated kind; a site with no file is known by its bare host only (``kind`` ``home``: its root path; any other
+    kind can't be told there: ``None``)."""
+    from yuki.connect.templates import page_of
+
+    m = page_of(url)
+    if m is not None:
+        return (not want or m.site == want) and (not kind or m.kind == kind)
+    host = _bare_host(url)
+    if not want or not host or site_key(host) != want:
+        return False
+    if not kind:
+        return True
+    if want != host:
+        return False   # a site with templates: its kinds are known, and this page is none of them
+    if kind == "home":
+        from urllib.parse import urlsplit
+
+        try:
+            return (urlsplit(url).path or "/") == "/"
+        except ValueError:
+            return None
+    return None
+
+
 def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
     """The browser window shows a page of ``site`` (and ``kind``): its Document's address, matched against the site
     templates (``yuki.connect.templates.page_of``), never a title. x8WebArc: the window read is the one the route
     launched or acted in, else the named ``process``'s top window, else the window in front (:func:`_window_for`), so
-    a page in the browser asked for counts and one in another browser never does. Evidence: ``via`` (which window),
+    a page in the browser asked for counts and one in another browser never does. ``site`` is normalised first
+    (:func:`site_key`: a site name, a host or an address all name the same site). Evidence: ``via`` (which window),
     ``process`` (its program)."""
     hwnd, image, how = _window_for(ctx, args)
     if not hwnd:
@@ -319,7 +393,6 @@ def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
         return False, {**ev, "status": "other_app"}
     try:
         from yuki.connect.spotify_desktop import run_uia, UiaTree
-        from yuki.connect.templates import page_of
 
         def job(automation: Any, shared: dict) -> None:
             docs = UiaTree(automation, hwnd).find("Document")
@@ -333,11 +406,17 @@ def probe_page_at(ctx: ProbeContext, args: Mapping[str, Any]) -> Verdict:
         return None, {**ev, "status": "unread"}
     if not urls:
         return None, {**ev, "status": "no_document"}
+    want = site_key(args.get("site"))
+    kind = " ".join(str(args.get("kind") or "").split()).casefold()
+    unsure = False
     for url in urls:
-        m = page_of(url)
-        if m is not None and m.site == str(args.get("site") or m.site) and \
-                (not args.get("kind") or m.kind == str(args.get("kind"))):
+        got = _page_matches(url, want, kind)
+        if got is True:
             return True, {**ev, "status": "page"}
+        unsure = unsure or got is None
+    if unsure:
+        # the site's page is showing, but its kind can't be told without a template for that site: never "not so"
+        return None, {**ev, "status": "kind_unknown"}
     return False, {**ev, "status": "other_page"}
 
 
@@ -657,4 +736,4 @@ def _check_of(raw: Mapping[str, Any] | None) -> Check | None:
 
 
 __all__ = ["POLL_S", "MAX_WAIT_S", "LEVEL_TOLERANCE", "MAX_LATE_READS", "ProbeContext", "PROBE_FUNCS", "BASELINES",
-           "Waited", "read", "wait", "recheck", "check", "baseline_key", "take_baseline"]
+           "Waited", "read", "wait", "recheck", "check", "baseline_key", "take_baseline", "site_key"]

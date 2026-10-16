@@ -48,11 +48,14 @@ from yuki.brain.context import (
     held_report,
     invalid_report,
     load_catalog,
+    look_report,
     one_line,
     read_report,
+    REST_DONE_WORD,
     request_turn,
     seed_block,
     sends_fn,
+    skill_rest_report,
     step_report,
     steer_blocks,
     swap_blocks,
@@ -106,6 +109,9 @@ LEVEL_LABELS: dict[str, str] = {"verified": "Checked on screen", "likely": "Like
 LINE_UNCONFIRMED = "I tried, but I couldn't confirm it worked."
 #: ``where``: " " and the step in plain words (" partway" when that step is unknown), or "" when nothing ran.
 LINE_STUCK = "I got stuck{where}{why}. Try another way?"
+#: sBrainFix (F2): a skill route's line, held while the planner did the rest of the request, when the budget or the
+#: replans ran out before the planner said it was all done: what the skill's check saw, and that the rest isn't.
+LINE_REST_UNDONE = "{line}; I couldn't get the rest done."
 #: The executor's own code words a stuck line may say, in plain words (x10). A consent refusal's code word is said only
 #: in the consent rule's own plain words (``consent.plain_why``, x11), and any other reason is left out: a reason is a
 #: code word (or an executor's note) for the logs and the planner, never speech (tonight's "...your usual way:
@@ -152,6 +158,18 @@ MAX_CUTOFFS = 1
 CUTOFF_TOKENS_STREAMED, CUTOFF_TOKENS_PLAIN = 64000, 20000
 #: A tool whose streamed input did not parse is answered with this (never run on a cut-short value).
 BAD_INPUT_TEXT = "Not run: its input could not be read as one JSON object. Send the call again."
+#: sBrainFix (F9): how many act plans that only looked go back to the planner with what they read in one request (the
+#: next one ends with its line, within the call budget either way).
+LOOK_BACKS_MAX = 2
+#: sBrainFix (F8): the outcome levels after which a seeded request's hand-off check is read once as an observer
+#: (review r1 L6: also ``unverified`` when an act step of the request ran: the driver's own finish gate judges it).
+OBSERVE_LEVELS: frozenset[str] = frozenset({"verified", "likely"})
+OBSERVE_ACTED_LEVELS: frozenset[str] = frozenset({"unverified"})
+#: sBrainFix (F2, review r1 M1): how many skill routes that ended done go back to the planner in one request for what
+#: is left of the request, and the model calls each such turn adds to the act budget (it is code's question: the
+#: planner's look at what the skill left, then its plan).
+SKILL_RESTS_MAX = 1
+SKILL_REST_CALLS = 2
 
 _END = object()
 
@@ -220,6 +238,14 @@ class _State:
     spent: set[str] = field(default_factory=set)
     #: x10: the one replan by steps after a skill's unconfirmed result was taken.
     retried_unconfirmed: bool = False
+    #: sBrainFix (F9): act plans that only looked and were sent back to the planner with what they read.
+    look_backs: int = 0
+    #: sBrainFix (F2): skill routes that ended done and went back to the planner for the rest of the request, and
+    #: those skills' ids (never run again in this request: they did their part).
+    skill_rests: int = 0
+    skills_done: set[str] = field(default_factory=set)
+    #: The held ending that turn put up (:attr:`held` while no other ending replaced it).
+    rest_held: tuple[str, dict[str, Any]] | None = None
 
 
 class _NoticeSink:
@@ -552,6 +578,8 @@ class Brain:
         self._checks_seen = 0
         #: The line the request ended with (the executor's run row carries it).
         self._final_text = ""
+        #: sBrainFix (F8): this request's hand-off check was already read as an observer.
+        self._seed_observed = False
         self._requests = 0
         self._request_started = time.monotonic()
         self._running = False
@@ -1304,6 +1332,7 @@ class Brain:
         self._checker = None
         self._checks_seen = 0
         self._final_text = ""
+        self._seed_observed = False
         self.needed_hands = False
         self._reset_accounting()
         self.last_summary = None
@@ -1393,9 +1422,11 @@ class Brain:
             pass
 
     def _budget_left(self, state: _State, bs: BrainSettings, req: _Request) -> bool:
-        """Act plans: at most ``act_calls`` model calls; answers: ``answer_calls`` or ``answer_s`` of work."""
+        """Act plans: at most ``act_calls`` model calls, plus :data:`SKILL_REST_CALLS` for each turn code itself asked
+        for after a skill route ended done (sBrainFix F2: ``skill_rests``; code's question, never the planner's
+        spending); answers: ``answer_calls`` or ``answer_s`` of work."""
         if state.kind == "act":
-            return state.calls < bs.act_calls
+            return state.calls < bs.act_calls + state.skill_rests * SKILL_REST_CALLS
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
 
@@ -1413,7 +1444,7 @@ class Brain:
             checks = Checks(plan_id=plan_id, channel=req.channel, seed=req.seed, skills=gathered.skill_keys,
                             sends=sends, failed_step=state.failed_step, repeat_rejected=state.repeat_rejected,
                             current_plan=state.current.id if state.current is not None else None,
-                            spent_skills=frozenset(state.spent))
+                            spent_skills=frozenset(state.spent), done_skills=frozenset(state.skills_done))
             params = build_params(model=bs.model, max_tokens=state.max_tokens or bs.max_tokens, system=system,
                                   messages=conv.messages(), effort=effort, thinking_display=bs.thinking_display,
                                   stream=bs.stream, eager=bs.eager)
@@ -1854,6 +1885,20 @@ class Brain:
                 # said as one ("send it when you're ready"), never a generic "the box holds it"
                 line = LINE_DRAFTED
             outcome = self._result_outcome(result, state, plan, line)
+            if (status == "unconfirmed" and look_only(plan, result) and state.look_backs < LOOK_BACKS_MAX
+                    and self._budget_left(state, bs, self._req)):
+                # sBrainFix (F9): an act plan that only looked did nothing, so its check reading nothing is no ending
+                # (16 Oct simulation B08: "I did it, but I couldn't confirm it worked." after one look at Spotify):
+                # what it read goes back to the planner for the plan that does it. Not a replan after a failure (the
+                # call budget bounds it, and LOOK_BACKS_MAX). Its line is held only when something acted earlier in
+                # the request (it stands if the model then changes nothing; the model's words never claim a result
+                # after an act); with nothing acted, the model's own reply is the answer, as for any plain reply.
+                state.look_backs += 1
+                state.held = (line, outcome) if state.acted else None
+                self.logger.log("brain_look_only", n=state.look_backs, reads=len(result.reads),
+                                probe=result.probe or None, acted=state.acted)
+                conv.add_user([tool_result(tool_id, look_report(result, plan)), *extra, *self._steer_turn(host)])
+                return False
             if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
                     and state.replans < bs.max_replans and self._budget_left(state, bs, self._req)):
                 # x10 (principle 1): a skill that acted and couldn't confirm is not the end while replans remain:
@@ -1875,6 +1920,24 @@ class Brain:
                 state.held = (line, outcome)
                 self.logger.log("steer", held_final=status)
                 conv.add_user([tool_result(tool_id, held_report(result, plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
+            if status == "done" and skill_rest(plan) and state.skill_rests < SKILL_RESTS_MAX:
+                # sBrainFix (F2, review r1 M1): a skill route checks only the skill's own part ("Open YouTube home"
+                # for "open a new tab of YouTube and put something on", 10 and 16 Oct: "Youtube is up." and nothing
+                # put on). Whether their words ask for more is the planner's to read, never code's: its line is held
+                # and the planner gets one turn with what the skill did, to plan the rest by steps or give the one-word
+                # reply that all is done (the held line then stands: code's line, never the model's words; any other
+                # reply, or the budget running out, says the rest isn't done: LINE_REST_UNDONE). Not a replan after a
+                # failure: SKILL_RESTS_MAX bounds it, and each such turn adds SKILL_REST_CALLS to the act budget (it is
+                # code's question; in the 16 Oct review run of B28 two memory reads had used the budget, so the look
+                # after it was the last call). A send or a join ends here (rule 8: nothing is planned on a send's
+                # back), and that skill is not run again in this request.
+                state.skill_rests += 1
+                state.skills_done.add(str(plan.skill))
+                state.held = state.rest_held = (line, outcome)
+                self.logger.log("brain_skill_rest", n=state.skill_rests, skill=skill_family(plan.skill))
+                conv.add_user([tool_result(tool_id, skill_rest_report(plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
             self._final(line, outcome)
@@ -1996,6 +2059,37 @@ class Brain:
         self._last_outcome = outcome
         self._final_text = str(text or "")
         self._push(Final(text, outcome=outcome))
+        self._observe_seed(outcome)
+
+    def _observe_seed(self, outcome: Mapping[str, Any] | None) -> None:
+        """sBrainFix (F8): a request a skill handed over that ends "verified" or "likely" by a plan's own check, or
+        "unverified" after an act step ran (review r1 L6: a play its probe couldn't read), has the hand-off's own check
+        read once as an observer, after the line went out, on its own thread (``done.observe_seed``; its verdict is
+        ignored: the driver's own finish gate decides what it learns). A plan the seed's check decided
+        (``seed_check``: the executor read it already) needs none. Once per request; never raises."""
+        try:
+            req, state = self._req, self._state
+            if req is None or not req.seed or self._seed_observed or not isinstance(outcome, Mapping):
+                return
+            level = str(outcome.get("level") or "")
+            if level not in OBSERVE_LEVELS and not (level in OBSERVE_ACTED_LEVELS and state is not None
+                                                    and state.acted):
+                return
+            plan = state.current if state is not None else None
+            if plan is not None and plan.seed_check:
+                return
+            self._seed_observed = True
+            from yuki.brain import done as _done
+
+            host = self._host_ref
+            seed = dict(req.seed)
+            env = _done.ProbeEnv(since=float(req.epoch), dispatcher=self.dispatcher,
+                                 memory=getattr(host, "memory", None) if host is not None else self.memory,
+                                 baseline=dict(seed.get("baseline") or {}) if isinstance(seed.get("baseline"), Mapping)
+                                 else {})
+            _done.observe_seed(seed, env, log=self.logger.log)
+        except Exception as exc:  # noqa: BLE001 - an observer never breaks a request's ending
+            self.logger.log("error", where="brain_seed_observer", error=type(exc).__name__)
 
     def _finish_text(self, text: str, state: _State, bs: BrainSettings, conv: Conversation, host: Host) -> bool:
         """A plain-text reply (already appended). If the user added something while it was written, it is not the last
@@ -2013,6 +2107,11 @@ class Brain:
         text = (text or "").strip()
         last = state.last
         if state.held is not None:
+            if state.held is state.rest_held and not rest_done_reply(text):
+                # sBrainFix (F2): after a skill route did its part, the planner neither planned the rest nor gave the
+                # one-word reply that all is done (context.REST_DONE_WORD): the skill's line, and that the rest isn't
+                self._finish_stuck(state)
+                return True
             # a plan ended and its line was held for the user's addition; the model changed nothing: the line stands
             # when something acted (code's line, never the model's claim), else the model's answer to it
             if state.acted or last is None or last.status != "declined":
@@ -2022,7 +2121,11 @@ class Brain:
             # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words
             self._final(last.line, self._outcome(state, level="failed" if state.acted else "answer", line=last.line))
             return True
-        if state.acted:
+        if state.acted or (state.kind == "act" and last is not None
+                           and last.status in ("refused", "mismatch", "error")):
+            # sBrainFix (review r1 runs): a plan that tried to act and was stopped, even with nothing acted, leaves the
+            # model's words no answer to give: in the 16 Oct B31 run its send was refused (text_mismatch) and its reply
+            # "Sent Hemanth a DM asking when he's joining the VC." would have been said. Code says where it stopped.
             self._finish_stuck(state)
             return True
         self._final(text or LINE_NO_REPLY, self._outcome(state, level="answer"))
@@ -2030,7 +2133,16 @@ class Brain:
 
     def _finish_stuck(self, state: _State, *, budget: bool = False) -> None:
         """The code line for an act plan that could not get there, or an answer that ran out of budget. A held ending
-        (no plan ran after it) is said as it was."""
+        (no plan ran after it) is said as it was; a skill route's, held for the rest of the request (sBrainFix F2),
+        says that the rest isn't done (:data:`LINE_REST_UNDONE`, level failed, partial): the planner never said it was
+        all done."""
+        if state.held is not None and state.held is state.rest_held:
+            held_line, held_outcome = state.held
+            line = LINE_REST_UNDONE.format(line=" ".join(str(held_line or "").split()).rstrip(". ") or "I did a part")
+            self._final(line, {**dict(held_outcome or {}), "level": "failed", "label": LEVEL_LABELS["failed"],
+                               "partial": True, "line": line,
+                               "open": max(1, int(dict(held_outcome or {}).get("open") or 0))})
+            return
         if state.held is not None:
             self._final(*state.held)
             return
@@ -2302,6 +2414,29 @@ def typed_draft(plan: Plan | None, seed: Mapping[str, Any] | None) -> bool:
     return plan.done.name == "field_holds" and bool(" ".join(str(plan.done.args.get("text") or "").split()))
 
 
+def rest_done_reply(text: Any) -> bool:
+    """The planner's reply after a skill route did its part is the one word code asked for when all is done
+    (``context.REST_DONE_WORD``, :func:`yuki.brain.context.skill_rest_report`): an exact reply format code set, never a
+    reading of the model's words (any other reply, "I can't pick one" or a sentence, is not it: the safe side)."""
+    return " ".join(str(text or "").split()).strip(" .!").casefold() == REST_DONE_WORD
+
+
+def skill_rest(plan: Plan | None) -> bool:
+    """A skill route whose skill ended done may have left part of the request undone (sBrainFix, F2): it goes back to
+    the planner for the rest. Not for a send or a join (rule 8: the capability's own ending stands). Code facts only
+    (the route, the declared commit)."""
+    return (plan is not None and plan.kind == "act" and bool(plan.skill)
+            and plan.consent.commit not in ("send", "join"))
+
+
+def look_only(plan: Plan | None, result: ExecResult) -> bool:
+    """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
+    check reading nothing is not the end of the request. Code facts only (the closed verb lists, the step states)."""
+    if plan is None or plan.kind != "act" or not plan.steps or plan.skill:
+        return False
+    return all(s.verb not in ACT_VERBS for s in plan.steps) and not _acted(result)
+
+
 def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
     model's text after non-committing steps is never taken as the final word)."""
@@ -2358,4 +2493,6 @@ def _as_result(got: Any) -> ExecResult:
 
 
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
-           "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps"]
+           "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps", "look_only",
+           "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "SKILL_RESTS_MAX", "SKILL_REST_CALLS",
+           "skill_rest", "rest_done_reply", "LINE_REST_UNDONE"]

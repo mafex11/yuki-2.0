@@ -24,7 +24,8 @@ doesn't cover makes the line "<what was verified>; I couldn't check the rest."
 
 **The line is code's**, one template per probe (:data:`LINES`), filled only from the probe's own arguments and
 evidence; the model writes no "done" sentence, so a weak probe can't carry a strong claim. ``None`` (couldn't read) is
-never "done": the engine's ``LINE_UNVERIFIED``. ``False`` goes back to the planner once with what showed; still false:
+never "done": the engine's ``LINE_UNVERIFIED`` after an act step ran, "I tried, ..." when none did (:func:`unread_line`).
+``False`` goes back to the planner once with what showed; still false:
 "I couldn't confirm <what the probe looked for>: <what showed>" (:func:`not_confirmed`; never the planner's goal text).
 A page check of a request that named its browser reads that browser's page (:func:`with_browser`).
 
@@ -62,7 +63,10 @@ NONE = "none"
 
 #: Each probe's arguments: ``(required, optional)``. A process probe takes ``process`` (``window`` is the engine's own
 #: alias for it); a generic probe's ``window`` is an hwnd from the overview, or a title hint. ``driver`` probes take any
-#: further scalar arguments (the driver module's own).
+#: further scalar arguments (the driver module's own). ``page_at``'s ``site`` may be written as a site file's name
+#: ("youtube"), a host ("youtube.com", "www.youtube.com") or an address: the engine's probe normalises it the one way
+#: (``yuki.skills.donecheck.site_key``: scheme, ``www.`` and path dropped, a host a site file lists -> that site), and
+#: the line names the site the same way (:func:`_site_words`); ``kind`` is a page template's kind (``home``, ``watch``).
 PROBE_ARGS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "read_back": ((), ()),
     "uia_name": (("process", "name"), ("role", "container")),
@@ -120,6 +124,8 @@ LINES: dict[str, str] = {
     "level_system": "The volume is at {level}%.",
     "page_at": "{site} is open.",
     "page_at_in": "{site} is open in {App}.",
+    "page_kind": "{site}'s {page} is open.",
+    "page_kind_in": "{site}'s {page} is open in {App}.",
     "tab_shown": "That tab is showing in {App}.",
     "foreground": "{App} is in front.",
     "mic_held": "{App} has the microphone now.",
@@ -703,6 +709,60 @@ def _display(value: Any) -> str:
     return util.app_name(str(value or "")) if value else "It"
 
 
+def _site_key(site: Any) -> str:
+    """A page check's site the way the probe reads it (``yuki.skills.donecheck.site_key``), or as written."""
+    try:
+        from yuki.skills.donecheck import site_key
+
+        return site_key(site)
+    except Exception:  # noqa: BLE001 - the probe module can't be read: the value as written
+        return " ".join(str(site or "").split()).casefold()
+
+
+def _host_name(host: str) -> str:
+    """The name in a bare host (review r1 L4): the label before its top-level one ("open.spotify.com" -> "spotify",
+    "en.wikipedia.org" -> "wikipedia", "github.com" -> "github"), or the one before that under a two-letter country
+    label after a short one ("bbc.co.uk" -> "bbc"). A fixed-format cut of DNS labels, never a reading of them."""
+    labels = [p for p in str(host or "").split(".") if p]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
+    if len(labels) >= 3 and len(labels[-1]) == 2 and len(labels[-2]) <= 3:
+        return labels[-3]
+    return labels[-2]
+
+
+def _site_words(site: Any) -> str:
+    """A page check's site as people say it (sBrainFix, F3): normalised the way the probe reads it (:func:`_site_key`),
+    so "youtube.com" and "https://www.youtube.com/" are said "Youtube" (never "Youtube Com", never an address read
+    out); a site with no file by the name in its host (:func:`_host_name`: "github.com" -> "Github",
+    "open.spotify.com" -> "Spotify")."""
+    key = _site_key(site)
+    return _display(_host_name(key) if "." in key else key)
+
+
+#: How a page template's kind is said where its key is not the page's plain name (review r1 L3); any other kind of a
+#: site file's ``[pages]`` is said "<kind> page". Display words for the files' keys, never a reading of a page.
+PAGE_KIND_WORDS: dict[str, str] = {"watch": "video page", "handle": "channel page"}
+
+
+def _page_words(site: Any, kind: Any) -> str:
+    """A page check's ``kind`` as said ("video page", "home page"), only when it is one the probe knows: a key of the
+    site file's ``[pages]`` (``yuki/connect/sites``), or ``home`` (any site's root path). ``""`` for none or any other
+    value (the plan's free text is never said)."""
+    want = " ".join(str(kind or "").split()).casefold()
+    if not want:
+        return ""
+    try:
+        from yuki.connect import templates
+
+        kinds = {str(k).casefold() for k in (templates.site(_site_key(site)).get("pages") or {})}
+    except Exception:  # noqa: BLE001 - no site files: only the root path is known
+        kinds = set()
+    if want not in kinds and want != "home":
+        return ""
+    return PAGE_KIND_WORDS.get(want, f"{want} page")
+
+
 def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
                 window_entry: Mapping[str, Any] | None = None,
                 consent: Mapping[str, Any] | None = None) -> tuple[str, dict[str, Any]]:
@@ -726,7 +786,13 @@ def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any]
             return "level_system", {"level": shown}
         return "level", {"App": app, "level": shown}
     if probe == "page_at":
-        site = _display(args.get("site"))
+        site = _site_words(args.get("site"))
+        page = _page_words(args.get("site"), args.get("kind"))
+        if page:
+            # review r1 L3: a check of one kind of page names it ("Youtube's video page is open in Arc."), so its
+            # "I couldn't confirm ..." never says the site isn't open while its home page is
+            return ("page_kind_in", {"site": site, "page": page, "App": app}) if args.get("process") else (
+                "page_kind", {"site": site, "page": page})
         # x9: the browser the page was read in, when the check was held to one (its ``process``)
         return ("page_at_in", {"site": site, "App": app}) if args.get("process") else ("page_at", {"site": site})
     if probe == "message_sent":
@@ -766,6 +832,9 @@ def claim_for(probe: str, args: Mapping[str, Any] | None, *, window_entry: Mappi
     (:data:`NAMED_FIRST`) and names it (never "It shows ..."). ``""``: no such claim (say the plain line)."""
     if probe in NO_CLAIM or probe not in PROBES or not isinstance(args, Mapping):
         return ""
+    if probe == "page_at" and " ".join(str(args.get("kind") or "").split()) and not _page_words(args.get("site"),
+                                                                                                args.get("kind")):
+        return ""   # review r1 L3: a kind no site file names can't be said, and "<site> is open" would be untrue
     try:
         key, fields = _line_parts(probe, args, {}, window_entry=window_entry)
         template = LINES[key]
@@ -898,6 +967,57 @@ def seed_done(seed: Mapping[str, Any], env: ProbeEnv) -> DoneResult:
                       seen=seen_words(probe, verdict, evidence), probe=probe, evidence=evidence)
 
 
+#: The seed checks the observer never reads (:func:`observe_seed`): a route's own read-back (nothing to read without the
+#: route), and a send's or a join's (the capability's own; rule 8: a check that reads a send is never a by-product).
+OBSERVE_SKIP = frozenset({"read_back", "message_sent", "mic_held"})
+
+
+def observe_seed(seed: Mapping[str, Any] | None, env: ProbeEnv, *,
+                 log: Callable[..., None] | None = None) -> threading.Thread | None:
+    """sBrainFix (F8): the hand-off's own check, read once as an observer after a request it seeded ended "verified" or
+    "likely" by a plan's own check; its verdict is ignored (the plan's check decided the line and the level). It is
+    how a skill's driver learns from the steps that finished its work: the Spotify playlist driver keeps "Japanese" as
+    another name of the row the steps played (``yuki.skills.spotify_route._handoff_verdict``, its finish gate after a
+    hand-off), which a seeded plan by steps with a probe of its own never ran (16 Oct simulation B08: played, never
+    learned). Read on a short-lived thread, off the speaking path, within :func:`seed_done`'s budget. Never for a
+    hand-off without a check, nor one whose check reads a send or a join (:data:`OBSERVE_SKIP`, a send's moment, a
+    sending skill's driver check: ``yuki.brain.plan.seed_sends``). ``log``: one content-free record (the probe's code
+    word and the result word). The thread, or ``None`` when nothing is read. Never raises."""
+    try:
+        spec = seed.get("done") if isinstance(seed, Mapping) else None
+        if not isinstance(spec, Mapping):
+            return None
+        probe = str(spec.get("probe") or "")
+        if not probe or probe in OBSERVE_SKIP or (probe == "moment" and str(spec.get("kind") or "") in COMMIT_MOMENTS):
+            return None
+        from yuki.brain.plan import seed_sends
+
+        if seed_sends(seed):
+            return None
+        held = dict(seed)
+    except Exception:  # noqa: BLE001 - an unreadable seed: nothing to observe
+        return None
+
+    def job() -> None:
+        try:
+            got = seed_done(held, env)
+            word = {True: "done", False: "false", None: "unverified"}.get(got.verdict, "unverified")
+        except Exception as exc:  # noqa: BLE001 - an observer never breaks anything
+            word = f"error_{type(exc).__name__}"[:48]
+        if log is not None:
+            try:
+                log("brain_seed_observer", check=probe, result=word)
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        thread = threading.Thread(target=job, name="yuki-brain-seed-observer", daemon=True)
+        thread.start()
+        return thread
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def with_browser(probe: str, args: Mapping[str, Any], browser: str) -> dict[str, Any]:
     """A probe's arguments with page_at's ``process`` (the program whose page it reads: ``yuki.skills.donecheck``
     compares it with the window's process image) filled from the browser the request named (x9: its process image,
@@ -909,23 +1029,40 @@ def with_browser(probe: str, args: Mapping[str, Any], browser: str) -> dict[str,
     return out
 
 
+def env_acted(env: ProbeEnv) -> bool:
+    """Whether an act step of this request ran before the check (the executor's last act: its window, or its own
+    verdict). Code facts only; an act whose window and verdict are both unknown counts as none (the safe side: "I
+    tried" is never a false claim)."""
+    return bool(dict(env.acted or {}).get("hwnd")) or isinstance(env.last_verdict, bool)
+
+
+def unread_line(env: ProbeEnv) -> str:
+    """The line for a check that couldn't read (sBrainFix, F9): the engine's "I did it, but I couldn't confirm it
+    worked." only after an act step ran (:func:`env_acted`); with none (a plan that only looked, 16 Oct simulation B08),
+    "I tried, but I couldn't confirm it worked." (``util.LINE_UNVERIFIED``): never "I did it" for nothing done."""
+    from yuki.skills.engine import LINE_UNVERIFIED
+
+    return LINE_UNVERIFIED if env_acted(env) else util.LINE_UNVERIFIED
+
+
 def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window: Mapping[str, Any] | None = None,
               cancelled: Callable[[], bool] | None = None, args: Mapping[str, Any] | None = None) -> DoneResult:
     """An act plan's own pick from the closed list: read (bounded), covered, lined. ``hwnd`` / ``last_window``: the
     window the last act step acted on (its events pace the re-reads; ``read_back`` names its app). ``args``: the
     done's arguments as the executor resolved them (x9: page_at's ``process`` the browser the request named,
-    :func:`with_browser`); ``None``: as the plan wrote them."""
-    from yuki.skills.engine import LINE_UNVERIFIED
+    :func:`with_browser`); ``None``: as the plan wrote them. A check that couldn't read says "I did it, but I couldn't
+    confirm it worked" only when an act step of this request ran; else "I tried, ..." (:func:`unread_line`)."""
     from yuki.brain.consent import plan_consent
 
+    unread = unread_line(env)
     probe, written, why = plan_done(plan)
     if probe == NONE or written is None or probe not in PROBES:
         # the validator lets no act plan through without a probe; a broken one is never "done"
-        return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="nothing was set to check it", probe=probe)
+        return DoneResult(None, util.UNVERIFIED, unread, seen="nothing was set to check it", probe=probe)
     args = dict(args) if isinstance(args, Mapping) else written
     if probe not in PICK_PROBES or (probe == "moment" and str(args.get("kind") or "") in COMMIT_MOMENTS):
         # this plan sent and joined nothing (rows 3-4): a send or a join read now would be the user's own doing
-        return DoneResult(None, util.UNVERIFIED, LINE_UNVERIFIED, seen="a send or a join is not this plan's to check",
+        return DoneResult(None, util.UNVERIFIED, unread, seen="a send or a join is not this plan's to check",
                           probe=probe, args=args)
     entry: dict[str, Any] = dict(last_window or {}) if probe == "read_back" else {}
     if probe in GENERIC_PROBES and probe != "file_exists" and env.dispatcher is not None:
@@ -942,7 +1079,7 @@ def pick_done(plan: Any, env: ProbeEnv, *, hwnd: int | None = None, last_window:
     consent = plan_consent(plan)
     if verdict is not True:
         return DoneResult(verdict, util.FAILED if verdict is False else util.UNVERIFIED,
-                          LINE_UNVERIFIED if verdict is None else util.LINE_FAILED,
+                          unread if verdict is None else util.LINE_FAILED,
                           seen=seen_words(probe, verdict, evidence), probe=probe, args=args, evidence=evidence,
                           window=entry)
     covered, uncovered = coverage(probe, args, plan, window_entry=entry, consent=consent)
@@ -972,6 +1109,11 @@ def not_confirmed(goal: str = "", seen: str = "", *, probe: str = "", args: Mapp
 def stuck(step: str, seen: str) -> str:
     """The line when the budget runs out (§2.3)."""
     step = " ".join(str(step or "").split()).rstrip(". ") or "a step"
+    first = step.split(" ", 1)[0]
+    if len(first) > 1 and first[0].isupper() and first[1:].islower():
+        # a step line in the island's words ("Clicking Play ネオン", sBrainFix F7) inside the sentence; a first word
+        # with capitals of its own ("YouTube") is a name and stays as it is
+        step = step[0].lower() + step[1:]
     seen = " ".join(str(seen or "").split()).rstrip(". ") or "it didn't work"
     return LINE_STUCK.format(step=step, seen=seen)
 
@@ -1041,4 +1183,4 @@ __all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT
            "allowed_probes", "as_hwnd", "claim_for", "coverage", "engine_line", "find_named", "line_for",
            "not_confirmed", "outcome", "overview", "own_check", "parse_args", "pick_done", "plan_class", "plan_done",
            "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck", "wait_read",
-           "window_of", "with_browser"]
+           "window_of", "with_browser", "env_acted", "unread_line", "observe_seed", "PAGE_KIND_WORDS"]

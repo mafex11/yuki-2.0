@@ -184,7 +184,8 @@ def plan_schema() -> dict[str, Any]:
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
             "to": _nullable("string", "The person or channel."),
-            "text": _nullable("string", "The exact message text."),
+            # sBrainFix (F1c): their own words, never translated or restyled (the core prompt says it in full)
+            "text": _nullable("string", "The message, in their words."),
         },
     }
     element = {
@@ -209,11 +210,13 @@ def plan_schema() -> dict[str, Any]:
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
             "expect": {"anyOf": [_probe_schema(), {"type": "null"}]},
-            "say": _nullable("string"),
+            # sBrainFix (F7): spoken the moment the step is dispatched, so before its result (the room: revises's
+            # description, which said nothing code uses: a replan's revises is code's own, parse_header)
+            "say": _nullable("string", "Spoken before any result."),
         },
     }
-    # goal, route, question and say carry no description here: the core prompt says each (one line in their terms;
-    # steps or skill:<id>; kind ask: one question; voice words for a slow step), and the probe arguments took the room
+    # goal, route and question carry no description here: the core prompt says each (one line in their terms; steps
+    # or skill:<id>; kind ask: one question), and the probe arguments took the room (say has a few words: sBrainFix)
     return {
         "type": "object",
         "additionalProperties": False,
@@ -221,7 +224,7 @@ def plan_schema() -> dict[str, Any]:
         "properties": {
             "goal": {"type": "string"},
             "kind": {"type": "string", "enum": list(KINDS)},
-            "revises": _nullable("string", "The plan id it replaces."),
+            "revises": _nullable("string"),
             "target": target,
             "route": {"type": "string"},
             "consent": consent,
@@ -453,6 +456,9 @@ class Checks:
         spent_skills: Skills that already ran in this request and handed over or couldn't confirm the result (code
             ids): a plan that runs one again is invalid, as is one that runs the skill the seed handed over
             (:func:`spent_skills`).
+        done_skills: Skills whose skill route ended done in this request (sBrainFix, F2: the planner was then asked
+            for the rest of the request): that exact skill is not run again here (its family still may, for another
+            value).
     """
 
     plan_id: str
@@ -464,6 +470,7 @@ class Checks:
     repeat_rejected: bool = False
     current_plan: str | None = None
     spent_skills: frozenset[str] = frozenset()
+    done_skills: frozenset[str] = frozenset()
 
 
 #: A hand-off whose skill never ran its own way to the end: one of its steps would send or join with no plan behind it
@@ -505,6 +512,8 @@ def _spent_error(where: str, skill: str, checks: Checks) -> str | None:
     """The error for a plan that runs a skill that just handed over or couldn't confirm (``skill``: a menu id, so the
     error holds no model-written text), else ``None``."""
     why = spent_skills(checks).get(skill_family(skill))
+    if why is None and str(skill or "").strip() in checks.done_skills:
+        why = "already did its part in this request"
     if why is None:
         return None
     # the id in quotes: the log's code of this error (error_code) leaves quoted values out
@@ -735,7 +744,17 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
         target = Target(*(_opt_str(t, k, errors, "target.", TARGET_CHARS) for k in ("app", "window", "person", "item")))
     route = raw.get("route")
     route = route.strip() if isinstance(route, str) else ""
+    if route[:6].casefold() == "route ":
+        route = route[6:].strip()   # the field's own name written in its value ("route skill:message", 16 Oct B31)
     skill = route[len(SKILL_ROUTE_PREFIX):].strip() if route.startswith(SKILL_ROUTE_PREFIX) else None
+    if skill is None and route != STEPS_ROUTE and checks.skills and route in checks.skills:
+        # sBrainFix (review r1 runs): a route written as a menu id itself, without "skill:" (16 Oct B28 runs: an
+        # invalid plan and a model call each time), is that skill's route: an exact catalog id, never a guess
+        skill = route
+    if skill is None and route != STEPS_ROUTE and kind in ("ask", "answer"):
+        # a question or an answer runs no skill, so its route is steps whatever else was written ("none", "ask":
+        # 16 Oct B08 runs, an invalid plan and a model call each time)
+        route = STEPS_ROUTE
     if route != STEPS_ROUTE and skill is None:
         errors.append("route must be steps or skill:<id> from the menu")
     elif skill is not None:
@@ -925,6 +944,17 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
         value = None
     if isinstance(value, str) and verb not in RAW_VALUE_VERBS:
         value = _unescape_json_text(value) if verb in ("run_skill", "memory") else unescape(value)
+    if verb == "look":
+        # sBrainFix (review r1 runs): a look written without what to read, or without the window a window read needs
+        # (16 Oct, about a third of the web runs: look_value_must_be_one_of / look_page_needs_window, an invalid plan
+        # after its earlier steps already ran), reads its window (else the desktop), in the plan's own target window
+        # when it names an hwnd: a read either way, so the default can do nothing the plan didn't ask for
+        own = (header.target.window or "").strip()
+        own = own if own.isdigit() else ""
+        if not " ".join(str(value or "").split()):
+            value = "window" if window or own else "desktop"
+        if not window and own and str(value).strip() in LOOK_NEEDS_WINDOW:
+            window = own
     if isinstance(value, str) and len(value) > VALUE_CHARS:
         errors.append(f"{where}value is longer than {VALUE_CHARS} characters")
     submit = raw.get("submit")
@@ -943,11 +973,52 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
         raise PlanError(errors)
     step = Step(index=index, verb=str(verb), window=window, element=element, value=value, submit=submit,
                 expect=expect, say=say)
+    if step.say:
+        # sBrainFix (F7): the line is heard before the step runs (the voice's step line as the step closes in the
+        # stream, the executor's as it starts), so its words are code's for that step, never the model's: on 10 and
+        # 16 Oct the model wrote "Playing your Japanese playlist now." and "Sent it to Hemanth." there, whatever the
+        # prompt said. The model still decides which steps are narrated (it wrote a say).
+        step = replace(step, say=step_line(step, header))
     _check_verb(step, header, checks, prior, where)
     if checks.failed_step is not None and not checks.repeat_rejected and step.same_as(checks.failed_step):
         checks.repeat_rejected = True
         raise PlanError([f"{where}that step just failed: change it"])
     return step
+
+
+#: sBrainFix (review r1 M2): the window and tab actions whose step is said by no line: a close may still be asked
+#: about first (consent's lasting row), so "Closing Arc." before that question would claim what may not happen.
+UNSAID_ACTIONS: frozenset[str] = frozenset({"close"})
+#: sBrainFix (review r1 L5): a run_skill step's line when its skill is a capability (shipped, never learned: a key
+#: without the learned ``#`` part, :func:`skill_family`); a learned skill's is the island's "Doing it the way I
+#: learned".
+LINE_CAPABILITY_STEP = "Working on it."
+
+
+def step_line(step: Step, header: Plan) -> str | None:
+    """What Yuki says as a step starts (sBrainFix, F7): the step in the island's words (``yuki.ui.step_words``:
+    built from the verb, the control's role and name, the plan's target app and the verb's closed values only, never
+    the step's free text), as a sentence ("Clicking Play ネオン."): what starts, never that it is done or happening
+    to work. ``None`` (nothing said) when no words come.
+
+    The line is heard before the step runs and before its consent check (review r1 M2), so it never says more than
+    what starts: typing is said without its Enter ("Typing in the Message box.", never "Typing and sending a
+    message.": Enter in an address bar sends nothing, and a send the check refuses never went); a close
+    (:data:`UNSAID_ACTIONS`) is said by no line; a capability's run_skill step is :data:`LINE_CAPABILITY_STEP`."""
+    if step.verb in ("window_action", "tab") and " ".join(str(step.value or "").split()).casefold() in UNSAID_ACTIONS:
+        return None
+    if step.verb == "run_skill":
+        call = step.skill_call(header.skill)
+        if call is None or skill_family(call[0]) == call[0]:
+            return LINE_CAPABILITY_STEP
+    try:
+        from yuki.ui.step_words import describe_plan_step
+
+        said = replace(step, submit=False) if step.submit else step
+        words = " ".join(str(describe_plan_step(said, app=header.target.app) or "").split()).rstrip(". ")
+    except Exception:  # noqa: BLE001 - presentation only: say nothing rather than the model's words
+        return None
+    return f"{words}."[:SAY_CHARS] if words else None
 
 
 def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step], where: str) -> None:
@@ -1185,5 +1256,5 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape", "seed_sends",
+    "spent_skills", "unescape", "seed_sends", "step_line", "UNSAID_ACTIONS", "LINE_CAPABILITY_STEP",
 ]

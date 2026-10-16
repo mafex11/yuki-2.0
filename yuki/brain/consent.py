@@ -121,8 +121,8 @@ LINE_NO_RECIPIENT = "a send names whom it goes to in consent.to"
 LINE_DECLARED_DRAFT = ("the plan declares a send (consent.commit send) but this step leaves a draft (its send slot "
                        "{slots} on a non-sending option): put the send slot on its sending value with the text in the "
                        "text slot, or declare consent.commit none for a draft")
-LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write the same text in both (the countdown "
-                      "shows consent.text)")
+LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write the same text in both, the message in "
+                      "their own words and language (the countdown shows consent.text)")
 LINE_QUOTE = ("consent.quote is not the user's words as heard: copy their words asking for the send exactly as they "
               "stand in their words (a name they said may be written as that person's name)")
 #: The quote stands in a turn that says nothing of the message, while another turn of theirs names the person and says
@@ -177,7 +177,9 @@ PLAIN_WHY: dict[str, str] = {
     "join_window": "joining is your click",
     "join_control": "joining is your click",
     "join_effect": "joining is your click",
-    "undeclared_send": "that would have sent something you didn't ask me to send",
+    # sBrainFix (F1d): true whether or not their words asked for the send (the refusal is about the way, never about
+    # what they asked: on 10 Oct and in the 16 Oct simulation this was said right after they said yes to the send)
+    "undeclared_send": "that step could have sent it outside the chat app's own way",
     "not_capability": "I only send messages through the chat apps' own way",
     "recipient": "I couldn't be sure who it was for",
     "recipient_slot": "I couldn't be sure who it was for",

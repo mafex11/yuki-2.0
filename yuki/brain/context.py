@@ -485,8 +485,11 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -
         text += "\n" + SEED_DRAFT_LINE
     missing = one_line(seed.get("missing"), 40) if isinstance(seed.get("missing"), str) else ""
     if missing:
-        text += (f"\nIts routes found no {missing} named as given. Pick the one they mean from what the screen shows "
-                 f"and what memory holds, then do it by steps.")
+        # sBrainFix (review r1 L2): the pick is made, not asked (16 Oct B08: "Which one's your Japanese playlist?"
+        # with every name read out, in 3 of 5 runs)
+        text += (f"\nIts routes found no {missing} named as given. Pick the one they most likely mean from what the "
+                 f"screen shows and what memory holds (ask only if none could be it, never with a list), then do it "
+                 f"by steps.")
     seen = seed.get("seen")
     names = [one_line(n, 80) for n in (seen if isinstance(seen, (list, tuple)) else ()) if str(n or "").strip()]
     if names:
@@ -722,6 +725,45 @@ def read_report(result: ExecResult | Mapping[str, Any]) -> str:
     return f"{head}\n\n{body}\n\nAnswer them now in plain text, from what came back."
 
 
+def look_report(result: ExecResult | Mapping[str, Any], plan: Plan | None) -> str:
+    """An act plan that only looked (sBrainFix, F9): nothing of it acted, and its check couldn't confirm what they asked
+    for, so what its reads returned (each fenced by whoever read it) goes back for the plan that does it, never a line
+    that says it was done. Code-written."""
+    pid = plan.id if plan else ""
+    reads = [str(r) for r in _field(result, "reads", None) or [] if str(r).strip()]
+    lines = [f"{CHECK_LABEL} Plan {pid} only looked (none of its steps acted), and its check couldn't confirm what "
+             f"they asked for."]
+    statuses = _field(result, "statuses", None) or []
+    if statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    lines.append("What its reads returned:\n\n" + "\n\n".join(reads) if reads else "(Its reads returned nothing.)")
+    lines.append(f"Now plan what is left to do (revises {pid}): the steps in the app, with a done probe that reads "
+                 f"the result; redo nothing that already took. If it is already done or can't be done, reply in one "
+                 f"short line saying what you saw.")
+    return "\n".join(lines)
+
+
+#: The one-word reply the planner gives after a skill route did its part when all they asked is done
+#: (:func:`skill_rest_report`; ``yuki.brain.agent.rest_done_reply`` compares it exactly).
+REST_DONE_WORD = "done"
+
+
+def skill_rest_report(plan: Plan | None, line: str) -> str:
+    """A skill route that ended done (sBrainFix, F2): the skill's own check saw its own part, which may be only part of
+    what they asked ("Open YouTube home" for "open a new tab and put something on"). Whether anything is left is the
+    planner's to read from their words, never code's: it plans the rest by steps or replies that it is all done (the
+    held line then stands). Code-written; the skill is a menu id, the line code's own."""
+    pid = plan.id if plan else ""
+    skill = str(getattr(plan, "skill", "") or "") if plan else ""
+    return "\n".join([
+        f"{CHECK_LABEL} Plan {pid} ended: done. The skill {skill} did its part and its own check saw it. Yuki's line "
+        f"for it, not said yet: {one_line(line, 200)}",
+        f"Their request may ask for more than that skill does. If any part of what they asked is not done yet, plan "
+        f"just that part now by steps (revises {pid}): look first, then click or type in the app, with a done probe "
+        f"that reads the result; don't run that skill again or redo what it did. If all they asked is done, reply "
+        f"with the one word: {REST_DONE_WORD}. If the rest can't be done, say why in one short line."])
+
+
 def invalid_report(errors: Sequence[str], statuses: Sequence[Any] = (), *, replans_left: int | None = None) -> str:
     text = f"{CHECK_LABEL} The plan was not run as written: " + "; ".join(errors)
     if statuses:
@@ -758,5 +800,7 @@ def answer_report(question: str, answer: str | None) -> str:
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "request_turn", "Conversation",
-           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report", "invalid_report", "unconfirmed_report", "answer_report", "clip",
+           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
+           "look_report", "skill_rest_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
+           "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]
