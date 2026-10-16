@@ -113,6 +113,26 @@ LINE_KEYS_SHORT = "I moved Spotify's volume to {now:g}%, but ran out of time bef
 PROVEN_ROUTES = (("volume", "spotify_in_app"), ("spotify.playlist", "library"))
 STATES = ("covered", "visible", "minimised")
 
+#: The slot the playlist rungs look for; a read of Your Library with no row of that name says so to the hand-off
+#: (failure fix-plan IF-seed: ``facts["missing"]``, a code word) with the row names it read (``facts_ram["seen"]``, RAM
+#: only, at most :data:`SEEN_MAX`), so the thinker picks the user's real playlist from the screen and memory.
+PLAYLIST_SLOT = "playlist"
+SEEN_MAX = 40
+#: After a request named a playlist no row is called (or Spotify had no usable window and nothing played): for this long
+#: (the exchange's span, fix-plan IF-words) the playlist the hand-off job then puts on, seen playing on this PC by its
+#: finish gate or by a rung's own check of the job's press, is what those words meant, kept through
+#: ``taste.note(said_as=...)`` so the same words play it at rung A next time. At most one watch at a time; nothing
+#: polls. Also how long after a play through such a pairing another row played drops it (:func:`_said_doubt`).
+PAIR_WATCH_S = 120.0
+#: Session states with nothing playing: a row the hand-off job's finish gate then sees playing is the job's pick (the
+#: paused playlist resumed included). Any other state with no row read as playing (playing something the read
+#: couldn't name, unread) starts no watch: never a wrong pairing.
+IDLE_STATES = ("paused", "stopped", "none", "closed", "opened")
+#: Spotify started by the launch rung (it already acted): its warm-up gets at least this long even past the request's
+#: time, and Your Library this long to fill (a cold or empty window would only hand the request to the thinker).
+LAUNCH_WARM_S = 2.5
+LAUNCH_ROWS_S = 2.0
+
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Data
@@ -401,7 +421,9 @@ class Look:
     ``not_built`` (frame only: not warm), ``no_library`` (player controls, no grid: collapsed Library or full-screen
     view), ``no_rows`` (a grid with no rows), ``not_in_view`` (rows, none with that name), ``ambiguous`` (two fit:
     asked, never guessed), ``no_wording`` (a row with neither known play nor pause wording: a missing label),
-    ``missing`` / ``timeout`` / ``error``. Names and elements stay in RAM."""
+    ``missing`` / ``timeout`` / ``error``. Names and elements stay in RAM: ``names`` (every row read, in the grid's
+    order), ``kept`` (the rows whose owner parsed and is not Spotify: PLAN.md D1's rule for names that may be kept,
+    encrypted, as taste candidates) and ``playing`` (the one row reading the pause wording at this read, or None)."""
 
     status: str
     name: str = ""
@@ -416,6 +438,9 @@ class Look:
     details: dict[str, Any] = field(default_factory=dict)
     calls: int = 0
     ms: float = 0.0
+    names: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)
+    playing: str | None = None
 
     def counts(self) -> dict[str, Any]:
         """Content-free: code words and counts only."""
@@ -471,6 +496,35 @@ def _owner_of(group: Any, lab: Any) -> str | None:
     return None
 
 
+def _pause_names(group: Any, lab: Any, learned: Mapping[str, str] | None) -> bool:
+    """Whether the row's own buttons hold its pause wording ("Pause {name}": the row that is playing)."""
+    names = {b.name for b in _sd().local_find(group, "Button")}
+    return any(pause.replace("{name}", group.name) in names for _play, pause, _s in _wordings(lab, learned))
+
+
+def _row_facts(groups: list[Any], lab: Any, learned: Mapping[str, str] | None) -> tuple[list[str], list[str],
+                                                                                         str | None]:
+    """``(names, kept, playing)`` of the rows read (RAM only): every row's name in the grid's order; the names whose
+    owner parsed and is not Spotify (PLAN.md D1: only those may be kept, encrypted); the one row reading its pause
+    wording, or None (none, or two: never guessed)."""
+    names: list[str] = []
+    kept: list[str] = []
+    playing: list[str] = []
+    spotify = str(getattr(lab, "spotify_owner", "") or "") if lab is not None else ""
+    for g in groups:
+        name = _sd().norm(g.name)
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+        owner = _owner_of(g, lab) if lab is not None else None
+        if owner is not None and spotify and owner != spotify and name not in kept:
+            kept.append(name)
+        if _pause_names(g, lab, learned):
+            playing.append(name)
+    return names, kept, (playing[0] if len(set(playing)) == 1 else None)
+
+
 def option_label(name: str, owner: str) -> str:
     """How the two-rows question offers one row (Yuki's own wording, built from the row's name and its owner as
     Spotify shows them); an answer is matched back to a row by this exact label (an identity, never by meaning)."""
@@ -493,29 +547,66 @@ def look_row(tree: Any, want: str, langs: list[Any] | None = None,
     groups = _groups(grid, lab)
     if not groups:
         return Look("no_rows")
+    names, kept, playing = _row_facts(groups, lab, learned)
+    seen = {"rows": len(groups), "names": names, "kept": kept, "playing": playing}
     hits = [g for g in groups if _fold(g.name) == _fold(want)]
     if not hits:
         # the answer to the two-rows question: one of the options it offered, the whole label as an identity
         hits = [g for g in groups if (o := _owner_of(g, lab)) is not None
                 and _fold(option_label(g.name, o)) == _fold(want)]
     if not hits:
-        return Look("not_in_view", rows=len(groups))
+        return Look("not_in_view", **seen)
     if len(hits) > 1:
         owners = [_owner_of(g, lab) for g in hits]
-        return Look("ambiguous", rows=len(groups), name=hits[0].name,
-                    owners=[o for o in owners if o] if all(owners) else [])
+        return Look("ambiguous", name=hits[0].name, owners=[o for o in owners if o] if all(owners) else [], **seen)
     group = hits[0]
     buttons = sd.local_find(group, "Button")
     for play, pause, source in _wordings(lab, learned):
         p = [b for b in buttons if b.name == play.replace("{name}", group.name)]
         q = [b for b in buttons if b.name == pause.replace("{name}", group.name)]
         if len(p) == 1 and not q:
-            return Look("ok", name=group.name, state="play", button=p[0], where="grid", source=source,
-                        rows=len(groups))
+            return Look("ok", name=group.name, state="play", button=p[0], where="grid", source=source, **seen)
         if len(q) == 1 and not p:
-            return Look("ok", name=group.name, state="pause", button=q[0], where="grid", source=source,
-                        rows=len(groups))
-    return Look("no_wording", name=group.name, rows=len(groups))
+            return Look("ok", name=group.name, state="pause", button=q[0], where="grid", source=source, **seen)
+    return Look("no_wording", name=group.name, **seen)
+
+
+def playing_row(tree: Any, langs: list[Any] | None = None, learned: Mapping[str, str] | None = None) -> str | None:
+    """The name of the playlist Spotify shows playing, with no name asked: the one row of DataGrid "Your Library"
+    whose own button reads its pause wording ("Pause {name}"), else the one button outside every DataGrid reading the
+    pause wording with a name (a playlist page's header; the player's bare "Pause" never fits a "Pause {name}"). None
+    when none or more than one fits (never guessed). Used after a hand-off: which playlist did the fallback start?"""
+    return playing_of(tree, langs, learned)[0]
+
+
+def playing_of(tree: Any, langs: list[Any] | None = None,
+               learned: Mapping[str, str] | None = None) -> tuple[str | None, bool]:
+    """:func:`playing_row` and whether that name may be kept (PLAN.md D1): True only for a Library row whose owner
+    parsed and isn't Spotify; a page header (its owner unread) never."""
+    sd = _sd()
+    langs = langs if langs is not None else _langs()
+    if not sd._built(tree, langs):
+        return None, False
+    grid, lab = _grid(tree, langs, learned)
+    if grid is not None:
+        _names, kept, playing = _row_facts(_groups(grid, lab), lab, learned)
+        if playing:
+            return playing, playing in kept
+        if any(_pause_names(g, lab, learned) for g in _groups(grid, lab)):
+            return None, False   # two rows read "Pause": never guessed
+    inside = {b.name for g in tree.find("DataGrid") for b in sd.local_find(tree.subtree(g), "Button")}
+    lab0 = lab if lab is not None else (langs[0] if langs else None)
+    found: set[str] = set()
+    for _play, pause, _source in _wordings(lab0, learned):
+        head, _, tail = pause.partition("{name}")
+        for b in tree.find("Button"):
+            text = str(b.name or "")
+            if b.name in inside or not text.startswith(head) or (tail and not text.endswith(tail)):
+                continue
+            name = sd.norm(text[len(head): len(text) - len(tail) if tail else None])
+            if name:
+                found.add(name)
+    return (next(iter(found)) if len(found) == 1 else None), False
 
 
 def _same(tree: Any, a: Any, b: Any) -> bool:
@@ -714,6 +805,23 @@ def _look(desk: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None,
     return look
 
 
+def _read_playing(desk: Any, hwnd: int, learned: Mapping[str, str] | None) -> tuple[str | None, str, bool]:
+    """One read of which playlist Spotify shows playing (:func:`playing_of`): ``(name or None, status, own)``; status
+    ``ok`` / ``none`` / ``timeout`` / ``error``; ``own``: a name PLAN.md D1 lets keep. Read-only."""
+    langs = _langs()
+
+    def job(automation: Any, shared: dict) -> None:
+        tree = _sd().UiaTree(automation, int(hwnd))
+        shared["name"], shared["own"] = playing_of(tree, langs, learned)
+        shared["read"] = True
+
+    shared, late = desk.uia(job, READ_S)
+    if not shared.get("read"):
+        return None, "timeout" if late else "error", False
+    name = shared.get("name")
+    return (str(name), "ok", bool(shared.get("own"))) if name else (None, "none", False)
+
+
 def _read_slider(desk: Any, hwnd: int) -> Look:
     """The slider's level now (no set)."""
     langs = _langs()
@@ -861,15 +969,17 @@ def where_playing(desk: Any, status: str, clock: Callable[[], float], sleep: Cal
     return verdict
 
 
-def _ensure_warm(desk: Any, win: Any, call: Any, facts: dict[str, Any], *, force: bool = False) -> bool:
+def _ensure_warm(desk: Any, win: Any, call: Any, facts: dict[str, Any], *, force: bool = False,
+                 floor_s: float = 0.0) -> bool:
     """The warm-up within the request's own time (H2): skipped for a Spotify process already seen built from here;
-    False when the window doesn't build in time ("couldn't")."""
+    False when the window doesn't build in time ("couldn't"). ``floor_s``: at least this long even past the request's
+    time (a rung that already acted: the launch)."""
     with _warmed_lock:
         known = win.pid in _warmed
     if known and not force:
         facts["warm"] = "skipped"
         return True
-    budget = min(_number("request_warm_s", REQUEST_WARM_S, 0.2, 3.0), _left(call))
+    budget = min(_number("request_warm_s", REQUEST_WARM_S, 0.2, 3.0), max(_left(call), float(floor_s)))
     if budget < 0.1:
         facts["warm"] = "no_time"
         return False
@@ -897,12 +1007,18 @@ def _cold(facts: Mapping[str, Any]) -> str:
 
 
 def forget_warm() -> None:
-    """Forget which Spotify processes were warm and the runs' "this PC" verdicts (tests; a Spotify restart gets a new
-    pid anyway)."""
+    """Forget which Spotify processes were warm, the runs' "this PC" verdicts, the names already kept as taste and any
+    playlist watch (tests; a Spotify restart gets a new pid anyway)."""
     with _warmed_lock:
         _warmed.clear()
     with _where_lock:
         _where.clear()
+    with _fed_lock:
+        _fed.clear()
+    with _pair_lock:
+        _pair.clear()
+        _pair_gen[0] += 1
+        _said_play.clear()
 
 
 def _log_read(call: Any, trigger: str, state: str | None, facts: Mapping[str, Any], look: Look | None) -> None:
@@ -960,6 +1076,385 @@ def _other_device(facts: dict[str, Any], *, volume: bool = False) -> Any:
     return _rr(ran=False, outcome="other_device", say=LINE_OTHER_VOLUME if volume else LINE_OTHER, facts=facts)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The user's own playlist names, and what their words meant (failure fix-plan Item 7)
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# 10 Oct: "play my Japanese playlist" read 24 Library rows, none named "Japanese" (the user's is "ネオン"), and every
+# rung stopped. Now:
+# (1) the rows a read sees are the user's own names: kept as taste candidates (encrypted; only rows PLAN.md D1 lets
+#     keep a name), so the menu and the resolver can offer them;
+# (2) a read with no row of that name hands over with ``facts["missing"]`` and the names read (``facts_ram["seen"]``),
+#     so the thinker picks the row from the screen and memory and clicks it by steps;
+# (3) the playlist that hand-off job then puts on is kept as what the words meant (``taste.note(said_as=...)``), so
+#     the same words play it here at rung A next time (:func:`_said_name`). Only that job teaches it: its finish gate
+#     (:func:`_handoff_verdict`), or a rung's own check when the job runs the skill again with the row it picked
+#     (:func:`_pair_request`, :func:`_played`). A play outside the job (the user's own pick after giving up may be
+#     anything) is never kept, and only a row D1 lets keep a name is (review r1 M2, L1);
+# (4) what the user says wins over what was learned: when a row reached through a pairing played and another row plays
+#     within the exchange's span (their correction, whatever its words), the pairing is dropped (``taste.unsay``), so
+#     the words hand over once more and learn again (:func:`_said_doubt`).
+# No mapping is written here, and nothing polls: the watch is a note in RAM that those checks read.
+
+#: Names already kept as taste by this process, per taste kind (folded; RAM): a read with nothing new writes nothing.
+_fed: dict[str, set[str]] = {}
+_fed_lock = threading.Lock()
+#: The one playlist watch at a time (:func:`_pair_start`), RAM only: its generation, the words asked, the row playing
+#: when they named no row (None: nothing playing), the row settled on, until when, and the run's memory, taste kind
+#: and log.
+_pair: dict[str, Any] = {}
+_pair_gen = [0]
+_pair_lock = threading.Lock()
+#: The last play of a row reached through a pairing (:func:`_said_note`), RAM only, under :data:`_pair_lock`: the
+#: words, the row, until when, and the run's memory, taste kind and log.
+_said_play: dict[str, Any] = {}
+
+
+def _taste_kind(call: Any) -> str:
+    """The taste kind of the playlist slot, from the data (``connection.py`` derives ``<app>_<kind>``:
+    ``spotify_playlist``); ``""`` when the skill has none."""
+    try:
+        skill = call.skill
+        slot = skill.slot(PLAYLIST_SLOT) if skill is not None else None
+        if slot is None:
+            return ""
+        from yuki.skills.taste import slot_kind
+
+        return str(slot_kind(skill, slot) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _said_name(call: Any, want: str) -> str | None:
+    """The playlist these exact words were paired with (they named no row, and it then played: :func:`_pair_settle`),
+    when that is another name; None without one or without memory. One bounded memory read."""
+    memory = getattr(call.ctx, "memory", None)
+    kind = _taste_kind(call)
+    if memory is None or not kind or not want:
+        return None
+    from yuki.skills import engine
+
+    def read(client: Any) -> Any:
+        from yuki.skills.taste import said_target
+
+        return said_target(engine._store_of(client), kind, want)
+
+    got = engine._mem(memory, "spotify_said", read, timeout_s=0.3)
+    name = " ".join(str(got or "").split())
+    return name if name and _fold(name) != _fold(want) else None
+
+
+def _feed_seen(call: Any, look: Look) -> None:
+    """The rows a read saw whose names may be kept (``look.kept``: owner parsed and not Spotify, PLAN.md D1) into
+    taste as the user's own playlist names (:func:`yuki.skills.taste.saw`: encrypted, no pick, never a fill), on a
+    short thread off the request's clock, only when this process hasn't kept them yet. Never for an eval run. Logged
+    as counts (``spotify_seen``)."""
+    names = [n for n in look.kept if n]
+    memory = getattr(call.ctx, "memory", None)
+    kind = _taste_kind(call)
+    if not names or memory is None or not kind or getattr(call.ctx, "origin", "") == "eval":
+        return
+    with _fed_lock:
+        known = _fed.setdefault(kind, set())
+        new = {_fold(n) for n in names} - known
+        if not new:
+            return
+        if len(known) > 4 * SEEN_MAX:
+            known.clear()
+        known.update(new)
+    log = _logger(call)
+
+    def job() -> None:
+        from yuki.skills import engine
+        from yuki.skills.taste import saw
+
+        got = engine._mem(memory, "spotify_seen", lambda c: saw(engine._store_of(c), kind, names), timeout_s=2.0)
+        if got is None:
+            with _fed_lock:          # not kept (memory busy or failed): a later read tries again
+                _fed.get(kind, set()).difference_update(new)
+        log("spotify_seen", added=int(got or 0), rows=len(names), kept=got is not None)
+
+    threading.Thread(target=job, name="yuki-spotify-seen", daemon=True).start()
+
+
+def _learns(call: Any) -> tuple[Any, str] | None:
+    """``(memory, taste kind)`` when this run may learn or drop what words meant: it has both, and it isn't an eval
+    run (an eval keeps and changes nothing)."""
+    memory = getattr(call.ctx, "memory", None)
+    kind = _taste_kind(call)
+    if memory is None or not kind or getattr(call.ctx, "origin", "") == "eval":
+        return None
+    return memory, kind
+
+
+def _pair_start(call: Any, asked: str, before: str | None, status: str) -> None:
+    """Start (or restart) the one playlist watch: these words named no row (or nothing could be read), so the playlist
+    the hand-off job then puts on within :data:`PAIR_WATCH_S` is what they meant. ``before``: the row playing at that
+    read (it playing on is nothing the job did); ``status``: the session then. With no row read as playing, only an
+    idle session (:data:`IDLE_STATES`) is watched. Never for an eval run, without memory or a taste kind."""
+    learns = _learns(call)
+    if learns is None or not asked:
+        return
+    log = _logger(call)
+    if before is None and status not in IDLE_STATES:
+        # something plays (or the session couldn't be read) and no row said which: a row seen playing later can't be
+        # told from it, so nothing is watched (no pairing learned this time, never a wrong one)
+        _pair_end(None, "")
+        log("spotify_pair", outcome="not_watched", session=status if str(status).isalpha() else "unknown")
+        return
+    _pair_open(asked, before, memory=learns[0], kind=learns[1], log=log)
+    log("spotify_pair", outcome="watching", before_known=before is not None)
+
+
+def _pair_open(asked: str, before: str | None, *, memory: Any, kind: str, log: Callable[..., None]) -> int:
+    """The watch for ``asked`` (replacing any), RAM only; its generation back. Nothing polls: the hand-off job's
+    finish gate (:func:`_handoff_verdict`) and a rung's own check of a same-exchange press (:func:`_played`) read it."""
+    with _pair_lock:
+        _pair_gen[0] += 1
+        gen = _pair_gen[0]
+        _pair.clear()
+        _pair.update(gen=gen, asked=asked, before=before, settled=None, until=time.monotonic() + PAIR_WATCH_S,
+                     memory=memory, kind=kind, log=log)
+    return gen
+
+
+def _pair_unread(call: Any, asked: str, status: str) -> None:
+    """No row could be read (no window, a cold window, no Library in view): the watch with nothing known playing."""
+    _pair_start(call, asked, None, status)
+
+
+def _pair_end(gen: int | None, outcome: str) -> None:
+    """End the watch (``gen``: only that one; None: whichever is on), logged with ``outcome`` when given."""
+    with _pair_lock:
+        if not _pair or (gen is not None and _pair.get("gen") != gen):
+            return
+        log = _pair.get("log")
+        _pair.clear()
+        _pair_gen[0] += 1
+    if outcome and callable(log):
+        log("spotify_pair", outcome=outcome)
+
+
+def _pair_pending(asked: str | None = None, gen: int | None = None) -> dict[str, Any] | None:
+    """The live watch (for ``asked`` / ``gen`` when given), or None; one whose time is up is ended here."""
+    with _pair_lock:
+        if not _pair:
+            return None
+        if time.monotonic() > float(_pair.get("until") or 0.0):
+            _pair.clear()
+            _pair_gen[0] += 1
+            return None
+        if (asked and _fold(_pair.get("asked")) != _fold(asked)) or (gen is not None and _pair.get("gen") != gen):
+            return None
+        return dict(_pair)
+
+
+def _bare(token: str) -> str:
+    """A word with the punctuation and symbols at its ends taken off (a machine normalisation, never meaning)."""
+    import unicodedata
+
+    i, j = 0, len(token)
+    while i < j and unicodedata.category(token[i])[0] in "PS":
+        i += 1
+    while j > i and unicodedata.category(token[j - 1])[0] in "PS":
+        j -= 1
+    return token[i:j]
+
+
+def _words_hold(words: Any, text: str) -> bool:
+    """Whether ``text`` is a whole-word span of one of the user's turns ``words`` (identity, case folded)."""
+    want = [w for w in (_bare(t) for t in _fold(text).split()) if w]
+    if not want:
+        return False
+    for turn in ([words] if isinstance(words, str) else list(words or [])):
+        have = [w for w in (_bare(t) for t in _fold(turn).split()) if w]
+        if any(have[i:i + len(want)] == want for i in range(len(have) - len(want) + 1)):
+            return True
+    return False
+
+
+def _pair_request(call: Any, row: str, *, acted: bool) -> int | None:
+    """A playlist rung found its row ``row`` and it plays (``acted``: this rung pressed or resumed it; else it already
+    played) while a watch is on. These very words, or that row named as the watch's words: nothing left to learn, the
+    watch ends. Another row while the request's words still hold the watch's (the same exchange: the hand-off job
+    running the skill with the row it picked, or the user correcting it before the job finished): the watch goes on,
+    and when this rung acted the watch's generation comes back (reopened first when it had settled on another row: the
+    newest pick wins) for the rung's own check to settle on once it sees the row play (:func:`_played`; the paused
+    playlist resumed counts too: review r1 L2). Any other request ends the watch: its row is never kept as the earlier
+    words' meaning."""
+    p = _pair_pending()
+    if p is None:
+        return None
+    asked = str(p.get("asked") or "")
+    if _fold(row) == _fold(asked) or _fold(_playlist_name(call.values)) == _fold(asked):
+        _pair_end(p.get("gen"), "named")
+        return None
+    if not _words_hold(getattr(call.ctx, "words", None), asked):
+        _pair_end(p.get("gen"), "other_request")
+        return None
+    if not acted:
+        return None
+    settled = p.get("settled")
+    if settled is None:
+        return int(p["gen"])
+    if _fold(settled) == _fold(row):
+        return None
+    return _pair_reopen(int(p["gen"]), str(settled))
+
+
+def _pair_reopen(gen: int, settled: str) -> int | None:
+    """The same exchange puts another row on after the watch settled on ``settled`` (a correction): the watch goes on
+    for the same words with that row as the one before, so the row now played is kept as their meaning (newest wins).
+    The new generation back (None: the watch is gone)."""
+    with _pair_lock:
+        if not _pair or _pair.get("gen") != gen:
+            return None
+        _pair_gen[0] += 1
+        new = _pair_gen[0]
+        _pair.update(gen=new, before=settled, settled=None, until=time.monotonic() + PAIR_WATCH_S)
+        log = _pair.get("log")
+    if callable(log):
+        log("spotify_pair", outcome="reopened")
+    return new
+
+
+def _pair_judge(gen: int, name: str) -> str:
+    """Whether a row the hand-off job's finish gate sees playing is what that job put on for the watch ``gen``:
+    ``new``; ``old`` (the row playing when the words named no row, or another row once one was settled); ``gone`` (no
+    such watch). Only that job asks, so the paused playlist resumed counts as new (review r1 L2: the playlist the user
+    means is often the one paused)."""
+    with _pair_lock:
+        if not _pair or _pair.get("gen") != gen or time.monotonic() > float(_pair.get("until") or 0.0):
+            return "gone"
+        settled = _pair.get("settled")
+        if settled is not None:
+            return "new" if _fold(settled) == _fold(name) else "old"
+        before = _pair.get("before")
+        return "old" if before is not None and _fold(before) == _fold(name) else "new"
+
+
+def _pair_settle(name: str, *, gen: int, own: bool) -> None:
+    """The hand-off job's playlist ``name`` is seen playing here (its finish gate, or a rung's own check of its
+    press): the words are kept as another name of it (``taste.note(..., said_as=words)``: the row gets one pick at this
+    hour, the words an encrypted pairing keyed by their digest; the newest pairing of the same words wins), off the
+    check's clock. Only a row PLAN.md D1 lets keep a name (``own``: a Library row whose owner parsed and isn't Spotify;
+    review r1 L1): any other (Spotify's own, an unparsed owner, a page header) is kept nowhere (``not_kept``). Once per
+    watch; the watch keeps the row it settled on until its time is up (the finish gate may ask again). Content-free
+    log."""
+    with _pair_lock:
+        if not _pair or _pair.get("gen") != gen or _pair.get("settled") is not None:
+            return
+        _pair["settled"] = name
+        p = dict(_pair)
+    log = p.get("log") or (lambda *_a, **_k: None)
+    if _fold(name) == _fold(p.get("asked")):
+        log("spotify_pair", outcome="same_name")
+        return
+    if not own or not name:
+        log("spotify_pair", outcome="not_kept")
+        return
+
+    def job() -> None:
+        from yuki.skills import engine
+        from yuki.skills.taste import note
+
+        kept = engine._mem(p["memory"], "spotify_pair",
+                           lambda c: note(engine._store_of(c), str(p["kind"]), name, said_as=str(p["asked"])),
+                           timeout_s=1.0)
+        log("spotify_pair", outcome="paired" if kept else "write_failed")
+
+    threading.Thread(target=job, name="yuki-spotify-pair", daemon=True).start()
+
+
+def _own(look: Look) -> bool:
+    """Whether the row a read found may be kept by name (PLAN.md D1): a Library row whose owner parsed and isn't
+    Spotify (``look.kept``); never a page button."""
+    return look.where == "grid" and bool(look.name) and any(_fold(n) == _fold(look.name) for n in look.kept)
+
+
+def _said_from(call: Any, look: Look) -> str | None:
+    """The words of this request that reached ``look``'s row through a pairing (:func:`_pair_settle`), or None. The
+    driver's own paired-row read (``details["said_as"]``: :func:`_look_named`, :func:`link_for`): the name asked is
+    those words. Else, when the row's own name isn't in the user's words, the paired words of that row that are (the
+    resolver's ``taste.find`` already put the row's name in the value: "play my Japanese playlist" arrives as
+    "ネオン"). Identity of the user's own words, never meaning; one bounded memory read, only in that case."""
+    if look.details.get("said_as"):
+        return _playlist_name(call.values) or None
+    words = getattr(call.ctx, "words", None)
+    memory = getattr(call.ctx, "memory", None)
+    kind = _taste_kind(call)
+    if not words or not look.name or memory is None or not kind or _words_hold(words, look.name):
+        return None
+    from yuki.skills import engine
+
+    def read(client: Any) -> Any:
+        from yuki.skills.taste import said_words
+
+        return said_words(engine._store_of(client), kind, look.name)
+
+    got = engine._mem(memory, "spotify_said_words", read, timeout_s=0.3)
+    return next((w for w in got or [] if _words_hold(words, w)), None)
+
+
+def _said_note(call: Any, row: str, words: str) -> None:
+    """A rung played ``row`` (or found it playing) reached through a pairing for the words ``words``
+    (:func:`_said_from`): remembered for :data:`PAIR_WATCH_S` (:func:`_said_doubt`), and the words watched with that
+    row as the one before (a hand-off after an unconfirmed play that puts another row on keeps that one: newest wins).
+    Never for an eval run."""
+    learns = _learns(call)
+    if learns is None or not words or not row:
+        return
+    log = _logger(call)
+    with _pair_lock:
+        _said_play.clear()
+        _said_play.update(words=words, row=row, until=time.monotonic() + PAIR_WATCH_S, memory=learns[0],
+                          kind=learns[1], log=log)
+    _pair_open(words, row, memory=learns[0], kind=learns[1], log=log)
+
+
+def _said_doubt(row: str, words: str | None = None) -> None:
+    """Another playlist ``row`` plays (a rung played it for a request named ``words``, or the hand-off job's finish
+    gate saw it) within :data:`PAIR_WATCH_S` after a row reached through a pairing played: what the user says wins
+    over what was learned (review r1 M2: their correction in a later turn, whatever its words), so that pairing is
+    dropped (``taste.unsay``: those words, only while they still point at that row). The words then hand over once
+    more and learn again (the safe direction: a pairing dropped costs one hand-off, a wrong one kept would play the
+    wrong playlist every time). The same words asked again, or the same row by another name, drop nothing. Off the
+    request's clock; content-free log."""
+    if not row:
+        return
+    with _pair_lock:
+        if not _said_play:
+            return
+        sp = dict(_said_play)
+        if time.monotonic() > float(sp.get("until") or 0.0):
+            _said_play.clear()
+            return
+        if _fold(row) == _fold(sp.get("row")) or (words is not None and _fold(words) == _fold(sp.get("words"))):
+            return
+        _said_play.clear()
+    log = sp.get("log") or (lambda *_a, **_k: None)
+
+    def job() -> None:
+        from yuki.skills import engine
+        from yuki.skills.taste import unsay
+
+        gone = engine._mem(sp["memory"], "spotify_unsay",
+                           lambda c: unsay(engine._store_of(c), str(sp["kind"]), str(sp["row"]),
+                                           words=str(sp["words"])), timeout_s=1.0)
+        log("spotify_pair", outcome="unlearned" if gone else "unlearn_none")
+
+    threading.Thread(target=job, name="yuki-spotify-unsay", daemon=True).start()
+
+
+def _missing(call: Any, look: Look, facts: dict[str, Any], status: str) -> Any:
+    """Rows read and none has the name asked (``not_in_view``): couldn't run, with what the hand-off needs (fix-plan
+    IF-seed): ``facts["missing"]`` (the slot, a code word) and ``facts_ram["seen"]`` (the names read, at most
+    :data:`SEEN_MAX`, RAM only); and the watch for what those words meant (:func:`_pair_start`)."""
+    facts["missing"] = PLAYLIST_SLOT
+    _pair_start(call, _playlist_name(call.values), look.playing, status)
+    return _rr(ran=False, outcome="not_in_view", facts=facts, facts_ram={"seen": list(look.names[:SEEN_MAX])})
+
+
 def _ask_two(look: Look) -> Any:
     """Two rows with one name: asked, never guessed. Options only when every row's owner is known and they differ
     (an answer is matched back to its row by the option's own label: :func:`look_row`)."""
@@ -971,13 +1466,42 @@ def _ask_two(look: Look) -> Any:
 
 
 def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str, Any]) -> Any:
+    """What a row (or page button) read means, after any press made on it (see :func:`_after_row`). A row reached
+    through a pairing (``details["said_as"]``) carries its own name for the checks (``facts_ram["row"]``); any other row
+    is checked by the name asked, which also finds the row a two-rows answer names (review r1 M1: that row's bare name
+    fits both rows). A row that plays (pressed, resumed, or already playing) tells the watch (:func:`_pair_request`: a
+    same-exchange press carries the watch's generation in ``facts_ram["pair"]`` for the rung's own check to settle on,
+    :func:`_played`) and the pairing doubt (:func:`_said_doubt`); one reached through a pairing is remembered
+    (:func:`_said_note`). Rows read with none of that name hand over with what was seen (:func:`_missing`)."""
+    got = _after_row(call, look, status, app_id, facts)
+    if look.status != "ok" or (got.ran is False and not got.already):
+        return got
+    if look.details.get("said_as"):
+        got.facts_ram["row"] = look.name      # the driver's own paired-row read: the value is still the words
+    if _learns(call) is None:
+        return got                       # an eval run (or no memory): no watch, pairing or doubt is touched
+    gen = _pair_request(call, look.name, acted=got.ran is not False and not got.already)
+    if gen is not None:
+        got.facts_ram["pair"] = {"gen": gen, "row": look.name, "own": _own(look)}
+    words = _said_from(call, look)
+    _said_doubt(look.name, words or _playlist_name(call.values))
+    if words:
+        got.facts["said_as"] = True      # the row these words were paired with (content-free flag)
+        _said_note(call, look.name, words)
+    return got
+
+
+def _after_row(call: Any, look: Look, status: str, app_id: str, facts: dict[str, Any]) -> Any:
     """What a row (or page button) read means, after any press made on it: an ask for two rows; "couldn't" for no
-    row; a "Play {name}" pressed -> acted; "Pause {name}" with the session playing -> already playing (checked by the
-    done-check: session playing and Spotify sounding here); "Pause {name}" with the session paused or stopped -> a
-    stale label: the session's own ``play`` (M1a: never Invoke, never a toggle)."""
+    row (with the names read: :func:`_missing`); a "Play {name}" pressed -> acted; "Pause {name}" with the session
+    playing -> already playing (checked by the done-check: session playing and Spotify sounding here); "Pause {name}"
+    with the session paused or stopped -> a stale label: the session's own ``play`` (M1a: never Invoke, never a
+    toggle)."""
     facts.update({k: v for k, v in look.counts().items() if k in ("rows", "row", "where", "label_source")})
     if look.status == "ambiguous":
         return _ask_two(look)
+    if look.status == "not_in_view":
+        return _missing(call, look, facts, status)
     if look.status != "ok":
         return _rr(ran=False, outcome=look.status, facts=facts, unverified_line=LINE_PLAY_UNCONFIRMED)
     digest = _entity_digest(call, look.name)
@@ -1078,29 +1602,67 @@ def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | 
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def _look_named(call: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None, press: bool = False) -> Look:
+    """:func:`_look` for the name asked; when no row has it (``not_in_view``), once more for the row these exact
+    words were paired with (:func:`_said_name`: they named no row before and that playlist then played), marked
+    ``details["said_as"]``. The first read is kept when that row isn't in view either (its names go to the hand-off).
+    A press happens only on the read that found its row (decide and press on one read)."""
+    look = _look(DESK, hwnd, want, learned=learned, press=press)
+    if look.status != "not_in_view":
+        return look
+    other = _said_name(call, want)
+    if not other:
+        return look
+    again = _look(DESK, hwnd, other, learned=learned, press=press)
+    if again.status in ("ok", "ambiguous", "no_wording"):
+        again.details["said_as"] = True
+        return again
+    return look
+
+
+def _check_name(look: Look, want: str) -> str:
+    """The name a row is read again by (the flip wait, the restore): the paired row's own name when the read reached it
+    through a pairing (``details["said_as"]``), else the name asked. The name asked, not the row's bare name, so the
+    row a two-rows answer names ("Lantern Rain by Odile Fenn") stays the one row it fits (review r1 M1); names are
+    matched with case and spacing folded, so Spotify's spelling needs nothing."""
+    return look.name if look.details.get("said_as") and look.name else want
+
+
+#: Reads that saw no row at all (nothing to say "missing" about): a watch may still learn what the words meant.
+UNREAD = ("not_built", "no_library", "no_rows", "timeout", "error")
+
+
 def play_library(call: Any) -> Any:
-    """Rung A, no focus: the row of DataGrid "Your Library" named as asked; its "Play {name}" button by Invoke. Not
-    while Spotify plays on another device; a cold window is warmed within the request's time."""
+    """Rung A, no focus: the row of DataGrid "Your Library" named as asked (or the row these words were paired with);
+    its "Play {name}" button by Invoke. Not while Spotify plays on another device; a cold window is warmed within the
+    request's time. The rows read are kept as the user's own names (:func:`_feed_seen`); none with that name hands
+    over with them (:func:`_missing`)."""
     want = _playlist_name(call.values)
     if not want:
         return _rr(ran=False, outcome="no_name")
     facts: dict[str, Any] = {}
     win, status, app_id, early = _prologue(call, facts)
     if early is not None:
+        if early.outcome == "no_window":
+            _pair_unread(call, want, status)
         return early
     state = DESK.state(win.hwnd)
     facts["state"] = state or "unknown"
     if not _ensure_warm(DESK, win, call, facts):
         _log_read(call, "library", state, facts, None)
+        _pair_unread(call, want, status)
         return _rr(ran=False, outcome=_cold(facts), facts=facts)
     learned = _learned_wording(call.ctx.memory)
-    look = _look(DESK, win.hwnd, want, learned=learned, press=True)
+    look = _look_named(call, win.hwnd, want, learned=learned, press=True)
     if look.status == "not_built" and facts.get("warm") == "skipped":
         # seen warm before, frame only now: one fresh warm-up within the time left, then once more
         if _ensure_warm(DESK, win, call, facts, force=True):
-            look = _look(DESK, win.hwnd, want, learned=learned, press=True)
-    look = _confirm_flip(call, win.hwnd, want, learned, look, state, facts)
+            look = _look_named(call, win.hwnd, want, learned=learned, press=True)
+    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts)
     _log_read(call, "library", state, facts, look)
+    _feed_seen(call, look)
+    if look.status in UNREAD:
+        _pair_unread(call, want, status)
     return _after_look(call, look, status, app_id, facts)
 
 
@@ -1120,13 +1682,19 @@ def play_restored(call: Any) -> Any:
     if state != "minimised":
         return _rr(ran=False, outcome="not_minimised", facts=facts)
     learned = _learned_wording(call.ctx.memory)
-    first = _look(DESK, win.hwnd, want, learned=learned)
-    if first.status in ("not_in_view", "no_rows", "no_wording"):
+    first = _look_named(call, win.hwnd, want, learned=learned)
+    _feed_seen(call, first)
+    if first.status == "not_in_view":
+        return _missing(call, first, facts, status)
+    if first.status in ("no_rows", "no_wording"):
         return _rr(ran=False, outcome=first.status, facts=facts)
     if first.status == "ambiguous":
         return _ask_two(first)
     if first.status == "ok" and first.state == "pause":
         return _after_look(call, first, status, app_id, facts)
+    # the row these words were paired with when the minimised window's read found that one, else the name asked (which
+    # also finds the row a two-rows answer names: review r1 M1)
+    name = _check_name(first, want) if first.status == "ok" else want
     prev = DESK.foreground()
     got = DESK.focus(win.hwnd)
     if _refused(got):
@@ -1137,8 +1705,11 @@ def play_restored(call: Any) -> Any:
     try:
         if not _ensure_warm(DESK, win, call, facts, force=True):
             return _rr(ran=False, outcome=_cold(facts), facts=facts)
-        look = _look(DESK, win.hwnd, want, learned=learned, press=True)
+        look = _look_named(call, win.hwnd, name, learned=learned, press=True)
+        if first.details.get("said_as"):
+            look.details["said_as"] = True
         _log_read(call, "restored", "front", facts, look)
+        _feed_seen(call, look)
         status, app_id = DESK.spotify_status(win.pid)
         return _after_look(call, look, status, app_id, facts)
     finally:
@@ -1160,10 +1731,19 @@ def link_for(call: Any, want: str) -> tuple[str | None, str]:
     from yuki.skills import engine
 
     links = engine._mem(memory, "spotify_links", lambda c: sd.learned_links(engine._store_of(c)), timeout_s=0.5)
-    hits = [(n, u) for n, u in (links or {}).items() if _fold(n) == _fold(want) and sd.playlist_uri_ok(u)]
-    if hits and len({u for _n, u in hits}) == 1:
-        return hits[0][1], hits[0][0]
-    return None, want
+
+    def hit(name: str) -> tuple[str | None, str]:
+        hits = [(n, u) for n, u in (links or {}).items() if _fold(n) == _fold(name) and sd.playlist_uri_ok(u)]
+        if hits and len({u for _n, u in hits}) == 1:
+            return hits[0][1], hits[0][0]
+        return None, name
+
+    uri, name = hit(want)
+    if uri is None and links:
+        other = _said_name(call, want)      # the playlist these words were paired with (a result seen before)
+        if other:
+            uri, name = hit(other)
+    return (uri, name) if uri else (None, want)
 
 
 def play_link(call: Any) -> Any:
@@ -1214,6 +1794,8 @@ def play_link(call: Any) -> Any:
     _log_read(call, "link", "front", facts, look)
     if look.status not in ("ok", "ambiguous"):
         return _rr(ran=False, outcome="page_" + look.status, facts=facts)
+    if _fold(name) != _fold(want):
+        look.details["said_as"] = True      # the link of the playlist these words were paired with
     status, app_id = DESK.spotify_status(win.pid)
     return _after_look(call, look, status, app_id, facts)
 
@@ -1354,9 +1936,12 @@ def play_search(call: Any) -> Any:
 
 
 def play_launch(call: Any) -> Any:
-    """Spotify isn't running (or has no window): launch it with its own ``--minimized`` argument (data; focus-taking,
-    never with a game in front: D17(2)), warm it within the time left and play the row. Spotify's start minimised is
-    unverified; a window that isn't built in time says "couldn't" (the thinker takes over)."""
+    """Spotify isn't running (or has no window): start it (``launch_args`` in the data, none by default: a window
+    started minimised never builds its tree, which made this rung cold by design on 10 Oct; focus-taking, never with a
+    game in front: D17(2)). A window that still comes up minimised (Spotify's own start setting) is restored. Then it
+    is warmed (at least :data:`LAUNCH_WARM_S`, even past the request's time: the rung already acted), Your Library gets
+    :data:`LAUNCH_ROWS_S` to fill, and the row is played. A window that isn't built in time says "couldn't" (the
+    thinker takes over)."""
     want = _playlist_name(call.values)
     if not want:
         return _rr(ran=False, outcome="no_name")
@@ -1378,24 +1963,42 @@ def play_launch(call: Any) -> Any:
         return _rr(ran=False, held="game", outcome="refused", facts=facts)
     if not getattr(got, "ok", False):
         return _rr(ran=False, outcome="launch_failed", facts=facts)
-    sleep = _sleeper(call)
+    clock, sleep = _clock(call), _sleeper(call)
     win = None
     while win is None:
         win = DESK.window()
         if win is not None or _left(call) <= POLL_S:
             break
         sleep(POLL_S)
-    if win is None or not _ensure_warm(DESK, win, call, facts):
+    if win is None:
+        return _rr(ran=False, outcome="cold_after_launch", facts=facts)
+    state = DESK.state(win.hwnd)
+    if state == "minimised":
+        # started minimised anyway (Spotify's own setting): restored so Chromium builds its tree (guarded focus)
+        back = DESK.focus(win.hwnd)
+        if _refused(back):
+            return _rr(ran=False, held="game", outcome="refused", facts=facts)
+        facts["restored"] = bool(getattr(back, "ok", False))
+        state = DESK.state(win.hwnd)
+    if not _ensure_warm(DESK, win, call, facts, force=True, floor_s=LAUNCH_WARM_S):
         return _rr(ran=False, outcome="cold_after_launch", facts=facts)
     # the session as the started Spotify shows it: still the phone playing -> left there, nothing pressed
     status, app_id, where = _this_pc(call, facts, win.pid)
     if where == "other":
         return _other_device(facts)
     learned = _learned_wording(call.ctx.memory)
-    state = DESK.state(win.hwnd)
-    look = _look(DESK, win.hwnd, want, learned=learned, press=True)
-    look = _confirm_flip(call, win.hwnd, want, learned, look, state, facts)    # started minimised: taken or not
+    look = _look_named(call, win.hwnd, want, learned=learned, press=True)
+    until = clock() + LAUNCH_ROWS_S
+    reads = 1
+    while look.status in ("not_built", "no_library", "no_rows") and clock() + POLL_S <= until:
+        # a just-started Spotify draws its player first and fills Your Library a moment later
+        sleep(POLL_S)
+        look = _look_named(call, win.hwnd, want, learned=learned, press=True)
+        reads += 1
+    facts["row_reads"] = reads
+    look = _confirm_flip(call, win.hwnd, _check_name(look, want), learned, look, state, facts)
     _log_read(call, "launch", state, facts, look)
+    _feed_seen(call, look)
     status, app_id = DESK.spotify_status(win.pid)
     return _after_look(call, look, status, app_id, facts)
 
@@ -1406,7 +2009,10 @@ def play_launch(call: Any) -> Any:
 
 
 def _playing_facts(ctx: Any, args: Mapping[str, Any]) -> tuple[Look | None, str, bool | None, dict[str, Any]]:
-    want = str(args.get("name") or "")
+    # the row the route reached through a pairing (the words named no row: that row's own name) is the one checked;
+    # else the name the check was written with (it also finds the row a two-rows answer names: review r1 M1)
+    row = (getattr(getattr(ctx, "result", None), "facts_ram", None) or {}).get("row")
+    want = str(row or args.get("name") or "")
     win = DESK.window()
     if win is None or not want:
         return None, "", None, {"status": "no_window" if win is None else "no_name"}
@@ -1450,13 +2056,79 @@ def _not_pressed(ctx: Any) -> bool:
     return bool(getattr(getattr(ctx, "result", None), "already", False))
 
 
+def _handoff_verdict(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]] | None:
+    """The finish gate after a hand-off (no route result: the thinker did it by steps) when the check names no row
+    that is in view: the fix-plan's ``missing`` case, where the words ("Japanese") named no row, so the check comes
+    with no name (the hand-off dropped it), or with that name. Which playlist shows playing (:func:`playing_row`),
+    Spotify's session and its sound here: a row the watch for these words judges new (:func:`_pair_judge`: not the one
+    playing when the words named no row; the paused one resumed counts) -> True, the words are kept as its other name
+    (:func:`_pair_settle`, only for a row D1 lets keep a name) and a pairing it contradicts is dropped
+    (:func:`_said_doubt`). Nothing playing and the session paused or stopped -> False. No watch to tell which was
+    started after the hand-off, an old row, or no sound here -> None (never a false done). ``None`` back: a row named
+    in view, checked the usual way."""
+    want = " ".join(str(args.get("name") or "").split())
+    win = DESK.window()
+    if win is None:
+        return None if want else (None, {"status": "no_window"})
+    memory_call = getattr(ctx, "memory_call", None)
+    learned = _learned_from_probe(memory_call) if memory_call is not None else None
+    if want:
+        named = _look(DESK, win.hwnd, want, learned=learned, page=True)
+        if named.status not in ("not_in_view", "missing", "no_library", "no_rows"):
+            return None                    # the named row is there (or unread): the usual check decides
+        if _pair_pending(want) is None:
+            return None
+    name, read, own = _read_playing(DESK, win.hwnd, learned)
+    status, _app_id = DESK.spotify_status(win.pid)
+    ev: dict[str, Any] = {"row": "pause" if name else read, "where": "handoff",
+                          "session": status if status.isalpha() else ""}
+    if name is None:
+        return (False if read == "none" and status in ("paused", "stopped") else None), ev
+    if status != "playing":
+        return (False if status in ("paused", "stopped") else None), ev
+    audio = DESK.render_active()
+    ev["audio"] = audio
+    if audio is not True:
+        if audio is False:
+            ev["reason"] = "other_device"
+        return None, ev
+    pending = _pair_pending(want or None)
+    judged = _pair_judge(int(pending["gen"]), name) if pending is not None else "gone"
+    if pending is None or judged != "new":
+        ev["reason"] = "not_shown_new"
+        return None, ev
+    _pair_settle(name, gen=int(pending["gen"]), own=own)
+    _said_doubt(name)
+    ev["new_row"] = True
+    return True, ev
+
+
+def _played(ctx: Any, look: Look, *, routed: bool) -> None:
+    """A playlist check saw a row playing here (True). A rung's own check of a same-exchange press
+    (``facts_ram["pair"]``: :func:`_pair_request`) settles the watch on the row that rung pressed; the finish gate of
+    a hand-off job (no route result) tells the pairing doubt which row plays (:func:`_said_doubt`)."""
+    if routed:
+        pair = (getattr(ctx.result, "facts_ram", None) or {}).get("pair")
+        if isinstance(pair, dict) and pair.get("gen") is not None:
+            _pair_settle(str(pair.get("row") or ""), gen=int(pair["gen"]), own=bool(pair.get("own")))
+    elif look.name:
+        _said_doubt(look.name)
+
+
 def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, dict[str, Any]]:
     """The playlist's done-check (D19): its row (or the page's button) reads "Pause {name}", Spotify's session says
     playing **and** Spotify sounds on this PC -> True. The row flipped and the session plays but no sound here -> None
     (``other_device``, said plainly: it started on another device). The row still reads "Play {name}", or the session
     is paused or stopped -> False. The row reads "Pause {name}" and Windows lists no Spotify session at all: the two
     disagree -> None. Anything unread -> None. The line said when it ends unconfirmed names what was done (a press,
-    or nothing: the row already read "Pause {name}")."""
+    or nothing: the row already read "Pause {name}"). As the finish gate after a hand-off whose words named no row in
+    view: :func:`_handoff_verdict`."""
+    routed = hasattr(getattr(ctx, "result", None), "facts_ram")
+    if not routed:
+        # no route result: the finish gate after a hand-off (the thinker's own steps), not a rung's own check
+        handed = _handoff_verdict(ctx, args)
+        if handed is not None:
+            return handed
     look, status, audio, ev = _playing_facts(ctx, args)
     if look is None:
         return None, ev
@@ -1464,6 +2136,7 @@ def probe_playing_here(ctx: Any, args: Mapping[str, Any]) -> tuple[bool | None, 
     if look.status == "ok" and look.state == "pause" and status == "playing":
         if audio is True:
             _set_line(ctx, unconfirmed)
+            _played(ctx, look, routed=routed)
             return True, ev
         if audio is False:
             ev["reason"] = "other_device"
@@ -1940,7 +2613,8 @@ NO_FOCUS_ROUTES: tuple[str, ...] = ("play_library", "play_search", "volume_slide
 
 __all__ = [
     "ASK_AMOUNT", "CONNECTION_FILE", "DESK", "Desk", "KEYS_MAX", "LINE_OTHER", "LINE_OTHER_AFTER", "LINE_OTHER_VOLUME",
-    "LINE_PLAY_UNCONFIRMED", "Look", "NO_FOCUS_ROUTES", "POLL_S", "PROBES", "REQUEST_WARM_S", "ROUTES", "THIS_PC_S",
-    "app_key", "extra_control", "forget_warm", "link_for", "look_page", "look_row", "look_slider", "mixer_linked",
-    "proven", "spotify_data", "where_playing", "window_state",
+    "IDLE_STATES", "LINE_PLAY_UNCONFIRMED", "Look", "NO_FOCUS_ROUTES", "PAIR_WATCH_S", "PLAYLIST_SLOT",
+    "POLL_S", "PROBES", "REQUEST_WARM_S", "ROUTES", "SEEN_MAX", "THIS_PC_S", "app_key", "extra_control", "forget_warm",
+    "link_for", "look_page", "look_row", "look_slider", "mixer_linked", "playing_of", "playing_row", "proven",
+    "spotify_data", "where_playing", "window_state",
 ]

@@ -48,7 +48,9 @@ library_grid = [["DataGrid", "Your Library"]]
 row_path = ["DataItem", "DataItem", "Group"]
 
 [labels.en.controls]
-# role, name, container (one of the paths above)
+# role, name, container (one of the paths above). Not shipped yet: "library_search" (the Library's search button) and
+# "library_filter" (its search box). The playlist's search route stays off by data until a live check records them
+# here (yuki/skills/connections/spotify.toml, variant "search": then its `when` line goes).
 volume = ["Slider", "Change volume", "now_playing_bar"]
 play = ["Button", "Play", "player_controls"]
 pause = ["Button", "Pause", "player_controls"]
