@@ -74,6 +74,39 @@ def router_on(settings: Any) -> bool:
         return False
     return bool(getattr(settings, "voice_router", False))
 
+
+#: sVoiceFix (sim-e2e-1 F6): where a call's say_first stops being words for the user. A spoken line never holds a line
+#: break or a tag of the call format; the model sometimes runs the rest of its call into the string (live-like 16 Oct:
+#: ``On it.",\n<parameter name="skill">spotify.playlist``), and the whole of it was spoken.
+SAY_FIRST_ENDS = ("\n", "\r", "<")
+#: After a double quote that closes no quote of the words' own, these (or nothing) are the call format's, not words.
+SAY_FIRST_CALL_MARKS = (",", "}")
+
+
+def say_first_words(text: Any) -> str:
+    """The words of a call's ``say_first`` that may be spoken: up to its first line break or ``<``, and up to a double
+    quote that closes no quote opened in the words when nothing but ``,`` / ``}`` (or nothing at all) follows it (the
+    call format running into the string: ``On it."`` and ``On it.",`` cut to ``On it.``, while ``Playing "Lofi Girl"
+    now.`` and ``[style: "calm"] On it.`` stay whole; review r1 L1). Trailing commas and spaces dropped, a line wrapped
+    whole in quotes unwrapped; ``""`` when nothing is left. Plumbing on our own call format, never the words' meaning."""
+    words = str(text or "")
+    cut = min((i for i in (words.find(end) for end in SAY_FIRST_ENDS) if i >= 0), default=len(words))
+    words = words[:cut]
+    inner = False   # inside a quote the words opened themselves
+    for i, ch in enumerate(words):
+        if ch != '"':
+            continue
+        rest = words[i + 1:].strip()
+        if not inner and (not rest or rest[0] in SAY_FIRST_CALL_MARKS):
+            words = words[:i]
+            break
+        inner = not inner
+    words = words.rstrip(" \t,;:").strip()
+    if len(words) > 1 and words[0] == '"' and words[-1] == '"':
+        words = words[1:-1].strip()
+    return words
+
+
 #: The mouth's core layer (frozen). Pipecat appends its own paragraphs about async tools
 #: and cancelling them; together they are the first system block, the same bytes every
 #: conversation.
@@ -212,9 +245,10 @@ list, misheard) -> the items from the Earlier block, or quick_memory(action="tod
 
 # Commitment discipline
 
-Saying you will do something is a promise, and only a tool call keeps it. If what you say is \
-"let me check", "I'll look", "on it", "one sec" or anything like it, the tell_yuki call (or the \
-hand, or the check_progress or more_of_result call) must be in that same reply. Every tool call is \
+Saying you will look or do something is a promise, and only a tool call keeps it: you cannot see inside the \
+windows yourself. "Let me check", "I'll look", "let me take a look at your screen", "on it", "one sec" or anything \
+like it comes only with the tell_yuki call (or the hand, or the check_progress or more_of_result call) in that same \
+reply. Every tool call is \
 made alone, with no words written before it, except quick_memory: a few words first ("Let me look."). tell_yuki, open_url and open_app carry their spoken \
 acknowledgement in say_first ("Sure, one sec."): it is said aloud the moment you write it, and the \
 work starts the moment the call is complete, so the user hears you at once and the thinker is \

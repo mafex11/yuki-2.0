@@ -272,23 +272,63 @@ _STEP_THEN_NOTE_LEAN = (
 #: request again and does the rest, or stays quiet when bringing it up was all of it (live 10 Oct #9 "try another way"
 #: and #16 "open YouTube in Arc not in Chrome" ended at a focus, #25 "do it" too, with 34 s of silence after it).
 STEP_FIRST_OPS = {"window": ("focus", "restore"), "tab": ("show", "new")}   # a new tab: only an empty one
+#: sVoiceFix (sim-e2e-1 F5; review r1 M1): "put something on YouTube on Arc" showed Arc's old Lofi Girl tab (already
+#: playing) and the turn ended in stay_quiet, silent, in 5 of 5 runs. Code now says the step's own line of what is
+#: showing at once (``{shown}``: :meth:`Hands._step_line`, "Arc is showing \"Lofi Girl ...\"."), and the talker is left
+#: one question: a hand-off, one hand, or stay_quiet, with no words of its own. A note that let it say what is showing
+#: itself got "It's playing." / "Playing now." in 6 of 9 such runs: a done the step never made.
+_STEP_CHECK_SAID_NOTE = (
+    "Done, verified, and said aloud for you just now: {shown}{already} One question only: did their newest turn ask for "
+    "more than seeing that (to put on or play something, \"just do it\", \"try another way\", that it is not done, or "
+    "anything more)? Yes: tell_yuki now (screen true, and in context what you just did), or, when what is left is one "
+    "step one of your hands does on what the desktop block shows, that hand instead, alone, with say_when_done for the "
+    "whole. No: stay_quiet. Write no words yourself: what is showing was said, and whether it plays is not yours to say."
+)
+_STEP_CHECK_SAID_NOTE_LEAN = (
+    "Done, verified, and said aloud for you just now: {shown}{already} One question only: did their newest turn ask for "
+    "more than seeing that (to put on or play something, \"just do it\", \"try another way\", that it is not done, or "
+    "anything more)? Yes: hand_over now (intent follow_up when that turn answers or adds to a job already waiting or "
+    "running, else new_task), or, when what is left is one step one of your hands does on what the desktop block "
+    "shows, that hand instead, alone, with say_when_done for the whole. No: stay_quiet. Write no words yourself: what "
+    "is showing was said, and whether it plays is not yours to say."
+)
+#: The same when no line of what is showing is known (a window whose app is not known), or it could not be said now
+#: (then it is owed: when the run ends in stay_quiet with no words, the bridge says it, :meth:`Hands.take_step_line`).
 _STEP_CHECK_NOTE = (
-    "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
-    "part of a request: read their newest turn again now (the words this step was for, never an older request). "
-    "When it asked for more than that (open, play, close, type, send or find something in it), do the rest now: "
-    "with one of your hands on what the desktop block shows, alone, with say_when_done for the whole, else hand it to "
-    "the thinker with tell_yuki (screen true, their request as they said it, and in context what you just did). When "
-    "bringing it up was all that turn asked, call stay_quiet alone. Never say it is done before a hand verified it."
+    "Done, verified, and nothing was said for it.{already} One question only: did their newest turn ask for more than "
+    "bringing it up (to put on or play something, \"just do it\", \"try another way\", that it is not done, or anything "
+    "more)? Yes: tell_yuki now (screen true, and in context what you just did), or, when what is left is one step one "
+    "of your hands does on what the desktop block shows, that hand instead, alone, with say_when_done for the whole. "
+    "No: say in a few words only what the report says is up now, never that anything plays or is done beyond it."
 )
 _STEP_CHECK_NOTE_LEAN = (
-    "That step is done, verified, and nothing was said for it. Bringing a window or tab up is usually only the first "
-    "part of a request: read their newest turn again now (the words this step was for, never an older request). "
-    "When it asked for more than that (open, play, close, type, send or find something in it), do the rest now: "
-    "with one of your hands on what the desktop block shows, alone, with say_when_done for the whole, else call "
-    "hand_over (intent follow_up when that turn answers or adds to a job already waiting or running, else new_task; "
-    "their words go with it by code). When bringing it up was all that turn asked, call stay_quiet alone. Never say "
-    "it is done before a hand verified it."
+    "Done, verified, and nothing was said for it.{already} One question only: did their newest turn ask for more than "
+    "bringing it up (to put on or play something, \"just do it\", \"try another way\", that it is not done, or anything "
+    "more)? Yes: hand_over now (intent follow_up when that turn answers or adds to a job already waiting or running, "
+    "else new_task), or, when what is left is one step one of your hands does on what the desktop block shows, that "
+    "hand instead, alone, with say_when_done for the whole. No: say in a few words only what the report says is up "
+    "now, never that anything plays or is done beyond it."
 )
+#: Said with the step check's note when the window or tab was there before the step (not a new tab).
+_STEP_ALREADY = " It was already open before this step: this step put on nothing new."
+#: sVoiceFix (F4): a hand refused for its call's own shape (a field it needs is missing or does not fit; nothing was
+#: done): it is called again once, as the report says. Live 10 Oct #18 and the sim: the tab hand was called four times
+#: with named alone or a number alone and refused each time, while the full talker handed a one-tab close over.
+_SHAPE_NOTE = (
+    "Not done, and nothing was done: the call lacked what the report names. Call it again now, once, alone, with that "
+    "filled in as the report says, and say nothing first. A tab is named by its title, never by a number asked of "
+    "them."
+)
+#: sVoiceFix (F6): a run_skill written with no skill (the call ran into its say_first, a line break and then
+#: ``<parameter name="skill">...``). Nothing ran; it is called again once, whole, never handed over with no seed.
+_MALFORMED_NOTE = (
+    "Not run: the call came out malformed (no skill in it), so nothing was done. Call it again now, whole and alone: "
+    "skill and slots as the Skills list gives them, say_first \"\" (you were heard already)."
+)
+#: sVoiceFix (F5): the step's own line (what is showing now) is at most this long; a title is cut at a word.
+STEP_LINE_TITLE_CHARS = 60
+#: How long a step line stays owed to a stay_quiet of the run its step check started (s).
+STEP_LINE_OWED_S = 20.0
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
 _TAB_CHOOSE_NOTE = (
     "Not done: {count} tabs fit that title, so nothing was closed or shown. When their words meant all of them, call "
@@ -944,6 +984,14 @@ class Hands:
         self._other_tabs: dict[int, tuple[list[str], list[str], float, frozenset[int]]] = {}
         #: x3 (3b): ``(user turn, count)``: how often a silent window or tab step gave the talker its turn back in it.
         self._step_checked: tuple[Any, int] | None = None
+        #: sVoiceFix (F5): ``(turn, line, at)``: what a silent step showed, when the step check could not say it at once
+        #: (review r1 M1: it says it at once as a rule): owed to a stay_quiet of the run that check started (the bridge
+        #: says it by code: :meth:`take_step_line`); dropped by any other answer
+        self._step_owed: tuple[Any, str, float] | None = None
+        #: sVoiceFix (F4, F6): ``(turn, n)``: calls refused for their own shape, and run_skill calls with no skill,
+        #: given back to the talker in this user turn (once each; the next goes on as before)
+        self._shape_given: tuple[Any, int] | None = None
+        self._malformed_given: tuple[Any, int] | None = None
 
     @property
     def skills_on(self) -> bool:
@@ -1643,6 +1691,7 @@ class Hands:
                                          properties=FunctionCallResultProperties(run_llm=False))
             return
         self._inflight[key] = started
+        self._step_owed = None   # sVoiceFix (F5): a hand answers the step check, so no step line is owed
         if args.get("say_first") and self.bridge is not None:
             await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
@@ -1671,7 +1720,13 @@ class Hands:
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
         game = _game_trouble(facts)
-        if game or (not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off")):
+        turn = self._call_safely(self.user_turn, None)
+        # sVoiceFix (F4): a call refused for its own shape, given back once to be called again: no trouble guidance
+        # ("never try again") rides with that call (it would contradict the note that asks for it)
+        shape_retry = bool(facts.get("shape") and not ok and not facts.get("stale") and turn is not None
+                           and self._given(self._shape_given, turn) < 1)
+        if game or (not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off")
+                    and not shape_retry):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
             self.trouble_game = game
         if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
@@ -1733,7 +1788,6 @@ class Hands:
             await params.result_callback({"done": report[:700], "then": rest[:200],
                                           "how_to_handle_it": note.format(rest=rest[:200])})
             return
-        turn = self._call_safely(self.user_turn, None)
         op = str(args.get("action") or ("show" if name == "tab" else ""))
         if confirmed and not str(args.get("say_when_done") or "").strip() and op in STEP_FIRST_OPS.get(name, ()) \
                 and not (op == "new" and str(args.get("url") or "").strip()) \
@@ -1743,10 +1797,28 @@ class Hands:
             # its turn back to do the rest, or stays quiet when that was all (at most twice per user turn: a focus,
             # then a new tab; never a loop)
             self._step_checked = (turn, self._step_checks(turn) + 1)
+            shown = " ".join(str(facts.get("step_line") or "").split())   # built off the loop, in _run (review r1 L2)
+            said = ""
+            if shown:
+                # review r1 M1: the step's own line of what is showing is said by code at once (never silence, and no
+                # talker words of "It's playing." for a tab that was only brought up)
+                try:
+                    from pipecat.frames.frames import TTSSpeakFrame
+
+                    await params.llm.push_frame(TTSSpeakFrame(text=shown))
+                    said = shown
+                except Exception:  # noqa: BLE001 - not said now: owed to this run's stay_quiet instead (the bridge)
+                    said = ""
+            self._step_owed = (turn, shown, time.monotonic()) if shown and not said else None
             if self.log is not None:
-                self.log.event("hands", op=name, step_check=True, call=params.tool_call_id)
-            await params.result_callback({"done": report[:700], "said": "",
-                                          "how_to_handle_it": self._note(_STEP_CHECK_NOTE, _STEP_CHECK_NOTE_LEAN)})
+                self.log.event("hands", op=name, step_check=True, call=params.tool_call_id, step_line=bool(shown),
+                               step_said=bool(said))
+            note = (self._note(_STEP_CHECK_SAID_NOTE, _STEP_CHECK_SAID_NOTE_LEAN) if said
+                    else self._note(_STEP_CHECK_NOTE, _STEP_CHECK_NOTE_LEAN))
+            # a tab shown or a window brought up was already open before this step (a fact of the step, not a reading)
+            already = "" if op == "new" else _STEP_ALREADY
+            await params.result_callback({"done": report[:700], "said": said, "how_to_handle_it": note.format(
+                shown=said, already=already)})
             return
         if confirmed and not line:
             from pipecat.frames.frames import FunctionCallResultProperties
@@ -1772,7 +1844,12 @@ class Hands:
             await params.result_callback({"refused": report[:700], "how_to_handle_it": _ACT_OFF_NOTE.format(
                 app=facts["act_off"])})
             return
-        if isinstance(facts.get("choose"), dict):
+        if isinstance(facts.get("choose"), dict) and rest:
+            # sVoiceFix (F4): several tabs fit, and the tab was only the first step of their request (its then): which
+            # tab is no question for them; the thinker does the whole request, by code (sim: #28 "open the YouTube tab,
+            # go through the home page" asked "Which one, Lofi Girl or the Opus walkthrough?" 3 of 3)
+            facts["stale"] = True
+        elif isinstance(facts.get("choose"), dict):
             # x3 (3f): several tabs fit the title: asked by title, never by number (live 10 Oct "which one's the
             # YouTube tab, is it tab 10?" and "I need you to say which tab number")
             choose = facts["choose"]
@@ -1790,6 +1867,16 @@ class Hands:
         if ok and facts.get("noop"):
             await params.result_callback({"no_change": report[:700], "how_to_say_it": _NOOP_NOTE})
             return
+        if facts.get("shape") and not ok and not facts.get("stale"):
+            # sVoiceFix (F4): refused for the call's own shape, nothing done: given back once in this turn to be called
+            # again as the report says (never a loop: the next such refusal goes to the thinker by code, below)
+            if shape_retry:
+                self._shape_given = (turn, self._given(self._shape_given, turn) + 1)
+                if self.log is not None:
+                    self.log.event("hands", op=name, shape_retry=True, call=params.tool_call_id)
+                await params.result_callback({"not_done": report[:700], "how_to_handle_it": _SHAPE_NOTE})
+                return
+            facts["stale"] = True   # once was enough: their request goes to the thinker, which reads the window
         if name == "press_keys" and ok:
             note, key = self._note(_KEYS_NOTE, _KEYS_NOTE_LEAN), "report"
         elif ok:
@@ -2152,6 +2239,45 @@ class Hands:
         got = self._step_checked
         return int(got[1]) if isinstance(got, tuple) and got[0] == turn else 0
 
+    @staticmethod
+    def _given(got: Any, turn: Any) -> int:
+        """How often a counter ``(turn, n)`` counted in this user turn (sVoiceFix: shape and malformed calls)."""
+        return int(got[1]) if isinstance(got, tuple) and got[0] == turn else 0
+
+    def _step_line(self, name: str, args: dict[str, Any], facts: dict[str, Any]) -> str:
+        """sVoiceFix (F5): one plain spoken line of what a silent window or tab step left showing, built from what the
+        hand acted on (the tab's title, the window's app and title as the summary read them): ``Arc is showing "Lofi
+        Girl - lofi hip hop radio - YouTube".`` / ``Spotify is in front.``. ``""`` when nothing is known. The screen's
+        own words, never a claim beyond the hand's report. Blocking (the app's name may scan processes): built in
+        :meth:`_run`, off the voice loop (review r1 L2). Never raises."""
+        try:
+            hwnd = int(args.get("window"))
+            app = self._browser_app(hwnd) or ""
+        except Exception:  # noqa: BLE001 - no line rather than a failed hand
+            return ""
+        title = " ".join(str(facts.get("shown") or "").split())
+        if name == "window" and not app:
+            return ""
+        if name == "tab" and title:
+            cut = title if len(title) <= STEP_LINE_TITLE_CHARS else (
+                title[:STEP_LINE_TITLE_CHARS].rsplit(" ", 1)[0].rstrip(" -,:;·|") + "…")
+            return f'{app} is showing "{cut}".' if app else f'"{cut}" is showing.'
+        if name == "tab":
+            return f"{app} has a new tab up." if app and str(args.get("action") or "") == "new" else ""
+        return f"{app} is in front."
+
+    def take_step_line(self, max_age_s: float = STEP_LINE_OWED_S) -> str | None:
+        """sVoiceFix (F5): the line a silent step check still owes, taken (said once by the bridge, when the run its
+        check started ends in stay_quiet with no words), else ``None``. Only for the user turn it was made in, and
+        within ``max_age_s``."""
+        owed, self._step_owed = self._step_owed, None
+        if owed is None:
+            return None
+        turn, line, at = owed
+        if time.monotonic() - float(at) > max_age_s or turn != self._call_safely(self.user_turn, None):
+            return None
+        return line or None
+
     def _skill_fallback(self, args: dict[str, Any], facts: dict[str, Any]) -> dict[str, Any] | None:
         """x3 (fix-plan 3c, principle 1): whether a run_skill that did not end in a checked done falls back to the
         thinker doing it the normal way (look at the screen, click, type), and with what: ``{"why", "pin", "context",
@@ -2349,6 +2475,21 @@ class Hands:
             await params.result_callback({"no_change": line or "nothing was waiting for that answer",
                                           "how_to_say_it": "Nothing was kept. Answer their words as usual."})
             return
+        self._step_owed = None   # sVoiceFix (F5): a skill answers the step check, so no step line is owed
+        if not str(args.get("skill") or "").strip():
+            # sVoiceFix (sim-e2e-1 F6): the call came out malformed (its skill ran into say_first, a line break and then
+            # <parameter name="skill">...). Nothing runs; the talker calls it again, once in this turn, never a hand-off
+            # with no seed. A second one in the same turn goes on as before (its run hands it to the thinker).
+            turn_now = self._call_safely(self.user_turn, None)
+            if turn_now is not None and self._given(self._malformed_given, turn_now) < 1:
+                self._malformed_given = (turn_now, self._given(self._malformed_given, turn_now) + 1)
+                if self.log is not None:
+                    self.log.event("hands", op=name, malformed=True, call=params.tool_call_id)
+                if args.get("say_first") and self.bridge is not None:
+                    await self.bridge._ack_if_silent(params, args)   # its words, cut to the words (F6), once
+                await params.result_callback({"not_run": "the call came out malformed: no skill in it",
+                                              "how_to_handle_it": _MALFORMED_NOTE})
+                return
         key = _step_key(name, args)
         if key in self._inflight and time.monotonic() - float(self._inflight[key]) > self.SKILL_HAND_MAX_S:
             # review r1 L2: a run past its backstop is still going: never started twice, and never a silent end
@@ -2666,6 +2807,35 @@ class Hands:
 
         return {via: wrap(via) for via in list(engine.VERB_FUNCS)}
 
+    @staticmethod
+    def _pick_slot(skill_key: str) -> str | None:
+        """sVoiceFix (F11): the slot a skill fills only from options offered aloud, when it cannot run without it: a
+        required slot that :func:`yuki.skills.taste.takes_offers` (every route needs a value only an offered option
+        carries; today ``web.open_video``'s ``video``), else ``None``. Data only (the routes' own conditions); ``None`` on
+        any doubt."""
+        try:
+            from yuki.skills.catalog import load
+            from yuki.skills.taste import takes_offers
+
+            skill = load().get(str(skill_key or ""))
+            for slot in getattr(skill, "slots", None) or ():
+                if getattr(slot, "required", False) and takes_offers(skill, slot):
+                    return str(slot.name)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _offers_waiting(self, now: float | None = None) -> bool:
+        """sVoiceFix (F11): whether options a run offered aloud can still be picked (the talker's options line is on),
+        as the pipeline keeps them (``last_skill["offers"]`` for ``youtube_feed.OFFER_KEEP_S``)."""
+        try:
+            from yuki.skills.youtube_feed import OFFER_KEEP_S as keep_s
+        except Exception:  # noqa: BLE001 - the pipeline's own number
+            keep_s = 900.0
+        last = self.last_skill or {}
+        now = time.time() if now is None else float(now)
+        return bool(last.get("offers")) and now - float(last.get("at") or 0.0) <= float(keep_s)
+
     def _judge_skill(self, skill_key: str, slots: dict[str, Any]) -> None:
         """Rule 8 for a skill that sends (its data's ``sends`` / ``sends_when``) or joins a call (its end state is
         ``call_join``, a voice channel): Yuki's own check reads the user's heard words and the policy, as for the
@@ -2716,6 +2886,16 @@ class Hands:
             facts.update(refused=True, outcome="refused", halted=True)   # x3: the thinker has it already, never again
             return False, (f"your last hand did not show the effect it was for ({self.halted}); your hands stay still "
                            f"until the user speaks again. Nothing was done"), facts
+        pick = self._pick_slot(skill_key)
+        if pick and slots.get(pick) in (None, "", {}, []) and not self._offers_waiting():
+            # sVoiceFix (sim-e2e-1 F11): a skill that only plays one of the options offered aloud, with none offered
+            # and none named ("put something on YouTube" ran web.open_video and asked "Which video?"): nothing runs and
+            # it falls back to the thinker by code (the pick is Yuki's: the normal way, by steps). Review r1 M2: this is
+            # the whole F11 fix; its menu line stays on the talker's menu (off it, the full talker reached for learned
+            # page lines instead and opened Excalidraw for "put something on YouTube and ARC browser")
+            facts.update(refused=True, outcome="refused", skill=skill_key)
+            return False, (f"that skill only plays an option offered to them aloud, and none is offered now; nothing "
+                           f"was done"), facts
         try:
             self._judge_skill(skill_key, slots)
         except _Refused as exc:
@@ -3066,6 +3246,12 @@ class Hands:
             ok, report, facts = self._act(name, args, facts)
             if not (ok and facts.get("verified") is True) and not facts.get("settled"):
                 self.halted = f"{name}: {report[:160]}"
+            elif ok and facts.get("verified") is True and name in STEP_FIRST_OPS \
+                    and not str(args.get("say_when_done") or "").strip() \
+                    and str(args.get("action") or ("show" if name == "tab" else "")) in STEP_FIRST_OPS[name]:
+                # sVoiceFix (F5; review r1 L2): what a window or tab step left showing, for the step check's spoken
+                # line, built here off the voice loop (the app's name may scan processes); RAM only, never logged
+                facts["step_line"] = self._step_line(name, args, facts)
             return ok, report, facts
         except _Refused as exc:
             facts["refused"] = True  # nothing was done: the talker says why ...
@@ -3078,6 +3264,8 @@ class Hands:
                 facts["handover"] = True   # ... or (bTalk) it goes to the planner by code: never refused silently
             if exc.choose is not None:
                 facts["choose"] = exc.choose   # ... or (x3) it asks which tab, by title
+            if exc.shape:
+                facts["shape"] = True   # ... or (sVoiceFix F4) the call is made again once, as the report says
             if exc.stale:
                 # ... unless what it was shown has changed under it (a tab or window no longer where it was): the
                 # request still stands and the thinker, which reads the window afresh, gets it by code (v3.10; live
@@ -3695,6 +3883,7 @@ class Hands:
                                f"done", stale=True)
             title = shown[index - 1]
         facts["target"] = f'TabItem "{title[:80]}"'
+        facts["shown"] = title   # sVoiceFix (F5): what the step check says is showing (RAM only, never logged)
         # review r1 L3: the window comes up first, so a refused focus (a game in front) leaves its tabs as they were
         # and "nothing was done" stays true
         lead = self._front(hwnd)
@@ -3750,7 +3939,10 @@ class Hands:
         r2 H1: a number counts only on a strip the talker was shown (the window in front's tabs line, or numbers offered
         to it from another window's read); for any other window's tabs the title alone names them, and a call with
         numbers and no title is refused as stale (the thinker gets it by code). ``new``
-        gets the window's browser (``_app``). Raises :class:`_Refused`; returns a copy (the call's own words untouched)."""
+        gets the window's browser (``_app``). sVoiceFix (F4): for close, ``named`` serves as the title when no title (and
+        no number the talker was shown) is given, as a title serves as ``named``; a call missing both, or whose named
+        words fit no title on a strip the talker was shown, is refused for its shape (called again once, by the note).
+        Raises :class:`_Refused`; returns a copy (the call's own words untouched)."""
         action = str(args.get("action") or "show")
         out = dict(args)
         if action in ("reopen",):
@@ -3761,9 +3953,19 @@ class Hands:
             return out
         numbers = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
         title = " ".join(str(args.get("title") or "").split())
+        from_named = False
+        if action == "close" and not title and not numbers:
+            # sVoiceFix (sim-e2e-1 F4): the talker fills one of the two; their words naming the tab serve as its title
+            # (live 10 Oct #18 and the sim: named "YouTube" alone was refused three times in a row, then a number)
+            title = " ".join(str(args.get("named") or "").split())
+            from_named = bool(title)
         if not numbers and not title:
-            raise _Refused("name the tab by its title (title: its words on the tabs line, or the part they said); "
-                           "nothing was done")
+            raise _Refused("give title: the tab's title as the tabs line shows it, or the part of it they said; nothing "
+                           "was done", shape=True)
+        if action == "close" and not title and not " ".join(str(args.get("named") or "").split()):
+            # a close by number alone: the words that name it come first (before Yuki's own check is asked about it)
+            raise _Refused("give named: the user's words that name each tab to close (or title: the tab's title); a "
+                           "tab their words do not name is never closed. Nothing was closed", shape=True)
         names, ids, known = self._tab_strip(hwnd)
         if not names:
             raise _Refused(f"the tabs of window {hwnd} could not be read; nothing was done", stale=True)
@@ -3778,6 +3980,10 @@ class Hands:
                 # call): its number is a guess (live #17's words with Arc in front: "tab 1" of Chrome, its Gmail tab,
                 # would have been closed with "Closed it."). The title alone names the tab; with none, the thinker
                 # reads that window and does it, by code, as before
+                if not title and action == "close":
+                    # sVoiceFix (F4): their words naming it serve as its title here too (a number there is a guess)
+                    title = " ".join(str(args.get("named") or "").split())
+                    from_named = bool(title)
                 if not title:
                     raise _Refused(f"the tabs of window {hwnd} were not on the tabs line you were shown, so a tab number "
                                    f"there is not known; nothing was done", stale=True)
@@ -3794,6 +4000,11 @@ class Hands:
                 out["_targets"] = [(n, names[n - 1], ids[n - 1] if n - 1 < len(ids) else "") for n in wanted]
                 return out
         hits = tabs_titled(title, names)
+        if not hits and from_named and known is None:
+            # their words (named) hold more than a title ("the YouTube tab I opened"): the strip was shown, so one call
+            # with the title as the tabs line shows it does it (never a number asked of them)
+            raise _Refused(f"no tab of window {hwnd} has a title with the words in named; give title: the tab's title "
+                           f"as the tabs line shows it, and named: their words. Nothing was done", shape=True)
         if not hits:
             raise _Refused(f"no tab of window {hwnd} has a title with those words; nothing was done", stale=True)
         if len(hits) > 1:
@@ -3888,9 +4099,9 @@ class Hands:
                            "closed")
         if not str(args.get("named") or args.get("title") or "").strip():
             # x3 (3f): a tab named by title carries the words that name it (the part they said); by number alone, the
-            # talker says which of their words name each one
-            raise _Refused("say in named which of the user's words name each tab to close; a tab their words do "
-                           "not name is never closed. Nothing was closed")
+            # talker says which of their words name each one (sVoiceFix F4: either field serves for the other)
+            raise _Refused("give named: the user's words that name each tab to close (or title: the tab's title); a "
+                           "tab their words do not name is never closed. Nothing was closed", shape=True)
         if any(not t[2] for t in targets):
             raise _Refused("those tabs have no identity to close them by; hand it to the thinker. Nothing was closed")
         facts["target"] = "TabItem " + ", ".join(f'"{str(t[1])[:60]}"' for t in targets)
@@ -4596,8 +4807,12 @@ class _Refused(Exception):
     """
 
     def __init__(self, message: str, *, stale: bool = False, held: str | None = None,
-                 act_off: str | None = None, handover: bool = False, choose: dict[str, Any] | None = None) -> None:
+                 act_off: str | None = None, handover: bool = False, choose: dict[str, Any] | None = None,
+                 shape: bool = False) -> None:
         super().__init__(message)
+        #: sVoiceFix (F4): refused for the call's own shape (a field it needs is missing or does not fit), nothing done:
+        #: the talker calls it again once, as the report says; a second such refusal in the turn goes to the thinker
+        self.shape = shape
         #: bTalk (``brain = "all"``): the step could send or join: handed over to the planner by code (design 3, L10).
         self.handover = handover
         #: x3 (3f): several tabs fit the title given: ``{"count", "numbers", "titles"}`` (the talker asks by title).
