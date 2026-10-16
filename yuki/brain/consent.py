@@ -695,6 +695,32 @@ def said_share(text: str, heard: str | Sequence[str], names: Sequence[str] = ())
     return best / len(own)
 
 
+def spoken_name(to: str, people: Callable[[str], list[list[str]] | None] | None) -> str:
+    """pBrain (B35, bRound2: 'Send "..." to हेमंत?' and "Sending to हेमंत" when the planner wrote ``consent.to`` in
+    Devanagari): the name a line says or shows for the person ``to`` names: memory's own name for them (the first of
+    the names its people index keeps, ``contacts.Contact.names``) when the index finds exactly one person in ``to`` and
+    ``to`` is that person's name (one of their names, a learned heard form, or a transliteration no name of theirs
+    stands beside), else ``to`` as given (nobody, two people, more words than their name, memory can't say). Only what
+    is said: whom a message goes to is never changed here. Memory's data, never a word list."""
+    from yuki.memory.contacts import span_in, tokens
+
+    given = words(to)
+    if not given or people is None:
+        return given
+    try:
+        found = people(given)
+    except Exception:  # noqa: BLE001 - memory can't say: the name as given
+        return given
+    if not isinstance(found, list) or len(found) != 1 or not found[0]:
+        return given
+    names = [words(str(n)) for n in found[0] if words(str(n))]
+    if not names:
+        return given
+    if any(tokens(n) == tokens(given) for n in names) or not any(span_in(n, given) for n in names):
+        return names[0]
+    return given
+
+
 def ask_send_question(text: str, to: str) -> str:
     """The question for a send the user is asked about: what goes to whom (the text cut to :data:`ASK_TEXT_CHARS`)."""
     body = words(text)
@@ -1398,7 +1424,7 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     seen = near_duplicate(body, live)
     if seen is not None:
         at = _clock(float(seen.get("at") or 0.0))
-        question = LINE_DUPLICATE.format(to=to, at=at) if to and at else LINE_DUPLICATE_PLAIN
+        question = LINE_DUPLICATE.format(to=spoken_name(to, look), at=at) if to and at else LINE_DUPLICATE_PLAIN
         return Verdict(ASK, 4, "duplicate", question=question)
     # whom it goes to: the user's words the quote stands for name the recipient (review r2 M1 a: a name said only
     # outside the quote is asked, never sent unasked)
@@ -1412,7 +1438,8 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
         # asked first, showing what goes to whom: a recipient the quote doesn't plainly name (speech heard the name
         # another way, two people go by it, the name was said only outside the quote), or Yuki's wording with little
         # of their words in it; a yes is their plain instruction
-        return Verdict(ASK, 4, "worded" if named else "recipient_unsaid", question=ask_send_question(body, to))
+        return Verdict(ASK, 4, "worded" if named else "recipient_unsaid",
+                       question=ask_send_question(body, spoken_name(to, look)))
     return Verdict(ALLOW, 4, "send" if said else "send_worded", countdown=True)
 
 
@@ -1469,7 +1496,7 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 __all__ = ["ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
            "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
-           "after_ask", "ask_send_question", "calling_windows", "chat_window", "check", "draft_slots",
+           "after_ask", "ask_send_question", "spoken_name", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_now", "in_words", "is_join_control", "join_controls", "may_commit",
            "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent", "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",

@@ -50,6 +50,7 @@ from yuki.brain.context import (
     load_catalog,
     look_report,
     one_line,
+    part_rest_report,
     read_report,
     REST_DONE_WORD,
     request_turn,
@@ -61,6 +62,7 @@ from yuki.brain.context import (
     step_report,
     steer_blocks,
     swap_blocks,
+    text_back_report,
     tool_result,
     unconfirmed_report,
 )
@@ -172,6 +174,20 @@ OBSERVE_ACTED_LEVELS: frozenset[str] = frozenset({"unverified"})
 #: planner's look at what the skill left, then its plan).
 SKILL_RESTS_MAX = 1
 SKILL_REST_CALLS = 2
+#: pBrain (17 Oct e2e2 B14 / bRound2 B28 r0: [ctrl+t, open_url youtube.com, look] with done "YouTube's home page",
+#: ended "Youtube's home page is open in Arc; I couldn't check the rest." and nothing put on): a steps plan that ended
+#: on a look (the core prompt's own sign of a plan doing a part) and whose done read true while covering only part of
+#: the target (level likely) goes back to the planner once with what the look read, its line held as a skill route's
+#: is (``part_rest``); each such turn adds SKILL_REST_CALLS to the act budget, as code's own question.
+PART_RESTS_MAX = 1
+#: pBrain (17 Oct e2e2 B14 r2: the done read "another page is showing" and the planner replied "Tell me what you want
+#: to watch and I'll put it on."): an act request not confirmed done whose planner answers in plain text gets one
+#: more planner turn before it ends (:func:`text_back`), adding TEXT_BACK_CALLS to the act budget (code's question).
+TEXT_BACKS_MAX = 1
+TEXT_BACK_CALLS = 2
+#: pBrain (B35, bRound2 "Sending to हेमंत"): the bound on the people-index read that gives a spoken line memory's own
+#: name for a send's recipient (:meth:`Brain._said_name`).
+SAID_NAME_TIMEOUT_S = 0.8
 #: bRound2 (B28): the user's own turns of this conversation the executor may find a step's app value in
 #: (:meth:`Host.said_before`): memory's turn log of the last ``SAID_BEFORE_S`` (the 10 Oct YouTube-in-Arc task ran 17
 #: minutes; "in arc not in Chrome" stood 4 minutes before "Open the fucking YouTube tab"), at most
@@ -261,6 +277,15 @@ class _State:
     skills_done: set[str] = field(default_factory=set)
     #: The held ending that turn put up (:attr:`held` while no other ending replaced it).
     rest_held: tuple[str, dict[str, Any]] | None = None
+    #: pBrain: steps plans that ended on a look with a done that read only part of the target (:func:`part_rest`),
+    #: sent back to the planner for the rest; and the plain-text replies to an unconfirmed act request sent back
+    #: (:func:`text_back`).
+    part_rests: int = 0
+    text_backs: int = 0
+    #: pBrain review r1 (L1): how many of the user's words (``Host.user_words``: their turns, steers, answers to a
+    #: question) there were when the last plan began; words added since mean the user spoke after it (a steer folded
+    #: into its report, an answer), and :func:`text_back` then leaves their reply to the planner's reading of them.
+    plan_words: int = 0
 
 
 class _NoticeSink:
@@ -1008,9 +1033,42 @@ class Brain:
 
     # -- the send countdown (copied from loop.Agent, push-style) ------------------------------------------------------
 
+    def _said_name(self, who: str) -> str:
+        """pBrain (B35, bRound2: "Sending to हेमंत" when the planner wrote ``consent.to`` in Devanagari): the name the
+        countdown says and shows for a send's recipient: memory's own name for the one person ``who`` names
+        (:func:`yuki.brain.consent.spoken_name` over memory's people index, ``contacts.named_in``: as written, a
+        learned heard form, a transliteration), else ``who`` as given. One bounded memory read
+        (:data:`SAID_NAME_TIMEOUT_S`); whom the message goes to is the skill's, never changed here."""
+        given = " ".join(str(who or "").split())
+        host = self._host_ref
+        memory = getattr(host, "memory", None) if host is not None else None
+        call = getattr(memory if memory is not None else self.memory, "call", None)
+        if not given or not callable(call):
+            return given
+
+        def people(text: str) -> list[list[str]] | None:
+            def go(client: Any) -> list[list[str]]:
+                from yuki.memory.contacts import named_in
+
+                return [list(c.names) for c, _matched in named_in(getattr(client, "store", client), text)]
+
+            try:
+                got = call("brain_said_name", go, timeout_s=SAID_NAME_TIMEOUT_S)
+            except Exception:  # noqa: BLE001 - memory can't say: the name as given
+                return None
+            return got if isinstance(got, list) else None
+
+        from yuki.brain.consent import spoken_name
+
+        said = spoken_name(given, people)
+        self.logger.log("brain_said_name", changed=said != given)
+        return said
+
     def _send_countdown(self, *, who: str, where: str, app: str, text: str, typed: bool, window: str,
                         who_alts: tuple[str, ...], where_alts: tuple[str, ...], from_memory: bool) -> str:
         seconds = float(self.send_countdown_s)
+        if seconds > 0:
+            who = self._said_name(who)   # pBrain: said and shown by memory's own name for them, never as written
         info = {"who": who, "where": where, "app": app, "text": text, "typed": typed, "window": window,
                 "who_alts": who_alts, "where_alts": where_alts, "from_memory": from_memory}
         if seconds <= 0:
@@ -1518,10 +1576,12 @@ class Brain:
 
     def _budget_left(self, state: _State, bs: BrainSettings, req: _Request) -> bool:
         """Act plans: at most ``act_calls`` model calls, plus :data:`SKILL_REST_CALLS` for each turn code itself asked
-        for after a skill route ended done (sBrainFix F2: ``skill_rests``; code's question, never the planner's
-        spending); answers: ``answer_calls`` or ``answer_s`` of work."""
+        for after a skill route ended done (sBrainFix F2: ``skill_rests``) or a steps plan's part did (pBrain:
+        ``part_rests``), and :data:`TEXT_BACK_CALLS` for each plain reply sent back (pBrain: ``text_backs``); code's
+        questions, never the planner's spending. Answers: ``answer_calls`` or ``answer_s`` of work."""
         if state.kind == "act":
-            return state.calls < bs.act_calls + state.skill_rests * SKILL_REST_CALLS
+            return state.calls < (bs.act_calls + (state.skill_rests + state.part_rests) * SKILL_REST_CALLS
+                                  + state.text_backs * TEXT_BACK_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
 
@@ -1553,6 +1613,7 @@ class Brain:
                 tool = call.next_tool()
                 if tool is not None and tool.name == PLAN_TOOL and call.plan is not None:
                     state.plans += 1
+                    state.plan_words = len(host.user_words)
                     result = self._run_plan(call.plan, executor, host, state, req, nonce)
                 resp = call.finish()
             except CallCancelled:
@@ -2037,6 +2098,23 @@ class Brain:
                 conv.add_user([tool_result(tool_id, skill_rest_report(plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
+            if (status == "done" and line != LINE_DRAFTED and part_rest(plan, result, outcome)
+                    and state.part_rests < PART_RESTS_MAX):
+                # pBrain (17 Oct e2e2 B14 r0, bRound2 B28 r0): the plan ended on a look, which the core prompt asks of
+                # steps doing a part, and its done read true while covering only part of the target (likely): a done
+                # that reads the first part ("YouTube's home page" for "...and put something on from the front
+                # page"). Whether more is left is the planner's to read from their words, never code's: as after a
+                # skill route, its line is held and the planner gets one turn with what the look read, to plan the
+                # rest by steps or give the one-word reply that all is done (the held line then stands; any other
+                # reply, or the budget running out, says the rest isn't done). PART_RESTS_MAX bounds it, and the
+                # turn adds SKILL_REST_CALLS to the act budget. Never after a send or a join (part_rest).
+                state.part_rests += 1
+                state.held = state.rest_held = (line, outcome)
+                self.logger.log("brain_done_part", n=state.part_rests, reads=len(result.reads),
+                                probe=result.probe or None)
+                conv.add_user([tool_result(tool_id, part_rest_report(result, plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
             self._final(line, outcome)
             return True
         if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
@@ -2204,6 +2282,20 @@ class Brain:
             return False
         text = (text or "").strip()
         last = state.last
+        where = text_back(state, self._req.seed if self._req is not None else None, words=len(host.user_words))
+        if where is not None and not self._cancelled.is_set():
+            # pBrain (17 Oct e2e2 B14 r2: the done read "another page is showing" and the planner's reply, "Tell me
+            # what you want to watch and I'll put it on.", ended the request on code's "I couldn't confirm ..."): an act
+            # request that is not confirmed done is never ended by the planner's words the first time: one more turn,
+            # with where it stands in code's line, to do the rest by steps (a pick left to it is its to make) or ask
+            # one question as a plan. Its next plain reply ends it as before (code's line). TEXT_BACKS_MAX bounds it,
+            # and the turn adds TEXT_BACK_CALLS to the act budget (code's question). Never on a send or a join.
+            state.text_backs += 1
+            self.logger.log("brain_text_back", n=state.text_backs, status=last.status if last is not None else None,
+                            held=state.held is not None, acted=state.acted, chars=len(text))
+            conv.add_user([{"type": "text", "text": text_back_report(state.current, where)},
+                           *self._steer_turn(host)])
+            return False
         if state.held is not None:
             if state.held is state.rest_held and not rest_done_reply(text):
                 # sBrainFix (F2): after a skill route did its part, the planner neither planned the rest nor gave the
@@ -2236,7 +2328,15 @@ class Brain:
         all done."""
         if state.held is not None and state.held is state.rest_held:
             held_line, held_outcome = state.held
-            line = LINE_REST_UNDONE.format(line=" ".join(str(held_line or "").split()).rstrip(". ") or "I did a part")
+            base = " ".join(str(held_line or "").split())
+            from yuki.brain.done import LINE_REST
+
+            # pBrain: a part's held line is done's own "<what was verified>; I couldn't check the rest." (part_rest
+            # holds only a likely ending): said once, as what was seen and that the rest isn't done
+            tail = LINE_REST.format(line="")
+            if base.endswith(tail):
+                base = base[:-len(tail)]
+            line = LINE_REST_UNDONE.format(line=base.rstrip(". ") or "I did a part")
             self._final(line, {**dict(held_outcome or {}), "level": "failed", "label": LEVEL_LABELS["failed"],
                                "partial": True, "line": line,
                                "open": max(1, int(dict(held_outcome or {}).get("open") or 0))})
@@ -2525,6 +2625,68 @@ def skill_rest(plan: Plan | None) -> bool:
     (the route, the declared commit)."""
     return (plan is not None and plan.kind == "act" and bool(plan.skill)
             and plan.consent.commit not in ("send", "join"))
+
+
+def _same_check(a: Any, b: Any) -> bool:
+    """Two probes read the same thing: the same probe with the same arguments, the process aside (a page check's
+    browser, which the executor fills from the request either way) and a page check's site normalised the way the
+    probe reads it (``done._site_key``: "youtube.com" is "youtube"). Code facts of the plan only."""
+    from yuki.brain.done import _site_key
+
+    if a is None or b is None or str(getattr(a, "name", "")) != str(getattr(b, "name", "")):
+        return False
+
+    def norm(probe: Any) -> dict[str, str]:
+        args = dict(getattr(probe, "args", None) or {})
+        out = {str(k): " ".join(str(v).split()).casefold() for k, v in args.items() if k != "process"}
+        if "site" in out:
+            out["site"] = _site_key(out["site"])
+        return out
+
+    return norm(a) == norm(b)
+
+
+def part_rest(plan: Plan | None, result: ExecResult, outcome: Mapping[str, Any] | None) -> bool:
+    """pBrain: a steps plan (no skill route, no send or join, not decided by a hand-off's own check) that ended on a
+    look, whose done is the very check one of its own act steps already expected (it reads what that step did, a
+    part) and read true while covering only part of the target (``likely``: a target field its probe doesn't read),
+    did only the first part of the request by its own plan's shape: it goes back to the planner for the rest. All three
+    17 Oct cases were [ctrl+t, open_url (expect YouTube's home page), look] with the done "YouTube's home page"; a plan
+    whose done reads something no step expected ([click a video, wait, look] with the done "a video page") ends as
+    before. Code facts only (the route, the declared commit, the last step's verb, the probes, the check's level),
+    never a reading of their words."""
+    if plan is None or plan.kind != "act" or plan.skill or plan.seed_check or not plan.steps:
+        return False
+    if plan.consent.commit in ("send", "join") or plan.steps[-1].verb != "look" or result.verdict is not True:
+        return False
+    if not any(s.verb in ACT_VERBS and _same_check(s.expect, plan.done) for s in plan.steps):
+        return False
+    return isinstance(outcome, Mapping) and str(outcome.get("level") or "") == "likely"
+
+
+def text_back(state: _State, seed: Mapping[str, Any] | None, *, words: int | None = None) -> str | None:
+    """pBrain: code's line for where an act request stands when the planner just replied in plain text and the request
+    is not confirmed done, so the reply goes back once (:data:`TEXT_BACKS_MAX`); ``None`` when it ends as before. Not
+    confirmed: its last plan stopped (a step or the done read otherwise: ``mismatch``, an ``error``), and the report
+    the planner got asked for a revised plan. Never with a held line (a look-back's, an unconfirmed skill's, a skill
+    route's or a part's turn already was code's one more turn, with a plain reply as one of its answers; the user's
+    addition), after a refusal (consent's line stands), an ending the executor called final (a game in front), or on a
+    send or a join (rule 8: nothing more is planned on a send's back, nor for a sending skill's hand-off), nor when the
+    user spoke since the last plan began (``words``: how many of their words there are now, against
+    :attr:`_State.plan_words`; review r1 L1: a "leave it" folded into the step report, or "no, forget it" to a
+    question, and the planner's "Okay." is their word, never pushed back). Code facts only."""
+    if state.kind != "act" or state.text_backs >= TEXT_BACKS_MAX or state.held is not None:
+        return None
+    if words is not None and words > state.plan_words:
+        return None
+    plan, last = state.current, state.last
+    if plan is not None and plan.consent.commit in ("send", "join"):
+        return None
+    if seed_sends(seed):
+        return None
+    if last is None or last.final or last.status not in ("mismatch", "error"):
+        return None
+    return " ".join(str(last.line or "").split()) or LINE_UNCONFIRMED
 
 
 def look_only(plan: Plan | None, result: ExecResult) -> bool:

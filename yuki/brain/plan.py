@@ -959,14 +959,19 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
     if verb == "look":
         # sBrainFix (review r1 runs): a look written without what to read, or without the window a window read needs
         # (16 Oct, about a third of the web runs: look_value_must_be_one_of / look_page_needs_window, an invalid plan
-        # after its earlier steps already ran), reads its window (else the desktop), in the plan's own target window
-        # when it names an hwnd: a read either way, so the default can do nothing the plan didn't ask for
-        own = (header.target.window or "").strip()
-        own = own if own.isdigit() else ""
+        # after its earlier steps already ran), reads its window (else the desktop): a read either way, so the default
+        # can do nothing the plan didn't ask for
+        own = " ".join((header.target.window or "").split())
+        # pBrain (17 Oct e2e2 B14 r0: [ctrl+t in "Arc.exe", open_url in "Arc.exe", look page] with no window on the
+        # look and a title as the target's window: look_page_needs_window, and the replan swapped its done for a
+        # first-part probe): a look with no window reads the window the plan's last step before it named, else the
+        # target's window (an hwnd or a title either way, resolved as a step's window is: done.window_of, else the
+        # window in front). A read of a window the plan itself names, so it can do nothing the plan didn't ask for.
+        before = next((p.window for p in reversed(prior) if (p.window or "").strip()), None)
         if not " ".join(str(value or "").split()):
-            value = "window" if window or own else "desktop"
-        if not window and own and str(value).strip() in LOOK_NEEDS_WINDOW:
-            window = own
+            value = "window" if window or before or own else "desktop"
+        if not window and str(value).strip() in LOOK_NEEDS_WINDOW:
+            window = before or own or None
     if isinstance(value, str) and len(value) > VALUE_CHARS:
         errors.append(f"{where}value is longer than {VALUE_CHARS} characters")
     submit = raw.get("submit")
