@@ -75,7 +75,11 @@ afterwards.  On 10 Oct at 20:55 Arc ignored the address while its window,
 behind another app, still showed a YouTube watch page; that page was taken for
 the one opened and the hand said "verified".  Now that is ``ok=False`` with
 ``details["reason"] = "page_unchanged"`` (also when the pages shown are of
-another host), so a skill moves on to its next rung.  ``deadline=`` (a
+another host), so a skill moves on to its next rung.  A window whose page
+before the hand-off *was* the very page asked for, and still is, is another
+matter (review r1 M1): the requested page is showing, so that is ``ok=True``
+with ``details["page_state"] = "already"`` and the window brought forward
+(a skill says "already", never a fresh "done").  ``deadline=`` (a
 ``time.monotonic()`` time) bounds the whole call - the start, the page, the
 window and bringing it forward - for a caller that must answer in time (a
 skill's rung; on 10 Oct one Arc launch took 26-34 s).  ``details["via_word"]``
@@ -1624,6 +1628,21 @@ def _await_page(identity: _AppIdentity, targets: list[str], before: dict[int, in
     return wait
 
 
+def _already_page(wait, unchanged: dict[int, str] | None, targets: list[str]):
+    """Review r1 M1: the page seen after the hand-off in a window whose main page right before it was already the very
+    page asked for and still is (a browser that ignored the address, or opened another tab of that same page), else
+    ``None``. Only the exact page: a page deeper than a requested site root (V11, :func:`_past_root`) never counts, so
+    the 20:55 old watch tab stays ``page_unchanged``."""
+    if wait is None or not unchanged:
+        return None
+    return next(
+        (page for page in wait.seen
+         if page.main and page.hwnd in unchanged and _page_key(page.url) == _page_key(unchanged[page.hwnd])
+         and any(_same_page(target, page.url) and not _past_root(target, page.url) for target in targets)),
+        None,
+    )
+
+
 def _unchanged_windows(wait, unchanged: dict[int, str] | None) -> list[int]:
     """The windows whose main page after the hand-off is the very page they showed before it."""
     if wait is None or not unchanged:
@@ -1699,21 +1718,28 @@ def _page_opened(
     identity: _AppIdentity | None = None,
     *,
     focus_floor_s: float | None = None,
+    already: bool = False,
 ) -> str:
     """Bring the window showing the requested page forward, wait out the rest of
     its content (within ``content_deadline``) and say so, fact first.
-    ``focus_floor_s``: the bring-forward's least time (``None``: its default)."""
+    ``focus_floor_s``: the bring-forward's least time (``None``: its default).
+    ``already`` (review r1 M1): that window showed this very page before the
+    hand-off and still does (:func:`_already_page`): said so, and
+    ``details["page_state"] = "already"``, never "now showing"."""
     seen = wait.matched
     hwnd = seen.hwnd
     info = window_info(hwnd)
     details.update(
         hwnd=hwnd,
-        window_reason="a window of it is showing the requested page",
+        window_reason=("a window of it already showed the requested page before the address was handed over"
+                       if already else "a window of it is showing the requested page"),
         title=info.title if info else "",
         process_name=info.process_name if info else "",
         page_verified=True,
         page={"title": seen.title, "url": seen.url},
     )
+    if already:
+        details["page_state"] = "already"
     appeared = [h for h in _window_snapshot()[0] if h not in before]
     details["new_windows"] = [
         {
@@ -1737,6 +1763,12 @@ def _page_opened(
     if (fresh := window_info(hwnd)) is not None:
         details["title"] = fresh.title
     new_window = hwnd in appeared
+    if already:
+        return (
+            f"{name} already showed {_page_phrase(seen.title, seen.url)} before the address was handed over and "
+            f"still shows it (no new page of it was seen): hwnd {hwnd} ({details['process_name']}) "
+            f"\"{details['title']}\"; {forward}"
+        )
     return (
         f"{name} is now showing {_page_phrase(seen.title, seen.url)}"
         f"{' in a new window' if new_window else ''}: hwnd {hwnd} "
@@ -2689,6 +2721,8 @@ def launch_app(
     windows show pages but none newly at the address the result is
     ``ok=False`` with ``details["reason"] = "page_unchanged"`` (Arc ignored
     the address and kept its old page, or showed a YouTube tab it already had).
+    A window that already showed the very page asked for and still does is
+    ``ok=True`` with ``details["page_state"] = "already"`` (review r1 M1).
 
     The window that appeared (or changed) is brought to the foreground exactly as
     :func:`focus_window` does and waited on until it accepts input, so the caller
@@ -2986,6 +3020,18 @@ def launch_app(
                                           again_deadline, page_targets, identity, focus_floor_s=focus_floor)
                     return finish(True, f"{opened} (the address was handed again once {chosen['name']} was "
                                         f"running: its first start showed no page)", details)
+        already_page = _already_page(page_wait, unchanged, page_targets)
+        if already_page is not None:
+            # review r1 M1: no page newly at the address, but a window that already showed the very page asked for
+            # still shows it: the page is up (brought forward), said as "already", never as a page opened
+            page_wait.matched = already_page
+            details["waited_ms"] = round((time.monotonic() - handed_off) * 1000.0, 1)
+            return finish(
+                True,
+                _page_opened(chosen["name"], page_wait, before, details, content_deadline, page_targets, identity,
+                             focus_floor_s=focus_floor, already=True),
+                details,
+            )
         details["page_verified"] = False if page_wait is not None and page_wait.seen else None
         still = _unchanged_windows(page_wait, unchanged)
         page_miss = _page_miss(chosen["name"], page_targets, page_wait, still)
@@ -3678,7 +3724,9 @@ def open_url(
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
     unchanged page, or pages none of which is newly at the address, give
-    ``ok=False`` with ``details["reason"] = "page_unchanged"``, never "verified".
+    ``ok=False`` with ``details["reason"] = "page_unchanged"``, never "verified";
+    the very page asked for, already showing before and still, is ``ok=True``
+    with ``details["page_state"] = "already"`` (review r1 M1).
 
     With the default handler, the handler's window is watched for (a new window,
     the foreground changing, or a window of the handler's program changing its
@@ -3768,6 +3816,19 @@ def open_url(
                 f"{opened}; "
                 + _page_opened(who, page_wait, before, details, content_deadline, [address],
                                focus_floor_s=focus_floor),
+                details,
+            )
+        already_page = _already_page(page_wait, unchanged, [address])
+        if already_page is not None:
+            # review r1 M1: the very page asked for was already showing and still is: "already", brought forward
+            page_wait.matched = already_page
+            process = getattr(window_info(already_page.hwnd), "process_name", "")
+            who = os.path.splitext(process)[0] if process else who
+            return finish(
+                True,
+                f"{opened}; "
+                + _page_opened(who, page_wait, before, details, content_deadline, [address],
+                               focus_floor_s=focus_floor, already=True),
                 details,
             )
         details["page_verified"] = False if page_wait is not None and page_wait.seen else None
