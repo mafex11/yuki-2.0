@@ -32,8 +32,10 @@ expectation still false after 1.5 s, is a **mismatch**: the planner gets the pla
 (at most 1.5k characters) and that window's view.
 
 **open_url opens in the browser the plan named** (x9): the step's ``window``, else the plan's target app, goes to the
-tool as ``app`` (the name Windows gives that program: "Arc.exe" -> "Arc"); with none, Windows' default handler opens
-it. A ``page_at`` check then reads that browser's page (its ``process``), never a page in another browser; a probe's
+tool as ``app`` (the name Windows gives that program: "Arc.exe" -> "Arc") when machine data says it is a browser (the
+user's own timeline, ``web_route.measured_browsers``: a program that showed pages of several sites; or a browser
+Windows has registered), so a chat app a link is in is never one; with none, Windows' default handler opens it. A
+``page_at`` check then reads that browser's page (its ``process``), never a page in another browser; a probe's
 ``process`` the plan wrote as an app's name ("Arc") is read as that program's image ("Arc.exe"), as the probes compare.
 
 **A run_skill step** gets the user's words of this exchange, and before them the span of an earlier request of theirs
@@ -348,9 +350,13 @@ class Executor:
         self._swap_words: list[str] = []
         self._done_replan = False
         self._last_overview: dict[str, Any] = {}
-        #: x9: the program (process image) of the browser this request last opened an address in by name; a page_at
-        #: check reads that browser's page, never another browser's (``""``: none named yet)
+        #: x9: the program (process image) of the browser this request's last open_url of a web address opened it in
+        #: by name; a page_at check reads that browser's page, never another browser's (``""``: none named, or the
+        #: last one went to Windows' default handler)
         self.browser = ""
+        #: x9 (review r1 M1): the programs that are browsers by machine data, read once per request
+        #: (:meth:`_browsers`; ``None``: not read yet)
+        self._browser_rows: list[dict[str, Any]] | None = None
         self._reset_plan()
         self._skill_context()
 
@@ -922,8 +928,13 @@ class Executor:
                               about=about))
         self._note_numbers(call, outcome)
         self._read_cache.pop(int(call.hwnd or 0), None)
-        if call.tool == "open_url" and words(call.input.get("app")) and _web_host(call.input.get("url")):
-            self._note_browser(call, outcome)
+        if call.tool == "open_url" and _web_host(call.input.get("url")):
+            # the browser a later page_at reads: the one this address went to by name; one that went to Windows'
+            # default handler names none, so an earlier one no longer holds the check (review r1 L3)
+            if words(call.input.get("app")):
+                self._note_browser(call, outcome)
+            else:
+                self.browser = ""
         own, why = util.action_verdict(call.tool, outcome)
         verdict = own
         expect = field_of(step, "expect", None)
@@ -1206,33 +1217,47 @@ class Executor:
            never guesses, so a name that fits no Start menu app fails the step with the candidates and the planner
            replans).
 
-        A name that is the address's own site ("YouTube" for youtube.com, "Microsoft Teams" for teams.microsoft.com)
-        names no browser, and Yuki's own window is never one. A name an app on this PC is known by
-        (``appnames.aliases``: machine data) is that app, never a title hint: "Arc" while Arc is closed starts Arc,
-        never a Chrome window whose title has the word "Arc". A name that fits windows on screen by their titles but no
-        one program is not started either. No browser named: ``app`` stays unset (Windows' default handler, as
-        before). Sets ``tool_input["app"]``; returns the browser's window (``None`` when it isn't open; the step's own
-        window when no browser was chosen), its entry, and the browser's process image (``""``: not known before it
-        opens)."""
+        Either way the program is taken only when machine data says it is a browser (:meth:`_is_browser`, review r1
+        M1): for "open the YouTube link Hemanth sent me on Discord" the plan's target app is Discord, which
+        would be handed the link and never open it. A name that is the address's own site ("YouTube" for youtube.com,
+        "Microsoft Teams" for teams.microsoft.com) names no browser, and Yuki's own window is never one. A name an app
+        on this PC is known by (``appnames.aliases``: machine data) is that app, never a title hint: "Arc" while Arc is
+        closed starts Arc, never a Chrome window whose title has the word "Arc". A name that fits windows on screen by
+        their titles but no one program is not started either. No browser named: ``app`` stays unset (Windows' default
+        handler, as before).
+
+        A bare host ("youtube.com", :func:`_bare_host`) is a web address here only when its browser is named (review
+        r1 L1); it goes to that browser as ``https://``, as a browser opens it. An ``app`` the step value wrote is kept
+        as written, and the call's window is that app's when one is listed (review r1 L4).
+
+        Sets ``tool_input["app"]`` (and ``"url"`` for a bare host); returns the window the address goes to (``None``
+        when its app isn't open; the step's own window when no browser was chosen), its entry, and its program's
+        process image (``""``: not known before it opens)."""
         windows = [dict(w) for w in payload.get("windows") or [] if isinstance(w, Mapping)
                    and done.as_hwnd(w.get("hwnd"))]
         front = done.as_hwnd(payload.get("foreground_hwnd"))
         given = words(tool_input.get("app"))
-        host = _web_host(tool_input.get("url"))
+        url = str(tool_input.get("url") or "").strip()
+        host = _web_host(url)
+        bare = "" if host else _bare_host(url)
         chosen: tuple[int | None, dict[str, Any], str] | None = None
         source = "none"
         if given:
-            # the plan wrote its app itself: kept as written; its program read off the list when it is open
+            # the plan wrote its app itself: kept as written; the call is that app's window when it is listed (its Act
+            # switch, the screen gate and the done-check's window are the app the address goes to), else none
             found = _app_windows(windows, given, front)
             source = "value"
-            chosen = (hwnd, dict(entry), str(found[0].get("process_name") or "") if found else "")
-        elif not host:
+            chosen = (done.as_hwnd(found[0].get("hwnd")), found[0], str(found[0].get("process_name") or "")) \
+                if found else (None, {}, "")
+            if bare and self._is_browser(chosen[2] or given):
+                tool_input["url"] = "https://" + url
+        elif not (host or bare):
             source = "not_web"   # a file, a folder or another scheme: its own handler opens it, as before
         else:
             target = words(field_of(field_of(self.head, "target", {}), "app", "")) if self.head is not None else ""
             names = [(name, kind) for name, kind in ((words(ref) if ref is not None else "", "window"),
                                                      (target, "target"))
-                     if name and not _names_site(name, host)]
+                     if name and not _names_site(name, host or bare)]
             resolved = dict(entry) if hwnd is not None and entry.get("process_name") and \
                 not _is_own_window(int(hwnd)) else None   # the one listed window the step's window field named
             for name, kind in names:   # the step's own window wholly first, then the plan's target app
@@ -1245,6 +1270,9 @@ class Executor:
                         found = [resolved]   # the one window the hint's title names
                 if found:
                     image = str(found[0].get("process_name") or "")
+                    if not self._is_browser(image):
+                        source = "not_browser"   # a program that isn't a browser (the chat app a link is in)
+                        continue
                     tool_input["app"] = _launch_name(image)
                     chosen, source = (done.as_hwnd(found[0].get("hwnd")), found[0], image), kind
                     break
@@ -1255,18 +1283,73 @@ class Executor:
                     continue   # Yuki's own window is never a browser
                 if fits and not _known_app(name):
                     continue   # a title hint for windows on screen that fit no one program: nothing to start
+                if not self._is_browser(name):
+                    source = "not_browser"   # no browser goes by that name on this PC: nothing to start
+                    continue
                 tool_input["app"] = name   # a browser that isn't open: open_url starts it with the address
                 chosen, source = (None, {}, ""), "named_" + kind
                 break
+            if bare and chosen is not None:
+                tool_input["url"] = "https://" + url   # a bare host its browser opens as https
+            elif bare:
+                source = "not_web"   # no browser named: a bare name.tld goes to its own handler, as before
         if log:
             self._emit_log("brain_open_url", source=source, open=bool(chosen and chosen[0]))   # a code word (log enum)
         return chosen if chosen is not None else (hwnd, dict(entry), "")
 
+    def _browsers(self) -> list[dict[str, Any]]:
+        """The programs that are browsers on this PC by machine data, each ``{"key", "name"}`` (app key, name), read
+        once per request; zero setup, never a list of browsers:
+
+        * the user's own timeline (``yuki.skills.web_route.measured_browsers`` with ``by_site=False``: a program that
+          showed pages of at least ``BROWSER_MIN_HOSTS`` hosts in the last ``BROWSER_DAYS`` days, never Yuki's own
+          rows; the web skill's definition, so a chat app that draws its one site, Discord or Slack, is never one),
+          through memory (one bounded query);
+        * the browsers Windows has registered (:func:`_registered_browsers`), so one installed but not used lately
+          ("open it in Firefox") counts too, and Chrome or Edge do while memory can't answer.
+
+        ``[]`` when neither can be read: then no program is taken for a browser (Windows' default handler opens the
+        address and the check reads the window in front, as before x9). Never raises."""
+        if self._browser_rows is None:
+            rows: Any = None
+            try:
+                run = done._memory_call(self.host.memory)
+
+                def go(client: Any) -> list[dict[str, Any]]:
+                    from yuki.skills.web_route import measured_browsers
+
+                    return measured_browsers(getattr(client, "store", client), by_site=False)
+
+                rows = run("brain_browsers", go) if run is not None else None
+            except Exception:  # noqa: BLE001 - memory unavailable or slow: the registered browsers only
+                rows = None
+            measured = [dict(r) for r in rows if isinstance(r, Mapping)] if isinstance(rows, list) else []
+            registered = _registered_browsers()
+            self._browser_rows = measured + registered
+            self._emit_log("brain_browsers", measured=len(measured), registered=len(registered))
+        return self._browser_rows
+
+    def _is_browser(self, name: str) -> bool:
+        """Whether a program (its image, "Arc.exe", or an app's name, "Arc", "Google Chrome") is a browser by machine
+        data (:meth:`_browsers`: the user's timeline, Windows' registered browsers), by every name it goes by
+        (``util.app_names``: as written, its process key, the name Windows gives it). Never a list of browsers.
+        ``False`` when it can't be read."""
+        try:
+            want = util.app_names(name)
+            return bool(want) and any(
+                want & (util.app_names(str(row.get("key") or "")) | util.app_names(str(row.get("name") or "")))
+                for row in self._browsers())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _note_browser(self, call: Call, outcome: Any) -> None:
-        """An ``open_url`` that named its browser ran (x9): that browser's program (its process image), for a page_at
-        check's ``process``. Known from the window it was resolved to, else from the window open_url reports
-        (``launch_app``'s ``details.hwnd`` with its ``process_name``, else as the window list shows that hwnd now; a
-        ``process_name`` with no hwnd is the launcher's own window in front, never the browser's). Never raises."""
+        """An ``open_url`` that named its app ran (x9): that app's program (its process image) is the browser a later
+        page_at check reads, when machine data says it is one (:meth:`_is_browser`); else none (``""``: the
+        check reads the window in front, as before), never an earlier browser of the request. Known from the window it
+        was resolved to, else from the window open_url reports (``launch_app``'s ``details.hwnd`` with its
+        ``process_name``, else as the window list shows that hwnd now; a ``process_name`` with no hwnd is the
+        launcher's own window in front, never the browser's). Never raises."""
+        image = ""
         try:
             image = self._open_images.get(call.index, "")
             if not image:
@@ -1279,21 +1362,22 @@ class Executor:
                     self._last_overview = now or self._last_overview
                     image = next((str(w.get("process_name") or "") for w in now.get("windows") or []
                                   if isinstance(w, dict) and done.as_hwnd(w.get("hwnd")) == opened), "")
-            if image:
-                self.browser = image
         except Exception:  # noqa: BLE001 - bookkeeping: the check then reads the window in front, as before
-            pass
+            image = ""
+        self.browser = image if image and self._is_browser(image) else ""
 
     def _page_process(self, site: str = "") -> str:
         """The program a page_at check reads (x9: YouTube in Chrome is never "likely" for an Arc request): the browser
-        this request opened an address in by name, else the plan's target app when a window of it is listed and it
-        isn't the page's own site. ``""`` when neither: the check reads the window in front, as before."""
+        this request's last open_url opened its address in by name, else the plan's target app when it is a browser
+        (:meth:`_is_browser`: never the chat app a link was opened from), a window of it is listed and it isn't the
+        page's own site. ``""`` when neither: the check reads the window in front, as before."""
         if self.browser:
             return self.browser
         target = words(field_of(field_of(self.head, "target", {}), "app", "")) if self.head is not None else ""
         if not target or _names_site(target, site):
             return ""
-        return self._listed_image(target)
+        image = self._listed_image(target)
+        return image if image and self._is_browser(image) else ""
 
     def _listed_image(self, name: str) -> str:
         """The process image of the one program an app name names among the listed windows ("Arc" -> "Arc.exe"), read
@@ -2376,6 +2460,81 @@ def _web_host(url: Any) -> str:
     except ValueError:
         return ""
     return (parts.hostname or "").casefold() if parts.scheme.casefold() in ("http", "https") else ""
+
+
+def _bare_host(url: Any) -> str:
+    """The host of a bare host value ("youtube.com", casefolded): one token with no scheme, path, port or user part,
+    not a file or folder on disk, whose ``https://`` reading has a dotted host. ``launch._page_address`` doesn't count
+    it a page (a bare ``name.tld`` is as likely a file), so it is read as one only for a step that names its browser
+    (review r1 L1: the 10 Oct talker wrote exactly "youtube.com"). ``""`` for anything else. A fixed machine format."""
+    import os
+    from urllib.parse import urlsplit
+
+    text = str(url or "").strip()
+    if not text or any(ch.isspace() or ch in "/\\:@" for ch in text):
+        return ""
+    try:
+        if os.path.exists(text):
+            return ""
+        host = urlsplit("https://" + text).hostname or ""
+    except (ValueError, OSError):
+        return ""
+    labels = host.split(".")
+    return host.casefold() if len(labels) > 1 and all(labels) else ""
+
+
+#: Where Windows keeps the browsers it lists as web browsers (each a client key with ``shell\open\command``), machine
+#: wide (both registry views) and the user's own.
+_BROWSER_CLIENTS = (("HKEY_LOCAL_MACHINE", r"SOFTWARE\Clients\StartMenuInternet"),
+                    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\WOW6432Node\Clients\StartMenuInternet"),
+                    ("HKEY_CURRENT_USER", r"SOFTWARE\Clients\StartMenuInternet"))
+
+
+def _registered_browsers() -> list[dict[str, str]]:
+    """The browsers Windows has registered as web browsers (``Clients\\StartMenuInternet``: the key its own list of
+    browsers reads), each ``{"key", "name"}``: its program's app key from the client's open command ("chrome" from
+    ``"C:\\...\\chrome.exe"``) and the client's name ("Google Chrome"; a resource reference, ``@...``, is left out).
+    Packaged browsers (Arc) don't register there; the timeline counts them. ``[]`` off Windows or when it can't be
+    read. Machine data, read-only; never raises."""
+    try:
+        import ntpath
+        import winreg
+
+        from yuki.core.appnames import app_key
+    except ImportError:
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for hive_name, path in _BROWSER_CLIENTS:
+        try:
+            root = winreg.OpenKey(getattr(winreg, hive_name), path)
+        except OSError:
+            continue
+        with root:
+            for i in range(256):   # a handful of browsers; the bound only keeps a broken hive from spinning
+                try:
+                    client = winreg.EnumKey(root, i)
+                except OSError:
+                    break
+                try:
+                    with winreg.OpenKey(root, client + r"\shell\open\command") as key:
+                        command = str(winreg.QueryValueEx(key, "")[0] or "").strip()
+                    with winreg.OpenKey(root, client) as key:
+                        try:
+                            name = str(winreg.QueryValueEx(key, "")[0] or "").strip()
+                        except OSError:
+                            name = ""
+                except OSError:
+                    continue
+                # the program: the quoted path, else the path up to its ".exe" (unquoted, it may hold spaces)
+                end = command.casefold().find(".exe")
+                exe = command[1:].partition('"')[0] if command.startswith('"') else \
+                    (command[:end + 4] if end >= 0 else "")
+                program = app_key(ntpath.basename(exe)) if exe.casefold().endswith(".exe") else ""
+                if program and program not in seen:
+                    seen.add(program)
+                    out.append({"key": program, "name": "" if name.startswith("@") else name})
+    return out
 
 
 def _span_text(value: str, turn: str) -> str:
