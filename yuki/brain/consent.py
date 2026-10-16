@@ -177,7 +177,9 @@ PLAIN_WHY: dict[str, str] = {
     "join_window": "joining is your click",
     "join_control": "joining is your click",
     "join_effect": "joining is your click",
-    "undeclared_send": "that would have sent something you didn't ask me to send",
+    # sBrainFix (F1d): true whether or not their words asked for the send (the refusal is about the way, never about
+    # what they asked: on 10 Oct and in the 16 Oct simulation this was said right after they said yes to the send)
+    "undeclared_send": "that step could have sent it outside the chat app's own way",
     "not_capability": "I only send messages through the chat apps' own way",
     "recipient": "I couldn't be sure who it was for",
     "recipient_slot": "I couldn't be sure who it was for",

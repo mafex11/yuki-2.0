@@ -184,7 +184,8 @@ def plan_schema() -> dict[str, Any]:
             "commit": {"type": "string", "enum": list(COMMITS)},
             "quote": _nullable("string", "Their exact words asking for it."),
             "to": _nullable("string", "The person or channel."),
-            "text": _nullable("string", "The exact message text."),
+            # sBrainFix (F1c): their own words, never translated or restyled (the core prompt says it in full)
+            "text": _nullable("string", "The message, in their words."),
         },
     }
     element = {
@@ -209,11 +210,13 @@ def plan_schema() -> dict[str, Any]:
             "value": _nullable("string"),
             "submit": {"type": "boolean"},
             "expect": {"anyOf": [_probe_schema(), {"type": "null"}]},
-            "say": _nullable("string"),
+            # sBrainFix (F7): spoken the moment the step is dispatched, so before its result (the room: revises's
+            # description, which said nothing code uses: a replan's revises is code's own, parse_header)
+            "say": _nullable("string", "Spoken before any result."),
         },
     }
-    # goal, route, question and say carry no description here: the core prompt says each (one line in their terms;
-    # steps or skill:<id>; kind ask: one question; voice words for a slow step), and the probe arguments took the room
+    # goal, route and question carry no description here: the core prompt says each (one line in their terms; steps
+    # or skill:<id>; kind ask: one question), and the probe arguments took the room (say has a few words: sBrainFix)
     return {
         "type": "object",
         "additionalProperties": False,
@@ -221,7 +224,7 @@ def plan_schema() -> dict[str, Any]:
         "properties": {
             "goal": {"type": "string"},
             "kind": {"type": "string", "enum": list(KINDS)},
-            "revises": _nullable("string", "The plan id it replaces."),
+            "revises": _nullable("string"),
             "target": target,
             "route": {"type": "string"},
             "consent": consent,
@@ -943,11 +946,31 @@ def parse_step(raw: Mapping[str, Any], index: int, header: Plan, checks: Checks,
         raise PlanError(errors)
     step = Step(index=index, verb=str(verb), window=window, element=element, value=value, submit=submit,
                 expect=expect, say=say)
+    if step.say:
+        # sBrainFix (F7): the line is heard before the step runs (the voice's step line as the step closes in the
+        # stream, the executor's as it starts), so its words are code's for that step, never the model's: on 10 and
+        # 16 Oct the model wrote "Playing your Japanese playlist now." and "Sent it to Hemanth." there, whatever the
+        # prompt said. The model still decides which steps are narrated (it wrote a say).
+        step = replace(step, say=step_line(step, header))
     _check_verb(step, header, checks, prior, where)
     if checks.failed_step is not None and not checks.repeat_rejected and step.same_as(checks.failed_step):
         checks.repeat_rejected = True
         raise PlanError([f"{where}that step just failed: change it"])
     return step
+
+
+def step_line(step: Step, header: Plan) -> str | None:
+    """What Yuki says as a step starts (sBrainFix, F7): the step in the island's words (``yuki.ui.step_words``:
+    built from the verb, the control's role and name, the plan's target app and the verb's closed values only, never
+    the step's free text), as a sentence ("Clicking Play ネオン."): what starts, never that it is done or happening
+    to work. ``None`` (nothing said) when no words come."""
+    try:
+        from yuki.ui.step_words import describe_plan_step
+
+        words = " ".join(str(describe_plan_step(step, app=header.target.app) or "").split()).rstrip(". ")
+    except Exception:  # noqa: BLE001 - presentation only: say nothing rather than the model's words
+        return None
+    return f"{words}."[:SAY_CHARS] if words else None
 
 
 def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step], where: str) -> None:
@@ -1185,5 +1208,5 @@ __all__ = [
     "Plan", "PlanError", "Checks", "required_probe", "parse_header", "parse_step", "validate_plan", "finish_plan",
     "synth_skill_step", "ExecHost", "StepSource", "StepStatus", "ExecResult", "STEP_STATES", "RESULT_STATUSES",
     "probe_args_text", "probe_errors", "error_code", "error_codes", "SEED_RERUN_OK", "skill_family", "seed_skill",
-    "spent_skills", "unescape", "seed_sends",
+    "spent_skills", "unescape", "seed_sends", "step_line",
 ]

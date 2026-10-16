@@ -48,6 +48,7 @@ from yuki.brain.context import (
     held_report,
     invalid_report,
     load_catalog,
+    look_report,
     one_line,
     read_report,
     request_turn,
@@ -152,6 +153,11 @@ MAX_CUTOFFS = 1
 CUTOFF_TOKENS_STREAMED, CUTOFF_TOKENS_PLAIN = 64000, 20000
 #: A tool whose streamed input did not parse is answered with this (never run on a cut-short value).
 BAD_INPUT_TEXT = "Not run: its input could not be read as one JSON object. Send the call again."
+#: sBrainFix (F9): how many act plans that only looked go back to the planner with what they read in one request (the
+#: next one ends with its line, within the call budget either way).
+LOOK_BACKS_MAX = 2
+#: sBrainFix (F8): the outcome levels after which a seeded request's hand-off check is read once as an observer.
+OBSERVE_LEVELS: frozenset[str] = frozenset({"verified", "likely"})
 
 _END = object()
 
@@ -220,6 +226,8 @@ class _State:
     spent: set[str] = field(default_factory=set)
     #: x10: the one replan by steps after a skill's unconfirmed result was taken.
     retried_unconfirmed: bool = False
+    #: sBrainFix (F9): act plans that only looked and were sent back to the planner with what they read.
+    look_backs: int = 0
 
 
 class _NoticeSink:
@@ -552,6 +560,8 @@ class Brain:
         self._checks_seen = 0
         #: The line the request ended with (the executor's run row carries it).
         self._final_text = ""
+        #: sBrainFix (F8): this request's hand-off check was already read as an observer.
+        self._seed_observed = False
         self._requests = 0
         self._request_started = time.monotonic()
         self._running = False
@@ -1304,6 +1314,7 @@ class Brain:
         self._checker = None
         self._checks_seen = 0
         self._final_text = ""
+        self._seed_observed = False
         self.needed_hands = False
         self._reset_accounting()
         self.last_summary = None
@@ -1854,6 +1865,20 @@ class Brain:
                 # said as one ("send it when you're ready"), never a generic "the box holds it"
                 line = LINE_DRAFTED
             outcome = self._result_outcome(result, state, plan, line)
+            if (status == "unconfirmed" and look_only(plan, result) and state.look_backs < LOOK_BACKS_MAX
+                    and self._budget_left(state, bs, self._req)):
+                # sBrainFix (F9): an act plan that only looked did nothing, so its check reading nothing is no ending
+                # (16 Oct simulation B08: "I did it, but I couldn't confirm it worked." after one look at Spotify):
+                # what it read goes back to the planner for the plan that does it. Not a replan after a failure (the
+                # call budget bounds it, and LOOK_BACKS_MAX). Its line is held only when something acted earlier in
+                # the request (it stands if the model then changes nothing; the model's words never claim a result
+                # after an act); with nothing acted, the model's own reply is the answer, as for any plain reply.
+                state.look_backs += 1
+                state.held = (line, outcome) if state.acted else None
+                self.logger.log("brain_look_only", n=state.look_backs, reads=len(result.reads),
+                                probe=result.probe or None, acted=state.acted)
+                conv.add_user([tool_result(tool_id, look_report(result, plan)), *extra, *self._steer_turn(host)])
+                return False
             if (status == "unconfirmed" and result.unconfirmed_skill and not state.retried_unconfirmed
                     and state.replans < bs.max_replans and self._budget_left(state, bs, self._req)):
                 # x10 (principle 1): a skill that acted and couldn't confirm is not the end while replans remain:
@@ -1996,6 +2021,34 @@ class Brain:
         self._last_outcome = outcome
         self._final_text = str(text or "")
         self._push(Final(text, outcome=outcome))
+        self._observe_seed(outcome)
+
+    def _observe_seed(self, outcome: Mapping[str, Any] | None) -> None:
+        """sBrainFix (F8): a request a skill handed over that ends "verified" or "likely" by a plan's own check: the
+        hand-off's own check is read once as an observer, after the line went out, on its own thread
+        (``done.observe_seed``; its verdict is ignored). A plan the seed's check decided (``seed_check``: the executor
+        read it already) needs none. Once per request; never raises."""
+        try:
+            req, state = self._req, self._state
+            if req is None or not req.seed or self._seed_observed or not isinstance(outcome, Mapping):
+                return
+            if str(outcome.get("level") or "") not in OBSERVE_LEVELS:
+                return
+            plan = state.current if state is not None else None
+            if plan is not None and plan.seed_check:
+                return
+            self._seed_observed = True
+            from yuki.brain import done as _done
+
+            host = self._host_ref
+            seed = dict(req.seed)
+            env = _done.ProbeEnv(since=float(req.epoch), dispatcher=self.dispatcher,
+                                 memory=getattr(host, "memory", None) if host is not None else self.memory,
+                                 baseline=dict(seed.get("baseline") or {}) if isinstance(seed.get("baseline"), Mapping)
+                                 else {})
+            _done.observe_seed(seed, env, log=self.logger.log)
+        except Exception as exc:  # noqa: BLE001 - an observer never breaks a request's ending
+            self.logger.log("error", where="brain_seed_observer", error=type(exc).__name__)
 
     def _finish_text(self, text: str, state: _State, bs: BrainSettings, conv: Conversation, host: Host) -> bool:
         """A plain-text reply (already appended). If the user added something while it was written, it is not the last
@@ -2302,6 +2355,14 @@ def typed_draft(plan: Plan | None, seed: Mapping[str, Any] | None) -> bool:
     return plan.done.name == "field_holds" and bool(" ".join(str(plan.done.args.get("text") or "").split()))
 
 
+def look_only(plan: Plan | None, result: ExecResult) -> bool:
+    """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
+    check reading nothing is not the end of the request. Code facts only (the closed verb lists, the step states)."""
+    if plan is None or plan.kind != "act" or not plan.steps or plan.skill:
+        return False
+    return all(s.verb not in ACT_VERBS for s in plan.steps) and not _acted(result)
+
+
 def _acted(result: ExecResult) -> bool:
     """Whether a plan's run did something on the PC: the executor says so, or an act step's status shows it ran (so a
     model's text after non-committing steps is never taken as the final word)."""
@@ -2358,4 +2419,5 @@ def _as_result(got: Any) -> ExecResult:
 
 
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
-           "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps"]
+           "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps", "look_only",
+           "LOOK_BACKS_MAX", "OBSERVE_LEVELS"]

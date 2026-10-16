@@ -722,6 +722,24 @@ def read_report(result: ExecResult | Mapping[str, Any]) -> str:
     return f"{head}\n\n{body}\n\nAnswer them now in plain text, from what came back."
 
 
+def look_report(result: ExecResult | Mapping[str, Any], plan: Plan | None) -> str:
+    """An act plan that only looked (sBrainFix, F9): nothing of it acted, and its check couldn't confirm what they asked
+    for, so what its reads returned (each fenced by whoever read it) goes back for the plan that does it, never a line
+    that says it was done. Code-written."""
+    pid = plan.id if plan else ""
+    reads = [str(r) for r in _field(result, "reads", None) or [] if str(r).strip()]
+    lines = [f"{CHECK_LABEL} Plan {pid} only looked (none of its steps acted), and its check couldn't confirm what "
+             f"they asked for."]
+    statuses = _field(result, "statuses", None) or []
+    if statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    lines.append("What its reads returned:\n\n" + "\n\n".join(reads) if reads else "(Its reads returned nothing.)")
+    lines.append(f"Now plan what is left to do (revises {pid}): the steps in the app, with a done probe that reads "
+                 f"the result; redo nothing that already took. If it is already done or can't be done, reply in one "
+                 f"short line saying what you saw.")
+    return "\n".join(lines)
+
+
 def invalid_report(errors: Sequence[str], statuses: Sequence[Any] = (), *, replans_left: int | None = None) -> str:
     text = f"{CHECK_LABEL} The plan was not run as written: " + "; ".join(errors)
     if statuses:
@@ -758,5 +776,6 @@ def answer_report(question: str, answer: str | None) -> str:
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
            "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "request_turn", "Conversation",
-           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report", "invalid_report", "unconfirmed_report", "answer_report", "clip",
+           "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
+           "look_report", "invalid_report", "unconfirmed_report", "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]
