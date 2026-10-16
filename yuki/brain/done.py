@@ -124,6 +124,8 @@ LINES: dict[str, str] = {
     "level_system": "The volume is at {level}%.",
     "page_at": "{site} is open.",
     "page_at_in": "{site} is open in {App}.",
+    "page_kind": "{site}'s {page} is open.",
+    "page_kind_in": "{site}'s {page} is open in {App}.",
     "tab_shown": "That tab is showing in {App}.",
     "foreground": "{App} is in front.",
     "mic_held": "{App} has the microphone now.",
@@ -707,20 +709,58 @@ def _display(value: Any) -> str:
     return util.app_name(str(value or "")) if value else "It"
 
 
-def _site_words(site: Any) -> str:
-    """A page check's site as people say it (sBrainFix, F3): normalised the way the probe reads it
-    (``yuki.skills.donecheck.site_key``), so "youtube.com" and "https://www.youtube.com/" are said "Youtube" (never
-    "Youtube Com", never an address read out); a site with no file by its host's first name ("github.com" -> "Github").
-    A fixed-format cut of a host, never a reading of it."""
+def _site_key(site: Any) -> str:
+    """A page check's site the way the probe reads it (``yuki.skills.donecheck.site_key``), or as written."""
     try:
         from yuki.skills.donecheck import site_key
 
-        key = site_key(site)
+        return site_key(site)
     except Exception:  # noqa: BLE001 - the probe module can't be read: the value as written
-        key = " ".join(str(site or "").split())
-    if "." in key:
-        key = key.split(".", 1)[0]
-    return _display(key)
+        return " ".join(str(site or "").split()).casefold()
+
+
+def _host_name(host: str) -> str:
+    """The name in a bare host (review r1 L4): the label before its top-level one ("open.spotify.com" -> "spotify",
+    "en.wikipedia.org" -> "wikipedia", "github.com" -> "github"), or the one before that under a two-letter country
+    label after a short one ("bbc.co.uk" -> "bbc"). A fixed-format cut of DNS labels, never a reading of them."""
+    labels = [p for p in str(host or "").split(".") if p]
+    if len(labels) < 2:
+        return labels[0] if labels else ""
+    if len(labels) >= 3 and len(labels[-1]) == 2 and len(labels[-2]) <= 3:
+        return labels[-3]
+    return labels[-2]
+
+
+def _site_words(site: Any) -> str:
+    """A page check's site as people say it (sBrainFix, F3): normalised the way the probe reads it (:func:`_site_key`),
+    so "youtube.com" and "https://www.youtube.com/" are said "Youtube" (never "Youtube Com", never an address read
+    out); a site with no file by the name in its host (:func:`_host_name`: "github.com" -> "Github",
+    "open.spotify.com" -> "Spotify")."""
+    key = _site_key(site)
+    return _display(_host_name(key) if "." in key else key)
+
+
+#: How a page template's kind is said where its key is not the page's plain name (review r1 L3); any other kind of a
+#: site file's ``[pages]`` is said "<kind> page". Display words for the files' keys, never a reading of a page.
+PAGE_KIND_WORDS: dict[str, str] = {"watch": "video page", "handle": "channel page"}
+
+
+def _page_words(site: Any, kind: Any) -> str:
+    """A page check's ``kind`` as said ("video page", "home page"), only when it is one the probe knows: a key of the
+    site file's ``[pages]`` (``yuki/connect/sites``), or ``home`` (any site's root path). ``""`` for none or any other
+    value (the plan's free text is never said)."""
+    want = " ".join(str(kind or "").split()).casefold()
+    if not want:
+        return ""
+    try:
+        from yuki.connect import templates
+
+        kinds = {str(k).casefold() for k in (templates.site(_site_key(site)).get("pages") or {})}
+    except Exception:  # noqa: BLE001 - no site files: only the root path is known
+        kinds = set()
+    if want not in kinds and want != "home":
+        return ""
+    return PAGE_KIND_WORDS.get(want, f"{want} page")
 
 
 def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any], *,
@@ -747,6 +787,12 @@ def _line_parts(probe: str, args: Mapping[str, Any], evidence: Mapping[str, Any]
         return "level", {"App": app, "level": shown}
     if probe == "page_at":
         site = _site_words(args.get("site"))
+        page = _page_words(args.get("site"), args.get("kind"))
+        if page:
+            # review r1 L3: a check of one kind of page names it ("Youtube's video page is open in Arc."), so its
+            # "I couldn't confirm ..." never says the site isn't open while its home page is
+            return ("page_kind_in", {"site": site, "page": page, "App": app}) if args.get("process") else (
+                "page_kind", {"site": site, "page": page})
         # x9: the browser the page was read in, when the check was held to one (its ``process``)
         return ("page_at_in", {"site": site, "App": app}) if args.get("process") else ("page_at", {"site": site})
     if probe == "message_sent":
@@ -786,6 +832,9 @@ def claim_for(probe: str, args: Mapping[str, Any] | None, *, window_entry: Mappi
     (:data:`NAMED_FIRST`) and names it (never "It shows ..."). ``""``: no such claim (say the plain line)."""
     if probe in NO_CLAIM or probe not in PROBES or not isinstance(args, Mapping):
         return ""
+    if probe == "page_at" and " ".join(str(args.get("kind") or "").split()) and not _page_words(args.get("site"),
+                                                                                                args.get("kind")):
+        return ""   # review r1 L3: a kind no site file names can't be said, and "<site> is open" would be untrue
     try:
         key, fields = _line_parts(probe, args, {}, window_entry=window_entry)
         template = LINES[key]
@@ -1134,4 +1183,4 @@ __all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT
            "allowed_probes", "as_hwnd", "claim_for", "coverage", "engine_line", "find_named", "line_for",
            "not_confirmed", "outcome", "overview", "own_check", "parse_args", "pick_done", "plan_class", "plan_done",
            "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck", "wait_read",
-           "window_of", "with_browser", "env_acted", "unread_line", "observe_seed"]
+           "window_of", "with_browser", "env_acted", "unread_line", "observe_seed", "PAGE_KIND_WORDS"]

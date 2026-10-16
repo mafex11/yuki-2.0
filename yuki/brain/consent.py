@@ -121,8 +121,8 @@ LINE_NO_RECIPIENT = "a send names whom it goes to in consent.to"
 LINE_DECLARED_DRAFT = ("the plan declares a send (consent.commit send) but this step leaves a draft (its send slot "
                        "{slots} on a non-sending option): put the send slot on its sending value with the text in the "
                        "text slot, or declare consent.commit none for a draft")
-LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write the same text in both (the countdown "
-                      "shows consent.text)")
+LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write the same text in both, the message in "
+                      "their own words and language (the countdown shows consent.text)")
 LINE_QUOTE = ("consent.quote is not the user's words as heard: copy their words asking for the send exactly as they "
               "stand in their words (a name they said may be written as that person's name)")
 #: The quote stands in a turn that says nothing of the message, while another turn of theirs names the person and says
