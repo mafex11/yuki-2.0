@@ -1368,6 +1368,12 @@ class VoiceBridge(QObject):
                     and j.user_turn == turn and turn > 0 and not j.unadopted]
         return max(live, key=lambda j: j.started_at) if live else None
 
+    def turn_handed_over(self) -> bool:
+        """vRound2: whether the user's current turn was handed to the thinker already and that job is still open
+        (:meth:`_same_turn_job`): the hands' step check then hands nothing over again (a reply that brought a tab up
+        and called hand_over beside it would otherwise start a second job for the same words). State only."""
+        return self._same_turn_job() is not None
+
     async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
         """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.
 

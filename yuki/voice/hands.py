@@ -329,6 +329,104 @@ _MALFORMED_NOTE = (
 STEP_LINE_TITLE_CHARS = 60
 #: How long a step line stays owed to a stay_quiet of the run its step check started (s).
 STEP_LINE_OWED_S = 20.0
+#: vRound2 (sim-e2e-1 F5, sVoiceFix's option (a)): at the step check after a window or tab was brought up with nothing
+#: said, Yuki's own check model (the commit check's: ``check_model``, else ``judge_model``; one forced call, no
+#: thinking) judges whether their newest words ask for more than that step did. The talker never reversed its own
+#: judgement there: 0 of 19 sVoiceFix runs handed over after showing Arc's already-playing tab for "put something on
+#: YouTube on Arc" / "why did you pause? Just do it." Yes: the rest goes to the thinker by code. No, a failed or a late
+#: call: the step's line as before (the check never acts on its own). Review r1 M1: the check starts when the hand's
+#: call arrives, beside the act (it reads only their words and the step's kind), and the step check waits for it at
+#: most until this long after it started (s), and at least :data:`REST_JOIN_FLOOR_S` once the hand returned. Measured
+#: 16 Oct from this PC: a warm call 1.0-4.6 s on Bedrock's Haiku, the SDK client's first making 3.5 s (warmed at the
+#: wake: :meth:`Hands.warm_check`).
+REST_CHECK_S = 5.0
+REST_JOIN_FLOOR_S = 0.5
+#: Characters of each turn of the user's words the check reads (as the commit check's), and of the step's report the
+#: thinker's context carries.
+REST_WORDS_CHARS = 600
+REST_REPORT_CHARS = 400
+REST_CHECK_PROMPT = """\
+You check one thing for Yuki, an assistant that acts on its user's Windows PC by voice. For the user's words, Yuki's \
+voice has just done one step: it brought a window or a browser tab to the front, or opened an empty tab, and nothing \
+else: it opened no page and clicked, played, typed or sent nothing. You see the user's own words and what that step \
+was, in code's words.
+
+First, why: one short sentence: what their newest words ask Yuki to do now (their earlier words only tell you what \
+"it" or "that" means). Then more: true when their newest words ask Yuki for anything this step did not do: to start, \
+put on, play, open, pick, search, close, write or send anything, to open a page or a new tab, to just do it or try \
+another way, or say it is still not done, even when the window or tab now showing already holds or plays such a \
+thing: this step started nothing, and nothing done before counts as done now. false only when this step is all their \
+newest words ask for: to see, show, switch to, bring up or open that window or tab, or that empty new tab."""
+#: The check's one tool (forced). ``why`` comes first: one sentence of reading written before the verdict (measured
+#: offline 16 Oct on "put something on YouTube on Arc" with its earlier turns shown: a bare verdict let Arc's old
+#: playing tab stand for it, 0 of 3, and an echo of their request first did no better; see the build report). Not
+#: strict: a strict schema is compiled on its first use, and that call ran past the bound. RAM only: ``why`` holds
+#: their words, so it is never logged.
+REST_CHECK_TOOL: dict[str, Any] = {
+    "name": "rest",
+    "description": "Why, in one short sentence, then whether their newest words ask for more than that step did.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["why", "more"],
+                     "properties": {"why": {"type": "string",
+                                            "description": "One short sentence: what their newest words ask Yuki to "
+                                                           "do now."},
+                                    "more": {"type": "boolean",
+                                             "description": "They ask for anything beyond seeing or bringing up a "
+                                                            "window or tab."}}},
+}
+#: What the thinker is told, as labelled context, when the check found more to do (``{what}``: the step in code's
+#: words, ``{report}``: its report, ``{already}``: :data:`_STEP_REST_ALREADY` or "").
+_STEP_REST_CONTEXT = (
+    "Yuki's voice did one step for these words itself, verified: {what}. Its report: {report}.{already} Yuki's own "
+    "check read their words as asking for more than that step did: do the rest of their request now, by steps, from "
+    "what is showing; that window or tab is up already."
+)
+_STEP_REST_ALREADY = " It was already open before this step, so it put on nothing new."
+#: Review r1 H1: what code says for their words then, when nothing was said for them yet (``VoiceBridge.may_ack``). The
+#: talker gets no run on this result: given the old tab's title it said "It's playing." in 10 of 12 such runs.
+STEP_REST_ACK = "On it."
+#: The talker's note on that result (no title, no done: what is showing is no part of what they asked).
+_STEP_REST_NOTE = (
+    "Not done yet: that step only brought it up. Yuki's own check read their words as asking for more, so the rest "
+    "went to the thinker by code; its outcome comes back to you. Code said the acknowledgement, if any (said). Say "
+    "nothing now: no other hand, never that it is done or playing."
+)
+#: The step in code's words for the check and the thinker, by hand and action (``yuki.voice.hands`` data, never words).
+_STEP_WHAT = {("window", "focus"): "brought a window to the front", ("window", "restore"): "restored a window",
+              ("tab", "show"): "brought a tab to the front", ("tab", "new"): "opened an empty new tab"}
+#: The same with the app the window is (its process's name, never a title: ``{app}``), for the rest check. Review r1
+#: M1: without the report the check read "Open Spotify." (running) as more, 3 of 3, until the step named the app.
+_STEP_WHAT_APP = {("window", "focus"): "brought the {app} window to the front",
+                  ("window", "restore"): "restored the {app} window",
+                  ("tab", "show"): "brought one of {app}'s tabs to the front",
+                  ("tab", "new"): "opened an empty new tab in {app}"}
+
+
+def _clip_words(text: Any, cap: int) -> str:
+    t = " ".join(str(text or "").split())
+    return t if len(t) <= cap else t[: cap - 1] + "…"
+
+
+def rest_message(words: list[str], earlier: list[str], name: str, op: str, already: bool, app: str = "") -> str:
+    """vRound2: what the step check's rest judgement reads (:data:`REST_CHECK_PROMPT`): the step in code's words (what
+    it did, in which app, and that it started nothing when the window or tab was open before it: facts of the step),
+    then the user's own words of this exchange and up to 3 earlier turns, newest last, so the verdict reads from them.
+    Review r1 M1: no report and no title (the check starts beside the act, before either exists, and a title of what is
+    showing is no part of what they asked)."""
+    app = " ".join(str(app or "").split())[:40]
+    what = _STEP_WHAT_APP[(name, op)].format(app=app) if app and (name, op) in _STEP_WHAT_APP else \
+        _STEP_WHAT.get((name, op), "brought it up")
+    lines = ["[What Yuki's voice is doing for them]", f"It {what}, and nothing else."]
+    if already:
+        lines.append("That window or tab was already open before this step, so this step starts nothing: whatever "
+                     "it shows or plays was there before.")
+    if earlier:
+        lines += ["", "[Their earlier words: context only]"]
+        lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in earlier]
+    lines += ["", "[The user's own words, this exchange, newest last]"]
+    lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in words]
+    return "\n".join(lines)
+
+
 #: x3 (3f): several tabs fit the title the talker gave: it asks which, by title, never for a number.
 _TAB_CHOOSE_NOTE = (
     "Not done: {count} tabs fit that title, so nothing was closed or shown. When their words meant all of them, call "
@@ -1692,6 +1790,9 @@ class Hands:
             return
         self._inflight[key] = started
         self._step_owed = None   # sVoiceFix (F5): a hand answers the step check, so no step line is owed
+        # vRound2 review r1 M1: a call that reaches the step check when it takes effect starts Yuki's own rest check
+        # now, beside the act (it reads their words and the step's kind only); the step check joins it
+        rest_job = self._rest_start(name, args) if self._rest_candidate(name, args) else None
         if args.get("say_first") and self.bridge is not None:
             await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
@@ -1798,6 +1899,15 @@ class Hands:
             # then a new tab; never a loop)
             self._step_checked = (turn, self._step_checks(turn) + 1)
             shown = " ".join(str(facts.get("step_line") or "").split())   # built off the loop, in _run (review r1 L2)
+            if rest_job is not None and not self._turn_handed_over():
+                # vRound2 (sVoiceFix option (a)): Yuki's own check read their words against what this step did (one
+                # bounded model call, started with the call, joined here off the loop). More to do: the rest goes to
+                # the thinker by code with the step's report. No, or no verdict: the step's line as before, and the
+                # talker's own question below. Not when this turn went to the thinker already (a hand_over beside the
+                # tab hand): never a second job
+                more = await asyncio.to_thread(self._rest_join, rest_job, name)
+                if more is True and await self._step_rest(params, name, op, args, report, op != "new"):
+                    return
             said = ""
             if shown:
                 # review r1 M1: the step's own line of what is showing is said by code at once (never silence, and no
@@ -2265,6 +2375,213 @@ class Hands:
         if name == "tab":
             return f"{app} has a new tab up." if app and str(args.get("action") or "") == "new" else ""
         return f"{app} is in front."
+
+    def _exchange_turns(self) -> tuple[list[str], list[str]]:
+        """``(recent, words)``: the user's heard turns (newest last) and this exchange's (x3, IF-words: the
+        conversation's hook, at most 4 within about 120 s; else the last 4 heard), each as heard, whitespace folded."""
+        recent = [" ".join(str(w).split()) for w in (self._call_safely(self.words, []) or []) if str(w).strip()]
+        exchange = self._call_safely(self.exchange, None) if self.exchange is not None else None
+        words = [" ".join(str(w).split()) for w in exchange if str(w).strip()][-4:] \
+            if isinstance(exchange, (list, tuple)) else []
+        return recent, (words or recent[-4:])
+
+    def _rest_candidate(self, name: str, args: dict[str, Any]) -> bool:
+        """vRound2 review r1 M1: whether this hand's call reaches the step check when it takes effect (a ``window``
+        focus/restore or ``tab`` show/new with no ``say_when_done`` and no ``then``, a new tab with no address, a step
+        check left in this user turn), with a bridge to hand the rest to and this turn not with the thinker already.
+        The call's own shape only (as the step check reads it after the act). Never raises."""
+        try:
+            op = str(args.get("action") or ("show" if name == "tab" else ""))
+            if self.halted or op not in STEP_FIRST_OPS.get(name, ()) or str(args.get("say_when_done") or "").strip():
+                return False
+            if " ".join(str(args.get("then") or "").split()) or (op == "new" and str(args.get("url") or "").strip()):
+                return False
+            turn = self._call_safely(self.user_turn, None)
+            if turn is None or self._step_checks(turn) >= self.STEP_CHECKS_PER_TURN:
+                return False
+            return self.bridge is not None and callable(getattr(self.bridge, "escalate", None)) \
+                and not self._turn_handed_over()
+        except Exception:  # noqa: BLE001 - no check: the step's line as before
+            return False
+
+    def _rest_start(self, name: str, args: dict[str, Any], app: str | None = None) -> dict[str, Any]:
+        """vRound2 (sVoiceFix option (a)), review r1 M1: Yuki's own check of a silent window or tab step, started when
+        the hand's call arrives, beside the act: do the user's newest words (with their earlier ones for what "it"
+        means) ask for more than this step does? One forced call of the commit check's model (``check_model``, else
+        ``judge_model``) on the turn's checker client, on its own thread. It reads the user's own heard words and the
+        step's kind and app in code's words (:func:`rest_message`; ``app``: the window's own when ``None``), never the
+        talker's wording, a report or a title. The job
+        (``done`` set when it ends; ``verdict`` ``True`` / ``False`` / ``None``, ``why`` a code word, ``ms``) is joined
+        by :meth:`_rest_join`. Never raises, never blocks."""
+        op = str(args.get("action") or ("show" if name == "tab" else ""))
+        job: dict[str, Any] = {"done": threading.Event(), "started": time.perf_counter(), "verdict": None, "why": "",
+                               "usage": {}, "ms": None}
+
+        def work() -> None:
+            try:
+                checker = self._checker()
+                settings = getattr(checker, "settings", None)
+                model = str(getattr(settings, "check_model", "") or getattr(settings, "judge_model", "") or "")
+                client = checker.client_now() if checker is not None else None
+                recent, words = self._exchange_turns()
+                if client is None or not model or not words:
+                    job["why"] = "no_client" if client is None else "no_model" if not model else "no_words"
+                    return
+                named = app
+                if named is None:
+                    try:
+                        named = self._browser_app(int(args.get("window"))) or ""   # the process's name: data
+                    except Exception:  # noqa: BLE001 - the step's kind alone
+                        named = ""
+                older = recent[:len(recent) - len(words)] if recent[-len(words):] == words else \
+                    [w for w in recent if w not in words]
+                request = {"model": model, "max_tokens": 160, "system": REST_CHECK_PROMPT, "tools": [REST_CHECK_TOOL],
+                           "tool_choice": {"type": "tool", "name": REST_CHECK_TOOL["name"]},
+                           "messages": [{"role": "user", "content": rest_message(words, older[-3:], name, op,
+                                                                                 op != "new", named)}]}
+                from yuki.agent.failover import claude_path
+
+                response = claude_path(client).messages.create(**request)
+                for block in getattr(response, "content", None) or []:
+                    data = getattr(block, "input", None) if getattr(block, "type", "") == "tool_use" else None
+                    if isinstance(data, dict) and isinstance(data.get("more"), bool):
+                        job["verdict"] = bool(data["more"])
+                        break
+                job["why"] = "" if job["verdict"] is not None else "no_verdict"
+                try:
+                    from yuki.log.requests import usage_tokens
+
+                    job["usage"] = dict(usage_tokens(getattr(response, "usage", None)) or {})
+                except Exception:  # noqa: BLE001
+                    job["usage"] = {}
+                cost = getattr(checker, "_cost", None)
+                if job["usage"] and callable(cost):
+                    cost(model, job["usage"])   # the turn's check spend, where the commit check keeps its own
+            except Exception as exc:  # noqa: BLE001 - no verdict: the step's line as before
+                job["verdict"], job["why"] = None, type(exc).__name__[:40]
+            finally:
+                job["ms"] = round((time.perf_counter() - job["started"]) * 1000)
+                job["done"].set()
+
+        try:
+            threading.Thread(target=work, name="yuki-rest-check", daemon=True).start()
+        except Exception as exc:  # noqa: BLE001 - no thread: no verdict
+            job["why"] = type(exc).__name__[:40]
+            job["done"].set()
+        return job
+
+    def _rest_join(self, job: dict[str, Any], name: str) -> bool | None:
+        """vRound2 review r1 M1: the rest check's verdict for the step check: waited for until :data:`REST_CHECK_S`
+        after it started, and at least :data:`REST_JOIN_FLOOR_S` now that the hand returned. ``True`` / ``False``, or
+        ``None`` (no client, an error, a late or unreadable answer: the caller says the step's line as before, never
+        acts on it). Blocking: off the voice loop. Logged content-free (the verdict word, the check's ms, the wait's ms,
+        a code word on a miss). Never raises."""
+        waited = time.perf_counter()
+        started = float(job.get("started") or waited) if isinstance(job, dict) else waited
+        try:
+            on_time = bool(job["done"].wait(max(REST_JOIN_FLOOR_S, REST_CHECK_S - (waited - started))))
+        except Exception:  # noqa: BLE001
+            on_time = False
+        verdict = job.get("verdict") if on_time else None
+        why = str(job.get("why") or "") if on_time else "timeout"
+        usage = job.get("usage") if on_time and isinstance(job.get("usage"), dict) else {}
+        if self.log is not None:
+            now = time.perf_counter()
+            self.log.event("hands", op=name, rest_check="more" if verdict else "no" if verdict is False else "none",
+                           ms=job.get("ms") if on_time else round((now - started) * 1000),
+                           wait_ms=round((now - waited) * 1000), why=why or None,
+                           tokens_in=int(usage.get("input_tokens") or 0) or None)
+        return verdict if isinstance(verdict, bool) else None
+
+    def _rest_check(self, name: str, op: str, app: str = "") -> bool | None:
+        """The rest check started and joined at once (an offline probe's way in; the step check starts it with the
+        call, :meth:`_rest_start`, and joins it after the act)."""
+        return self._rest_join(self._rest_start(name, {"action": op}, app), name)
+
+    def warm_check(self) -> None:
+        """vRound2 review r1 M1: the rest check's model client made now, on its own thread, so its first call at a
+        step check pays no making of it (measured 16 Oct from this PC: 3.5 s, and a cold first check missed its bound
+        in every fresh process). No model call, no cost. Called at the wake (``Conversation._awake``). Never raises."""
+        def work() -> None:
+            try:
+                # the worker agent's client, as :meth:`_checker` reads it (that memo is left alone: it is the turn's)
+                runtime = getattr(self.bridge, "runtime", None)
+                agent = getattr(getattr(runtime, "worker", None), "agent", None)
+                client = agent.client if agent is not None else None
+                if client is None:
+                    return
+                from yuki.agent.failover import claude_path
+                from yuki.log.requests import usage_tokens  # noqa: F401 - imported now, not at the first check
+
+                claude_path(client)
+                make = getattr(client, "client_for", None)
+                if callable(make) and getattr(client, "region", None) is not None:
+                    make(client.region)   # the default path's own SDK client, kept by the failover client
+            except Exception:  # noqa: BLE001 - only a head start
+                pass
+
+        try:
+            threading.Thread(target=work, name="yuki-rest-warm", daemon=True).start()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _turn_handed_over(self) -> bool:
+        """vRound2: whether this user turn is with the thinker already (``VoiceBridge.turn_handed_over``; a stand-in
+        bridge without it: no). Never raises."""
+        fn = getattr(self.bridge, "turn_handed_over", None)
+        try:
+            return bool(fn()) if callable(fn) else False
+        except Exception:  # noqa: BLE001 - unknown: no second job is the safe side
+            return True
+
+    async def _step_rest(self, params: Any, name: str, op: str, args: dict[str, Any], report: str,
+                         already: bool) -> bool:
+        """vRound2: the check found more to do after a silent window or tab step: the rest of their request goes to the
+        thinker now, by code, with the step's report as labelled context (their words go as their words, as for any
+        hand-off). Review r1 H1: the talker gets no run on it (shown the old tab's title, it said "It's playing." in 10
+        of 12 runs). Code says :data:`STEP_REST_ACK` when nothing was said for their words yet (``may_ack``), and the
+        result carries no done and no title. ``False`` when no hand-off could start (the caller then says the step's
+        line as before)."""
+        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
+        bridge = self.bridge
+        ack = False
+        try:
+            ack = bool(bridge.may_ack()) if callable(getattr(bridge, "may_ack", None)) else False
+        except Exception:  # noqa: BLE001
+            ack = False
+        context = _STEP_REST_CONTEXT.format(what=_STEP_WHAT.get((name, op), "brought it up"),
+                                            report=" ".join(str(report).split())[:REST_REPORT_CHARS].rstrip(" ."),
+                                            already=_STEP_REST_ALREADY if already else "")
+        try:
+            try:
+                passed = await bridge.escalate(params, name, args, report, acked=ack, context=context)
+            except TypeError:   # a stand-in bridge without the v3.14 / v3.18 arguments
+                passed = await bridge.escalate(params, name, args, report)
+        except Exception as exc:  # noqa: BLE001 - then the step's line as before
+            passed = False
+            if self.log is not None:
+                self.log.event("hands", op=name, escalate_error=type(exc).__name__)
+        if not passed:
+            return False
+        said = ""
+        if ack:
+            # said by code as other code lines are, and marked said only once it went to the voice (review r1 L1)
+            try:
+                await params.llm.push_frame(TTSSpeakFrame(text=STEP_REST_ACK))
+                said = STEP_REST_ACK
+                bridge.acked()
+                mark = getattr(bridge, "mark_spoken", None)
+                if callable(mark):
+                    mark(params.tool_call_id)
+            except Exception:  # noqa: BLE001 - not said: the thinker's own outcome is the next they hear
+                said = ""
+        if self.log is not None:
+            self.log.event("hands", op=name, escalated=True, step_rest=True, acked=bool(said), call=params.tool_call_id)
+        await params.result_callback({"passed_on": "the rest of their request went to the thinker", "said": said,
+                                      "how_to_handle_it": _STEP_REST_NOTE},
+                                     properties=FunctionCallResultProperties(run_llm=False))
+        return True
 
     def take_step_line(self, max_age_s: float = STEP_LINE_OWED_S) -> str | None:
         """sVoiceFix (F5): the line a silent step check still owes, taken (said once by the bridge, when the run its
@@ -2825,6 +3142,30 @@ class Hands:
             return None
         return None
 
+    def _needs_offer(self, skill_key: str, slots: dict[str, Any]) -> bool:
+        """sVoiceFix (F11): whether a run_skill is refused before any rung runs: its skill only plays an option offered
+        aloud (:meth:`_pick_slot`), their words named none and none is offered now. Data only."""
+        pick = self._pick_slot(skill_key)
+        return bool(pick) and slots.get(pick) in (None, "", {}, []) and not self._offers_waiting()
+
+    def refused_first(self, args: Any) -> bool:
+        """vRound2 (sVoiceFix "Left", lean #10): whether this ``run_skill`` call would be refused before running and
+        then go to the thinker by code with their whole request (:meth:`_needs_offer`, and the skill's data lets it be
+        handed over), as :meth:`_skill_hand` and :meth:`_skill_fallback` decide it. The pipeline reads it for a reply's
+        calls before Pipecat runs them in parallel (``pipeline.reply_skips``): the reply's other calls then do not run.
+        Data only (the skill's slots and hand-off flag, the offers kept); never the words. Never raises."""
+        try:
+            if not self.skills_on or self.halted or not isinstance(args, dict):
+                return False
+            key = str(args.get("skill") or "").strip()
+            slots = dict(args.get("slots")) if isinstance(args.get("slots"), dict) else {}
+            if not key or not self._needs_offer(key, slots):
+                return False
+            skill = _skill_def(key)
+            return skill is not None and bool(getattr(skill, "handoff", True))
+        except Exception:  # noqa: BLE001 - unknown: the reply runs as it is
+            return False
+
     def _offers_waiting(self, now: float | None = None) -> bool:
         """sVoiceFix (F11): whether options a run offered aloud can still be picked (the talker's options line is on),
         as the pipeline keeps them (``last_skill["offers"]`` for ``youtube_feed.OFFER_KEEP_S``)."""
@@ -2886,8 +3227,7 @@ class Hands:
             facts.update(refused=True, outcome="refused", halted=True)   # x3: the thinker has it already, never again
             return False, (f"your last hand did not show the effect it was for ({self.halted}); your hands stay still "
                            f"until the user speaks again. Nothing was done"), facts
-        pick = self._pick_slot(skill_key)
-        if pick and slots.get(pick) in (None, "", {}, []) and not self._offers_waiting():
+        if self._needs_offer(skill_key, slots):
             # sVoiceFix (sim-e2e-1 F11): a skill that only plays one of the options offered aloud, with none offered
             # and none named ("put something on YouTube" ran web.open_video and asked "Which video?"): nothing runs and
             # it falls back to the thinker by code (the pick is Yuki's: the normal way, by steps). Review r1 M2: this is
