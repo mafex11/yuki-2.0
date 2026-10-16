@@ -66,7 +66,7 @@ from PySide6.QtCore import QObject, Signal
 from yuki.voice.expressive import strip_tags
 from yuki.voice.mouth import (
     APP_NAMED_NOTE, CODE_SAID_NOTE, CORRECTION_MARK, REMEMBER_NOTE, SAVED_NOTE, SPOKEN_NOTE, WITHDRAWN_NOTE,
-    brain_request, outcome_fields, result_payload, talker_kind, voice_on_brain, waiting_payload,
+    brain_request, outcome_fields, result_payload, say_first_words, talker_kind, voice_on_brain, waiting_payload,
 )
 from yuki.voice.narrator import RANKS, Item, asks, condense, ends_sentence, machine_text, sentences
 from yuki.voice.progress import JobLog, step_of
@@ -1195,6 +1195,7 @@ class VoiceBridge(QObject):
     async def tell_yuki(self, params: Any) -> None:
         """Pipecat handler for ``tell_yuki`` (async: registered with ``cancel_on_interruption=False``), and for the lean
         talker's ``hand_over``. bTalk: under ``brain = "all"`` it is :meth:`_hand_over` (the exact words, by code)."""
+        self._drop_step_line()   # sVoiceFix (F5): a hand-off answers a step check: no step line is owed any more
         if self.on_brain:
             await self._hand_over(params)
             return
@@ -1263,7 +1264,7 @@ class VoiceBridge(QObject):
                 self._log("bridge", op="merged_same_turn", job_id=same.job_id, call=params.tool_call_id)
         done_before = self.actions.text()
         said = spoken_words(params.context)
-        first = str(args.get("say_first") or "").strip()
+        first = say_first_words(args.get("say_first"))
         if first and first not in said:
             said.append(first)
         tabs = self.tabs_for_thinker()
@@ -1346,7 +1347,7 @@ class VoiceBridge(QObject):
 
     def _acked(self, params: Any, args: dict[str, Any]) -> bool:
         """Whether the user hears an acknowledgement for this hand-off (its say_first, or the reply's words)."""
-        if str(args.get("say_first") or "").strip():
+        if say_first_words(args.get("say_first")):
             return True
         try:
             return bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
@@ -1376,7 +1377,7 @@ class VoiceBridge(QObject):
         progress line 11 s later. Whether the reply had words is a fact about the stream
         (:attr:`spoke_in_reply`), not about what they say; the words are the mouth's own.
         """
-        words = str(args.get("say_first") or "").strip()
+        words = say_first_words(args.get("say_first"))   # sVoiceFix (F6): never a call run into the string, whole
         if self.said_early is not None and self.said_early(str(params.tool_call_id)):
             return  # already said while the mouth was writing the call (v3.5)
         spoke = self.spoke_in_reply() if self.spoke_in_reply is not None else True
@@ -1934,6 +1935,35 @@ class VoiceBridge(QObject):
                                       "how_to_say_it": (graded_note or SPOKEN_NOTE)
                                       + (" Still more after this." if rest else "")})
 
+    def _drop_step_line(self) -> None:
+        """sVoiceFix (F5): the hands' owed step line, dropped (something other than silence answered the step)."""
+        hands = getattr(self, "hands", None)
+        if hands is not None:
+            try:
+                hands._step_owed = None
+            except Exception:  # noqa: BLE001 - a stand-in without it
+                pass
+
+    async def _say_step_line(self, params: Any) -> bool:
+        """sVoiceFix (F5): a run a silent window or tab step started (its step check) ends in stay_quiet with no words:
+        the step's own line of what is showing now is said by code (live-like 16 Oct sim: "put something on YouTube on
+        Arc" showed Arc's old tab and then nothing at all, 5 of 5 runs). ``True`` when said; the call is settled."""
+        hands = getattr(self, "hands", None)
+        take = getattr(hands, "take_step_line", None) if hands is not None else None
+        line = take() if callable(take) else None
+        push = getattr(getattr(params, "llm", None), "push_frame", None)
+        if not line or push is None:
+            return False
+        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+
+        await push(TTSSpeakFrame(text=line))
+        if self.mark_spoken is not None:
+            self.mark_spoken(params.tool_call_id)
+        self._log("bridge", op="quiet", said_by="step_line", chars=len(line))
+        await params.result_callback({"ok": True, "note": f"Said aloud for you just now: {line} Say nothing more."},
+                                     properties=FunctionCallResultProperties(run_llm=False))
+        return True
+
     async def stay_quiet(self, params: Any) -> None:
         """Pipecat handler for ``stay_quiet``: the mouth chose to say nothing; settled without a turn."""
         from pipecat.frames.frames import FunctionCallResultProperties
@@ -1968,6 +1998,10 @@ class VoiceBridge(QObject):
             await params.result_callback({"not_quiet": "A result, a failure or a question is always said. Say what it "
                                           "says now, in a few words of your own."})
             return
+        if not by_user and not spoke_now and await self._say_step_line(params):
+            return   # sVoiceFix (F5): never silence after a step that only brought something up
+        if by_user or spoke_now:
+            self._drop_step_line()
         # V2 (3 Oct): a stay_quiet on the user's own words is final. It used to be refused once after the name (v3.6)
         # and once in a live exchange (v3.9); live 3 Oct "go away" got a quiet, the refusal made the talker run again,
         # and it said it was still there. Whom the words were for is the talker's judgement (the prompt: outside a
@@ -2014,7 +2048,7 @@ class VoiceBridge(QObject):
         from pipecat.frames.frames import FunctionCallResultProperties
 
         args = params.arguments if isinstance(params.arguments, dict) else {}
-        words = str(args.get("say_first") or "").strip()
+        words = say_first_words(args.get("say_first"))
         spoke = bool(self.spoke_in_reply()) if self.spoke_in_reply is not None else False
         self._drop_claim("ended")   # Item 2(c): "shut up" is never the answer to a waiting question
         await self._ack_if_silent(params, args)
@@ -3427,7 +3461,7 @@ class VoiceBridge(QObject):
                              tabs=self.tabs_for_thinker(), app_named=app_named)
         job = self._new_job(request)
         job.app_named = app_named
-        job.acked = bool(str(args.get("say_first") or "").strip())
+        job.acked = bool(say_first_words(args.get("say_first")))
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
@@ -3438,7 +3472,7 @@ class VoiceBridge(QObject):
         # take this variable's name, so the held run searched memory with Yuki's own words)
         self._gui(lambda: self._submit(job, text, origin, lane=lane, view=view, memory_query=query,
                                        user_words=heard, needs_hands=False if args.get("acts") is False else None))
-        words = str(args.get("say_first") or "").strip()
+        words = say_first_words(args.get("say_first"))
         if words and self.speak is not None:
             await self.speak(words)
         self._log("bridge", op="submit", token=job.token, intent="held_run", words_chars=len(request),
@@ -3797,14 +3831,14 @@ class VoiceBridge(QObject):
         if not request:
             return False
         job = self._new_job(request)
-        job.acked = bool(str(args.get("say_first") or "").strip())
+        job.acked = bool(say_first_words(args.get("say_first")))
         with self._lock:
             self._unsubmitted[job.token] = job
         origin = self._foreground()
         ctx = self._voice_context(context, turns)
         query = _memory_words(request, heard)
         self._gui(lambda: self._submit(job, request, origin, memory_query=query, user_words=turns, context=ctx))
-        words = str(args.get("say_first") or "").strip()
+        words = say_first_words(args.get("say_first"))
         if words and self.speak is not None:
             await self.speak(words)
         self._log("bridge", op="submit", token=job.token, intent="held_run", brain=True, words_chars=len(request),

@@ -74,6 +74,22 @@ def router_on(settings: Any) -> bool:
         return False
     return bool(getattr(settings, "voice_router", False))
 
+
+#: sVoiceFix (sim-e2e-1 F6): where a call's say_first stops being words for the user. A field's value never holds a
+#: line break, a double quote or a tag of the call format; the model sometimes runs the rest of its call into the
+#: string (live-like 16 Oct: ``On it.",\n<parameter name="skill">spotify.playlist``), and the whole of it was spoken.
+SAY_FIRST_ENDS = ("\n", "\r", '"', "<")
+
+
+def say_first_words(text: Any) -> str:
+    """The words of a call's ``say_first`` that may be spoken: up to its first line break, double quote or ``<`` (the
+    call format running into the string), trailing commas and spaces dropped; ``""`` when nothing is left. Plumbing on
+    our own call format, never the words' meaning."""
+    words = str(text or "")
+    cut = min((i for i in (words.find(end) for end in SAY_FIRST_ENDS) if i >= 0), default=len(words))
+    return words[:cut].rstrip(" \t,;:").strip()
+
+
 #: The mouth's core layer (frozen). Pipecat appends its own paragraphs about async tools
 #: and cancelling them; together they are the first system block, the same bytes every
 #: conversation.
@@ -212,9 +228,10 @@ list, misheard) -> the items from the Earlier block, or quick_memory(action="tod
 
 # Commitment discipline
 
-Saying you will do something is a promise, and only a tool call keeps it. If what you say is \
-"let me check", "I'll look", "on it", "one sec" or anything like it, the tell_yuki call (or the \
-hand, or the check_progress or more_of_result call) must be in that same reply. Every tool call is \
+Saying you will look or do something is a promise, and only a tool call keeps it: you cannot see inside the \
+windows yourself. "Let me check", "I'll look", "let me take a look at your screen", "on it", "one sec" or anything \
+like it comes only with the tell_yuki call (or the hand, or the check_progress or more_of_result call) in that same \
+reply. Every tool call is \
 made alone, with no words written before it, except quick_memory: a few words first ("Let me look."). tell_yuki, open_url and open_app carry their spoken \
 acknowledgement in say_first ("Sure, one sec."): it is said aloud the moment you write it, and the \
 work starts the moment the call is complete, so the user hears you at once and the thinker is \
@@ -2083,6 +2100,24 @@ def menu_keys(menu: str | None) -> list[str]:
             if key and " " not in key and key not in keys:
                 keys.append(key)
     return keys
+
+
+def talker_skill_keys(menu: str | None) -> list[str]:
+    """The talker's ``run_skill`` keys for a conversation: its Skills menu's (:func:`menu_keys`), then, when it lists
+    any, the capabilities kept off that menu because they only play an option offered aloud
+    (:func:`yuki.skills.menu.talker_pick_keys`, sVoiceFix F11): the options line names those while options are offered,
+    so they stay callable. ``[]`` with no menu."""
+    keys = menu_keys(menu)
+    if not keys:
+        return []
+    try:
+        from yuki.skills.catalog import load
+        from yuki.skills.menu import talker_pick_keys
+
+        extra = talker_pick_keys(load())
+    except Exception:  # noqa: BLE001 - the menu's keys alone
+        extra = []
+    return keys + [k for k in extra if k not in keys]
 
 
 #: The people directory in the talker's cached profile layer is cut to this (whole lines).

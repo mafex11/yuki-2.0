@@ -45,8 +45,8 @@ from yuki.voice.hands import talker_hand_tools
 from yuki.voice.recall import QUICK_MEMORY
 from yuki.voice.mouth import (
     CHECK_PROGRESS, END_CONVERSATION, GO_QUIET, HAND_OVER, HANDOFF_TOOLS, LEAN_MOUTH_PROMPT, MORE_OF_RESULT,
-    MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel, mouth_system_blocks, router_on, talker_kind,
-    voice_on_brain, volatile_block, with_markers,
+    MOUTH_PROMPT, STAY_QUIET, TELL_YUKI, MouthMemory, ReplyChannel, mouth_system_blocks, router_on, say_first_words,
+    talker_kind, voice_on_brain, volatile_block, with_markers,
 )
 
 #: The speech channels (``Settings.voice_speech_channel``, v3.16).
@@ -458,7 +458,9 @@ def early_words(partial_json: str) -> str | None:
     The mouth writes ``say_first`` first (its schema asks it to); the moment its string is complete in
     the streamed JSON it can be spoken, while the rest of the call is still being written (v3.5,
     docs/VOICE.md §5.2). Parsing the call's own JSON: ``None`` until the value is complete, or when
-    the arguments have no ``say_first``.
+    the arguments have no ``say_first``. sVoiceFix (F6): only its words up to a line break, a double quote or a ``<``
+    (:func:`~yuki.voice.mouth.say_first_words`): a call that ran the rest of itself into the string is never spoken
+    whole.
     """
     import json
 
@@ -477,7 +479,8 @@ def early_words(partial_json: str) -> str | None:
         value, _end = json.JSONDecoder().raw_decode(partial_json, start)
     except ValueError:
         return None  # the string is not complete yet
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    words = say_first_words(value) if isinstance(value, str) else ""
+    return words or None
 
 
 def early_flag(partial_json: str, name: str) -> bool | None:
@@ -4808,13 +4811,13 @@ class Conversation:
         cached = getattr(self, "_skill_keys_cache", None)
         if cached is not None:
             return list(cached)
-        from yuki.voice.mouth import menu_keys
+        from yuki.voice.mouth import talker_skill_keys
 
         memory = getattr(self, "mouth_memory", None)
         hands = getattr(self.bridge, "hands", None)
         keys: list[str] = []
         if skills_on(self.settings) and self.settings.voice_hands and hands is not None and memory is not None:
-            keys = menu_keys(getattr(memory, "skills", None))
+            keys = talker_skill_keys(getattr(memory, "skills", None))
         if not keys and memory is not None and getattr(memory, "skills", None):
             memory.skills = None
         self._skill_keys_cache = tuple(keys)
