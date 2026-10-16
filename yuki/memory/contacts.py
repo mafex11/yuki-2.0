@@ -26,6 +26,27 @@ Read side (no model, SQL aggregates over ``messages``; a few ms): routes ranked 
 messages per route are decrypted when read, for the resolved person only (style samples). :func:`directory` is the
 compact "people" block (<= :data:`DIRECTORY_CHARS`) for the agent's cached profile layer and the voice talker.
 
+**Names as speech recognition writes them** (failure fix-plan item 6, IF-people). A name is matched in the user's words
+as written first: the person's name, an alias, or a heard form memory learned when the user corrected or confirmed a
+mishearing ("hey meant" -> Hemanth: ``name_aliases``, :func:`with_learned`). Failing that, one person and only one may
+be matched by how the words *sound* (:class:`Heard`): each word is put in Latin letters (:func:`romanize`: a Brahmic
+script such as Devanagari letter by letter from Unicode's own letter names, so "हेमंत" reads "hemanth", doubled
+letters once), reduced to a coarse sound key (:func:`sound_key`: consonant classes, vowels and "h" left out, so
+"Hemanth" and "hey meant" are both ``MNT``) and an onset (the first consonant's class, or ``V``), and a run of up to
+:data:`HEARD_MAX_WORDS` words matches a name when key and onset are equal **and** the spellings are close: a run in
+another script than the name (a conversion) within :data:`HEARD_SCRIPT_DISTANCE`; two Latin spellings (a mishearing)
+within :data:`HEARD_MAX_DISTANCE`, and only for names of :data:`HEARD_MIN_LETTERS` letters with a key of
+:data:`HEARD_MIN_KEY` (a short name matches a Latin run only as written; an app's, not a person's, within one letter
+of three: "Ark" for Arc). A run that sounds like two people matches neither, and handles with digits match only as
+written. :func:`named_in` (who does this text name, unprompted) reads Latin words only as written, learned heard forms
+included, and by sound only a transliteration: a guess at a mishearing would name people the user never meant ("fit
+their" sounds like Father). :func:`names_person`, a check for one name already given (a person slot's value), reads
+Latin runs by sound too, one word or a name split in two. :func:`resolve` reads a name by sound only when asked
+(``heard=True``, which only :func:`names_person` passes: a name the talker or thinker inferred, confirmed by the user's
+words sounding like it, two signals agreeing), and then only when no group chat or channel is called exactly that. By
+default a literal name nobody in the index has stays nobody's: the chat driver says it doesn't know who that is, and
+never sends to someone who merely sounds alike. Fixed format rules over the user's own data, never a word list.
+
 Lightweight: the model call runs only when memory changed since the last run (after the nightly audit, or by hand);
 nothing here is on a request's path but SQL.
 
@@ -40,11 +61,17 @@ Public API (the memory API wraps it: ``MemoryClient.contact``, ``people_director
     Linker(worker).run(kind="refresh" | "rebuild", dry_run=False, now=None) -> LinkResult
     people(store, learned=True) -> list[Contact]        # live contacts with their routes (cached by a stamp); with
                                                         # the heard forms learned since the last rebuild (aliases)
-    resolve(store, ref, near_thread=None) -> list[Contact]
+    resolve(store, ref, near_thread=None, heard=False) -> list[Contact]   # heard: also by sound (names_person)
     rank_routes(store, contact, now=None, near_thread=None) -> Ranking
     card(store, contact, now=None, near_thread=None, samples=STYLE_SAMPLES) -> dict
     directory(store, now=None, chars=DIRECTORY_CHARS) -> str
-    named_in(store, text) -> list[(Contact, words)]     # contacts whose name or alias the text contains
+    named_in(store, text) -> list[(Contact, words)]     # contacts the text names: a name or alias as written, or
+                                                        # (one person only) its transliteration
+    names_person(store, name, texts, by_sound=True) -> Contact | None  # the one person ``name`` is, when ``texts``
+                                                        # name them (as written, transliterated or, unless
+                                                        # by_sound=False: a send's recipient, by sound)
+    transliterated(store, name) -> Contact | None       # the one person a name in a Brahmic script reads as
+    sounds_in(name, texts, short=False) -> str | None   # the words in ``texts`` that sound like ``name`` (an app)
     contacts_of_threads(store, thread_ids) -> {thread id: [(Contact, Route)]}
     recent_chat_contacts(store, now=None, minutes=10) -> list[dict]
     call_contacts(store, now=None) -> list[dict]
@@ -61,6 +88,7 @@ import math
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -151,6 +179,310 @@ def span_in(needle: str | Sequence[str] | None, hay: str | Sequence[str] | None)
         if h[i] == first and h[i:i + len(n)] == n:
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Names as heard: transliteration and sound (see the module docstring)
+# ---------------------------------------------------------------------------
+
+#: A run of at most this many words of the user's words is compared with a name by sound.
+HEARD_MAX_WORDS = 3
+#: A Latin sound key shorter than this tells too few names apart: such a name matches a Latin run only as written.
+HEARD_MIN_KEY = 3
+#: Latin letters a name and a Latin run of words both need before they may match by sound.
+HEARD_MIN_LETTERS = 4
+#: How far apart two Latin spellings may be (edit distance over the longer one's length, doubled letters read once)
+#: and still be one name heard two ways: "hey meant" / "hemanth" 0.375 and "this card" / "discord" 0.375 pass;
+#: "brick" / "brook" 0.4 and "crap" / "komal" 0.67 (the same sound keys) are refused.
+HEARD_MAX_DISTANCE = 0.38
+#: A run written in a Brahmic script is read into Latin letter by letter (a conversion, not a mishearing), so it may
+#: match a name with any sound key, of at least this many letters...
+HEARD_SCRIPT_MIN_LETTERS = 3
+#: ...when the spellings are this close: "हेमंत" read "hemanth" / "hemanth" 0.125, "एल्सा" read "elsa" / "elsa" 0.
+HEARD_SCRIPT_DISTANCE = 0.25
+#: A short name that is not a person's (an app's: "Arc", "Zen") may match a Latin run by sound with a key this long,
+#: of at least :data:`HEARD_SHORT_MIN_LETTERS` letters each, spelled within :data:`HEARD_SHORT_DISTANCE` (one letter
+#: of three: "Ark" for Arc). Never for a person: whom a message goes to keeps the stricter rule.
+HEARD_SHORT_MIN_KEY = 2
+HEARD_SHORT_MIN_LETTERS = 3
+HEARD_SHORT_DISTANCE = 0.34
+#: The Brahmic scripts' Unicode blocks (Devanagari to Sinhala): each letter's own Unicode name gives its Latin sound.
+_INDIC = (0x0900, 0x0DFF)
+#: Sound classes (a coarse consonant skeleton: voicing, aspiration and the s/sh/ch, v/w/f merges speech recognition
+#: and Indian English blur). Two letters first, then one; vowels, "y" and a lone "h" have none.
+_SOUND_PAIRS = {"ph": "F", "sh": "S", "ch": "S", "th": "T", "dh": "T", "kh": "K", "gh": "K", "ck": "K", "bh": "P",
+                "jh": "J", "wh": "F"}
+_SOUND = {"b": "P", "p": "P", "d": "T", "t": "T", "g": "K", "k": "K", "q": "K", "s": "S", "z": "S", "j": "J",
+          "f": "F", "v": "F", "w": "F", "l": "L", "m": "M", "n": "N", "r": "R", "x": "KS"}
+#: A nukta changes the consonant it sits on (Devanagari क़ ज़ फ़ ड़): its Latin sound after the change.
+_NUKTA = {"k": "q", "kh": "kh", "g": "g", "j": "z", "ph": "f", "dd": "r", "ddh": "rh"}
+#: Letters that open a word with no consonant class of their own (the onset ``V``): vowels, "h" and "y".
+_OPEN = frozenset("aeiouhy")
+
+
+def spoken_words(text: str | None) -> list[tuple[int, str]]:
+    """The words of ``text`` with where each starts: runs of letters and digits, a combining mark kept with the letter
+    it sits on (a Devanagari vowel sign or virama, an accent). :func:`tokens` splits a word at such a mark ("हेमंत" ->
+    "हेमं", "श"); its words are digested into stored keys, so it stays as it is and only the heard matching reads
+    these."""
+    out: list[tuple[int, str]] = []
+    cur: list[str] = []
+    start = 0
+    for i, ch in enumerate(text or ""):
+        if ch.isalnum() or (cur and unicodedata.category(ch).startswith("M")):
+            if not cur:
+                start = i
+            cur.append(ch)
+        elif cur:
+            out.append((start, "".join(cur)))
+            cur = []
+    if cur:
+        out.append((start, "".join(cur)))
+    return out
+
+
+def _indic_sound(rest: str) -> tuple[str, bool]:
+    """A Brahmic letter's Latin sound from the tail of its Unicode name (``KA``, ``SHA``, ``AA``, ``VOCALIC R``) and
+    whether it is a consonant (its name is a consonant sound plus the inherent ``A``)."""
+    if rest.startswith("VOCALIC"):
+        return "ri", False
+    word = rest.split()[-1] if rest.split() else ""
+    if len(word) >= 2 and word.endswith("A") and word[-2] not in "AEIOU":
+        sound = word[:-1].lower()
+        return ("ch" if sound == "c" else sound), True     # Unicode's CA is said "cha"
+    return word.lower(), False
+
+
+def _is_script(word: str) -> bool:
+    """Whether ``word`` is written in a Brahmic script (any of its letters is)."""
+    return any(_INDIC[0] <= ord(ch) <= _INDIC[1] for ch in word)
+
+
+def romanize(word: str | None) -> str:
+    """The Latin letters a word sounds as, lower case: Latin without its accents; a Brahmic script (Devanagari to
+    Sinhala) letter by letter from each letter's Unicode name ("DEVANAGARI LETTER SHA" -> "sh" with its inherent "a",
+    a vowel sign "II" -> "ii" in that "a"'s place, the virama dropping it, a word's last inherent "a" left unsaid);
+    digits and any other script are left out. A fixed format rule over Unicode's own data, never a word list."""
+    out: list[str] = []
+    pending = False       # a consonant's inherent "a", not said yet
+    for ch in unicodedata.normalize("NFD", str(word or "")):
+        cp = ord(ch)
+        if _INDIC[0] <= cp <= _INDIC[1]:
+            name = unicodedata.name(ch, "")
+            _head, letter, rest = name.partition(" LETTER ")
+            if letter:
+                sound, consonant = _indic_sound(rest)
+                if pending:
+                    out.append("a")
+                out.append(sound)
+                pending = consonant
+                continue
+            _head, sign, rest = name.partition(" VOWEL SIGN ")
+            if sign:
+                out.append(_indic_sound(rest)[0])
+                pending = False
+                continue
+            if name.endswith(" SIGN VIRAMA"):
+                pending = False
+            elif name.endswith(" SIGN NUKTA"):
+                if out:
+                    out[-1] = _NUKTA.get(out[-1], out[-1])
+            elif name.endswith((" SIGN ANUSVARA", " SIGN CANDRABINDU", " SIGN VISARGA")):
+                if pending:
+                    out.append("a")
+                    pending = False
+                out.append("h" if name.endswith("VISARGA") else "n")
+            continue
+        if pending:
+            out.append("a")
+            pending = False
+        if ch.isascii() and ch.isalpha():
+            out.append(ch.lower())
+    return "".join(out)
+
+
+def sound_key(letters: str | None) -> str:
+    """A coarse sound key of Latin letters (:data:`_SOUND_PAIRS`, :data:`_SOUND`): "Hemanth" and "hey meant" -> MNT,
+    "Discord" and "this card" -> TSKRT. A repeated class with no vowel between counts once."""
+    s = "".join(ch for ch in str(letters or "").casefold() if "a" <= ch <= "z")
+    out: list[str] = []
+    last = ""
+    i = 0
+    while i < len(s):
+        pair = s[i:i + 2]
+        if pair == "ch" and s[i + 2:i + 3] in ("r", "l"):
+            code = "K"             # "chr", "chl" are said k ("Chrome")
+            i += 2
+        elif pair in _SOUND_PAIRS:
+            code = _SOUND_PAIRS[pair]
+            i += 2
+        else:
+            ch = s[i]
+            i += 1
+            code = ("S" if s[i:i + 1] in ("e", "i", "y") else "K") if ch == "c" else _SOUND.get(ch, "")
+            if not code and ch != "h":
+                last = ""          # a vowel between: the next class counts again
+                continue
+        for k in code:
+            if k != last:
+                out.append(k)
+            last = k
+    return "".join(out)
+
+
+def _once(letters: str) -> str:
+    """Letters with a doubled letter read once ("haraniish" -> "hemanth": a long vowel is one sound)."""
+    out: list[str] = []
+    for ch in letters:
+        if not out or out[-1] != ch:
+            out.append(ch)
+    return "".join(out)
+
+
+def _distance(a: str, b: str) -> float:
+    """Edit distance of two spellings over the longer one's length (0: the same, 1: nothing alike)."""
+    if a == b:
+        return 0.0
+    if not a or not b:
+        return 1.0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1] / max(len(a), len(b))
+
+
+@dataclass(frozen=True)
+class Heard:
+    """How a name or a run of words sounds: its Latin letters (:func:`romanize`, doubled letters once), its sound key
+    (:func:`sound_key`), its onset (the first consonant's class, ``V`` when it opens with a vowel, "h" or "y") and
+    whether it was written in a Brahmic script (``script``: read into Latin, not heard)."""
+
+    letters: str
+    key: str
+    onset: str
+    script: bool = False
+
+
+def heard_of(words: Sequence[str]) -> Heard | None:
+    """How a run of written words sounds, or ``None`` when it can't be compared: a word with digits (a handle), or a
+    word with no letters this reads (another script)."""
+    parts = [romanize(w) for w in words]
+    if not parts or any(not p for p in parts) or any(ch.isdigit() for w in words for ch in w):
+        return None
+    letters = _once("".join(parts))
+    onset = "V" if letters[0] in _OPEN else sound_key(letters[:3])[:1]
+    return Heard(letters, sound_key(letters), onset, all(_is_script(w) for w in words))
+
+
+def heard_form(name: str | None) -> Heard | None:
+    """How a name sounds (:func:`heard_of` on its words)."""
+    return heard_of([w for _start, w in spoken_words(name)])
+
+
+def _sound_ok(run: Heard, name: Heard, *, short: bool = False) -> bool:
+    """Whether a run of words may be ``name`` heard or written another way: the same sound key and onset, and close
+    spellings. A run and a name in different scripts (one read into Latin: a conversion) need only a name of
+    :data:`HEARD_SCRIPT_MIN_LETTERS` letters and spellings within :data:`HEARD_SCRIPT_DISTANCE`; two Latin spellings (a
+    mishearing) need a key of :data:`HEARD_MIN_KEY`, :data:`HEARD_MIN_LETTERS` letters each and
+    :data:`HEARD_MAX_DISTANCE` (a short name matches them only as written). ``short`` (a name that is not a person's:
+    an app's): a shorter name may match too, under :data:`HEARD_SHORT_MIN_KEY`, :data:`HEARD_SHORT_MIN_LETTERS` and
+    :data:`HEARD_SHORT_DISTANCE`."""
+    if not name.key or run.key != name.key or run.onset != name.onset:
+        return False
+    if run.script != name.script:
+        return len(name.letters) >= HEARD_SCRIPT_MIN_LETTERS and \
+            _distance(run.letters, name.letters) <= HEARD_SCRIPT_DISTANCE
+    far = _distance(run.letters, name.letters)
+    if len(name.key) >= HEARD_MIN_KEY and min(len(run.letters), len(name.letters)) >= HEARD_MIN_LETTERS:
+        return far <= HEARD_MAX_DISTANCE
+    return short and len(name.key) >= HEARD_SHORT_MIN_KEY and \
+        min(len(run.letters), len(name.letters)) >= HEARD_SHORT_MIN_LETTERS and far <= HEARD_SHORT_DISTANCE
+
+
+def heard_spans(text: str | None, max_words: int = HEARD_MAX_WORDS, *,
+                single: bool = True, latin: bool = True) -> list[tuple[int, str, Heard]]:
+    """Every run of 1 to ``max_words`` words of ``text`` that may be compared with a name by sound: ``(where it starts,
+    the words as written, how it sounds)``. A run never crosses a word with digits or one in a script this doesn't
+    read. ``single``: a lone Latin word counts too (a check for one given name); without it only runs of two or more
+    Latin words (a name speech recognition split: "hey meant") and words in a Brahmic script do, since a lone English
+    word that sounds like a name is the commonest false match ("matter" for Mother). ``latin=False``: runs in a
+    Brahmic script only (a conversion, never a guess at a mishearing: "fit their" sounds like Father)."""
+    text = str(text or "")
+    words = spoken_words(text)
+    if not latin:      # only Brahmic-script words can start or join a run: the rest is never read by sound here
+        script = [_is_script(w) for _s, w in words]
+        if not any(script):
+            return []
+    out: list[tuple[int, str, Heard]] = []
+    for i in range(len(words)):
+        for n in range(1, max_words + 1):
+            part = words[i:i + n]
+            if len(part) < n or (not latin and not script[i + n - 1]):
+                break
+            form = heard_of([w for _s, w in part])
+            if form is None:
+                break
+            if not form.script and (not latin or (n == 1 and not single)):
+                continue
+            start, end = part[0][0], part[-1][0] + len(part[-1][1])
+            out.append((start, text[start:end], form))
+    return out
+
+
+def sounds_in(name: str | None, texts: Sequence[str] | str | None, *, short: bool = False) -> str | None:
+    """The words in ``texts`` that sound like ``name`` (:func:`_sound_ok`), as written there; ``None`` when none does
+    or ``name`` can't be compared. A check for one given name that is not a person (an app: "this card" for Discord;
+    with ``short``, "Ark" for Arc); people go through :func:`named_in` / :func:`names_person`, which also keep a sound
+    to one person."""
+    form = heard_form(name)
+    if form is None:
+        return None
+    for text in [texts] if isinstance(texts, str) else list(texts or []):
+        for _start, words, run in heard_spans(text):
+            if _sound_ok(run, form, short=short):
+                return words
+    return None
+
+
+def _heard_index(found: Sequence[Any]) -> dict[str, list[tuple[Any, Heard]]]:
+    """Sound key -> ``(contact, how the name sounds)`` for every name and alias of ``found`` that can be compared."""
+    index: dict[str, list[tuple[Any, Heard]]] = {}
+    for c in found:
+        for n in c.names:
+            form = heard_form(n)
+            if form is not None and form.key:
+                index.setdefault(form.key, []).append((c, form))
+    return index
+
+
+def _heard_one(index: dict[str, list[tuple[Any, Heard]]], run: Heard) -> Any | None:
+    """The one contact whose name ``run`` may be: one spelled the same if any, else every close one; none or two
+    people: ``None``."""
+    close = [(c, f) for c, f in index.get(run.key, []) if _sound_ok(run, f)]
+    same = [c for c, f in close if f.letters == run.letters]
+    pool = same or [c for c, _f in close]
+    return pool[0] if pool and len({c.id for c in pool}) == 1 else None
+
+
+def heard_people(found: Sequence[Any], text: str | None, *, single: bool = False,
+                 latin: bool = True) -> list[tuple[int, Any, str]]:
+    """The contacts of ``found`` that ``text`` names by sound (a transliteration, a mishearing spelled close), each at
+    the first run of words that sounds like one of their names and like nobody else's: ``(where it starts, contact,
+    the words as written)``, in the order they appear. ``single``: lone Latin words count too; ``latin=False``:
+    transliterations only (:func:`heard_spans`)."""
+    spans = heard_spans(text, single=single, latin=latin)
+    index = _heard_index(found) if spans else {}
+    if not index:
+        return []
+    hits: dict[int, tuple[int, Any, str]] = {}
+    for start, words, run in spans:
+        c = _heard_one(index, run)
+        if c is not None and (c.id not in hits or start < hits[c.id][0]):
+            hits[c.id] = (start, c, words)
+    return sorted(hits.values(), key=lambda h: h[0])
 
 
 def _clean(value: Any, cap: int) -> str:
@@ -1216,10 +1548,17 @@ def places(store: Store) -> list[Route]:
     return [r for r in all_routes(store) if r.contact_id is None]
 
 
-def resolve(store: Store, ref: Any, *, near_thread: int | None = None) -> list[Contact]:
+def resolve(store: Store, ref: Any, *, near_thread: int | None = None, heard: bool = False) -> list[Contact]:
     """The contacts ``ref`` names: ``contact:N`` / ``route:N``, else its words as a name or alias (whole words, case
     aside; a misheard form the user corrected counts); several when several fit, the one with a route in
-    ``near_thread`` first. ``[]`` when none."""
+    ``near_thread`` first. ``[]`` when none.
+
+    ``heard`` (only :func:`names_person`, which also needs the user's words to name that person): when no name fits
+    as written and no group chat or channel is called exactly that, the one person ``ref`` sounds like (its
+    transliteration or a close mishearing of one of their names, and nobody else's: the module docstring), so
+    "Hemant" finds Hemanth. Never by default: every other caller (the chat driver's target, the people lookup, alias
+    learning) gets a literal name as said, so a name that is not one of the user's people is never swapped for one
+    who sounds alike and a message never goes to them."""
     found = people(store)
     text = " ".join(str(ref or "").split())
     if not text:
@@ -1233,19 +1572,36 @@ def resolve(store: Store, ref: Any, *, near_thread: int | None = None) -> list[C
     want = tokens(text)
     exact = [c for c in found if any(tokens(n) == want for n in c.names)]
     hits = exact or [c for c in found if any(span_in(n, want) or span_in(want, n) for n in c.names)]
+    if not hits and heard:
+        # by sound only when asked, and only for a name no place goes by: a group chat or channel called exactly
+        # ``ref`` is that place (chat.find_target's next step), never a person who sounds like it
+        try:
+            place = any(tokens(r.chat) == want for r in places(store))
+        except Exception:
+            place = False
+        form = None if place else heard_form(text)
+        one = _heard_one(_heard_index(found), form) if form is not None else None
+        hits = [one] if one is not None else []
     if near_thread is not None and len(hits) > 1:
         hits.sort(key=lambda c: not any(near_thread in r.thread_ids for r in c.routes))
     return hits
 
 
 def named_in(store: Store, text: str | None) -> list[tuple[Contact, str]]:
-    """Contacts whose name or alias stands in ``text`` as whole words: ``(contact, the words as matched)``, in the
-    order they first appear. A lookup of the user's own people (memory's data), never a word list."""
+    """Contacts ``text`` names: ``(contact, the words as matched)``, in the order they first appear. A name or alias
+    (heard forms memory learned included: "hey meant" once the user confirmed it) standing in it as whole words; else,
+    for a person no name of whom stands there, a run in a Brahmic script read into Latin that sounds like one of their
+    names and like nobody else's (:func:`heard_people`: a transliteration such as "हेमंत"). Latin words are never read
+    by sound here: unprompted, a guess at a mishearing names people the user never meant ("fit their" sounds like
+    Father); a check for a name already given does (:func:`names_person`). A lookup of the user's own people (memory's
+    data), never a word list."""
     words = tokens(text)
     if not words:
         return []
+    found = people(store)
     out: list[tuple[int, Contact, str]] = []
-    for c in people(store):
+    taken: list[tuple[int, int]] = []          # the word ranges a name stands in as written
+    for c in found:
         best: tuple[int, str] | None = None
         for n in c.names:
             nt = tokens(n)
@@ -1253,13 +1609,69 @@ def named_in(store: Store, text: str | None) -> list[tuple[Contact, str]]:
                 continue
             for i in range(len(words) - len(nt) + 1):
                 if words[i:i + len(nt)] == nt:
+                    taken.append((i, i + len(nt)))
                     if best is None or i < best[0]:
                         best = (i, n)
                     break
         if best is not None:
             out.append((best[0], c, best[1]))
+    seen = {c.id for _i, c, _n in out}
+    # one person by a transliteration: judged against everyone (a run that sounds like two people names neither),
+    # added only for people no name of whom stands there as written, and never from words a name already stands in
+    for start, c, heard in heard_people(found, text, latin=False):
+        at = len(tokens(str(text)[:start]))
+        span = (at, at + len(tokens(heard)))
+        if c.id in seen or any(a < span[1] and span[0] < b for a, b in taken):
+            continue
+        seen.add(c.id)
+        out.append((at, c, heard))
     out.sort(key=lambda x: x[0])
     return [(c, n) for _i, c, n in out]
+
+
+def names_person(store: Store, name: str | None, texts: Sequence[str] | str | None, *,
+                 by_sound: bool = True) -> Contact | None:
+    """The one person ``name`` stands for (:func:`resolve` with ``heard``: a name or alias, a learned heard form, or
+    the one person it sounds like; two people: ``None``), when ``texts`` name that same person: :func:`named_in` on
+    each (as written, a heard form memory learned, a transliteration), or, since ``name`` was given for this very
+    person, a run of Latin words, one or a name speech recognition split in two, that sounds like one of their names
+    and like nobody else's (:func:`heard_people` with ``single``). The check a person slot's value gets when the
+    user's words don't spell it ("Hemanth" for "message hey meant on this card", or for "His name is हेमंत"). Sound
+    here only ever confirms a name the talker or thinker inferred, with the words naming that person too; a literal
+    name the user said is checked as said (the resolver keeps it, and :func:`resolve` without ``heard`` finds nobody
+    for a name not theirs).
+
+    ``by_sound=False`` (a send's recipient: whom a message goes to): no Latin by sound at all, neither for ``name``
+    (found as written) nor in ``texts`` (:func:`named_in` only: as written, a learned heard form, a transliteration),
+    so a thinker's "Kiran" for the user's "Karan" is nobody's, never a send to Kiran. Never raises (``None``)."""
+    try:
+        who = {c.id: c for c in resolve(store, name, heard=bool(by_sound))}
+        if len(who) != 1:
+            return None
+        target = next(iter(who.values()))
+        found = people(store)
+        for text in [texts] if isinstance(texts, str) else list(texts or []):
+            if any(c.id == target.id for c, _w in named_in(store, text)):
+                return target
+            if by_sound and any(c.id == target.id for _s, c, _w in heard_people(found, text, single=True)):
+                return target
+    except Exception:
+        return None
+    return None
+
+
+def transliterated(store: Store, name: str | None) -> Contact | None:
+    """The one person a name written in a Brahmic script reads as, letter for letter (:func:`named_in`: as written, or
+    its transliteration of one of their names and nobody else's: "हेमंत" -> Hemanth). A conversion, never a guess at a
+    mishearing: ``None`` for a name with no Brahmic letter (a Latin name is matched only as written, or confirmed), one
+    that reads as nobody, or as two people. Never raises (``None``)."""
+    try:
+        if not any(_is_script(w) for _s, w in spoken_words(name)):
+            return None
+        who = {c.id: c for c, _w in named_in(store, name)}
+    except Exception:
+        return None
+    return next(iter(who.values())) if len(who) == 1 else None
 
 
 def contacts_of_threads(store: Store, thread_ids: Sequence[int]) -> dict[int, list[tuple[Contact, Route]]]:

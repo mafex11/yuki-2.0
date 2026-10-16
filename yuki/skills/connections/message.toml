@@ -35,7 +35,14 @@ sends_when = { slot = "send", in = ["send"] }
 serves = [{ end = "message_sent", target = "chat", needs = "chat" }]
 bind = { person = "contact", app = "app" }
 
-# Whom: a person or a group chat or channel, exactly as the user said it.
+# Whom: a person or a group chat or channel. It stays a text slot (a group chat or channel goes by its name, exactly
+# as the user said it), and it is person-bound: `bind` above reads it as a `contact`, so the resolver
+# (yuki/skills/resolve.py, failure fix-plan item 6) also accepts the name the talker or the thinker gives when memory's
+# people index resolves it to exactly one person whom the user's words name as heard - a misheard form memory learned
+# ("hey meant" for Hemanth), a transliteration ("हेमंत") or a close mishearing by sound - and runs it as that
+# person's own name. A name two people fit is dropped and asked; a group chat or channel still needs its name said.
+# A name the user said that none of their people goes by, but that sounds like exactly one of them, is asked ("Did you
+# mean Hemanth?"), never swapped for that person.
 [[capability.message.slot]]
 name = "person"
 type = "text"
@@ -43,20 +50,25 @@ role = "fill"
 required = true
 ask = "Who to?"
 
-# The app, only when the user named one: validated as said (no options list, so an app the talker supplies but the
-# user never said is dropped and the person's own route stands). An app with no chat data here is a question.
+# The app, only when the user named one: validated against their words by the app's known names (its key, its title
+# and programs in the chat data, the names their timeline shows it under: "discord.com" or "Discord.exe" for
+# "Discord"), or heard there by sound ("this card" for Discord); with no app given, an app their words name (one of the
+# apps these routes drive) fills it. An app they never said is dropped and the person's own route stands. An app with
+# no chat data here is a question.
 [[capability.message.slot]]
 name = "app"
 type = "app"
 role = "means"
 fill = "driver"
 
-# What to write: the user's own words only ("" = just open the chat).
+# What to write: the user's own words only ("" = just open the chat). A text the talker or the thinker worded that
+# their words don't hold is asked about (the engine hands it to the thinker), never dropped to "" and run as an open.
 [[capability.message.slot]]
 name = "text"
 type = "text"
 role = "fill"
 default = ""
+ask = "What should I write?"
 
 # send: they plainly said to send it; draft: type it and leave it for them.
 [[capability.message.slot]]
