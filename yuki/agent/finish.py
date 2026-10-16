@@ -803,6 +803,23 @@ LINE_SKILL_UNCONFIRMED = "I couldn't confirm that's done."
 #: Said when a pinned skill that sends ended with send pressed and its own check unable to see the message land (review
 #: r2 M1): never sent back to "finish it" (rule 8: a second send), never said as done.
 LINE_SKILL_SENT_UNCONFIRMED = "I pressed send, but I couldn't confirm it landed."
+#: x5Fallback: the statuses of a pinned skill's check that can't read by design once its routes handed over: it reads
+#: the route's own result (``no_route``: which page the route opened), it has no spec or no value for a template
+#: (``no_check``, ``no_value``), no name to look for (``no_name``: the hand-off left the user's word for the thing out
+#: of it, a playlist "Japanese" that is named otherwise, or a name nobody heard), or no code reads it (``no_probe``,
+#: ``no_driver``). The thinker's own steps can never raise such a check, so the outcome verdict of its trace decides
+#: (as for a skill with no machine check at all).
+UNREADABLE_AFTER_HANDOFF = frozenset({"no_route", "no_check", "no_value", "no_name", "no_probe", "no_driver"})
+
+
+def _unreadable(evidence: Any) -> bool:
+    """Whether a check's evidence says it can't read by design after a hand-off (:data:`UNREADABLE_AFTER_HANDOFF`);
+    an ``all`` check when one of its parts can't (its evidence is ``{"p0": {...}, ...}``). Code words only."""
+    if not isinstance(evidence, dict):
+        return False
+    if str(evidence.get("status") or "") in UNREADABLE_AFTER_HANDOFF:
+        return True
+    return any(_unreadable(v) for k, v in evidence.items() if str(k)[:1] == "p" and str(k)[1:].isdigit())
 
 
 def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
@@ -811,12 +828,20 @@ def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
                sent: bool = False) -> tuple[str, str | None]:
     """A done (or a plain-text ending) on a request with a pinned skill: ``("ok", None)`` when its done-check sees the
     result (or the skill has no machine check the thinker's own steps could raise: the outcome verdict of its trace
-    decides), ``("hold", note)`` to send it back ("not done yet", at most :data:`SKILL_BOUNCES` times),
-    ``("unconfirmed", gap)`` after that: the request ends, said as "couldn't confirm". ``memory_call(what, fn)``: the
-    agent's memory, for the memory-backed probes (``message_sent``, ``moment``; review r2 M1). ``sent``: a send was
-    pressed in this request: for a skill that sends (``pinned["sends"]``) a check that didn't see it is
+    decides), ``("hold", note)`` to send it back ("not done yet: finish it by steps", at most :data:`SKILL_BOUNCES`
+    times), ``("unconfirmed", gap)`` after that: the request ends, said as "couldn't confirm". ``memory_call(what,
+    fn)``: the agent's memory, for the memory-backed probes (``message_sent``, ``moment``; review r2 M1). ``sent``: a
+    send was pressed in this request: for a skill that sends (``pinned["sends"]``) a check that didn't see it is
     ``("sent_unconfirmed", gap)`` at once, never a "finish it" note (a second send). Data only (the probe's verdict),
-    never the words."""
+    never the words.
+
+    x5Fallback (failure audit 10 Oct, C2): a check that couldn't read is the thinker's own steps' to decide, never a
+    "couldn't confirm" by itself, when the seed had a ``missing`` value (its routes found nothing by the name asked:
+    "Japanese" for the playlist named ネオン, so the check can't look for the right row) or the check can't read
+    by design after a hand-off (:data:`UNREADABLE_AFTER_HANDOFF`: web.open_page's check reads the page its own route
+    opened). Then ``("ok", None)``: the request's outcome verdict over the thinker's own trace (its steps' own
+    checks) grades it, so a verified click says done and an unverified one says "couldn't confirm" (never a false
+    done). A check that reads "not so" still holds."""
     if not isinstance(pinned, dict) or not pinned.get("key"):
         return "ok", None
     done = pinned.get("done")
@@ -841,13 +866,17 @@ def skill_gate(pinned: dict[str, Any] | None, *, since: float, bounces: int,
     if pinned.get("sends") and sent:
         # send was pressed: the message may have gone whatever the check read, so it is never sent back (rule 8)
         return "sent_unconfirmed", SKILL_UNCONFIRMED
+    if verdict is None and (pinned.get("missing") or _unreadable(evidence)):
+        # x5Fallback: the seed's check can't see the result the thinker reached by steps (not by the name asked, or
+        # not without its route's own result): the outcome verdict of the thinker's own trace decides
+        return "ok", None
     seen = "the PC shows otherwise" if verdict is False else "the PC couldn't read it"
     status = str(evidence.get("status") or "") if isinstance(evidence, dict) else ""
     if int(bounces) < SKILL_BOUNCES:
         words = str(pinned.get("done_words") or "what they asked").rstrip(". ") or "what they asked"
         return "hold", (f"not done yet: {seen}" + (f" ({status})" if status.replace("_", "").isalpha() else "")
-                        + f". The usual way ({pinned.get('key')}) is done only when: {words}. Check the screen and "
-                        f"finish it, or say plainly that it couldn't be confirmed.")
+                        + f". The usual way ({pinned.get('key')}) is done only when: {words}. Look at the screen and "
+                        f"finish it by steps (look, click, type), or say plainly that it couldn't be confirmed.")
     return "unconfirmed", SKILL_UNCONFIRMED
 
 __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILED", "LEARNED_MIN_CONFIRMED",
@@ -856,4 +885,4 @@ __all__ = ["ANSWER", "CONTRADICTED", "EXPECTED", "EXPECTED_UNVERIFIABLE", "FAILE
            "is_expected", "noop_line", "outcome_verdict", "readies", "sayable", "similar", "step_level",
            "CLAIMS", "LINE_NOTHING_DONE", "LINE_NOT_CHECKED", "claim", "claim_gap", "did_other", "honest_text",
            "last_windowless", "read_back", "SKILL_BOUNCES", "SKILL_UNCONFIRMED", "LINE_SKILL_UNCONFIRMED",
-           "LINE_SKILL_SENT_UNCONFIRMED", "skill_gate"]
+           "LINE_SKILL_SENT_UNCONFIRMED", "UNREADABLE_AFTER_HANDOFF", "skill_gate"]
