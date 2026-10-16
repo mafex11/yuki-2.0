@@ -2357,33 +2357,28 @@ def _folded(text: Any) -> str:
 
 
 def grant_person(store: Any, person: Any, *others: Any) -> int | None:
-    """The id of the one person a send grant goes to (the executor's ``Executor._skill_grant``): the one person
-    memory's people index finds for ``person`` (the capability's person slot, what the chat driver looks up): a name
-    or alias as written, a heard form memory learned ("hey meant"), a transliteration ("हेमंत"), never by sound
-    (:func:`yuki.memory.contacts.resolve` without ``heard``, :func:`~yuki.memory.contacts.transliterated`); each of
-    ``others`` (the plan's recipient, as the countdown showed it) that names anyone must name that same one.
-    ``None`` when ``person`` names nobody or two people, or another name names someone else. Never raises."""
+    """The id of the one person a send grant goes to (the executor's ``Executor._skill_grant``): the person the chat
+    driver's own lookup reads ``person`` as (the capability's person slot; :func:`yuki.skills.chat.whom`, the same
+    :func:`~yuki.skills.chat.find_target` a run makes, review r2 M2): a name or alias as written, a heard form memory
+    learned ("hey meant"), a transliteration ("हेमंत"), never by sound. Each of ``others`` (the plan's recipient, as
+    the countdown showed it) that names anyone must name that same person. ``None`` when ``person`` names nobody, two
+    people, a group chat or channel by its whole name ("Rohan's bday"), or both a person and a place, or when another
+    name reads as anyone or anything else. Never raises."""
     try:
-        from yuki.memory import contacts as C
+        from yuki.skills.chat import whom
 
-        def ids(name: Any) -> set[int]:
-            text = _words(name)
-            if not text:
-                return set()
-            found = {int(c.id) for c in C.resolve(store, text)}
-            if not found:
-                one = C.transliterated(store, text)
-                found = {int(one.id)} if one is not None else set()
-            return found
-
-        first = ids(person)
-        if len(first) != 1:
+        kind, first = whom(store, _words(person))
+        if kind != "person" or first is None:
             return None
         for other in others:
-            seen = ids(other)
-            if seen and seen != first:
+            if not _words(other):
+                continue
+            seen, pid = whom(store, _words(other))
+            if seen == "unknown":
+                continue
+            if seen != "person" or pid != first:
                 return None
-        return next(iter(first))
+        return int(first)
     except Exception:  # noqa: BLE001 - memory can't say: no person id, so the grant covers no worded send
         return None
 

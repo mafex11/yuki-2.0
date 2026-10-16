@@ -9,11 +9,14 @@ are data in that app's connection file, table ``[chat]`` (``discord.toml``, ``wh
 **Whom, and where.** The ``person`` slot is the user's own words. Memory's people index finds them
 (:func:`yuki.memory.contacts.resolve`: names, aliases, misheard forms the user corrected, a first name for a full
 one); two people who fit are a question, never a guess. A group chat or channel is found by its name (the chat name's
-words, identity only), and only then is a message typed there. The person's routes are ranked by memory
-(``rank_routes``: the user's own lasting choice first, then where they message most lately), and only their own
-direct messages count (:data:`PERSON_KIND`, the chat's kind as memory keeps it): a message to a person, a draft or a
-send in any wording, never goes into a group chat or channel they write in, even one ranked first. With no direct
-message of theirs in any app the routes drive, the run says so ("no route": the thinker does it its own way). Each
+words, identity only), and only then is a message typed there; words that are a group's whole name and also name a
+person are a question, unless the person's name only stands inside them ("Rohan" in "Rohan's bday": the group). The
+person's routes are ranked by memory (``rank_routes``: the user's own lasting choice first, then where they message
+most lately), and only their own direct messages count (:data:`PERSON_KIND`, the chat's kind as memory keeps it): a
+message to a person, a draft or a send in any wording, never goes into a group chat or channel they write in, even
+one ranked first. A person whose chats are groups or channels only is told plainly ("I don't have a direct chat with
+X"); one with no DM in the named app hears "I don't have a <app> chat with X" (or is offered their DM in another
+app); with DMs only in apps the routes don't drive, the run says "no route" (the thinker does it its own way). Each
 route's app comes from its stored service or its threads' programs, matched against the apps' data. The app is the one
 the user named, else the usual route's; the done line names an app the user didn't.
 
@@ -88,6 +91,12 @@ ASK_WHICH = "Which {who}: {names}?"
 ASK_OTHER_APP = "I don't have a {app} chat with {name}. {usual} instead?"
 LINE_NO_APP_CHAT = "I don't have a {app} chat with {name}."
 LINE_NO_ROUTE = "I don't know where you message {name}."
+#: A person memory knows, whose chats with the user are all group chats or channels (review r2 L1): told plainly, never
+#: a hand-off that could type into one of those.
+LINE_NO_DM = "I don't have a direct chat with {name}."
+#: The words are a group chat's or channel's whole name, and also name one of the user's people (review r2 M2): asked,
+#: never guessed. ``kind`` is the chat's kind as memory keeps it (``group``, ``channel``).
+ASK_PERSON_OR_PLACE = "{person}, or the {place} {kind}?"
 LINE_ACT_OFF = "Act is switched off for {app} in Yuki's settings, so I left it."
 LINE_TOOK_OVER = "You took over, so I left it there."
 LINE_HELD = "Should I go ahead?"
@@ -225,6 +234,9 @@ class ChatRoute:
     thread_ids: list[int]
     urls: list[str] = field(default_factory=list)
     preferred: bool = False
+    #: review r2 L2: another of the user's people holds a route on this chat's threads too (memory linked one DM to two
+    #: people, two Rahuls): the chat is not one person's own DM for sure, so no send grant covers it
+    shared: bool = False
 
 
 @dataclass
@@ -239,6 +251,8 @@ class Target:
     routes: list[ChatRoute]
     place: bool = False
     id: int | None = None
+    #: review r2 L1: the person has chats with the user, and none is a direct message (groups or channels only)
+    no_dm: bool = False
 
 
 @dataclass
@@ -284,8 +298,10 @@ def find_target(store: Any, person: str) -> Target | Asked:
     """Whom ``person`` (the user's words) names: one of their people (``contacts.resolve``: a name or alias, whole or a
     whole-word part of it, a misheard form the user corrected; two who fit: a question), with only their own direct
     messages as routes (:data:`PERSON_KIND`, memory's chat kind: never a group chat or channel they write in, even one
-    ranked first); else a group chat or channel whose name is those words (identity), else "I don't know who that
-    is"."""
+    ranked first; a DM another of their people also holds is marked ``shared``); else a group chat or channel whose
+    name is those words (identity), else "I don't know who that is". When the words are a group's or channel's whole
+    name, a person whose name only stands inside them is not the one named (the place wins), and a person they name
+    as a whole name or a part of one makes it a question, never a guess (review r2 M2)."""
     from yuki.memory import contacts as C
 
     who = _words(person)
@@ -298,6 +314,22 @@ def find_target(store: Any, person: str) -> Target | Asked:
     people: dict[int, Any] = {}
     for c in found:
         people.setdefault(int(c.id), c)
+    want = C.tokens(who)
+    try:
+        places = [r for r in C.places(store) if want and C.tokens(r.chat) == want]
+    except Exception:  # noqa: BLE001
+        places = []
+    if places and people:
+        # review r2 M2: the words are a group chat's or channel's whole name. A person whose name only stands inside
+        # them ("Rohan" in "Rohan's bday") is not who was named: the place the user named wins. A person the words
+        # name as a whole name or alias, or as a part of their name, fits too: asked, never guessed
+        fits = [c for c in people.values() if any(C.tokens(n) == want or C.span_in(want, n) for n in c.names)]
+        if not fits:
+            people = {}
+        else:
+            kind = str(getattr(places[0], "kind", "") or "group")
+            return Asked(ASK_PERSON_OR_PLACE.format(person=fits[0].name, place=places[0].chat, kind=kind),
+                         [fits[0].name, places[0].chat], outcome="person_or_place")
     if len(people) > 1:
         names = [c.name for c in people.values()][:3]
         return Asked(ASK_WHICH.format(who=who, names=" or ".join(names)), names, outcome="two_people")
@@ -305,15 +337,18 @@ def find_target(store: Any, person: str) -> Target | Asked:
         contact = next(iter(people.values()))
         try:
             ranking = C.rank_routes(store, contact)
-            routes = [_chat_route(store, r) for r in ranking.routes if getattr(r, "kind", "") == PERSON_KIND]
-        except Exception:  # noqa: BLE001
+            dms = [r for r in ranking.routes if getattr(r, "kind", "") == PERSON_KIND]
+            others = len(ranking.routes) - len(dms)
+            owners = C.contacts_of_threads(store, [t for r in dms for t in r.thread_ids]) if dms else {}
             routes = []
-        return Target(name=contact.name, said=who, routes=routes, id=int(contact.id))
-    want = C.tokens(who)
-    try:
-        places = [r for r in C.places(store) if want and C.tokens(r.chat) == want]
-    except Exception:  # noqa: BLE001
-        places = []
+            for r in dms:
+                route = _chat_route(store, r)
+                # review r2 L2: a DM whose threads another live contact also holds is not this person's alone
+                route.shared = any(int(c.id) != int(contact.id) for t in r.thread_ids for c, _r in owners.get(t, []))
+                routes.append(route)
+        except Exception:  # noqa: BLE001
+            routes, others = [], 0
+        return Target(name=contact.name, said=who, routes=routes, id=int(contact.id), no_dm=not routes and others > 0)
     if places:
         now = time.time()
         try:
@@ -324,13 +359,32 @@ def find_target(store: Any, person: str) -> Target | Asked:
     return Asked(LINE_UNKNOWN.format(who=who), outcome="unknown_person")
 
 
+def whom(store: Any, name: str) -> tuple[str, int | None]:
+    """How the chat driver reads ``name`` as a recipient (:func:`find_target`, the very lookup a run makes):
+    ``("person", id)``, ``("place", None)`` (a group chat or channel by its whole name), ``("ask", None)`` (two people,
+    or a person and a place: a question) or ``("unknown", None)``. A name written in another script than their people's names
+    ("हेमंत") is the one person it reads as (``contacts.transliterated``). Identity data only; never raises."""
+    try:
+        from yuki.memory import contacts as C
+
+        target = find_target(store, name)
+        if isinstance(target, Target):
+            return ("place", None) if target.place or target.id is None else ("person", int(target.id))
+        if target.outcome == "unknown_person":
+            one = C.transliterated(store, name)
+            return ("person", int(one.id)) if one is not None else ("unknown", None)
+        return ("ask", None) if target.outcome in ("two_people", "person_or_place") else ("unknown", None)
+    except Exception:  # noqa: BLE001
+        return "unknown", None
+
+
 def pick_route(target: Target, app_named: str | None) -> ChatRoute | Asked:
-    """The route to use: the named app's (none: a question offering the usual one), else the usual route. A person's
-    routes are their direct messages only (:func:`find_target`), so with none in any app this is "no route" (memory
-    knows them, but no chat of theirs the routes drive), never a group chat or channel."""
+    """The route to use: the named app's (none there: a question offering their DM in another app, else the plain
+    "I don't have a <app> chat with X"), else the usual route. A person's routes are their direct messages only
+    (:func:`find_target`), never a group chat or channel: with groups or channels only, the plain "I don't have a
+    direct chat with X" (review r2 L1); with DMs only in apps the routes don't drive, or no chats known at all, "no
+    route" (memory knows them, but no chat of theirs the routes drive: the thinker does it its own way)."""
     known = [r for r in target.routes if r.app]
-    if not target.place and not known:
-        return Asked(LINE_NO_ROUTE.format(name=target.name), outcome="no_route")
     if app_named:
         hit = next((r for r in known if r.app == app_named), None)
         if hit is not None:
@@ -341,6 +395,9 @@ def pick_route(target: Target, app_named: str | None) -> ChatRoute | Asked:
         return Asked(LINE_NO_APP_CHAT.format(app=_title(app_named), name=target.name), outcome="no_app_chat")
     if known:
         return known[0]
+    if target.no_dm:
+        # review r2 L1: their chats are groups or channels only: said plainly, never a hand-off that could type there
+        return Asked(LINE_NO_DM.format(name=target.name), outcome="no_dm")
     return Asked(LINE_NO_ROUTE.format(name=target.name), outcome="no_route")
 
 
@@ -913,7 +970,7 @@ def _after_open(call: RouteCall, app: str, data: Mapping[str, Any], target: Targ
         # person, though Yuki worded the text or speech wrote the name another way. Only into that person's own
         # direct message (the route's kind as memory keeps it): a group chat or channel of theirs is read by other
         # people, so there the send carries no person id and needs the user's own words (review r1 H1)
-        own_dm = not target.place and target.id is not None and route.kind == "dm"
+        own_dm = not target.place and target.id is not None and route.kind == "dm" and not route.shared
         sends = ({"to": _said_as(call, target), "what": text, "person_id": target.id if own_dm else None,
                   "kind": route.kind} if send and not blind else None)
         grant = getattr(call.ctx, "grant", None) if getattr(call.ctx, "origin", "") == "thinker" else None
@@ -1315,5 +1372,5 @@ ROUTES: dict[str, Callable[[RouteCall], RouteResult]] = {
 PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message_done": probe_message_done}
 
 __all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
-           "pick_route", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
+           "pick_route", "whom", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
            "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat"]

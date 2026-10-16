@@ -131,6 +131,9 @@ DEFAULT_COUNTDOWN_S = 3.0
 #: their yes) only when it was open at least this long and ran out (``going``). A host with no countdown (0 s: the
 #: Brain's and the old loop's default, off the desktop) returns at once.
 COUNTED_MIN_S = 0.5
+#: review r2 M1: a ``run_skill`` send whose engine outcome is one of these sent nothing (it asked, handed over, was
+#: refused or held, or its check saw nothing go), so the same message may be sent by a later step of the request.
+NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "failed"})
 #: How long a pause waits for the user to resume before the run stops quietly (s; ``takeover_idle_stop_s``).
 PAUSE_LIMIT_S = 600.0
 
@@ -889,9 +892,12 @@ class Executor:
         if call.tool == "run_skill":
             # review r1 L3: Yuki's own wording sends only after a countdown the user could stop, or their yes
             grant = self._skill_grant(call, verdict, person_id=person_id, counted=self._counted or said_yes)
-            if grant.get("send") is True and send_key is not None:
-                self._sent_keys.add(send_key)
-        return self._dispatch_act(index, step, call, effect=effect, grant=grant)
+        result = self._dispatch_act(index, step, call, effect=effect, grant=grant)
+        if grant is not None and grant.get("send") is True and send_key is not None and self._may_have_sent(index):
+            # review r2 M1: counted as sent only once the step's own result says it may have gone; a run that asked,
+            # handed over, was refused or saw nothing go (a retry after "WhatsApp instead?" -> yes) never counts
+            self._sent_keys.add(send_key)
+        return result
 
     def _skill_grant(self, call: Call, verdict: consent.Verdict | None, *, person_id: int | None = None,
                      counted: bool = False) -> dict[str, Any]:
@@ -931,6 +937,17 @@ class Executor:
         key, slots = consent.skill_input(call, self.head)
         sk = util.skill(key)
         return sk is not None and consent.skill_sends(sk, slots, partial=False)
+
+    def _may_have_sent(self, index: int) -> bool:
+        """Whether the ``run_skill`` send of step ``index`` may have gone out (review r2 M1), from the engine's own
+        outcome for it: never for one that asked (a question, the chat's kept draft, "WhatsApp instead?"), handed
+        over, was refused or held before anything went, or whose check saw nothing go (``failed``: the message
+        capability's check says no only when no send key was pressed). Anything else (done, unconfirmed, an error,
+        no outcome) may have sent: counted, so it never goes twice."""
+        run = next((r for r in reversed(self.skill_outcomes) if r.index == index), None)
+        payload = getattr(getattr(run, "outcome", None), "payload", None) if run is not None else None
+        state = str(payload.get("outcome") or "") if isinstance(payload, dict) else ""
+        return state not in NOT_SENT_OUTCOMES
 
     def _send_person(self, call: Call) -> tuple[int | None, tuple[Any, str]]:
         """``(person id, send key)`` of a ``run_skill`` send: the one person its person slot names (memory's people
