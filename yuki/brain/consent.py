@@ -21,7 +21,8 @@ applies decides:
    hosts, by the Now board's read of the window being a ``conversation`` (the extraction's kind, its generic chat
    detector's too), or by memory's capture profiles calling the program or page a ``conversation``, a window whose
    program is unknown counting as a chat; or a window where Yuki's typed text waits; and a line break anywhere else
-   but a browser loading one address or a document, since the commit check is never shown that Enter), is a
+   but a browser loading one address, since the commit check is never shown that Enter: in an editor too, whose
+   terminal or chat panel runs or sends it, review r2 L4), is a
    ``run_skill`` whose skill sends with these slots, or the commit check says ``effect = send`` (a button, menu item
    or split button click, a key, or typing with ``press_enter`` anywhere else, a search box, a command field, is
    may-commit and goes to the check, told when Yuki's text waits, so "type a search, press Enter" is row 5's;
@@ -45,20 +46,23 @@ applies decides:
      (the capability runs with its send slot on a non-sending option; for Yuki's own wording the chat opens with no
      text and the wording is typed without Enter);
    * ``quote`` (their words asking for it) stands in the user's words of this exchange, whole words in order, where a
-     name the recipient goes by may stand in place of how the words named them (speech heard "hey meant" or "हेमंत"
-     for Hemanth); else **refuse**;
+     name the recipient goes by may stand for one to :data:`NAME_GAP` of the words they said there (speech heard "hey
+     meant" or "हेमंत" for Hemanth), and those words name the recipient or no one, never another person
+     (:func:`_quote_place`, review r2 M1 b); else **refuse**;
    * the text is their own words (a span of them), or Yuki's wording of what they said, both measured in the turns
      the quote stands in (:func:`quote_turns`), never every turn of the exchange: :func:`said_share`, the share of
      the text's words (the recipient's names aside) they said close together there. When that falls short of
-     :data:`SAID_SHARE` but another turn of theirs names the person and says the message, **refuse** (the planner
-     quotes that turn). None of them: nothing of the message came from the user, they named only the person:
-     **draft**;
+     :data:`SAID_SHARE` but another turn of theirs names the person and says something of the message, **refuse**
+     (the planner quotes that turn). None of them: nothing of the message came from the user, they named only the
+     person: **draft**. When those turns name someone else too, the share that sends without asking is measured in
+     the words the quote stands for alone;
    * every ``sends_when`` slot on a sending value, else **refuse** (a slot left out would be filled with its default,
      a draft: never counted down or reported as sent);
    * a near-duplicate of the user's recent messages to that person (``util.similar``, last 3 hours): **ask** "send it
-     again?"; Yuki's wording with less than :data:`SAID_SHARE` of it from their words, or a recipient their words
-     don't name (literally or through the people index: one person): **ask** "Send "<text>" to <to>?" (a yes is their
-     plain instruction);
+     again?"; Yuki's wording with less than :data:`SAID_SHARE` of it from their words, or a recipient the words the
+     quote stands for don't name (through the people index: exactly one person who goes by ``to``; literally when it
+     knows no one by that name; review r2 M1 a): **ask** "Send "<text>" to <to>?" (a yes is their plain
+     instruction);
    * otherwise **allow** with the countdown first (showing the text, the user may stop or change it).
 5. **Lasting**: any other may-commit step (its traits destroy or reach: a committing-role click, a key, a shell, a
    close, a non-web open, a fetch after a file, clipboard or memory read, M9), and a step of a kind the user's policy
@@ -138,6 +142,8 @@ ASK_TEXT_CHARS = 160
 #: the check gave none (it gives none when it found the send asked for). What is typed, where; voice-shaped.
 LINE_MAYBE_SEND_TYPED = "Should I type \"{text}\" and press Enter{where}? That may send it."
 LINE_MAYBE_SEND_KEY = "Should I press {key}{where}? That may send what's typed there."
+#: The same when the executor passed the text Yuki typed there and has not sent (review r2 L6).
+LINE_MAYBE_SEND_KEY_TEXT = "Should I press {key}{where}? That may send \"{text}\", typed there."
 LINE_CHECK_FAILED = "Should I go ahead with that? I couldn't check it was what you asked for."
 #: The same question naming the step (``describe_step``'s running words for it: "Closing Slack").
 LINE_CHECK_FAILED_STEP = "Should I go ahead with {step}? I couldn't check it was what you asked for."
@@ -161,8 +167,6 @@ SAID_SPAN = 2
 #: The extraction kind (``yuki.memory.extract.model.Extraction.kind``, carried on the Now board's window entries) of a
 #: chat: Enter there sends a message, whatever app it is (the generic chat detector's too).
 CHAT_KIND = "conversation"
-#: The extraction kinds where a line break in typed text is a new line, not a submit (an editor's document).
-NEWLINE_KINDS = frozenset({"document"})
 
 #: The plain words said for a refusal's code word (``Verdict.why``), for a line the user hears; a code word itself is
 #: never said. Missing or empty: nothing worth saying (the planner's own fixes).
@@ -220,7 +224,8 @@ class Live:
     """Code facts at the moment a step runs.
 
     ``game``: the game in front (``""`` none, its name, ``None`` unknown: counted as a game). ``calling``: the windows
-    the Now board lists in ``calling_tabs``. ``typed_pending``: windows holding text Yuki typed and has not sent.
+    the Now board lists in ``calling_tabs``. ``typed_pending``: windows holding text Yuki typed and has not sent (a
+    set of hwnds, or the executor's own map of hwnd to the text waiting there, which a question then shows).
     ``reads``: what this request has read so far (``file``, ``clipboard``, ``memory``: M9). ``join_controls``: the
     (role, name) pairs capabilities declare as their join control, casefolded. ``recent``: the user's own last messages
     to the person the send names (``{"text", "at"}``). ``people_in(text)``: memory's people index, the names of each
@@ -232,7 +237,7 @@ class Live:
 
     game: str | None = ""
     calling: frozenset[int] = frozenset()
-    typed_pending: frozenset[int] = frozenset()
+    typed_pending: frozenset[int] | Mapping[int, str] = frozenset()
     reads: frozenset[str] = frozenset()
     join_controls: frozenset[tuple[str, str]] = frozenset()
     recent: tuple[Mapping[str, Any], ...] = ()
@@ -364,81 +369,283 @@ def _recipient_names(to: str, who: str, look: _People, user_words: Sequence[str]
 
 
 def _named_by_user(to: str, who: str, user_words: Sequence[str], look: _People) -> bool:
-    """The recipient is someone the user's words name: ``to`` or the person slot's words stand in them, or memory's
-    people index finds exactly one person in them who goes by ``to`` (a misheard or transliterated name the index
-    knows: ``contacts`` matches heard forms)."""
+    """Some of the user's words name the recipient: ``to`` or the person slot's words stand in them, or memory's people
+    index finds exactly one person in them who goes by ``to`` (a misheard or transliterated name the index knows:
+    ``contacts`` matches heard forms). Only for whether another turn of theirs speaks of the message
+    (:func:`_said_elsewhere`); whether the send's own quote names the recipient is :func:`_names_recipient`'s."""
     if any(n and in_words(n, user_words) for n in (to, who)):
         return True
     return len(_fits(look(_joined(user_words)), to)) == 1
 
 
-def _cut_names(text: str, names: Sequence[str]) -> tuple[list[list[str]], bool]:
+@dataclass(frozen=True)
+class _Who:
+    """Whom a send goes to, for one check: ``to``, the person slot's words (``slot``), every name they go by
+    (:func:`_recipient_names`), and memory's people index (``look``)."""
+
+    to: str
+    slot: str = ""
+    names: tuple[str, ...] = ()
+    look: Any = None
+
+    def people(self, text: str) -> list[list[str]] | None:
+        return self.look(text) if self.look is not None else None
+
+
+def _goes_by(person: Sequence[str], name: str) -> bool:
+    """One of this person's names (memory's people index) is ``name``'s words."""
+    from yuki.memory.contacts import tokens
+
+    want = tokens(name)
+    return bool(want) and any(tokens(n) == want for n in person)
+
+
+def _others(text: str, rec: _Who, body: str = "") -> list[list[str]]:
+    """The people memory's index finds in ``text`` other than the recipient (none of their names is ``to``'s words),
+    leaving out anyone the message itself names ("Tell Hemanth that Rahul is coming": Rahul is what it says, not whom
+    it goes to). ``[]`` too when memory can't say."""
+    from yuki.memory.contacts import span_in
+
+    return [p for p in rec.people(text) or []
+            if not _goes_by(p, rec.to) and not any(span_in(n, body) for n in p)]
+
+
+def _cuts(text: str, names: Sequence[str]) -> tuple[list[list[str]], bool, bool, bool]:
     """``text``'s words with every run of words that is one of ``names`` cut out (the longest first): the pieces left
-    between them, and whether any name was cut."""
+    between them, whether any name was cut, and whether one was cut before the first piece and after the last (a cut
+    always lies between two pieces)."""
     from yuki.memory.contacts import tokens
 
     runs = sorted({tuple(tokens(n)) for n in names if tokens(n)}, key=len, reverse=True)
     ws = tokens(text)
     pieces: list[list[str]] = []
     cur: list[str] = []
-    cut, i = False, 0
+    cut = lead = trail = False
+    i = 0
     while i < len(ws):
         hit = next((r for r in runs if tuple(ws[i:i + len(r)]) == r), None)
         if hit is None:
             cur.append(ws[i])
+            trail = False
             i += 1
             continue
         if cur:
             pieces.append(cur)
             cur = []
+        elif not pieces:
+            lead = True
         i += len(hit)
-        cut = True
+        cut = trail = True
     if cur:
         pieces.append(cur)
+    return pieces, cut, lead, trail
+
+
+def _cut_names(text: str, names: Sequence[str]) -> tuple[list[list[str]], bool]:
+    """``text``'s words with every name the recipient goes by cut out: the pieces left, and whether any was cut."""
+    pieces, cut, _lead, _trail = _cuts(text, names)
     return pieces, cut
 
 
-def quote_in_words(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> bool:
-    """Row 4: the plan's quote stands in the user's words (:func:`in_words`), or does once every name the recipient
-    goes by (``names``) is cut out of it: each piece left stands in their words. Speech writes a name the way it heard
-    it ("hey meant", "हेमंत"); the planner writes the person's name. A quote that is only a name does not stand."""
-    if in_words(quote, user_words):
-        return True
-    pieces, cut = _cut_names(quote, names)
-    return cut and bool(pieces) and all(in_words(" ".join(p), user_words) for p in pieces)
+#: The most of the user's words a name the plan's quote writes as the recipient's may stand for (review r2 M1 b): a
+#: first and last name, or a name speech heard in pieces ("hey meant" for Hemanth; "हेमंत" is two of the people
+#: index's words).
+NAME_GAP = 4
 
 
-def _quote_turn_indices(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> tuple[list[str], set[int]]:
-    """The user's turns (non-empty, in order) and the indices of those the quote stands in: for the quote, or for each
-    piece of it left once the recipient's names are cut out (:func:`quote_in_words`), the fewest neighbouring turns
-    whose words hold it (speech finals split a sentence)."""
-    from yuki.memory.contacts import span_in
+def _token_spans(text: str) -> list[tuple[str, int, int]]:
+    """``contacts.tokens``' words of ``text`` (casefolded runs of letters and digits, everything else separating),
+    each with where it stands in ``text`` (start, end), so a run of them is given back as the user said it: a script's
+    vowel signs, which split its words there ("हेमंत" is two), stay in what memory's people index is shown."""
+    out: list[tuple[str, int, int]] = []
+    cur: list[str] = []
+    start = end = 0
+    for i, ch in enumerate(text):
+        for c in ch.casefold():
+            if c.isalnum():
+                if not cur:
+                    start = i
+                cur.append(c)
+                end = i + 1
+            elif cur:
+                out.append(("".join(cur), start, end))
+                cur = []
+    if cur:
+        out.append(("".join(cur), start, end))
+    return out
+
+
+def _gap_kind(said: str, rec: _Who) -> str:
+    """What the user's own words where a quote writes the recipient's name (``said``, as they said them) say of
+    people: ``recipient`` (one of the names the recipient goes by, or memory's index finds only people who go by
+    ``to``), ``nobody`` (it finds no one, or can't say), or ``other`` (it finds someone else: the planner's name took
+    another person's place)."""
+    from yuki.memory.contacts import tokens
+
+    gap = tokens(said)
+    if any(tokens(n) == gap for n in rec.names):
+        return "recipient"
+    found = rec.people(said)
+    if not found:
+        return "nobody"
+    return "recipient" if all(_goes_by(p, rec.to) for p in found) else "other"
+
+
+def _edge(runs: Sequence[str], rec: _Who) -> tuple[str, int] | None:
+    """A name cut at the quote's edge stands for the user's words next to it, one to :data:`NAME_GAP` of them
+    (``runs``, shortest first, as they said them): ``("recipient", n)`` when the first ``n`` name the recipient alone,
+    ``("nobody", 1)`` when no run names anyone; ``None`` when a run names someone else and none the recipient alone,
+    or no words are there (the quote's name stands for nothing they said)."""
+    kinds = [_gap_kind(r, rec) for r in runs if r]
+    if not kinds:
+        return None
+    if "recipient" in kinds:
+        return "recipient", kinds.index("recipient") + 1
+    return ("nobody", 1) if all(k == "nobody" for k in kinds) else None
+
+
+def _align(h: Sequence[str], pieces: Sequence[Sequence[str]], lead: bool, trail: bool, rec: _Who,
+           said: Callable[[int, int], str]) -> tuple[int, int, bool] | None:
+    """Where in the user's words ``h`` (one turn, or neighbouring turns, as words; ``said(a, b)``: words ``a`` to
+    ``b`` as they said them) the quote's pieces stand in order, each name cut out of the quote standing for one to
+    :data:`NAME_GAP` of their words that name the recipient or no one (:func:`_gap_kind`; review r2 M1 b): ``(start,
+    end, a cut's words name the recipient)``, a placement naming the recipient preferred; ``None``: nowhere."""
+    h = list(h)
+    found: list[tuple[int, int, bool]] = []
+    if not pieces:
+        return None
+
+    def place(k: int, prev_end: int, start: int, named: bool) -> bool:
+        """Places piece ``k`` (the first anywhere, a later one one to NAME_GAP words after the one before it); True
+        once a placement naming the recipient is found (the search stops)."""
+        p = list(pieces[k])
+        lo, hi = (1 if lead else 0, len(h)) if k == 0 else (prev_end + 1, prev_end + NAME_GAP)
+        for i in range(lo, min(hi, len(h) - len(p)) + 1):
+            if h[i:i + len(p)] != p:
+                continue
+            s, nm = start, named
+            if k == 0:
+                s = i
+                if lead:
+                    edge = _edge([said(i - n, i) for n in range(1, min(NAME_GAP, i) + 1)], rec)
+                    if edge is None:
+                        continue
+                    s, nm = i - edge[1], edge[0] == "recipient"
+            else:
+                kind = _gap_kind(said(prev_end, i), rec)
+                if kind == "other":
+                    continue
+                nm = nm or kind == "recipient"
+            end = i + len(p)
+            if k + 1 < len(pieces):
+                if place(k + 1, end, s, nm):
+                    return True
+                continue
+            stop = end
+            if trail:
+                edge = _edge([said(end, end + n) for n in range(1, min(NAME_GAP, len(h) - end) + 1)], rec)
+                if edge is None:
+                    continue
+                stop, nm = end + edge[1], nm or edge[0] == "recipient"
+            found.append((s, stop, nm))
+            if nm:
+                return True
+        return False
+
+    place(0, 0, 0, False)
+    return next((f for f in found if f[2]), found[0] if found else None)
+
+
+@dataclass(frozen=True)
+class _Placed:
+    """Where the plan's quote stands in the user's words: the turns (non-empty, in order), the indices of those it
+    stands in, the user's own words it stands for (``span``, as they said them: the names they said where the quote
+    writes the recipient's), and whether those words name the recipient where the quote's name stands
+    (``gap_named``)."""
+
+    entries: list[str]
+    held: frozenset[int]
+    span: str
+    gap_named: bool
+
+
+def _quote_place(quote: str, user_words: Sequence[str], rec: _Who) -> _Placed | None:
+    """Row 4: where the plan's quote stands in the user's words (one turn, or the fewest neighbouring turns: speech
+    finals split a sentence), whole words in order: as it is, or with each name the recipient goes by (``rec.names``)
+    standing for the user's own words there (speech writes a name the way it heard it, "hey meant" or "हेमंत"; the
+    planner writes the person's name), which must name the recipient or no one, never someone else (:func:`_align`).
+    A quote that is only a name does not stand. ``None``: it stands nowhere."""
+    from yuki.memory.contacts import tokens
 
     entries = [words(w) for w in user_words if words(w)]
     q = words(quote)
     if not q or not entries:
-        return entries, set()
+        return None
     if in_words(q, entries):
-        texts = [q]
+        pieces, lead, trail = [tokens(q)], False, False
     else:
-        pieces, cut = _cut_names(q, names)
-        texts = [" ".join(p) for p in pieces] if cut else []
-    held: set[int] = set()
-    for text in texts:
-        for size in range(1, len(entries) + 1):
-            hits = [i for i in range(len(entries) - size + 1) if span_in(text, " ".join(entries[i:i + size]))]
-            if hits:
-                for i in hits:
-                    held.update(range(i, i + size))
-                break
-    return entries, held
+        pieces, cut, lead, trail = _cuts(q, rec.names)
+        if not cut or not pieces:
+            return None
+    for size in range(1, len(entries) + 1):
+        hits: list[tuple[int, tuple[int, int, bool], str]] = []
+        for i in range(len(entries) - size + 1):
+            text = " ".join(entries[i:i + size])
+            spans = _token_spans(text)
+
+            def said(a: int, b: int, text: str = text, spans: list = spans) -> str:
+                return text[spans[a][1]:spans[b - 1][2]] if 0 <= a < b <= len(spans) else ""
+
+            at = _align([t for t, _s, _e in spans], pieces, lead, trail, rec, said)
+            if at is not None:
+                hits.append((i, at, said(at[0], at[1])))
+        if hits:
+            held = frozenset(j for i, _at, _span in hits for j in range(i, i + size))
+            _i, (_s, _e, named), span = next((x for x in hits if x[1][2]), hits[0])
+            return _Placed(entries, held, span, named)
+    return None
 
 
-def quote_turns(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> list[str]:
-    """The turns of the user's words the plan's quote stands in, each run of neighbouring turns joined: where row 4
-    measures what of a message came from them (:func:`said_share`), never every turn of the exchange (words they said
-    to Yuki for something else, "Yuki, are you there?", are not what to send). ``[]``: it stands nowhere."""
-    entries, held = _quote_turn_indices(quote, user_words, names)
+def _names_recipient(placed: _Placed, rec: _Who) -> bool:
+    """Row 4 (review r2 M1 a): the user's words the quote stands for name the recipient: memory's people index finds
+    exactly one person there who goes by ``to``; or, the index finding no one who does, ``to`` or the person slot's
+    words stand there (a group or channel by its name), or the words where the quote writes the name name them
+    (:func:`_gap_kind`). Two people who go by that name: not named (asked, never guessed). A name said only outside
+    the quote is not named either: asked. Another person named in the quote too does not unname the recipient: the
+    index takes words this user says to Yuki all the time for people ("bro", 10 Oct), so that would ask about their
+    ordinary requests; where the message's words came from is measured in the quote alone then (:func:`_send`)."""
+    from yuki.memory.contacts import span_in
+
+    span = placed.span
+    if not span:
+        return False
+    fits = _fits(rec.people(span), rec.to)
+    if fits:
+        return len(fits) == 1
+    return placed.gap_named or any(n and span_in(n, span) for n in (rec.to, rec.slot))
+
+
+def quote_in_words(quote: str, user_words: Sequence[str], names: Sequence[str] = (), *, to: str = "",
+                   people_in: Callable[[str], list[list[str]] | None] | None = None) -> bool:
+    """Row 4: the plan's quote stands in the user's words, as it is or with each name the recipient goes by
+    (``names``, for ``to``) standing for their own words there, which name the recipient or no one
+    (:func:`_quote_place`; ``people_in``: memory's people index)."""
+    look = _People(Live(people_in=people_in))
+    return _quote_place(quote, user_words, _Who(to=words(to), names=tuple(names), look=look)) is not None
+
+
+def _quote_turn_indices(quote: str, user_words: Sequence[str], names: Sequence[str] = (),
+                        rec: _Who | None = None) -> tuple[list[str], set[int]]:
+    """The user's turns (non-empty, in order) and the indices of those the quote stands in (:func:`_quote_place`)."""
+    rec = rec if rec is not None else _Who(to="", names=tuple(names))
+    placed = _quote_place(quote, user_words, rec)
+    if placed is None:
+        return [words(w) for w in user_words if words(w)], set()
+    return placed.entries, set(placed.held)
+
+
+def _runs_of(entries: Sequence[str], held: Sequence[int] | frozenset[int]) -> list[str]:
+    """The held turns, each run of neighbouring turns joined."""
     runs: list[str] = []
     cur: list[str] = []
     last = None
@@ -451,6 +658,14 @@ def quote_turns(quote: str, user_words: Sequence[str], names: Sequence[str] = ()
     if cur:
         runs.append(" ".join(cur))
     return runs
+
+
+def quote_turns(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> list[str]:
+    """The turns of the user's words the plan's quote stands in, each run of neighbouring turns joined: where row 4
+    measures what of a message came from them (:func:`said_share`), never every turn of the exchange (words they said
+    to Yuki for something else, "Yuki, are you there?", are not what to send). ``[]``: it stands nowhere."""
+    entries, held = _quote_turn_indices(quote, user_words, names)
+    return _runs_of(entries, held)
 
 
 def said_share(text: str, heard: str | Sequence[str], names: Sequence[str] = ()) -> float:
@@ -486,21 +701,42 @@ def ask_send_question(text: str, to: str) -> str:
     return LINE_ASK_SEND.format(text=body, to=words(to)) if body and words(to) else LINE_ASK_SEND_PLAIN
 
 
-def maybe_send_question(step: Call) -> str:
+def _clip_text(text: Any) -> str:
+    body = words(text)
+    return body[:ASK_TEXT_CHARS - 1].rstrip() + "…" if len(body) > ASK_TEXT_CHARS else body
+
+
+def waiting_text(hwnd: int | None, live: Live | None) -> str:
+    """The text Yuki typed in that window and has not sent, when the caller passed the executor's map
+    (``live.typed_pending`` as hwnd to text); ``""`` when none waits or only the window is known."""
+    pending = live.typed_pending if live is not None else None
+    key = _hwnd_key(hwnd)
+    if key is None or not isinstance(pending, Mapping):
+        return ""
+    try:
+        return words(pending.get(key) or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def maybe_send_question(step: Call, live: Live | None = None) -> str:
     """The question for Enter typed or pressed in a window known not to be a chat, which the commit check calls a send
-    (row 5): what is typed (cut to :data:`ASK_TEXT_CHARS`) and in which app, or the key. Code words only (the tool's
-    own input and the window's program), so a yes is a yes to that very step."""
+    (row 5): what is typed (cut to :data:`ASK_TEXT_CHARS`) and in which app, or the key and the text of Yuki's waiting
+    there that it may send (:func:`waiting_text`; review r2 L6). Code words and Yuki's own typing only (the tool's
+    input, the window's program, what Yuki typed), so a yes is a yes to that very step."""
     app = util.app_name(step.app) if words(step.app) else ""
     where = f" in {app}" if app else ""
     inp = step.input or {}
     if step.tool == "type_text":
-        body = words(inp.get("text"))
-        if len(body) > ASK_TEXT_CHARS:
-            body = body[:ASK_TEXT_CHARS - 1].rstrip() + "…"
+        body = _clip_text(inp.get("text"))
         if body:
             return LINE_MAYBE_SEND_TYPED.format(text=body, where=where)
     key = words(inp.get("key")) if step.tool == "press" else ""
-    return LINE_MAYBE_SEND_KEY.format(key=(key[:1].upper() + key[1:]) if key else "Enter", where=where)
+    key = (key[:1].upper() + key[1:]) if key else "Enter"
+    waiting = _clip_text(waiting_text(step.hwnd, live))
+    if waiting:
+        return LINE_MAYBE_SEND_KEY_TEXT.format(key=key, where=where, text=waiting)
+    return LINE_MAYBE_SEND_KEY.format(key=key, where=where)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -770,9 +1006,10 @@ def sends_now(call: Call, live: Live, traits: Traits | None = None) -> bool:
     is a may-commit step like a key: the commit check, shown "and presses Enter", decides it (row 5), and its ``send``
     (a chat the data doesn't know) is asked (row 5) or comes back to row 4. A line break in the text is an Enter the
     check is never shown (it sees the text as one line), so it sends for certain outside a chat's window too, unless
-    the step loads one web address in a browser (:func:`navigates`) or the window's read is a document, where a line
-    break is a new line (:data:`NEWLINE_KINDS`; review r1 M2). ``tools.sends_for_certain`` itself is left as it is: the
-    old loop shares it."""
+    the step loads one web address in a browser (:func:`navigates`; review r1 M2). A document is no exception: an
+    editor's read is a ``document`` while its integrated terminal or chat panel, where a line break runs or sends, has
+    the focus (review r2 L4); the planner types each line and presses Enter as its own step, which is checked.
+    ``tools.sends_for_certain`` itself is left as it is: the old loop shares it."""
     traits = traits if traits is not None else traits_of(call, live)
     if not sends_for_certain(traits):
         return False
@@ -783,14 +1020,15 @@ def sends_now(call: Call, live: Live, traits: Traits | None = None) -> bool:
     if chat_window(call, live) is not False:
         return True
     if _line_break_submit(call):
-        return not navigates(call, live) and window_kind(call.hwnd, live) not in NEWLINE_KINDS
+        return not navigates(call, live)
     return False
 
 
 def _line_break_submit(call: Call) -> bool:
-    """A ``type_text`` that submits only by a line break in its text (``press_enter`` not set): the commit check's step
-    line says nothing of that Enter."""
-    return call.tool == "type_text" and (call.input or {}).get("press_enter") is not True
+    """A ``type_text`` whose text holds a line break (with ``press_enter`` or without): the commit check's step line
+    shows the text as one line, so it says nothing of that Enter (only of ``press_enter``'s own, at the end)."""
+    text = (call.input or {}).get("text")
+    return call.tool == "type_text" and isinstance(text, str) and ("\r" in text or "\n" in text)
 
 
 def typed_address(call: Call) -> str:
@@ -1071,7 +1309,7 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         # asking for it (the check's ``asked``) don't skip the question: nothing in the data says this is a chat whose
         # message capability could send it. The check's own question when it gave one (only when not asked), else
         # what is typed and where (review r1 L1).
-        question = (words(getattr(cv, "question", "")) if not asked else "") or maybe_send_question(step)
+        question = (words(getattr(cv, "question", "")) if not asked else "") or maybe_send_question(step, live)
         return Verdict(ASK, 5, "maybe_send", question=question)
     if by_code or effect == "send":
         return _send(step, plan, consent, user_words, live, sk, asked, failed, effect)
@@ -1130,20 +1368,24 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     # the commit check: their words ask for this very send (to that person, with that text), else a draft
     if failed or not asked or effect != "send":
         return _draft(step, sk, slots, body, own, "not_asked")
-    # the quote is their words as heard (a name they said may be written as the person's name)
+    # the quote is their words as heard (a name they said may be written as the person's name, never in place of
+    # another person's: review r2 M1 b)
     names = _recipient_names(to, who, look, user_words)
-    if not quote or not quote_in_words(quote, user_words, names):
+    rec = _Who(to=to, slot=who, names=tuple(names), look=look)
+    placed = _quote_place(quote, user_words, rec) if quote else None
+    if placed is None:
         return Verdict(REFUSE, 4, "quote", line=LINE_QUOTE)
     # what the message says came from them, in the turns the quote stands in (never every turn of the exchange: what
     # they said to Yuki for something else is not what to send): their own words, or Yuki's wording of what they said
     # there, its words close together (said_share); nothing of it from them is naming only the person: a draft (rule
     # 8). Review r1 M1.
-    turns = quote_turns(quote, user_words, names)
+    turns = _runs_of(placed.entries, placed.held)
     said = bool(step_text) and in_words(step_text, turns)
     share = 1.0 if said else said_share(body, turns, names)
-    if share < SAID_SHARE and _said_elsewhere(body, step_text, to, who, user_words, quote, names, look):
+    if share < SAID_SHARE and _said_elsewhere(body, step_text, to, who, placed, names, look):
         # the quote is a turn that says nothing of the message ("Do it, bro") while another turn of theirs names the
-        # person and says it: the planner quotes that turn (a refusal it can fix, before any draft or ask)
+        # person and says something of it: the planner quotes that turn (a refusal it can fix, before any draft or
+        # ask), and the share there decides
         return Verdict(REFUSE, 4, "quote_turn", line=LINE_QUOTE_TURN)
     if share <= 0.0:
         return _draft(step, sk, slots, body, own, "not_said")
@@ -1156,24 +1398,32 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
         at = _clock(float(seen.get("at") or 0.0))
         question = LINE_DUPLICATE.format(to=to, at=at) if to and at else LINE_DUPLICATE_PLAIN
         return Verdict(ASK, 4, "duplicate", question=question)
-    named = _named_by_user(to, who, user_words, look)
+    # whom it goes to: the user's words the quote stands for name the recipient (review r2 M1 a: a name said only
+    # outside the quote is asked, never sent unasked)
+    named = _names_recipient(placed, rec)
+    if _others(" ".join(turns), rec, body):
+        # the turns name someone else too: what of the message goes to the recipient without asking is measured in
+        # the words the quote stands for alone (the rest of the turn may be what to tell the other person)
+        said = bool(step_text) and in_words(step_text, [placed.span])
+        share = 1.0 if said else said_share(body, [placed.span], names)
     if not named or share < SAID_SHARE:
-        # asked first, showing what goes to whom: a recipient their words don't plainly name (speech heard the name
-        # another way), or Yuki's wording with little of their words in it; a yes is their plain instruction
+        # asked first, showing what goes to whom: a recipient the quote doesn't plainly name (speech heard the name
+        # another way, two people go by it, the name was said only outside the quote), or Yuki's wording with little
+        # of their words in it; a yes is their plain instruction
         return Verdict(ASK, 4, "worded" if named else "recipient_unsaid", question=ask_send_question(body, to))
     return Verdict(ALLOW, 4, "send" if said else "send_worded", countdown=True)
 
 
-def _said_elsewhere(body: str, step_text: str, to: str, who: str, user_words: Sequence[str], quote: str,
-                    names: Sequence[str], look: _People) -> bool:
+def _said_elsewhere(body: str, step_text: str, to: str, who: str, placed: _Placed, names: Sequence[str],
+                    look: _People) -> bool:
     """Whether a turn of the user's words the quote does not stand in names the recipient (:func:`_named_by_user`)
-    and says the message: the text is a span of it, or at least :data:`SAID_SHARE` of the text's words stand close
-    together in it (:func:`said_share`)."""
-    entries, held = _quote_turn_indices(quote, user_words, names)
-    for i, turn in enumerate(entries):
-        if i in held:
+    and says something of the message: the text is a span of it, or some of the text's words stand close together in
+    it (:func:`said_share` above 0; review r2 L2: "he'll" is two words, so "ask him when he'll come" holds only 2 of
+    "When will you come?"'s 4). The planner then quotes that turn, and the share there decides ask or allow."""
+    for i, turn in enumerate(placed.entries):
+        if i in placed.held:
             continue
-        says = (bool(step_text) and in_words(step_text, [turn])) or said_share(body, [turn], names) >= SAID_SHARE
+        says = (bool(step_text) and in_words(step_text, [turn])) or said_share(body, [turn], names) > 0.0
         if says and _named_by_user(to, who, [turn], look):
             return True
     return False
@@ -1216,10 +1466,10 @@ def after_ask(verdict: Verdict) -> Verdict:
 
 
 __all__ = ["ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
-           "NEWLINE_KINDS", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
+           "NAME_GAP", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
            "after_ask", "ask_send_question", "calling_windows", "chat_window", "check", "draft_slots",
            "failed_question", "field_of", "game_now", "in_words", "is_join_control", "join_controls", "may_commit",
            "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent", "policy_holds",
            "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",
            "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot", "traits_of",
-           "typed_address", "navigates", "window_kind", "window_page"]
+           "typed_address", "navigates", "waiting_text", "window_kind", "window_page"]
