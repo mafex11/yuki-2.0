@@ -65,7 +65,7 @@ from collections import deque
 from types import SimpleNamespace
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from yuki.ui.own_window import PAGES as YUKI_PAGES
 
@@ -178,6 +178,13 @@ _PASSED_ACK_NOTE = (
     "It did not take effect, so it was handed to the thinker with this report and the window already read; its outcome "
     "comes back to you. They have heard nothing yet for their words: say two or three words that you are on it (\"On "
     "it.\", \"One sec.\"), nothing about what did not work, never that it is done; no retry, no other hand."
+)
+#: pVoice: the same when code said the acknowledgement ("On it.", :data:`STEP_REST_ACK`) and the talker gets no run on
+#: it (vRound2 found the talker's run there called another hand in 3 of 11 runs, while the thinker held the request).
+_PASSED_SAID_NOTE = (
+    "It did not take effect, so it went to the thinker by code with this report and the window already read; its "
+    "outcome comes back to you. Code said the acknowledgement (said). Say nothing now: no retry, no other hand, never "
+    "that it is done."
 )
 #: What the talker reads when the same step was called again while it ran, or an opening it just did (v3.10:
 #: live 2026-09-28 09:07:13 two open_url calls for one "open YouTube" said "Opening YouTube. Opening YouTube now.
@@ -419,6 +426,79 @@ def rest_message(words: list[str], earlier: list[str], name: str, op: str, alrea
     if already:
         lines.append("That window or tab was already open before this step, so this step starts nothing: whatever "
                      "it shows or plays was there before.")
+    if earlier:
+        lines += ["", "[Their earlier words: context only]"]
+        lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in earlier]
+    lines += ["", "[The user's own words, this exchange, newest last]"]
+    lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in words]
+    return "\n".join(lines)
+
+
+#: pVoice (e2e2 #9, #13, #14, #26): the turn's end check. vRound2's rest check covers a silent window or tab step;
+#: two more turns ended with the rest of the request undone:
+#: (a) "then": a hand's ``then`` went back to the talker, which only scrolled or brought something up and the turn
+#:     ended silently (#9 "Try another way, bro." after the failed playlist run: open Spotify, then a scroll; 0 of 5);
+#: (b) "first": the turn ended at an opening or a step with nothing after it (#14 "open a new tab and put something on
+#:     from the front page": a new tab with youtube.com, "YouTube's up.", then nothing).
+#: The same kind of judgement (Yuki's own check model, one forced call, started with the hand's call and joined after
+#: it) reads their own heard words and the turn's steps in code's words, never the talker's. More (or, for "then", no
+#: verdict: an open rest is never left in silence): the rest goes to the thinker by code. No: as before.
+END_CHECK_PROMPT = """\
+You check one thing for Yuki, an assistant that acts on its user's Windows PC by voice. For the user's words, Yuki's \
+voice has just done the steps listed, and nothing else: it opened, brought up or scrolled what they name, and \
+clicked, picked, played, typed or sent nothing. You see the user's own words and those steps, in code's words.
+
+First, why: one short sentence: what their newest words ask Yuki to do now (their earlier words only tell you what \
+"it" or "that" means). Then more: true when their newest words ask Yuki for anything those steps did not do \
+themselves: to put on, play, pick, click, close, write or send anything, to just do it or try another way, or say it \
+is still not done, even when what is showing now already holds or plays such a thing: nothing done before these \
+steps counts as done now. false only when those steps are all their newest words ask for (to open, go to, search, \
+see, switch to, bring up or scroll that app, page, window or tab)."""
+#: The end check's one tool (forced; ``why`` first, as the rest check's; RAM only, never logged).
+END_CHECK_TOOL: dict[str, Any] = {
+    "name": "rest",
+    "description": "Why, in one short sentence, then whether their newest words ask for more than those steps did.",
+    "input_schema": {"type": "object", "additionalProperties": False, "required": ["why", "more"],
+                     "properties": {"why": {"type": "string",
+                                            "description": "One short sentence: what their newest words ask Yuki to "
+                                                           "do now."},
+                                    "more": {"type": "boolean",
+                                             "description": "They ask for anything those steps did not do "
+                                                            "themselves."}}},
+}
+#: At most this many end checks in one user turn (a ``then`` step and one opening; never a loop).
+END_CHECKS_PER_TURN = 2
+#: The hands that only bring something up or move it, and start nothing: after a ``then`` went back to the talker, a
+#: turn that ends at one of these left the rest of the request open (a code fact of the hands, not of the words).
+MOVE_OPS: dict[str, tuple[str, ...] | None] = {"scroll": None, "window": ("focus", "restore"), "tab": ("show",)}
+#: What the thinker is told, as labelled context, when the rest goes to it at the turn's end (``{steps}``: the steps in
+#: code's words; ``{earlier}``: :data:`_END_REST_EARLIER` or "").
+_END_REST_CONTEXT = {
+    "then": ("Yuki's voice did these steps for these words itself, verified: {steps}. The rest of their request was "
+             "left undone after them: do it now, by steps, from what is showing; what those steps opened or brought "
+             "up is up already.{earlier}"),
+    "first": ("Yuki's voice did these steps for these words itself, verified: {steps}. Yuki's own check read their "
+              "words as asking for more than those steps did: do the rest of their request now, by steps, from what is "
+              "showing; what those steps opened or brought up is up already.{earlier}"),
+}
+#: The earlier request of this conversation that ended not done (``VoiceBridge.last_not_done``), for the thinker.
+_END_REST_EARLIER = (" Their request before this one ended not done (its outcome: \"{outcome}\"): never redo the way "
+                     "that one tried.")
+#: The talker's note on that result (as :data:`_STEP_REST_NOTE`: no done, no title).
+_END_REST_NOTE = (
+    "Not done yet: those steps only opened or brought something up. The rest of their request went to the thinker by "
+    "code; its outcome comes back to you. Code said the acknowledgement, if any (said). Say nothing now: no other "
+    "hand, never that it is done or playing."
+)
+
+
+def end_message(words: list[str], earlier: list[str], steps: list[str]) -> str:
+    """pVoice: what the turn's end check reads (:data:`END_CHECK_PROMPT`): the turn's steps in code's words (each a
+    fact of a hand's call: what it opened, brought up or scrolled, in which app; never a report or a title), then the
+    user's own words of this exchange and up to 3 earlier turns, newest last."""
+    lines = ["[What Yuki's voice did for them, in order]"]
+    lines += [f"- It {s}." for s in steps if s] or ["- It brought something up."]
+    lines.append("Nothing else: it clicked, picked, played, typed or sent nothing.")
     if earlier:
         lines += ["", "[Their earlier words: context only]"]
         lines += [f'- "{_clip_words(w, REST_WORDS_CHARS)}"' for w in earlier]
@@ -1090,6 +1170,11 @@ class Hands:
         #: given back to the talker in this user turn (once each; the next goes on as before)
         self._shape_given: tuple[Any, int] | None = None
         self._malformed_given: tuple[Any, int] | None = None
+        #: pVoice: the ``then`` a verified step gave back to the talker in this user turn, while the rest it names is
+        #: still open (``{"turn", "steps" (code's words), "hand", "args", "report"}``; RAM only), and ``(turn, n)``:
+        #: the end checks started in that turn (at most :data:`END_CHECKS_PER_TURN`)
+        self._then_open: dict[str, Any] | None = None
+        self._end_checked: tuple[Any, int] | None = None
 
     @property
     def skills_on(self) -> bool:
@@ -1100,6 +1185,7 @@ class Hands:
         """The user spoke: the talker may use its hands again (after telling them what happened)."""
         self.halted = None
         self._forced_memo = {}
+        self._then_open = None   # pVoice: a new turn's words are a new request (its own steps, its own rest)
         self._commit_check = None   # bTalk: a user turn is one request for the commit check too
         self._join_grant = None
         judge = self._authorizer
@@ -1769,10 +1855,14 @@ class Hands:
     async def handle(self, params: Any) -> None:
         """One hand: run it off the loop, then its report goes back as the call's result."""
         name = params.function_name
+        args = params.arguments if isinstance(params.arguments, dict) else {}
+        then_open = self._then_now()
+        if then_open is not None and not self._moves(name, args):
+            # pVoice: a hand that can act after a "then" is the talker's own try at the rest: its outcome decides
+            self._then_open = then_open = None
         if self.skills_on and name in (SKILL_HAND, KEEP_USUAL_HAND):
             await self._handle_skill(params)   # Phase S: one of the user's skills, or the answer to its question
             return
-        args = params.arguments if isinstance(params.arguments, dict) else {}
         started = time.monotonic()
         key = _step_key(name, args)
         recent = self._opened.get(key) if name in ("open_url", "open_app") else None
@@ -1792,7 +1882,11 @@ class Hands:
         self._step_owed = None   # sVoiceFix (F5): a hand answers the step check, so no step line is owed
         # vRound2 review r1 M1: a call that reaches the step check when it takes effect starts Yuki's own rest check
         # now, beside the act (it reads their words and the step's kind only); the step check joins it
-        rest_job = self._rest_start(name, args) if self._rest_candidate(name, args) else None
+        # pVoice: a step after a "then" (that only moves) or an opening with nothing after it starts the turn's end
+        # check the same way (vRound2's rest check stays the silent window or tab step's when no "then" is open)
+        end_kind = self._end_candidate(name, args, then_open)
+        end_job = self._end_start(name, args, end_kind, then_open) if end_kind else None
+        rest_job = self._rest_start(name, args) if end_job is None and self._rest_candidate(name, args) else None
         if args.get("say_first") and self.bridge is not None:
             await self.bridge._ack_if_silent(params, args)  # said already while it was written, as a rule
         self.busy += 1
@@ -1880,6 +1974,15 @@ class Hands:
             # fx2: the rest of their request is still to do: the talker gets its turn back (run_llm) with the screen
             # as it is once it settled (the new window's items, a popup that came with it), and does the rest with
             # one hand or hands it over - never a done line for half of it
+            # pVoice: and that rest stays open, in code's words, until a hand that can act tries it or the thinker
+            # takes it: a turn that ends at a step that only moves, or in quiet, hands it on (never silence)
+            if turn is not None:
+                steps = list((then_open or {}).get("steps") or [])
+                steps.append(await asyncio.to_thread(self._end_step, name, args))
+                self._then_open = {"turn": turn, "steps": steps[-4:], "hand": name, "args": dict(args),
+                                   "report": report[:REST_REPORT_CHARS]}
+                if self.log is not None:
+                    self.log.event("hands", op=name, then_open=True, steps=len(steps), call=params.tool_call_id)
             settle = await asyncio.to_thread(self.settle_after_open)
             if self.log is not None:
                 self.log.event("hands", op="open_settle", hand=name, rest_chars=len(rest), call=params.tool_call_id,
@@ -1890,6 +1993,15 @@ class Hands:
                                           "how_to_handle_it": note.format(rest=rest[:200])})
             return
         op = str(args.get("action") or ("show" if name == "tab" else ""))
+        if end_job is not None and not rest and not facts.get("starting") \
+                and (confirmed or (ok and facts.get("expected") and end_kind == "then")) \
+                and await self._end_rest(params, name, args, report, end_job):
+            # pVoice: the turn's end check read their words as asking for more than this turn's steps did (or a
+            # "then" step's rest was left at a step that only moves): the rest went to the thinker by code; the done
+            # line, if any, was not said (it would stand for the whole)
+            if speak:
+                self._lines_said.pop(" ".join(line.casefold().split()), None)
+            return
         if confirmed and not str(args.get("say_when_done") or "").strip() and op in STEP_FIRST_OPS.get(name, ()) \
                 and not (op == "new" and str(args.get("url") or "").strip()) \
                 and turn is not None and self._step_checks(turn) < self.STEP_CHECKS_PER_TURN:
@@ -2023,13 +2135,15 @@ class Hands:
             if passed:
                 from pipecat.frames.frames import FunctionCallResultProperties
 
+                # pVoice (vRound2 "found, not built"): the acknowledgement is code's ("On it."), and the talker gets
+                # no run on a request the thinker now holds: given one, it ran another hand in 3 of 11 such runs
+                # (a scroll, a focus with a then) and said "Spotify's playing now" before any outcome
+                said = await self._say_ack(params) if ack else ""
                 if self.log is not None:
-                    self.log.event("hands", op=name, escalated=True, acked=ack, call=params.tool_call_id)
-                if ack:
-                    self.bridge.acked()
-                await params.result_callback({key: report[:700], "passed_on": True,
-                                              "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
-                                             properties=FunctionCallResultProperties(run_llm=ack))
+                    self.log.event("hands", op=name, escalated=True, acked=bool(said), call=params.tool_call_id)
+                await params.result_callback({key: report[:700], "passed_on": True, "said": said,
+                                              "how_to_handle_it": _PASSED_SAID_NOTE if said else _PASSED_NOTE},
+                                             properties=FunctionCallResultProperties(run_llm=False))
                 return
         await params.result_callback({key: report[:700], "how_to_say_it": note})
 
@@ -2414,6 +2528,23 @@ class Hands:
         (``done`` set when it ends; ``verdict`` ``True`` / ``False`` / ``None``, ``why`` a code word, ``ms``) is joined
         by :meth:`_rest_join`. Never raises, never blocks."""
         op = str(args.get("action") or ("show" if name == "tab" else ""))
+
+        def message(words: list[str], older: list[str]) -> str:
+            named = app
+            if named is None:
+                try:
+                    named = self._browser_app(int(args.get("window"))) or ""   # the process's name: data
+                except Exception:  # noqa: BLE001 - the step's kind alone
+                    named = ""
+            return rest_message(words, older[-3:], name, op, op != "new", named)
+
+        return self._check_start(REST_CHECK_PROMPT, REST_CHECK_TOOL, message)
+
+    def _check_start(self, system: str, tool: dict[str, Any],
+                     message: Callable[[list[str], list[str]], str]) -> dict[str, Any]:
+        """The rest check's and the end check's one model call (pVoice: shared), on its own thread: ``message(words,
+        older)`` (built there: it may read the window's app) under ``system``, ``tool`` forced. The job dict as
+        :meth:`_rest_start` describes it. Never raises, never blocks."""
         job: dict[str, Any] = {"done": threading.Event(), "started": time.perf_counter(), "verdict": None, "why": "",
                                "usage": {}, "ms": None}
 
@@ -2427,18 +2558,11 @@ class Hands:
                 if client is None or not model or not words:
                     job["why"] = "no_client" if client is None else "no_model" if not model else "no_words"
                     return
-                named = app
-                if named is None:
-                    try:
-                        named = self._browser_app(int(args.get("window"))) or ""   # the process's name: data
-                    except Exception:  # noqa: BLE001 - the step's kind alone
-                        named = ""
                 older = recent[:len(recent) - len(words)] if recent[-len(words):] == words else \
                     [w for w in recent if w not in words]
-                request = {"model": model, "max_tokens": 160, "system": REST_CHECK_PROMPT, "tools": [REST_CHECK_TOOL],
-                           "tool_choice": {"type": "tool", "name": REST_CHECK_TOOL["name"]},
-                           "messages": [{"role": "user", "content": rest_message(words, older[-3:], name, op,
-                                                                                 op != "new", named)}]}
+                request = {"model": model, "max_tokens": 160, "system": system, "tools": [tool],
+                           "tool_choice": {"type": "tool", "name": tool["name"]},
+                           "messages": [{"role": "user", "content": message(words, older)}]}
                 from yuki.agent.failover import claude_path
 
                 response = claude_path(client).messages.create(**request)
@@ -2470,12 +2594,13 @@ class Hands:
             job["done"].set()
         return job
 
-    def _rest_join(self, job: dict[str, Any], name: str) -> bool | None:
+    def _rest_join(self, job: dict[str, Any], name: str, field: str = "rest_check", **extra: Any) -> bool | None:
         """vRound2 review r1 M1: the rest check's verdict for the step check: waited for until :data:`REST_CHECK_S`
         after it started, and at least :data:`REST_JOIN_FLOOR_S` now that the hand returned. ``True`` / ``False``, or
         ``None`` (no client, an error, a late or unreadable answer: the caller says the step's line as before, never
         acts on it). Blocking: off the voice loop. Logged content-free (the verdict word, the check's ms, the wait's ms,
-        a code word on a miss). Never raises."""
+        a code word on a miss; pVoice: the end check's under ``field`` ``end_check``, with ``extra`` code words). Never
+        raises."""
         waited = time.perf_counter()
         started = float(job.get("started") or waited) if isinstance(job, dict) else waited
         try:
@@ -2487,10 +2612,10 @@ class Hands:
         usage = job.get("usage") if on_time and isinstance(job.get("usage"), dict) else {}
         if self.log is not None:
             now = time.perf_counter()
-            self.log.event("hands", op=name, rest_check="more" if verdict else "no" if verdict is False else "none",
+            self.log.event("hands", op=name, **{field: "more" if verdict else "no" if verdict is False else "none"},
                            ms=job.get("ms") if on_time else round((now - started) * 1000),
                            wait_ms=round((now - waited) * 1000), why=why or None,
-                           tokens_in=int(usage.get("input_tokens") or 0) or None)
+                           tokens_in=int(usage.get("input_tokens") or 0) or None, **extra)
         return verdict if isinstance(verdict, bool) else None
 
     def _rest_check(self, name: str, op: str, app: str = "") -> bool | None:
@@ -2542,7 +2667,18 @@ class Hands:
         of 12 runs). Code says :data:`STEP_REST_ACK` when nothing was said for their words yet (``may_ack``), and the
         result carries no done and no title. ``False`` when no hand-off could start (the caller then says the step's
         line as before)."""
-        from pipecat.frames.frames import FunctionCallResultProperties, TTSSpeakFrame
+        context = _STEP_REST_CONTEXT.format(what=_STEP_WHAT.get((name, op), "brought it up"),
+                                            report=" ".join(str(report).split())[:REST_REPORT_CHARS].rstrip(" ."),
+                                            already=_STEP_REST_ALREADY if already else "")
+        return await self._rest_over(params, name, args, report, context, _STEP_REST_NOTE, step_rest=True)
+
+    async def _rest_over(self, params: Any, name: str, args: dict[str, Any], report: str, context: str, note: str,
+                         **logged: Any) -> bool:
+        """The rest of their request to the thinker by code (``bridge.escalate`` with ``context`` as labelled context),
+        "On it." said by code when nothing was said for their words yet, and the call settled with ``note`` and no
+        talker run (vRound2's step rest; pVoice: the turn's end check too). ``logged``: content-free code words for
+        the ``hands`` line. ``False`` when no hand-off could start (the caller goes on as before)."""
+        from pipecat.frames.frames import FunctionCallResultProperties
 
         bridge = self.bridge
         ack = False
@@ -2550,38 +2686,174 @@ class Hands:
             ack = bool(bridge.may_ack()) if callable(getattr(bridge, "may_ack", None)) else False
         except Exception:  # noqa: BLE001
             ack = False
-        context = _STEP_REST_CONTEXT.format(what=_STEP_WHAT.get((name, op), "brought it up"),
-                                            report=" ".join(str(report).split())[:REST_REPORT_CHARS].rstrip(" ."),
-                                            already=_STEP_REST_ALREADY if already else "")
         try:
             try:
                 passed = await bridge.escalate(params, name, args, report, acked=ack, context=context)
             except TypeError:   # a stand-in bridge without the v3.14 / v3.18 arguments
                 passed = await bridge.escalate(params, name, args, report)
-        except Exception as exc:  # noqa: BLE001 - then the step's line as before
+        except Exception as exc:  # noqa: BLE001 - then the caller's way as before
             passed = False
             if self.log is not None:
                 self.log.event("hands", op=name, escalate_error=type(exc).__name__)
         if not passed:
             return False
-        said = ""
-        if ack:
-            # said by code as other code lines are, and marked said only once it went to the voice (review r1 L1)
-            try:
-                await params.llm.push_frame(TTSSpeakFrame(text=STEP_REST_ACK))
-                said = STEP_REST_ACK
-                bridge.acked()
-                mark = getattr(bridge, "mark_spoken", None)
-                if callable(mark):
-                    mark(params.tool_call_id)
-            except Exception:  # noqa: BLE001 - not said: the thinker's own outcome is the next they hear
-                said = ""
+        said = await self._say_ack(params) if ack else ""
         if self.log is not None:
-            self.log.event("hands", op=name, escalated=True, step_rest=True, acked=bool(said), call=params.tool_call_id)
+            self.log.event("hands", op=name, escalated=True, acked=bool(said), call=params.tool_call_id, **logged)
         await params.result_callback({"passed_on": "the rest of their request went to the thinker", "said": said,
-                                      "how_to_handle_it": _STEP_REST_NOTE},
+                                      "how_to_handle_it": note},
                                      properties=FunctionCallResultProperties(run_llm=False))
         return True
+
+    async def _say_ack(self, params: Any) -> str:
+        """:data:`STEP_REST_ACK` said by code as other code lines are, marked said only once it went to the voice
+        (vRound2 review r1 L1). Returns what was said (``""``: not said; the thinker's own outcome is the next they
+        hear). Never raises."""
+        from pipecat.frames.frames import TTSSpeakFrame
+
+        try:
+            await params.llm.push_frame(TTSSpeakFrame(text=STEP_REST_ACK))
+            self.bridge.acked()
+            mark = getattr(self.bridge, "mark_spoken", None)
+            if callable(mark):
+                mark(params.tool_call_id)
+            return STEP_REST_ACK
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # -- pVoice: the turn's end check ---------------------------------------------------------------------------------
+
+    def _end_step(self, name: str, args: dict[str, Any]) -> str:
+        """One hand's step in code's words for the end check and the thinker (a fact of its call: what it opened,
+        brought up or scrolled, in which app; the address the call gave; never a report or a title). Blocking (it may
+        read the window's app): called on the check's thread. Never raises."""
+        try:
+            op = str(args.get("action") or ("show" if name == "tab" else ""))
+            app = ""
+            if args.get("window") not in (None, ""):
+                try:
+                    app = self._browser_app(int(args.get("window"))) or ""   # the process's name: data
+                except Exception:  # noqa: BLE001
+                    app = ""
+            url = " ".join(str(args.get("url") or "").split())[:160]
+            if name == "open_url":
+                where = " ".join(str(args.get("app") or "").split())[:40] or "the browser"
+                return f"opened the address {url} in {where}"
+            if name == "open_app":
+                return "opened the app " + " ".join(str(args.get("name") or "").split())[:60]
+            if name == "tab" and op == "new":
+                return (f"opened the address {url} in a new tab of {app or 'the browser'}" if url
+                        else f"opened an empty new tab in {app or 'the browser'}")
+            if name == "scroll":
+                way = " ".join(str(args.get("direction") or "").split())[:10]
+                return f"scrolled the {app or 'front'} window {way}".rstrip()
+            if (name, op) in _STEP_WHAT_APP:
+                return _STEP_WHAT_APP[(name, op)].format(app=app) if app else _STEP_WHAT[(name, op)]
+            return f"used its {name} hand"
+        except Exception:  # noqa: BLE001
+            return f"used its {name} hand"
+
+    @staticmethod
+    def _moves(name: str, args: dict[str, Any]) -> bool:
+        """Whether this hand only brings something up or moves it (:data:`MOVE_OPS`), starting nothing."""
+        if name not in MOVE_OPS:
+            return False
+        ops = MOVE_OPS[name]
+        return ops is None or str(args.get("action") or ("show" if name == "tab" else "")) in ops
+
+    def _then_now(self) -> dict[str, Any] | None:
+        """The ``then`` given back to the talker in this user turn and still open (pVoice), else ``None``."""
+        got = self._then_open
+        if not isinstance(got, dict) or got.get("turn") != self._call_safely(self.user_turn, None):
+            return None
+        return got
+
+    def _end_candidate(self, name: str, args: dict[str, Any], then_open: dict[str, Any] | None) -> str | None:
+        """pVoice: the kind of end check this call gets when it takes effect, by its own shape (``"then"``: a hand that
+        only moves after a ``then`` went back in this turn; ``"first"``: an opening or a new tab with an address, with
+        no ``then``, said or silent: the silent window or tab step is vRound2's), else ``None``. Only with a bridge to
+        hand the rest to, this turn not with the thinker already, hands not halted, at most
+        :data:`END_CHECKS_PER_TURN` per turn. Never raises."""
+        try:
+            if self.halted or " ".join(str(args.get("then") or "").split()):
+                return None
+            turn = self._call_safely(self.user_turn, None)
+            if turn is None or self._given(self._end_checked, turn) >= END_CHECKS_PER_TURN:
+                return None
+            if self.bridge is None or not callable(getattr(self.bridge, "escalate", None)) or self._turn_handed_over():
+                return None
+            op = str(args.get("action") or ("show" if name == "tab" else ""))
+            if then_open is not None:
+                return "then" if self._moves(name, args) else None
+            if name in OPEN_HANDS or (name == "tab" and op == "new" and str(args.get("url") or "").strip()):
+                return "first"
+            return None
+        except Exception:  # noqa: BLE001 - no check: as before
+            return None
+
+    def _end_start(self, name: str, args: dict[str, Any], kind: str,
+                   then_open: dict[str, Any] | None) -> dict[str, Any]:
+        """pVoice: the end check, started when the hand's call arrives (beside the act, as vRound2's rest check): did
+        this turn's steps (the ``then`` step's, then this one) do all their newest words asked? The job dict of
+        :meth:`_check_start`, with ``kind`` and the steps (``holder["steps"]``, filled on the check's thread)."""
+        turn = self._call_safely(self.user_turn, None)
+        self._end_checked = (turn, self._given(self._end_checked, turn) + 1)
+        before = list((then_open or {}).get("steps") or [])
+        holder: dict[str, Any] = {"steps": before}
+
+        def message(words: list[str], older: list[str]) -> str:
+            holder["steps"] = [*before, self._end_step(name, args)]
+            return end_message(words, older[-3:], holder["steps"])
+
+        job = self._check_start(END_CHECK_PROMPT, END_CHECK_TOOL, message)
+        job["kind"], job["holder"] = kind, holder
+        return job
+
+    async def _end_rest(self, params: Any, name: str, args: dict[str, Any], report: str,
+                        job: dict[str, Any]) -> bool:
+        """pVoice: the end check's verdict at the end of the turn (joined off the loop). More, or for ``then`` no
+        verdict (an open rest is never left in silence: principle 1, unconfirmed is done the normal way): the rest of
+        their request goes to the thinker by code (:meth:`_rest_over`) and ``True``. No, or no verdict for ``first``:
+        ``False`` (as before). Never a second job (this turn with the thinker already: ``False``)."""
+        kind = str(job.get("kind") or "first")
+        more = await asyncio.to_thread(self._rest_join, job, name, "end_check", check=kind)
+        self._then_open = None   # judged: open no more either way
+        if more is False or (more is None and kind != "then") or self._turn_handed_over():
+            return False
+        steps = [s for s in (job.get("holder") or {}).get("steps") or [] if s] or [self._end_step(name, args)]
+        context = _END_REST_CONTEXT[kind if kind in _END_REST_CONTEXT else "first"].format(
+            steps="; ".join(steps)[:REST_REPORT_CHARS], earlier=self._earlier_not_done())
+        return await self._rest_over(params, name, args, report, context, _END_REST_NOTE, turn_rest=kind,
+                                     verdict="more" if more else "none")
+
+    def _earlier_not_done(self) -> str:
+        """:data:`_END_REST_EARLIER` with the outcome of this conversation's request before this one, when it ended
+        not done (``VoiceBridge.last_not_done``: its own words, RAM only), else ``""``. Never raises."""
+        fn = getattr(self.bridge, "last_not_done", None)
+        try:
+            outcome = fn() if callable(fn) else None
+        except Exception:  # noqa: BLE001
+            outcome = None
+        text = " ".join(str(outcome or "").split())[:REST_REPORT_CHARS]
+        return _END_REST_EARLIER.format(outcome=text.replace('"', "'")) if text else ""
+
+    async def quiet_rest(self, params: Any) -> bool:
+        """pVoice: the bridge's stay_quiet backstop for a run a ``then`` started (the talker read "still to do" and
+        chose silence, with no hand since): the rest of their request goes to the thinker by code, never silence.
+        ``True`` when it went (the call is settled, "On it." said if nothing was yet); else ``False``. Never raises."""
+        then_open = self._then_now()
+        if then_open is None or self.halted or self.bridge is None or self._turn_handed_over():
+            return False
+        self._then_open = None
+        try:
+            steps = [s for s in then_open.get("steps") or [] if s]
+            context = _END_REST_CONTEXT["then"].format(steps="; ".join(steps)[:REST_REPORT_CHARS] or "a step",
+                                                       earlier=self._earlier_not_done())
+            return await self._rest_over(params, str(then_open.get("hand") or "stay_quiet"),
+                                         dict(then_open.get("args") or {}), str(then_open.get("report") or ""),
+                                         context, _END_REST_NOTE, turn_rest="quiet")
+        except Exception:  # noqa: BLE001 - then the bridge's own way
+            return False
 
     def take_step_line(self, max_age_s: float = STEP_LINE_OWED_S) -> str | None:
         """sVoiceFix (F5): the line a silent step check still owes, taken (said once by the bridge, when the run its
@@ -3046,13 +3318,12 @@ class Hands:
                 self.log.event("hands", op=name, escalate_error=type(exc).__name__, request_id=hand_id)
         if not passed:
             return False
+        said = await self._say_ack(params) if ack else ""   # pVoice: as for a hand's hand-off (code's "On it.")
         self._skill_reply_log(params, name, False, report, facts, ms, hand_id, line=False, fallback=why,
-                              escalated=True, acked=ack, handover=why == "handover", seed=pin is not None)
-        if ack:
-            self.bridge.acked()
-        await params.result_callback({"not_done": told[:700], "passed_on": True,
-                                      "how_to_handle_it": _PASSED_ACK_NOTE if ack else _PASSED_NOTE},
-                                     properties=FunctionCallResultProperties(run_llm=ack))
+                              escalated=True, acked=bool(said), handover=why == "handover", seed=pin is not None)
+        await params.result_callback({"not_done": told[:700], "passed_on": True, "said": said,
+                                      "how_to_handle_it": _PASSED_SAID_NOTE if said else _PASSED_NOTE},
+                                     properties=FunctionCallResultProperties(run_llm=False))
         return True
 
     def _skill_request_id(self) -> str | None:

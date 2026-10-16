@@ -805,6 +805,35 @@ NOT_ACTING: frozenset[str] = frozenset({"stay_quiet", "end_conversation", "go_qu
                                         "cancel_tell_yuki"})
 
 
+#: pVoice (vRound2 "found, not built"): a hand called in a talker run that no user turn started (a result's, a
+#: thinker's line) while the thinker holds the user's current request (``VoiceBridge.turn_handed_over``: a job made for
+#: this very turn, still open) is that same request: the thinker does all of it, so the hand is not run. vRound2's
+#: layer 1 saw the talker scroll, or bring Spotify up with a "then", in 3 of 11 such runs. A call in the reply the
+#: user's own words started (a hand beside the hand-off) and anything after their next words run as before.
+THINKER_HOLDS: dict[str, str] = {
+    "not_run": "Not run: the thinker has this request now and does all of it, so nothing was done here.",
+    "how_to_handle_it": "Say nothing about it.",
+}
+#: Hands never stopped by that rule (an answer to the talker's own question, which acts on nothing).
+THINKER_HOLDS_SPARES: frozenset[str] = frozenset({"keep_usual"})
+
+
+def thinker_holds(name: str, bridge: Any) -> bool:
+    """pVoice: whether the hand ``name`` is stopped by :data:`THINKER_HOLDS`: the talker's run that called it was not
+    started by the user's words (``bridge.user_turn()`` false) and the user's current turn is with the thinker, open
+    (``bridge.turn_handed_over()``). State only, never the words; anything unknown runs the hand (``False``)."""
+    if name in THINKER_HOLDS_SPARES or bridge is None:
+        return False
+    try:
+        by_user = getattr(bridge, "user_turn", None)
+        held = getattr(bridge, "turn_handed_over", None)
+        if not callable(by_user) or not callable(held) or by_user():
+            return False
+        return bool(held())
+    except Exception:  # noqa: BLE001 - unknown: the hand runs as before
+        return False
+
+
 def reply_skips(calls: Any, hands: Any) -> dict[str, str]:
     """vRound2: the calls of one reply that are left out (their tool call ids, each with a code word), by the
     reply-level rule (:data:`SIBLING_SKIPPED`). ``calls``: ``(tool call id, name, arguments)`` of one reply, in order;
@@ -5257,6 +5286,13 @@ class Conversation:
         lost. Sound hands touch no window and run. State only (the note, the stream, which hand), never what was said.
         """
         if await self._skip_left_out(params):
+            return
+        if thinker_holds(params.function_name, self.bridge):
+            # pVoice: a run no user turn started, while the thinker holds this turn's request: never a second hand on it
+            from pipecat.frames.frames import FunctionCallResultProperties
+
+            self.log.event("hands", op=params.function_name, thinker_holds=True, call=params.tool_call_id)
+            await params.result_callback(dict(THINKER_HOLDS), properties=FunctionCallResultProperties(run_llm=False))
             return
         if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)

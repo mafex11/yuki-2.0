@@ -1374,6 +1374,34 @@ class VoiceBridge(QObject):
         and called hand_over beside it would otherwise start a second job for the same words). State only."""
         return self._same_turn_job() is not None
 
+    #: pVoice: how recent the request before this one must be for :meth:`last_not_done` (s).
+    LAST_NOT_DONE_S = 300.0
+
+    def last_not_done(self) -> str | None:
+        """pVoice: the outcome of this conversation's newest finished spoken request when it ended not done (failed,
+        or done below ``likely`` with nothing acted), within :attr:`LAST_NOT_DONE_S`, else ``None``: the hands' end
+        check hands the rest of a request on with it ("try another way" after the playlist run that did not get
+        there), so the thinker never redoes that way. Its own words (content: RAM only, never logged). Not one the
+        user stopped or a newer request replaced. The job table's states and verdicts only."""
+        now = time.monotonic()
+        with self._lock:
+            done = list(self._finished)
+        for job in reversed(done):
+            if job.source != "voice" or job.remember or job.unadopted:
+                continue
+            if job.finished_at is None or now - job.finished_at > self.LAST_NOT_DONE_S:
+                return None
+            if job.superseded or job.state == CANCELLED or job.paused_out:
+                return None
+            verdict = job.verdict if isinstance(job.verdict, dict) else {}
+            level = str(verdict.get("level") or "")
+            if job.state == DONE and (level in ("verified", "likely") or (level == "unverified"
+                                                                          and verdict.get("acted"))):
+                return None
+            outcome = " ".join(str(job.outcome or "").split())
+            return outcome[:300] or None
+        return None
+
     async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
         """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.
 
@@ -2004,6 +2032,14 @@ class VoiceBridge(QObject):
             self._log("bridge", op="quiet", refused="result_owed")
             await params.result_callback({"not_quiet": "A result, a failure or a question is always said. Say what it "
                                           "says now, in a few words of your own."})
+            return
+        hands = getattr(self, "hands", None)
+        rest = getattr(hands, "quiet_rest", None) if hands is not None else None
+        if not by_user and not spoke_now and callable(rest) and await rest(params):
+            # pVoice: a run a "then" started (the rest of their request still to do) ended in quiet with no hand: the
+            # rest went to the thinker by code, never silence (the hands settled the call)
+            self._drop_step_line()
+            self._log("bridge", op="quiet", said_by="rest_handed_on")
             return
         if not by_user and not spoke_now and await self._say_step_line(params):
             return   # sVoiceFix (F5): never silence after a step that only brought something up
