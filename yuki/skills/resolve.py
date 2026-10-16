@@ -1168,13 +1168,16 @@ def _title(app: str) -> str:
 def done_line(skill: Skill, values: Mapping[str, Any], named: Sequence[str] = (), *, route: Route | None = None,
               say: str | None = None) -> str:
     """The line said once the done-check saw it: the route's or the skill's template filled, plus each guessed slot's
-    ``say`` (one word corrects it). ``say``: the route's own words (a driver's), used instead of the template."""
-    base = say or fill(route.say if route is not None and route.say else skill.done_line, values) or ""
+    ``say`` (one word corrects it). ``say``: the route's own words (a driver's), used instead of the template. An app
+    slot's value is said as the app's title ("in Arc"), never its key ("in arc"; e2e simulation F12)."""
+    shown = {k: (_title(v) if isinstance(v, str) and v and getattr(skill.slot(k), "type", None) == "app" else v)
+             for k, v in values.items()}
+    base = say or fill(route.say if route is not None and route.say else skill.done_line, shown) or ""
     extra = []
     for name in named:
         slot = skill.slot(name)
         if slot is not None and slot.say:
-            words = fill(slot.say, values)
+            words = fill(slot.say, shown)
             if words and words.casefold() not in base.casefold():
                 extra.append(words)
     if extra:
