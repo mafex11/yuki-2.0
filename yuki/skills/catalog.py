@@ -87,18 +87,23 @@ KEY_CHARS = 120
 
 @dataclass(frozen=True)
 class _Row:
-    """One live learned row, decrypted (RAM only)."""
+    """One live learned row, decrypted (RAM only). ``by_user``: its name is the user's own Rename (kept as they wrote
+    it: :func:`means_free` cuts only a name Yuki made)."""
 
     id: int
     key: str
     capability: str
     spec: Mapping[str, Any]
     name: str
+    by_user: bool = False
 
 
 _lock = threading.Lock()
 #: The learned rows the process last read from its store: ``(learned version, rows, errors)``.
 _learned: tuple[str, tuple[_Row, ...], tuple[str, ...]] = ("", (), ())
+#: vRound2: the names each means slot's values go by on this PC, as the process last read them with its store
+#: (:func:`means_names`): ``{preference base ("web.open_page:browser"): (names, ...)}``. RAM only.
+_means_seen: dict[str, tuple[str, ...]] = {}
 #: Per folder set: ``(capabilities version, learned version, Loaded)``.
 _cache: dict[tuple[str, ...], tuple[str, str, Loaded]] = {}
 #: Errors already reported to a log (each once per process).
@@ -146,8 +151,128 @@ def _decode(store: Any) -> tuple[tuple[_Row, ...], tuple[str, ...]]:
         if not isinstance(spec, Mapping) or int(spec.get("v") or 0) != SPEC_VERSION:
             errors.append(f"learned:{int(rid)}: spec_version")
             continue
-        out.append(_Row(id=int(rid), key=str(key or ""), capability=str(cap_key or ""), spec=spec, name=name))
+        out.append(_Row(id=int(rid), key=str(key or ""), capability=str(cap_key or ""), spec=spec, name=name,
+                        by_user=_by_user(prov)))
     return tuple(out), tuple(errors)
+
+
+def _by_user(provenance: Any) -> bool:
+    """Whether a learned row's name is the user's own Rename (``skills.provenance``: ``named_by = "user"``)."""
+    if isinstance(provenance, (str, bytes)):
+        try:
+            provenance = json.loads(provenance or "{}")
+        except ValueError:
+            return False
+    return isinstance(provenance, Mapping) and provenance.get("named_by") == "user"
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# vRound2: a means slot's value is never part of a learned name the talker reads
+# ---------------------------------------------------------------------------------------------------------------------
+#
+# A means slot is never bound (design §4.2), yet the naming call was asked to name "the program when the user uses
+# it nearly always", so 5 of the 12 learned talker lines on the 10 Oct DB read "Open Excalidraw in Arc", "Open Slack in
+# Chrome"...: the talker took "ARC browser" in "put something on YouTube and ARC browser" for the Excalidraw skill
+# (sim-e2e-1, sVoiceFix "Left"), and the thinker's note named the browser the same way. The cut below is the slot's own
+# data, never a word list: the phrase its ``say`` template makes of a value ("in {browser}" -> "in Arc"), for each
+# name a value of that slot goes by on this PC (the options the user's runs and occasions gave it: ``prefs``, keyed by
+# the slot's preference base; the names their timeline shows each program under).
+
+
+def pref_base(slot: Any, capability: str) -> str:
+    """A means slot's preference base: its ``pref`` up to the scope (``"web.open_page:browser"``), else
+    ``"<capability>:<slot>"``."""
+    pref = str(getattr(slot, "pref", "") or "")
+    return pref.split("@", 1)[0] if pref else f"{capability}:{getattr(slot, 'name', '')}"
+
+
+def _means_names(store: Any, caps: Loaded) -> dict[str, tuple[str, ...]]:
+    """The names each capability's means slot's values go by on this PC (see the section note): every option
+    ``prefs`` holds for that slot's preference base (any scope), with an app option's names from the user's timeline
+    (``yuki.skills.resolve.known_apps``), and an enum slot's own options. Two queries per means slot at most; never
+    raises (``{}``)."""
+    out: dict[str, tuple[str, ...]] = {}
+    try:
+        from yuki.skills.resolve import known_apps
+
+        apps = known_apps(store)
+    except Exception:  # noqa: BLE001 - option keys alone
+        apps = {}
+    for cap in caps.skills:
+        for slot in cap.slots:
+            if slot.role != "means":
+                continue
+            base = pref_base(slot, cap.key)
+            if base in out:
+                continue
+            try:
+                rows = store._query("SELECT DISTINCT option FROM prefs WHERE slot = ? OR substr(slot, 1, ?) = ?",
+                                    (base, len(base) + 1, base + "@"))
+            except Exception:  # noqa: BLE001 - a database before migration 41: no options seen
+                rows = []
+            names: list[str] = [str(o) for o in slot.options]
+            for (option,) in rows:
+                option = " ".join(str(option or "").split())
+                if not option:
+                    continue
+                names.append(option)
+                got = apps.get(option.casefold()) if slot.type == "app" else None
+                names += [str(n) for n in (got or {}).get("names") or [] if str(n).strip()]
+            out[base] = tuple(dict.fromkeys(n for n in names if n.strip()))
+    return out
+
+
+def means_names() -> dict[str, tuple[str, ...]]:
+    """The process's last-read table of :func:`_means_names` (``{}`` before any store-aware load)."""
+    with _lock:
+        return dict(_means_seen)
+
+
+def _tok(word: str) -> str:
+    return word.strip(".,:;!?()[]{}\"'").casefold()
+
+
+def _cut(words: list[str], phrase: list[str]) -> tuple[list[str], bool]:
+    """``words`` with every run of whole words equal to ``phrase`` taken out (case and edge punctuation aside)."""
+    n, out, i, cut = len(phrase), [], 0, False
+    while i < len(words):
+        if n and [_tok(w) for w in words[i:i + n]] == phrase:
+            i, cut = i + n, True
+            continue
+        out.append(words[i])
+        i += 1
+    return out, cut
+
+
+def means_free(text: str, skill: Any, names: Mapping[str, Iterable[str]] | None = None) -> str:
+    """``text`` (a learned skill's name or a line) with every unbound means slot's value phrase cut out, by the
+    slot's own data: its ``say`` template filled with each name a value of that slot goes by (``names``: preference
+    base -> names, :func:`means_names` when ``None``), whole words, case aside ("Open Excalidraw in Arc" with ``in
+    {browser}`` and "Arc" -> "Open Excalidraw"). ``""`` when a value still stands in it after the cut (a slot with no
+    template, or a phrase its template does not make: code can't cut it cleanly) or nothing is left. The text as it is
+    when no value of a means slot is in it. Never raises (the text as it is)."""
+    text = " ".join(str(text or "").split())
+    try:
+        table = means_names() if names is None else names
+        bound = dict(getattr(skill, "bound", {}) or {})
+        cap = str(getattr(skill, "capability", "") or getattr(skill, "key", "") or "")
+        words = text.split()
+        for slot in getattr(skill, "slots", ()) or ():
+            if slot.role != "means" or slot.name in bound:
+                continue
+            values = sorted({" ".join(str(n).split()) for n in table.get(pref_base(slot, cap)) or () if str(n).strip()},
+                            key=lambda n: -len(n.split()))
+            say = str(slot.say or "")
+            holder = "{" + slot.name + "}"
+            if say.count("{") == 1 and holder in say:
+                for value in values:
+                    words, _hit = _cut(words, [_tok(w) for w in say.replace(holder, value).split()])
+            for value in values:
+                if _cut(words, [_tok(w) for w in value.split()])[1]:
+                    return ""   # a value its template did not cover: no clean cut by its own data
+        return " ".join(words).strip(" -,:;·|")
+    except Exception:  # noqa: BLE001
+        return text
 
 
 def named(provenance: Any) -> bool:
@@ -265,7 +390,9 @@ def _with_taste_kinds(skill: Skill) -> Skill:
                                       for s in skill.slots))
 
 
-def _combine(caps: Loaded, rows: tuple[_Row, ...], row_errors: tuple[str, ...], learned_v: str) -> Loaded:
+def _combine(caps: Loaded, rows: tuple[_Row, ...], row_errors: tuple[str, ...], learned_v: str,
+             means: Mapping[str, Iterable[str]] | None = None) -> Loaded:
+    means = means or {}
     by_key = {s.key: s for s in caps.skills}
     learned: list[Skill] = []
     errors = list(caps.errors) + list(row_errors)
@@ -277,8 +404,10 @@ def _combine(caps: Loaded, rows: tuple[_Row, ...], row_errors: tuple[str, ...], 
         if row.key in by_key or any(s.key == row.key for s in learned):
             errors.append(f"learned:{row.id}: key_taken")
             continue
+        # vRound2: a name Yuki made never carries a means slot's value (the user's own Rename stays as they wrote it)
+        name = row.name if row.by_user else means_free(row.name, cap, means)
         try:
-            learned.append(specialise(cap, key=row.key, spec=row.spec, name=row.name))
+            learned.append(specialise(cap, key=row.key, spec=row.spec, name=name))
         except ConnectionError_ as exc:
             errors.append(f"learned:{row.id}: {str(exc).rpartition(': ')[2][:60]}")
     version = caps.version if not learned_v else hashlib.sha256(
@@ -398,8 +527,11 @@ def load(dirs: Iterable[str | Path] | None = None, *, store: Any = None,
             stale = learned_v != _learned[0]
         if stale:
             rows, row_errors = _decode(store) if learned_v else ((), ())
+            seen = _means_names(store, caps) if rows else {}   # vRound2: read with the rows (the same nightly pass)
             with _lock:
                 _learned = (learned_v, rows, row_errors)
+                _means_seen.clear()
+                _means_seen.update(seen)
     with _lock:
         learned_v, rows, row_errors = _learned
         key = _folders(dirs)
@@ -407,7 +539,7 @@ def load(dirs: Iterable[str | Path] | None = None, *, store: Any = None,
         if hit is not None and hit[0] == caps.version and hit[1] == learned_v:
             loaded = hit[2]
         else:
-            loaded = _combine(caps, rows, row_errors, learned_v)
+            loaded = _combine(caps, rows, row_errors, learned_v, dict(_means_seen))
             _cache[key] = (caps.version, learned_v, loaded)
     _report(loaded.errors, log)
     return loaded
@@ -424,6 +556,7 @@ def clear_cache() -> None:
     global _learned
     with _lock:
         _learned = ("", (), ())
+        _means_seen.clear()
         _cache.clear()
         _reported.clear()
     connection.clear_cache()
@@ -458,4 +591,5 @@ ROUTES: dict[str, Callable[[Any], Any]] = {"ask_means": route_ask_means}
 
 
 __all__ = ["SPEC_VERSION", "LIVE_STATES", "KEY_CHARS", "CAPABILITIES_ONLY", "capabilities", "learned_version",
-           "named", "specialise", "learned_on", "load", "get", "clear_cache", "route_ask_means", "ROUTES"]
+           "named", "specialise", "learned_on", "load", "get", "clear_cache", "route_ask_means", "ROUTES",
+           "pref_base", "means_names", "means_free"]

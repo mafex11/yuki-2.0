@@ -788,6 +788,49 @@ def settle_only_when_newest(aggregator: Any) -> None:
     aggregator._is_deferred = _is_deferred
 
 
+#: vRound2 (sVoiceFix "Left", lean #10): the reply-level rule. Pipecat runs a reply's calls in parallel, so when one
+#: run_skill is refused before it runs and goes to the thinker by code with their whole request, a call beside it still
+#: ran: "put something on YouTube and ARC browser" got web.open_video (refused: nothing offered, to the thinker) and the
+#: learned "Open Excalidraw in Arc", which opened Excalidraw and asked "Keep this as your usual?". Now such a reply's
+#: other calls are left out before Pipecat runs them, and each gets this result. Calls that do nothing on the desktop
+#: or for a job (stay quiet, a look into memory, a cancel) are never left out.
+SIBLING_SKIPPED: dict[str, str] = {
+    "not_run": "Not run: another call of this same reply could not run, so their whole request went to the thinker "
+               "by code; this one was left out so nothing is done twice.",
+    "how_to_handle_it": "Say nothing about it.",
+}
+#: The talker's calls that never act or start a job (never left out by :func:`reply_skips`).
+NOT_ACTING: frozenset[str] = frozenset({"stay_quiet", "end_conversation", "go_quiet", "more_of_result",
+                                        "check_progress", QUICK_MEMORY["name"], "cancel_hand_over",
+                                        "cancel_tell_yuki"})
+
+
+def reply_skips(calls: Any, hands: Any) -> dict[str, str]:
+    """vRound2: the calls of one reply that are left out (their tool call ids, each with a code word), by the
+    reply-level rule (:data:`SIBLING_SKIPPED`). ``calls``: ``(tool call id, name, arguments)`` of one reply, in order;
+    ``hands``: the talker's hands (``yuki.voice.hands.Hands.refused_first``: a run_skill that will be refused before
+    running and go to the thinker by code with their whole request, by its data).
+
+    When the reply has such a run_skill and another call that acts or hands over, the whole request goes to the thinker
+    once and nothing else of the reply runs: a hand-off of the same reply carries it (``"handoff"``: it may have begun
+    the thinker already while its call was written, so the refused run_skill is left out too), else the refused run_skill
+    does by its own fallback (``"refused_skill"``). Names and data only, never the words. Never raises (``{}``)."""
+    try:
+        calls = [(str(cid), str(name or ""), args) for cid, name, args in calls or ()]
+        if len(calls) < 2 or hands is None or not callable(getattr(hands, "refused_first", None)):
+            return {}
+        acting = [c for c in calls if c[1] not in NOT_ACTING]
+        lead = next((c for c in acting if c[1] == "run_skill" and hands.refused_first(c[2])), None)
+        if lead is None or len(acting) < 2:
+            return {}
+        handoff = next((c for c in acting if c[1] in HANDOFF_TOOLS), None)
+        keep = handoff or lead
+        why = "handoff" if handoff is not None else "refused_skill"
+        return {cid: why for cid, _name, _args in acting if cid != keep[0]}
+    except Exception:  # noqa: BLE001 - the reply runs as it is
+        return {}
+
+
 #: Tools whose result is answered at once even while the voice is still saying the words the talker wrote before the
 #: call (leftVoice: quick_memory's "Let me look."): see ``Conversation._answer_look_now`` and ``ClauseTTS``.
 ANSWER_WHILE_SPEAKING = frozenset({"quick_memory"})
@@ -913,6 +956,12 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
             if call is not None and call.first_text is not None:
                 self._yuki_spoke.update(str(fc.tool_call_id) for fc in function_calls
                                         if str(fc.tool_call_id) not in self._yuki_unspoken)
+            if function_calls and len(function_calls) > 1:
+                # vRound2: the reply-level rule (reply_skips), decided before Pipecat runs the calls in parallel; a
+                # call held until the user answers is no part of it (nothing of it runs now anyway)
+                hook("reply_calls", [(str(getattr(fc, "tool_call_id", fc)), getattr(fc, "function_name", ""),
+                                      getattr(fc, "arguments", None)) for fc in function_calls
+                                     if not self._yuki_hold.get(str(getattr(fc, "tool_call_id", fc)), False)])
             await super().run_function_calls(function_calls)
 
         async def push_frame(self, frame: Any, direction: Any = None) -> None:
@@ -2478,6 +2527,10 @@ class _Hooks:
         """The reply's calls are complete: an early start for a call that is not among them is void."""
         self.c.bridge.settle_early(ids)
 
+    def reply_calls(self, calls: list[tuple[str, str, Any]]) -> None:
+        """vRound2: a reply of several calls, about to run in parallel: the ones the reply-level rule leaves out."""
+        self.c._note_reply(calls)
+
     def heard(self) -> str | None:
         """What recognition was unsure of in the latest user words, for a call answering them (else ``None``)."""
         call = getattr(self.c._llm, "_yuki_call", None) if getattr(self.c, "_llm", None) is not None else None
@@ -3279,6 +3332,9 @@ class Conversation:
         self._recent_close: Any = None
         #: The talker's quick memory tool (:class:`yuki.voice.recall.QuickMemory`), made with the services.
         self.quick_memory: Any = None
+        #: vRound2: the calls of a reply the reply-level rule left out (:func:`reply_skips`), by tool call id: each is
+        #: answered :data:`SIBLING_SKIPPED` when its handler starts, and runs nothing (bounded; taken once).
+        self._left_out: dict[str, str] = {}
         # -- vGame (5 Oct) -----------------------------------------------------------------------------------
         #: The full-screen game in front (its name from memory's game voice session, or ``"fullscreen"``), else
         #: ``None``; with a call (fresh evidence) this is focus mode (:attr:`focus`). Set by the session.
@@ -4992,6 +5048,8 @@ class Conversation:
         """tell_yuki (or the lean talker's hand_over), held like a hand when the mouth asked and handed over in one reply
         on doubtful words."""
         name = params.function_name if params.function_name in HANDOFF_TOOLS else "tell_yuki"
+        if await self._skip_left_out(params):
+            return
         if self._held(name, params.tool_call_id):
             self.bridge.drop_early(str(params.tool_call_id))
             await self._hold(params)
@@ -5159,6 +5217,34 @@ class Conversation:
         if timer is not None:
             timer.cancel()
 
+    def _note_reply(self, calls: list[tuple[str, str, Any]]) -> None:
+        """vRound2: the reply-level rule (:func:`reply_skips`) over a reply of several calls, before Pipecat runs them
+        in parallel: the calls it leaves out are kept here until their handlers start. Logged content-free."""
+        skips = reply_skips(calls, getattr(self.bridge, "hands", None))
+        if not skips:
+            return
+        if len(self._left_out) > 32:
+            self._left_out.clear()   # ids of long-settled replies; this reply's are added just below
+        self._left_out.update(skips)
+        self.log.event("hands", op="reply_rule", calls=len(calls), left_out=len(skips),
+                       why=next(iter(skips.values())))
+
+    async def _skip_left_out(self, params: Any) -> bool:
+        """vRound2: a call the reply-level rule left out is answered :data:`SIBLING_SKIPPED` and runs nothing (a hand-off
+        among them also drops its early start); ``False`` for any other call."""
+        why = self._left_out.pop(str(params.tool_call_id), None)
+        if why is None:
+            return False
+        from pipecat.frames.frames import FunctionCallResultProperties
+
+        handoff = params.function_name in HANDOFF_TOOLS
+        if handoff:
+            self.bridge.drop_early(str(params.tool_call_id))
+        self.log.event("bridge" if handoff else "hands", op=params.function_name, left_out=why,
+                       call=params.tool_call_id)
+        await params.result_callback(dict(SIBLING_SKIPPED), properties=FunctionCallResultProperties(run_llm=False))
+        return True
+
     async def _hand_or_hold(self, params: Any) -> None:
         """A hand, unless recognition was unsure of the user's words and the mouth spoke with the call.
 
@@ -5168,6 +5254,8 @@ class Conversation:
         the mouth to wait for the answer if it asked (stay_quiet), else to call it again, so nothing is
         lost. Sound hands touch no window and run. State only (the note, the stream, which hand), never what was said.
         """
+        if await self._skip_left_out(params):
+            return
         if self._held(params.function_name, params.tool_call_id, params.arguments):
             await self._hold(params)
             return

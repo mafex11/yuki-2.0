@@ -27,7 +27,8 @@ entity slot (the user's own names, best at this hour first). A learned skill's l
 the user's own), its fixed values (``[slot = value]``) and the slots still filled per request. Never its free-text
 learned menu line (failure fix-plan Item 1: "open Claude (claude.ai) in Chrome" named a browser the skill does not
 bind, and steered the talker and the planner away from the browser the user named; a means slot is never bound, so
-the browser stays a free slot the user's words fill).
+the browser stays a free slot the user's words fill). Nor a means slot's value inside the name (vRound2: "Open
+Excalidraw in Arc" reads "Open Excalidraw"; :func:`yuki.skills.catalog.means_free`, by the slot's own data).
 A learned skill runs only for its own fixed key values: words naming another value run its capability (lSplit review
 r2 L1; :func:`request_key`), and the headings say so. People are not listed (the talker has the people directory). A
 skill with no usable rung and no hand-off is left out. The talker's menu is rebuilt nightly (it sits in the cached
@@ -44,7 +45,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from yuki.skills.catalog import load
+from yuki.skills.catalog import load, means_free
 from yuki.skills.connection import MENU_LINE_CHARS, Loaded, Skill, scope_value
 
 #: The talker's and the thinker's menu size cap (``Settings.skills_menu_chars``).
@@ -96,8 +97,14 @@ def _value(value: Any) -> str:
 def _label(skill: Skill) -> str:
     """A learned skill's words on its line: its name alone (failure fix-plan Item 1). Its learned menu line is free
     text from the naming call and named browsers the skill does not bind ("in Chrome"); the fixed values that follow
-    the name say what the skill is."""
-    return " ".join(str(skill.name or "").split())
+    the name say what the skill is.
+
+    vRound2: never a means slot's value either (sim-e2e-1: the talker read "ARC browser" as "Open Excalidraw in Arc"):
+    the name with each unbound means slot's value phrase cut, by the slot's own data
+    (:func:`yuki.skills.catalog.means_free`; the catalog already cuts the names Yuki made, so this cuts the user's own
+    Rename on this line only). When no clean cut is possible, the line takes its capability's neutral words instead."""
+    name = " ".join(str(skill.name or "").split())
+    return means_free(name, skill) or " ".join(str(skill.menu or "").split()) if name else name
 
 
 def _slot_part(slot: Any, names: list[str]) -> str:

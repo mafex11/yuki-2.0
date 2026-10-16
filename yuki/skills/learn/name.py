@@ -14,7 +14,10 @@ for every group that has no name yet, in one call, and checks every answer by co
   kind) or ``means``:
   a value read from an ``entity``, ``value`` or ``contact`` (a playlist, a level, a person) is **never** sent, only
   "fixed (not shown)";
-* the **means** used (the program or control, with shares; app keys as display names);
+* not the **means** used (the program or control): a means slot is never bound (design §4.2), so a name never says
+  it (vRound2: "Open Excalidraw in Arc" made the talker read "ARC browser" as that skill). Any means value a name or
+  menu line still holds (from the user's phrasings) is cut by code, by the slot's own data
+  (:func:`yuki.skills.catalog.means_free`);
 * the slots that still **vary**: their names, types and kinds, never their values;
 * the **kept** control names of a recorded path (names Yuki already keeps: ``trace_store`` promotion);
 * a time summary computed here from the occasions' times ("on weekdays, mostly 14:10-14:40"), and how often;
@@ -27,16 +30,16 @@ is never withheld (review r1 M1): the model is asked to name the service or the 
 right, and sending it already exposed it.
 
 **The prompt carries no example taken from this user's habits** (critique M8): its examples are placeholders
-(``BrowserX``, ``example.org``).
+(``example.org``).
 
 **What comes back** (forced tool call ``name_skills``): per group ``name`` (2-6 words), ``menu`` (one line, at most
 140 characters, saying when to pick it), ``ask`` per varying slot, ``everyday`` (true / false; false when unsure) and
 up to 3 ``use_when`` phrasings. **Validated by code:** the JSON shape, every length, one line each, no template
 braces, and **no withheld value inside** (a case-folded check of the values the caller knows, whole words for values
 of up to 3 characters: a privacy guard over known values, never a reading of meaning). A group whose name or menu
-fails, or whose call failed, stays **nameless**: it gets a code-built label (``"CallSite in BrowserX: site tab"``,
-from sendable values and the capability key only), runs on request, and ``Named.named`` is false (the offer gate's
-input; which offer classes need it is lWire's call, see the build report's merge note 5).
+fails, or whose call failed, stays **nameless**: it gets a code-built label (``"CallSite: site tab"``, from sendable
+values and the capability key only, never a means value), runs on request, and ``Named.named`` is false (the offer
+gate's input; which offer classes need it is lWire's call, see the build report's merge note 5).
 
 **Cost and cadence** (design §9.4): at most :data:`MAX_GROUPS` groups and **one call per** :data:`CALL_GAP_S` (a
 night); groups already named are answered from the **signature cache** (a keyed digest of what would be sent, minus
@@ -75,7 +78,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 #: The prompt's version: part of every signature, so a new prompt names again (once, within the call budget).
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2   # vRound2: names never say the program or control (a means value)
 #: At most this many groups in one call (design §4.6).
 MAX_GROUPS = 10
 #: At most one call in this long (a night), unless forced (design §0.6: at most one batched call a night).
@@ -132,7 +135,6 @@ the user did by themselves on their PC; nobody wrote these habits down. Each GRO
 - capability: what Yuki can do on any PC for it (a built-in way), with its plain description;
 - never: what Yuki never does for it (the user does that step themselves);
 - fixed: what stays the same every time (a service, a site, a page kind, an app), or "fixed (not shown)";
-- means: which program or control the user used, with shares;
 - varies: what changes each time (slot names and kinds only, never their values);
 - controls: names of controls the user clicked on the way, when Yuki keeps them;
 - when / seen: when it usually happens and how often;
@@ -140,11 +142,12 @@ the user did by themselves on their PC; nobody wrote these habits down. Each GRO
 
 For each group return:
 - name: what the user would call it, 2 to 6 words, starting with a verb. Name the fixed service, site or app \
-when there is one, and the program when the user uses it nearly always. Never name anything the group does not \
-show. Example (placeholders): "Open the forum in BrowserX".
+when there is one. Never name the program, browser or control it is done in: Yuki picks that per request, and \
+the user may ask for another. Never name anything the group does not show. Example (placeholders): "Open the \
+forum".
 - menu: one line, at most 140 characters, telling an assistant when to pick this skill over the plain \
-capability: what it does and for which request. Example: "open their usual forum front page \
-(example.org) in BrowserX when they ask for the forum".
+capability: what it does and for which request, never in which program or browser. Example: "open their usual \
+forum front page (example.org) when they ask for the forum".
 - ask: for each slot that varies, the short question to ask when the user's words don't give it, ending with \
 "?". Example: {"slot": "thread", "question": "Which thread?"}.
 - everyday: true when the habit belongs to the user's personal life or routine logistics: leisure, music, \
@@ -541,12 +544,13 @@ def payload(group: NameInput, loaded: Any) -> _Payload:
 def signature(store: Any, p: _Payload) -> str:
     """The group's cache key: a keyed digest (the store's cipher; a plain hash without one) of what identifies the
     habit (prompt version, capability, end, fixed values, the hidden fixed values too, so two habits that differ only
-    in a value never sent keep apart, the means used nearly always, the varying slots, the kept controls), never
-    counts, times or phrasings: a name stays while the habit's identity does. Only the digest is ever kept."""
+    in a value never sent keep apart, the varying slots, the kept controls), never counts, times or phrasings: a name
+    stays while the habit's identity does. Never the means used (vRound2: a name never says it, so a change of browser
+    names nothing again). Only the digest is ever kept."""
     ident = {"v": PROMPT_VERSION, "capability": str(p.group.capability), "end": str(p.group.end),
              "fixed": sorted([list(f) for f in p.fixed]), "hidden": sorted(p.hidden),
              "hidden_values": list(p.hidden_values),
-             "dominant": sorted(p.dominant), "varies": [v[0] for v in p.varies], "steps": list(p.steps)}
+             "varies": [v[0] for v in p.varies], "steps": list(p.steps)}
     text = json.dumps(ident, sort_keys=True, ensure_ascii=False)
     cipher = getattr(store, "cipher", None)
     if cipher is not None:
@@ -558,26 +562,57 @@ def signature(store: Any, p: _Payload) -> str:
 
 
 def label(p: _Payload) -> str:
-    """The nameless label, built by code from sendable values and the capability key only ("CallSite in BrowserX:
-    site tab"; a usage record with nothing fixed: "message"). Never a withheld value. A fixed means (the browser, a
-    ``means`` source) goes after "in", never into the head, and a program is named once (review r1 L7)."""
+    """The nameless label, built by code from sendable values and the capability key only ("CallSite: site tab"; a
+    usage record with nothing fixed: "message"). Never a withheld value, and never a means value (vRound2: the program
+    or control it was done in is no part of a skill's name; a fixed ``means`` source value is left out as well)."""
     roles = {s.name: s.role for s in getattr(p.cap, "slots", ()) or ()}
-    head_values: list[str] = []
-    fixed_means: list[str] = []
-    for slot, src, value in p.fixed:
-        if value:
-            (fixed_means if src == "means" or roles.get(slot) == "means" else head_values).append(value)
-    head = " ".join(head_values)
-    in_head = {v.casefold() for v in head_values}
-    program = next((v for v in [*p.dominant, *fixed_means] if v.casefold() not in in_head), "")
-    if program:
-        head = f"{head} in {program}" if head else program
+    head = " ".join(value for slot, src, value in p.fixed
+                    if value and src != "means" and roles.get(slot) != "means")
     tail = _tail(p.group.capability)
     text = f"{head}: {tail}" if head else tail
     text = _line(text)
     if _holds(text, p.withheld) or not _plain(text):
         text = tail
     return text if len(text) <= NAME_CHARS else text[: NAME_CHARS - 1].rstrip() + "…"
+
+
+def _means_table(p: _Payload) -> dict[str, list[str]]:
+    """vRound2: the names this group's means values go by (``NameInput.means``: app keys or option codes, their
+    display names), by the capability's means slot's preference base (:func:`yuki.skills.catalog.pref_base`)."""
+    out: dict[str, list[str]] = {}
+    try:
+        from yuki.skills.catalog import pref_base
+    except Exception:  # noqa: BLE001
+        return out
+    slot_of = {s.name: s for s in getattr(p.cap, "slots", ()) or ()}
+    cap_key = str(getattr(p.cap, "key", "") or p.group.capability)
+    for slot_name, counts in (p.group.means or {}).items():
+        slot = slot_of.get(str(slot_name))
+        if slot is None or slot.role != "means":
+            continue
+        names = out.setdefault(pref_base(slot, cap_key), [])
+        for value in (counts or {}):
+            value = _line(value)
+            if value:
+                names += [value, _app_name(value.casefold(), p.group.apps)]
+    for slot_name, _src, value in p.fixed:
+        slot = slot_of.get(slot_name)
+        if slot is not None and slot.role == "means" and value:
+            out.setdefault(pref_base(slot, cap_key), []).append(value)
+    return out
+
+
+def _without_means(text: Any, p: _Payload) -> str:
+    """``text`` with this group's means values cut by the slot's own data (:func:`yuki.skills.catalog.means_free`);
+    ``""`` when one can't be cut cleanly. The text as it is with no capability or no means value in it."""
+    line = _line(text)
+    if p.cap is None or not line:
+        return line
+    try:
+        from yuki.skills.catalog import means_free
+    except Exception:  # noqa: BLE001
+        return line
+    return means_free(line, p.cap, _means_table(p))
 
 
 def _check_name(text: Any, withheld: Sequence[str]) -> str | None:
@@ -599,10 +634,15 @@ def validate(raw: Any, p: _Payload) -> tuple[Named | None, str]:
     Questions for slots that don't vary, or that fail a check, and phrasings that fail one are dropped alone."""
     if not isinstance(raw, Mapping):
         return None, "bad_shape"
-    name = _check_name(raw.get("name"), p.withheld)
+    # vRound2: a means value the name or the menu line still holds (copied from their phrasings) is cut by code, by the
+    # slot's own data; a name it can't be cut from cleanly fails (asked again another night)
+    name = _check_name(_without_means(raw.get("name"), p), p.withheld)
     if name is None:
         return None, "bad_name"
-    menu = _check_menu(raw.get("menu"), p.withheld)
+    given = _line(raw.get("menu"))
+    menu_text = _without_means(given, p) if given else ""
+    # a menu line with a means value no clean cut can take out is dropped alone (it is never read at request time)
+    menu = _check_menu(menu_text, p.withheld) if (menu_text or not given) else ""
     if menu is None:
         return None, "bad_menu"
     everyday = raw.get("everyday")
@@ -651,8 +691,7 @@ def _block(gid: str, p: _Payload, safe: Callable[[Any, int], str]) -> list[str]:
     fixed = [f"{safe(s, 30)} = {safe(v, VALUE_CHARS)}" for s, _src, v in p.fixed]
     fixed += [f"{safe(s, 30)} = fixed (not shown)" for s in p.hidden]
     lines.append("fixed: " + ("; ".join(fixed) if fixed else "nothing"))
-    for slot, used in p.means:
-        lines.append(f"means ({safe(slot, 30)}): " + ", ".join(f"{safe(v, VALUE_CHARS)} {pct}%" for v, pct in used))
+    # vRound2: the means used (the program or control) is not sent: a name never says it (see the module docstring)
     varies = [f"{safe(n, 30)} ({safe(t, 12)}{', ' + safe(k, 20) if k else ''})" for n, t, k in p.varies]
     lines.append("varies: " + (", ".join(varies) if varies else "nothing"))
     if p.steps:
