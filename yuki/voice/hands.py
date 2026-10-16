@@ -212,7 +212,7 @@ _NOW = " Instant: call it alone, no words before it."
 #: The spoken acknowledgement of a slow hand (open_url, open_app), said the moment it is written (v3.5).
 _SAY_FIRST = {
     "type": "string",
-    "description": "Written first: the few words said as it starts (\"Opening it.\"). Call it alone.",
+    "description": "Written first: the few words said as it starts (\"On it.\"). Call it alone.",
 }
 #: fx2: the rest of a request an opening hand does not do. "Open Chrome and restore the pages." went 0 for 5 in 3b's
 #: replays (29-build §4), and 0 for 5 at 756ba4a with no learned way (37-build-fx2 §3): the talker opened Chrome alone,
@@ -792,6 +792,12 @@ class ActionLog:
         return "\n".join(lines)
 
 
+
+def _game_trouble(facts: dict[str, Any]) -> bool:
+    """Whether a hand's facts say a game stopped it (D17: the game gate held or refused it, or the hand found a game in
+    front): the code signal for the talker's game note (x4TalkerPrompt merge note), never the focus state alone."""
+    return facts.get("held") == "game" or facts.get("refused") == "game" or bool(facts.get("game_front"))
+
 class Hands:
     """The mouth's desktop tools over a backend (the brain's), with the summary they act on.
 
@@ -865,6 +871,10 @@ class Hands:
         #: H1 (v3.17): when a hand last did not take effect or was refused, and when a tab or window was last closed
         #: (monotonic): measured states that bring their guidance into the talker's next calls.
         self.trouble_at: float | None = None
+        #: x4TalkerPrompt merge note (review r2 M1): whether that last trouble was a game's (the game gate held or
+        #: refused the hand, or its report found a game in front), never the focus state alone, which is "fullscreen"
+        #: for a video too. The pipeline passes it as ``state["hand_game"]`` (``mouth.GAME_TROUBLE_NOTE``).
+        self.trouble_game: bool = False
         self.closed_at: float | None = None
         # -- v3.18: practice memory (hand traces, learned ways) ---------------------------------------------------
         #: :class:`~yuki.agent.memory.MemoryAccess` the hands' traces go to (``record_hand_trace`` / ``record_run``),
@@ -1660,8 +1670,10 @@ class Hands:
         # the report and says what happened (or hands it over).
         verified = facts.get("verified")
         confirmed = ok and verified is True and name != "press_keys"
-        if not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off"):
+        game = _game_trouble(facts)
+        if game or (not confirmed and not facts.get("settled") and not facts.get("held") and not facts.get("act_off")):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
+            self.trouble_game = game
         if ok and name in ("tab", "window") and str(args.get("action") or "") == "close":
             self.closed_at = time.monotonic()
         if confirmed and name in ("open_url", "open_app"):
@@ -2467,10 +2479,12 @@ class Hands:
 
         outcome = str(facts.get("outcome") or "")
         verified = facts.get("verified") is True
-        if outcome in ("failed", "error", "timeout") or (facts.get("refused") and not facts.get("held")
-                                                         and not facts.get("act_off") and not facts.get("memory_slow")
-                                                         and not facts.get("unsure_focus")):
+        game = _game_trouble(facts)
+        if game or outcome in ("failed", "error", "timeout") or (
+                facts.get("refused") and not facts.get("held") and not facts.get("act_off")
+                and not facts.get("memory_slow") and not facts.get("unsure_focus")):
             self.trouble_at = time.monotonic()   # its guidance rides with the talker's next calls (v3.17)
+            self.trouble_game = game
         self.actions.add("your hand", _what(name, args), report[:400], ok=ok, verified=facts.get("verified"))
         if self.on_step is not None:
             try:

@@ -5510,6 +5510,9 @@ class Conversation:
                 at = getattr(hands, "trouble_at", None)
                 if at is not None and now - at <= self.HAND_TROUBLE_S:
                     state["hand_trouble"] = True
+            if state.get("hand_trouble") and isinstance(getattr(hands, "trouble_game", None), bool):
+                # x4TalkerPrompt merge note (review r2 M1): the hands' own game signal keys the talker's game note
+                state["hand_game"] = hands.trouble_game
         closed = [x for x in (getattr(hands, "closed_at", None), getattr(self.bridge, "closed_at", None))
                   if isinstance(x, (int, float))]
         if closed and now - max(closed) <= self.CLOSED_S:
