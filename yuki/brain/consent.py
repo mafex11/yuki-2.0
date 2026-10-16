@@ -15,20 +15,23 @@ applies decides:
    exception: a ``run_skill`` of a capability whose commit word (phase L's D24 table, ``Skill.commit``) is ``words``,
    on the user's plain words (the commit check's ``asked``; decision 7).
 4. **Send**: the step sends for certain (:func:`sends_now`: a click on a control that is not a button, menu item or
-   split button while Yuki's typed text waits in that window; typing with Enter or a line break only where Enter sends
-   a message: a chat's window, :func:`chat_window`, by its program among a chat app's connection data (``[chat]
+   split button while Yuki's typed text waits in that window; typing with Enter or a line break where Enter sends a
+   message: a chat's window, :func:`chat_window`, by its program among a chat app's connection data (``[chat]
    images`` / ``processes``), by the page it shows (the Now board's address) on one of a chat app's web ``services``
-   hosts, or by memory's capture profiles calling the program or page a ``conversation``, a window whose program is
-   unknown counting as a chat; or a window where Yuki's typed text waits), is a ``run_skill`` whose skill sends with
-   these slots, or the commit check says ``effect = send`` (a button, menu item or split button click, a key, or
-   typing with Enter anywhere else, a search box, a command field, is may-commit and goes to the check, told when
-   Yuki's text waits, so "type a search, press Enter" is row 5's, and a chat no data knows still comes back here as
-   the check's ``send``; designer's call, review r2 L1, failure fix-plan item 11).
+   hosts, by the Now board's read of the window being a ``conversation`` (the extraction's kind, its generic chat
+   detector's too), or by memory's capture profiles calling the program or page a ``conversation``, a window whose
+   program is unknown counting as a chat; or a window where Yuki's typed text waits; and a line break anywhere else
+   but a browser loading one address or a document, since the commit check is never shown that Enter), is a
+   ``run_skill`` whose skill sends with these slots, or the commit check says ``effect = send`` (a button, menu item
+   or split button click, a key, or typing with ``press_enter`` anywhere else, a search box, a command field, is
+   may-commit and goes to the check, told when Yuki's text waits, so "type a search, press Enter" is row 5's;
+   designer's call, review r2 L1, failure fix-plan item 11).
 
    One web address typed with Enter into a browser window known not to be a chat (:func:`navigates`: its address bar)
    opens that page, as ``open_url`` would: judged as typing (rows 1-2), never a send, whatever word the check gives
-   it. Enter typed or pressed in a window known not to be a chat, which the check calls a send their words didn't ask
-   for, is **ask**ed with the check's question (a search box it misread, or a chat no data knows: their call).
+   it. Enter typed or pressed in a window known not to be a chat, which the check calls a send, is **ask**ed: the
+   check's question when their words didn't ask for it, else what is typed and where (a search box it misread, or a
+   chat no data knows: their call, never a dead end; review r1 L1).
 
    A send: **refuse** ("undeclared send") unless the plan declared ``consent.commit = send`` and the step is a sending
    capability. A plan that declares a send while its capability step leaves a draft (its send slot on a non-sending
@@ -44,9 +47,12 @@ applies decides:
    * ``quote`` (their words asking for it) stands in the user's words of this exchange, whole words in order, where a
      name the recipient goes by may stand in place of how the words named them (speech heard "hey meant" or "हेमंत"
      for Hemanth); else **refuse**;
-   * the text is their own words (a span of them), or Yuki's wording of what they said: :func:`said_share`, the share
-     of the text's words (the recipient's names aside) that stand in their words of this exchange. None of them:
-     nothing of the message came from the user, they named only the person: **draft**;
+   * the text is their own words (a span of them), or Yuki's wording of what they said, both measured in the turns
+     the quote stands in (:func:`quote_turns`), never every turn of the exchange: :func:`said_share`, the share of
+     the text's words (the recipient's names aside) they said close together there. When that falls short of
+     :data:`SAID_SHARE` but another turn of theirs names the person and says the message, **refuse** (the planner
+     quotes that turn). None of them: nothing of the message came from the user, they named only the person:
+     **draft**;
    * every ``sends_when`` slot on a sending value, else **refuse** (a slot left out would be filled with its default,
      a draft: never counted down or reported as sent);
    * a near-duplicate of the user's recent messages to that person (``util.similar``, last 3 hours): **ask** "send it
@@ -98,7 +104,12 @@ LINE_UNDECLARED_SEND = ("that step would send something the plan did not declare
 LINE_TYPED_ENTER = ("typing with Enter here sends what is typed (a chat app's window or page, or Yuki's unsent text "
                     "waits there), and the plan declared no send: send a message through the message capability with "
                     "commit send, type it without submit and press Enter as its own step (that step is checked), or "
-                    "leave it as a draft")
+                    "leave it as a draft; to open a web address, use open_url")
+#: The same for a line break in typed text outside a chat app's window: it presses Enter, and the commit check is shown
+#: the text without it, so it can't judge that Enter (planner-facing).
+LINE_LINE_BREAK = ("a line break in the typed text presses Enter, which may send or run it, and the commit check can't "
+                   "see it: type the text without the line break and set submit (that Enter is checked), or press "
+                   "Enter as its own step")
 LINE_NOT_CAPABILITY = "send through the message capability"
 LINE_RECIPIENT = "the step sends to someone other than the plan's recipient"
 #: Planner-facing refusals of a declared send (code facts the planner can fix).
@@ -110,6 +121,10 @@ LINE_TEXT_MISMATCH = ("the capability's text slot and consent.text differ: write
                       "shows consent.text)")
 LINE_QUOTE = ("consent.quote is not the user's words as heard: copy their words asking for the send exactly as they "
               "stand in their words (a name they said may be written as that person's name)")
+#: The quote stands in a turn that says nothing of the message, while another turn of theirs names the person and says
+#: it (10 Oct: "message hey meant ... ask him when he will come", then "Do it, bro"): the planner quotes that turn.
+LINE_QUOTE_TURN = ("consent.quote stands in a turn of their words that says nothing of the message, and another turn "
+                   "names the person and says what to send: quote their words from that turn")
 LINE_DRAFTED = "It's typed in; send it when you're ready."
 LINE_DUPLICATE = "You sent that to {to} at {at}. Send it again?"
 LINE_DUPLICATE_PLAIN = "You sent that recently. Send it again?"
@@ -119,6 +134,10 @@ LINE_ASK_SEND = "Send \"{text}\" to {to}?"
 LINE_ASK_SEND_PLAIN = "Send that message?"
 #: The most characters of the text a question shows.
 ASK_TEXT_CHARS = 160
+#: Enter typed or pressed in a window known not to be a chat, which the commit check calls a send: the question when
+#: the check gave none (it gives none when it found the send asked for). What is typed, where; voice-shaped.
+LINE_MAYBE_SEND_TYPED = "Should I type \"{text}\" and press Enter{where}? That may send it."
+LINE_MAYBE_SEND_KEY = "Should I press {key}{where}? That may send what's typed there."
 LINE_CHECK_FAILED = "Should I go ahead with that? I couldn't check it was what you asked for."
 #: The same question naming the step (``describe_step``'s running words for it: "Closing Slack").
 LINE_CHECK_FAILED_STEP = "Should I go ahead with {step}? I couldn't check it was what you asked for."
@@ -128,12 +147,22 @@ LINE_SEND_SLOT = ("the send leaves its send slot ({slots}) out: fill it with its
 #: A near-duplicate send counts within this many seconds (the user's messages to that person, §2.3).
 DUPLICATE_WINDOW_S = 3 * 3600.0
 #: Yuki's own wording of a message goes with the countdown alone when at least this share of its words (the
-#: recipient's names aside, each word once) stand in the user's words of this exchange: a rewording keeps their words
-#: and changes the person ("ask him when he will come" -> "When will you come?": 3 of 4). Less is asked first, showing
-#: the text; none at all is a draft (they named only the person, rule 8). A counted share of words, never a reading of
-#: them; measured on the 10 Oct requests (failure fix-plan item 11), where the commit check alone called "Message
-#: Hemanth." an asked send.
-SAID_SHARE = 0.5
+#: recipient's names aside, each word once) the user said close together in the turns their quote stands in
+#: (:func:`said_share`): a rewording keeps their words and changes one in four, the person ("ask him when he will
+#: come" -> "When will you come?": 3 of 4). Less is asked first, showing the text; none at all is a draft (they named
+#: only the person, rule 8). A counted share of words, never a reading of them; measured on the 10 Oct requests
+#: (failure fix-plan item 11, review r1 M1), where the commit check alone called "Message Hemanth." an asked send, and
+#: half (the old bar, counted over every turn) let words that only frame a request ("Can you message Hemanth for me?"
+#: -> "Hey, can you hop on for me?": 4 of 7) send Yuki's own message.
+SAID_SHARE = 0.75
+#: The stretch of the user's words the share is counted in: at most this many times the message's own words (a
+#: rewording of what they said to say keeps its words together; common words scattered over a long turn don't add up).
+SAID_SPAN = 2
+#: The extraction kind (``yuki.memory.extract.model.Extraction.kind``, carried on the Now board's window entries) of a
+#: chat: Enter there sends a message, whatever app it is (the generic chat detector's too).
+CHAT_KIND = "conversation"
+#: The extraction kinds where a line break in typed text is a new line, not a submit (an editor's document).
+NEWLINE_KINDS = frozenset({"document"})
 
 #: The plain words said for a refusal's code word (``Verdict.why``), for a line the user hears; a code word itself is
 #: never said. Missing or empty: nothing worth saying (the planner's own fixes).
@@ -198,7 +227,8 @@ class Live:
     person named in ``text`` (``None``: memory can't say). ``policy``: the autonomy policy reader. ``pages``: the
     address each window shows (the Now board's ``windows[].url`` by hwnd), for a caller that read the board already;
     ``None``: :func:`window_page` reads the board itself when a step needs it (typing with Enter outside a chat app's
-    program)."""
+    program). ``kinds``: the same for the extraction's kind of each window (``windows[].kind``: ``conversation`` for
+    a chat), read by :func:`window_kind`."""
 
     game: str | None = ""
     calling: frozenset[int] = frozenset()
@@ -210,6 +240,7 @@ class Live:
     policy: Any = None
     now: float = field(default_factory=time.time)
     pages: Mapping[int, str] | None = None
+    kinds: Mapping[int, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -377,18 +408,74 @@ def quote_in_words(quote: str, user_words: Sequence[str], names: Sequence[str] =
     return cut and bool(pieces) and all(in_words(" ".join(p), user_words) for p in pieces)
 
 
+def _quote_turn_indices(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> tuple[list[str], set[int]]:
+    """The user's turns (non-empty, in order) and the indices of those the quote stands in: for the quote, or for each
+    piece of it left once the recipient's names are cut out (:func:`quote_in_words`), the fewest neighbouring turns
+    whose words hold it (speech finals split a sentence)."""
+    from yuki.memory.contacts import span_in
+
+    entries = [words(w) for w in user_words if words(w)]
+    q = words(quote)
+    if not q or not entries:
+        return entries, set()
+    if in_words(q, entries):
+        texts = [q]
+    else:
+        pieces, cut = _cut_names(q, names)
+        texts = [" ".join(p) for p in pieces] if cut else []
+    held: set[int] = set()
+    for text in texts:
+        for size in range(1, len(entries) + 1):
+            hits = [i for i in range(len(entries) - size + 1) if span_in(text, " ".join(entries[i:i + size]))]
+            if hits:
+                for i in hits:
+                    held.update(range(i, i + size))
+                break
+    return entries, held
+
+
+def quote_turns(quote: str, user_words: Sequence[str], names: Sequence[str] = ()) -> list[str]:
+    """The turns of the user's words the plan's quote stands in, each run of neighbouring turns joined: where row 4
+    measures what of a message came from them (:func:`said_share`), never every turn of the exchange (words they said
+    to Yuki for something else, "Yuki, are you there?", are not what to send). ``[]``: it stands nowhere."""
+    entries, held = _quote_turn_indices(quote, user_words, names)
+    runs: list[str] = []
+    cur: list[str] = []
+    last = None
+    for i in sorted(held):
+        if cur and last is not None and i != last + 1:
+            runs.append(" ".join(cur))
+            cur = []
+        cur.append(entries[i])
+        last = i
+    if cur:
+        runs.append(" ".join(cur))
+    return runs
+
+
 def said_share(text: str, heard: str | Sequence[str], names: Sequence[str] = ()) -> float:
-    """The share (0-1) of a message's words that stand in the user's words (``heard``: their quote, or every turn of
-    this exchange), each word once, the recipient's names aside: how much of Yuki's wording came from what they said.
-    ``0`` when the text has no word of its own. A count of words, never a reading of them."""
+    """The share (0-1) of a message's words (the recipient's names aside, each word once) that the user said close
+    together: the most of them found within one stretch of their words at most :data:`SAID_SPAN` times the message's
+    own words long, inside one run of ``heard`` (the turns their quote stands in, :func:`quote_turns`) and between the
+    recipient's names. A rewording of what they said to say keeps its words together ("ask him when he will come" ->
+    "When will you come?": 3 of 4), while words that only frame the request to Yuki on either side of the name ("Can
+    you message Hemanth for me?") or common words scattered over a long turn don't add up. ``0`` when the text has no
+    word of its own. A count of words, never a reading of them."""
     from yuki.memory.contacts import tokens
 
     name_words = {t for n in names for t in tokens(n)}
     own = list(dict.fromkeys(t for t in tokens(text) if t not in name_words))
     if not own:
         return 0.0
-    said = set(tokens(heard if isinstance(heard, str) else " ".join(str(h or "") for h in heard)))
-    return sum(1 for t in own if t in said) / len(own)
+    want = set(own)
+    span = max(1, SAID_SPAN * len(own))
+    best = 0
+    for run in ([heard] if isinstance(heard, str) else list(heard or [])):
+        pieces, _cut = _cut_names(str(run or ""), names)
+        for piece in pieces:
+            for i in range(max(1, len(piece) - span + 1)):
+                best = max(best, len(want.intersection(piece[i:i + span])))
+    return best / len(own)
 
 
 def ask_send_question(text: str, to: str) -> str:
@@ -397,6 +484,23 @@ def ask_send_question(text: str, to: str) -> str:
     if len(body) > ASK_TEXT_CHARS:
         body = body[:ASK_TEXT_CHARS - 1].rstrip() + "…"
     return LINE_ASK_SEND.format(text=body, to=words(to)) if body and words(to) else LINE_ASK_SEND_PLAIN
+
+
+def maybe_send_question(step: Call) -> str:
+    """The question for Enter typed or pressed in a window known not to be a chat, which the commit check calls a send
+    (row 5): what is typed (cut to :data:`ASK_TEXT_CHARS`) and in which app, or the key. Code words only (the tool's
+    own input and the window's program), so a yes is a yes to that very step."""
+    app = util.app_name(step.app) if words(step.app) else ""
+    where = f" in {app}" if app else ""
+    inp = step.input or {}
+    if step.tool == "type_text":
+        body = words(inp.get("text"))
+        if len(body) > ASK_TEXT_CHARS:
+            body = body[:ASK_TEXT_CHARS - 1].rstrip() + "…"
+        if body:
+            return LINE_MAYBE_SEND_TYPED.format(text=body, where=where)
+    key = words(inp.get("key")) if step.tool == "press" else ""
+    return LINE_MAYBE_SEND_KEY.format(key=(key[:1].upper() + key[1:]) if key else "Enter", where=where)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -532,32 +636,29 @@ def _chat_data() -> tuple[frozenset[str], frozenset[str]] | None:
     return (frozenset(programs), frozenset(hosts)) if programs else None
 
 
-#: A board read for :func:`window_page` serves the rule's other questions about the same step for this long (one
-#: check asks up to three times: the step's traits, may-commit, the send row).
+#: A board read for :func:`window_page` and :func:`window_kind` serves the rule's other questions about the same step
+#: for this long (one check asks several times: the step's traits, may-commit, the send row).
 PAGE_TTL_S = 1.0
-_pages_read: dict[int, tuple[float, str]] = {}
+_board_read: dict[int, tuple[float, str, str]] = {}
 
 
-def window_page(hwnd: int | None, live: Live | None = None) -> str:
-    """The address the window shows: ``live.pages`` when the caller read the board already, else the Now board's entry
-    for that window (``windows[].url``, read now: 50 ms at most, kept :data:`PAGE_TTL_S`). ``""``: not known (no board,
-    a window with no page, a page privacy keeps out). Never raises."""
-    if not hwnd:
-        return ""
+def _hwnd_key(hwnd: Any) -> int | None:
+    if not hwnd or isinstance(hwnd, bool):
+        return None
     try:
-        key = int(hwnd)
+        return int(hwnd)
     except (TypeError, ValueError):
-        return ""
-    if live is not None and live.pages is not None:
-        try:
-            return words(live.pages.get(key) or "")
-        except Exception:  # noqa: BLE001
-            return ""
+        return None
+
+
+def _board_window(key: int) -> tuple[str, str]:
+    """The Now board's entry for one window, read now (50 ms at most, kept :data:`PAGE_TTL_S`): its address
+    (``windows[].url``) and the extraction's kind (``windows[].kind``). ``("", "")``: not known. Never raises."""
     now = time.monotonic()
-    hit = _pages_read.get(key)
+    hit = _board_read.get(key)
     if hit is not None and now - hit[0] <= PAGE_TTL_S:
-        return hit[1]
-    url = ""
+        return hit[1], hit[2]
+    url = kind = ""
     try:
         from yuki.memory.now import shared_client
 
@@ -565,14 +666,44 @@ def window_page(hwnd: int | None, live: Live | None = None) -> str:
         board = client.now(wait_s=0.05) if client is not None else None
         for w in (board or {}).get("windows") or []:
             if isinstance(w, Mapping) and str(w.get("hwnd")) == str(key):
-                url = words(w.get("url") or "")
+                url, kind = words(w.get("url") or ""), words(w.get("kind") or "")
                 break
     except Exception:  # noqa: BLE001 - no board: not known
-        url = ""
-    if len(_pages_read) > 64:
-        _pages_read.clear()
-    _pages_read[key] = (now, url)
-    return url
+        url = kind = ""
+    if len(_board_read) > 64:
+        _board_read.clear()
+    _board_read[key] = (now, url, kind)
+    return url, kind
+
+
+def window_page(hwnd: int | None, live: Live | None = None) -> str:
+    """The address the window shows: ``live.pages`` when the caller read the board already, else the Now board's entry
+    for that window (:func:`_board_window`). ``""``: not known (no board, a window with no page, a page privacy keeps
+    out). Never raises."""
+    key = _hwnd_key(hwnd)
+    if key is None:
+        return ""
+    if live is not None and live.pages is not None:
+        try:
+            return words(live.pages.get(key) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+    return _board_window(key)[0]
+
+
+def window_kind(hwnd: int | None, live: Live | None = None) -> str:
+    """The kind memory's extraction gave the window's last read (``conversation``, ``page``, ``document``, ...):
+    ``live.kinds`` when the caller read the board already, else the Now board's entry (:func:`_board_window`). ``""``:
+    not known. Never raises."""
+    key = _hwnd_key(hwnd)
+    if key is None:
+        return ""
+    if live is not None and live.kinds is not None:
+        try:
+            return words(live.kinds.get(key) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+    return _board_window(key)[1]
 
 
 def _host(url: str) -> str:
@@ -601,10 +732,12 @@ def _capture_kind(program: str, url: str) -> str:
 def chat_window(call: Call, live: Live | None = None) -> bool | None:
     """Whether the step's window is a chat's, where Enter sends a message. Data only, never names: its program
     (``call.app``, the window's process) among the programs a chat app's connection data lists; the page it shows
-    (:func:`window_page`) on one of a chat app's web hosts or below one (Discord or WhatsApp in a browser); or memory's
-    capture profiles calling that program or page a ``conversation`` (Teams, Telegram, Messenger, LinkedIn or Instagram
-    messages: chats with no message capability). ``None``: the program is unknown, or the chat apps' data can't be read
-    (the caller counts that as a chat, fail closed)."""
+    (:func:`window_page`) on one of a chat app's web hosts or below one (Discord or WhatsApp in a browser); the Now
+    board's read of that window a ``conversation`` (:func:`window_kind`: the extraction's own kind, its generic chat
+    detector's too, so a chat no data names, Signal or Element, still counts); or memory's capture profiles calling
+    that program or page a ``conversation`` (Teams, Telegram, Messenger, LinkedIn or Instagram messages: chats with no
+    message capability). ``None``: the program is unknown, or the chat apps' data can't be read (the caller counts
+    that as a chat, fail closed)."""
     import ntpath
 
     from yuki.core.appnames import app_key
@@ -621,7 +754,9 @@ def chat_window(call: Call, live: Live | None = None) -> bool | None:
     host = _host(url)
     if host and any(host == h or host.endswith("." + h) for h in hosts):
         return True
-    if _capture_kind(program, url) == "conversation":
+    if call.hwnd and window_kind(call.hwnd, live) == CHAT_KIND:
+        return True
+    if _capture_kind(program, url) == CHAT_KIND:
         return True
     return False if key else None
 
@@ -631,9 +766,13 @@ def sends_now(call: Call, live: Live, traits: Traits | None = None) -> bool:
     that window (``tools.sends_for_certain``) does. Typing with Enter or a line break does only where Enter sends a
     message: in a chat app's own window or page (:func:`chat_window`; a program that can't be told counts as a chat,
     fail closed), or in a window where Yuki's typed text waits (Enter sends that text too, and the commit check is not
-    told of it for typing). Anywhere else (an address bar, a search box, a command field) typing with Enter is a
-    may-commit step like a key: the commit check decides it (row 5), and its ``send`` (a chat the data doesn't know)
-    brings it back to row 4. ``tools.sends_for_certain`` itself is left as it is: the old loop shares it."""
+    told of it for typing). Anywhere else (an address bar, a search box, a command field) typing with ``press_enter``
+    is a may-commit step like a key: the commit check, shown "and presses Enter", decides it (row 5), and its ``send``
+    (a chat the data doesn't know) is asked (row 5) or comes back to row 4. A line break in the text is an Enter the
+    check is never shown (it sees the text as one line), so it sends for certain outside a chat's window too, unless
+    the step loads one web address in a browser (:func:`navigates`) or the window's read is a document, where a line
+    break is a new line (:data:`NEWLINE_KINDS`; review r1 M2). ``tools.sends_for_certain`` itself is left as it is: the
+    old loop shares it."""
     traits = traits if traits is not None else traits_of(call, live)
     if not sends_for_certain(traits):
         return False
@@ -641,7 +780,17 @@ def sends_now(call: Call, live: Live, traits: Traits | None = None) -> bool:
         return True
     if call.hwnd and int(call.hwnd) in live.typed_pending:
         return True
-    return chat_window(call, live) is not False
+    if chat_window(call, live) is not False:
+        return True
+    if _line_break_submit(call):
+        return not navigates(call, live) and window_kind(call.hwnd, live) not in NEWLINE_KINDS
+    return False
+
+
+def _line_break_submit(call: Call) -> bool:
+    """A ``type_text`` that submits only by a line break in its text (``press_enter`` not set): the commit check's step
+    line says nothing of that Enter."""
+    return call.tool == "type_text" and (call.input or {}).get("press_enter") is not True
 
 
 def typed_address(call: Call) -> str:
@@ -915,13 +1064,15 @@ def _check(step: Call, plan: Any, user_words: list[str], live: Live, cv: Any) ->
         return Verdict(REFUSE, 4, "declared_draft",
                        line=LINE_DECLARED_DRAFT.format(slots=", ".join(send_slots(sk)) or "send"))
     by_code = sends_now(step, live, traits) or (sk is not None and skill_sends(sk, slots))
-    if not by_code and effect == "send" and not asked and step.tool in _ENTER_TOOLS \
-            and chat_window(step, live) is False:
-        # Enter typed or pressed where no chat app's data says Enter sends (a search box, a command field; the check
-        # called "lofi hip hop" + Enter in Arc's command bar a send on 10 Oct), and their words didn't ask for a send:
-        # theirs to say, asked plainly with the check's question, never refused into a dead end. A send their words
-        # asked for still goes through the capability (row 4 below).
-        return Verdict(ASK, 5, "maybe_send", question=words(getattr(cv, "question", "")) or failed_question(step))
+    if not by_code and effect == "send" and step.tool in _ENTER_TOOLS and chat_window(step, live) is False:
+        # Enter typed or pressed where no data says Enter sends (a search box, a command field; the check called
+        # "lofi hip hop" + Enter in Arc's command bar a send on 10 Oct, and "Japanese" + Enter in Spotify's search
+        # might be), or a chat no data knows: theirs to say, asked plainly, never refused into a dead end. Their words
+        # asking for it (the check's ``asked``) don't skip the question: nothing in the data says this is a chat whose
+        # message capability could send it. The check's own question when it gave one (only when not asked), else
+        # what is typed and where (review r1 L1).
+        question = (words(getattr(cv, "question", "")) if not asked else "") or maybe_send_question(step)
+        return Verdict(ASK, 5, "maybe_send", question=question)
     if by_code or effect == "send":
         return _send(step, plan, consent, user_words, live, sk, asked, failed, effect)
 
@@ -946,8 +1097,14 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     the person means a draft). The order matters: an ask's yes skips everything after it (``after_ask``), so every
     refusal and the send slots come before the asks."""
     if consent["commit"] != "send":
-        typed_send = step.tool == "type_text" and sends_now(step, live)
-        return Verdict(REFUSE, 4, "undeclared_send", line=LINE_TYPED_ENTER if typed_send else LINE_UNDECLARED_SEND)
+        line = LINE_UNDECLARED_SEND
+        if step.tool == "type_text" and sends_now(step, live):
+            # a line break outside a chat's window (no Yuki text waiting there) sends for certain only because the
+            # check can't see it: the planner types without it
+            by_break = _line_break_submit(step) and chat_window(step, live) is False \
+                and not (step.hwnd and int(step.hwnd) in live.typed_pending)
+            line = LINE_LINE_BREAK if by_break else LINE_TYPED_ENTER
+        return Verdict(REFUSE, 4, "undeclared_send", line=line)
     if step.tool != "run_skill" or sk is None or not getattr(sk, "sends", False):
         return Verdict(REFUSE, 4, "not_capability", line=LINE_NOT_CAPABILITY)
     _key, slots = skill_input(step, plan)
@@ -977,9 +1134,17 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
     names = _recipient_names(to, who, look, user_words)
     if not quote or not quote_in_words(quote, user_words, names):
         return Verdict(REFUSE, 4, "quote", line=LINE_QUOTE)
-    # what the message says came from them: their own words, or Yuki's wording of what they said in this exchange (the
-    # quote and their turns); nothing of it from them is naming only the person: a draft (rule 8)
-    share = 1.0 if own else said_share(body, [quote, *user_words], names)
+    # what the message says came from them, in the turns the quote stands in (never every turn of the exchange: what
+    # they said to Yuki for something else is not what to send): their own words, or Yuki's wording of what they said
+    # there, its words close together (said_share); nothing of it from them is naming only the person: a draft (rule
+    # 8). Review r1 M1.
+    turns = quote_turns(quote, user_words, names)
+    said = bool(step_text) and in_words(step_text, turns)
+    share = 1.0 if said else said_share(body, turns, names)
+    if share < SAID_SHARE and _said_elsewhere(body, step_text, to, who, user_words, quote, names, look):
+        # the quote is a turn that says nothing of the message ("Do it, bro") while another turn of theirs names the
+        # person and says it: the planner quotes that turn (a refusal it can fix, before any draft or ask)
+        return Verdict(REFUSE, 4, "quote_turn", line=LINE_QUOTE_TURN)
     if share <= 0.0:
         return _draft(step, sk, slots, body, own, "not_said")
     if not skill_sends(sk, slots, partial=False):
@@ -996,7 +1161,22 @@ def _send(step: Call, plan: Any, consent: dict[str, Any], user_words: list[str],
         # asked first, showing what goes to whom: a recipient their words don't plainly name (speech heard the name
         # another way), or Yuki's wording with little of their words in it; a yes is their plain instruction
         return Verdict(ASK, 4, "worded" if named else "recipient_unsaid", question=ask_send_question(body, to))
-    return Verdict(ALLOW, 4, "send" if own else "send_worded", countdown=True)
+    return Verdict(ALLOW, 4, "send" if said else "send_worded", countdown=True)
+
+
+def _said_elsewhere(body: str, step_text: str, to: str, who: str, user_words: Sequence[str], quote: str,
+                    names: Sequence[str], look: _People) -> bool:
+    """Whether a turn of the user's words the quote does not stand in names the recipient (:func:`_named_by_user`)
+    and says the message: the text is a span of it, or at least :data:`SAID_SHARE` of the text's words stand close
+    together in it (:func:`said_share`)."""
+    entries, held = _quote_turn_indices(quote, user_words, names)
+    for i, turn in enumerate(entries):
+        if i in held:
+            continue
+        says = (bool(step_text) and in_words(step_text, [turn])) or said_share(body, [turn], names) >= SAID_SHARE
+        if says and _named_by_user(to, who, [turn], look):
+            return True
+    return False
 
 
 def _draft(step: Call, sk: Any, slots: Mapping[str, Any], body: str, own: bool, why: str) -> Verdict:
@@ -1035,10 +1215,11 @@ def after_ask(verdict: Verdict) -> Verdict:
     return replace(verdict, result=ALLOW, countdown=verdict.row == 4)
 
 
-__all__ = ["ALLOW", "ASK", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME", "PLAIN_WHY",
-           "REFUSE", "RESULTS", "SAID_SHARE", "Call", "Live", "Verdict", "after_ask", "ask_send_question",
-           "calling_windows", "chat_window", "check", "draft_slots", "failed_question", "field_of", "game_now",
-           "in_words", "is_join_control", "join_controls", "may_commit", "near_duplicate", "person_slot", "plain_why",
-           "plan_consent", "policy_holds", "quote_in_words", "said_share", "screen_gate", "send_slots", "sends_now",
-           "skill_commit", "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot",
-           "traits_of", "typed_address", "navigates", "window_page"]
+__all__ = ["ALLOW", "ASK", "CHAT_KIND", "COMMITS", "DRAFT", "EFFECTS", "LINE_ASK_SEND", "LINE_DRAFTED", "LINE_GAME",
+           "NEWLINE_KINDS", "PLAIN_WHY", "REFUSE", "RESULTS", "SAID_SHARE", "SAID_SPAN", "Call", "Live", "Verdict",
+           "after_ask", "ask_send_question", "calling_windows", "chat_window", "check", "draft_slots",
+           "failed_question", "field_of", "game_now", "in_words", "is_join_control", "join_controls", "may_commit",
+           "maybe_send_question", "near_duplicate", "person_slot", "plain_why", "plan_consent", "policy_holds",
+           "quote_in_words", "quote_turns", "said_share", "screen_gate", "send_slots", "sends_now", "skill_commit",
+           "skill_input", "skill_joins", "skill_sends", "step_traits", "takes_screen", "text_slot", "traits_of",
+           "typed_address", "navigates", "window_kind", "window_page"]
