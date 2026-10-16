@@ -21,6 +21,14 @@ mechanism can serve them and re-emits both as one ``pressed(action)`` signal.
 Combos are written the way a user would type them. Key names are resolved through
 the current keyboard layout where possible, so ``"ctrl+alt+/"`` works on layouts
 where ``/`` is not where a US layout puts it.
+
+The default stays Alt+Shift (x12Overlay, after live 10 Oct 21:09:45, where it brought
+the ask bar up mid-run and the bar took the run's keyboard). The harm was the bar
+taking the foreground, not the chord: pressed while a run holds the desk, the bar now
+shows without the keyboard (:meth:`yuki.ui.overlay.Overlay.toggle`). The chord's
+menu-mask tap already keeps Windows from switching the input language on a press of
+it (:class:`ChordHookThread`), and the shortcut is the user's to change (Settings,
+"Open Yuki anywhere").
 """
 
 from __future__ import annotations

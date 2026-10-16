@@ -24,12 +24,36 @@ to the live chat thread (:class:`yuki.ui.chatview.ChatThreadView` over the tray'
 bubble per message, typed or spoken, Yuki's replies streaming in, and each
 response's steps. The card calls keep working (they return :class:`ThreadCard`
 stand-ins), so the controller in :mod:`yuki.ui.app` is unchanged.
+
+**A run's foreground is never taken** (x12Overlay; live 10 Oct 21:09:45 and 21:10:00 the hotkey brought the bar up
+mid-run, it took the keyboard, and the run's ctrl+t into Arc was refused twice: "Foreground window changed ... got
+'Yuki'"). Every key Yuki's hands send must land in the window the run works in, and only one window has the keyboard:
+
+* **the hotkey while a run holds the desk** (:func:`run_holds_desk`: a request working or about to act, Yuki's hands
+  at work, or the "Yuki is acting" marker) shows the bar *without* taking the keyboard: no foreground hand-over,
+  shown with ``WA_ShowWithoutActivating`` and pinned ``WS_EX_NOACTIVATE`` (so nothing activates it: not Windows
+  picking the next window when the run closes one), compact (the input row only, so it covers as little of the
+  run's window as it can) and a line that says to click it. The user's mouse press on it (watched on its native
+  window, before any child sees it) makes it the ask bar as usual and hands it the keyboard, the way the island's
+  steer box does. A run waiting on the user's typed answer doesn't count: they open the bar to answer it. Every other
+  way the bar opens (a question, a click on the island, a card's Reply, the tray, the window) is the user's or a
+  question's, and takes the keyboard as before;
+* **a submit while a run holds the desk** (an answer, words for a paused run, a request for the reading lane) closes
+  the bar, so the run's next keys don't meet it in front;
+* **closing while it holds the foreground** hands the keyboard straight back to the window that was in front before
+  it, not 150 ms later when the fade ends (a run's first step, sent the moment the bar steps aside for it, no longer
+  meets the fading bar in front).
+
+Plumbing only: who holds the keyboard is measured on the run's own state and on window handles, never on what
+anybody typed or said.
 """
 
 from __future__ import annotations
 
+import ctypes
+import os
 import time
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -56,6 +80,7 @@ from PySide6.QtWidgets import (
 )
 
 from yuki.ui import tokens as _tokens
+from yuki.ui.focus import FocusResult, set_no_activate
 from yuki.ui.surface import (
     ANIM_MS,
     CARD_BG,
@@ -98,7 +123,176 @@ SCROLL_STYLE = (
 #: a wait: nothing blocks on it.
 FOCUS_GRACE_MS = 200
 
+#: The bar shown without the keyboard (a run holds the desk): how often its line is read again (ms) -- whether a run
+#: still holds the desk, and which window is in front (where the keyboard goes back to). A UI timer, not a wait; it
+#: runs only while that bar shows.
+SPARE_TICK_MS = 1000
+#: Yuki's own input ended this recently: its hands are still on the desk, between two sends of one step (s).
+DESK_QUIET_S = 2.0
+#: A response in the thread with no sign of life for this long is not a run any more, whatever its status says (a
+#: lost end event): the "Yuki is acting" marker's own bound (:data:`yuki.memory.acting.MAX_AGE_S`).
+DESK_STALE_S = 600.0
+#: The bar's line while it shows without the keyboard, and once no run holds the desk any more.
+SPARE_LINE = "Yuki is mid-task. Click here to type."
+SPARE_FREE_LINE = "Click here to type."
+#: The input's own line.
+ASK_LINE = "Ask Yuki"
+#: Step kinds (:class:`yuki.ui.chat_model.Step`) that are Yuki's hands, or a thinker job, at work while they run.
+_HAND_STEPS = frozenset({"tool", "hand", "job"})
+
 CardTone = Literal["reply", "question", "error", "context", "nudge"]
+
+
+# -- who holds the desk -----------------------------------------------------------------------------------------------
+
+
+def _last_life(item: Any) -> float:
+    """The latest moment a thread response showed it was alive (epoch s): its bubble, its end, its steps."""
+    moments = [getattr(item, "at", 0.0), getattr(item, "ended_at", None) or 0.0]
+    for step in getattr(item, "steps", None) or []:
+        moments.append(getattr(step, "started", 0.0) or 0.0)
+        moments.append(getattr(step, "ended", None) or 0.0)
+    return max(float(m) for m in moments if isinstance(m, (int, float)))
+
+
+def own_input_recent() -> bool:
+    """One of Yuki's own input actions runs now, or ended under :data:`DESK_QUIET_S` ago (any hand in this process:
+    the worker's, the voice's, a routine card's; :mod:`yuki.actions.leases`)."""
+    try:
+        from yuki.actions import leases
+
+        if leases.own_input_now():
+            return True
+        at = float(leases.own_input_at() or 0.0)
+        return bool(at) and time.monotonic() - at <= DESK_QUIET_S
+    except Exception:  # noqa: BLE001 - no leases (an offline render): nobody's hands
+        return False
+
+
+def acting_marker() -> bool:
+    """The "Yuki is acting" marker stands (:mod:`yuki.memory.acting`: a request with its hands on the desktop, from
+    its first action to its end, in any of Yuki's processes; a dead process's or a stale one never counts)."""
+    try:
+        from yuki.memory import acting
+
+        return acting.current(None) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def run_holds_desk(model: Any, *, waiting: bool = False, now: float | None = None,
+                   own_input: Callable[[], bool] = own_input_recent,
+                   marker: Callable[[], bool] = acting_marker) -> str | None:
+    """Why a run holds the desk now (Yuki's hands are on the mouse and keyboard, or are about to be), as a short
+    content-free code, or ``None`` when the desk is the user's.
+
+    * ``hands``: a tool, a voice hand or a thinker job is running in the thread (``model``: the live
+      :class:`~yuki.ui.chat_model.ChatModel`; ``None`` in card mode);
+    * ``run``: a request is in hand (pending or running), between steps or still planning its first one (live
+      21:09:45: the request had read memory and was planning; it acted 5 s later);
+    * ``input``: Yuki's own input runs or just ended (:func:`own_input_recent`);
+    * ``acting``: the "Yuki is acting" marker stands (:func:`acting_marker`);
+    * ``question`` (``waiting`` only): a request waits on the user's typed answer.
+
+    ``waiting`` False (the hotkey opening the bar): a request waiting on the user's typed answer is not holding the
+    desk -- they open the bar to answer it, and it acts on nothing meanwhile -- and the acting marker, which such a
+    request keeps standing, is then not counted either. ``waiting`` True (a submit): it counts, because the answer
+    sets it acting again. A response with no sign of life for :data:`DESK_STALE_S` is not counted (a lost end event).
+    Nothing here reads what a message says: statuses, step kinds and times only.
+    """
+    t = time.time() if now is None else float(now)
+    question = False
+    items = list(getattr(model, "items", None) or []) if model is not None else []
+    for item in reversed(items):
+        if getattr(item, "kind", "") != "assistant":
+            continue
+        try:
+            if t - _last_life(item) > DESK_STALE_S:
+                continue
+        except (TypeError, ValueError):
+            continue
+        status = str(getattr(item, "status", "") or "")
+        if status == "question":
+            if waiting:
+                return "question"
+            question = True
+            continue
+        if any(getattr(s, "kind", "") in _HAND_STEPS and bool(getattr(s, "running", False))
+               for s in getattr(item, "steps", None) or []):
+            return "hands"
+        if getattr(item, "jobs", None) and status in ("pending", "running"):
+            return "run"
+    if own_input():
+        return "input"
+    if not question and marker():
+        return "acting"
+    return None
+
+
+# -- windows (handles only; every call is one Win32 query or SetForegroundWindow) -------------------------------------
+
+_U32: Any = None
+
+
+def _user32() -> Any:
+    """A private ``user32`` with its own prototypes (the process-wide ``windll.user32`` is shared; its ``restype``\\ s
+    are not this module's to set)."""
+    global _U32
+    if _U32 is None:
+        from ctypes import wintypes
+
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetForegroundWindow.argtypes = []
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u32.SetForegroundWindow.restype = wintypes.BOOL
+        for name in ("IsWindow", "IsWindowVisible", "IsIconic"):
+            getattr(u32, name).argtypes = [wintypes.HWND]
+            getattr(u32, name).restype = wintypes.BOOL
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        _U32 = u32
+    return _U32
+
+
+def foreground_window() -> int:
+    """The window in front now (0 when Windows can't say)."""
+    try:
+        return int(_user32().GetForegroundWindow() or 0)
+    except Exception:  # noqa: BLE001 - not on Windows
+        return 0
+
+
+def window_usable(hwnd: int) -> bool:
+    """``hwnd`` is a live, visible window that is not minimised: one the keyboard can be handed to."""
+    try:
+        u32 = _user32()
+        return bool(hwnd) and bool(u32.IsWindow(hwnd)) and bool(u32.IsWindowVisible(hwnd)) \
+            and not bool(u32.IsIconic(hwnd))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def window_is_ours(hwnd: int) -> bool:
+    """``hwnd`` belongs to this process (the bar, the island, a card): never a window to hand the keyboard back to."""
+    try:
+        from ctypes import wintypes
+
+        pid = wintypes.DWORD(0)
+        _user32().GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value) == os.getpid()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def give_foreground(hwnd: int) -> bool:
+    """Hand the foreground to ``hwnd`` (allowed: the caller's process holds it); True when Windows says it is in
+    front afterwards."""
+    try:
+        _user32().SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        return False
+    return foreground_window() == int(hwnd)
 
 
 class AskInput(QPlainTextEdit):
@@ -553,6 +747,9 @@ class Overlay(SurfaceWindow):
     the shortcut), then the Intent card when there is one (words an offer put here unsent; a request's resolved chips),
     the thread (the live chat, in the design's turns), and a foot of key hints with the call's timer.
 
+    Opened by the hotkey while a run holds the desk, it shows without the keyboard (see the module docstring:
+    :meth:`toggle`, :meth:`desk_held`); a click on it makes it the ask bar as usual.
+
     Signals:
         submitted: Text the user entered. The controller decides whether that is a
             new request or the answer to a pending question -- the overlay does not
@@ -585,6 +782,16 @@ class Overlay(SurfaceWindow):
         self._proxies: list[ThreadCard] = []
         #: The call's ``(timer, app)`` for the foot, or None (the tray gives it: the island's clock).
         self.call_line: Any = lambda: None
+        #: Why the bar shows without the keyboard (a :func:`run_holds_desk` code), or None: it has (or may take) it.
+        self._spare: str | None = None
+        #: The window that was in front before the bar (where a run works, or where the user was): the keyboard goes
+        #: back there when the bar closes while it holds the foreground. 0: none known.
+        self._yield_to = 0
+        #: The bar came up without the keyboard and ``opened`` waits until it is the ask bar (the user's click, or a
+        #: question): memory's cards move into a thread the user can see, never into the folded one.
+        self._opened_pending = False
+        self._presses_watched = False
+        self._dismissing = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 1)
@@ -600,7 +807,7 @@ class Overlay(SurfaceWindow):
         row.addWidget(self.face, 0, Qt.AlignmentFlag.AlignVCenter)
         self.input = AskInput(self.top_row)
         self.input.setFont(L.ui_font(19))
-        self.input.setPlaceholderText("Ask Yuki")
+        self.input.setPlaceholderText(ASK_LINE)
         self.input.submitted.connect(self._on_submit)
         self.input.escaped.connect(self.dismiss)
         self.input.wants_height.connect(self._on_input_height)
@@ -707,6 +914,9 @@ class Overlay(SurfaceWindow):
         self._grace_timer.setSingleShot(True)
         self._grace_timer.setInterval(FOCUS_GRACE_MS)
         self._grace_timer.timeout.connect(self._end_focus_grace)
+        self._spare_timer = QTimer(self)
+        self._spare_timer.setInterval(SPARE_TICK_MS)
+        self._spare_timer.timeout.connect(self._spare_tick)
         self.restyle()
 
     # -- look (the Lattice ask bar) -------------------------------------------------------------------------
@@ -749,9 +959,10 @@ class Overlay(SurfaceWindow):
         painter.setPen(QPen(L.ASKBAR_BORDER, 1.0))
         painter.drawPath(path)
         y = self.top_row.geometry().bottom() + 1
-        painter.fillRect(QRectF(1, y, self.width() - 2, 1), L.HAIR)    # under the input row
-        fy = self.foot.geometry().top()
-        painter.fillRect(QRectF(1, fy, self.width() - 2, 1), L.HAIR)   # over the foot
+        if not self.foot.isHidden():   # the bar without the keyboard is the input row alone
+            painter.fillRect(QRectF(1, y, self.width() - 2, 1), L.HAIR)    # under the input row
+            fy = self.foot.geometry().top()
+            painter.fillRect(QRectF(1, fy, self.width() - 2, 1), L.HAIR)   # over the foot
         painter.end()
 
     def _on_text(self) -> None:
@@ -814,6 +1025,7 @@ class Overlay(SurfaceWindow):
     def hideEvent(self, e: object) -> None:  # noqa: D102
         super().hideEvent(e)
         self._call_tick.stop()
+        self._end_spare(hidden=True)   # the next open decides afresh
 
     # -- thread mode (the live chat thread) ------------------------------------
 
@@ -876,15 +1088,16 @@ class Overlay(SurfaceWindow):
         return max(120, int(area.height() * MAX_CARDS_FRACTION))
 
     def fit(self) -> None:
-        """Size the thread to its content (capped), then the window to the layout. Keeps the top-left fixed."""
+        """Size the thread to its content (capped), then the window to the layout. Keeps the top-left fixed. The bar
+        shown without the keyboard keeps the thread folded away (it covers as little of the run's window as it can)."""
         if self.thread is not None:
-            content = self.thread.content_height() if self._thread_model.items else 0
+            content = self.thread.content_height() if self._thread_model.items and self._spare is None else 0
             stack = min(content, self.max_cards_height())
             if self.thread.height() != stack or self.thread.isVisible() != (stack > 0):
                 self.thread.setFixedHeight(stack)
                 self.thread.setVisible(stack > 0)
         else:
-            content = self._cards.sizeHint().height() if self.cards() else 0
+            content = self._cards.sizeHint().height() if self.cards() and self._spare is None else 0
             stack = min(content, self.max_cards_height())
             if self._scroll.height() != stack or self._scroll.isVisible() != (stack > 0):
                 self._scroll.setFixedHeight(stack)
@@ -948,47 +1161,226 @@ class Overlay(SurfaceWindow):
     def focus_target(self) -> QWidget:  # noqa: D102 - SurfaceWindow hook
         return self.input
 
-    def open(self) -> None:
+    def desk_held(self, *, waiting: bool = False) -> str | None:
+        """Why a run holds the desk now (:func:`run_holds_desk` over this bar's thread), or None. A check that fails
+        says None: the bar then behaves as it always did."""
+        try:
+            return run_holds_desk(self._thread_model, waiting=waiting)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def open(self, *, spare_run: bool = False) -> None:
         """Show the overlay (or just refocus it) with the input ready to type in (the grace period is armed before
-        anything is shown, so the hand-over's activation messages never read as "clicked away")."""
+        anything is shown, so the hand-over's activation messages never read as "clicked away").
+
+        ``spare_run`` (the hotkey, :meth:`toggle`): if a run holds the desk as the bar comes up
+        (:meth:`desk_held`), the bar shows **without the keyboard** -- no foreground hand-over, shown with
+        ``WA_ShowWithoutActivating`` and then pinned ``WS_EX_NOACTIVATE``, the input row alone with a "click here to
+        type" line, ``opened`` held back until it is the ask bar -- so the run's keys keep landing where it works; the
+        user's press on the bar makes it the ask bar as usual (:meth:`_claim`). Every other caller (a question, a
+        click on the island or a card, the tray, the window) takes the keyboard, as before; on a bar showing without
+        it, that takes it now."""
         coming_up = not self.isVisible() or self.closing
-        self._focus_grace = True
-        self._grace_timer.start()
+        why = self.desk_held() if spare_run and coming_up else None
+        emit_opened = coming_up
+        if why:
+            self._begin_spare(why)
+        else:
+            if self._spare is not None:
+                # the bar showing without the keyboard becomes the ask bar: the ``opened`` it held back goes out
+                # once, below
+                emit_opened = emit_opened or self._opened_pending
+                self._opened_pending = False
+                self._end_spare()
+            self._focus_grace = True
+            self._grace_timer.start()
         self.expand_input()
         self.fit()
         self.fade_in(self.anchor())
-        if coming_up:
+        self._watch_presses()
+        if self._spare is not None:
+            # after the show (fade_in clears the pin on a hidden window): from here nothing activates it, not even a
+            # click -- the user's press takes the keyboard itself (_claim)
+            set_no_activate(self._hwnd(), True)
+            self._opened_pending = self._opened_pending or coming_up
+        elif emit_opened:
             self.opened.emit()
 
-    def dismiss(self) -> None:
-        """Hide the overlay and tell the controller it is gone."""
-        if not self.isVisible() or self.closing:
+    def dismiss(self, why: str = "") -> None:
+        """Hide the overlay and tell the controller it is gone. Holding the foreground, it first hands it straight
+        back to the window that was in front before it (:meth:`_give_back`; first, so "Reduce motion", which hides at
+        once, gives it back too). ``why``: for that log line only."""
+        if not self.isVisible() or self.closing or self._dismissing:
             return
-        self.fade_out()
+        self._dismissing = True   # the give-back's own deactivation must not dismiss a second time
+        try:
+            self._give_back(why or "close")
+            self.fade_out()
+        finally:
+            self._dismissing = False
         self.dismissed.emit()
 
     def toggle(self) -> None:
-        """Open if hidden, dismiss if shown."""
+        """The hotkey: open if hidden (sparing a run that holds the desk: :meth:`open`), dismiss if shown."""
         if self.isVisible() and not self.closing:
-            self.dismiss()
+            self.dismiss("hotkey")
         else:
-            self.open()
+            self.open(spare_run=True)
 
     def changeEvent(self, event: QEvent) -> None:  # noqa: D102 - Qt override
         super().changeEvent(event)
-        if (
-            event.type() == QEvent.Type.ActivationChange
-            and self.isVisible()
-            and not self.isActiveWindow()
-            and not self._focus_grace
-        ):
+        if event.type() != QEvent.Type.ActivationChange or not self.isVisible():
+            return
+        if self._spare is not None:
+            # shown without the keyboard, pinned no-activate: the user's click takes it through _claim, before any
+            # activation. Becoming active here is somebody else's doing (Windows picking the next window as the run
+            # closes one): the keyboard goes straight back; with nowhere to give it, the bar is the ask bar as usual.
+            # Losing an activation it never had is nothing.
+            if self.isActiveWindow() and self._give_back("not_clicked") == "nowhere":
+                self._end_spare()
+            return
+        if not self.isActiveWindow() and not self._focus_grace:
             self.dismiss()
+
+    def _watch_presses(self) -> None:
+        """Watch the bar's native window for mouse presses (once): every press anywhere on the bar reaches the window
+        before the child under it, so the bar showing without the keyboard can hand it over on the user's click."""
+        handle = self.windowHandle()
+        if handle is not None and not self._presses_watched:
+            handle.installEventFilter(self)
+            self._presses_watched = True
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: D102 - Qt override
+        if (
+            self._spare is not None
+            and event.type() == QEvent.Type.MouseButtonPress
+            and watched is self.windowHandle()
+            and not self.closing
+        ):
+            self._claim()
+        return super().eventFilter(watched, event)   # the press goes on to the child (a caret, Speak) as usual
+
+    def _claim(self) -> None:
+        """The user's press on the bar showing without the keyboard: it is the ask bar now, and takes the keyboard
+        (the press made Yuki the receiver of the last input, so the hand-over is allowed; the grace covers its
+        transient activation messages)."""
+        self._end_spare(clicked=True)
+        self._focus_grace = True
+        self._grace_timer.start()
+        self.take_focus(reason="clicked")
 
     def _end_focus_grace(self) -> None:
         """Close the grace window; if the hand-over did not stick, try once more (without the injected key-up)."""
         self._focus_grace = False
         if self.isVisible() and not self.closing and not self.isActiveWindow():
             self.take_focus(reason="grace_end", allow_unlock=False)
+
+    def take_focus(self, *, reason: str, allow_unlock: bool = True) -> FocusResult:
+        """:meth:`SurfaceWindow.take_focus`, except while the bar spares a run (then nothing is taken, and the
+        ``focus_path`` record says so: ``path`` ``spare_run``, ``why``). Remembers the window that was in front
+        before (:attr:`_yield_to`)."""
+        if self._spare is not None:
+            own, front = self._hwnd(), foreground_window()
+            if front and not self._is_own(front):
+                self._yield_to = front
+            self.focus_path.emit({"window": self.objectName(), "reason": reason, "path": "spare_run",
+                                  "why": self._spare, "ok": False, "hwnd": own, "foreground_before": front,
+                                  "foreground_after": front})
+            return FocusResult(ok=False, path="spare_run", hwnd=own, foreground_before=front, foreground_after=front,
+                               attached=False, attach_error=0, set_foreground_returned=[], injected=0,
+                               elapsed_ms=0.0)
+        result = super().take_focus(reason=reason, allow_unlock=allow_unlock)
+        before = int(result.foreground_before or 0)
+        if before and not self._is_own(before):
+            self._yield_to = before
+        return result
+
+    # -- sparing a run (the bar without the keyboard) ---------------------------------------------------------------
+
+    def _hwnd(self) -> int:
+        try:
+            return int(self.winId())
+        except Exception:  # noqa: BLE001 - gone
+            return 0
+
+    def _is_own(self, hwnd: int) -> bool:
+        return int(hwnd) == self._hwnd() or window_is_ours(int(hwnd))
+
+    def _begin_spare(self, why: str) -> None:
+        """Show without the keyboard: the input row alone (the thread and the foot fold away), a "click here to
+        type" line, no foreground hand-over, and the window in front kept as the one to give back to."""
+        self._spare = why
+        self._focus_grace = False
+        self._grace_timer.stop()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.foot.setVisible(False)
+        self.face.set_state("idle")
+        self.input.setPlaceholderText(SPARE_LINE)
+        front = foreground_window()
+        if front and not self._is_own(front):
+            self._yield_to = front
+        self._spare_timer.start()
+
+    def _end_spare(self, *, clicked: bool = False, hidden: bool = False) -> None:
+        """Back to the ask bar as usual: the thread folds back in, and the ``opened`` it held back goes out now
+        (``clicked``: the user's press on it, its input gets the keyboard; ``hidden``: it closed without ever being the
+        ask bar, so nothing opened)."""
+        was = self._spare
+        if was is None:
+            return
+        pending, self._opened_pending = self._opened_pending, False
+        self._spare = None
+        self._spare_timer.stop()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        own = self._hwnd()
+        if own:
+            set_no_activate(own, False)
+        self.foot.setVisible(True)
+        self.face.set_state("listening")
+        self.input.setPlaceholderText(ASK_LINE)
+        if clicked:
+            self.input.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+            self.focus_path.emit({"window": self.objectName(), "reason": "clicked", "path": "user_click",
+                                  "ok": True, "was": was})
+        self.fit()
+        if pending and not hidden:
+            self.opened.emit()
+
+    def _spare_tick(self) -> None:
+        """While the bar shows without the keyboard: its line follows whether a run still holds the desk, and the
+        window in front is the one the keyboard goes back to."""
+        if self._spare is None or not self.isVisible() or self.closing:
+            self._spare_timer.stop()
+            return
+        held = self.desk_held()
+        if held:
+            self._spare = held
+        line = SPARE_LINE if held else SPARE_FREE_LINE
+        if self.input.placeholderText() != line:
+            self.input.setPlaceholderText(line)
+        front = foreground_window()
+        if front and not self._is_own(front):
+            self._yield_to = front
+
+    def _give_back(self, why: str) -> str:
+        """The bar holds the foreground and must not (it is closing, or it spares a run): the window that was in
+        front before it gets the keyboard now (a run's next key lands where it works), not when the fade ends.
+
+        Returns ``not_holding`` (the bar doesn't hold the foreground: the user clicked away, a run focused its
+        window, or it never had it -- nothing to do), ``given``, or ``nowhere`` (that window is gone, minimised or
+        Yuki's own, or Windows refused)."""
+        own = self._hwnd()
+        if not own or foreground_window() != own:
+            return "not_holding"
+        target = int(self._yield_to or 0)
+        if not target or self._is_own(target) or not window_usable(target):
+            self.focus_path.emit({"window": self.objectName(), "reason": "give_back", "why": why,
+                                  "path": "nowhere", "ok": False})
+            return "nowhere"
+        ok = give_foreground(target)
+        self.focus_path.emit({"window": self.objectName(), "reason": "give_back", "why": why,
+                              "path": "set_foreground", "ok": ok, "hwnd": target})
+        return "given" if ok else "nowhere"
 
     # -- cards -------------------------------------------------------------
 
@@ -1097,10 +1489,16 @@ class Overlay(SurfaceWindow):
         self.input.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_submit(self, text: str) -> None:
-        """Hand the text to the controller; the field empties."""
+        """Hand the text to the controller; the field empties. If a run held the desk before this submit (counting
+        one waiting on this very answer), the bar then closes and gives the keyboard back: the words went to the run
+        (an answer, words for a paused run) or to the reading lane beside it, and the run's next keys must not meet
+        the bar in front. The request this submit starts itself is not that run (it is judged before the submit)."""
+        held = self.desk_held(waiting=True)
         self.collapse_input()
         self.clear_intent()
         self.submitted.emit(text)
+        if held and self.isVisible() and not self.closing:
+            self.dismiss("submit_during_run")
 
 
 class ThreadCard(QObject):
