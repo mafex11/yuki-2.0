@@ -749,10 +749,21 @@ HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. When a hand's try does not take effect, it is handed \
 to the thinker by itself, with the report and the window already read: you are told it was passed on, you say \
 nothing then, and its outcome comes back to you to say once. Never try again, never try another key or hand \
-to fix it, never undo it yourself: your hands stay still until they speak again. When a hand was refused \
-(nothing was done) because it is already as they want, say so in a few plain words ("that tab's gone already"); \
-otherwise hand their request over now (say_first "On it."). Never the report's own terms, and never ask them for a \
-number."""
+to fix it, never undo it yourself: your hands stay still until they speak again. When nothing was done and nothing \
+was passed on: if it is already as they want, say so in a few plain words ("that tab's gone already"); if a game is \
+in front or Act is off for that app (a report or this block says so), say in a few words that it can't be done now \
+("Can't right now.") and never hand it over, not even when they insist ("just do it"); else hand their request over \
+now (say_first "On it."). Never the report's own terms, and never ask them for a number."""
+
+#: Review r1 H1 (D17(2)): with a game in front, a request a hand could not do is never handed to the thinker, also on
+#: the turn after, when they insist and the cores' "just do it: hand it over" rule pulls the other way. It goes last in
+#: the volatile block (after the desktop), only while a game is in front and a hand was in trouble a moment ago.
+GAME_TROUBLE_NOTE = (
+    "[Private, never to be said: a game is in front and a hand of yours just could not do what they asked. That request "
+    "stays undone until they leave the game, even when they insist (\"just do it\", \"try again\"): no {tool} for it "
+    "and no other hand; say in a few words that it can't be done now (\"Can't right now.\"), no reason. A new, "
+    "different request is as usual.]"
+)
 
 REOPEN_GUIDE = """\
 A tab or window was closed in this conversation. A closed tab comes back only with the tab hand's reopen, with \
@@ -1030,8 +1041,10 @@ on its own, and start every reply as a whole sentence."""
 LEAN_HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. One that did not take effect went on by itself, by code: \
 say nothing; its outcome comes back to you to say once. Never retry it, try another hand or undo it. One that was \
-refused did nothing: if it is already as they want, say so in a few plain words; otherwise hand_over now (say_first \
-"On it."), never asking them for a number."""
+refused did nothing: if it is already as they want, say so in a few plain words; if a game is in front or Act is off \
+for that app (a report or this block says so), say in a few words that it can't be done now ("Can't right now.") and \
+never hand it over, not even when they insist ("just do it"); else hand_over now (say_first "On it."), never asking \
+them for a number."""
 
 LEAN_REOPEN_GUIDE = """\
 A tab or window was closed in this conversation. A closed tab comes back only with the tab hand's reopen, expect set \
@@ -2295,7 +2308,8 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     Speech line, :data:`WORK_GUIDE` with a thinker line, and from ``state``: ``hand_trouble`` (a hand of the talker's
     did not take effect or was refused a moment ago: :data:`HAND_TROUBLE_NOTE`), ``closed`` (a tab or window was closed
     in this conversation: :data:`REOPEN_GUIDE`), ``held`` (H2: the words of its last reply that were held back, too long
-    to say at once: :data:`HELD_NOTE`).
+    to say at once: :data:`HELD_NOTE`). With ``hand_trouble`` and a game in ``state["focus"]``, :data:`GAME_TROUBLE_NOTE`
+    also goes last, after the desktop (x4 review r1 H1).
 
     ``practice`` (v3.18): practice memory's lines for these words (:mod:`yuki.voice.practice`): the Lessons line (the
     apps in play's pitfalls and habits, at most 400 characters) and, when one qualifies, the Learned ways line; they go
@@ -2394,6 +2408,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n" if state.get("skills_now") else "\n\n") + "[" + options_line + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
+    if state.get("hand_trouble") and focus and focus.get("game"):
+        # review r1 H1: last, so it outweighs the cores' "just do it: hand it over"
+        text += "\n\n" + GAME_TROUBLE_NOTE.format(tool="hand_over" if lean else "tell_yuki")
     if (channel or "").strip().lower() == "marker":
         text += "\n\n" + MARKER_REMINDER
     return {"type": "text", "text": text}
