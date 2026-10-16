@@ -751,18 +751,29 @@ to the thinker by itself, with the report and the window already read: you are t
 nothing then, and its outcome comes back to you to say once. Never try again, never try another key or hand \
 to fix it, never undo it yourself: your hands stay still until they speak again. When nothing was done and nothing \
 was passed on: if it is already as they want, say so in a few plain words ("that tab's gone already"); if a game is \
-in front or Act is off for that app (a report or this block says so), say in a few words that it can't be done now \
+in front or Act is off for that app (its report says so), say in a few words that it can't be done now \
 ("Can't right now.") and never hand it over, not even when they insist ("just do it"); else hand their request over \
 now (say_first "On it."). Never the report's own terms, and never ask them for a number."""
 
 #: Review r1 H1 (D17(2)): with a game in front, a request a hand could not do is never handed to the thinker, also on
 #: the turn after, when they insist and the cores' "just do it: hand it over" rule pulls the other way. It goes last in
-#: the volatile block (after the desktop), only while a game is in front and a hand was in trouble a moment ago.
+#: the volatile block (after the desktop). Review r2 M1: only when code says the hands' last trouble was a game's
+#: (``state["hand_game"]``: the gate refused it, or its report named the game in front), never on the focus state
+#: alone: that is "fullscreen" for any full-screen window, a YouTube video too, and a hand that fails there is an
+#: ordinary failure that falls back as usual (Principle 1).
 GAME_TROUBLE_NOTE = (
     "[Private, never to be said: a game is in front and a hand of yours just could not do what they asked. That request "
     "stays undone until they leave the game, even when they insist (\"just do it\", \"try again\"): no {tool} for it "
     "and no other hand; say in a few words that it can't be done now (\"Can't right now.\"), no reason. A new, "
     "different request is as usual.]"
+)
+#: Review r2 M1, until the pipeline sets ``state["hand_game"]`` (the key absent): a hand was in trouble with a
+#: full-screen window in front, which may be a game or a video, so the rule is keyed to the hand's own report.
+GAME_REPORT_NOTE = (
+    "[Private, never to be said: when a hand's report just now says a game is in front, that request stays undone "
+    "until they leave the game, even when they insist (\"just do it\", \"try again\"): no {tool} for it and no other "
+    "hand; say in a few words that it can't be done now (\"Can't right now.\"), no reason. A report that names no "
+    "game, or one that was passed on, is handled as usual, and so is a new, different request.]"
 )
 
 REOPEN_GUIDE = """\
@@ -1042,7 +1053,7 @@ LEAN_HAND_TROUBLE_NOTE = """\
 A hand of yours just did not take effect or was refused. One that did not take effect went on by itself, by code: \
 say nothing; its outcome comes back to you to say once. Never retry it, try another hand or undo it. One that was \
 refused did nothing: if it is already as they want, say so in a few plain words; if a game is in front or Act is off \
-for that app (a report or this block says so), say in a few words that it can't be done now ("Can't right now.") and \
+for that app (its report says so), say in a few words that it can't be done now ("Can't right now.") and \
 never hand it over, not even when they insist ("just do it"); else hand_over now (say_first "On it."), never asking \
 them for a number."""
 
@@ -2245,19 +2256,25 @@ def skills_options_line(options: Any) -> str | None:
     the name exactly as listed), that words which left the pick to Yuki ("put something on") run the first one with no
     question (x4, 10 Oct: the talker asked "what d'you want to play?" for "put something on YouTube"), else the
     question once ("New from NDL, Deji and Sidemen: want one?" when the done line did not already say it), and that
-    nothing plays otherwise. The pick comes first, so a cut at the cap drops the question, never the run."""
+    nothing plays otherwise. Over the cap the titles get shorter, then go; only then is the end cut, and the pick comes
+    first, so a cut drops the question, never the run."""
     parts = [_option_parts(o) for o in (options or [])]
     parts = [(n, t) for n, t in parts if n][:3]
     if not parts:
         return None
     names = [n for n, _t in parts]
     said = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
-    listed = " | ".join(n + (f" ({t[:OPTION_TITLE_CHARS].rstrip()})" if t else "") for n, t in parts)
-    text = (f"Offered on request, nothing plays: new uploads from {listed}. Their pick (\"the {min(names, key=len)} "
-            f"one\"), or the first when their words left the pick to you (\"put something on\"): run_skill "
-            f"{PICK_SKILL}, video = its name as listed, no question. Else, unless said already, ask once: \"New from "
-            f"{said}: want {'it' if len(names) == 1 else 'one'}?\"")
-    return text if len(text) <= SKILLS_OPTIONS_CHARS else text[: SKILLS_OPTIONS_CHARS - 1].rstrip() + "…"
+    text = ""
+    # x4 review r2 L3: over the cap, the titles get shorter (then go) before anything is cut, so the question stays whole
+    for cap in (OPTION_TITLE_CHARS, OPTION_TITLE_CHARS // 2, 0):
+        listed = " | ".join(n + (f" ({t[:cap].rstrip()})" if t and cap else "") for n, t in parts)
+        text = (f"Offered on request, nothing plays: new uploads from {listed}. Their pick (\"the "
+                f"{min(names, key=len)} one\"), or the first when their words left the pick to you (\"put something "
+                f"on\"): run_skill {PICK_SKILL}, video = its name as listed, no question. Else, unless said already, ask "
+                f"once: \"New from {said}: want {'it' if len(names) == 1 else 'one'}?\"")
+        if len(text) <= SKILLS_OPTIONS_CHARS:
+            return text
+    return text[: SKILLS_OPTIONS_CHARS - 1].rstrip() + "…"
 
 
 def fetch_skills_options(memory: Any, *, timeout_s: float = 0.3, now: float | None = None) -> list[dict[str, str]]:
@@ -2308,8 +2325,10 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     Speech line, :data:`WORK_GUIDE` with a thinker line, and from ``state``: ``hand_trouble`` (a hand of the talker's
     did not take effect or was refused a moment ago: :data:`HAND_TROUBLE_NOTE`), ``closed`` (a tab or window was closed
     in this conversation: :data:`REOPEN_GUIDE`), ``held`` (H2: the words of its last reply that were held back, too long
-    to say at once: :data:`HELD_NOTE`). With ``hand_trouble`` and a game in ``state["focus"]``, :data:`GAME_TROUBLE_NOTE`
-    also goes last, after the desktop (x4 review r1 H1).
+    to say at once: :data:`HELD_NOTE`). With ``hand_trouble``, a game note also goes last, after the desktop (x4 review
+    r1 H1): :data:`GAME_TROUBLE_NOTE` when ``state["hand_game"]`` (set by the pipeline: the hands' last trouble was a
+    game's) is true; with that key absent, :data:`GAME_REPORT_NOTE` (keyed to the hand's report) when
+    ``state["focus"]`` has a game or a full-screen window (review r2 M1). ``hand_game`` false: no game note.
 
     ``practice`` (v3.18): practice memory's lines for these words (:mod:`yuki.voice.practice`): the Lessons line (the
     apps in play's pitfalls and habits, at most 400 characters) and, when one qualifies, the Learned ways line; they go
@@ -2340,7 +2359,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     if focus:
         # vGame: a full-screen game in front or a call on (measured states, set by the conversation)
         game, on_call = focus.get("game"), bool(focus.get("call"))
-        where = ((f"in a game ({game})" if isinstance(game, str) and game else "in a full-screen game or video")
+        # review r2 M1: "fullscreen" is any full-screen window in front (session._game_now), a video too: never "a game"
+        named_game = isinstance(game, str) and game and game != "fullscreen"
+        where = ((f"in a game ({game})" if named_game else "in a full-screen game or video")
                  + (" and on a voice call" if on_call else "")) if game else "on a voice call"
         text += "\n[" + (LEAN_FOCUS_GUIDE.format(where=where) if lean else
                           skill_guide(FOCUS_GUIDE.format(where=where), keys)) + "]"
@@ -2408,9 +2429,16 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n" if state.get("skills_now") else "\n\n") + "[" + options_line + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
-    if state.get("hand_trouble") and focus and focus.get("game"):
-        # review r1 H1: last, so it outweighs the cores' "just do it: hand it over"
-        text += "\n\n" + GAME_TROUBLE_NOTE.format(tool="hand_over" if lean else "tell_yuki")
+    if state.get("hand_trouble"):
+        # review r1 H1: last, so it outweighs the cores' "just do it: hand it over". Review r2 M1: keyed to the hands'
+        # own game signal when the pipeline gives it (the key present), else to the hand's report, never to the focus
+        # state alone ("fullscreen" is any full-screen window: a video in Arc too)
+        if "hand_game" in state:
+            game_note = GAME_TROUBLE_NOTE if state.get("hand_game") else None
+        else:
+            game_note = GAME_REPORT_NOTE if focus and focus.get("game") else None
+        if game_note:
+            text += "\n\n" + game_note.format(tool="hand_over" if lean else "tell_yuki")
     if (channel or "").strip().lower() == "marker":
         text += "\n\n" + MARKER_REMINDER
     return {"type": "text", "text": text}
