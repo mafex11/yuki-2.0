@@ -459,6 +459,11 @@ class Checks:
         done_skills: Skills whose skill route ended done in this request (sBrainFix, F2: the planner was then asked
             for the rest of the request): that exact skill is not run again here (its family still may, for another
             value).
+        words: The user's own words of this request (bRound2, F1c: a send's text is measured against them,
+            :func:`send_text_error`); empty: not measured.
+        text_bounced: A send's text that kept too few of their words was already sent back once in this request
+            (the next one is accepted, and row 4 asks with that text). ``bounced_now``: it was this call's plan (one
+            Checks per model call), so the same plan validated again is bounced the same.
     """
 
     plan_id: str
@@ -471,6 +476,9 @@ class Checks:
     current_plan: str | None = None
     spent_skills: frozenset[str] = frozenset()
     done_skills: frozenset[str] = frozenset()
+    words: tuple[str, ...] = ()
+    text_bounced: bool = False
+    bounced_now: bool = False
 
 
 #: A hand-off whose skill never ran its own way to the end: one of its steps would send or join with no plan behind it
@@ -785,6 +793,10 @@ def parse_header(raw: Mapping[str, Any], checks: Checks) -> Plan:
             errors.append("a send needs consent.quote (the user's words asking for it), consent.to and consent.text")
         if consent.commit == "join" and not (consent.quote and consent.to):
             errors.append("a join needs consent.quote (the user's words asking for it) and consent.to")
+        if consent.commit == "send" and consent.quote and consent.to and consent.text:
+            bounce = send_text_error(consent, checks)
+            if bounce:
+                errors.append(bounce)
         if consent.commit != "none" and kind != "act":
             errors.append("only an act plan commits anything: consent.commit none for an answer or a question")
     raw_done = raw.get("done")
@@ -1109,6 +1121,36 @@ def _check_verb(step: Step, header: Plan, checks: Checks, prior: Sequence[Step],
                              f"pressing send; with no capability for that app, leave a draft and tell the user"])
 
 
+#: bRound2 (F1c): a send whose text keeps too few of the words the user said for it goes back to the planner once.
+LINE_SEND_TEXT = ("consent.text: write the message in the words they said for it, turned to that person (him or her "
+                  "becomes you), never reworded, restyled or translated (the text slot the same); if they asked for "
+                  "other words or another language, send this plan again unchanged")
+
+
+def send_text_error(consent: Consent, checks: Checks) -> str | None:
+    """bRound2 (F1c, 16 Oct B31: "...ask him, like, when he will come and join the VC." planned as "Bhai kab aa rha VC
+    join karne?" in 3 of 3 sBrainFix runs and sent so after the user's yes on main; B35 "...ask him when he will come"
+    planned as "bhai kab aayega VC join karne?", which keeps none of their words, so row 4 left a draft of a send
+    they plainly asked for): a send's ``consent.text`` that keeps too few of the words the user said for it
+    (``consent.said_share`` below ``consent.SAID_SHARE`` in every one of their turns of this request, the recipient's
+    names aside; none at all included) is sent back to the planner once in a request (:data:`LINE_SEND_TEXT`). A second
+    plan, the same or not, is accepted, and row 4 decides as before (asked with the exact text, or a draft when none
+    of it is theirs). A count of words in whatever language they spoke, never a reading of them; ``None`` when there
+    is nothing to measure."""
+    if (checks.text_bounced and not checks.bounced_now) or not checks.words:
+        return None
+    from yuki.brain import consent as rules
+
+    # measured in every turn of theirs in this request, each on its own (row 4 then measures in the quote's turns and
+    # sends a quote of a turn that says nothing of the message, "Yeah.", back to quote the one that does)
+    turns = [str(w) for w in checks.words if str(w).strip()]
+    share = rules.said_share(str(consent.text or ""), turns, [str(consent.to or "")])
+    if share < rules.SAID_SHARE:
+        checks.text_bounced = checks.bounced_now = True   # this call's plan read again bounces the same
+        return LINE_SEND_TEXT
+    return None
+
+
 def validate_plan(raw: Mapping[str, Any], checks: Checks) -> Plan:
     """The whole plan, validated (header, each step, and the rules over all steps); raises :class:`PlanError` with
     every error found."""
@@ -1250,6 +1292,7 @@ class ExecResult:
 
 
 __all__ = [
+    "send_text_error", "LINE_SEND_TEXT",
     "ACT_VERBS", "READ_VERBS", "VERBS", "KINDS", "COMMITS", "SKILL_PROBES", "GENERIC_PROBES", "PROBES", "PROBE_ARGS",
     "ENGINE_ONLY_PROBES", "LOOK_WHATS", "WINDOW_ACTIONS", "TAB_ACTIONS", "MEMORY_KINDS", "VERB_FIELDS", "PLAN_TOOL",
     "STEPS_ROUTE", "SKILL_ROUTE_PREFIX", "MAX_STEPS", "plan_schema", "Target", "Consent", "Probe", "Element", "Step",

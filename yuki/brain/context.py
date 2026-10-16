@@ -74,6 +74,21 @@ SEED_DRAFT_LINE = ("A message done by steps is typed, never sent: leave it as a 
 #: The most names a seed's ``seen`` list shows (IF-seed: up to 40, kept in RAM only), and their room in characters.
 SEEN_MAX = 40
 SEEN_CHARS = 700
+#: bRound2 (B08): what memory ties to a hand-off's missing value (:func:`seed_memory`), read within this wait
+#: (alongside the request turn's other reads: the pairing is one keyed read, the facts two keyword reads), at most
+#: ``SEED_MEMORY_NAMES`` of the names the skill read, from the newest ``SEED_RECALL_N`` hits of each read.
+SEED_MEMORY_WAIT_S = 1.5
+SEED_RECALL_N = 10
+SEED_MEMORY_NAMES = 3
+#: How a pick memory holds is said to the planner (code's words, the names fenced after it): ``paired`` the pairing the
+#: Spotify driver learned when that row played for those very words (``taste.said_target``), ``facts`` the names of
+#: the rows read that memory's own facts about the words name.
+SEED_MEMORY_LINES: dict[str, str] = {
+    "paired": ('Memory: their "{value}" is the {missing} below (it played for those very words before). Do it by '
+               'steps now with that one; no question.'),
+    "facts": ('Memory\'s facts about their "{value}" {missing} name {which} below. Do it by steps now with {that}; no '
+              'question.'),
+}
 CHECK_LABEL = "[Yuki's check, not the user]"
 STEER_LABEL = "[The user added while you were working]"
 ANSWER_LABEL = "[The user's answer to your question]"
@@ -451,7 +466,133 @@ def recent_block(history: Sequence[Exchange], *, limit: int) -> str:
     return RECENT_LABEL + "\n" + "\n\n".join(parts)
 
 
-def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -> str:
+def _fold(text: Any) -> str:
+    return " ".join(str(text or "").split()).casefold()
+
+
+def _names_in(name: str, text: str) -> bool:
+    """Whether ``name`` stands in ``text`` whole (case and spacing folded; never inside a longer word): identity of a
+    name the screen showed in memory's own text, never a reading of it."""
+    want, hay = _fold(name), _fold(text)
+    if not want:
+        return False
+    at = hay.find(want)
+    while at >= 0:
+        before = hay[at - 1] if at > 0 else " "
+        after = hay[at + len(want)] if at + len(want) < len(hay) else " "
+        if not (before.isalnum() and want[0].isalnum()) and not (after.isalnum() and want[-1].isalnum()):
+            return True
+        at = hay.find(want, at + 1)
+    return False
+
+
+def seed_memory(memory: Any, seed: Mapping[str, Any] | None, *, timeout_s: float = SEED_MEMORY_WAIT_S
+                ) -> dict[str, Any] | None:
+    """bRound2 (B08): which of the names a skill read on screen memory ties to the value its routes found no row for
+    (IF-seed ``missing``, the value the caller gave in ``slots``, the names in ``seen``), so the planner plays it
+    rather than asking "which one's your Japanese playlist?" (16 Oct: 2 of 6 runs asked, though memory's facts say
+    the user's Japanese and anime playlist is ネオン and the 4 Oct session played it for those words):
+
+    * ``paired``: the row the skill's driver learned for these very words when it played for them
+      (``yuki.skills.taste.said_target``, the slot's taste kind);
+    * else ``facts``: the names read that stand whole in memory's session summaries and facts holding every word of
+      "<value> <slot>" (its own keyword reads, newest first), at most :data:`SEED_MEMORY_NAMES`.
+
+    ``{"value", "missing", "names", "from"}``, or ``None`` (no missing value, nothing read, memory can't say, or none
+    of the names). Identity of names in memory's own text; never a reading of the words. RAM only."""
+    if not isinstance(seed, Mapping):
+        return None
+    missing = seed.get("missing")
+    slots = seed.get("slots")
+    seen = seed.get("seen")
+    if not isinstance(missing, str) or not missing.strip() or not isinstance(slots, Mapping) \
+            or not isinstance(seen, (list, tuple)) or not seen:
+        return None
+    value = slots.get(missing)
+    if isinstance(value, Mapping):
+        # the seed's slots carry {"value", "from"} (engine's hand-off), the value itself maybe a taste pick {"name"}
+        value = value.get("value") if "value" in value else value.get("name")
+    if isinstance(value, Mapping):
+        value = value.get("name")
+    value = one_line(value, 80) if isinstance(value, str) else ""
+    names = [one_line(n, 80) for n in seen if str(n or "").strip()][:SEEN_MAX]
+    call = getattr(memory, "call", None)
+    if not value or not names or not callable(call):
+        return None
+    kind = ""
+    try:
+        from yuki.skills.catalog import load
+        from yuki.skills.taste import slot_kind
+
+        sk = load().get(str(seed.get("skill") or seed.get("key") or ""))
+        sl = sk.slot(missing) if sk is not None else None
+        kind = str(slot_kind(sk, sl) or "") if sl is not None else ""
+    except Exception:  # noqa: BLE001 - no pairing then; the facts still may say
+        kind = ""
+
+    def go(client: Any) -> tuple[str | None, list[str]]:
+        store = getattr(client, "store", client)
+        paired = None
+        if kind:
+            from yuki.skills.taste import said_target
+
+            paired = said_target(store, kind, value)
+        texts: list[str] = []
+        if not paired:
+            # memory's own keyword reads (every word present, newest first): the session summaries (what they asked
+            # and Yuki did), then the facts; no embedder and no scan of every conversation turn (the whole recall took
+            # 2.4 s on the 16 Oct copy, these about 0.8 s)
+            query = f"{value} {missing}"
+            for name, attr in (("keyword_summaries", "text"), ("keyword_journal", "fact")):
+                read = getattr(store, name, None)
+                if not callable(read):
+                    continue
+                try:
+                    texts += [str(getattr(e, attr, "") or "") for e in (read(query, limit=SEED_RECALL_N) or [])]
+                except Exception:  # noqa: BLE001 - one read failing leaves the other's
+                    continue
+        return paired, texts
+
+    try:
+        paired, texts = call("brain_seed_memory", go, timeout_s=timeout_s)
+    except Exception:  # noqa: BLE001
+        return None
+    if paired:
+        hit = next((n for n in names if _fold(n) == _fold(paired)), None)
+        return {"value": value, "missing": missing, "names": [hit or one_line(paired, 80)], "from": "paired"}
+    picked: list[str] = []
+    for text in texts or ():
+        for n in names:
+            if n not in picked and _names_in(n, text):
+                picked.append(n)
+        if len(picked) >= SEED_MEMORY_NAMES:
+            break
+    if not picked:
+        return None
+    return {"value": value, "missing": missing, "names": picked[:SEED_MEMORY_NAMES], "from": "facts"}
+
+
+def seed_memory_text(hint: Mapping[str, Any] | None, *, nonce: str = "") -> str:
+    """The seed block's line for :func:`seed_memory`'s pick: code's words, then the names fenced (they are the screen's
+    text). ``""`` without one."""
+    if not isinstance(hint, Mapping) or not hint.get("names"):
+        return ""
+    names = [one_line(n, 80) for n in hint["names"] if str(n or "").strip()]
+    source = str(hint.get("from") or "")
+    template = SEED_MEMORY_LINES.get(source)
+    if not names or not template:
+        return ""
+    value = one_line(hint.get("value"), 80)
+    missing = one_line(hint.get("missing"), 40)
+    one = len(names) == 1
+    line = template.format(value=value, missing=missing, which="one" if one else "these",
+                           that="that one" if one else "the likelier one")
+    listed = "\n".join(f"- {n}" for n in names)
+    return line + "\n" + fence(listed, source=f"the {missing} names memory ties to their words", nonce=nonce or "seed")
+
+
+def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "",
+               hint: Mapping[str, Any] | None = None) -> str:
     """A skill's plan seed (rung C): goal, slot values, its fixed done check, what was tried (code data), and, when the
     routes said so (IF-seed, Items 5 and 7), ``missing``: the slot whose value no route could find, and ``seen``: the
     names the route read on screen there (outside text: fenced as untrusted data, never instructions). The label says
@@ -496,12 +637,16 @@ def seed_block(seed: Mapping[str, Any] | None, *, limit: int, nonce: str = "") -
         listed = clip("\n".join(f"- {n}" for n in names[:SEEN_MAX]), SEEN_CHARS)
         where = f"the {missing} names" if missing else "the names"
         text += "\n" + fence(listed, source=f"{where} the skill read on screen", nonce=nonce or "seed")
+    told = seed_memory_text(hint, nonce=nonce) if missing and not rerun else ""
+    if told:
+        # bRound2 (B08): the pick memory holds for their words (seed_memory), so it is made, not asked
+        text += "\n" + told
     return text
 
 
 def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: Gathered,
                  history: Sequence[Exchange], seed: Mapping[str, Any] | None, limits: Any,
-                 nonce: str) -> list[dict[str, Any]]:
+                 nonce: str, seed_hint: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
     """The request's one user turn, as text blocks in the design's order; the last block carries breakpoint 4."""
     texts: list[str] = []
     recent = recent_block(history, limit=limits.recent_chars)
@@ -523,7 +668,7 @@ def request_turn(*, words: Sequence[str], channel: str, context: str, gathered: 
         texts.append(fence(gathered.overview, source="the window list and what the windows show", nonce=nonce))
     else:
         texts.append("[The window list could not be read just now: look before acting.]")
-    seed_text = seed_block(seed, limit=limits.seed_chars, nonce=nonce)
+    seed_text = seed_block(seed, limit=limits.seed_chars, nonce=nonce, hint=seed_hint)
     if seed_text:
         texts.append(seed_text)
     blocks = [{"type": "text", "text": t} for t in texts if t]
@@ -799,7 +944,8 @@ def answer_report(question: str, answer: str | None) -> str:
 
 
 __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "read_profile", "read_menu",
-           "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "request_turn", "Conversation",
+           "load_catalog", "sends_fn", "Exchange", "recent_block", "seed_block", "seed_memory", "seed_memory_text",
+           "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
            "look_report", "skill_rest_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
            "answer_report", "clip",
