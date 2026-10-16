@@ -909,6 +909,39 @@ def skill_rest_report(plan: Plan | None, line: str) -> str:
         f"with the one word: {REST_DONE_WORD}. If the rest can't be done, say why in one short line."])
 
 
+def part_rest_report(result: ExecResult | Mapping[str, Any], plan: Plan | None, line: str) -> str:
+    """pBrain: a steps plan that ended on a look (a plan doing a part) and whose done read true while covering only
+    part of the target: that done may read only the first part of what they asked ("YouTube's home page" for "...and
+    put something on from the front page"). What the look read (each fenced by whoever read it) goes back with code's
+    held line; the planner does the rest by steps or replies that all is done (the held line then stands).
+    Code-written."""
+    pid = plan.id if plan else ""
+    reads = [str(r) for r in _field(result, "reads", None) or [] if str(r).strip()]
+    lines = [f"{CHECK_LABEL} Plan {pid} ended on a look, and its done probe read true but checks only part of the "
+             f"target. Yuki's line for it, not said yet: {one_line(line, 200)}"]
+    statuses = _field(result, "statuses", None) or []
+    if statuses:
+        lines.append("Steps:\n" + _statuses_text(statuses))
+    if reads:
+        lines.append("What its reads returned:\n\n" + "\n\n".join(reads))
+    lines.append(f"If any part of what they asked is not done yet, do it now by steps from what the look showed "
+                 f"(revises {pid}), with a done probe that reads the last part they asked for; redo nothing that took. "
+                 f"If all they asked is done, reply with the one word: {REST_DONE_WORD}. If the rest can't be done, "
+                 f"say why in one short line.")
+    return "\n".join(lines)
+
+
+def text_back_report(plan: Plan | None, line: str) -> str:
+    """pBrain: an act request not confirmed done got a plain reply from the planner: it was not said, and the planner
+    gets one more turn with where it stands (code's own line) to finish by steps or ask as a plan. Code-written."""
+    pid = plan.id if plan else "null"
+    return (f"{CHECK_LABEL} Your reply above was not said: their request is not done yet. Where it stands, in "
+            f"Yuki's line: {one_line(line, 200)}\nDo the rest now with a plan by steps (revises {pid}), from what "
+            f"showed, redoing nothing that took; a pick left to you, make it from memory and the screen. If their "
+            f"words leave a real choice open, plan kind ask with one short question. If it can't be done, say why in "
+            f"one short line.")
+
+
 def invalid_report(errors: Sequence[str], statuses: Sequence[Any] = (), *, replans_left: int | None = None) -> str:
     text = f"{CHECK_LABEL} The plan was not run as written: " + "; ".join(errors)
     if statuses:
@@ -948,5 +981,6 @@ __all__ = ["Gathered", "gather", "read_overview", "read_you", "read_people", "re
            "request_turn", "Conversation",
            "tool_result", "steer_blocks", "swap_blocks", "cutoff_report", "held_report", "step_report", "read_report",
            "look_report", "skill_rest_report", "REST_DONE_WORD", "invalid_report", "unconfirmed_report",
+           "part_rest_report", "text_back_report",
            "answer_report", "clip",
            "one_line", "fence", "CHECK_LABEL", "STEER_LABEL"]
