@@ -272,27 +272,45 @@ _STEP_THEN_NOTE_LEAN = (
 #: request again and does the rest, or stays quiet when bringing it up was all of it (live 10 Oct #9 "try another way"
 #: and #16 "open YouTube in Arc not in Chrome" ended at a focus, #25 "do it" too, with 34 s of silence after it).
 STEP_FIRST_OPS = {"window": ("focus", "restore"), "tab": ("show", "new")}   # a new tab: only an empty one
-#: sVoiceFix (sim-e2e-1 F5): the note says what is showing now ({shown}: :meth:`Hands._step_line`), and that a tab or
-#: video already there is not something put on: "put something on YouTube on Arc" showed Arc's old Lofi Girl tab
-#: (already playing) and the turn ended in stay_quiet, silent, in 5 of 5 runs. Silence is no longer an answer here: when
-#: the talker stays quiet anyway, the bridge says ``{shown}`` by code (:meth:`Hands.take_step_line`).
+#: sVoiceFix (sim-e2e-1 F5; review r1 M1): "put something on YouTube on Arc" showed Arc's old Lofi Girl tab (already
+#: playing) and the turn ended in stay_quiet, silent, in 5 of 5 runs. Code now says the step's own line of what is
+#: showing at once (``{shown}``: :meth:`Hands._step_line`, "Arc is showing \"Lofi Girl ...\"."), and the talker is left
+#: one question: a hand-off, one hand, or stay_quiet, with no words of its own. A note that let it say what is showing
+#: itself got "It's playing." / "Playing now." in 6 of 9 such runs: a done the step never made.
+_STEP_CHECK_SAID_NOTE = (
+    "Done, verified, and said aloud for you just now: {shown}{already} One question only: did their newest turn ask for "
+    "more than seeing that (to put on or play something, \"just do it\", \"try another way\", that it is not done, or "
+    "anything more)? Yes: tell_yuki now (screen true, and in context what you just did), or, when what is left is one "
+    "step one of your hands does on what the desktop block shows, that hand instead, alone, with say_when_done for the "
+    "whole. No: stay_quiet. Write no words yourself: what is showing was said, and whether it plays is not yours to say."
+)
+_STEP_CHECK_SAID_NOTE_LEAN = (
+    "Done, verified, and said aloud for you just now: {shown}{already} One question only: did their newest turn ask for "
+    "more than seeing that (to put on or play something, \"just do it\", \"try another way\", that it is not done, or "
+    "anything more)? Yes: hand_over now (intent follow_up when that turn answers or adds to a job already waiting or "
+    "running, else new_task), or, when what is left is one step one of your hands does on what the desktop block "
+    "shows, that hand instead, alone, with say_when_done for the whole. No: stay_quiet. Write no words yourself: what "
+    "is showing was said, and whether it plays is not yours to say."
+)
+#: The same when no line of what is showing is known (a window whose app is not known), or it could not be said now
+#: (then it is owed: when the run ends in stay_quiet with no words, the bridge says it, :meth:`Hands.take_step_line`).
 _STEP_CHECK_NOTE = (
-    "Done, verified, and nothing was said for it. Showing now: {shown}{already} Was seeing that all their newest turn "
-    "asked? Only then: say in a few words what is showing. If "
-    "they asked to put on or play something (showing what was already open plays nothing new), said \"just do it\", "
-    "\"try another way\" or that it is not done, or asked for anything more: tell_yuki now (screen true, and in "
-    "context what you just did); when what is left is one step one of your hands does on what the desktop block shows, "
-    "that hand instead, alone, with say_when_done for the whole. Never silence, never more than the report says."
+    "Done, verified, and nothing was said for it.{already} One question only: did their newest turn ask for more than "
+    "bringing it up (to put on or play something, \"just do it\", \"try another way\", that it is not done, or anything "
+    "more)? Yes: tell_yuki now (screen true, and in context what you just did), or, when what is left is one step one "
+    "of your hands does on what the desktop block shows, that hand instead, alone, with say_when_done for the whole. "
+    "No: say in a few words only what the report says is up now, never that anything plays or is done beyond it."
 )
 _STEP_CHECK_NOTE_LEAN = (
-    "Done, verified, and nothing was said for it. Showing now: {shown}{already} Was seeing that all their newest turn "
-    "asked? Only then: say in a few words what is showing. If "
-    "they asked to put on or play something (showing what was already open plays nothing new), said \"just do it\", "
-    "\"try another way\" or that it is not done, or asked for anything more: hand_over now (intent follow_up when "
-    "that turn answers or adds to a job already waiting or running, else new_task); when what is left is one step one "
-    "of your hands does on what the desktop block shows, that hand instead, alone, with say_when_done for the whole. "
-    "Never silence, never more than the report says."
+    "Done, verified, and nothing was said for it.{already} One question only: did their newest turn ask for more than "
+    "bringing it up (to put on or play something, \"just do it\", \"try another way\", that it is not done, or anything "
+    "more)? Yes: hand_over now (intent follow_up when that turn answers or adds to a job already waiting or running, "
+    "else new_task), or, when what is left is one step one of your hands does on what the desktop block shows, that "
+    "hand instead, alone, with say_when_done for the whole. No: say in a few words only what the report says is up "
+    "now, never that anything plays or is done beyond it."
 )
+#: Said with the step check's note when the window or tab was there before the step (not a new tab).
+_STEP_ALREADY = " It was already open before this step: this step put on nothing new."
 #: sVoiceFix (F4): a hand refused for its call's own shape (a field it needs is missing or does not fit; nothing was
 #: done): it is called again once, as the report says. Live 10 Oct #18 and the sim: the tab hand was called four times
 #: with named alone or a number alone and refused each time, while the full talker handed a one-tab close over.
@@ -966,8 +984,9 @@ class Hands:
         self._other_tabs: dict[int, tuple[list[str], list[str], float, frozenset[int]]] = {}
         #: x3 (3b): ``(user turn, count)``: how often a silent window or tab step gave the talker its turn back in it.
         self._step_checked: tuple[Any, int] | None = None
-        #: sVoiceFix (F5): ``(turn, line, at)``: what a silent step showed, owed to a stay_quiet of the run its step
-        #: check started (the bridge says it by code: :meth:`take_step_line`); dropped by any other answer
+        #: sVoiceFix (F5): ``(turn, line, at)``: what a silent step showed, when the step check could not say it at once
+        #: (review r1 M1: it says it at once as a rule): owed to a stay_quiet of the run that check started (the bridge
+        #: says it by code: :meth:`take_step_line`); dropped by any other answer
         self._step_owed: tuple[Any, str, float] | None = None
         #: sVoiceFix (F4, F6): ``(turn, n)``: calls refused for their own shape, and run_skill calls with no skill,
         #: given back to the talker in this user turn (once each; the next goes on as before)
@@ -1778,15 +1797,28 @@ class Hands:
             # its turn back to do the rest, or stays quiet when that was all (at most twice per user turn: a focus,
             # then a new tab; never a loop)
             self._step_checked = (turn, self._step_checks(turn) + 1)
-            shown = self._step_line(name, args, facts)
-            self._step_owed = (turn, shown, time.monotonic()) if shown else None
+            shown = " ".join(str(facts.get("step_line") or "").split())   # built off the loop, in _run (review r1 L2)
+            said = ""
+            if shown:
+                # review r1 M1: the step's own line of what is showing is said by code at once (never silence, and no
+                # talker words of "It's playing." for a tab that was only brought up)
+                try:
+                    from pipecat.frames.frames import TTSSpeakFrame
+
+                    await params.llm.push_frame(TTSSpeakFrame(text=shown))
+                    said = shown
+                except Exception:  # noqa: BLE001 - not said now: owed to this run's stay_quiet instead (the bridge)
+                    said = ""
+            self._step_owed = (turn, shown, time.monotonic()) if shown and not said else None
             if self.log is not None:
-                self.log.event("hands", op=name, step_check=True, call=params.tool_call_id, step_line=bool(shown))
-            note = self._note(_STEP_CHECK_NOTE, _STEP_CHECK_NOTE_LEAN)
+                self.log.event("hands", op=name, step_check=True, call=params.tool_call_id, step_line=bool(shown),
+                               step_said=bool(said))
+            note = (self._note(_STEP_CHECK_SAID_NOTE, _STEP_CHECK_SAID_NOTE_LEAN) if said
+                    else self._note(_STEP_CHECK_NOTE, _STEP_CHECK_NOTE_LEAN))
             # a tab shown or a window brought up was already open before this step (a fact of the step, not a reading)
-            already = "" if op == "new" else " It was already open before this step."
-            await params.result_callback({"done": report[:700], "said": "", "how_to_handle_it": note.format(
-                shown=shown or "as the report says.", already=already)})
+            already = "" if op == "new" else _STEP_ALREADY
+            await params.result_callback({"done": report[:700], "said": said, "how_to_handle_it": note.format(
+                shown=said, already=already)})
             return
         if confirmed and not line:
             from pipecat.frames.frames import FunctionCallResultProperties
@@ -2216,12 +2248,13 @@ class Hands:
         """sVoiceFix (F5): one plain spoken line of what a silent window or tab step left showing, built from what the
         hand acted on (the tab's title, the window's app and title as the summary read them): ``Arc is showing "Lofi
         Girl - lofi hip hop radio - YouTube".`` / ``Spotify is in front.``. ``""`` when nothing is known. The screen's
-        own words, never a claim beyond the hand's report."""
+        own words, never a claim beyond the hand's report. Blocking (the app's name may scan processes): built in
+        :meth:`_run`, off the voice loop (review r1 L2). Never raises."""
         try:
             hwnd = int(args.get("window"))
-        except (TypeError, ValueError):
+            app = self._browser_app(hwnd) or ""
+        except Exception:  # noqa: BLE001 - no line rather than a failed hand
             return ""
-        app = self._browser_app(hwnd) or ""
         title = " ".join(str(facts.get("shown") or "").split())
         if name == "window" and not app:
             return ""
@@ -2776,16 +2809,21 @@ class Hands:
 
     @staticmethod
     def _pick_slot(skill_key: str) -> str | None:
-        """sVoiceFix (F11): the slot a skill fills only from options offered aloud (:func:`yuki.skills.menu.picks_offered`:
-        ``web.open_video``'s ``video``), else ``None``. Data only; ``None`` on any doubt."""
+        """sVoiceFix (F11): the slot a skill fills only from options offered aloud, when it cannot run without it: a
+        required slot that :func:`yuki.skills.taste.takes_offers` (every route needs a value only an offered option
+        carries; today ``web.open_video``'s ``video``), else ``None``. Data only (the routes' own conditions); ``None`` on
+        any doubt."""
         try:
             from yuki.skills.catalog import load
-            from yuki.skills.menu import picks_offered
+            from yuki.skills.taste import takes_offers
 
             skill = load().get(str(skill_key or ""))
-            return picks_offered(skill) if skill is not None else None
+            for slot in getattr(skill, "slots", None) or ():
+                if getattr(slot, "required", False) and takes_offers(skill, slot):
+                    return str(slot.name)
         except Exception:  # noqa: BLE001
             return None
+        return None
 
     def _offers_waiting(self, now: float | None = None) -> bool:
         """sVoiceFix (F11): whether options a run offered aloud can still be picked (the talker's options line is on),
@@ -2852,7 +2890,9 @@ class Hands:
         if pick and slots.get(pick) in (None, "", {}, []) and not self._offers_waiting():
             # sVoiceFix (sim-e2e-1 F11): a skill that only plays one of the options offered aloud, with none offered
             # and none named ("put something on YouTube" ran web.open_video and asked "Which video?"): nothing runs and
-            # it falls back to the thinker by code (the pick is Yuki's: the normal way, by steps)
+            # it falls back to the thinker by code (the pick is Yuki's: the normal way, by steps). Review r1 M2: this is
+            # the whole F11 fix; its menu line stays on the talker's menu (off it, the full talker reached for learned
+            # page lines instead and opened Excalidraw for "put something on YouTube and ARC browser")
             facts.update(refused=True, outcome="refused", skill=skill_key)
             return False, (f"that skill only plays an option offered to them aloud, and none is offered now; nothing "
                            f"was done"), facts
@@ -3206,6 +3246,12 @@ class Hands:
             ok, report, facts = self._act(name, args, facts)
             if not (ok and facts.get("verified") is True) and not facts.get("settled"):
                 self.halted = f"{name}: {report[:160]}"
+            elif ok and facts.get("verified") is True and name in STEP_FIRST_OPS \
+                    and not str(args.get("say_when_done") or "").strip() \
+                    and str(args.get("action") or ("show" if name == "tab" else "")) in STEP_FIRST_OPS[name]:
+                # sVoiceFix (F5; review r1 L2): what a window or tab step left showing, for the step check's spoken
+                # line, built here off the voice loop (the app's name may scan processes); RAM only, never logged
+                facts["step_line"] = self._step_line(name, args, facts)
             return ok, report, facts
         except _Refused as exc:
             facts["refused"] = True  # nothing was done: the talker says why ...

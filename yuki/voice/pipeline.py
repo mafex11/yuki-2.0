@@ -458,9 +458,9 @@ def early_words(partial_json: str) -> str | None:
     The mouth writes ``say_first`` first (its schema asks it to); the moment its string is complete in
     the streamed JSON it can be spoken, while the rest of the call is still being written (v3.5,
     docs/VOICE.md §5.2). Parsing the call's own JSON: ``None`` until the value is complete, or when
-    the arguments have no ``say_first``. sVoiceFix (F6): only its words up to a line break, a double quote or a ``<``
-    (:func:`~yuki.voice.mouth.say_first_words`): a call that ran the rest of itself into the string is never spoken
-    whole.
+    the arguments have no ``say_first``. sVoiceFix (F6): only its words (:func:`~yuki.voice.mouth.say_first_words`: up
+    to a line break, a ``<``, or a stray closing quote with only the call's ``,`` / ``}`` after it): a call that ran
+    the rest of itself into the string is never spoken whole.
     """
     import json
 
@@ -4811,13 +4811,13 @@ class Conversation:
         cached = getattr(self, "_skill_keys_cache", None)
         if cached is not None:
             return list(cached)
-        from yuki.voice.mouth import talker_skill_keys
+        from yuki.voice.mouth import menu_keys
 
         memory = getattr(self, "mouth_memory", None)
         hands = getattr(self.bridge, "hands", None)
         keys: list[str] = []
         if skills_on(self.settings) and self.settings.voice_hands and hands is not None and memory is not None:
-            keys = talker_skill_keys(getattr(memory, "skills", None))
+            keys = menu_keys(getattr(memory, "skills", None))
         if not keys and memory is not None and getattr(memory, "skills", None):
             memory.skills = None
         self._skill_keys_cache = tuple(keys)

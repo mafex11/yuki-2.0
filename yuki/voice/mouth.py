@@ -75,19 +75,36 @@ def router_on(settings: Any) -> bool:
     return bool(getattr(settings, "voice_router", False))
 
 
-#: sVoiceFix (sim-e2e-1 F6): where a call's say_first stops being words for the user. A field's value never holds a
-#: line break, a double quote or a tag of the call format; the model sometimes runs the rest of its call into the
-#: string (live-like 16 Oct: ``On it.",\n<parameter name="skill">spotify.playlist``), and the whole of it was spoken.
-SAY_FIRST_ENDS = ("\n", "\r", '"', "<")
+#: sVoiceFix (sim-e2e-1 F6): where a call's say_first stops being words for the user. A spoken line never holds a line
+#: break or a tag of the call format; the model sometimes runs the rest of its call into the string (live-like 16 Oct:
+#: ``On it.",\n<parameter name="skill">spotify.playlist``), and the whole of it was spoken.
+SAY_FIRST_ENDS = ("\n", "\r", "<")
+#: After a double quote that closes no quote of the words' own, these (or nothing) are the call format's, not words.
+SAY_FIRST_CALL_MARKS = (",", "}")
 
 
 def say_first_words(text: Any) -> str:
-    """The words of a call's ``say_first`` that may be spoken: up to its first line break, double quote or ``<`` (the
-    call format running into the string), trailing commas and spaces dropped; ``""`` when nothing is left. Plumbing on
-    our own call format, never the words' meaning."""
+    """The words of a call's ``say_first`` that may be spoken: up to its first line break or ``<``, and up to a double
+    quote that closes no quote opened in the words when nothing but ``,`` / ``}`` (or nothing at all) follows it (the
+    call format running into the string: ``On it."`` and ``On it.",`` cut to ``On it.``, while ``Playing "Lofi Girl"
+    now.`` and ``[style: "calm"] On it.`` stay whole; review r1 L1). Trailing commas and spaces dropped, a line wrapped
+    whole in quotes unwrapped; ``""`` when nothing is left. Plumbing on our own call format, never the words' meaning."""
     words = str(text or "")
     cut = min((i for i in (words.find(end) for end in SAY_FIRST_ENDS) if i >= 0), default=len(words))
-    return words[:cut].rstrip(" \t,;:").strip()
+    words = words[:cut]
+    inner = False   # inside a quote the words opened themselves
+    for i, ch in enumerate(words):
+        if ch != '"':
+            continue
+        rest = words[i + 1:].strip()
+        if not inner and (not rest or rest[0] in SAY_FIRST_CALL_MARKS):
+            words = words[:i]
+            break
+        inner = not inner
+    words = words.rstrip(" \t,;:").strip()
+    if len(words) > 1 and words[0] == '"' and words[-1] == '"':
+        words = words[1:-1].strip()
+    return words
 
 
 #: The mouth's core layer (frozen). Pipecat appends its own paragraphs about async tools
@@ -2100,24 +2117,6 @@ def menu_keys(menu: str | None) -> list[str]:
             if key and " " not in key and key not in keys:
                 keys.append(key)
     return keys
-
-
-def talker_skill_keys(menu: str | None) -> list[str]:
-    """The talker's ``run_skill`` keys for a conversation: its Skills menu's (:func:`menu_keys`), then, when it lists
-    any, the capabilities kept off that menu because they only play an option offered aloud
-    (:func:`yuki.skills.menu.talker_pick_keys`, sVoiceFix F11): the options line names those while options are offered,
-    so they stay callable. ``[]`` with no menu."""
-    keys = menu_keys(menu)
-    if not keys:
-        return []
-    try:
-        from yuki.skills.catalog import load
-        from yuki.skills.menu import talker_pick_keys
-
-        extra = talker_pick_keys(load())
-    except Exception:  # noqa: BLE001 - the menu's keys alone
-        extra = []
-    return keys + [k for k in extra if k not in keys]
 
 
 #: The people directory in the talker's cached profile layer is cut to this (whole lines).

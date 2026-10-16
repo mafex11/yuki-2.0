@@ -1947,7 +1947,8 @@ class VoiceBridge(QObject):
     async def _say_step_line(self, params: Any) -> bool:
         """sVoiceFix (F5): a run a silent window or tab step started (its step check) ends in stay_quiet with no words:
         the step's own line of what is showing now is said by code (live-like 16 Oct sim: "put something on YouTube on
-        Arc" showed Arc's old tab and then nothing at all, 5 of 5 runs). ``True`` when said; the call is settled."""
+        Arc" showed Arc's old tab and then nothing at all, 5 of 5 runs). The step check says that line at once as a rule
+        (review r1 M1); this is the backstop for one it could not say then. ``True`` when said; the call is settled."""
         hands = getattr(self, "hands", None)
         take = getattr(hands, "take_step_line", None) if hands is not None else None
         line = take() if callable(take) else None

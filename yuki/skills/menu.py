@@ -6,11 +6,7 @@ S3.1, S3.5; PLAN.md B.2 "Talker cache"; phase L design §2 "The request path", �
 * every **capability** first, one neutral line each (at most 8, from the shipped files): always there, so any request
   runs at rung A from day one whatever is learned (design §2, critique H1, acceptance A2). Nothing learned removes or
   shortens one, and the size cap never cuts one (failure fix-plan Item 1); only a capability with no usable rung and
-  no hand-off is left out (nothing it could do), and, on the talker's menu only, one that plays nothing but an option
-  offered aloud (:func:`picks_offered`, today ``web.open_video``; sim-e2e-1 F11: the full talker ran it for "put
-  something on YouTube in Arc" and asked "Which video?" in 2 of 2 runs). The talker reaches that one only through the
-  options line its volatile block carries while options are offered (``mouth.skills_options_line``), and its key stays
-  callable (:func:`talker_pick_keys`);
+  no hand-off is left out (nothing it could do);
 * then the user's **learned skills** that fix a key value (a site, a calling service) and carry a real name (the
   naming call's or the user's own; ``Skill.name``), each on its own named line: the talker gets the top
   :data:`TALKER_LEARNED` (12), the thinker every live one (the catalog keeps at most 20), in the catalog's order
@@ -82,37 +78,11 @@ def listed(skill: Skill) -> bool:
     return binds_key(skill) and bool(" ".join(str(skill.name or "").split()))
 
 
-def picks_offered(skill: Any) -> str | None:
-    """The slot a skill fills only from options offered aloud ("the Deji one"), when it has one it cannot run without:
-    a required slot that :func:`yuki.skills.taste.takes_offers` (every route needs a value only an offered option
-    carries; today ``web.open_video``'s ``video``), else ``None``. Data only (the routes' own conditions); ``None`` on any
-    doubt."""
-    try:
-        from yuki.skills.taste import takes_offers
-
-        for slot in getattr(skill, "slots", None) or ():
-            if getattr(slot, "required", False) and takes_offers(skill, slot):
-                return str(slot.name)
-    except Exception:  # noqa: BLE001
-        return None
-    return None
-
-
-def talker_pick_keys(loaded: Loaded | None) -> list[str]:
-    """sVoiceFix (F11): the capabilities left off the talker's menu because they only play an option offered aloud
-    (:func:`picks_offered`): their keys stay in the talker's ``run_skill`` keys (the options line names them while
-    options are offered), in the catalog's order."""
-    if loaded is None:
-        return []
-    return [s.key for s in getattr(loaded, "skills", None) or () if not s.learned and picks_offered(s)]
-
-
 def menu_skills(loaded: Loaded, audience: str = TALKER) -> list[Skill]:
-    """The skills a menu lists, in order: every capability (always; on the talker's, not one that only plays an option
-    offered aloud: :func:`picks_offered`), then the learned skills with a line of their own (:func:`listed`: a fixed
-    key value and a real name; the talker's top :data:`TALKER_LEARNED`; the thinker's and the planner's all, at most
-    the catalog's 20), in the catalog's order."""
-    caps = [s for s in loaded.skills if not s.learned and (audience != TALKER or not picks_offered(s))]
+    """The skills a menu lists, in order: every capability (always), then the learned skills with a line of their own
+    (:func:`listed`: a fixed key value and a real name; the talker's top :data:`TALKER_LEARNED`; the thinker's and the
+    planner's all, at most the catalog's 20), in the catalog's order."""
+    caps = [s for s in loaded.skills if not s.learned]
     named = [s for s in loaded.skills if s.learned and listed(s)]
     return caps + (named if audience in (THINKER, PLANNER) else named[:TALKER_LEARNED])
 
@@ -322,5 +292,5 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
 
 
 __all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "TALKER_LEARNED", "TALKER_HEAD", "PLANNER_HEAD",
-           "names_other_key", "binds_key", "listed", "picks_offered", "talker_pick_keys", "menu_skills", "skill_line",
-           "menu_lines", "menu_text", "planner_menu", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]
+           "names_other_key", "binds_key", "listed", "menu_skills", "skill_line", "menu_lines", "menu_text",
+           "planner_menu", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]
