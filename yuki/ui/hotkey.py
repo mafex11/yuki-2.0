@@ -29,19 +29,28 @@ shows without the keyboard (:meth:`yuki.ui.overlay.Overlay.toggle`). The chord's
 menu-mask tap already keeps Windows from switching the input language on a press of
 it (:class:`ChordHookThread`), and the shortcut is the user's to change (Settings,
 "Open Yuki anywhere").
+
+:class:`KeyClaim` is the one hook here that does hold keys back, and only while the
+ask bar shows without the keyboard: the user starts typing the moment the hotkey is
+released, and those words are for Yuki, not for the run's window in front (a chat
+box holding Yuki's draft, where Enter sends). Their first key that types is held
+back and the bar takes the keyboard; the keys held back meanwhile are then typed
+into it.
 """
 
 from __future__ import annotations
 
 import ctypes
 import os
+import threading
 import time
 from ctypes import wintypes
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from PySide6.QtCore import QObject, QThread, Signal
 
+from yuki.core.inputtag import is_yuki_input
 from yuki.ui.focus import INJECT_MARK, send_mask_key
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters to type checkers
@@ -406,7 +415,9 @@ class ChordHookThread(_MessageLoopThread):
       which is the behaviour AutoHotkey's mask relies on.
 
     The user's keys are all passed on untouched; the tap is extra, and the hook
-    ignores its own injected events. Side effect: Windows' own Alt+Shift
+    ignores its own injected events (the ask bar's :class:`KeyClaim`, a separate hook
+    that runs only while the bar shows without the keyboard, is the one that holds
+    keys back). Side effect: Windows' own Alt+Shift
     input-language switch requires the chord with no key in between, so with the
     mask it no longer cycles the layout on the same press. That is deliberately
     not suppressed by eating keys (see ``docs/UI.md``); Win+Space still switches.
@@ -626,6 +637,333 @@ class ChordHookThread(_MessageLoopThread):
             for held in self._held
             if held == pressing or user32.GetAsyncKeyState(held) & _KEY_HELD
         }
+
+
+# -- the ask bar's claim on the user's keys (x12Overlay review r1 M3) ------------------------------------------------
+
+#: How long the claim holds the user's keys back for the ask bar to take the keyboard (s). Past it they are dropped,
+#: never sent on to the window they were not for, and every key passes again.
+CLAIM_HOLD_S = 2.5
+#: At most this many key events are held back (more are dropped).
+CLAIM_KEEP = 128
+VK_ESCAPE = 0x1B
+#: Text sent as characters, not keys (a dictation tool's words): ``scanCode`` holds the character.
+VK_PACKET = 0xE7
+VK_LSHIFT, VK_LCONTROL = 0xA0, 0xA2
+_LSHIFT_SCAN, _LCONTROL_SCAN = 0x2A, 0x1D
+LLKHF_EXTENDED = 0x01
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+MAPVK_VK_TO_CHAR = 2
+PM_NOREMOVE = 0x0000
+#: Modifiers a key is a shortcut with (for the app in front or for Windows, not words for Yuki): Ctrl, Alt, Win.
+_SHORTCUT_MODS = frozenset({MOD_CONTROL, MOD_ALT, MOD_WIN})
+#: Modifiers that belong to the system while held (Alt+Tab, Win+D): never held back, even once the claim is made.
+_SYSTEM_MODS = frozenset({MOD_ALT, MOD_WIN})
+
+#: One key event held back: ``(vk, scan, hook flags, is_up, shift held, ctrl held)``.
+HeldKey = tuple[int, int, int, bool, bool, bool]
+
+
+class ClaimState:
+    """The claim's state, kept apart from the hook so it can be read plainly: :meth:`on_key` for every key event the
+    hook sees (on the hook's thread), :meth:`release` from the GUI.
+
+    * ``armed``: the user's first key-down that types (``types(vk)``: it makes a character on the layout in front;
+      Enter, Backspace, Space and Tab do; so does text a dictation tool sends) with no Ctrl, Alt or Win held is held
+      back and the claim is made
+      (``claimed``). Esc is held back too and closes the bar (``escaped``). A shortcut, a modifier, an arrow or a media
+      key passes: those are for the app in front or for Windows;
+    * ``claiming``: every key-down and its key-up is held back, with whether Shift and Ctrl were held, until the bar
+      has the keyboard (:meth:`release`), or for :data:`CLAIM_HOLD_S` at most (then they are dropped);
+    * ``escaped``: only Esc's own key-up is held back;
+    * ``off``: everything passes.
+
+    Yuki's own keys (its stamp, :func:`yuki.core.inputtag.is_yuki_input`) always pass and are never counted: the run
+    keeps typing where it works until the user types to Yuki. The modifiers the user holds are followed from their
+    own events (no key state is polled, so no other program's "pressed since" bit is used up), seeded once at start.
+    """
+
+    def __init__(self, *, types: Callable[[int], bool], now: Callable[[], float] = time.monotonic) -> None:
+        self.mode = "armed"
+        self.types, self.now = types, now
+        self.dropped = 0
+        self._held: list[HeldKey] = []
+        self._downs: set[int] = set()
+        self._mods: set[int] = set()
+        self._since = 0.0
+        self._lock = threading.Lock()
+
+    def seed(self, held: Callable[[int], bool]) -> None:
+        """The modifiers held as the claim starts (``held(vk)``: Windows' state of one key)."""
+        with self._lock:
+            self._mods = {_VK_TO_MOD[vk] for vk in _VK_TO_MOD if held(vk)}
+
+    def on_key(self, vk: int, scan: int, flags: int, message: int, extra: int) -> tuple[bool, str | None]:
+        """One key event: ``(hold it back, what it signals)``; the signal is ``claimed``, ``escaped`` or None."""
+        if is_yuki_input(extra):
+            return False, None
+        mod = _VK_TO_MOD.get(vk)
+        down = message in _KEY_DOWN
+        if not down and message not in _KEY_UP:
+            return False, None
+        with self._lock:
+            if mod is not None:
+                if down:
+                    self._mods.add(mod)
+                else:
+                    self._mods.discard(mod)
+                return False, None
+            if self.mode == "claiming" and self.now() - self._since > CLAIM_HOLD_S:
+                self._expire()
+            mode = self.mode
+            if mode == "off":
+                return False, None
+            if not down:
+                if vk not in self._downs:
+                    return False, None   # a key that went down before the claim: its own window gets its key-up
+                self._downs.discard(vk)
+                if mode == "claiming":
+                    self._keep((vk, scan, flags, True, False, False))
+                return True, None
+            if mode == "armed":
+                if self._mods & _SHORTCUT_MODS:
+                    return False, None
+                if vk == VK_ESCAPE:
+                    self.mode = "escaped"
+                    self._downs.add(vk)
+                    return True, "escaped"
+                try:
+                    typing = vk == VK_PACKET or bool(self.types(vk))
+                except Exception:  # noqa: BLE001 - unknown: not taken for words
+                    typing = False
+                if not typing:
+                    return False, None
+                self.mode = "claiming"
+                self._since = self.now()
+                self._keep((vk, scan, flags, False, MOD_SHIFT in self._mods, False))
+                self._downs.add(vk)
+                return True, "claimed"
+            if mode == "claiming":
+                if self._mods & _SYSTEM_MODS:
+                    return False, None
+                self._keep((vk, scan, flags, False, MOD_SHIFT in self._mods, MOD_CONTROL in self._mods))
+                self._downs.add(vk)
+                return True, None
+            return False, None
+
+    def _keep(self, key: HeldKey) -> None:
+        if len(self._held) < CLAIM_KEEP:
+            self._held.append(key)
+        else:
+            self.dropped += 1
+
+    def _expire(self) -> None:
+        self.dropped += len(self._held)
+        self._held.clear()
+        self._downs.clear()
+        self.mode = "off"
+
+    def release(self) -> tuple[list[HeldKey], bool, bool]:
+        """End the claim (everything passes from here): the keys held back, oldest first, and whether the user holds
+        Shift and Ctrl now."""
+        with self._lock:
+            held, self._held = self._held, []
+            self._downs.clear()
+            self.mode = "off"
+            return held, MOD_SHIFT in self._mods, MOD_CONTROL in self._mods
+
+
+def replay_events(held: list[HeldKey], *, shift_now: bool, ctrl_now: bool) -> list[tuple[int, int, int]]:
+    """``(vk, scan, dwFlags)`` records that type ``held`` again, in order, each key-down with the Shift and Ctrl it
+    had (pressed or let go around it), and the modifiers as the user holds them now at the end."""
+    out: list[tuple[int, int, int]] = []
+    shift, ctrl = shift_now, ctrl_now
+    for vk, scan, flags, up, want_shift, want_ctrl in held:
+        if vk == VK_PACKET:   # a character as it came: no modifiers apply
+            out.append((0, int(scan), KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0)))
+            continue
+        if not up:
+            if want_shift != shift:
+                out.append((VK_LSHIFT, _LSHIFT_SCAN, 0 if want_shift else KEYEVENTF_KEYUP))
+                shift = want_shift
+            if want_ctrl != ctrl:
+                out.append((VK_LCONTROL, _LCONTROL_SCAN, 0 if want_ctrl else KEYEVENTF_KEYUP))
+                ctrl = want_ctrl
+        out.append((int(vk), int(scan),
+                    (KEYEVENTF_EXTENDEDKEY if flags & LLKHF_EXTENDED else 0) | (KEYEVENTF_KEYUP if up else 0)))
+    if shift != shift_now:
+        out.append((VK_LSHIFT, _LSHIFT_SCAN, 0 if shift_now else KEYEVENTF_KEYUP))
+    if ctrl != ctrl_now:
+        out.append((VK_LCONTROL, _LCONTROL_SCAN, 0 if ctrl_now else KEYEVENTF_KEYUP))
+    return out
+
+
+_CLAIM_U32: ctypes.WinDLL | None = None
+
+
+def _claim_user32() -> ctypes.WinDLL:
+    """A private ``user32`` with the prototypes the claim uses (the shared ``windll.user32`` is not ours to set)."""
+    global _CLAIM_U32
+    if _CLAIM_U32 is None:
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        u32.GetForegroundWindow.argtypes = []
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+        u32.GetKeyboardLayout.restype = ctypes.c_void_p
+        u32.MapVirtualKeyExW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+        u32.MapVirtualKeyExW.restype = wintypes.UINT
+        u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        u32.GetAsyncKeyState.restype = ctypes.c_short
+        _CLAIM_U32 = u32
+    return _CLAIM_U32
+
+
+def key_types_text(vk: int) -> bool:
+    """Whether ``vk`` makes a character on the keyboard layout of the window in front (letters, digits, punctuation,
+    Space, Enter, Backspace, Tab); arrows, F-keys and media keys do not. One table lookup, no state changed."""
+    u32 = _claim_user32()
+    hwnd = u32.GetForegroundWindow()
+    thread = int(u32.GetWindowThreadProcessId(hwnd, None)) if hwnd else 0
+    return bool(int(u32.MapVirtualKeyExW(int(vk), MAPVK_VK_TO_CHAR, u32.GetKeyboardLayout(thread))) & 0x7FFFFFFF)
+
+
+def key_held(vk: int) -> bool:
+    """Windows' state of one key now (the "held" bit only)."""
+    return bool(int(_claim_user32().GetAsyncKeyState(int(vk))) & 0x8000)
+
+
+def send_keys(records: list[tuple[int, int, int]]) -> int:
+    """Inject ``(vk, scan, dwFlags)`` keyboard records, each stamped :data:`~yuki.ui.focus.INJECT_MARK` (so no hook of
+    Yuki's takes them for the user's); how many Windows accepted."""
+    if not records:
+        return 0
+    from yuki.ui.focus import INPUT, INPUT_KEYBOARD, KEYBDINPUT
+
+    array = (INPUT * len(records))()
+    for slot, (vk, scan, flags) in zip(array, records):
+        slot.type = INPUT_KEYBOARD
+        slot.u.ki = KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=flags, time=0, dwExtraInfo=INJECT_MARK)
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    u32.SendInput.restype = wintypes.UINT
+    return int(u32.SendInput(len(records), array, ctypes.sizeof(INPUT)))
+
+
+class KeyClaim(QThread):
+    """The ask bar's claim on the user's keys while it shows without the keyboard (see :class:`ClaimState`): a
+    ``WH_KEYBOARD_LL`` hook on its own thread, installed by :meth:`start` and removed by :meth:`stop`, so it exists
+    only for those few seconds. Unlike :class:`ChordHookThread` it holds keys back -- the user's, never Yuki's own.
+
+    A hook Windows gives up on (the process too busy to answer in time) lets every key through: the claim fails open,
+    to the window in front, never closed.
+
+    Signals:
+        claimed: The user's first key that types was held back: the bar takes the keyboard, then :meth:`release`.
+        escaped: The user pressed Esc: the bar closes.
+        failed: ``(reason)`` the hook could not be installed (the bar still takes a click).
+    """
+
+    claimed = Signal()
+    escaped = Signal()
+    failed = Signal(str)
+
+    def __init__(self, parent: QObject | None = None, *, state: ClaimState | None = None,
+                 send: Callable[[list[tuple[int, int, int]]], int] = send_keys) -> None:
+        super().__init__(parent)
+        self.state = state if state is not None else ClaimState(types=key_types_text)
+        self._send = send
+        self._thread_id: int | None = None
+        self._stop_asked = False
+
+    def run(self) -> None:  # noqa: D102 - QThread entry point
+        try:
+            self._watch()
+        finally:
+            self._thread_id = None
+
+    def _watch(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        hook_proc = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hook_proc, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = wintypes.HHOOK
+        user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+                                        wintypes.UINT]
+        msg = wintypes.MSG()
+        # this thread's message queue exists from here, so a WM_QUIT posted by stop() is never lost
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
+        self._thread_id = int(kernel32.GetCurrentThreadId())
+        try:
+            self.state.seed(key_held)
+        except Exception:  # noqa: BLE001 - no modifiers known held
+            pass
+        state = self.state
+
+        def on_key(n_code: int, w_param: int, l_param: int) -> int:
+            hold, signal = False, None
+            try:
+                if n_code == HC_ACTION:
+                    event = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    hold, signal = state.on_key(int(event.vkCode), int(event.scanCode), int(event.flags),
+                                                int(w_param), int(event.dwExtraInfo or 0))
+            except Exception:  # noqa: BLE001 - a raising callback takes the hook down: pass the key on
+                hold, signal = False, None
+            if signal == "claimed":
+                self.claimed.emit()   # queued across to the GUI thread
+            elif signal == "escaped":
+                self.escaped.emit()
+            if hold:
+                return 1
+            return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+        callback = hook_proc(on_key)   # the name holds the trampoline's only reference for the hook's life
+        handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, callback, None, 0)
+        if not handle:
+            self.failed.emit(f"keyboard hook unavailable (win32 error {ctypes.get_last_error()})")
+            return
+        try:
+            if self._stop_asked:
+                return
+            while True:
+                got = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if got in (0, -1):  # WM_QUIT, or the queue broke
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            user32.UnhookWindowsHookEx(handle)
+
+    def stop(self) -> None:
+        """Remove the hook and end the thread (also when called before the thread has started its loop)."""
+        self._stop_asked = True
+        deadline = time.monotonic() + 2.0
+        while self.isRunning() and time.monotonic() < deadline:
+            thread_id = self._thread_id
+            if thread_id:
+                ctypes.windll.user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+            if self.wait(25):
+                break
+
+    def release(self, *, replay: bool) -> int:
+        """End the claim: with ``replay`` (the ask bar has the keyboard now) the keys held back are typed into it,
+        with the Shift and Ctrl they had; without, they are dropped. How many key records were sent."""
+        held, shift_now, ctrl_now = self.state.release()
+        if not replay:
+            self.state.dropped += len(held)
+            return 0
+        if not held:
+            return 0
+        try:
+            return self._send(replay_events(held, shift_now=shift_now, ctrl_now=ctrl_now))
+        except Exception:  # noqa: BLE001 - not on Windows
+            return 0
 
 
 class HotkeyListener(QObject):
