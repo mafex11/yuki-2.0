@@ -16,9 +16,12 @@ eval). Step by step:
 
 1. **Validate what was given** against every turn of the current exchange (``words``: the user's turns since the
    last finished job, newest last) and any older turns of the conversation the caller passes (``earlier``). An enum
-   value must be one of its options; numbers are numbers in range; ``points`` is a signed number or the schema's
-   direction words ``up`` / ``down``; an entity or a text must stand in the user's words as whole words
-   (:func:`yuki.skills.uia_route.said`) or be a name the menu listed (taste) or a told value. A person (a ``person``
+   value must be one of its options, or a boolean that spells exactly one of them (lSkills, live 17 Oct: ``mute:
+   true`` for on / off, :func:`bool_option`); numbers are numbers in range; ``points`` is a signed number or the
+   schema's direction words ``up`` / ``down``; an entity or a text must stand in the user's words as whole words
+   (:func:`yuki.skills.uia_route.said`) or be a name the menu listed (taste) or a told value; an entity value no taste
+   row is called that sounds like exactly one listed name is that name (lSkills, live 17 Oct: "Lumin" for lumen with
+   ``[playlist: lumen | ネオン]`` listed; :func:`yuki.skills.taste.heard_as`). A person (a ``person``
    slot, or a text slot the capability binds to a ``contact``: ``message``'s ``person``) may also be a name the
    people index resolves to exactly one person whom the words name as heard: a learned misheard form ("hey meant"),
    a transliteration ("हेमंत") or a close mishearing by sound (:func:`yuki.memory.contacts.names_person`); a group
@@ -230,6 +233,30 @@ def _site_said(value: str, words: Sequence[str]) -> bool:
     return any(f and f != _words(value).casefold() and _said(f, words) for f in dict.fromkeys(forms))
 
 
+def _truth(value: Any) -> bool | None:
+    """A value as a boolean: a JSON boolean as itself, a string in the standard library's boolean spellings
+    (``configparser.ConfigParser.BOOLEAN_STATES``: 1/yes/true/on, 0/no/false/off, case aside), else ``None``. A data
+    format conversion (how a tool argument spells a switch), never the meaning of the user's words."""
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, (str, int)):
+        return None
+    from configparser import ConfigParser
+
+    return ConfigParser.BOOLEAN_STATES.get(_words(value).casefold())
+
+
+def bool_option(options: Sequence[str], value: Any) -> str | None:
+    """lSkills: the one option of an enum slot that spells the same switch as a boolean ``value`` (``True`` -> "on" of
+    ``["on", "off"]``, through :func:`_truth` on both sides), else ``None`` (no boolean, or options that aren't a
+    switch: ``["in_app", "mixer"]``)."""
+    truth = _truth(value)
+    if truth is None:
+        return None
+    hits = [o for o in options if _truth(o) is truth]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _num(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -269,6 +296,10 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
     if t == "enum":
         want = _words(value).casefold()
         hit = next((o for o in slot.options if o.casefold() == want), None)
+        if hit is None:
+            # lSkills (live 17 Oct): the talker sent ``mute: true`` (a JSON boolean) for options on / off, the value
+            # was dropped and the volume skill asked "Louder, quieter, or to what level?"
+            hit = bool_option(slot.options, value)
         return (hit is not None), hit
     if t == "number":
         x = _num(value)
@@ -283,7 +314,8 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
     if t == "bool":
         if isinstance(value, bool):
             return True, value
-        return False, None
+        truth = _truth(value)
+        return (truth is not None), truth
     text = _words(value)
     if t == "app":
         if any(text.casefold() == o.casefold() for o in slot.options):
@@ -323,6 +355,14 @@ def check_value(slot: Slot, value: Any, words: Sequence[str], *, menu_names: Seq
         return True, told if isinstance(told, Mapping) else {"name": _words(told)}
     if _said(text, words):
         return True, {"name": text}
+    if menu_names:
+        # lSkills: a value the words don't hold as written ("Lumin playlist") that sounds like exactly one listed name,
+        # which the words do hold by sound ("Put on Lumin on Spotify"): that listed name
+        from yuki.skills.taste import heard_as
+
+        alike = heard_as(menu_names, text)
+        if alike and any(heard_as([alike], str(w)) for w in words if w):
+            return True, {"name": alike}
     return False, None
 
 
@@ -1009,6 +1049,13 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             if ok:
                 if slot.taste and isinstance(value, dict) and store is not None:
                     hit = taste.find(store, slot.taste, value.get("name", ""))
+                    if hit is None and menu_names:
+                        # lSkills (live 17 Oct): "Lumin" heard for lumen, with [playlist: lumen | ネオン] on the menu:
+                        # a heard value no row is called that sounds like exactly one of the user's own listed names
+                        # is that one (contacts' sound key, onset and spelling distance: data, never a word list)
+                        alike = taste.heard_as(menu_names, value.get("name", ""))
+                        if alike:
+                            hit = taste.find(store, slot.taste, alike)
                     if hit is not None:
                         value = {"name": hit.name, "key": hit.entity_key, "ref": hit.ref}
                 elif offered and isinstance(value, dict):
@@ -1319,5 +1366,6 @@ def eval_resolver(db_path: Any, *, client: Any = None, model: str | None = None,
 
 __all__ = ["AGAIN_S", "DIRECTIONS", "HELD_LINE", "FILL_ORDER", "FROM_GRANT", "CONFIRM_PERSON", "JUST_ACTED_S",
            "CONFIRM_ONCE_S", "Live", "Plan", "Ask", "Held", "Handoff", "Refused", "app_name", "app_identity",
-           "known_apps", "named_app", "just_acted", "call_apps", "check_value", "pref_option", "from_pref",
+           "known_apps", "named_app", "just_acted", "call_apps", "check_value", "bool_option", "pref_option",
+           "from_pref",
            "told_values", "ladder", "resolve", "done_line", "canonical", "EvalResolver", "eval_resolver"]

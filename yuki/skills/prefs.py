@@ -799,7 +799,10 @@ class FillPolicyScorer:
     * the candidates are ``yuki.skills.web_route.BROWSER_POLICIES`` (``front_or_recent``: the program in front, or the
       last in front at most 30 min before; ``band``: the most used in this weekday/weekend hour band over 28 days;
       ``site``: the one the occasion's site was last shown in; ``most``: the most used over 14 days); the confirmed
-      usual wins before any of them at run time (rule 1), so it is no candidate here;
+      usual wins before any of them at run time (rule 1), so it is no candidate here. lSkills (live 17 Oct): ``most``
+      and ``band`` are scored as web_route applies them now - each second weighted by its age
+      (``BROWSER_HALF_LIFE_DAYS``), among the programs still in use at the occasion (``BROWSER_STALE_DAYS``) - so the
+      policy kept is judged on the rule that will run;
     * each occasion is predicted with only what came before its visit (an occasion with no visit is left out), among the
       programs the user used for this skill;
     * the best is kept when it beats ``most`` by :data:`POLICY_MARGIN`, else ``most``.
@@ -812,7 +815,14 @@ class FillPolicyScorer:
         self._loaded = False
         self._starts: dict[str, list[float]] = {}
         self._cum: dict[str, list[float]] = {}
+        # lSkills: the same sums with each second weighted by its age (web_route.BROWSER_HALF_LIFE_DAYS), kept
+        # relative to ``now`` so one cumulative list serves every occasion (:meth:`_wsum`)
+        self._wcum: dict[str, list[float]] = {}
         self._band: dict[tuple[str, bool, int], tuple[list[float], list[float]]] = {}
+        self._wband: dict[tuple[str, bool, int], list[float]] = {}
+        # lSkills: per program, the start and end of each of its own page rows, oldest first (web_route.fresh_keys:
+        # a program whose page rows stopped days before the newest program's is no longer in use)
+        self._pages: dict[str, tuple[list[float], list[float]]] = {}
         self._rows: list[tuple[float, float, str]] = []
         self._row_starts: list[float] = []
         self._site: dict[str, tuple[list[float], list[str]]] = {}
@@ -837,30 +847,76 @@ class FillPolicyScorer:
         except Exception:  # noqa: BLE001
             rows = []
         band: dict[tuple[str, bool, int], tuple[list[float], list[float]]] = {}
+        wband: dict[tuple[str, bool, int], list[float]] = {}
         site: dict[str, tuple[list[float], list[str]]] = {}
         for process, started, ended, seconds, host in rows:
             key = app_key(str(process or "")) or ""
             if not key or started is None:
                 continue
             s, e, sec = float(started), float(ended or started), float(seconds or 0.0)
+            w = sec * self._age_factor(s)
             starts = self._starts.setdefault(key, [])
             cum = self._cum.setdefault(key, [])
+            wcum = self._wcum.setdefault(key, [])
             starts.append(s)
             cum.append((cum[-1] if cum else 0.0) + sec)
+            wcum.append((wcum[-1] if wcum else 0.0) + w)
             stamp = datetime.fromtimestamp(s)
-            b = band.setdefault((key, stamp.weekday() >= 5, stamp.hour), ([], []))
+            slot = (key, stamp.weekday() >= 5, stamp.hour)
+            b = band.setdefault(slot, ([], []))
             b[0].append(s)
             b[1].append((b[1][-1] if b[1] else 0.0) + sec)
+            wb = wband.setdefault(slot, [])
+            wb.append((wb[-1] if wb else 0.0) + w)
             self._rows.append((s, e, key))
             if host:
+                pages = self._pages.setdefault(key, ([], []))
+                pages[0].append(s)
+                pages[1].append(max(e, pages[1][-1] if pages[1] else e))   # the latest end so far
                 dom = registrable_domain(str(host))
                 if dom:
                     site.setdefault(dom, ([], []))
                     site[dom][0].append(s)
                     site[dom][1].append(key)
         self._band = band
+        self._wband = wband
         self._site = site
         self._row_starts = [r[0] for r in self._rows]
+
+    def _age_factor(self, at: float) -> float:
+        """``2 ** ((at - now) / half-life)``: a second at ``at`` weighted against ``now`` (web_route's
+        ``BROWSER_HALF_LIFE_DAYS``); :meth:`_wsum` turns a window of such seconds into weights against its own t0."""
+        from yuki.skills.web_route import BROWSER_HALF_LIFE_DAYS
+
+        return math.pow(2.0, (float(at) - self.now) / (BROWSER_HALF_LIFE_DAYS * 86400.0))
+
+    def _wsum(self, starts: list[float], wcum: list[float], lo: float, hi: float) -> float:
+        """The seconds of ``[lo, hi)`` each weighted by its age at ``hi`` (lSkills: the recent weight
+        web_route.measured_browsers ranks "the one used most" by)."""
+        import bisect
+
+        i, j = bisect.bisect_left(starts, lo), bisect.bisect_left(starts, hi)
+        if j <= i:
+            return 0.0
+        return (wcum[j - 1] - (wcum[i - 1] if i > 0 else 0.0)) / self._age_factor(hi)
+
+    def _fresh(self, keys: list[str], t0: float) -> list[str]:
+        """Of ``keys``, the programs still in use at ``t0`` (web_route.fresh_keys, as of then): those whose own page
+        rows before ``t0`` went on until at most ``BROWSER_STALE_DAYS`` before the newest such row of any of them."""
+        import bisect
+
+        from yuki.skills.web_route import BROWSER_STALE_DAYS
+
+        last: dict[str, float] = {}
+        for k in keys:
+            starts, ends = self._pages.get(k, ([], []))
+            i = bisect.bisect_left(starts, t0) - 1
+            if i >= 0:
+                last[k] = ends[i]
+        if not last:
+            return list(keys)
+        newest = max(last.values())
+        return [k for k in keys if k in last and newest - last[k] <= BROWSER_STALE_DAYS * 86400.0]
 
     @staticmethod
     def _sum(starts: list[float], cum: list[float], lo: float, hi: float) -> float:
@@ -878,17 +934,19 @@ class FillPolicyScorer:
         from yuki.skills.web_route import BAND_H, RECENT_S
 
         if policy == "most":
-            got = {k: self._sum(self._starts.get(k, []), self._cum.get(k, []), t0 - POLICY_MOST_DAYS * 86400.0, t0)
-                   for k in keys}
+            # lSkills: as web_route ranks it now: each second by its age, among the programs still in use
+            got = {k: self._wsum(self._starts.get(k, []), self._wcum.get(k, []), t0 - POLICY_MOST_DAYS * 86400.0, t0)
+                   for k in self._fresh(keys, t0)}
         elif policy == "band":
             stamp = datetime.fromtimestamp(t0)
             weekend = stamp.weekday() >= 5
             got = {}
-            for k in keys:
+            for k in self._fresh(keys, t0):
                 total = 0.0
                 for d in range(-BAND_H, BAND_H + 1):
-                    starts, cum = self._band.get((k, weekend, (stamp.hour + d) % 24), ([], []))
-                    total += self._sum(starts, cum, t0 - POLICY_LOOKBACK_DAYS * 86400.0, t0)
+                    slot = (k, weekend, (stamp.hour + d) % 24)
+                    starts, _cum = self._band.get(slot, ([], []))
+                    total += self._wsum(starts, self._wband.get(slot, []), t0 - POLICY_LOOKBACK_DAYS * 86400.0, t0)
                 got[k] = total
         elif policy == "front_or_recent":
             i = bisect.bisect_left(self._row_starts, t0) - 1

@@ -62,6 +62,19 @@ x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, an
 * **A browser that ignored the last two hand-offs** (kept the very page it had) is not handed the next one for a while
   (RAM, this process; review r1 L1): its address-bar rung runs at once.
 
+lSkills (live 17 Oct: every Arc open failed with protocol activation's ``0x80270254``, then the address-bar rung said
+"no window" in 96 ms with Arc up, and Yuki opened Excalidraw in Chrome):
+
+* rung A's hand-off goes on through the browser's alias when Windows refuses its protocol activation (inside
+  ``launch``: never "not installed"), and asks ``launch`` for the hand-off only (``address_bar=False``): typing is this
+  skill's next rung;
+* the address-bar rung finds the browser's window by the Start menu app's identity when no window of its program is
+  listed (:func:`_bar_window`: a window hidden in the background is shown, a browser with none is brought up), and logs
+  where it came from (``how``) or, with none, how many of its processes run (``procs``);
+* **the user's own recent browsing outweighs old counts** (habits: Arc -> Chrome on 11 Oct): "the one used most" and
+  the hour band weigh each second by its age (:data:`BROWSER_HALF_LIFE_DAYS`), and a browser no longer in use
+  (:func:`fresh_keys`) fills nothing by them. Yuki's own opens still count for nothing (bRound2).
+
 **message, web_link** (:func:`route_chat_web_link`). A chat whose captured address the chat app's own ``[chat.links]``
 data matches (critique L4: an address is a route only when the app's link data recognises it) opens at that address in
 a browser (the one that address's site was last shown in, unless a learned policy says otherwise). It only opens the
@@ -126,6 +139,15 @@ BROWSER_POLICIES: tuple[str, ...] = ("front_or_recent", "band", "site", "most")
 #: The hour band (h either side of now) and look-back (days) of the ``band`` policy.
 BAND_H = 1
 BAND_DAYS = 28
+#: lSkills (live 17 Oct; habits: Arc -> Chrome on 11 Oct): the user's own recent browsing outweighs old observation
+#: counts. A second of browsing counts ``0.5 ** (age / BROWSER_HALF_LIFE_DAYS)`` in "the one used most" and in the hour
+#: band (``measured_browsers``' ``weight``, ``band_browser``), and a browser whose own page rows stopped
+#: ``BROWSER_STALE_DAYS`` before the newest row of the browser used last (relative, so a week away from the PC makes
+#: none stale) fills nothing by ``most`` or ``band`` (:func:`fresh_keys`); named, the user's usual, ``site`` (the
+#: browser the site itself was last shown in: Excalidraw's drawings live in Arc) and front/recent are untouched. On the 17 Oct
+#: copy the weekend 03-05 h band still read Arc (Arc's last weekend nights) four days after the switch.
+BROWSER_HALF_LIFE_DAYS = 3.5
+BROWSER_STALE_DAYS = 4.0
 #: How much a done-check's front-window read may take (one UIA job on its own thread).
 FRONT_READ_S = 0.5
 #: x8WebArc: the least time a rung's page open gets, however much of the request's budget the resolve and an earlier
@@ -312,10 +334,13 @@ def _focus(hwnd: int) -> Any:
 
 def _open_url(url: str, app: str | None, deadline: float | None = None) -> Any:
     """``launch.open_url``: the address handed over as a launch argument, answering by ``deadline`` (a
-    ``time.monotonic()`` time; x8WebArc: on 10 Oct one Arc launch took 26-34 s, past the talker's 30 s)."""
+    ``time.monotonic()`` time; x8WebArc: on 10 Oct one Arc launch took 26-34 s, past the talker's 30 s). lSkills: the
+    hand-off only (``address_bar=False``): this skill's own next rung types the address (:func:`route_address_bar`),
+    so a browser that ignored it never gets two new tabs. A packaged browser whose protocol activation Windows refuses
+    (Arc: ``0x80270254``) is started through its alias inside ``launch`` (``details["protocol_refused"]``)."""
     from yuki.actions import launch
 
-    return launch.open_url(url, app=app or None, deadline=deadline)
+    return launch.open_url(url, app=app or None, deadline=deadline, address_bar=False)
 
 
 def _launch_deadline(call: RouteCall) -> float:
@@ -809,6 +834,7 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
             (*hosts, now - days * 86400.0, now))
     except Exception:  # noqa: BLE001
         return []
+    weights = _recent_weights(store, now, days)
     out = []
     for process, seconds, last, n_hosts, site_last in rows:
         key = _app_key(process)
@@ -822,8 +848,43 @@ def measured_browsers(store: Any, *, now: float | None = None, days: float = BRO
         except Exception:  # noqa: BLE001
             pass
         out.append({"key": key, "name": name or key, "seconds": float(seconds or 0.0), "last": float(last or 0.0),
-                    "hosts": int(n_hosts or 0), "site_last": float(site_last) if site_last is not None else None})
+                    "hosts": int(n_hosts or 0), "site_last": float(site_last) if site_last is not None else None,
+                    "weight": float(weights.get(str(process), float(seconds or 0.0)))})
+    # lSkills: most used first by recent weight (a switch of browser shows within days, not after the 14-day window)
+    out.sort(key=lambda m: (-m["weight"], -m["seconds"], m["key"]))
     return out
+
+
+def _recent_weights(store: Any, now: float, days: float) -> dict[str, float]:
+    """``{timeline process: the user's own page seconds of the last days, each weighted by its age}``
+    (:data:`BROWSER_HALF_LIFE_DAYS`; by the day, so one grouped read): what "the one used most" ranks by. Never a page
+    Yuki itself opened (:data:`NOT_YUKIS_VISIT_SQL`). Never raises (``{}``: the raw seconds rank)."""
+    try:
+        rows = own_rows_query(
+            store,
+            "SELECT t.process, CAST((? - t.started_at) / 86400.0 AS INTEGER) AS d, sum(t.active_s + t.passive_s) "
+            "FROM timeline t WHERE t.host IS NOT NULL AND t.started_at >= ? AND t.started_at <= ? AND t.by_yuki = 0 "
+            "AND t.state = 'present' AND t.process IS NOT NULL{own} GROUP BY t.process, d",
+            (now, now - days * 86400.0, now))
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, float] = {}
+    for process, age_d, seconds in rows:
+        w = 0.5 ** ((max(0.0, float(age_d or 0)) + 0.5) / BROWSER_HALF_LIFE_DAYS)
+        out[str(process)] = out.get(str(process), 0.0) + float(seconds or 0.0) * w
+    return out
+
+
+def fresh_keys(measured: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The measured browsers still in use (lSkills): every one whose own page rows went on until at most
+    :data:`BROWSER_STALE_DAYS` before the newest row of the browser used last, in the order measured. Relative to that
+    newest row, never to now: after a week away nothing is stale. Pure (the ``last`` field of
+    :func:`measured_browsers`)."""
+    keys = [m for m in measured if m.get("key")]
+    if not keys:
+        return []
+    newest = max(float(m.get("last") or 0.0) for m in keys)
+    return [str(m["key"]) for m in keys if newest - float(m.get("last") or 0.0) <= BROWSER_STALE_DAYS * 86400.0]
 
 
 def last_in_front(store: Any, keys: Sequence[str], *, now: float | None = None, within_s: float = RECENT_S,
@@ -880,7 +941,9 @@ def band_browser(store: Any, keys: Sequence[str], *, now: float | None = None, h
         at = datetime.fromtimestamp(float(started or 0.0))
         if at.hour in band and (at.weekday() >= 5) == weekend:
             key = _app_key(process)
-            totals[key] = totals.get(key, 0.0) + float(seconds or 0.0)
+            # lSkills: each second by its age (BROWSER_HALF_LIFE_DAYS): last week's nights outweigh the month's
+            age_d = max(0.0, now - float(started or 0.0)) / 86400.0
+            totals[key] = totals.get(key, 0.0) + float(seconds or 0.0) * 0.5 ** (age_d / BROWSER_HALF_LIFE_DAYS)
     return max(totals, key=totals.__getitem__) if totals else None
 
 
@@ -892,8 +955,13 @@ def browser_rule(*, named: str | None, said: bool, front: str | None, recent: st
     else ``most``): ``front`` / ``recent`` for ``front_or_recent``, ``band``, ``site`` (the browser the site was last
     shown in) > ``most`` (the browser they use most) > ``default`` (``""``: Windows' handler). Pure: a replay on a
     database copy runs it too (``scripts/browser_rule_replay.py``; ``site_first`` is that script's old knob, kept as
-    an alias of the ``site`` policy)."""
+    an alias of the ``site`` policy).
+
+    lSkills (live 17 Oct): ``measured`` comes most used by recent weight first (:func:`measured_browsers`), and
+    ``band`` and ``most`` take only a browser still in use (:func:`fresh_keys`): Arc, unused since 12 Oct while Chrome
+    ran every day, fills nothing by them; named, the usual, ``site`` and front/recent are as before."""
     keys = [str(m.get("key") or "") for m in measured if m.get("key")]
+    fresh = fresh_keys(measured) or keys
     if named and said:
         return _app_key(named), "words"
     if pref:
@@ -906,14 +974,14 @@ def browser_rule(*, named: str | None, said: bool, front: str | None, recent: st
         if recent and recent in keys:
             return recent, "recent"
     elif policy == "band":
-        if band and band in keys:
+        if band and band in fresh:
             return band, "band"
     elif policy == "site":
         shown = [m for m in measured if m.get("key") and m.get("site_last") is not None]
         if shown:
             return str(max(shown, key=lambda m: float(m["site_last"]))["key"]), "site"
-    if keys:
-        return keys[0], "most"
+    if fresh:
+        return fresh[0], "most"
     return "", "default"
 
 
@@ -1207,7 +1275,7 @@ def choose_browser(call: RouteCall, *, hosts: Sequence[str] = (), policy: str | 
             front = None
         recent = last_in_front(store, keys)
     if store is not None and not named and policy == "band":
-        band = band_browser(store, keys)
+        band = band_browser(store, fresh_keys(measured) or keys)     # lSkills: among the browsers still in use
     key, source = browser_rule(named=named, said=said, front=front, recent=recent,
                                pref=named if not said else None, measured=measured, policy=policy, band=band)
     ask = _suspect_ask(key, source, suspect, measured)
@@ -1694,6 +1762,44 @@ def _keys() -> Any:
     return keys
 
 
+def _bar_window(call: RouteCall, key: str, name: str, source: str, end: float) -> tuple[int, str]:
+    """``(hwnd, where it came from)`` of the browser window the address-bar rung types into (lSkills, live 17 Oct: this
+    rung found "no window" in 96 ms with Arc up, after Arc refused protocol activation): the window the rung before
+    acted in (``noted``); else that browser's top user window by its program (``listed``); else its own window by the
+    Start menu app's identity (``launch.app_window``: its AppUserModelID or package, so a packaged browser is found
+    whatever its process is called; a window hidden in the background shown, or the browser brought up when it shows
+    none: ``open`` / ``minimized`` / ``hidden`` / ``launched``); ``(0, code)`` when none (``none``, ``no_app``, and
+    ``refused`` with a game in front). Code words only in the facts."""
+    hwnd = _noted_window(call, key)
+    if hwnd:
+        return hwnd, "noted"
+    hwnd = next((h for h, _pid in _app_windows(key)), 0)
+    if hwnd:
+        return hwnd, "listed"
+    app = name if source != "default" and name else _browser_title(key)
+    try:
+        from yuki.actions import launch
+
+        got, how = launch.app_window(app, deadline=end)
+    except Exception:  # noqa: BLE001
+        return 0, "none"
+    return (int(got), str(how)) if got else (0, str(how or "none"))
+
+
+def _running_count(key: str) -> int:
+    """How many processes of the program whose app key is ``key`` run now (a content-free count for the log)."""
+    try:
+        import psutil
+
+        n = 0
+        for p in psutil.process_iter(["name"]):
+            if _app_key(p.info.get("name") or "") == key:
+                n += 1
+        return n
+    except Exception:  # noqa: BLE001
+        return -1
+
+
 def route_address_bar(call: RouteCall) -> RouteResult:
     """web.open_page's and web.open_video's second rung A (x8WebArc; the path that worked in Arc on 5 Oct): the address
     typed into the chosen browser's own address field, in its own window.
@@ -1729,13 +1835,17 @@ def route_address_bar(call: RouteCall) -> RouteResult:
     facts: dict[str, Any] = {"browser_from": source, "via": "address_bar"}
     if not key:
         return RouteResult(ran=False, outcome="no_browser", facts=facts)
-    hwnd = _noted_window(call, key) or next((h for h, _pid in _app_windows(key)), 0)
+    end = max(_launch_deadline(call), started + BAR_FLOOR_S)
+    hwnd, window_from = _bar_window(call, key, name, source, end)
+    facts["how"] = window_from      # where the window came from (a code word the content-free log keeps: "how")
     pid = _window_pid(hwnd) if hwnd else 0
     if not hwnd or not pid:
+        if window_from == "refused":
+            return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
+        facts["procs"] = _running_count(key)     # live 17 Oct: "no_window" with Arc up; which it was, next time
         return RouteResult(ran=False, outcome="no_window", facts=facts)
     if _refused("focus", hwnd=hwnd):
         return RouteResult(ran=False, held="game", outcome="refused", facts=facts)
-    end = max(_launch_deadline(call), started + BAR_FLOOR_S)
     seen: dict[str, Any] = {"via": "address_bar", "process": _window_image(hwnd), "front": False, "state": ""}
     # review r1 H1: what each window it will look in shows now (its own first): a page a window already showed is
     # never the page this rung opened, in that window (the done-check compares with these too)
@@ -1743,7 +1853,9 @@ def route_address_bar(call: RouteCall) -> RouteResult:
     known = {hwnd, *others}
     befores = _pages_now([hwnd] + others)
     before_url = befores.get(hwnd, "")
-    ram: dict[str, Any] = {"expect": expect, "address": url, "browser": key, "befores": befores}
+    # the done-check reads this window by the program it belongs to (found by identity, its image is the truth)
+    ram: dict[str, Any] = {"expect": expect, "address": url, "browser": _app_key(seen["process"]) or key,
+                           "befores": befores}
     _claim_app(call, key)
     focused = _focus(hwnd)
     if _held_by_game(focused):

@@ -52,6 +52,20 @@ keyed digest the key, the row's name encrypted as its target), so :func:`find` m
 identity of the user's own words, learned from a seen result, never a list of meanings written here; the newest pairing
 of the same words wins, and :func:`unsay` drops one the user's later choice contradicts (what they say wins over what
 was learned).
+
+**By sound and by meaning** (lSkills, live 17 Oct: "Lumin" for lumen asked "say it again"; "anime playlist" asked which
+playlist a minute after "Japanese" was paired with ネオン; "something chill" took 15-29 s through the thinker):
+
+* :func:`heard_as` - a heard name that sounds like exactly one of the user's own listed names is that name (the people
+  index's reading of names by sound; data, never a word list): the resolver uses it on the menu's candidates;
+* :func:`described` + :func:`judge` - when words name no entity and no pairing holds them, memory describes the user's
+  own entities (what they called each before, when they pick it, how much, what played while it ran) and the voice's
+  small model judges which one the words name or describe, or that they only ask for a mood (then the hour's usual,
+  :func:`top`, plays), or none. One forced tool call with the names as an enum, bounded (:data:`MEANING_WAIT_S`), its
+  answer kept for the same words and descriptions (:data:`MEANING_TTL_S`); a ``name`` verdict stands only when the words
+  say that name by identity or sound. The Spotify driver asks it after its Library read and, once its own check sees
+  the row play, keeps those words as another name of the row (:func:`note` ``said_as``): the next time is by identity,
+  with no judgement. Content goes to the model only, never to a log.
 """
 
 from __future__ import annotations
@@ -291,6 +305,373 @@ def find_offered(store: Any, name: Any, *, now: float | None = None) -> dict[str
         return youtube_feed.pick(store, name, now=now)
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# lSkills (live 17 Oct): a heard name by sound, and words by meaning
+# ---------------------------------------------------------------------------------------------------------------------
+
+#: The judgement of what words mean is bounded by this long (a thread joined at most so; one small model call, about
+#: 1-1.5 s from this PC), and kept for the same words and the same names this long (RAM; the library and the restore
+#: rung of one request ask once).
+MEANING_WAIT_S = 3.0
+MEANING_TTL_S = 600.0
+#: At most this many of the user's own entities are described to it, each with at most this many titles memory saw
+#: playing while it ran, from the last this many days.
+MEANING_ITEMS = 16
+MEANING_TITLES = 4
+MEANING_DAYS = 30.0
+#: What the judgement may answer (code words, logged as they are): the words say its ``name`` (or a mishearing of it),
+#: what the user ``called`` it before, or describe its ``content``; ``mood`` asks for a feel no entity states (the
+#: hour's usual then plays: :func:`top`); ``none`` names something not among them; ``unknown``: no judgement (no model,
+#: too slow, an eval).
+MEANING_WHYS: tuple[str, ...] = ("name", "called", "content", "mood", "none")
+
+
+@dataclass(frozen=True)
+class Meant:
+    """What the user's words were judged to mean among their own entities: ``name`` (one of the names described, or
+    ``None``), ``why`` (:data:`MEANING_WHYS`, or ``unknown``) and how long the judgement took (ms)."""
+
+    name: str | None
+    why: str
+    ms: float = 0.0
+
+
+def heard_as(names: Any, said: Any) -> str | None:
+    """lSkills (live 17 Oct: "Lumin" heard for lumen while the talker's menu listed ``[playlist: lumen | ネオン]``):
+    the one of ``names`` (the user's own names: the menu's taste candidates, the rows an app showed) that ``said``
+    sounds like, or ``None`` (none, two, or ``said`` is one of them as written). Sound only, through the people
+    index's own reading of names (:func:`yuki.memory.contacts.sounds_in` with ``short``: the same sound key and onset
+    and spellings close enough, "Lumin"/"lumen" 0.25); a name in another script, or with digits, never matches. Data,
+    never a list of words."""
+    text = " ".join(str(said or "").split())
+    if not text:
+        return None
+    try:
+        from yuki.memory.contacts import sounds_in
+    except Exception:  # noqa: BLE001
+        return None
+    pool = [" ".join(str(n or "").split()) for n in names or []]
+    if any(_norm(n) == _norm(text) for n in pool if n):
+        return None
+    hits: dict[str, str] = {}
+    for name in pool:
+        if not name or _norm(name) in hits:
+            continue
+        try:
+            if sounds_in(name, [text], short=True) is not None:
+                hits[_norm(name)] = name
+        except Exception:  # noqa: BLE001 - a name that can't be read by sound
+            continue
+    return next(iter(hits.values())) if len(hits) == 1 else None
+
+
+def _peak_hours(hist: list[float]) -> str:
+    """When an entity is picked most, from its 24-hour histogram: the hours at least half as busy as its busiest, as
+    ranges ("22-01h, 06h"); ``""`` with no picks. A format of numbers, never a judgement."""
+    top_v = max(hist) if hist else 0.0
+    if top_v <= 0:
+        return ""
+    on = [v >= 0.5 * top_v for v in hist]
+    if all(on):
+        return "any hour"
+    start = next(i for i in range(24) if not on[i])     # begin after an off hour, so a range across midnight is one
+    spans: list[tuple[int, int]] = []
+    cur: int | None = None
+    for k in range(1, 25):
+        h = (start + k) % 24
+        if on[h] and cur is None:
+            cur = h
+        elif not on[h] and cur is not None:
+            spans.append((cur, (h - 1) % 24))
+            cur = None
+    if cur is not None:
+        spans.append((cur, (start + 24) % 24))
+    return ", ".join(f"{a:02d}h" if a == b else f"{a:02d}-{b:02d}h" for a, b in spans)
+
+
+def _heard_titles(store: Any, kind: str, now: float, days: float) -> dict[str, list[str]]:
+    """``{entity name (folded): titles}``: for a capability kind read from a media context (:func:`capability_kinds`:
+    Spotify's playlist), the app's own window titles (the timeline's, the user's rows) seen while that entity's context
+    ran in the last ``days``, at most :data:`MEANING_TITLES` each, most seen first; a title seen under two entities is
+    the app's own frame, not something one of them holds, and is left out. Decrypted in RAM, never logged; ``{}`` for
+    any other kind or when it can't be read."""
+    hit = next(((app, end) for k, app, end in capability_kinds() if k == kind), None)
+    if hit is None:
+        return {}
+    app, end = hit
+    since = now - float(days) * 86400.0
+    try:
+        moments = store.moments_between(since, now + 1.0, kinds=[end], app=app)
+        rows = store._query(
+            "SELECT started_at, title_ciphertext FROM timeline WHERE process = ? AND by_yuki = 0 AND started_at >= ? "
+            "AND started_at <= ? AND title_ciphertext IS NOT NULL ORDER BY started_at DESC LIMIT 2000",
+            (app, since, now))
+    except Exception:  # noqa: BLE001
+        return {}
+    spans: list[tuple[float, float, str]] = []
+    for i, m in enumerate(moments):
+        try:
+            name = _norm(store.moment_entity(m))
+        except Exception:  # noqa: BLE001
+            continue
+        if not name:
+            continue
+        at = float(m.get("at") or 0.0)
+        nxt = float(moments[i + 1].get("at") or at) if i + 1 < len(moments) else now
+        spans.append((at, min(nxt, at + 3 * 3600.0), name))
+    if not spans:
+        return {}
+    import bisect
+
+    starts = [s[0] for s in spans]
+    seen: dict[str, dict[str, int]] = {}
+    for started, title_ct in rows:
+        i = bisect.bisect_right(starts, float(started)) - 1
+        if i < 0 or float(started) >= spans[i][1]:
+            continue
+        try:
+            title = " ".join(str(store._dec(title_ct) or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        if title:
+            by = seen.setdefault(title, {})
+            by[spans[i][2]] = by.get(spans[i][2], 0) + 1
+    out: dict[str, dict[str, int]] = {}
+    for title, by in seen.items():
+        if len(by) == 1:
+            name, count = next(iter(by.items()))
+            out.setdefault(name, {})[title] = count
+    return {name: [t for t, _c in sorted(titles.items(), key=lambda kv: (-kv[1], kv[0]))[:MEANING_TITLES]]
+            for name, titles in out.items()}
+
+
+def described(store: Any, kind: str, *, now: float | None = None, names: Any = (), days: float = MEANING_DAYS,
+              limit: int = MEANING_ITEMS) -> list[dict[str, Any]]:
+    """lSkills: the user's own entities of ``kind`` with what memory knows of each, for a judgement of what words mean
+    (:func:`judge`): ``{"name", "called", "hours", "plays", "heard"}`` - what the user called it before (the words
+    paired with it: :func:`note` ``said_as``), when they pick it most (:func:`_peak_hours`), how often (the decayed
+    count), and what played while it ran (:func:`_heard_titles`). The picked ones first, most picked first, then the
+    names their own app showed, then ``names`` (rows a driver read just now) not known yet; at most ``limit``.
+    Decrypted in RAM, never logged. Read only; never raises (``[]``)."""
+    now = time.time() if now is None else float(now)
+    try:
+        rows = store._query("SELECT name_ciphertext, hist_weekday, hist_weekend, n_obs, source, last_at FROM tastes "
+                            "WHERE kind = ?", (kind,))
+        said = store._query("SELECT name_ciphertext, ref_ciphertext FROM tastes WHERE kind = ? "
+                            "ORDER BY last_at DESC, id DESC", (said_kind(kind),))
+    except Exception:  # noqa: BLE001
+        return []
+    called: dict[str, list[str]] = {}
+    for words_ct, target_ct in said:
+        try:
+            words = " ".join(str(store._dec(words_ct) or "").split())
+            target = _norm(store._dec(target_ct)) if target_ct else ""
+        except Exception:  # noqa: BLE001
+            continue
+        if words and target:
+            called.setdefault(target, []).append(words)
+    heard = _heard_titles(store, kind, now, days)
+    items: list[tuple[tuple[int, float, float], dict[str, Any]]] = []
+    for name_ct, wd, we, n_obs, source, last_at in rows:
+        try:
+            name = " ".join(str(store._dec(name_ct) or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        if not name:
+            continue
+        hist = [a + b for a, b in zip(_hist(wd), _hist(we))]
+        item: dict[str, Any] = {"name": name}
+        if called.get(_norm(name)):
+            item["called"] = called[_norm(name)][:4]
+        if (hours := _peak_hours(hist)):
+            item["hours"] = hours
+        if float(n_obs or 0.0) > 0:
+            item["plays"] = round(float(n_obs), 1)
+        if heard.get(_norm(name)):
+            item["heard"] = heard[_norm(name)]
+        picked = str(source or "") != SEEN_SOURCE and float(n_obs or 0.0) > 0
+        items.append(((0 if picked else 1, -float(n_obs or 0.0), float(last_at or 0.0)), item))
+    items.sort(key=lambda kv: kv[0])
+    out = [item for _k, item in items]
+    have = {_norm(i["name"]) for i in out}
+    for n in names or []:
+        clean = " ".join(str(n or "").split())
+        if clean and _norm(clean) not in have:
+            have.add(_norm(clean))
+            out.append({"name": clean})
+    return out[:max(0, int(limit))]
+
+
+MEANING_SYSTEM = """You decide which of a person's own {things} their words mean, for a voice assistant about to
+play it. Each item is one of theirs: its exact name, and what memory knows about it: the words they called it by before
+("called": their own description of it, the strongest clue), when they usually pick it ("hours"), how much ("plays"),
+and titles that played while it ran ("heard").
+Answer only with the pick tool:
+- name: the words say its name, or a mishearing or spelling of it.
+- called: the words say what they called it before, or a word for the same language, scene or genre (say "K-pop" for
+  an item they called "Korean", or "lofi" for one they called "study beats"), and no other item fits as well.
+- content: the words name a language, a genre, a scene or an artist, and its name or its "heard" titles plainly show
+  that of exactly one item.
+- mood: the words ask for a feel or an activity without naming one of their {things} ("something chill", "something
+  to work out to", "something to sleep to"), and no item's name or "called" words say it: pick nothing (their usual
+  for the hour will play). A feel or an activity is never content.
+- none: the words name one of their {things} by a word none of these goes by ("my gym playlist" with no item called
+  that), or two items fit equally: pick nothing."""
+
+
+_meaning_cache: dict[tuple[str, str, str], tuple[float, Meant]] = {}
+_meaning_lock = threading.Lock()
+_client_box: list[Any] = []
+_client_lock = threading.Lock()
+
+
+def _judge_client(settings: Any = None) -> Any:
+    """The small model's client, made once per process (the voice's own kind of failover client; a waited-on call).
+    Making it costs about 0.5 s (settings, the failover table), so :func:`prewarm` makes it ahead of the first need."""
+    with _client_lock:
+        if _client_box:
+            return _client_box[0]
+        if settings is None:
+            from yuki.config import Settings
+
+            settings = Settings()
+        from yuki.agent.failover import make_client
+
+        client = make_client(settings, role="voice", waited_on=True)
+        _client_box[:] = [client]
+        return client
+
+
+def prewarm() -> None:
+    """Make :func:`judge`'s client on a short thread of its own, now (a caller that may need a judgement in a moment:
+    the playlist rung, as its Library read starts, when the words name no row it knows). No model call; never raises."""
+    if _client_box:
+        return
+
+    def make() -> None:
+        try:
+            _judge_client()
+        except Exception:  # noqa: BLE001 - the judgement makes it then, or says unknown
+            pass
+
+    threading.Thread(target=make, name="yuki-taste-judge-warm", daemon=True).start()
+
+
+def _name_said(said: str, name: str) -> bool:
+    """Whether ``said`` says ``name`` itself: its letters and digits in a row ("the 3 AM one" holds "3AM"), or a run of
+    it sounds like the name (:func:`heard_as`: "Lumin" for lumen). Identity and sound, never meaning: the check behind a
+    judgement that the words name an item (a model once called "workout" a mishearing of lumen)."""
+    def squash(text: str) -> str:
+        return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+    if squash(name) and squash(name) in squash(said):
+        return True
+    return heard_as([name], said) is not None
+
+
+def _settle(response: Any, names: list[str], text: str, ms: float,
+            items: list[dict[str, Any]] | None = None) -> Meant:
+    """A judgement's answer as a :class:`Meant`: the name only when it is one described (the tool's enum holds that
+    already) and the code word allows one; a ``name`` verdict only when the words say that name by identity or sound
+    (:func:`_name_said`), else ``none``."""
+    call = next((b for b in getattr(response, "content", []) or [] if getattr(b, "type", None) == "tool_use"), None)
+    args = dict(getattr(call, "input", {}) or {}) if call is not None else {}
+    why = str(args.get("why") or "")
+    pick = " ".join(str(args.get("name") or "").split())
+    name = next((n for n in names if _norm(n) == _norm(pick)), None) if pick else None
+    if why not in MEANING_WHYS:
+        why = "none"
+    if why in ("mood", "none"):
+        name = None
+    elif name is None or (why == "name" and not _name_said(text, name)):
+        why, name = "none", None
+    elif why == "called" and items is not None and not any(
+            _norm(i.get("name")) == _norm(name) and i.get("called") for i in items):
+        why = "content"     # nothing was ever called that: it can only be what the item holds
+    return Meant(name, why, ms)
+
+
+def judge(said: str, words: Any, items: list[dict[str, Any]], *, kind: str = "spotify_playlist",
+          client: Any = None, model: str | None = None, settings: Any = None,
+          wait_s: float = MEANING_WAIT_S) -> Meant:
+    """lSkills (live 17 Oct: "anime playlist" asked which playlist twice although "Japanese" had just been paired with
+    ネオン; "something chill" took 15-29 s): which of the user's own entities ``said`` means, judged by a small model
+    (the voice's mouth model) on memory's own descriptions of them (:func:`described`), never by a word list. One
+    forced tool call whose name field is an enum of the names described (it can only answer one of them, or none),
+    bounded by ``wait_s`` on its own thread; ``Meant(None, "unknown")`` when there is nothing to judge, no client, or no
+    answer in time (an answer that comes late is still kept for the same words and the same descriptions, so the next
+    ask within :data:`MEANING_TTL_S` has it at once). A ``name`` verdict stands only when the words say that name by
+    identity or sound (:func:`_name_said`). Content (names, titles, words) goes to the model only, never to a log."""
+    started = time.perf_counter()
+    names = [str(i.get("name") or "") for i in items if i.get("name")]
+    text = " ".join(str(said or "").split())
+    if not names or not text:
+        return Meant(None, "unknown")
+    # the same words against the same descriptions (a new pairing or play changes them, and the answer may change)
+    key = (str(kind), _norm(text), json.dumps(items, ensure_ascii=False, sort_keys=True))
+    now_m = time.monotonic()
+    with _meaning_lock:
+        got = _meaning_cache.get(key)
+        if got is not None and now_m - got[0] < MEANING_TTL_S:
+            return got[1]
+    try:
+        if settings is None:
+            from yuki.config import Settings
+
+            settings = Settings()
+        model = model or str(getattr(settings, "voice_mouth_model", "") or "")
+        client = client if client is not None else _judge_client(settings)
+    except Exception:  # noqa: BLE001 - no model here: no judgement
+        return Meant(None, "unknown", round((time.perf_counter() - started) * 1000.0, 1))
+    things = "playlists" if kind.endswith("playlist") else (kind.rsplit("_", 1)[-1] + "s")
+    turns = [str(w) for w in (words if isinstance(words, (list, tuple)) else [words]) if str(w or "").strip()]
+    tool = {"name": "pick", "description": "Which of their items the words mean (or none).",
+            "input_schema": {"type": "object", "properties": {
+                "name": {"type": "string", "enum": names + [""], "description": "the item's exact name, or empty"},
+                "why": {"type": "string", "enum": list(MEANING_WHYS)}}, "required": ["name", "why"]}}
+    request = {"model": model, "max_tokens": 80,
+               "system": MEANING_SYSTEM.replace("{things}", things),
+               "tools": [tool], "tool_choice": {"type": "tool", "name": "pick"},
+               "messages": [{"role": "user", "content": json.dumps(
+                   {"said": text, "their words": turns[-3:], "items": items}, ensure_ascii=False)}]}
+    box: dict[str, Any] = {}
+    box_lock = threading.Lock()
+
+    def keep(meant: Meant) -> None:
+        with _meaning_lock:
+            at = time.monotonic()
+            for k in [k for k, (t, _m) in _meaning_cache.items() if at - t >= MEANING_TTL_S]:
+                _meaning_cache.pop(k, None)
+            _meaning_cache[key] = (at, meant)
+
+    def run() -> None:
+        try:
+            response = client.messages.create(**request)
+        except Exception as exc:  # noqa: BLE001 - reported as no judgement
+            box["error"] = type(exc).__name__
+            return
+        with box_lock:
+            box["response"] = response
+            late = bool(box.get("late"))
+        if late:
+            # the caller stopped waiting: kept for the next ask of the same words (a retry, the hand-off's own run)
+            keep(_settle(response, names, text, round((time.perf_counter() - started) * 1000.0, 1), items))
+
+    thread = threading.Thread(target=run, name="yuki-taste-meaning", daemon=True)
+    thread.start()
+    thread.join(max(0.1, float(wait_s)))
+    ms = round((time.perf_counter() - started) * 1000.0, 1)
+    with box_lock:
+        response = box.get("response")
+        if response is None:
+            box["late"] = True
+    if response is None:
+        return Meant(None, "unknown", ms)
+    meant = _settle(response, names, text, ms, items)
+    keep(meant)
+    return meant
 
 
 def takes_offers(skill: Any, slot: Any) -> bool:
@@ -853,7 +1234,10 @@ def seed(store: Any, *, now: float | None = None, log: LogFn | None = None, retr
 
 __all__ = ["SIGMA_MIN", "FALLBACK_MASS", "MENU_CANDIDATES", "OPTIONS_N", "SEEN_SOURCE", "SEEN_MAX", "SAID_SUFFIX",
            "Taste", "hour_score", "score_at", "top", "candidates", "seen_names", "options", "said_kind", "said_target",
-           "said_words", "find", "offered", "find_offered", "takes_offers", "SEED_DAYS", "HALF_LIFE_DAYS",
+           "said_words", "find", "offered", "find_offered", "takes_offers", "MEANING_WAIT_S", "MEANING_TTL_S",
+           "MEANING_ITEMS", "MEANING_TITLES", "MEANING_DAYS", "MEANING_WHYS", "Meant", "heard_as", "described", "judge",
+           "prewarm",
+           "SEED_DAYS", "HALF_LIFE_DAYS",
            "SESSION_GAP_S", "FLOOR", "OPAQUE_VAR", "RETIRED_KINDS", "ASKED_FILLS", "GUESS_FILLS", "OFFER_FIELDS",
            "entity_key", "site_kinds",
            "capability_kinds", "slot_kind", "recompute", "seed_sites", "note", "saw", "unsay", "busy", "seed"]

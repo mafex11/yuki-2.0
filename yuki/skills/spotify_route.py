@@ -1094,6 +1094,10 @@ def _other_device(facts: dict[str, Any], *, volume: bool = False) -> Any:
 # (4) what the user says wins over what was learned: when a row reached through a pairing played and another row plays
 #     within the exchange's span (their correction, whatever its words), the pairing is dropped (``taste.unsay``), so
 #     the words hand over once more and learn again (:func:`_said_doubt`).
+# (5) lSkills (live 17 Oct): words that name no row and no pairing (``anime``, ``something chill``) are judged against
+#     memory's own description of the user's playlists before the hand-off (:func:`_meant_row`: taste.described +
+#     taste.judge, a small model; a mood takes the hour's usual), and a row this rung plays for them is watched like a
+#     hand-off's, so its own check keeps the words as another name of it: learned after one go, by identity next time.
 # No mapping is written here, and nothing polls: the watch is a note in RAM that those checks read.
 
 #: Names already kept as taste by this process, per taste kind (folded; RAM): a read with nothing new writes nothing.
@@ -1478,6 +1482,29 @@ def _after_look(call: Any, look: Look, status: str, app_id: str, facts: dict[str
         return got
     if look.details.get("said_as"):
         got.facts_ram["row"] = look.name      # the driver's own paired-row read: the value is still the words
+    meant = str(look.details.get("meant") or "")
+    if meant:
+        # lSkills: the row memory related the words to (_meant_row): checked by its own name, the value still the
+        # words; a play this rung made is watched like a hand-off's, so once its check sees it play the words are kept
+        # as another name of it (taste.note said_as: the next "anime playlist" plays it by identity, no judgement).
+        # A mood is never kept: the hour decides it each time
+        got.facts_ram["row"] = look.name
+        got.facts["how"] = str(look.details.get("meant_why") or "")    # name / called / content / mood
+        learns = _learns(call)
+        if learns is None:
+            return got
+        _said_doubt(look.name, meant)
+        if got.ran is not False and not got.already and look.details.get("meant_why") != "mood":
+            log = _logger(call)
+            with _pair_lock:
+                # remembered like a play reached through a pairing (_said_note): another row put on within the watch's
+                # span (their correction) drops what these words were taken to mean (_said_doubt -> taste.unsay)
+                _said_play.clear()
+                _said_play.update(words=meant, row=look.name, until=time.monotonic() + PAIR_WATCH_S,
+                                  memory=learns[0], kind=learns[1], log=log)
+            gen = _pair_open(meant, None, memory=learns[0], kind=learns[1], log=log)
+            got.facts_ram["pair"] = {"gen": gen, "row": look.name, "own": _own(look)}
+        return got
     if _learns(call) is None:
         return got                       # an eval run (or no memory): no watch, pairing or doubt is touched
     gen = _pair_request(call, look.name, acted=got.ran is not False and not got.already)
@@ -1605,27 +1632,88 @@ def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | 
 def _look_named(call: Any, hwnd: int, want: str, *, learned: Mapping[str, str] | None, press: bool = False) -> Look:
     """:func:`_look` for the name asked; when no row has it (``not_in_view``), once more for the row these exact
     words were paired with (:func:`_said_name`: they named no row before and that playlist then played), marked
-    ``details["said_as"]``. The first read is kept when that row isn't in view either (its names go to the hand-off).
-    A press happens only on the read that found its row (decide and press on one read)."""
+    ``details["said_as"]``; with no pairing, once more for the row memory relates the words to (:func:`_meant_row`,
+    lSkills: "anime playlist" -> ネオン; "something chill" -> the hour's usual), marked ``details["meant"]`` (the words)
+    and ``details["meant_why"]`` (a code word). The first read is kept when that row isn't in view either (its names
+    go to the hand-off). A press happens only on the read that found its row (decide and press on one read)."""
     look = _look(DESK, hwnd, want, learned=learned, press=press)
     if look.status != "not_in_view":
         return look
     other = _said_name(call, want)
-    if not other:
+    if other:
+        again = _look(DESK, hwnd, other, learned=learned, press=press)
+        if again.status in ("ok", "ambiguous", "no_wording"):
+            again.details["said_as"] = True
+            return again
         return look
-    again = _look(DESK, hwnd, other, learned=learned, press=press)
+    meant = _meant_row(call, want, look.names)
+    if meant is None:
+        return look
+    name, why = meant
+    again = _look(DESK, hwnd, name, learned=learned, press=press)
     if again.status in ("ok", "ambiguous", "no_wording"):
-        again.details["said_as"] = True
+        again.details["meant"] = want
+        again.details["meant_why"] = why
         return again
     return look
+
+
+#: lSkills: the least time left in the request for the judgement of what the words mean to be asked at all (it takes
+#: about 1-1.5 s, and the row's press and its check follow).
+MEANING_MIN_LEFT_S = 1.2
+
+
+def _meant_row(call: Any, want: str, seen: Any = ()) -> tuple[str, str] | None:
+    """lSkills (live 17 Oct: "anime playlist" asked which playlist although "Japanese" was paired with ネオン a minute
+    before; "something chill" took 15-29 s through the thinker): the playlist the words ``want`` mean when no row is
+    called that and no pairing holds them, ``(name, why)``, else None.
+
+    Memory describes the user's own playlists (:func:`yuki.skills.taste.described`: what they called each before, when
+    they play it, how much, what played while it ran), with the rows this read saw (``seen``), and a small model judges
+    which one the words name or describe (:func:`yuki.skills.taste.judge`; ``why`` ``name`` / ``called`` /
+    ``content``). Words that only ask for a mood (``mood``) take the playlist they pick most at this hour
+    (:func:`yuki.skills.taste.top`, the taste fill's own rule). Anything else (``none``, no answer in time, too little
+    time left, an eval run, no memory) is None: the hand-off asks or finds it, as before. The data read is one bounded
+    memory call; the judgement runs on this rung's thread, never inside memory's. Logged content-free
+    (``spotify_meaning``: the code word, ms, how many described)."""
+    memory = getattr(call.ctx, "memory", None)
+    kind = _taste_kind(call)
+    if memory is None or not kind or not want or getattr(call.ctx, "origin", "") == "eval":
+        return None
+    left = _left(call)
+    if left < MEANING_MIN_LEFT_S:
+        return None
+    from yuki.skills import engine, taste
+
+    names = [str(n) for n in (seen or ()) if n][:SEEN_MAX]
+    items = engine._mem(memory, "spotify_meaning_data",
+                        lambda c: taste.described(engine._store_of(c), kind, names=names), timeout_s=0.5)
+    log = _logger(call)
+    if not items:
+        log("spotify_meaning", why="no_data", items=0)
+        return None
+    meant = taste.judge(want, getattr(call.ctx, "words", None) or [want], list(items), kind=kind,
+                        wait_s=min(taste.MEANING_WAIT_S, max(1.0, left - 1.0)))
+    if meant.name and meant.why in ("name", "called", "content"):
+        log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=True)
+        return meant.name, meant.why
+    if meant.why == "mood":
+        best = engine._mem(memory, "spotify_hour_taste", lambda c: taste.top(engine._store_of(c), kind, n=1),
+                           timeout_s=0.3)
+        name = best[0].name if best else ""
+        log("spotify_meaning", why="mood", ms=meant.ms, items=len(items), picked=bool(name))
+        return (name, "mood") if name else None
+    log("spotify_meaning", why=meant.why, ms=meant.ms, items=len(items), picked=False)
+    return None
 
 
 def _check_name(look: Look, want: str) -> str:
     """The name a row is read again by (the flip wait, the restore): the paired row's own name when the read reached it
     through a pairing (``details["said_as"]``), else the name asked. The name asked, not the row's bare name, so the
     row a two-rows answer names ("Lantern Rain by Odile Fenn") stays the one row it fits (review r1 M1); names are
-    matched with case and spacing folded, so Spotify's spelling needs nothing."""
-    return look.name if look.details.get("said_as") and look.name else want
+    matched with case and spacing folded, so Spotify's spelling needs nothing. lSkills: a row reached by what the
+    words mean (``details["meant"]``) is read again by its own name too."""
+    return look.name if (look.details.get("said_as") or look.details.get("meant")) and look.name else want
 
 
 #: Reads that saw no row at all (nothing to say "missing" about): a watch may still learn what the words meant.
@@ -1640,6 +1728,13 @@ def play_library(call: Any) -> Any:
     want = _playlist_name(call.values)
     if not want:
         return _rr(ran=False, outcome="no_name")
+    value = call.values.get(PLAYLIST_SLOT)
+    if not (isinstance(value, Mapping) and value.get("key")) and getattr(call.ctx, "origin", "") != "eval":
+        # lSkills: the words name no playlist memory knows (the resolver found no row): a judgement of what they mean
+        # may follow the Library read (_meant_row), so its client is made now, beside the read
+        from yuki.skills import taste
+
+        taste.prewarm()
     facts: dict[str, Any] = {}
     win, status, app_id, early = _prologue(call, facts)
     if early is not None:
@@ -1708,6 +1803,9 @@ def play_restored(call: Any) -> Any:
         look = _look_named(call, win.hwnd, name, learned=learned, press=True)
         if first.details.get("said_as"):
             look.details["said_as"] = True
+        if first.details.get("meant"):
+            look.details["meant"] = first.details["meant"]
+            look.details["meant_why"] = first.details.get("meant_why")
         _log_read(call, "restored", "front", facts, look)
         _feed_seen(call, look)
         status, app_id = DESK.spotify_status(win.pid)

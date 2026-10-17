@@ -32,7 +32,14 @@ menu entry it is - facts about the entry, never about which app it is:
      running Arc was "started" with a URL and showed nothing).
   Running the executable inside its package folder directly would start it
   *without* package identity, and so with a different data folder (a fresh
-  browser profile), which is why none of these does that;
+  browser profile), which is why none of these does that.
+  lSkills (live 17 Oct): a package may declare a scheme and still refuse the
+  protocol contract - Arc, a full-trust desktop package, failed every open with
+  ``0x80270254`` ("does not support the contract specified or is not
+  installed"; a model read that aloud as "Arc isn't installed"). Then the same
+  start goes on at once through the alias, else ``ActivateApplication``, the
+  refusal is kept for the process (:data:`_NO_PROTOCOL`), and a failure is
+  said as a fact (:func:`_activation_failure`), never in Windows' words;
 * a desktop app is started with ``Start-Process -FilePath <exe> -ArgumentList
   ...``, the executable being the target of its Start menu shortcut (whose own
   arguments and working folder are kept), else the file its AppID names, else
@@ -84,6 +91,17 @@ with ``details["page_state"] = "already"`` and the window brought forward
 window and bringing it forward - for a caller that must answer in time (a
 skill's rung; on 10 Oct one Arc launch took 26-34 s).  ``details["via_word"]``
 says how the app was started as a code word a content-free log keeps.
+
+**The browser's own address bar** (lSkills, live 17 Oct). ``open_url(url,
+app=...)`` with a web address: when the browser didn't open the address handed
+to it (``page_unchanged``, a start that failed, or a packaged browser's windows
+showing no page at all) and it is a browser by machine data (its manifest
+declares the scheme, or Windows lists it under ``StartMenuInternet``), the
+address is typed into its own address bar in its own window
+(:func:`_address_bar_open`): a new tab, the address typed only into a text
+field of the browser's own frame (never a page's box, so never a send) and read
+back, Enter, and done only when a window newly shows the page. A browser that
+ignored the last hand-offs gets the address typed at once.
 
 **An app running with no window** (closed to the background or the tray) is
 brought back when launched without arguments: its own hidden main window is
@@ -1134,13 +1152,16 @@ def _uri_schemes(args: list[str]) -> list[str] | None:
     return schemes or None
 
 
-def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict | None, list[str]]:
+def _plan_start_with_args(chosen: dict[str, str], args: list[str], *,
+                          protocol: bool = True) -> tuple[dict | None, list[str]]:
     """How to start ``chosen`` with ``args``, or why it cannot be.
 
     For a packaged app, in order (see the module docstring): protocol activation
     when every argument is a URI of a scheme it declares, its App Execution
     Alias, ``ActivateApplication``.  For a desktop app, ``Start-Process`` on its
-    program file.
+    program file.  ``protocol=False`` (lSkills, live 17 Oct): protocol activation
+    is left out - the app refused that contract (:data:`_NO_PROTOCOL`), so the
+    alias, else ``ActivateApplication``, carries the arguments instead.
 
     Returns:
         ``(plan, notes)``.  ``plan["via"]`` is ``"AppExecutionAlias"`` or
@@ -1166,7 +1187,15 @@ def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict
         if facts["error"]:
             notes.append(facts["error"])
         schemes = _uri_schemes(args)
-        if schemes and all(scheme in facts["protocols"] for scheme in schemes):
+        declared = bool(schemes) and all(scheme in facts["protocols"] for scheme in schemes)
+        refused = appid.lower() in _NO_PROTOCOL
+        if declared and (refused or not protocol):
+            # lSkills (live 17 Oct): the manifest declares the scheme, but Windows refused protocol activation for it
+            # (Arc, a full-trust desktop package: HRESULT 0x80270254, "does not support the contract"): the alias,
+            # else ActivateApplication, carries the address instead; never "not installed"
+            notes.append("protocol activation left out: the app refused that contract"
+                         + (" earlier in this session" if refused else ""))
+        elif declared:
             # x8WebArc (10 Oct): every argument is a URI of a scheme the package declares, so it is handed over
             # the way a running instance is built to receive it, before the alias: Arc ignored every web address
             # its alias carried (3, 5 and 10 Oct: it stayed on the page it had, or showed an old tab).
@@ -1190,7 +1219,9 @@ def _plan_start_with_args(chosen: dict[str, str], args: list[str]) -> tuple[dict
             }, notes
         if not facts["error"] and not facts["aliases"]:
             notes.append("its package manifest declares no App Execution Alias")
-        if facts["protocols"]:
+        if declared:
+            pass   # the scheme is declared; protocol activation was refused (noted above)
+        elif facts["protocols"]:
             notes.append(
                 "not every argument is a URI of a scheme its manifest declares "
                 f"({', '.join(facts['protocols'])})"
@@ -1292,6 +1323,44 @@ def _activation_manager_interface():  # -> type[comtypes.IUnknown]
 
 
 _ACTIVATION_INTERFACE = None
+
+#: lSkills (live 17 Oct): the AppUserModelIDs (lowercased) whose protocol activation Windows refused in this process
+#: (every Arc open failed with ``COMError -2144927148`` = ``0x80270254``, "This app does not support the contract
+#: specified or is not installed": a full-trust desktop package declares ``windows.protocol`` but takes links through
+#: its program's command line). A fact about the installed package, so the next start goes straight to its alias. RAM
+#: only; a new process (an updated package) tries protocol activation again.
+_NO_PROTOCOL: set[str] = set()
+_no_protocol_lock = threading.Lock()
+#: How long a running package that refused protocol activation is watched for the page its alias carried (its react
+#: time plus a second), before ``open_url``'s address bar takes over.
+_REFUSED_PAGE_S = _RUNNING_REACT_S + 1.0
+
+
+def _hresult_of(error: str) -> int | None:
+    """The HRESULT a ``COMError``/``OSError`` text carries (``"COMError: (-2144927148, ..."``), as an unsigned int, or
+    ``None``. A machine format (comtypes' own error text), never words."""
+    text = str(error or "")
+    head = text.partition("(")[2].partition(",")[0].strip()
+    try:
+        value = int(head)
+    except ValueError:
+        return None
+    return value & 0xFFFFFFFF
+
+
+def _activation_failure(name: str, via: str, error: str) -> str:
+    """What a failed packaged activation says, as a fact the caller can repeat: never Windows' own message text, whose
+    "or is not installed" a model read aloud as "Arc isn't installed" on 17 Oct (the app was installed: its Start menu
+    entry was found, which is how it was resolved)."""
+    code = _hresult_of(error)
+    if code is not None:
+        return (f"Windows would not hand {name} the arguments by {via} (HRESULT 0x{code:08X}); {name} is installed "
+                f"(its Start menu entry was found)")
+    if "did not return within" in str(error):
+        return (f"activating {name} by {via} did not answer in time; {name} is installed "
+                f"(its Start menu entry was found)")
+    return (f"activating {name} by {via} failed ({str(error)[:120]}); {name} is installed "
+            f"(its Start menu entry was found)")
 
 _shell_api = ctypes.WinDLL("shell32")  # private: its argtypes leak nowhere
 
@@ -2943,14 +3012,41 @@ def launch_app(
             launched_pid = pid
             if error:
                 into["launch_error"] = error
-            failure = (
-                f"activating the packaged app {plan['aumid']!r} with arguments "
-                f"({plan['via']}) failed: {error}"
-            )
+                if (code := _hresult_of(error)) is not None:
+                    into["launch_hresult"] = f"0x{code:08X}"
+            failure = _activation_failure(chosen["name"], str(plan["via"]), error)
         return launched_pid, failure
 
     launched_pid, failure = hand_over(details)
     mark("start")
+    if (not details["launched"] and plan is not None and plan.get("via") == "ActivateForProtocol"
+            and details.get("refused") != "game" and _hresult_of(str(details.get("launch_error") or "")) is not None):
+        # only a refusal Windows answered with an HRESULT: an activation that merely didn't return in time may still
+        # deliver the address, and a second hand-off would open it twice
+        # lSkills (live 17 Oct): Windows refused protocol activation (Arc: 0x80270254 on every open; the model then
+        # said "Arc isn't installed" or opened the page in Chrome). That is a fact about the installed package: kept
+        # for this process, and the arguments go the next way at once - its App Execution Alias, else
+        # ActivateApplication - with the page checked as before (a running Arc that ignores what its alias carries
+        # comes back ``page_unchanged``, and ``open_url``'s address-bar step takes over)
+        with _no_protocol_lock:
+            _NO_PROTOCOL.add(str(chosen["appid"]).lower())
+        refused = {"via": "protocol", "hresult": details.pop("launch_hresult", ""), "error": failure}
+        details.pop("launch_error", None)
+        again, again_notes = _plan_start_with_args(chosen, arg_list, protocol=False)
+        if again is not None:
+            plan = again
+            details["protocol_refused"] = refused
+            details["resolution_notes"] = list(details.get("resolution_notes") or []) + again_notes
+            details["via"] = plan["via"]
+            details["arguments"] = plan["arguments"]
+            details.pop("uris", None)
+            if "command" in plan:
+                details["exe"] = plan["exe"]
+                details["exe_source"] = plan["source"]
+                details["start_command"] = plan["command"]
+            details["via_word"] = VIA_WORDS.get(str(plan["via"]), "")
+            launched_pid, failure = hand_over(details)
+            mark("start_again")
     if not details["launched"]:
         return finish(False, f"could not start {chosen['name']!r}: {failure}", details)
 
@@ -2977,6 +3073,11 @@ def launch_app(
     if page_targets:
         details["page_targets"] = page_targets
         content_deadline = handed_off + content_timeout_s + (0.0 if already_running else timeout_s)
+        if already_running and details.get("protocol_refused"):
+            # lSkills: a running package that refused protocol activation got the address through its alias, which Arc
+            # ignored on 3, 5 and 10 Oct: a browser that takes it shows the page within the react time, so the
+            # address bar (open_url) isn't kept waiting the whole content wait behind it
+            content_deadline = min(content_deadline, handed_off + _REFUSED_PAGE_S)
         if deadline is not None:
             content_deadline = min(content_deadline, float(deadline))
         page_wait = _await_page(identity, page_targets, before, content_deadline - time.monotonic(),
@@ -3704,22 +3805,330 @@ def _default_handler(target: str) -> str:
     return os.path.basename(_handler_path(target)).lower()
 
 
+# ---------------------------------------------------------------------------
+# lSkills (live 17 Oct): the address typed into the browser's own address bar
+# ---------------------------------------------------------------------------
+#: The keys every desktop browser opens a new tab with, its address field focused (in Arc they open its command bar,
+#: which takes an address the same way: the path that worked in Arc on 5 Oct). The same fact as
+#: ``yuki/skills/connections/web.toml``'s ``new_tab``.
+_NEW_TAB_KEYS: tuple[str, ...] = ("ctrl", "t")
+#: How long the address-bar step watches for the page after Enter (at least :data:`_BAR_PAGE_MIN_S`), and the least
+#: time the whole step gets however much of a caller's deadline the hand-off before it spent.
+_BAR_PAGE_S = 4.0
+_BAR_PAGE_MIN_S = 1.5
+_BAR_FLOOR_S = 6.0
+#: How many address hand-offs in a row an app may ignore (keep the very page it had) before :func:`open_url` types the
+#: address at once (the hand-off's page wait skipped), and for how long that holds. One when Windows already refused
+#: the app's protocol activation (its link path failed once), else two: a single slow page must not turn a working
+#: browser's link path into keystrokes (x8WebArc review r1 L1). RAM only, this process.
+_IGNORED_AFTER = 2
+_IGNORED_KEEP_S = 4 * 3600.0
+_ignored_handoffs: dict[str, tuple[int, float]] = {}
+_ignored_lock = threading.Lock()
+#: ``Clients\StartMenuInternet``: where Windows lists the desktop browsers it knows (its own default-apps list reads
+#: it).
+_BROWSER_CLIENTS = (("HKEY_CURRENT_USER", r"SOFTWARE\Clients\StartMenuInternet"),
+                    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\Clients\StartMenuInternet"),
+                    ("HKEY_LOCAL_MACHINE", r"SOFTWARE\WOW6432Node\Clients\StartMenuInternet"))
+_browser_images_cache: list[frozenset[str]] = []
+
+
+def _appid_of(app: str) -> str:
+    """The AppID of the Start menu app ``app`` names (exact or the one substring match), ``""`` when none or several."""
+    try:
+        chosen, _candidates = _match_apps(app, get_start_apps())
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(chosen.get("appid") or "") if chosen else ""
+
+
+def _note_ignored(appid: str, ignored: bool) -> None:
+    """One more address hand-off ``appid`` ignored (``ignored``), or one it opened (the count is cleared)."""
+    key = str(appid or "").lower()
+    if not key:
+        return
+    with _ignored_lock:
+        if ignored:
+            _ignored_handoffs[key] = (_ignored_handoffs.get(key, (0, 0.0))[0] + 1, time.monotonic())
+        else:
+            _ignored_handoffs.pop(key, None)
+
+
+def _ignores_handoff(appid: str) -> bool:
+    """Whether ``appid`` ignored enough address hand-offs in a row (:data:`_IGNORED_AFTER`; one once its protocol
+    activation was refused), the latest within :data:`_IGNORED_KEEP_S`."""
+    key = str(appid or "").lower()
+    with _ignored_lock:
+        got = _ignored_handoffs.get(key)
+    if not got or time.monotonic() - got[1] >= _IGNORED_KEEP_S:
+        return False
+    return got[0] >= (1 if key in _NO_PROTOCOL else _IGNORED_AFTER)
+
+
+def _registered_browser_images() -> frozenset[str]:
+    """The program images (lowercased, ``chrome.exe``) Windows lists as desktop browsers
+    (:data:`_BROWSER_CLIENTS`: each client's ``shell\\open\\command``), read once per process. Machine data; never
+    raises (an empty set)."""
+    if _browser_images_cache:
+        return _browser_images_cache[0]
+    out: set[str] = set()
+    try:
+        import ntpath
+        import winreg
+
+        for hive, path in _BROWSER_CLIENTS:
+            try:
+                root = winreg.OpenKey(getattr(winreg, hive), path)
+            except OSError:
+                continue
+            with root:
+                for i in range(256):
+                    try:
+                        client = winreg.EnumKey(root, i)
+                    except OSError:
+                        break
+                    try:
+                        with winreg.OpenKey(root, client + r"\shell\open\command") as key:
+                            command = str(winreg.QueryValueEx(key, "")[0] or "").strip()
+                    except OSError:
+                        continue
+                    end = command.casefold().find(".exe")
+                    exe = command[1:].partition('"')[0] if command.startswith('"') else \
+                        (command[:end + 4] if end >= 0 else "")
+                    if exe.casefold().endswith(".exe"):
+                        out.add(ntpath.basename(exe).lower())
+    except Exception:  # noqa: BLE001 - not on Windows, or unreadable: none known
+        pass
+    got = frozenset(out)
+    _browser_images_cache[:] = [got]
+    return got
+
+
+def _takes_addresses(chosen: dict[str, str], identity: _AppIdentity, target: str, details: dict) -> bool:
+    """Whether the app is a web browser by machine data, so its own address bar may take the address: a packaged app
+    whose manifest declares the address's scheme (``windows.protocol``: Arc declares http and https), or a desktop
+    program Windows lists as a browser (:func:`_registered_browser_images`). Never a list of browsers; a chat app that
+    draws one site (no such declaration) never qualifies."""
+    try:
+        scheme = urlsplit(target).scheme.lower()
+    except ValueError:
+        return False
+    protocols = details.get("manifest_protocols")
+    if protocols is None and _is_packaged(chosen.get("appid", "")):
+        protocols = _package_app_facts(chosen["appid"]).get("protocols") or []
+    if protocols and scheme in [str(p).lower() for p in protocols]:
+        return True
+    images = _registered_browser_images()
+    if not images:
+        return False
+    exes = {os.path.basename(p).lower() for p in identity.exe_paths}
+    if details.get("exe"):
+        exes.add(os.path.basename(str(details["exe"])).lower())
+    return bool(exes & images)
+
+
+def _own_window(identity: _AppIdentity) -> tuple[int | None, str]:
+    """The app's window to type an address into: ``(hwnd, how)``, ``how`` a code word: ``open`` (on screen, topmost
+    first), ``minimized``, ``hidden`` (shown now: an app closed to the background), ``none``. By the app's identity
+    (its AppUserModelID or package, its program file), never by its process name."""
+    try:
+        pids = identity.running_pids()
+    except Exception:  # noqa: BLE001
+        pids = set()
+    if not pids:
+        return None, "none"
+    hwnd, state = _find_app_window(identity, pids)
+    if hwnd is None:
+        return None, "none"
+    if state == "hidden":
+        return (hwnd, "hidden") if _show_window(hwnd) else (None, "none")
+    return hwnd, state
+
+
+def app_window(app: str, *, deadline: float | None = None) -> tuple[int | None, str]:
+    """``(hwnd, how)``: the Start menu app ``app``'s own window, for a caller that types into it (the web skill's
+    address-bar rung): found by the app's identity (:func:`_own_window`: ``open``, ``minimized``, ``hidden``); with
+    the app not running or showing no window, ``launch_app(app)`` brings one up (``launched``); ``(None, why)``
+    otherwise (``no_app``: no such Start menu app; ``none``: no window came). Never raises; never with a game in front
+    (``launch_app`` refuses it: ``(None, "refused")``)."""
+    try:
+        chosen, _candidates = _match_apps(app, get_start_apps())
+    except Exception:  # noqa: BLE001
+        chosen = None
+    if chosen is None:
+        return None, "no_app"
+    identity = _identity_for(chosen, None)
+    hwnd, how = _own_window(identity)
+    if hwnd:
+        return hwnd, how
+    try:
+        started = launch_app(app, deadline=deadline)
+    except Exception:  # noqa: BLE001
+        return None, "none"
+    if (started.details or {}).get("refused") == "game":
+        return None, "refused"
+    got = (started.details or {}).get("hwnd")
+    return (int(got), "launched") if started.ok and got else (None, "none")
+
+
+def _address_bar_open(app: str, target: str, *, deadline: float | None, handed: ActionResult) -> ActionResult | None:
+    """lSkills (live 17 Oct: every Arc open failed, then Yuki said "Arc isn't installed" or opened the page in Chrome):
+    the address typed into the browser's own address bar, in its own window, after the address handed to it as a launch
+    argument didn't open (``handed``: ``page_unchanged``, or a start that failed while the app runs). ``None`` when the
+    step doesn't apply (the app isn't a browser by machine data, no window, a game in front): the hand-off's own result
+    stands. Otherwise the result of this step (``details["via_word"] = "address_bar"``, the hand-off's details under
+    ``handoff``).
+
+    The steps (the web skill's address-bar rung, :func:`yuki.skills.web_route.route_address_bar`, in one call): the
+    app's window by identity (:func:`_own_window`; one brought up when it shows none); what each of its windows shows
+    first (:func:`_pages_before`: a page already there is never the page opened; its own window already on the very
+    page asked for is "already"); the window to the front (``focus_window``); a new tab (:data:`_NEW_TAB_KEYS`); then
+    only when focus is on a text field of the browser's own frame in that same program
+    (:func:`yuki.skills.web_route.frame_field`: never a page's own box, so never a send) the address is typed and read
+    back (no Enter on an address that didn't arrive whole), an inline completion after it deleted, and Enter
+    navigates. Done only when one of its windows newly shows a page at the address (:func:`_await_page`). Every key
+    goes through Yuki's guarded input (nothing with a game in front: D17)."""
+    started = time.perf_counter()
+    end = time.monotonic() + _BAR_FLOOR_S
+    if deadline is not None:
+        end = max(float(deadline), end)
+    hd = dict(getattr(handed, "details", None) or {})
+    try:
+        chosen, _candidates = _match_apps(app, get_start_apps())
+    except Exception:  # noqa: BLE001
+        chosen = None
+    if chosen is None:
+        return None
+    identity = _identity_for(chosen, {"exe": hd.get("exe")} if hd.get("exe") else None)
+    if not identity.confirmable or not _takes_addresses(chosen, identity, target, hd):
+        return None
+    details: dict = {"url": target, "name": chosen["name"], "appid": chosen["appid"], "via": "address_bar",
+                     "via_word": "address_bar", "page_targets": [target], "launched": bool(hd.get("launched")),
+                     "handoff": {k: hd.get(k) for k in ("via", "via_word", "reason", "page_state", "launched",
+                                                        "protocol_refused") if k in hd}}
+
+    def finish(ok: bool, summary: str, stage: str) -> ActionResult:
+        details["bar_stage"] = stage
+        details.setdefault("verified", True if ok and details.get("page_verified") else (False if not ok else None))
+        return ActionResult(ok=ok, summary=summary, details=details,
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0)
+
+    hwnd, how = _own_window(identity)
+    if not hwnd:
+        # not running, or running with no window it can show: brought up the way the Start menu starts it (no
+        # arguments), then its window takes the address
+        try:
+            up = launch_app(app, deadline=end)
+        except Exception:  # noqa: BLE001
+            up = None
+        got = (up.details or {}).get("hwnd") if up is not None and up.ok else None
+        if not got or (up.details or {}).get("refused") == "game":
+            return None
+        hwnd, how = int(got), "launched"
+    details["bar_window"] = how
+    if _gamegate.refuse_input("focus", hwnd=hwnd) is not None:
+        return None
+    pid = _window_pid(hwnd)
+    befores = _pages_before(identity, min(_PAGE_BEFORE_S, max(0.2, 0.25 * (end - time.monotonic()))))
+    details["before_pages"] = [{"hwnd": h, "url": u} for h, u in befores.items()]
+    before, _before_pids, _titles = _window_snapshot()
+    focused = focus_window(hwnd, timeout_s=min(2.0, max(0.5, end - time.monotonic())))
+    if (focused.details or {}).get("refused") == "game":
+        details["refused"] = "game"
+        return finish(False, str(focused.summary), "refused")
+    if not focused.ok:
+        return finish(False, f"could not bring {chosen['name']} forward to type the address ({focused.summary})",
+                      "not_focused")
+    own = befores.get(hwnd, "")
+    if own and _same_page(target, own) and not _past_root(target, own):
+        # its own window already shows the very page asked for (now in front): nothing is typed; "already"
+        details.update(hwnd=hwnd, page_verified=True, page_state="already", page={"title": "", "url": own},
+                       process_name=getattr(window_info(hwnd), "process_name", ""))
+        return finish(True, f"{chosen['name']} already showed {own} and is in front now (nothing typed)", "already")
+    from yuki.actions import input as keys
+
+    opened = keys.hotkey(*_NEW_TAB_KEYS, expect_hwnd=hwnd)
+    if (opened.details or {}).get("refused") == "game":
+        details["refused"] = "game"
+        return finish(False, str(opened.summary), "refused")
+    if not opened.ok:
+        return finish(False, f"{chosen['name']} didn't take the new-tab keys ({opened.summary})", "keys_refused")
+    try:
+        field_hwnd = int((opened.details or {}).get("foreground_hwnd") or 0)
+    except (TypeError, ValueError):
+        field_hwnd = 0
+    if not field_hwnd or _window_pid(field_hwnd) != pid:
+        return finish(False, f"the new-tab keys took focus out of {chosen['name']}: nothing was typed", "other_window")
+    try:
+        from yuki.skills.web_route import frame_field
+
+        field_ok, why = frame_field(pid)
+    except Exception:  # noqa: BLE001 - can't tell: never typed
+        field_ok, why = None, "unread"
+    details["bar_field"] = why
+    if field_ok is not True:
+        keys.press("escape", expect_hwnd=field_hwnd)
+        return finish(False, f"focus in {chosen['name']} is not on its own address field ({why}): nothing was typed",
+                      "no_field")
+    typed = keys.type_text(target, expect_hwnd=field_hwnd)
+    if (typed.details or {}).get("refused") == "game":
+        details["refused"] = "game"
+        return finish(False, str(typed.summary), "refused")
+    facts = typed.details or {}
+    if not typed.ok or facts.get("readback") != "arrived":
+        keys.press("escape", expect_hwnd=field_hwnd)
+        return finish(False, f"the address didn't arrive whole in {chosen['name']}'s address field: no Enter",
+                      "not_typed")
+    if facts.get("readback_source") == "caret" or \
+            len(" ".join(str(facts.get("readback_text") or "").split())) > len(target):
+        # the field completed the address inline: that rest goes, so Enter opens the address asked for
+        keys.press("delete", expect_hwnd=field_hwnd)
+    entered = keys.press("enter", expect_hwnd=field_hwnd)
+    if not entered.ok:
+        return finish(False, f"Enter in {chosen['name']}'s address field was refused ({entered.summary})",
+                      "enter_refused")
+    watch = max(_BAR_PAGE_MIN_S, min(_BAR_PAGE_S, end - time.monotonic()))
+    wait = _await_page(identity, [target], before, watch, unchanged=befores)
+    details["page_check"] = _page_details(wait)
+    details["identity"] = identity.describe()
+    if wait is not None and wait.matched is not None:
+        opened_line = _page_opened(chosen["name"], wait, before, details, time.monotonic(), [target], identity,
+                                   focus_floor_s=_DEADLINE_FOCUS_FLOOR_S)
+        why_typed = ("Windows refused to hand it the address" if hd.get("protocol_refused") and not hd.get("launched")
+                     else "it ignored the address handed to it")
+        return finish(True, f"{opened_line} (typed into {chosen['name']}'s own address bar: {why_typed})", "page")
+    details["page_verified"] = False if wait is not None and wait.seen else None
+    details["hwnd"] = hwnd
+    details["process_name"] = getattr(window_info(hwnd), "process_name", "")
+    return finish(False, f"typed the address into {chosen['name']}'s own address bar and pressed Enter, but no page "
+                         f"of it at that address was seen within {watch:.1f} s", "not_seen")
+
+
 def open_url(
     url: str, *, app: str | None = None, content_timeout_s: float = CONTENT_WAIT_S,
-    deadline: float | None = None,
+    deadline: float | None = None, address_bar: bool = True,
 ) -> ActionResult:
     """Open a URL (or any shell target: a file, a folder).
 
     Args:
         url: the target.
         app: ``None`` opens it with the user's default handler.  Otherwise the
-            Start menu app to open it with, which is exactly
-            ``launch_app(app, args=[url])`` - the target is handed to the app as
-            an argument, so nothing is typed anywhere - including bringing the
-            window to the front and waiting for the content.
+            Start menu app to open it with, which is ``launch_app(app,
+            args=[url])`` - the target is handed to the app as an argument -
+            including bringing the window to the front and waiting for the
+            content.
         content_timeout_s: bound on the wait for the content to be on screen.
         deadline: x8WebArc: a ``time.monotonic()`` time the whole call answers
             by (see :func:`launch_app`); ``None``: the waits above only.
+        address_bar: lSkills (live 17 Oct): with ``app`` and a web address, when
+            the app didn't open the address handed to it (``page_unchanged``:
+            it kept the page it had; or the start failed while it runs) and it
+            is a browser by machine data, the address is typed into its own
+            address bar (:func:`_address_bar_open`; a new tab, a frame field
+            only, verified by the page). After two ignored hand-offs in a row
+            (one once its protocol activation was refused) the hand-off is
+            skipped and the address typed at once. ``False``: the hand-off's
+            own result only (the web skill, whose next rung types it itself).
 
     A web address handed to a browser that was already running is checked
     against what its windows showed right before (:func:`_pages_before`): an
@@ -3752,9 +4161,51 @@ def open_url(
     if (refused := _gamegate.refuse_input("open_url")) is not None:
         return finish(False, refused, {"url": target, "refused": "game"})
     if app is not None and app.strip():
+        address = _page_address(target)
+        typed_first = None
+        if address and address_bar:
+            appid = _appid_of(app)
+            if appid and _ignores_handoff(appid):
+                # it ignored the last hand-offs (kept the very page it had): the address goes into its own address
+                # bar at once, not after the whole page wait (x8WebArc review r1 L1, carried to the hand)
+                typed_first = _address_bar_open(app, address, deadline=deadline,
+                                                handed=ActionResult(ok=False, summary="", details={"launched": False}))
+                if typed_first is not None and typed_first.ok:
+                    typed_first.details["url"] = target
+                    typed_first.details["handoff_skipped"] = True
+                    return typed_first
         launched = launch_app(app, args=[target], content_timeout_s=content_timeout_s, deadline=deadline)
         launched.details["url"] = target
-        return launched
+        if not address or not address_bar:
+            return launched
+        ld = launched.details
+        appid = str(ld.get("appid") or "")
+        if launched.ok and ld.get("page_verified") is True:
+            _note_ignored(appid, False)
+            return launched
+        if ld.get("refused") == "game" or typed_first is not None:
+            return launched
+        ignored = ld.get("reason") == "page_unchanged"
+        if ignored and ld.get("page_state") == "same":
+            _note_ignored(appid, True)
+        page_check = ld.get("page_check") if isinstance(ld.get("page_check"), dict) else {}
+        # its windows show no page at all after a packaged app's alias or activation carried the address (percFix: Arc
+        # started cold on its own new-tab view); a program started with the address on its command line is left alone
+        blank = (bool(page_check.get("windows")) and not page_check.get("seen")
+                 and ld.get("via") in ("AppExecutionAlias", "ActivateApplication"))
+        failed_start = not ld.get("launched") and bool(ld.get("protocol_refused") or ld.get("launch_error"))
+        if not (ignored or failed_start or (blank and ld.get("page_verified") is not True)):
+            return launched
+        typed = _address_bar_open(app, address, deadline=deadline, handed=launched)
+        if typed is None:
+            return launched
+        typed.details["url"] = target
+        if typed.ok:
+            return typed
+        # neither got there: the hand-off's facts first (what it did), then what the address bar did
+        launched.details["address_bar"] = {k: typed.details.get(k) for k in ("bar_stage", "bar_window", "bar_field")}
+        return ActionResult(ok=False, summary=f"{launched.summary}; then {typed.summary}", details=launched.details,
+                            elapsed_ms=launched.elapsed_ms + typed.elapsed_ms)
 
     focus_floor = _FOCUS_FLOOR_S
     if deadline is not None:
