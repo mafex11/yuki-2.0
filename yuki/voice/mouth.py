@@ -226,8 +226,9 @@ kind a turn is, hand it over. Do not ask the user for details the thinker may al
 where they are, which account or what "my" refers to: hand it over and let it ask if it has to.
 Hand over the whole of what they want in one request, every detail they gave (where, who, what to say), never \
 one stage at a time: the thinker finds the way itself. Good: "message Rohan on the Friends server in plans, ask \
-when he's joining" -> one tell_yuki with all of it. Two asks at once ("play my Japanese playlist and turn it down") \
-are one tell_yuki, never one part by a hand or skill and the rest dropped. "Put something on" or "play something" \
+when he's joining" -> one tell_yuki with all of it. Two things to do at once ("play my Japanese playlist and turn it \
+down") are one call per ask in one reply when each is one hand step or skill, else one tell_yuki with all of it; never \
+one part done and the rest dropped. "Put something on" or "play something" \
 leaves the pick to Yuki: tell_yuki at once, never ask what.
 
 The memory lookup block is an automatic search for the user's latest words: the few nearest \
@@ -478,7 +479,8 @@ say_first ("On it.") is heard at once. A hand that does not take effect is passe
 retry it, try another hand or undo it yourself. A thinker's result is said, never followed by a hand of yours, and \
 "just do it", "try another way" or something not done or done wrong is never a hand's: tell_yuki. Keys and \
 shortcuts (Enter too) are the thinker's, which looks before it acts; your type hand only types words into the \
-field the focus line names.
+field the focus line names. Two asks at once, each one hand step ("pause the music and minimize Discord"): one call \
+per ask, all in this same reply, in their order; when any ask needs the thinker, all of it goes to the thinker.
 
 What they point at on the screen: the items line lists the window in front's links, buttons and rows, \
 numbered, read while they talked. When the item they mean is on it ("click the mix", "play the second one", \
@@ -623,6 +625,12 @@ _LEARNED_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index("Good: they ask for what 
                                     HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".')]
 _SPOTIFY_EXAMPLE_OLD = HANDS_PROMPT[HANDS_PROMPT.index('Bad: user "open Spotify and play my focus playlist".'):
                                     HANDS_PROMPT.index('Good: user "close the Claude tabs and the ElevenLabs one"')]
+#: lSpeed (live 17 Oct, multi 0/6): the hands block's two-asks sentence; with a Skills menu the Skills paragraph says
+#: it for skills and hands alike, so it is left out there (one place, no added size).
+_TWO_ASKS_HANDS = HANDS_PROMPT[HANDS_PROMPT.index(" Two asks at once, each one hand step"):
+                               HANDS_PROMPT.index("goes to the thinker.\n", HANDS_PROMPT.index(" Two asks at once, each "
+                                                                                              "one hand step"))
+                               + len("goes to the thinker.")]
 
 #: The Skills paragraph (it takes the Lessons / Learned ways paragraph's place): the menu follows the hands block.
 SKILLS_PARAGRAPH = """\
@@ -631,8 +639,9 @@ run_skill alone, its key, slots only from their words as said or a name its line
 them and names a guess), say_first "" or "On it.". When code says its line or passes it on, say nothing after it. \
 "Again" or "a bit more": again true. They name another value for its last run ("no, the slider inside Spotify"): \
 run_skill again with it, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone. Two things \
-at once ("play my Japanese playlist and turn it down"), a message not plainly worded, or no line fits: the thinker, \
-as before.
+to do at once ("play my Japanese playlist and turn it down"), each one skill or hand step: one call per part, all in \
+this same reply, in their order. One thing with its app or place ("YouTube and Arc") is one ask, one call. When any \
+part needs the thinker (a message not plainly worded, no line fits), all of it goes to the thinker in one call.
 
 """
 
@@ -648,6 +657,8 @@ VOLUME_EXAMPLES = """\
 Good: user "turn Spotify down a bit". You: run_skill(say_first="", skill="volume", slots={"target": "Spotify", \
 "change": "down"}) alone
 Bad: user "reduce the YouTube volume". You: media_key(...) (volume is never a key: run_skill volume)
+Good: user "pause the music and mute the PC". You, in one reply: media_key(key="playpause", want="paused", \
+say_when_done=""), then run_skill(say_first="", skill="volume", slots={"target": "system", "mute": "on"})
 """
 
 PLAYLIST_EXAMPLES = """\
@@ -665,6 +676,7 @@ def hands_prompt(skill_keys: Any = ()) -> str:
     if not keys:
         return HANDS_PROMPT
     text = HANDS_PROMPT.replace(_LESSONS_OLD, SKILLS_PARAGRAPH).replace(_LEARNED_EXAMPLE_OLD, "")
+    text = text.replace(_TWO_ASKS_HANDS, "")   # lSpeed: the Skills paragraph says it for skills and hands alike
     text = text.replace(_LEARNED_WAY_OLD, "two or more steps (but a skill), anything")
     if VOLUME_SKILL in keys:
         text = (text.replace(_INSTANT_OLD, _INSTANT_VOLUME).replace(_VOLUME_OLD, VOLUME_PARAGRAPH)
@@ -923,11 +935,11 @@ their standing rules, what a result told you, one lookup line that states exactl
 ask what they meant when you did not catch it. Asked about something they told you to keep: the Earlier block, else \
 quick_memory or hand it over; never "I don't have that" without a look. "Yeah", "yes" or "do it" right after Yuki \
 asked something answers it: act on it (a result's question: hand_over follow_up).
-Act yourself only when one hand step on the desktop block, or one skill on the Skills list, is all they ask; \
-focusing a window is never the first step of more.
+Act yourself only when one hand step on the desktop block, or one skill on the Skills list, is all they ask (two \
+such asks: one call each); focusing a window is never the first step of more.
 Anything on their screen or in a window (a message, where something is): hand_over in the same reply, no words \
 on what you see or don't; the desktop block holds names only.
-Hand over everything else, all they want in one hand_over (two asks too): their activity and day, calls, \
+Hand over everything else, all they want in one hand_over: their activity and day, calls, \
 memory beyond one plain fact, files, messages, people, plans, anything of more than one step, looking up, advising \
 or deciding, and anything that sends, posts, joins, deletes or buys. Unsure: hand it over. Never say Yuki can't do \
 something and never ask for details Yuki may know: hand it over and let it ask. Words that leave the pick to Yuki \
@@ -945,7 +957,7 @@ cancel_hand_over, saying you are stopping.
 
 # Promises and outcomes
 "On it" or "let me check" goes with its call in the same reply: a promise without the call means nothing happens. \
-Every tool call is made alone, with no words before it (quick_memory may have a few). Until a result or a hand's \
+Calls go with no words before them (quick_memory may have a few). Until a result or a hand's \
 done line says it worked, all you say about it, say_first too, is that you are on it: never "playing", "opening", \
 "sending" or "done". What the work is doing comes only from your work line, step lines and results. Step lines, a \
 countdown and outcomes said by code in your voice are your own words in the conversation: follow on from them and \
@@ -1018,8 +1030,8 @@ it on, say nothing after it. "Again" or "a bit more": again true. Another value 
 run: run_skill again with it, corrects true. Their answer to "Keep this as your usual?" is keep_usual, alone."""
 
 LEAN_VOLUME_PARAGRAPH = """\
-Every volume request is run_skill volume: target (the app they name), change, level or mute from their words; code \
-picks their usual control and asks when unclear. Fine with a game in front."""
+Every volume request is run_skill volume: target (the app named), change, level or mute (on/off) from their words; \
+code picks their usual control, asks if unclear. Fine with a game in front."""
 
 
 def lean_hands_prompt(skill_keys: Any = ()) -> str:
@@ -1136,6 +1148,43 @@ HAND_OVER: dict[str, Any] = {
     },
     "required": ["say_first", "intent"],
 }
+
+#: lSpeed (live test 17 Oct, problem 1): what the talker reads about the learned reflex that ran for the words it
+#: answers (``state["reflex"]``, set by the pipeline): the reflex ran the user's own learned hand at the end of their
+#: turn, with no model in front, through the hands' own act and check. By its state: done (checked), still running,
+#: or tried and not done. ``{changed}``: they went on talking after the pause it acted on.
+REFLEX_NOTES = {
+    "done": ("[Done already, by code, and checked: {what} ({report}). That is what these exact words of theirs got "
+             "before, so it is what they asked for. {changed}Say only the few done words you would have given it "
+             "(\"Paused.\"), or nothing when they can see it happen; no call for it (a call for it is skipped), and "
+             "never another target for it.]"),
+    "running": ("[Being done right now, by code, for these exact words of theirs (what they got before): {what}. "
+                "{changed}Make your usual call for their request: when it is the same call, code skips it once this is "
+                "done and says its done line.]"),
+    "failed": ("[Tried by code for their words, and it did not take effect: {what} ({report}). Nothing of it is done: "
+               "handle their request as usual.]"),
+}
+#: ... when the words the reflex acted on were only the start of what they said (Flux's eager end of turn, then more).
+REFLEX_CHANGED = ("It was the start of what they said: they went on after a pause, so do the rest of it as usual, "
+                  "never this part again. ")
+#: The result of the talker's call that repeats the reflex's own (skipped: it was done once, checked).
+REFLEX_DUP_SAID = ("Already done a moment ago for these same words, and checked, so it was not done twice. Your done "
+                   "line was said. Do not say it again.")
+REFLEX_DUP_SILENT = ("Already done a moment ago for these same words, and checked, so it was not done twice. Say "
+                     "nothing about it.")
+
+
+def reflex_note(state: dict[str, Any] | None) -> str:
+    """The volatile block's line for the reflex that ran for the words (``""``: none)."""
+    if not isinstance(state, dict):
+        return ""
+    template = REFLEX_NOTES.get(str(state.get("state") or ""))
+    if template is None:
+        return ""
+    report = " ".join(str(state.get("report") or "").split())[:240] or "checked"
+    return template.format(what=" ".join(str(state.get("what") or "").split())[:160], report=report,
+                           changed=REFLEX_CHANGED if state.get("changed") else "")
+
 
 #: The lean talker's cancel tool (Pipecat's ``cancel_hand_over``), worded like the full talker's.
 CANCEL_HAND_OVER_DESCRIPTION = (
@@ -2384,6 +2433,9 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
     yConsumers: ``state["you"]`` (the memory service's one "you right now" line, ``younow.render(you, "talker")``,
     at most 300 characters; the pipeline sets it for the lean talker only, from its background cache) rides as
     :data:`YOU_LINE` right after the focus guide.
+
+    lSpeed: ``state["reflex"]`` (the learned reflex that ran for these words: its state, what it did, its report,
+    whether they went on talking after it) rides as :func:`reflex_note` right after the desktop block.
     """
     state = state or {}
     keys = state.get("skill_keys") or ()
@@ -2467,6 +2519,10 @@ def volatile_block(*, now: datetime | None = None, lookup: str | None = None,
         text += ("\n" if state.get("skills_now") else "\n\n") + "[" + options_line + "]"
     if desk:
         text += f"\n\n{DESK_LABEL}\n{desk.strip()}]"
+    reflex = reflex_note(state.get("reflex"))
+    if reflex:
+        # lSpeed: the learned reflex that ran for these words (after the desktop it acted on, before the game note)
+        text += "\n\n" + reflex
     if state.get("hand_trouble"):
         # review r1 H1: last, so it outweighs the cores' "just do it: hand it over". Review r2 M1: keyed to the hands'
         # own game signal when the pipeline gives it (the key present), else to the hand's report, never to the focus
