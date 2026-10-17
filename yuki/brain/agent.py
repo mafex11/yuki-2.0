@@ -42,6 +42,7 @@ from yuki.brain.context import (
     Conversation,
     Exchange,
     Gathered,
+    answer_part_report,
     answer_report,
     cutoff_report,
     gather,
@@ -186,6 +187,15 @@ PART_REST_CALLS = 2
 #: more planner turn before it ends (:func:`text_back`), adding TEXT_BACK_CALLS to the act budget (code's question).
 TEXT_BACKS_MAX = 1
 TEXT_BACK_CALLS = 2
+#: fBrain (18 Oct live A, "Pause the song bro, also what time's my meeting tomorrow": one act plan, a memory read and
+#: the pause, ended on the pause's line and never answered the question): an act plan that ended and read memory or
+#: fetched something in its steps gets one more planner turn with what those reads returned, its line held, to answer
+#: what their words asked (:func:`answer_due`); the line is then said with the answer after it. Each such turn adds
+#: ANSWER_PART_CALLS to the act budget (code's question).
+ANSWER_PARTS_MAX = 1
+ANSWER_PART_CALLS = 1
+#: The read verbs whose results are content for the user (a look reads the screen to check or to find a control).
+ANSWER_READ_VERBS: frozenset[str] = frozenset({"memory", "fetch"})
 #: pBrain (B35, bRound2 "Sending to हेमंत"): the bound on the people-index read that gives a spoken line memory's own
 #: name for a send's recipient (:meth:`Brain._said_name`).
 SAID_NAME_TIMEOUT_S = 0.8
@@ -291,6 +301,10 @@ class _State:
     #: (:func:`text_back`).
     part_rests: int = 0
     text_backs: int = 0
+    #: fBrain: act plans whose memory or fetch reads went back to the planner for the answer to their question
+    #: (:func:`answer_due`), and the held ending that turn put up (:attr:`held` while no other ending replaced it).
+    answer_parts: int = 0
+    answer_held: tuple[str, dict[str, Any]] | None = None
     #: pBrain review r1 (L1): how many of the user's words (``Host.user_words``: their turns, steers, answers to a
     #: question) there were when the last plan began; words added since mean the user spoke after it (a steer folded
     #: into its report, an answer), and :func:`text_back` then leaves their reply to the planner's reading of them.
@@ -1672,7 +1686,7 @@ class Brain:
         ``answer_calls`` or ``answer_s`` of work."""
         if state.kind == "act":
             return state.calls < (bs.act_calls + state.part_rests * PART_REST_CALLS
-                                  + state.text_backs * TEXT_BACK_CALLS)
+                                  + state.text_backs * TEXT_BACK_CALLS + state.answer_parts * ANSWER_PART_CALLS)
         work_s = time.monotonic() - req.started - self._waited_s
         return state.calls < bs.answer_calls and work_s < bs.answer_s
 
@@ -2189,6 +2203,17 @@ class Brain:
                 conv.add_user([tool_result(tool_id, part_rest_report(result, plan, line)), *extra,
                                *self._steer_turn(host)])
                 return False
+            if (answer_due(plan, result, status) and state.answer_parts < ANSWER_PARTS_MAX
+                    and not self._cancelled.is_set()):
+                # fBrain: the plan read memory (or fetched) beside what it did, and nothing ever answers from those
+                # reads after an act plan ends: its line is held and the planner answers from them in plain text
+                # (or the one word that nothing more was asked); code says its line, then that answer
+                state.answer_parts += 1
+                state.held = state.answer_held = (line, outcome)
+                self.logger.log("brain_answer_part", n=state.answer_parts, reads=len(result.reads), status=status)
+                conv.add_user([tool_result(tool_id, answer_part_report(result, plan, line)), *extra,
+                               *self._steer_turn(host)])
+                return False
             self._final(line, outcome)
             return True
         if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
@@ -2371,6 +2396,13 @@ class Brain:
             conv.add_user([{"type": "text", "text": text_back_report(state.current, where)},
                            *self._steer_turn(host)])
             return False
+        if state.held is not None and state.held is state.answer_held:
+            # fBrain: the act's own line, then the planner's answer from what the plan read (the one word: no question)
+            held_line, held_outcome = state.held
+            answer = "" if rest_done_reply(text) else " ".join(text.split())
+            line = f"{held_line.rstrip()} {answer}".strip() if answer else held_line
+            self._final(line, {**dict(held_outcome or {}), "line": line} if answer else dict(held_outcome or {}))
+            return True
         if state.held is not None:
             if state.held is state.rest_held and not rest_done_reply(text):
                 # after a part was done (part_rest), the planner neither planned the rest nor gave the one-word reply
@@ -2761,6 +2793,19 @@ def text_back(state: _State, seed: Mapping[str, Any] | None, *, words: int | Non
     return " ".join(str(last.line or "").split()) or LINE_UNCONFIRMED
 
 
+def answer_due(plan: Plan | None, result: ExecResult, status: str) -> bool:
+    """fBrain: an act plan that ended (done, not confirmed, drafted) with a memory read or a fetch among its steps
+    (:data:`ANSWER_READ_VERBS`) whose results came back: what it read is content for the user, and the plan's ending says
+    only what it did, so the reads go back to the planner once for the answer (:func:`answer_part_report`). Never on a
+    send or a join (consent's own line stands alone), a skill route, or a plan that only looked (``look_only`` sends
+    its reads back already). Code facts only (the plan's verbs, its status, whether reads came back)."""
+    if plan is None or plan.kind != "act" or plan.skill or status not in ("done", "unconfirmed", "drafted"):
+        return False
+    if plan.consent.commit in ("send", "join") or not result.reads:
+        return False
+    return any(s.verb in ANSWER_READ_VERBS for s in plan.steps) and any(s.verb in ACT_VERBS for s in plan.steps)
+
+
 def look_only(plan: Plan | None, result: ExecResult) -> bool:
     """An act plan whose every step only reads (look, memory, fetch, wait), so nothing of it acted (sBrainFix, F9): its
     check reading nothing is not the end of the request. Code facts only (the closed verb lists, the step states)."""
@@ -2828,4 +2873,4 @@ def _as_result(got: Any) -> ExecResult:
 __all__ = ["Brain", "Host", "CANCELLED", "WITHDRAWN", "PARKED", "PAUSE_STOP_LINE", "LEVEL_LABELS", "OUTCOME_KEYS",
            "STEP_WORDS", "REASON_WORDS", "plain_reason", "typed_draft", "with_watch_steps", "look_only",
            "LOOK_BACKS_MAX", "OBSERVE_LEVELS", "OBSERVE_ACTED_LEVELS", "PART_RESTS_MAX", "PART_REST_CALLS",
-           "rest_done_reply", "LINE_REST_UNDONE"]
+           "rest_done_reply", "LINE_REST_UNDONE", "answer_due", "ANSWER_PARTS_MAX", "ANSWER_PART_CALLS"]
