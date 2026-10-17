@@ -44,9 +44,9 @@ THINKER = "thinker"
 PLANNER = "planner"
 AUDIENCES: tuple[str, ...] = (TALKER, THINKER, PLANNER)
 #: A capability line's own room for the user's values (contract C5), on top of its words (MENU_LINE_CHARS).
-VALUES_CHARS = 420
+VALUES_CHARS = 640
 #: Values named per capability at most; names per entity slot or site page kind at most.
-VALUES_N = 10
+VALUES_N = 16
 NAMES_N = 5
 #: A value or a name on a line is cut to this.
 VALUE_CHARS = 30
