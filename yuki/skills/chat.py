@@ -1586,61 +1586,8 @@ def _call_question(call: RouteCall, data: Mapping[str, Any], app: str, name: str
     return line.replace("{channel}", name).replace("{app}", _title(app)), "own" if own else "other"
 
 
-def _join_tail(call: RouteCall, data: Mapping[str, Any], app: str, hwnd: int, image: str, before: bool | None,
-               name: str, facts: dict[str, Any]) -> RouteResult:
-    """After a voice channel was opened (its link, or the switcher): Discord taking the microphone, else the app's own
-    "Join Voice" button (its label from the data, judged like a send), then the onset again. A join that took is noted
-    in tastes. Shared by both of ``discord.voice``'s rungs."""
-    hands = call.ctx.hands
-    joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
-    pressed = ""
-    if not joined and before is not False:
-        # review r2 L5: no onset can show (the microphone unreadable, or Discord already held it): the channel still
-        # gets the same time to open before "Join Voice" is pressed (never the channel in view before)
-        call.ctx.sleep(VOICE_WAIT_S)
-    if not joined:
-        label = ((data.get("labels") or {}).get("en") or {}).get("join_voice")
-        if isinstance(label, list) and len(label) >= 2 and hwnd:
-            role, button = str(label[0]), str(label[1])
-            question = _judged(hands, hwnd, image, role, button)
-            if question == HANDED_OVER:
-                from yuki.skills.engine import TO_PLANNER
-
-                return RouteResult(ran=True, outcome=TO_PLANNER, app=app)
-            if question is not None:
-                return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
-            if _refused("click", hwnd=hwnd):
-                return RouteResult(ran=True, held="game", outcome="refused", app=app)
-            pressed = _press(hwnd, role, button)
-            if pressed == "pressed":
-                joined = _wait_mic(call.ctx, image, before, JOIN_WAIT_S)
-    if joined:
-        _note_channel(call.ctx, name)
-    return RouteResult(ran=True, outcome="joined" if joined else "opened", app=app,
-                       say=SAY_JOINED.format(channel=name, app=_title(app)),
-                       unverified_line=LINE_VOICE_UNCONFIRMED.format(channel=name),
-                       facts={**facts, "onset": joined, "join_button": pressed or "not_needed",
-                              "mic_before": {True: "held", False: "free", None: "unknown"}[before]})
-
-
-def _in_call_gate(call: RouteCall, data: Mapping[str, Any], app: str, name: str, before: bool | None
-                  ) -> RouteResult | None:
-    """The in-call question before a join (:func:`_call_question`), or ``None`` when the join may go ahead."""
-    answer = call.values.get("join_in_call")
-    if answer is True:
-        return None
-    asked = _call_question(call, data, app, name, before)
-    if asked is None:
-        # lMsg: with no call live there was no question to answer, so a "no" given here (a planner's guess, live 17
-        # Oct: "Okay, I'll leave your call as it is" with no call open) is no answer: the join goes ahead
-        return None
-    if answer is False:
-        return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")   # their "no": their call stays as it is
-    return RouteResult(ran=False, ask=asked[0], outcome="ask_in_call", facts={"call": asked[1]})
-
-
 def route_voice_join(call: RouteCall) -> RouteResult:
-    """``discord.voice``'s second rung: asked first when a call is live (:func:`_call_question`), then the quick switcher
+    """``discord.voice``'s rung A: asked first when a call is live (:func:`_call_question`), then the quick switcher
     with the voice filter and the channel's name, Enter, then "Join Voice" if the microphone wasn't taken (see the
     module docstring)."""
     app = str(call.args.get("app") or "")
@@ -1660,9 +1607,16 @@ def route_voice_join(call: RouteCall) -> RouteResult:
     image = str((data.get("images") or [""])[0])
     # the microphone before anything is done: the question's "is it Discord's own call", and the onset's baseline
     before = _mic_held(image)
-    gate = _in_call_gate(call, data, app, name, before)
-    if gate is not None:
-        return gate
+    answer = call.values.get("join_in_call")
+    if answer is not True:
+        asked = _call_question(call, data, app, name, before)
+        if asked is not None:
+            if answer is False:
+                # their "no" to the in-call question: their call stays as it is
+                return RouteResult(ran=False, ask=LINE_STAY, outcome="declined")
+            return RouteResult(ran=False, ask=asked[0], outcome="ask_in_call", facts={"call": asked[1]})
+        # lMsg: with no call live there was no question to answer, so a "no" given here (a planner's guess, live 17
+        # Oct: "Okay, I'll leave your call as it is" with no call open) is no answer: the join goes ahead
     hands = call.ctx.hands
     if hands is None or not data.get("switcher"):
         return RouteResult(ran=False, outcome="no_hands" if hands is None else "no_switcher")
@@ -1684,195 +1638,35 @@ def route_voice_join(call: RouteCall) -> RouteResult:
         return RouteResult(ran=False, outcome="switcher_unseen", facts={"steps": len(steps), "steps_done": done})
     if done == 0:
         return RouteResult(ran=False, outcome="switcher_failed", facts={"steps": len(steps)})
-    return _join_tail(call, data, app, hwnd, image, before, name, {"steps_done": done})
+    joined = _wait_mic(call.ctx, image, before, VOICE_WAIT_S)
+    pressed = ""
+    if not joined and before is not False:
+        # review r2 L5: no onset can show (the microphone unreadable, or Discord already held it): the switcher's
+        # channel still gets the same time to open before "Join Voice" is pressed (never the channel in view before)
+        call.ctx.sleep(VOICE_WAIT_S)
+    if not joined:
+        label = ((data.get("labels") or {}).get("en") or {}).get("join_voice")
+        if isinstance(label, list) and len(label) >= 2:
+            role, button = str(label[0]), str(label[1])
+            question = _judged(hands, hwnd, image, role, button)
+            if question == HANDED_OVER:
+                from yuki.skills.engine import TO_PLANNER
 
-
-# ---------------------------------------------------------------------------------------------------------------------
-# discord.voice by server (kHands): a voice channel memory saw, found by its server and/or its name, opened by its link
-# ---------------------------------------------------------------------------------------------------------------------
-
-#: Said when the user named a server and memory knows no voice channel there (never a guess).
-LINE_NO_SERVER_VOICE = "I don't know a voice channel in {server} on {app}."
-#: Asked when their words fit several known voice channels (the one question that matters for a join).
-ASK_WHICH_VOICE = "Which one: {names}?"
-
-
-@dataclass
-class VoiceChannel:
-    """A voice channel memory saw in the app: its name, the place it sits in (Discord's server), its address (a
-    capture thread's URL), when last seen and how many of memory's rows name it. RAM only."""
-
-    name: str
-    place: str
-    url: str
-    seen: float = 0.0
-    rows: int = 0
-
-
-def voice_channels(store: Any, data: Mapping[str, Any]) -> list[VoiceChannel] | None:
-    """The voice channels memory saw in the app (its own keys, ``processes``): capture threads whose scope is the app's
-    voice-channel label and the channel's name ("Voice Channel lofi lounge") and that carry the channel's address; the
-    place is read from the window title by the app's own separator (``place_sep``: Discord's "lofi lounge | Mafex's
-    Hangout"). One per address, the newest name. ``None`` when memory's threads can't be read."""
-    from yuki.memory import contacts as C
-
-    keys = sorted({_app_key(p) for p in data.get("processes") or []} - {""})
-    labels = voice_labels(data)
-    sep = str(data.get("place_sep") or "")
-    if not keys or not labels:
-        return []
-    marks = ",".join("?" * len(keys))
-    try:
-        rows = store._query(f"SELECT title_ciphertext, scope_ciphertext, url_ciphertext, last_seen FROM threads "
-                            f"WHERE process IN ({marks}) AND merged_into IS NULL ORDER BY last_seen DESC", keys)
-    except Exception:  # noqa: BLE001
-        return None
-    found: dict[str, VoiceChannel] = {}
-    places: dict[str, str] = {}
-    for title_b, scope_b, url_b, seen in rows:
-        try:
-            title = str(store._dec(title_b) or "") if title_b else ""
-            scope = str(store._dec(scope_b) or "") if scope_b else ""
-            url = str(store._dec(url_b) or "") if url_b else ""
-        except Exception:  # noqa: BLE001 - a row the key can't read
-            continue
-        if not url:
-            continue
-        place = title.rsplit(sep, 1)[1].strip() if sep and sep in title else ""
-        if place and url not in places:
-            places[url] = place
-        words = C.tokens(scope)
-        label = next((lab for lab in labels if words[:len(lab)] == lab and len(words) > len(lab)), None)
-        if label is None:
-            continue
-        name = " ".join(scope.split()[len(label):]).strip()
-        got = found.get(url)
-        if got is None:
-            found[url] = VoiceChannel(name=name, place=place, url=url, seen=float(seen or 0.0), rows=1)
-        else:
-            got.rows += 1
-    for url, vc in found.items():
-        vc.place = vc.place or places.get(url, "")
-    return sorted(found.values(), key=lambda v: -v.seen)
-
-
-def _skeleton(word: str) -> str:
-    """A word's consonants in order (letters only, casefolded): how a name said as its letters ("MFX") stands for a
-    spoken one ("Mafex"). A fixed spelling rule over names, never a meaning."""
-    return "".join(ch for ch in word.casefold() if ch.isalpha() and ch not in "aeiouy")
-
-
-def _place_named(said: str, places: Sequence[str]) -> list[str]:
-    """The places (servers) the user's words name: whose name holds the words (whole, in order); else the one that
-    sounds like them (:func:`yuki.skills.taste.heard_as`); else the ones with a word whose consonants are exactly a
-    word of theirs said as letters ("MFX" for "Mafex's"). Identity of names only."""
-    from yuki.memory import contacts as C
-    from yuki.skills import taste
-
-    want = C.tokens(said)
-    pool = [p for p in dict.fromkeys(places) if p]
-    if not want or not pool:
-        return []
-    held = [p for p in pool if C.span_in(want, p)]
-    if held:
-        return held
-    alike = taste.heard_as(pool, said)
-    if alike:
-        return [alike]
-    keys = {_skeleton(w) for w in want if len(_skeleton(w)) >= 2 and len(w) <= 5}
-    return [p for p in pool if keys & {_skeleton(w) for w in C.tokens(p) if len(_skeleton(w)) >= 2}]
-
-
-def pick_voice_channel(found: Sequence[VoiceChannel], channel: str, place: str, usual: Sequence[str] = ()
-                       ) -> VoiceChannel | str | None:
-    """The one known voice channel the user's words name (``channel`` and/or ``place``, their words), a question
-    (``str``) when several fit, or ``None`` when none does. A server alone with several channels there: the one their
-    joins name most (``usual``: the taste candidates, best first) when exactly one of them is there, else asked."""
-    from yuki.memory import contacts as C
-    from yuki.skills import taste
-
-    pool = list(found)
-    if place:
-        named = set(_place_named(place, [v.place for v in pool]))
-        pool = [v for v in pool if v.place in named]
-        if not pool:
-            return None
-    if channel:
-        want = C.tokens(channel)
-        held = [v for v in pool if C.span_in(want, v.name)]
-        if not held:
-            alike = taste.heard_as([v.name for v in pool], channel)
-            held = [v for v in pool if alike and v.name == alike]
-        pool = held
-    if not pool:
-        return None
-    if len(pool) == 1:
-        return pool[0]
-    if not channel:
-        liked = [v for v in pool if any(C.span_in(C.tokens(u), v.name) for u in usual)]
-        if len(liked) == 1:
-            return liked[0]
-    places = {v.place for v in pool}
-    names = [f"{v.name} in {v.place}" if len(places) > 1 and v.place else v.name for v in pool[:3]]
-    return ASK_WHICH_VOICE.format(names=", ".join(names[:-1]) + (" or " if len(names) > 1 else "") + names[-1])
-
-
-def _voice_link(data: Mapping[str, Any], url: str) -> str | None:
-    """The app's own deep link for a channel's address (the first of its ``links`` whose URL shape matches)."""
-    return deep_link(data, ChatRoute(app="", kind="channel", chat="", handle=None, thread_ids=[], urls=[url]))
-
-
-def route_voice_link(call: RouteCall) -> RouteResult:
-    """``discord.voice``'s first rung (kHands): a voice channel memory saw in the app, found by the server and/or the
-    channel the user named (:func:`pick_voice_channel`), asked first when a call is live, opened by the app's own deep
-    link (``launch.open_url``'s guarded handler), then joined as after the switcher (:func:`_join_tail`). Several fit:
-    asked by name. None known: the next rung (the switcher by the channel's name), or, with a server named and no
-    channel, said plainly."""
-    from yuki.skills import taste
-    from yuki.skills.engine import _mem, _store_of
-
-    app = str(call.args.get("app") or "")
-    data = app_data(app)
-    if not data:
-        return RouteResult(ran=False, outcome="no_app_data")
-    channel = call.values.get("channel")
-    server = call.values.get("server")
-    name = _words(channel.get("name") if isinstance(channel, Mapping) else channel)
-    place = _words(server.get("name") if isinstance(server, Mapping) else server)
-    if not name and not place:
-        return RouteResult(ran=False, ask="Which voice channel?", outcome="no_channel")
-    if call.ctx.memory is None:
-        return RouteResult(ran=False, outcome="no_memory")
-    found = _mem(call.ctx.memory, "voice_channels", lambda c: voice_channels(_store_of(c), data), timeout_s=0.8)
-    if not isinstance(found, list):
-        return RouteResult(ran=False, outcome="no_memory")
-    usual = _mem(call.ctx.memory, "voice_usual", lambda c: taste.candidates(_store_of(c), "discord_voice", limit=20),
-                 timeout_s=0.5) or []
-    pick = pick_voice_channel(found, name, place, usual)
-    if isinstance(pick, str):
-        return RouteResult(ran=False, ask=pick, outcome="ask_which", facts={"known": len(found)})
-    if pick is None:
-        if place and not name:
-            return RouteResult(ran=False, ask=LINE_NO_SERVER_VOICE.format(server=place, app=_title(app)),
-                               outcome="unknown_channel", facts={"known": len(found)})
-        return RouteResult(ran=False, outcome="not_known", facts={"known": len(found)})
-    uri = _voice_link(data, pick.url)
-    if not uri:
-        return RouteResult(ran=False, outcome="no_link")
-    image = str((data.get("images") or [""])[0])
-    before = _mic_held(image)
-    gate = _in_call_gate(call, data, app, pick.name, before)
-    if gate is not None:
-        return gate
-    if _refused("open_url"):
-        return RouteResult(ran=False, held="game", outcome="refused")
-    opened = _open_uri(uri)
-    if _held_by_game(opened):
-        return RouteResult(ran=False, held="game", outcome="refused")
-    if not getattr(opened, "ok", False):
-        return RouteResult(ran=False, outcome="not_opened")
-    return _join_tail(call, data, app, _app_hwnd(data), image, before, pick.name,
-                      {"known": len(found), "by": "link"})
+                return RouteResult(ran=True, outcome=TO_PLANNER, app=app)
+            if question is not None:
+                return RouteResult(ran=True, ask=question, outcome="held_by_check", app=app)
+            if _refused("click", hwnd=hwnd):
+                return RouteResult(ran=True, held="game", outcome="refused", app=app)
+            pressed = _press(hwnd, role, button)
+            if pressed == "pressed":
+                joined = _wait_mic(call.ctx, image, before, JOIN_WAIT_S)
+    if joined:
+        _note_channel(call.ctx, name)
+    return RouteResult(ran=True, outcome="joined" if joined else "opened", app=app,
+                       say=SAY_JOINED.format(channel=name, app=_title(app)),
+                       unverified_line=LINE_VOICE_UNCONFIRMED.format(channel=name),
+                       facts={"onset": joined, "join_button": pressed or "not_needed", "steps_done": done,
+                              "mic_before": {True: "held", False: "free", None: "unknown"}[before]})
 
 
 def _note_channel(ctx: Any, name: str) -> None:
@@ -1887,11 +1681,9 @@ def _note_channel(ctx: Any, name: str) -> None:
 
 ROUTES: dict[str, Callable[[RouteCall], RouteResult]] = {
     "open_link": route_open_link, "switcher": route_switcher, "voice_join": route_voice_join,
-    "voice_link": route_voice_link,
 }
 PROBES: dict[str, Callable[..., tuple[bool | None, dict[str, Any]]]] = {"message_done": probe_message_done}
 
 __all__ = ["ROUTES", "PROBES", "ChatRoute", "Target", "Asked", "app_data", "chat_apps", "app_of", "find_target",
            "pick_route", "whom", "deep_link", "switcher_query", "run_steps", "chat_state", "route_open_link",
-           "route_switcher", "route_voice_join", "route_voice_link", "voice_channels", "pick_voice_channel",
-           "VoiceChannel", "probe_message_done", "sent_in_chat"]
+           "route_switcher", "route_voice_join", "probe_message_done", "sent_in_chat"]

@@ -677,7 +677,7 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "from Windows. Name it by window ([hwnd]) or by app (the app as they said it: \"WhatsApp\", \"Arc\"; "
             "minimize and close then act on every window of it). \"Force quit\" is close. Maximized keeps the title bar "
             "and taskbar; full screen is fullscreen (F11), never maximize. A window is not a tab. close only when they "
-            "asked to close that window or app." + _NOW
+            "asked to close that window or app, with their words asking for it in named." + _NOW
         ),
         "properties": {
             "window": _WINDOW,
@@ -695,14 +695,14 @@ HAND_TOOLS: list[dict[str, Any]] = [
             "Your hand for a browser's tabs, in any of its windows (not only the one in front). show: bring up the tab "
             "their words name (its window comes to the front). close: exactly the tabs they named, each by its identity "
             "and verified gone. new: a new tab in that window; with url, that address in a new tab of that browser. "
-            "reopen: the tab most recently closed, verified by expect. A tab is named by their own words for it "
-            "(named: \"YouTube\", \"the aniwave\"): code finds the tab whose title holds them, nearest window first; "
-            "app when they named the browser. Never ask them for a tab number. What a page holds is the thinker's."
-            + _NOW
+            "reopen: the tab most recently closed, verified by expect. A tab is named by the name they said for it "
+            "(named: \"YouTube\", \"aniwave\"; their word, never a title you read): code finds the tabs whose title "
+            "holds it, in every browser window, nearest first. Never ask them for a tab number. What a page holds is the "
+            "thinker's." + _NOW
         ),
         "properties": {
-            "named": {"type": "string", "description": "show, close: their own words for the tab."},
-            "app": {"type": "string", "description": "The browser they named (\"Arc\"), else leave it out."},
+            "named": {"type": "string", "description": "show, close: the name they said for the tab (\"YouTube\")."},
+            "app": {"type": "string", "description": "Only when they named the browser (\"in Arc\"); else leave it out."},
             "action": {"type": "string", "enum": ["show", "close", "new", "reopen"], "description": "Default show."},
             "window": {"type": "integer", "description": "Optional: the window's [hwnd]; new and reopen need it."},
             "every": {"type": "boolean",
@@ -1349,11 +1349,9 @@ class Hands:
         self.last_skill: dict[str, Any] | None = None
         #: The one "Keep this as your usual?" waiting for its answer (RAM only): pref, option, run key, when.
         self.pending_keep: dict[str, Any] | None = None
-        #: x3 (fix-plan 3f): the tabs of a window that was not in front, read for a tab hand by title: ``{hwnd: (names,
-        #: ids, read at, numbers offered)}`` (RAM only). Review r2 H1: the talker never saw those tabs, so a number for
-        #: one is a guess, acted on only when that number was offered to it from this very read (several tabs fit
-        #: its title: :data:`_TAB_CHOOSE_NOTE`), and a second call naming those goes by the same read.
-        self._other_tabs: dict[int, tuple[list[str], list[str], float, frozenset[int]]] = {}
+        #: The tabs of windows read for a tab hand by their words (kHands, every group): ``{hwnd: (names, ids, read
+        #: at)}`` (RAM only), so the action log's lines on those tabs can be told alive (:meth:`record_alive`).
+        self._other_tabs: dict[int, tuple[list[str], list[str], float]] = {}
         #: x3 (3b): ``(user turn, count)``: how often a silent window or tab step gave the talker its turn back in it.
         self._step_checked: tuple[Any, int] | None = None
         #: sVoiceFix (F5): ``(turn, line, at)``: what a silent step showed, when the step check could not say it at once
@@ -1757,31 +1755,29 @@ class Hands:
         metadata decides; the media keys are a fixed set of sound keys that can close or send nothing)."""
         if name in ("click", "type"):
             return   # judged inside, once the control they act on is known (its role decides for a click)
-        hwnd = args.get("window")
-        names: list[str] = []
-        if name == "tab":
-            targets = args.get("_targets")
-            if isinstance(targets, list):
-                names = [str(t[1]) for t in targets]   # x3: found by title or number (:meth:`_tab_args`)
-            else:
-                with self._lock:
-                    shown = list(self.last.tabs.get(int(hwnd), []) if str(hwnd).lstrip("-").isdigit() else [])
-                wanted = ([args.get("tab")] if args.get("tab") is not None else []) + list(args.get("tabs") or [])
-                for n in wanted:
-                    try:
-                        names.append(shown[int(n) - 1])
-                    except (TypeError, ValueError, IndexError):
-                        continue
-        call = judged_call(name, args, tab_names=names)
-        if call is None:
-            return
-        tool, tool_input = call
-        target: dict[str, Any] = {"hwnd": hwnd, "app": self._app_at(hwnd), "title": self._title_shown(hwnd)}
-        if name == "tab" and str(args.get("action") or "") == "close":
-            target["element"] = "tabs " + ", ".join(f'"{n}"' for n in tool_input.get("tabs") or [])
-        verdict = self.authorize(tool, tool_input, target)
-        if verdict is not None and not getattr(verdict, "allowed", False):
-            raise self._held_refusal(verdict)
+        # kHands r1 M5: each window acted on is judged (an app's every window; the tabs found in each window, by their
+        # words: :meth:`_tab_args`); new and reopen name no tab
+        targets = args.get("_targets") if name == "tab" else None
+        jobs: list[tuple[Any, list[str]]] = [(args.get("window"), [])]
+        if isinstance(targets, list) and targets:
+            by_window: dict[int, list[str]] = {}
+            for t in targets:
+                by_window.setdefault(int(t[3]), []).append(str(t[1]))
+            jobs = list(by_window.items())
+        elif name == "window" and isinstance(args.get("_hwnds"), list) and str(args.get("action") or "") in (
+                "minimize", "close"):
+            jobs = [(h, []) for h in args["_hwnds"]]
+        for hwnd, names in jobs:
+            call = judged_call(name, {**args, "window": hwnd}, tab_names=names)
+            if call is None:
+                return
+            tool, tool_input = call
+            target: dict[str, Any] = {"hwnd": hwnd, "app": self._app_at(hwnd), "title": self._title_shown(hwnd)}
+            if name == "tab" and str(args.get("action") or "") == "close":
+                target["element"] = "tabs " + ", ".join(f'"{n}"' for n in tool_input.get("tabs") or [])
+            verdict = self.authorize(tool, tool_input, target)
+            if verdict is not None and not getattr(verdict, "allowed", False):
+                raise self._held_refusal(verdict)
 
     # -- the desktop summary ------------------------------------------------------
 
@@ -3226,8 +3222,10 @@ class Hands:
         read the window's app): called on the check's thread. Never raises."""
         try:
             op = str(args.get("action") or ("show" if name == "tab" else ""))
-            app = ""
-            if args.get("window") not in (None, ""):
+            # kHands r1 L9: a window or tab call that named the app is in that app (the window found from it, or the
+            # browser whose tab it was); else the window's own program
+            app = " ".join(str(args.get("app") or "").split())[:40] if name in ("window", "tab") else ""
+            if not app and args.get("window") not in (None, ""):
                 try:
                     app = self._browser_app(int(args.get("window"))) or ""   # the process's name: data
                 except Exception:  # noqa: BLE001
@@ -4576,8 +4574,15 @@ class Hands:
     def _window_args(self, args: dict[str, Any]) -> dict[str, Any]:
         """The window hand's arguments with its window found (kHands): the ``window`` given, else the windows of the app
         they named (``app``: "WhatsApp", "Arc", "Slack"), as stacked; ``_hwnds`` keeps every one of them (minimize and
-        close act on each). Restore picks a minimized one first. Raises :class:`_Refused`; returns a copy."""
+        close act on each). Restore picks a minimized one first. A close needs their own words asking for it (``named``;
+        ``app`` only says which windows). Raises :class:`_Refused`; returns a copy."""
         out = dict(args)
+        if str(args.get("action") or "") == "close" and not str(args.get("named") or "").strip():
+            # A whole window holds everything in it: closed only when the user asked for exactly that (live 14:20 the
+            # talker offered to close all of Chrome because one tab would not close); checked before Yuki's own check
+            raise _Refused("closing a whole window is only for when the user asked to close that window: put "
+                           "their words asking for it in named. Nothing was closed; if a tab would not close, "
+                           "the thinker handles it", reason="no_words")
         if args.get("window") is not None:
             return out
         app = " ".join(str(args.get("app") or "").split())
@@ -4586,8 +4591,7 @@ class Hands:
                            reason="no_window")
         found = self._windows_of(app)
         if not found:
-            raise _Refused(f"no window of {app[:40]} is open on the desktop block; nothing was done",
-                           reason="no_app_window")
+            raise self._no_app_window(app)
         if str(args.get("action") or "") == "restore":
             with self._lock:
                 overview = self.last.overview or {}
@@ -4792,6 +4796,8 @@ class Hands:
                 tb = tb.tb_next
             if tb is not None:
                 facts["refused_at"] = f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}"
+            if exc.code == "game":
+                facts["refused"], facts["game_front"] = "game", True   # D17(2): said as such, never handed over
             if exc.held is not None:
                 facts["held"] = True   # ... or asks the check's question (v3.18)
                 facts["question"] = exc.held
@@ -4961,12 +4967,6 @@ class Hands:
         if name == "window":
             hwnd = self._window(args)
             action = str(args.get("action") or "")
-            if action == "close" and not str(args.get("named") or args.get("app") or "").strip():
-                # A whole window holds everything in it: closed only when the user asked for exactly that
-                # (live 14:20 the talker offered to close all of Chrome because one tab would not close).
-                raise _Refused("closing a whole window is only for when the user asked to close that window: put "
-                               "their words asking for it in named. Nothing was closed; if a tab would not close, "
-                               "the thinker handles it", reason="no_words")
             act = getattr(self.backend, "window_action", None)
             if not callable(act):
                 raise _Refused("this desktop has no window hand", reason="no_backend")
@@ -5500,7 +5500,7 @@ class Hands:
             now = time.monotonic()
             self._other_tabs = {h: v for h, v in self._other_tabs.items() if now - v[2] < _TABS_FRESH_S}
             self._other_tabs[int(hwnd)] = ([str(t.name) for t in tabs],
-                                           [str(getattr(t, "tab_id", "") or "") for t in tabs], now, frozenset())
+                                           [str(getattr(t, "tab_id", "") or "") for t in tabs], now)
             self._other_complete = {h: c for h, c in self._other_complete.items() if h in self._other_tabs}
             self._other_complete[int(hwnd)] = bool(getattr(strip, "complete", True))
         return strip
@@ -5513,38 +5513,68 @@ class Hands:
         windows = [w for w in overview.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") is not None]
         return app_windows(app, windows)
 
-    def _search_order(self, hwnd: int | None, app: str) -> list[int]:
-        """The windows a tab named by words is looked for in, nearest first: the one given and its program's other
-        windows; else the program they named; else the window in front, then every other one as stacked."""
+    def _no_app_window(self, app: str) -> _Refused:
+        """The refusal for an app named that no window on the desk block is (kHands r1 L8): stale, so the thinker
+        resolves it (a nickname, or open it), with the open apps' names for it; never "it isn't open" on a name."""
+        with self._lock:
+            hwnds = list(self.last.apps)
+        shown = list(dict.fromkeys(n for n in (self._browser_app(h) for h in hwnds) if n))[:12]
+        return _Refused(f"no window on the desktop block is the app named {app[:40]!r} by its program's name (open: "
+                        f"{', '.join(shown) or 'none'}); nothing was done", stale=True, reason="no_app_window")
+
+    def _is_browser(self, hwnd: int) -> bool:
+        """Whether a window's program is a web browser by machine data (kHands r1 M6: :func:`web_app`); a stand-in desk
+        answers for itself (``web_app``), else by Windows' list of browsers alone."""
+        with self._lock:
+            overview = self.last.overview or {}
+        w = next((w for w in overview.get("windows") or [] if isinstance(w, dict) and w.get("hwnd") == hwnd), None)
+        if w is None:
+            return False
+        process = str(w.get("process_name") or w.get("app") or "")
+        own = getattr(self.backend, "web_app", None)
+        if callable(own):
+            return bool(own(process))
+        return web_app(process, w.get("pid") if _is_real_backend(self.backend) else None)
+
+    def _search_order(self, hwnd: int | None, app: str, *, only_app: bool) -> list[int]:
+        """The windows a tab named by words is looked for in, nearest first (kHands r1 M3/M6): the browser named
+        (``app``) first, the window given first among them when it is one; then the window given and its program's
+        other windows, then the window in front and the rest as stacked, browsers only (:meth:`_is_browser`: a
+        terminal's or an editor's tabs are searched only in a window the talker gave). ``only_app`` (a close): the
+        browser named binds, none of the rest."""
         with self._lock:
             overview = self.last.overview or {}
             front = self.last.foreground
             known = set(self.last.hwnds)
         stacked = [int(w["hwnd"]) for w in overview.get("windows") or []
                    if isinstance(w, dict) and w.get("hwnd") is not None]
+        order: list[int] = []
+        if app:
+            named = self._windows_of(app)
+            if not named:
+                raise self._no_app_window(app)
+            order = ([hwnd] if hwnd in named else []) + named
+            if only_app:
+                return list(dict.fromkeys(order))[:self.TAB_SEARCH_WINDOWS]
         if hwnd is not None:
             process = self._app_at(hwnd)
-            same = [h for h in stacked if h != hwnd and process and self._app_at(h) == process]
-            order = [hwnd, *same]
-        elif app:
-            order = self._windows_of(app)
-            if not order:
-                raise _Refused(f"no window of {app[:40]} is open on the desktop block; nothing was done",
-                               reason="no_app_window")
-        else:
-            order = ([front] if front in known else []) + [h for h in stacked if h != front]
+            order += [hwnd, *(h for h in stacked if h != hwnd and process and self._app_at(h) == process)]
+        rest = ([front] if front in known else []) + stacked
+        order += [h for h in dict.fromkeys(rest) if h not in order and self._is_browser(h)]
         return list(dict.fromkeys(order))[:self.TAB_SEARCH_WINDOWS]
 
     def _tab_args(self, args: dict[str, Any]) -> dict[str, Any]:
         """A tab hand's arguments with the tabs it acts on found (``_targets``: ``[(place, title, id, hwnd)]``), for show
-        and close (kHands). A tab is named by their words for it (``named``, or ``title``: "YouTube", "the aniwave"): it
-        is found in the window given, else in the windows of the browser they named (``app``), else in the window in
-        front and then the others as stacked, each strip read with every group (a pinned tab too), and the first window
-        with a tab whose title holds those words is the one (:func:`tabs_titled`). Several there: show brings up the one
-        already showing among them, else the first (cheap and undone with a word: named by the step line); close asks
-        which by title (:data:`_TAB_CHOOSE_NOTE`) unless ``every`` (their words meant all of them). Numbers (``tab``,
-        ``tabs``) count only on the tabs line the talker was shown, and their titles must agree with the words given.
-        ``new`` gets the window's browser (``_app``). Raises :class:`_Refused` (with a reason code); returns a copy."""
+        and close (kHands). A tab is named by their word for it (``named``, or ``title``: "YouTube", "aniwave"), looked
+        for in the windows :meth:`_search_order` gives (the browser named first; a close stays in it), each strip read
+        with every group (a pinned tab too): the first window with a tab whose title holds those words is the one
+        (:func:`tabs_titled`). Several there: show brings up the one already showing among them, else the first (cheap
+        and undone with a word: named by the step line); close asks which by title (:data:`_TAB_CHOOSE_NOTE`) unless
+        ``every`` (their words meant all of them: every match in every window looked at). Words that fit no title read
+        are given back once with the titles (review r1 M4), then go to the thinker. Never with a game in front for show
+        (no strip read). Numbers (``tab``, ``tabs``) count only on the tabs line the talker was shown, and their titles
+        must agree with the words given. ``new`` gets the window's browser (``_app``). Raises :class:`_Refused` (with a
+        reason code); returns a copy."""
         action = str(args.get("action") or "show")
         out = dict(args)
         if action == "reopen":
@@ -5585,8 +5615,17 @@ class Hands:
             raise _Refused("give named: their own words for the tab (\"YouTube\", \"the aniwave\"), and app when they "
                            "named the browser; never a number asked of them. Nothing was done", shape=True,
                            reason="no_words")
-        order = self._search_order(hwnd, app)
-        read = 0
+        if action == "show":
+            game = self._game_front()
+            if game:
+                # D17 (kHands r1 M6): a tab shown brings its window up, which never happens over a game: no strip is read
+                from yuki.memory.gamegate import refusal_text
+
+                raise _Refused(refusal_text(game, "front"), reason="game")
+        every = action == "close" and bool(args.get("every"))
+        order = self._search_order(hwnd, app, only_app=action == "close")
+        read: list[str] = []
+        gathered: list[tuple[Any, int]] = []
         deadline = time.monotonic() + self.TAB_SEARCH_TOTAL_S
         for h in order:
             left = deadline - time.monotonic()
@@ -5596,12 +5635,15 @@ class Hands:
             tabs = list(getattr(strip, "tabs", None) or [])
             if not tabs:
                 continue
-            read += 1
             names = [str(t.name) for t in tabs]
+            read.extend(names)
             hits = tabs_titled(words, names)
             if not hits:
                 continue
             found = [tabs[i - 1] for i in hits]
+            if every:
+                gathered.extend((t, h) for t in found)   # kHands r1 L10: all of them, in every window looked at
+                continue
             out["window"] = h
             if action == "show":
                 pick = next((t for t in found if t.selected), found[0])
@@ -5609,15 +5651,27 @@ class Hands:
                     out["_picked_of"] = len(found)
                 out["_targets"] = [(pick.index, pick.name, getattr(pick, "tab_id", "") or "", h)]
                 return out
-            if len(found) > 1 and not args.get("every"):
+            if len(found) > 1:
                 listed = "; ".join(f'"{t.name[:60]}"' for t in found[:6])
                 raise _Refused(f"{len(found)} tabs fit those words: {listed}. Nothing was closed",
                                choose={"count": len(found), "titles": listed}, reason="several")
             out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t in found]
             return out
+        if gathered:
+            out["window"] = gathered[0][1]
+            out["_targets"] = [(t.index, t.name, getattr(t, "tab_id", "") or "", h) for t, h in gathered]
+            return out
         if not read:
             raise _Refused("no tab strip could be read in the windows looked at; nothing was done", stale=True,
                            reason="no_strip")
+        if len(words.split()) > 1:
+            # kHands r1 M4: words beyond the title's ("the aniwave", "the YouTube tab") match no title: given back once
+            # with the titles read, so the next call names the tab by its title's own words (then the thinker)
+            listed = "; ".join(f'"{n[:60]}"' for n in list(dict.fromkeys(read))[:12])
+            raise _Refused(f"no tab's title holds all the words in named; the tabs open: {listed}. If one of these is "
+                           f"the tab their words meant, call it again with named = the words of its title they said; "
+                           f"if none is, call it again exactly as before. Nothing was done", shape=True,
+                           reason="no_match_words")
         raise _Refused("no tab's title holds those words in the windows looked at; nothing was done", stale=True,
                        reason="no_match")
 
@@ -5712,19 +5766,20 @@ class Hands:
         if any(not t[2] for t in targets):
             raise _Refused("those tabs have no identity to close them by; hand it to the thinker. Nothing was closed",
                            reason="no_identity")
-        hwnd = int(targets[0][3])
-        facts["app"] = self._app_at(hwnd)
+        facts["app"] = self._app_at(int(targets[0][3]))
         facts["target"] = "TabItem " + ", ".join(f'"{str(t[1])[:60]}"' for t in targets)
         facts["sent_at"] = time.monotonic()
         closed, failed, lines = [], [], []
-        for _n, title, tab_id, _h in targets:
-            result = act(hwnd, tab_id, "close")
+        for _n, title, tab_id, hwnd in targets:   # each in its own window (every: kHands r1 L10)
+            result = act(int(hwnd), tab_id, "close")
             good = bool(getattr(result, "ok", False)) and bool(_detail(result, "verified"))
             (closed if good else failed).append(title)
             lines.append(str(getattr(result, "summary", "")))
             facts["action_ms"] = round(float(getattr(result, "elapsed_ms", 0.0) or 0.0))
-        if closed:
-            self._other_tabs.pop(hwnd, None)   # that window's strip changed: a later call reads it again
+            if good:
+                self._other_tabs.pop(int(hwnd), None)   # that window's strip changed: a later call reads it again
+        if len({int(t[3]) for t in targets}) > 1:
+            facts["windows"] = len({int(t[3]) for t in targets})
         facts["verified"] = bool(closed) and not failed
         report = "; ".join(lines)
         if closed:
@@ -6148,6 +6203,50 @@ class Hands:
 def _squash(text: Any) -> str:
     """Letters and digits only, casefolded ("WhatsApp.Root" -> "whatsapproot")."""
     return "".join(ch for ch in str(text or "").casefold() if ch.isalnum())
+
+
+#: :func:`web_app`'s answers per program image (RAM only, this process).
+_WEB_APPS: dict[str, bool] = {}
+
+
+def web_app(process: str, pid: Any = None) -> bool:
+    """Whether a program is a web browser by machine data (kHands r1 M6): Windows lists it as a desktop browser
+    (``Clients\\StartMenuInternet``: :func:`yuki.actions.launch._registered_browser_images`), or (``pid`` of the real
+    desktop given) it is a packaged app whose own manifest declares web addresses (a ``windows.protocol`` for http or
+    https: Arc). Never a list of browsers. Read-only, kept per image; never raises (``False``)."""
+    image = str(process or "").strip().lower()
+    if not image:
+        return False
+    if image in _WEB_APPS:
+        return _WEB_APPS[image]
+    try:
+        from yuki.actions.launch import _registered_browser_images
+
+        if image in _registered_browser_images():
+            _WEB_APPS[image] = True
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    if pid is None:
+        return False
+    try:
+        import os
+        from xml.etree import ElementTree
+
+        from yuki.core.appnames import WindowsProbe
+
+        probe = WindowsProbe()
+        full, _aumid = probe.package_of_process(int(pid))
+        root = probe.package_path(full) if full else ""
+        found = False
+        if root:
+            tree = ElementTree.parse(os.path.join(root, "AppxManifest.xml")).getroot()
+            found = any(str(el.tag).rsplit("}", 1)[-1] == "Protocol"
+                        and str(el.get("Name") or "").lower() in ("http", "https") for el in tree.iter())
+    except Exception:  # noqa: BLE001 - unknown this time: asked again next time
+        return False
+    _WEB_APPS[image] = found
+    return found
 
 
 def app_forms(process: str) -> tuple[set[str], set[str]]:
