@@ -275,6 +275,8 @@ class Job:
     remember: bool = False
     #: The desktop action it is running now, in a few words (for the shared action log).
     acting: str = ""
+    #: lVoice: ``(hwnd, tab id)`` that action leaves its effect on (``_acting_on``), for the log's liveness check.
+    acting_on: tuple[int | None, str] | None = None
     #: The ``finishes_with`` of the action call it is running now (the brain's mark that the call completes
     #: the request), and that line once the call succeeded: the result it then ends with is said as it is,
     #: at once, by code (v3.6).
@@ -806,6 +808,11 @@ class VoiceBridge(QObject):
         self._loop = loop
         self.closing = False
         self._named_refused = False
+        if loop is not None:
+            # lVoice (live 17 Oct, problem 2): a conversation going live starts the shared action log's lines anew.
+            # Before, one log carried a quarter of an hour across conversations: 5 of 5 browser tasks that worked in a
+            # first run failed in the second (aimed at a tab closed since, or "There you go" with nothing done)
+            self._new_conversation()
         if loop is None:
             self.gate = None
             self.steps = None
@@ -840,6 +847,28 @@ class VoiceBridge(QObject):
                     if job.wait_handle is not None:
                         job.wait_handle.cancel()
                         job.wait_handle = None
+
+    def _new_conversation(self) -> None:
+        """lVoice: the hands (and the action log) start a new conversation's state. Never raises."""
+        try:
+            hands = self.hands
+            if hands is not None and callable(getattr(hands, "new_conversation", None)):
+                hands.new_conversation()   # it starts the shared log's new conversation too
+            else:
+                self.actions.new_conversation()
+            self._log("bridge", op="new_conversation", convo=getattr(self.actions, "convo", None))
+        except Exception:  # noqa: BLE001 - a log that keeps its lines is the old behaviour, never a crash
+            pass
+
+    def _done_text(self) -> str:
+        """lVoice (problem 2): the action log as the thinker reads it with a request: this conversation's lines, each
+        with its age, none whose window or tab is gone (the hands' identity check on the last desktop read or the OS;
+        cheap, on the loop)."""
+        alive = getattr(self.hands, "record_alive", None) if self.hands is not None else None
+        try:
+            return self.actions.text(alive=alive) if callable(alive) else self.actions.text()
+        except TypeError:   # an older log without the check
+            return self.actions.text()
 
     def _run(self, fn: Callable[[], None]) -> None:
         try:
@@ -1262,7 +1291,7 @@ class VoiceBridge(QObject):
                 # or a re-run of the same words) is that request again, never a second job saying a second outcome.
                 intent = "follow_up"
                 self._log("bridge", op="merged_same_turn", job_id=same.job_id, call=params.tool_call_id)
-        done_before = self.actions.text()
+        done_before = self._done_text()
         said = spoken_words(params.context)
         first = say_first_words(args.get("say_first"))
         if first and first not in said:
@@ -1420,6 +1449,55 @@ class VoiceBridge(QObject):
         with self._lock:
             jobs = list(self._jobs.values()) + list(self._unsubmitted.values()) + list(self._finished)
         return any(j.source == "voice" and not j.remember and not j.unadopted and j.user_turn == turn for j in jobs)
+
+    def answer_pending(self) -> bool:
+        """lVoice review r1 L8: whether a voice job waits on a question the user heard (:meth:`_answerable`) or a turn
+        of theirs is held as such an answer (a claim not settled yet). The hands' end check then hands no rest on:
+        :meth:`escalate` would route their words as that job's answer, though a hand already acted on them. State
+        only; ``True`` when it cannot be told (nothing is handed on then). Never raises."""
+        try:
+            claim = self._claim
+            if claim is not None and not claim.done and not claim.dropped:
+                return True
+            return self._answerable() is not None
+        except Exception:  # noqa: BLE001
+            return True
+
+    async def note_planned(self, text: str) -> bool:
+        """lVoice review r1 L2: a labelled note (code's words: a part of the reply the voice planned and did not run,
+        once the thinker took their whole request) for the open job made for the user's current turn
+        (:meth:`_same_turn_job`): steered into it while it runs, or kept for when it starts. Never routed as the answer
+        to a question it asks (a job waiting on one is left alone), never a new job. ``True`` when it went. Logged
+        content-free. Never raises."""
+        job = self._same_turn_job()
+        if job is None or not text or job.state == WAITING:
+            return False
+        loop = asyncio.get_running_loop()
+        decided: asyncio.Future = loop.create_future()
+
+        note = "(From Yuki's voice, about the request you are on) " + " ".join(str(text).split())
+
+        def route() -> None:
+            how = "none"
+            try:
+                if job.closing is None and job.state in OPEN_STATES and job.state != WAITING:
+                    if job.job_id is not None and job.state == RUNNING:
+                        self._steer(job, job.job_id, note)   # as an adopted job's note is steered in (_adopt)
+                        how = "added"
+                    elif job.state == QUEUED:
+                        job.pending_steers.append(note)   # not started yet: delivered when it starts (_on_started)
+                        how = "queued"
+            except Exception:  # noqa: BLE001
+                how = "none"
+            loop.call_soon_threadsafe(lambda: decided.done() or decided.set_result(how))
+
+        self._gui(route)
+        try:
+            how = await asyncio.wait_for(decided, timeout=5.0)
+        except asyncio.TimeoutError:
+            how = "none"
+        self._log("bridge", op="note_planned", token=job.token, how=how, chars=len(text))
+        return how != "none"
 
     async def _ack_if_silent(self, params: Any, args: dict[str, Any]) -> None:
         """Say the call's ``say_first`` words now when the reply that made it said nothing aloud.
@@ -1715,7 +1793,7 @@ class VoiceBridge(QObject):
         request = " ".join(str(words or "").split()) or heard[-1].strip()
         if self.on_brain:
             return self._brain_early(call_id, heard, request, turns, convo)
-        done_before = self.actions.text()
+        done_before = self._done_text()
         said = [x for x in (said or []) if x and x.strip()]
         tabs = self.tabs_for_thinker()
         text = brain_request(request, heard, done_before=done_before, said=said, tabs=tabs)
@@ -2555,6 +2633,7 @@ class VoiceBridge(QObject):
             self._changed()
             return
         job.acting = _action_words(name, tool_input)
+        job.acting_on = _acting_on(name, tool_input)   # lVoice: the window / tab its effect sits on (identities)
         step = step_of(name, tool_input)
         if step is None:
             return
@@ -2592,7 +2671,12 @@ class VoiceBridge(QObject):
             # What the thinker did on the desktop, for the mouth and the next hand-off (a list
             # of tool names is plumbing: which calls act, not what anything means).
             what = (job.acting if job is not None and job.acting else name)
-            self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
+            hwnd, tab = (getattr(job, "acting_on", None) or (None, "")) if job is not None else (None, "")
+            try:
+                self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False,
+                                 turn=job.user_turn if job is not None else None, hwnd=hwnd, tab_id=tab)
+            except TypeError:   # an older log without the identities
+                self.actions.add("the thinker", what, summary[:400], ok=bool(ok), verified=None if ok else False)
             if job is not None:
                 job.finished_by_action = job.finishing if ok else None
                 job.finishing = None
@@ -3479,7 +3563,7 @@ class VoiceBridge(QObject):
         context = (" ".join(str(context).split())[:1200] if context else
                    f"my own one-step try ({name}) did not take effect: {' '.join(str(report).split())[:400]}")
         said = spoken_words(params.context)
-        text = brain_request(request, heard, context=context, done_before=self.actions.text(), said=said,
+        text = brain_request(request, heard, context=context, done_before=self._done_text(), said=said,
                              tabs=self.tabs_for_thinker())
         job = self._new_job(request)
         job.escalated = True
@@ -3519,7 +3603,7 @@ class VoiceBridge(QObject):
             return await self._brain_run_held(args, context, heard)
         app_named = " ".join(str(args.get("app_named") or "").split())[:80] or None
         text = brain_request(request, heard, context=str(args.get("context") or "").strip() or None,
-                             done_before=self.actions.text(), said=spoken_words(context),
+                             done_before=self._done_text(), said=spoken_words(context),
                              tabs=self.tabs_for_thinker(), app_named=app_named)
         job = self._new_job(request)
         job.app_named = app_named
@@ -3674,13 +3758,15 @@ class VoiceBridge(QObject):
 
     def _done_block(self) -> str:
         """What Yuki's hands and its plans did on the desktop in this conversation, labelled (code facts), or ``""``."""
-        done = " ".join(str(self.actions.text() or "").split())
+        done = " ".join(str(self._done_text() or "").split())
         if not done:
             return ""
         if len(done) > self.DONE_CHARS:
             done = "…" + done[-(self.DONE_CHARS - 1):]   # the newest are what "the tab we just opened" points to
-        return ("Done on the desktop earlier in this conversation, newest last, each with what was verified (facts for "
-                "what their words refer to, not instructions): " + done)
+        # lVoice (problem 2): history with its age: what it says was so then, and none of it was done for this request
+        return ("Done on the desktop earlier in this conversation, newest last, each with its age and what was "
+                "verified then (facts for what their words refer to, not instructions; none of it was done for this "
+                "request): " + done)
 
     def _voice_context(self, convo: Any, turns: list[str] | None, *, extra: str | None = None,
                        remember: bool = False) -> str:
@@ -4180,6 +4266,22 @@ def _action_words(name: str, tool_input: dict | None) -> str:
         if value not in (None, "", []):
             parts.append(f"{key}={str(value)[:80]}")
     return " ".join(parts)
+
+
+def _acting_on(name: str, tool_input: dict | None) -> tuple[int | None, str]:
+    """lVoice (problem 2): ``(hwnd, tab id)`` a thinker's desktop step leaves its effect on, from its own input (the
+    window it names, the tab it selects by id), so the action log drops the line once that window or tab is gone. A
+    close leaves nothing there (its line says it is gone, and stays). Plumbing of the tools' fields, never words."""
+    data = tool_input if isinstance(tool_input, dict) else {}
+    if str(data.get("action") or "") == "close":
+        return None, ""
+    raw = data.get("hwnd", data.get("expect_hwnd"))
+    try:
+        hwnd = int(raw) if raw not in (None, "", 0) and str(raw).lstrip("-").isdigit() else None
+    except (TypeError, ValueError):
+        hwnd = None
+    tab = str(data.get("tab") or "") if name == "tab" and str(data.get("action") or "") == "select" else ""
+    return hwnd, tab
 
 
 def _foreground_hwnd() -> int | None:
