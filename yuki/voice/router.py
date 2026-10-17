@@ -40,17 +40,20 @@ focusing, minimizing, maximizing or closing a window they name, showing or closi
 item that is on an items line, typing their words into the field the focus line names, opening an address or an app, \
 opening Yuki's own window;
 - one of the user's skills on the Skills line, when there is one: the talker runs it in one call, whatever app it is \
-in;
+in; two separate asks in one turn ("pause the music and mute the PC") are one call each;
+- a message to someone (the message skill: it opens their chat and types their words);
+- a short question about their day, what they did, who they talked to or what they usually pick (the talker reads its \
+day block and one quick memory look);
 - ending this conversation, or quiet time.
 
-The thinker is needed (to = thinker) for everything else: their day, activity, calls, meetings and memory, their files, \
-messages, people and plans; anything of two or more steps; anything inside a window that no items line lists; looking \
-something up, working something out, advising; something they tell Yuki to keep (a rule, a correction, a fact about \
-their life); and a redo of something Yuki did wrong.
+The thinker is needed (to = thinker) for everything else: their files, plans, calls and meetings in detail, memory \
+beyond a short day question; anything of several steps inside an app; anything inside a window that no items line \
+lists; looking something up, working something out, advising; something they tell Yuki to keep (a rule, a correction, \
+a fact about their life); and a redo of something Yuki did wrong.
 
 screen is true when doing it needs what is inside the window in front (a video, a button, an item, a message on it).
 
-Good: "what did I do today?" -> thinker. "pause the music" -> talker. "open Chrome" -> talker. "thanks, perfect" -> \
+Good: "what did I do today?" -> talker. "summarise my meetings this week" -> thinker. "pause the music" -> talker. "open Chrome" -> talker. "thanks, perfect" -> \
 talker. "click the mix" and the mix is on the items line -> talker; it is not -> thinker, screen true. "open Spotify \
 and play my focus playlist" -> talker when the Skills line has a playlist skill, else thinker. "who's my \
 accountant?" -> thinker. "close the Claude tabs" and they are on the tabs line -> talker. On a call, "bro did you see that clutch" -> talker. "my cousin just got a job at Zomato" -> \
