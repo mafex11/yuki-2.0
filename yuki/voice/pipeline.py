@@ -37,7 +37,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from yuki.config import Settings
+from yuki.config import Settings, thinking_off
 from yuki.voice.expressive import strip_tags
 from yuki.voice.keys import DEEPGRAM, ELEVENLABS, GOOGLE, get_key
 from yuki.voice.keyterms import name_terms, vocabulary
@@ -446,6 +446,7 @@ class LlmCall:
     practice_block: str | None = None   # content: the request only, never a log
     talker_block: str = ""              # "pitfall:7;habit:9;skill:12"
     talker_block_chars: int = 0
+    tool: bool = False                  # kMind: a tool call began in this reply (the claim gate stops checking)
 
 
 #: Tools whose spoken acknowledgement travels in the call itself (``say_first``), said as soon as it is written.
@@ -1212,7 +1213,11 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             response = await super()._create_message_stream(api_call, params)
                         else:
                             client = hooks.client_for(target.get("region"))
-                            response = await client.beta.messages.create(**adapt_params(params, target["model"]))
+                            moved_params = adapt_params(params, target["model"])
+                            off = params.get("thinking")
+                            if isinstance(off, dict) and off.get("type") in ("disabled", "between_tools"):
+                                moved_params["thinking"] = thinking_off(target["model"])   # kMind: each model's own
+                            response = await client.beta.messages.create(**moved_params)
                         stream = response.__aiter__()
                         try:
                             first = await stream.__anext__()
@@ -1292,6 +1297,7 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                         if kind == "content_block_start" and getattr(event.content_block, "type", "") == "tool_use":
                             tool_id, args = str(event.content_block.id), ""
                             name = getattr(event.content_block, "name", "")
+                            call.tool = True
                             if call.first_text is not None and self._yuki_words is None:
                                 # The reply's words are complete (it goes on to a call): the voice says the
                                 # sentence waiting for its lookahead now, not when the call is written (v3.7).
@@ -1301,14 +1307,9 @@ def _layered_service(base: type, memory: MouthMemory, hooks: Any) -> type:
                             # The mouth has decided to hand over: the thinker starts on the user's own words while
                             # the call is still being written (v3.6), as soon as its first field says whether the
                             # window in front is to be read for it (v3.9, a few tokens in).
+                            # kMind: hand_over starts when its call is complete (its understanding, written last,
+                            # goes with the request: contract C3); tell_yuki on its first field, as before
                             early_wait = name == "tell_yuki" and call.user_turn
-                            if name == "hand_over" and call.user_turn:
-                                # bTalk (design 2, 8): hand_over has no screen field to wait for; the request starts on
-                                # the block's first bytes, as tell_yuki's does on its first field
-                                if self._speculation_gate.is_speculating:
-                                    self._yuki_early_pending = (tool_id, False)   # once the turn is confirmed
-                                else:
-                                    hook("handoff_began", tool_id, False)
                         elif (kind == "content_block_delta" and tool_id is not None
                               and hasattr(event.delta, "partial_json")):
                             args += event.delta.partial_json or ""
@@ -1643,6 +1644,8 @@ class _Turn:
     gave_up: bool = False                # the rerun was silent too: the error tone said so, the window was extended
     tts_silent: int = 0                  # replies of this turn whose voice played nothing at all
     repeat_dropped: bool = False         # V9: a reply to it was word for word the line said before, and was not said
+    claim_dropped: bool = False          # kMind: a line of its reply claimed something done with nothing done (dropped)
+    claim_rerun: bool = False            # ... and it was answered again for that (the rerun is told so)
     # vGame (5 Oct): said to Yuki by measured evidence, and what the fast path did with it
     named: bool = False                  # the name was heard with it (the wake word), or it came right after the name
     fast: str | None = None              # "dismiss" (ended at once) | "name" (the name alone, answered at once)
@@ -2559,7 +2562,8 @@ class _Hooks:
         if self.routed():
             return []   # Settings → AI moved the talker: its client retries there and uses only the user's backup
         s = self.c.settings
-        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(s.voice_mouth_model, [])
+        model = getattr(self.c, "talker_model", None) or s.voice_mouth_model
+        return [dict(t) for t in (getattr(s, "model_fallbacks", None) or {}).get(model, [])
                 if isinstance(t, dict) and t.get("model")]
 
     def sticky_index(self, size: int) -> int:
@@ -3429,6 +3433,9 @@ class Conversation:
         #: (``full`` / ``lean``); fixed for the conversation with its tools and prompt.
         self.brain_voice = voice_on_brain(settings)
         self.talker = talker_kind(settings)
+        #: kMind: the talker's model: the lean talker's own (``Settings.voice_lean_model``), else the mouth's.
+        self.talker_model = str((getattr(settings, "voice_lean_model", "") if self.talker == "lean" else "")
+                                or settings.voice_mouth_model)
         #: yConsumers: the lean talker (voice on the new brain) gets memory's one "you right now" line in its volatile
         #: block, from :class:`TalkerYou`'s background cache; the full talker is byte-for-byte as before.
         self._you_on = self.talker == "lean"
@@ -4762,6 +4769,7 @@ class Conversation:
 
         self._recent_job, self._recent_close = job, close
         log, session, started = self.log, self.session, time.monotonic()
+        lean = self.talker == "lean"
 
         def work() -> None:
             try:
@@ -4770,11 +4778,18 @@ class Conversation:
                 failed = object()
                 text = fetch_recent(memory, failed=failed)
                 ok = text is not failed   # a failed read keeps the view read at the build (review F4)
+                card = None
+                if lean:
+                    from yuki.voice.mouth import fetch_you_card
+
+                    card = fetch_you_card(memory)   # kMind (C1): the card as it is now; None keeps the build's
                 with lock:
                     before = mouth_memory.recent
                     used = ok and gate["open"]
                     if used:
                         mouth_memory.recent = text
+                    if card and gate["open"]:
+                        mouth_memory.you_card = card
                 if log is not None:
                     log.event("recent", op="woken", session=session, ok=ok, used=used,
                               chars=len(text or "") if ok else 0,
@@ -5051,8 +5066,8 @@ class Conversation:
             client=self._client,
             retry_on_timeout=True,
             settings=AnthropicLLMService.Settings(
-                model=s.voice_mouth_model, max_tokens=s.voice_mouth_max_tokens, enable_prompt_caching=True,
-                thinking=AnthropicLLMService.ThinkingConfig(type="disabled"),
+                model=self.talker_model, max_tokens=s.voice_mouth_max_tokens, enable_prompt_caching=True,
+                thinking=AnthropicLLMService.ThinkingConfig(**thinking_off(self.talker_model)),
                 # The core layer: Pipecat composes its async-tool paragraphs onto it; the
                 # service subclass sends the result as the first of the prompt's layers.
                 system_instruction=LEAN_MOUTH_PROMPT if lean else MOUTH_PROMPT,
@@ -5183,6 +5198,10 @@ class Conversation:
                                 context=lambda: {"user": self.observer.last_user_text},
                                 shadow=self.channel == "marker", **code_only)   # v3.16: marker: it only measures
             guard.on_drop = self.observer.guarded
+            if self.talker == "lean":
+                # kMind (the claim gate, Hands.acted_this_turn): no "done" without an act in this turn
+                guard.claim_open = self._claim_open
+                guard.on_claim = self._claim_dropped
             self.guard = guard
             self.observer.guard = guard
             tts.set_guard(guard)
@@ -5724,8 +5743,8 @@ class Conversation:
         except Exception as exc:  # noqa: BLE001 - then only the connection is warmed
             self.log.event("warm", note=f"plain warm-up ({type(exc).__name__})")
         try:
-            response = await self._client.messages.create(model=self.settings.voice_mouth_model, max_tokens=1,
-                                                          **request)
+            response = await self._client.messages.create(model=self.talker_model, max_tokens=1,
+                                                          thinking=thinking_off(self.talker_model), **request)
             usage = getattr(response, "usage", None)
             self.log.event("warm", ms=round((time.monotonic() - started) * 1000),
                            cache_write_tokens=getattr(usage, "cache_creation_input_tokens", None),
@@ -6327,7 +6346,7 @@ class Conversation:
         turn = obs.turn
         if turn is None or turn.trigger != "user" or not (turn.user_text or "").strip():
             return None
-        if turn.heard or turn.tools or turn.quiet or turn.gave_up:
+        if (turn.heard and not turn.claim_dropped) or turn.tools or turn.quiet or turn.gave_up:
             return None  # heard something, or acted, or handed over, or chose silence, or already given up on
         if not (turn.cut or turn.responses):
             return None  # its reply may still be on its way
@@ -6376,6 +6395,9 @@ class Conversation:
                 turn.rerun = True
                 turn.responses_at_rerun = turn.responses
                 turn.rerun_at = now
+                if turn.claim_dropped:
+                    # kMind: answered again because a line claimed something done with nothing done (told so)
+                    turn.claim_dropped, turn.claim_rerun = False, True
                 obs.rerun_turn = turn
                 self.log.event("reply_watch", op="rerun", turn=turn.n, cut=bool(turn.cut),
                                responses=turn.responses, after_ms=round((now - turn.transcript_at) * 1000),
@@ -6502,6 +6524,8 @@ class Conversation:
         turn = self.observer.turn
         if turn is not None and getattr(turn, "repeat_dropped", False):
             state["repeat"] = True   # V9: the rerun is told its last reply repeated the line before
+        if turn is not None and getattr(turn, "claim_rerun", False):
+            state["claim"] = True    # kMind: the rerun is told its last reply claimed something not done
         scrolling = self._scrolling_line()
         if scrolling:
             state["scrolling"] = scrolling   # V7: a page scrolling on by itself; the talker stops it
@@ -6532,10 +6556,56 @@ class Conversation:
             you_line = talker_you().line()
             if you_line:
                 state["you"] = you_line
+        if self.talker == "lean":
+            # kMind (claim gate): whether a hand or skill of the talker's did something verified in this user turn
+            acted = self._acted_this_turn()
+            if acted is not None:
+                state["acted"] = acted
         reflex = self._reflex_state()
         if reflex:
             state["reflex"] = reflex   # lSpeed: the reflex that ran for these words (mouth.REFLEX_NOTES)
         return state
+
+    def _claim_open(self) -> bool:
+        """kMind (the claim gate): the talker's words now are a reply to the user's own turn in which nothing was done
+        yet: no call in this turn or this reply, no hand or skill verified anything (``Hands.acted_this_turn``), no
+        reflex did it. A stream and state fact, never the words. Never raises."""
+        try:
+            turn = self.observer.turn
+            if turn is None or turn.trigger != "user" or turn.tools:
+                return False
+            call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+            if call is None or not call.user_turn or call.tool:
+                return False
+            return self._acted_this_turn() is False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _claim_dropped(self) -> None:
+        """kMind: a line of the reply claimed something done with nothing done; it was dropped (the turn is answered
+        again once, told so: ``_reply_watch``, ``mouth.CLAIM_NOTE``)."""
+        turn = self.observer.turn
+        if turn is not None and turn.trigger == "user":
+            turn.claim_dropped = True
+            self.log.event("claim_gate", op="dropped", turn=turn.n)
+
+    def _acted_this_turn(self) -> bool | None:
+        """kMind (the claim gate, ``Hands.acted_this_turn``): ``True`` / ``False`` for a user turn (a reflex that did
+        it counts), ``None`` when there are no hands or this call is not a user turn's. Never raises."""
+        call = getattr(getattr(self, "_llm", None), "_yuki_call", None)
+        if call is not None and not getattr(call, "user_turn", True):
+            return None
+        hands = getattr(self.bridge, "hands", None)
+        fn = getattr(hands, "acted_this_turn", None)
+        if not callable(fn):
+            return None
+        try:
+            if fn():
+                return True
+            rec = self._reflex_state()
+            return bool(rec and rec.get("state") == "done")
+        except Exception:  # noqa: BLE001
+            return None
 
     #: V7: a continuous scroll waits while the user talks and this long after their words (they may be "stop").
     SCROLL_TALK_HOLD_S = 1.5

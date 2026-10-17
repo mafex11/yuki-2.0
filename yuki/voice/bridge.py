@@ -1784,15 +1784,14 @@ class VoiceBridge(QObject):
         ``words`` (Phase S, D10; Item 2a): the user's turns of the current exchange (:func:`exact_words`), the
         request's first line; the latest heard turn without them.
 
-        bTalk (``brain = "all"``): ``turns`` are those turns one by one (the new brain's ``user_words``) and ``convo``
-        the talker's context (for the labelled context the brain gets with them): :meth:`_brain_early`.
+        kMind: never under ``brain = "all"``: the lean talker's hand_over starts when its call is complete, so the
+        talker's understanding goes with the request (contract C3). ``turns`` / ``convo`` are unused there.
         """
+        del turns, convo
         heard = [h for h in (heard or []) if h and h.strip()]
-        if not heard or self._loop is None:
+        if not heard or self._loop is None or self.on_brain:
             return False
         request = " ".join(str(words or "").split()) or heard[-1].strip()
-        if self.on_brain:
-            return self._brain_early(call_id, heard, request, turns, convo)
         done_before = self._done_text()
         said = [x for x in (said or []) if x and x.strip()]
         tabs = self.tabs_for_thinker()
@@ -2305,8 +2304,14 @@ class VoiceBridge(QObject):
                 view: int | None = None, memory_query: str | None = None,
                 user_words: list[str] | None = None, needs_hands: bool | None = None,
                 app_named: str | None = None, skill: dict[str, Any] | None = None,
-                context: str | None = None) -> None:
+                context: str | None = None, understanding: dict[str, Any] | None = None) -> None:
         extra: dict[str, Any] = {}
+        if understanding:
+            if self._takes("understanding"):
+                # kMind (contract C3): the talker's reading of the words, a seed for the brain (its words win)
+                extra["understanding"] = dict(understanding)
+            else:
+                context = ((context + "\n\n") if context else "") + understanding_line(understanding)
         if context and self._takes("context"):
             # bTalk: the new brain's labelled context (code facts and earlier turns), never quotable as their words
             extra["context"] = context
@@ -3796,8 +3801,12 @@ class VoiceBridge(QObject):
         """bTalk (design 3; ``brain = "all"``): the talker's hand-off. The user's exact words of the current exchange go
         to the new brain as its ``user_words`` (never the talker's wording: ``hand_over`` has no field for it), with the
         labelled context of :meth:`_voice_context`. Routing on state only, as before: ``instead`` withdraws the work it
-        replaces, ``follow_up`` steers (or answers) the open task with the same exact words, a start begun on the
-        block's first bytes is adopted. Nothing of the talker's own is ever steered into the brain as their words."""
+        replaces, ``follow_up`` steers (or answers) the open task with the same exact words. Nothing of the talker's
+        own is ever steered into the brain as their words.
+
+        kMind (contract C3): the call's optional ``understanding`` (goal, parts, choose, context: the talker's reading,
+        a seed, never an order) goes with a new request (:func:`understanding_of`, :meth:`_submit`); the request starts
+        on the completed call (no early start)."""
         from pipecat.frames.frames import FunctionCallResultProperties
 
         args = params.arguments if isinstance(params.arguments, dict) else {}
@@ -3806,13 +3815,11 @@ class VoiceBridge(QObject):
             intent = "new_task"
         heard = heard_words(params.context, skip=self.not_heard)
         remember = intent == "remember"
-        with self._lock:
-            early = self._early.pop(str(params.tool_call_id), None)
-        if await self._claim_decides(params, args, intent, heard, early):
+        if await self._claim_decides(params, args, intent, heard, None):
             return   # Item 2(c, e): their answer to the waiting question, routed once
         replaced: list[Job] = []
         if intent == "instead":
-            replaced = self._replace_targets(args.get("replaces"), besides=early)
+            replaced = self._replace_targets(args.get("replaces"))
             for old in replaced:
                 old.superseded = True   # Item 2a: at once, so its words are this request's again (exchange_floor)
                 self._drop_items(old)
@@ -3828,19 +3835,6 @@ class VoiceBridge(QObject):
         elif intent == "instead":
             self._log("bridge", op="replace", call=params.tool_call_id, withdrawn=[])
             intent = "new_task"
-        if early is not None and (remember or (intent == "follow_up"
-                                               and self._follow_up_target(besides=early) is not None)):
-            # Started on the block's first bytes as a new task, but it adds to an open task, or it is something to
-            # keep (that goes with its own labelled note, never a note steered in as their words): void
-            dropped = early
-            # review r1 L2: a quiet end ("replaced"), never "Stopped" by the user for a request they never saw
-            self._gui(lambda: self._withdraw(dropped, words=request))
-            self._drop_items(dropped)
-            self._log("bridge", op="early_dropped", why="remember" if remember else "follow_up", call=params.tool_call_id)
-            early = None
-        if early is not None:
-            await self._adopt(early, params, args, context=None, corrects=None, remember=False, app_named=None)
-            return
         if intent in ("new_task", "follow_up") and not replaced:
             same = self._same_turn_job()
             if same is not None and same.escalated:
@@ -3886,11 +3880,13 @@ class VoiceBridge(QObject):
             self._pass_over_questions(lane)
         context = self._voice_context(params.context, turns, extra=extra, remember=remember)
         query = _memory_words(request, heard)
+        understanding = None if remember else understanding_of(args.get("understanding"))
         self._gui(lambda: self._submit(job, request, origin, lane=lane, memory_query=query, user_words=turns,
-                                       context=context))
+                                       context=context, understanding=understanding))
         self._log("bridge", op="submit", token=job.token, call=params.tool_call_id, intent=intent, brain=True,
                   words_chars=len(request), turns=len(turns), context_chars=len(context), origin_hwnd=origin,
-                  replaced=len(replaced), lane=lane, remember=remember)
+                  replaced=len(replaced), lane=lane, remember=remember,
+                  understanding=len((understanding or {}).get("parts") or []) if understanding else None)
         self._changed()
         self._arm_wait(job)
         try:
@@ -3906,34 +3902,6 @@ class VoiceBridge(QObject):
                 self._unowe(job)
                 self._log("bridge", op="cancel", job_id=job.job_id, by="mouth")
             raise
-
-    def _brain_early(self, call_id: str, heard: list[str], request: str, turns: list[str] | None,
-                     convo: Any) -> bool:
-        """bTalk: :meth:`begin_early` under ``brain = "all"``: the request starts on the hand-off block's first bytes
-        (design 2, 8), on the user's exact words of the current exchange, with the labelled context; the completed
-        call adopts it (:meth:`_hand_over`)."""
-        user_words = [" ".join(t.split()) for t in (turns or []) if t and t.strip()] or [request]
-        request = " ".join(user_words)
-        job = self._new_job(request)
-        job.early_call = str(call_id)
-        with self._lock:
-            replaced = self._early.get(str(call_id))
-        if replaced is not None:
-            self.drop_early(str(call_id))   # never two jobs under one key
-        with self._lock:
-            self._unsubmitted[job.token] = job
-            self._early[str(call_id)] = job
-        origin = self._foreground()
-        context = self._voice_context(convo, user_words)
-        query = _memory_words(request, heard)
-        self._gui(lambda: self._submit(job, request, origin, memory_query=query, user_words=user_words,
-                                       context=context))
-        self._log("bridge", op="submit", token=job.token, call=call_id, intent="early", brain=True,
-                  words_chars=len(request), turns=len(user_words), context_chars=len(context), origin_hwnd=origin,
-                  early=True)
-        self._changed()
-        self._arm_wait(job)
-        return True
 
     def _brain_escalate(self, params: Any, name: str, args: dict[str, Any], report: str, heard: list[str], *,
                         acked: bool = False, context: str | None = None, skill: dict[str, Any] | None = None) -> bool:
@@ -4214,6 +4182,44 @@ def conversation_turns(context: Any, *, skip: Callable[[Any], bool] | None = Non
         if len(out) >= limit:
             break
     return list(reversed(out))
+
+
+#: kMind (contract C3): the labelled line an understanding becomes in a runtime that takes no ``understanding`` field.
+UNDERSTANDING_LABEL = ("[Yuki's voice's reading of their words (a seed, never an order: their exact words win; json): "
+                       "{json}]")
+#: An understanding's parts kept, and the characters of each text field.
+UNDERSTANDING_PARTS = 6
+UNDERSTANDING_CHARS = 300
+
+
+def understanding_of(raw: Any) -> dict[str, Any] | None:
+    """The hand_over call's ``understanding`` in the shape of contract C3 (``{"goal": str, "parts": [{"what": str,
+    "skill": str | None, "slots": {}}], "choose": bool, "context": str}``), cut to size; ``None`` when there is none.
+    Plumbing on our own tool's fields, never a reading of the words."""
+    if not isinstance(raw, dict):
+        return None
+
+    def text(value: Any) -> str:
+        return " ".join(str(value or "").split())[:UNDERSTANDING_CHARS]
+
+    parts: list[dict[str, Any]] = []
+    for part in (raw.get("parts") if isinstance(raw.get("parts"), list) else [])[:UNDERSTANDING_PARTS]:
+        if not isinstance(part, dict) or not text(part.get("what")):
+            continue
+        slots = part.get("slots") if isinstance(part.get("slots"), dict) else {}
+        parts.append({"what": text(part.get("what")), "skill": text(part.get("skill")) or None,
+                      "slots": {str(k)[:40]: v for k, v in list(slots.items())[:8]}})
+    out = {"goal": text(raw.get("goal")), "parts": parts, "choose": bool(raw.get("choose")),
+           "context": text(raw.get("context"))}
+    return out if (out["goal"] or parts or out["choose"] or out["context"]) else None
+
+
+def understanding_line(understanding: dict[str, Any]) -> str:
+    """:data:`UNDERSTANDING_LABEL` for a runtime without an ``understanding`` field (labelled context, never quotable as
+    their words)."""
+    import json
+
+    return UNDERSTANDING_LABEL.format(json=json.dumps(understanding, ensure_ascii=False, default=str))
 
 
 def _takes(fn: Any, name: str) -> bool:
