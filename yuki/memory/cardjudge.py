@@ -26,12 +26,14 @@ writer's) and up to 5 code lines, at most 2 of them asking, each line carrying i
 "While you were away" list shows when at least 2 things wait.
 
 **Live** (``[judge] mode = "on"``, the shipped default since 18 Oct; the old first-writer chain is gone): the judge
-alone writes the cards. **Shadow** (a setting): no card at all; the judge decides what it *would* have shown and logs it
-(``judge_decision``, content-free), with no model call. ``mode = "off"``: no proactive cards. :meth:`CardJudge.tick` is
-the worker's loop body: the upkeep (:meth:`CardJudge.upkeep`: expiry, the check-in fold, the questions' upkeep, the
-routine lane's learning, at their own pace under any hold but paused or off), then one evaluation when YouNow woke the
-judge or a deadline came. The generators read the items' real state (``live``); B1 and B4 count stored rows
-(:class:`yuki.memory.attend.RowHistory`), so a restart resets nothing. The chosen candidate is written for real
+alone writes the cards. **Shadow** (a setting): none of Yuki's own cards; the judge decides what it *would* have shown
+and logs it (``judge_decision``, content-free), with no model call. ``mode = "off"``: none of Yuki's own cards. In every
+mode the user's own cards still go (:data:`OWED_TYPES`: a reminder they set, a "tell me when" request) and the upkeep
+runs. :meth:`CardJudge.tick` is the worker's loop body in every mode: the upkeep (:meth:`CardJudge.upkeep`: expiry, the
+check-in fold, the questions' upkeep, the routine lane's learning, at their own pace under any hold but paused or
+cards off), then, when YouNow woke the judge or a deadline came, one evaluation (on), or one of the user's own cards
+only plus, in shadow, the logged "would show" pass. The generators read the items' real state (``live``); B1 and B4
+count stored rows (:class:`yuki.memory.attend.RowHistory`), so a restart resets nothing. The chosen candidate is written for real
 (:meth:`CardJudge._commit`): code text, or the one writer call (:class:`CardWriter`, checked in code) then the
 commit-time check again; a check-in makes its question row (``Store.record_checkin_question``, answers fold into goals
 by id); a reminder keeps its item and due time (``Store.reminded``); a standing request's row is already written (the
@@ -42,12 +44,11 @@ questions marked asked with the card, the weekly review marked delivered with it
 policy holds (never in a game, a call, a meeting or while Yuki acts) or the user is idle. Every card's type is its
 ``trigger`` (reminders keep ``reminder`` / ``confirm``), so the ledger counts it without decrypting.
 
-**Wakes**: in shadow :meth:`CardJudge.shadow` runs after every pass of the old chain (``NudgeWorker.run``); live,
-``NudgeWorker.run`` waits on YouNow's wake event with a timeout of the judge's next deadline, at most
-:data:`LIVE_CEILING_S` (no 15 s tick). Either returns at once unless the YouNow builder's wake event was set (a hold
-change, a breakpoint, a card reaction, the judge's deadline) or one of the judge's own deadlines came (an item coming
-due, a hold ending, the Today moment, the events scan; at most a minute while a candidate waits for a better moment, at
-most 15 minutes otherwise). Most wakes during a game or a call stop at the policy before any database read.
+**Wakes**: ``NudgeWorker.run`` waits on YouNow's wake event with a timeout of the judge's next deadline, at most
+:data:`LIVE_CEILING_S` (no 15 s tick). :meth:`CardJudge.tick` evaluates nothing unless the YouNow builder's wake event
+was set (a hold change, a breakpoint, a card reaction, the judge's deadline) or one of the judge's own deadlines came
+(an item coming due, a hold ending, the Today moment, the events scan; at most a minute while a candidate waits for a
+better moment, at most 15 minutes otherwise). Most wakes during a game or a call stop at the policy before any database read.
 
 **The ledger** reads content-free columns only (``nudges``: kind, trigger, shown_at, reaction, outcome; the check-in
 row's trigger; ``questions.status`` by id; ``nudge_checkins`` writer outcomes) and never decrypts. Seeds are per
@@ -68,10 +69,9 @@ Public API::
     ShadowBook(store)                                       # nudge_state['judge_shadow']; attend.History
     CardWriter(store, worker, ledger)                       # the fresh prompt, the tool, the checks (live only)
     CardJudge(store, *, config_fn, ...) / CardJudge.for_worker(worker, you_fn)
-        .shadow(now=None, done=None) -> dict | None         # NudgeWorker.run, after each tick (wrapped; shadow)
-        .tick(now=None) -> dict | None                      # NudgeWorker.run's body with mode "on" (live)
+        .tick(now=None) -> dict | None                      # NudgeWorker.run's body (every mode)
         .upkeep(now, config) / .wait_s(now) / .wait(timeout) / .interrupt()
-        .evaluate(now, live=False) -> dict                  # one evaluation (content-free summary)
+        .evaluate(now, live=False, owed=None) -> dict       # one evaluation (content-free summary)
     report(store, now, days=7) -> dict
 """
 
@@ -124,7 +124,7 @@ from yuki.memory.candidates import (
 )
 from yuki.memory.cardrules import deadline_lines, with_card_rules
 from yuki.memory.checkins import DAY_START_SETTLE_S, DAY_START_WITHIN_S, MOMENT_WORDS, MOMENTS, user_day
-from yuki.memory.younow import SWITCH_HELD_S, presence_now
+from yuki.memory.younow import CHANGED_MAX, SECTION_CAPS, SWITCH_HELD_S, presence_now, thaw
 
 #: The moment test's bar (a first guess, tuned from the shadow log; §10.1).
 BAR = 0.30
@@ -139,9 +139,11 @@ BREAK_CLASSES: tuple[str, ...] = ("sit_down", "after_commit", "focus_end")
 #: sit_down: settled after a return within this long; switch / after_commit: within this long of the breakpoint.
 SIT_DOWN_WITHIN_S = 10 * 60.0
 BREAKPOINT_FRESH_S = 3 * 60.0
-#: focus_end: the switch came after at least this long on one thing (YouNow keeps 30 minutes of ``changed``).
+#: focus_end: the switch came after at least this long on one thing (YouNow keeps 30 minutes, at most 12 items, of
+#: ``changed``: see :func:`moment_class`).
 FOCUS_END_S = 30 * 60.0
-#: A "no" on a card (Not now, Less of these) rests its type this long.
+#: A "no" on a card rests its type this long: Not now, Less of these, Skip on a question, and closing a card's reply
+#: box without sending (the tray acks all but Less of these as ``dismissed``; one reaction, so one rule).
 NO_REST_S = 24 * 3600.0
 #: calm: no input for at least this long; burst: input within this long, in the same window at least BURST_SAME_S.
 CALM_IDLE_S = 30.0
@@ -214,13 +216,17 @@ SEEDS: dict[tuple[str, str], str] = {
 #: Types the ledger never steps by itself: user-asked and deadline items (B2), and the judge's own Today / away cards
 #: (only the user's "Less of these" moves those).
 NO_AUTO_STEP: tuple[str, ...] = ("reminder", "asked", "routine", "today", "away")
+#: The user's own cards (a reminder they set, a "tell me when" request they made): they go in every ``[judge]`` mode,
+#: shadow and off included (those modes are about Yuki's own cards). Their generators: ``CALL_UNKNOWN_GENERATORS``.
+OWED_TYPES: tuple[str, ...] = ("reminder", "asked")
 
 
 @dataclass(frozen=True)
 class JudgeConfig:
     """The privacy file's ``[judge]`` table."""
 
-    mode: str = "on"         # on: the judge writes the cards | shadow: no card, the judge logs | off: no cards
+    mode: str = "on"         # on: the judge writes the cards | shadow: it only logs Yuki's own | off: none of Yuki's
+    #                          own (shadow and off: the user's own reminders and requests still go, OWED_TYPES)
     digest: bool = True      # false: no Today card; the check-in head is an ordinary card; digest-only items dropped
 
     @classmethod
@@ -235,6 +241,29 @@ class JudgeConfig:
 # ---------------------------------------------------------------------------
 
 
+#: Room for one more ``changed`` item (bytes): a section this far under YouNow's byte cap lost nothing to it.
+CHANGED_ITEM_ROOM = 320
+
+
+def _changed_whole(changed: Any) -> bool:
+    """Whether YouNow's ``changed`` still holds its whole window: fewer items than its count cap, and room left under
+    its byte cap (both drop the oldest items first)."""
+    items = list(changed or ())
+    if len(items) >= CHANGED_MAX:
+        return False
+    try:
+        size = len(json.dumps(thaw(items), ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+    return size + CHANGED_ITEM_ROOM <= int(SECTION_CAPS.get("changed", 0))
+
+
+def _changed_from(changed: Any) -> float:
+    """The oldest instant ``changed`` still covers (``inf`` when empty: nothing is known)."""
+    ats = [float(c["at"]) for c in changed or () if c.get("at") is not None]
+    return min(ats) if ats else math.inf
+
+
 def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: float = 120.0) -> str:
     """The timing class at ``now`` from YouNow (and the seconds since the user's last real input, when known):
 
@@ -243,7 +272,9 @@ def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: f
     * ``sit_down`` - the stretch settled within :data:`SIT_DOWN_WITHIN_S` (just sat down);
     * ``after_commit`` - a call or a game ended, plus the return hold, within :data:`BREAKPOINT_FRESH_S`;
     * ``focus_end`` - a new front app held for ``SWITCH_HELD_S``, within :data:`BREAKPOINT_FRESH_S`, after at least
-      :data:`FOCUS_END_S` on one thing (the previous switch, else the stretch's start);
+      :data:`FOCUS_END_S` on one thing (the previous switch, else the stretch's start - only when ``changed`` still
+      holds its whole window, :func:`_changed_whole`, or reaches back that far: YouNow keeps at most 12 items of every
+      kind, so a busy half hour pushes an earlier switch out and the stretch is not known to be long);
     * ``switch`` - the same, after a shorter stretch (a hop: not a break);
     * ``calm`` - no input for :data:`CALM_IDLE_S` or more;
     * ``steady`` - anything else (active input, no breakpoint), and every case with the input time unknown (the
@@ -273,7 +304,12 @@ def moment_class(you: Any, now: float, idle_s: float | None, *, return_hold_s: f
         last = switches[-1]
         before = [s for s in switches[:-1] if s < last]
         start = pres.get("at_pc_since")
-        prev = before[-1] if before else (float(start) if start is not None else None)
+        if before:
+            prev = before[-1]
+        elif _changed_whole(changed) or _changed_from(changed) <= last - FOCUS_END_S:
+            prev = float(start) if start is not None else None   # no switch since they sat down: the stretch's start
+        else:
+            prev = None   # older items gave way (the cap): an earlier switch may be gone, so not a long stretch
         return "focus_end" if prev is not None and last - prev >= FOCUS_END_S else "switch"
     if idle_s is not None and idle_s >= CALM_IDLE_S:
         return "calm"
@@ -1122,41 +1158,34 @@ class CardJudge:
 
     # -- the hook --------------------------------------------------------------------------------------
 
-    def shadow(self, now: float | None = None, done: Sequence[dict[str, Any]] | None = None) -> dict[str, Any] | None:
-        """``NudgeWorker.run``'s one call after each pass of the old chain (wrapped there; ``[judge] mode =
-        "shadow"``). Returns at once unless the YouNow builder woke the judge or one of its deadlines came; then one
-        evaluation (its content-free summary). Off, or on (the live loop is :meth:`tick`): nothing."""
+    def tick(self, now: float | None = None) -> dict[str, Any] | None:
+        """``NudgeWorker.run``'s loop body in every ``[judge] mode``: the upkeep at its own pace, then - when YouNow
+        woke the judge or one of its deadlines came - one evaluation. ``on``: live, it may write one card. ``shadow`` /
+        ``off``: only the user's own cards go live (:data:`OWED_TYPES`, a reminder they set, a standing request), then
+        in shadow the "would show" pass over the rest (logged, nothing written). Returns the content-free summary (the
+        live one), or None (nothing due, or no YouNow source). Never raises."""
         now = float(self.clock()) if now is None else float(now)
         mode = self._seen_mode()
-        if mode != "shadow" or not self._has_you:
-            return None   # off, live, or no you-right-now source at all (a worker built outside the memory service)
-        cfg = self.config_fn()
-        for r in done or ():
-            if isinstance(r, dict) and r.get("nudge_id"):
-                self.book.bump(now, cfg, "old", str(r.get("trigger") or "?"))
-        builder, woke = self._woke()
-        if not woke and now < self._next_eval:
-            return None
-        self.counters["wake" if woke else "deadline"] += 1
-        return self.evaluate(now, builder=builder, why="wake" if woke else "deadline")
-
-    def tick(self, now: float | None = None) -> dict[str, Any] | None:
-        """``NudgeWorker.run``'s loop body with ``[judge] mode = "on"`` (live, jSwitch): the upkeep at its own pace,
-        then - when YouNow woke the judge or one of its deadlines came - one live evaluation, which may write one card.
-        Returns its content-free summary, or None (nothing due). Never raises."""
-        now = float(self.clock()) if now is None else float(now)
-        if self._seen_mode() != "on" or not self._has_you:
-            return None
         cfg = self.config_fn()
         try:
             self.upkeep(now, cfg)
         except Exception as exc:  # noqa: BLE001
             self._log("nudge_error", where="judge_upkeep", error=type(exc).__name__)
+        if not self._has_you:
+            return None   # no you-right-now source at all (a worker built outside the memory service)
         builder, woke = self._woke()
         if not woke and now < self._next_eval:
             return None
         self.counters["wake" if woke else "deadline"] += 1
-        return self.evaluate(now, builder=builder, why="wake" if woke else "deadline", live=True)
+        why = "wake" if woke else "deadline"
+        if mode == "on":
+            return self.evaluate(now, builder=builder, why=why, live=True)
+        got = self.evaluate(now, builder=builder, why=why, live=True, owed=True)
+        if mode == "shadow":
+            next_eval = self._next_eval   # the owed pass's own deadline (a reminder coming due) is kept
+            self.evaluate(now, builder=builder, why=why, owed=False)
+            self._next_eval = min(self._next_eval, next_eval)
+        return got
 
     def _seen_mode(self) -> str:
         mode = self.mode()
@@ -1279,14 +1308,20 @@ class CardJudge:
 
     # -- one evaluation ----------------------------------------------------------------------------------
 
-    def evaluate(self, now: float, *, builder: Any = None, why: str = "call", live: bool = False) -> dict[str, Any]:
+    def evaluate(self, now: float, *, builder: Any = None, why: str = "call", live: bool = False,
+                 owed: bool | None = None) -> dict[str, Any]:
         """One evaluation: holds, the pile, the moment, the modes, the rank, the Today card; in shadow records what it
-        would show (nothing is written but the judge's own state), live writes the one card it picks. Never raises into
-        the caller's loop (errors are logged content-free and the next evaluation comes in a minute)."""
+        would show (nothing is written but the judge's own state), live writes the one card it picks. ``owed``: True,
+        only the user's own cards (:data:`OWED_TYPES`; no Today card, no events scan, nothing counted in the shadow
+        book); False, every other card (shadow's pass after the owed one). Never raises into the caller's loop (errors
+        are logged content-free and the next evaluation comes in a minute)."""
         cfg = self.config_fn()
         summary: dict[str, Any] = {"at": round(now, 1), "why": why, "live": bool(live)}
+        if owed is not None:
+            summary["owed"] = bool(owed)
         try:
-            self._evaluate(now, builder if builder is not None else self._builder(), cfg, summary, live=live)
+            self._evaluate(now, builder if builder is not None else self._builder(), cfg, summary, live=live,
+                           owed=owed)
         except Exception as exc:  # noqa: BLE001
             self.counters["errors"] += 1
             self._log("nudge_error", where="judge", error=type(exc).__name__)
@@ -1311,22 +1346,26 @@ class CardJudge:
         """What B1 / B4, the frames and the look caps count: stored rows live, the shadow book in shadow."""
         return self.history if live else self.book
 
-    def _evaluate(self, now: float, builder: Any, cfg: Any, summary: dict[str, Any], *, live: bool = False) -> None:
+    def _evaluate(self, now: float, builder: Any, cfg: Any, summary: dict[str, Any], *, live: bool = False,
+                  owed: bool | None = None) -> None:
         jcfg = self._jcfg.get()
         self.last_pile = []
         hist = self._hist(live)
+        full_run = owed is None   # every card (mode on): the Today card, the events scan, the routine
+        book = owed is not True   # the owed pass (shadow / off) counts nothing in the shadow book
         if self._written:
             self._expire_written(now)
         you = builder.snapshot() if builder is not None else None
         if you is None:
-            self.book.evals(now, cfg)
-            self._note_held(now, cfg, "no_state")   # [you] enabled = false, or not built yet: everything held
+            if book:
+                self.book.evals(now, cfg)
+                self._note_held(now, cfg, "no_state")   # [you] enabled = false, or not built yet: everything held
             summary["held"] = "no_state"
             self._schedule(now, [], waiting=False)   # the builder's first beat wakes the judge
             return
         # the snapshot's own holds first (a game, a call, away: no database read at all), then the user's switches.
         # Live, a routine may be due: a meeting in front or a settling stretch is no common hold (rLane's exceptions)
-        routine = live and self.lane is not None and type_on("routine", cfg)
+        routine = live and full_run and self.lane is not None and type_on("routine", cfg)
         common = common_hold(you, now, Switches(), cfg, routine=routine)
         sw = Switches()
         if common is None:
@@ -1336,25 +1375,27 @@ class CardJudge:
             reason = str(common.reason or "")
             if reason.startswith("H0:") or reason == "H6:presence_unknown":
                 summary["quiet"] = True   # the user's own switches or memory paused: count nothing, write nothing
-            else:
+            elif book:
                 self.book.evals(now, cfg)
-            self._note_held(now, cfg, common.reason)
+            if book:
+                self._note_held(now, cfg, common.reason)
             summary["held"] = common.reason
             self._expire_waiting(now, cfg, present=None)
             deadlines: list[float | None] = [common.retry_at, *self._waiting_deadlines()]
-            if live:
+            if live and full_run:
                 self._maybe_scan(now, cfg, reason, None)
                 deadlines.append(self._scan_at + SCAN_EVERY_S)
             self._schedule(now, deadlines, waiting=False)
             self._publish(now, cfg, hist)
             return
-        self.book.evals(now, cfg)
-        self._note_held(now, cfg, None)
-        self._today_prev, self._today_wait = self._today_wait, None
+        if book:
+            self.book.evals(now, cfg)
+            self._note_held(now, cfg, None)
+            self._today_prev, self._today_wait = self._today_wait, None   # the owed pass makes no Today card
         first = holds(you, now, sw, cfg, type="*")
-        only = CALL_UNKNOWN_GENERATORS if first.reason == "H3:call_unknown" else None
+        only = CALL_UNKNOWN_GENERATORS if owed or first.reason == "H3:call_unknown" else None
         ctx = Context(self.store, you, now, cfg, self.seen, live=live, memo=self.memo,
-                      lane=self.lane if live else None, worker=self.worker if live else None)
+                      lane=self.lane if live and full_run else None, worker=self.worker if live else None)
         pile = generate(ctx, only=only)
         self.last_pile = pile
         self._tell_errors(now, ctx.errors)
@@ -1363,7 +1404,8 @@ class CardJudge:
         idle = self._idle()
         klass = moment_class(you, now, idle, return_hold_s=float(cfg.return_hold_s))
         timing = TIMING[klass] * self.ledger.multiplier(klass)
-        self.book.bump(now, cfg, "classes", klass)
+        if book:
+            self.book.bump(now, cfg, "classes", klass)
         summary.update(klass=klass, idle_known=idle is not None, pile=[c.fields() for c in pile])
         deadlines = list(ctx.deadlines)
         eligible: list[_Eligible] = []
@@ -1373,6 +1415,8 @@ class CardJudge:
         present = {c.key for c in pile}
         queued_now: set[str] = set()
         for c in pile:
+            if owed is not None and (c.type in OWED_TYPES) != owed:
+                continue   # shadow / off: the user's own cards go in the owed pass, the rest in shadow's own pass
             if not type_on(c.type, cfg):
                 self._drop(now, cfg, c, "B3:toggle")
                 continue
@@ -1451,7 +1495,7 @@ class CardJudge:
         deadline_first = [e for e in eligible if e.tier == 2]
         if deadline_first:
             chosen = self._pick(now, cfg, you, deadline_first, klass, deadlines, live=live)
-        if chosen is None and jcfg.digest:
+        if chosen is None and jcfg.digest and owed is not True:
             chosen = self._today(now, cfg, you, sw, head, klass, timing, frames, deadlines, live=live)
             if chosen is None:
                 chosen = self._away(now, cfg, you, sw, klass, timing, deadlines, live=live)
@@ -1462,15 +1506,15 @@ class CardJudge:
             for e in eligible:
                 if e.cand.key != chosen.get("key") and e.cand.key not in self.waiting:
                     self._wait(now, cfg, e.cand, "rank")
-        elif live:
+        elif live and full_run:
             # a routine possible lets a meeting in front (or settling) past the common hold: the scan still skips H1-H5
             self._maybe_scan(now, cfg, None if first.allow else first.reason, idle)
-        if live:
+        if live and full_run:
             deadlines.append(self._scan_at + SCAN_EVERY_S)
         summary["chosen"] = chosen
         self._expire_waiting(now, cfg, present=present if full else None, failed=failed)
         self._expire_queue(now)
-        if live:
+        if live and full_run:
             self._persist_queue(now)
         self._schedule(now, deadlines + self._waiting_deadlines(),
                        waiting=bool(self.waiting) or self._today_wait is not None)

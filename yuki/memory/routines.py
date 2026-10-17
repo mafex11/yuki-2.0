@@ -61,9 +61,9 @@ hits (retired unconfirmed after 28 days).
   (:func:`fact_fate`): the user's review ("not right") or their correction turns the line off for good; a model's
   tidy-up (dreaming's merge or retire, the admission bar) is undone the next night: its version ends and the line is
   written again from counts.
-* :func:`due_offers` (which offerable routines' card window is open now, for the card lane, never more than the day's
-  cards left), :func:`active_near` (the talker's "now" block: offerable routines only, R1.5), :func:`why_line` (the
-  card's why line, from counts), :func:`tell`.
+* :func:`active_near` (the talker's "now" block: offerable routines only, R1.5), :func:`why_line` (the card's why
+  line, from counts), :func:`tell`. The card window and its due rule are the card lane's
+  (:mod:`yuki.memory.routine_offers`).
 * Logs: ``routines_mined`` (content-free: keys, unmapped counts, candidates, states, cpu ms) in the portrait log.
 
 CLI: ``python -m yuki.memory.routines --show`` (the routines, read-only), ``--report`` (mine now on a temporary copy
@@ -142,13 +142,6 @@ MEASURED_ORIGIN = "measured"
 #: writer (dreaming, the admission bar, a recheck) is a tidy-up the miner undoes from the counts.
 USER_PASSES = ("review", "correct")
 USER_RUN_KINDS = ("correct",)
-#: The card lane's windows (PLAN B.3 triggers; the lane's settings may narrow them): early [at - 8, at - 1] min,
-#: late [at + 1, at + 3] min.
-OFFER_LEAD_MIN = 8.0
-OFFER_LEAD_LAST_MIN = 1.0
-OFFER_LATE_MIN = (1.0, 3.0)
-#: Routine cards a day, at most (the lane's ``routine_per_day``).
-OFFERS_PER_DAY = 2
 
 #: The day-sets a clock window is mined on: a fixed calendar menu (calendar structure, not words).
 DAYSETS: dict[str, Callable[[date], bool]] = {
@@ -1562,94 +1555,6 @@ class RoutineMiner:
 # ---------------------------------------------------------------------------------------------------------------------
 # For the card lane, the talker and the user's own words
 # ---------------------------------------------------------------------------------------------------------------------
-
-
-def offer_window(row: Mapping[str, Any], d: date, *, lead_min: float = OFFER_LEAD_MIN,
-                 lead_last_min: float = OFFER_LEAD_LAST_MIN,
-                 late_min: tuple[float, float] = OFFER_LATE_MIN) -> tuple[float, float] | None:
-    """The card window of a routine on day ``d`` by its offer mode (early ``[at - 8, at - 1]``, late
-    ``[at + 1, at + 3]`` minutes), as epoch seconds; None for quiet or off, or a day outside its day-set."""
-    mode = str(row.get("offer_mode") or "early")
-    if mode not in ("early", "late") or not dayset_has(str(row.get("dayset")), d) or row.get("at_min") is None:
-        return None
-    dm = from_clock(float(row["at_min"]))
-    lo, hi = (dm - lead_min, dm - lead_last_min) if mode == "early" else (dm + late_min[0], dm + late_min[1])
-    return day_start(d) + lo * 60.0, day_start(d) + hi * 60.0
-
-
-def done_today(store: Any, row: Mapping[str, Any], now: float, *, skills: Sequence[Any] | None = None) -> bool:
-    """The routine's own end state already happened today (since 04:00): the user reached its learned skill's end
-    (:func:`skill_onsets`), or a run of its skill's habit ended done (:func:`habit_run_done`); a playlist routine
-    counts only its own playlist (:func:`key_entity`)."""
-    since = day_start(day_of(now))
-    skill = next((s for s in (load_skills(store) if skills is None else skills) if s.key == row.get("skill_id")), None)
-    entity = key_entity(row.get("key"))
-    if skill is not None:
-        if skill_onsets(store, skill, since, now, app=row.get("app"), entity=entity):
-            return True
-        return habit_run_done(store, skill, since, now, entity=entity) is not None
-    try:
-        from yuki.memory.testtag import sql_real_skill_run
-
-        got = store._query("SELECT 1 FROM skill_runs WHERE skill = ? AND t0 >= ? AND t0 < ? AND outcome = 'done' AND "
-                           + sql_real_skill_run() + " LIMIT 1",
-                           (str(row.get("skill_id")), since, now))
-    except Exception:  # noqa: BLE001 - no skill ledger yet
-        got = []
-    return bool(got)
-
-
-def due_offers(store: Any, now: float | None = None, *, skills: Sequence[Any] | None = None,
-               trusted: Callable[[Any], bool] | None = None, per_day: int = OFFERS_PER_DAY,
-               lead_min: float = OFFER_LEAD_MIN, lead_last_min: float = OFFER_LEAD_LAST_MIN,
-               late_min: tuple[float, float] = OFFER_LATE_MIN) -> list[dict[str, Any]]:
-    """The routines whose card window is open now (R2.3 "when a routine is due"), first window first: active, of a
-    learned skill that passes the offer gate (``offers.skill_offerable``) and whose route is trusted for offers
-    (``registry.offer_ready``, D14, unless ``trusted`` says otherwise), offer mode early or late, today in its day-set,
-    ``now`` inside the mode's window, its end state not yet happened today, not offered today, and fewer than
-    ``per_day`` routine cards offered today. The card lane (rLane) adds its own holds (game in front, calls, quiet
-    hours, the tab census) on top. Content-free dicts."""
-    from yuki.memory.offers import skill_offerable
-
-    now = time.time() if now is None else float(now)
-    skills = load_skills(store) if skills is None else tuple(skills)
-    by_key = {s.key: s for s in skills}
-    today = day_of(now)
-    since = day_start(today)
-    offered = store.routine_events(since=since, until=now + 1.0, kinds=["offered"])
-    if len({e["routine_id"] for e in offered}) >= per_day:
-        return []
-    offered_ids = {e["routine_id"] for e in offered}
-    if trusted is None:
-        def trusted(skill: Any) -> bool:
-            from yuki.memory.offers import offer_trusted
-
-            return offer_trusted(store, skill)   # D14; a usage record's runs pooled with its capability's
-    out: list[dict[str, Any]] = []
-    for row in store.routines(states=["active"]):
-        skill = by_key.get(row.get("skill_id"))
-        if skill is None or row["id"] in offered_ids or not skill_offerable(store, skill)[0]:
-            continue
-        win = offer_window(row, today, lead_min=lead_min, lead_last_min=lead_last_min, late_min=late_min)
-        if win is None or not win[0] <= now <= win[1]:
-            continue
-        if any(_gap(o["at_min"], row.get("at_min")) < MATCH_MIN and o["key"] == row["key"] for o in out):
-            continue   # a told row and a mined row of one moment: one card
-        if done_today(store, row, now, skills=skills):
-            continue
-        try:
-            ok = bool(trusted(skill))
-        except Exception:  # noqa: BLE001
-            ok = False
-        if not ok:
-            continue
-        out.append({"id": int(row["id"]), "key": row["key"], "skill": row.get("skill_id"), "app": row.get("app"),
-                    "dayset": row["dayset"], "at_min": row["at_min"], "mode": row.get("offer_mode") or "early",
-                    "window": [win[0], win[1]], "expires_at": day_start(today) + (from_clock(float(row["at_min"]))
-                                                                                  + 10.0) * 60.0,
-                    "hits": row.get("hits"), "eligible": row.get("eligible"), "rate": row.get("rate")})
-    out.sort(key=lambda o: o["window"][0])
-    return out[:max(0, per_day - len(offered_ids))]   # never more than the day's routine cards left (review L5)
 
 
 def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, limit: int = 2,

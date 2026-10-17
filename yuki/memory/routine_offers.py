@@ -28,8 +28,10 @@ its usual window, with no model and no cost:
   for a ``judged`` one, its Won't words known), its route not distrusted (``offers.offer_trusted``: an "open" skill
   whose newest runs did not fail; a "change" skill by D14's bar), and
   available: for a site tab (``web_route.site_tab``) the tab census of its bound service
-  (:class:`yuki.memory.callevidence.SiteTabs`, at most once a day per routine; one tab found by identity, never two,
-  never an unreadable strip). Not available: no card that day;
+  (:class:`yuki.memory.callevidence.SiteTabs`; one tab found by identity, never two, never an unreadable strip). A
+  found tab holds for the day; not found yet (no browser window, no tab, an unreadable strip) is read again at most
+  every :data:`CENSUS_RETRY_S` while the card is due, only at moments the policy already passed. Not available: no
+  card yet;
 * **the card**: kind ``notice``, trigger ``routine``, heading "Your usual" (the UI), its text from fixed templates per
   end kind ("Your 9:00 meeting is coming up." late: "... started a minute ago ...") and the learned name as the
   question ("<name>?"; a nameless skill gets its end kind's fixed question), the why line from the counts ("You've
@@ -108,6 +110,8 @@ LEARN_EVERY_S = 60.0
 REQUEST_FILE = "routine_offer_now.json"
 #: An ``offer-now`` request waits at most this long past its time for the card gates (s).
 REQUEST_WAIT_S = 10 * 60.0
+#: A routine's tab census that found no tab (yet) is read again after this long (s); a found one holds for the day.
+CENSUS_RETRY_S = 4 * 60.0
 #: Event kinds of ``routine_events`` this lane writes (map-routines R1.2).
 EVENT_KINDS: tuple[str, ...] = ("offered", "held", "accepted", "run_ok", "run_failed", "declined", "ignored",
                                 "self_served", "never", "mode_change")
@@ -603,8 +607,9 @@ class RoutineLane:
         self._held: dict[int, str] = {}
         #: (routine id, day, reason) held events already written (one row each a day).
         self._held_rows: set[tuple[int, str, str]] = set()
-        #: (routine id, day) -> the day's census answer (at most one census a day per routine; offer-now asks again).
-        self._census: dict[tuple[int, str], bool | None] = {}
+        #: (routine id, day) -> (the census answer, when read): True holds for the day; False / None is read again
+        #: after CENSUS_RETRY_S (the window opens before the user sits down; offer-now always asks again).
+        self._census: dict[tuple[int, str], tuple[bool | None, float]] = {}
         self._learned_at = 0.0
         self._request_mtime: float | None = None
         self._request: dict[str, Any] | None = None
@@ -811,13 +816,14 @@ class RoutineLane:
 
         def check(skill: Any) -> bool | None:
             key = (d.routine.id, day)
-            if key in self._census and not d.forced:
-                return self._census[key]
+            hit = self._census.get(key)
+            if hit is not None and not d.forced and (hit[0] is True or 0.0 <= now - hit[1] < CENSUS_RETRY_S):
+                return hit[0]
             if self._available is not None:
                 got = self._available(self.store, skill)
             else:
                 got = available(self.store, skill, log=self._log)
-            self._census[key] = got
+            self._census[key] = (got, now)
             if len(self._census) > 64:
                 self._census = {k: v for k, v in self._census.items() if k[1] == day}
             return got

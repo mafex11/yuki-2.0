@@ -574,8 +574,6 @@ def offer_trusted(store: Any, skill: Any, *, now: float | None = None) -> bool:
             return bool(registry.offer_ready(store, skill, now=now))
         # lBrain: an offer is a learner's call, so a live test's runs never count (``real_only``, as offer_ready)
         total_ok = sum(sum(t.ok for t in registry.trust(store, k, now=now, real_only=True).values()) for k in keys)
-        if str(getattr(skill, "kind", "") or "change") == "open":
-            return total_ok >= registry.OPEN_RUNS
         newest = _pooled_last(store, keys, registry.CHANGE_WINDOW)
         return (total_ok >= registry.CHANGE_RUNS and len(newest) >= registry.CHANGE_WINDOW
                 and 0 not in newest[:registry.CHANGE_WINDOW])

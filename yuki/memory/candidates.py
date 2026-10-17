@@ -1209,8 +1209,10 @@ USUAL_BACK_DAYS = 21
 USUAL_NEAR_S = 45 * 60.0
 USUAL_MIN_DAYS = 3
 USUAL_MIN_SHARE = 0.33
-#: Not when they put it on within this long (they are on it, or just were).
+#: Not when they put it on within this long (they are on it, or just were): read fresh at every evaluation.
 USUAL_RECENT_S = 2 * 3600.0
+#: The day counts (21 days of moments) are read again at most this often (they move by the day, not the minute).
+USUAL_STATS_S = 600.0
 #: The card is about now: it goes stale after this long.
 USUAL_TTL_S = 30 * 60.0
 #: The one cheap wording call (only with a you-card to word it from): the model, its cap and its wait.
@@ -1272,8 +1274,8 @@ def usual_now(store: Any, now: float, caps: Sequence[Any] | None = None) -> list
     """The media the user usually puts on around now: per capability (:func:`_usual_caps`), the days in the last
     :data:`USUAL_BACK_DAYS` of the same kind as today (weekday / weekend) on which the user's own end moment of it came
     within :data:`USUAL_NEAR_S` of now's time of day, against the days they did anything at the PC around then.
-    Content-free counts (``{"cap", "hits", "days", "share", "at_min", "recent"}``), best first; only those over the
-    bar. A browser capability (its connection app is no program of the moments) counts the programs that also record
+    Content-free counts (``{"cap", "hits", "days", "share", "at_min", "apps"}``; ``apps``: the programs its picks came
+    from, for :func:`_usual_recent`), best first; only those over the bar. A browser capability (its connection app is no program of the moments) counts the programs that also record
     pages (a browser, measured). Never raises (``[]``)."""
     caps = _usual_caps() if caps is None else list(caps)
     if not caps:
@@ -1299,7 +1301,6 @@ def usual_now(store: Any, now: float, caps: Sequence[Any] | None = None) -> list
         picks = [float(r[0]) for r in rows if r[1] == cap.end and r[3] == "user" and str(r[2] or "") in own]
         if not picks:
             continue
-        recent = any(now - at < USUAL_RECENT_S for at in picks)
         hit_days: dict[Any, float] = {}
         for at in picks:
             d = datetime.fromtimestamp(at).date()
@@ -1311,9 +1312,20 @@ def usual_now(store: Any, now: float, caps: Sequence[Any] | None = None) -> list
         if hits >= USUAL_MIN_DAYS and share >= USUAL_MIN_SHARE:
             tods = sorted(_tod_s(at) for at in hit_days.values())
             out.append({"cap": cap, "hits": hits, "days": days, "share": round(share, 2),
-                        "at_min": round(tods[len(tods) // 2] / 60.0), "recent": recent})
+                        "at_min": round(tods[len(tods) // 2] / 60.0), "apps": frozenset(own)})
     out.sort(key=lambda u: (-u["share"], -u["hits"]))
     return out
+
+
+def _usual_recent(store: Any, u: dict[str, Any], now: float) -> bool:
+    """Whether the user put this on themselves within :data:`USUAL_RECENT_S` (one indexed query, fresh each
+    evaluation; unknown counts as yes: no card)."""
+    try:
+        rows = store._query("SELECT app FROM moments WHERE kind = ? AND at >= ? AND at < ? AND by = 'user'",
+                            (u["cap"].end, now - USUAL_RECENT_S, now + 1.0))
+    except Exception:  # noqa: BLE001
+        return True
+    return any(str(r[0] or "") in u["apps"] for r in rows)
 
 
 def _usual_pick(store: Any, cap: Any, now: float) -> dict[str, Any]:
@@ -1393,10 +1405,10 @@ def gen_usual(ctx: Context) -> list[Candidate]:
     now = ctx.now
     day = user_day(now, ctx.config.resume_day_start)
     out: list[Candidate] = []
-    for u in usual_now(ctx.store, now):
+    for u in ctx.memo.get("usual:stats", None, now, USUAL_STATS_S, lambda: usual_now(ctx.store, now)):
         cap = u["cap"]
         key = f"usual:{cap.key}:{day}"
-        if u["recent"] or ctx.seen.looked(key, now, 86400.0):
+        if ctx.seen.looked(key, now, 86400.0) or _usual_recent(ctx.store, u, now):
             continue
         store = ctx.store
         made: dict[str, Any] = {}
@@ -1429,13 +1441,6 @@ def gen_usual(ctx: Context) -> list[Candidate]:
             slots = dict(pick["slots"])
             if slots.get("choose"):
                 slots["context"] = f"the user's usual {thing} around {when} ({made.get('words') or ''})"
-            if pick["offers"]:
-                try:
-                    from yuki.skills import youtube_feed
-
-                    youtube_feed.said(store, pick["offers"][:1], at=now)   # named on the card: "the X one" finds it
-                except Exception:  # noqa: BLE001
-                    pass
             from yuki.memory.offers import SKILL_WONT_LINES
 
             step = (f"put on \"{pick['title']}\"" if pick["title"] else f"put on {pick['name']}" if pick["name"]
@@ -1460,7 +1465,7 @@ def gen_usual(ctx: Context) -> list[Candidate]:
 #: seen-marks and expiry.
 GENERATORS: tuple[tuple[str, Callable[[Context], list[Candidate]], float], ...] = (
     ("routine", gen_routine, 0.0),
-    ("usual", gen_usual, 600.0),
+    ("usual", gen_usual, 0.0),
     ("reminder", gen_reminders, 0.0),
     ("asked", gen_asked, 0.0),
     ("checkin", gen_checkins, 60.0),
