@@ -1620,7 +1620,14 @@ def _confirm_flip(call: Any, hwnd: int, want: str, learned: Mapping[str, str] | 
     facts["flip"] = seen or "unread"
     facts["flip_reads"] = reads
     if seen == "play":
-        look.details["not_taken"] = True
+        # fSkills (live 18 Oct: "not_taken" 0.2 s before the playlist audibly started, then the link rung and the
+        # thinker, 18 s): the row's own label lags the press, so Spotify's media session is read too; a session that
+        # plays now and didn't before the press is the press taken (the done-check still checks which playlist)
+        status, _app_id = DESK.spotify_status(None)
+        if status == "playing" and facts.get("session") != "playing":
+            facts["flip"] = "session"
+        else:
+            look.details["not_taken"] = True
     return look
 
 

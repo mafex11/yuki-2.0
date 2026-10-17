@@ -1935,6 +1935,18 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - the offer is extra; the run goes on without it
             pending = None
     result = run(resolved, ctx)
+    other = _other_than_corrected(resolved, result, ctx, corrects=bool(corrects))
+    if other is not None:
+        # fSkills (live 18 Oct: "No, not this one. The other playlist" ran ネオン again, the very one just put on):
+        # a correction whose run found the PC already so changes nothing the user asked to change, so the slot's next
+        # own candidate of theirs runs instead (their taste order, the corrected value left out)
+        again_slots = {**dict(slots or {}), other[0]: other[1]}
+        redo = _mem(ctx.memory, "skill_resolve", lambda c: res_mod.resolve(
+            resolved.skill.key, again_slots, words, store=_store_of(c) if c is not None else None, live=live,
+            again=again, default_step=step, disable_after=disable_after,
+            **({"earlier": [str(w) for w in earlier if w]} if earlier else {})), timeout_s=1.0)             if ctx.memory is not None else None
+        if isinstance(redo, Plan):
+            result = run(redo, ctx)
     if picked is not None and result.done:
         # the pick played and its done-check saw it: the line names it and why (code-written), and the conversation
         # keeps it ("another one" takes the next; a quick change counts as a skip)
@@ -1954,6 +1966,38 @@ def resolve_and_run(skill_key: str, slots: Mapping[str, Any] | None, words: list
         except Exception:  # noqa: BLE001 - no offer named
             pass
     return result
+
+
+def _other_than_corrected(resolved: Any, result: SkillResult, ctx: RunContext, *,
+                          corrects: bool) -> tuple[str, str] | None:
+    """fSkills: ``(slot, the next own candidate's name)`` when a correction (``corrects``) resolved to the very state
+    the PC already shows (its run ``already``): the user said "not this one", so the taste slot that named it takes
+    the user's next own candidate of that kind (:func:`yuki.skills.taste.top` at this hour, the current one left out;
+    else the next name :func:`yuki.skills.taste.candidates` lists). ``None`` otherwise, or with no other candidate."""
+    if not corrects or result.outcome != "already" or not isinstance(resolved, Plan) or ctx.memory is None:
+        return None
+    from yuki.skills import taste
+
+    for slot in resolved.skill.slots:
+        value = resolved.values.get(slot.name)
+        if not slot.taste or not isinstance(value, Mapping):
+            continue
+        now_key, now_name = str(value.get("key") or ""), " ".join(str(value.get("name") or "").split()).casefold()
+
+        def pick(c: Any, kind: str = slot.taste) -> str | None:
+            store = _store_of(c)
+            for t in taste.top(store, kind, n=6):
+                if t.name and t.entity_key != now_key and " ".join(t.name.split()).casefold() != now_name:
+                    return t.name
+            for n in taste.candidates(store, kind):
+                if n and " ".join(str(n).split()).casefold() != now_name:
+                    return str(n)
+            return None
+
+        name = _mem(ctx.memory, "taste_other", pick, timeout_s=0.5)
+        if name:
+            return slot.name, str(name)
+    return None
 
 
 def run_for_voice(hands: Any, args: Mapping[str, Any], words: list[str], *, game: str | None = None,

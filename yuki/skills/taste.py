@@ -94,7 +94,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 #: The smoothing of the hour histograms when scoring an hour (minutes; map-routines T1.3: sigma = 90 min).
 SIGMA_MIN = 90.0
@@ -383,7 +383,118 @@ def heard_as(names: Any, said: Any) -> str | None:
                 hits[_norm(name)] = name
         except Exception:  # noqa: BLE001 - a name that can't be read by sound
             continue
-    return next(iter(hits.values())) if len(hits) == 1 else None
+    if hits:
+        return next(iter(hits.values())) if len(hits) == 1 else None
+    return _closest_heard(pool, text)
+
+
+#: fSkills (live 18 Oct: "MBL's YouTube channel" heard for the user's channel NDL): how each Latin letter is said when
+#: a short all-capital word is spelled out letter by letter (an initialism as speech recognition writes it), the
+#: alphabet's own spoken names: a format conversion, like :func:`yuki.memory.contacts.romanize`, never a word list.
+LETTER_NAMES = {"a": "ay", "b": "bee", "c": "see", "d": "dee", "e": "ee", "f": "ef", "g": "jee", "h": "aych",
+                "i": "eye", "j": "jay", "k": "kay", "l": "el", "m": "em", "n": "en", "o": "oh", "p": "pee",
+                "q": "kyoo", "r": "ar", "s": "es", "t": "tee", "u": "yoo", "v": "vee", "w": "dubleyoo", "x": "ex",
+                "y": "why", "z": "zee"}
+#: A word of 2 to this many Latin capitals, nothing else, is read as spelled out (an initialism).
+SPELLED_MAX = 5
+#: The closed-set tier (:func:`_closest_heard`): two spoken forms at most this far apart (edit distance over the longer
+#: one, the closest of their readings: "soccer" read "soker" / "lumen" 0.25 once its final "r" is left unsaid; "MBL"
+#: spelled "embeeel" / "endeeel" 0.29)...
+LOOSE_DISTANCE = 0.34
+#: ...and the best of the user's names at least this much closer than the next one (else two may be meant: none).
+LOOSE_MARGIN = 0.12
+#: Letters each side needs (a shorter spoken form matches only as written or by the strict rule).
+LOOSE_MIN_LETTERS = 4
+#: Runs of up to this many words of what was said are compared.
+LOOSE_MAX_WORDS = 3
+_LOOSE_OPEN = "aeiouhy"
+
+
+def _spoken_forms(words: Sequence[str]) -> tuple[set[str], bool] | None:
+    """The Latin readings of a run of words (lower case, :func:`yuki.memory.contacts.romanize`): an initialism spelled
+    out by :data:`LETTER_NAMES`; each with a "c" also read as "k" (English says "soccer" with a k), and a final
+    vowel + "r" also unsaid (an accent that drops it, or speech recognition that adds it); each with doubled letters
+    once and as written. ``(readings, any word spelled out)``; ``None`` when a word has digits or no letters read."""
+    from yuki.memory.contacts import romanize
+
+    parts: list[str] = []
+    spelled = False
+    for w in words:
+        if 2 <= len(w) <= SPELLED_MAX and w.isascii() and w.isalpha() and w.isupper():
+            parts.append("".join(LETTER_NAMES.get(ch, "") for ch in w.casefold()))
+            spelled = True
+            continue
+        if any(ch.isdigit() for ch in w):
+            return None
+        r = romanize(w)
+        if not r:
+            return None
+        parts.append(r)
+    base = "".join(parts)
+    if not base:
+        return None
+    out: set[str] = set()
+    for v in {base, base.replace("c", "k")}:
+        for f in (v, "".join(ch for i, ch in enumerate(v) if i == 0 or ch != v[i - 1])):
+            out.add(f)
+            if len(f) > 2 and f[-1] == "r" and f[-2] in "aeiou":
+                out.add(f[:-1])
+    return out, spelled
+
+
+def _loose_gap(said: Sequence[str], name: str) -> float | None:
+    """How far a run of words is from one of the user's names by sound (the closest pair of their readings), or
+    ``None`` when they can't be the same: another onset, too few letters, or (unless both were spelled out letter by
+    letter) no common sound key (:func:`yuki.memory.contacts.sound_key`). Fixed format rules over the two spellings."""
+    from yuki.memory.contacts import _distance, sound_key, spoken_words
+
+    a = _spoken_forms(said)
+    b = _spoken_forms([w for _s, w in spoken_words(name)])
+    if a is None or b is None:
+        return None
+    (ra, sa), (rb, sb) = a, b
+    if min(min(len(x) for x in ra), min(len(x) for x in rb)) < LOOSE_MIN_LETTERS:
+        return None
+
+    def onset(x: str) -> str:
+        return "V" if x[0] in _LOOSE_OPEN else sound_key(x[:3])[:1]
+
+    if {onset(x) for x in ra}.isdisjoint({onset(x) for x in rb}):
+        return None
+    if not (sa and sb) and {sound_key(x) for x in ra}.isdisjoint({sound_key(x) for x in rb}):
+        return None
+    return min(_distance(x, y) for x in ra for y in rb)
+
+
+def _closest_heard(pool: Sequence[str], text: str) -> str | None:
+    """fSkills (live 18 Oct: "Play soccer on Spotify" for the playlist lumen; "MBL's YouTube channel" for the channel
+    NDL): with the strict rule finding none, the one of the user's OWN names (a closed set: their playlists, their
+    channels) that a run of ``text`` is closest to by sound (:func:`_loose_gap` within :data:`LOOSE_DISTANCE`), and
+    clearly closer than any other of them (:data:`LOOSE_MARGIN`); else ``None``. Only ever among the names the caller
+    lists, never a guess at an open name; the done line names what ran, so a wrong pick shows at once."""
+    try:
+        from yuki.memory.contacts import spoken_words
+    except Exception:  # noqa: BLE001
+        return None
+    words = [w for _s, w in spoken_words(text)]
+    runs = [words[i:i + n] for n in range(1, LOOSE_MAX_WORDS + 1) for i in range(len(words) - n + 1)]
+    best: dict[str, tuple[float, str]] = {}
+    for name in pool:
+        if not name:
+            continue
+        for run in runs:
+            try:
+                gap = _loose_gap(run, name)
+            except Exception:  # noqa: BLE001 - a name that can't be read by sound
+                gap = None
+            if gap is not None and gap <= LOOSE_DISTANCE and (_norm(name) not in best or gap < best[_norm(name)][0]):
+                best[_norm(name)] = (gap, name)
+    if not best:
+        return None
+    ranked = sorted(best.values())
+    if len(ranked) > 1 and ranked[1][0] - ranked[0][0] < LOOSE_MARGIN:
+        return None
+    return ranked[0][1]
 
 
 def _peak_hours(hist: list[float]) -> str:

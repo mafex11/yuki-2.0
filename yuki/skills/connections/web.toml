@@ -74,7 +74,10 @@ driver = "web_route"
 call = "open_page"
 needs_focus = true
 means = "browser"
-# the browser window it opened the page in shows it (by template value, or by host for a host-scope page)
+# the browser window it opened the page in shows it (by template value, or by host for a host-scope page). fSkills (live
+# 18 Oct): a window that showed the same address before counts by its selected tab's identity (another tab selected
+# now: the page opened; read before the open), and a window whose Documents can't be read (Arc) by the rungs' own
+# page-only read, so a page opened is no false contradiction (two of those disabled this rung for every site)
 done = { probe = "driver", driver = "web_route", call = "page_shown", within_s = 6 }
 # the watcher's own read of that window (memory's Now board), a second source
 recheck = { probe = "driver", driver = "web_route", call = "page_seen", after_s = 3 }
