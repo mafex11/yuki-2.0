@@ -103,6 +103,11 @@ FROM_GRANT = "granted"
 #: slot's own place, right after "words" and before every fill, so it is never a guess and never fills an empty slot;
 #: the step runner types it as a draft only (:func:`yuki.skills.uia_route.note_draft`). A code word in the logs.
 FROM_WORDED = "worded"
+#: Where a value came from when Yuki chose it because the user asked it to choose ("a video I like", "put something
+#: on": ``choose = true``; kTaste, contract C2, :func:`yuki.skills.taste.choose`): kept in the slot's own place right
+#: after "words" (what the user named still wins: the engine chooses only when they named nothing), named in the done
+#: line by the engine, and a guess for taste (``taste.GUESS_FILLS``: Yuki's own pick never feeds itself).
+FROM_CHOSEN = "chosen"
 #: The slot types code checks with no words at all (an option, a number, a switch): how a ``sends_when`` slot's given
 #: value is read before the slot loop (:func:`_sends`).
 CODE_TYPES: tuple[str, ...] = ("enum", "number", "points", "bool")
@@ -1132,7 +1137,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             people: Callable[[str], dict[str, Any] | None] | None = None,
             default_step: float = 10.0, earlier: Sequence[str] | None = None,
             heard_person: Callable[[str, Sequence[str]], str | None] | None = None,
-            granted: Mapping[str, str] | None = None, _strict: bool = False) -> Result:
+            granted: Mapping[str, str] | None = None, chosen: Mapping[str, Any] | None = None,
+            chosen_from: str = FROM_CHOSEN, _strict: bool = False) -> Result:
     """Fill ``skill_key``'s slots and pick its rungs (see the module docstring). ``words``: the user's own words, each
     turn exactly as heard or typed (the current exchange: their turns since the last finished job, newest last);
     ``earlier``: older turns of this conversation (their own words too), a source for validating a value the caller
@@ -1142,7 +1148,11 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     consent rule allowed for this very run (the engine's :func:`~yuki.skills.engine.granted_values`: a send it allowed
     and counted down, or the user's yes to it; failure fix-plan Item 11's L2): a given text value of that slot that the
     words don't hold but equals it (case and spaces aside) is kept as given (filled :data:`FROM_GRANT`), never
-    dropped; nothing is ever filled from it, and it changes nothing for a value the words already hold.
+    dropped; nothing is ever filled from it, and it changes nothing for a value the words already hold. ``chosen``
+    (kTaste, contract C2): slot name -> the value the engine chose for this very run (Yuki's pick when the user asked
+    it to choose, or the upload of the channel they named), filled ``chosen_from`` (:data:`FROM_CHOSEN`, or ``words``
+    when the user named the channel) before any other source of that slot; a value the caller gave for it is not
+    checked then (the engine took it out).
 
     lResolve: on a draft or an open (a capability that may send, on a run that doesn't: :func:`_sends`, read before
     the slot loop and checked again on its values), the caller's own wording of what to write is kept as a draft
@@ -1220,6 +1230,10 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
     # (a learned skill's bound default, its fill policy's preference, a live guess) can never replace an earlier one,
     # and what the user said ("words") always comes first.
     for slot in skill.slots:
+        if chosen and slot.name in chosen and chosen[slot.name] not in (None, ""):
+            # kTaste (C2): the engine's pick for this run (the user asked Yuki to choose, or named only the channel)
+            values[slot.name], filled[slot.name] = chosen[slot.name], str(chosen_from or FROM_CHOSEN)
+            continue
         menu_names = taste.candidates(store, slot.taste, now=now) if (slot.taste and store is not None) else []
         # tTaste merge note 2 (phase T): a slot every route of which runs only with a value an offered option carries
         # (``taste.takes_offers``: today ``web.open_video``'s ``video``) lists the names just offered aloud, and a value
@@ -1400,7 +1414,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
             # sound match asked, as before (rule 8)
             return resolve(skill_key, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                            again=again, disable_after=disable_after, people=people, default_step=default_step,
-                           earlier=earlier, heard_person=heard_person, granted=granted, _strict=True)
+                           earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
+                           chosen_from=chosen_from, _strict=True)
     # What the user said wins over a learned skill's bound value too: its routes carry that value in their arguments,
     # so a value they said for a bound slot that is another one runs its capability instead (a learned skill never
     # hides its capability; the engine's request_key does the same for a given key slot before this)
@@ -1409,7 +1424,8 @@ def resolve(skill_key: str, slots: Mapping[str, Any] | None, words: Sequence[str
                 _identity(skill.slot(name), bound) for name, bound in (skill.bound or {}).items()):
         return resolve(skill.capability, slots, words, store=store, live=live, loaded=loaded, now=now, until=until,
                        again=again, disable_after=disable_after, people=people, default_step=default_step,
-                       earlier=earlier, heard_person=heard_person, granted=granted, _strict=_strict)
+                       earlier=earlier, heard_person=heard_person, granted=granted, chosen=chosen,
+                       chosen_from=chosen_from, _strict=_strict)
     # a direction with no amount: the user's own step for it (a preference), else the default step
     for slot in skill.slots:
         v = values.get(slot.name)

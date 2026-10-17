@@ -37,7 +37,8 @@ occasions); else the browser they use most; else Windows' default handler. "A br
 program whose own timeline rows (not Yuki's) of the last 14 days showed pages of at least 3 hosts, or a page of the
 site itself (a chat app that draws its one site in its own window shows one or two). The address is a launch argument
 (``launch.open_url``: nothing typed). A page opens and nothing else: nothing plays until the user picks. A picked video
-opens its own link and is checked by the page in front showing that video and the browser's media session playing. A
+(theirs, or Yuki's pick when they asked it to choose: ``yuki.skills.taste.choose``) opens its own link and is checked by
+the page in front showing that video and the browser's media session playing. A
 browser the user didn't name is named in the done line, so one word corrects it.
 
 x8WebArc (10 Oct: "open YouTube in Arc" opened nothing new in Arc five times, and once "verified" an old tab):

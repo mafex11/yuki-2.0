@@ -1,5 +1,5 @@
-"""YouTube's fresh uploads from the user's own channels, named on request; nothing plays (PLAN.md Phase T, D0, D16;
-map-routines T1.4).
+"""YouTube's fresh uploads from the user's own channels, and which channel each watched video is (PLAN.md Phase T, D0,
+D16; map-routines T1.4; audit 17 Oct decision 2).
 
 **Zero setup (D0, D16):** no API key, no account, no sign-in. Every address is a template of the site file
 ``yuki/connect/sites/youtube.toml`` (``[urls]``: the handle page, the public feed, oEmbed, the watch page), and every
@@ -7,19 +7,31 @@ answer is a fixed machine format: the page's ``<link rel="canonical">`` tag, the
 here guesses meaning.
 
 **Which channels:** the user's own, from taste (kind :data:`CHANNEL_KIND`, the site's handle page kind:
-:func:`yuki.skills.taste.site_kinds`): the handle pages they visit and the videos they watch, by hour of day. A watched
-video counts for its channel once its channel is known: a feed listed it, or one oEmbed read of it (the nightly part).
-Never the portrait's interests (rule 3: no join of interests to handles by name).
+:func:`yuki.skills.taste.site_kinds`): the handle pages they visit and the videos they watch, by hour of day, weighted
+by how long they watched (:func:`watched`: the timeline's media seconds on each watch page; YouTube itself says a click
+misleads). A watched video counts for its channel once its channel is known (:func:`attribute_local`, then the nightly
+part). Never the portrait's interests (rule 3: no join of interests to handles by name).
 
-**Reads** (all counted in ``yt_reads``, at most :data:`MAX_READS_PER_HOUR` in any hour across processes, of which the
-nightly part takes at most :data:`NIGHT_READS`; never with a game in front; never when the user's privacy file blocks
-the site):
+**Which channel a watched video is** (kTaste, 17 Oct audit: 15 of 240 watched videos were tied to a channel):
+
+* first from what Yuki already captured, no read: the watch page's own capture (``captures`` kind :data:`CAPTURE_KIND`,
+  Yuki's extractor writes ``Video: <title>`` and ``By: <author>``, a fixed format of its own), taken only when its
+  title stands in that visit's window title (identity: the same video), and only once the author is a channel Yuki
+  knows by that exact name (a feed's or oEmbed's display name, or its handle);
+* else one oEmbed read **per author** (not per video): the author's most-watched video is read, and when oEmbed names
+  the same author, every video captured under that author joins that channel; the videos with no capture, one read
+  each, most-watched first.
+
+**Reads** (all counted in ``yt_reads``; never with a game in front; never when the user's privacy file blocks the
+site): a request's feeds at most :data:`MAX_READS_PER_HOUR` in any hour on top of the nightly part's own reads; the
+nightly part at most :data:`NIGHT_LOOKUPS` handle pages and :data:`NIGHT_OEMBED` oEmbed answers (small JSON) in any
+hour, counting its own reads of the last hour (a pass run again after a restart takes no more):
 
 * a channel's id: one read of its handle page, once (``yt_channels``; a failure that got an answer is retried at most
   :data:`LOOKUP_TRIES` times, a week apart; no answer at all, offline, counts no try): the nightly part, for the
   channels the user picks most;
-* a watched video's channel: one oEmbed read per video id, ever (an answer, even a failed one; offline is tried
-  again), the nightly part, the newest watches first, the ones right after an offer before the rest;
+* a watched video's channel: oEmbed (above), one read per video id ever (an answer, even a failed one; offline is
+  tried again);
 * a channel's fresh uploads: its public feed, **only on request** (:func:`offer`): when a run opens YouTube's home
   page (:func:`wants`), the top :data:`FEED_CHANNELS` channels at this hour whose feed is older than
   :data:`FEED_FRESH_S` are read in parallel within :data:`REQUEST_BUDGET_S` (``Settings.youtube_feed_budget_s``);
@@ -31,9 +43,11 @@ had on screen (no ``page`` moment of that video: the moments' ``entity_key``, D2
 channel at this hour x exp(-age / 7 days)``, one per channel, the top :data:`OFFER_N`. Ranking notes nothing: the
 caller names them with a checked done line (:func:`offer_line`: "New from NDL, Deji and Sidemen: want one?"; the names
 are the channels' own, from the user's data) and only then notes them (:func:`said`, :meth:`Pending.confirm`), so an
-offer never named is never scored and never pickable. **Nothing plays:** a video opens only when the user picks one
-("the Deji one": :func:`pick`, through ``web.open_video``, whose slot takes no taste guess). Shorts are left out
-(their link is not a watch page).
+offer never named is never scored and never pickable. **The offer plays nothing:** after "open YouTube" a video opens
+only when the user picks one ("the Deji one": :func:`pick`, through ``web.open_video``). When the user asks Yuki to
+choose ("a video I like", "put something on": ``choose = true``, decision 2), Yuki's own pick plays instead
+(:func:`yuki.skills.taste.choose`, which reads the same feeds through :func:`refresh`). Shorts are left out (their link
+is not a watch page).
 
 **Learning and the live check:** each offer named is a ``taste_events`` row; the nightly part writes its outcome: the
 user's next YouTube pick within :data:`OUTCOME_S` was one of the three (``hit``), from one of the three channels
@@ -98,16 +112,24 @@ OFF_STATE = "taste.youtube_offers"
 #: A channel id lookup that failed is retried after this long, at most this many times in all.
 LOOKUP_RETRY_S = 7 * 86400.0
 LOOKUP_TRIES = 3
-#: The nightly part: its reads in any hour at most (half the hour's cap, so a request in the same hour still reads
-#: feeds, however often the pass runs: its reads of the last hour count against it), the read kinds that are its own,
-#: of which channel lookups at most (the rest go to oEmbed), the channels it looks at (most picked first), how far back
-#: it attributes watched videos, and each read's socket timeout.
-NIGHT_READS = 4
+#: The nightly part: its handle-page reads and oEmbed reads in any hour at most (its own reads of the last hour count
+#: against them; a request's feeds keep their own :data:`MAX_READS_PER_HOUR` on top), the channels it looks at (most
+#: picked first), how far back it attributes watched videos, and each read's socket timeout. An oEmbed answer is a
+#: small JSON (under 1 kB), one per author, so a few dozen a night catch up within days.
+NIGHT_LOOKUPS = 6
+NIGHT_OEMBED = 60
 NIGHT_KINDS = ("page", "oembed")
-NIGHT_LOOKUPS = 3
-NIGHT_CHANNELS = 16
-ATTRIBUTE_DAYS = 14.0
+NIGHT_CHANNELS = 24
+ATTRIBUTE_DAYS = 60.0
 NIGHT_TIMEOUT_S = 8.0
+#: Yuki's own capture of a watch page (``yuki.memory.extract.page.extract_video``): its kind and the fixed starts of
+#: its first two lines (Yuki's own format, read back by identity, never a guess at meaning).
+CAPTURE_KIND = "video"
+CAPTURE_TITLE = "Video: "
+CAPTURE_AUTHOR = "By: "
+#: A capture counts for a visit when it was taken this long before the visit's first row or after its last.
+CAPTURE_BEFORE_S = 10.0
+CAPTURE_AFTER_S = 120.0
 #: Bytes read at most per answer (a handle page is large; its canonical link sits in the head and ends the read).
 PAGE_MAX_BYTES = 2_000_000
 FEED_MAX_BYTES = 512_000
@@ -270,14 +292,27 @@ def enabled(store: Any) -> bool:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def request_cap(store: Any, now: float | None = None) -> int:
+    """The hourly cap a request's feed reads go under: :data:`MAX_READS_PER_HOUR` on top of the nightly part's own
+    reads of the last hour (they never starve a request). Never raises."""
+    now = time.time() if now is None else float(now)
+    try:
+        used = (store.yt_reads_since(now - 3600.0).get("kinds") or {})
+        night = sum(int(used.get(k, 0) or 0) for k in NIGHT_KINDS)
+    except Exception:  # noqa: BLE001
+        night = 0
+    return MAX_READS_PER_HOUR + night
+
+
 def _read(store: Any, kind: str, url: str | None, *, max_bytes: int, timeout_s: float, deadline: float | None = None,
-          stop: Callable[[bytes], bool] | None = None) -> tuple[int, bytes] | None:
-    """One GET under the hourly cap: ``(HTTP status, body)`` (status 0: no answer), or None when the cap is reached or
-    the address is not an https template (nothing read). ``stop(chunk)`` True ends the read early. Never raises."""
+          stop: Callable[[bytes], bool] | None = None, cap: int = MAX_READS_PER_HOUR) -> tuple[int, bytes] | None:
+    """One GET under the hourly cap ``cap`` (every kind counted, across processes): ``(HTTP status, body)`` (status 0:
+    no answer), or None when the cap is reached or the address is not an https template (nothing read).
+    ``stop(chunk)`` True ends the read early. Never raises."""
     if not url or not url.startswith("https://"):
         return None
     try:
-        rid = store.yt_read_reserve(kind, cap=MAX_READS_PER_HOUR)
+        rid = store.yt_read_reserve(kind, cap=int(cap))
     except Exception:  # noqa: BLE001 - no table yet: no read
         return None
     if rid is None:
@@ -390,14 +425,14 @@ def _is_watch(link: str) -> bool:
 
 
 def fetch_feed(store: Any, key: str, channel_id: str, *, now: float, timeout_s: float,
-               deadline: float | None = None) -> dict[str, int]:
+               deadline: float | None = None, cap: int = MAX_READS_PER_HOUR) -> dict[str, int]:
     """Read one channel's feed and keep its uploads (watch pages only: shorts left out), its display name and the
     cache row. The cache row marks the feed read only once its body parsed (tTaste r1 L2), or for an error answer (a
     404, a 429: it waits :data:`FEED_FRESH_S` like a read one, a backoff under the hourly cap); no answer (offline, a
     timeout) or a body cut off by the deadline leaves it stale, so the next request reads it again. Content-free
     counts: ``ok`` / ``failed`` / ``capped``, ``bytes``, ``videos``."""
     got = _read(store, "feed", _url(FEED_URL, id=channel_id), max_bytes=FEED_MAX_BYTES, timeout_s=timeout_s,
-                deadline=deadline)
+                deadline=deadline, cap=cap)
     if got is None:
         return {"capped": 1}
     status, body = got
@@ -440,9 +475,10 @@ def _fetch_all(store: Any, todo: Sequence[tuple[str, str]], *, now: float, budge
     deadline = started + budget_s
     results: list[dict[str, int]] = []
     lock = threading.Lock()
+    cap = request_cap(store, now)
 
     def one(key: str, cid: str) -> None:
-        got = fetch_feed(store, key, cid, now=now, timeout_s=budget_s, deadline=deadline + 0.5)
+        got = fetch_feed(store, key, cid, now=now, timeout_s=budget_s, deadline=deadline + 0.5, cap=cap)
         with lock:
             results.append(got)
 
@@ -504,6 +540,21 @@ def rank(store: Any, picks: Sequence[Any], known: Mapping[str, Mapping[str, Any]
     return out
 
 
+def refresh(store: Any, keys: Sequence[str], *, now: float, budget_s: float = REQUEST_BUDGET_S,
+            log: LogFn | None = None) -> dict[str, int]:
+    """The feeds of the channels ``keys`` (taste rows of :data:`CHANNEL_KIND`) with a known id whose feed is older than
+    :data:`FEED_FRESH_S`, read in parallel within ``budget_s`` under the request's cap (:func:`request_cap`); a late
+    one finishes on its own thread and serves the next request. Content-free counts; never raises."""
+    try:
+        known = store.yt_channels(keys)
+        cache = store.yt_feed_cache(keys)
+    except Exception:  # noqa: BLE001
+        return {"channels": 0, "ok": 0, "failed": 0, "capped": 0, "late": 0, "bytes": 0}
+    stale = [(k, str(known[k]["channel_id"])) for k in keys
+             if (known.get(k) or {}).get("channel_id") and now - cache.get(k, (0.0, 0))[0] >= FEED_FRESH_S]
+    return _fetch_all(store, stale, now=now, budget_s=float(budget_s), log=log)
+
+
 def offer(store: Any, *, now: float | None = None, game: str | None = None, budget_s: float = REQUEST_BUDGET_S,
           fresh_days: float = FRESH_DAYS, log: LogFn | None = None) -> list[Offer]:
     """On request (a run opening YouTube's home): read the stale feeds of the top :data:`FEED_CHANNELS` channels at
@@ -528,12 +579,7 @@ def offer(store: Any, *, now: float | None = None, game: str | None = None, budg
             _log(log, "taste_offer", n=0, channels=0)
             return []
         keys = [t.entity_key for t in picks]
-        known = store.yt_channels(keys)
-        cache = store.yt_feed_cache(keys)
-        stale = [(k, str(known[k]["channel_id"])) for k in keys
-                 if (known.get(k) or {}).get("channel_id") and now - cache.get(k, (0.0, 0))[0] >= FEED_FRESH_S]
-        left = float(budget_s) - (time.perf_counter() - started)
-        fetched = _fetch_all(store, stale, now=now, budget_s=left, log=log)
+        fetched = refresh(store, keys, now=now, budget_s=float(budget_s) - (time.perf_counter() - started), log=log)
         known = store.yt_channels(keys)   # display names a feed just gave
         offers = rank(store, picks, known, now=now, fresh_days=fresh_days)
         _log(log, "taste_offer", n=len(offers), channels=len(picks), fetched=fetched["ok"], with_id=sum(
@@ -718,19 +764,169 @@ def pick(store: Any, value: Any, *, now: float | None = None) -> dict[str, Any] 
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# For taste's recompute
+# What the user watched: per video, how long, and whose (for taste's recompute and its chooser)
 # ---------------------------------------------------------------------------------------------------------------------
+
+#: Watch time counts in units of this many seconds of the page's media playing (five minutes watched = one unit), at
+#: most :data:`UNITS_CAP` per visit; a visit that played nothing is still a click (:data:`CLICK_UNITS`).
+UNIT_S = 300.0
+UNITS_CAP = 6.0
+CLICK_UNITS = 0.1
 
 
 def _template(row: Mapping[str, Any]) -> str:
     return str((row.get("facts") or {}).get("template") or "")
 
 
+def units(secs: float) -> float:
+    """Watch seconds as taste units (:data:`UNIT_S`), between :data:`CLICK_UNITS` and :data:`UNITS_CAP`."""
+    return min(UNITS_CAP, max(CLICK_UNITS, float(secs or 0.0) / UNIT_S))
+
+
+def watched(store: Any, *, since: float, now: float) -> dict[str, dict[str, Any]]:
+    """``{video_key: {"id", "secs", "spans", "first", "last"}}``: every watch page of the site that was in front in
+    ``[since, now)``, from the timeline's own rows (their path read by the site's templates, a fixed format), with the
+    seconds its media played (``media_s``) and each row's ``(start, end, window title)`` (RAM only; titles never
+    logged). Never raises (``{}``)."""
+    try:
+        from yuki.connect.templates import page_of, site
+
+        hosts = [str(h) for h in (site(SITE).get("site") or {}).get("hosts") or []]
+        if not hosts:
+            return {}
+        rows = store._query(
+            f"SELECT started_at, ended_at, host, title_ciphertext, path_ciphertext, media_s FROM timeline WHERE host IN "
+            f"({','.join('?' * len(hosts))}) AND started_at >= ? AND started_at < ? AND path_ciphertext IS NOT NULL "
+            f"ORDER BY started_at", (*hosts, float(since), float(now)))
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for started, ended, host, title_ct, path_ct, media_s in rows:
+        try:
+            path = str(store._dec(path_ct) or "")
+            m = page_of(f"https://{host}{path}") if path.startswith("/") else None
+            if m is None or m.site != SITE or m.kind != WATCH_PAGE or not _plain(str(m.entity or "")):
+                continue
+            title = " ".join(str(store._dec(title_ct) or "").split()) if title_ct else ""
+        except Exception:  # noqa: BLE001 - a row the key can't read
+            continue
+        vid = str(m.entity)
+        key = video_key(store, vid)
+        e = out.setdefault(key, {"id": vid, "secs": 0.0, "spans": [], "first": float(started), "last": 0.0})
+        e["secs"] += float(media_s or 0.0)
+        e["spans"].append((float(started), float(ended or started), title))
+        e["last"] = max(e["last"], float(started))
+    return out
+
+
+def _captures(store: Any, since: float, now: float) -> list[tuple[float, str, str]]:
+    """``[(at, title, author)]`` of Yuki's own watch-page captures (:data:`CAPTURE_KIND`: its ``Video:`` and ``By:``
+    lines), oldest first, decrypted in RAM. Never raises (``[]``)."""
+    try:
+        rows = store._query("SELECT at, delta_ciphertext FROM captures WHERE kind = ? AND at >= ? AND at < ? "
+                            "ORDER BY at", (CAPTURE_KIND, float(since), float(now)))
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[tuple[float, str, str]] = []
+    for at, text_ct in rows:
+        try:
+            lines = str(store._dec(text_ct) or "").split("\n")
+        except Exception:  # noqa: BLE001
+            continue
+        if len(lines) < 2 or not lines[0].startswith(CAPTURE_TITLE) or not lines[1].startswith(CAPTURE_AUTHOR):
+            continue
+        title = " ".join(lines[0][len(CAPTURE_TITLE):].split())
+        author = " ".join(lines[1][len(CAPTURE_AUTHOR):].split())
+        if title and author:
+            out.append((float(at), title, author))
+    return out
+
+
+def _author_of(spans: Sequence[tuple[float, float, str]], caps: Sequence[tuple[float, str, str]],
+               starts: Sequence[float]) -> tuple[str, str] | None:
+    """``(author, the video's title)`` of a watched video from the captures taken during its rows whose title stands
+    in that row's window title (identity: the same video, not a sidebar's); the author most of them name. None when
+    no capture holds it."""
+    import bisect
+
+    votes: dict[str, list[Any]] = {}
+    for start, end, window in spans:
+        win = _fold(window)
+        if not win:
+            continue
+        i = bisect.bisect_left(starts, start - CAPTURE_BEFORE_S)
+        while i < len(caps) and caps[i][0] <= end + CAPTURE_AFTER_S:
+            _at, title, author = caps[i]
+            if _fold(title) in win:
+                got = votes.setdefault(_fold(author), [0, author, title])
+                got[0] += 1
+            i += 1
+    if not votes:
+        return None
+    best = max(votes.values(), key=lambda v: v[0])
+    return str(best[1]), str(best[2])
+
+
+def _channel_names(store: Any) -> dict[str, str | None]:
+    """``{folded display name or handle: channel_key}`` of the channels Yuki knows (a feed's or oEmbed's name, the
+    handle); a name two channels share maps to None (never guessed between them)."""
+    out: dict[str, str | None] = {}
+    for key, info in (store.yt_channels() or {}).items():
+        for n in {_fold(info.get("name")), _fold(info.get("handle"))} - {""}:
+            out[n] = key if out.get(n, key) == key else None
+    return out
+
+
+def attribute_local(store: Any, *, now: float, days: float = ATTRIBUTE_DAYS,
+                    seen: Mapping[str, Mapping[str, Any]] | None = None
+                    ) -> tuple[dict[str, int], dict[str, dict[str, Any]], list[tuple[str, str, float]]]:
+    """No reads: the watched videos of the last ``days`` with no channel yet, tied to a channel through Yuki's own
+    capture of the page (:func:`_author_of`) when that author is a channel Yuki knows by that exact name
+    (:func:`_channel_names`). Returns content-free counts, the authors still unknown (``{folded author: {"author",
+    "title", "videos": [(video_key, id, secs)]}}``, RAM only) and the videos with no capture (``[(video_key, id,
+    secs)]``), both for the nightly oEmbed reads (:func:`attribute_watched`)."""
+    since = now - float(days) * 86400.0
+    seen = watched(store, since=since, now=now) if seen is None else seen
+    counts = {"watched": len(seen), "known": 0, "local": 0, "pending_authors": 0, "no_capture": 0}
+    if not seen:
+        return counts, {}, []
+    have = {str(v["video_key"]): v for v in store.yt_videos(video_keys=list(seen))}
+    counts["known"] = sum(1 for k in seen if (have.get(k) or {}).get("channel_key"))
+    todo = {k: e for k, e in seen.items() if k not in have}
+    caps = _captures(store, since - CAPTURE_AFTER_S, now + 1.0)
+    starts = [c[0] for c in caps]
+    names = _channel_names(store) if todo else {}
+    rows: list[dict[str, Any]] = []
+    pending: dict[str, dict[str, Any]] = {}
+    bare: list[tuple[str, str, float]] = []
+    for key, e in todo.items():
+        got = _author_of(e["spans"], caps, starts)
+        if got is None:
+            bare.append((key, e["id"], float(e["secs"])))
+            continue
+        author, title = got
+        ch = names.get(_fold(author))
+        if ch:
+            rows.append({"video_key": key, "channel_key": ch, "video_id": e["id"], "title": title, "source": "page"})
+            continue
+        p = pending.setdefault(_fold(author), {"author": author, "videos": [], "secs": 0.0})
+        p["videos"].append((key, e["id"], float(e["secs"])))
+        p["secs"] += float(e["secs"])
+    if rows:
+        store.save_yt_videos(rows, at=now)
+        for r in rows:
+            store.mark_yt_videos([r["video_key"]], "watched_at", float(seen[r["video_key"]]["first"]))
+    counts.update(local=len(rows), pending_authors=len(pending), no_capture=len(bare))
+    return counts, pending, bare
+
+
 def attributed(store: Any, page_rows: Iterable[Mapping[str, Any]],
-               users: Callable[[Mapping[str, Any]], bool]) -> list[tuple[float, str, str, str]]:
-    """The user's watched videos whose channel is known (a feed listed it, or oEmbed named it), as channel picks for
-    taste: ``(at, handle, the handle page's link, group)`` (group: the moments' ``entity_key`` of the handle page, so a
-    channel page and one of its videos minutes apart are one pick). ``users(row)``: the pick is the user's."""
+               users: Callable[[Mapping[str, Any]], bool], *, now: float | None = None
+               ) -> list[tuple[float, str, str, str, float]]:
+    """The user's watched videos whose channel is known, as channel picks for taste: ``(at, handle, the handle page's
+    link, group, units)`` per visit (group: the moments' ``entity_key`` of the handle page, so a channel page and one of
+    its videos minutes apart are one pick; units: the video's watch seconds (:func:`watched`) shared over its visits by
+    their dwell, as :func:`units`). ``users(row)``: the pick is the user's."""
     from yuki.connect.templates import fill
 
     watch = f"{SITE}.{WATCH_PAGE}"
@@ -740,12 +936,62 @@ def attributed(store: Any, page_rows: Iterable[Mapping[str, Any]],
     vids = {str(v["video_key"]): str(v["channel_key"]) for v in store.yt_videos(
         video_keys={str(r["entity_key"]) for r in rows}) if v.get("channel_key")}
     chans = store.yt_channels(set(vids.values()))
-    out: list[tuple[float, str, str, str]] = []
+    end = time.time() if now is None else float(now)
+    seen = watched(store, since=min(float(r["at"]) for r in rows) - 3600.0, now=end + 1.0)
+    dwell: dict[str, float] = {}
     for r in rows:
-        handle = (chans.get(vids.get(str(r["entity_key"]), "")) or {}).get("handle")
-        if handle:
-            out.append((float(r["at"]), str(handle), fill(SITE, HANDLE_PAGE, handle=str(handle)) or "",
-                        _handle_group(store, str(handle))))
+        dwell[str(r["entity_key"])] = dwell.get(str(r["entity_key"]), 0.0) + max(0.0, float(r.get("value") or 0.0))
+    out: list[tuple[float, str, str, str, float]] = []
+    for r in rows:
+        key = str(r["entity_key"])
+        handle = (chans.get(vids.get(key, "")) or {}).get("handle")
+        if not handle:
+            continue
+        secs = float((seen.get(key) or {}).get("secs") or 0.0)
+        share = max(0.0, float(r.get("value") or 0.0)) / dwell[key] if dwell.get(key) else 1.0
+        out.append((float(r["at"]), str(handle), fill(SITE, HANDLE_PAGE, handle=str(handle)) or "",
+                    _handle_group(store, str(handle)), units(secs * share)))
+    return out
+
+
+#: :func:`by_channel` is kept in RAM this long per store and hour (the chooser asks it on every judged pick).
+BY_CHANNEL_TTL_S = 600.0
+_by_channel_lock = threading.Lock()
+_by_channel_cache: dict[tuple[int, int, int], tuple[float, dict[str, dict[str, Any]]]] = {}
+
+
+def by_channel(store: Any, *, since: float, now: float) -> dict[str, dict[str, Any]]:
+    """``{channel_key: {"secs", "videos", "titles"}}``: what the user watched of each channel in ``[since, now)``
+    (watch seconds, how many videos, the titles they watched longest first: RAM only, for the chooser's judgement),
+    kept :data:`BY_CHANNEL_TTL_S`. Never raises (``{}``)."""
+    key = (id(store), int(since // 3600), int(now // 3600))
+    with _by_channel_lock:
+        got = _by_channel_cache.get(key)
+        if got is not None and time.monotonic() - got[0] < BY_CHANNEL_TTL_S:
+            return got[1]
+    out = _by_channel(store, since=since, now=now)
+    with _by_channel_lock:
+        _by_channel_cache.clear()
+        _by_channel_cache[key] = (time.monotonic(), out)
+    return out
+
+
+def _by_channel(store: Any, *, since: float, now: float) -> dict[str, dict[str, Any]]:
+    try:
+        seen = watched(store, since=since, now=now)
+        vids = {str(v["video_key"]): v for v in store.yt_videos(video_keys=list(seen)) if v.get("channel_key")}
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, e in sorted(seen.items(), key=lambda kv: -float(kv[1]["secs"])):
+        v = vids.get(key)
+        if v is None:
+            continue
+        c = out.setdefault(str(v["channel_key"]), {"secs": 0.0, "videos": 0, "titles": []})
+        c["secs"] += float(e["secs"])
+        c["videos"] += 1
+        if v.get("title") and len(c["titles"]) < 3:
+            c["titles"].append(" ".join(str(v["title"]).split()))
     return out
 
 
@@ -763,11 +1009,12 @@ def fresh_ages(store: Any) -> dict[str, float]:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: int = NIGHT_LOOKUPS) -> dict[str, int]:
+def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: int = NIGHT_LOOKUPS,
+                    cap: int = MAX_READS_PER_HOUR) -> dict[str, int]:
     """One read of the handle page of each channel the user picks most (:data:`NIGHT_CHANNELS`, most picked first)
-    that has no id yet: its canonical link's channel id, kept for good. At most ``limit`` reads; a failure that got an
-    answer is retried a week later, at most :data:`LOOKUP_TRIES` times; no answer at all (offline, a timeout) counts no
-    try and ends the pass (the next one tries again; tTaste r1 L4)."""
+    that has no id yet: its canonical link's channel id, kept for good. At most ``limit`` reads under the hourly
+    ``cap``; a failure that got an answer is retried a week later, at most :data:`LOOKUP_TRIES` times; no answer at all
+    (offline, a timeout) counts no try and ends the pass (the next one tries again; tTaste r1 L4)."""
     from yuki.skills import taste
 
     rows = taste.top(store, CHANNEL_KIND, now=now, n=10_000)
@@ -788,7 +1035,7 @@ def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: 
             break
         parser = _Canonical()
         got = _read(store, "page", _url(HANDLE_PAGE, handle=t.name), max_bytes=PAGE_MAX_BYTES,
-                    timeout_s=NIGHT_TIMEOUT_S, stop=parser.take)
+                    timeout_s=NIGHT_TIMEOUT_S, stop=parser.take, cap=cap)
         if got is None:
             break   # the hour's reads are used up
         counts["lookups"] += 1
@@ -808,71 +1055,78 @@ def lookup_channels(store: Any, *, now: float, log: LogFn | None = None, limit: 
     return counts
 
 
-def attribute_watched(store: Any, *, now: float, log: LogFn | None = None, limit: int = NIGHT_READS) -> dict[str, int]:
-    """oEmbed reads (one per video id, ever) for the user's own watched videos of the last :data:`ATTRIBUTE_DAYS` whose
-    channel is unknown: the watches right after an offer first (their outcome waits on it), then the newest; as many
-    as ``limit`` and the hour's cap allow. Each answer's ``author_url`` (the channel's handle page) and
-    ``author_name``. A video with an answer, even a failed one, is never read again; no answer (offline, a timeout)
-    keeps nothing and ends the pass, so the next one reads it."""
-    counts = {"oembed": 0, "attributed": 0, "oembed_failed": 0, "oembed_offline": 0}
+def _oembed(store: Any, vid: str, *, cap: int) -> tuple[int, str | None, str | None, str | None] | None:
+    """One oEmbed read of a video: ``(status, handle, author name, title)`` (status 0: no answer), or None when the
+    hour's reads are used up or the id is no plain id."""
+    watch_url = _url(WATCH_PAGE, id=vid) if _plain(vid) else None
+    if not watch_url:
+        return 404, None, None, None
+    got = _read(store, "oembed", _url(OEMBED_URL, url=watch_url), max_bytes=OEMBED_MAX_BYTES,
+                timeout_s=NIGHT_TIMEOUT_S, cap=cap)
+    if got is None:
+        return None
+    status, body = got
+    handle = name = title = None
+    if status == 200:
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace"))
+            m = _page(data.get("author_url"))
+            if m is not None and m.kind == HANDLE_PAGE and m.entity:
+                handle = str(m.entity)
+                name = " ".join(str(data.get("author_name") or "").split()) or None
+                title = " ".join(str(data.get("title") or "").split()) or None
+        except (ValueError, AttributeError):
+            handle = None
+    return status, handle, name, title
+
+
+def attribute_watched(store: Any, *, now: float, log: LogFn | None = None, limit: int = NIGHT_OEMBED,
+                      cap: int = MAX_READS_PER_HOUR, network: bool = True) -> dict[str, int]:
+    """The watched videos of the last :data:`ATTRIBUTE_DAYS` with no channel yet: first by Yuki's own captures, no
+    read (:func:`attribute_local`); then, with ``network``, oEmbed reads (as many as ``limit`` and the hour's ``cap``
+    allow): one per author still unknown (their most-watched video; when oEmbed names the same author, every video
+    captured under that author joins that channel), then the videos with no capture, most-watched first. A video with
+    an answer, even a failed one, is never read again; no answer (offline, a timeout) keeps nothing and ends the pass,
+    so the next one reads it."""
+    counts: dict[str, int] = {"oembed": 0, "attributed": 0, "oembed_failed": 0, "oembed_offline": 0}
     try:
-        rows = store.moments_between(now - ATTRIBUTE_DAYS * 86400.0, now + 1.0, kinds=["page"])
-    except Exception:  # noqa: BLE001
+        local, pending, bare = attribute_local(store, now=now)
+    except Exception as exc:  # noqa: BLE001
+        _log(log, "yt_oembed", error=type(exc).__name__)
         return counts
-    watch = f"{SITE}.{WATCH_PAGE}"
-    rows = [r for r in rows if _template(r) == watch and r.get("by") == "user" and r.get("entity_key")]
-    if not rows:
-        return counts
-    known = {str(v["video_key"]) for v in store.yt_videos(video_keys={str(r["entity_key"]) for r in rows})}
-    windows = [(float(e["at"]), float(e["at"]) + OUTCOME_S) for e in store.taste_events(
-        since=now - ATTRIBUTE_DAYS * 86400.0, kinds=["offered"])]
-    todo: dict[str, Mapping[str, Any]] = {}
-    for r in sorted(rows, key=lambda r: (not any(lo <= float(r["at"]) <= hi for lo, hi in windows),
-                                         -float(r["at"]))):
-        key = str(r["entity_key"])
-        if key not in known and key not in todo:
-            todo[key] = r
-    for key, r in todo.items():
+    counts.update({k: int(v) for k, v in local.items()})
+    queue: list[tuple[str, str, float, dict[str, Any] | None]] = []
+    for p in sorted(pending.values(), key=lambda p: -float(p["secs"])):
+        key, vid, secs = max(p["videos"], key=lambda v: v[2])
+        queue.append((key, vid, secs, p))
+    queue += [(k, v, s, None) for k, v, s in sorted(bare, key=lambda b: -b[2])]
+    for key, vid, _secs, group in queue if network else []:
         if counts["oembed"] >= limit or blocked() is not None:
             break
-        try:
-            vid = str(store.moment_entity(r) or "")
-        except Exception:  # noqa: BLE001
-            continue
-        watch_url = _url(WATCH_PAGE, id=vid) if _plain(vid) else None
-        if not watch_url:
-            continue
-        got = _read(store, "oembed", _url(OEMBED_URL, url=watch_url), max_bytes=OEMBED_MAX_BYTES,
-                    timeout_s=NIGHT_TIMEOUT_S)
+        got = _oembed(store, vid, cap=cap)
         if got is None:
             break   # the hour's reads are used up
+        status, handle, name, title = got
         counts["oembed"] += 1
-        status, body = got
         if not status:
             counts["oembed_offline"] += 1
             break   # no answer: nothing kept, the next pass reads it again
-        handle, name = None, None
-        if status == 200:
-            try:
-                data = json.loads(body.decode("utf-8", errors="replace"))
-                m = _page(data.get("author_url"))
-                if m is not None and m.kind == HANDLE_PAGE and m.entity:
-                    handle = str(m.entity)
-                    name = " ".join(str(data.get("author_name") or "").split()) or None
-            except (ValueError, AttributeError):
-                handle = None
         ch = channel_key(store, handle) if handle else None
+        rows = [{"video_key": key, "channel_key": ch, "video_id": vid, "title": title, "source": "oembed"}]
         if ch:
             store.save_yt_channel(ch, handle=handle, name=name, at=now)
             counts["attributed"] += 1
+            if group is not None and name and _fold(name) == _fold(group["author"]):
+                # the same author by identity: every video captured under that name is this channel's
+                rows += [{"video_key": k, "channel_key": ch, "video_id": v, "source": "page"}
+                         for k, v, _s in group["videos"] if k != key]
+                counts["attributed"] += len(rows) - 1
         else:
             counts["oembed_failed"] += 1
         # one row either way: a video id is read once, ever (a failed one keeps no channel)
-        store.save_yt_videos([{"video_key": key, "channel_key": ch, "video_id": vid, "source": "oembed"}], at=now)
-        store.mark_yt_videos([key], "watched_at", float(r["at"]))
+        store.save_yt_videos(rows, at=now)     # watched_at: settle() marks it from the page moments
     _log(log, "yt_oembed", **counts)
     return counts
-
 
 def _outcome(store: Any, event: Mapping[str, Any], now: float) -> str | None:
     """An offer's outcome from the user's next YouTube page within :data:`OUTCOME_S` (any side: a pick through Yuki
@@ -952,22 +1206,24 @@ def settle(store: Any, *, now: float, log: LogFn | None = None) -> dict[str, int
 
 
 def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, network: bool = True) -> dict[str, int]:
-    """YouTube's nightly part (``taste.seed``, after the recompute): with the offers on, reads allowed and nothing in
-    front, the channel lookups then oEmbed for watched videos, within :data:`NIGHT_READS` in any hour less the reads of
-    its own kinds (:data:`NIGHT_KINDS`) the last hour already made (a pass run again after a restart takes no more, so
-    a request keeps its share of the cap; tTaste r1 L5); then :func:`settle`. Content-free counts; never raises
-    (``{"error": 1}``)."""
+    """YouTube's nightly part (``taste.seed``, after the recompute): the watched videos' channels from Yuki's own
+    captures (no read), then, with reads allowed and nothing in front, the channel lookups (at most
+    :data:`NIGHT_LOOKUPS`) and oEmbed for watched videos (at most :data:`NIGHT_OEMBED`), each less the reads of its own
+    kind the last hour already made (a pass run again after a restart takes no more; a request keeps its own cap on
+    top, :func:`request_cap`); then :func:`settle`. The offers' live switch (:data:`OFF_STATE`) no longer stops the
+    attribution: the chooser needs it. Content-free counts; never raises (``{"error": 1}``)."""
     now = time.time() if now is None else float(now)
     out: dict[str, int] = {}
     try:
-        if network and enabled(store) and blocked() is None:
-            used = (store.yt_reads_since(now - 3600.0).get("kinds") or {})
-            left = NIGHT_READS - sum(int(used.get(k, 0) or 0) for k in NIGHT_KINDS)
-            out["night_left"] = max(0, left)
-            if left > 0:
-                out.update(lookup_channels(store, now=now, log=log, limit=min(NIGHT_LOOKUPS, left)))
-                if left - out.get("lookups", 0) > 0 and not out.get("lookup_offline"):
-                    out.update(attribute_watched(store, now=now, log=log, limit=left - out.get("lookups", 0)))
+        reads = network and blocked() is None
+        used = (store.yt_reads_since(now - 3600.0).get("kinds") or {}) if reads else {}
+        cap = MAX_READS_PER_HOUR + NIGHT_LOOKUPS + NIGHT_OEMBED
+        pages = NIGHT_LOOKUPS - int(used.get("page", 0) or 0)
+        if reads and pages > 0:
+            out.update(lookup_channels(store, now=now, log=log, limit=pages, cap=cap))
+        oembed = NIGHT_OEMBED - int(used.get("oembed", 0) or 0)
+        out.update(attribute_watched(store, now=now, log=log, limit=max(0, oembed), cap=cap,
+                                     network=bool(reads and oembed > 0 and not out.get("lookup_offline"))))
         out.update(settle(store, now=now, log=log))
         out["reads_hour"] = int(store.yt_reads_since(now - 3600.0).get("reads", 0))
     except Exception as exc:  # noqa: BLE001
@@ -977,7 +1233,8 @@ def nightly(store: Any, *, now: float | None = None, log: LogFn | None = None, n
 
 
 __all__ = ["SITE", "CHANNEL_KIND", "MAX_READS_PER_HOUR", "FEED_CHANNELS", "REQUEST_BUDGET_S", "FRESH_DAYS",
-           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "NIGHT_READS", "NIGHT_KINDS", "Offer", "Pending", "wants", "blocked",
-           "enabled", "video_key", "channel_key", "parse_feed", "channel_id_of", "fetch_feed", "rank", "offer", "said",
-           "offer_line", "start", "offered", "pick", "attributed", "fresh_ages", "lookup_channels", "attribute_watched",
-           "live_bar", "settle", "nightly"]
+           "OFFER_N", "OFFER_KEEP_S", "OFF_STATE", "NIGHT_LOOKUPS", "NIGHT_OEMBED", "NIGHT_KINDS", "UNIT_S", "Offer",
+           "Pending", "wants", "blocked", "enabled", "video_key", "channel_key", "parse_feed", "channel_id_of",
+           "fetch_feed", "request_cap", "refresh", "rank", "offer", "said", "offer_line", "start", "offered", "pick",
+           "units", "watched", "attribute_local", "attributed", "by_channel", "fresh_ages", "lookup_channels",
+           "attribute_watched", "live_bar", "settle", "nightly"]
