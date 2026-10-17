@@ -88,7 +88,7 @@ def report(store: Any, res: Any, *, now: float, inc: dict[str, Any] | None = Non
             "means": c.means if c else {}, "rung": c.rung if c else None, "link_share": c.link_share if c else None,
             "exec_end": c.exec_end if c else None, "commit": c.commit if c else None,
             "end_commit": c.end_commit if c else None, "probe": c.probe if c else None,
-            "covered": c.covered if c else 0, "merged": list(g.merged_from),
+            "covered": c.covered if c else 0,
             "state": p.state if p else ("refused" if g.bar.passes else "seen"),
             "offer_static": p.provenance.get("offer_static") if p else None,
             "late": sum(1 for o in g.occasions if o.by == "user" and not o.context_known),
@@ -125,7 +125,6 @@ def report(store: Any, res: Any, *, now: float, inc: dict[str, Any] | None = Non
         "dropped": dict(sorted(built.dropped.items())) if built else {},
         "browsers": built.browsers if built else {},
         "groups": groups, "seen": seen, "c_only": c_only,
-        "merges": [{"from": a, "into": b} for a, b in res.merges],
         "totals": {"named_skills": sum(1 for d in groups if d["state"] in ("candidate", "trusted", "listed")
                                        and not d["usage"]),
                    "usage_records": sum(1 for d in groups if d["state"] in ("candidate", "trusted", "listed")
@@ -157,11 +156,10 @@ def _text(rep: dict[str, Any]) -> str:
                      f"n={d['n']}/{d['days']}d asked={d['asked']} last={d['last']} means={d['means']} "
                      f"rung={d['rung']} link={d['link_share']} exec={d['exec_end']}/{d['commit']} "
                      f"state={d['state']} offer_static={d['offer_static']} late={d['late']}"
-                     + (f" merged={d['merged']}" if d["merged"] else "") + (f" verbs={d['verbs']}" if d['verbs'] else ""))
+                     + (f" verbs={d['verbs']}" if d['verbs'] else ""))
     lines.append("groups no capability serves (route C only, never written):")
     for d in rep["c_only"]:
         lines.append(f"  {d['end']:<14} app={d['app']} n={d['n']}/{d['days']}d passes={d['passes']}")
-    lines.append(f"merges: {rep['merges']}")
     lines.append(f"seen only (below the bar): {len(rep['seen'])}")
     for d in rep["seen"][:30]:
         lines.append(f"  {d['capability']:<18} {d['gid']} {d['end']} n={d['n']}/{d['days']}d asked={d['asked']} "

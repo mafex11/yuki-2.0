@@ -2,14 +2,16 @@
 ``yuki.memory.trace_families`` (design §7: ``step_token`` and the LCS overlap move here before phase P deletes that
 module).
 
-* **The key** of a group is ``(capability, end kind, key-slot values)``. The app, the means (the browser, the chat app,
-  the control) and the fill values (a person, a video, a level) are attributes, never part of a skill's identity.
-* **Split**: a key value splits off its own group only when its own occasions pass the candidate bar
-  (:func:`passes`); the rest stay the capability's slot (``seen``, in the report only). An occasion missing a required
-  key value joins the one passing group of its capability with the same means; with two or more, it counts for none.
-* **Usage records**: a capability with no key slot gives one group for all its occasions (the messages, the voice
-  joins, the volume changes): it adds no menu line; it exists for the Playbook, provenance, the means preference,
-  routines on a ``routine_key`` fill slot, and trust.
+* **One record per capability** (audit 17 Oct, contract C5): a capability's occasions make one group, keyed
+  ``(capability, end kind)`` with no key value (its ``<capability>#all`` row). The values of its value slot (a site, a
+  meeting service, a playlist) are data on that record (:mod:`yuki.skills.learn.values`), never a split: a key value
+  never makes a group of its own. The one exception keeps what already rests on a per-value row: ``keep`` (the skill
+  keys of learned rows a live routine is keyed on, or the user's Forget / Not mine tombstone) keeps those occasions on
+  that row's own group, so the routine's onsets and the tombstone's exclusions hold; their values still count on the
+  record (``Group.extra``).
+* **Usage records**: every capability's record adds no menu line of its own (its capability's line, with the values
+  inline, stands for it); it exists for the Playbook, provenance, the means preference, routines on a
+  ``routine_key`` fill slot, and trust.
 * **The bar** (design §4.7): at least :data:`MIN_OCCASIONS` user occasions on :data:`MIN_DAYS` distinct days in the
   last :data:`BAR_DAYS`, the last within :data:`RECENT_DAYS`; or :data:`MIN_ASKED` asked occasions on as many days.
 * **Skill keys** (:func:`skill_key`) are derived by a versioned function of the capability and the keyed digests of the
@@ -192,8 +194,9 @@ class Group:
     occasions: list[Any] = field(default_factory=list)
     usage: bool = False                                # binds no key value (a usage record)
     bar: Bar = field(default_factory=Bar)
-    merged_from: list[str] = field(default_factory=list)
     skill_id: int | None = None                        # the learned row it was written to (the writer sets it)
+    #: A record's occasions kept on a per-value row (a routine anchor, a tombstone): they count for its values only.
+    extra: list[Any] = field(default_factory=list)
 
     @property
     def gid(self) -> str:
@@ -231,11 +234,13 @@ def value_digest(cipher: Any, slot: str, value: Any) -> str:
     return str(cipher.digest("learn-key", str(slot), text))[:16]
 
 
-def build(occasions: Sequence[Any], caps: dict[str, Any], cipher: Any, now: float) -> tuple[list[Group], list[Group]]:
-    """``(groups, seen)``: the occasions of each capability grouped by its key-slot values with the split rule; the
-    groups whose key values did not pass alone are ``seen`` (report only). Occasions bound to no capability are grouped
-    by ``(none, end kind, app)``: route C only, never written (no done-check), listed in the report (design §4.1 A3).
-    Each occasion's ``group`` is set to the group it counts for (``None``: none)."""
+def build(occasions: Sequence[Any], caps: dict[str, Any], cipher: Any, now: float, *,
+          keep: frozenset[str] | set[str] = frozenset()) -> tuple[list[Group], list[Group]]:
+    """``(groups, seen)``: one record group per capability (contract C5: its values are data on it, never a split),
+    plus the per-value groups ``keep`` names (skill keys of rows a live routine is keyed on, or a tombstone); the
+    groups below the bar are ``seen`` (report only). Occasions bound to no capability are grouped by ``(none, end
+    kind, app)``: route C only, never written (no done-check), listed in the report (design §4.1 A3). Each occasion's
+    ``group`` is set to the group it counts for (``None``: none)."""
     by_cap: dict[str, list[Any]] = defaultdict(list)
     for o in occasions:
         o.group = None
@@ -259,53 +264,49 @@ def build(occasions: Sequence[Any], caps: dict[str, Any], cipher: Any, now: floa
             continue
         key_slots = [s for s in cap.slots if s.role == "key" and s.name in cap.bind]
         end = Counter(o.kind for o in items).most_common(1)[0][0]
-        if not key_slots:
-            g = Group(capability=cap_key, end=end, keys=(), occasions=list(items), usage=True)
-            g.bar = bar(items, now)
-            if g.bar.passes:
-                for o in items:
-                    o.group = g
-            (groups if g.bar.passes else seen).append(g)
-            continue
-        complete: dict[tuple[tuple[str, str], ...], list[Any]] = defaultdict(list)
-        values: dict[tuple[tuple[str, str], ...], dict[str, Any]] = {}
+        record = Group(capability=cap_key, end=end, keys=(), usage=True)
+        kept: dict[tuple[tuple[str, str], ...], Group] = {}
         missing: list[Any] = []
         for o in items:
-            parts: list[tuple[str, str]] = []
-            vals: dict[str, Any] = {}
-            lost = False
-            for s in key_slots:
-                v = o.attrs.get(s.name)
-                if v in (None, ""):
-                    if s.required:
-                        lost = True
-                        break
-                    continue      # an optional key slot with no value (a site's front page): a value of its own
-                parts.append((s.name, value_digest(cipher, s.name, v)))
-                vals[s.name] = v
-            if lost:
-                missing.append(o)
-                continue
-            k = tuple(sorted(parts))
-            complete[k].append(o)
-            values.setdefault(k, vals)
-        passing: list[Group] = []
-        for k, its in sorted(complete.items()):
-            g = Group(capability=cap_key, end=end, keys=k, values=dict(values[k]), occasions=list(its))
-            g.bar = bar(its, now)
-            (passing if g.bar.passes else seen).append(g)
+            if key_slots and keep:
+                parts: list[tuple[str, str]] = []
+                vals: dict[str, Any] = {}
+                lost = False
+                for s in key_slots:
+                    v = o.attrs.get(s.name)
+                    if v in (None, ""):
+                        if s.required:
+                            lost = True
+                            break
+                        continue
+                    parts.append((s.name, value_digest(cipher, s.name, v)))
+                    vals[s.name] = v
+                if lost:
+                    missing.append(o)
+                    continue
+                k = tuple(sorted(parts))
+                if skill_key(cipher, cap_key, k) in keep:
+                    g = kept.get(k)
+                    if g is None:
+                        g = kept[k] = Group(capability=cap_key, end=end, keys=k, values=dict(vals))
+                    g.occasions.append(o)
+                    continue
+            record.occasions.append(o)
         for o in missing:
-            # a required key value missing (a hold with no service): the one passing group with the same means, else
-            # none (two or more: never guessed)
+            # a required key value missing (a hold with no service): the one kept group with the same means, else the
+            # record (two or more: never guessed)
             means = _means_of(o, cap)
-            fits = [g for g in passing if means is None or means in {_means_of(x, cap) for x in g.occasions}]
-            if len(fits) == 1:
-                fits[0].occasions.append(o)
-        for g in passing:
-            g.bar = bar(g.occasions, now)
-            for o in g.occasions:
-                o.group = g
-        groups.extend(passing)
+            fits = [g for g in kept.values() if means is None or means in {_means_of(x, cap) for x in g.occasions}]
+            (fits[0].occasions if len(fits) == 1 else record.occasions).append(o)
+        for g in [*kept.values(), record]:
+            if g is not record:
+                record.extra.extend(g.occasions)
+            # the record stands for the whole capability: its bar counts the kept rows' occasions too
+            g.bar = bar([*g.occasions, *g.extra], now)
+            if g.bar.passes:
+                for o in g.occasions:
+                    o.group = g
+            (groups if g.bar.passes else seen).append(g)
     return groups, seen
 
 

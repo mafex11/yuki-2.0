@@ -1,14 +1,18 @@
 """The skill learner (phase L, ``docs/research/audit-2026-10-09/learner/design.md`` revision 2; decisions D21-D24).
 
-Yuki learns which of its capabilities the user actually uses, with which fixed values, in which program, when, and
-writes each habit as a learned skill: a ``skills`` row the catalog loads (``yuki.skills.catalog``), the Playbook shows,
-the routine miner keys on and the card lane may offer. Nobody writes the user's habits into code or data: this package
+Yuki learns which of its capabilities the user actually uses, with which values, in which program, when, and writes
+ONE record per capability (audit 17 Oct, contract C5): a ``skills`` row (``<capability>#all``) whose spec holds the
+user's known values for it ("your things": the sites, meeting services, playlists, each with counts, days, hours, the
+usual means, heard words and the work flag; :mod:`yuki.skills.learn.values`). A value never becomes a skill of its own;
+the per-value rows written before are retired by the next pass (their user marks carried onto the values), except a
+row a live routine is keyed on (its anchor). The catalog loads the records (``yuki.skills.catalog``), the menu shows
+the values inline on the capability's line, the Playbook lists them, the you-card reads them. Nobody writes the user's habits into code or data: this package
 holds no app key, site, page kind, person, time or default (the capabilities' data and the user's moments say all).
 
 The pipeline (each a module here)::
 
     moments (+ timeline, trace, runs) --occasions--> occasions  (D18 acting filter, late sends, live-kind rules)
-        --bind--> capability per occasion (its serves and bind data)  --group--> habits (split by key values only)
+        --bind--> capability per occasion (its serves and bind data)  --group--> one record per capability (+ values)
         --compile--> rung, executable end, commit (engine D24), probe  --write--> skills rows (+ naming, lName)
         --> occasions.skill_id (the routine miner reads it; one skill per moment by construction)
 
@@ -43,6 +47,10 @@ INCREMENTAL_S = 3600.0
 #: Its absence also means no full pass was ever written: the first incremental slot runs the first full pass instead
 #: (design §9.3: at first start the learner rebuilds over the days on disk), at most every :data:`FIRST_RETRY_S`.
 BROWSERS_STATE = "learn:browsers"
+#: Set by the first full pass written since one record per capability (contract C5) shipped: until then the per-site
+#: rows written before still stand and no record holds the user's values (menus, the Playbook and the you-card would
+#: show none), so the first idle incremental slot runs that pass once (review M2), as on a fresh database.
+RECORDS_STATE = "learn:records"
 BROWSERS_FRESH_S = 26 * 3600.0
 FIRST_RETRY_S = 3600.0
 DAY_S = 86400.0
@@ -66,7 +74,6 @@ class Result:
     seen: list[Any] = field(default_factory=list)
     compiled: dict[str, Any] = field(default_factory=dict)
     planned: list[Any] = field(default_factory=list)
-    merges: list[tuple[str, str]] = field(default_factory=list)
     cpu_s: float = 0.0
     wall_s: float = 0.0
     named: int = 0
@@ -113,65 +120,28 @@ def quiet(store: Any, now: float | None = None, *, idle_s: float | None = None,
     return busy
 
 
-def _merge_none(groups: list[Any], seen: list[Any], compiled: dict[str, Any], caps: dict[str, Any],
-                browsers: dict[str, int], now: float) -> list[tuple[str, str]]:
-    """Design §4.2's merge: occasions no capability serves whose executable end is a page of a domain (sends in a
-    browser chat on a site: the commit is the user's words, so the end Yuki may reach is that site's page) join the
-    passing site group whose bound site is on the same registrable domain (same capability end, same bound value).
-    A ``none`` group is split by each occasion's own registrable domain first (review r1 L5): each part joins only its
-    own domain's site group; what joins none stays in the ``none`` group (report only)."""
-    from yuki.memory.moments import registrable_domain
-    from yuki.skills.learn import group as G
-    from yuki.skills.learn.bind import NONE
-
-    targets: dict[tuple[str, str], Any] = {}
-    for g in groups:
-        cap = caps.get(g.capability)
-        if cap is None or g.capability == NONE:
-            continue
-        site_slot = next((s for s, src in cap.bind.items() if src == "site"), "")
-        if site_slot and g.values.get(site_slot):
-            targets[(compiled[g.gid].exec_end, registrable_domain(str(g.values[site_slot])))] = g
-    merges: list[tuple[str, str]] = []
-    for pool in (groups, seen):
-        for g in list(pool):
-            if g.capability != NONE or g.end != "message_sent":
-                continue
-            parts: dict[str, list[Any]] = {}
-            for o in g.occasions:
-                if o.src.get("host") and o.app in browsers:
-                    parts.setdefault(registrable_domain(o.src.get("host")), []).append(o)
-            moved: set[int] = set()
-            for domain, its in sorted(parts.items(), key=lambda kv: -len(kv[1])):
-                target = targets.get(("page", domain))
-                if target is None or not domain:
-                    continue
-                target.occasions.extend(its)
-                if g.gid not in target.merged_from:
-                    target.merged_from.append(g.gid)
-                for o in its:
-                    o.group = target
-                    moved.add(id(o))
-                merges.append((g.gid, target.gid))
-            if not moved:
-                continue
-            g.occasions = [o for o in g.occasions if id(o) not in moved]
-            if not g.occasions:
-                pool.remove(g)
-            else:
-                g.bar = G.bar(g.occasions, now)
-    return merges
-
-
-def _occasion_keys(occasions: Sequence[Any], caps: dict[str, Any]) -> None:
-    """Each occasion's group key digest and its means value (content-free columns of ``occasions``)."""
+def _occasion_keys(occasions: Sequence[Any], caps: dict[str, Any], cipher: Any) -> None:
+    """Each occasion's key digest and its means value (content-free columns of ``occasions``). On a capability's record
+    (no key of its own) the digest is its value's id (:func:`yuki.skills.learn.values.value_id`: the record spec's
+    ``values[].id``), so the routine miner tells the record's values apart (``skill:<record>|<value id>``); on a kept
+    per-value row, a digest of the row's keys."""
     import hashlib
+
+    from yuki.skills.learn import values as V
 
     for o in occasions:
         g = o.group
-        if g is not None:
-            o.key_value_digest = hashlib.sha256(json.dumps(list(g.keys), separators=(",", ":")).encode()).hexdigest()[:16]
         cap = caps.get(o.capability)
+        if g is not None:
+            o.key_value_digest = None
+            if not g.keys and cap is not None:
+                ident, _others = V.value_slots(cap)
+                raw = (o.attrs or {}).get(ident.name) if ident is not None else None
+                if raw not in (None, ""):
+                    o.key_value_digest = V.value_id(cipher, ident.name, raw)
+            elif g.keys:
+                o.key_value_digest = hashlib.sha256(json.dumps(list(g.keys), separators=(",", ":")).encode()
+                                                    ).hexdigest()[:16]
         if cap is not None:
             for s in cap.slots:
                 if s.role == "means" and s.name in cap.bind and o.attrs.get(s.name):
@@ -217,7 +187,7 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
                 if cap is not None:
                     o.capability, o.attrs = cap.key, B.attrs_for(cap, o.src)
         caps = dict(idx.by_key)
-        groups, seen = G.build(built.occasions, caps, store.cipher, now)
+        groups, seen = G.build(built.occasions, caps, store.cipher, now, keep=W.kept_keys(store))
         # a skill run of a learned skill counts on that skill's own group (its key values are the skill's)
         by_key = {G.skill_key(store.cipher, g.capability, g.keys): g for g in groups if g.capability in caps}
         for o in built.occasions:
@@ -225,20 +195,18 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
             if target is not None and o.group is not target:
                 if o.group is not None and o in o.group.occasions:
                     o.group.occasions.remove(o)
+                    if o.group.usage and not target.usage:
+                        o.group.extra.append(o)     # still counts for the record's values (contract C5)
                 target.occasions.append(o)
                 o.group = target
         for g in groups:
-            g.bar = G.bar(g.occasions, now)
+            g.bar = G.bar([*g.occasions, *g.extra], now)
         for g in groups:
             cap = caps.get(g.capability)
             if cap is not None:
                 res.compiled[g.gid] = C.compile_group(g, cap, store, idx)
-        res.merges = _merge_none(groups, seen, res.compiled, caps, idx.browsers, now)
-        for g in groups:
-            if g.merged_from:
-                g.bar = G.bar(g.occasions, now)
         res.groups, res.seen = groups, seen
-        _occasion_keys(built.occasions, caps)
+        _occasion_keys(built.occasions, caps, store.cipher)
         planned, counts = W.plan(store, groups, caps, res.compiled, now)
         res.planned = planned
         res.counts.update(counts)
@@ -262,12 +230,12 @@ def _run(store: Any, *, now: float | None, name: bool, worker: Any, log: LogFn |
                                                    prune=True)
             try:
                 store.set_nudge_state(BROWSERS_STATE, json.dumps({"at": now, "browsers": built.browsers}))
+                store.set_nudge_state(RECORDS_STATE, json.dumps({"at": now, "v": 1}))
             except Exception:  # noqa: BLE001
                 pass
         res.counts["occasions"] = len(built.occasions)
         res.counts["groups"] = len(groups)
         res.counts["seen_groups"] = len(seen)
-        res.counts["merged"] = len(res.merges)
         res.counts["skills"] = sum(1 for p in planned if not p.group.usage)
         res.counts["usage_records"] = sum(1 for p in planned if p.group.usage)
     except Exception as exc:  # noqa: BLE001 - logged; the next night tries again
@@ -311,12 +279,13 @@ def _backfill(store: Any, res: Result | None, *, worker: Any = None, log: LogFn 
 
 
 def _first_pass_due(store: Any, now: float) -> bool:
-    """No full pass was ever written on this database (:data:`BROWSERS_STATE` is absent), and none was tried in the
+    """No full pass was ever written on this database (:data:`BROWSERS_STATE` is absent) or none since the records
+    shipped (:data:`RECORDS_STATE` absent: the one-time move from per-site rows to values), and none was tried in the
     last :data:`FIRST_RETRY_S` by this process."""
     if now - _first_tried_at < FIRST_RETRY_S:
         return False
     try:
-        return not store.nudge_state(BROWSERS_STATE)
+        return not store.nudge_state(BROWSERS_STATE) or not store.nudge_state(RECORDS_STATE)
     except Exception:  # noqa: BLE001 - unknown: the incremental pass, as usual
         return False
 
@@ -324,8 +293,8 @@ def _first_pass_due(store: Any, now: float) -> bool:
 def incremental(store: Any, *, now: float | None = None, log: LogFn | None = None) -> dict[str, Any]:
     """The last :data:`INCREMENTAL_S` of occasions rebuilt and mapped onto the learned skills already written (no new
     skill, no model call; the night pass makes those). An occasion whose key matches no written skill keeps the skill
-    the last full pass gave its end moment (or its asked run): the hold joins, asked-occasion mappings and the
-    ``none`` merges keep their skill until the next night (review r1 L8). On a database no full pass was ever written
+    the last full pass gave its end moment (or its asked run): the hold joins and asked-occasion mappings keep their
+    skill until the next night (review r1 L8). On a database no full pass was ever written
     to (the first start after the install), this slot runs the first full pass instead, then the back-fill (design
     §9.3); the moments hub calls it only when the user is idle, with no game in front and no call. Content-free
     counts; never raises."""
@@ -390,11 +359,15 @@ def _incremental(store: Any, *, now: float, log: LogFn | None) -> dict[str, Any]
                 keys.append((s.name, G.value_digest(store.cipher, s.name, v)))
             if lost:
                 continue
-            sid = ids.get(G.skill_key(store.cipher, cap.key, tuple(sorted(keys))))
+            # a kept per-value row (a routine anchor, a tombstone) first, else the capability's record (contract C5)
+            sid = ids.get(G.skill_key(store.cipher, cap.key, tuple(sorted(keys)))) if keys else None
+            if sid is None:
+                sid = ids.get(G.skill_key(store.cipher, cap.key, ()))
+                keys = []
             if sid is not None:
                 o.group = SimpleNamespace(skill_id=sid, keys=tuple(sorted(keys)))
                 mapped += 1
-        _occasion_keys(built.occasions, idx.by_key)
+        _occasion_keys(built.occasions, idx.by_key, store.cipher)
         # the full pass's joins (a hold with no service, an asked run, a merged send) carried over by end moment / run
         by_moment: dict[int, tuple[int, Any]] = {}
         by_run: dict[str, tuple[int, Any]] = {}
@@ -444,7 +417,25 @@ def nightly(store: Any, *, now: float | None = None, worker: Any = None, log: Lo
         return None
     res = run(store, now=now, name=True, worker=worker, log=log, write_rows=True)
     _backfill(store, res, worker=worker, log=log)
+    _ways(store, now=now, worker=worker, log=log)
     return res
+
+
+def _ways(store: Any, *, now: float, worker: Any = None, log: LogFn | None = None) -> None:
+    """Lane kWays' learner of the user's own ways (contract C4: ``yuki.skills.learn.ways``, its own module), run
+    after the night's pass when that module is installed: its ``nightly(store, now=, worker=, log=)``. A guarded import
+    (the module lands on its own branch); a failure is logged content-free and never stops the night."""
+    try:
+        from yuki.skills.learn import ways
+    except ImportError:
+        return
+    fn = getattr(ways, "nightly", None)
+    if not callable(fn):
+        return
+    try:
+        fn(store, now=now, worker=worker, log=log)
+    except Exception as exc:  # noqa: BLE001 - the next night tries again
+        _log(log, "error", where="learn.ways", error=type(exc).__name__)
 
 
 def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequence[int] | None = None) -> Any:
@@ -452,8 +443,10 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     ``routines.keyed_onsets`` to it): day-onsets per ``skill:<id>`` (``|<entity key>`` for a capability whose fill slot
     is a ``routine_key``, a playlist) from the user's own timed occasions (never Yuki's or asked ones, never a late
     send's, never a skill whose run commits: sends and joins), the seen ones apart from hold joins (D7). One skill per
-    moment by construction: no ``ambiguous`` key. A usage record (no key value bound) gives onsets only through a
-    ``routine_key`` fill slot (design §4.2)."""
+    moment by construction: no ``ambiguous`` key. A capability's record (``#all``, contract C5) gives onsets per value:
+    ``skill:<record id>|<value id>`` (``occasions.key_value_digest``, the record spec's ``values[].id``: one site, one
+    meeting service; :func:`yuki.skills.learn.values.routine_value` reads it back), or per entity through a
+    ``routine_key`` fill slot (a playlist); a record with no value slot (volume) makes no routine (design §4.2)."""
     from yuki.memory import routines as R
     from yuki.skills.catalog import capabilities
 
@@ -461,7 +454,8 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     wanted = {int(i) for i in skill_ids} if skill_ids is not None else None
     lo = since - R.ONSET_GAP_S
     try:
-        rows = store._query("SELECT o.skill_id, o.at, o.kind, o.app, o.entity_key, o.facts, o.capability, s.key"
+        rows = store._query("SELECT o.skill_id, o.at, o.kind, o.app, o.entity_key, o.facts, o.capability, s.key,"
+                            " o.key_value_digest"
                             " FROM occasions o JOIN skills s ON s.id = o.skill_id WHERE o.skill_id IS NOT NULL AND"
                             " o.by = 'user' AND o.context_known = 1 AND o.at >= ? AND o.at < ? ORDER BY o.at",
                             (float(lo), float(until)))
@@ -472,7 +466,9 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     out = R.Inputs()
     from yuki.skills.engine import run_commit
 
-    for sid, at, kind, app, ekey, facts, cap_key, skey in rows:
+    from yuki.skills.learn.values import value_slots
+
+    for sid, at, kind, app, ekey, facts, cap_key, skey, kvd in rows:
         if wanted is not None and int(sid) not in wanted:
             continue
         cap = caps.get(str(cap_key))
@@ -483,20 +479,27 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
             continue
         key = f"skill:{int(sid)}"
         routine_slot = any(s.role == "fill" and s.routine_key for s in cap.slots)
-        usage = not any(s.role == "key" and s.name in cap.bind for s in cap.slots)
-        if usage and not routine_slot:
-            # design section 4.2 (review r1 L1): a usage record (nothing bound: the volume record) makes a routine only
-            # through a routine_key fill slot (a playlist), never as itself
-            out.unmapped[f"{kind}|usage"] += 1
-            continue
+        # a capability's record (contract C5: ``#all``): its routines are per value (a site, a meeting service)
+        entity: str | None = None
         if routine_slot:
             if not ekey:
                 out.unmapped[f"{kind}|no_entity"] += 1
                 continue
-            key += f"|{str(ekey)[:16]}"
+            entity = str(ekey)[:16]
+        elif str(skey).endswith("#all"):
+            if value_slots(cap)[0] is None:
+                # design section 4.2 (review r1 L1): a record with no value (volume) makes no routine as itself
+                out.unmapped[f"{kind}|usage"] += 1
+                continue
+            if not kvd:
+                out.unmapped[f"{kind}|no_value"] += 1
+                continue
+            entity = str(kvd)[:16]
+        if entity:
+            key += f"|{entity}"
         if key not in out.keys:
-            out.keys[key] = R.KeyInfo(key, str(skey), str(app or ""), str(kind), str(ekey)[:16] if routine_slot else None,
-                                      False, str(getattr(cap, "kind", "change")))
+            out.keys[key] = R.KeyInfo(key, str(skey), str(app or ""), str(kind), entity, False,
+                                      str(getattr(cap, "kind", "change")))
         out.moments += 1
         every[key].append(float(at))
         try:
@@ -511,5 +514,5 @@ def routine_inputs(store: Any, since: float, until: float, *, skill_ids: Sequenc
     return out
 
 
-__all__ = ["INCREMENTAL_S", "BROWSERS_STATE", "FIRST_RETRY_S", "Result", "quiet", "run", "rebuild", "incremental",
+__all__ = ["INCREMENTAL_S", "BROWSERS_STATE", "RECORDS_STATE", "FIRST_RETRY_S", "Result", "quiet", "run", "rebuild", "incremental",
            "nightly", "routine_inputs"]

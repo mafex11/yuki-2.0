@@ -1,51 +1,39 @@
-"""The skill menu: what the talker and the thinker see of the skills, and their ``run_skill`` schemas (map-skills
-S3.1, S3.5; PLAN.md B.2 "Talker cache"; phase L design §2 "The request path", §4.2, §4.9).
+"""The skill menu: what the talker, the thinker and the planner see of the skills, and their ``run_skill`` schemas
+(map-skills S3.1, S3.5; PLAN.md B.2 "Talker cache"; audit 17 Oct contracts C4, C5).
 
-**What is on it** (phase L, branch lPage):
+**What is on it**:
 
-* every **capability** first, one neutral line each (at most 8, from the shipped files): always there, so any request
-  runs at rung A from day one whatever is learned (design §2, critique H1, acceptance A2). Nothing learned removes or
-  shortens one, and the size cap never cuts one (failure fix-plan Item 1); only a capability with no usable rung and
-  no hand-off is left out (nothing it could do);
-* then the user's **learned skills** that fix a key value (a site, a calling service) and carry a real name (the
-  naming call's or the user's own; ``Skill.name``), each on its own named line: the talker gets the top
-  :data:`TALKER_LEARNED` (12), the thinker every live one (the catalog keeps at most 20), in the catalog's order
-  (trusted first, then the most used). A learned skill that fixes no key value (a usage record: messages, voice joins,
-  volume) adds no line: its capability's line stands for it (design §4.2). Nor does a nameless one (a night with no
-  naming budget, e.g. ``message#all``: its code-built label names a browser it doesn't bind): its capability's line
-  stands for it too. With the skills switch at ``"capabilities"`` the catalog holds no learned skill at all
-  (:func:`yuki.skills.catalog.load`), so only the capability lines are left.
+* every **capability**, one line each (from the shipped files): always there, so any request runs at rung A whatever
+  is learned; only a capability with no usable rung and no hand-off is left out (nothing it could do). After its words
+  and slots, the line carries **the user's own values for it** in a compact budget of their own
+  (:data:`VALUES_CHARS`; contract C5): the things the learner knows they use with it (their sites, with the browser
+  each usually opens in and a work mark; their meeting tabs), an entity slot's taste names (their playlists), and for
+  a capability that opens a site's pages the names of each site page kind (their YouTube channels). Best first: by
+  recency-weighted use (``rank="n_obs"``: stable through the day for a cached prompt block) or lifted by this hour
+  (``rank="hour"``). A value never has a line of its own: the per-value learned lines are gone (one skill, many
+  values; a value the user marked Not mine is never shown);
+* then **the user's own ways** (contract C4: lane kWays' ``origin = 'learned_way'`` rows), one short line each, run
+  through the ``app.way`` capability with ``way`` set to the line's value.
 
-Within ``Settings.skills_menu_chars`` (2,400) the learned lines give way (they come last); the capability lines are
-always on. One line each, at most 140 characters::
+Within ``Settings.skills_menu_chars`` (2,400) the values give way first (half their budget, then none); a capability's
+words are never cut for size. One line each::
 
-    - spotify.playlist: play a playlist, album or liked songs from Spotify's Your Library, by its name [playlist]
-    - <learned key>: <its name> [site = <fixed value>] [item] [browser]
+    - spotify.playlist: play a playlist, album or liked songs from Spotify's Your Library, by its name [playlist] · theirs: [playlist: lumen | 3AM]
+    - web.open_page: open a site's front page ... [site] [page] [item] [browser] · theirs: youtube, claude.ai (work) ... · usually in Chrome
+    - app.way: <the way's name> [way = <its key>] [item] [text]
 
-A capability's line: its ``menu``, its slot names, the options of an enum slot and up to 5 taste candidates of an
-entity slot (the user's own names, best at this hour first). A learned skill's line: its name (the naming call's or
-the user's own), its fixed values (``[slot = value]``) and the slots still filled per request. Never its free-text
-learned menu line (failure fix-plan Item 1: "open Claude (claude.ai) in Chrome" named a browser the skill does not
-bind, and steered the talker and the planner away from the browser the user named; a means slot is never bound, so
-the browser stays a free slot the user's words fill). Nor a means slot's value inside the name (vRound2: "Open
-Excalidraw in Arc" reads "Open Excalidraw"; :func:`yuki.skills.catalog.means_free`, by the slot's own data).
-A learned skill runs only for its own fixed key values: words naming another value run its capability (lSplit review
-r2 L1; :func:`request_key`), and the headings say so. People are not listed (the talker has the people directory). A
-skill with no usable rung and no hand-off is left out. The talker's menu is rebuilt nightly (it sits in the cached
-``HANDS_PROMPT`` block; same-day changes go in its volatile ``skills_now``); the thinker's sits in its ``run_skill``
-tool's description and changes only with :func:`yuki.skills.registry.menu_version`.
-
-The new brain's planner (bSkill, brain-design 2.1 and 6) has its own audience, :data:`PLANNER`: the thinker's skills,
-headed by :data:`PLANNER_HEAD` (how a line is routed, ``route = "skill:<id>"``, and filled), in the planner's cached
-system block behind breakpoint 3 (:func:`planner_menu`). Skill ids never enter its tool schema: code checks the
-route's id against the live catalog.
+People are not listed (the talker has the people directory). The talker's menu is rebuilt nightly (it sits in the
+cached ``HANDS_PROMPT`` block; same-day changes go in its volatile ``skills_now``); the thinker's sits in its
+``run_skill`` tool's description and changes only with :func:`yuki.skills.registry.menu_version`. The new brain's
+planner has its own audience, :data:`PLANNER`, headed by :data:`PLANNER_HEAD`, in the planner's cached system block
+behind breakpoint 3 (:func:`planner_menu`).
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from yuki.skills.catalog import load, means_free
+from yuki.skills.catalog import load
 from yuki.skills.connection import MENU_LINE_CHARS, Loaded, Skill, scope_value
 
 #: The talker's and the thinker's menu size cap (``Settings.skills_menu_chars``).
@@ -55,10 +43,18 @@ THINKER = "thinker"
 #: The new brain's planner (bSkill, brain-design 2.1 / 6): its menu sits in the system block behind cache breakpoint 3.
 PLANNER = "planner"
 AUDIENCES: tuple[str, ...] = (TALKER, THINKER, PLANNER)
-#: The talker's menu holds every capability line plus at most this many learned skills (design §4.9).
-TALKER_LEARNED = 12
-#: A fixed value on a learned skill's line is cut to this.
+#: A capability line's own room for the user's values (contract C5), on top of its words (MENU_LINE_CHARS).
+VALUES_CHARS = 640
+#: Values named per capability at most; names per entity slot or site page kind at most.
+VALUES_N = 16
+NAMES_N = 5
+#: A value or a name on a line is cut to this.
 VALUE_CHARS = 30
+#: Lane kWays' learned ways (contract C4): their rows' origin, and the capability they run through.
+WAY_ORIGIN = "learned_way"
+WAY_CAPABILITY = "app.way"
+#: The talker lists at most this many learned ways.
+WAYS_N = 10
 
 
 def _clip(text: str, n: int) -> str:
@@ -66,26 +62,10 @@ def _clip(text: str, n: int) -> str:
     return text if len(text) <= n else text[: max(0, n - 1)].rstrip() + "…"
 
 
-def binds_key(skill: Skill) -> bool:
-    """Whether a learned skill fixes a key value (its own menu line, design §4.2); ``False`` for a capability and for
-    a usage record (it fixes no key value)."""
-    return skill.learned and any(s.role == "key" and s.name in skill.bound for s in skill.slots)
-
-
-def listed(skill: Skill) -> bool:
-    """Whether a learned skill gets a menu line of its own: it fixes a key value (:func:`binds_key`) and carries a real
-    name (the catalog blanks a nameless row's code-built label: ``yuki.skills.catalog.named``). ``False`` for a
-    capability (its line is always there: :func:`menu_skills`)."""
-    return binds_key(skill) and bool(" ".join(str(skill.name or "").split()))
-
-
 def menu_skills(loaded: Loaded, audience: str = TALKER) -> list[Skill]:
-    """The skills a menu lists, in order: every capability (always), then the learned skills with a line of their own
-    (:func:`listed`: a fixed key value and a real name; the talker's top :data:`TALKER_LEARNED`; the thinker's and the
-    planner's all, at most the catalog's 20), in the catalog's order."""
-    caps = [s for s in loaded.skills if not s.learned]
-    named = [s for s in loaded.skills if s.learned and listed(s)]
-    return caps + (named if audience in (THINKER, PLANNER) else named[:TALKER_LEARNED])
+    """The skills a menu lists, in order: every capability (always). A learned row is never a line of its own (its
+    values ride on its capability's line, contract C5); the learned ways come from the store (:func:`way_lines`)."""
+    return [s for s in loaded.skills if not s.learned]
 
 
 def _value(value: Any) -> str:
@@ -94,70 +74,152 @@ def _value(value: Any) -> str:
     return _clip(str(value or ""), VALUE_CHARS)
 
 
-def _label(skill: Skill) -> str:
-    """A learned skill's words on its line: its name alone (failure fix-plan Item 1). Its learned menu line is free
-    text from the naming call and named browsers the skill does not bind ("in Chrome"); the fixed values that follow
-    the name say what the skill is.
-
-    vRound2: never a means slot's value either (sim-e2e-1: the talker read "ARC browser" as "Open Excalidraw in Arc"):
-    the name with each unbound means slot's value phrase cut, by the slot's own data
-    (:func:`yuki.skills.catalog.means_free`; the catalog already cuts the names Yuki made, so this cuts the user's own
-    Rename on this line only). When no clean cut is possible, the line takes its capability's neutral words instead."""
-    name = " ".join(str(skill.name or "").split())
-    return means_free(name, skill) or " ".join(str(skill.menu or "").split()) if name else name
-
-
-def _slot_part(slot: Any, names: list[str]) -> str:
+def _slot_part(slot: Any) -> str:
     if slot.type == "enum" and slot.options:
         return f"[{slot.name}: {' | '.join(slot.options)}]"
-    if names:
-        return f"[{slot.name}: {' | '.join(_clip(n, 30) for n in names[:5])}]"
     return f"[{slot.name}]"
 
 
-def skill_line(skill: Skill, *, candidates: dict[str, list[str]] | None = None) -> str:
-    """One menu line (at most :data:`MENU_LINE_CHARS`): key, menu words, each slot with its options or candidates. A
-    learned skill's line names it (its name only, never its learned menu text), shows its fixed values (``[slot =
-    value]``) and lists only the slots still filled per request."""
-    cands = candidates or {}
-    bound = dict(skill.bound) if skill.learned else {}
-    head = f"- {skill.key}: {_label(skill) if skill.learned else skill.menu}"
-    fixed = [f"[{s.name} = {_value(bound[s.name])}]" for s in skill.slots if s.name in bound and _value(bound[s.name])]
-    free = [s for s in skill.slots if s.name not in bound]
-    tries = (
-        [head, *fixed, *(_slot_part(s, list(cands.get(s.name) or [])) for s in free)],
-        # the slot lists give way first, then the free slots, then the words
-        [head, *fixed, *(f"[{s.name}]" for s in free)],
-        [head, *fixed],
-    )
+def skill_line(skill: Skill, *, values: str = "") -> str:
+    """One menu line: key, menu words and each slot (an enum slot with its options), at most
+    :data:`MENU_LINE_CHARS` (the options give way first), then the user's values for it (``values``, from
+    :func:`values_part`, in a budget of their own)."""
+    head = f"- {skill.key}: {skill.menu}"
+    tries = ([head, *(_slot_part(s) for s in skill.slots)], [head, *(f"[{s.name}]" for s in skill.slots)], [head])
+    line = _clip(" ".join(tries[-1]), MENU_LINE_CHARS)
     for parts in tries:
-        line = " ".join(parts)
-        if len(line) <= MENU_LINE_CHARS:
-            return line
-    return _clip(" ".join(tries[-1]), MENU_LINE_CHARS)
+        if len(" ".join(parts)) <= MENU_LINE_CHARS:
+            line = " ".join(parts)
+            break
+    return f"{line} · {values}" if values else line
+
+
+def _app_name(store: Any, key: str, names: dict[str, str]) -> str:
+    if key and key not in names:
+        try:
+            names[key] = str(store.app_display_name(key) or key)
+        except Exception:  # noqa: BLE001
+            names[key] = key
+    return names.get(key, "")
+
+
+def values_part(skill: Skill, store: Any, *, now: float | None = None, rank: str = "hour",
+                chars: int = VALUES_CHARS) -> str:
+    """The user's own values for one capability, in at most ``chars`` (``""`` when none): the learner's known values
+    (contract C5; their usual means when one is shared by most: "usually in Chrome", others named per value; a work
+    value marked), each entity slot's taste names (``[playlist: a | b]``), and for a capability that opens site pages,
+    each site page kind's taste names ("youtube handle: Sidemen | NDL"). Never raises."""
+    from collections import Counter
+
+    try:
+        from yuki.skills import taste
+        from yuki.skills.learn import values as V
+    except Exception:  # noqa: BLE001
+        return ""
+    parts: list[str] = []
+    taste_slots = {s.name for s in skill.slots if s.taste}
+    try:
+        vals = V.known(store, skill.key, now=now).get(skill.key) or []
+        if rank == "n_obs":
+            vals = sorted(vals, key=lambda v: (-float(v.get("score") or 0.0), str(v.get("id"))))
+        vals = [v for v in vals if v.get("slot") not in taste_slots][:VALUES_N]
+    except Exception:  # noqa: BLE001
+        vals = []
+    if vals:
+        names: dict[str, str] = {}
+        usual_of = {str(v.get("id")): next(iter((v.get("usual") or {}).values()), "") for v in vals}
+        common, n = (Counter(u for u in usual_of.values() if u).most_common(1) or [("", 0)])[0]
+        shared = common if n >= max(2, len(vals) // 2) else ""
+        bits = []
+        for v in vals:
+            notes = []
+            if v.get("everyday") is False:
+                notes.append("work")
+            u = usual_of.get(str(v.get("id")))
+            if u and u != shared:
+                notes.append(f"in {_app_name(store, u, names)}")
+            label = v.get("label") or v.get("value") or v.get("name")
+            if v.get("named_by") == "user" and _value(v.get("name")) != _value(label):
+                notes.insert(0, f"they call it {_value(v.get('name'))}")   # the slot takes the label itself
+            bits.append(_value(label) + (f" ({', '.join(notes)})" if notes else ""))
+        parts.append("theirs: " + ", ".join(bits) + (f" · usually in {_app_name(store, shared, names)}" if shared
+                                                       else ""))
+    try:
+        for slot in skill.slots:
+            if slot.taste:
+                got = [_value(n) for n in taste.candidates(store, slot.taste, now=now, by=rank)[:NAMES_N] if n]
+                if got:
+                    parts.append(f"[{slot.name}: {' | '.join(got)}]")
+        if str(getattr(skill, "end", "") or "") == "call_join" and skill.app:
+            # the voice channels a join was noted for on this app (tastes ``<app>_voice``, as the planner's places)
+            got = [_value(n) for n in taste.candidates(store, f"{skill.app}_voice", now=now, by=rank)[:NAMES_N] if n]
+            if got:
+                parts.append(f"voice channels: {' | '.join(got)}")
+        if any(src == "site" for src in (skill.bind or {}).values()):
+            for kind, site, page, _var in taste.site_kinds():
+                got = [_value(n) for n in taste.candidates(store, kind, now=now, by=rank)[:NAMES_N] if n]
+                if got:
+                    parts.append(f"{site} {page}: {' | '.join(got)}")
+    except Exception:  # noqa: BLE001
+        pass
+    if not parts:
+        return ""
+    # each part keeps a share of the budget (the learner's values the most), so one long list never hides the others
+    room = max(0, chars - 3 * (len(parts) - 1))
+    first = room if len(parts) == 1 else int(room * 0.6)
+    rest = (room - first) // max(1, len(parts) - 1)
+    return " · ".join(_clip(part, first if i == 0 else rest) for i, part in enumerate(parts))
+
+
+def way_lines(store: Any, *, limit: int = WAYS_N) -> list[str]:
+    """Contract C4: one short line per learned way of the user's (lane kWays' rows: ``origin = 'learned_way'``, live,
+    most used first): ``- app.way: <its name> [way = <its key>] [item] [text]``. ``[]`` with none (or before lane kWays'
+    rows exist). Never raises."""
+    if store is None:
+        return []
+    try:
+        from yuki.skills.catalog import LIVE_STATES
+
+        rows = store._query("SELECT key, name_ciphertext FROM skills WHERE origin = ? AND deleted_at IS NULL AND"
+                            " retired_at IS NULL AND state IN (" + ",".join("?" * len(LIVE_STATES)) + ") ORDER BY"
+                            " uses DESC, updated_at DESC LIMIT ?", (WAY_ORIGIN, *LIVE_STATES, int(limit)))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for key, name_ct in rows:
+        try:
+            name = " ".join(str(store._dec(name_ct) or "").split()) if name_ct else ""
+        except Exception:  # noqa: BLE001
+            name = ""
+        if key and name:
+            out.append(_clip(f"- {WAY_CAPABILITY}: {name} [way = {key}] [item] [text]", MENU_LINE_CHARS))
+    return out
 
 
 def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, chars: int = MENU_CHARS,
                rank: str = "hour", audience: str = TALKER) -> list[str]:
-    """The menu's lines (:func:`menu_skills` for ``audience``): every capability line, then the learned lines within
-    ``chars`` (they give way; a capability line is never cut for size: Item 1). With ``store``: the taste candidates of
-    entity slots (``rank``: ``hour``, best at this hour first, or ``n_obs``, most seen first: stable between the
-    nightly recomputes) and only skills that have a usable rung or may hand over."""
-    from yuki.skills import registry, taste
+    """The menu's lines (:func:`menu_skills` for ``audience``): every capability line with the user's values (with
+    ``store``: only skills that have a usable rung or may hand over), then the learned ways, within ``chars``: the
+    values give way first (half their budget, then none), then the ways; a capability's own words are never cut."""
+    from yuki.skills import registry
 
-    out: list[str] = []
-    used = 0
+    skills: list[Skill] = []
     for skill in menu_skills(loaded, audience):
-        cands: dict[str, list[str]] = {}
         if store is not None:
             table = registry.trust(store, skill.key, now=now)
             if not skill.handoff and not any(registry.usable(r, table.get(r.key), now=now)[0] for r in skill.routes):
                 continue
-            for slot in skill.slots:
-                if slot.taste and slot.name not in skill.bound:
-                    cands[slot.name] = taste.candidates(store, slot.taste, now=now, by=rank)
-        line = skill_line(skill, candidates=cands)
-        if skill.learned and used + len(line) + 1 > chars:
+        skills.append(skill)
+    ways = way_lines(store) if store is not None else []
+    out: list[str] = []
+    for budget in (VALUES_CHARS, VALUES_CHARS // 2, 0):
+        out = [skill_line(s, values=values_part(s, store, now=now, rank=rank, chars=budget)
+                          if store is not None and budget else "") for s in skills]
+        if sum(len(x) + 1 for x in out) + sum(len(x) + 1 for x in ways) <= chars or not budget:
+            break
+    used = sum(len(x) + 1 for x in out)
+    for line in ways:
+        if used + len(line) + 1 > chars:
             break
         out.append(line)
         used += len(line) + 1
@@ -165,16 +227,22 @@ def menu_lines(loaded: Loaded, *, store: Any = None, now: float | None = None, c
 
 
 #: The talker's heading (its menu follows).
-TALKER_HEAD = ("Skills (run_skill with the key; slots only from their words or a name listed). A line with a name is "
-               "one the user does often, its = values fixed; when they name another value, use the plain line:")
+TALKER_HEAD = ("Skills (run_skill with the key; slots only from their words or a name listed). After a line, "
+               "\"theirs\" lists the user's own values for it, best first: use it to match their words to one. When "
+               "they leave the choice to Yuki (something they'd like, something chill), never pick from it yourself: "
+               "pass slots choose: true and context: their words, and Yuki picks by their taste (when even the kind is "
+               "left open, the skill they usually use around now). An app.way line is a way of theirs: run app.way "
+               "with its way value:")
 
 
 #: The planner's heading (bSkill): what a line is and how its slots are filled. Generic: no app, no skill, no case.
 #: The route (``skill:<id>``) and the step value's shape are in the core prompt and the plan tool; a send slot left
 #: out is refused by the consent rule (bExec merge note 3), so the heading says to fill it.
-PLANNER_HEAD = ("Each line: - <id>: what it does [slot] or [slot: option | option]. A named line is a habit learned "
-                "from the user, its = values fixed: when their words name another value, use the plain line. Slots "
-                "only from their words or a listed name or option; leave the rest out (Yuki fills them). A skill that "
+PLANNER_HEAD = ("Each line: - <id>: what it does [slot] or [slot: option | option], then \"theirs\": the user's own "
+                "values for it, best first, to match their words (an app.way line is a way of theirs: route app.way "
+                "with its way value). When they leave the choice to Yuki, never pick from \"theirs\": give choose: "
+                "true and context: their words, and Yuki picks by their taste. "
+                "Slots only from their words or a listed name or option; leave the rest out (Yuki fills them). A skill that "
                 "sends: its send slot takes the sending option only with consent.commit send, else the other.")
 
 
@@ -271,11 +339,12 @@ def talker_tool(keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
 
 
 #: The thinker's tool's fixed head (its menu follows).
-THINKER_HEAD = ("Run a skill: a built-in way to do something on this PC, or one Yuki learned from the user (a line "
-                "with a name; its = values are fixed, so when they name another value use the plain line). It takes "
-                "the route that works on this PC, checked by the PC before it counts as done. Give slots only from "
-                "their words or a name listed; leave the rest out (Yuki fills them from their usuals). Done only when "
-                "its check saw the result. Skills:")
+THINKER_HEAD = ("Run a skill: a built-in way to do something on this PC (\"theirs\" after a line lists the user's "
+                "own values for it, best first, to match their words), or a way of the user's own (an app.way line: "
+                "run app.way with its way value). It takes the route that works on this PC, checked by the PC before "
+                "it counts as done. Give slots only from their words or a name listed; leave the rest out (Yuki fills "
+                "them from their usuals). When they leave the choice to Yuki, never pick from \"theirs\": give "
+                "choose: true and context: their words. Done only when its check saw the result. Skills:")
 
 
 def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]:
@@ -298,6 +367,6 @@ def thinker_tool(menu: str, keys: list[str] | tuple[str, ...]) -> dict[str, Any]
     }
 
 
-__all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "TALKER_LEARNED", "TALKER_HEAD", "PLANNER_HEAD",
-           "names_other_key", "binds_key", "listed", "menu_skills", "skill_line", "menu_lines", "menu_text",
+__all__ = ["MENU_CHARS", "TALKER", "THINKER", "PLANNER", "AUDIENCES", "VALUES_CHARS", "TALKER_HEAD", "PLANNER_HEAD",
+           "names_other_key", "menu_skills", "skill_line", "values_part", "way_lines", "menu_lines", "menu_text",
            "planner_menu", "request_key", "talker_tool", "THINKER_HEAD", "thinker_tool"]
