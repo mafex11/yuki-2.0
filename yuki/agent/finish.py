@@ -332,6 +332,13 @@ def _part_done(still: list[int], actions: list[dict[str, Any]], levels: list[str
 #: small8: the ``seen`` of a request held at likely because a step of it was refused before it ran (plain words).
 SEEN_REFUSED = "one step couldn't run, so not all of it was checked"
 
+#: lThink (live 17 Oct, problem 8): a skill run whose own done-check saw the result is a verified step, and the loop
+#: counts the window it left in front as acted on with that verified result (``Agent._skill_backs``), so the claim
+#: check no longer holds a done that only repeats what the skill checked. When the skill's second check (its recheck,
+#: run on its own thread) then says the result is not there, the step stops counting: its ``why`` becomes this, at
+#: "not confirmed" (``Agent._skill_recheck_applied``).
+SKILL_RECHECK_WHY = "its own second check found it not done"
+
 #: small8 review F1: the tools whose effect is the content or the view itself (what was typed, the keys' effect, where
 #: the view went, a slider's value), by kind (``press`` and ``hotkey`` are both keys). A refused one of these is set
 #: aside only when the same kind of step did work earlier in the same app: then what it aimed at was reached that way.
