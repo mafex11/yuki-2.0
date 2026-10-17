@@ -2226,8 +2226,6 @@ class Agent:
             if lessons:
                 self._session_lessons.append((time.time(), lessons))
                 self.logger.log("session_lessons", apps=sorted(lessons), lines=sum(len(v) for v in lessons.values()))
-                self._keep_pitfalls(outcome=outcome, at=at, lessons=lessons)
-            self._keep_slider_way(outcome=outcome, at=at)
         except Exception as exc:  # noqa: BLE001 - a lesson never breaks a request
             self.logger.log("session_lessons", error=f"{type(exc).__name__}: {exc}"[:200])
 
@@ -2280,106 +2278,6 @@ class Agent:
                     logger.log("held_how_saved", ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
 
         threading.Thread(target=save, name="yuki-held-how", daemon=True).start()
-
-    def _keep_slider_way(self, *, outcome: str, at: float) -> None:
-        """N2 (report 47, review): after one success, the way a slider of that app was moved (which control of the read
-        holds it, set by its value or its own keys and read back) as a practice procedure for that app, so the next
-        request goes straight to it. Practice memory's distiller learns only runs of three actions or more; this is
-        one. Learned from the run's verified step, never hard-coded per app."""
-        if outcome != "final" or not getattr(self.memory, "installed", False):
-            return
-        objects: dict[str, dict[str, Any]] = {}
-        for s in getattr(self, "_trace", None) or []:
-            if (s.get("tool") == "set_slider" and s.get("kind") == "action" and s.get("ok") is True
-                    and s.get("verdict") is True and s.get("app")):
-                control = str(s.get("target") or "").split(", window ", 1)[0].strip()
-                if not control or control.startswith("window "):
-                    continue
-                keys = (s.get("input") or {}).get("keys") if isinstance(s.get("input"), dict) else None
-                # vfix3: a shortcut is kept only when this very step verified it moved the level (its report:
-                # "pressed the app's own shortcut ..."); a shortcut that did nothing here is not a way
-                shortcut = ("+".join(str(k) for k in keys)[:30]
-                            if isinstance(keys, list) and keys and "pressed the app's own shortcut" in str(
-                                s.get("result") or "") else "")
-                how = (f"with keys {shortcut} (its own shortcut, verified: the level moved)" if shortcut else
-                       "with to (percent) or by (points); it reads the value back")
-                objects[str(s["app"])] = {"kind": "procedure", "body": {"steps": [   # each step at most 160 chars
-                    "Read the window",
-                    f"set_slider on {control[:60]} {how}",
-                    "Never drag the slider or script the mouse; the mixer is another control"]}}
-        if objects:
-            self._write_practice(objects, origin="slider", outcome=outcome, at=at)
-
-    #: How long the background write of a run's pitfalls may take (s; off the request's path).
-    PITFALL_WRITE_S = 8.0
-
-    def _keep_pitfalls(self, *, outcome: str, at: float, lessons: dict[str, list[str]] | None = None) -> None:
-        """N8 (report 47, review): a failed or stopped run's pitfalls and the way that worked after them
-        (:func:`task_frame.session_pitfalls`) into practice memory, so every lane and the next session read them for that
-        app (practice memory shows a pitfall of an app in play to every request). Through the existing practice store
-        (``practice.add_playbook``, a ``pitfall`` with one ``observed`` event of this run: a tentative object the ledger
-        weighs like any other; a near-identical earlier one of Yuki's own is superseded, not piled up). No migration.
-        Practice memory's own post-mortem may refine it when its budget allows. On a daemon thread; never raises."""
-        trace = getattr(self, "_trace", None) or []
-        if not getattr(self.memory, "installed", False) or not callable(getattr(self.memory, "call", None)):
-            return
-        pits = task_frame.session_pitfalls(trace, outcome=outcome,
-                                           steers=list(getattr(self, "_steer_texts", None) or []))
-        if not pits:
-            return
-        objects = {app: {"kind": "pitfall", "body": {"text": pit["text"], "instead": pit["instead"] or None}}
-                   for app, pit in pits.items()}
-
-        def kept(_ids: list[int]) -> None:
-            for app in pits:   # practice memory shows it now: the session copy would only repeat it
-                if lessons is not None:
-                    lessons.pop(app, None)
-
-        self._write_practice(objects, origin="session", outcome=outcome, at=at, on_done=kept)
-
-    def _write_practice(self, objects: dict[str, dict[str, Any]], *, origin: str, outcome: str, at: float,
-                        on_done: Any = None) -> None:
-        """Write practice objects learned by code from this run (``{app: {"kind", "body"}}``; the intent is the
-        request's words through memory's secret filter) with one ``observed`` event of this run, through the existing
-        practice store (``practice.add_playbook``; no migration). A near-identical live object of the same kind, app and
-        ``origin`` is superseded, not piled up. On a daemon thread, off the request's path; never raises."""
-        intent = " ".join(str(self._this_query or "").split())[:120] or "a task"
-        key = f"agent:{getattr(self.memory, 'session_id', None) or ''}:{self.lane}-{self._requests}"
-        logger = self.logger
-        memory = self.memory
-
-        def write(client: Any) -> list[int]:
-            from yuki.memory import practice as practice_store
-
-            ids = []
-            what = practice_store._redact(intent) or "a task"   # memory's secret filter, as for every trace
-            embed = getattr(client, "_embed", None)
-            vec = embed(practice_store.vector_text(client.store, what)) if callable(embed) else None
-            for app, obj in objects.items():
-                supersedes = None
-                if vec is not None:
-                    near = practice_store.near(client.store, vec, kinds=[obj["kind"]], limit=4)
-                    same = [o for o in near if o.origin == origin and practice_store.app_key(app) in o.apps
-                            and (o.score or 0.0) >= practice_store.SUPERSEDE_COSINE]
-                    supersedes = same[0].id if same else None
-                ids.append(practice_store.add_playbook(
-                    client.store, {"kind": obj["kind"], "intent": what, "apps": [app], "origin": origin,
-                                   "body": obj["body"], "sources": [key]},
-                    events=[{"type": "observed", "run_key": key, "refs": {"outcome": outcome}, "at": at}],
-                    vector=vec, embed_model=getattr(getattr(client, "_embedder", None), "model_name", None),
-                    supersedes=supersedes))
-            return ids
-
-        def run() -> None:
-            try:
-                ids = memory.call(f"practice_{origin}", write, timeout_s=self.PITFALL_WRITE_S)
-                logger.log("practice_written", origin=origin, ok=True, apps=sorted(objects), ids=list(ids or []))
-                if on_done is not None:
-                    on_done(list(ids or []))
-            except Exception as exc:  # noqa: BLE001 - memory never breaks a request
-                logger.log("practice_written", origin=origin, ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
-
-        threading.Thread(target=run, name=f"yuki-practice-{origin}", daemon=True).start()
 
     #: N9: how long the people-lately block is reused (s), and how long a request waits for it the first time (s; a
     #: slower answer is kept for the next request when it lands).
@@ -4304,9 +4202,8 @@ class Agent:
                 fetched = self._fetch_memory(app=app, query=query, first=first, lean=lean, previous=previous,
                                              apps=apps or (), screen=screen, action=action,
                                              payload=self._overview_payload)
-            frame = task_frame.build(facts, focus=focus, clip=clip, knowhow=fetched.knowhow,
-                                     pinned=getattr(self, "_request_skill", None),
-                                     overview=self._overview_payload, practice=getattr(fetched, "practice", None),
+            frame = task_frame.build(facts, focus=focus, clip=clip, pinned=getattr(self, "_request_skill", None),
+                                     overview=self._overview_payload,
                                      named_app=getattr(self, "_request_app_named", None),
                                      lessons=self._lessons_for(self._overview_payload),
                                      lately=self._people_lately() if self._request_voice else ())
@@ -4388,7 +4285,6 @@ class Agent:
             "action": action,
             "own_discounted": int((fetched.related or {}).get("own_discounted") or 0),
             "frame": frame.info(),
-            "practice": _practice_info(getattr(fetched, "practice", None)),
             "lookup_ms": elapsed_ms,
         }
         self.logger.log(
@@ -4424,7 +4320,6 @@ class Agent:
             action=action,
             own_discounted=int((fetched.related or {}).get("own_discounted") or 0),
             frame=frame.info(),
-            practice=_practice_info(getattr(fetched, "practice", None)),
             frame_facts_ms=(facts or {}).get("elapsed_ms") if isinstance(facts, dict) else None,
             memory_session=getattr(self.memory, "session_id", None),
             app=app,
@@ -5602,16 +5497,6 @@ def _real_backend_type() -> type:
     from yuki.agent.tools import _LazyRealBackend
 
     return _LazyRealBackend
-
-
-def _practice_info(practice: Any) -> dict[str, Any] | None:
-    """Content-free facts of what practice memory gave a request (ids, cosines, the apps in play, how long it took)."""
-    if not isinstance(practice, dict):
-        return None
-    return {"ways": [(w.get("id"), w.get("cosine")) for w in practice.get("ways") or [] if isinstance(w, dict)],
-            "pitfalls": [(p.get("id"), p.get("cosine")) for p in practice.get("pitfalls") or [] if isinstance(p, dict)],
-            "apps": list(practice.get("apps") or []), "named": list(practice.get("named") or []),
-            "measured": practice.get("measured"), "ms": practice.get("ms")}
 
 
 def _split_personality(portrait: str | None) -> tuple[str, str | None]:

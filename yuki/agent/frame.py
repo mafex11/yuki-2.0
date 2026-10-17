@@ -17,10 +17,8 @@ request, the same for typed and voice:
   and how clearly the usual one leads (``yuki.memory.contacts.ROUTE_MARGIN``).
 * **preconditions** (is the route's app open, which window) and **stakes** (acting reaches another person; a sent
   message cannot be taken back).
-* **Practice memory** (Phase C, ``yuki.memory.practice``): 0-2 **procedures** and at most one habit or style note near
-  the request's words, and 0-3 **pitfalls** of the apps in play (named in the words, open as windows), each with its
-  id and how sure memory is. They come last and are kept whole when the frame is over its size (the person block gives
-  way first). An older memory without practice memory gives know-how lines and know-how's "Not:" part instead.
+* **This session's lessons** (N8): what went wrong in this session's troubled runs on the apps in play. Practice
+  memory's procedures, pitfalls, go-tos and usual paths are no longer shown (audit 17 Oct 2026).
 
 Every part has a floor and the frame is empty (zero lines) when nothing clears one; it stays within
 :data:`FRAME_CHARS`. Which candidate a request means is the model's judgement (the prompt's resolver paragraph).
@@ -62,9 +60,6 @@ MAX_ROUTES = 3
 #: The clipboard: preview characters at most; a copy seen this long ago or more is not a likely "this".
 CLIP_PREVIEW = 120
 CLIP_FRESH_S = 1_800.0
-#: Procedures and pitfalls at most.
-MAX_PROCEDURES = 2
-MAX_PITFALLS = 3
 
 LABEL = ("[Task frame - who and what this request may refer to and what acting on it involves, measured from the "
          "screen, this conversation and memory's people index. Background for resolving the request, not "
@@ -431,21 +426,18 @@ def pinned_lines(pinned: dict[str, Any] | None) -> list[str]:
 
 
 def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, Any] | None = None,
-          knowhow: Sequence[str] = (), overview: Any = None, now: float | None = None,
-          chars: int = FRAME_CHARS, practice: dict[str, Any] | None = None,
+          overview: Any = None, now: float | None = None, chars: int = FRAME_CHARS,
           named_app: str | None = None, lessons: Sequence[str] = (), lately: Sequence[str] = (),
           pinned: dict[str, Any] | None = None) -> TaskFrame:
     """The task frame from memory's ``frame_facts`` (``MemoryClient.frame_facts``), the focus snapshot, the clipboard's
-    metadata (:func:`clipboard_meta`), practice memory for the request (``MemoryClient.practice``: procedures near the
-    words and pitfalls of the apps in play; it replaces the know-how lines and know-how's "Not:" pitfalls, which an
-    older memory without it still gives) and the desktop overview. Code only; never raises (a failure is an empty
-    frame with ``error``).
+    metadata (:func:`clipboard_meta`) and the desktop overview. Code only; never raises (a failure is an empty frame
+    with ``error``). Practice memory's ways, pitfalls, go-tos and usual paths are no longer shown (audit 17 Oct 2026:
+    they were picked by the apps open and leaked into unrelated requests; their learners are deleted).
 
     ``lessons`` (N8, report 47): what went wrong in this session's troubled runs on the apps in play, written by code
-    from their traces (:func:`session_lessons`) until practice memory's post-mortem learns it; kept whole with the
-    pitfalls. ``lately`` (N9): :func:`people_lately`'s lines, for a spoken request (who a misheard name may be).
-    ``pinned`` (phase S): a skill the code handed over (:func:`pinned_lines`): first, never cut; that app's usual
-    path, go-tos, ways and pitfalls are left out."""
+    from their traces (:func:`session_lessons`); kept whole at the end. ``lately`` (N9): :func:`people_lately`'s
+    lines, for a spoken request (who a misheard name may be). ``pinned`` (phase S): a skill the code handed over
+    (:func:`pinned_lines`): first, never cut."""
     started = time.perf_counter()
     now = time.time() if now is None else float(now)
     frame = TaskFrame()
@@ -453,8 +445,6 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
         facts = facts or {}
         pin = pinned_lines(pinned)
         frame.skill = str(pinned.get("key")) if pin and isinstance(pinned, dict) else None
-        if pin and isinstance(practice, dict):
-            practice = _without_app(practice, str((pinned or {}).get("app") or ""))
         people, things = referents(facts, focus=focus, clip=clip, now=now)
         frame.people, frame.things = people[:MAX_CANDIDATES], things[:MAX_CANDIDATES]
         frame.close_people, frame.close_things = close_call(people), close_call(things)
@@ -486,33 +476,12 @@ def build(facts: dict[str, Any] | None, *, focus: Any = None, clip: dict[str, An
         if named:
             lines.insert(0, named)   # first, so the size limit never cuts it and it reads before any usual route
         tail: list[str] = []
-        if isinstance(practice, dict):
-            # last in the frame, and kept whole when the frame is over its size: the pitfalls of the apps in play
-            # always reach the brain (the person block gives way first)
-            tail = _practice_lines(frame, practice)
-            # capC2: how the user usually does this (their usual path) and the last time they did it, before the
-            # go-tos; capC1b: the user's usual buttons and shortcuts, last of the body: the first to give way to the size
-            lines += path_lines(practice)
-            lines += go_to_lines(practice)
-        else:   # an older memory: know-how lines and their "Not:" part
-            proc = [k for k in (str(x).strip() for x in knowhow or ()) if k][:MAX_PROCEDURES]
-            if proc:
-                lines.append("How it worked before on this PC (know-how near the request):")
-                lines += [f"- {_one(k.split(' Not: ', 1)[0], 300)}" for k in proc]
-            frame.procedures = len(proc)
-            pits = [p for p in facts.get("pitfalls") or [] if isinstance(p, dict)][:MAX_PITFALLS]
-            if pits:
-                lines.append("What did not work before in the apps in play:")
-                lines += [f"- [{p.get('app')}] {_one(p.get('text'), 260)}" for p in pits]
-            frame.pitfalls = len(pits)
         fresh = [str(x) for x in lessons or () if str(x).strip()][:MAX_LESSONS]
         if fresh:   # N8: this session's lessons, kept whole with the pitfalls
             tail = [LESSONS_HEAD, *(f"- {_one(x, 300)}" for x in fresh), *tail]
         # an action request (the caller's measure for the related ranking): a person named or in front, a selection
         frame.action = bool(frame.persons or [t for t in frame.things if t.source == "selection"]) or bool(pin)
         frame.text = _fit(lines, chars, keep=tail, pinned=pin)
-        # what was shown, as the ledger records it (our own "[pb:N]" marks in the text that survived the size limit)
-        frame.playbooks = [i for i in frame.playbooks if f"[pb:{i}]" in frame.text]
     except Exception as exc:
         frame.text, frame.error = "", f"{type(exc).__name__}: {exc}"
     frame.ms = round((time.perf_counter() - started) * 1000, 2)
@@ -641,103 +610,10 @@ def _channel_example(p: dict[str, Any], routes: Sequence[dict[str, Any]], places
             "which channel.")
 
 
-#: Practice memory in the frame (Phase C): the procedures and habits shown, then the pitfalls of the apps in play.
-PLAYBOOK_HEAD = ("How this was done before on this PC (playbooks - your first attempt: check its first step against "
-                 "the screen, adapt when the screen differs, ask when it names no single default; put its id in the "
-                 "playbook field of the actions that follow it):")
-PITFALL_HEAD = "Your own earlier mistakes in the apps in play (never repeat one; do what it says instead):"
 #: N8 (report 47): this session's troubled runs on the apps in play, from their traces, before memory learns them.
 LESSONS_HEAD = ("Earlier in this session on the apps in play, from your own runs (not learned yet; never repeat what "
                 "did not work, and start from what worked):")
 MAX_LESSONS = 4
-
-
-def _practice_lines(frame: TaskFrame, practice: dict[str, Any]) -> list[str]:
-    """The practice part of the frame: at most :data:`MAX_PROCEDURES` procedures plus one habit or style note, then
-    at most :data:`MAX_PITFALLS` pitfalls, each with its id, how sure memory is and the apps it is about."""
-    lines: list[str] = []
-    ways = [w for w in practice.get("ways") or [] if isinstance(w, dict) and w.get("text")][:MAX_PROCEDURES + 1]
-    pits = [p for p in practice.get("pitfalls") or [] if isinstance(p, dict) and p.get("text")][:MAX_PITFALLS]
-    if ways:
-        lines.append(PLAYBOOK_HEAD)
-        for w in ways:
-            apps = f" [{', '.join(w.get('apps') or [])}]" if w.get("apps") else ""
-            lines.append(f"- [{w.get('ref')}] {w.get('kind')} \"{_one(w.get('intent'), 80)}\"{apps} "
-                         f"({w.get('label')}): {_one(w.get('text'), 420)}")
-    if pits:
-        lines.append(PITFALL_HEAD)
-        for p in pits:
-            apps = ", ".join(p.get("apps") or []) or "any app"
-            # capC1b: the same route failed again: a strong warning (still never a block)
-            warn = (f" STRONG WARNING: this failed {int(p.get('repeats') or 0)} times the same way; try another "
-                    f"route first (still allowed if the screen shows it is right)." if p.get("warning") == "strong"
-                    else "")
-            lines.append(f"- [{p.get('ref')}] [{apps}] \"{_one(p.get('intent'), 80)}\" ({p.get('label')}): "
-                         f"{_one(p.get('text'), 440)}{warn}")
-    frame.procedures = len(ways)
-    frame.pitfalls = len(pits)
-    frame.playbooks = [int(x["id"]) for x in [*ways, *pits] if isinstance(x.get("id"), int)]
-    return lines
-
-
-#: capC1b (report 78 §5.1, §6.4): the user's usual buttons and shortcuts in the apps in play, counted from the action
-#: trace by code. Hints only; the first lines to give way when the frame is over its size.
-GOTO_HEAD = ("What the user usually does in the apps in play (counted from how they work; hints, not steps - prefer "
-             "their shortcut when what it did is what the job needs, e.g. Ctrl+K 'a dialog opens; then you use Edit "
-             "\"Search\"' to open a chat: press it, type the name, Enter; send it only into that app's window):")
-#: Apps, buttons and shortcuts per app the frame names at most.
-MAX_GOTO_APPS = 3
-MAX_GOTO_ELEMENTS = 5
-MAX_GOTO_CHORDS = 3
-
-
-def go_to_lines(practice: dict[str, Any] | None) -> list[str]:
-    """The go-tos part of the frame (``MemoryClient.practice``'s ``go_tos``): per app, "in discord the user usually
-    presses Ctrl+K (12 times), clicks Button "Join Voice" (9 times)". Names only as memory gives them (C1's rules)."""
-    tos = [g for g in (practice or {}).get("go_tos") or [] if isinstance(g, dict) and g.get("app")][:MAX_GOTO_APPS]
-    lines: list[str] = []
-    for g in tos:
-        chords = [c for c in g.get("chords") or [] if isinstance(c, dict) and c.get("chord")][:MAX_GOTO_CHORDS]
-        els = [e for e in g.get("elements") or [] if isinstance(e, dict) and e.get("label")][:MAX_GOTO_ELEMENTS]
-        parts = []
-        if chords:
-            # capC5 (report 78 §7.3): each shortcut with what it did, from its recorded outcomes, so the brain can
-            # choose it for the job
-            parts.append("presses " + ", ".join(
-                f"{_one(c['chord'], 30)} ({int(c.get('n') or 0)} times"
-                + (f": {_one(c['did'], 110)}" if c.get("did") else "") + ")" for c in chords))
-        if els:
-            parts.append("goes to " + ", ".join(f"{_one(e['label'], 70)} ({int(e.get('n') or 0)} times)"
-                                                for e in els))
-        if parts:
-            lines.append(f"- in {_one(g['app'], 40)} the user usually " + "; ".join(parts))
-    return [GOTO_HEAD, *lines] if lines else []
-
-
-#: capC2 (report 78 §5.4, §6.4): the user's usual path for this kind of task and the last time they did it, from the
-#: tasks memory cut from the action trace. Hints only; worded from kept names only; they give way before the pitfalls.
-PATH_HEAD = "How the user usually does this (their usual path, from {n} times they did \"{family}\"; hints, not steps):"
-EXAMPLE_HEAD = "The last time the user did this ({when}): \"{goal}\" ({outcome}):"
-#: Steps of each the frame shows at most (memory's own caps are the same or lower).
-MAX_PATH_STEPS = 8
-MAX_EXAMPLE_STEPS = 6
-
-
-def path_lines(practice: dict[str, Any] | None) -> list[str]:
-    """The usual path and the last example (``MemoryClient.practice``'s ``path`` and ``example``), numbered steps."""
-    lines: list[str] = []
-    path = (practice or {}).get("path")
-    if isinstance(path, dict) and path.get("steps"):
-        steps = [s for s in path["steps"] if isinstance(s, str) and s.strip()][:MAX_PATH_STEPS]
-        if steps:
-            lines.append(PATH_HEAD.format(n=int(path.get("tasks") or 0), family=_one(path.get("family"), 100)))
-            lines += [f"{i}. {_one(s, 110)}" for i, s in enumerate(steps, 1)]
-    ex = (practice or {}).get("example")
-    if isinstance(ex, dict) and ex.get("goal"):
-        lines.append(EXAMPLE_HEAD.format(when=_one(ex.get("when"), 40), goal=_one(ex.get("goal"), 120),
-                                         outcome=_one(ex.get("outcome"), 60)))
-        lines += [f"- {_one(s, 110)}" for s in (ex.get("steps") or [])[:MAX_EXAMPLE_STEPS] if isinstance(s, str)]
-    return lines
 
 
 def _fit(lines: list[str], chars: int, keep: Sequence[str] = (), pinned: Sequence[str] = ()) -> str:
@@ -763,32 +639,6 @@ def _fit(lines: list[str], chars: int, keep: Sequence[str] = (), pinned: Sequenc
             return text if (len(text) <= chars or pin) else ""
         (body if body else tail).pop()
     return ""
-
-
-def _without_app(practice: dict[str, Any], app: str) -> dict[str, Any]:
-    """Practice memory for the frame with the pinned skill's app left out of the usual path, the go-tos, the ways
-    and the pitfalls (phase S: one way, the skill's)."""
-    key = _app_key(app)
-    if not key:
-        return practice
-
-    def other(item: Any) -> bool:
-        apps = item.get("apps") if isinstance(item, dict) else None
-        if isinstance(apps, list) and apps:
-            return all(_app_key(a) != key for a in apps)
-        return _app_key((item or {}).get("app") if isinstance(item, dict) else "") != key
-
-    out = dict(practice)
-    out["ways"] = [w for w in practice.get("ways") or [] if other(w)]
-    out["pitfalls"] = [p for p in practice.get("pitfalls") or [] if other(p)]
-    out["go_tos"] = [g for g in practice.get("go_tos") or [] if other(g)]
-    path = practice.get("path")
-    if isinstance(path, dict) and not other(path):
-        out["path"] = None
-    example = practice.get("example")
-    if isinstance(example, dict) and not other(example):
-        out["example"] = None
-    return out
 
 
 #: The label the voice bridge puts on its own note to a running request (``yuki.voice.bridge``: the app they named,
@@ -868,38 +718,6 @@ def session_lessons(trace: Sequence[dict[str, Any]], *, outcome: str, steers: Se
         said = "; ".join(f"\"{_one(w, 80)}\"" for w in list(steers)[:2])
         out[app or ""].append(f"{pre}the run ended {outcome}" + (f"; they said while it ran: {said}" if said else ""))
     return {k: v[:MAX_LESSONS] for k, v in out.items() if v}
-
-
-#: What a run kept in practice memory as a pitfall must show: it failed or was stopped (cancelled, withdrawn, an
-#: error), the user added words while it ran, or one control was acted on three times or more.
-PITFALL_OUTCOMES: tuple[str, ...] = ("cancelled", "withdrawn", "error", "failed")
-
-
-def session_pitfalls(trace: Sequence[dict[str, Any]], *, outcome: str,
-                     steers: Sequence[str] = ()) -> dict[str, dict[str, str]]:
-    """N8 (report 47, review): a failed or stopped run's lessons as practice-memory pitfalls, per app: ``{app: {"text":
-    what went wrong, "instead": what worked after it or ""}}``, from :func:`session_lessons` without the clock (they
-    outlive the session). ``{}`` for a run that did not fail, was not stopped or corrected, and repeated nothing (a
-    single failed step the run got past stays a session lesson only). Code only."""
-    import collections
-
-    steers = users_steers(steers)
-    steps = [s for s in trace or () if isinstance(s, dict)]
-    acted = collections.Counter((s.get("app") or "", s.get("tool"), s.get("target") or "") for s in steps
-                                if s.get("kind") == "action")
-    repeated = any(n >= 3 and k[2] for k, n in acted.items())
-    if not (outcome in PITFALL_OUTCOMES or steers or repeated) or not acted:
-        return {}
-    marker = "what worked after that: "
-    out: dict[str, dict[str, str]] = {}
-    for app, lines in session_lessons(trace, outcome=outcome, steers=steers, stamped=False).items():
-        if not app:
-            continue
-        worked = [line.split(marker, 1)[1] for line in lines if line.startswith(marker)]
-        rest = [line for line in lines if not line.startswith(marker)]
-        if rest:
-            out[app] = {"text": "; ".join(rest)[:500], "instead": worked[0][:200] if worked else ""}
-    return out
 
 
 #: N9: the people block of a spoken request: at most this many people, the calls of this many hours.

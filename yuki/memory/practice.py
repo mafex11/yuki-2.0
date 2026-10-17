@@ -1,48 +1,22 @@
-"""Practice memory: how this user does things on this PC, learned from Yuki's own runs and what memory already observes,
-and never a mistake twice (revamp Phase C; design docs/research/revamp-2026-10-02/03-learning.md §7, build report
-27-build-C.md).
+"""Practice memory's store half: Yuki's run traces, the Playbook ledger and the step helpers the skill learner uses.
 
-Before this, Yuki's "know-how" was five free-text rows, three carrying window numbers or pixel coordinates, none ever
-used, and the brain had called ``remember_how`` zero times (03 §0). A success taught nothing; a failure was not a
-durable object; retrieval followed the window in front. This module is the store-level half of the replacement
-(migration 29); :mod:`yuki.memory.practice_learn` holds the model passes that write into it.
+Practice memory (revamp Phase C, migration 29) once held four learners' output in ``playbooks``: the demo learner, the
+habit miner, the run learner's post-mortems and distills, the old loop's session pitfalls and slider ways. The audit
+of 17 Oct (docs/research/audit-2026-10-17/00-SYNTHESIS.md, decision 3) switched those learners off and deleted them;
+migration 45 retired every row they wrote, and nothing writes a new one. What stays:
 
 * **Run traces** (``runs``): every agent request and voice hand, one row per step - the tool, the target (the app as
   its ``app_key``, the control's role and name, the window's title; never a window number as meaning), an input summary
   (window ids, element ids and coordinates are taken out and kept apart as the run's *numbers*), the verdict and why,
   result facts up to :data:`RESULT_CHARS`, duration, the share of its model call's cost. Step 0 is the request itself:
-  the user's words, the outcome, the measured signals (:func:`run_signals`), the playbooks shown and cited, and where
-  learning stands. Secret-filtered, then encrypted; pruned with the captures (30 days).
-* **Practice objects** (``playbooks``), four kinds: *procedure* (steps by visible control name and role, slots for what
-  changes; and, when every step was a hand the talker has, the same steps as the skill runner runs them - ``run``,
-  :func:`executable_step`), *habit* (a default with its alternatives and counts, or "no single default: ask"), *pitfall* (what failed,
-  what it actually did, what to do instead, generalised to its family), *style* (how the user wants something
-  written). Bi-temporal like know-how: a new version supersedes the old one and takes its ledger with it.
-* **The ledger** (``playbook_events``): every piece of evidence and every use, with its weight (:data:`WEIGHTS`).
-  **Confidence is computed, never asked of a model** (:func:`evaluate`): a Beta-style estimate of the ledger's
-  positive against negative weight, times ``0.5 ** (days since the last evidence / half-life)`` (:data:`HALF_LIFE_DAYS`),
-  and the state follows from the same numbers: candidate (one source: shown as tentative) -> active (two independent
-  sources, or the user's own words) -> trusted (:data:`TRUST_USES` clean uses) -> stale (past a half-life without
-  evidence: "verify first") -> retired (contradicted: confidence under :data:`RETIRE_BELOW` with
-  :data:`RETIRE_NEGATIVES` negative events, or forgotten by the user).
-* **Retrieval by target and intent** (:func:`relevant`): the request's words against each object's intent vector
-  (the shared embedder), the apps in play (named in the words as whole words of a stored app name, the open windows,
-  the apps the caller names) instead of the window in front, a similarity floor per kind; pitfalls of the apps in play
-  always come (at most :data:`MAX_PITFALLS`), procedures at most :data:`MAX_WAYS`, a habit or style note at most
-  :data:`MAX_HABITS`.
-* **The Playbook page** (:func:`workflows`, :func:`workflow_edit`): procedures, lessons and proposals with uses, last use
-  and confidence; save / edit (the user's words, re-distilled by the pipeline) / disable / forget, every one through
-  the ledger.
-* **Only a success is learning** (appLearn, 4 Oct; the user: "the things it should learn should be the ones that it
-  successfully executed ... Why do you want to learn failures?"). A way (procedure or habit) learned from a run is shown
-  and announced only once it rests on a verified success (:func:`learned_way`): a run that ended done with its last
-  action verified and nobody correcting it (a ``succeeded`` event, :func:`verified_run`, :func:`stamp_successes`), a
-  later run that worked with it, or the user's own word. A pitfall is a quiet internal "avoid this" note: shown to the
-  brain so a mistake is not repeated, never on the Playbook page, never announced; what failed becomes visible only as
-  part of a later success (the way's "what didn't work"). :func:`workflows` ``learned`` lists the announced ones.
+  the user's words, the outcome, the measured signals (:func:`run_signals`). Secret-filtered, then encrypted; pruned
+  with the captures (30 days). Read by the Activity ledger, the finish gate's :func:`control_record` and the reflex.
+* **The ledger** (``playbook_events``, :func:`evaluate`, :func:`recompute`) and the Playbook page's old sections
+  (:func:`workflows`, :func:`workflow_edit`): empty since migration 45, kept until the page drops them.
+* **Step helpers** for the skill learner's compiler (``yuki.skills.learn.compile``): :func:`demo_step`,
+  :func:`clean_parts`, :func:`clean_end`; and :func:`launch_identities` (the apps a Start entry runs as).
 
-No model is called here; no regex, keyword list or per-app branch decides anything: numbers are counts, cosines and
-times; strings are only compared with stored strings (whole-word spans, as :mod:`yuki.memory.contacts` does).
+No model is called here; no regex, keyword list or per-app branch decides anything.
 
 Public API::
 
@@ -50,27 +24,12 @@ Public API::
     input_summary(tool_input) -> (text, numbers)
     run_signals(steps, *, outcome, steers=0, breaker=0) -> dict
     record_run(store, run) -> dict;  record_hand_trace(store, ..., injected=, cited=, control=) -> dict
-    run_header(store, key) / run_steps(store, key) / pending_runs(store, ...)
-    executable_step(step, slot=, literal_ok=) -> dict | None;  clean_run(steps) -> [dict]   # skill-runner steps
-    add_playbook(store, obj, *, events, vector=None, embed_model=None, supersedes=None, now=None) -> int
+    control_record(store, *, app, tool, control) -> dict;  launch_identities(store) -> dict
     add_events(store, events, *, now=None) -> int;  recompute(store, ids, *, now=None)
     evaluate(kind, events, *, created_at, now) -> dict
     live(store, kinds=None, include_disabled=False) -> [Playbook];  get(store, ref) -> Playbook | None
-    vectors(store, ids) -> {id: vector};  near(store, vec, *, kinds=None, limit=8) -> [Playbook]
-    apps_named(store, words, known=()) -> [app_key]
-    relevant(store, *, query_vec, apps_in_play, now=None, detail=False) -> dict
     workflows(store, *, now=None) -> dict;  workflow_edit(store, ref, action, words="", *, now=None) -> dict
-    learned_way(kind, events) -> bool;  verified_run(store, key) -> bool;  judged_ok(store, key) -> bool | None;  corrected_by_quote(store, key) -> bool
-    stamp_successes(store, *, run_keys=None, ok=None, dry_run=False) -> [(id, run_key)]
-    provenance(store, obj) -> (verdict, why);  pitfall_overflow(store, pitfalls, cap=) -> [id]   # appClean
-    retire_cleaned(store, items, *, run_key) -> [id];  cap_pitfalls(store, *, cap=, dry_run=False) -> [id]
-    cap_enabled(store) -> bool;  set_clean_state(store, "applied" | "undone", run)   # the daily cap's gate
-
-**Cleaning what is saved** (appClean, 4 Oct): :mod:`yuki.memory.practice_clean` re-judges every saved object - a way
-stays only on the user's word, a success or what the user does (:func:`provenance`, code), near-duplicates merge into
-the one that worked, kept procedures become a title and numbered steps - and pitfalls are capped per app
-(:data:`PITFALLS_PER_APP`; also daily once a pass was applied: :func:`cap_pitfalls`, :func:`cap_enabled`). Each
-change is a ``cleaned`` ledger event under ``clean:<run>`` and can be taken back.
+    demo_step(row, name, ...) -> dict | None;  clean_parts(parts) -> [dict];  clean_end(end) -> dict | None
 """
 
 from __future__ import annotations
@@ -78,11 +37,10 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
-import numpy as np
 
 from yuki.memory.store import Store, app_key
 
@@ -90,11 +48,8 @@ from yuki.memory.store import Store, app_key
 # Constants (sizes are plumbing; weights, half-lives and floors are tunables measured on replay, 27-build-C.md §3)
 # ---------------------------------------------------------------------------
 
-KINDS: tuple[str, ...] = ("procedure", "habit", "pitfall", "style")
 #: "How to do it" kinds (the Playbook page's procedures) and lessons (pitfalls and style notes).
 WAY_KINDS: tuple[str, ...] = ("procedure", "habit")
-LESSON_KINDS: tuple[str, ...] = ("pitfall", "style")
-STATES: tuple[str, ...] = ("probation", "candidate", "active", "trusted", "stale", "retired", "disabled")
 #: Probation (revamp D personal, 30c-build-D-personal.md): objects migrated from the old know-how rows (origin
 #: "knowhow") start here, at low confidence, and are never shown to the brain until a successful run confirms them -
 #: a run that worked with it (``ran_ok``), a run the distiller learned the same thing from (an ``observed`` event of a
@@ -169,14 +124,6 @@ def _demo_rules_from(learning: Any) -> dict[str, Any]:
             "proven_runs": count("demo_alone_after_proven_runs", DEMO_PROVEN_RUNS)}
 
 
-def set_demo_rules(learning: Any) -> dict[str, Any]:
-    """The practice worker's D3 settings, from the trace's rules (``TraceRules.learning``); ``None``: back to reading
-    the settings file (:func:`demo_rules`). Returns the rules now in force."""
-    global _DEMO_OVERRIDE
-    _DEMO_OVERRIDE = None if learning is None else _demo_rules_from(learning)
-    return demo_rules()
-
-
 def demo_rules() -> dict[str, Any]:
     """Decision D3's rules in force: ``hint`` ("at_once": a demo seen once is a hint at once; anything else: it is
     held back until it is a way), ``times``, ``proven_runs``. The practice worker's (:func:`set_demo_rules`), else the
@@ -227,28 +174,8 @@ LEARNED_SHOWN = 5
 #: The run key prefix of the clean-up pass's ledger events (appClean): ``clean:<portrait run id>``, or
 #: ``clean:daily-<day>`` for the daily pitfall cap. Never a run's evidence (:func:`_run_evidence`).
 CLEAN_RUN_PREFIX = "clean:"
-#: The checkpoint that turns the daily pitfall cap on (appClean review F3): ``applied:<run id>`` once a clean-up pass
-#: has been written (its merges done first, after the user's reviewed dry run); ``undone:<run>`` once a pass or a day's
-#: cap is taken back, so the cap does not retire again what the undo restored. Unset (before any pass): the cap waits.
-CLEAN_CHECKPOINT = "practice_clean_state"
-#: Most live pitfalls kept per app (appClean, 4 Oct; the user: "theres too many spotify lessons"): a request is shown
-#: at most :data:`MAX_PITFALLS` of an app in play, so more than one spare per app only crowds the ranking. The
-#: weakest (no words of the user's, lowest confidence, least evidence, oldest evidence) are retired past it.
-PITFALLS_PER_APP = 4
-#: Where a practice object came from, as the clean-up pass judges it (:func:`provenance`, code only). A way stays
-#: only with the first three; the next two retire it (appClean: "a way stays only if it came from a verified success").
-PROVENANCES: tuple[str, ...] = ("user", "success", "observed", "failed", "unconfirmed", "lesson")
-KEEP_PROVENANCES: tuple[str, ...] = ("user", "success", "observed")
-#: The named auto-reset event the learner sets when a run it read taught a way or marked one a success (appLearn review):
-#: the tray waits on it, only while a done run's Learned box is still to come (``yuki.ui.learned_wait``, its own copy).
-LEARNED_EVENT_NAME = "Local\\YukiLearnedReady"
 
 
-def signal_learned() -> bool:
-    """Wake the tray's wait for a run's learning (:data:`LEARNED_EVENT_NAME`); ``False`` when nobody waits."""
-    from yuki.memory.store import signal_event
-
-    return signal_event(LEARNED_EVENT_NAME)
 #: Half-life of an object's evidence, days: app mechanics change with app updates, personal defaults drift slowly.
 HALF_LIFE_DAYS: dict[str, float] = {"procedure": 60.0, "pitfall": 60.0, "habit": 180.0, "style": 180.0}
 #: Clean uses (cited, then ran_ok with no negative evidence after them) before an active object is trusted.
@@ -257,22 +184,6 @@ TRUST_USES = 3
 #: against two failures after use: 0.25; a taught object with two failures stays: 0.44).
 RETIRE_BELOW = 0.30
 RETIRE_NEGATIVES = 2
-#: An object this similar (intent vectors) to a live one of the same kind is a new version of it, not a second one.
-SUPERSEDE_COSINE = 0.85
-#: Retrieval floors (cosine of the request's words to the object's intent + family, both without app names, the shared
-#: multilingual MiniLM): a procedure, habit or style note scoped to an app in play needs WAY_APP_MIN_COSINE, any other
-#: WAY_MIN_COSINE; a pitfall of an app in play always comes, any other pitfall needs PITFALL_MIN_COSINE. Measured on the
-#: replay set's requests (27-build-C.md §3): against the right intent 0.33-0.85; against another object of the same app
-#: at most 0.31 once app names are out (0.64 with them); against an unrelated object of the same topic up to 0.55.
-WAY_MIN_COSINE = 0.45
-WAY_APP_MIN_COSINE = 0.35
-PITFALL_MIN_COSINE = 0.45
-#: Most procedures, habit/style notes and pitfalls one request is shown (SkillsBench: at most ~3 focused items).
-MAX_WAYS = 2
-MAX_HABITS = 1
-MAX_PITFALLS = 3
-#: A shown object's rank: its cosine scaled by its confidence (an unsure object ranks a little lower, never out).
-CONFIDENCE_RANK = 0.25
 #: Trace sizes (characters) and steps kept per run.
 RESULT_CHARS = 300
 INPUT_CHARS = 300
@@ -292,8 +203,6 @@ NUMBER_KEYS: frozenset[str] = frozenset({"hwnd", "expect_hwnd", "element", "read
                                          "dx", "dy", "item"})
 #: The rendered body of an object (the frame, the Playbook page).
 BODY_CHARS = 600
-MAX_PROC_STEPS = 8
-STEP_CHARS = 160
 
 
 def _now(now: float | None) -> float:
@@ -620,91 +529,6 @@ def record_hand_trace(store: Store, *, session_id: str | None, name: str, args: 
     return record_run(store, run, now=now)
 
 
-@dataclass
-class RunHeader:
-    """Step 0 of a run, decrypted."""
-
-    id: int
-    run_key: str
-    session_id: str | None
-    request_id: str | None
-    source: str
-    lane: str | None
-    at: float
-    ended_at: float | None
-    app: str | None
-    words: str
-    reply: str
-    outcome: str | None
-    signals: dict[str, Any]
-    injected: list[int]
-    cited: list[int]
-    note: dict[str, Any]
-    learn: str | None
-    learn_at: float | None
-    cost_usd: float | None
-    calls: int | None
-    ms: float | None
-
-
-@dataclass
-class RunStep:
-    step: int
-    at: float
-    tool: str
-    kind: str | None
-    app: str | None
-    target: str | None
-    input: str | None
-    ok: bool | None
-    verdict: bool | None
-    why: str | None
-    result: str | None
-    ms: float | None
-    cost_usd: float | None
-    cited: list[int]
-    expected: bool = False
-    sig: str | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"step": self.step, "tool": self.tool, "kind": self.kind, "app": self.app, "ok": self.ok,
-                "verdict": self.verdict, "expected": self.expected, "sig": self.sig}
-
-
-def _header(store: Store, r: Any) -> RunHeader:
-    pb = json.loads(r["playbooks"] or "{}")
-    try:
-        note = json.loads(store._dec(r["note_ciphertext"]) or "{}")
-    except (ValueError, TypeError):
-        note = {}
-    return RunHeader(
-        id=int(r["id"]), run_key=r["run_key"], session_id=r["session_id"], request_id=r["request_id"],
-        source=r["source"], lane=r["lane"], at=float(r["at"]), ended_at=r["ended_at"], app=r["app"],
-        words=store._dec(r["input_ciphertext"]) or "", reply=store._dec(r["result_ciphertext"]) or "",
-        outcome=r["outcome"], signals=json.loads(r["signals"] or "{}"), injected=_ids(pb.get("injected")),
-        cited=_ids(pb.get("cited")), note=note if isinstance(note, dict) else {}, learn=r["learn"],
-        learn_at=r["learn_at"], cost_usd=r["cost_usd"], calls=r["calls"], ms=r["ms"])
-
-
-def run_header(store: Store, key: str) -> RunHeader | None:
-    rows = store._query("SELECT * FROM runs WHERE run_key=? AND step=0", (key,))
-    return _header(store, rows[0]) if rows else None
-
-
-def run_steps(store: Store, key: str) -> list[RunStep]:
-    out = []
-    for r in store._query("SELECT * FROM runs WHERE run_key=? AND step>0 ORDER BY step", (key,)):
-        meta = json.loads(r["playbooks"] or "{}")
-        out.append(RunStep(step=int(r["step"]), at=float(r["at"]), tool=r["tool"], kind=r["kind"], app=r["app"],
-                           target=store._dec(r["target_ciphertext"]), input=store._dec(r["input_ciphertext"]),
-                           ok=None if r["ok"] is None else bool(r["ok"]),
-                           verdict=None if r["verdict"] is None else bool(r["verdict"]),
-                           why=store._dec(r["why_ciphertext"]), result=store._dec(r["result_ciphertext"]),
-                           ms=r["ms"], cost_usd=r["cost_usd"], cited=_ids(meta.get("cited")),
-                           expected=bool(meta.get("expected")), sig=meta.get("sig")))
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Executable steps: a procedure's steps in the form the talker's skill runner runs as they are (fx2, 29-build §3 item 3)
 # ---------------------------------------------------------------------------
@@ -732,82 +556,6 @@ END_KINDS: tuple[str, ...] = ("window_verified", "page_reached", "field_submitte
 #: (a window of the app in front, a new page). A fact's state (a field sent, a control selected, a file saved) ends
 #: only the last part, where the outcome's own action is the part's last step and its measured report is the check.
 PART_END_KINDS: tuple[str, ...] = ("window_verified", "page_reached")
-
-
-def _input_dict(text: str | None) -> dict[str, Any] | None:
-    """A kept step input (compact JSON, :func:`input_summary`) back as a dict; ``None`` when it was clipped or is not
-    JSON (a fixed machine format: no guessing)."""
-    try:
-        got = json.loads(text or "{}")
-    except (TypeError, ValueError):
-        return None
-    return got if isinstance(got, dict) else None
-
-
-def executable_step(s: RunStep | dict[str, Any], *, slot: str | None = None, literal_ok: bool = True
-                    ) -> dict[str, Any] | None:
-    """One trace step that ran ok as a skill step: ``{"do", "role", "name", "keys", "url", "app", "direction",
-    "slot"}`` (only the fields its ``do`` uses), or ``None`` when the talker's hands cannot do it as it is (a tool they
-    do not have, a control with no name, a scroll by pixels, an input clipped in the trace).
-
-    Targets are a control's role and visible name, keys by name, an app by name; **never a window number, element id
-    or coordinate** (those were never kept in the input). Typed text is never kept: a type step names the slot it fills
-    from the user's words (``slot``; ``""`` = their words). An address is kept only when ``literal_ok`` (a procedure
-    with no slots: nothing in it changes from one request to the next). Machine fields only; no text is judged."""
-    if isinstance(s, RunStep):
-        tool, kind, ok, verdict, inp, app = s.tool, s.kind, s.ok, s.verdict, _input_dict(s.input), s.app
-    else:
-        tool, kind, ok, verdict = s.get("tool"), s.get("kind"), s.get("ok"), s.get("verdict")
-        raw = s.get("input")
-        inp, app = (raw if isinstance(raw, dict) else _input_dict(raw)), s.get("app")
-    if kind != "action" or not ok or verdict is False or inp is None:
-        return None
-    tool = str(tool or "")
-    do = str(inp.get("do") or "")   # a skill run's own step kept as it was written
-    if do not in SKILL_DOS:
-        do = {"click": "click", "type_text": "type", "type": "type", "hotkey": "keys", "press_keys": "keys",
-              "press": "keys", "launch_app": "open_app", "open_app": "open_app", "open_url": "open_url",
-              "scroll": "scroll"}.get(tool, "")
-    if not do:
-        return None
-
-    def clip(v: Any) -> str:
-        return _clip(_redact(v), RUN_FIELD_CHARS)
-
-    if do == "click":
-        name = clip(inp.get("name"))
-        return {"do": "click", "role": clip(inp.get("role")), "name": name} if name else None
-    if do == "type":
-        return {"do": "type", "slot": _clip(slot or "", 40)}
-    if do == "keys":
-        keys = inp.get("keys")
-        if not isinstance(keys, list) and inp.get("key"):
-            if int(inp.get("times") or 1) != 1:
-                return None   # one key several times is no single combination
-            keys = [inp.get("key")]
-        keys = [clip(k).casefold() for k in (keys or []) if clip(k)]
-        return {"do": "keys", "keys": keys[:4]} if 1 <= len(keys) <= 4 else None
-    if do == "open_app":
-        name = clip(inp.get("name") or inp.get("query") or app)
-        if not name:
-            return None
-        # appOpen: the program a launcher started for it (the hand's watched step, its own window verified: the step's
-        # app), kept when it is not just the name again, so launch_app recognises it next time
-        image = app_key(str(inp.get("image") or (app if verdict is True and inp.get("watch") else "") or "")) or ""
-        keep_image = bool(image) and app_key(name) != image
-        return {"do": "open_app", "name": name, **({"app": clip(image)} if keep_image else {})}
-    if do == "open_url":
-        url = clip(inp.get("url"))
-        if not url or not literal_ok:
-            return None
-        return {"do": "open_url", "url": url, **({"app": clip(inp.get("app"))} if inp.get("app") else {})}
-    if do == "pick":
-        # capC4: a skill run's own pick step, kept as it ran (the container, the item's role, its name's digest or the
-        # slot it was matched by; never the item's name)
-        step = _clean_step({**inp, "do": "pick", **({"slot": _clip(slot, 40)} if slot else {})})
-        return step
-    direction = str(inp.get("direction") or "").casefold()
-    return {"do": "scroll", "direction": direction} if direction in ("up", "down") else None
 
 
 def _clean_step(s: Any, *, allow: Sequence[str] = SKILL_DOS) -> dict[str, Any] | None:
@@ -951,9 +699,7 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
             return None
         return _clean_step({"do": "click", "role": role, "name": name, **({"aid": aid} if aid else {})})
     if kind == "keys":
-        from yuki.memory.trace_habits import chord_keys
-
-        keys = chord_keys(row.get("chord"))
+        keys = [k.strip().casefold() for k in str(row.get("chord") or "").split("+") if k.strip()]
         return {"do": "keys", "keys": [_clip(k, 30) for k in keys][:4]} if keys and len(keys) <= 4 else None
     if kind in ("type", "paste"):
         return {"do": "type", "slot": _clip(slot or "", 40)}
@@ -970,37 +716,6 @@ def demo_step(row: dict[str, Any], name: str | None, *, slot: str = "", aid: str
         direction = str(row.get("chord") or "").casefold()   # the trace keeps a wheel's direction as its chord
         return {"do": "scroll", "direction": direction} if direction in ("up", "down") else None
     return None
-
-
-#: lBrain (live test 17 Oct): the learner never learns from the live test harness's runs (:mod:`yuki.memory.testtag`:
-#: their session id, or the tag in their run key). They stay as they are (``pending``), in the query's own filter, so
-#: they never take a real run's slot. Live lookups (:func:`control_record`) still read them.
-def _real_runs_sql() -> str:
-    from yuki.memory.testtag import sql_real_run
-
-    return sql_real_run()
-
-
-def pending_runs(store: Store, *, limit: int = 20) -> list[RunHeader]:
-    """Runs waiting for the learner, oldest first (never a live test's: :func:`_real_runs_sql`)."""
-    rows = store._query("SELECT * FROM runs WHERE step=0 AND learn='pending' AND " + _real_runs_sql()
-                        + " ORDER BY at LIMIT ?", (int(limit),))
-    return [_header(store, r) for r in rows]
-
-
-def set_learned(store: Store, key: str, state: str, note: str | None = None, *, now: float | None = None) -> None:
-    store._write(lambda conn: conn.execute(
-        "UPDATE runs SET learn=?, learn_at=?, learn_note=? WHERE run_key=? AND step=0",
-        (state, _now(now), _clip(note, 300) or None, key)))
-
-
-def runs_between(store: Store, since: float, until: float | None = None) -> list[RunHeader]:
-    """Run heads in ``[since, until)``, oldest first; never a live test's (:func:`_real_runs_sql`)."""
-    sql, params = "SELECT * FROM runs WHERE step=0 AND " + _real_runs_sql() + " AND at >= ?", [float(since)]
-    if until is not None:
-        sql += " AND at < ?"
-        params.append(float(until))
-    return [_header(store, r) for r in store._query(sql + " ORDER BY at", params)]
 
 
 # ---------------------------------------------------------------------------
@@ -1172,88 +887,12 @@ def _insert_event(conn: Any, store: Store, pid: int, type_: str, at: float, run_
          store._enc(json.dumps(refs, ensure_ascii=False, default=str)) if refs is not None else None))
 
 
-def _clean_obj(obj: dict[str, Any]) -> dict[str, Any]:
-    kind = str(obj.get("kind") or "")
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}")
-    intent = _clip(obj.get("intent"), 120)
-    if not intent:
-        raise ValueError("intent is empty")
-    body = dict(obj.get("body") or {})
-    if kind == "procedure":
-        body["steps"] = [_clip(_redact(s), STEP_CHARS) for s in (body.get("steps") or []) if str(s).strip()][
-            :MAX_PROC_STEPS]
-        body["slots"] = [_clip(s, 40) for s in (body.get("slots") or []) if str(s).strip()][:6]
-        run = clean_run(body.pop("run", None))
-        if run:
-            body["run"] = run
-        parts = clean_parts(body.pop("parts", None))   # capC4: a demo way's parts, validated again
-        if parts:
-            body["parts"] = parts
-    else:
-        body.pop("run", None)
-        body.pop("parts", None)
-    for k in ("text", "instead", "default"):
-        if body.get(k) is not None:
-            body[k] = _clip(_redact(body[k]), BODY_CHARS)
-    apps = sorted({k for k in (app_key(a) for a in (obj.get("apps") or [])) if k})
-    return {"kind": kind, "intent": intent, "apps": apps,
-            "entities": [_clip(e, 80) for e in (obj.get("entities") or []) if str(e).strip()][:6],
-            "body": body, "avoid": _clip(_redact(obj.get("avoid")), 300) or None,
-            "family": _clip(_redact(obj.get("family")), 300) or None, "origin": str(obj.get("origin") or "run"),
-            "sources": list(obj.get("sources") or [])[:12]}
-
-
-def add_playbook(store: Store, obj: dict[str, Any], *, events: Sequence[dict[str, Any]] = (),
-                 vector: np.ndarray | None = None, embed_model: str | None = None, supersedes: int | None = None,
-                 now: float | None = None) -> int:
-    """Write one practice object (a new version of ``supersedes`` when given: that one is retired, its ledger moves to
-    the new version, and a ``superseded`` event marks it) with its evidence events (``{"type", "run_key", "refs",
-    "at"}``), then compute its confidence and state. Returns the new id."""
-    now = _now(now)
-    o = _clean_obj(obj)
-    enc = store._enc
-
-    def op(conn: Any) -> int:
-        pid = int(conn.execute(
-            "INSERT INTO playbooks(kind, intent_ciphertext, apps, entities_ciphertext, body_ciphertext,"
-            " avoid_ciphertext, family_ciphertext, origin, sources_ciphertext, state, valid_from, created_at,"
-            " updated_at) VALUES (?,?,?,?,?,?,?,?,?,'candidate',?,?,?)",
-            (o["kind"], enc(o["intent"]), json.dumps(o["apps"]), enc(json.dumps(o["entities"], ensure_ascii=False)),
-             enc(json.dumps(o["body"], ensure_ascii=False)), enc(o["avoid"]) if o["avoid"] else None,
-             enc(o["family"]) if o["family"] else None, o["origin"],
-             enc(json.dumps(o["sources"], ensure_ascii=False, default=str)), now, now, now)).lastrowid)
-        if vector is not None:
-            v = np.asarray(vector, dtype=np.float32).ravel()
-            norm = float(np.linalg.norm(v)) or 1.0
-            conn.execute("INSERT INTO playbook_vec(playbook_id, model, dim, vec_ciphertext) VALUES (?,?,?,?)",
-                         (pid, embed_model or "unknown", int(v.shape[0]),
-                          store.cipher.encrypt_bytes((v / norm).astype(np.float32).tobytes())))
-        if supersedes is not None:
-            old = conn.execute("SELECT id FROM playbooks WHERE id=? AND valid_to IS NULL", (int(supersedes),)).fetchone()
-            if old is not None:
-                conn.execute("UPDATE playbooks SET valid_to=?, superseded_by=?, state='retired', updated_at=?"
-                             " WHERE id=?", (now, pid, now, int(supersedes)))
-                conn.execute("UPDATE playbook_events SET playbook_id=? WHERE playbook_id=?", (pid, int(supersedes)))
-                _insert_event(conn, store, int(supersedes), "superseded", now, None, {"by": pid})
-        for e in events:
-            type_ = str(e.get("type") or "")
-            if type_ in EVENT_TYPES:
-                _insert_event(conn, store, pid, type_, float(e.get("at") or now), e.get("run_key"), e.get("refs"))
-        return pid
-
-    pid = store._write(op)
-    recompute(store, [pid], now=now)
-    return pid
-
-
 def add_events(store: Store, events: Sequence[dict[str, Any]], *, now: float | None = None) -> int:
     """Append ledger events (``{"playbook_id", "type", "run_key", "refs", "at"}``) to live objects and recompute them."""
     now = _now(now)
     good = [e for e in events if str(e.get("type") or "") in EVENT_TYPES and isinstance(e.get("playbook_id"), int)]
     if not good:
         return 0
-    good += mark_demo_successes(store, good, now=now)
 
     def op(conn: Any) -> int:
         n = 0
@@ -1267,133 +906,6 @@ def add_events(store: Store, events: Sequence[dict[str, Any]], *, now: float | N
     n = store._write(op)
     recompute(store, sorted({int(e["playbook_id"]) for e in good}), now=now)
     return n
-
-
-def mark_demo_successes(store: Store, events: Sequence[dict[str, Any]], *, now: float) -> list[dict[str, Any]]:
-    """capC4 (decision D3, review F1): the ``succeeded`` marks to add beside these events. A ``ran_ok`` on a way learned
-    from what the user did (its ledger has a demo learner's ``demonstrated`` event) proves it only when that run is a
-    verified success by its own trace (:func:`verified_run`: it ended done and its last action's effect was seen) - a
-    label alone (a post-mortem's "ok") never does. Measured, no model; one mark a way and run."""
-    out: list[dict[str, Any]] = []
-    seen: set[tuple[int, str]] = set()
-    for e in events:
-        key = str(e.get("run_key") or "")
-        pid = int(e["playbook_id"])
-        if e.get("type") != "ran_ok" or not _run_evidence(key) or (pid, key) in seen:
-            continue
-        seen.add((pid, key))
-        try:
-            demo = store._query("SELECT 1 FROM playbook_events WHERE playbook_id=? AND type='demonstrated' AND"
-                                " substr(run_key, 1, ?) = ? LIMIT 1", (pid, len(DEMO_RUN_PREFIX), DEMO_RUN_PREFIX))
-            if not demo:
-                continue
-            done = store._query("SELECT 1 FROM playbook_events WHERE playbook_id=? AND type='succeeded' AND run_key=?"
-                                " LIMIT 1", (pid, key))
-            if done or not verified_run(store, key):
-                continue
-            how = demo_run_reached(store, pid, key)
-            if how is None:
-                continue
-        except Exception:  # noqa: BLE001 - no proof read: no mark
-            continue
-        out.append({"playbook_id": pid, "type": "succeeded", "run_key": key, "at": float(e.get("at") or now),
-                    "refs": {"via": f"Yuki's run used your way and {how}"}})
-    return out
-
-
-def _same_demo_step(way: dict[str, Any], ran: dict[str, Any]) -> bool:
-    """Whether a run's executed step (its kept input, a skill run's own ``do``) is the way's stored step: strings
-    compared with strings, keys as a set; a type step's text is the request's, so any typing is that step."""
-    do = way.get("do")
-    if do != ran.get("do"):
-        return False
-    if do == "click":
-        return _words_cf(way.get("name")) == _words_cf(ran.get("name")) and (
-            not way.get("role") or not ran.get("role") or _words_cf(way.get("role")) == _words_cf(ran.get("role")))
-    if do == "keys":
-        return {str(k).casefold() for k in way.get("keys") or []} == {str(k).casefold() for k in ran.get("keys") or []}
-    if do == "pick":
-        box_w = way.get("in") if isinstance(way.get("in"), dict) else {}
-        box_r = ran.get("in") if isinstance(ran.get("in"), dict) else {}
-        return _words_cf(box_w.get("role")) == _words_cf(box_r.get("role")) and (
-            str(way.get("item") or "") == str(ran.get("item") or ""))
-    if do == "open_app":
-        return _words_cf(way.get("name")) == _words_cf(ran.get("name"))
-    if do == "open_url":
-        return _words_cf(way.get("url")).rstrip("/") == _words_cf(ran.get("url")).rstrip("/")
-    if do == "scroll":
-        return str(way.get("direction") or "") == str(ran.get("direction") or "")
-    return do == "type"
-
-
-def _words_cf(value: Any) -> str:
-    return " ".join(str(value or "").split()).casefold()
-
-
-def demo_run_reached(store: Store, pid: int, key: str) -> str | None:
-    """Second verification V6 (decision D3: "1 of Yuki's own runs used it and verified the outcome"): how one of
-    Yuki's runs that cited a way learned from what the user did proves it, or ``None`` when it does not. Either the
-    action trace shows that run (its own rows, source ``yuki``, its run key) reaching a standing demo's checked outcome
-    kind on the same target (its keyed target signature), or the run's executed steps are the way's runnable steps, in
-    order (only its first steps that open an app or a page may be left out: the screen was already past them). A run
-    that cited it and verified something else proves nothing. Machine fields only."""
-    from yuki.memory import trace_demos as TD
-    from yuki.memory import trace_tasks as T
-
-    events = ledger(store, pid)
-    gone = demo_withdrawals(events)
-    standing = {str(e.run_key) for e in events if e.type == "demonstrated" and str(e.run_key or "").startswith(
-        DEMO_RUN_PREFIX) and str(e.run_key) not in gone}
-    if not standing:
-        return None
-    wanted: set[tuple[str, str]] = set()
-    for r in store._query("SELECT run_key, refs_ciphertext FROM playbook_events WHERE playbook_id=? AND"
-                          " type='demonstrated'", (int(pid),)):
-        if str(r["run_key"]) not in standing or not r["refs_ciphertext"]:
-            continue
-        try:
-            refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
-        except (TypeError, ValueError):
-            continue
-        if isinstance(refs, dict) and refs.get("fact") and refs.get("target"):
-            wanted.add((str(refs["fact"]), str(refs["target"])))
-    try:
-        rows = store._query("SELECT process, page_key, element_key, file_digest, facts FROM ui_actions WHERE run_key=?"
-                            " AND source='yuki'", (key,))
-    except Exception:  # noqa: BLE001 - a database before the action trace
-        rows = []
-    for r in rows:
-        facts = TD.facts_of(dict(r))
-        for fact, target in wanted:
-            value = facts.get(fact)
-            if value is None or value is False:
-                continue
-            if TD.target_sig(store, fact, T._target(fact, dict(r), value)) == target:   # noqa: SLF001 - one rule
-                return "the action trace shows it reached the same checked outcome"
-    o = get(store, pid)
-    if o is None:
-        return None
-    way = [s for p in o.parts for s in p.get("run") or []] or list(o.run)
-    if not way or any(s.get("do") not in SKILL_DOS for s in way):
-        return None
-    ran = []
-    for s in run_steps(store, key):
-        if s.kind != "action" or not s.ok or s.verdict is False:
-            continue
-        inp = _input_dict(s.input)
-        if inp and inp.get("do"):
-            ran.append(inp)
-
-    def covers(need: list[dict[str, Any]]) -> bool:
-        it = iter(ran)
-        return all(any(_same_demo_step(w, r) for r in it) for w in need)
-
-    for k in range(len(way)):
-        if k and way[k - 1].get("do") not in ("open_app", "open_url"):
-            break
-        if covers(way[k:]):
-            return "it ran your way's own steps, its last action verified"
-    return None
 
 
 @dataclass
@@ -1530,20 +1042,6 @@ def evaluate(kind: str, events: Sequence[Any], *, created_at: float, now: float 
             "demos": demo_best, "demo_targets": len(demo_groups), "trial": demo_seen and not settled}
 
 
-def demo_key(task_id: int, target_sig: str) -> str:
-    """The run key of a demo learner's ``demonstrated`` event (:data:`DEMO_RUN_PREFIX`)."""
-    return f"{DEMO_RUN_PREFIX}{int(task_id)}:{target_sig}"
-
-
-def demo_task(key: Any) -> int | None:
-    """The task id a demo run key rests on, or ``None`` for any other key."""
-    text = str(key or "")
-    if not text.startswith(DEMO_RUN_PREFIX):
-        return None
-    head = text[len(DEMO_RUN_PREFIX):].partition(":")[0]
-    return int(head) if head.isdigit() else None
-
-
 def demo_withdrawals(events: Sequence[Any]) -> set[str]:
     """The demo run keys whose latest Day-page mark is a withdrawal (``demo_withdrawn`` after any ``demo_restored``)."""
     state: dict[str, bool] = {}
@@ -1591,13 +1089,6 @@ def recompute(store: Store, ids: Iterable[int], *, now: float | None = None) -> 
     return out
 
 
-def refresh(store: Store, *, now: float | None = None) -> int:
-    """Recompute every live object (decay moves with the clock; the practice worker runs it daily). Returns the
-    number recomputed."""
-    ids = [o.id for o in live(store, include_disabled=True)]
-    return len(recompute(store, ids, now=now))
-
-
 # ---------------------------------------------------------------------------
 # What is learned: only a success (appLearn, 4 Oct)
 # ---------------------------------------------------------------------------
@@ -1606,19 +1097,6 @@ def refresh(store: Store, *, now: float | None = None) -> int:
 def _run_evidence(key: Any) -> bool:
     """A real run's key (not the know-how migration's own, nor the clean-up pass's)."""
     return bool(key) and not str(key).startswith((MIGRATION_RUN_PREFIX, CLEAN_RUN_PREFIX, DEMO_RUN_PREFIX))
-
-
-def learned_way(kind: str, events: Sequence[Any]) -> bool:
-    """Whether an object counts as something Yuki learned to do - shown on the Playbook page and to the brain as a way:
-    a procedure or habit that either rests on a success (:data:`SUCCESS_EVENTS`) or was not learned from a run at all
-    (the miner's habits from what the user does, know-how carried over, the user's own words). A way learned from a run
-    (an ``observed`` event with a run's key) without a success is not one: a failed or stopped run never makes a way.
-    Pitfalls and style notes are never ways."""
-    if kind not in WAY_KINDS:
-        return False
-    if any(e.type in SUCCESS_EVENTS for e in events):
-        return True
-    return not any(e.type == "observed" and _run_evidence(e.run_key) for e in events)
 
 
 def verified_run(store: Store, key: str) -> bool:
@@ -1657,37 +1135,7 @@ def judged_ok(store: Store, key: str) -> bool | None:
     if learn != "done":
         return None
     mode, _sep, outcome = note.partition(": ")
-    ok = outcome in WORKED_OUTCOMES if mode == "postmortem" else outcome not in WRONG_OUTCOMES
-    # a run judged before the learner noted its full verdict (a post-mortem the model labelled worked, whose lesson
-    # quotes the user's correction) is still a corrected run: it never makes a way
-    return ok and not corrected_by_quote(store, key)
-
-
-def corrected_by_quote(store: Store, key: str) -> bool:
-    """Whether a lesson written from this run quotes the user's correction of it (their next words after it, or words
-    they added while it ran): the measured half of the learner's correction test
-    (:func:`yuki.memory.practice_learn.corrected_run`), read back from the ledger (a lesson's ``taught`` event keeps
-    its quote). One indexed read; the follow-ups only when such a quote exists."""
-    rows = store._query("SELECT e.refs_ciphertext FROM playbook_events e JOIN playbooks p ON p.id = e.playbook_id"
-                        " WHERE e.run_key=? AND e.type='taught' AND p.kind IN (%s)" % ",".join("?" * len(LESSON_KINDS)),
-                        (key, *LESSON_KINDS))
-    quotes = []
-    for r in rows:
-        try:
-            refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
-        except Exception:
-            continue
-        if isinstance(refs, dict) and str(refs.get("quote") or "").strip():
-            quotes.append(str(refs["quote"]))
-    if not quotes:
-        return False
-    h = run_header(store, key)
-    if h is None:
-        return False
-    from yuki.memory import practice_learn as PL
-
-    words = [f["words"] for f in PL.followups(store, h)] + [t for t in (h.note.get("steers") or []) if t]
-    return any(PL.quote_ok(q, words) for q in quotes)
+    return outcome in WORKED_OUTCOMES if mode == "postmortem" else outcome not in WRONG_OUTCOMES
 
 
 def _success_sets(store: Store, ids: Sequence[int]) -> tuple[set[int], set[int], dict[int, float]]:
@@ -1735,174 +1183,9 @@ def _is_way(store: Store, o: Playbook, from_run: set[int], proven: set[int]) -> 
     return _proven_by_trace(store, o.id)
 
 
-def stamp_successes(store: Store, *, run_keys: Sequence[str] | None = None, ok: bool | None = None,
-                    dry_run: bool = False, now: float | None = None) -> list[tuple[int, str]]:
-    """Mark the live ways learned from a run that turned out a verified success (:func:`verified_run`, judged so) with
-    a ``succeeded`` event, so they are shown and announced, and stay so after the run's trace is pruned. ``run_keys``:
-    only those runs (the learner, after reading one: ``ok`` is its own judgement of it); ``None``: every way not marked
-    yet (the daily refresh, and the backfill: ``--stamp-successes``), judged from each run's learn state. Ways already
-    resting on a success are left alone. ``dry_run``: say what would be marked, write nothing. Returns ``[(id, run)]``."""
-    now = _now(now)
-    if run_keys is not None:
-        keys = [k for k in dict.fromkeys(run_keys) if _run_evidence(k)]
-        if not keys:
-            return []
-        rows = store._query("SELECT DISTINCT playbook_id, run_key FROM playbook_events WHERE type='observed' AND"
-                            " run_key IN (%s)" % ",".join("?" * len(keys)), keys)
-        pairs = [(int(r[0]), str(r[1])) for r in rows]
-    else:
-        rows = store._query("SELECT DISTINCT playbook_id, run_key FROM playbook_events WHERE type='observed' AND"
-                            " run_key IS NOT NULL")
-        pairs = [(int(r[0]), str(r[1])) for r in rows if _run_evidence(r[1])]
-    if not pairs:
-        return []
-    ways = {o.id for o in live(store, WAY_KINDS, include_disabled=True)}
-    _from_run, done, _succeeded = _success_sets(store, [pid for pid, _key in pairs if pid in ways])
-    out: list[tuple[int, str]] = []
-    judged: dict[str, bool] = {}
-    for pid, key in pairs:
-        if pid not in ways or pid in done:
-            continue
-        if key not in judged:
-            j = ok if ok is not None else judged_ok(store, key)
-            judged[key] = bool(j) and verified_run(store, key)
-        if judged[key]:
-            out.append((pid, key))
-            done.add(pid)
-    if out and not dry_run:
-        def when(key: str) -> float:
-            # the learner's mark is now (it just read the run); the backfill's is the run's own end, so an old way
-            # marked today is never taken for something a run in progress just taught (the return card's Learned box)
-            if run_keys is not None:
-                return now
-            head = store._query("SELECT at, ended_at FROM runs WHERE run_key=? AND step=0", (key,))
-            return float(head[0]["ended_at"] or head[0]["at"]) if head else now
-
-        add_events(store, [{"playbook_id": pid, "type": "succeeded", "run_key": key, "at": when(key),
-                            "refs": {"via": "the run ended done and its last action verified"}}
-                           for pid, key in out], now=now)
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Cleaning what is saved (appClean, 4 Oct): provenance, the pitfall cap, retiring with a record
 # ---------------------------------------------------------------------------
-
-
-def provenance(store: Store, o: Playbook, events: Sequence[Any] | None = None) -> tuple[str, str]:
-    """Where an object came from, measured from its ledger and its runs' traces (no model): ``(verdict, why)``, the
-    verdict one of :data:`PROVENANCES`.
-
-    A pitfall or style note is a ``lesson`` (judged on its own words, never by this). A way (procedure or habit) is:
-    ``user`` - the user's own word (Save on the Playbook page, a teach-back answer, a quote of theirs it rests on);
-    ``success`` - a run that worked marked it (``succeeded``, ``ran_ok``) or the run it came from is a verified success
-    by its trace that the learner did not judge wrong (:func:`_proven_by_trace`); ``observed`` - not learned from Yuki's
-    runs at all but from what the user does (the nightly miner's days); ``failed`` - learned from runs whose traces are
-    there and none of which was a verified success (failed, stopped, corrected, or done with its last step unverified);
-    ``unconfirmed`` - learned from runs whose traces are gone without ever being marked a success, or carried over from
-    the old know-how notes and never confirmed by a run since (on probation)."""
-    if o.kind not in WAY_KINDS:
-        return "lesson", "a lesson, judged on its own words"
-    events = list(events) if events is not None else ledger(store, o.id)
-    if any(e.type == "user_saved" or (e.type == "taught" and not str(e.run_key or "").startswith(MIGRATION_RUN_PREFIX))
-           for e in events):
-        return "user", "the user's own word (saved, taught or quoted)"
-    if any(e.type in ("succeeded", "ran_ok") for e in events):
-        return "success", "a run that worked marked it"
-    if any(e.type == "demonstrated" and str(e.run_key or "").startswith(DEMO_RUN_PREFIX) for e in events):
-        return "user", "the user did it themselves, with a checked outcome (learned from what they did)"
-    if any(e.type in ("demonstrated", "user_fixed") for e in events):
-        return "user", "the user did it themselves right after Yuki's try did not work, and it worked"
-    keys = list(dict.fromkeys(str(e.run_key) for e in events if e.type == "observed" and _run_evidence(e.run_key)))
-    if keys:
-        if any(verified_run(store, k) and judged_ok(store, k) is not False for k in keys):
-            return "success", "the run it came from is a verified success by its trace"
-        traced = [k for k in keys if store._query("SELECT 1 FROM runs WHERE run_key=? AND step=0", (k,))]
-        if traced:
-            return "failed", f"learned from {len(traced)} run(s) whose traces show no verified success"
-        return "unconfirmed", "learned from a run that was never marked a success (its trace is gone)"
-    if o.origin in PROBATION_ORIGINS and not confirmed(events):
-        return "unconfirmed", "carried over from the old notes, never confirmed by a run"
-    return "observed", "seen in what the user does, not learned from Yuki's runs"
-
-
-def provenance_rank(verdict: str) -> int:
-    """How strongly a kept way stands (merge survivors): the user's word, then a success, then what the user does."""
-    return {"user": 3, "success": 2, "observed": 1}.get(verdict, 0)
-
-
-def pitfall_rank(store: Store, o: Playbook, events: Sequence[Any] | None = None) -> tuple:
-    """A pitfall's standing for the per-app cap (measured): the user's own words in it first, then confidence, then
-    evidence, then the newest evidence."""
-    events = list(events) if events is not None else ledger(store, o.id)
-    taught = any(e.type == "taught" and not str(e.run_key or "").startswith(MIGRATION_RUN_PREFIX) for e in events)
-    return (1 if taught else 0, float(o.confidence or 0.0), int(o.n_observed or 0), float(o.last_evidence_at or 0.0),
-            int(o.id))
-
-
-def pitfall_overflow(store: Store, pitfalls: Sequence[Playbook], *, cap: int = PITFALLS_PER_APP) -> list[int]:
-    """The pitfalls past the cap of their apps (code): strongest first (:func:`pitfall_rank`), each kept while every app
-    it names (or "no app") still has room. Returns the ids to retire, weakest last."""
-    ranked = sorted(pitfalls, key=lambda o: pitfall_rank(store, o), reverse=True)
-    room: Counter = Counter()
-    out = []
-    for o in ranked:
-        apps = list(o.apps) or [""]
-        if all(room[a] < cap for a in apps):
-            for a in apps:
-                room[a] += 1
-        else:
-            out.append(o.id)
-    return out
-
-
-def retire_cleaned(store: Store, items: Sequence[dict[str, Any]], *, run_key: str,
-                   now: float | None = None) -> list[int]:
-    """Retire live objects bi-temporally (``valid_to``, state retired; a merged one ``superseded_by`` the object it
-    went into), each with a ``cleaned`` ledger event under ``run_key`` (``{"id", "action", "category", "why",
-    "into"}``). Nothing is deleted; :func:`yuki.memory.practice_clean.undo` takes it back. Returns the ids retired."""
-    now = _now(now)
-
-    def op(conn: Any) -> list[int]:
-        done = []
-        for it in items:
-            pid = int(it["id"])
-            into = int(it["into"]) if it.get("into") is not None else None
-            n = conn.execute("UPDATE playbooks SET valid_to=?, state='retired', superseded_by=?, updated_at=?"
-                             " WHERE id=? AND valid_to IS NULL", (now, into, now, pid)).rowcount
-            if n:
-                _insert_event(conn, store, pid, "cleaned", now, run_key,
-                              {"action": it.get("action") or "retire", "category": it.get("category"),
-                               "why": it.get("why"), "into": into})
-                done.append(pid)
-        return done
-
-    return store._write(op)
-
-
-def cap_enabled(store: Store) -> bool:
-    """Whether the daily pitfall cap runs (:data:`CLEAN_CHECKPOINT`): only after a clean-up pass was applied and while
-    no undo has come since."""
-    return str(store.source_checkpoint(CLEAN_CHECKPOINT) or "").startswith("applied:")
-
-
-def set_clean_state(store: Store, state: str, run: Any) -> None:
-    """Record a clean-up pass applied (``"applied"``) or a pass / day's cap taken back (``"undone"``)."""
-    store.set_source_checkpoint(CLEAN_CHECKPOINT, f"{state}:{run}")
-
-
-def cap_pitfalls(store: Store, *, cap: int = PITFALLS_PER_APP, dry_run: bool = False,
-                 now: float | None = None) -> list[int]:
-    """The daily pitfall cap (the practice worker's refresh, appClean): live pitfalls past :data:`PITFALLS_PER_APP` per
-    app are retired (code; the weakest first), under the run key ``clean:daily-<day>``. Disabled ones are left alone.
-    Returns the ids retired (or that would be, ``dry_run``)."""
-    now = _now(now)
-    over = pitfall_overflow(store, live(store, ["pitfall"]), cap=cap)
-    if over and not dry_run:
-        retire_cleaned(store, [{"id": i, "action": "retire", "category": "over_cap",
-                                "why": f"more than {cap} pitfalls for its app"} for i in over],
-                       run_key=f"{CLEAN_RUN_PREFIX}daily-{_day(now)}", now=now)
-    return over
 
 
 def live(store: Store, kinds: Sequence[str] | None = None, *, include_disabled: bool = False) -> list[Playbook]:
@@ -1925,383 +1208,9 @@ def get(store: Store, ref: Any) -> Playbook | None:
     return _playbook(store, rows[0]) if rows else None
 
 
-def vectors(store: Store, ids: Sequence[int]) -> dict[int, np.ndarray]:
-    ids = [int(i) for i in ids]
-    if not ids:
-        return {}
-    rows = store._query("SELECT playbook_id, vec_ciphertext FROM playbook_vec WHERE playbook_id IN (%s)"
-                        % ",".join("?" * len(ids)), ids)
-    return {int(r["playbook_id"]): np.frombuffer(store.cipher.decrypt_bytes(r["vec_ciphertext"]), dtype=np.float32)
-            for r in rows}
-
-
-def near(store: Store, vec: np.ndarray | None, *, kinds: Sequence[str] | None = None, limit: int = 8,
-         apps: Sequence[str] = ()) -> list[Playbook]:
-    """Live objects nearest to ``vec`` (cosine in ``score``), best first; objects of ``apps`` come along when there is
-    no vector."""
-    objs = live(store, kinds)
-    if vec is None:
-        keys = {app_key(a) for a in apps if a}
-        return [o for o in objs if set(o.apps) & keys][:limit]
-    q = np.asarray(vec, dtype=np.float32).ravel()
-    q = q / (float(np.linalg.norm(q)) or 1.0)
-    vecs = vectors(store, [o.id for o in objs])
-    scored = []
-    for o in objs:
-        v = vecs.get(o.id)
-        if v is not None and v.shape == q.shape:
-            o.score = float(v @ q)
-            scored.append(o)
-    scored.sort(key=lambda o: -(o.score or 0.0))
-    return scored[:limit]
-
-
 # ---------------------------------------------------------------------------
 # Retrieval by target and intent
 # ---------------------------------------------------------------------------
-
-
-def _tokens(text: Any) -> list[str]:
-    from yuki.memory.contacts import tokens
-
-    return tokens(str(text or ""))
-
-
-def _span_in(needle: Any, hay: Any) -> bool:
-    from yuki.memory.contacts import span_in
-
-    return span_in(needle, hay)
-
-
-def known_apps(store: Store, extra: Sequence[str] = (), *, days: float = 60.0) -> dict[str, set[str]]:
-    """``{app_key: names}`` memory knows an app by: the processes and display names of capture threads seen in the
-    last ``days``, the apps of live practice objects, and ``extra`` (the open windows' process names). Stored strings
-    only."""
-    out: dict[str, set[str]] = {}
-
-    def add(key: Any, name: Any) -> None:
-        k = app_key(str(key or "")) if key else None
-        if not k:
-            return
-        out.setdefault(k, set()).add(k)
-        if name:
-            out[k].add(str(name))
-
-    for a in extra or ():
-        add(a, None)
-    try:
-        cutoff = time.time() - days * 86400.0
-        for r in store._query("SELECT DISTINCT process, app FROM threads WHERE process IS NOT NULL AND last_seen >= ?",
-                              (cutoff,)):
-            add(r["process"], r["app"])
-    except Exception:
-        pass
-    for o in live(store):
-        for a in o.apps:
-            add(a, None)
-    return out
-
-
-def app_name_tokens(store: Store, extra: Sequence[str] = ()) -> list[tuple[str, ...]]:
-    """Every app name memory has stored (:func:`known_apps`), as word tuples, longest first."""
-    names = {tuple(_tokens(n)) for ns in known_apps(store, extra).values() for n in ns}
-    return sorted((n for n in names if n), key=lambda n: (-len(n), n))
-
-
-def strip_apps(text: str | None, names: Sequence[tuple[str, ...]]) -> str:
-    """``text``'s words without the app names in it (whole-word spans equal to stored app names): what is left is the
-    intent. Retrieval matches the *target app* by scope (the apps in play) and the *intent* by meaning; with the app's
-    name in both vectors, any two requests about one app looked alike to the small embedder (measured: "go to the LLM OS
-    tab in Warp" against a Warp window-maximize procedure, 0.64 with the names, 0.30 without; 27-build-C.md §3)."""
-    toks = _tokens(text)
-    out: list[str] = []
-    i = 0
-    while i < len(toks):
-        for n in names:
-            if tuple(toks[i:i + len(n)]) == n:
-                i += len(n)
-                break
-        else:
-            out.append(toks[i])
-            i += 1
-    return " ".join(out)
-
-
-def intent_words(store: Store, text: str | None, extra: Sequence[str] = ()) -> str:
-    """``text`` with app names taken out (:func:`strip_apps`), or ``text`` itself when it names none (so the vector
-    the related memories already made for the same words is reused)."""
-    text = str(text or "")
-    stripped = strip_apps(text, app_name_tokens(store, extra))
-    if stripped == " ".join(_tokens(text)):
-        return text
-    return stripped or text
-
-
-def vector_text(store: Store, intent: str, family: str | None = None, extra: Sequence[str] = ()) -> str:
-    """What an object's vector is made of: its intent and the family it generalises to (so a lesson is found for the
-    whole family, not one wording), app names taken out (:func:`intent_words`)."""
-    return intent_words(store, f"{intent}. {family}" if family else str(intent or ""), extra)
-
-
-def apps_named(store: Store, words: str | None, known: Sequence[str] = ()) -> list[str]:
-    """App keys whose name stands in ``words`` as whole words ("open Chrome", "in Discord"): a check of the user's words
-    against app names memory has stored (capture threads, practice objects, the open windows), never a word list."""
-    if not str(words or "").strip():
-        return []
-    hay = _tokens(words)
-    found = []
-    for key, names in known_apps(store, known).items():
-        if any(_span_in(n, hay) for n in names if _tokens(n)):
-            found.append(key)
-    return sorted(found)
-
-
-def _item(o: Playbook, cosine: float | None, why: str, detail: bool = False) -> dict[str, Any]:
-    out = {"id": o.id, "ref": o.ref, "kind": o.kind, "intent": o.intent, "apps": list(o.apps),
-           "text": o.text(440 if o.kind == "pitfall" else BODY_CHARS),
-           "family": o.family, "state": o.state, "label": o.label(), "confidence": o.confidence,
-           "cosine": None if cosine is None else round(float(cosine), 3), "why": why}
-    if o.kind == "procedure" and o.origin in ("demo", "fixed"):
-        # capC5: taught by the action trace (a demo, or the user's fix after a failure): the A/B switch's scope, and
-        # the skill runner replays it against its recorded path
-        out["trace"] = True
-    if o.demo:
-        # capC4: learned from what the user did; a trial is a hint only (decision D3: never run alone)
-        out["source"] = DEMO_SOURCE
-        out["demo"] = True
-        out["sends"] = bool((o.body or {}).get("sends"))
-        if o.trial:
-            out["trial"] = True
-        if o.hint_only:
-            out["hint_only"] = True   # review F2: never offered to the talker's hands, never run by the skill runner
-    if detail:
-        out.update(o.detail())
-    return out
-
-
-#: capC1b (report 78 §6.3): a way one of whose executable steps is the very step a pitfall's failed route took ranks
-#: this much lower. A pitfall lowers rank only: it never takes a way out, never blocks an action.
-PITFALL_RANK = 0.6
-#: A pitfall whose failed route failed again on this many distinct runs (the same element key and app, or the same
-#: step) is shown to the brain as a strong warning (still never a block).
-REPEATED_RUNS = 2
-
-
-def route_step(step: Any) -> tuple | None:
-    """A skill step's identity for comparing it with a pitfall's failed route (capC1b): what it does, the control's
-    role and name, the address, the app it pins and the keys, whitespace folded and casefolded; ``expect`` and slots
-    aside. Equality of machine fields, never a judgement of text."""
-    if not isinstance(step, dict) or not step.get("do"):
-        return None
-    return (str(step["do"]), *(" ".join(str(step.get(k) or "").split()).casefold() for k in ("role", "name", "url",
-                                                                                             "app")),
-            tuple(str(k).strip().casefold() for k in step.get("keys") or ()))
-
-
-def failed_routes(objs: Sequence[Playbook]) -> tuple[set[tuple[str, tuple]], set[str]]:
-    """The failed routes the live pitfalls keep (capC1b, ``body.route``): ``({(the route's app as an app key, its step
-    as :func:`route_step`)}, their element keys)`` (second verification V6: a route failed in one app, never in every
-    app)."""
-    steps: set[tuple[str, tuple]] = set()
-    keys: set[str] = set()
-    for o in objs:
-        route = (o.body or {}).get("route") if o.kind == "pitfall" else None
-        if not isinstance(route, dict):
-            continue
-        sig = route_step(route.get("step"))
-        if sig is not None:
-            steps.add((app_key(str(route.get("app") or "")) or "", sig))
-        keys.update(str(k) for k in route.get("element_keys") or [] if k)
-    return steps, keys
-
-
-def takes_failed_route(o: Playbook, bad_steps: set[tuple[str, tuple]]) -> bool:
-    """Whether one of a procedure's executable steps is a route that failed (:func:`failed_routes`) in an app it is
-    for: the route's app is one of the way's apps, or the step pins that app (a route kept without an app counts in
-    any). A way learned from the user's own actions (``body.trace``, the correction learner's) never is: its own
-    evidence is the user taking that step to the very state it was for (second verification V5)."""
-    if not bad_steps or o.kind != "procedure" or (o.body or {}).get("trace"):
-        return False
-    apps = {k for k in (app_key(str(a)) for a in o.apps or ()) if k}
-    for s in o.run:
-        sig = route_step(s)
-        if sig is None:
-            continue
-        pinned = app_key(str(s.get("app") or "")) if isinstance(s, dict) else ""
-        for app, bad in bad_steps:
-            if bad == sig and (not app or app in apps or app == pinned):
-                return True
-    return False
-
-
-def relevant(store: Store, *, query_vec: np.ndarray | None, apps_in_play: Sequence[str] = (),
-             now: float | None = None, ways: int = MAX_WAYS, habits: int = MAX_HABITS,
-             pitfalls: int = MAX_PITFALLS, detail: bool = False, go_tos: bool = True,
-             paths: bool | None = None) -> dict[str, Any]:
-    """What practice memory holds for one request: ``{"ways": [...], "pitfalls": [...], "go_tos": [...], "apps": [...],
-    "ms"}``.
-
-    *Ways* (procedures, then at most ``habits`` habit or style note) clear a similarity floor to the request's words:
-    :data:`WAY_APP_MIN_COSINE` when scoped to an app in play, else :data:`WAY_MIN_COSINE`; without the words' vector
-    none come (no unranked filler). *Pitfalls* of an app in play always come (nearest the words first, then the most
-    confident); others clear :data:`PITFALL_MIN_COSINE`. Ranked by cosine scaled by confidence. Disabled, retired and
-    superseded objects never come, nor a way learned from a run that did not succeed (:func:`learned_way`: a failed
-    method is never offered as the way to do it; what failed comes as a pitfall).
-
-    capC1b (report 78 §6.3-6.4): a way that takes the very step a pitfall's failed route took ranks
-    :data:`PITFALL_RANK` lower (``lowered``), never out; a pitfall whose route failed on :data:`REPEATED_RUNS` runs or
-    more carries ``warning: "strong"`` and ``repeats``. *Go-tos* (``go_tos``, :func:`yuki.memory.trace_habits.go_tos`):
-    for the apps in play in the order given (named ones first), the user's top elements and chords from the action
-    trace, counted by code; names only as the element registry keeps them; ``detail`` gives more.
-
-    capC2 (report 78 §6.4): ``path`` (the nearest family's usual path, at most 8 steps worded from kept names only, or
-    ``None``) and ``example`` (one trimmed past task of that family, or ``None``), from
-    :func:`yuki.memory.trace_families.hints` with the ways' own similarity floors; ``detail`` gives more. ``paths``
-    (default: as ``go_tos``, so the talker, which asks for no go-tos, gets neither)."""
-    started = time.perf_counter()
-    now = _now(now)
-    in_play = sorted({k for k in (app_key(a) for a in apps_in_play or ()) if k})
-    order = [k for k in dict.fromkeys(app_key(a) for a in apps_in_play or () if a) if k]
-    from yuki.memory import trace_replay
-
-    # capC5 (report 78 §7): the A/B switch, read live; off is today's Yuki without what the action trace taught (no
-    # demo or fix ways, no go-tos, no usual paths or examples)
-    learned = trace_replay.use_learned()
-    if not learned:
-        go_tos, paths = False, False
-    objs = [o for o in live(store) if learned or not trace_replay.from_trace(o.origin, o.body)]
-    bad_steps, bad_keys = failed_routes(objs)
-    lowered: set[int] = set()
-    from_run, proven, _succeeded = _success_sets(store, [o.id for o in objs if o.kind in WAY_KINDS])
-    q = None
-    if query_vec is not None:
-        q = np.asarray(query_vec, dtype=np.float32).ravel()
-        q = q / (float(np.linalg.norm(q)) or 1.0)
-    vecs = vectors(store, [o.id for o in objs]) if q is not None else {}
-
-    def cos(o: Playbook) -> float | None:
-        v = vecs.get(o.id)
-        return float(v @ q) if q is not None and v is not None and v.shape == q.shape else None
-
-    def rank(c: float | None, o: Playbook) -> float:
-        conf = float(o.confidence if o.confidence is not None else 0.5)
-        return (c if c is not None else 0.0) * (1.0 - CONFIDENCE_RANK + CONFIDENCE_RANK * conf)
-
-    way_hits: list[tuple[float, Playbook, float, str]] = []
-    habit_hits: list[tuple[float, Playbook, float, str]] = []
-    pit_hits: list[tuple[tuple[float, float], Playbook, float | None, str]] = []
-    hint_at_once = demo_rules()["hint"] == "at_once"
-    for o in objs:
-        if o.state == "probation":   # migrated know-how: never shown until a successful run confirms it
-            continue
-        c = cos(o)
-        hit = bool(set(o.apps) & set(in_play))
-        if o.kind == "pitfall":
-            if hit:
-                pit_hits.append(((1.0, rank(c, o) or float(o.confidence or 0.0)), o, c,
-                                 f"its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"))
-            elif c is not None and c >= PITFALL_MIN_COSINE:
-                pit_hits.append(((0.0, rank(c, o)), o, c, f"near the words (cosine {c:.2f})"))
-            continue
-        if c is None:
-            continue
-        floor = WAY_APP_MIN_COSINE if hit else WAY_MIN_COSINE
-        if c < floor:
-            continue
-        if o.kind in WAY_KINDS and not _is_way(store, o, from_run, proven):
-            continue
-        if o.trial and not hint_at_once:
-            continue   # review F6: the user's [trace] learn_demo_hint holds a demo seen once back until it is a way
-        why = f"cosine {c:.2f}" + (f", its app is in play ({', '.join(sorted(set(o.apps) & set(in_play)))})"
-                                   if hit else "")
-        score = rank(c, o)
-        if takes_failed_route(o, bad_steps):
-            score *= PITFALL_RANK
-            lowered.add(o.id)
-            why += "; one of its steps is a route that failed before (ranked lower, still allowed)"
-        (way_hits if o.kind == "procedure" else habit_hits).append((score, o, c, why))
-    hint: dict[str, Any] = {}
-    if go_tos if paths is None else paths:
-        from yuki.memory import trace_families
-
-        hint = trace_families.hints(store, q, order, floor=WAY_MIN_COSINE, app_floor=WAY_APP_MIN_COSINE,
-                                    detail=detail, now=now)
-    # capC4 (report 78 §6.4, §7): the nearest family's way (family -> path -> playbook) comes along when its own
-    # words did not bring it, then a way comes before a trial (a hint), and a way shown makes the path redundant
-    family_pid = _family_playbook(store, hint.pop("family_id", None))
-    if family_pid is not None and all(o.id != family_pid for _r, o, _c, _w in way_hits):
-        linked = next((o for o in objs if o.id == family_pid and o.kind == "procedure" and o.state != "probation"
-                       and (hint_at_once or not o.trial) and _is_way(store, o, from_run, proven)), None)
-        if linked is not None:
-            c = cos(linked)
-            way_hits.append((rank(c if c is not None else WAY_APP_MIN_COSINE, linked), linked, c,
-                             "the way of your usual path for this"))
-    # capC5: a way whose runs by the skill runner keep stopping off its recorded path ranks lower, never out
-    deviated = trace_replay.deviations(store, [o.id for _r, o, _c, _w in way_hits], now=now) if way_hits else {}
-    if deviated:
-        way_hits = [(score * trace_replay.deviation_factor(deviated.get(o.id, 0)), o, c,
-                     why + (f"; its last {deviated[o.id]} run(s) stopped off its path (ranked lower, still allowed)"
-                            if deviated.get(o.id) else "")) for score, o, c, why in way_hits]
-    way_hits.sort(key=lambda x: (x[1].trial, -x[0]))
-    habit_hits.sort(key=lambda x: -x[0])
-    pit_hits.sort(key=lambda x: (-x[0][0], -int(_repeats(x[1]) >= REPEATED_RUNS), -x[0][1]))
-    out_ways = [_item(o, c, why, detail) for _r, o, c, why in way_hits[:ways]]
-    if family_pid is not None and any(w["id"] == family_pid and not w.get("trial") for w in out_ways) and \
-            isinstance(hint.get("path"), dict):
-        hint["path"] = None
-    for item in out_ways:
-        if item["id"] in lowered:
-            item["lowered"] = True
-        if deviated.get(item["id"]):
-            item["deviations"] = int(deviated[item["id"]])
-    out_ways += [_item(o, c, why, detail) for _r, o, c, why in habit_hits[:habits]]
-    out_pits = []
-    for _r, o, c, why in pit_hits[:pitfalls]:
-        item = _item(o, c, why, detail)
-        n = _repeats(o)
-        if n:
-            item["repeats"] = n
-            if n >= REPEATED_RUNS:
-                item["warning"] = "strong"
-        out_pits.append(item)
-    out = {"ways": out_ways, "pitfalls": out_pits, "apps": in_play, "objects": len(objs)}
-    if go_tos:
-        from yuki.memory import trace_habits
-
-        out["go_tos"] = trace_habits.go_tos(store, order, now=now, detail=detail, lower=bad_keys)
-    out.update(hint)
-    out["ms"] = round((time.perf_counter() - started) * 1000, 2)
-    return out
-
-
-def _family_playbook(store: Store, family_id: Any) -> int | None:
-    """capC4: the playbook a family of the user's tasks is linked to (``ui_families.playbook_id``, written by the demo
-    learner), or ``None``. Review F9: when that version was replaced since (a later run's update, the clean-up pass, a
-    user's edit), the link follows ``superseded_by`` to the live version."""
-    if family_id is None:
-        return None
-    try:
-        rows = store._query("SELECT playbook_id FROM ui_families WHERE id = ?", (int(family_id),))
-        pid = int(rows[0][0]) if rows and rows[0][0] is not None else None
-        for _hop in range(16):
-            if pid is None:
-                return None
-            got = store._query("SELECT valid_to, superseded_by FROM playbooks WHERE id = ?", (pid,))
-            if not got:
-                return None
-            if got[0][0] is None:
-                return pid
-            pid = int(got[0][1]) if got[0][1] is not None else None
-    except Exception:
-        return None
-    return None
-
-
-def _repeats(o: Playbook) -> int:
-    """How many runs failed by a pitfall's failed route (capC1b: one ``observed`` event per failing run); 0 for a
-    pitfall without a route."""
-    route = (o.body or {}).get("route") if o.kind == "pitfall" else None
-    return int(o.n_observed or 0) if isinstance(route, dict) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2441,27 +1350,6 @@ def workflow_edit(store: Store, ref: Any, action: str, words: str = "", *, now: 
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def pending_edits(store: Store) -> list[tuple[Playbook, str, float]]:
-    """``(object, the user's words, when)`` for each edit asked on the Playbook page and not applied yet."""
-    out = []
-    for o in live(store, include_disabled=True):
-        rows = store._query("SELECT type, at, refs_ciphertext FROM playbook_events WHERE playbook_id=? AND type IN"
-                            " ('user_edit', 'edit_applied') ORDER BY id", (o.id,))
-        last_edit = None
-        for r in rows:
-            if r["type"] == "user_edit":
-                try:
-                    refs = json.loads(store._dec(r["refs_ciphertext"]) or "{}")
-                except (ValueError, TypeError):
-                    refs = {}
-                last_edit = (str(refs.get("words") or ""), float(r["at"]))
-            else:
-                last_edit = None
-        if last_edit and last_edit[0]:
-            out.append((o, last_edit[0], last_edit[1]))
-    return out
-
-
 def launch_identities(store: Store) -> dict[str, list[str]]:
     """What practice memory learned the apps of Start entries run as (appOpen F3): ``{entry name casefolded: [image
     names]}``, from the executable ``open_app`` steps of the live, enabled ways that count as learned
@@ -2485,18 +1373,10 @@ def launch_identities(store: Store) -> dict[str, list[str]]:
     return out
 
 
-__all__ = [
-    "KINDS", "WEIGHTS", "HALF_LIFE_DAYS", "Playbook", "RunHeader", "RunStep", "run_key", "input_summary",
-    "run_signals", "record_run", "record_hand_trace", "run_header", "run_steps", "pending_runs", "set_learned",
-    "add_playbook", "add_events", "evaluate", "recompute", "live", "get", "vectors", "near", "apps_named",
-    "relevant", "workflows", "workflow_edit", "pending_edits", "control_key", "control_record", "control_parts",
-    "executable_step", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS", "learned_way", "verified_run", "judged_ok", "corrected_by_quote",
-    "LEARNED_EVENT_NAME", "signal_learned",
-    "stamp_successes", "provenance", "provenance_rank", "pitfall_rank", "pitfall_overflow", "retire_cleaned",
-    "cap_pitfalls", "PITFALLS_PER_APP", "CLEAN_RUN_PREFIX", "CLEAN_CHECKPOINT", "cap_enabled", "set_clean_state",
-    "launch_identities",
-    # capC4: ways learned from what the user did
-    "TRACE_DOS", "MAX_PARTS", "PICK_DIGEST_CHARS", "END_KINDS", "DEMO_RUN_PREFIX", "DEMO_TIMES", "DEMO_PROVEN_RUNS",
-    "TRIAL_LABEL", "DEMO_SOURCE", "set_demo_rules", "demo_rules", "mark_demo_successes", "PART_END_KINDS", "demo_step", "clean_parts", "clean_end", "runnable_parts", "demo_key", "demo_task",
-    "demo_withdrawals",
-]
+__all__ = ["WEIGHTS", "HALF_LIFE_DAYS", "Playbook", "run_key", "input_summary", "run_signals", "record_run",
+           "record_hand_trace", "add_events", "evaluate", "recompute", "live", "get", "workflows", "workflow_edit",
+           "control_key", "control_record", "control_parts", "clean_run", "SKILL_DOS", "SUCCESS_EVENTS",
+           "verified_run", "judged_ok", "CLEAN_RUN_PREFIX", "launch_identities", "TRACE_DOS", "MAX_PARTS",
+           "PICK_DIGEST_CHARS", "END_KINDS", "DEMO_RUN_PREFIX", "DEMO_TIMES", "DEMO_PROVEN_RUNS", "TRIAL_LABEL",
+           "DEMO_SOURCE", "demo_rules", "PART_END_KINDS", "demo_step", "clean_parts", "clean_end", "runnable_parts",
+           "demo_withdrawals"]
