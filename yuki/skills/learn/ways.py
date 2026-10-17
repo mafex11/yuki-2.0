@@ -732,6 +732,8 @@ def learn(store: Any, *, now: float | None = None, client: Any = None, settings:
         if write:
             c = _write(store, live, old, now=now)
             counts.update(c)
+            if live:
+                counts["evidence"] = int(_import_evidence(store, now=now))
         _emit(log, "ways_pass", **{k: v for k, v in counts.items() if isinstance(v, int)})
         counts["found"] = live
     except Exception as exc:  # noqa: BLE001 - a learner never breaks the nightly pass
@@ -785,6 +787,22 @@ def _write(store: Any, live: Sequence[Way], old: Mapping[str, Mapping[str, Any]]
 
     store._write(op)
     return counts
+
+
+def _import_evidence(store: Any, *, now: float) -> bool:
+    """The user's own checked demonstrations are the replay rung's evidence (``registry.import_evidence``, the intake's
+    pipeline call: ``seed_ok`` 1), so ``app.way``'s rung B is usable before its first run (rung B needs one verified
+    run, its own or imported). Its own runs then count as any rung's: two contradicted done-checks disable it."""
+    try:
+        from yuki.skills import registry
+        from yuki.skills.connection import load
+
+        cap = load().get(CAPABILITY)
+        route = next((r for r in (cap.routes if cap is not None else ()) if r.rung == "B"), None)
+        return bool(route is not None and registry.import_evidence(store, CAPABILITY, route, ok=1,
+                                                                   source=ORIGIN, now=now))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def keep_told(store: Any, *, app: str, spec: Mapping[str, Any], name: str, now: float | None = None) -> str | None:
