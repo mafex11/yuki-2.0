@@ -100,12 +100,11 @@ The personal brief and personal-ness (yuki.memory.brief; written by the nightly 
         # which brief lines and memory items a reply or card was written from (ids only; the nightly judge)
     memory.activity_header(since=None, until=None) -> dict    # threads touched, things finished, dates ahead
 
-Practice memory (migration 29, yuki.memory.practice; learned by the service's practice worker, yuki.memory.practice_learn)::
+Practice memory (migration 29, yuki.memory.practice; its learners were retired by migration 45)::
 
     memory.record_run(run) -> dict                       # one agent request's step trace (the agent loop writes it)
     memory.record_hand_trace(session_id, name, args, ok, verified, report, ms, app=, target=, words=,
                              injected=, cited=, control=) -> dict
-    memory.practice(words, apps=, open_apps=, detail=False) -> dict    # ways / habits and pitfalls for the apps in play
     memory.workflows() -> dict                           # practice ways for the run card's chips
     memory.workflow_edit(ref, "save" | "edit" | "disable" | "enable" | "forget", words="") -> dict
     memory.playbook() -> dict                            # the window's Playbook page (audit 17 Oct)
@@ -4642,47 +4641,6 @@ class MemoryClient:
                                     report=report, ms=ms, at=at, app=app, target=target, words=words, why=why,
                                     request_id=request_id, injected=injected, cited=cited, control=control)
 
-    def practice(self, words: str = "", *, apps: Any = (), open_apps: Any = (), embed_wait_s: float | None = None,
-                 now: float | None = None, detail: bool = False, go_tos: bool = True,
-                 paths: bool | None = None) -> dict:
-        """What practice memory holds for one request (``yuki.memory.practice.relevant``): ``{"ways": [procedures, then
-        a habit or style note], "pitfalls": [...], "apps": [the apps in play], "named": [apps named in the words],
-        "measured": bool, "ms"}``. The apps in play are the apps named in ``words`` (whole words of an app name memory
-        has stored), ``apps`` (the caller's: apps the request names) and ``open_apps`` (the open windows' process
-        names) - not the window in front alone. Ways clear a similarity floor to the words (the same vector as the
-        related memories); pitfalls of an app in play always come. ``detail``: each item also carries its structured
-        body (``steps``, ``run`` - a procedure's executable steps for the talker's skill runner, ``slots``, ``what``,
-        ``instead``, ``default``, ``ask``, ``avoid``), so a caller renders it without the Playbook page. ``go_tos``
-        (capC1b): the user's usual buttons and fields and their shortcuts in each app in play, counted from the action
-        trace (``yuki.memory.trace_habits.go_tos``; ``detail`` gives more); ``go_tos=False`` (a caller that never
-        shows them: the talker's lookups) neither works them out nor counts them as served (second verification V7).
-        capC2: ``path`` (the user's usual path for the nearest family of their tasks, at most 8 steps) and ``example``
-        (one trimmed past task of it), each ``None`` when there is none; ``detail`` gives more; ``paths`` (default: as
-        ``go_tos``) leaves them out. Never raises (empty lists)."""
-        from yuki.memory import practice as _p
-
-        started = time.perf_counter()
-        try:
-            text = " ".join(str(words or "").split())
-            known = [str(a) for a in (*(open_apps or ()), *(apps or ())) if a]
-            # the intent is matched without the app names (the apps are matched by scope): the words' own vector when
-            # they name no app, else one more embedding of what is left (~20 ms on the service's pipe)
-            intent = _p.intent_words(self.store, text, known) if text else ""
-            vec = self._embed(intent or text, embed_wait_s) if text else None
-            named = _p.apps_named(self.store, text, known)
-            # in order of how directly the request is about them (the go-tos show the first few): the apps the words
-            # name, the caller's, then the open windows
-            ordered = [*named, *(str(a) for a in (apps or ()) if a), *(str(a) for a in (open_apps or ()) if a)]
-            out = _p.relevant(self.store, query_vec=vec, apps_in_play=ordered, now=now, detail=bool(detail),
-                              go_tos=bool(go_tos), paths=None if paths is None else bool(paths))
-            out["named"] = named
-            out["measured"] = vec is not None
-        except Exception as exc:
-            out = {"ways": [], "pitfalls": [], "go_tos": [], "apps": [], "named": [], "measured": False,
-                   "error": f"{type(exc).__name__}: {exc}"}
-        out["ms"] = round((time.perf_counter() - started) * 1000, 1)
-        return out
-
     def workflows(self, *, skills: bool = False) -> dict:
         """Practice memory's ways (``yuki.memory.practice.workflows``) for the run card's chips (``skills`` is accepted
         and ignored: the Playbook page reads :meth:`playbook`). Never raises."""
@@ -4875,29 +4833,6 @@ class MemoryClient:
 
         return trace_store.undo_forget(self.store, int(diary_id))
 
-    def go_tos(self, apps: Any = (), *, detail: bool = False) -> list[dict]:
-        """capC1b: the user's usual buttons and fields and their shortcuts in these apps (process or app names), counted
-        from the action trace (``yuki.memory.trace_habits.go_tos``): names only as the element registry keeps them.
-        Read only; never raises (``[]``)."""
-        from yuki.memory import trace_habits
-        from yuki.memory.store import app_key
-
-        try:
-            return trace_habits.go_tos(self.store, [app_key(str(a)) or str(a) for a in apps or () if a],
-                                       detail=bool(detail), count=False)
-        except Exception:  # noqa: BLE001
-            return []
-
-    def trace_learning(self) -> dict:
-        """capC1b: what was learned from the action trace, content-free (``yuki.memory.practice_learn.learn_health``):
-        ways from the user's own fixes, notes of failed routes (and how many failed again), go-tos served today."""
-        from yuki.memory import practice_learn
-
-        try:
-            return practice_learn.learn_health(self.store)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": type(exc).__name__}
-
     # -- capC2: tasks (report 78 §5.2-5.4, decision D5) ----------------------------------------------------------------
 
     def day_tasks(self, since: float, until: float) -> list[dict]:
@@ -4931,16 +4866,6 @@ class MemoryClient:
             return {"ok": False, "error": "That can't be undone here."}
         return trace_tasks.undo_correction(self.store, tid)
 
-    def trace_tasks_health(self) -> dict:
-        """capC2: the task pass in counts (tasks found today, how many unclear, today's cost and its cap, windows
-        waiting); content-free."""
-        from yuki.memory import trace_tasks
-
-        try:
-            return trace_tasks.health(self.store)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": type(exc).__name__}
-
     # -- capC4: ways learned from what the user did (report 78 §6.1-6.2) -----------------------------------------------
 
     def name_digests(self, process: str, role: str, names: Any) -> list[str]:
@@ -4958,88 +4883,8 @@ class MemoryClient:
         except Exception:  # noqa: BLE001
             return []
 
-    def container_digests(self, process: str, boxes: Any) -> list[str]:
-        """capC4, second verification V8: the keyed digest the action trace takes over a picked item's container
-        (``yuki.memory.trace_demos.container_digest``) for each ``(role, AutomationId, parent's role)`` of ``boxes``,
-        cut to ``yuki.memory.practice.PICK_DIGEST_CHARS`` hex characters as the way keeps it. Read only; never raises
-        (``[]``)."""
-        from yuki.memory import practice as _p
-        from yuki.memory import trace_demos
-
-        try:
-            return [trace_demos.container_digest(self.store, str(process or ""), *(str(x or "") for x in tuple(b)[:3]))
-                    [:_p.PICK_DIGEST_CHARS] for b in list(boxes or [])[:400]]
-        except Exception:  # noqa: BLE001
-            return []
-
-    def trace_demos_health(self) -> dict:
-        """capC4: ways and trials learned from what the user did, in counts (content-free)."""
-        from yuki.memory import trace_demos
-
-        try:
-            return trace_demos.health(self.store)
-        except Exception as exc:  # noqa: BLE001
-            return {"error": type(exc).__name__}
-
     # -- capC6: the workflow graph's queries (report 78 §5.4, yuki.memory.trace_graph) ------------------------------
     # Read only; names only from the element registry's kept names; tasks the user rejected never shown as theirs.
-
-    def trace_workflows(self, words: str = "", *, app: str | None = None, limit: int = 5,
-                        embed_wait_s: float | None = 8.0) -> dict:
-        """capC6: the user's workflows (families of tasks done the same way, :func:`yuki.memory.trace_graph.families`):
-        ``{"families": [...], "ranked": bool (by the words' meaning), "app": {...} | None}``. ``words``: the nearest
-        families to them ("how do I usually do X"; with no vector within ``embed_wait_s`` they come most recent first
-        and ``ranked`` is False); ``app``: the families spanning it, plus its go-tos, shortcuts and usual transitions
-        (:func:`yuki.memory.trace_graph.in_app`). Never raises."""
-        from yuki.memory import trace_graph
-
-        out: dict[str, Any] = {"families": [], "ranked": False, "app": None}
-        try:
-            text = " ".join(str(words or "").split())
-            vec = self._embed(text, embed_wait_s) if text else None
-            out["ranked"] = vec is not None
-            out["families"] = trace_graph.families(self.store, app=app or None, query_vec=vec, limit=limit)
-            if app:
-                out["app"] = trace_graph.in_app(self.store, app, with_families=False)   # families read just above
-        except Exception as exc:  # noqa: BLE001
-            out["error"] = type(exc).__name__
-        return out
-
-    def trace_tasks_between(self, since: Any, until: Any = None, *, limit: int = 40) -> dict:
-        """capC6: the tasks the user did overlapping ``[since, until)`` (:func:`yuki.memory.trace_graph.tasks_between`):
-        goals (theirs once renamed), apps, outcomes (checked or not); tasks they said were not theirs or not one task
-        are left out (``left_out`` counts them). Never raises."""
-        from yuki.memory import trace_graph
-
-        try:
-            lo, hi = self._window(since, until)
-            return trace_graph.tasks_between(self.store, lo, hi, limit=limit)
-        except Exception as exc:  # noqa: BLE001
-            return {"tasks": [], "more": 0, "left_out": 0, "error": type(exc).__name__}
-
-    def trace_next(self, *, element: str | None = None, task: Any = None) -> dict:
-        """capC6: what usually comes next after an element (its element key: transitions and the usual paths holding
-        it) or after a task (``task:12`` or 12: what the next task in the same stretch of work usually is). Never
-        raises (``{}``)."""
-        from yuki.memory import trace_graph
-
-        try:
-            if element:
-                return trace_graph.next_after_element(self.store, str(element))
-            if task is not None:
-                return trace_graph.next_after_task(self.store, int(str(task).split(":")[-1]))
-        except Exception:  # noqa: BLE001
-            pass
-        return {}
-
-    def trace_task_apps(self, task: Any) -> list[dict]:
-        """capC6: the apps a task spans (``task:12`` or 12), with its own steps in each. Never raises (``[]``)."""
-        from yuki.memory import trace_graph
-
-        try:
-            return trace_graph.task_apps(self.store, int(str(task).split(":")[-1]))
-        except Exception:  # noqa: BLE001
-            return []
 
     def done_evidence(self, since: float, until: float, *, limit: int = 12) -> list[dict]:
         """capC6: tasks whose outcome the PC checked inside ``[since, until)`` (learnable only: never unclear, never
@@ -5050,27 +4895,12 @@ class MemoryClient:
         return trace_graph.done_evidence(self.store, float(since), float(until), limit=limit)
 
     def way_path(self, pid: Any) -> dict:
-        """capC5: the recorded path a learned way is replayed against (``yuki.skills.uia_route.way_path``, lCore's port
-        of ``trace_replay.way_path``, so phase P can delete that module): per step the app it acted in, the site when it
-        was a web page, whether it stayed in the window of the step before, whether a dialog came up after it. Machine
-        facts only, no names. Read only; never raises."""
-        try:
-            from yuki.skills.uia_route import way_path
-        except Exception:  # noqa: BLE001 - the old module while it still ships
-            from yuki.memory import trace_replay
+        """capC5: the recorded path a learned way is replayed against (``yuki.skills.uia_route.way_path``): per step
+        the app it acted in, the site when it was a web page, whether it stayed in the window of the step before,
+        whether a dialog came up after it. Machine facts only, no names. Read only; never raises."""
+        from yuki.skills.uia_route import way_path
 
-            return trace_replay.way_path(self.store, pid)
         return way_path(self.store, pid)
-
-    def trace_replay_health(self) -> dict:
-        """capC5: learned ways the skill runner ran this week, the deviations it stopped at, the handovers and
-        takeovers, and whether the A/B switch is on (counts, content-free)."""
-        from yuki.memory import trace_replay
-
-        try:
-            return {**trace_replay.health(self.store), "use_learned": trace_replay.use_learned()}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": type(exc).__name__}
 
     # -- phase S: skills (yuki.skills; PLAN.md D13). The tray uses its own Store through these; none of the new tables
     # -- (skills, skill_routes, skill_runs, prefs, pref_events, tastes) is ever exposed by the MCP.

@@ -439,7 +439,8 @@ def _matches(skill: Any, cap: Any, m: Mapping[str, Any], app: str | None) -> boo
 
 
 def key_entity(key: Any) -> str | None:
-    """The entity part of a learned routine key (``skill:<id>|<entity key>``: a playlist routine), else ``None``."""
+    """The entity part of a learned routine key (``skill:<id>|<entity key>``: a playlist routine; a capability record's
+    ``skill:<record id>|<value id>``: its value id, read through ``yuki.skills.learn.values``), else ``None``."""
     parts = str(key or "").split("|")
     if len(parts) == 2 and parts[0].startswith("skill:") and parts[1]:
         return parts[1]
@@ -518,14 +519,18 @@ def skill_onsets(store: Any, skill: Any, since: float, until: float, *, app: str
     return sorted(out)
 
 
-def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity: str | None = None) -> float | None:
+def habit_run_done(store: Any, skill: Any, since: float, until: float, *, entity: str | None = None,
+                   key: str | None = None) -> float | None:
     """The first time in ``[since, until]`` a run of the skill's habit ended done (``done`` / ``already``): its own key,
     and a usage record's capability (``offers.habit_keys``: "play my X playlist" runs on the capability; lWire review
     r1 M3). ``entity``: a ``routine_key`` routine's entity; a run counts only when its played entity
     (``skill_runs.entity_digest``, the moments' own digest) is that one, read through the moments that carry both.
-    Never raises."""
-    from yuki.memory.offers import habit_keys
+    ``key``: the routine's key; a routine on one value of a capability's record (``offers.routine_value``) has no run
+    of its own value in the ledger, so ``None``. Never raises."""
+    from yuki.memory.offers import habit_keys, routine_value
 
+    if key and routine_value(store, key) is not None:
+        return None
     keys = habit_keys(skill)
     if not keys:
         return None
@@ -627,10 +632,12 @@ def keyed_onsets(store: Any, since: float, until: float, *, skills: Sequence[Any
 def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float, until: float,
                     presence: Presence | None) -> Inputs:
     """The learner's inputs with each key's means app (its occasions' most used app; a key's first occasion otherwise)
-    and its offer gate, and ``presence`` when the caller has one. Never drops a key."""
+    and its offer gate, and ``presence`` when the caller has one: the skill's, and for a routine on one value of a
+    capability's record (``skill:<record id>|<value id>``) that value's own (``offers.routine_gate``: its everyday and
+    Not mine in place of the record's naming verdict). Never drops a key."""
     from dataclasses import replace
 
-    from yuki.memory.offers import skill_offerable
+    from yuki.memory.offers import routine_gate, routine_value, skill_offerable
 
     by_key = {s.key: s for s in skills}
     apps: dict[int, str] = {}
@@ -659,7 +666,14 @@ def _learned_inputs(store: Any, got: Inputs, skills: Sequence[Any], since: float
                 gate[info.skill] = bool(skill_offerable(store, by_key.get(info.skill))[0])
             except Exception:  # noqa: BLE001
                 gate[info.skill] = False
-        got.keys[key] = replace(info, app=apps.get(sid, info.app), offerable=gate[info.skill])
+        offerable = gate[info.skill]
+        value = routine_value(store, key)
+        if value is not None:
+            try:
+                offerable = bool(routine_gate(store, by_key.get(info.skill), key, value=value)[0])
+            except Exception:  # noqa: BLE001
+                offerable = False
+        got.keys[key] = replace(info, app=apps.get(sid, info.app), offerable=offerable)
     if presence is not None:
         got.presence = presence
     return got
@@ -1562,16 +1576,23 @@ def active_near(store: Any, now: float | None = None, minutes: float = 60.0, *, 
     """Active routines of a skill that passes the offer gate whose time is within ``minutes`` of now on a day of their
     day-set (the talker's "now" block), nearest first, at most ``limit``: content-free numbers plus the label when one
     was told. Context routines (a skill that is never offered, such as a voice channel) never reach it (R1.5)."""
-    from yuki.memory.offers import skill_offerable
+    from yuki.memory.offers import routine_gate, routine_value, skill_offerable
 
     now = time.time() if now is None else float(now)
     today = day_of(now)
     dm_now = day_minute(now)
-    offerable = {s.key for s in (load_skills(store) if skills is None else skills)
-                 if getattr(s, "origin", "") == "learned" and skill_offerable(store, s)[0]}
+    learned = {s.key: s for s in (load_skills(store) if skills is None else skills)
+               if getattr(s, "origin", "") == "learned"}
+    offerable = {k for k, s in learned.items() if skill_offerable(store, s)[0]}
     out = []
     for row in store.routines(states=["active"]):
-        if row.get("skill_id") not in offerable:
+        value = routine_value(store, row.get("key"))
+        if value is not None:
+            # a routine on one value of a capability's record: that value's own gate (offers.routine_gate)
+            skill = learned.get(str(row.get("skill_id") or ""))
+            if skill is None or not routine_gate(store, skill, row.get("key"), value=value)[0]:
+                continue
+        elif row.get("skill_id") not in offerable:
             continue
         if not dayset_has(str(row["dayset"]), today) or row.get("at_min") is None:
             continue

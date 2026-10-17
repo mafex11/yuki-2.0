@@ -75,13 +75,6 @@ journaled, :mod:`yuki.memory.calldigest` (thread ``yuki-memory-calldigest``)
 writes its timeline digest with Haiku, never while a call is open or something
 is full screen.
 
-Practice memory (:mod:`yuki.memory.practice_learn`, thread ``yuki-memory-practice``,
-with the portrait): Yuki's run traces become procedures and pitfalls (Haiku, after a
-run's follow-up window, measured triggers only), the old know-how rows are taken in,
-the user's Playbook-page edits are applied, and once a night - idle, never during a
-call or a game - the miner turns recurring activity into habits or a teach-back
-question. Budgeted (about $0.15 a day in all), nothing while ``paused``.
-
 The action trace (:mod:`yuki.memory.trace`, report 78 phase C1, shadow): only once the user turned on Settings ->
 Record how I work (``[trace] record_actions``), how they work in each app (the element, the kind of action, the
 shortcut, what changed; never typed letters, clipboard content or pixels), as ``ui_actions`` rows. Threads
@@ -612,41 +605,6 @@ def run(args: argparse.Namespace) -> int:
                 log("error", where="portrait_start", error=f"{type(exc).__name__}: {exc}")
                 portrait = None
 
-        if not (args.no_journal or args.no_portrait):
-            try:   # practice memory (Phase C): learns from Yuki's runs and the user's activity; Haiku/Sonnet, budgeted
-                from yuki.memory.embed import get_embedder as _practice_embedder
-                from yuki.memory.portrait import PortraitWorker as _PracticeModel
-                from yuki.memory.practice_learn import PracticeWorker
-                from yuki.memory.watcher import user_idle_s as _practice_idle
-
-                def practice_fullscreen() -> dict[str, Any]:
-                    tl = timeline
-                    st = tl.stats() if tl is not None and tl.alive else {}
-                    return {"fullscreen": bool(st.get("fullscreen"))}
-
-                practice_model = (portrait.worker if portrait is not None
-                                  else _PracticeModel(store, embedder=_practice_embedder()))
-                def practice_trace_rules() -> Any:
-                    # capC1b: decision D3 for the correction learner, from the trace's own [trace] section (the
-                    # trace starts later in this function; None until then: the default, "at once")
-                    tr = trace
-                    return tr.rules() if tr is not None else None
-
-                def practice_game() -> bool:
-                    # capQ2b: the hard game gate (started later in this function; None until then: it holds). fGate:
-                    # a CPU job, so the running gate ("lightweight while gaming": any game running, in front or not)
-                    from yuki.memory.gamegate import running_holds
-
-                    return running_holds(game_gate)
-
-                practice = PracticeWorker(store, practice_model, db_path=db_path, log=log, idle_fn=_practice_idle,
-                                          live_fn=practice_fullscreen, embedder=_practice_embedder(),
-                                          trace_rules=practice_trace_rules, game_fn=practice_game)
-                threading.Thread(target=_guarded(practice.run, log, "practice"), args=(stop,),
-                                 name="yuki-memory-practice", daemon=True).start()
-            except Exception as exc:  # everything else runs on without it
-                log("error", where="practice_start", error=f"{type(exc).__name__}: {exc}")
-
         if timeline is not None and not (args.no_journal or args.no_episodes):
             try:
                 from yuki.memory.episodes import EpisodeWorker
@@ -681,16 +639,10 @@ def run(args: argparse.Namespace) -> int:
                         out["game_front"] = game["front"]
                     return out          # no live gate: the cards' gate reads the open stretch's program instead
 
-                from yuki.core.attention import shared as shared_attention
-
-                # the observation cards read the screen recall's cache in-process (no pipe, no new embedding)
-                recall_cache = screen_recall.latest if screen_recall is not None else None
                 from yuki.memory.embed import get_embedder as _nudge_embedder   # shared; loads on first use
 
                 nudges = NudgeWorker(store, db_path=db_path, privacy=privacy, locked_fn=session_locked,
-                                     attention=shared_attention(),
-                                     live_fn=live_state, log=log, screen_fn=recall_cache,
-                                     embedder=_nudge_embedder(),
+                                     live_fn=live_state, log=log, embedder=_nudge_embedder(),
                                      you_fn=lambda: you_builder)   # jCore: the judge reads it late (built after phase F)
                 nudges_thread = threading.Thread(
                     target=_guarded(nudges.run, log, "nudges"), args=(stop, pause_path),

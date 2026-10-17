@@ -254,124 +254,12 @@ _TRACE_STATE_WORDS = {"paused": "paused right now, because memory is paused",
                       "failed": "could not start", "no_input": "not hearing your mouse and keys"}
 
 
-def _trace_learn_words(learn: str | None, health: Any, now: float | None = None) -> str:
-    """capC1b: what was learned from the trace, in plain words (``trace:learn``, written by the practice worker;
-    the watchdog's skips from ``trace:health``). ``""`` when there is nothing to say."""
-    try:
-        data = json.loads(learn) if learn else {}
-    except (TypeError, ValueError):
-        data = {}
-    parts = []
-    fixes, pits = int(data.get("fixes") or 0), int(data.get("pitfalls") or 0)
-    if fixes:
-        parts.append(f"learned {fixes} way{'s' if fixes != 1 else ''} from your own fixes")
-    if pits:
-        again = int(data.get("repeated") or 0)
-        parts.append(f"kept {pits} note{'s' if pits != 1 else ''} of tries that went wrong"
-                     + (f" ({again} went wrong the same way again)" if again else ""))
-    # capQ2b second verification V3: the go-tos served "today" only when the row is from today (the practice
-    # worker writes it on its tick, which waits while memory is paused)
-    served = int(data.get("go_tos_today") or 0) if _same_day(data, time.time() if now is None else now) else 0
-    if served:
-        parts.append(f"your usual buttons and shortcuts helped {served} request{'s' if served != 1 else ''} today")
+def _trace_skip_words(health: Any) -> str:
+    """The watchdog's skips (``trace:health``), in plain words; ``""`` when there is nothing to say."""
     skipped = int((health or {}).get("hung_skipped") or 0) if isinstance(health, dict) else 0
-    if skipped:
-        parts.append(f"skipped {skipped} look{'s' if skipped != 1 else ''} into apps that stopped answering")
-    return ("; " + "; ".join(parts)) if parts else ""
-
-
-def _same_day(data: dict, now: float) -> bool:
-    """capQ2b: whether a health row's "today" numbers are about today: its ``day`` (or, for a row written before it
-    had one, the local day of its ``at``) is the local day of ``now``. A row written yesterday evening keeps its
-    totals for a day, but its "today" counts are yesterday's."""
-    from datetime import datetime
-
-    today = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
-    day = data.get("day")
-    if not day:
-        try:
-            day = datetime.fromtimestamp(float(data.get("at") or 0)).strftime("%Y-%m-%d")
-        except (TypeError, ValueError, OSError, OverflowError):
-            return False
-    return str(day) == today
-
-
-def _trace_tasks_words(raw: str | None, now: float) -> str:
-    """capC2: the task pass in plain words (``trace:tasks``, written by the practice worker): tasks found today, how
-    many of them have no checked end, today's cost against its cap, stretches still waiting. ``""`` when there is
-    nothing to say or the value is a day old. capQ2b: the "today" numbers only when the row is from today."""
-    try:
-        data = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
-        data = {}
-    if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
+    if not skipped:
         return ""
-    if not _same_day(data, now):
-        data = {**data, "tasks_today": 0, "unclear_today": 0, "cost_today": 0.0, "refused_today": 0}
-    parts = []
-    n, unclear = int(data.get("tasks_today") or 0), int(data.get("unclear_today") or 0)
-    if n:
-        parts.append(f"found {n} task{'s' if n != 1 else ''} in your sessions today"
-                     + (f" ({unclear} of them with no clear end)" if unclear else ""))
-    cost, cap = float(data.get("cost_today") or 0.0), float(data.get("budget") or 0.0)
-    if cost >= 0.005:
-        parts.append(f"that cost about ${cost:.2f} of the ${cap:.2f} a day it may use"
-                     + (" (the day's limit is reached; the rest waits for tomorrow)" if data.get("refused_today")
-                        else ""))
-    waiting = int(data.get("backlog") or 0)
-    if waiting:
-        parts.append(f"{waiting} finished session{'s' if waiting != 1 else ''} still to look at, when you're away")
-    return ("; " + "; ".join(parts)) if parts else ""
-
-
-def _trace_demos_words(raw: str | None, now: float) -> str:
-    """capC4: ways learned from what you did, in plain words (``trace:demos``, written by the practice worker): how
-    many Yuki may use on its own, how many it has seen only once (hints), what it learned or set aside today. ``""``
-    when there is nothing to say or the value is a day old. capQ2b: "new today" and "set aside today" only when the
-    row is from today (the row is rewritten only when the demo pass runs, so on the next day it still held
-    yesterday's numbers)."""
-    try:
-        data = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
-        data = {}
-    if not isinstance(data, dict) or now - float(data.get("at") or 0) > 86400:
-        return ""
-    if not _same_day(data, now):
-        data = {**data, "learned_today": 0, "refused_today": 0}
-    ways, trials = int(data.get("ways") or 0), int(data.get("trials") or 0)
-    hints = int(data.get("hints") or 0)   # second verification V11: ways its hands cannot take, hints for the thinker
-    parts = []
-    if ways or trials or hints:
-        bits = []
-        if ways:
-            bits.append(f"{ways} it can do on its own")
-        if hints:
-            bits.append(f"{hints} it follows as a guide but can't repeat click by click")
-        if trials:
-            bits.append(f"{trials} seen only once, kept as hints until you do {'them' if trials != 1 else 'it'} "
-                        f"again")
-        total = ways + trials + hints
-        parts.append(f"learned {total} way{'s' if total != 1 else ''} from what you did (" + ", ".join(bits[:-1])
-                     + (" and " if len(bits) > 1 else "") + bits[-1] + ")")
-    learned, refused = int(data.get("learned_today") or 0), int(data.get("refused_today") or 0)
-    if learned:
-        parts.append(f"{learned} new today")
-    if refused:
-        parts.append(f"{refused} task{'s' if refused != 1 else ''} today set aside (nothing reliable to repeat)")
-    return ("; " + "; ".join(parts)) if parts else ""
-
-
-def _trace_replay_words(conn: Any, trace: dict[str, Any], now: float) -> str:
-    """capC5: learned ways done your way this week, the times it stopped because the screen was not as when you did
-    it, the handovers and takeovers, and the A/B switch when it is off, in plain words (counts over the runs table's
-    cleartext columns; ``yuki.memory.trace_replay``). ``""`` when there is nothing to say."""
-    try:
-        from yuki.memory import trace_replay
-
-        on = trace.get(trace_replay.SWITCH_KEY) is not False
-        return trace_replay.health_words(trace_replay.health(conn, now=now), on=on)
-    except Exception:  # noqa: BLE001
-        return ""
+    return f"; skipped {skipped} look{'s' if skipped != 1 else ''} into apps that stopped answering"
 
 
 def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now: float | None = None) -> Check:
@@ -408,10 +296,6 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
         yours = conn.execute("SELECT count(*) FROM ui_actions WHERE at >= ? AND source != 'yuki'",
                              (since,)).fetchone()[0]
         row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:health'").fetchone()
-        learn_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:learn'").fetchone()
-        tasks_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:tasks'").fetchone()
-        demos_row = conn.execute("SELECT value FROM nudge_state WHERE name = 'trace:demos'").fetchone()
-        replay = _trace_replay_words(conn, trace, now)   # capC5: ways run your way, deviations, handovers
     except Exception as exc:
         return Check(TRACE_CHECK, WARN, f"on, but its records could not be read ({type(exc).__name__})")
     finally:
@@ -432,10 +316,7 @@ def check_trace(db: Path | None = None, privacy_file: Path | None = None, *, now
                   f" ({yours:,} of them yours; {share}% with the button or field named)")
     if state in _TRACE_STATE_WORDS:
         detail += f"; {_TRACE_STATE_WORDS[state]}"
-    detail += _trace_learn_words(learn_row[0] if learn_row else None, health, now)
-    detail += _trace_tasks_words(tasks_row[0] if tasks_row else None, now)
-    detail += _trace_demos_words(demos_row[0] if demos_row else None, now)
-    detail += replay
+    detail += _trace_skip_words(health)
     if state in ("hooks_down", "failed", "no_input"):
         return Check(TRACE_CHECK, WARN, detail, "Restart Yuki from the tray; if it stays, send logs\\memory-*.jsonl.")
     return Check(TRACE_CHECK, OK, detail)
@@ -1174,7 +1055,7 @@ def check_you_state(*, now: float | None = None, client: Any = None) -> Check:
 
 def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
     """yUsual (state-design.md §6.1): "judge: mode, shown / would-show today". The mode from the privacy file's
-    ``[judge]`` table (default shadow); the cards shown today (the ``nudges`` table's content-free columns, the user's
+    ``[judge]`` table (default on); the cards shown today (the ``nudges`` table's content-free columns, the user's
     day from ``[nudges] resume_day_start``); in shadow, what the judge would have shown today from its own book
     (``nudge_state['judge_shadow']``: code text apart from writer asks, the Today card's times). Read-only."""
     try:
@@ -1182,8 +1063,8 @@ def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
     except Exception as exc:  # noqa: BLE001
         return Check(JUDGE_CHECK, SKIP, f"not available ({type(exc).__name__})")
     table = _privacy_table("judge")
-    mode = str(table.get("mode", "shadow")).strip().casefold()
-    mode = mode if mode in ("off", "shadow", "on") else "shadow"
+    mode = str(table.get("mode", "on")).strip().casefold()
+    mode = mode if mode in ("off", "shadow", "on") else "on"
     db = db or default_db_path()
     now = time.time() if now is None else float(now)
     if not db.exists():
@@ -1209,7 +1090,8 @@ def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
         return Check(JUDGE_CHECK, WARN, f"could not read the database ({type(exc).__name__})")
     shown_words = f"{shown} card{'s' if shown != 1 else ''} shown today"
     if mode == "off":
-        return Check(JUDGE_CHECK, OK, f"off: the old card makers only; {shown_words}")
+        return Check(JUDGE_CHECK, OK,
+                     f"off: no cards of Yuki's own (reminders and requests still arrive); {shown_words}")
     if mode == "on":
         return Check(JUDGE_CHECK, OK, f"on: {shown_words}")
     try:
@@ -1221,13 +1103,14 @@ def check_judge(db: Path | None = None, *, now: float | None = None) -> Check:
     code = sum(int(v.get("code", 0) or 0) for v in would.values() if isinstance(v, dict))
     writer = sum(int(v.get("writer", 0) or 0) for v in would.values() if isinstance(v, dict))
     total = sum(int(n or 0) for v in would.values() if isinstance(v, dict) for n in v.values())
-    detail = (f"shadow: {shown_words} by the old card makers; the judge would have shown {total} "
+    detail = (f"shadow: no cards of Yuki's own are shown (reminders and requests still arrive); {shown_words}; "
+              f"the judge would have shown {total} "
               f"({code} in code text, {writer} asking the writer)")
     if day.get("today"):
         detail += f"; its Today card at {', '.join(str(t) for t in day['today'][:3])}"
     if not book:
         detail += "; no shadow notes yet"
-    return Check(JUDGE_CHECK, OK, detail)
+    return Check(JUDGE_CHECK, WARN, detail)
 
 
 TASTE_CHECK = "Taste"

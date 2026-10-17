@@ -121,7 +121,8 @@ SETTLE_KINDS: tuple[str, ...] = ("accepted", "declined", "ignored")
 #: The card's words per end kind of the skill's habit (its capability's served end: ``routines.served_kind``), fixed
 #: templates; a skill whose end kind has none is never offered (fail closed). ``{at}``: the usual time to the quarter
 #: hour ("9:00"); ``{when}``: the measured median ("09:05"); ``{label}``: the name the user gave the routine. ``ask``:
-#: the question when the learned skill has no real name (``offers.card_question``: its name otherwise).
+#: the question when the learned skill has no real name (``offers.card_question``: its name otherwise); ``value_ask``:
+#: the question of a routine on one value of a capability's record (``{name}``: that value's name, contract C5).
 ONSET_WORDS: dict[str, dict[str, str]] = {
     "call_join": {
         "early": "Your {at} meeting is coming up.",
@@ -130,6 +131,7 @@ ONSET_WORDS: dict[str, dict[str, str]] = {
         "named_late": "{label} has started.",
         "why": "You've joined it around {when} on {hits} of the last {eligible} {days}.",
         "ask": "Bring its tab forward?",
+        "value_ask": "Bring the {name} tab forward?",
     },
     "media_context": {
         "early": "Your usual music around {at}.",
@@ -138,6 +140,7 @@ ONSET_WORDS: dict[str, dict[str, str]] = {
         "named_late": "Your usual {label}?",
         "why": "You've put it on around {when} on {hits} of the last {eligible} {days}.",
         "ask": "Put it on?",
+        "value_ask": "Put on {name}?",
     },
     "page": {
         "early": "Your usual around {at}.",
@@ -146,6 +149,7 @@ ONSET_WORDS: dict[str, dict[str, str]] = {
         "named_late": "{label} around {at}.",
         "why": "You've opened it around {when} on {hits} of the last {eligible} {days}.",
         "ask": "Open it?",
+        "value_ask": "Open {name}?",
     },
 }
 #: The day-set's words in the why line (the miner's fixed calendar menu: weekdays, weekends, all, one weekday).
@@ -444,14 +448,21 @@ def why_line(r: Routine, skill: Any = None) -> str:
                                days=DAY_WORDS.get(r.dayset, "days"))
 
 
-def card_question(store: Any, skill: Any) -> str:
-    """The card's question for ``skill``: its learned name as a question, else its end kind's fixed ``ask`` words
-    (``offers.card_question``); ``""`` when its end kind has no words (never offered)."""
+def card_question(store: Any, skill: Any, key: str | None = None) -> str:
+    """The card's question for ``skill``: for a routine on one value of a capability's record (``key``,
+    ``offers.routine_value``) the value named in its end kind's ``value_ask`` words ("Open YouTube?"); else its learned
+    name as a question, else its end kind's fixed ``ask`` words (``offers.card_question``); ``""`` when its end kind has
+    no words (never offered)."""
     words = _words(skill)
     if words is None:
         return ""
     from yuki.memory import offers
 
+    value = offers.routine_value(store, key) if key else None
+    if value is not None and words.get("value_ask"):
+        name = " ".join(str(value[1].get("name") or value[1].get("label") or "").split())
+        if name:
+            return words["value_ask"].format(name=name)
     return offers.card_question(store, skill, fallback=words.get("ask", ""))
 
 
@@ -508,13 +519,22 @@ AVAILABILITY: dict[tuple[str, str], Callable[[Any, Any, Callable[..., Any] | Non
 }
 
 
-def available(store: Any, skill: Any, log: Callable[..., Any] | None = None) -> bool | None:
-    """Whether the skill's target is there now (the first of its rung-A routes that has a check)."""
+def available(store: Any, skill: Any, log: Callable[..., Any] | None = None, *,
+              slots: dict[str, Any] | None = None) -> bool | None:
+    """Whether the skill's target is there now (the first of its rung-A routes that has a check). ``slots``: a value
+    routine's own slot (:func:`routine_params`), filled into the route's arguments as a learned row's bound value is
+    (a capability record binds none)."""
     for route in getattr(skill, "routes", ()) or ():
         if str(getattr(route, "rung", "")) != "A":
             continue
         check = AVAILABILITY.get((str(getattr(route, "driver", "") or ""), str(getattr(route, "call", "") or "")))
         if check is not None:
+            if slots:
+                from dataclasses import replace
+
+                from yuki.skills.connection import fill_partial
+
+                route = replace(route, args=dict(fill_partial(dict(getattr(route, "args", None) or {}), slots)))
             return check(store, route, log)
     return True
 
@@ -686,7 +706,8 @@ class RoutineLane:
             words = None
             if d.skill is not None:
                 try:
-                    words = card_text(r, d.skill, phase(d.at, now, d.mode), card_question(self.store, d.skill))
+                    words = card_text(r, d.skill, phase(d.at, now, d.mode),
+                                      card_question(self.store, d.skill, r.key))
                 except Exception:
                     words = None
             opens = now if d.forced else window(r, day, config)[0]
@@ -737,7 +758,7 @@ class RoutineLane:
         """When the routine's end state was reached today (the user reached its learned skill's end, or a skill run of
         it ended done: :func:`first_onset`), or None. ``since`` narrows the start (a card's time)."""
         start = since if since is not None else day_start_at(now, getattr(config, "resume_day_start", "04:00"))
-        return first_onset(self.store, skill, start, now, include_runs=True, entity=_entity(r))
+        return first_onset(self.store, skill, start, now, include_runs=True, entity=_entity(r), key=r.key)
 
     def due(self, now: float, config: Any, *, request: dict[str, Any] | None = None) -> list[Due]:
         """The routines due now (see the module docstring), by window start; a forced one (``offer-now``) first."""
@@ -822,7 +843,10 @@ class RoutineLane:
             if self._available is not None:
                 got = self._available(self.store, skill)
             else:
-                got = available(self.store, skill, log=self._log)
+                from yuki.skills.learn.values import routine_slots
+
+                # a value routine's census looks for its value (a capability record binds no service)
+                got = available(self.store, skill, log=self._log, slots=routine_slots(self.store, d.routine.key))
             self._census[key] = (got, now)
             if len(self._census) > 64:
                 self._census = {k: v for k, v in self._census.items() if k[1] == day}
@@ -836,7 +860,7 @@ class RoutineLane:
 
         r, skill = d.routine, d.skill
         why_not = None
-        question = card_question(self.store, skill) if skill is not None else ""
+        question = card_question(self.store, skill, r.key) if skill is not None else ""
         if skill is None:
             why_not = "no_skill"
         elif (text := card_text(r, skill, phase(d.at, now, d.mode), question)) is None:
@@ -978,8 +1002,8 @@ class RoutineLane:
                                             and e["detail"].get("why") == "less" for e in recorded.values()):
             feedback(self.store, n.id, "less", now=now)   # an explicit press counts, on an offer-now card too
             changed = True
-        joined_at = (first_onset(self.store, skill, n.at, min(now, n.at + SELF_SERVED_WITHIN_S), entity=_entity(r))
-                     if skill else None)
+        joined_at = (first_onset(self.store, skill, n.at, min(now, n.at + SELF_SERVED_WITHIN_S), entity=_entity(r),
+                                 key=r.key) if skill else None)
         if n.outcome is None and joined_at is not None and n.reaction not in ("accepted",):
             # the end state landed while the card waited: its button stops (expires when the join lands), and a card
             # never shown leaves the pending list (the tray asks again before it shows a queued one: card_still_due)
@@ -1075,7 +1099,8 @@ class RoutineLane:
         skill = self._skill(r.skill_id) if r is not None else None
         day_start = getattr(config, "resume_day_start", "04:00")
         start = day_start_at(first, day_start)
-        days = {routine_day(t, day_start) for t in onsets(self.store, skill, start, now)} if skill else set()
+        days = ({routine_day(t, day_start) for t in onsets(self.store, skill, start, now, key=r.key)} if skill
+                else set())
         return len(days), offered, accepted
 
 
@@ -1085,9 +1110,20 @@ class RoutineLane:
 
 
 def routine_params(store: Any, r: Routine, skill: Any) -> dict[str, Any]:
-    """The routine's own slot values for its card run: for a routine keyed by an entity (its capability's
-    ``routine_key`` fill slot: a playlist), that entity's name from the user's latest moment of it (``moments
-    .entity_key``; decrypted in RAM, sealed in the card's encrypted inputs, never logged). ``{}`` otherwise."""
+    """The routine's own slot values for its card run: for a routine on one value of a capability's record
+    (``offers.routine_value``: a site, a meeting service), that value's slot (``yuki.skills.learn.values
+    .routine_slots``); for a routine keyed by an entity (its capability's ``routine_key`` fill slot: a playlist), that
+    entity's name from the user's latest moment of it (``moments.entity_key``). Decrypted in RAM, sealed in the card's
+    encrypted inputs, never logged. ``{}`` otherwise."""
+    from yuki.memory.offers import routine_value
+
+    if routine_value(store, r.key) is not None:
+        try:
+            from yuki.skills.learn.values import routine_slots
+
+            return routine_slots(store, r.key)
+        except Exception:
+            return {}
     parts = str(r.key or "").split("|")
     slot = next((s for s in getattr(skill, "slots", ()) or () if s.role == "fill" and s.routine_key), None)
     if len(parts) < 2 or slot is None or not parts[1]:
@@ -1111,12 +1147,30 @@ def _entity(r: Any) -> str | None:
     return key_entity(getattr(r, "key", None))
 
 
+def _value_onsets(store: Any, key: Any, since: float, until: float) -> list[float] | None:
+    """A value routine's onsets (``yuki.skills.learn.values.value_onsets``: its value's user occasions and end
+    moments), or ``None`` when ``key`` is no routine on one value of a capability's record."""
+    from yuki.memory.offers import routine_value
+
+    if not key or routine_value(store, key) is None:
+        return None
+    try:
+        from yuki.skills.learn.values import value_onsets
+
+        return value_onsets(store, key, since, until)
+    except Exception:
+        return []
+
+
 def onsets(store: Any, skill: Any, since: float, until: float, *, app: str | None = None,
-           entity: str | None = None) -> list[float]:
-    """When the user reached the skill's end state, oldest first, never Yuki's own (D18): a learned skill's
-    (:func:`yuki.memory.routines.skill_onsets`: its occasions and the user's matching moments; ``entity``: a
-    ``routine_key`` routine's one entity, :func:`yuki.memory.routines.key_entity`), or an old skill's ``routine_on``
-    (kind, app) moments."""
+           entity: str | None = None, key: str | None = None) -> list[float]:
+    """When the user reached the skill's end state, oldest first, never Yuki's own (D18): a routine on one value of a
+    capability's record (``key``: :func:`_value_onsets`), a learned skill's (:func:`yuki.memory.routines.skill_onsets`:
+    its occasions and the user's matching moments; ``entity``: a ``routine_key`` routine's one entity,
+    :func:`yuki.memory.routines.key_entity`), or an old skill's ``routine_on`` (kind, app) moments."""
+    got = _value_onsets(store, key, since, until)
+    if got is not None:
+        return got
     if getattr(skill, "origin", "") == "learned":
         from yuki.memory.routines import skill_onsets
 
@@ -1137,14 +1191,16 @@ def onsets(store: Any, skill: Any, since: float, until: float, *, app: str | Non
 
 
 def first_onset(store: Any, skill: Any, since: float, until: float, *, include_runs: bool = False,
-                entity: str | None = None) -> float | None:
+                entity: str | None = None, key: str | None = None) -> float | None:
     """The first time in ``[since, until]`` the routine's end state was reached: the user's own onset, or (with
     ``include_runs``) a run of the skill's habit that ended done (said "open my meeting" already; a usage record's
     capability runs too: :func:`yuki.memory.routines.habit_run_done`). ``entity``: a ``routine_key`` routine's one
-    entity (a playlist): another one never counts."""
-    got = onsets(store, skill, since, until, entity=entity)
+    entity (a playlist): another one never counts. ``key``: the routine's key; a routine on one value of a
+    capability's record counts its value's onsets only (:func:`_value_onsets`; the ledger keeps no run of a value)."""
+    value_got = _value_onsets(store, key, since, until)
+    got = value_got if value_got is not None else onsets(store, skill, since, until, entity=entity)
     first = got[0] if got else None
-    if include_runs and getattr(skill, "key", None):
+    if include_runs and getattr(skill, "key", None) and value_got is None:
         if getattr(skill, "origin", "") == "learned":
             from yuki.memory.routines import habit_run_done
 
@@ -1277,7 +1333,8 @@ def card_still_due(store: Any, nudge_id: int, *, now: float | None = None,
         skill = load(store=store).get(str(r.skill_id))
     except Exception:
         skill = None
-    if skill is not None and first_onset(store, skill, n.at, now, include_runs=True, entity=_entity(r)) is not None:
+    if skill is not None and first_onset(store, skill, n.at, now, include_runs=True, entity=_entity(r),
+                                         key=r.key) is not None:
         return {"due": False, "why": "done", "final": True}
     try:
         from yuki.memory.store import CALL_OPEN_STATUSES
