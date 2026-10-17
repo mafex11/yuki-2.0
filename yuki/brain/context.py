@@ -6,7 +6,7 @@
     system [core prompt]  <- bp 1   [profile + standing rules]  <- bp 2   [menu]  <- bp 3
     user   [last two requests: their words + Yuki's final answer] [channel] [their exact words]
            [the talker's reading of them: a seed] [context: card / coach text, labelled, not quotable] [time]
-           [the you-card] [people named] [overview] [plan seed]                               <- bp 4
+           [the you-card] [you right now] [people named] [overview] [plan seed]               <- bp 4
     assistant [thinking + plan]   user [step statuses + screen diff (+ the window's view on a mismatch)]  ...
 
 * **Append-only.** :class:`Conversation` keeps one request's messages; it appends, never edits or deletes an earlier
@@ -16,11 +16,12 @@
   characters): who the user is, what they are doing now, what they usually do at this hour, their things (sites and
   usual browser, channels, playlists and what they mean, people and how their names are heard, servers, projects),
   open loops and a two-line recent past, each line saying how sure it is. When it comes, it replaces the brief in the
-  profile block, the "you right now" record and the places block (it holds all three); the places are still read for
-  the join check (:func:`channel_known`). When it can't be read (``""``), those three stand in, as before.
+  profile block and the places block (it holds both); the places are still read for the join check
+  (:func:`channel_known`). When it can't be read (``""``), those two stand in, as before. The "you right now" record
+  stays either way (review M3: its fail-closed line when it misses its wait; the card may come without a live part).
 * **The talker's understanding** (contract C3, voice only): the talker's reading of the heard words (goal, parts, a
   pick left to Yuki, context), shown labelled as a seed: their exact words win.
-* **The "you right now" record** (when no you-card came) comes through the state design's section 11 interface: the request turn's provider
+* **The "you right now" record** comes through the state design's section 11 interface: the request turn's provider
   (:func:`read_you`) asks ``shared_client().you(sections=THINKER_SECTIONS)`` (version-cached in the client, one small
   answer when nothing changed) and renders ``render(you, "thinker")`` (≤ 1,200 characters, inside the overview slot;
   a stale record says "not known", fail closed). The board is not asked for here: the overview (``Dispatcher``) reads
@@ -172,8 +173,8 @@ class Gathered:
     Attributes:
         overview: The window list and the Now picture (``Dispatcher.overview_text``), and when it was read.
         payload: The overview as data (the executor's window facts).
-        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in); ``""`` when the
-            you-card came (it holds the same).
+        you: The "you right now" text (``render(you, "thinker")``, or the Now board as a stand-in; with or without
+            the you-card).
         card: The you-card (C1, :func:`read_card`), ``""`` when it could not be read.
         people: People named and their last messages.
         places: The user's places from memory (:func:`read_places`: the pages they watch, the voice channels they
@@ -672,13 +673,15 @@ def gather(*, dispatcher: Any, memory: Any, settings: Any, words: str, names: Se
         out.card = str(results.get("card") or "")
         out.people = str(results.get("people") or "")
         brief, rules = results.get("profile") if isinstance(results.get("profile"), tuple) else ("", None)
+        # the live record always (review M3: RAM-cached, its own fail-closed line when it misses its wait); the card
+        # may lack its live part
+        you = results.get("you")
+        out.you = YOU_UNKNOWN if you is None else str(you)   # missed its wait: fails closed
         if out.card:
-            # kBrain (C1): the card holds who they are, what they're doing now and their things: the brief, the
-            # you-now record and the places block would say the same again (the places stay read for the join check)
+            # kBrain (C1): the card holds who they are and their things: the brief and the places block would say the
+            # same again (the places stay read for the join check)
             out.profile = profile_text(names=names, brief=None, rules=rules, limit=limits.profile_chars)
         else:
-            you = results.get("you")
-            out.you = YOU_UNKNOWN if you is None else str(you)   # missed its wait: fails closed
             places = results.get("places")
             out.places = places.text if isinstance(places, Places) else ""
             out.profile = profile_text(names=names, brief=brief, rules=rules, limit=limits.profile_chars)

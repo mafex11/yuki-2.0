@@ -1351,6 +1351,9 @@ class ExecResult:
     #: steps is safe (it sends and joins nothing, and its route may be followed after acting): that skill's id. The
     #: Brain then replans once by steps after a look instead of ending (x10); ``None`` otherwise.
     unconfirmed_skill: str | None = None
+    #: kBrain review M2: on a plan that didn't end done, the lines of the request's ``run_skill`` parts their own check
+    #: saw done, said before the line the request ends on (``done.with_parts``).
+    parts: list[str] = field(default_factory=list)
 
 
 __all__ = [

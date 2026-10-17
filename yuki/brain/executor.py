@@ -133,7 +133,10 @@ DEFAULT_COUNTDOWN_S = 3.0
 COUNTED_MIN_S = 0.5
 #: review r2 M1: a ``run_skill`` send whose engine outcome is one of these sent nothing (it asked, handed over, was
 #: refused or held, or its check saw nothing go), so the same message may be sent by a later step of the request.
-NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "failed"})
+NOT_SENT_OUTCOMES = frozenset({"asked", "handed_over", "refused", "held_game", "held_call", "failed"})
+#: kBrain review M1: the skill engine's code words for a run it held before acting: a game in front, a call live
+#: (decision 2: a pick is never put on then). Settled: the run ends on the engine's own line, never a replan.
+HELD_OUTCOMES = {"held_game": "game", "held_call": "call"}
 #: How long a pause waits for the user to resume before the run stops quietly (s; ``takeover_idle_stop_s``).
 PAUSE_LIMIT_S = 600.0
 
@@ -142,6 +145,8 @@ LINE_BUSY = "Something else is using the mouse and keyboard right now, so I stop
 LINE_PAUSE_STOP = "Stopped. Nothing else was done."
 LINE_STOPPED_SEND = "Stopped. Nothing was sent."
 LINE_CUT_SHORT = "I lost my train of thought partway through, so I stopped there."
+#: A run the engine held for a live call that gave no line of its own (its own line says so and names the pick).
+LINE_HELD_CALL = "You're on a call, so I held off."
 LINE_DRAFT_HELD = "I opened the chat but didn't type the text in."
 LINE_CHAT_UNCONFIRMED = "I couldn't confirm the chat is open, so I didn't type anything."
 #: A ``run_skill`` step that didn't get it done, as said when the request ends on it (x9: never the outcome's code
@@ -224,7 +229,9 @@ class RunResult:
     (the user's words in ``words``: replan with them), ``refused`` (``line``; ``final`` ends the run with it, else a
     replan may route around it), ``declined`` (the user said no), ``stopped`` (the stream was cut short, the
     countdown was stopped, or the pause ran out), ``cancelled``, ``busy`` (the desk lease was held elsewhere).
-    ``line``: what code says when the run ends here. ``outcome``: ``Final.outcome`` when it ends here."""
+    ``line``: what code says when the run ends here. ``outcome``: ``Final.outcome`` when it ends here. ``parts``: on
+    a run that didn't end done, the lines of the request's ``run_skill`` parts whose own check saw them done (this plan's
+    and earlier plans'), said before the line the request ends on (kBrain review M2)."""
 
     status: str
     plan_id: str = ""
@@ -236,6 +243,7 @@ class RunResult:
     line: str = ""
     final: bool = False
     outcome: dict[str, Any] | None = None
+    parts: list[str] = field(default_factory=list)
 
     def statuses_text(self) -> str:
         """The step statuses in one block, for the replan message."""
@@ -331,8 +339,8 @@ class Executor:
         self.acting = False
         self.replans = 0
         self.revision = 0
-        #: kBrain: the lines of parts an earlier plan of this request did, its own skill's check seeing them (a later
-        #: part stopped that plan): said first in the request's line (``done.parts_done``).
+        #: kBrain: the lines of parts earlier plans of this request did, their own skill's check seeing them (kept by
+        #: :meth:`begin`): said first in the request's line (``done.parts_done`` / ``done.with_parts``).
         self._parts_before: list[str] = []
         self.trace: list[dict[str, Any]] = []
         self.numbers: set[int] = set()
@@ -398,12 +406,14 @@ class Executor:
 
     def begin(self, head: Any) -> None:
         """A new plan (or a revision): its header (goal .. question) closed in the stream. Steps already done stay
-        done; a revision lists only what is left (or what it redoes). kBrain: the parts the plan before it did and its
-        own skill saw done (a later part stopped it) are kept, so the request's line says them too."""
+        done; a revision lists only what is left (or what it redoes). kBrain: the parts the plans before it did and
+        their own skill saw done (a later part stopped that plan, or the planner went on after it) are kept, so the
+        request's line says them too; not after the user's own words redirected it (a steer)."""
         self._join_reads()
         if self._result is not None and self._result.status == "mismatch":
             self.replans += 1          # a replan after a mismatch counts; one after the user's own words does not
-            self._parts_before.extend(self._parts_seen())
+        if self._result is not None and self._result.status != "steer":
+            self._parts_before = self._done_parts()
         self._reset_plan()
         self.revision += 1
         self.head = head
@@ -544,11 +554,6 @@ class Executor:
         if answer:
             return model_calls >= ANSWER_MODEL_CALLS or time.monotonic() - self.started_mono >= ANSWER_SECONDS
         return self.replans >= self.max_replans or model_calls >= ACT_MODEL_CALLS
-
-    def stuck_line(self) -> str:
-        """The line when the budget is spent: "I got stuck at <step>: <what showed>. Try another way?"."""
-        failed = self.last_failed or {}
-        return done.stuck(str(failed.get("words") or failed.get("verb") or ""), str(failed.get("seen") or ""))
 
     def status_line(self) -> str | None:
         """The running plan in a few words, for "how's it going?" (``bridge.work_line``): the step running or the
@@ -1117,15 +1122,20 @@ class Executor:
         return None
 
     def _skill_result(self, index: int, step: Any, call: Call, outcome: Any) -> RunResult | None:
-        """A ``run_skill`` step's own outcome: done (its check saw it), held for a game, a question, a hand-off (rung
-        C: a plan seed for the planner), or not done."""
+        """A ``run_skill`` step's own outcome: done (its check saw it), held for a game or a call, a question, a
+        hand-off (rung C: a plan seed for the planner), or not done."""
         status = self.statuses[index]
         payload = outcome.payload if isinstance(outcome.payload, dict) else {}
         state = str(payload.get("outcome") or "")
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-        if payload.get("refused") == "game" or details.get("refused") == "game" or state == "held_game":
-            status.state, status.why = "refused", "game"
-            return RunResult("refused", line=consent.LINE_GAME, final=True)
+        held = HELD_OUTCOMES.get(state) or (
+            "game" if payload.get("refused") == "game" or details.get("refused") == "game" else "")
+        if held:
+            # kBrain review M1: held before it acted (a game in front, a call live): settled, never a replan; the
+            # engine's own line says so and names the pick it kept for later
+            status.state, status.why = "refused", held
+            return RunResult("refused", line=done.engine_line(outcome) or (
+                consent.LINE_GAME if held == "game" else LINE_HELD_CALL), final=True)
         if details.get("refused") == "act_off" or payload.get("refused") == "act_off":
             status.state, status.why = "refused", "act_off"
             return RunResult("refused", line=done.engine_line(outcome) or str(outcome.summary or ""), final=True)
@@ -1923,7 +1933,7 @@ class Executor:
         try:
             payload = outcome.payload if isinstance(getattr(outcome, "payload", None), dict) else {}
             details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-            if payload.get("refused") or details.get("refused") or str(payload.get("outcome") or "") == "held_game":
+            if payload.get("refused") or details.get("refused") or str(payload.get("outcome") or "") in HELD_OUTCOMES:
                 return   # held before it acted: nothing was typed
             key, slots = consent.skill_input(call, self.head)
             sk = util.skill(key)
@@ -2116,6 +2126,7 @@ class Executor:
                             memory=self.host.memory, last_verdict=self.last_act.get("verdict"),
                             baseline=dict((self.seed or {}).get("baseline") or {}), acted=acted,
                             lock=self._dispatch_lock)
+        deciding: _SkillRun | None = None
         if cls == "skill" and self.seed and self.seed.get("done") and not str(
                 field_of(self.head, "route", "")).startswith("skill:"):
             result = done.seed_done(self.seed, env)
@@ -2133,12 +2144,19 @@ class Executor:
                                          type_after=deciding.type_after, typed=deciding.typed)
         else:
             result = self._pick_done(env)
+        if cls in ("skill", "join") and not (deciding is not None and deciding.drafted):
+            # kBrain review M2: the request's other parts their own skills saw done (this plan's, and earlier plans' a
+            # later part stopped) are said first; a send's or a draft's line stands alone (consent's own words)
+            result.line = done.with_parts(self._done_parts(exclude=deciding), result.line)
         self._last_done = result
         self._emit_log("done_check", check=result.probe, result={True: "done", False: "false", None: "unverified"}[
             result.verdict], level=result.level, covered=len(result.covered), uncovered=len(result.uncovered))
-        # what the check looked for in code's words, never the planner's goal text (x9: it called the user "they")
-        unconfirmed = done.not_confirmed(seen=result.seen, probe=result.probe, args=result.args,
-                                         window_entry=result.window) if result.verdict is False else ""
+        # what the check looked for in code's words, never the planner's goal text (x9: it called the user "they"); a
+        # request of parts already says each part in its own words (the probe's part as "couldn't confirm")
+        parted = result.probe == done.PARTS
+        unconfirmed = (result.line if parted else done.not_confirmed(
+            seen=result.seen, probe=result.probe, args=result.args, window_entry=result.window)) \
+            if result.verdict is False else ""
         if result.verdict is False and cls == "pick" and not self._done_replan and self.replans < self.max_replans:
             self._done_replan = True   # one replan with what showed; still false after it: "I couldn't confirm"
             self.last_failed = {"step": None, "verb": "done", "words": "the final check", "seen": result.seen}
@@ -2148,49 +2166,58 @@ class Executor:
                              mismatch=Mismatch(step=len(self.steps) - 1, verb="done", why="done_false",
                                                expected=f"{result.probe} true", seen=result.seen,
                                                view=self._view(self.last_act.get("hwnd"))), line=unconfirmed)
-        if result.verdict is False and cls == "pick":
+        if result.verdict is False and cls == "pick" and not parted:
             result.line = unconfirmed
         self._start_recheck(result, env)
         final = done.outcome(result, self.trace, step_words=self._step_words(), refused=self._refused_count())
         return RunResult("done", plan_id=self.plan_id, statuses=list(self.statuses), done=result, line=result.line,
                          final=True, outcome=final, reads=list(self.read_results))
 
-    def _part(self, run: _SkillRun) -> done.DoneResult:
-        """One ``run_skill`` part of this plan, by its own skill's check."""
+    def _part(self, run: _SkillRun, *, several: bool = True) -> done.DoneResult:
+        """One ``run_skill`` part of this plan, by its own skill's check (``several``: the request has other parts)."""
         sends = consent.skill_sends(util.skill(run.key), run.slots, partial=False)
         return done.part_result(run.outcome, drafted=run.drafted, sends=sends, type_after=run.type_after,
-                                typed=run.typed)
+                                typed=run.typed, several=several)
 
-    def _parts_seen(self) -> list[str]:
-        """The lines of this plan's ``run_skill`` parts whose own check saw them done (kept across a replan)."""
-        out: list[str] = []
+    def _done_parts(self, exclude: _SkillRun | None = None) -> list[str]:
+        """The lines of the request's ``run_skill`` parts whose own check saw them done, each once: earlier plans'
+        (kept by :meth:`begin`) and this plan's, ``exclude`` aside (the part the line itself is about)."""
+        out = list(self._parts_before)
         for run in self.skill_outcomes:
+            if run is exclude:
+                continue
             try:
                 result = self._part(run)
             except Exception:  # noqa: BLE001 - a part not read is not said
                 continue
-            if result.verdict is True and result.line:
+            if result.verdict is True and result.line and result.line not in out:
                 out.append(result.line)
         return out
 
     def _pick_done(self, env: done.ProbeEnv) -> done.DoneResult:
         """A plan the planner checks (no skill route, no send or join): each ``run_skill`` part by its own skill's
-        check, and the plan's ``done`` probe for the part done by steps. A plan whose every act step is a skill and
-        whose ``done`` is none is decided by its parts alone (kBrain: "play my Japanese playlist and turn it down",
-        0 of 6 in live test 1, is two parts, each checked)."""
-        parts = [self._part(run) for run in self.skill_outcomes]
+        check, and the plan's ``done`` probe for the part done by steps (said as a part: what it looked for). A plan
+        whose every act step is a skill and whose ``done`` is none is decided by its parts alone (kBrain: a request of
+        two parts, a playlist and a level, is one plan with a part per skill, each checked by its own skill)."""
+        runs = list(self.skill_outcomes)
+        before = self._parts_before
         probe, args, _why = done.plan_done(self.head)
         only_skills = all(self._verb(s) == "run_skill" for s in self.steps if self._verb(s) in ACT_VERBS)
-        if (parts or self._parts_before) and probe == done.NONE and only_skills:
-            return done.parts_done(parts, before=self._parts_before)
+        if (runs or before) and probe == done.NONE and only_skills:
+            several = len(runs) + len(before) > 1
+            return done.parts_done([self._part(run, several=several) for run in runs], before=before)
         entry = {"process_name": self.last_act.get("app") or "", "title": self.last_act.get("title") or ""}
         # x9: page_at reads the page of the browser this request named (never a page in another browser)
         result = done.pick_done(self.head, env, hwnd=self.last_act.get("hwnd"), last_window=entry,
                                 cancelled=self.host.cancelled,
                                 args=self._probe_args(probe, args) if args is not None else None)
-        if not parts and not self._parts_before:
+        if not runs and not before:
             return result
-        return done.parts_done([*parts, result], before=self._parts_before)
+        if result.verdict is False:
+            # the part done by steps, as a part: what its probe looked for, in code's words (never the goal text)
+            result.line = done.not_confirmed(seen=result.seen, probe=result.probe, args=result.args,
+                                             window_entry=result.window)
+        return done.parts_done([*(self._part(run) for run in runs), result], before=before)
 
     def _deciding_skill(self, cls: str) -> _SkillRun | None:
         """The ``run_skill`` step whose capability's own check decides the plan. A send plan: the last one that sent
@@ -2284,6 +2311,11 @@ class Executor:
         result.plan_id = result.plan_id or self.plan_id
         result.statuses = result.statuses or list(self.statuses)
         result.reads = result.reads or list(self.read_results)
+        if result.status != "done" and not result.parts:
+            try:
+                result.parts = self._done_parts()   # kBrain review M2: said before the line a request ends on
+            except Exception:  # noqa: BLE001 - parts not read are not said
+                result.parts = []
         if result.final and result.outcome is None:
             result.outcome = done.outcome(self._last_done if result.status == "done" else None, self.trace,
                                           step_words=self._step_words(), refused=self._refused_count())

@@ -329,8 +329,9 @@ class Lane(QThread):
             return self._brain
 
     def _make_brain(self) -> Any:
-        """This lane's brain, sharing the loop agent's settings (so the model switch reaches it), its session log and
-        the runtime's memory. The worker's acts (one desk lease per act run) with the send countdown and the takeover
+        """This lane's brain, sharing the loop agent's settings, its session log and the runtime's memory. Its planner
+        model is its own (``brain_model``, else the brain's default: ``BrainSettings``), so the old loop's model switch
+        does not reach it. The worker's acts (one desk lease per act run) with the send countdown and the takeover
         pause; the front desk only looks: its dispatcher is on the hands-blocked backend and an act plan is handed to
         the worker (``Brain.hands`` false)."""
         from yuki.brain import Brain
@@ -1046,6 +1047,8 @@ class AgentRuntime(QObject):
         #: ``COST_CHECK_S`` (incremental log reads), one ``notice`` a day past the threshold.
         self._cost_alert = None
         self._cost_stop = threading.Event()
+        #: kBrain: the start-up warm-up's timer (cancelled on stop).
+        self._brain_warm: threading.Timer | None = None
         try:
             from yuki.core.cost import CostAlert, CostLedger
 
@@ -1072,9 +1075,9 @@ class AgentRuntime(QObject):
         (:meth:`warm_brain`)."""
         self.worker.start()
         self.front_desk.start()
-        warm = threading.Timer(self.BRAIN_WARM_DELAY_S, self.warm_brain)
-        warm.daemon = True
-        warm.start()
+        self._brain_warm = threading.Timer(self.BRAIN_WARM_DELAY_S, self.warm_brain)
+        self._brain_warm.daemon = True
+        self._brain_warm.start()
         if self._cost_alert is not None:
             def loop() -> None:
                 while not self._cost_stop.wait(self.COST_CHECK_S if self._cost_checked else 30.0):
@@ -1112,6 +1115,8 @@ class AgentRuntime(QObject):
         exchange that closed the app could be lost at exit.
         """
         self._cost_stop.set()
+        if self._brain_warm is not None:
+            self._brain_warm.cancel()
         for lane in (self.worker, self.front_desk):
             lane.shutdown()
         for lane in (self.worker, self.front_desk):

@@ -68,6 +68,7 @@ from yuki.brain.context import (
     tool_result,
     unconfirmed_report,
 )
+from yuki.brain.done import with_parts
 from yuki.brain.plan import (
     ACT_VERBS,
     PLAN_TOOL,
@@ -692,6 +693,8 @@ class Brain:
         #: kBrain: when the planner's prefix was last written or read (a planner call or a warm-up; monotonic, 0:
         #: never in this app run), for :meth:`warm_cache`.
         self._warm_at = 0.0
+        self._warming = False
+        self._warm_lock = threading.Lock()
         self._reset_accounting()
         #: The ``request_summary`` of the last request that ended (``None`` while one runs).
         self.last_summary: dict[str, Any] | None = None
@@ -808,37 +811,59 @@ class Brain:
         no planner call or warm-up ran in the last :data:`WARM_AFTER_S`, and never while a request runs. Runs on the
         caller's thread (callers use a background one); ``effort`` / ``thinking`` are the old loop's interface and are
         not used (the planner's own effort is). ``True`` when it ran, ``False`` when skipped, ``None`` when the call
-        failed. Content-free log; never raises."""
-        if self._running or (self._warm_at and time.monotonic() - self._warm_at < WARM_AFTER_S):
-            self.logger.log("model_prewarm", skipped="brain: warm or busy")
-            return False
-        self._warm_at = time.monotonic()
+        failed (the next call may try again). Its spend is a ``startup_cost`` record, which the day's spend counts
+        (``yuki.core.cost``), never a request's. Content-free log; never raises."""
+        with self._warm_lock:
+            if self._running or self._warming or (
+                    self._warm_at and time.monotonic() - self._warm_at < WARM_AFTER_S):
+                self.logger.log("model_prewarm", skipped="brain: warm or busy")
+                return False
+            self._warming = True
         started = time.perf_counter()
         try:
-            bs = BrainSettings.read(self.settings)
-            names = list(getattr(self.settings, "user_names", []) or [])
-            card = read_card(self.memory)
-            brief, rules = read_profile_parts(self.memory)
-            # the same bytes as the request's breakpoint 2 and 3 (context.gather composes them the same way)
-            profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars)
-            menu, _lines, _keys = read_menu(self.memory, self.settings, limit=bs.menu_chars)
-            params = build_params(model=bs.model, max_tokens=1, system=system_blocks(profile, menu),
-                                  messages=[{"role": "user", "content": [{"type": "text", "text": WARM_TEXT}]}],
-                                  effort=bs.effort_typed, thinking_display=bs.thinking_display, stream=bs.stream,
-                                  eager=bs.eager)
-            if bs.stream:
-                with self.client.messages.stream(**params) as stream:
-                    for _event in stream:
-                        pass
-                    message = stream.get_final_message()
-            else:
-                message = self.client.messages.create(**params)
+            return self._warm()
         except Exception as exc:  # noqa: BLE001 - only an optimisation
             self.logger.log("model_prewarm", ok=False, error=type(exc).__name__,
                             ms=round((time.perf_counter() - started) * 1000, 1))
             return None
-        self.logger.log("model_prewarm", ok=True, model=bs.model, ms=round((time.perf_counter() - started) * 1000, 1),
-                        tokens=usage_tokens(getattr(message, "usage", None)))
+        finally:
+            self._warming = False
+
+    def _warm(self) -> bool:
+        """:meth:`warm_cache`'s call and its accounting (raises on a failed call)."""
+        started = time.perf_counter()
+        bs = BrainSettings.read(self.settings)
+        names = list(getattr(self.settings, "user_names", []) or [])
+        card = read_card(self.memory)
+        brief, rules = read_profile_parts(self.memory)
+        # the same bytes as the request's breakpoint 2 and 3 (context.gather composes them the same way)
+        profile = profile_text(names=names, brief=None if card else brief, rules=rules, limit=bs.profile_chars)
+        menu, _lines, _keys = read_menu(self.memory, self.settings, limit=bs.menu_chars)
+        params = build_params(model=bs.model, max_tokens=1, system=system_blocks(profile, menu),
+                              messages=[{"role": "user", "content": [{"type": "text", "text": WARM_TEXT}]}],
+                              effort=bs.effort_typed, thinking_display=bs.thinking_display, stream=bs.stream,
+                              eager=bs.eager)
+        if bs.stream:
+            with self.client.messages.stream(**params) as stream:
+                for _event in stream:
+                    pass
+                message = stream.get_final_message()
+        else:
+            message = self.client.messages.create(**params)
+        self._warm_at = time.monotonic()   # review L2: only a warm-up that ran holds the next one off
+        ms = round((time.perf_counter() - started) * 1000, 1)
+        model = self._used_model(bs.model)
+        tokens = usage_tokens(getattr(message, "usage", None))
+        try:
+            cost = self.settings.estimate_cost(model, tokens)
+        except Exception:  # noqa: BLE001
+            cost = None
+        self.logger.log("model_prewarm", ok=True, model=model, ms=ms, tokens=tokens)
+        # review L2: the day's spend reads warm-ups from ``startup_cost`` records (``yuki.core.cost``), as the old
+        # loop's; a request's own totals never hold it
+        self.logger.log("startup_cost", kind="model_prewarm", lane=self.lane, model=model,
+                        elapsed_s=round(ms / 1000, 2), tokens=tokens,
+                        cost_usd=None if cost is None else round(cost, 6))
         return True
 
     @property
@@ -1950,7 +1975,8 @@ class Brain:
             "verdict": getattr(found, "verdict", None) if found is not None else None,
             "probe": str(getattr(found, "probe", "") or "") if found is not None else "",
             "line": str(getattr(got, "line", "") or ""), "check_calls": checks,
-            "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False))}
+            "outcome": getattr(got, "outcome", None), "final": bool(getattr(got, "final", False)),
+            "parts": [str(p) for p in getattr(got, "parts", None) or [] if str(p or "").strip()]}
         status = str(getattr(got, "status", "") or "error")
         if status == "done":
             # "done" only when the check saw it; any other reading is said as not confirmed, with the executor's line
@@ -2150,8 +2176,9 @@ class Brain:
             return True
         if result.final and result.line and status in ("refused", "stopped") and not self._cancelled.is_set():
             # the executor ends the run here with its own line (a game in front: "after the round?"; the desk busy):
-            # no replan routes around it
-            self._final(result.line, self._result_outcome(result, state, plan, result.line))
+            # no replan routes around it; the parts already done are said first (review M2)
+            line = with_parts(result.parts, result.line)
+            self._final(line, self._result_outcome(result, state, plan, line))
             return True
         if status == "stopped":
             self._push(self._cancel_event())
@@ -2339,8 +2366,11 @@ class Brain:
                 self._final(*state.held)
                 return True
         if last is not None and last.line and last.status in ("refused", "mismatch", "error"):
-            # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words
-            self._final(last.line, self._outcome(state, level="failed" if state.acted else "answer", line=last.line))
+            # the executor's own line for why it stopped (a refusal's "after the round?") wins over the model's words;
+            # the parts already done are said first (review M2)
+            line = with_parts(last.parts, last.line)
+            self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
+                                            partial=bool(last.parts)))
             return True
         if state.acted or (state.kind == "act" and last is not None
                            and last.status in ("refused", "mismatch", "error")):
@@ -2390,6 +2420,8 @@ class Brain:
             why = plain_reason(last.reason, refused=last.status == "refused")
         line = (last.line if last is not None and last.line and last.status in ("mismatch", "refused") else
                 LINE_STUCK.format(where=f" {where}" if where else "", why=f": {why}" if why else ""))
+        # review M2: the parts already done (their own skill's check saw them) are said before where it stopped
+        line = with_parts(last.parts if last is not None else (), line)
         self._final(line, self._outcome(state, level="failed" if state.acted else "answer", line=line,
                                         partial=state.acted))
 
@@ -2770,6 +2802,7 @@ def _as_result(got: Any) -> ExecResult:
     for key, default in (("seen", ""), ("view", ""), ("line", ""), ("probe", ""), ("reason", ""), ("expected", "")):
         data[key] = str(data.get(key) or default)
     data["reads"] = [str(r) for r in data.get("reads") or []]
+    data["parts"] = [str(p) for p in data.get("parts") or [] if str(p or "").strip()]
     data["acted"] = bool(data.get("acted"))
     data["check_calls"] = int(data.get("check_calls") or 0)
     return ExecResult(**data)

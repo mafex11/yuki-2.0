@@ -163,7 +163,6 @@ LINE_NOT_CONFIRMED_PLAIN = "I couldn't confirm it: {seen}."
 NAMED_FIRST: tuple[str, ...] = ("{App}", "{site}", "{file}", "\"")
 #: Probes whose line claims nothing a person could check by looking ("shows the change", "its own check saw it").
 NO_CLAIM = frozenset({NONE, "read_back", "driver"})
-LINE_STUCK = "I got stuck at {step}: {seen}. Try another way?"
 LINE_RECHECK = "Looking again, I can't see that any more."
 #: A draft whose text can't be shown to be in: the chat was seen open and Yuki's wording typed, but the typing's own
 #: check couldn't read it back; or the capability's draft wasn't confirmed by its own check.
@@ -933,7 +932,11 @@ def engine_line(outcome: Any) -> str:
     payload = getattr(outcome, "payload", None)
     if isinstance(payload, dict) and isinstance(payload.get("done_line"), str) and payload["done_line"].strip():
         return " ".join(payload["done_line"].split())
-    summary = str(getattr(outcome, "summary", "") or "")
+    # the report's first line whole when the outcome carries it (kBrain review M1: a held pick's line names the pick
+    # and can run past the summary's 200 characters), else the summary
+    summary = next((str(b.get("text")).split("\n", 1)[0] for b in getattr(outcome, "content", None) or []
+                    if isinstance(b, dict) and b.get("type") == "text" and str(b.get("text") or "").strip()), "") \
+        or str(getattr(outcome, "summary", "") or "")
     for mark in ("Done and checked: ", "Say: ", "Say so plainly: ", "Not changed: "):
         head, sep, rest = summary.partition(mark)
         if sep and rest.strip():
@@ -982,16 +985,45 @@ LINE_PART_FAILED = "the other part didn't take"
 
 
 def part_result(outcome: Any, *, drafted: bool = False, sends: bool = False, type_after: bool = False,
-                typed: bool | None = None) -> DoneResult:
-    """kBrain: one part of a plan of several, by its own skill's check (:func:`skill_done`). A part whose skill gave no
-    line of its own is said as a part ("I couldn't confirm the other part"), never the whole request's generic line."""
+                typed: bool | None = None, several: bool = True) -> DoneResult:
+    """kBrain: one part of a request, by its own skill's check (:func:`skill_done`). When the request has other parts
+    (``several``), a part whose skill gave no line of its own is said as a part ("I couldn't confirm the other part"),
+    never the whole request's generic line; a request of one part keeps :func:`skill_done`'s line."""
     result = skill_done(outcome, drafted=drafted, sends=sends, type_after=type_after, typed=typed)
-    if not (engine_line(outcome) if outcome is not None else "") and not drafted:
+    if several and not (engine_line(outcome) if outcome is not None else "") and not drafted:
         if result.verdict is None:
             result.line = LINE_PART_UNCONFIRMED
         elif result.verdict is False:
             result.line = LINE_PART_FAILED
     return result
+
+
+#: The probe word of a request decided part by part (:func:`parts_done`): its line already says each part.
+PARTS = "parts"
+
+
+def _part_lines(lines: Sequence[Any]) -> list[str]:
+    """Part lines, each once, in order, without their closing full stops."""
+    out: list[str] = []
+    for line in lines:
+        text = " ".join(str(line or "").split()).rstrip(" .")
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def with_parts(done_parts: Sequence[str], line: str) -> str:
+    """kBrain review M2: ``line`` (about one part, or why the request stopped) with the lines of the request's other
+    parts their own check saw done said first, each once ("Playing X; the level is 30%. <line>"); a part ``line``
+    already holds is not said again (a code-built line compared as text, never a reading of its meaning)."""
+    line = " ".join(str(line or "").split())
+    held = line.casefold()
+    lines = [text for text in _part_lines(done_parts) if text.casefold() not in held]
+    if not lines:
+        return line
+    lead = "; ".join(lines) + "."
+    lead = lead[0].upper() + lead[1:]
+    return f"{lead} {line}" if line else lead
 
 
 def parts_done(parts: Sequence[DoneResult], *, before: Sequence[str] = ()) -> DoneResult:
@@ -1003,11 +1035,7 @@ def parts_done(parts: Sequence[DoneResult], *, before: Sequence[str] = ()) -> Do
     parts = [p for p in parts if p is not None]
     if len(parts) == 1 and not before:
         return parts[0]
-    lines: list[str] = []
-    for line in [*before, *(p.line for p in parts)]:
-        text = " ".join(str(line or "").split()).rstrip(" .")
-        if text and text not in lines:
-            lines.append(text)
+    lines = _part_lines([*before, *(p.line for p in parts)])
     verdicts = [p.verdict for p in parts]
     if parts and all(v is True for v in verdicts):
         verdict = True
@@ -1020,7 +1048,7 @@ def parts_done(parts: Sequence[DoneResult], *, before: Sequence[str] = ()) -> Do
     if line:
         line = line[0].upper() + line[1:]
     sends = [p.send for p in parts if p.send]
-    return DoneResult(verdict, level, line, seen="; ".join(p.seen for p in parts if p.seen), probe="parts",
+    return DoneResult(verdict, level, line, seen="; ".join(p.seen for p in parts if p.seen), probe=PARTS,
                       covered=[c for p in parts for c in p.covered], uncovered=[u for p in parts for u in p.uncovered],
                       recheck=any(p.recheck for p in parts), evidence={"parts": len(parts) + len(before)},
                       send=sends[-1] if sends else None)
@@ -1192,18 +1220,6 @@ def not_confirmed(goal: str = "", seen: str = "", *, probe: str = "", args: Mapp
     return LINE_NOT_CONFIRMED.format(what=what, seen=seen) if what else LINE_NOT_CONFIRMED_PLAIN.format(seen=seen)
 
 
-def stuck(step: str, seen: str) -> str:
-    """The line when the budget runs out (§2.3)."""
-    step = " ".join(str(step or "").split()).rstrip(". ") or "a step"
-    first = step.split(" ", 1)[0]
-    if len(first) > 1 and first[0].isupper() and first[1:].islower():
-        # a step line in the island's words ("Clicking Play ネオン", sBrainFix F7) inside the sentence; a first word
-        # with capitals of its own ("YouTube") is a name and stays as it is
-        step = step[0].lower() + step[1:]
-    seen = " ".join(str(seen or "").split()).rstrip(". ") or "it didn't work"
-    return LINE_STUCK.format(step=step, seen=seen)
-
-
 def recheck_later(result: DoneResult, env: ProbeEnv, on_result: Callable[[bool | None], None], *,
                   after_s: float = RECHECK_AFTER_S) -> threading.Thread | None:
     """D19's second look for a probe that can flip: one read ``after_s`` later on a short-lived thread (off the
@@ -1268,6 +1284,6 @@ __all__ = ["COMMIT_MOMENTS", "COVERS", "DONE_BUDGET_S", "ENGINE_PROBES", "EXPECT
            "GENERIC_PROBES", "LINES", "NONE", "PICK_PROBES", "PROBES", "PROBE_ARGS", "DoneResult", "ProbeEnv",
            "allowed_probes", "as_hwnd", "claim_for", "coverage", "engine_line", "find_named", "line_for",
            "not_confirmed", "outcome", "overview", "own_check", "parse_args", "pick_done", "plan_class", "plan_done",
-           "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "stuck", "wait_read",
-           "part_result", "parts_done", "LINE_PART_UNCONFIRMED", "LINE_PART_FAILED",
+           "probe_name", "read", "recheck_later", "seed_done", "seen_words", "skill_done", "wait_read",
+           "part_result", "parts_done", "with_parts", "PARTS", "LINE_PART_UNCONFIRMED", "LINE_PART_FAILED",
            "window_of", "with_browser", "env_acted", "unread_line", "observe_seed", "PAGE_KIND_WORDS"]
