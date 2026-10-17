@@ -80,7 +80,7 @@ WEIGHTS: dict[str, float] = {"observed": 1.0, "observed_day": 0.5, "ran_ok": 1.0
 #: ``succeeded`` (appLearn): the run a way was learned from (its ``observed`` run) ended done with its last action
 #: verified and nobody corrected it - what lets a way learned from a run be shown and announced (:func:`learned_way`).
 #: It weighs nothing: the run's own ``observed`` event is already its evidence.
-#: ``cleaned`` (appClean): what the practice clean-up pass (:mod:`yuki.memory.practice_clean`) or the daily pitfall
+#: ``cleaned`` (appClean): what the practice clean-up pass (deleted 18 Oct 2026) or the daily pitfall
 #: cap did to an object (retired, merged into another, rewritten as title and steps), under the run key
 #: ``clean:<run id>`` (:data:`CLEAN_RUN_PREFIX`), so a whole pass can be taken back.
 #: ``demo_withdrawn`` / ``demo_restored`` (capC4): the task a ``demonstrated`` event of the demo learner rests on was

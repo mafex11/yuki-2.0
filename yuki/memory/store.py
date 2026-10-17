@@ -8227,39 +8227,6 @@ class Store:
             output_tokens=r["output_tokens"] or 0, score=score,
         )
 
-    def revise_weekly_review(
-        self, review: WeeklyReview, *, text: str, sections: dict[str, Any], teaser: str | None, model: str | None,
-        stats: ReviewStats | None = None, vector: np.ndarray | None = None, embed_model: str | None = None,
-    ) -> int:
-        """Store a corrected version of a finished review (``python -m yuki.memory.recheck``): a new ``ok`` row for the
-        same week and period, dated like the original (so the review schedule and the teaser card see no new run:
-        its ``nudge_id`` is carried over), and the original marked ``superseded`` (kept as history, out of every
-        ``ok`` read: the latest review, recall, the window). Returns the new id."""
-        now = time.time()
-        stats = stats or ReviewStats()
-
-        def seal(value: Any) -> str | None:
-            return None if value is None else self.cipher.encrypt(json.dumps(value, ensure_ascii=False, default=str))
-
-        def op(conn: sqlite3.Connection) -> int:
-            cur = conn.execute(
-                "INSERT INTO weekly_reviews(at, finished_at, week, period_start, period_end, trigger, model,"
-                " text_ciphertext, sections_ciphertext, teaser_ciphertext, numbers_ciphertext, candidates_ciphertext,"
-                " candidates_run_id, nudge_id, calls, input_tokens, output_tokens, cache_write_tokens,"
-                " cache_read_tokens, cost_usd, latency_ms, stop_reason, outcome)"
-                " VALUES (?,?,?,?,?,'recheck',?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?,'ok')",
-                (float(review.at), now, review.week, float(review.period_start), float(review.period_end), model,
-                 self._enc(text), seal(sections), self._enc(teaser), seal(review.numbers), review.candidates_run_id,
-                 review.nudge_id, stats.calls, stats.input_tokens, stats.output_tokens, stats.cache_write_tokens,
-                 stats.cache_read_tokens, stats.cost_usd, stats.latency_ms, stats.stop_reason))
-            new_id = int(cur.lastrowid)
-            conn.execute("UPDATE weekly_reviews SET outcome='superseded' WHERE id=?", (int(review.id),))
-            if vector is not None:
-                self._put_vec(conn, "weekly_review_vec", "review_id", new_id, vector, embed_model)
-            return new_id
-
-        return self._write(op)
-
     def start_weekly_review(
         self, week: str, period_start: float, period_end: float, trigger: str, model: str | None,
         *, at: float | None = None,
