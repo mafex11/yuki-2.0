@@ -496,6 +496,22 @@ class Settings:
         voice_lessons_chars: The Lessons line's size in the talker's volatile block.
         voice_hand_traces: Every talker hand (and learned-way run) is kept as a run trace in practice memory so the
             learners see the hands too (v3.18; written off the voice loop).
+        voice_reflex: lSpeed (live test 17 Oct 2026, problem 1; ``yuki.voice.reflex``). The user's own words for which
+            one talker hand (a media key, a relative volume change or mute, a window brought up, restored or
+            minimised, a scroll, an app opened) was verified done, and nothing else was done for that turn, are kept
+            (encrypted, in memory); the next time exactly those words are heard, that hand runs at once at the end of
+            their turn, with no model in front, and the talker only speaks. Never for sends, closes, tabs, messages,
+            joins or with a game in front; words that mapped to two different calls are dropped; a correction in the
+            next words (a small model call, within ``voice_reflex_correct_s``) drops the entry.
+        voice_reflex_at: When a reflex acts: ``"eager"`` (Flux's eager end of turn, measured 17 Oct: median 0.48-0.67 s
+            after speech; the final transcript is re-checked and nothing acts twice) or ``"final"`` (the final
+            transcript, 0.32-0.48 s later).
+        voice_reflex_wait_s: The talker's call for those words waits at most this long for the reflex's outcome (a
+            hand takes 4-400 ms), so it is told it is done and only speaks.
+        voice_reflex_seed_days / voice_reflex_seed_skip: The first seeding reads the user's own repeated talker hands
+            of this many days (practice memory's hand traces), leaving out sessions whose id starts with one of these
+            (the live test harness's own). A conversation whose own session id starts with one of these learns,
+            runs and takes corrections in RAM only: nothing of it is written to the user's book.
         voice_practice, voice_skills (Phase S, D15): the old talker learning path (the Lessons and Learned ways lines,
             the step-list ``run_skill``) is off by default. It never runs beside the skill path: with ``skills`` on it
             stays off whatever these say; with ``skills = false`` they work as before S (``voice_practice`` the lines,
@@ -681,6 +697,13 @@ class Settings:
     voice_skill_min_confidence: float = 0.70
     voice_lessons_chars: int = 400
     voice_hand_traces: bool = True
+    # lSpeed (live test 17 Oct 2026, problem 1): the learned reflex path (yuki.voice.reflex)
+    voice_reflex: bool = True
+    voice_reflex_at: str = "eager"
+    voice_reflex_wait_s: float = 0.45
+    voice_reflex_correct_s: float = 20.0
+    voice_reflex_seed_days: float = 30.0
+    voice_reflex_seed_skip: tuple[str, ...] = ("livetest-",)
     # Phase S skills (docs/research/audit-2026-10-09/PLAN.md; yuki.skills.DEFAULTS mirrors these). The switch (failure
     # fix-plan Item 1): YUKI_SKILLS, else "skills" in settings.json, else on; "capabilities" hides the learned rows
     skills: bool = field(default_factory=lambda: skills_mode() != "off")
