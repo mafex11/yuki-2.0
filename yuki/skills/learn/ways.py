@@ -590,20 +590,9 @@ def _emit(log: Callable[..., Any] | None, event: str, **fields: Any) -> None:
         pass
 
 
-def _app_title(store: Any, app: str) -> str:
-    """The app as people say it: its window's own title as the registry keeps it, else its prettified program name."""
-    try:
-        rows = store._query("SELECT name_ciphertext, process FROM ui_elements WHERE role IN ('Window', 'Document') AND "
-                            "name_ciphertext IS NOT NULL ORDER BY n DESC LIMIT 400")
-        from yuki.memory.store import app_key
-
-        for r in rows:
-            if (app_key(str(r["process"] or "")) or "") == app:
-                name = " ".join(str(store._dec(r["name_ciphertext"]) or "").split())
-                if name:
-                    return name[:NAME_CHARS]
-    except Exception:  # noqa: BLE001
-        pass
+def _app_title(app: str) -> str:
+    """The app as people say it: its prettified program name (review L4: never a window's title, which may be a
+    document's or a page's)."""
     try:
         from yuki.core.appnames import prettify
 
@@ -672,7 +661,7 @@ def find(store: Any, now: float, *, judge: Judge | None = None) -> list[Way]:
             return None
         sa = specs.setdefault(group_key(a[0]), template(store, a, now=now))
         sb = specs.setdefault(group_key(b[0]), template(store, b, now=now))
-        return judge.same(sa, sb, _app_title(store, a[0].app))
+        return judge.same(sa, sb, _app_title(a[0].app))
 
     candidates = {k: v for k, v in groups.items() if len(v) >= MIN_DEMOS}
     merged = merge_groups(candidates, judge=same)
@@ -718,7 +707,7 @@ def learn(store: Any, *, now: float | None = None, client: Any = None, settings:
                 if prov.get("item_noun"):
                     way.spec["item_noun"] = prov["item_noun"]
             else:
-                got = judge.name(way.spec, _app_title(store, way.app), _labels(store, way.app))
+                got = judge.name(way.spec, _app_title(way.app), _labels(store, way.app))
                 name = " ".join(str((got or {}).get("name") or "").split())[:NAME_CHARS]
                 if name:
                     way.name, way.everyday, way.named_by = name, bool((got or {}).get("everyday")), "model"
@@ -726,7 +715,7 @@ def learn(store: Any, *, now: float | None = None, client: Any = None, settings:
                     if noun:
                         way.spec["item_noun"] = noun
                 else:
-                    way.name, way.everyday, way.named_by = f"your way in {_app_title(store, way.app)}", False, ""
+                    way.name, way.everyday, way.named_by = f"your way in {_app_title(way.app)}", False, ""
         counts["model_calls"] = judge.calls
         counts["ways"] = len(live)
         if write:
@@ -865,17 +854,34 @@ def live_ways(store: Any) -> list[dict[str, Any]]:
 
 
 def menu_lines(store: Any) -> list[str]:
-    """One line per live way for a menu or the you-card: its name, key, app, item noun and top things (never offered;
-    "runs when asked")."""
+    """One line per live way for a menu or the you-card: its name, key, app, item noun and top things, and the item
+    values its controls take (their own labels, exactly as the route compares them: ``item = "New thread"``); never
+    offered, "runs when asked"."""
     out = []
     for w in live_ways(store):
         item = (w["spec"].get("item") or {})
         things_ = [t["name"] for t in item.get("things") or []][:5]
         noun = str(w["spec"].get("item_noun") or "item")
+        controls = [(" ".join(str(s.get("name") or "").split()), str(s.get("role") or "control"))
+                    for s in w["spec"].get("steps") or []
+                    if isinstance(s, dict) and s.get("do") == "control" and str(s.get("name") or "").strip()]
         out.append(f'{w["name"] or "your way"} [{w["key"]}] in {w["app"]}'
                    + (f"; {noun}: {', '.join(things_)}" if things_ else "")
-                   + ("; or a new one" if any(s.get("do") == "control" for s in w["spec"].get("steps") or []) else "")
+                   + "".join(f'; or item "{c}" (its {role})' for c, role in controls)
                    + "; runs when asked")
+    return out
+
+
+def control_labels(store: Any) -> list[str]:
+    """The labels of the live ways' controls (``item = "New thread"``): the values ``app.way``'s item slot takes for
+    them whatever words the user used ("a fresh one"), as a menu lists them (kTaste merge note). Never raises."""
+    out: list[str] = []
+    for w in live_ways(store):
+        for s in w["spec"].get("steps") or []:
+            name = " ".join(str(s.get("name") or "").split()) if isinstance(s, dict) and s.get("do") == "control" \
+                else ""
+            if name and name not in out:
+                out.append(name)
     return out
 
 
@@ -931,4 +937,5 @@ if __name__ == "__main__":
 
 __all__ = ["CAPABILITY", "ORIGIN", "END_FACTS", "MAX_WAYS", "Step", "Demo", "Way", "demonstrations", "group_key",
            "passes", "kept_places", "merge_groups", "things", "template", "way_key", "find", "learn", "keep_told",
-           "live_ways", "menu_lines", "note_use", "name_digest", "container_digest", "covered_apps", "capability_id"]
+           "live_ways", "menu_lines", "control_labels", "note_use", "name_digest", "container_digest", "covered_apps",
+           "capability_id"]

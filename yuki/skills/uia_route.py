@@ -13,9 +13,10 @@ until phase P deletes them; the engine's routes never consult ``use_learned``.
 **The user's own ways** (kWays, contract C4; audit 17 Oct): the capability ``app.way`` (``connections/ways.toml``)
 has one rung B route, :func:`route_way` (``ROUTES["way"]``, done-check ``PROBES["way_done"]``): a way the learner
 kept (:mod:`yuki.skills.learn.ways`) is replayed by :class:`SkillRunner` on the voice hands or the brain's desk
-hands: the item of its list the user's words name (a group label of theirs, or a span of one item's name), a control
-only when their words name it, the field by its identity, their own words typed, the end key only when they said to
-send (on the brain: only under its consent grant for this step, else the planner gets it with the text typed).
+hands: the place the ``item`` slot names (a control by its own label; else a row of the way's learned list, by a group
+label of theirs or by the row's own text; a send naming only a group asks first which row), the field by its
+identity, their own words typed, the end key only when they said to send (on the brain: only under its consent grant
+for this step, else the planner gets it with the text typed). The done line names the row it picked.
 
 The by-name part (:func:`find_in`, :func:`press`, :func:`app_window`) is the engine's ``uia_invoke`` verb and
 ``uia_name`` probe: a control found by its role and name **inside its container path**, searched from the window
@@ -118,7 +119,6 @@ from __future__ import annotations
 import threading
 import time
 import weakref
-from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -223,11 +223,16 @@ class SkillStep:
     #: second verification V8: the container's identity as C1 keys it (the keyed digest of its role, AutomationId and
     #: its parent's role), so a same-named item in another list of the same role is never picked.
     box_digest: str = ""
-    #: kWays, a slot pick of the user's own ways (:func:`route_way`): ``""`` the item's whole name is the words;
-    #: ``span`` the words stand, whole words in order, in exactly one item of a set; ``part`` the words are a group
-    #: label (a whole part of the items' composite names, "..., work"): the first item of that group in reading order
-    #: (they are one thing: picking any selects it).
+    #: kWays, a slot pick of the user's own ways (:func:`route_way`), only among the rows of the way's learned list
+    #: (composite names of 2 or more parts, :meth:`SkillRunner._way_rows`): ``part`` the words are a group label of
+    #: theirs, a later part of the row's name ("..., work"): the first such row in reading order; ``span`` the words
+    #: stand, whole words in order, in exactly one row's own text (its first part), among the siblings of rows that
+    #: carry one of the way's labels (``labels``). A way's other steps say what they are (``field``: its field by its
+    #: keyed digests; ``control``: the control its item slot named), so the brain's desk hands know them
+    #: (:meth:`DeskHands._own`). ``""``: not a way's step (a slot pick's item's whole name is the words).
     match: str = ""
+    #: kWays: the way's group labels (its learned things), the anchor of a ``span`` pick's list.
+    labels: tuple[str, ...] = ()
 
     def what(self) -> str:
         """The step in a few words, for reports (content: the thinker and memory only)."""
@@ -403,7 +408,7 @@ def way_step(i: int, way: dict[str, Any], mine: SkillStep | None = None) -> Skil
         expect=_words(way.get("expect")) or mine.expect, aid=_words(way.get("aid")),
         box_role=_words(box.get("role")), box_name=_words(box.get("name")), item=_words(way.get("item")),
         slot=way.get("do") == "pick" and not way.get("item"), box_digest=_words(box.get("digest")),
-        match=_words(way.get("match")))
+        match=_words(way.get("match")), labels=tuple(_words(x) for x in way.get("labels") or [] if _words(x)))
 
 
 def fill_slots(steps: list[SkillStep], run: list[dict[str, Any]]) -> list[SkillStep]:
@@ -970,6 +975,8 @@ class SkillRunner:
         self._brought: int | None = None
         #: Second verification N2: the app a UWP frame window hosts, per window, for this run.
         self._hosted: dict[int, str] = {}
+        #: kWays, per run: the names of the rows a way's pick clicked (RAM only: the done line names the row).
+        self.picked: list[str] = []
 
     def _stop_if_taken(self) -> None:
         """Raise :class:`_TakenOver` when the user took over (review F3: checked inside each step, not only between
@@ -1276,19 +1283,11 @@ class SkillRunner:
                     if boxed is None:
                         return "no_digest", None, 0
                     cands = [e for e, d in zip(cands, boxed) if d.casefold().startswith(step.box_digest.casefold())]
-                if step.slot:
+                if step.slot and step.match:
+                    hits = self._way_rows(step, cands)   # kWays: only the rows of the way's learned list
+                elif step.slot:
                     said_name = _words(step.text).casefold()   # (never ``want``: that is the path's window)
                     hits = [e for e in cands if said_name and _words(e.get("name")).casefold() == said_name]
-                    if not hits and said_name and step.match in ("span", "part"):
-                        # kWays: an item of a set (a sibling of its own role under its parent: a sidebar's rows)
-                        siblings = Counter((e.get("parent"), str(e.get("role") or "")) for e in els)
-                        items = [e for e in cands if siblings[(e.get("parent"), str(e.get("role") or ""))] > 1]
-                        if step.match == "part":
-                            # a group label names one thing: any of its items selects it, the first in reading order
-                            hits = [e for e in items if said_name in {p.casefold() for p in _name_parts(
-                                e.get("name"))}][:1]
-                        else:
-                            hits = [e for e in items if said(step.text, [_words(e.get("name"))])]
                 else:
                     digests = self._digests(step.app or app, step.role, [_words(e.get("name")) for e in cands])
                     if digests is None:
@@ -1311,6 +1310,24 @@ class SkillRunner:
             if time.monotonic() >= deadline:
                 return why, None, 0
             time.sleep(POLL_S)
+
+    @staticmethod
+    def _way_rows(step: SkillStep, cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """kWays (review H1): a way's slot pick, only among the rows of its learned list: a candidate whose composite
+        name has 2 or more parts (UI Automation's ", "-joined row texts; a command button's one-part name never is
+        one). ``part``: the label is a later part of the row's name (never its own text, the learner's rule), the
+        first such row in reading order. ``span``: the words stand in the row's own text (its first part), among the
+        siblings of rows that carry one of the way's labels (the list itself, never a toolbar)."""
+        if not _words(step.text):
+            return []
+        rows = [(e, _name_parts(e.get("name"))) for e in cands]
+        rows = [(e, parts) for e, parts in rows if len(parts) >= 2]
+        if step.match == "part":
+            label = _folded(step.text)
+            return [e for e, parts in rows if label in {p.casefold() for p in parts[1:]}][:1]
+        labels = {_folded(x) for x in step.labels if _words(x)}
+        homes = {e.get("parent") for e, parts in rows if labels & {p.casefold() for p in parts[1:]}}
+        return [e for e, parts in rows if e.get("parent") in homes and said(step.text, [parts[0]])]
 
     def _front_app(self) -> tuple[str, str]:
         """``(app key, title)`` of the window in front."""
@@ -1519,7 +1536,8 @@ class SkillRunner:
             from yuki.voice.hands import RISKY_CLICK_ROLES
 
             verdict = self._held("click", {"hwnd": hwnd, "element": role_name},
-                                 {"hwnd": hwnd, "app": app, "title": title, "element": role_name},
+                                 {"hwnd": hwnd, "app": app, "title": title, "element": role_name,
+                                  **({"way_step": step.match} if step.match else {})},
                                  force=str(element.get("role") or "") in RISKY_CLICK_ROLES)
             if verdict is not None:
                 return held(verdict, target)
@@ -1570,8 +1588,11 @@ class SkillRunner:
             # second verification V1: Yuki's own check sees whose item it is (the live name, as for a click), never
             # only "an item of the list"
             seen = f'{role} "{_words(element.get("name"))[:80]}" in the {step.box_role}'
+            # kWays (review H1): a way's pick says how it matched, so the desk hands never pass a row found by the
+            # user's words as the capability's own step (``DeskHands._own``: Yuki's one-step check sees it)
             verdict = self._held("click", {"hwnd": hwnd, "element": seen},
-                                 {"hwnd": hwnd, "app": app, "title": title, "element": seen})
+                                 {"hwnd": hwnd, "app": app, "title": title, "element": seen,
+                                  **({"way_step": step.match} if step.match else {})})
             if verdict is not None:
                 return held(verdict, target)
             self._stop_if_taken()   # review F3: the user took over while it looked or was checked: nothing done
@@ -1590,6 +1611,8 @@ class SkillRunner:
             verdict, why = action_verdict("click", outcome)
             if outcome.ok:
                 remember_rid(self._session, step, hwnd, app, element)   # capC5 anchor 4, this session only
+                if step.slot and step.match:
+                    self.picked.append(_words(element.get("name")))   # kWays: the done line names it (RAM only)
             return done(ok=bool(outcome.ok), verdict=verdict if outcome.ok else False, why=why, tool="click",
                         target=f"{target} in \"{title[:60]}\"", app=app, hwnd=hwnd,
                         report=f"{lead}picked a {role} in the {step.box_role}: {outcome.summary}")
@@ -1800,6 +1823,7 @@ class SkillRunner:
         self._acted, self._last_hwnd, self._before_run, self._dialogs = set(), None, set(before), {}
         self._prev_pre, self._prev_exp, self._prev_brought, self._brought = None, None, None, None
         self._hosted = {}
+        self.picked = []
         # second verification N1: a run that picks an item by the user's words never re-finds a control by RuntimeId
         self._no_rid = any(s.do == "pick" and s.slot for s in steps)
         part_before = ("", "")
@@ -2455,15 +2479,15 @@ def _name_parts(name: Any) -> list[str]:
 
 
 def choose_way(ways: list[dict[str, Any]], given: Any, words: list[str]) -> dict[str, Any] | None:
-    """The way a run means: the one ``given`` names (its key, or its name as the menu shows it), else the only live
-    one, else the one whose app or name stands in the user's words; ``None`` when that leaves none or several."""
+    """The way a run means: the one ``given`` names (its key, or its name as the menu shows it); with nothing given,
+    the only live one, else the one whose app or name stands in the user's words. ``None`` when that leaves none or
+    several, or when a way was given that is none of these (review L1: never another way in its place)."""
     if isinstance(given, Mapping):
         given = given.get("key") or given.get("name")
     key = _words(given)
     if key:
         hits = [w for w in ways if w.get("key") == key or (w.get("name") and _folded(w["name"]) == _folded(key))]
-        if hits:
-            return hits[0]
+        return hits[0] if hits else None
     if len(ways) == 1:
         return ways[0]
     named = [w for w in ways if (w.get("name") and said(w["name"], words))
@@ -2471,42 +2495,48 @@ def choose_way(ways: list[dict[str, Any]], given: Any, words: list[str]) -> dict
     return named[0] if len(named) == 1 else None
 
 
-def way_steps_for(way: Mapping[str, Any], *, item: str, text: str, send: bool, words: list[str]
+def way_steps_for(way: Mapping[str, Any], *, item: str, text: str, send: bool
                   ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """The run of one learned way for these values: ``(the way's steps as the step runner keeps them, the steps as
-    given, content-free facts)``. The item slot is picked by the user's words: a group label it names (``part``),
-    else the words as a span of one item's name; a control runs only when the user's words name it (its own label,
-    whole words); the field is found by its identity (role, container digest, name digests: never its name); the
-    typing is the user's words; the end key only when the run sends. Raises :class:`SkillRefused` when nothing of the
-    way can run with these values."""
+    given, content-free facts)``. The ``item`` slot (the brain's reading of the user's words) decides the place, and
+    nothing else does (review M1: never a label found somewhere in the utterance or the text): a control's own label
+    (whole, case aside) runs that control; else a group label of theirs it holds picks that group's row (``part``);
+    else its words pick the one row whose own text holds them (``span``); empty: where the app is now. The field is
+    found by its identity (role, container digest, name digests: never its name); the typing is the user's words; the
+    end key only when the run sends. Facts: ``item`` (``thing`` / ``span`` / ""), ``thing`` (the label, RAM only),
+    ``control`` (its label, RAM only), ``controls`` (the way's control labels), ``field``, ``typed``, ``end``.
+    Raises :class:`SkillRefused` when the values don't fit the way (a place it has no list for, nothing to run)."""
     spec = way.get("spec") if isinstance(way.get("spec"), Mapping) else {}
     app = str(spec.get("app") or way.get("app") or "")
     run: list[dict[str, Any]] = []
     given: list[dict[str, Any]] = []
-    facts: dict[str, Any] = {"item": "", "control": 0, "field": False, "typed": False, "end": False}
     item_spec = spec.get("item") if isinstance(spec.get("item"), Mapping) else {}
-    things = [str(t.get("name") or "") for t in item_spec.get("things") or [] if isinstance(t, Mapping)]
-    controls = [s for s in spec.get("steps") or [] if isinstance(s, Mapping) and s.get("do") == "control"]
-    named_controls = [c for c in controls if _words(c.get("name")) and said(_words(c.get("name")), words)]
+    things = [_words(t.get("name")) for t in item_spec.get("things") or [] if isinstance(t, Mapping)]
+    things = [t for t in things if t]
+    controls = [s for s in spec.get("steps") or [] if isinstance(s, Mapping) and s.get("do") == "control"
+                and _words(s.get("name"))]
     item_words = _words(item)
+    control = next((c for c in controls if item_words and _folded(c.get("name")) == _folded(item_words)), None)
+    thing = "" if control is not None else next((t for t in things if said(t, [item_words])), "")
+    if item_words and control is None and not item_spec:
+        raise SkillRefused("that way has no list to pick a place from")
+    facts: dict[str, Any] = {"item": "", "thing": thing, "control": _words((control or {}).get("name")),
+                             "controls": [_words(c.get("name")) for c in controls], "field": False, "typed": False,
+                             "end": False}
     for s in spec.get("steps") or []:
         if not isinstance(s, Mapping):
             continue
         do = s.get("do")
-        if do == "item" and item_words and item_spec:
-            if named_controls and any(said(item_words, [_words(c.get("name"))]) for c in named_controls):
-                continue    # the item words name the control itself ("a new thread"), not an item
-            thing = next((t for t in things if t and said(t, [item_words])), "")
+        if do == "item" and item_words and control is None and item_spec:
             run.append({"do": "pick", "role": str(item_spec.get("role") or ""),
                         "in": {"role": str(item_spec.get("parent") or "")}, "app": app,
-                        "match": "part" if thing else "span"})
+                        "match": "part" if thing else "span", "labels": things})
             given.append({"do": "pick", "text": thing or item_words})
             facts["item"] = "thing" if thing else "span"
-        elif do == "control" and s in named_controls:
+        elif do == "control" and control is not None and s is control:
             run.append({"do": "click", "role": _words(s.get("role")), "name": _words(s.get("name")),
-                        **({"aid": _words(s.get("aid"))} if _words(s.get("aid")) else {})})
+                        "match": "control", **({"aid": _words(s.get("aid"))} if _words(s.get("aid")) else {})})
             given.append({"do": "click", "role": _words(s.get("role")), "name": _words(s.get("name"))})
-            facts["control"] += 1
         elif do == "field":
             fields = [f for f in spec.get("field") or [] if isinstance(f, Mapping) and f.get("name_digest")]
             if not fields:
@@ -2515,7 +2545,7 @@ def way_steps_for(way: Mapping[str, Any], *, item: str, text: str, send: bool, w
             same = [f for f in fields if str(f.get("box") or "") == box and f.get("role") == fields[0].get("role")]
             run.append({"do": "pick", "role": str(fields[0].get("role") or ""),
                         "in": {"role": str(fields[0].get("parent") or ""), **({"digest": box} if box else {})},
-                        "item": "|".join(str(f["name_digest"]) for f in same), "app": app})
+                        "item": "|".join(str(f["name_digest"]) for f in same), "app": app, "match": "field"})
             given.append({"do": "pick"})
             facts["field"] = True
         elif do == "text" and _words(text):
@@ -2547,17 +2577,52 @@ def _way_store(memory: Any, fn: Any, what: str = "ways") -> Any:
 
 #: The capability the user's own ways run through (``connections/ways.toml``; contract C4).
 CAPABILITY_WAY = "app.way"
-#: The done line's words per outcome (data; the done line names the way, never what was typed).
-WAY_SAY = {"sent": "Done: sent in {app}.", "draft": "Typed it in {app}; it's waiting there, not sent."}
+#: The done line's words per outcome (data). ``{where}``: the row the way picked by its own text (RAM only, never
+#: logged) and the app, or the app alone; never what was typed.
+WAY_SAY = {"sent": "Done: sent in {where}.", "draft": "Typed it in {where}; it's waiting there, not sent."}
+#: kWays review M2: a send that names only one of the user's groups (a project) never goes into a row Yuki chose
+#: unasked: it asks first, naming that group's latest row by its own text (or a new one, when the way has a control);
+#: the very same run asked for again within this time is the user's answer to that question ("that one"). RAM only.
+WAY_ASK_KEEP_S = 180.0
+_way_asks: dict[tuple[str, str, str], float] = {}
+_way_asks_lock = threading.Lock()
+
+
+def _way_asked(key: tuple[str, str, str]) -> bool:
+    """Whether this very run (way, group, text) was asked about moments ago (the ask is used up); else it is noted
+    as asked now."""
+    now = time.monotonic()
+    with _way_asks_lock:
+        for k, at in list(_way_asks.items()):
+            if now - at > WAY_ASK_KEEP_S:
+                _way_asks.pop(k, None)
+        if _way_asks.pop(key, None) is not None:
+            return True
+        _way_asks[key] = now
+        return False
+
+
+def _peek_row(hands: Any, step: dict[str, Any], label: str, app: str) -> str:
+    """The own text (first part) of the row a ``part`` pick of ``label`` would take now: one read of the app's
+    windows, nothing clicked or brought forward; ``""`` when it isn't seen."""
+    try:
+        how, found, _n = SkillRunner(hands)._pick(way_step(0, step, SkillStep(i=0, do="pick", text=label)), [app],
+                                                  0.0, None)
+    except Exception:  # noqa: BLE001 - not seen: the question names no row
+        return ""
+    parts = _name_parts(found[2].get("name")) if how == "found" and found is not None else []
+    return parts[0] if parts else ""
 
 
 def route_way(call: Any) -> Any:
     """The ``app.way`` capability's rung B (contract C4): one of the user's own ways replayed by
-    :class:`SkillRunner` (each step found by identity, checked, held for Yuki's own check, the user's hands stop it),
-    on the voice hands or the brain's desk hands (their declared-steps scope, as the chat driver's own steps: the
-    picks and the typing are the capability's; the end key is not declared, so Yuki's one-step check judges it with
-    the user's words). Never with a game in front (the route takes focus). ``facts_ram`` carries what the done-check
-    reads (typed, submitted)."""
+    :class:`SkillRunner` with every step held for Yuki's own check (``held_all``, as :func:`run_route`), on the voice
+    hands or the brain's desk hands (their declared-steps scope, as the chat driver's own steps: the field's pick,
+    a group row's pick and a control the item slot named are the capability's; a row found by the user's words is
+    seen by Yuki's one-step check; the end key is declared only under the brain's grant, else that check judges it).
+    A send naming only a group asks first which row (:data:`WAY_ASK_KEEP_S`). Never with a game in front (the route
+    takes focus). The done line names the row it picked; ``facts_ram`` carries what the done-check reads (typed,
+    submitted)."""
     from yuki.skills.engine import TO_PLANNER, RouteResult
     from yuki.skills.learn import ways as learned
 
@@ -2576,10 +2641,20 @@ def route_way(call: Any) -> Any:
     send = str(values.get("send") or "") == "send"
     text = str(values.get("text") or "")
     try:
-        run, given, plan = way_steps_for(way, item=str(values.get("item") or ""), text=text, send=send, words=words)
+        run, given, plan = way_steps_for(way, item=str(values.get("item") or ""), text=text, send=send)
     except SkillRefused:
         return RouteResult(ran=False, outcome="refused_steps")
-    app = str((way.get("spec") or {}).get("app") or way.get("app") or "")
+    spec = way.get("spec") if isinstance(way.get("spec"), Mapping) else {}
+    app = str(spec.get("app") or way.get("app") or "")
+    noun = _words(spec.get("item_noun")) or "item"
+    if send and plan["thing"] and not _way_asked((str(way["key"]), _folded(plan["thing"]), _folded(text))):
+        pick = next((s for s in run if s.get("match") == "part"), None)
+        row = _peek_row(hands, pick, plan["thing"], app) if pick is not None else ""
+        new = plan["controls"][0] if plan["controls"] else ""
+        where = f'your latest {plan["thing"]} {noun}, "{row[:60]}"' if row else f'which {plan["thing"]} {noun}'
+        ask = f"Send it in {where}" + (f", or in a new {noun}?" if new else "?")
+        return RouteResult(ran=False, outcome="which_item", ask=ask, options=[o for o in (row[:60], new) if o],
+                           facts={"asked": "which_item", "seen": bool(row)}, app=app)
     item = {"run": run, "apps": [app], "ref": f"skill:{way['key']}", "intent": str(way.get("name") or ""),
             "text": ""}
     args = {"steps": given, "sends": False}
@@ -2595,19 +2670,21 @@ def route_way(call: Any) -> Any:
     own = given if granted else [s for s in given if s.get("do") != "keys"]
     sends = {"to": _words(grant.get("person")) if granted else "", "what": text} if granted else None
     scope = declare(key=str(way["key"]), steps=own, way_text="", sends=sends) if callable(declare) else nullcontext()
+    runner = SkillRunner(hands, held_all=True)
     try:
         with scope:
-            ok, _report, facts = SkillRunner(hands).run(args, item=item, words=words)
+            ok, _report, facts = runner.run(args, item=item, words=words)
     except SkillRefused:
         return RouteResult(ran=False, outcome="refused_steps")
     results = [r for r in facts.get("results") or [] if isinstance(r, StepResult)]
     typed = any(r.step.do == "type" and r.ok and r.verdict is True for r in results)
-    submitted = any(r.step.do == "keys" and r.ok and r.verdict is not False for r in results) if send else None
+    # review L2: sent only when the end key's effect was seen (an undecided screen change is not a send)
+    submitted = any(r.step.do == "keys" and r.ok and r.verdict is True for r in results) if send else None
     done = int(facts.get("steps_done") or 0)
     ram = {"way": way["key"], "typed": typed if plan["typed"] else None, "submitted": submitted, "send": send,
            "picked": plan["item"]}
     shown = {"steps": int(facts.get("steps") or 0), "done": done, "pick": plan["item"] or "none",
-             "controls": plan["control"], "send": send}
+             "control": bool(plan["control"]), "send": send}
     if facts.get("refused") == "game" or facts.get("act_off"):
         return RouteResult(ran=done > 0, held="game" if facts.get("refused") == "game" else None, outcome="refused",
                            facts=shown, facts_ram=ram, app=app)
@@ -2621,7 +2698,9 @@ def route_way(call: Any) -> Any:
     verified = True if (ok and facts.get("verified") is True) else (False if facts.get("deviation") else None)
     if verified:
         _way_store(ctx.memory, lambda store: learned.note_use(store, str(way["key"])), "way_use")
-    say = WAY_SAY["sent" if send and submitted else "draft"].format(app=app_words(app)) if ok else None
+    row = (_name_parts(runner.picked[0]) or [""])[0] if runner.picked else ""
+    where = f'your {noun} "{row[:60]}" in {app_words(app)}' if row else app_words(app)
+    say = WAY_SAY["sent" if send and submitted else "draft"].format(where=where) if ok else None
     return RouteResult(ran=done > 0 if done or not ok else None, verified=verified, say=say,
                        outcome="steps_ok" if ok else str(facts.get("deviation") or "failed"), facts=shown,
                        facts_ram=ram, app=app)
@@ -2963,8 +3042,14 @@ class DeskHands:
                         return "name"
                     if text == _folded(grant.get("text")):
                         return "text"
-            elif tool == "click" and scope["picks"] and not scope["sends"]:
-                return "pick"
+            elif tool == "click" and scope["picks"]:
+                # kWays: a learned way's own steps (its field found by its keyed digests, a row of the user's group
+                # found by their label, the control its item slot named by its label) are the capability's even in a
+                # run that sends (its send is the end key, judged on its own); a row found by the user's words never
+                # is (review H1: Yuki's one-step check sees the element)
+                way = facts.get("way_step")
+                if way in ("field", "part", "control") or (not scope["sends"] and way != "span"):
+                    return "pick"
             return None
         if tool == "click" and grant.get("join") is True:
             from yuki.brain import consent
