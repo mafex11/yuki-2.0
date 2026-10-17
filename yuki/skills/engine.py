@@ -1722,22 +1722,37 @@ def _truthy(value: Any) -> bool:
     return bool(value)
 
 
+def asks_choice(slots: Mapping[str, Any] | None) -> bool:
+    """Whether a ``run_skill``'s slots ask Yuki to choose (contract C2: ``choose`` true): the engine fills the empty
+    slot with its pick, so a caller's "a video nobody picked never plays" guard (the voice hands' ``_needs_offer``)
+    lets it through. Never raises."""
+    try:
+        return isinstance(slots, Mapping) and _truthy(slots.get("choose"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunContext, live: Live,
                     settings: Any = None) -> "_Pick | SkillResult | None":
     """kTaste (contract C2; audit 17 Oct decision 2): when the user asked Yuki to choose (``slots.choose``), or named
     only a channel for a video ("put on Deji's new video"), Yuki picks like a recommender
     (:func:`yuki.skills.taste.choose`) and the run plays its pick: a video (``web.open_video``; ``web.open_page`` on
     YouTube's front page asked to choose becomes it: "put something on YouTube" plays), a channel's page
-    (``web.open_page`` on a channel page kind), a playlist of the user's own (``spotify.playlist``). With a game in
-    front or a call live nothing is put on: the result says so and names the pick for later (:func:`taste.held_line`).
-    ``None``: not such a request, no pick (nothing of theirs to pick from, memory too slow), or a value the user named
-    for the slot (theirs wins); the request then runs the normal way with the choice slots taken out."""
+    (``web.open_page`` on a channel page kind), a playlist of the user's own (``spotify.playlist``). A video or playlist
+    text given with it counts only when it stands in their words and IS one of their channels or playlists
+    (``taste._same_name``); asked to choose, any other text given is their words for the judgement and the pick is free
+    (review M1); not asked, it goes the normal way (review H2: "the Sidemen video about the island" is a search, never
+    Sidemen's newest). With a game in front nothing is put on; with a call live nothing Yuki chose is put on (a channel
+    they named plays, review L4): the result says so and keeps the pick for later (:func:`taste.held_line`,
+    :func:`taste.keep_for_later`). ``None``: not such a request, no pick (nothing of theirs to pick from, memory too
+    slow), or a concrete value they gave (an offered option, a link: theirs wins); the request then runs the normal way
+    with the choice slots taken out."""
     from yuki.skills import taste
     from yuki.skills.catalog import load
     from yuki.skills.connection import scope_value
 
     given = dict(slots or {})
-    asked = _truthy(given.get("choose"))
+    asked = asks_choice(given)
     context = " ".join(str(given.get("context") or "").split())
     rest = {k: v for k, v in given.items() if k not in CHOICE_SLOTS}
     skill = load().get(str(skill_key or ""))
@@ -1764,41 +1779,47 @@ def _choice_request(skill_key: str, slots: Mapping[str, Any] | None, ctx: RunCon
             rest.pop("page", None)
         else:
             return None
-    elif cap == "web.open_video":
-        video = rest.get("video")
-        name = _given_text(video) if not (isinstance(video, Mapping) and video.get("ref")) else ""
+    else:      # web.open_video, spotify.playlist: a text given for the slot
+        slot_name = taste.CHOOSE_SLOTS[kind]
+        given_v = rest.pop(slot_name, None)
+        if isinstance(given_v, Mapping) and given_v.get("ref"):
+            return None            # a concrete one (an offered option's link, a learned link): theirs, the normal way
+        name = _given_text(given_v)
         if name:
             from yuki.skills.uia_route import said
 
-            if not said(name, ctx.words) or _offered_pick(ctx, name):
-                return None        # not the user's words, or an offered upload they picked ("the Deji one")
-            only = name
-        elif not asked:
+            if not said(name, ctx.words):
+                name = ""          # not their words: no constraint (asked), else the normal way as given
+            elif cap == "web.open_video" and _offered_pick(ctx, name):
+                return None        # an offered upload they picked ("the Deji one"): the offer's own path
+        if name and (asked or cap == "web.open_video"):
+            only = name            # a channel or playlist of theirs if it IS one (asked: else a hint; not: else normal)
+        if not asked and not only:
             return None
-        rest.pop("video", None)
-    elif not asked or _given_text(rest.get(taste.CHOOSE_SLOTS[kind])):
-        return None
     slot = (load().get(key) or skill).slot(taste.CHOOSE_SLOTS[kind])
     taste_kind = str(getattr(slot, "taste", "") or "")
-    hold = "game" if live.game else ("call" if _in_call(ctx.hands, ctx.memory) else "")
+    hold = "game" if live.game else ("call" if asked and _in_call(ctx.hands, ctx.memory) else "")
 
     def pick(client: Any) -> Any:
         return taste.choose(_store_of(client), kind, words=list(ctx.words), context=context,
-                            session=ctx.session_id, only=only, taste_kind=taste_kind, settings=settings, log=ctx.log,
-                            network=not hold, judge_wait_s=0.0 if hold else taste.CHOOSE_WAIT_S)
+                            session=ctx.session_id, only=only, asked=asked, taste_kind=taste_kind, settings=settings,
+                            log=ctx.log, network=not hold, judge_wait_s=0.0 if hold else taste.CHOOSE_WAIT_S)
 
     choice = _mem(ctx.memory, "taste_choose", pick, timeout_s=CHOOSE_TIMEOUT_S)
-    if hold and (asked or choice is not None):
-        say = taste.held_line(choice, hold)
-        _emit(ctx, "skill_run", skill=key, result="held_game" if hold == "game" else HELD_CALL, choose=True,
-              origin=ctx.origin)
-        return SkillResult(skill=key, outcome="held_game" if hold == "game" else HELD_CALL, say=say,
-                           held=live.game or None)
+    if not asked and choice is None:
+        return None                # the text named no channel of theirs: the normal way with it, as before
+    if hold:
+        if choice is not None:
+            # named for later and kept: the next ask of this conversation puts it on (review L3)
+            taste.keep_for_later(choice, session=ctx.session_id)
+        outcome = "held_game" if hold == "game" else HELD_CALL
+        _emit(ctx, "skill_run", skill=key, result=outcome, choose=True, origin=ctx.origin)
+        return SkillResult(skill=key, outcome=outcome, say=taste.held_line(choice, hold), held=live.game or None)
     if choice is None:
         return None
     chosen = {choice.slot: choice.value, **choice.extra}
     return _Pick(key, {k: v for k, v in rest.items() if k not in chosen}, chosen,
-                 "words" if only and not asked else FROM_CHOSEN, choice, taste_kind)
+                 "words" if choice.named else FROM_CHOSEN, choice, taste_kind)
 
 
 def _offered_pick(ctx: RunContext, name: str) -> bool:
@@ -1980,4 +2001,4 @@ __all__ = ["BUDGET_S", "PINNED_CHARS", "LINE_UNVERIFIED", "LINE_FAILED", "LINE_O
            "HANDOFF_ORIGINS", "FROM_UNHEARD", "FROM_GIVEN", "SEEN_MAX", "COMMIT_BY_END", "COMMIT_BY_NEED", "commit_for",
            "run_commit", "served_commit", "ledger_skill", "RouteResult", "RouteCall", "RunContext", "SkillResult",
            "VERB_FUNCS", "open_uri", "pinned", "SEED_KEYS", "plan_seed", "run", "resolve_and_run", "run_for_voice",
-           "run_for_thinker", "granted_values", "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL"]
+           "run_for_thinker", "granted_values", "CHOICE_SLOTS", "CHOOSE_TIMEOUT_S", "HELD_CALL", "asks_choice"]

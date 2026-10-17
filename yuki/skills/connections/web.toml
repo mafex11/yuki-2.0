@@ -104,10 +104,11 @@ done_line = "Playing it."
 offer_class = "never"
 handoff = true
 
-# The picked video: one of the offered options (phase T gives them with their link); a channel the user named ("Deji's
-# new video": that channel's newest unwatched upload, yuki/skills/taste.py choose with only=); or Yuki's own pick when
-# the user asked it to choose (choose = true). No entity kind on purpose: the taste fill never guesses a video for a
-# request that asked for none; only a request that asked Yuki to choose plays one nobody named.
+# The picked video: one of the offered options (phase T gives them with their link); a channel of theirs given alone
+# as the video ("Deji's new video": video = "Deji", that channel's newest unwatched upload, yuki/skills/taste.py choose
+# with only=; any longer words, a title or "the one about the island", go the normal way: the thinker finds it); or
+# Yuki's own pick when the user asked it to choose (choose = true). No entity kind on purpose: the taste fill never
+# guesses a video for a request that asked for none; only a request that asked Yuki to choose plays one nobody named.
 [[capability."web.open_video".slot]]
 name = "video"
 type = "entity"
