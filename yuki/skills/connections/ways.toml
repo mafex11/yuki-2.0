@@ -18,7 +18,7 @@ app = "app"
 [capability."app.way"]
 end = "message_sent"
 kind = "change"
-menu = "do one of the user's own ways in an app (way, item, their words); a draft unless they said send"
+menu = "do one of the user's own ways in an app (way, item, their words); a draft unless their words ask to send, tell or ask it"
 done_line = "Done."
 commit = "words"
 offer_class = "never"
